@@ -16,24 +16,33 @@
 //! Legacy table/column names are kept exactly. Timestamps bind as ISO-8601
 //! UTC with `::timestamptz` casts (repo convention from 0001/0002).
 
+use std::collections::HashSet;
+
 use sqlx::{Pool, Postgres};
 
 use super::inactivity::{
     flag_inactive, should_flag, InactivityCandidate, InactivityOutcome, INACTIVITY_EVENT_SOURCE,
 };
 
-/// Inactivity store failure: transport only.
+/// Inactivity store failure: transport, or a sweep timestamp that never parsed.
 #[derive(Debug, thiserror::Error)]
 pub enum InactivityStoreError {
     #[error("inactivity store database error: {0}")]
     Db(#[from] sqlx::Error),
+    #[error("invalid inactivity sweep timestamp: {0:?}")]
+    InvalidTimestamp(String),
 }
+
+/// Quiet-member rows per select: the sweep re-runs the bounded select until
+/// it comes back empty, so no single read materializes an unbounded row set.
+const SWEEP_PAGE_ROWS: usize = 4_096;
 
 /// One hourly sweep (legacy `flagInactive`): select members still present,
 /// not bots, quiet since before the cutoff, and either never flagged or last
 /// flagged before the cutoff; record one `member_inactive` event each and
 /// return their ids. `days` is the `TWO_INACTIVITY_DAYS` threshold, `now` the
-/// sweep time as ISO-8601 UTC.
+/// sweep time as ISO-8601 UTC. An unparseable `now` fails the sweep with
+/// [`InactivityStoreError::InvalidTimestamp`] before any query or write.
 pub async fn run_sweep(
     pool: &Pool<Postgres>,
     now: &str,
@@ -41,7 +50,10 @@ pub async fn run_sweep(
 ) -> Result<InactivityOutcome, InactivityStoreError> {
     let parse = super::funnel::parse_iso_millis;
     let format = super::funnel::format_iso_millis;
-    let now_ms = parse(now).unwrap_or(0);
+    // Fail closed before any query or write: an unparseable sweep time must
+    // never silently flag nobody and report success.
+    let now_ms =
+        parse(now).ok_or_else(|| InactivityStoreError::InvalidTimestamp(now.to_owned()))?;
     // The cutoff is computed in Rust (legacy `Date.now() - days * 86_400_000`)
     // and binds as one ISO timestamp: no interval arithmetic in SQL, and the
     // same millisecond feeds both the query and the outcome stamp.
@@ -56,94 +68,143 @@ pub async fn run_sweep(
         Option<sqlx::types::time::OffsetDateTime>,
         bool,
     );
-    let rows: Vec<SweepRow> = sqlx::query_as(
-        "SELECT guild_id, member_id, COALESCE(last_active_at, joined_at),
-                inactive_flagged_at, is_bot
-           FROM members
-          WHERE left_at IS NULL
-            AND NOT is_bot
-            AND COALESCE(last_active_at, joined_at) < $1::timestamptz
-            AND (inactive_flagged_at IS NULL OR inactive_flagged_at < $1::timestamptz)",
-    )
-    .bind(&cutoff)
-    .fetch_all(pool)
-    .await?;
     /// `OffsetDateTime` to epoch millis for the shared ISO formatter.
     fn epoch_millis(dt: &sqlx::types::time::OffsetDateTime) -> i64 {
         dt.unix_timestamp() * 1000 + i64::from(dt.millisecond())
     }
-    let candidates: Vec<InactivityCandidate> = rows
-        .into_iter()
-        .map(
-            |(guild_id, member_id, last_seen, flagged_at, is_bot)| InactivityCandidate {
-                guild_id,
-                member_id,
+    // Progress is structural, not observational: pages advance a composite
+    // `(guild_id, member_id)` cursor along PRIMARY KEY order, so each page is
+    // disjoint from every earlier page by construction. Rows that stay
+    // eligible after being visited — a full page whose events already exist
+    // but whose projections lag, or a page MemberJoin reopens by clearing
+    // `inactive_flagged_at` — can never pin the window or hide the writable
+    // tail behind them: the cursor has already moved past their keys. A page
+    // therefore ends the sweep only when it comes back empty or short, never
+    // because its rows were seen before.
+    let mut cursor: Option<(String, String)> = None;
+    let mut written: Vec<(String, String)> = Vec::with_capacity(SWEEP_PAGE_ROWS);
+    let mut outcome = InactivityOutcome { flagged: vec![] };
+    let cutoff_ms = super::inactivity::inactivity_cutoff_ms(now_ms, days);
+    loop {
+        // Keyset paging re-runs the bounded select with the previous page's
+        // final key instead of using OFFSET (an offset would skip members the
+        // earlier pages just flagged). `$3` is false on the first page, when
+        // `$4`/`$5` are empty and ignored; on later pages the row comparison
+        // seeks strictly past the cursor. Suppressed members are excluded
+        // here, not only at the per-write gate: they never leave the eligible
+        // set, so without the exclusion a suppressed prefix of
+        // SWEEP_PAGE_ROWS or more would fill whole pages the sweep must still
+        // walk key by key. The per-write suppression check stays as the
+        // TOCTOU gate for opt-outs that land between this select and the
+        // write.
+        let (has_cursor, cursor_guild, cursor_member) = cursor
+            .as_ref()
+            .map(|(guild_id, member_id)| (true, guild_id.as_str(), member_id.as_str()))
+            .unwrap_or((false, "", ""));
+        let rows: Vec<SweepRow> = sqlx::query_as(
+            "SELECT guild_id, member_id, COALESCE(last_active_at, joined_at),
+                    inactive_flagged_at, is_bot
+               FROM members
+              WHERE left_at IS NULL
+                AND NOT is_bot
+                AND COALESCE(last_active_at, joined_at) < $1::timestamptz
+                AND (inactive_flagged_at IS NULL OR inactive_flagged_at < $1::timestamptz)
+                AND NOT EXISTS (
+                    SELECT 1 FROM privacy_opt_outs AS opt
+                    WHERE opt.guild_id = members.guild_id
+                      AND opt.member_id = members.member_id
+                )
+                AND (NOT $3::boolean OR (guild_id, member_id) > ($4, $5))
+              ORDER BY guild_id, member_id
+              LIMIT $2",
+        )
+        .bind(&cutoff)
+        .bind(SWEEP_PAGE_ROWS as i64)
+        .bind(has_cursor)
+        .bind(cursor_guild)
+        .bind(cursor_member)
+        .fetch_all(pool)
+        .await?;
+        if rows.is_empty() {
+            break;
+        }
+        let page_len = rows.len();
+        if let Some((guild_id, member_id, _, _, _)) = rows.last() {
+            cursor = Some((guild_id.clone(), member_id.clone()));
+        }
+        let candidates: Vec<InactivityCandidate> = rows
+            .into_iter()
+            .map(
+                |(guild_id, member_id, last_seen, flagged_at, is_bot)| InactivityCandidate {
+                    guild_id,
+                    member_id,
+                    last_seen_ms: last_seen.as_ref().map(epoch_millis),
+                    flagged_at_ms: flagged_at.as_ref().map(epoch_millis),
+                    is_bot,
+                    has_left: false,
+                },
+            )
+            .collect();
+        let page = flag_inactive(&candidates, now_ms, days);
+        for flagged in &page.flagged {
+            let key = super::inactivity::member_inactive_event_key(
+                &flagged.guild_id,
+                &flagged.member_id,
+                &flagged.occurred_at,
+            );
+            let mut tx = pool.begin().await?;
+            // Serialize with concurrent opt-outs so a sweep that selected the
+            // member before the opt-out cannot write after the purge. Lock order
+            // matches `opt_out_member`'s sorted order; ROW EXCLUSIVE never blocks
+            // other writers. The select already excludes suppressed members;
+            // this is the TOCTOU gate for opt-outs landing between the select
+            // and the write: a suppressed pair is skipped, since the flag event
+            // would otherwise recreate per-user data the purge just removed.
+            sqlx::query("LOCK TABLE events, members, privacy_opt_outs IN ROW EXCLUSIVE MODE")
+                .execute(&mut *tx)
+                .await?;
+            // Revalidate the initial SELECT's eligibility atomically with the
+            // write: the member may have become active, left, become a bot, or
+            // been flagged by a concurrent sweep after selection. `FOR UPDATE`
+            // pins the row so a concurrent winner commits first and this
+            // transaction observes its flag stamp; a stale candidate rolls back
+            // with no event, no flag mutation, and no outcome entry.
+            type FreshRow = (
+                Option<sqlx::types::time::OffsetDateTime>,
+                Option<sqlx::types::time::OffsetDateTime>,
+                bool,
+                Option<sqlx::types::time::OffsetDateTime>,
+            );
+            let fresh: Option<FreshRow> = sqlx::query_as(
+                "SELECT COALESCE(last_active_at, joined_at), inactive_flagged_at, is_bot, left_at
+               FROM members WHERE guild_id = $1 AND member_id = $2 FOR UPDATE",
+            )
+            .bind(&flagged.guild_id)
+            .bind(&flagged.member_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some((last_seen, flagged_at, is_bot, left_at)) = fresh else {
+                tx.rollback().await?;
+                continue;
+            };
+            let current = InactivityCandidate {
+                guild_id: flagged.guild_id.clone(),
+                member_id: flagged.member_id.clone(),
                 last_seen_ms: last_seen.as_ref().map(epoch_millis),
                 flagged_at_ms: flagged_at.as_ref().map(epoch_millis),
                 is_bot,
-                has_left: false,
-            },
-        )
-        .collect();
-    let mut outcome = flag_inactive(&candidates, now_ms, days);
-    let cutoff_ms = super::inactivity::inactivity_cutoff_ms(now_ms, days);
-    let mut written: Vec<(String, String)> = Vec::with_capacity(outcome.flagged.len());
-    for flagged in &outcome.flagged {
-        let key = super::inactivity::member_inactive_event_key(
-            &flagged.guild_id,
-            &flagged.member_id,
-            &flagged.occurred_at,
-        );
-        let mut tx = pool.begin().await?;
-        // Serialize with concurrent opt-outs so a sweep that selected the
-        // member before the opt-out cannot write after the purge. Lock order
-        // matches `opt_out_member`'s sorted order; ROW EXCLUSIVE never blocks
-        // other writers. A suppressed pair is skipped: the flag event would
-        // otherwise recreate per-user data the purge just removed.
-        sqlx::query("LOCK TABLE events, members, privacy_opt_outs IN ROW EXCLUSIVE MODE")
-            .execute(&mut *tx)
-            .await?;
-        // Revalidate the initial SELECT's eligibility atomically with the
-        // write: the member may have become active, left, become a bot, or
-        // been flagged by a concurrent sweep after selection. `FOR UPDATE`
-        // pins the row so a concurrent winner commits first and this
-        // transaction observes its flag stamp; a stale candidate rolls back
-        // with no event, no flag mutation, and no outcome entry.
-        type FreshRow = (
-            Option<sqlx::types::time::OffsetDateTime>,
-            Option<sqlx::types::time::OffsetDateTime>,
-            bool,
-            Option<sqlx::types::time::OffsetDateTime>,
-        );
-        let fresh: Option<FreshRow> = sqlx::query_as(
-            "SELECT COALESCE(last_active_at, joined_at), inactive_flagged_at, is_bot, left_at
-               FROM members WHERE guild_id = $1 AND member_id = $2 FOR UPDATE",
-        )
-        .bind(&flagged.guild_id)
-        .bind(&flagged.member_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some((last_seen, flagged_at, is_bot, left_at)) = fresh else {
-            tx.rollback().await?;
-            continue;
-        };
-        let current = InactivityCandidate {
-            guild_id: flagged.guild_id.clone(),
-            member_id: flagged.member_id.clone(),
-            last_seen_ms: last_seen.as_ref().map(epoch_millis),
-            flagged_at_ms: flagged_at.as_ref().map(epoch_millis),
-            is_bot,
-            has_left: left_at.is_some(),
-        };
-        if !should_flag(&current, cutoff_ms) {
-            tx.rollback().await?;
-            continue;
-        }
-        if crate::privacy::suppressed_in(&mut tx, &flagged.guild_id, &flagged.member_id).await? {
-            tx.rollback().await?;
-            continue;
-        }
-        let inserted: Option<(i64,)> = sqlx::query_as(
+                has_left: left_at.is_some(),
+            };
+            if !should_flag(&current, cutoff_ms) {
+                tx.rollback().await?;
+                continue;
+            }
+            if crate::privacy::suppressed_in(&mut tx, &flagged.guild_id, &flagged.member_id).await?
+            {
+                tx.rollback().await?;
+                continue;
+            }
+            let inserted: Option<(i64,)> = sqlx::query_as(
             "INSERT INTO events (event_type, member_id, guild_id, occurred_at, source, metadata, idempotency_key)
              VALUES ('member_inactive', $1, $2, $3::timestamptz, $4, $5, $6)
              ON CONFLICT (idempotency_key) DO NOTHING RETURNING id",
@@ -156,34 +217,48 @@ pub async fn run_sweep(
         .bind(&key)
         .fetch_optional(&mut *tx)
         .await?;
-        if inserted.is_some() {
-            sqlx::query(
-                "UPDATE members SET inactive_flagged_at = $1::timestamptz
+            if inserted.is_some() {
+                sqlx::query(
+                    "UPDATE members SET inactive_flagged_at = $1::timestamptz
                   WHERE guild_id = $2 AND member_id = $3",
+                )
+                .bind(&flagged.occurred_at)
+                .bind(&flagged.guild_id)
+                .bind(&flagged.member_id)
+                .execute(&mut *tx)
+                .await?;
+                written.push((flagged.guild_id.clone(), flagged.member_id.clone()));
+            } else if sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM events WHERE idempotency_key = $1",
             )
-            .bind(&flagged.occurred_at)
-            .bind(&flagged.guild_id)
-            .bind(&flagged.member_id)
-            .execute(&mut *tx)
-            .await?;
-            written.push((flagged.guild_id.clone(), flagged.member_id.clone()));
-        } else if sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM events WHERE idempotency_key = $1",
-        )
-        .bind(&key)
-        .fetch_one(&mut *tx)
-        .await?
-            > 0
-        {
-            // Already flagged in an earlier sweep: the outcome still reports
-            // the member, but there is no new write to gate.
-            written.push((flagged.guild_id.clone(), flagged.member_id.clone()));
+            .bind(&key)
+            .fetch_one(&mut *tx)
+            .await?
+                > 0
+            {
+                // Already flagged in an earlier sweep: the outcome still reports
+                // the member, but there is no new write to gate. The lagging
+                // projection is deliberately left alone — repairing it here
+                // would rewrite another sweep's outcome — and the keyset
+                // cursor advances past such pages regardless of write outcome.
+                written.push((flagged.guild_id.clone(), flagged.member_id.clone()));
+            }
+            tx.commit().await?;
         }
-        tx.commit().await?;
+        outcome.flagged.extend(page.flagged);
+        if page_len < SWEEP_PAGE_ROWS {
+            break;
+        }
     }
+    // Linear membership: one set build, one O(1) probe per outcome, and the
+    // probes borrow, so the filter clones nothing per item.
+    let written_set: HashSet<(&str, &str)> = written
+        .iter()
+        .map(|(guild_id, member_id)| (guild_id.as_str(), member_id.as_str()))
+        .collect();
     outcome
         .flagged
-        .retain(|f| written.contains(&(f.guild_id.clone(), f.member_id.clone())));
+        .retain(|f| written_set.contains(&(f.guild_id.as_str(), f.member_id.as_str())));
     Ok(outcome)
 }
 
@@ -424,6 +499,101 @@ mod tests {
             .await
             .expect("event count");
         assert_eq!(count.0, 0);
+        drop_schema(&pool, &schema).await;
+    }
+
+    #[tokio::test]
+    async fn sweep_pages_past_a_suppressed_prefix_without_dropping_the_tail() {
+        let Some((pool, schema)) = test_pool("inactivity_suppressed_prefix")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping inactivity_store test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        // A full page of suppressed-and-quiet members ahead of a writable tail.
+        // Suppressed rows never leave the eligible set, so without the
+        // select-time exclusion they would pin the LIMIT window and the sweep
+        // would end without ever visiting the tail. `generate_series` keeps
+        // the seed to two statements.
+        sqlx::query(
+            "INSERT INTO members (guild_id, member_id, joined_at)
+             SELECT 'guild-a', 'member-' || g, '2026-07-01T00:00:00.000Z'::timestamptz
+             FROM generate_series(1, 4196) g",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed members");
+        sqlx::query(
+            "INSERT INTO privacy_opt_outs (guild_id, member_id)
+             SELECT 'guild-a', 'member-' || g FROM generate_series(1, 4096) g",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed opt-outs");
+        let outcome = run_sweep(&pool, "2026-09-07T00:00:00.000Z", 14)
+            .await
+            .expect("sweep past suppressed prefix");
+        assert_eq!(outcome.flagged.len(), 100);
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM events")
+            .fetch_one(&pool)
+            .await
+            .expect("event count");
+        assert_eq!(count.0, 100);
+        drop_schema(&pool, &schema).await;
+    }
+
+    #[tokio::test]
+    async fn sweep_pages_past_a_lagging_projection_prefix_without_dropping_the_tail() {
+        let Some((pool, schema)) = test_pool("inactivity_lagging_prefix")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping inactivity_store test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        // A full page whose events already exist but whose projections lag,
+        // ahead of a 100-member writable tail. The existing-event arm reports
+        // without touching projections, so without keyset progress the prefix
+        // would reselect on every page and the sweep would end without ever
+        // visiting the tail. `generate_series` keeps the seed to two
+        // statements; the seeded keys match this sweep's idempotency shape.
+        sqlx::query(
+            "INSERT INTO members (guild_id, member_id, joined_at)
+             SELECT 'guild-a', 'member-' || g, '2026-07-01T00:00:00.000Z'::timestamptz
+             FROM generate_series(1, 4196) g",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed members");
+        sqlx::query(
+            "INSERT INTO events (event_type, member_id, guild_id, occurred_at, source, metadata, idempotency_key)
+             SELECT 'member_inactive', 'member-' || g, 'guild-a',
+                    '2026-09-07T00:00:00.000Z'::timestamptz, 'job:inactivity',
+                    '{\"thresholdDays\":14}',
+                    'guild-a:member-' || g || ':member_inactive:2026-09-07T00:00:00.000Z'
+             FROM generate_series(1, 4096) g",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed existing events");
+        let outcome = run_sweep(&pool, "2026-09-07T00:00:00.000Z", 14)
+            .await
+            .expect("sweep past lagging prefix");
+        assert_eq!(outcome.flagged.len(), 4196);
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM events")
+            .fetch_one(&pool)
+            .await
+            .expect("event count");
+        assert_eq!(count.0, 4196);
+        // Existing-event rows are reported but their projections stay
+        // untouched; only the writable tail advances.
+        let untouched: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM members WHERE inactive_flagged_at IS NULL")
+                .fetch_one(&pool)
+                .await
+                .expect("untouched projection count");
+        assert_eq!(untouched.0, 4096);
         drop_schema(&pool, &schema).await;
     }
 }
