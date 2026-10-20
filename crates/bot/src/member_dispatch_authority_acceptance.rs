@@ -7,7 +7,7 @@
 //! runtime lane. Do not move it into an unselected standalone ignored target.
 
 use super::*;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::Notify;
 use two_bot_core::member_moderation::MemberModerationStore;
 use two_bot_testsupport::TestDatabase;
@@ -158,7 +158,11 @@ impl AuthorityRest {
                     });
                     tokio::time::sleep(response.delay).await;
                     let body = response.body.unwrap_or_default();
-                    let header = format!("HTTP/1.1 {} Fixture\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", response.status, body.len());
+                    let header = format!(
+                        "HTTP/1.1 {} Fixture\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        response.status,
+                        body.len()
+                    );
                     let _ = stream.write_all(header.as_bytes()).await;
                     let _ = stream.write_all(body.as_bytes()).await;
                 });
