@@ -29,7 +29,10 @@ fn executor_for(mock: &MockRest) -> ActionExecutor {
 }
 
 fn history(ids: &[String]) -> ScriptedResponse {
-    let rows = ids.iter().map(|id| serde_json::json!({"id": id})).collect();
+    let rows = ids
+        .iter()
+        .map(|id| serde_json::json!({"id": id, "author": {"bot": false}}))
+        .collect();
     ScriptedResponse::json(200, serde_json::Value::Array(rows))
 }
 

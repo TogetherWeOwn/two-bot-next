@@ -1360,7 +1360,11 @@ async fn purge_stopped_early_reports_the_reason_in_the_reply_and_the_audit_row()
         vec![
             ScriptedResponse::json(
                 200,
-                json!([{"id": aged_message_id(1)}, {"id": aged_message_id(2)}, {"id": aged_message_id(3)}]),
+                json!([
+                    {"id": aged_message_id(1), "author": {"bot": false}},
+                    {"id": aged_message_id(2), "author": {"bot": false}},
+                    {"id": aged_message_id(3), "author": {"bot": false}}
+                ]),
             ),
             ScriptedResponse::status(204),
             ScriptedResponse::status(403),

@@ -1752,7 +1752,11 @@ async fn purge_stopped_early_reports_the_reason_in_the_result_and_the_audit_row(
             channel(None, "0"),
             ScriptedResponse::json(
                 200,
-                json!([{"id": aged_message_id(1)}, {"id": aged_message_id(2)}, {"id": aged_message_id(3)}]),
+                json!([
+                    {"id": aged_message_id(1), "author": {"bot": false}},
+                    {"id": aged_message_id(2), "author": {"bot": false}},
+                    {"id": aged_message_id(3), "author": {"bot": false}}
+                ]),
             ),
             ScriptedResponse::status(204),
             ScriptedResponse::rate_limited(0.0, "0"),
@@ -1886,7 +1890,10 @@ async fn full_purge_audit_metadata_and_stored_payload_are_byte_identical_to_befo
             channel(None, "0"),
             ScriptedResponse::json(
                 200,
-                json!([{"id": fresh_message_id(1)}, {"id": fresh_message_id(2)}]),
+                json!([
+                    {"id": fresh_message_id(1), "author": {"bot": false}},
+                    {"id": fresh_message_id(2), "author": {"bot": false}}
+                ]),
             ),
             ScriptedResponse::status(204),
         ],
