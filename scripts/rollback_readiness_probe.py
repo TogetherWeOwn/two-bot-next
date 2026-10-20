@@ -141,6 +141,30 @@ class Result:
         return f"{'PASS' if self.ok else 'FAIL'} {self.name}: {self.reason}"
 
 
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    raised message is fixed vocabulary: it names no key, value or path.
+    """
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
+
+
+def decode_strict(body):
+    """Decode JSON while refusing duplicate object keys at any depth."""
+    return json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+
+
 def is_int(value, low=0, high=I64_MAX):
     # JSON true/false decode to bool, a subclass of int; floats never count.
     return isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
@@ -252,20 +276,24 @@ def read_manifest(path):
                 first = read_line(stream)
             if not first:
                 raise ProbeError(f"{path.name} is empty")
-            manifest = validate_manifest(json.loads(first))
+            manifest = validate_manifest(decode_strict(first))
             last = b""
             while line := read_line(stream):
                 if line.strip():
                     last = line
     except ProbeError:
         raise
+    except DuplicateKeyError:
+        raise ProbeError(f"{path.name} manifest line carries duplicate JSON object keys")
     except (OSError, EOFError, zlib.error) as e:
         raise ProbeError(f"{path.name} is not a complete gzip archive ({e.__class__.__name__})")
     except (ValueError, RecursionError):
         # ValueError also carries bad UTF-8 and the int-digit cap; refuse all as non-JSON.
         raise ProbeError(f"{path.name} manifest line is not JSON")
     try:
-        end = json.loads(last) if last else None
+        end = decode_strict(last) if last else None
+    except DuplicateKeyError:
+        raise ProbeError(f"{path.name} end marker carries duplicate JSON object keys")
     except (ValueError, RecursionError):
         end = None
     if not isinstance(end, dict) or end.get("kind") != "end" or not is_int(end.get("rows"), high=(1 << 64) - 1):
@@ -292,7 +320,9 @@ def load_live_sequences(path):
     if len(data) > SEQUENCES_FILE_CAP:
         raise ProbeError("sequences file exceeds byte cap")
     try:
-        rows = json.loads(data)
+        rows = decode_strict(data)
+    except DuplicateKeyError:
+        raise ProbeError(f"{path} carries duplicate JSON object keys")
     except (ValueError, RecursionError):
         # Excessively nested input exhausts the decoder's recursion budget.
         raise ProbeError(f"{path} is not JSON; expected the SEQUENCES_QUERY result")
@@ -372,7 +402,9 @@ def readyz_state(status, body):
     if len(body) > READYZ_BODY_CAP:
         raise ProbeError("/readyz answered over the body cap")
     try:
-        report = json.loads(body)
+        report = decode_strict(body)
+    except DuplicateKeyError:
+        raise ProbeError(f"/readyz {status} carries duplicate JSON object keys")
     except (ValueError, RecursionError):
         # Excessively nested input exhausts the decoder's recursion budget
         # below READYZ_BODY_CAP; grade it as no breakdown, never a crash.
