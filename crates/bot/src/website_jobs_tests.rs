@@ -254,7 +254,12 @@ async fn roster_paginates_and_rejects_failed_or_repeated_pages() {
         ScriptedResponse::status(500),
     )
     .await;
-    let members = roster(&executor(&mock), "2222").await.unwrap();
+    let RosterScan::Complete(members) = roster(&executor(&mock), "2222", BOT_FLOOR_MAX_PAGES)
+        .await
+        .unwrap()
+    else {
+        panic!("a 1001-member roster fits within the page budget");
+    };
     assert_eq!(members.len(), 1001);
     let requests = mock.requests();
     assert!(requests[0]
@@ -277,7 +282,9 @@ async fn roster_paginates_and_rejects_failed_or_repeated_pages() {
     ] {
         let mock = MockRest::start(vec![response], ScriptedResponse::status(500)).await;
         assert_eq!(
-            roster(&executor(&mock), "2222").await.err(),
+            roster(&executor(&mock), "2222", BOT_FLOOR_MAX_PAGES)
+                .await
+                .err(),
             Some(ErrorClass::Rest)
         );
         mock.shutdown().await;
