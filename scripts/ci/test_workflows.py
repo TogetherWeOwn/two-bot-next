@@ -3210,6 +3210,7 @@ class WorkflowTests(unittest.TestCase):
             "raid_list_db",
             "reengagement_list_db",
             "member_moderation_db",
+            "stream_live_store",
         ):
             with self.subTest(target=target):
                 self.assertIn(target, step["run"])
@@ -3249,6 +3250,18 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(ignored_sweeps), 1)
         self.assertIn("--test-threads=1", ignored_sweeps[0])
         self.assertIn("--skip regenerate_reference_docs", ignored_sweeps[0])
+        # These guards reject the sweep's bootstrap URL. Derive exact skip
+        # tokens from the Rust tests so a rename cannot leave a tolerated panic
+        # behind; a prefix/typo or a skip on another invocation is not enough.
+        stream_ignored = re.findall(
+            r'(?m)^#\[ignore[^\n]*\]\s*(?:#\[[^\n]*\]\s*)*(?:async\s+)?fn\s+(\w+)\s*\(',
+            (ROOT / "crates/core/tests/stream_live_store.rs").read_text(),
+        )
+        self.assertEqual(len(stream_ignored), 9)
+        ignored_skips = re.findall(r"(?:^|\s)--skip\s+(\S+)", ignored_sweeps[0])
+        for name in stream_ignored:
+            with self.subTest(stream_ignored=name):
+                self.assertIn(name, ignored_skips)
         # One MEMBER_TESTDB export serves both the ignored sweep and the
         # fail-closed member_moderation_db re-run. Pin its count and logical
         # command order so a redundant later export cannot mask a deleted or
@@ -3306,6 +3319,7 @@ class WorkflowTests(unittest.TestCase):
             "--test reengagement_list_db": False,
             "--test game_activity_report_db": False,
             "--test member_moderation_db": True,
+            "--test stream_live_store": True,
         }
         for needle, wants_db_feature in guarded_needles.items():
             with self.subTest(needle=needle):
@@ -3316,6 +3330,31 @@ class WorkflowTests(unittest.TestCase):
                     self.assertIn("--features db", matches[0])
                 else:
                     self.assertNotIn("--features db", matches[0])
+        # Stream and member moderation share one of the 12 fail-closed runs.
+        # It must actually execute the ignored stream cases, with the last URL
+        # export selecting their accepted empty-password agent_test form.
+        stream_runs = [
+            run for run in guarded
+            if re.search(r"--test stream_live_store(?:\s|$)", run)
+        ]
+        self.assertEqual(
+            len(stream_runs), 1, "expected one guarded stream_live_store invocation",
+        )
+        stream_run = stream_runs[0]
+        self.assertIn("--test member_moderation_db", stream_run)
+        self.assertIn("-- --ignored --test-threads=1", stream_run)
+        for name in stream_ignored:
+            with self.subTest(stream_rerun=name):
+                self.assertNotIn(f"--skip {name}", stream_run)
+        stream_rerun_index = logical_lines.index(stream_run)
+        database_exports = [
+            line for line in logical_lines[:stream_rerun_index]
+            if line.startswith("export TWO_TEST_DATABASE_URL=")
+        ]
+        self.assertEqual(database_exports[-1:], [
+            "export TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/agent_test",
+        ])
+        self.assertLess(ignored_sweep_index, stream_rerun_index)
         env_wrapped = [
             run for run in cov_runs
             if run.startswith('cov_run env -u PGPASSWORD -u PGPASSFILE -u PGOPTIONS "$COV"')
