@@ -712,19 +712,31 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             return;
         }
         let Some(snapshot) = self.live.overwrite_snapshot(room) else {
-            if action.attempts == 0 {
-                // Nothing was persisted or sent: forget the in-memory approval so
-                // the member can request access again when authoritative state returns.
-                self.unwind_grant(room, member);
-                self.queue.mark_succeeded(&action);
-            } else {
-                // A retry after an unknown-outcome PUT may already have landed:
-                // keep the claim and the witness, retry from fresh evidence.
+            // Rate limits do not consume attempts, so attempts == 0 does not
+            // prove the grant was unsent. Only the store can rule out a witness.
+            let grants = match self.store.join_grants(self.live.guild_id).await {
+                Ok(grants) => grants,
+                Err(error) => {
+                    self.join_grant_store_failed(action, room, error, now_ms, started);
+                    return;
+                }
+            };
+            if grants
+                .get(&room)
+                .is_some_and(|members| members.contains(&member))
+            {
+                // A witnessed PUT may already have landed: keep the claim and
+                // witness, and retry from fresh overwrite evidence.
                 self.mark_failed_observed(
                     action,
                     "join approval overwrite evidence unavailable".to_owned(),
                     elapsed_ms(now_ms, started),
                 );
+            } else {
+                // No witness exists, so forget this unpersisted approval and
+                // let the member request access again once evidence returns.
+                self.unwind_grant(room, member);
+                self.queue.mark_succeeded(&action);
             }
             return;
         };

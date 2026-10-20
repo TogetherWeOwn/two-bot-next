@@ -176,6 +176,7 @@ struct Store {
     save_privacy_errors: Mutex<VecDeque<StoreError>>,
     /// Durable approved Connect grants, keyed by room then member.
     join_grants: Mutex<BTreeMap<u64, BTreeSet<u64>>>,
+    join_grants_errors: Mutex<VecDeque<StoreError>>,
     save_join_grant_errors: Mutex<VecDeque<StoreError>>,
     remove_join_grant_errors: Mutex<VecDeque<StoreError>>,
     add_creator_error: Mutex<Option<StoreError>>,
@@ -253,6 +254,7 @@ impl Store {
             privacy: Mutex::new(BTreeMap::new()),
             save_privacy_errors: Mutex::new(VecDeque::new()),
             join_grants: Mutex::new(BTreeMap::new()),
+            join_grants_errors: Mutex::new(VecDeque::new()),
             save_join_grant_errors: Mutex::new(VecDeque::new()),
             remove_join_grant_errors: Mutex::new(VecDeque::new()),
             add_creator_error: Mutex::new(None),
@@ -710,6 +712,9 @@ impl RoomPersistence for Store {
         Ok(true)
     }
     async fn join_grants(&self, _: u64) -> Result<BTreeMap<u64, BTreeSet<u64>>, StoreError> {
+        if let Some(error) = self.join_grants_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
         Ok(self.join_grants.lock().unwrap().clone())
     }
     async fn save_join_grant(

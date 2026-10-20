@@ -202,8 +202,14 @@ the Join channel. The join-request flow is in
   is an access obligation, not proof of a new grant: an earlier PUT may have
   landed even if a retry returns AccessDenied, cancellation or another
   definitive refusal. Unknown grant outcomes retain the row through those
-  refusals and across restart hydration. A successful grant followed by a
-  failed move also retains it. A retained row can conservatively represent an
+  refusals and across restart hydration. When overwrite evidence is unknown,
+  the worker reads the existing grant witnesses: only confirmed absence for
+  this room and member releases the in-memory claim. A witness keeps the claim
+  and retries; a failed read also keeps it, using the normal persistence retry
+  or credential-refusal halt. The queue's attempt count is not evidence of
+  witness absence: a 429 from the PUT or the following move requeues without
+  consuming attempts. A successful grant followed by a failed move also
+  retains the witness. A retained row can conservatively represent an
   unsent earlier attempt; do not infer ownership from arbitrary Connect allows.
   `/public` still clears only the witnessed Connect allow, preserving unrelated
   member allow/deny bits and vote-kick denies. Refused or uncertain revocation

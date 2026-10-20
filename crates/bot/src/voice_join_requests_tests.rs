@@ -1342,6 +1342,105 @@ async fn an_approval_retry_without_overwrite_evidence_keeps_its_claim() {
 }
 
 #[tokio::test]
+async fn a_rate_limited_approval_without_overwrite_evidence_keeps_its_witnessed_claim() {
+    for limited_move in [true, false] {
+        let (mut worker, trace) = private_room().await;
+        enter(&worker, OUTSIDER, 2_000);
+        worker.reconcile();
+        drain(&mut worker).await;
+        let request = request_of(&worker, OUTSIDER);
+        let errors = if limited_move {
+            &worker.http.move_errors
+        } else {
+            &worker.http.overwrite_errors
+        };
+        errors
+            .lock()
+            .unwrap()
+            .push_back(RoomHttpError::RateLimited {
+                retry_after_ms: 100,
+                global: false,
+            });
+        press(&mut worker, OWNER, JoinDecision::Approve, request.id.0);
+        assert!(worker.dispatch_one(1_000_000).await);
+        // Both 429 sources preserve attempts == 0, despite the stored witness;
+        // the move's 429 happens after the Connect PUT has already landed.
+        assert_eq!(outsider_writes(&worker).len(), usize::from(limited_move));
+        assert_eq!(stored_grants(&worker), [OUTSIDER]);
+        assert!(worker.privacy[&ROOM].granted.contains(&MemberId(OUTSIDER)));
+        let known = hide_overwrites(&worker);
+        trace.lock().unwrap().clear();
+        assert!(worker.dispatch_one(10_000_000).await);
+        assert!(
+            worker.privacy[&ROOM].granted.contains(&MemberId(OUTSIDER)),
+            "unknown evidence must keep the witnessed claim (move 429: {limited_move})"
+        );
+        assert_eq!(stored_grants(&worker), [OUTSIDER]);
+        assert_eq!(outsider_writes(&worker).len(), usize::from(limited_move));
+        assert!(!calls(&trace).contains(&format!("move:{OUTSIDER}:{ROOM}")));
+        // Fresh evidence completes the same approval; /public can then revoke
+        // its Connect allow in this process, without restart hydration.
+        worker.live.upsert_channel(known);
+        assert!(worker.dispatch_one(20_000_000).await);
+        assert_eq!(
+            outsider_writes(&worker).len(),
+            1 + usize::from(limited_move)
+        );
+        assert!(calls(&trace).contains(&format!("move:{OUTSIDER}:{ROOM}")));
+        assert!(cached_outsider(&worker)
+            .is_some_and(|entry| entry.allow.contains(Permissions::CONNECT)));
+        assert_eq!(stored_grants(&worker), [OUTSIDER]);
+        worker.apply_privacy(OWNER, false, "Ana", PrivacyCommand::Public);
+        drain(&mut worker).await;
+        assert!(calls(&trace).contains(&format!("delete_overwrite:{ROOM}:{OUTSIDER}")));
+        assert!(cached_outsider(&worker).is_none());
+        assert!(stored_grants(&worker).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn an_approval_without_overwrite_evidence_does_not_treat_a_store_error_as_absence() {
+    for error in [
+        StoreError::Unavailable,
+        StoreError::Conflict,
+        StoreError::CredentialRefused,
+    ] {
+        let (mut worker, trace) = private_room().await;
+        enter(&worker, OUTSIDER, 2_000);
+        worker.reconcile();
+        drain(&mut worker).await;
+        let request = request_of(&worker, OUTSIDER);
+        press(&mut worker, OWNER, JoinDecision::Approve, request.id.0);
+        let known = hide_overwrites(&worker);
+        worker
+            .store
+            .join_grants_errors
+            .lock()
+            .unwrap()
+            .push_back(error);
+        trace.lock().unwrap().clear();
+        assert!(worker.dispatch_one(1_000_000).await);
+        assert!(
+            worker.privacy[&ROOM].granted.contains(&MemberId(OUTSIDER)),
+            "{error:?}"
+        );
+        assert!(stored_grants(&worker).is_empty());
+        assert!(outsider_writes(&worker).is_empty());
+        assert!(!calls(&trace).contains(&format!("move:{OUTSIDER}:{ROOM}")));
+        assert!(worker.failures().iter().any(|failure| matches!(failure,
+            LifecycleFailure::Persistence { channel_id: Some(ROOM), error: recorded } if *recorded == error
+        )));
+        assert_eq!(worker.halted, error == StoreError::CredentialRefused);
+        if error != StoreError::CredentialRefused {
+            worker.live.upsert_channel(known);
+            assert!(worker.dispatch_one(10_000_000).await);
+            assert_eq!(outsider_writes(&worker).len(), 1);
+            assert_eq!(stored_grants(&worker), [OUTSIDER]);
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_revoke_without_overwrite_evidence_retries_once_it_returns() {
     let (mut worker, trace, _) = approved_over(None).await;
     let reply = worker.apply_privacy(OWNER, false, "Ana", PrivacyCommand::Public);
