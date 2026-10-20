@@ -1043,25 +1043,26 @@ fn rank_tick_self_heals_non_cumulative_ladder_and_publishes() {
                 }),
                 "frozen roster list still required: {requests:?}"
             );
-            let truth = truth.lock().expect("member truth");
-            assert!(
-                truth
-                    .point_reads
-                    .iter()
-                    .any(|(stuck, roles)| *stuck == 0 && roles.as_slice() == ["12".to_owned()]),
-                "initial point read must show Member only: {:?}",
-                truth.point_reads
-            );
-            assert!(
-                truth.point_reads.iter().any(|(stuck, roles)| {
-                    *stuck >= 1
-                        && roles.iter().any(|role| role == "11")
-                        && roles.iter().any(|role| role == "12")
-                }),
-                "post-repair point read must show Prospect and Member: {:?}",
-                truth.point_reads
-            );
-            drop(truth);
+            {
+                let truth = truth.lock().expect("member truth");
+                assert!(
+                    truth
+                        .point_reads
+                        .iter()
+                        .any(|(stuck, roles)| *stuck == 0 && roles.as_slice() == ["12".to_owned()]),
+                    "initial point read must show Member only: {:?}",
+                    truth.point_reads
+                );
+                assert!(
+                    truth.point_reads.iter().any(|(stuck, roles)| {
+                        *stuck >= 1
+                            && roles.iter().any(|role| role == "11")
+                            && roles.iter().any(|role| role == "12")
+                    }),
+                    "post-repair point read must show Prospect and Member: {:?}",
+                    truth.point_reads
+                );
+            }
             let rank: Option<String> =
                 sqlx::query_scalar("SELECT rank_key FROM member_ranks WHERE guild_id=$1 AND member_id='1001'")
                     .bind(guild)
