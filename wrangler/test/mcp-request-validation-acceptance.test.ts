@@ -26,6 +26,7 @@ const UPSTREAM = {
   components: [["process", "ready"], ["gateway", "ready"], ["database", "ready"]],
   jobs: { backfill: { parked: false, running: false, consecutive_failures: 0 } },
 };
+const AUDIT_EXCERPT = { available: true, rows: [], truncated: false };
 
 function harness() {
   const names: string[] = [];
@@ -42,7 +43,8 @@ function harness() {
           async fetch(req: Request) {
             forwarded.push({ method: req.method, url: req.url,
               authorization: req.headers.get("authorization"), body: await req.text() });
-            return Response.json(UPSTREAM);
+            const path = new URL(req.url).pathname;
+            return Response.json(path === "/ops/audit" ? AUDIT_EXCERPT : UPSTREAM);
           },
         };
       },
@@ -280,7 +282,8 @@ for (const name of TOOLS) {
       assert.equal(body.error, undefined);
       assert.ok(body.result?.structuredContent, "valid tool must actually execute, not just acknowledge");
       const path = name === "get_status" ? "/health"
-        : name === "get_gateway" || name === "get_backfill_progress" ? "/readyz" : null;
+        : name === "get_gateway" || name === "get_backfill_progress" ? "/readyz"
+        : name === "get_audit" ? "/ops/audit" : null;
       assert.deepEqual(h.names, path === null ? [] : ["two-bot"]);
       assert.deepEqual(h.forwarded, path === null ? []
         : [{ method: "GET", url: `http://c${path}`, authorization: null, body: "" }]);

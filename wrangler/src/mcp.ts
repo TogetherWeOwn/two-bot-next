@@ -18,8 +18,7 @@
  *   explicit `implemented: false` marker (no backfill JSON API exists yet)
  * - `get_config` → redacted non-secret Worker snapshot (no container read,
  *   never secrets)
- * - `get_audit` → explicit `implemented: false` stub (no audit JSON API
- *   exists yet; real audit read is follow-up work, never faked data)
+ * - `get_audit` → `GET http://c/ops/audit`, bounded redacted audit excerpt
  *
  * Control tools are out of scope (deferred behind step-up scope + control
  * token + audit write). Unknown tool names return JSON-RPC `-32601`.
@@ -48,6 +47,9 @@ export const MCP_MAX_BODY_BYTES = 64 * 1024;
 export const MCP_INBOUND_MAX_BODY_BYTES = 64 * 1024;
 export const MCP_INBOUND_BODY_TIMEOUT_MS = 6000;
 
+// Internal binding dispatch, not a credential. Public ingress strips this
+// header; only the authenticated MCP handler stamps it on its fixed GET.
+export const MCP_AUDIT_READ_HEADER = "x-two-bot-mcp-audit-read";
 const SINGLETON_NAME = "two-bot";
 
 export const MCP_TOOL_NAMES = [
@@ -94,7 +96,7 @@ const TOOL_DESCRIPTIONS: Record<McpToolName, string> = {
   get_backfill_progress:
     "Backfill jobs excerpt from /readyz (phase 1: implemented=false; no backfill JSON API yet)",
   get_config: "Redacted non-secret Worker config snapshot (read-only, never secrets)",
-  get_audit: "Audit excerpt (phase 1: implemented=false; real audit read is follow-up)",
+  get_audit: "Bounded redacted audit excerpt from /ops/audit (read-only, newest 50 rows)",
 };
 
 function toolEntries(): unknown[] {
@@ -187,7 +189,7 @@ function toolResult(id: unknown, data: unknown): Response {
 /** One bounded container GET through the fenced singleton DO. */
 async function containerGet(
   env: McpEnv,
-  path: "/health" | "/readyz",
+  path: "/health" | "/readyz" | "/ops/audit",
   signal: AbortSignal,
 ): Promise<Response> {
   const deployment = deploymentId(
@@ -201,11 +203,17 @@ async function containerGet(
     .fetch(
       new Request(`http://c${path}`, {
         method: "GET",
-        headers: { [DEPLOYMENT_HEADER]: deployment },
+        headers: {
+          [DEPLOYMENT_HEADER]: deployment,
+          ...(path === "/ops/audit" ? { [MCP_AUDIT_READ_HEADER]: "1" } : {}),
+        },
         signal,
       }),
     );
-  return abortable(upstream, signal);
+  return abortable(upstream.then((response) => {
+    if (signal.aborted) void response.body?.cancel().catch(() => {});
+    return response;
+  }), signal);
 }
 
 function combineSignals(request: Request, timeoutMs: number): AbortSignal {
@@ -254,9 +262,45 @@ function isReadyzReport(data: unknown): boolean {
   );
 }
 
+/** Reject schema drift rather than accidentally proxying private audit columns. */
+function isAuditExcerpt(data: unknown): boolean {
+  if (typeof data !== "object" || data === null || Array.isArray(data)) return false;
+  const excerpt = data as Record<string, unknown>;
+  if (Object.keys(excerpt).sort().join(",") !== "available,rows,truncated" ||
+      typeof excerpt.available !== "boolean" || typeof excerpt.truncated !== "boolean" ||
+      !Array.isArray(excerpt.rows) || excerpt.rows.length > 50) return false;
+  if (!excerpt.available && (excerpt.rows.length !== 0 || excerpt.truncated)) return false;
+  const keys = [
+    "action", "actor_id", "delivery_state", "destination_channel_id", "entry_id",
+    "guild_id", "kind", "message_id", "occurred_at", "source_channel_id", "target_id",
+  ].join(",");
+  return excerpt.rows.every((value: unknown) => {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+    const row = value as Record<string, unknown>;
+    if (Object.keys(row).sort().join(",") !== keys) return false;
+    const nullableIds = ["actor_id", "target_id", "source_channel_id", "destination_channel_id", "message_id"];
+    const snowflake = (field: unknown) => typeof field === "string" && /^[0-9]{1,20}$/.test(field);
+    return typeof row.entry_id === "string" && /^[A-Za-z0-9_:.-]{1,128}$/.test(row.entry_id)
+      && snowflake(row.guild_id)
+      && nullableIds.every((key) => row[key] === null || snowflake(row[key]))
+      && typeof row.occurred_at === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(row.occurred_at)
+      && typeof row.kind === "string" && ["message_edit", "message_delete", "member_update", "voice_join", "voice_leave", "voice_move", "moderation_action"].includes(row.kind)
+      && typeof row.delivery_state === "string" && ["none", "pending", "delivering", "delivered", "quarantined"].includes(row.delivery_state)
+      && (row.action === null || (typeof row.action === "string" && [
+        "member_kick", "member_prune", "member_ban", "member_unban", "member_update",
+        "member_role_update", "member_move", "member_disconnect", "message_delete",
+        "message_bulk_delete", "channel_update", "channel_overwrite_create",
+        "channel_overwrite_update", "channel_overwrite_delete", "moderation.ban",
+        "moderation.tempban", "moderation.kick", "moderation.timeout", "moderation.warn",
+        "moderation.purge", "moderation.slowmode", "moderation.lockdown", "moderation.unlock",
+        "moderation.unban_scheduled",
+      ].includes(row.action)));
+  });
+}
+
 async function readContainerJson(
   env: McpEnv,
-  path: "/health" | "/readyz",
+  path: "/health" | "/readyz" | "/ops/audit",
   signal: AbortSignal,
 ): Promise<{ ok: true; data: unknown } | { ok: false; oversize: boolean }> {
   let upstream: Response;
@@ -265,10 +309,12 @@ async function readContainerJson(
   } catch {
     return { ok: false, oversize: false };
   }
-  const botResponse =
-    path === "/health" ? upstream.ok : isReadyzBotResponse(upstream.status, upstream.headers.get("content-type"));
+  const contentType = upstream.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
+  const botResponse = path === "/ops/audit"
+    ? upstream.status === 200 && contentType === "application/json"
+    : path === "/health" ? upstream.ok : isReadyzBotResponse(upstream.status, contentType ?? null);
   if (signal.aborted || !botResponse) {
-    await upstream.body?.cancel().catch(() => {});
+    void upstream.body?.cancel().catch(() => {});
     return { ok: false, oversize: false };
   }
   let body: string | null;
@@ -280,19 +326,19 @@ async function readContainerJson(
   if (body === null || signal.aborted) {
     // Oversize (null) or a timeout that won the race during the read: never
     // echo upstream bytes, just report the class.
-    await upstream.body?.cancel().catch(() => {});
+    void upstream.body?.cancel().catch(() => {});
     return { ok: false, oversize: body === null };
   }
   try {
     const data = JSON.parse(body) as unknown;
-    if (path === "/readyz" && !isReadyzReport(data)) {
+    if ((path === "/readyz" && !isReadyzReport(data)) ||
+        (path === "/ops/audit" && !isAuditExcerpt(data))) {
       return { ok: false, oversize: false };
     }
     return { ok: true, data };
   } catch {
-    if (path === "/readyz") {
-      // Non-JSON 200/503 bodies (plain text, arrays-as-text, junk) are not
-      // readiness reports.
+    if (path !== "/health") {
+      // Non-JSON bodies are not readiness reports or audit excerpts.
       return { ok: false, oversize: false };
     }
     return { ok: true, data: { text: body } };
@@ -391,8 +437,15 @@ async function callTool(
       });
     }
     case "get_audit": {
-      // No audit JSON API exists yet: pin the stub, never fake entries.
-      return toolResult(id, { implemented: false });
+      const res = await readContainerJson(env, "/ops/audit", signal);
+      if (!res.ok) {
+        return jsonError(
+          id,
+          -32000,
+          res.oversize ? "container body exceeds limit" : "container request failed",
+        );
+      }
+      return toolResult(id, res.data);
     }
   }
 }
