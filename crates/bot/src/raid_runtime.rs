@@ -53,17 +53,17 @@ fn is_snowflake(value: &str) -> bool {
 
 /// The raid configuration for one observation.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct RaidSettings {
-    pub(crate) tuning: RaidTuning,
+pub struct RaidSettings {
+    pub tuning: RaidTuning,
     /// `None` means log only: no channel is guessed on a live server.
-    pub(crate) staff_channel: Option<String>,
+    pub staff_channel: Option<String>,
 }
 
 impl RaidSettings {
     /// A missing or unusable number (zero, negative, non-finite, unparsable)
     /// falls back to the default rather than disabling the watch, and an
     /// unusable channel falls back to log-only. Present-but-bad values warn.
-    pub(crate) fn from_vars(vars: &HashMap<String, String>) -> Self {
+    pub fn from_vars(vars: &HashMap<String, String>) -> Self {
         let number = |key: &str, default: f64| match vars.get(key).map(|raw| raw.trim()) {
             None | Some("") => default,
             Some(raw) => match raw.parse::<f64>() {
@@ -95,14 +95,14 @@ impl RaidSettings {
 }
 
 /// Where the live [`RaidSettings`] come from.
-pub(crate) trait SettingsSource: Send + 'static {
+pub trait SettingsSource: Send + 'static {
     fn current(&mut self) -> impl Future<Output = RaidSettings> + Send;
 }
 
 /// Tuning and the staff channel are store-first (hot rows win over the
-/// deployment environment) and re-read at most every [`SETTINGS_MAX_AGE`]; a
+/// deployment environment) and re-read at most every `SETTINGS_MAX_AGE`; a
 /// failed refresh keeps the last good values.
-pub(crate) struct StoreSettings {
+pub struct StoreSettings {
     pool: PgPool,
     guild_id: String,
     deployment: HashMap<String, String>,
@@ -113,7 +113,7 @@ pub(crate) struct StoreSettings {
 }
 
 impl StoreSettings {
-    pub(crate) fn new(pool: PgPool, guild_id: u64, deployment: HashMap<String, String>) -> Self {
+    pub fn new(pool: PgPool, guild_id: u64, deployment: HashMap<String, String>) -> Self {
         Self {
             pool,
             guild_id: guild_id.to_string(),
@@ -127,7 +127,7 @@ impl StoreSettings {
 
     /// Re-read on every observation (tests).
     #[cfg(test)]
-    pub(crate) fn with_max_age(mut self, max_age: Duration) -> Self {
+    pub fn with_max_age(mut self, max_age: Duration) -> Self {
         self.max_age = max_age;
         self
     }
@@ -340,7 +340,7 @@ impl<S: SettingsSource> RaidWorker<S> {
 }
 
 /// The pipeline-facing half: queue only, never block.
-pub(crate) struct RaidRuntime {
+pub struct RaidRuntime {
     joins: mpsc::Sender<JoinObservation>,
 }
 
@@ -358,7 +358,7 @@ impl JoinObserver for RaidRuntime {
 }
 
 /// Spawn the worker. It ends when the last [`RaidRuntime`] reference drops.
-pub(crate) fn start<S: SettingsSource>(
+pub fn start<S: SettingsSource>(
     guild_id: u64,
     settings: S,
     executor: ActionExecutor,
@@ -379,11 +379,7 @@ pub(crate) fn start<S: SettingsSource>(
 
 /// Production wiring: deployment values from the environment, hot rows from the
 /// settings store. Always on, as legacy raid watch was (TWO-56).
-pub(crate) fn start_from_env(
-    pool: PgPool,
-    executor: ActionExecutor,
-    guild_id: u64,
-) -> Arc<RaidRuntime> {
+pub fn start_from_env(pool: PgPool, executor: ActionExecutor, guild_id: u64) -> Arc<RaidRuntime> {
     let deployment = SETTING_KEYS
         .iter()
         .filter_map(|key| {

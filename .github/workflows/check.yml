@@ -270,7 +270,7 @@ jobs:
 
       - name: soak evidence parser (offline, fixtures only)
         run: |
-          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_evidence.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p '*soak*evidence*.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_gate5_outage.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_watch_checkpoint_doc_conformance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_voice_config_apply_doc_conformance.py' -v
@@ -281,6 +281,7 @@ jobs:
       - name: cutover rollback-readiness probe and freeze drill (offline)
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_rollback_readiness_probe.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_rollback_readiness_input_limits_acceptance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cutover_freeze_drill.py' -v
 
       - name: staging E2E run-record template (offline)
@@ -288,6 +289,7 @@ jobs:
           python3 scripts/check_run_record.py --record scripts/fixtures/staging_e2e_run_record_mock.json --allow-mock
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_run_record.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_run_record_no_echo_acceptance.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_run_record_condition_shapes.py' -v
 
       - name: Validate voice template fixtures (hermetic, no renderer)
         run: |
@@ -700,12 +702,14 @@ jobs:
         id: prepare_test_databases
         run: |
           # The database service stores data and WAL on a 1 GiB tmpfs. The HARD
-          # coverage lane replays the database suites. max_wal_size is a soft
-          # checkpoint target, not a hard ceiling: heavy WAL can exceed it, so
-          # keep recycling bounded with headroom for relation files and segment
-          # creation. The pre/post suite reports bracket the run for tuning.
-          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_wal_size = '512MB'"
-          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET min_wal_size = '64MB'"
+          # coverage replay exhausted the previous 512 MB soft WAL target
+          # (run 39360867142). max_wal_size is a soft checkpoint target, not a
+          # hard ceiling: heavy WAL can still exceed it, so checkpoint earlier
+          # and leave room for relation files and transient segments. Do not
+          # raise the memory ceiling or relax fsync, full_page_writes or
+          # synchronous_commit. The pre/post suite reports bracket the run.
+          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_wal_size = '128MB'"
+          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET min_wal_size = '32MB'"
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c 'SELECT pg_reload_conf()'
           createdb -h agent-testdb -U agent_test two_bot_test_ci
           createdb -h agent-testdb -U agent_test two_next_backup_ci
@@ -727,8 +731,8 @@ jobs:
               'fsync': 'on',
               'full_page_writes': 'on',
               'synchronous_commit': 'on',
-              'max_wal_size': '512MB',
-              'min_wal_size': '64MB',
+              'max_wal_size': '128MB',
+              'min_wal_size': '32MB',
           }
           fields = ', '.join(f"'{key}', current_setting('{key}')" for key in expected)
           settings = json.loads(subprocess.check_output([
@@ -1687,7 +1691,10 @@ jobs:
         run: cargo test -p two-bot --locked join_risk_runtime_ -- --include-ignored
 
       - name: containment runtime acceptance (mock Discord and CI service only)
-        run: cargo test -p two-bot --locked containment_runtime_ -- --include-ignored
+        run: cargo test -p two-bot --locked --lib --bins containment_worker_ -- --include-ignored
+
+      - name: containment worker-path soak (mock Discord and CI service only)
+        run: cargo test -p two-bot --locked --test containment_worker_soak -- --include-ignored
 
       - name: Raid cohort query (CI service container only)
         env:
@@ -2574,6 +2581,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_smoke_run.py -v
       - name: Verify staging events read (offline fixtures, no database)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_events_read.py -v
+      - name: Verify staging event evidence semantics (offline fixtures, no database)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_events_read_acceptance.py -v
       - name: Verify cutover acceptance probes (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_qa_cutover_probes.py -v
       - name: Verify cutover freeze drill (offline fixtures)

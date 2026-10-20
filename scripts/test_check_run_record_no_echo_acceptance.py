@@ -295,6 +295,44 @@ class NoEchoAcceptanceTests(unittest.TestCase):
             [result.stdout, result.stderr], "cli-subprocess-db-url",
         )
 
+    def test_acceptance_key_only_secret_is_refused_with_redacted_path(self):
+        sentinel = "gh" + "p_" + "KeyOnlyNeverEcho42"
+        record = {"outer": [{sentinel: "innocent"}]}
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            errors = checker.validate(record, {}, allow_mock=True)
+        self.assert_clean(
+            [sentinel, "KeyOnlyNeverEcho42"],
+            ["\n".join(errors), out.getvalue(), err.getvalue()], "key-only",
+        )
+        self.assertEqual(len(errors), 1, "key alone must trigger public-safety refusal")
+        self.assertTrue(errors[0].startswith(
+            "$.outer[0].[redacted-key]: public-safety scan hit "))
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(err.getvalue(), "")
+
+    def test_acceptance_cli_subprocess_secret_key_never_echoes(self):
+        sentinel = "xo" + "xb-" + "KeyOnlyNeverEcho42"
+        with tempfile.TemporaryDirectory(
+            dir=os.getenv("PAPERCLIP_RUN_SCRATCH_DIR")
+        ) as tmp:
+            record, schema = Path(tmp) / "record.json", Path(tmp) / "schema.json"
+            record.write_text(json.dumps({"outer": [{sentinel: "innocent"}]}), encoding="utf-8")
+            # Permissive schema prevents an unknown-field refusal from masking
+            # the missing key scan; the CLI must fail for public safety alone.
+            schema.write_text("{}", encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "scripts" / "check_run_record.py"),
+                 "--record", str(record), "--schema", str(schema), "--allow-mock"],
+                capture_output=True, text=True,
+                env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"), timeout=60,
+            )
+        self.assert_clean([sentinel, "KeyOnlyNeverEcho42"],
+                          [result.stdout, result.stderr], "key-only-subprocess")
+        self.assertEqual(result.returncode, 1, "CLI must refuse a secret in a key alone")
+        self.assertEqual(result.stderr, "")
+        self.assertIn("$.outer[0].[redacted-key]: public-safety scan hit ", result.stdout)
+
     # --- passing controls: behavior and protections unchanged ---------------
 
     def test_control_valid_records_still_validate(self):

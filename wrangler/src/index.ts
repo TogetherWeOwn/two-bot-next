@@ -127,7 +127,7 @@ import { applyStagingFaultInjection } from "./staging-fault.ts";
 import { parseRelease, releaseTag, workerVersionTag } from "./error-events.ts";
 import { applySecurityHeaders, withSecurityHeaders } from "./security-headers.ts";
 import { REQUEST_ID_HEADER, ensureRequestId } from "./request-id.ts";
-import { handleMcp } from "./mcp.ts";
+import { handleMcp, MCP_AUDIT_READ_HEADER } from "./mcp.ts";
 import {
   DASHBOARD_CLIENT_ID_HEADER,
   DASHBOARD_CLIENT_SECRET_HEADER,
@@ -863,10 +863,13 @@ export class TwoBotContainer extends Container<Env> {
     if (url.pathname === CONTROL_PATH) return this.control(request);
     if (url.pathname === ACTIONS_PATH) return this.internalActions(request);
     if (url.pathname === EVENTSUB_PATH) return this.internalEventsub(request);
-    if (url.pathname === OPS_CONFIG_PATH || url.pathname === OPS_KILLSWITCH_PATH || url.pathname === OPS_AUDIT_PATH) {
+    const mcpAuditRead = url.origin === "http://c" && url.pathname === OPS_AUDIT_PATH
+      && !url.search && request.method === "GET" && request.headers.get(MCP_AUDIT_READ_HEADER) === "1";
+    if (url.pathname === OPS_CONFIG_PATH || url.pathname === OPS_KILLSWITCH_PATH
+      || (url.pathname === OPS_AUDIT_PATH && !mcpAuditRead)) {
       return this.opsControl(request);
     }
-    if (url.pathname !== "/health" && url.pathname !== "/readyz" && url.pathname !== OPS_METRICS_PATH
+    if (!mcpAuditRead && url.pathname !== "/health" && url.pathname !== "/readyz" && url.pathname !== OPS_METRICS_PATH
       && !OPS_JSON_PATHS.includes(url.pathname)) {
       return new Response("not found", { status: 404, headers: withSecurityHeaders() });
     }
@@ -874,6 +877,11 @@ export class TwoBotContainer extends Container<Env> {
       return await this.owned(async () => {
         await this.ownership.require(this.id(), request.headers.get(DEPLOYMENT_HEADER) ?? "");
         // Reached only through the Worker's ops gates (see default export).
+        // MCP's internal dispatch reads the Rust audit, not the DO's admin
+        // history at the same path. Never forward the dispatch/caller headers.
+        if (mcpAuditRead) {
+          return this.proxyOpsBody("http://c/ops/audit", OPS_JSON_CONTENT_TYPE, "audit unavailable\n");
+        }
         if (url.pathname === OPS_METRICS_PATH) {
           await this.armKeepalive();
           return this.proxyOpsBody("http://c/metrics", OPS_METRICS_CONTENT_TYPE, "metrics unavailable\n");
@@ -1924,6 +1932,7 @@ export default {
       if (gate) return gate;
       try {
         const forwarded = new Request(request);
+        forwarded.headers.delete(MCP_AUDIT_READ_HEADER);
         forwarded.headers.set(DEPLOYMENT_HEADER, deploymentId(env.CF_VERSION_METADATA?.id));
         return await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(forwarded);
       } catch (error) { return refused(error); }

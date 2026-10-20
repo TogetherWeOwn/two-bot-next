@@ -10,8 +10,13 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { createServer } from "node:http";
 import { once } from "node:events";
+import { tmpdir } from "node:os";
+import { join, relative } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   OVERRIDE_HEADER,
   VERSION_HEADER,
@@ -250,4 +255,40 @@ test("smoke rejects non-origin base URLs", async () => {
       /base-url must be an HTTP\(S\) origin/,
     );
   }
+});
+
+test("smoke CLI refuses an invalid URL through symlinks and spaced paths", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "smoke link "));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const real = fileURLToPath(new URL("../../bin/smoke.mjs", import.meta.url));
+  const link = join(root, "smoke.mjs");
+  const spacedDir = join(root, "spaced dir");
+  const spaced = join(spacedDir, "smoke.mjs");
+  mkdirSync(spacedDir);
+  symlinkSync(real, link);
+  symlinkSync(real, spaced);
+
+  for (const argv1 of [real, link, spaced, relative(process.cwd(), link)]) {
+    const executed = spawnSync(process.execPath, [argv1, "not-a-url"], {
+      env: {},
+      encoding: "utf8",
+      timeout: 15_000,
+    });
+    assert.equal(executed.error, undefined, argv1);
+    assert.equal(executed.signal, null, argv1);
+    assert.equal(executed.status, 2, `${argv1}\n${executed.stderr}`);
+    assert.equal(executed.stdout, "", argv1);
+    assert.equal(executed.stderr, "smoke: Invalid URL\n", argv1);
+  }
+
+  const imported = spawnSync(
+    process.execPath,
+    ["--input-type=module", "--eval", `await import(${JSON.stringify(pathToFileURL(link).href)})`],
+    { env: {}, encoding: "utf8", timeout: 15_000 },
+  );
+  assert.equal(imported.error, undefined);
+  assert.equal(imported.signal, null);
+  assert.equal(imported.status, 0);
+  assert.equal(imported.stdout, "");
+  assert.equal(imported.stderr, "");
 });

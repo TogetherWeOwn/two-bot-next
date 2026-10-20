@@ -170,7 +170,7 @@ fn member(id: u64, bot: bool, roles: &[&str]) -> Value {
 }
 
 fn event() -> Value {
-    json!({"id":"3000", "name":"Test night", "scheduled_start_time":"2026-10-01T19:00:00Z", "status":1, "channel_id":null, "description":"fixture"})
+    json!({"id":"3000", "guild_id":"2222", "name":"Test night", "scheduled_start_time":"2026-10-01T19:00:00Z", "status":1, "channel_id":null, "description":"fixture"})
 }
 
 #[tokio::test]
