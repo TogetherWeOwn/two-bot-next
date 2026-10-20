@@ -50,8 +50,8 @@ pub struct ApplyReport {
 /// page). Every call issues exactly one wire request through `rest`, so
 /// `rest.requests()` agrees with the wire count.
 ///
-/// `next_after` is the page's last id when the page is non-empty (the caller
-/// advances past it), else `None` (end of list).
+/// `next_after` is the last retained member's id, or `None` when no rows
+/// survive validation. Skipped rows do not supply a resume cursor.
 pub async fn fetch_member_page(
     rest: &RestClient,
     guild_id: Id<GuildMarker>,
@@ -91,11 +91,16 @@ pub async fn fetch_member_page(
             .and_then(|v| v.as_str())
             .map(|s| s.to_owned());
         let pending = value.get("pending").and_then(|v| v.as_bool());
-        let is_bot = value
-            .get("user")
-            .and_then(|user| user.get("bot"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let is_bot = match value.get("user").and_then(|user| user.get("bot")) {
+            // Discord omits this optional field for humans; malformed values
+            // must not become persisted human classifications.
+            None => false,
+            Some(serde_json::Value::Bool(is_bot)) => *is_bot,
+            Some(_) => {
+                tracing::warn!(reason = "invalid_bot_flag", "member_catchup row skipped");
+                continue;
+            }
+        };
         members.push(MemberRow {
             member_id,
             joined_at,
