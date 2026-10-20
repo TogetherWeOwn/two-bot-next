@@ -5163,6 +5163,85 @@ class WorkflowTests(unittest.TestCase):
                             self.assertEqual(defaults, [],
                                              f"failed retry must not default anything, got: {calls}")
 
+    def early_pinned_components_retry(self):
+        # This run-step installer is not a dtolnay action. Require exactly one
+        # so removing it (or changing its id) cannot make the guard vacuous.
+        steps = self.workflows["check.yml"]["jobs"]["check"]["steps"]
+        installers = [index for index, step in enumerate(steps)
+                      if step.get("id") == "pinned_components"]
+        self.assertEqual(len(installers), 1, "check must install pinned_components before pip")
+        index = installers[0]
+        installer = steps[index]
+        self.assertNotIn("uses", installer)
+        self.assertEqual(installer.get("run", "").strip(),
+                         "rustup toolchain install --no-self-update")
+        # UniqueKeyLoader is a BaseLoader: even 'false' is a truthy string.
+        self.assertEqual(installer.get("continue-on-error"), "true")
+        self.assertLess(index + 1, len(steps), "the early installer needs an immediate retry")
+        retry = steps[index + 1]
+        self.assertNotIn("uses", retry)
+        self.assertTrue(retry.get("run"), "the immediate retry must execute a script")
+        self.assertEqual(retry.get("if"), "steps.pinned_components.outcome == 'failure'")
+        self.assertEqual(retry.get("shell"), "bash")
+        self.assertEqual(retry.get("env", {}).get("RUSTUP_PERMIT_COPY_RENAME"), "1")
+        self.assertNotIn("continue-on-error", retry, "the early retry must not swallow failure")
+        pip_steps = [index for index, step in enumerate(steps)
+                     if "python3 -m pip" in step.get("run", "")]
+        self.assertTrue(pip_steps, "check must retain its Python tooling install")
+        self.assertLess(index + 1, min(pip_steps), "finish the toolchain before pip probes rustc")
+        return retry
+
+    def test_early_rust_toolchain_install_is_retry_guarded(self):
+        self.early_pinned_components_retry()
+
+    def test_early_rust_toolchain_retry_fails_closed_behaviorally(self):
+        # Execute the real retry, but never rustup or sleep: only those external
+        # effects are shimmed. The early install resolves rust-toolchain.toml;
+        # unlike the action retries it must not issue a new `rustup default`.
+        retry = self.early_pinned_components_retry()
+        fake_prelude = (
+            "FAKE_N=0\n"
+            "rustup() {\n"
+            "  printf '%s\\0' \"$@\" >> \"$FAKE_RUSTUP_CALLS\"\n"
+            "  printf '\\n' >> \"$FAKE_RUSTUP_CALLS\"\n"
+            "  FAKE_N=$((FAKE_N + 1))\n"
+            "  [ \"$FAKE_N\" -ge \"$FAKE_SUCCEED_ON\" ]\n"
+            "}\n"
+            "sleep() { :; }\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            calls_path = Path(tmp) / "rustup-calls.txt"
+            for case_name, succeed_on, expected_status, expected_installs in (
+                ("always-fails", "99", 1, 5),
+                ("succeeds-on-2", "2", 0, 2),
+            ):
+                with self.subTest(case=case_name):
+                    calls_path.write_bytes(b"")
+                    # No inherited credentials/startup hooks, real toolchain
+                    # directories or PATH tools, even if a script drifts.
+                    run_env = {
+                        "PATH": tmp,
+                        "HOME": tmp,
+                        "CARGO_HOME": str(Path(tmp) / "cargo"),
+                        "RUSTUP_HOME": str(Path(tmp) / "rustup"),
+                        "RUSTUP_PERMIT_COPY_RENAME": retry["env"]["RUSTUP_PERMIT_COPY_RENAME"],
+                        "FAKE_RUSTUP_CALLS": str(calls_path),
+                        "FAKE_SUCCEED_ON": succeed_on,
+                    }
+                    proc = subprocess.run(
+                        ["/bin/bash", "--noprofile", "--norc", "-eo", "pipefail",
+                         "-c", fake_prelude + retry["run"]],
+                        env=run_env, capture_output=True, text=True, timeout=5,
+                    )
+                    self.assertEqual(proc.returncode, expected_status,
+                                     f"unexpected early retry status: {proc.stderr}")
+                    self.assertEqual(
+                        calls_path.read_bytes().splitlines(),
+                        [b"toolchain\0install\0--no-self-update\0"] * expected_installs,
+                        "early retry must install exactly the repository-selected toolchain; "
+                        "no extra arguments or default command",
+                    )
+
     def test_overflow_runner_must_name_its_own_job(self):
         self.assertTrue(runner_allowed("worker", self.workflows["check.yml"]["jobs"]["worker"]["runs-on"]))
         for runs_on in (ROUTED_RUNNER.format(job="check"), "ubuntu-latest", ["self-hosted"],
