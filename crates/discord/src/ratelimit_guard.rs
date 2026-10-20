@@ -1217,6 +1217,34 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn cancelled_bare_body_keeps_padded_header_deadline_without_restarting_it() {
+        let guard = RateLimitGuard::new(GuardConfig::default()).unwrap();
+        let route = "GET /guilds/1/roles";
+        let mut headers = http::HeaderMap::new();
+        headers.insert("retry-after", http::HeaderValue::from_static("2"));
+        let mut accounting = ResponseAccounting::new(&guard, 429, &headers, true);
+        accounting.track_bare_bucket(route, &headers);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        drop(accounting);
+
+        // Cancellation must leave the original 2 s + 250 ms deadline, not
+        // discard it or start another full wait after the elapsed second.
+        assert!(guard.check_route_now("GET /guilds/2/roles", false).is_ok());
+        let started = Instant::now();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1200), guard.admit_route(route, false))
+                .await
+                .is_err(),
+            "cancelled bare response must retain the header deadline and pad"
+        );
+        tokio::time::timeout(Duration::from_millis(100), guard.admit_route(route, false))
+            .await
+            .expect("cancellation must not restart the header deadline")
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(1250));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn unresolved_body_holds_admission_past_provisional_expiry() {
         for (header, elapsed, body_timing) in [
             (Some("0.1"), Duration::from_millis(500), 1.0),
