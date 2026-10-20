@@ -519,9 +519,9 @@ jobs:
           # Ephemeral CI service only; tests explicitly use an empty password.
           # Slice scratch databases are created in the prepare step below.
           POSTGRES_HOST_AUTH_METHOD: trust
-        # PG18 places data and WAL below this volume. The patch-coverage sweep
-        # replays database-backed suites, so give disposable data room without
-        # spilling it into shared-host disk or swap; keep PostgreSQL defaults.
+        # PG18 places data and WAL below this volume. Rust test lanes replay
+        # database-backed suites, so give disposable data room without spilling
+        # it into shared-host disk or swap; keep PostgreSQL defaults.
         # Tmpfs counts against the 3GiB service cap.
         options: >-
           --tmpfs /var/lib/postgresql:rw,size=2147483648
@@ -700,7 +700,7 @@ jobs:
       - name: Prepare isolated test databases
         id: prepare_test_databases
         run: |
-          # The database service stores data and WAL on a 1 GiB tmpfs. The HARD
+          # The database service stores data and WAL on a 2 GiB tmpfs. The HARD
           # coverage lane replays the database suites. max_wal_size is a soft
           # checkpoint target, not a hard ceiling: heavy WAL can exceed it, so
           # keep recycling bounded with headroom for relation files and segment
@@ -991,13 +991,14 @@ jobs:
           # Ephemeral CI service only; tests explicitly use an empty password.
           # Slice scratch databases are created in the prepare step below.
           POSTGRES_HOST_AUTH_METHOD: trust
-        # PG18 places data and WAL below this volume. Isolate disposable fixture
-        # checkpoint I/O from shared-host disk; keep PostgreSQL defaults intact.
-        # Tmpfs counts against the 2GiB service cap; do not spill it into swap.
+        # PG18 places data and WAL below this volume. Rust test lanes replay
+        # database-backed suites, so give disposable data room without spilling
+        # it into shared-host disk or swap; keep PostgreSQL defaults.
+        # Tmpfs counts against the 3GiB service cap.
         options: >-
-          --tmpfs /var/lib/postgresql:rw,size=1073741824
-          --memory 2147483648
-          --memory-swap 2147483648
+          --tmpfs /var/lib/postgresql:rw,size=2147483648
+          --memory 3221225472
+          --memory-swap 3221225472
           --health-cmd "test $(stat -f -c %T $PGDATA) = tmpfs && pg_isready -U agent_test -d agent_test"
           --health-interval 5s
           --health-timeout 5s
@@ -1162,7 +1163,7 @@ jobs:
 
       - name: Prepare isolated test databases
         run: |
-          # The database service stores data and WAL on a 1 GiB tmpfs. This
+          # The database service stores data and WAL on a 2 GiB tmpfs. This
           # lane runs ~30 sequential suites that each create, migrate and drop
           # disposable databases. Unbounded WAL (the PG18 default max_wal_size
           # is 1GB) filled it: run 39209332791 died in the ignored-db-stores
@@ -1328,8 +1329,8 @@ jobs:
       - name: Internal-member durable store regressions (CI service only)
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-        # Serialized: 8 tests x full 93-migration schema on the 1 GiB tmpfs
-        # Postgres service exhausts disk with parallel CREATE DATABASE
+        # Serialized: 8 tests x full 93-migration schema exhausted the original
+        # 1 GiB tmpfs Postgres service with parallel CREATE DATABASE
         # (run 39149193652 attempt 1: PG_VERSION No space left on device).
         # Serialization caps peak pressure only; cumulative WAL is capped in
         # Prepare isolated test databases (run 39197217315 attempt 1 still
@@ -1456,13 +1457,14 @@ jobs:
           # Ephemeral CI service only; tests explicitly use an empty password.
           # Slice scratch databases are created in the prepare step below.
           POSTGRES_HOST_AUTH_METHOD: trust
-        # PG18 places data and WAL below this volume. Isolate disposable fixture
-        # checkpoint I/O from shared-host disk; keep PostgreSQL defaults intact.
-        # Tmpfs counts against the 2GiB service cap; do not spill it into swap.
+        # PG18 places data and WAL below this volume. Rust test lanes replay
+        # database-backed suites, so give disposable data room without spilling
+        # it into shared-host disk or swap; keep PostgreSQL defaults.
+        # Tmpfs counts against the 3GiB service cap.
         options: >-
-          --tmpfs /var/lib/postgresql:rw,size=1073741824
-          --memory 2147483648
-          --memory-swap 2147483648
+          --tmpfs /var/lib/postgresql:rw,size=2147483648
+          --memory 3221225472
+          --memory-swap 3221225472
           --health-cmd "test $(stat -f -c %T $PGDATA) = tmpfs && pg_isready -U agent_test -d agent_test"
           --health-interval 5s
           --health-timeout 5s
@@ -1627,7 +1629,7 @@ jobs:
 
       - name: Prepare isolated test databases
         run: |
-          # The database service stores data and WAL on a 1 GiB tmpfs. This
+          # The database service stores data and WAL on a 2 GiB tmpfs. This
           # lane runs 26 sequential database suites against it. Unbounded WAL
           # (the PG18 default max_wal_size is 1GB) filled the stores lane's
           # tmpfs in run 39209332791 with `PANIC: could not write to file

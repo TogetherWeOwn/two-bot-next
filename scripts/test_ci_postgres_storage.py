@@ -68,8 +68,8 @@ class PostgresStorageTests(unittest.TestCase):
     def test_only_the_rust_test_lanes_get_bounded_pg18_storage(self):
         self.assertEqual(len(TOKENS), len(OPTIONS) * 2)
         self.assertIn("image: postgres:18.6@sha256:", SERVICE)
-        self.assertEqual(OPTIONS["--tmpfs"], "/var/lib/postgresql:rw,size=1073741824")
-        self.assertEqual(OPTIONS["--memory"], "2147483648")
+        self.assertEqual(OPTIONS["--tmpfs"], "/var/lib/postgresql:rw,size=2147483648")
+        self.assertEqual(OPTIONS["--memory"], "3221225472")
         self.assertEqual(OPTIONS["--memory-swap"], OPTIONS["--memory"])
         # One bounded service per lane, byte-identical: the lanes must keep
         # sharing the config the single `check` job had.

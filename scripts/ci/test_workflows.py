@@ -2771,12 +2771,14 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("'max_wal_size': '512MB'", verify["run"])
         self.assertIn("'min_wal_size': '64MB'", verify["run"])
 
-    def test_rust_test_postgres_tmpfs_budget_covers_patch_coverage(self):
-        service = self.workflows["check.yml"]["jobs"]["rust-tests"]["services"]["agent-testdb"]
-        options = service["options"]
-        self.assertIn("--tmpfs /var/lib/postgresql:rw,size=2147483648", options)
-        self.assertIn("--memory 3221225472", options)
-        self.assertIn("--memory-swap 3221225472", options)
+    def test_rust_lane_postgres_tmpfs_budget_covers_database_sweeps(self):
+        for job_id in ("rust-tests", "ignored-db-stores", "ignored-db-runtime"):
+            with self.subTest(job=job_id):
+                service = self.workflows["check.yml"]["jobs"][job_id]["services"]["agent-testdb"]
+                options = service["options"]
+                self.assertIn("--tmpfs /var/lib/postgresql:rw,size=2147483648", options)
+                self.assertIn("--memory 3221225472", options)
+                self.assertIn("--memory-swap 3221225472", options)
 
     def test_tmpfs_postgres_wal_budget_is_bounded_in_every_lane(self):
         # Run 39209332791: only rust-tests bounded WAL while the ignored lanes
@@ -3057,9 +3059,10 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
 
     def test_stores_postgres_wal_budget_is_bounded(self):
-        # Same budget as rust-tests: two main runs PANIC'd the 1 GiB tmpfs
-        # service with No space left on device mid-suite (runs 39149193652,
-        # 39197217315 attempt 1), failing every test in internal_member_store.
+        # Two prior main runs PANIC'd when the original 1 GiB tmpfs filled;
+        # keep WAL bounded despite the shared 2 GiB tmpfs / 3 GiB service cap.
+        # Runs 39149193652 and 39197217315 attempt 1 failed mid-suite, failing
+        # every test in internal_member_store.
         job = self.workflows["check.yml"]["jobs"]["ignored-db-stores"]
         prepare = next(
             step for step in job["steps"]
@@ -3125,7 +3128,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_runtime_postgres_wal_budget_is_bounded(self):
         # Same budget as rust-tests and the stores lane: the runtime lane runs
-        # 26 sequential database suites against the same 1 GiB tmpfs service,
+        # 26 sequential database suites against the same 2 GiB tmpfs service,
         # so WAL recycling stays bounded with headroom for relation files.
         job = self.workflows["check.yml"]["jobs"]["ignored-db-runtime"]
         prepare = next(
@@ -5500,9 +5503,9 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
 
     def test_nextest_postgres_wal_budget_is_bounded(self):
-        # Same budget as the check.yml lanes: the reusable lane shares the
-        # 1 GiB tmpfs service, so it caps WAL recycling in prepare and pins
-        # the cap in a verify step instead of running unbounded.
+        # Same WAL budget as the check.yml lanes: this separate reusable lane
+        # uses a 1 GiB tmpfs service, so it caps WAL recycling in prepare and
+        # pins the cap in a verify step instead of running unbounded.
         job = self.workflows["reusable-rust-nextest.yml"]["jobs"]["nextest"]
         prepare = next(
             step for step in job["steps"]
