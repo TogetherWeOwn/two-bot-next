@@ -283,6 +283,24 @@ impl std::fmt::Debug for RawResponse {
     }
 }
 
+/// Release a read's permit outside the receipt path (a stalled header/body or
+/// a truncated body), logging a storage failure like the receipt path. `site`
+/// is a fixed label naming the early-release site (`header_timeout`,
+/// `body_timeout`, `body_error`) for log triage. A failed completion holds
+/// the lane by design; the warn is the only signal.
+async fn complete_early_release(
+    permit: two_bot_core::send_admission::AdmissionPermit,
+    site: &'static str,
+) {
+    if let Err(error) = permit.complete(None).await {
+        tracing::warn!(
+            %error,
+            site,
+            "Discord send admission completion failed; lane held"
+        );
+    }
+}
+
 impl RawResponse {
     /// Call only for a definite effect/no-effect, after validating any required
     /// mutation receipt. A storage fault must not authorize effect replay.
@@ -594,7 +612,7 @@ impl HyperTransport {
                 Err(_) => {
                     if request.method() == Method::Get {
                         if let Some(permit) = permit {
-                            let _ = permit.complete(None).await;
+                            complete_early_release(permit, "header_timeout").await;
                         }
                     }
                     return Err(HEADER_TIMEOUT_MESSAGE.to_owned());
@@ -733,7 +751,7 @@ impl PendingHeaders<'_> {
                 // permit held (uncertain) by returning with it taken.
                 if self.complete_on_receipt {
                     if let Some(permit) = self.permit.take() {
-                        let _ = permit.complete(None).await;
+                        complete_early_release(permit, "body_timeout").await;
                     }
                 }
                 return Err(BODY_TIMEOUT_MESSAGE.to_owned());
@@ -743,7 +761,7 @@ impl PendingHeaders<'_> {
                 // a receipted read (every GET) must release the lane.
                 if self.complete_on_receipt {
                     if let Some(permit) = self.permit.take() {
-                        let _ = permit.complete(None).await;
+                        complete_early_release(permit, "body_error").await;
                     }
                 }
                 return Err("Discord response body unavailable".to_owned());

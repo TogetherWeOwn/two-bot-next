@@ -410,6 +410,25 @@ production enablement is its own rollout decision. To stop posting
 without touching the receiver, unset the gate (or set it to `"0"`) and
 redeploy: verified deliveries return to ack-only.
 
+## Lost go-live announcements
+
+Outcome reason `send_failed_unreleased` means the Discord send provably
+never landed, but releasing the started claim row failed (database error
+or noop), so the row stays fenced: the Twitch retry is answered
+`Duplicate` (2xx) and the announcement never posts. There is no
+automatic re-post or release retry; the row is never reclaimed. It
+counts as attempted+failed in `eventsub_post_failed_share`, like every
+other sender-reaching failure, and it logs one fixed-class warn naming
+the reason with no delivery data, safe to alert on as-is.
+
+Operator action: confirm the stream is (or was) actually live on
+Twitch, post a manual announcement if the moment still matters, and
+investigate the release failure in the container logs and database
+health around the warn. Do not hand-delete the ledger row and do not
+redeploy to repair one lost announcement.
+Source: `crates/core/src/stream_live_store.rs:614-642`,
+`crates/bot/src/eventsub_delivery.rs:86-98`.
+
 ## Dark-unless-enabled behavior
 
 Dark is the normal state, not an outage:

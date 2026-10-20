@@ -2,8 +2,11 @@
 
 from copy import deepcopy
 import importlib.util
+import os
 from pathlib import Path
 import re
+import subprocess
+import tempfile
 import tomllib
 import unittest
 
@@ -65,6 +68,9 @@ JOB_INVENTORY = {
     # Five-minute user-flow synthetic (docs/synthetic-user-flow.md): staging
     # health-contract plus passive production probes; pinned shape below.
     "synthetic-user-flow.yml": {"staging", "prod-passive"},
+    # Creator-join slow-burn card filer
+    # (docs/runbook.md#alert-voice-join-slow-burn); pinned shape below.
+    "slow-burn-tracker.yml": {"tracker"},
     # SDLC separation gate (org test-guard reusable, warn mode): one
     # reusable call, least-privilege grant pinned below.
     "test-guard.yml": {"test-guard"},
@@ -2403,6 +2409,123 @@ def synthetic_user_flow_errors(workflow):
     return errors
 
 
+def slow_burn_tracker_errors(workflow):
+    """Creator-join slow-burn card filer (docs/runbook.md#alert-voice-join-slow-burn).
+
+    Runs on a 5-minute schedule and manual dispatch, only from main, through
+    the `slow-burn-tracker` environment. One job: `tracker` restores the
+    cached burn ring and coverage sidecar, runs the reviewed
+    scripts/slow_burn_tracker.py (staging scrape plus the checked-in
+    slow-burn verdict, then exactly one file/refresh/resolve issue write),
+    saves both on live runs and uploads the evidence receipt. The 5-minute
+    cadence is load-bearing for the slow long-window baseline. Dispatch takes
+    only the fixture choice (live/fire/clear proof runs file under a test
+    label without touching the ring or coverage) and the dry-run flag.
+    """
+    name = "slow-burn-tracker.yml"
+    errors = []
+    if "env" in workflow:
+        errors.append(f"{name}: workflow-level env must stay absent")
+    on = workflow.get("on") or {}
+    if set(on) != {"schedule", "workflow_dispatch"}:
+        errors.append(f"{name}: triggers must be exactly schedule and workflow_dispatch")
+    else:
+        schedules = on.get("schedule") or []
+        if schedules != [{"cron": "*/5 * * * *"}]:
+            errors.append(f"{name}: schedule must stay every 5 minutes")
+        dispatch = on.get("workflow_dispatch") or {}
+        inputs = (dispatch.get("inputs") or {}) if isinstance(dispatch, dict) else {}
+        if set(dispatch) != {"inputs"} or set(inputs) != {"fixture", "dry_run"}:
+            errors.append(f"{name}: workflow_dispatch must carry only the fixture and dry_run inputs")
+        else:
+            fixture = inputs["fixture"] or {}
+            if (fixture.get("type") != "choice"
+                    or fixture.get("options") != ["live", "fire", "clear"]
+                    or fixture.get("default") != "live"):
+                errors.append(f"{name}: fixture must be a live/fire/clear choice defaulting to live")
+            dry_run = inputs["dry_run"] or {}
+            if dry_run.get("type") != "boolean" or dry_run.get("default") not in (False, "false"):
+                errors.append(f"{name}: dry_run must be an opt-in boolean defaulting to false")
+    if workflow.get("permissions") != {}:
+        errors.append(f"{name}: top-level permissions must stay empty")
+    if workflow.get("concurrency") != {"group": "slow-burn-tracker", "cancel-in-progress": "false"}:
+        errors.append(f"{name}: must use its own slow-burn-tracker group without cancelling")
+    jobs = workflow.get("jobs") or {}
+    if set(jobs) != {"tracker"}:
+        errors.append(f"{name}: jobs must be exactly tracker")
+        return errors
+    job = jobs["tracker"]
+    if job.get("name") != "slow-burn tracker":
+        errors.append(f"{name}:tracker: job name must stay slow-burn tracker")
+    if job.get("environment") != "slow-burn-tracker":
+        errors.append(f"{name}:tracker: must read only the slow-burn-tracker Environment")
+    if job.get("if") != "github.ref == 'refs/heads/main'":
+        errors.append(f"{name}:tracker: must run only from main")
+    if job.get("permissions") != {"contents": "read", "issues": "write"}:
+        errors.append(f"{name}:tracker: must keep contents:read plus issues:write only")
+    if job.get("timeout-minutes") != "10":
+        errors.append(f"{name}:tracker: timeout must stay 10 minutes")
+    if not runner_allowed("tracker", job.get("runs-on")):
+        errors.append(f"{name}:tracker: must use the routed runner expression for job 'tracker'")
+    for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
+        if key in job:
+            errors.append(f"{name}:tracker: must not set {key}")
+    steps = job.get("steps") or []
+    if len(steps) != 6:
+        errors.append(f"{name}:tracker: must run checkout, setup-node, restore, track, save and upload")
+        return errors
+    checkout, setup_node, restore, track, save, upload = steps
+    if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
+            or (checkout.get("with") or {}).get("persist-credentials") != "false":
+        errors.append(f"{name}:tracker: checkout must be pinned and must not persist credentials")
+    if not str(setup_node.get("uses", "")).startswith("actions/setup-node@") \
+            or (setup_node.get("with") or {}).get("node-version") != "24":
+        errors.append(f"{name}:tracker: setup-node must be pinned at node 24 for the verdict driver")
+    # Split restore/save: a full actions/cache step restores in its main
+    # phase, so the save step would overwrite the tracker's fresh ring with
+    # the stale cached copy before saving it back.
+    restore_with = restore.get("with") or {}
+    if (not str(restore.get("uses", "")).startswith("actions/cache/restore@")
+            or "slow-burn-ring-v1-" not in str(restore_with.get("key", ""))
+            or "slow-burn-ring-v1-" not in str(restore_with.get("restore-keys", ""))):
+        errors.append(f"{name}:tracker: ring restore must use actions/cache/restore "
+                      "with the rotating key and prefix fallback")
+    save_with = save.get("with") or {}
+    if (not str(save.get("uses", "")).startswith("actions/cache/save@")
+            or "slow-burn-ring-v1-" not in str(save_with.get("key", ""))
+            or "restore-keys" in save_with):
+        errors.append(f"{name}:tracker: ring save must use actions/cache/save "
+                      "with the rotating key and no restore")
+    if save.get("if") != "${{ !cancelled() && steps.track.outputs.fixture != 'fire' && steps.track.outputs.fixture != 'clear' }}":
+        errors.append(f"{name}:tracker: ring save must skip fixture proof runs")
+    if track.get("id") != "track":
+        errors.append(f"{name}:tracker: track step must expose id track for the save gate")
+    if "scripts/slow_burn_tracker.py" not in str(track.get("run", "")) or "uses" in track:
+        errors.append(f"{name}:tracker: track step must call scripts/slow_burn_tracker.py")
+    track_env = track.get("env") or {}
+    if (track_env.get("STAGING_WORKER_URL") != "${{ vars.STAGING_WORKER_URL }}"
+            or track_env.get("METRICS_SCRAPE_TOKEN") != "${{ secrets.METRICS_SCRAPE_TOKEN }}"
+            or track_env.get("GH_TOKEN") != "${{ secrets.GITHUB_TOKEN }}"
+            or "secrets." in str(track.get("run", ""))):
+        errors.append(f"{name}:tracker: track step must pass staging url, scrape token and GitHub token via env only")
+    if upload.get("if") != "always()":
+        errors.append(f"{name}:tracker: upload must run with if: always() so failures keep their artifact")
+    if not str(upload.get("uses", "")).startswith("actions/upload-artifact@"):
+        errors.append(f"{name}:tracker: must upload the run evidence artifact")
+    for step in steps:
+        if step is not track and "secrets." in str(step):
+            errors.append(f"{name}:tracker: only the track step may hold a secret")
+    text = str(job).lower().replace(" ", "")
+    for marker in ("wrangler", "production", "tojson(secrets", "secrets[", "set-x", "setx", "xtrace",
+                   "cloudflare_api_token", "ownership_control"):
+        if marker in text:
+            errors.append(f"{name}:tracker: must not contain {marker!r}")
+    secrets = set(re.findall(r"secrets\.([a-z0-9_]+)", text))
+    if secrets != {"metrics_scrape_token", "github_token"}:
+        errors.append(f"{name}: must read only the scrape bearer and the GitHub token")
+    return errors
+
+
 def workflow_policy_errors(workflows):
     errors = []
     errors.extend(staging_gateway_injection_errors(workflows))
@@ -2440,6 +2563,11 @@ def workflow_policy_errors(workflows):
             # Pinned shape above; the generic environment/marker scan below
             # would flag its synthetic-alerts binding and probe paths.
             errors.extend(synthetic_user_flow_errors(workflow))
+            continue
+        if name == "slow-burn-tracker.yml":
+            # Pinned shape above; the generic environment/marker scan below
+            # would flag its slow-burn-tracker binding and staging probe URL.
+            errors.extend(slow_burn_tracker_errors(workflow))
             continue
         if name == "staging-rollback-drill.yml":
             # Manual drill (TOG-14008): pinned shape above; the generic
@@ -2604,6 +2732,28 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('service_ip="$(getent ahostsv4 agent-testdb 2>/dev/null | awk \'NR == 1 { print $1; exit }\')" || service_ip=""', run)
         self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
 
+    def assert_wal_reload_ordering_is_pinned(self, run):
+        # Order is load-bearing both ways: the ALTERs must precede the
+        # reload (ALTER SYSTEM only writes postgresql.auto.conf, which the
+        # reload reads), and the reload must precede the first createdb,
+        # since the bootstrap databases are created later in this same step.
+        reload = run.index("pg_reload_conf()")
+        self.assertLess(
+            run.index("ALTER SYSTEM SET max_wal_size = '512MB'"),
+            reload,
+            "max_wal_size ALTER must precede pg_reload_conf()",
+        )
+        self.assertLess(
+            run.index("ALTER SYSTEM SET min_wal_size = '64MB'"),
+            reload,
+            "min_wal_size ALTER must precede pg_reload_conf()",
+        )
+        self.assertLess(
+            reload,
+            run.index("createdb "),
+            "pg_reload_conf() must precede the first createdb",
+        )
+
     def test_rust_test_postgres_wal_budget_is_bounded(self):
         job = self.workflows["check.yml"]["jobs"]["rust-tests"]
         prepare = next(
@@ -2617,8 +2767,243 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
         self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
         self.assertIn("pg_reload_conf()", prepare["run"])
+        self.assert_wal_reload_ordering_is_pinned(prepare["run"])
         self.assertIn("'max_wal_size': '512MB'", verify["run"])
         self.assertIn("'min_wal_size': '64MB'", verify["run"])
+
+    def test_tmpfs_postgres_wal_budget_is_bounded_in_every_lane(self):
+        # Run 39209332791: only rust-tests bounded WAL while the ignored lanes
+        # ran the PG18 default (max_wal_size 1GB) on the same 1 GiB tmpfs, and
+        # the stores lane PANICed with ENOSPC mid-suite. Every lane that mounts
+        # the bounded service must carry the budget and verify it.
+        for job_id in ("rust-tests", "ignored-db-stores", "ignored-db-runtime"):
+            with self.subTest(job=job_id):
+                job = self.workflows["check.yml"]["jobs"][job_id]
+                prepare = next(
+                    step for step in job["steps"]
+                    if step.get("name") == "Prepare isolated test databases"
+                )
+                verify = next(
+                    step for step in job["steps"]
+                    if step.get("name") == "Verify disposable Postgres defaults"
+                )
+                self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
+                self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
+                self.assertIn("pg_reload_conf()", prepare["run"])
+                # Reload-before-ALTER writes auto.conf but never applies it;
+                # the verify probe would then fail online, so pin the order.
+                run = prepare["run"]
+                self.assertLess(
+                    run.index("ALTER SYSTEM SET max_wal_size"),
+                    run.index("pg_reload_conf()"),
+                )
+                self.assertLess(
+                    run.index("ALTER SYSTEM SET min_wal_size"),
+                    run.index("pg_reload_conf()"),
+                )
+                self.assertIn("'max_wal_size': '512MB'", verify["run"])
+                self.assertIn("'min_wal_size': '64MB'", verify["run"])
+
+    def test_nextest_lane_bounds_tmpfs_wal_and_reports_headroom(self):
+        lane = self.workflows["reusable-rust-nextest.yml"]["jobs"]["nextest"]
+        steps = lane["steps"]
+        names = [step.get("name") for step in steps]
+        prepare = next(
+            step for step in steps
+            if step.get("name") == "Prepare isolated test databases"
+        )
+        self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
+        self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
+        self.assertIn("pg_reload_conf()", prepare["run"])
+        run = prepare["run"]
+        self.assertLess(
+            run.index("ALTER SYSTEM SET max_wal_size"),
+            run.index("pg_reload_conf()"),
+        )
+        self.assertLess(
+            run.index("ALTER SYSTEM SET min_wal_size"),
+            run.index("pg_reload_conf()"),
+        )
+        # The nextest lane must verify the effective settings before tests run:
+        # pg_reload_conf() returning false still exits 0 under ON_ERROR_STOP,
+        # and the report only prints pg_settings. Without this probe the lane
+        # can run its whole suite on the PG18 default 1GB WAL budget.
+        self.assertIn("Verify disposable Postgres defaults", names)
+        self.assertEqual(
+            names.index("Verify disposable Postgres defaults"),
+            names.index("Prepare isolated test databases") + 1,
+        )
+        verify = next(
+            step for step in steps
+            if step.get("name") == "Verify disposable Postgres defaults"
+        )
+        self.assertEqual(verify.get("shell"), "bash")
+        for key, value in (
+            ("data_directory", "/var/lib/postgresql/18/docker"),
+            ("fsync", "on"),
+            ("full_page_writes", "on"),
+            ("synchronous_commit", "on"),
+            ("max_wal_size", "512MB"),
+            ("min_wal_size", "64MB"),
+        ):
+            self.assertIn(f"'{key}': '{value}'", verify["run"])
+        self.assertIn("current_setting(", verify["run"])
+        # Pin the rejection itself, not just the expected values: deleting the
+        # comparison makes the step print whatever it fetches and exit 0.
+        self.assertIn("if settings != expected:", verify["run"])
+        self.assertIn(
+            "raise SystemExit('disposable Postgres data path or durability defaults changed')",
+            verify["run"],
+        )
+        self.assertIn("Report Postgres storage headroom", names)
+        report = next(
+            step for step in steps
+            if step.get("name") == "Report Postgres storage headroom"
+        )
+        self.assertEqual(
+            names.index("Report Postgres storage headroom"),
+            names.index("Verify disposable Postgres defaults") + 1,
+        )
+        self.assertIn("ON_ERROR_STOP=1", report["run"])
+        self.assertIn("pg_database_size", report["run"])
+        self.assertIn("pg_ls_waldir()", report["run"])
+        # Post-suite bracket: max_wal_size is a soft target, so the pre-suite
+        # report cannot show peak WAL. The post-suite report always runs after
+        # the suite for the next ENOSPC triage.
+        self.assertIn("Report Postgres storage headroom (post-suite)", names)
+        post = next(
+            step for step in steps
+            if step.get("name") == "Report Postgres storage headroom (post-suite)"
+        )
+        self.assertEqual(post.get("if"), "always()")
+        self.assertGreater(
+            names.index("Report Postgres storage headroom (post-suite)"),
+            names.index("cargo nextest (unit and binary, retries=1, JUnit)"),
+        )
+        self.assertIn("ON_ERROR_STOP=1", post["run"])
+        self.assertIn("pg_database_size", post["run"])
+        self.assertIn("pg_ls_waldir()", post["run"])
+
+    def test_every_rust_lane_guards_runner_disk_headroom(self):
+        lanes = [
+            (workflow, job_id)
+            for workflow, job_id in (
+                ("check.yml", "check"),
+                ("check.yml", "rust-tests"),
+                ("check.yml", "ignored-db-stores"),
+                ("check.yml", "ignored-db-runtime"),
+                ("reusable-rust-nextest.yml", "nextest"),
+            )
+        ]
+        self.assertEqual(len(lanes), 5)
+        guards = []
+        for workflow, job_id in lanes:
+            with self.subTest(workflow=workflow, job=job_id):
+                steps = self.workflows[workflow]["jobs"][job_id]["steps"]
+                names = [step.get("name") for step in steps]
+                prereq = next(
+                    name for name in names
+                    if str(name).startswith("Job-container prerequisites")
+                )
+                self.assertIn("Guard runner disk headroom", names)
+                self.assertEqual(
+                    names.index("Guard runner disk headroom"),
+                    names.index(prereq) + 1,
+                )
+                guard = next(
+                    step for step in steps
+                    if step.get("name") == "Guard runner disk headroom"
+                )
+                self.assertEqual(guard.get("shell"), "bash")
+                run = guard["run"]
+                self.assertIn("floor=1073741824", run)
+                self.assertIn("::error::runner disk exhausted", run)
+                self.assertIn("Infra flake: rerun the job.", run)
+                # Pin the rejection path, not just the floor literal: a guard
+                # that keeps the floor and error text but stops comparing
+                # free_bytes must fail offline.
+                self.assertIn('for mount in / "$GITHUB_WORKSPACE"', run)
+                self.assertIn("df -B1 --output=avail", run)
+                self.assertIn('if [ "$free_bytes" -lt "$floor" ]', run)
+                self.assertIn("exit 1", run)
+                guards.append((workflow, job_id, run))
+        # All five copies stay byte-identical: a single-copy exit-1 removal or
+        # -lt/-gt inversion must fail offline instead of silently disabling
+        # the only fail-fast protection for that lane.
+        bodies = [run for _, _, run in guards]
+        self.assertEqual(len(set(bodies)), 1, "the lanes' disk guards drifted apart")
+        # Execute each guard with a stubbed df: fail when either mount is below
+        # the floor, pass when both are at or above it. Follows the stub
+        # pattern in scripts/test_ci_postgres_storage.py.
+        floor = 1073741824
+        scenarios = (
+            ("root low", floor - 1, floor, 1),
+            ("workspace low", floor, floor - 1, 1),
+            ("both low", floor - 1, floor - 1, 1),
+            ("both at floor", floor, floor, 0),
+            ("both above", floor + 1, floor + 1, 0),
+        )
+        stubs = (
+            'df() { if [ "$1" = "-h" ]; then return 0; fi; '
+            'last="${@: -1}"; '
+            'if [ "$last" = "/" ]; then printf \'Avail\\n%s\\n\' "$STUB_ROOT_AVAIL"; '
+            'else printf \'Avail\\n%s\\n\' "$STUB_WS_AVAIL"; fi; }; '
+            "du() { return 0; }; "
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = os.path.join(tmp, "ws")
+            runner_temp = os.path.join(tmp, "rt")
+            os.makedirs(workspace)
+            os.makedirs(runner_temp)
+            for workflow, job_id, run in guards:
+                for label, root_avail, ws_avail, expected in scenarios:
+                    with self.subTest(workflow=workflow, job=job_id, case=label):
+                        env = dict(
+                            os.environ,
+                            GITHUB_WORKSPACE=workspace,
+                            RUNNER_TEMP=runner_temp,
+                            STUB_ROOT_AVAIL=str(root_avail),
+                            STUB_WS_AVAIL=str(ws_avail),
+                        )
+                        result = subprocess.run(
+                            ["bash", "-c", stubs + run],
+                            env=env,
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                        )
+                        self.assertEqual(
+                            result.returncode, expected,
+                            f"{label}: root={root_avail} ws={ws_avail} "
+                            f"stdout={result.stdout!r} stderr={result.stderr!r}",
+                        )
+
+    def test_postgres_lanes_report_storage_headroom_post_suite(self):
+        # max_wal_size is a soft checkpoint target, not a hard ceiling: the
+        # pre-suite report cannot show peak WAL. Every Postgres lane brackets
+        # its run with an always-runs post-suite report for ENOSPC triage.
+        for job_id in ("rust-tests", "ignored-db-stores", "ignored-db-runtime"):
+            with self.subTest(job=job_id):
+                job = self.workflows["check.yml"]["jobs"][job_id]
+                steps = job["steps"]
+                names = [step.get("name") for step in steps]
+                self.assertIn("Report Postgres storage headroom (post-suite)", names)
+                post = next(
+                    step for step in steps
+                    if step.get("name") == "Report Postgres storage headroom (post-suite)"
+                )
+                self.assertEqual(post.get("if"), "always()")
+                test_steps = [
+                    index for index, candidate in enumerate(steps)
+                    if "cargo test" in str(candidate.get("run", ""))
+                ]
+                self.assertTrue(test_steps)
+                self.assertGreater(steps.index(post), max(test_steps))
+                self.assertIn("ON_ERROR_STOP=1", post["run"])
+                self.assertIn("pg_database_size", post["run"])
+                self.assertIn("pg_ls_waldir()", post["run"])
+                self.assertIn("max_wal_size", post["run"])
+                self.assertIn("min_wal_size", post["run"])
 
     def test_stores_container_pins_disposable_database_service_address(self):
         # Same hardening as rust-tests: the stores lane runs ~30 sequential
@@ -2680,6 +3065,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
         self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
         self.assertIn("pg_reload_conf()", prepare["run"])
+        self.assert_wal_reload_ordering_is_pinned(prepare["run"])
         self.assertIn("'max_wal_size': '512MB'", verify["run"])
         self.assertIn("'min_wal_size': '64MB'", verify["run"])
 
@@ -2746,6 +3132,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
         self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
         self.assertIn("pg_reload_conf()", prepare["run"])
+        self.assert_wal_reload_ordering_is_pinned(prepare["run"])
         self.assertIn("'max_wal_size': '512MB'", verify["run"])
         self.assertIn("'min_wal_size': '64MB'", verify["run"])
 
@@ -2862,6 +3249,27 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(ignored_sweeps), 1)
         self.assertIn("--test-threads=1", ignored_sweeps[0])
         self.assertIn("--skip regenerate_reference_docs", ignored_sweeps[0])
+        # One MEMBER_TESTDB export serves both the ignored sweep and the
+        # fail-closed member_moderation_db re-run. Pin its count and logical
+        # command order so a redundant later export cannot mask a deleted or
+        # moved sweep export.
+        member_exports = [
+            index for index, line in enumerate(logical_lines)
+            if line == "export MEMBER_TESTDB=agent-testdb"
+        ]
+        self.assertEqual(len(member_exports), 1)
+        ignored_sweep_index = next(
+            index for index, line in enumerate(logical_lines)
+            if line.startswith("cov_run ")
+            and "--workspace --lib --bins --tests" in line
+            and "-- --ignored" in line
+        )
+        member_rerun_index = next(
+            index for index, line in enumerate(logical_lines)
+            if "--test member_moderation_db" in line
+        )
+        self.assertLess(member_exports[0], ignored_sweep_index)
+        self.assertLess(ignored_sweep_index, member_rerun_index)
         self.assertEqual(len([run for run in sweeps if "-- --ignored" not in run]), 1)
         main_sweep = [run for run in sweeps if "-- --ignored" not in run][0]
         # Guarded suites panic under the bootstrap URL; they run only in
@@ -5084,6 +5492,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
         self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
         self.assertIn("pg_reload_conf()", prepare["run"])
+        self.assert_wal_reload_ordering_is_pinned(prepare["run"])
         self.assertIn("'max_wal_size': '512MB'", verify["run"])
         self.assertIn("'min_wal_size': '64MB'", verify["run"])
 
@@ -5228,6 +5637,10 @@ class WorkflowTests(unittest.TestCase):
                         # by size label.
                         expected = {"contents": "read", "issues": "read",
                                     "pull-requests": "read"}
+                    elif (name, job_id) == ("slow-burn-tracker.yml", "tracker"):
+                        # Slow-burn card filer: files, refreshes and resolves
+                        # the one tracking issue per firing key.
+                        expected = {"contents": "read", "issues": "write"}
                     self.assertEqual(job["permissions"], expected)
                     for step in job.get("steps", []):
                         if step.get("uses", "").startswith("actions/checkout@"):

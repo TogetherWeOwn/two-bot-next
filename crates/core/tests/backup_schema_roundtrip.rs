@@ -1454,6 +1454,55 @@ async fn pre_reservation_v4_restores_and_clears_newer_reservation_rows() {
 }
 
 #[tokio::test]
+async fn v8_archive_restores_and_clears_newer_guild_counters() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    seed(pool).await;
+    let directory = ArchiveDirectory::new();
+    let current_path = directory.path("v9-source.ndjson.gz");
+    dump(pool, &current_path).await.unwrap();
+    let mut old = inspect(&current_path).unwrap();
+    assert_eq!(old.manifest.version, 9);
+    for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
+        let rows = old.buffers.remove(name).unwrap();
+        assert!(!rows.is_empty(), "fixture must populate newer {name}");
+        old.manifest.tables.retain(|table| table.name != name);
+    }
+    old.manifest.version = 8;
+    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
+    let old_path = directory.path("pre-guild-counters-v8.ndjson.gz");
+    write_archive(&old_path, &old);
+    let inspected = inspect(&old_path).expect("pre-change v8 archive remains readable");
+    assert_eq!(inspected.manifest.version, 8);
+    assert_eq!(
+        inspected.manifest.missing_tables(),
+        ["game_activity_guild_aggregates", "assistant_monthly_builds"]
+    );
+    // This test deliberately replaces a reused isolated rehearsal target.
+    forget_moderation_history(pool).await;
+    let report = restore(pool, &old_path).await.unwrap();
+    assert!(report.ok);
+    for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(name)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "v8 restore clears newer {name} target rows");
+    }
+    let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(members > 0, "older covered data is restored, not discarded");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn v3_prefix_restores_into_migrated_schema_without_retaining_newer_target_data() {
     let Some(db) = database().await else {
         return;

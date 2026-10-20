@@ -181,27 +181,110 @@ async fn prepare_cleanup_connection(conn: &mut sqlx::PgConnection) -> Result<()>
     Ok(())
 }
 
+/// Substrings marking a teardown failure as transient hosted-runner
+/// infrastructure (DNS, dropped connection) rather than a deterministic
+/// teardown bug (unknown database, permission). Anything outside this list
+/// fails fast and is never retried.
+fn is_transient_teardown_error(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_lowercase();
+    const MARKERS: &[&str] = &[
+        "temporary failure in name resolution",
+        "failed to lookup address information",
+        "name or service not known",
+        "connection refused",
+        "connection reset",
+        "connection closed",
+        "broken pipe",
+        "unexpected eof",
+        "got 0 bytes",
+        "expected to read",
+        "could not connect",
+        "server closed the connection",
+        "connection timed out",
+        "timed out",
+    ];
+    MARKERS.iter().any(|marker| text.contains(marker))
+}
+
+/// A retry that finds the database already gone means an earlier attempt
+/// committed its DROP server-side before the client saw EOF. Fixture names
+/// are unique per process/time/sequence and only this Cleanup drops them,
+/// so "does not exist" on attempt 2+ is success, never a bug.
+fn is_teardown_already_dropped(error: &anyhow::Error) -> bool {
+    format!("{error:#}")
+        .to_lowercase()
+        .contains("does not exist")
+}
+
+/// Run a teardown operation until it succeeds, retrying only transient
+/// hosted-runner infrastructure failures. The attempt budget is explicit so
+/// unit tests pin the loop: a transient-then-success operation is called
+/// until success, a deterministic error is called exactly once. A
+/// "does not exist" error after the first attempt means an earlier DROP
+/// already committed, so it returns success; the first attempt stays strict
+/// so wrong-name teardown bugs still fail fast.
+async fn with_teardown_retries<F, Fut>(attempts: usize, mut operation: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let attempts = attempts.max(1);
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match operation().await {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt > 1 && is_teardown_already_dropped(&error) => {
+                eprintln!(
+                    "test-database teardown already dropped on attempt {attempt}/{attempts}; treating as success"
+                );
+                return Ok(());
+            }
+            Err(error) if attempt < attempts && is_transient_teardown_error(&error) => {
+                eprintln!(
+                    "transient test-database teardown failure (attempt {attempt}/{attempts}): {error:#}; retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(250u64 << (attempt - 1))).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 impl Cleanup {
+    async fn drop_once(admin: &PgPool, name: &str) -> Result<()> {
+        let _ddl = DATABASE_DDL.lock().await;
+        let mut conn = admin.acquire().await?;
+        prepare_cleanup_connection(&mut conn).await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE \"{}\" WITH (FORCE)",
+            name
+        )))
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
+
     async fn close(self) -> Result<()> {
-        for pool in self.independent_pools.into_inner().unwrap() {
+        let Self {
+            admin,
+            pool,
+            independent_pools,
+            name,
+        } = self;
+        for pool in independent_pools.into_inner().unwrap() {
             pool.close().await;
         }
-        self.pool.close().await;
+        pool.close().await;
         // The name is generated internally, not supplied by a caller.
-        let result: Result<()> = async {
-            let _ddl = DATABASE_DDL.lock().await;
-            let mut conn = self.admin.acquire().await?;
-            prepare_cleanup_connection(&mut conn).await?;
-            sqlx::query(sqlx::AssertSqlSafe(format!(
-                "DROP DATABASE \"{}\" WITH (FORCE)",
-                self.name
-            )))
-            .execute(&mut *conn)
-            .await?;
-            Ok(())
-        }
-        .await;
-        self.admin.close().await;
+        // Hosted runners occasionally lose the service hostname for seconds;
+        // the same blip that fails bootstrap connects can also kill an
+        // in-flight DROP with EOF. Retry only transient teardown failures;
+        // anything else fails fast with its original context. The DDL guard
+        // is per attempt inside drop_once, never held across backoff sleep.
+        const ATTEMPTS: usize = 4;
+        let result = with_teardown_retries(ATTEMPTS, || Self::drop_once(&admin, &name)).await;
+        admin.close().await;
         result.context("drop disposable test database")?;
         Ok(())
     }
@@ -788,6 +871,135 @@ mod tests {
             guard_database_url(&format!("postgres://agent_test:@agent-testdb:5432/{name}"))
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn teardown_retry_covers_transient_infra_but_not_teardown_bugs() {
+        for transient in [
+            "drop disposable test database: error communicating with database: \
+             expected to read 5 bytes, got 0 bytes at EOF",
+            "server closed the connection unexpectedly",
+            "connection reset by peer",
+            "pool timed out while waiting for an open connection",
+        ] {
+            assert!(
+                is_transient_teardown_error(&anyhow::anyhow!("{transient}")),
+                "should retry: {transient}"
+            );
+        }
+        for deterministic in [
+            "database \"two_bot_test_deadbeef\" does not exist",
+            "permission denied to drop database",
+            "cannot drop the currently open database",
+            "set disposable database teardown timeout: statement timeout",
+        ] {
+            assert!(
+                !is_transient_teardown_error(&anyhow::anyhow!("{deterministic}")),
+                "must fail fast: {deterministic}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn teardown_retry_retries_transient_until_success() {
+        use std::sync::{Arc, Mutex};
+        let calls = Arc::new(Mutex::new(0usize));
+        with_teardown_retries(4, || {
+            let calls = calls.clone();
+            async move {
+                let mut calls = calls.lock().unwrap();
+                *calls += 1;
+                let attempt = *calls;
+                drop(calls);
+                if attempt < 3 {
+                    Err(anyhow::anyhow!("connection reset by peer"))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*calls.lock().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn teardown_retry_fails_fast_on_deterministic_error() {
+        use std::sync::{Arc, Mutex};
+        let calls = Arc::new(Mutex::new(0usize));
+        let result = with_teardown_retries(4, || {
+            let calls = calls.clone();
+            async move {
+                *calls.lock().unwrap() += 1;
+                Err(anyhow::anyhow!("permission denied to drop database"))
+            }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn teardown_retry_exhausts_attempts_on_persistent_transient() {
+        use std::sync::{Arc, Mutex};
+        let calls = Arc::new(Mutex::new(0usize));
+        let result = with_teardown_retries(4, || {
+            let calls = calls.clone();
+            async move {
+                *calls.lock().unwrap() += 1;
+                Err(anyhow::anyhow!(
+                    "expected to read 5 bytes, got 0 bytes at EOF"
+                ))
+            }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(*calls.lock().unwrap(), 4);
+    }
+
+    #[tokio::test]
+    async fn teardown_retry_treats_already_dropped_as_success_after_transient() {
+        use std::sync::{Arc, Mutex};
+        let calls = Arc::new(Mutex::new(0usize));
+        with_teardown_retries(4, || {
+            let calls = calls.clone();
+            async move {
+                let mut calls = calls.lock().unwrap();
+                *calls += 1;
+                let attempt = *calls;
+                drop(calls);
+                if attempt == 1 {
+                    Err(anyhow::anyhow!(
+                        "expected to read 5 bytes, got 0 bytes at EOF"
+                    ))
+                } else {
+                    Err(anyhow::anyhow!(
+                        "database \"two_bot_test_deadbeef\" does not exist"
+                    ))
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*calls.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn teardown_retry_fails_fast_when_first_attempt_finds_nothing() {
+        use std::sync::{Arc, Mutex};
+        let calls = Arc::new(Mutex::new(0usize));
+        let result = with_teardown_retries(4, || {
+            let calls = calls.clone();
+            async move {
+                *calls.lock().unwrap() += 1;
+                Err(anyhow::anyhow!(
+                    "database \"two_bot_test_deadbeef\" does not exist"
+                ))
+            }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(*calls.lock().unwrap(), 1);
     }
 
     fn transient_io_error() -> sqlx::Error {
