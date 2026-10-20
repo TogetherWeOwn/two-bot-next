@@ -52,10 +52,10 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import sanitize_evidence_rows as sanitizer  # noqa: E402
-import staging_probe as probe  # noqa: E402
-import staging_voice_smoke as smoke  # noqa: E402
-import staging_voice_synthetic as synth  # noqa: E402
+import sanitize_evidence_rows as sanitizer
+import staging_probe as probe
+import staging_voice_smoke as smoke
+import staging_voice_synthetic as synth
 
 SMOKE_GET_JSON_DUP = "interactions endpoint answered 200 with duplicate JSON object keys"
 SMOKE_HEALTH_DUP = "GET /health carries duplicate JSON object keys"
