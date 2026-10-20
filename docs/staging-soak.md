@@ -165,6 +165,13 @@ sequence baselines, the accepted timestamp window or pending outages. A
 malformed resume cannot close a disconnect; a later valid recovery measures
 from the original disconnect, and an unrecovered outage remains open UNKNOWN.
 
+Only `connect`, `disconnect`, `resume`, `dispatch` and `unknown` event kinds
+are accepted. Missing or unrecognised kinds remain UNKNOWN evidence but cannot
+advance the accepted timestamp window or make later valid recovery appear
+regressed. In the committed sample, `heartbeat_oops` at 00:00:26 remains an
+UNKNOWN interval; the accepted window ends at the explicit `unknown` record's
+event timestamp, 00:00:22, not its interval endpoint or the rejected event.
+
 Event timestamps and explicit UNKNOWN start/end timestamps must normalize to
 representable UTC datetimes. UTC underflow/overflow becomes bounded malformed
 evidence, not a traceback or a diagnostic containing the rejected value;

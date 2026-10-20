@@ -24,9 +24,9 @@ are accepted. A regressed event becomes UNKNOWN and is not applied to outage,
 session, or sequence state. A new session id resets the sequence baseline
 (Discord sequences are per-session; see docs/gateway-recovery.md). A repeated
 or older seq in the same session is a duplicate delivery, not a missed event.
-Any unrecognised ``event`` value or malformed line is preserved as an UNKNOWN
-interval so the live run in TOG-10955 must explain it instead of inheriting a
-silent skip.
+Any unrecognised or missing ``event`` value or malformed line is preserved as
+an UNKNOWN interval without advancing the accepted timestamp window or changing
+session, sequence or outage state. Later valid records are still processed.
 
 Connect, resume and dispatch events require a nonempty string ``session``
 identity. Any other, missing or empty identity is preserved as a fixed
@@ -182,6 +182,9 @@ def summarize(lines):
         # block performs no recursive traversal and cannot raise it. The
         # only decoder-level backstop is the json.loads handler above.
         event = record.get("event")
+        if event not in KNOWN_EVENTS:
+            note_unknown(ts, ts, f"unrecognised event {event!r}")
+            continue
         session = record.get("session")
 
         if event in ("connect", "resume", "dispatch"):
@@ -251,8 +254,6 @@ def summarize(lines):
         elif event == "unknown":
             note_unknown(start or ts, end,
                          str(record.get("reason", "unspecified")))
-        else:
-            note_unknown(ts, ts, f"unrecognised event {event!r}")
 
     if down_since is not None:
         # Log ends while disconnected: the outage length is unbounded, so it
