@@ -3316,6 +3316,14 @@ class WorkflowTests(unittest.TestCase):
                     self.assertIn("--features db", matches[0])
                 else:
                     self.assertNotIn("--features db", matches[0])
+        staging_migrate = next(
+            run for run in guarded if "--test staging_migrate_db" in run
+        )
+        self.assertTrue(
+            staging_migrate.startswith(
+                "cov_run env TWO_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test "
+            )
+        )
         env_wrapped = [
             run for run in cov_runs
             if run.startswith('cov_run env -u PGPASSWORD -u PGPASSFILE -u PGOPTIONS "$COV"')
