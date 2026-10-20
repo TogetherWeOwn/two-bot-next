@@ -20,6 +20,9 @@ use two_bot_core::stream_live_store::*;
 /// green instead of emitting guard panics that flake detection misattributes
 /// as test flakes.
 fn test_options(url: &str) -> Result<PgConnectOptions, &'static str> {
+    if url.contains('?') || url.contains('#') {
+        return Err("invalid test URL");
+    }
     let options: PgConnectOptions = url.parse().map_err(|_| "invalid test URL")?;
     if options.get_host() != "agent-testdb" || options.get_socket().is_some() {
         return Err("refusing non-test host");
@@ -64,6 +67,8 @@ fn live_test_options_require_the_approved_container() {
         "postgres://agent_test:@127.0.0.1/agent_test",
         "postgres://agent_test:@agent-testdb/agent_test?host=/var/run/postgresql",
         "postgres://agent_test:@agent-testdb/agent_test?port=5433",
+        "postgres://agent_test:@agent-testdb/agent_test?sslmode=disable",
+        "postgres://agent_test:@agent-testdb/agent_test#fragment",
         "postgres://other_user:@agent-testdb/agent_test",
         "postgres://agent_test:@agent-testdb/production",
         "postgres://agent_test:fixture-password@agent-testdb/agent_test",
