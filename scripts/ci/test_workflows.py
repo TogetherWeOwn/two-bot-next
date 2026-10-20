@@ -2729,19 +2729,19 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('service_ip="$(getent ahostsv4 agent-testdb 2>/dev/null | awk \'NR == 1 { print $1; exit }\')" || service_ip=""', run)
         self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
 
-    def assert_wal_reload_ordering_is_pinned(self, run):
+    def assert_wal_reload_ordering_is_pinned(self, run, max_wal="512MB", min_wal="64MB"):
         # Order is load-bearing both ways: the ALTERs must precede the
         # reload (ALTER SYSTEM only writes postgresql.auto.conf, which the
         # reload reads), and the reload must precede the first createdb,
         # since the bootstrap databases are created later in this same step.
         reload = run.index("pg_reload_conf()")
         self.assertLess(
-            run.index("ALTER SYSTEM SET max_wal_size = '512MB'"),
+            run.index(f"ALTER SYSTEM SET max_wal_size = '{max_wal}'"),
             reload,
             "max_wal_size ALTER must precede pg_reload_conf()",
         )
         self.assertLess(
-            run.index("ALTER SYSTEM SET min_wal_size = '64MB'"),
+            run.index(f"ALTER SYSTEM SET min_wal_size = '{min_wal}'"),
             reload,
             "min_wal_size ALTER must precede pg_reload_conf()",
         )
@@ -2761,12 +2761,15 @@ class WorkflowTests(unittest.TestCase):
             step for step in job["steps"]
             if step.get("name") == "Verify disposable Postgres defaults"
         )
-        self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
-        self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
+        # The coverage replay exhausted 1 GiB even with the old 512 MB soft
+        # WAL target. Keep a smaller target without changing durability or
+        # the fixture's memory ceiling.
+        self.assertIn("ALTER SYSTEM SET max_wal_size = '128MB'", prepare["run"])
+        self.assertIn("ALTER SYSTEM SET min_wal_size = '32MB'", prepare["run"])
         self.assertIn("pg_reload_conf()", prepare["run"])
-        self.assert_wal_reload_ordering_is_pinned(prepare["run"])
-        self.assertIn("'max_wal_size': '512MB'", verify["run"])
-        self.assertIn("'min_wal_size': '64MB'", verify["run"])
+        self.assert_wal_reload_ordering_is_pinned(prepare["run"], "128MB", "32MB")
+        self.assertIn("'max_wal_size': '128MB'", verify["run"])
+        self.assertIn("'min_wal_size': '32MB'", verify["run"])
 
     def test_stores_container_pins_disposable_database_service_address(self):
         # Same hardening as rust-tests: the stores lane runs ~30 sequential

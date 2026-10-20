@@ -34,8 +34,11 @@ async fn audit_global_admission_precedes_the_late_authorization() {
     .await;
     let guard = Arc::new(RateLimitGuard::new(Default::default()).unwrap());
     let exec = executor(&mock, &guard);
-    guard.observe_global(Some(0.4));
+    // Include any scheduler delay after the 400 ms + 250 ms cooldown starts.
     let started = Instant::now();
+    guard.observe_global(Some(0.4));
+    // Model a scheduler delay between installing the cooldown and admission.
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let result = exec
         .post_mirror_checked("4444", "audit test", "oa_fixture", async {
             assert!(started.elapsed() >= Duration::from_millis(600));
