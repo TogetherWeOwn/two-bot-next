@@ -52,7 +52,7 @@
     },
     {
       "name": "privacy",
-      "description": "Manage your analytics privacy for this server.",
+      "description": "Manage your analytics privacy and deletion requests for this server.",
       "family": "core",
       "gate": "always",
       "default_member_permissions": null,
@@ -87,6 +87,60 @@
           "max_value": null,
           "max_length": null,
           "choices": []
+        },
+        {
+          "name": "delete",
+          "description": "Request deletion of your stored data for this server.",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "deletion-status",
+          "description": "Show the status of your deletion request.",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [],
+          "options": [
+            {
+              "name": "request-id",
+              "description": "The request id returned when you requested deletion.",
+              "type": "string",
+              "required": true,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 128,
+              "choices": []
+            }
+          ]
+        },
+        {
+          "name": "deletion-receipt",
+          "description": "Show the completed receipt for your deletion request.",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [],
+          "options": [
+            {
+              "name": "request-id",
+              "description": "The request id returned when you requested deletion.",
+              "type": "string",
+              "required": true,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 128,
+              "choices": []
+            }
+          ]
         }
       ],
       "smoke": "deferred",

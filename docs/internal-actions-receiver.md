@@ -144,6 +144,50 @@ Stable caller mapping, idempotency claim, action validation, outbound admission,
 execution and durable finalization remain receiver responsibilities; this
 capability does not itself permit a Discord effect.
 
+## Automation import contract
+
+`automations.import` accepts the version-1 command document produced by
+`automations.export`; the existing MEE6 translation path is unchanged. Parsing
+preserves command document order and duplicate names. Malformed wire entries
+contribute to `skipped`; parsed definitions still undergo normal name,
+description, template and trigger validation.
+
+Planning simulates current content and case-insensitive trigger ownership in
+document order. Each accepted occurrence sees the results of earlier accepted
+occurrences, including those with the same name. Changed content requires
+`overwrite: true`, even for a name first created earlier in this import;
+identical content converges without overwrite. An accepted update releases its
+previous trigger, including when it becomes slash-only. The next accepted
+claimant owns a released trigger. Refused occurrences never change simulated
+content or acquire/release triggers. Validation refusals are reported first,
+followed by overwrite/trigger refusals in document order.
+
+The transactional service applies only the exact parsed-entry indices accepted
+by that plan, in document order, while holding the guild capacity lock. The
+capacity precheck still counts the union of existing names and validated
+candidate names and refuses the whole import before command writes if it is
+over budget. Accepted same-content occurrences are rewritten and count as
+`imported`; each rejected occurrence and malformed wire entry counts as
+`skipped`. `conflicts` retains translation collisions followed by refused
+overwrite/trigger names. Fresh rows are enabled; rewrites preserve the current
+enabled flag and original creator/timestamp.
+
+Each accepted occurrence has one audit ID
+`<import-audit-id>#cmd:<name>#<ordinal>`, with a zero-based per-name ordinal among
+all parsed occurrences, including rejected ones. The command writes, occurrence
+audits and `<import-audit-id>#summary` commit together. The receiver replays the
+committed summary's original counts and conflict names without replanning or
+rewriting commands after later admin edits.
+
+Authentication, durable nonce burn, action claims and feature gates are
+unchanged. Overwrite still requires the separately configured
+`TWO_INTERNAL_ALLOW_AUTOMATIONS_OVERWRITE` capability in addition to the base
+automations flag. These import semantics do not enable ingress, publish
+commands, grant capabilities or authorize a rollout. Parser/planner coverage
+lives in `automation_import_occurrence_planner_acceptance`; the corresponding
+`automation_import_occurrence_service_acceptance` suite checks transactional
+rows, provenance, audit facts and replay readback on disposable databases only.
+
 ## Configuration contract
 
 `two_bot_core::internal_action_config::InternalActionConfig::from_env` returns

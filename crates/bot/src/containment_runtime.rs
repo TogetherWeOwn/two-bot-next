@@ -41,7 +41,7 @@ use two_bot_core::containment::{
     plan_quarantine, quarantine_outcome, ContainmentAlert, ContainmentDisposition,
     ContainmentIncident, ContainmentIncidentState, ContainmentPolicy, ContainmentReason,
     ContainmentRole, DestructiveAction, DestructiveAuditEvent, QuarantineFailure, QuarantinePlan,
-    DEFAULT_CONTAINMENT_HEAT_THRESHOLD, DEFAULT_CONTAINMENT_MAX_AGE_MS,
+    QuarantineRefusal, DEFAULT_CONTAINMENT_HEAT_THRESHOLD, DEFAULT_CONTAINMENT_MAX_AGE_MS,
     DEFAULT_CONTAINMENT_WINDOW_MS,
 };
 use two_bot_core::containment_store::{ContainmentStore, EventClaim, IncidentClaim};
@@ -68,7 +68,7 @@ const HOT_KEYS: [&str; 4] = [WINDOW_KEY, MAX_AGE_KEY, HEAT_KEY, CHANNEL_KEY];
 
 /// Discord audit-log action to legacy destructive weight. Unsupported actions
 /// never acquire a weight and are skipped before any claim.
-pub(crate) fn map_action(action: &AuditLogEventType) -> Option<DestructiveAction> {
+pub fn map_action(action: &AuditLogEventType) -> Option<DestructiveAction> {
     match action {
         AuditLogEventType::MemberKick => Some(DestructiveAction::MemberKick),
         AuditLogEventType::MemberBanAdd => Some(DestructiveAction::MemberBan),
@@ -83,18 +83,18 @@ pub(crate) fn map_action(action: &AuditLogEventType) -> Option<DestructiveAction
 
 /// The containment configuration for one observation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ContainmentSettings {
-    pub(crate) window_ms: i64,
-    pub(crate) max_age_ms: i64,
-    pub(crate) heat_threshold: u64,
+pub struct ContainmentSettings {
+    pub window_ms: i64,
+    pub max_age_ms: i64,
+    pub heat_threshold: u64,
     /// `None` means log only: no channel is guessed on a live server.
-    pub(crate) staff_channel: Option<String>,
+    pub staff_channel: Option<String>,
 }
 
 impl ContainmentSettings {
     /// A missing or unusable number falls back to the shipped default rather
     /// than disabling containment. Present-but-bad values warn.
-    pub(crate) fn from_vars(vars: &HashMap<String, String>) -> Self {
+    pub fn from_vars(vars: &HashMap<String, String>) -> Self {
         let seconds = |key: &str, default_ms: i64| match vars.get(key).map(|raw| raw.trim()) {
             None | Some("") => default_ms,
             Some(raw) => match raw.parse::<f64>().ok().and_then(seconds_to_ms) {
@@ -145,7 +145,7 @@ fn is_snowflake(value: &str) -> bool {
 }
 
 /// Cold user lists: comma-separated snowflakes, read once at boot.
-pub(crate) fn id_list(vars: &HashMap<String, String>, key: &str) -> HashSet<String> {
+pub fn id_list(vars: &HashMap<String, String>, key: &str) -> HashSet<String> {
     vars.get(key)
         .map(|raw| {
             raw.split(',')
@@ -159,8 +159,8 @@ pub(crate) fn id_list(vars: &HashMap<String, String>, key: &str) -> HashSet<Stri
 
 /// Where the live [`ContainmentSettings`] come from. `Sync` is required: the
 /// worker is shared by reference across awaits (`contain`, `plan`) and the
-/// spawned [`run`](ContainmentWorker::run) future must stay `Send`.
-pub(crate) trait SettingsSource: Send + Sync + 'static {
+/// spawned `run` future must stay `Send`.
+pub trait SettingsSource: Send + Sync + 'static {
     fn current(&mut self) -> impl Future<Output = ContainmentSettings> + Send;
 }
 
@@ -260,9 +260,10 @@ fn processing_now_ms(fallback_ms: i64) -> i64 {
         .unwrap_or(fallback_ms)
 }
 
-/// Fail closed: any malformed role (or a non-array body) refuses the whole
-/// snapshot, so a dropped managed or higher-than-bot role can never let the
-/// plan remove the others against the whole-plan preflight rule.
+/// Fail closed on malformed fields rather than dropping individual roles.
+/// The core planner additionally validates identities, hierarchy positions,
+/// baseline presence and coverage of both fetched held-role sets before it
+/// can produce any removals or an empty-plan success.
 fn role_snapshot(body: &serde_json::Value) -> Option<Vec<ContainmentRole>> {
     let roles = body.as_array()?;
     roles
@@ -539,7 +540,17 @@ impl<S: SettingsSource> ContainmentWorker<S> {
         };
         match plan_quarantine(guild_id, &executor_roles, &bot_roles, &snapshot, dry_run) {
             QuarantinePlan::DryRun => PlanOutcome::DryRun,
-            QuarantinePlan::Refused { .. } => {
+            QuarantinePlan::Refused {
+                reason: QuarantineRefusal::InvalidEvidence,
+                ..
+            } => {
+                error!("containment_refused: role evidence incomplete or contradictory");
+                PlanOutcome::Refused
+            }
+            QuarantinePlan::Refused {
+                reason: QuarantineRefusal::ManagedRole | QuarantineRefusal::Hierarchy,
+                ..
+            } => {
                 error!("containment_refused: hierarchy or managed role blocks removal");
                 PlanOutcome::Refused
             }
@@ -709,7 +720,7 @@ fn log_disposition(disposition: &ContainmentDisposition) {
 }
 
 /// The pipeline-facing half: queue only, never block.
-pub(crate) struct ContainmentRuntime {
+pub struct ContainmentRuntime {
     entries: mpsc::Sender<AuditLogObservation>,
 }
 
@@ -727,8 +738,8 @@ impl AuditEntryObserver for ContainmentRuntime {
 }
 
 /// Spawn the worker. It ends when the last [`ContainmentRuntime`] reference
-/// drops. Identity is verified inside [`run`], before any entry is claimed.
-pub(crate) fn start<S: SettingsSource>(
+/// drops. Identity is verified inside `run`, before any entry is claimed.
+pub fn start<S: SettingsSource>(
     guild_id: u64,
     settings: S,
     store: ContainmentStore,
@@ -762,7 +773,7 @@ pub(crate) fn start<S: SettingsSource>(
 /// come from the deployment environment; Hot tuning comes from the settings
 /// store. `armed` is false unless dry-run is explicitly `0` outside session
 /// mode, and only an armed worker executes removals.
-pub(crate) fn start_from_env(
+pub fn start_from_env(
     pool: PgPool,
     executor: ActionExecutor,
     guild_id: u64,

@@ -25,6 +25,7 @@ use crate::gateway::GatewayPipeline;
 use crate::onboarding::{OnboardingJob, OnboardingRuntime};
 
 mod ingress;
+mod recipient_acceptance;
 
 const SESSION: &str = "onboarding-session";
 const DEADLINE: Duration = Duration::from_secs(20);
@@ -215,7 +216,9 @@ async fn discord(paused: Arc<AtomicBool>, pause_at: PauseAt) -> MockRest {
                 ScriptedResponse::json(200, json!({"user":{"id":"999"},"roles":roles}))
             }
             ("GET", "/guilds/2222/members/77") => {
-                ScriptedResponse::json(200, json!({"user":{"id":"77"},"roles":[]}))
+                // Unchanged-recipient control: current and captured roles agree.
+                // recipient_acceptance owns the changed-state cases.
+                ScriptedResponse::json(200, json!({"user":{"id":"77","bot":false},"roles":[GAME_PICKS[0].role_id],"pending":false}))
             }
             ("GET", "/channels/10" | "/channels/11" | "/channels/12" | "/channels/13") => {
                 let id = path.strip_prefix("/channels/").unwrap();
@@ -625,7 +628,7 @@ async fn welcome_restart(pending: bool) {
         assert_eq!(menu["custom_id"], GAME_SELECT_ID);
         assert_eq!(
             menu["options"][0]["default"], true,
-            "captured roles survive a cold cache"
+            "unchanged current roles keep the same default after a cold restart"
         );
         assert_eq!(
             body["allowed_mentions"],

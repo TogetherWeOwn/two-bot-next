@@ -10,7 +10,8 @@ Source of behavior: `crates/core/src/channel_moderation.rs`
 (`plan_lockdown` moves only the send, thread and reaction lockdown bits,
 `plan_unlock` restores the recorded seed verbatim) and `docs/cutover-sequence.md` §1 (freeze and
 drain). The harness is `scripts/cutover_freeze_drill.py`; its offline
-checks are `scripts/test_cutover_freeze_drill.py`.
+checks are `scripts/test_cutover_freeze_drill.py` and
+`scripts/test_cutover_freeze_drill_observation_acceptance.py`.
 
 ## Scope and guards
 
@@ -23,6 +24,15 @@ checks are `scripts/test_cutover_freeze_drill.py`.
 - Authenticated Discord reads and writes refuse every redirect before a
   follow-up request, even to the same origin. The fixed failure message and
   receipt omit the bot token, redirect Location, headers and response body.
+- Acknowledged writes are not observations: slowmode and lockdown steps
+  read the channel back and match the intended value and masks before they
+  pass. The notice post reads the exact message back and matches both its
+  message and channel identity before passing; the notice identity is kept
+  for cleanup even when that presence read fails, until an independent GET
+  proves absence. Only Discord's Unknown Message (`10008`) proves the
+  notice is gone; a DELETE reply, a generic 404, or a local flag never does.
+- An already-locked baseline refuses before any mutation, and every
+  readback re-checks the staging guild and drill channel identity.
 - On any step failure the harness best-effort restores slowmode, the
   overwrite seed and the notice, then reports the failing step. A restore
   mismatch is `NEEDS WORK`, never a silent waiver.
@@ -32,7 +42,7 @@ checks are `scripts/test_cutover_freeze_drill.py`.
 | # | Step | What proves it |
 |---|---|---|
 | 1 | Baseline read | Channel slowmode plus the `@everyone` allow/deny seed, hashed |
-| 2 | Freeze notice post | Notice message created in the drill channel |
+| 2 | Freeze notice post | Exact-message GET matches the posted message id and drill channel id |
 | 3 | Slowmode on | Channel reads back 30 s |
 | 4 | Lockdown | `@everyone` deny carries `SEND_MESSAGES`, allow cleared of it |
 | 5 | Command surface verify | Guild command list still answers with `ping` present |

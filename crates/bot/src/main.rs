@@ -29,6 +29,8 @@ mod commands_cli;
 mod community_jobs;
 mod containment_runtime;
 #[cfg(test)]
+mod containment_runtime_evidence_tests;
+#[cfg(test)]
 mod containment_runtime_tests;
 mod database_roles_cli;
 mod db_log;
@@ -91,6 +93,8 @@ mod onboarding_tests;
 mod onboarding_unknown_only_acceptance_tests;
 #[cfg(test)]
 mod onboarding_worker_failure_acceptance_tests;
+#[cfg(test)]
+mod ops_audit_acceptance_tests;
 mod ops_backfill;
 mod ops_http;
 mod preflight;
@@ -122,6 +126,8 @@ mod ticket_runtime;
 #[path = "../../core/tests/support/tracing_capture.rs"]
 mod tracing_capture;
 mod website_jobs;
+#[cfg(test)]
+mod website_roster_cap_acceptance_tests;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

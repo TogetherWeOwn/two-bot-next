@@ -18,7 +18,7 @@
  *   text echoed; a hung stub aborts at ~6 s with a JSON-RPC error.
  */
 
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import worker, { type Env } from "../src/index.ts";
 
@@ -430,8 +430,9 @@ test("tools/call get_config reports the Worker version, never unknown here", asy
   assert.deepEqual(h.forwarded, [], "get_config must not touch the container");
 });
 
-test("tools/call get_audit pins the implemented=false stub", async () => {
-  const h = harness(() => Response.json({ synthetic: true }));
+test("tools/call get_audit returns a real empty excerpt with one fenced GET", async () => {
+  const excerpt = { available: true, rows: [], truncated: false };
+  const h = harness(() => Response.json(excerpt));
   const res = await worker.fetch(
     rpc("tools/call", { name: "get_audit", arguments: {} }),
     h.env,
@@ -439,8 +440,12 @@ test("tools/call get_audit pins the implemented=false stub", async () => {
   );
   assert.equal(res.status, 200);
   const body = await rpcBody(res);
-  assert.deepEqual(body.result?.structuredContent, { implemented: false });
-  assert.deepEqual(h.forwarded, [], "get_audit must not touch the container");
+  assert.deepEqual(body.result?.structuredContent, excerpt);
+  assert.equal(h.forwarded.length, 1);
+  assert.equal(h.forwarded[0]!.method, "GET");
+  assert.equal(new URL(h.forwarded[0]!.url).pathname, "/ops/audit");
+  assert.equal(h.forwarded[0]!.headers["x-two-bot-deployment-id"], "synthetic-mcp-deployment");
+  assert.equal(h.forwarded[0]!.headers.authorization, undefined);
 });
 
 test("initialize falls back to a supported version for unknown requests", async () => {
@@ -597,6 +602,93 @@ async function settleWithin<T>(work: Promise<T>, label: string, ms: number): Pro
     clearTimeout(timer);
   }
 }
+
+/** Model runtime cleanup throws; a native source cancel hook only rejects. */
+function syncThrowingReaderCleanup(
+  t: TestContext,
+  stream: ReadableStream<Uint8Array>,
+  method: "cancel" | "releaseLock",
+  marker: string,
+) {
+  const state = { attempts: 0 };
+  const getReader = stream.getReader.bind(stream);
+  t.mock.method(stream, "getReader", () => {
+    const reader = getReader();
+    const cancel = reader.cancel.bind(reader);
+    const release = reader.releaseLock.bind(reader);
+    t.mock.method(reader, method, () => {
+      state.attempts++;
+      throw new Error(marker);
+    });
+    // Use the original methods so even a guard-removal mutant leaves no lock.
+    t.after(async () => {
+      if (stream.locked) {
+        await cancel();
+        release();
+      } else {
+        await stream.cancel();
+      }
+    });
+    return reader;
+  });
+  return state;
+}
+
+for (const method of ["cancel", "releaseLock"] as const) {
+  test(`inbound oversize keeps the parse refusal when reader ${method} throws synchronously`, async (t) => {
+    const marker = `synthetic-intake-sync-${method}`;
+    const h = harness(() => Response.json({ synthetic: true }));
+    const { stream } = trackedChunks([encoder.encode(paddedRpcBody(INBOUND_CAP_BYTES + 1))], 0);
+    const state = syncThrowingReaderCleanup(t, stream, method, marker);
+    const res = await settleWithin(worker.fetch(rawMcp(stream), h.env, h.ctx), marker, 3_000);
+    await assertIntakeRefusal(res, marker);
+    assert.equal(state.attempts, 1, "throwing cleanup is attempted exactly once");
+    assert.deepEqual(h.names, [], "refused intake must not resolve the DO");
+    assert.deepEqual(h.forwarded, [], "refused intake must not reach the container");
+    // node:test also fails on any unhandled rejection from this request.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  });
+
+  test(`outbound oversize keeps the limit refusal when reader ${method} throws synchronously`, async (t) => {
+    const marker = `synthetic-outbound-sync-${method}`;
+    const { stream } = trackedChunks([encoder.encode(`${marker}${"x".repeat(INBOUND_CAP_BYTES)}`)], 0);
+    const state = syncThrowingReaderCleanup(t, stream, method, marker);
+    const h = harness(() => new Response(stream));
+    const res = await settleWithin(
+      worker.fetch(rpc("tools/call", { name: "get_status", arguments: {} }), h.env, h.ctx),
+      marker,
+      3_000,
+    );
+    assert.equal(res.status, 200);
+    assert.deepEqual(await rpcBody(res), {
+      jsonrpc: "2.0", id: 1, error: { code: -32000, message: "container body exceeds limit" },
+    }, "cleanup must not turn overflow into a generic failure or echo the marker");
+    assert.equal(state.attempts, 1, "throwing cleanup is attempted exactly once");
+    assert.equal(h.forwarded.length, 1, "one bounded container request, no cleanup retry");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  });
+}
+
+test("rejected upstream keeps the tool refusal when body cancel throws synchronously", async (t) => {
+  const marker = "synthetic-response-sync-cancel";
+  const { stream } = trackedChunks([encoder.encode(marker)], 0);
+  const cancel = stream.cancel.bind(stream);
+  const cleanup = t.mock.method(stream, "cancel", () => { throw new Error(marker); });
+  t.after(async () => { await cancel(); });
+  const h = harness(() => new Response(stream, { status: 500 }));
+  const res = await settleWithin(
+    worker.fetch(rpc("tools/call", { name: "get_status", arguments: {} }), h.env, h.ctx),
+    marker,
+    3_000,
+  );
+  assert.equal(res.status, 200);
+  assert.deepEqual(await rpcBody(res), {
+    jsonrpc: "2.0", id: 1, error: { code: -32000, message: "container request failed" },
+  });
+  assert.equal(cleanup.mock.callCount(), 1, "throwing body cleanup is attempted exactly once");
+  assert.equal(h.forwarded.length, 1);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+});
 
 /** The one fixed intake refusal: same shape for every intake failure. */
 async function assertIntakeRefusal(res: Response, marker?: string) {

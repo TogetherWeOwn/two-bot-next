@@ -871,7 +871,10 @@ async fn purge_history_failures_are_retryable_without_any_deletion() {
                 channel(None, "0"),
                 ScriptedResponse::json(
                     200,
-                    json!([{"id":fresh_message_id(1)},{"id":fresh_message_id(2)}]),
+                    json!([
+                        {"id":fresh_message_id(1),"author":{"bot":false}},
+                        {"id":fresh_message_id(2),"author":{"bot":false}}
+                    ]),
                 ),
                 ScriptedResponse::status(204),
                 channel(None, "0"),
@@ -932,7 +935,7 @@ async fn uncertain_purge_deletions_keep_same_key_and_distinct_key_fenced() {
             let messages: Vec<Value> = [fresh_message_id(1), fresh_message_id(2)]
                 .iter()
                 .take(count)
-                .map(|id| json!({"id":id}))
+                .map(|id| json!({"id":id,"author":{"bot":false}}))
                 .collect();
             let mock = MockRest::start(
                 vec![
@@ -1304,7 +1307,10 @@ async fn purge_counts_bulk_delete_and_replays_without_rest_or_duplicate_audit() 
             channel(None, "0"),
             ScriptedResponse::json(
                 200,
-                json!([{"id":fresh_message_id(1)},{"id":fresh_message_id(2)}]),
+                json!([
+                    {"id":fresh_message_id(1),"author":{"bot":false}},
+                    {"id":fresh_message_id(2),"author":{"bot":false}}
+                ]),
             ),
             ScriptedResponse::status(204),
         ],

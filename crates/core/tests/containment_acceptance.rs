@@ -85,7 +85,7 @@ impl ClaimedEvidenceFixture {
 fn event(id: &str, action: DestructiveAction, at: i64) -> DestructiveAuditEvent {
     DestructiveAuditEvent {
         audit_entry_id: id.into(),
-        guild_id: "guild".into(),
+        guild_id: "22".into(),
         executor_id: Some("executor".into()),
         action,
         target_id: Some("target".into()),
@@ -108,11 +108,11 @@ fn role(id: &str, position: i64, permissions: u64, managed: bool) -> Containment
 
 fn snapshot() -> Vec<ContainmentRole> {
     vec![
-        role("bot", 10, 1 << 28, false),
-        role("safe", 1, 1 << 11, false),
-        role("danger-a", 2, 1 << 3, false),
-        role("danger-b", 3, 1 << 28, false),
-        role("guild", 0, 1 << 3, false),
+        role("88", 10, 1 << 28, false),
+        role("76", 1, 1 << 11, false),
+        role("77", 2, 1 << 3, false),
+        role("78", 3, 1 << 28, false),
+        role("22", 0, 1 << 3, false),
     ]
 }
 
@@ -141,17 +141,17 @@ fn weighted_threshold_and_duplicate_fixture_remove_only_dangerous_roles() {
     let trigger = event("c", DestructiveAction::MemberKick, NOW);
     let incident = fixture.observe(&policy, trigger.clone(), NOW).unwrap();
     let plan = plan_quarantine(
-        "guild",
-        &ids(&["safe", "danger-a", "guild", "danger-b"]),
-        &ids(&["bot"]),
+        "22",
+        &ids(&["76", "77", "22", "78"]),
+        &ids(&["88"]),
         &snapshot(),
         false,
     );
     let outcome = discord.execute(plan);
     fixture.complete(&incident.id, outcome);
     assert_eq!(outcome, ContainmentIncidentState::Contained);
-    assert_eq!(discord.requests, ids(&["danger-a", "danger-b"]));
-    assert_eq!(discord.confirmed, ids(&["danger-a", "danger-b"]));
+    assert_eq!(discord.requests, ids(&["77", "78"]));
+    assert_eq!(discord.confirmed, ids(&["77", "78"]));
     assert!(fixture.observe(&policy, trigger, NOW).is_none());
     assert_eq!(fixture.incidents.len(), 1);
     assert_eq!(
@@ -173,9 +173,9 @@ fn dry_run_threshold_records_incident_without_discord_writes() {
         .unwrap();
     let mut discord = MockDiscord::default();
     let outcome = discord.execute(plan_quarantine(
-        "guild",
-        &ids(&["danger-a"]),
-        &ids(&["bot"]),
+        "22",
+        &ids(&["77"]),
+        &ids(&["88"]),
         &snapshot(),
         true,
     ));
@@ -188,17 +188,12 @@ fn dry_run_threshold_records_incident_without_discord_writes() {
 fn whole_plan_preflight_refuses_before_any_mock_write() {
     for (position, managed) in [(10, false), (2, true)] {
         let roles = [
-            role("bot", 10, 0, false),
-            role("danger-a", 1, 1 << 3, false),
-            role("blocked", position, 1 << 28, managed),
+            role("22", 0, 0, false),
+            role("88", 10, 0, false),
+            role("77", 1, 1 << 3, false),
+            role("80", position, 1 << 28, managed),
         ];
-        let plan = plan_quarantine(
-            "guild",
-            &ids(&["danger-a", "blocked"]),
-            &ids(&["bot"]),
-            &roles,
-            false,
-        );
+        let plan = plan_quarantine("22", &ids(&["77", "80"]), &ids(&["88"]), &roles, false);
         let mut discord = MockDiscord::default();
         assert_eq!(discord.execute(plan), ContainmentIncidentState::Refused);
         assert!(discord.requests.is_empty());
@@ -221,18 +216,18 @@ fn partial_removal_stops_and_uncertain_incident_blocks_after_cooldown() {
         ..MockDiscord::default()
     };
     let mut roles = snapshot();
-    roles.push(role("danger-c", 4, 1 << 2, false));
+    roles.push(role("79", 4, 1 << 2, false));
     let outcome = discord.execute(plan_quarantine(
-        "guild",
-        &ids(&["danger-a", "danger-b", "danger-c"]),
-        &ids(&["bot"]),
+        "22",
+        &ids(&["77", "78", "79"]),
+        &ids(&["88"]),
         &roles,
         false,
     ));
     fixture.complete(&incident.id, outcome);
     assert_eq!(outcome, ContainmentIncidentState::Uncertain);
-    assert_eq!(discord.confirmed, ids(&["danger-a"]));
-    assert_eq!(discord.requests, ids(&["danger-a", "danger-b"]));
+    assert_eq!(discord.confirmed, ids(&["77"]));
+    assert_eq!(discord.requests, ids(&["77", "78"]));
     assert_eq!(discord.responses.len(), 1, "no next role and no retry");
     assert!(fixture
         .observe(
@@ -303,7 +298,7 @@ fn cooldown_suppresses_realert_but_still_logs_with_stable_alert_shape() {
         proposal.heat,
         5,
         ContainmentIncidentState::Contained,
-        ids(&["danger-a", "danger-b"]),
+        ids(&["77", "78"]),
     );
     let message = alert.staff_message();
     assert_eq!(message.mentions, MentionPolicy::None);
@@ -312,7 +307,7 @@ fn cooldown_suppresses_realert_but_still_logs_with_stable_alert_shape() {
         "**Anti-nuke contained** — destructive heat 5/5.\n\
          Executor: `executor` · action: `member.kick` · target: `target`.\n\
          Incident/audit entry: `e`.\n\
-         Removed dangerous roles (2): `danger-a` `danger-b`.\n\
+         Removed dangerous roles (2): `77` `78`.\n\
          Restore check: unavailable.\n\
          \n\
          No member join was kicked or banned by this feature. Verify the executor and run the guarded staging restore procedure if drift is reported."
@@ -346,7 +341,7 @@ fn cooldown_suppresses_realert_but_still_logs_with_stable_alert_shape() {
         } => {
             assert_eq!(
                 (guild_id.as_str(), executor_id.as_str()),
-                ("guild", "executor")
+                ("22", "executor")
             );
             assert_eq!((heat, threshold), (6, 5));
         }
@@ -437,15 +432,15 @@ fn transient_failure_has_no_automatic_retry_or_second_incident() {
             ..MockDiscord::default()
         };
         let outcome = discord.execute(plan_quarantine(
-            "guild",
-            &ids(&["danger-a", "danger-b"]),
-            &ids(&["bot"]),
+            "22",
+            &ids(&["77", "78"]),
+            &ids(&["88"]),
             &snapshot(),
             false,
         ));
         fixture.complete(&incident.id, outcome);
         assert_eq!(outcome, ContainmentIncidentState::Uncertain);
-        assert_eq!(discord.requests, ids(&["danger-a"]));
+        assert_eq!(discord.requests, ids(&["77"]));
         assert!(discord.confirmed.is_empty());
         assert_eq!(discord.responses.len(), 1);
         assert!(fixture

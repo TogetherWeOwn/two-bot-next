@@ -621,16 +621,20 @@ impl HyperTransport {
             },
         };
         let status = response.status().as_u16();
-        let accounting = crate::ratelimit_guard::ResponseAccounting::new(
+        let mut accounting = crate::ratelimit_guard::ResponseAccounting::new(
             &self.guard,
             status,
             response.headers(),
             !is_interaction_token_request(request),
         );
-        // Learn per-route bucket state from this response's `X-RateLimit-*`
-        // headers before the body is read: the next admission gates on it.
+        // Full bucket state is known at headers. Bare Retry-After waits for
+        // body classification so existing body timing/scope policy still wins.
+        let route_key = bucket_route_key(request);
         self.guard
-            .observe_bucket(&bucket_route_key(request), response.headers());
+            .observe_bucket_headers(&route_key, response.headers());
+        if status == 429 {
+            accounting.track_bare_bucket(&route_key, response.headers());
+        }
         attempt.finish(Some(status));
         // The 429 wait honors `retry-after` first, then the bucket
         // `reset-after` hint: on a 429 both name the same pause, and the reset
@@ -1136,18 +1140,17 @@ impl ActionExecutor {
         essential: bool,
     ) -> Result<(), GuardError> {
         let guard = &self.inner.transport.guard;
-        // Route-aware admission on the paced lanes: the guard paces all
-        // executors sharing it and holds same-bucket reads until the header
-        // reset (see admit_route). Lane-less sends keep plain admission.
+        // Lane-less admission also honors learned route deadlines, but only
+        // paced lanes take a shared pacing turn.
+        let route_key = bucket_route_key(request);
         let Some(kick_lane) = lane else {
-            return guard.admit(essential).await;
+            return guard.admit_route_recheck(&route_key, essential).await;
         };
         let (lock, interval) = if kick_lane {
             (&self.inner.kick_last_at, self.inner.kick_interval)
         } else {
             (&self.inner.pace_last_at, self.inner.pace_interval)
         };
-        let route_key = bucket_route_key(request);
         // Wait out guard gates (global pause, this route's bucket deadline,
         // shared pacing) before taking the lane lock: a route-local bucket
         // reset can be seconds away, and sleeping it out under the lane
@@ -1614,7 +1617,8 @@ impl ActionExecutor {
         let reason = audit_reason(reason)?;
         let until = until_iso
             .map(|s| {
-                Timestamp::parse(s).map_err(|e| DiscordError::Rejected(format!("bad until: {e}")))
+                Timestamp::parse(&normalize_timeout_until(s))
+                    .map_err(|e| DiscordError::Rejected(format!("bad until: {e}")))
             })
             .transpose()?;
         let req = Self::request_of(
@@ -2507,18 +2511,20 @@ impl ActionExecutor {
 
     /// Read-only purge phase. Even a timeout here proves no deletion was sent.
     /// Pinned messages and this bot's own posts (ticket, sticky and LFG panels)
-    /// are listed but never returned for deletion. The bot identity is read only
-    /// when a listed message was authored by some bot.
+    /// are listed but never returned for deletion. The bot identity is read unless
+    /// every listed message is explicitly marked as authored by a non-bot.
     pub(crate) async fn list_purge_messages(
         &self,
         channel_id: &str,
         count: u64,
     ) -> Result<Vec<Id<MessageMarker>>, DiscordError> {
+        if !(1..=100).contains(&count) {
+            return Err(DiscordError::Rejected(format!(
+                "purge out of range: {count}"
+            )));
+        }
         let channel: Id<ChannelMarker> = snowflake(channel_id)?;
-        let limit: u16 = count
-            .clamp(1, 100)
-            .try_into()
-            .map_err(|_| DiscordError::Rejected(format!("purge out of range: {count}")))?;
+        let limit = count as u16;
         let list_req = Self::request_of(self.inner.factory.channel_messages(channel).limit(limit))?;
         let res = self.call_once_raw(list_req, &[200]).await?;
         let unreadable =
@@ -2535,10 +2541,10 @@ impl ActionExecutor {
             }
             rows.push((id, row));
         }
-        let any_bot = rows
+        let needs_own_id = rows
             .iter()
-            .any(|(_, row)| row["author"]["bot"].as_bool() == Some(true));
-        let own_id = if any_bot {
+            .any(|(_, row)| row["author"]["bot"].as_bool() != Some(false));
+        let own_id = if needs_own_id {
             Some(self.current_bot_user_id().await?.to_string())
         } else {
             None
@@ -3726,11 +3732,13 @@ impl ActionExecutor {
                 self.unban(&exec.guild_id, user_id, &exec.reason).await?;
             }
             ActionOutcome::Purged { channel_id, .. } => {
-                let count = exec.count.unwrap_or(0);
+                let count = exec
+                    .count
+                    .ok_or_else(|| DiscordError::Rejected("purge count required".into()))?;
                 let report = self.purge(channel_id, count, &exec.reason).await?;
                 return Ok(ActionOutcome::Purged {
                     channel_id: channel_id.clone(),
-                    // `purge` counts listed ids (≤100 by clamp); always fits.
+                    // `purge` counts listed ids (≤100 by validated limit); always fits.
                     affected: report.affected as usize,
                 });
             }
@@ -3928,6 +3936,19 @@ fn audit_reason(reason: &str) -> Result<String, DiscordError> {
         )));
     }
     Ok(trimmed.to_owned())
+}
+
+/// Normalize service UTC expiries for pinned Twilight, which rejects short
+/// `Z` timestamps. Offset-bearing inputs keep their existing representation.
+pub(crate) fn normalize_timeout_until(until_iso: &str) -> String {
+    if let Some(core) = until_iso.strip_suffix(['Z', 'z']) {
+        let base = core
+            .split_once('.')
+            .map_or(core, |(date_time, _)| date_time);
+        format!("{base}+00:00")
+    } else {
+        until_iso.to_owned()
+    }
 }
 
 /// `timeout` until timestamp: now + duration, RFC 3339 (legacy

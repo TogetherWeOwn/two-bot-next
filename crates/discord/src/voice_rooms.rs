@@ -290,6 +290,27 @@ pub enum RoomHttpError {
     UnknownOutcome,
 }
 
+/// Accept only a channel matching the create request. A malformed or
+/// contradictory 2xx may still have created a channel: never turn it into
+/// proof of no effect, expose the body, or derive ownership from its id.
+fn creation_receipt(
+    body: &[u8],
+    guild_id: Snowflake,
+    kind: ChannelType,
+    parent_id: Option<Snowflake>,
+) -> Result<Channel, RoomHttpError> {
+    // Twilight's Id deserializer rejects missing, malformed and zero ids.
+    let channel: Channel =
+        serde_json::from_slice(body).map_err(|_| RoomHttpError::UnknownOutcome)?;
+    if channel.guild_id.map(Id::get) != Some(guild_id)
+        || channel.kind != kind
+        || channel.parent_id.map(Id::get) != parent_id
+    {
+        return Err(RoomHttpError::UnknownOutcome);
+    }
+    Ok(channel)
+}
+
 /// A message the bot posted: the channel it landed in and its id, so the same
 /// message can be edited later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -732,7 +753,12 @@ impl RoomHttp {
         }
         let request = request.try_into_request().map_err(classify_http_error)?;
         let body = self.send(request, still_in_creator).await?;
-        serde_json::from_slice(&body).map_err(|_| RoomHttpError::UnknownOutcome)
+        creation_receipt(
+            &body,
+            guild_id,
+            ChannelType::GuildVoice,
+            attributes.parent_id,
+        )
     }
 
     /// Discord's bulk `PATCH /guilds/{guild.id}/channels`: set each listed
@@ -870,9 +896,9 @@ impl RoomHttp {
 
     /// Create a V9 companion text channel in the room's category, with the
     /// full overwrite set (including the bot's View allow) in the POST —
-    /// never patched afterwards. Single attempt: an unknown outcome must not
-    /// produce another POST (the worker adopts the channel from its live
-    /// snapshot when it can, and records the failure otherwise).
+    /// never patched afterwards. One POST per invocation; receipt validation
+    /// failures are uncertain outcomes. The worker's snapshot adoption and
+    /// later queue retries are separate from this adapter's single attempt.
     pub async fn create_companion(
         &self,
         plan: &TextChannelPlan,
@@ -891,7 +917,12 @@ impl RoomHttp {
             .try_into_request()
             .map_err(classify_http_error)?;
         let body = self.send(request, still_managing).await?;
-        serde_json::from_slice(&body).map_err(|_| RoomHttpError::UnknownOutcome)
+        creation_receipt(
+            &body,
+            plan.guild_id,
+            ChannelType::GuildText,
+            Some(plan.category_id),
+        )
     }
 
     /// Grant one occupant View on the companion (V9 join): a Member allow,
@@ -999,8 +1030,9 @@ impl RoomHttp {
 
     /// V3: create the Join voice channel next to a private room. No
     /// overwrites ride the POST, so it syncs to the category and the bot's own
-    /// access comes from the category rather than a new grant. Single attempt:
-    /// an unknown outcome must not produce another POST.
+    /// access comes from the category rather than a new grant. One POST per
+    /// invocation; invalid receipts are uncertain outcomes. This does not fence
+    /// the worker's separate retry/adoption path (see the creation-plan doc).
     pub async fn create_join_voice_channel(
         &self,
         guild_id: Snowflake,
@@ -1024,7 +1056,7 @@ impl RoomHttp {
         }
         let request = request.try_into_request().map_err(classify_http_error)?;
         let body = self.send(request, still_valid).await?;
-        serde_json::from_slice(&body).map_err(|_| RoomHttpError::UnknownOutcome)
+        creation_receipt(&body, guild_id, ChannelType::GuildVoice, parent_id)
     }
 
     /// Post an operator notice to a channel. Only the given role (if any) can

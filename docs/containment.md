@@ -58,8 +58,18 @@ window that would end later caps the cooldown there: the incident still opens
 and alerts, the executor stays suppressed through that instant, and the store
 logs `containment_cooldown_capped`.
 
-`plan_quarantine` returns dry-run, whole-plan refusal, or ordered role IDs. It
-excludes safe roles, unheld roles and `@everyone`. If any held dangerous role is
+`plan_quarantine` returns dry-run, whole-plan refusal, or ordered role IDs.
+Before planning (including dry-run), it requires canonical nonzero u64 role
+identities with no duplicate rows, non-negative hierarchy positions, an unmanaged
+`@everyone` baseline (`id == guild_id`, position zero), and snapshot coverage of
+every role in both fetched held-role sets. IDs must be unique within each held-role
+set; overlap between the executor's and bot's sets is allowed.
+Missing or contradictory evidence returns `InvalidEvidence` with no role IDs,
+never removals or an empty-plan success. This defends against malformed or
+incomplete evidence; it does not imply Discord normally returns partial lists.
+
+With complete evidence, the planner excludes safe roles, unheld roles and
+`@everyone`. If any held dangerous role is
 managed or at/above the bot's highest role, **none** are removable. A managed-role
 refusal takes precedence over hierarchy, as in legacy. Dangerous permissions are
 KickMembers, BanMembers, Administrator, ManageChannels, ManageGuild,
@@ -118,3 +128,13 @@ startup gates and alert delivery are wired by `crates/bot/src/containment_runtim
 dry-run-default plans, armed-only removals, shared-executor staff posts) with
 mock-Discord plus ignored agent-testdb worker tests; staging soak acceptance
 remains unimplemented and untested.
+
+The adapter rejects malformed JSON fields as `containment_snapshot_failed` and
+reports incomplete or contradictory typed evidence with the fixed diagnostic
+`containment_refused: role evidence incomplete or contradictory`. Neither path
+logs upstream payloads or attempts a role DELETE; it completes the incident as
+failed or refused, never contained. A complete safe-only snapshot still permits
+the genuine empty-plan contained outcome. The protected
+`containment_evidence_acceptance` and `containment_runtime_evidence_` suites pin
+these boundaries alongside the existing managed-role and hierarchy controls.
+No activation, permission widening, automatic retry or deployment is implied.
