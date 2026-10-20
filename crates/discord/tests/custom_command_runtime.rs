@@ -1173,3 +1173,195 @@ fn custom_command_error_display_strings_are_pinned() {
         "Custom-command template could not be rendered."
     );
 }
+
+// Acceptance: a refused slash defer leaves a failed `command.run` row.
+//
+// `docs/custom-commands.md` handoff item 5 requires rendering inside the
+// delivery/audit outcome path so a REST failure leaves a failed
+// `command.run` fact. A defer refused before any Discord-side mutation
+// (scripted 4xx) is such a failure; an ambiguous defer failure (uncertain
+// wire outcome) must stay unaudited so a later retry cannot double-record.
+
+type RunAuditRow = (
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+);
+
+async fn run_audit_row(pool: &sqlx::PgPool, interaction_id: u64) -> Option<RunAuditRow> {
+    sqlx::query_as(
+        "SELECT guild_id, actor_id, action, target_key, outcome, reason \
+         FROM automation_audit_log WHERE id = $1",
+    )
+    .bind(format!("custom:run:{interaction_id}"))
+    .fetch_optional(pool)
+    .await
+    .unwrap()
+}
+
+async fn command_run_row_count(pool: &sqlx::PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM automation_audit_log WHERE action = 'command.run'")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+async fn refused_slash_defer_leaves_failed_command_run_row() {
+    let pool = test_pool().await;
+    seed_text_command(&pool, "audit marker xyzzy {user}").await;
+    // The first (and only) REST call is the interaction defer; Discord
+    // refuses it with a definitive 4xx before any reply or edit can exist.
+    let mock = MockRest::start(
+        vec![ScriptedResponse::status(403)],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(pool.clone(), &mock, true);
+    assert!(runtime
+        .handle_interaction(&slash(140, "faq", 0, &[]), Some("Test guild"))
+        .await
+        .is_err());
+    assert_eq!(mock.requests().len(), 1, "only the refused defer is sent");
+    mock.shutdown().await;
+
+    let row = run_audit_row(&pool, 140)
+        .await
+        .expect("a refused defer leaves a failed command.run row");
+    assert_eq!(
+        row,
+        (
+            "2222".to_owned(),
+            Some("3333".to_owned()),
+            "command.run".to_owned(),
+            Some("faq".to_owned()),
+            "failed".to_owned(),
+            Some("delivery_failed".to_owned()),
+        )
+    );
+    assert_eq!(command_run_row_count(&pool).await, 1);
+    // No template or rendered message content may reach any audit column.
+    let joined = [
+        "custom:run:140",
+        row.0.as_str(),
+        row.1.as_deref().unwrap_or_default(),
+        row.2.as_str(),
+        row.3.as_deref().unwrap_or_default(),
+        row.4.as_str(),
+        row.5.as_deref().unwrap_or_default(),
+    ]
+    .join(" ");
+    assert!(
+        !joined.contains("xyzzy"),
+        "audit row stores no template/message content: {joined}"
+    );
+    assert!(
+        !joined.contains("<@"),
+        "audit row stores no rendered mention: {joined}"
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+async fn ambiguous_slash_defer_leaves_no_command_run_row() {
+    let pool = test_pool().await;
+    seed_text_command(&pool, "audit marker xyzzy {user}").await;
+    for (id, response) in [
+        (141, ScriptedResponse::status(500)),
+        // The defer may have landed, but its response arrives after the
+        // shared executor's five-second deadline. Acceptance is unknown.
+        (
+            142,
+            ScriptedResponse::status(204).delayed(std::time::Duration::from_secs(6)),
+        ),
+    ] {
+        let mock = MockRest::start(vec![response], ScriptedResponse::status(500)).await;
+        let runtime = runtime(pool.clone(), &mock, true);
+        assert!(runtime
+            .handle_interaction(&slash(id, "faq", 0, &[]), Some("Test guild"))
+            .await
+            .is_err());
+        assert_eq!(
+            mock.requests().len(),
+            1,
+            "the uncertain defer is not retried"
+        );
+        mock.shutdown().await;
+        assert!(
+            run_audit_row(&pool, id).await.is_none(),
+            "an ambiguous defer must not append a definitive command.run row"
+        );
+    }
+    assert_eq!(command_run_row_count(&pool).await, 0);
+
+    // Because the ambiguous attempt stayed unaudited, a later retry of the
+    // same interaction records exactly one row: its own success.
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            ScriptedResponse::json(200, json!({"id": "9000"})),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = self::runtime(pool.clone(), &mock, true);
+    assert!(runtime
+        .handle_interaction(&slash(141, "faq", 0, &[]), Some("Test guild"))
+        .await
+        .unwrap());
+    mock.shutdown().await;
+    let row = run_audit_row(&pool, 141)
+        .await
+        .expect("the retry records its success");
+    assert_eq!(row.4, "ok");
+    assert_eq!(command_run_row_count(&pool).await, 1, "no double-record");
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+async fn successful_slash_run_audit_row_is_unchanged() {
+    let pool = test_pool().await;
+    seed_text_command(&pool, "audit marker xyzzy {user}").await;
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),                      // defer
+            ScriptedResponse::json(200, json!({"id": "9000"})), // edit
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(pool.clone(), &mock, true);
+    assert!(runtime
+        .handle_interaction(&slash(143, "faq", 0, &[]), Some("Test guild"))
+        .await
+        .unwrap());
+    assert_eq!(mock.requests().len(), 2, "defer plus edit, nothing else");
+    let patches = patch_contents(&mock);
+    assert_eq!(patches.len(), 1);
+    assert_eq!(patches[0]["content"], "audit marker xyzzy <@3333>");
+    assert_eq!(patches[0]["allowed_mentions"]["parse"], json!([]));
+    mock.shutdown().await;
+
+    let row = run_audit_row(&pool, 143)
+        .await
+        .expect("the success path audits its run");
+    assert_eq!(
+        row,
+        (
+            "2222".to_owned(),
+            Some("3333".to_owned()),
+            "command.run".to_owned(),
+            Some("faq".to_owned()),
+            "ok".to_owned(),
+            None,
+        )
+    );
+    assert_eq!(command_run_row_count(&pool).await, 1);
+    pool.close().await;
+}

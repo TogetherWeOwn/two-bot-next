@@ -555,11 +555,14 @@ spacings can also leave the baseline window empty — so the tracker records
 the most recent covered moment beside the ring, seeds the tracking start on
 the first live unknown run when it never covered, and warns once the slow
 windows go ~6.5 h uncovered: while coverage is gone genuine burns go unfiled
-and open cards stay unclosed. The tracker needs the `slow-burn-tracker` environment
-bearer for `/ops/metrics`; without it the run warns and stays green. Prove
-the path by dispatching the workflow with the fire and clear fixtures: they
-run the real verdict and the real issue calls under the `slow-burn-test`
-label without touching the live ring.
+and open cards stay unclosed. Live runs read the existing `staging`
+environment bearer `STAGING_METRICS_SCRAPE_TOKEN` for `/ops/metrics`, bound
+with `deployment: false` so the five-minute scrape adds no staging deployment
+record (the main-only branch policy still applies); without it the run warns
+and stays green. Prove the path by dispatching the workflow with the fire and
+clear fixtures: a separate `fixture` job, which binds no environment and
+holds no scrape bearer, runs the real verdict and the real issue calls under
+the `slow-burn-test` label without touching the live ring.
 
 #### Alert: voice creator-map stale
 

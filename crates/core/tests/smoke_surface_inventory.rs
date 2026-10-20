@@ -131,6 +131,64 @@ fn inventory_matches_registry_output_in_publish_order() {
                     "/{name} option {option_name} choice value"
                 );
             }
+            let expected_sub_options = expected["options"].as_array().cloned().unwrap_or_default();
+            assert_eq!(
+                option.options.len(),
+                expected_sub_options.len(),
+                "/{name} option {option_name} nested option count"
+            );
+            for (sub_option, expected_sub_option) in
+                option.options.iter().zip(expected_sub_options.iter())
+            {
+                let sub_option_name = expected_sub_option["name"]
+                    .as_str()
+                    .expect("nested option name");
+                assert_eq!(sub_option.name, sub_option_name);
+                assert_eq!(
+                    sub_option.description.as_str(),
+                    expected_sub_option["description"]
+                        .as_str()
+                        .expect("nested option description")
+                );
+                assert_eq!(
+                    option_type_name(sub_option.kind),
+                    expected_sub_option["type"]
+                        .as_str()
+                        .expect("nested option type")
+                );
+                assert_eq!(
+                    sub_option.required.unwrap_or(false),
+                    expected_sub_option["required"]
+                        .as_bool()
+                        .expect("nested option required")
+                );
+                assert_eq!(num(&expected_sub_option["min_value"]), sub_option.min_value);
+                assert_eq!(num(&expected_sub_option["max_value"]), sub_option.max_value);
+                assert_eq!(
+                    expected_sub_option["max_length"].as_u64().map(|v| v as u32),
+                    sub_option.max_length
+                );
+                let sub_option_choices = expected_sub_option["choices"]
+                    .as_array()
+                    .expect("nested option choices");
+                assert_eq!(sub_option.choices.len(), sub_option_choices.len());
+                for (choice, expected_choice) in
+                    sub_option.choices.iter().zip(sub_option_choices.iter())
+                {
+                    assert_eq!(
+                        choice.name.as_str(),
+                        expected_choice["name"]
+                            .as_str()
+                            .expect("nested choice name")
+                    );
+                    assert_eq!(
+                        choice.value.as_str(),
+                        expected_choice["value"]
+                            .as_str()
+                            .expect("nested choice value")
+                    );
+                }
+            }
         }
     }
 }

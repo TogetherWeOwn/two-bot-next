@@ -106,6 +106,83 @@ fn connect_options(raw: &str, statement_timeout: &str) -> Result<PgConnectOption
         .options([("statement_timeout", statement_timeout)]))
 }
 
+// A seconds-long agent-testdb DNS blip failed every test in one binary with no
+// retry (run 39197217315 attempt 1: 7x bootstrap-connect "Temporary failure in
+// name resolution", 1x teardown EOF). Connect-level retry lives in
+// `retry_on_transient`/`with_bootstrap_retries`; the statement layer below
+// absorbs a blip that kills a CREATE/migrate connection instead of
+// failing the suite on the first lost packet.
+const SETUP_DDL_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(2)];
+
+/// Run `op` until it succeeds or `delays` run out, sleeping one delay between
+/// attempts. Returns the last error when every attempt fails. Each retry is
+/// one stderr line, so a passing suite still shows the blip it absorbed.
+async fn retry_with_backoff<T, E, F, Fut>(
+    what: &str,
+    delays: &[Duration],
+    mut op: F,
+) -> std::result::Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, E>>,
+    E: std::fmt::Display,
+{
+    let mut delays = delays.iter();
+    loop {
+        match op().await {
+            Ok(value) => return Ok(value),
+            Err(error) => match delays.next() {
+                Some(delay) => {
+                    eprintln!("{what} failed, retrying in {delay:?}: {error}");
+                    tokio::time::sleep(*delay).await;
+                }
+                None => return Err(error),
+            },
+        }
+    }
+}
+
+/// A setup CREATE whose connection died after the server committed leaves the
+/// database behind: the retry then reports duplicate_database (42P04), which
+/// proves the setup goal instead of failing it.
+fn is_database_already_exists(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|error| error.code())
+        .is_some_and(|code| code == "42P04")
+}
+
+/// Run CREATE DATABASE, absorbing a blip that kills the admin connection. Each
+/// attempt takes the DDL gate; the backoff sleep never holds it.
+async fn create_database_with_retry(admin: &PgPool, name: &str, delays: &[Duration]) -> Result<()> {
+    retry_with_backoff("create disposable test database", delays, || async {
+        let _ddl = DATABASE_DDL.lock().await;
+        match sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{name}\"")))
+            .execute(admin)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) if is_database_already_exists(&error) => Ok(()),
+            Err(error) => Err(anyhow::Error::from(error)),
+        }
+    })
+    .await
+}
+
+/// Run the fixture migrations, absorbing a blip that breaks the pool's first
+/// new TCP connections. A persistently broken migration fails after the
+/// bounded backoff instead of hanging the suite.
+async fn run_migrations_with_retry(
+    pool: &PgPool,
+    migrations: &Migrator,
+    delays: &[Duration],
+) -> Result<()> {
+    retry_with_backoff("migrate disposable test database", delays, || async {
+        migrations.run(pool).await.map_err(anyhow::Error::from)
+    })
+    .await
+}
+
 // CREATE/DROP DATABASE can wait for checkpoints. Queue fixture lifecycle DDL
 // outside the unchanged SQL deadline instead of making concurrent drops race it.
 // Cargo runs test binaries sequentially; tests inside each binary share this gate.
@@ -380,13 +457,8 @@ impl TestDatabase {
         .await
         .context("connect to test bootstrap database")?;
         let name = database_name();
-        let created = {
-            let _ddl = DATABASE_DDL.lock().await;
-            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{name}\"")))
-                .execute(&admin)
-                .await
-        };
-        if let Err(error) = created {
+        if let Err(error) = create_database_with_retry(&admin, &name, &SETUP_DDL_RETRY_DELAYS).await
+        {
             admin.close().await;
             return Err(error).context("create disposable test database");
         }
@@ -426,7 +498,9 @@ impl TestDatabase {
                 .context("cleanup after fixture connect failure")?;
             return Err(error).context("connect to disposable test database");
         }
-        if let Err(error) = migrations.run(fixture.pool()).await {
+        if let Err(error) =
+            run_migrations_with_retry(fixture.pool(), migrations, &SETUP_DDL_RETRY_DELAYS).await
+        {
             fixture
                 .close()
                 .await
@@ -595,6 +669,29 @@ pub fn assert_event_store_columns(actual: &[String], required: &[&str]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+
+    /// Fast retry schedule for wiring tests: 200ms total, so elapsed time
+    /// proves the retries ran without a 15s wall-clock wait.
+    const WIRING_DELAYS: [Duration; 2] = [Duration::from_millis(100), Duration::from_millis(100)];
+
+    /// A guard-valid bootstrap URL naming a database nobody creates, derived
+    /// from the live bootstrap so the failure is a fast undefined_catalog.
+    /// Returns None (skip the test) without a configured bootstrap database.
+    fn missing_bootstrap_url() -> Option<String> {
+        let os = std::env::var_os("TWO_TEST_DATABASE_URL")?;
+        let base = os
+            .into_string()
+            .expect("invalid test bootstrap configuration");
+        // Splice the path by hand: Url serialization drops the explicit empty
+        // password colon, which the guard requires byte-for-byte.
+        let (head, _) = base
+            .rsplit_once('/')
+            .expect("test bootstrap URL names a database");
+        let missing = format!("{head}/two_bot_test_missing_bootstrap_probe");
+        guard_database_url(&missing).expect("probe bootstrap URL stays guarded");
+        Some(missing)
+    }
 
     fn names(columns: &[&str]) -> Vec<String> {
         columns.iter().map(|name| name.to_string()).collect()
@@ -691,10 +788,11 @@ mod tests {
 
     #[tokio::test]
     async fn administrative_timeout_does_not_relax_fixture_queries() {
-        let raw = match std::env::var("TWO_TEST_DATABASE_URL") {
-            Ok(raw) => raw,
-            Err(std::env::VarError::NotPresent) => return,
-            Err(error) => panic!("invalid test bootstrap configuration: {error}"),
+        let raw = match std::env::var_os("TWO_TEST_DATABASE_URL") {
+            Some(os) => os
+                .into_string()
+                .expect("invalid test bootstrap configuration"),
+            None => return,
         };
         let fixture = TestDatabase::create(&raw, &sqlx::migrate!("./tests/migrations"))
             .await
@@ -825,10 +923,11 @@ mod tests {
 
     #[tokio::test]
     async fn teardown_budget_is_finite_and_separate_from_fixture_queries() {
-        let url = match std::env::var("TWO_TEST_DATABASE_URL") {
-            Ok(url) => url,
-            Err(std::env::VarError::NotPresent) => return,
-            Err(error) => panic!("invalid test bootstrap configuration: {error}"),
+        let url = match std::env::var_os("TWO_TEST_DATABASE_URL") {
+            Some(os) => os
+                .into_string()
+                .expect("invalid test bootstrap configuration"),
+            None => return,
         };
         let db = TestDatabase::create(&url, &sqlx::migrate!("./tests/migrations"))
             .await
@@ -871,6 +970,38 @@ mod tests {
             guard_database_url(&format!("postgres://agent_test:@agent-testdb:5432/{name}"))
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn backoff_retry_returns_the_first_success() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let attempts = AtomicU64::new(0);
+        let result = retry_with_backoff("test op", &[Duration::ZERO, Duration::ZERO], || {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            async move {
+                if attempt < 3 {
+                    Err::<&str, &str>("boom")
+                } else {
+                    Ok("done")
+                }
+            }
+        })
+        .await;
+        assert_eq!(result, Ok("done"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn backoff_retry_gives_up_after_the_last_delay() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let attempts = AtomicU64::new(0);
+        let result = retry_with_backoff("test op", &[Duration::ZERO, Duration::ZERO], || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async { Err::<(), &str>("boom") }
+        })
+        .await;
+        assert_eq!(result, Err("boom"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
 
     #[test]
@@ -1070,21 +1201,30 @@ mod tests {
         );
     }
 
-    /// What a real Postgres auth failure returns during connect.
+    /// Stand-in database error carrying a message and an optional SQLSTATE
+    /// code: proves CREATE recognizes a lost-then-created database and the
+    /// connect classifier fails fast on auth errors.
     #[derive(Debug)]
-    struct FakeDatabaseError(&'static str);
+    struct FakeDbError {
+        message: &'static str,
+        code: Option<&'static str>,
+    }
 
-    impl std::fmt::Display for FakeDatabaseError {
+    impl std::fmt::Display for FakeDbError {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str(self.0)
+            f.write_str(self.message)
         }
     }
 
-    impl std::error::Error for FakeDatabaseError {}
+    impl std::error::Error for FakeDbError {}
 
-    impl sqlx::error::DatabaseError for FakeDatabaseError {
+    impl sqlx::error::DatabaseError for FakeDbError {
         fn message(&self) -> &str {
-            self.0
+            self.message
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            self.code.map(std::borrow::Cow::Borrowed)
         }
 
         fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
@@ -1104,6 +1244,128 @@ mod tests {
         }
     }
 
+    #[test]
+    fn create_treats_a_duplicate_database_as_created() {
+        let duplicate = sqlx::Error::Database(Box::new(FakeDbError {
+            message: "database already exists",
+            code: Some("42P04"),
+        }));
+        assert!(is_database_already_exists(&duplicate));
+        let missing = sqlx::Error::Database(Box::new(FakeDbError {
+            message: "database does not exist",
+            code: Some("3D000"),
+        }));
+        assert!(!is_database_already_exists(&missing));
+        let eof = sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "expected to read 5 bytes, got 0 bytes at EOF",
+        ));
+        assert!(!is_database_already_exists(&eof));
+    }
+
+    #[test]
+    fn retry_budgets_are_bounded_and_enabled() {
+        assert_eq!(
+            SETUP_DDL_RETRY_DELAYS,
+            [Duration::from_secs(1), Duration::from_secs(2)]
+        );
+    }
+
+    #[tokio::test]
+    async fn create_database_retry_treats_a_duplicate_as_created() {
+        let raw = match std::env::var_os("TWO_TEST_DATABASE_URL") {
+            Some(os) => os
+                .into_string()
+                .expect("invalid test bootstrap configuration"),
+            None => return,
+        };
+        let fixture = TestDatabase::create(&raw, &sqlx::migrate!("./tests/migrations"))
+            .await
+            .unwrap();
+        create_database_with_retry(
+            &fixture.cleanup.as_ref().unwrap().admin,
+            fixture.name(),
+            &[Duration::ZERO],
+        )
+        .await
+        .expect("re-creating the fixture database must succeed via 42P04");
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_database_retry_gives_up_after_the_last_delay() {
+        let Some(missing) = missing_bootstrap_url() else {
+            return;
+        };
+        // A lazy pool that can never connect: every CREATE attempt fails fast
+        // without creating anything, so the elapsed backoff proves the
+        // retries ran.
+        let dead = PgPoolOptions::new().max_connections(1).connect_lazy_with(
+            connect_options(&missing, ADMIN_DDL_STATEMENT_TIMEOUT).expect("probe options parse"),
+        );
+        let start = Instant::now();
+        create_database_with_retry(&dead, "two_bot_test_never_created_probe", &WIRING_DELAYS)
+            .await
+            .expect_err("CREATE against a dead admin must keep failing");
+        assert!(
+            start.elapsed() >= Duration::from_millis(100),
+            "CREATE returned in {:?} without running the 200ms retry backoff",
+            start.elapsed()
+        );
+        dead.close().await;
+    }
+
+    #[tokio::test]
+    async fn migrations_retry_gives_up_after_the_last_delay() {
+        let raw = match std::env::var_os("TWO_TEST_DATABASE_URL") {
+            Some(os) => os
+                .into_string()
+                .expect("invalid test bootstrap configuration"),
+            None => return,
+        };
+        let fixture = TestDatabase::create(&raw, &sqlx::migrate!("./tests/migrations"))
+            .await
+            .unwrap();
+        let broken = sqlx::migrate!("./tests/broken_migrations");
+        let start = Instant::now();
+        run_migrations_with_retry(fixture.pool(), &broken, &WIRING_DELAYS)
+            .await
+            .expect_err("a broken migration must keep failing");
+        assert!(
+            start.elapsed() >= Duration::from_millis(100),
+            "migrations returned in {:?} without running the 200ms retry backoff",
+            start.elapsed()
+        );
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_create_still_retries_migrations_past_the_first_production_delay() {
+        let raw = match std::env::var_os("TWO_TEST_DATABASE_URL") {
+            Some(os) => os
+                .into_string()
+                .expect("invalid test bootstrap configuration"),
+            None => return,
+        };
+        // Pins the public TestDatabase::create delegate to the 1s/2s
+        // production migration backoff: a broken migration keeps failing, so
+        // at 1.5s the first delay is consumed and a later attempt is in
+        // flight, and the timeout must elapse. Emptying the delegate delays
+        // returns the error in milliseconds and the timeout observes it. The
+        // cancelled create drops its fixture, whose Drop schedules
+        // best-effort teardown of the created database.
+        let broken = sqlx::migrate!("./tests/broken_migrations");
+        let probe = tokio::time::timeout(
+            Duration::from_millis(1500),
+            TestDatabase::create(&raw, &broken),
+        )
+        .await;
+        assert!(
+            probe.is_err(),
+            "public TestDatabase::create returned before the 1s production migration delay elapsed"
+        );
+    }
+
     async fn assert_fails_fast(error: sqlx::Error) {
         let mut slot = Some(error);
         let mut calls = 0;
@@ -1120,9 +1382,10 @@ mod tests {
 
     #[tokio::test]
     async fn non_transient_errors_are_not_retried() {
-        assert_fails_fast(sqlx::Error::from(FakeDatabaseError(
-            "password authentication failed",
-        )))
+        assert_fails_fast(sqlx::Error::from(FakeDbError {
+            message: "password authentication failed",
+            code: None,
+        }))
         .await;
         assert_fails_fast(sqlx::Error::Protocol("unexpected auth message".to_string())).await;
         assert_fails_fast(sqlx::Error::Configuration(

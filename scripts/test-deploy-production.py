@@ -218,7 +218,9 @@ class StaticGuardTests(unittest.TestCase):
         # else (another workflow, another branch, queued/cancelled) never
         # reaches the guard.
         run_trigger = "\n".join(triggers["workflow_run"])
-        self.assertIn("workflows: [deploy-staging]", run_trigger)
+        # Both staging and CI completions notify: whichever finishes last on
+        # the same SHA promotes (10-20 race: staging green 23 min before CI).
+        self.assertIn("workflows: [deploy-staging, check]", run_trigger)
         self.assertIn("types: [completed]", run_trigger)
         self.assertIn("branches: [main]", run_trigger)
         # schedule: the daily backstop for a soaked commit the event missed.
@@ -597,6 +599,21 @@ class StaticGuardTests(unittest.TestCase):
         conditions = [line.strip() for line in gate if line.strip().startswith("if:")]
         self.assertEqual(conditions, ["if: env.MODE == 'deploy'"], gate)
 
+    def test_workflow_run_context_reaches_the_guard(self):
+        # Behaviour tests inject env directly; pin the real workflow wiring
+        # on the guard step so missing or misbound event fields cannot pass.
+        guard_step = next(step for step in steps(JOBS["guard"])
+                          if step[0].strip() == f"- name: {GUARD_STEP}")
+        env = children(children(guard_step[1:], 8)["env"][1:], 10)
+        for name, field in (("WORKFLOW_RUN_SHA", "head_sha"),
+                            ("WORKFLOW_RUN_CONCLUSION", "conclusion"),
+                            ("WORKFLOW_RUN_UPDATED_AT", "updated_at"),
+                            ("WORKFLOW_RUN_PATH", "path"),
+                            ("WORKFLOW_RUN_EVENT", "event")):
+            with self.subTest(name=name):
+                self.assertIn(name, env)
+                self.assertEqual(value(env[name]), "${{ github.event.workflow_run." + field + " }}")
+
     def test_drill_switch_reaches_the_guard_and_refuses_unrollbackable_runs(self):
         # The drill proves the fail-to-rollback chain, which exists only on
         # a deploy-mode run with takeover: anything else refuses in the
@@ -621,7 +638,8 @@ class StaticGuardTests(unittest.TestCase):
 class GuardBehaviourTests(unittest.TestCase):
     def guard(self, sha=SHA, rollback="", image=None, takeover="false", allow_unstaged="false",
               ref="refs/heads/main", auto="", resolved_sha=None, event="workflow_dispatch",
-              run_sha="", run_conclusion="", run_updated="", hold="", spike="", **responses):
+              run_sha="", run_conclusion="", run_updated="", hold="", spike="",
+              run_path="", run_event="", **responses):
         if image is None:
             image = IMAGE if rollback else ""
         api = {**green(), "staging-latest": {"total_count": 1, "workflow_runs": [staging_run()]},
@@ -725,6 +743,7 @@ class GuardBehaviourTests(unittest.TestCase):
                 "EVENT_NAME": event,
                 "WORKFLOW_RUN_SHA": run_sha, "WORKFLOW_RUN_CONCLUSION": run_conclusion,
                 "WORKFLOW_RUN_UPDATED_AT": run_updated, "HOLD_UNTIL": hold,
+                "WORKFLOW_RUN_PATH": run_path, "WORKFLOW_RUN_EVENT": run_event,
                 "INJECT_ERROR_RATE_SPIKE": spike,
                 "PRODUCTION_WORKER_URL": "https://production.example.test",
                 "AUTO_APPROVE": auto,
@@ -1344,6 +1363,78 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertIn("Soak:", summary)
         # The target came from the latest-successful selection, not the trigger.
         self.assertEqual(calls[0][0], f"repos/{REPO}/actions/workflows/deploy-staging.yml/runs")
+
+    def test_staging_completion_before_ci_skips_green_ci_pending(self):
+        # 10-20 race: deploy-staging finished ~23 min before check.yml on the
+        # same SHA. The staging-triggered run must skip green, not refuse;
+        # the CI completion promotes.
+        for status in ("queued", "in_progress", "waiting"):
+            with self.subTest(status=status):
+                pending = workflow_run(status=status, conclusion=None)
+                code, outputs, summary, _, stdout = self.guard(
+                    event="workflow_run", sha="", run_sha=SHA, run_conclusion="success",
+                    run_path=".github/workflows/deploy-staging.yml", run_event="push",
+                    **{"ci-runs": {"total_count": 1, "workflow_runs": [pending]}, "ci-run": pending})
+                self.assertEqual(code, 0, stdout)
+                self.assertEqual(outputs["skip"], "ci-pending")
+                self.assertEqual(outputs["sha"], SHA)
+                self.assertIn("still running", summary)
+
+    def test_completed_red_ci_still_refuses_automatic_run(self):
+        red = workflow_run(conclusion="failure")
+        self.assertRefused(self.guard(
+            event="workflow_run", sha="", run_sha=SHA, run_conclusion="success",
+            **{"ci-runs": {"total_count": 1, "workflow_runs": [red]}, "ci-run": red}),
+            "no successful completed verdict")
+
+    def test_dispatch_with_pending_ci_still_refuses(self):
+        pending = workflow_run(status="in_progress", conclusion=None)
+        self.assertRefused(self.guard(
+            **{"ci-runs": {"total_count": 1, "workflow_runs": [pending]}, "ci-run": pending}),
+            "no successful completed verdict")
+
+    def test_ci_completion_on_latest_staged_sha_promotes(self):
+        # CI finished last: the check-triggered run promotes the latest staged
+        # SHA through every gate (ci-ok, worker check, staging, soak).
+        code, outputs, summary, calls, stdout = self.guard(
+            event="workflow_run", sha="", run_sha=SHA, run_conclusion="success",
+            run_path=".github/workflows/check.yml", run_event="push",
+            **{"production-readyz": {"status": 200, "build_revision": "f" * 40}})
+        self.assertEqual(code, 0, stdout)
+        self.assertEqual(outputs["sha"], SHA)
+        self.assertEqual(outputs["skip"], "")
+        self.assertEqual(outputs["auto"], "true")
+        self.assertEqual(outputs["takeover"], "true")
+        self.assertEqual(calls[0][0], f"repos/{REPO}/actions/workflows/deploy-staging.yml/runs")
+        self.assertTrue(any(path.endswith("/check-runs") for path, _ in calls))
+
+    def test_ci_completion_before_staging_skips_green_staging_pending(self):
+        # CI finished first (or on a superseded commit): its SHA is not the
+        # latest staged one, so it skips green and the staging completion
+        # promotes. No gate reads beyond the staging lookup.
+        ci_sha = "d" * 40
+        code, outputs, summary, calls, stdout = self.guard(
+            event="workflow_run", sha="", run_sha=ci_sha, run_conclusion="success",
+            run_path=".github/workflows/check.yml", run_event="push")
+        self.assertEqual(code, 0, stdout)
+        self.assertEqual(outputs["skip"], "staging-pending")
+        self.assertEqual(outputs["sha"], ci_sha)
+        self.assertEqual([path for path, _ in calls],
+                         [f"repos/{REPO}/actions/workflows/deploy-staging.yml/runs"])
+        self.assertIn("nothing to promote", summary)
+
+    def test_ci_completion_red_or_not_push_skips_green(self):
+        for conclusion, event, reason in (("failure", "push", "ci-not-green"),
+                                          ("cancelled", "push", "ci-not-green"),
+                                          ("success", "pull_request", "ci-not-push"),
+                                          ("success", "schedule", "ci-not-push")):
+            with self.subTest(conclusion=conclusion, event=event):
+                code, outputs, _, calls, _ = self.guard(
+                    event="workflow_run", sha="", run_sha=SHA, run_conclusion=conclusion,
+                    run_path=".github/workflows/check.yml", run_event=event)
+                self.assertEqual(code, 0)
+                self.assertEqual(outputs["skip"], reason)
+                self.assertEqual(calls, [])
 
     def test_target_older_than_live_skips_green(self):
         # The live build already contains the target: deploying it would be
