@@ -214,15 +214,22 @@ function isReadyzBotResponse(status: number, contentType: string | null): boolea
 }
 
 /** A parsed /readyz body is only a readiness report when it carries the
- * HealthReport shape (components is an array of [name, status] pairs). The
+ * HealthReport shape: every component is an exact [string, status] pair,
+ * with status ready, starting or down (crates/core/src/health.rs). The
  * Worker's ownership/storage fence also answers 503 application/json with
  * `{error:"ownership_fenced"}` (see ownership.ts refused()); that body must
  * stay a generic failure, never an empty gateway/jobs success. */
 function isReadyzReport(data: unknown): boolean {
+  if (typeof data !== "object" || data === null) return false;
+  const components = (data as Record<string, unknown>)["components"];
   return (
-    typeof data === "object" &&
-    data !== null &&
-    Array.isArray((data as Record<string, unknown>)["components"])
+    Array.isArray(components) &&
+    components.every((entry: unknown) =>
+      Array.isArray(entry) &&
+      entry.length === 2 &&
+      typeof entry[0] === "string" &&
+      (entry[1] === "ready" || entry[1] === "starting" || entry[1] === "down")
+    )
   );
 }
 
