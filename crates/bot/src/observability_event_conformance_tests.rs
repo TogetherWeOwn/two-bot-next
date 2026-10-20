@@ -80,7 +80,7 @@ const SHUTDOWN_RS_EVENTS: [&str; 2] = [
 const JOBS_RS_EVENTS: [&str; 1] = ["periodic job failed"];
 
 /// `crates/bot/src/voice_rooms.rs`: the cataloged voice messages.
-const VOICE_RS_CATALOG_MESSAGES: [&str; 16] = [
+const VOICE_RS_CATALOG_MESSAGES: [&str; 17] = [
     "voice room rename decision",
     "voice join completed",
     "voice_operation succeeded",
@@ -97,11 +97,12 @@ const VOICE_RS_CATALOG_MESSAGES: [&str; 16] = [
     "voice creator revalidation failed; keeping the cached view",
     "voice creator refresh failed; keeping the cached view",
     "voice halt re-probe skipped: Discord credential latch set",
+    "voice admin store failed",
 ];
 
 /// `voice_event` field values (`crates/bot/src/voice_rooms.rs`), the bounded
 /// voice vocabulary that rides the gateway sink.
-const VOICE_EVENT_VALUES: [&str; 7] = [
+const VOICE_EVENT_VALUES: [&str; 8] = [
     "voice_join",
     "voice_join_received",
     "voice_operation",
@@ -109,6 +110,7 @@ const VOICE_EVENT_VALUES: [&str; 7] = [
     "voice_reconcile",
     "voice_dead_letter",
     "voice_creator_orphan",
+    "voice_admin_store",
 ];
 
 /// Metric event labels, in `two_bot_core::metrics::EVENTS` order. Unknown
@@ -194,12 +196,13 @@ const MAIN_RS_ADJACENT: [&str; 14] = [
 
 // `crates/bot/src/voice_rooms.rs`: per-command voice UX receipts, not gateway
 // session events.
-const VOICE_RS_ADJACENT: [&str; 20] = [
+const VOICE_RS_ADJACENT: [&str; 22] = [
     "voice succession refused",
     "voice actor load failed; retrying with capped backoff",
     "voice actor load failed; credential refused, not retrying",
     "voice notice settings unreadable",
     "voice notice had no working destination",
+    "voice notice configured channel failed; trying fallback",
     "voice create reservation settle failed",
     "import preview planned an apply; refusing without writing",
     "voice vote response failed; not retried",
@@ -213,6 +216,7 @@ const VOICE_RS_ADJACENT: [&str; 20] = [
     "voice worker halt cleared: store credentials healthy",
     "voice worker stuck: queued actions with no progress",
     "stored empty-grace override out of range; using boot fallback",
+    "stored invite-code override invalid; using vanity fallback",
     "temp-voice admission setting invalid; using default",
     "voice live view was not ready on a connected gateway; republished from cache",
 ];

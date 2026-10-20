@@ -45,6 +45,7 @@ export const RUST_ALERT_AXES: Record<string, Record<string, string>> = {
   two_bot_gateway_checkpoint_failures_total: { stage: "CHECKPOINT_FAILURE_STAGES" },
   two_bot_dispatch_drops_total: { lane: "DISPATCH_LANES" },
   two_bot_internal_actions_total: { family: "INTERNAL_ACTION_FAMILIES", outcome: "INTERNAL_ACTION_OUTCOMES" },
+  two_bot_rest_guard_breaker_open: {},
   two_bot_community_facts_drain_failures_total: { reason: "COMMUNITY_FACTS_DRAIN_REASONS" },
   two_bot_eventsub_posts_total: { outcome: "EVENTSUB_POST_OUTCOMES" },
   two_bot_eventsub_reconcile_passes_total: { outcome: "EVENTSUB_RECONCILE_OUTCOMES" },
