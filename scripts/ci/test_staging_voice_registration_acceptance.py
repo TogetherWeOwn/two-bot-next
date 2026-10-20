@@ -34,6 +34,7 @@ smoke = importlib.import_module("staging_voice_smoke")
 API = "https://discord.com/api/v10"
 GUILD = "1545644954272137297"
 APP = "1469137636663758888"
+OTHER_GUILD = "9999999999999999999"
 IDENTITY = API + "/users/@me"
 LIST = API + "/applications/" + APP + "/guilds/" + GUILD + "/commands"
 TOKEN = "fixture-bot-token-not-a-real-credential"
@@ -193,8 +194,8 @@ class VoiceRegistrationAcceptanceTests(unittest.TestCase):
                 self.assertEqual(rank["version"], value)
 
     def test_invalid_list_ids_refuse_before_every_detail_request(self):
-        invalid = ("", "0", "01", "-1", "+1", " 1", "1 ", "1.0", "1e3",
-                   "18446744073709551616", "9" * 21, "9" * 2048,
+        invalid = ("", "0", "01", "-1", "+1", " 1", "1 ", "1.0", "1e3", "１", "١",
+                   "1١", "18446744073709551616", "9" * 21, "9" * 2048,
                    "1/" + SENTINEL, "1?" + SENTINEL + "=1", "1#" + SENTINEL,
                    "%31/" + SENTINEL, "1\\" + SENTINEL, None, True, 1, {}, [], MISSING)
         for value in invalid:
@@ -216,6 +217,24 @@ class VoiceRegistrationAcceptanceTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assert_refused(self.run_cli(self.changed("detail", "id", value)))
 
+    def test_explicit_guild_fields_must_agree_with_the_fenced_endpoint(self):
+        for stage in ("list", "detail"):
+            for value in (OTHER_GUILD, "0", GUILD + "?" + SENTINEL, None, True):
+                with self.subTest(stage=stage, value=value):
+                    result = self.run_cli(self.changed(stage, "guild_id", value))
+                    self.assert_refused(result)
+                    if stage == "list":
+                        self.assert_no_details()
+
+    def test_optional_guild_field_can_be_omitted_on_guild_scoped_responses(self):
+        rows = commands()
+        for row in rows:
+            del row["guild_id"]
+        code, out, _, receipt = self.run_cli(self.routes(rows))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(receipt["guild_id"], GUILD)
+        self.assertEqual(receipt["result"], "pass")
+
     def test_duplicate_target_names_are_not_first_match_wins(self):
         for same_id in (False, True):
             for first in (False, True):
@@ -227,6 +246,25 @@ class VoiceRegistrationAcceptanceTests(unittest.TestCase):
                     result = self.run_cli(self.routes(rows))
                     self.assert_refused(result)
                     self.assert_no_details()
+
+    def test_one_resource_id_cannot_identify_two_target_names(self):
+        rows = commands()
+        rows[1]["id"] = rows[0]["id"]
+        routes = self.routes(rows)
+        # Each detail independently looks valid to a name-first inspector.
+        routes[LIST + "/" + rows[0]["id"]] = body(rows[0])
+        result = self.run_cli(routes)
+        self.assert_refused(result)
+        self.assert_no_details()
+
+    def test_target_id_alias_under_an_unrelated_name_is_ambiguous(self):
+        rows = commands()
+        rows.append(dict(rows[0], name="unrelated-command"))
+        routes = self.routes(rows)
+        routes[LIST + "/" + rows[0]["id"]] = body(rows[0])
+        result = self.run_cli(routes)
+        self.assert_refused(result)
+        self.assert_no_details()
 
     def test_missing_voice_entry_skips_without_poisoning_valid_targets(self):
         # A missing name is pending registration (SKIP), not a malformed entry:
@@ -242,7 +280,7 @@ class VoiceRegistrationAcceptanceTests(unittest.TestCase):
         self.assertEqual(checks["create"]["verdict"], "skip")
 
     def test_both_list_and_detail_versions_must_be_canonical_bounded_snowflakes(self):
-        invalid = ("", "0", "01", "-1", "1.0",
+        invalid = ("", "0", "01", "-1", "1.0", "１", "١", "1١",
                    "18446744073709551616", "9" * 2048,
                    SENTINEL + "\nPASS rank: forged", None, True, 1, {}, [], MISSING)
         for stage in ("list", "detail"):
