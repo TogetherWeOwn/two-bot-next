@@ -92,8 +92,8 @@ macro_rules! invalid_id_case {
     };
 }
 
-invalid_id_case!(empty_signup_refuses_before_any_io, "".to_owned(), false);
-invalid_id_case!(empty_leave_refuses_before_any_io, "".to_owned(), true);
+invalid_id_case!(empty_signup_refuses_before_any_io, "", false);
+invalid_id_case!(empty_leave_refuses_before_any_io, "", true);
 invalid_id_case!(
     overlong_ascii_signup_refuses_before_any_io,
     "a".repeat(129),

@@ -188,6 +188,17 @@ impl Transaction {
     }
 }
 
+// Match SQLx's generic executor boundary: transactions require an explicit
+// dereference to their connection instead of an implicit argument coercion.
+pub trait Executor<'a> {
+    fn connection(self) -> &'a mut Connection;
+}
+impl<'a> Executor<'a> for &'a mut Connection {
+    fn connection(self) -> &'a mut Connection {
+        self
+    }
+}
+
 pub struct Query {
     sql: String,
     binds: Vec<String>,
@@ -208,7 +219,8 @@ impl Query {
         self
     }
 
-    pub async fn execute(self, connection: &mut Connection) -> Result<(), Error> {
+    pub async fn execute<'a>(self, executor: impl Executor<'a>) -> Result<(), Error> {
+        let connection = executor.connection();
         assert!(
             self.sql.contains("pg_advisory_xact_lock"),
             "unsupported offline SQL execution"
