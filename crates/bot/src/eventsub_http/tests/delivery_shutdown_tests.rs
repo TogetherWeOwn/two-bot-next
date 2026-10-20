@@ -388,7 +388,11 @@ async fn read_raw_paused(stream: &mut tokio::net::TcpStream, budget: Duration) -
     let mut tmp = [0u8; 4096];
     let steps = budget.as_millis() / 100 + 1;
     for _ in 0..steps {
-        match futures_util::future::poll_immediate(&mut stream.read(&mut tmp)).await {
+        let read = {
+            let future = Box::pin(stream.read(&mut tmp));
+            futures_util::future::poll_immediate(future).await
+        };
+        match read {
             Some(Ok(0)) => break,
             Some(Ok(n)) => buf.extend_from_slice(&tmp[..n]),
             Some(Err(error)) => panic!("client read failed: {error}"),
