@@ -48,12 +48,12 @@ async fn assert_execution_refuses(count: Option<u64>) {
     let requests = mock.requests();
     assert!(
         requests.is_empty(),
-        "count {count:?} must refuse before list, identity or delete I/O; sent {} requests, result {result:?}",
+        "count {count:?} must refuse before list, identity or delete I/O; sent {} requests",
         requests.len()
     );
     assert!(
         matches!(result, Err(DiscordError::Rejected(_))),
-        "count {count:?} must be a local refusal, got {result:?}"
+        "count {count:?} must be a local refusal"
     );
     mock.shutdown().await;
 }
@@ -87,7 +87,7 @@ async fn assert_direct_refuses(count: u64) {
     let result = executor_for(&mock).purge(CHANNEL, count, REASON).await;
     assert!(
         mock.requests().is_empty(),
-        "direct purge({count}) must refuse before any I/O; got {result:?}"
+        "direct purge({count}) must refuse before any I/O"
     );
     assert!(matches!(result, Err(DiscordError::Rejected(_))));
     mock.shutdown().await;

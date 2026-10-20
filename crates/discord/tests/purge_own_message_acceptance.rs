@@ -138,7 +138,7 @@ async fn unknown_flag_with_unavailable_identity_never_deletes() {
     let result = executor_for(&mock).purge(CHANNEL, 1, REASON).await;
     assert!(
         matches!(result, Err(DiscordError::Unavailable(_))),
-        "failed identity read must fail closed, got {result:?}"
+        "failed identity read must fail closed"
     );
     let requests = mock.requests();
     assert_eq!(
