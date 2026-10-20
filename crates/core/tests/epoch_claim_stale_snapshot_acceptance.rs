@@ -238,15 +238,16 @@ async fn stale_after_newer_writes_nothing() {
     let Some(db) = connect("stale-zero-writes").await else {
         return;
     };
-    // Pin the contract to another guild first, so ANY write by the stale
-    // tick — rows, epoch, or contract pin — is observable.
-    write_counter(db.pool(), OTHER_GUILD, T0, 7)
-        .await
-        .expect("pin contract to other guild");
     let newer = vec![event("event-1", "Sunday Squad")];
     replace_events(db.pool(), GUILD, T2, &newer)
         .await
         .expect("newer snapshot commits");
+    // Pin the contract to another guild AFTER the newer commit (which re-pins
+    // to its own guild), so ANY write by the stale tick — rows, epoch, or
+    // contract pin — is observable.
+    write_counter(db.pool(), OTHER_GUILD, T0, 7)
+        .await
+        .expect("pin contract to other guild");
     // The stale fetch carries a never-before-seen id: the resurrection case
     // the row-only guards cannot stop.
     let stale = vec![
