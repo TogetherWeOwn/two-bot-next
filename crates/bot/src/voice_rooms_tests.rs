@@ -37,6 +37,8 @@ mod name_filter_acceptance;
 mod name_rerender;
 #[path = "voice_private_runtime_tests.rs"]
 mod private;
+#[path = "voice_responder_admission_acceptance_tests.rs"]
+mod responder_admission_acceptance;
 #[path = "voice_rooms_sink_tests.rs"]
 mod sink;
 #[path = "../../core/tests/support/tracing_capture.rs"]
