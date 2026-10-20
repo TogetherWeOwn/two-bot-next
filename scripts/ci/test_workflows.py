@@ -2732,19 +2732,19 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('service_ip="$(getent ahostsv4 agent-testdb 2>/dev/null | awk \'NR == 1 { print $1; exit }\')" || service_ip=""', run)
         self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
 
-    def assert_wal_reload_ordering_is_pinned(self, run):
+    def assert_wal_reload_ordering_is_pinned(self, run, max_wal="512MB", min_wal="64MB"):
         # Order is load-bearing both ways: the ALTERs must precede the
         # reload (ALTER SYSTEM only writes postgresql.auto.conf, which the
         # reload reads), and the reload must precede the first createdb,
         # since the bootstrap databases are created later in this same step.
         reload = run.index("pg_reload_conf()")
         self.assertLess(
-            run.index("ALTER SYSTEM SET max_wal_size = '512MB'"),
+            run.index(f"ALTER SYSTEM SET max_wal_size = '{max_wal}'"),
             reload,
             "max_wal_size ALTER must precede pg_reload_conf()",
         )
         self.assertLess(
-            run.index("ALTER SYSTEM SET min_wal_size = '64MB'"),
+            run.index(f"ALTER SYSTEM SET min_wal_size = '{min_wal}'"),
             reload,
             "min_wal_size ALTER must precede pg_reload_conf()",
         )
@@ -2764,12 +2764,15 @@ class WorkflowTests(unittest.TestCase):
             step for step in job["steps"]
             if step.get("name") == "Verify disposable Postgres defaults"
         )
-        self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
-        self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
+        # The coverage replay exhausted 1 GiB even with the old 512 MB soft
+        # WAL target. Keep a smaller target without changing durability or
+        # the fixture's memory ceiling.
+        self.assertIn("ALTER SYSTEM SET max_wal_size = '128MB'", prepare["run"])
+        self.assertIn("ALTER SYSTEM SET min_wal_size = '32MB'", prepare["run"])
         self.assertIn("pg_reload_conf()", prepare["run"])
-        self.assert_wal_reload_ordering_is_pinned(prepare["run"])
-        self.assertIn("'max_wal_size': '512MB'", verify["run"])
-        self.assertIn("'min_wal_size': '64MB'", verify["run"])
+        self.assert_wal_reload_ordering_is_pinned(prepare["run"], "128MB", "32MB")
+        self.assertIn("'max_wal_size': '128MB'", verify["run"])
+        self.assertIn("'min_wal_size': '32MB'", verify["run"])
 
     def test_rust_lane_postgres_tmpfs_budget_covers_database_sweeps(self):
         for job_id in ("rust-tests", "ignored-db-stores", "ignored-db-runtime"):
@@ -2784,8 +2787,15 @@ class WorkflowTests(unittest.TestCase):
         # Run 39209332791: only rust-tests bounded WAL while the ignored lanes
         # ran the PG18 default (max_wal_size 1GB) on the same 1 GiB tmpfs, and
         # the stores lane PANICed with ENOSPC mid-suite. Every lane that mounts
-        # the bounded service must carry the budget and verify it.
-        for job_id in ("rust-tests", "ignored-db-stores", "ignored-db-runtime"):
+        # the bounded service must carry its own budget and verify it.
+        # rust-tests is tighter because its coverage replay exhausted 1 GiB at
+        # 512 MB (run 39360867142). The other lanes stay at 512/64 MB.
+        budgets = {
+            "rust-tests": ("128MB", "32MB"),
+            "ignored-db-stores": ("512MB", "64MB"),
+            "ignored-db-runtime": ("512MB", "64MB"),
+        }
+        for job_id, (max_wal, min_wal) in budgets.items():
             with self.subTest(job=job_id):
                 job = self.workflows["check.yml"]["jobs"][job_id]
                 prepare = next(
@@ -2796,8 +2806,12 @@ class WorkflowTests(unittest.TestCase):
                     step for step in job["steps"]
                     if step.get("name") == "Verify disposable Postgres defaults"
                 )
-                self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
-                self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
+                self.assertIn(
+                    f"ALTER SYSTEM SET max_wal_size = '{max_wal}'", prepare["run"]
+                )
+                self.assertIn(
+                    f"ALTER SYSTEM SET min_wal_size = '{min_wal}'", prepare["run"]
+                )
                 self.assertIn("pg_reload_conf()", prepare["run"])
                 # Reload-before-ALTER writes auto.conf but never applies it;
                 # the verify probe would then fail online, so pin the order.
@@ -2810,8 +2824,8 @@ class WorkflowTests(unittest.TestCase):
                     run.index("ALTER SYSTEM SET min_wal_size"),
                     run.index("pg_reload_conf()"),
                 )
-                self.assertIn("'max_wal_size': '512MB'", verify["run"])
-                self.assertIn("'min_wal_size': '64MB'", verify["run"])
+                self.assertIn(f"'max_wal_size': '{max_wal}'", verify["run"])
+                self.assertIn(f"'min_wal_size': '{min_wal}'", verify["run"])
 
     def test_nextest_lane_bounds_tmpfs_wal_and_reports_headroom(self):
         lane = self.workflows["reusable-rust-nextest.yml"]["jobs"]["nextest"]
@@ -3127,7 +3141,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
 
     def test_runtime_postgres_wal_budget_is_bounded(self):
-        # Same budget as rust-tests and the stores lane: the runtime lane runs
+        # Same WAL budget as the stores lane: the runtime lane runs
         # 26 sequential database suites against the same 2 GiB tmpfs service,
         # so WAL recycling stays bounded with headroom for relation files.
         job = self.workflows["check.yml"]["jobs"]["ignored-db-runtime"]
@@ -5503,7 +5517,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
 
     def test_nextest_postgres_wal_budget_is_bounded(self):
-        # Same WAL budget as the check.yml lanes: this separate reusable lane
+        # Same WAL budget as the ignored DB lanes: this separate reusable lane
         # uses a 1 GiB tmpfs service, so it caps WAL recycling in prepare and
         # pins the cap in a verify step instead of running unbounded.
         job = self.workflows["reusable-rust-nextest.yml"]["jobs"]["nextest"]
