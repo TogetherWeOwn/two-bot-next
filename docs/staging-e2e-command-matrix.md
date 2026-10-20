@@ -80,7 +80,7 @@ run on staging. Never record them as passed until a human has run them.
 | --- | --- | --- | --- |
 | `/kick` (vote) | `vote_kick_open_vote_close_round_trip_through_interactions`: occupant opens via `/kick`, Yes ballots to strict majority close Passed with disabled buttons, replay stays terminal; room-scoped deny/disconnect enforcement pinned by `strict_majority_passes_and_enforces_on_that_room_only` | Occupant `/kick` opens a public ballot; majority Yes disconnects and Connect-denies the target on that room only; refusals stay ephemeral with no state change | UNPROVEN — human run required |
 | `/setup` | `setup_then_import_confirm_round_trip_through_interactions` reads the admin panel before and after the import | Admin sees status/health/creators; members see the generic panel only | UNPROVEN — human run required |
-| `/import` | Same test: upload previews the diff, Confirm applies the file exactly once (`Import applied: …`), stored config equals the upload, Cancel writes nothing | Manage Server upload shows the diff preview; Confirm applies it; Cancel writes nothing | UNPROVEN — human run required |
+| `/import` | Same test: upload previews the diff, Confirm applies the file exactly once (`Import applied: …`), stored config equals the upload, replayed Confirm expires with no second apply; Cancel-consumes-preview pinned by `import_cancel_writes_nothing_and_consumes_the_preview` | Manage Server upload shows the diff preview; Confirm applies it; Cancel writes nothing | UNPROVEN — human run required |
 
 Out of this slice: owner-command round-trips (`/limit`, `/private`, `/name`)
 ship separately and are untouched here.

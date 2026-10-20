@@ -10257,6 +10257,15 @@ fn applied(trace: &Trace) -> bool {
         .any(|entry| entry == "config_apply")
 }
 
+fn applied_count(trace: &Trace) -> usize {
+    trace
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry.as_str() == "config_apply")
+        .count()
+}
+
 #[test]
 fn parse_export_and_import_attachment_option() {
     let export = with_user(
@@ -10605,11 +10614,20 @@ async fn setup_then_import_confirm_round_trip_through_interactions() {
     assert!(owned, "voice owns the confirm callback");
     assert!(response_text(&response.expect("applied")).starts_with("Import applied:"));
     assert_eq!(*shared.lock().unwrap(), full_config());
-    assert!(applied(&trace));
+    assert_eq!(applied_count(&trace), 1, "one apply per confirm");
 
-    // The panel still answers after the import lands.
-    let (owned, _) = handle_import_capture(&runtime, &setup, Some(&inventory)).await;
+    // Replay: pressing Confirm again expires instead of applying twice.
+    let (owned, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(owned, "voice owns the replayed confirm callback");
+    let replayed = response_text(&response.expect("expired replay"));
+    assert!(replayed.contains("expired"), "{replayed}");
+    assert_eq!(applied_count(&trace), 1, "no second apply");
+    assert_eq!(*shared.lock().unwrap(), full_config());
+
+    // The panel still answers with content after the import lands.
+    let (owned, panel) = handle_import_capture(&runtime, &setup, Some(&inventory)).await;
     assert!(owned, "voice still owns /setup after the import");
+    assert!(!response_text(&panel.expect("post-import panel")).is_empty());
 }
 
 #[tokio::test]
@@ -11793,11 +11811,13 @@ async fn vote_kick_open_vote_close_round_trip_through_interactions() {
     assert_eq!(response.kind, InteractionResponseType::UpdateMessage);
     let content = response_text(&response);
     assert!(content.contains("2/3 needed"), "{content}");
-    assert!(
-        ballot_button_states(&response)
-            .iter()
-            .all(|(_, disabled)| !disabled),
-        "active ballot keeps live buttons"
+    assert_eq!(
+        ballot_button_states(&response),
+        vec![
+            (vote_button_id(vote_id, VoteBallot::Yes), false),
+            (vote_button_id(vote_id, VoteBallot::No), false),
+        ],
+        "active ballot keeps both live buttons"
     );
 
     // Second Yes: strict majority closes the vote Passed, buttons disabled.
@@ -11808,19 +11828,31 @@ async fn vote_kick_open_vote_close_round_trip_through_interactions() {
     assert_eq!(response.kind, InteractionResponseType::UpdateMessage);
     let content = response_text(&response);
     assert!(content.contains("Vote passed"), "{content}");
-    assert!(
-        ballot_button_states(&response)
-            .iter()
-            .all(|(_, disabled)| *disabled),
-        "closed ballot disables its buttons"
+    assert_eq!(
+        ballot_button_states(&response),
+        vec![
+            (vote_button_id(vote_id, VoteBallot::Yes), true),
+            (vote_button_id(vote_id, VoteBallot::No), true),
+        ],
+        "closed ballot keeps both buttons, disabled"
     );
 
     // Replay: a further ballot stays terminal instead of reopening.
     let replay = component_interaction(&vote_button_id(vote_id, VoteBallot::Yes), None, VOTER_C);
     let (owned, response) = handle_capture(&runtime, &replay).await;
     assert!(owned, "voice owns the replay ballot callback");
-    let content = response_text(&response.expect("replay update"));
+    let response = response.expect("replay update");
+    assert_eq!(response.kind, InteractionResponseType::UpdateMessage);
+    let content = response_text(&response);
     assert!(content.contains("Vote passed"), "{content}");
+    assert_eq!(
+        ballot_button_states(&response),
+        vec![
+            (vote_button_id(vote_id, VoteBallot::Yes), true),
+            (vote_button_id(vote_id, VoteBallot::No), true),
+        ],
+        "replay keeps the closed Passed shell"
+    );
 }
 
 // ---- lifecycle-outcome signals (offline cutover verification) ----
