@@ -299,6 +299,71 @@ class RollbackReadinessProbeTests(unittest.TestCase):
         self.assertEqual(code, 0, results)
         self.assertIn("two-funnel-20261002T051700Z.ndjson.gz v9", results["PASS manifest"])
 
+    def assert_invalid_created_at(self, value):
+        self.fx.write_archive("two-funnel-20261002T041700Z.ndjson.gz",
+                              archive_lines(manifest(createdAt=value)))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, results, summary = self.probe()
+        self.assertEqual(err.getvalue(), "")
+        self.assertEqual(code, 1)
+        self.assertEqual(set(results), {"FAIL manifest", "FAIL sequences", "PASS readyz",
+                                        "PASS deploy-config"})
+        self.assertEqual(results["FAIL manifest"],
+                         "FAIL manifest: manifest has invalid createdAt timestamp")
+        self.assertEqual(results["FAIL sequences"],
+                         "FAIL sequences: no valid backup manifest to compare against")
+        self.assertEqual(summary, "rollback readiness: 2/4 checks passed")
+        self.assertNotIn(value, "\n".join(results.values()))
+
+    def test_unicode_digit_created_at_refuses_without_echo(self):
+        timestamp = "2026-10-02T04:17:00.123456789+23:59"
+        for digits in ("٠١٢٣٤٥٦٧٨٩", "０１２３４５６７８９"):
+            translation = str.maketrans("0123456789", digits)
+            for match in re.finditer(r"[0-9]+", timestamp):
+                value = (timestamp[:match.start()] + match[0].translate(translation)
+                         + timestamp[match.end():])
+                with self.subTest(value=value):
+                    self.assert_invalid_created_at(value)
+
+    def test_out_of_range_created_at_offsets_refuse_without_echo(self):
+        for offset in ("+24:00", "-24:00", "+23:60", "-23:60"):
+            with self.subTest(offset=offset):
+                self.assert_invalid_created_at("2026-10-02T04:17:00" + offset)
+
+    def test_invalid_created_at_fraction_lengths_refuse_without_echo(self):
+        for fraction in ("", "1234567890"):
+            for zone in ("Z", "+23:59", "-23:59"):
+                value = f"2026-10-02T04:17:00.{fraction}{zone}"
+                with self.subTest(value=value):
+                    self.assertLess(len(value), probe.CREATED_AT_MAX_LEN)
+                    self.assert_invalid_created_at(value)
+
+    def test_created_at_ascii_fraction_and_offset_boundaries_pass(self):
+        for fraction in ("", ".1", ".123456789"):
+            for zone in ("Z", "+00:00", "-00:00", "+23:59", "-23:59"):
+                value = f"2026-10-02T04:17:00{fraction}{zone}"
+                with self.subTest(value=value):
+                    self.fx.write_archive("two-funnel-20261002T041700Z.ndjson.gz",
+                                          archive_lines(manifest(createdAt=value)))
+                    code, results, summary = self.probe()
+                    self.assertEqual(code, 0, results)
+                    self.assertIn(f"createdAt {value}, eventsSequence", results["PASS manifest"])
+                    self.assertEqual(summary, "rollback readiness: 4/4 checks passed")
+
+    def test_decompressed_reader_stops_at_cap_plus_one(self):
+        cap = 16
+        for prefix in (b"", b"x" * (cap - 2) + b"\n"):
+            with self.subTest(prefix_bytes=len(prefix)), mock.patch.object(probe, "DECOMPRESSED_CAP", cap):
+                raw = io.BytesIO(prefix + b"x" * 64)
+                stream = probe.BudgetedStream(raw)
+                if prefix:
+                    self.assertEqual(probe.read_line(stream), prefix)
+                with self.assertRaisesRegex(probe.ProbeError, "^archive exceeds decompressed byte cap$"):
+                    probe.read_line(stream)
+                self.assertEqual(raw.tell(), cap + 1)
+                self.assertEqual(stream.total, cap + 1)
+
     def test_single_failure_fails_only_that_check(self):
         missing_guild = CONFIG.replace('TWO_GUILD_NAME = "TogetherWeOwn"\n', "")
         cases = {
@@ -950,6 +1015,14 @@ class DuplicateJsonKeyRefusalTests(unittest.TestCase):
         text = out.getvalue()
         self.assertEqual(code, 0, text)
         self.assertIn("rollback readiness: 4/4 checks passed", text)
+
+
+def load_tests(loader, tests, pattern):
+    # Keep protected acceptance coverage on the existing CI and direct-script routes.
+    import test_rollback_readiness_input_limits_acceptance as input_limits
+
+    tests.addTests(loader.loadTestsFromModule(input_limits))
+    return tests
 
 
 if __name__ == "__main__":

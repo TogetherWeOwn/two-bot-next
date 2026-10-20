@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { readFileSync } from "node:fs";
+import { isDirectInvocation } from "./is-direct-invocation.mjs";
 
 // Mirrors READYZ_* in scripts/rollback_readiness_probe.py; the drift test in
 // test/readiness-gate.test.ts pins these names to crates/bot/src/server.rs.
@@ -35,7 +36,7 @@ export function checkReadyz(code, report) {
   throw new Error("Unexpected bot readiness status or components");
 }
 
-if (process.argv[1] === new URL(import.meta.url).pathname) {
+if (isDirectInvocation(process.argv[1], import.meta.url)) {
   try {
     console.log(checkReadyz(process.argv[2], JSON.parse(readFileSync(process.argv[3], "utf8"))));
   } catch {

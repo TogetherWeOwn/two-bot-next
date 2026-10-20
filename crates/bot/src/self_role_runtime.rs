@@ -377,8 +377,8 @@ impl SelfRoleRuntime {
             if target.iter().any(|id| !offered.contains(id)) {
                 return Err(RuntimeError::InvalidSnapshot);
             }
-            let remaining = plan_select_delta(panel, &snapshot.member_role_ids, target)
-                .map_err(|_| RuntimeError::InvalidSnapshot)?;
+            let remaining =
+                convergence_plan(panel, &prepared.audit, &snapshot.member_role_ids, target)?;
             prepared.remaining = remaining;
             prepared.snapshot = snapshot;
             let next = prepared
@@ -646,10 +646,12 @@ impl SelfRoleRuntime {
         } else {
             &prepared.event.desired_role_ids
         };
-        if snapshot.member_is_bot
-            || snapshot.validate(&self.guild_id, panel, &offered).is_some()
-            || panel_roles(panel, &snapshot.member_role_ids) != *target
-        {
+        if snapshot.member_is_bot || snapshot.validate(&self.guild_id, panel, &offered).is_some() {
+            return Err(RuntimeError::InvalidSnapshot);
+        }
+        let remaining =
+            convergence_plan(panel, &prepared.audit, &snapshot.member_role_ids, target)?;
+        if !remaining.add_role_ids.is_empty() || !remaining.remove_role_ids.is_empty() {
             return Err(RuntimeError::InvalidSnapshot);
         }
         let option = if panel.exclusive {
@@ -1424,11 +1426,10 @@ impl SelfRoleRuntime {
         } else {
             &event.desired_role_ids
         };
-        let remaining = plan_select_delta(panel, &snapshot.member_role_ids, recovery_target)
-            .map_err(|_| RuntimeError::InvalidSnapshot)?;
         audit.option_key = plan.option_key.clone();
         audit.role_id = plan.role_id.clone();
         audit.operation = plan.operation;
+        let remaining = convergence_plan(panel, audit, &snapshot.member_role_ids, recovery_target)?;
         audit.effects = event.effects.clone();
         audit.desired_role_ids = event.desired_role_ids.clone();
         audit.pre_mutation_role_ids = event.pre_mutation_role_ids.clone();
@@ -1667,6 +1668,35 @@ fn committed_target(
     }
 }
 
+/// Immutable intent records the whole panel, but independent button/reaction
+/// events own only their audited option. Use the same scope for forward work,
+/// rollback, replay and settlement without rewriting the admitted snapshots.
+fn convergence_plan(
+    panel: &SelfRolePanel,
+    audit: &SelfRoleAudit,
+    held: &HashSet<String>,
+    target: &[String],
+) -> Result<SelfRolePlan, RuntimeError> {
+    let mut plan =
+        plan_select_delta(panel, held, target).map_err(|_| RuntimeError::InvalidSnapshot)?;
+    if !panel.exclusive && matches!(audit.source, PanelMode::Button | PanelMode::Reaction) {
+        let role = audit
+            .role_id
+            .as_ref()
+            .ok_or(RuntimeError::InvalidSnapshot)?;
+        if !panel
+            .options
+            .iter()
+            .any(|option| &option.role_id == role && audit.option_key.as_ref() == Some(&option.key))
+        {
+            return Err(RuntimeError::InvalidSnapshot);
+        }
+        plan.add_role_ids.retain(|id| id == role);
+        plan.remove_role_ids.retain(|id| id == role);
+    }
+    Ok(plan)
+}
+
 fn panel_roles(panel: &SelfRolePanel, roles: &HashSet<String>) -> Vec<String> {
     panel
         .options
@@ -1679,3 +1709,7 @@ fn panel_roles(panel: &SelfRolePanel, roles: &HashSet<String>) -> Vec<String> {
 #[cfg(test)]
 #[path = "self_role_runtime_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "self_role_nonexclusive_acceptance_tests.rs"]
+mod nonexclusive_acceptance_tests;

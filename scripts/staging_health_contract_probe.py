@@ -52,6 +52,8 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
 
+from build_identity import UNSTAMPED, is_build_id_shape, is_build_revision_shape
+
 STAGING_HOST = re.compile(r"two-bot-next-staging\.[a-z0-9-]+\.workers\.dev")
 BODY_CAP = 64 << 10
 TIMEOUT_SECONDS = 10
@@ -216,23 +218,37 @@ def parse_readyz(status, value):
     return state, value
 
 
-def printable_str(value):
-    # Remote identity is echoed into output and the receipt: ASCII printable only.
-    return value if isinstance(value, str) and value.isascii() and value.isprintable() else None
+def canonical_build_identity(report):
+    """Return a canonical stamped identity or the exact unstamped pair."""
+    if not isinstance(report, dict):
+        return None
+    revision, build_id = report.get("build_revision"), report.get("build_id")
+    if revision == UNSTAMPED and build_id == UNSTAMPED:
+        return revision, build_id
+    if is_build_revision_shape(revision) and is_build_id_shape(build_id):
+        return revision, build_id
+    return None
 
 
 def check_build(report, expected_sha):
+    if expected_sha is not None and not is_build_revision_shape(expected_sha):
+        return Result("build", False, "expected SHA must be a canonical 40-character lowercase hex commit")
     if not isinstance(report, dict):
         return Result("build", False, "no readyz body to read build identity from")
-    revision = printable_str(report.get("build_revision"))
-    build_id = printable_str(report.get("build_id"))
-    if not revision or not build_id:
-        return Result("build", False, "readyz without the compiled build_revision/build_id")
-    if expected_sha and revision != expected_sha:
+    identity = canonical_build_identity(report)
+    if identity is None:
+        return Result("build", False, "readyz without the compiled build_revision/build_id "
+                      "in the canonical shape")
+    revision, build_id = identity
+    if revision == UNSTAMPED:
+        return Result("build", expected_sha is None,
+                      "build identity is unstamped (unknown)" +
+                      ("; cannot match the expected SHA" if expected_sha is not None else ""))
+    if expected_sha is not None and revision != expected_sha:
         return Result("build", False,
                       f"build_revision {revision} does not match the expected SHA")
     detail = f"build_revision {revision} build_id {build_id}"
-    if expected_sha:
+    if expected_sha is not None:
         detail += " matches the expected SHA"
     return Result("build", True, detail)
 
@@ -240,6 +256,8 @@ def check_build(report, expected_sha):
 def run(args, fetch_fn=fetch):
     try:
         origin = staging_origin(args.staging_url)
+        if args.expected_sha is not None and not is_build_revision_shape(args.expected_sha):
+            raise ProbeError("expected SHA must be a canonical 40-character lowercase hex commit")
     except ProbeError as error:
         return None, [Result("origin", False, str(error))], None
     results = []
@@ -280,16 +298,17 @@ def run(args, fetch_fn=fetch):
 def evidence_shape(results, report, expected_sha):
     """Allowlisted receipt: check names, verdicts and shape tokens only."""
     failure = (report or {}).get("gateway_failure") or {}
+    identity = canonical_build_identity(report)
     return {"checks": [{"check": result.name, "verdict": "pass" if result.ok else "fail",
                         "shape": result.reason} for result in results],
-            "build_revision": printable_str((report or {}).get("build_revision")),
-            "build_id": printable_str((report or {}).get("build_id")),
+            "build_revision": identity[0] if identity else None,
+            "build_id": identity[1] if identity else None,
             "gateway_failure_class": failure.get("class"),
             "gateway_failure_root_cause": ("unverified"
                                            if any(result.checkpoint_read_failed
                                                   for result in results)
                                            else None),
-            "expected_sha": expected_sha}
+            "expected_sha": expected_sha if is_build_revision_shape(expected_sha) else None}
 
 
 def parse_args(argv):
@@ -312,7 +331,7 @@ def main(argv=None, fetch_fn=fetch):
     failed = sum(not result.ok for result in results)
     print(f"staging health-contract probe: {len(results) - failed}/{len(results)} checks passed")
     if origin is None:
-        # Origin fence refusal: no request was sent, nothing to attest.
+        # Origin/input fence refusal: no request was sent, nothing to attest.
         return 2
     receipt = {"origin": origin,
                "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
