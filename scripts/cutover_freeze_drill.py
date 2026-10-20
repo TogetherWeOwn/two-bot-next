@@ -439,6 +439,10 @@ def _post_notice(call, channel_id, applied):
     if not isinstance(notice_id, str) or not notice_id:
         raise DrillError("discord notice reply carried no message id")
     applied["notice"] = notice_id
+    observed = call("get_notice", channel_id=channel_id, notice_id=notice_id)
+    if (not isinstance(observed, dict) or observed.get("id") != notice_id
+            or observed.get("channel_id") != channel_id):
+        raise DrillError("notice presence readback does not match the created notice")
     return "freeze notice posted"
 
 
