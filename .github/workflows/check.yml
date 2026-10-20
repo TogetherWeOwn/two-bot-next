@@ -213,6 +213,8 @@ jobs:
       - name: Retry pinned Rust toolchain components on transient network failure
         if: steps.pinned_components.outcome == 'failure'
         shell: bash
+        env:
+          RUSTUP_PERMIT_COPY_RENAME: 1
         run: |
           set -euo pipefail
           for attempt in 1 2 3 4 5; do
