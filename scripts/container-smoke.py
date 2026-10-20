@@ -93,6 +93,22 @@ def docker(*args, timeout=30, check=True, text=True):
     )
 
 
+def inspect_state(name):
+    """The State object of `docker inspect NAME`, or a clean FAIL.
+
+    An empty inspect array or a missing/non-object entry/State is a
+    malformed-probe FAIL naming the inspect check -- never an
+    IndexError/KeyError/TypeError traceback, and Docker output is never
+    echoed into the failure.
+    """
+    entries = json.loads(docker("inspect", name).stdout)
+    require(isinstance(entries, list) and entries, "docker inspect returned no entries")
+    require(isinstance(entries[0], dict), "docker inspect entry must be a JSON object")
+    state = entries[0].get("State")
+    require(isinstance(state, dict), "docker inspect entry has no State")
+    return state
+
+
 def image_file(container, path):
     """Return (tar header, bytes) for one regular file, following symlinks."""
     archive = docker("cp", "--follow-link", f"{container}:{path}", "-", timeout=60, text=False).stdout
@@ -104,7 +120,7 @@ def image_file(container, path):
 
 def pid1_uids(name):
     """Real, effective, saved and filesystem uid of the container's PID 1."""
-    pid = json.loads(docker("inspect", name).stdout)[0]["State"]["Pid"]
+    pid = inspect_state(name).get("Pid")
     require(isinstance(pid, int) and pid > 0, "container PID 1 has no host process")
     # `docker top` runs ps beside the daemon and keeps only this container's
     # processes; select PID 1 by its host PID rather than by row order.
@@ -195,7 +211,12 @@ def http_response(url):
 
 
 def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BYTES):
-    metadata = json.loads(docker("image", "inspect", image).stdout)[0]
+    image_entries = json.loads(docker("image", "inspect", image).stdout)
+    require(isinstance(image_entries, list) and image_entries,
+            "docker image inspect returned no entries")
+    require(isinstance(image_entries[0], dict),
+            "docker image inspect entry must be a JSON object")
+    metadata = image_entries[0]
     # Resolve the tag once; measurement and every image probe use this ID.
     image = metadata["Id"]
     report(f"Docker storage-driver Size (diagnostic only): {metadata['Size']} bytes")
@@ -250,6 +271,8 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
             port = docker("port", name, "8080/tcp").stdout.strip()
             require(port.startswith("127.0.0.1:"), f"unexpected published port: {port}")
             url = "http://" + port
+            # Each wait loop below owns a full 30s budget measured from its
+            # own start; the timeout text states the budget its loop enforces.
             deadline = time.monotonic() + 30
             while True:
                 code, body = http_response(url + "/health")
@@ -257,7 +280,7 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
                     require(body == {"status": "ok"}, "/health body must report status ok")
                     break
                 require(time.monotonic() < deadline, "/health did not return 200 within 30s")
-                state = json.loads(docker("inspect", name).stdout)[0]["State"]
+                state = inspect_state(name)
                 require(state["Running"], "container exited before becoming healthy")
                 time.sleep(0.25)
             code, body = http_response(url + "/readyz")
@@ -289,10 +312,15 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
             require(len(uid) == 4 and all(value != 0 for value in uid), "runtime PID 1 is root")
             require(docker("exec", name, BINARY, "--healthcheck", timeout=5, check=False).returncode == 0,
                     "--healthcheck must exit 0 against the live process")
+            # The HEALTHCHECK wait restarts the budget: time the /health loop
+            # consumed must not shrink this loop's documented 30s.
+            deadline = time.monotonic() + 30
             while True:
-                state = json.loads(docker("inspect", name).stdout)[0]["State"]
+                state = inspect_state(name)
                 require(state["Running"], "container exited during healthcheck")
-                if state["Health"]["Status"] == "healthy":
+                health = state.get("Health")
+                require(isinstance(health, dict), "docker inspect entry has no Health")
+                if health.get("Status") == "healthy":
                     break
                 require(time.monotonic() < deadline, "Docker HEALTHCHECK did not become healthy within 30s")
                 time.sleep(0.25)
@@ -319,7 +347,7 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
             elapsed = time.monotonic() - started
             require(elapsed <= 10, f"SIGTERM took {elapsed:.3f}s (maximum 10s)")
             require(result.stdout.strip() == "0", f"SIGTERM exit code was {result.stdout.strip()}, expected 0")
-            state = json.loads(docker("inspect", name).stdout)[0]["State"]
+            state = inspect_state(name)
             require(not state["Running"] and not state["OOMKilled"], "container failed to shut down cleanly")
             report(f"PASS SIGTERM exits 0 in {elapsed:.3f}s (maximum 10s); no OOM")
         except CleanupFailure:
