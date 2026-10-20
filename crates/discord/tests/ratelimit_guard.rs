@@ -34,8 +34,16 @@ async fn audit_global_admission_precedes_the_late_authorization() {
     .await;
     let guard = Arc::new(RateLimitGuard::new(Default::default()).unwrap());
     let exec = executor(&mock, &guard);
-    guard.observe_global(Some(0.4));
+    // Anchor before observing the pause: the guard sets its deadline at
+    // observation time plus 0.4 s and the 250 ms pad, and admission only
+    // returns at or after that deadline, so authorization (which runs after
+    // admission) lands at least 650 ms after this anchor. Anchoring after
+    // `observe_global` instead subtracted any scheduling gap between the two
+    // lines from the measured wait, so a gap over 50 ms made the 600 ms floor
+    // unsatisfiable even though admission honored the full pause. Delays
+    // after this anchor can only push observation and authorization later.
     let started = Instant::now();
+    guard.observe_global(Some(0.4));
     let result = exec
         .post_mirror_checked("4444", "audit test", "oa_fixture", async {
             assert!(started.elapsed() >= Duration::from_millis(600));

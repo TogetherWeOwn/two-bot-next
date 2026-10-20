@@ -11,7 +11,7 @@
 mod tests;
 
 use two_bot_core::audit_mirror::{
-    AuditMirror, MirrorChannel, MirrorError, MirrorMessage, MirrorOverwrite,
+    validate_history_page, AuditMirror, MirrorChannel, MirrorError, MirrorMessage, MirrorOverwrite,
 };
 
 use crate::executor::{ActionExecutor, DiscordError};
@@ -153,19 +153,20 @@ impl AuditMirror for ActionExecutor {
             .fetch_channel_messages(channel_id, before, limit)
             .await
             .map_err(mirror_read_error)?;
-        rows.iter()
+        let page = rows
+            .iter()
             .map(|row| {
                 let parse = || {
-                    let id = row.get("id")?.as_str()?;
-                    id.parse::<u64>().ok()?;
                     Some(MirrorMessage {
-                        id: id.to_owned(),
+                        id: row.get("id")?.as_str()?.to_owned(),
                         author_id: row.get("author")?.get("id")?.as_str()?.to_owned(),
                         content: row.get("content")?.as_str()?.to_owned(),
                     })
                 };
                 parse().ok_or_else(|| unreadable(channel_id, "malformed history entry"))
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        validate_history_page(&page, before, limit)?;
+        Ok(page)
     }
 }

@@ -3,6 +3,7 @@
 // Secrets come from env, never argv or stdout. Emits only a validated
 // owner id and a UTC observation timestamp; nothing else is printable.
 import { control } from './ownership-control.mjs';
+import { isDirectInvocation } from './is-direct-invocation.mjs';
 
 class StatusError extends Error {}
 
@@ -84,7 +85,7 @@ export async function readOwnershipStatus({ url, token }, send = fetch, now = ()
   return sanitizeStatus(state, observedAt);
 }
 
-if (process.argv[1] === new URL(import.meta.url).pathname) {
+if (isDirectInvocation(process.argv[1], import.meta.url)) {
   try {
     if (process.argv.length !== 2) {
       throw new StatusError('Ownership status takes no arguments; stop without substituting credentials');

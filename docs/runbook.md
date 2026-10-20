@@ -239,7 +239,7 @@ names, never error text or payloads. Take the first action for the reported clas
 | `timeout` | Check the job status and pool-pressure metrics to locate the bounded operation before considering a restart. |
 | `panic` | Correlate the sanitized failure log with the deployed revision; the panic payload is intentionally unavailable. |
 | `feed` | Check the configured feed source's availability and recent fetch status through authorized diagnostics; do not copy response bodies. |
-| `recovery_required` | Preserve feed cursor and pending recovery state; follow the established recovery path before any manual replay or cursor change. |
+| `recovery_required` | Preserve feed cursor and pending recovery state; follow the established recovery path before any manual replay or cursor change. `/feed-remove` refuses while pending delivery evidence is unresolved, so a parked poller or deleted channel blocks removal until recovery can run; no force path exists. |
 
 The streak clears on the next successful completion. For feed delivery
 specifically, follow the [feed supervisor operator guide](feed-supervisor.md).
@@ -690,10 +690,36 @@ the growths would page forever on the leftover (see the pairing warning in
 [cutover dashboard queries](cutover-dashboard-queries.md)). The alert fires
 when a loss stays outstanding for 3 consecutive samples and resolves on the
 first sample with recovery growth. The first sample only stores the baseline. A
-missing, duplicated, or non-numeric sample changes nothing and holds the current
-state. A counter that went backwards means the process restarted: that sample is
-not a window, the streak restarts, and a firing alert holds rather than
-clearing. The firing key is the constant `gateway_unpaired_disconnect`.
+missing, duplicated, mislabeled, or invalid counter sample changes nothing and
+holds the current state. Gateway counters must be nonnegative safe integers.
+A counter that went backwards, or a change in the validated
+`two_bot_process_incarnation` identity from the same metrics scrape, means the
+process restarted: that sample is not a window, the streak restarts, and a
+firing alert holds rather than clearing. The next valid flat sample resolves;
+new disconnect growth still opens an outstanding loss. This prevents a healthy
+replacement's equal recovery sum and higher disconnect total from being
+misread as a same-process loss. A ready `/readyz` gateway component alone never
+suppresses an outstanding disconnect. The firing key is the constant
+`gateway_unpaired_disconnect`.
+
+Process identity consists of four fixed `part` series (`0` through `3`), each an
+unsigned 32-bit integer, forming one nonzero random process-lifetime value.
+It is independent of image revision, wall clock, PID and DO lifetime. All four
+rows must be present, uniquely labeled, and valid before identity can be used;
+malformed identity fails the scrape and holds the state. Older containers may
+omit the entire family. Legacy stored state without a valid identity adopts
+its first identity without discarding an outstanding loss: adoption is not
+proof of restart. It still needs real recovery growth, a counter decrease, or
+a later observed identity change to retire that loss. After an attributed
+baseline, missing identity holds the pairing state rather than comparing
+unattributed counters. Do not delete or reset alert storage to work around an
+ambiguous legacy latch.
+
+A process boundary is attribution evidence, not proof of gateway health or a
+clear remediation baseline. The authorized rollout still needs serving-image
+verification, continuous captures and a full successfully evaluated 30-minute
+clear/reset sequence with expired cooldown. Neither this rule change nor its
+fixture tests arm a drill or authorize a restart.
 
 First response: scrape `/ops/metrics` as described above and compare the
 disconnect and recovery counters with the previous scrape. Then read the

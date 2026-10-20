@@ -34,6 +34,17 @@ pub enum CreateClaim {
     Refused(RefusalReason),
 }
 
+/// The durable witness observed by [`PgRoomStore::save_join_grant`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinGrantIntent {
+    /// No room row exists, so no intent was written.
+    RoomMissing,
+    /// This call inserted the intent; no earlier grant is witnessed.
+    Fresh,
+    /// An earlier intent survives: its Connect PUT may already have landed.
+    Retained,
+}
+
 /// Durable recipients that may hold this room's bot-issued owner mask.
 /// Completion is fenced to this preparation; a newer intent must survive.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -607,7 +618,7 @@ impl PgRoomStore {
     /// V3 approved Connect grants for the guild's rooms, keyed by room channel.
     /// One row is one member the worker approved and Discord may still hold a
     /// Connect allow for: it is written before the grant PUT and retired only
-    /// after the revocation PUT lands (or the grant is definitively refused).
+    /// after a safe revoke (or a fresh intent's PUT is definitively refused).
     /// A room absent from the map holds no approved grants.
     pub async fn join_grants_in_guild(
         &self,
@@ -630,15 +641,15 @@ impl PgRoomStore {
         Ok(grants)
     }
 
-    /// Record an approval's intent before granting Connect. Idempotent: a
-    /// retried intent is a no-op. Returns false (writing nothing) when no row
-    /// tracks the room, so a grant can never outlive its room.
+    /// Record an approval's intent before granting Connect. The insert result
+    /// distinguishes a fresh intent from a retained obligation: a refused retry
+    /// cannot disprove an earlier PUT. A missing room writes nothing.
     pub async fn save_join_grant(
         &self,
         guild_id: Snowflake,
         channel_id: Snowflake,
         member_id: Snowflake,
-    ) -> Result<bool, sqlx::Error> {
+    ) -> Result<JoinGrantIntent, sqlx::Error> {
         if member_id == 0 {
             return Err(invalid_argument("join grant member must be nonzero"));
         }
@@ -651,9 +662,9 @@ impl PgRoomStore {
         .fetch_one(&self.pool)
         .await?;
         if !exists {
-            return Ok(false);
+            return Ok(JoinGrantIntent::RoomMissing);
         }
-        sqlx::query(
+        let inserted = sqlx::query(
             "INSERT INTO voice_join_grants (guild_id, room_channel_id, member_id)
              VALUES ($1, $2, $3)
              ON CONFLICT DO NOTHING",
@@ -662,11 +673,16 @@ impl PgRoomStore {
         .bind(channel_id.to_string())
         .bind(member_id.to_string())
         .execute(&self.pool)
-        .await?;
-        Ok(true)
+        .await?
+        .rows_affected();
+        Ok(if inserted == 0 {
+            JoinGrantIntent::Retained
+        } else {
+            JoinGrantIntent::Fresh
+        })
     }
 
-    /// Retire a grant after its revocation landed (or its grant was refused).
+    /// Retire a grant after a safe revoke (or a fresh intent's PUT was refused).
     /// Idempotent: retiring an absent row is success, so a retried revoke
     /// whose outcome was unknown cannot leave a duplicate or fail.
     pub async fn remove_join_grant(

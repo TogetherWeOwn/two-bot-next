@@ -118,7 +118,7 @@ use two_bot_core::{
     AutomodPolicy, CommandDefinition, OverwriteTarget, PermissionFinding,
     PermissionOverwrite as HealthOverwrite, Snowflake, VoicePermission, VoicePermissionScope,
 };
-use two_bot_cutover::voice_rooms::{CreateClaim, OwnerGrantIntent, PgRoomStore};
+use two_bot_cutover::voice_rooms::{CreateClaim, JoinGrantIntent, OwnerGrantIntent, PgRoomStore};
 use two_bot_discord::voice_rooms::{
     can_enforce_kick, can_manage_room, effective_permissions, MessageRef, RoomChannelAttributes,
     RoomHttp, RoomHttpError,
@@ -352,16 +352,16 @@ pub trait RoomPersistence: Send + Sync {
         &self,
         guild: Snowflake,
     ) -> impl Future<Output = Result<BTreeMap<Snowflake, BTreeSet<Snowflake>>, StoreError>> + Send;
-    /// Record an approval's intent before granting Connect. Idempotent; a
-    /// retried intent is a no-op. `Ok(false)` when the room has no database
-    /// row, so a grant never outlives its room.
+    /// Record an approval's intent before granting Connect, distinguishing a
+    /// fresh insert from an existing obligation that may already hold access.
+    /// A missing room writes nothing, so a grant never outlives its room.
     fn save_join_grant(
         &self,
         guild: Snowflake,
         room: Snowflake,
         member: Snowflake,
-    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
-    /// Retire a grant after its revocation landed (or its grant was refused).
+    ) -> impl Future<Output = Result<JoinGrantIntent, StoreError>> + Send;
+    /// Retire a grant after a safe revoke (or a fresh intent's PUT was refused).
     /// Idempotent: retiring an absent grant is success.
     fn remove_join_grant(
         &self,
@@ -601,7 +601,7 @@ impl RoomPersistence for PgRoomStore {
         guild: Snowflake,
         room: Snowflake,
         member: Snowflake,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<JoinGrantIntent, StoreError> {
         self.save_join_grant(guild, room, member)
             .await
             .map_err(store_error)
@@ -1558,6 +1558,7 @@ const EMPTY_ROOM_GRACE: Duration = Duration::from_secs(60);
 
 /// Boot-only infrastructure protection. Stored settings remain unwired; these
 /// already-forwarded process keys must never be inferred from room rows.
+/// On refusal, return only the fixed setting key, never its value or parser error.
 fn configured_protected_channels(
     env: impl Fn(&str) -> Option<String>,
 ) -> Result<HashSet<Snowflake>, &'static str> {
@@ -1573,11 +1574,9 @@ fn configured_protected_channels(
         };
         for value in raw.split(',') {
             let value = value.trim();
-            let id = value
-                .parse::<Snowflake>()
-                .map_err(|_| "invalid protected channel id")?;
+            let id = value.parse::<Snowflake>().map_err(|_| key)?;
             if id == 0 || value != id.to_string() || (!multiple && raw.contains(',')) {
-                return Err("invalid protected channel id");
+                return Err(key);
             }
             protected.insert(id);
         }
@@ -3143,8 +3142,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         // Hydrate approved Connect grants: a private room remembers its
         // approvals so a later `/public` revokes them; a grant whose room is
         // public or gone still needs its revocation, which the queue lost on
-        // restart, so it is re-queued here. The witness is retired only by a
-        // successful revoke (or a refused grant), never by this hydration.
+        // restart, so it is re-queued here. Only a safe revoke or a fresh
+        // intent's definitively refused PUT retires it, never this hydration.
         let mut pending_revokes = Vec::new();
         for (room, members) in &join_grants {
             match privacy.get_mut(room) {
@@ -4977,7 +4976,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// First working destination: the configured channel, then the guild
     /// system channel, a DM to the guild owner, and finally a creator
     /// channel's chat. A destination that fails is dropped and the next is
-    /// tried.
+    /// tried. A failing configured channel warns once (op name plus the
+    /// bounded outcome, never the notice text or the mention) so a
+    /// misconfigured channel is distinguishable from a working one; a
+    /// successful send stays silent, and so does a rate limit, which is a
+    /// retry rather than an outcome (the channel may be healthy).
     async fn deliver_notice(&self, settings: &LoggingSettings, text: &str) -> bool {
         let mention = settings
             .mention_role_id
@@ -4986,13 +4989,25 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .channel_id
             .filter(|channel| self.live.text_notice_channel(*channel))
         {
-            if self
+            match self
                 .http
                 .send_notice(NoticeTarget::Channel(channel), text, mention)
                 .await
-                .is_ok()
             {
-                return true;
+                Ok(()) => return true,
+                // Rate limits are retries, never outcomes: skip the warn
+                // before the classifier, like its other callers.
+                Err(RoomHttpError::RateLimited { .. }) => {}
+                Err(error) => {
+                    let guild = self.live.guild_id.to_string();
+                    let outcome = voice_outcome_from_http(&error);
+                    warn!(
+                        guild,
+                        op = "send_notice",
+                        outcome,
+                        "voice notice configured channel failed; trying fallback"
+                    );
+                }
             }
         }
         let Some((system_channel_id, owner_id)) = self.live.notice_context() else {
@@ -9291,6 +9306,16 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
     accepted_join
 }
 
+/// Name a refused boot setting without exposing configured values or parser errors.
+fn invalid_boot_setting(key: &'static str) -> RoomHttpError {
+    warn!(
+        key,
+        reason = "invalid_value",
+        "temp-voice boot setting invalid; refusing voice runtime"
+    );
+    RoomHttpError::InvalidRequest
+}
+
 /// Build the production sink: lifecycle actors plus the S4 responder.
 pub fn build_production_runtime(
     token: &str,
@@ -9298,24 +9323,20 @@ pub fn build_production_runtime(
     name_policy: AutomodPolicy,
     live_source: impl Fn() -> Option<two_bot_core::settings::LiveSettings> + Send + Sync + 'static,
 ) -> Result<VoiceResponder<PgRoomStore, RoomHttp, RoomHttp>, RoomHttpError> {
-    // Malformed protection IDs refuse the whole runtime. The gateway reports it
-    // through its cataloged `voice HTTP setup failed` event.
+    // Fatal settings name only the first refused key, in existing validation
+    // order, before the gateway's generic `voice HTTP setup failed` event.
     let protected = configured_protected_channels(|key| std::env::var(key).ok())
-        .map_err(|_| RoomHttpError::InvalidRequest)?;
+        .map_err(invalid_boot_setting)?;
     let generator = configured_generator_channel(|key| std::env::var(key).ok())
-        .map_err(|_| RoomHttpError::InvalidRequest)?;
-    let empty_grace = configured_empty_grace(
-        std::env::var("TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS")
-            .ok()
-            .as_deref(),
-    )
-    .map_err(|_| RoomHttpError::InvalidRequest)?;
+        .map_err(|_| invalid_boot_setting("TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID"))?;
+    let empty_grace = configured_empty_grace(std::env::var(EMPTY_GRACE_KEY).ok().as_deref())
+        .map_err(|_| invalid_boot_setting(EMPTY_GRACE_KEY))?;
     let synthetic_humans = configured_synthetic_humans(
         std::env::var("TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS")
             .ok()
             .as_deref(),
     )
-    .map_err(|_| RoomHttpError::InvalidRequest)?;
+    .map_err(|_| invalid_boot_setting("TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS"))?;
     let replies = RoomHttp::new(token.to_owned())?;
     let http = replies.clone();
     let store = PgRoomStore::new(pool);
