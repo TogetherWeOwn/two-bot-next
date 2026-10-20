@@ -431,9 +431,12 @@ impl RateLimitGuard {
             .filter(|until| *until > now)
     }
 
-    /// Learn one response's per-route bucket state from its `X-RateLimit-*`
-    /// headers. Only an exhausted bucket (`Remaining` 0 with a resolvable
-    /// reset) installs a deadline; a response with remaining budget never
+    /// Learn header-only per-route bucket state from `X-RateLimit-*`, or
+    /// treat `Retry-After` with no `X-RateLimit-*` headers as bare. Transports
+    /// collecting a body use `observe_bucket_headers` and `ResponseAccounting`
+    /// instead, so body timing/scope signals can exclude the bare fallback.
+    /// An exhausted bucket (`Remaining` 0 with a resolvable reset) installs a
+    /// deadline; a response with remaining budget never
     /// retires a live one. A same-window straggler is indistinguishable from
     /// a newer window by its reset timing — the earlier-generated reply
     /// carries the larger `Reset-After` and arrives later, so its computed
@@ -449,6 +452,21 @@ impl RateLimitGuard {
     /// never wakes admission (sleepers wait on the deadline itself), and
     /// nothing here removes one.
     pub fn observe_bucket(&self, route: &str, headers: &http::HeaderMap) {
+        let observed_at = Instant::now();
+        self.observe_bucket_headers(route, headers);
+        if Self::has_bare_retry_after(headers) {
+            let timing = headers
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok())
+                .and_then(parse_retry_after_header);
+            self.observe_bare_retry_after(route, timing, observed_at);
+        }
+    }
+
+    /// Full bucket headers can be learned before the body is classified;
+    /// bare Retry-After must wait for response accounting to rule out body
+    /// timing and scope signals.
+    pub(crate) fn observe_bucket_headers(&self, route: &str, headers: &http::HeaderMap) {
         let observed_at = Instant::now();
         let value = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
         let bucket = match value("x-ratelimit-bucket") {
@@ -535,6 +553,38 @@ impl RateLimitGuard {
             }
             (None, _) => {}
         };
+    }
+
+    fn has_bare_retry_after(headers: &http::HeaderMap) -> bool {
+        headers.contains_key("retry-after")
+            && !headers
+                .keys()
+                .any(|name| name.as_str().starts_with("x-ratelimit-"))
+    }
+
+    fn observe_bare_retry_after(&self, route: &str, timing: Option<f64>, observed_at: Instant) {
+        let wait = timing
+            .filter(|secs| secs.is_finite() && *secs >= 0.0)
+            .and_then(|secs| Duration::try_from_secs_f64(secs).ok());
+        let Some(wait) = wait else { return };
+        let wait = wait
+            .checked_add(Duration::from_millis(two_bot_core::RETRY_AFTER_PADDING_MS))
+            .unwrap_or(wait);
+        let until = observed_at
+            .checked_add(wait)
+            .unwrap_or(observed_at + self.config.window);
+        let mut state = self.state.lock().expect("Discord guard state");
+        // Preserve a learned bucket mapping: replacing it with the raw route
+        // would discard an existing longer deadline on the named bucket.
+        let bucket = state
+            .routes
+            .0
+            .get(route)
+            .cloned()
+            .unwrap_or_else(|| route.to_owned());
+        let entry = state.buckets.0.entry(bucket.clone()).or_insert(until);
+        *entry = (*entry).max(until);
+        state.routes.0.insert(route.to_owned(), bucket);
     }
 
     /// Withdraw one invalid-request tally (a `shared`-scope 429 whose body
@@ -897,6 +947,7 @@ pub(crate) struct ResponseAccounting<'a> {
     reset_after_header: Option<f64>,
     invalid_tally: Option<Instant>,
     observed_at: Instant,
+    bare_route: Option<String>,
 }
 
 impl<'a> ResponseAccounting<'a> {
@@ -944,6 +995,13 @@ impl<'a> ResponseAccounting<'a> {
             reset_after_header,
             invalid_tally: tallied.then_some(observed_at),
             observed_at,
+            bare_route: None,
+        }
+    }
+
+    pub(crate) fn track_bare_bucket(&mut self, route: &str, headers: &http::HeaderMap) {
+        if RateLimitGuard::has_bare_retry_after(headers) {
+            self.bare_route = Some(route.to_owned());
         }
     }
 
@@ -968,6 +1026,23 @@ impl<'a> ResponseAccounting<'a> {
                 || value.get("scope").and_then(|v| v.as_str()) == Some("global")
         });
         let global = response.status == 429 && (self.global_header.is_some() || global_body);
+        // Only genuinely bare responses teach the fallback. An explicit body
+        // timing or scope signal (even global:false) keeps its existing local
+        // retry policy instead of acquiring a second header-derived wait.
+        if let Some(route) = self.bare_route.take() {
+            let has_body_signal = body.as_ref().is_some_and(|value| {
+                ["retry_after", "global", "scope"]
+                    .iter()
+                    .any(|key| value.get(key).is_some())
+            });
+            if response.status == 429 && !global && !has_body_signal {
+                self.guard.observe_bare_retry_after(
+                    &route,
+                    self.retry_after_header,
+                    self.observed_at,
+                );
+            }
+        }
         if global {
             let timing = response
                 .body_retry_after_secs()
@@ -986,6 +1061,10 @@ impl<'a> ResponseAccounting<'a> {
 
 impl Drop for ResponseAccounting<'_> {
     fn drop(&mut self) {
+        if let Some(route) = self.bare_route.take() {
+            self.guard
+                .observe_bare_retry_after(&route, self.retry_after_header, self.observed_at);
+        }
         if let Some(id) = self.global_header.take() {
             self.guard.finish_global(
                 id,
@@ -1135,6 +1214,34 @@ mod tests {
             guard.snapshot().global_pause_remaining,
             GLOBAL_PAUSE_FALLBACK_CAP
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_bare_body_keeps_padded_header_deadline_without_restarting_it() {
+        let guard = RateLimitGuard::new(GuardConfig::default()).unwrap();
+        let route = "GET /guilds/1/roles";
+        let mut headers = http::HeaderMap::new();
+        headers.insert("retry-after", http::HeaderValue::from_static("2"));
+        let mut accounting = ResponseAccounting::new(&guard, 429, &headers, true);
+        accounting.track_bare_bucket(route, &headers);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        drop(accounting);
+
+        // Cancellation must leave the original 2 s + 250 ms deadline, not
+        // discard it or start another full wait after the elapsed second.
+        assert!(guard.check_route_now("GET /guilds/2/roles", false).is_ok());
+        let started = Instant::now();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1200), guard.admit_route(route, false))
+                .await
+                .is_err(),
+            "cancelled bare response must retain the header deadline and pad"
+        );
+        tokio::time::timeout(Duration::from_millis(100), guard.admit_route(route, false))
+            .await
+            .expect("cancellation must not restart the header deadline")
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(1250));
     }
 
     #[tokio::test(start_paused = true)]

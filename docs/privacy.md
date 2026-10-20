@@ -107,7 +107,10 @@ are outside this implementation's scope.
   in-memory collector) belongs to this class: guild-keyed rows with no member
   column, gated before every persist by the same per-user opt-out and the
   presence toggle above, so opted-out members never persist and a disabled
-  guild drains and drops. The voice toggle is independent: with voice off but
+  guild drains and drops. The gate read and the upsert share one serializing
+  transaction holding the suppression table, so an opt-out landing mid-flush
+  either filters out of that flush or waits for its commit. The voice toggle
+  is independent: with voice off but
   presence on, play aggregates still persist while voice-derived `in_voice_ms`
   stays 0 (voice spans drain and drop). The table is not a replay fence and
   holds no fence rows; member erasure and opt-out purges have no row to delete

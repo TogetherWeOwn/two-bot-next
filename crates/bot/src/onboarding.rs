@@ -126,6 +126,62 @@ impl AcceptedWelcome {
     }
 }
 
+enum FreshRecipient {
+    Eligible { roles: Vec<String> },
+    Ineligible,
+}
+
+/// Parse one strict member document. Missing `bot` or `pending` means false
+/// (Discord omits both for an ordinary human). A present non-bool, a user id
+/// that is not this member, or a role that is not a snowflake string is
+/// unreadable, not proof the member left.
+fn fresh_recipient(
+    member_id: u64,
+    body: &serde_json::Value,
+) -> Result<FreshRecipient, RuntimeError> {
+    let user = body
+        .get("user")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(RuntimeError::Member)?;
+    let id = user
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(RuntimeError::Member)?;
+    if id != member_id.to_string() {
+        return Err(RuntimeError::Member);
+    }
+    let bot = match user.get("bot") {
+        None => false,
+        Some(value) => value.as_bool().ok_or(RuntimeError::Member)?,
+    };
+    let pending = match body.get("pending") {
+        None => false,
+        Some(value) => value.as_bool().ok_or(RuntimeError::Member)?,
+    };
+    let roles = body
+        .get("roles")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(RuntimeError::Member)?;
+    let mut current = Vec::with_capacity(roles.len());
+    for role in roles {
+        let id = role.as_str().ok_or(RuntimeError::Member)?;
+        if id
+            .parse::<u64>()
+            .ok()
+            .filter(|parsed| *parsed != 0)
+            .is_none()
+        {
+            return Err(RuntimeError::Member);
+        }
+        current.push(id.to_owned());
+    }
+    if bot || pending {
+        Ok(FreshRecipient::Ineligible)
+    } else {
+        Ok(FreshRecipient::Eligible { roles: current })
+    }
+}
+
 pub struct OnboardingRuntime {
     pool: PgPool,
     executor: ActionExecutor,
@@ -468,15 +524,17 @@ impl OnboardingRuntime {
                 bot,
                 pending,
                 trigger,
-                roles,
+                roles: _,
             } => {
+                // Captured eligibility is a ceiling. welcome re-reads the member
+                // and may only narrow it; an ineligible capture performs no read.
                 if guild_id != config.guild_id
                     || !welcome_trigger(trigger)
                     || decide_prompt(bot, pending, false) != PromptDecision::Prompt
                 {
                     return Ok(());
                 }
-                self.welcome(&config, member_id, &roles, now_ms / 1000, &occurred_at)
+                self.welcome(&config, member_id, now_ms / 1000, &occurred_at)
                     .await
             }
             OnboardingJob::Goodbye {
@@ -625,11 +683,26 @@ impl OnboardingRuntime {
         Err(RuntimeError::Discord)
     }
 
+    /// Live guild member for a queued welcome. `Ineligible` is proven (404,
+    /// pending, or bot) and must not leave a marker. Any other unreadable
+    /// document is [`RuntimeError::Member`] so the worker retains the job.
+    async fn current_recipient(
+        &self,
+        guild_id: u64,
+        member_id: u64,
+    ) -> Result<FreshRecipient, RuntimeError> {
+        let path = format!("/guilds/{guild_id}/members/{member_id}");
+        match self.executor.get_json_strict(&path).await {
+            Ok(Some(body)) => fresh_recipient(member_id, &body),
+            Ok(None) => Ok(FreshRecipient::Ineligible),
+            Err(_) => Err(RuntimeError::Member),
+        }
+    }
+
     async fn welcome(
         &self,
         config: &OnboardingConfig,
         member_id: u64,
-        roles: &[String],
         now_secs: i64,
         at: &str,
     ) -> Result<(), RuntimeError> {
@@ -664,6 +737,14 @@ impl OnboardingRuntime {
             config.landing_channel_ids.clone()
         };
         let Some(channel) = self.first_postable(config, &channels).await? else {
+            return Ok(());
+        };
+        // Fresh membership before the prompt lock. Proven absence, a pending
+        // member, or a bot skips with no marker. Unreadable evidence fails
+        // before begin_prompt so the durable job stays retryable.
+        let FreshRecipient::Eligible { roles } =
+            self.current_recipient(config.guild_id, member_id).await?
+        else {
             return Ok(());
         };
         let WelcomeEffect::Post {
