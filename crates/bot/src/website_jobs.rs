@@ -16,6 +16,7 @@ use two_bot_core::{
     RANK_SNAPSHOT_INTERVAL_MS, SCHEDULED_EVENTS_INTERVAL_MS,
 };
 use two_bot_discord::executor::{ActionExecutor, DiscordError};
+use two_bot_discord::internal_events::canonical_snowflake;
 
 use crate::{
     activation::BootActivation,
@@ -44,6 +45,10 @@ mod tests;
 #[cfg(test)]
 #[path = "website_snapshot_tests.rs"]
 mod snapshot_tests;
+
+#[cfg(test)]
+#[path = "website_event_identity_acceptance_tests.rs"]
+mod event_identity_acceptance_tests;
 
 #[derive(Clone, Copy)]
 pub enum Kind {
@@ -592,21 +597,29 @@ pub(crate) async fn bot_floor_scan(
     Ok(two_bot_core::BotFloorScan::Truncated)
 }
 
-fn raw_event(value: &Value) -> Result<RawScheduledEvent, ErrorClass> {
-    if !value.is_object() {
+fn raw_event(value: &Value, guild: &str) -> Result<RawScheduledEvent, ErrorClass> {
+    if !value.is_object() || canonical_snowflake(&value["guild_id"]) != Some(guild) {
         return Err(ErrorClass::Rest);
     }
-    snowflake(&value["id"])?;
+    let id = canonical_snowflake(&value["id"]).ok_or(ErrorClass::Rest)?;
+    let channel_id = match value.get("channel_id") {
+        None | Some(Value::Null) => None,
+        Some(channel) => Some(
+            canonical_snowflake(channel)
+                .ok_or(ErrorClass::Rest)?
+                .to_owned(),
+        ),
+    };
     let optional = |name: &str| match value.get(name) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) => Ok(Some(s.clone())),
         _ => Err(ErrorClass::Rest),
     };
     Ok(RawScheduledEvent {
-        id: optional("id")?,
+        id: Some(id.to_owned()),
         name: optional("name")?,
         scheduled_start_time: optional("scheduled_start_time")?,
-        channel_id: optional("channel_id")?,
+        channel_id,
         description: optional("description")?,
         status: value["status"].as_i64(),
     })
@@ -785,7 +798,7 @@ async fn snapshot_once(
             .as_array()
             .ok_or(ErrorClass::Rest)?
             .iter()
-            .map(raw_event)
+            .map(|value| raw_event(value, guild))
             .collect::<Result<Vec<_>, _>>()?;
         let events = normalize_events(&raw).ok_or(ErrorClass::Rest)?;
         if publication_stopped(shutdown) {
