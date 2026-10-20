@@ -469,7 +469,10 @@ async fn purge_and_slowmode_success_audit_and_replay_without_repeating_effects()
         vec![
             ScriptedResponse::json(
                 200,
-                json!([{"id":fresh_message_id(1)},{"id":fresh_message_id(2)}]),
+                json!([
+                    {"id":fresh_message_id(1),"author":{"bot":false}},
+                    {"id":fresh_message_id(2),"author":{"bot":false}}
+                ]),
             ),
             ScriptedResponse::status(204),
             patched(),
@@ -532,7 +535,13 @@ async fn purge_of_messages_older_than_fourteen_days_deletes_them_singly() {
     let (old_a, old_b) = (aged_message_id(1), aged_message_id(2));
     let mock = MockRest::start(
         vec![
-            ScriptedResponse::json(200, json!([{"id": old_a}, {"id": old_b}])),
+            ScriptedResponse::json(
+                200,
+                json!([
+                    {"id": old_a, "author": {"bot": false}},
+                    {"id": old_b, "author": {"bot": false}}
+                ]),
+            ),
             ScriptedResponse::status(204),
             ScriptedResponse::status(204),
         ],
@@ -1036,7 +1045,10 @@ async fn purge_delete_failure_still_retains_the_lane() {
             vec![
                 ScriptedResponse::json(
                     200,
-                    json!([{"id":"600000000000000001"},{"id":"600000000000000002"}]),
+                    json!([
+                        {"id":"600000000000000001","author":{"bot":false}},
+                        {"id":"600000000000000002","author":{"bot":false}}
+                    ]),
                 ),
                 failure,
             ],

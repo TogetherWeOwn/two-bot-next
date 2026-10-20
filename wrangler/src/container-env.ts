@@ -362,6 +362,7 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_TOTALLY_MADE_UP: TEST,
   TWO_TYPO_KEYS: TEST,
   TWO_UNKNOWN: TEST,
+  TWO_TUNING_LOG_TEST_CHILD: TEST,
   // Store-only guild setting: the invite responder resolves it from the live
   // settings snapshot, never from the process environment, so there is
   // nothing to forward.

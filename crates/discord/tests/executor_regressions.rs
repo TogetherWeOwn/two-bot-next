@@ -560,9 +560,9 @@ async fn purge_outcome_uses_actual_affected_count() {
         vec![ScriptedResponse::json(
             200,
             serde_json::json!([
-                {"id": fresh_message_id(1)},
-                {"id": fresh_message_id(2)},
-                {"id": fresh_message_id(3)}
+                {"id": fresh_message_id(1), "author": {"bot": false}},
+                {"id": fresh_message_id(2), "author": {"bot": false}},
+                {"id": fresh_message_id(3), "author": {"bot": false}}
             ]),
         )],
         ScriptedResponse::status(204),
@@ -641,10 +641,11 @@ async fn purge_accepts_a_valid_empty_history_without_deletion() {
     mock.shutdown().await;
 }
 
+// Deletion-planning fixtures use explicitly human authors to avoid identity reads.
 fn history<S: AsRef<str>>(ids: &[S]) -> ScriptedResponse {
     let rows = ids
         .iter()
-        .map(|id| serde_json::json!({"id": id.as_ref()}))
+        .map(|id| serde_json::json!({"id": id.as_ref(), "author": {"bot": false}}))
         .collect();
     ScriptedResponse::json(200, serde_json::Value::Array(rows))
 }
@@ -760,11 +761,11 @@ async fn purge_skips_pinned_messages_and_the_bots_own_panels() {
 }
 
 #[tokio::test]
-async fn purge_reads_the_bot_identity_only_when_a_bot_authored_a_message() {
+async fn purge_of_explicitly_human_messages_does_not_read_the_bot_identity() {
     let (a, b) = (fresh_message_id(1), fresh_message_id(2));
     let rows = serde_json::json!([
         {"id": a, "pinned": false, "author": {"id": "10", "bot": false}},
-        {"id": b, "pinned": false, "author": {"id": "11"}},
+        {"id": b, "pinned": false, "author": {"id": "11", "bot": false}},
     ]);
     let mock = MockRest::start(
         vec![ScriptedResponse::json(200, rows)],
@@ -782,7 +783,7 @@ async fn purge_reads_the_bot_identity_only_when_a_bot_authored_a_message() {
 #[tokio::test]
 async fn purge_of_only_protected_messages_deletes_nothing() {
     let id = fresh_message_id(1);
-    let rows = serde_json::json!([{"id": id, "pinned": true}]);
+    let rows = serde_json::json!([{"id": id, "pinned": true, "author": {"bot": false}}]);
     let mock = MockRest::start(
         vec![ScriptedResponse::json(200, rows)],
         ScriptedResponse::status(500),

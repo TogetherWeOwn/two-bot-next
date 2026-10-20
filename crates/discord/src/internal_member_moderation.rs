@@ -29,7 +29,7 @@ use two_bot_core::member_moderation::{
 };
 use two_bot_core::{ModerationAction, ModerationActor, ModerationPolicy, ModerationTarget};
 
-use crate::{ActionExecutor, DiscordError};
+use crate::{executor::normalize_timeout_until, ActionExecutor, DiscordError};
 
 /// Parsed website fields; construct only after request authorization. Actor and
 /// target ids are attribution requests, not proof of guild membership or
@@ -357,21 +357,6 @@ impl MemberDiscord for SigningDiscord<'_> {
     }
 }
 
-/// Normalize the service's `format_iso_millis` expiry for Twilight:
-/// `2023-11-14T23:13:20.000Z` becomes `2023-11-14T23:13:20+00:00`.
-/// Inputs already carrying an offset pass through untouched.
-fn normalize_timeout_until(until_iso: &str) -> String {
-    if let Some(core) = until_iso.strip_suffix(['Z', 'z']) {
-        let base = match core.split_once('.') {
-            Some((date_time, _)) => date_time,
-            None => core,
-        };
-        format!("{base}+00:00")
-    } else {
-        until_iso.to_owned()
-    }
-}
-
 /// Local guard refusals never reached the wire, so like confirmed 4xx they
 /// prove no mutation happened and the claim is safe to release; the message
 /// stays truthful about the pause.
@@ -388,6 +373,8 @@ fn map_discord_error(error: DiscordError) -> MemberDiscordError {
 fn member_error(error: MemberError) -> ActionError {
     let (code, message) = match &error {
         MemberError::Policy(refusal) => (ErrorCode::ActionNotAllowed, refusal.to_string()),
+        MemberError::TargetNotMember => (ErrorCode::ActionNotAllowed, error.to_string()),
+        MemberError::AuthorityUnavailable => (ErrorCode::DiscordUnavailable, error.to_string()),
         MemberError::Reason(reason) => (ErrorCode::Malformed, reason.to_string()),
         MemberError::Malformed { field, message } => (
             ErrorCode::Malformed,
