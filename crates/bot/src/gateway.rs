@@ -272,6 +272,8 @@ struct Hello {
 
 /// Client-side bound from pool acquisition through COMMIT, including stalled
 /// responses on an acquired connection. Never restore readiness during drain.
+/// A successful call restores only the snapshot it armed itself: a newer Ready
+/// publication in the same generation, or a disconnect that bumped it, stays.
 /// Source: <https://docs.rs/tokio/1/tokio/time/fn.timeout.html>
 async fn checkpoint_io<T>(
     state: &RwLock<GatewayState>,
@@ -292,7 +294,9 @@ async fn checkpoint_io<T>(
         .map_err(|_| sqlx::Error::InvalidArgument("gateway checkpoint deadline exceeded".into()))?;
     if result.is_ok() {
         let mut state = state.write().await;
-        if *state != GatewayState::Draining
+        // Armed is this call's own in-flight mark. Connected means a later
+        // publication already won; Draining and a bumped generation must win too.
+        if *state == GatewayState::Armed
             && generation.load(Ordering::Acquire) == observed_generation
         {
             *state = previous;
