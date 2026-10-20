@@ -3289,9 +3289,11 @@ class WorkflowTests(unittest.TestCase):
         staging_source = (ROOT / "crates/cutover/tests/staging_migrate_db.rs").read_text()
         staging_names = set(re.findall(r'#\[ignore[^\]]*\]\s*async fn (\w+)\(', staging_source))
         self.assertTrue(staging_names, "guarded ignored fixtures must be discovered")
+        # Match complete tokens: a suffixed filter would not skip the fixture.
+        broad_skips = set(re.findall(r"--skip (\S+)", ignored_sweeps[0]))
         for name in sorted(staging_names):
             with self.subTest(staging_skip=name):
-                self.assertIn(f"--skip {name}", ignored_sweeps[0])
+                self.assertIn(name, broad_skips)
         guarded = [run for run in cov_runs if "llvm-cov --no-report -p " in run]
         self.assertEqual(len(guarded), 12)
         for run in guarded:
