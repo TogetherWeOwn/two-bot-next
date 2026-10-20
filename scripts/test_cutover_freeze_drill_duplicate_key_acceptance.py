@@ -24,7 +24,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import test_cutover_freeze_drill as fixtures  # noqa: E402
+import test_cutover_freeze_drill as fixtures
 
 drill = fixtures.drill
 STAGING_GUILD = fixtures.STAGING_GUILD
