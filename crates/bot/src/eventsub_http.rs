@@ -128,10 +128,9 @@ impl BoundEventsubReceiver {
             .with_graceful_shutdown(crate::server::shutdown_requested(shutdown.clone()))
             .into_future();
         tokio::pin!(server);
-        let mut shutdown = shutdown;
         let deadline = tokio::select! {
             biased;
-            _ = shutdown.wait_for(|latched| *latched) => {
+            _ = crate::server::shutdown_requested(shutdown.clone()) => {
                 let deadline = tokio::time::Instant::now() + crate::shutdown::deadline();
                 Self::close_admission(&self.state).await;
                 deadline
