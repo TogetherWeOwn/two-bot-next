@@ -149,6 +149,35 @@ def runner_allowed(job_id, runs_on):
     return runs_on == ROUTED_RUNNER.format(job=job_id)
 
 
+def shell_logical_lines(script):
+    """Join backslash continuations so each shell command is one line."""
+    lines, pending = [], ""
+    for raw_line in script.splitlines():
+        stripped = raw_line.strip()
+        pending = f"{pending} {stripped}".strip() if pending else stripped
+        if stripped.endswith("\\"):
+            pending = pending[:-1].strip()
+            continue
+        lines.append(pending)
+        pending = ""
+    if pending:
+        lines.append(pending)
+    return lines
+
+
+# An `#[ignore ...]` line, any further attribute lines, then the fn it marks.
+IGNORED_TEST_FN = re.compile(
+    r"^[ \t]*#\[ignore\b[^\n]*\n(?:[ \t]*#\[[^\n]*\n)*[ \t]*(?:async[ \t]+)?fn[ \t]+(\w+)",
+    re.MULTILINE,
+)
+
+
+def ignored_test_names(suite):
+    """The #[ignore]d test fns of the integration test target `suite`."""
+    [path] = ROOT.glob(f"crates/*/tests/{suite}.rs")
+    return IGNORED_TEST_FN.findall(path.read_text(encoding="utf-8"))
+
+
 # Staging deploy push filter. Each deploy restarts the bot container and drops the
 # gateway for ~2 minutes, so a push that touches only non-runtime paths must not
 # start one (the B2 soak needs a stable staging). The filter is a deny-list so an
@@ -3217,18 +3246,7 @@ class WorkflowTests(unittest.TestCase):
         # occurrence mask a flag dropped from another invocation (e.g.
         # --ignore-run-fail removed from either sweep). Join line
         # continuations, then assert flags on each cov_run separately.
-        logical_lines = []
-        pending = ""
-        for raw_line in step["run"].splitlines():
-            stripped = raw_line.strip()
-            pending = f"{pending} {stripped}".strip() if pending else stripped
-            if stripped.endswith("\\"):
-                pending = pending[:-1].strip()
-                continue
-            logical_lines.append(pending)
-            pending = ""
-        if pending:
-            logical_lines.append(pending)
+        logical_lines = shell_logical_lines(step["run"])
         cov_runs = [line for line in logical_lines if line.startswith("cov_run ")]
         # cov_run's failure annotation must go to stderr: the stdout report
         # retry redirects cov_run's stdout into the lcov file.
@@ -3355,6 +3373,69 @@ class WorkflowTests(unittest.TestCase):
         )
         checkout = next(step for step in job["steps"] if step.get("uses", "").startswith("actions/checkout@"))
         self.assertEqual(checkout["with"]["fetch-depth"], "0")
+
+    def test_patch_coverage_ignored_sweep_skips_tests_that_cannot_pass_there(self):
+        # The ignored sweep tolerates failures, but the flake ledger reads
+        # every FAILED line it prints as a flake. No ignored test in these
+        # suites can pass under its two_bot_test_ci URL, so the sweep skips
+        # each one. Names come from the sources: a new ignored test in one of
+        # these suites fails here until the sweep skips it too.
+        # Exact-URL suites: a fail-closed run elsewhere still executes them.
+        refused_suites = (
+            "legacy_tls_fence", "legacy_verify_db", "raid_list_db",
+            "reengagement_list_db", "staging_migrate_db", "internal_events",
+            "mutation_429_proves_no_effect_channel",
+        )
+        # Red acceptance suites: the store lane skips every one of them too.
+        red_suites = (
+            "backfill_audit_log", "backfill_bans_invites_onboarding",
+            "backfill_event_users_reactions_pins",
+        )
+        jobs = self.workflows["check.yml"]["jobs"]
+        step = next(
+            step for step in jobs["rust-tests"]["steps"]
+            if step.get("name") == "Patch coverage (HARD, 80% of added lines)"
+        )
+        [sweep] = [
+            line for line in shell_logical_lines(step["run"])
+            if line.startswith("cov_run ") and "--workspace --lib --bins --tests" in line
+            and "-- --ignored" in line
+        ]
+        sweep_skips = re.findall(r"--skip (\S+)", sweep)
+        # Fail-closed command lines only: both tolerated sweeps drop out.
+        runs = [
+            line
+            for job in jobs.values() for candidate in job.get("steps", [])
+            for line in shell_logical_lines(str(candidate.get("run", "")))
+            if "--ignore-run-fail" not in line
+        ]
+        expected = set()
+        for suite in refused_suites:
+            names = ignored_test_names(suite)
+            self.assertTrue(names, suite)
+            expected.update(names)
+            target = re.compile(rf"--test {re.escape(suite)}(?:\s|$)")
+            gates = [
+                re.findall(r"--skip (\S+)", line) for line in runs
+                if target.search(line) and re.search(r"--(?:include-)?ignored\b", line)
+            ]
+            for name in names:
+                with self.subTest(suite=suite, test=name):
+                    self.assertTrue(
+                        any(not any(skip in name for skip in skips) for skips in gates),
+                        f"no fail-closed --test {suite} run executes {name}",
+                    )
+        [store_lane] = [line for line in runs if "--test backfill_audit_log" in line]
+        store_skips = re.findall(r"--skip (\S+)", store_lane)
+        for suite in red_suites:
+            names = ignored_test_names(suite)
+            self.assertTrue(names, suite)
+            expected.update(names)
+            for name in names:
+                with self.subTest(suite=suite, test=name):
+                    self.assertIn(name, store_skips)
+        self.assertEqual(len(sweep_skips), len(set(sweep_skips)))
+        self.assertEqual(set(sweep_skips) - {"regenerate_reference_docs"}, expected)
 
     def test_voice_synthetic_shape_is_pinned_and_mutations_fail(self):
         import copy
