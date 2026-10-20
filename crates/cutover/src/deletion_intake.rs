@@ -1,8 +1,8 @@
 //! Authenticated member deletion intake + durable requester receipts.
 //!
-//! Thin S4 adapter over the existing retention ledger and scheduler: a real
-//! published member entrypoint (the `/privacy` command surface) accepts an
-//! explicit deletion request and persists it through the same
+//! Thin S4 adapter over the existing retention ledger and scheduler: the
+//! published `/privacy delete` member entrypoint accepts an explicit deletion
+//! request and persists it through the same
 //! `retention_deletion_requests` rows [`crate::retention::request_user_deletion`]
 //! writes — never the narrower opt-out purge — and the existing
 //! [`crate::retention::run_retention`] scheduler drain settles the receipt.
@@ -22,14 +22,9 @@
 //! * The request scope names the guild/member footprint only — every
 //!   erasure-plan table's guild/member rows — never global erasure. Retained
 //!   control-plane exceptions stay retained and are disclosed on the receipt.
-//! * Live-gateway call sites that invoke the intake on real dispatches are
-//!   follow-up work: the adapter exists but is not invoked on live
-//!   interactions, so members cannot yet submit requests through it. The
-//!   definition returned here is the existing `/privacy` surface reused for
-//!   publication shape only; it carries no dedicated deletion subcommand yet
-//!   (its only "delet…" copy is the narrower opt-out subcommand this adapter
-//!   never routes to). The router that already publishes `/privacy` is reused
-//!   unchanged.
+//! * The live `/privacy` delete, deletion-status and deletion-receipt handlers
+//!   bind every intake call to the interaction's guild and authenticated actor;
+//!   the request id is the only caller-supplied argument on reads.
 //! * Voice-raw coverage is pinned to voice-session `events` rows, matching the
 //!   retention module's documented limits.
 
@@ -39,10 +34,10 @@ use two_bot_core::CommandDefinition;
 
 use super::retention::DELETION_SLA_HOURS;
 
-/// Acknowledgement for an accepted deletion request: accepted/pending only,
-/// never completion. Completion is observed later through
-/// [`deletion_status_for_requester`] / [`deletion_receipt_for_requester`]
-/// after the scheduler drains.
+/// Acknowledgement for a deletion request. Fresh requests are pending only;
+/// an interaction retry can report `completed` if the scheduler drained since
+/// the original request. Completion details are observed through
+/// [`deletion_status_for_requester`] / [`deletion_receipt_for_requester`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeletionAck {
     /// The durable request id (deterministic per guild/requester/interaction,
@@ -105,9 +100,11 @@ const MAX_REQUEST_ID_LEN: usize = 128;
 /// Static disclosure of the retained control-plane exceptions. Constant text:
 /// it names scopes and tables, never a member id.
 const RETAINED_LIMITS: &str = "Retained control-plane exceptions: privacy_opt_outs suppression \
-    tombstone; operator-released moderation_idempotency replay fence and its executions; \
-    guild_settings, guild_settings_audit, audit_kill_switch, member_erasure_audit; \
-    moderation, audit, ticket, voice-room and settings rows outside the member footprint. \
+    tombstone; privacy_opt_out_audit (member_id, actor) purge receipts; \
+    retention_deletion_requests request/receipt ledger; operator-released \
+    moderation_idempotency replay fence and its executions; guild_settings, \
+    guild_settings_audit, audit_kill_switch, member_erasure_audit; moderation, \
+    audit, ticket, voice-room and settings rows outside the member footprint. \
     This receipt covers the guild/member footprint only.";
 
 fn invalid_request(reason: &str) -> sqlx::Error {
@@ -132,8 +129,8 @@ fn validate_token_free_id(value: &str, what: &str) -> Result<(), sqlx::Error> {
 }
 
 /// Deterministic request id for one guild/requester/interaction triple, so an
-/// interaction retry returns the same pending request without queueing a
-/// second destructive effect. The interaction id is the idempotency key: it is
+/// interaction retry returns the same request with its current status without
+/// queueing a second destructive effect. The interaction id is the idempotency key: it is
 /// validated but never stored (the durable ledger holds scope only, no bearer
 /// tokens), and the hash binds it to the authenticated pair so one member's
 /// retry can never resolve to another member's request.
@@ -152,10 +149,10 @@ fn deterministic_request_id(guild_id: &str, requester_id: &str, interaction_id: 
 /// Accept an explicit member deletion request from the authenticated
 /// guild/requester pair and persist it to the durable request ledger (the same
 /// rows [`crate::retention::request_user_deletion`] writes), never the
-/// narrower opt-out purge. Acknowledgement is pending only. A retry with the
-/// same interaction id returns the same pending request without queueing a
-/// duplicate destructive effect. Identities and the interaction id are refused
-/// before any write.
+/// narrower opt-out purge. Fresh requests are acknowledged as pending. A retry
+/// with the same interaction id returns the same request's current status
+/// without queueing a duplicate destructive effect. Identities and the
+/// interaction id are refused before any write.
 pub async fn request_member_deletion(
     pool: &PgPool,
     guild_id: &str,
@@ -328,6 +325,13 @@ pub async fn deletion_status_for_requester(
     })
 }
 
+fn deletion_receipt_scope(guild_id: &str, requester_id: &str) -> String {
+    format!(
+        "guild {guild_id} member {requester_id} member-footprint erasure \
+         (erasable rows in the member erasure plan; request ledger retained)"
+    )
+}
+
 /// Durable, requester-authorized completion receipt read. Fails while the
 /// request is still pending — no false receipt — and never infers delivery
 /// from anything but the settled ledger row the scheduler drain writes.
@@ -353,12 +357,7 @@ pub async fn deletion_receipt_for_requester(
         user_id: row.user_id.clone(),
         requested_at_unix: row.requested_at_unix,
         completed_at_unix,
-        scope: format!(
-            "guild {} member {} member-footprint erasure \
-             (members, member_levels, voice-session events; per-user erasure plan, \
-             per-guild purge queue)",
-            row.guild_id, row.user_id
-        ),
+        scope: deletion_receipt_scope(&row.guild_id, &row.user_id),
         retained_limits: RETAINED_LIMITS.to_owned(),
     })
 }
@@ -368,14 +367,9 @@ pub async fn deletion_receipt_for_requester(
 /// one reviewed command surface. It binds the subject to the authenticated
 /// requester (no caller-supplied user/member/target option).
 ///
-/// Not yet a deletion entrypoint: the live definition carries only the
-/// opt-out/opt-in/status subcommands, and its only "delet…" copy is the
-/// narrower opt-out subcommand ("Delete your stored activity…") this adapter
-/// never routes to. A dedicated deletion request/status subcommand and the
-/// live-dispatch call sites that invoke the intake are follow-up work; until
-/// then members cannot submit requests through this surface. The fallback
-/// below preserves the same guild-only shape for test isolation only and
-/// advertises no deletion entrypoint.
+/// The published definition includes deletion request/status/receipt verbs on
+/// the same guild-only surface; the bot's live handler derives guild/member
+/// identity from the interaction before invoking this intake.
 pub fn privacy_deletion_command() -> CommandDefinition {
     if let Some(definition) = two_bot_core::commands::core_commands()
         .into_iter()
@@ -383,5 +377,24 @@ pub fn privacy_deletion_command() -> CommandDefinition {
     {
         return definition;
     }
-    CommandDefinition::new("privacy", "Manage your analytics privacy for this server.")
+    CommandDefinition::new(
+        "privacy",
+        "Manage your analytics privacy and deletion requests for this server.",
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{deletion_receipt_scope, RETAINED_LIMITS};
+
+    #[test]
+    fn receipt_discloses_retained_audit_and_only_member_erasure_scope() {
+        assert!(RETAINED_LIMITS.contains("privacy_opt_out_audit (member_id, actor)"));
+        assert!(RETAINED_LIMITS.contains("retention_deletion_requests request/receipt ledger"));
+        let scope = deletion_receipt_scope("711111111111111111", "744444444444444444");
+        assert!(scope.contains("guild 711111111111111111 member 744444444444444444"));
+        assert!(scope.contains("erasable rows in the member erasure plan"));
+        assert!(scope.contains("request ledger retained"));
+        assert!(!scope.contains("purge queue"));
+    }
 }

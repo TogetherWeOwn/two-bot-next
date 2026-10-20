@@ -201,8 +201,8 @@ pub use channel_moderation::{
     message_created_ms, moderation_result_text, plan_lockdown, plan_purge, plan_unlock,
     require_channel_reason, validate_purge_count, validate_slowmode_seconds, BoundsError,
     ChannelModerationVerb, ChannelOutcome, EveryoneOverwrite, LockdownPlan, LockdownRecord,
-    LockdownSeed, MaskError, PurgePlan, UnlockError, UnlockPlan, LOCKDOWN_BITS, MAX_PURGE_COUNT,
-    MAX_SLOWMODE_SECONDS, MIN_PURGE_COUNT, SEND_MESSAGES_BIT,
+    LockdownSeed, MaskError, PurgePlan, PurgeReport, PurgeStopReason, UnlockError, UnlockPlan,
+    LOCKDOWN_BITS, MAX_PURGE_COUNT, MAX_SLOWMODE_SECONDS, MIN_PURGE_COUNT, SEND_MESSAGES_BIT,
 };
 #[cfg(feature = "db")]
 pub use channel_moderation_store::{

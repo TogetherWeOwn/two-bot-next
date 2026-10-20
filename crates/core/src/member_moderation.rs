@@ -210,9 +210,12 @@ impl MemberError {
     #[must_use]
     pub fn enforcement_outcome(&self) -> &'static str {
         match self {
-            Self::Policy(_) | Self::Reason(_) | Self::Malformed { .. } | Self::KeyMismatch => {
-                "refused"
-            }
+            Self::Policy(_)
+            | Self::Reason(_)
+            | Self::Malformed { .. }
+            | Self::KeyMismatch
+            | Self::AuthorityUnavailable
+            | Self::TargetNotMember => "refused",
             Self::Discord(error) if error.is_safe_pre_mutation() => "refused",
             Self::Discord(_) => "discord_error",
             Self::Store(_) => "storage_error",
@@ -522,6 +525,16 @@ pub trait MemberModerationStore: Send + Sync {
         claimed_at: &str,
     ) -> impl Future<Output = Result<ClaimState, StoreError>> + Send;
 
+    /// Read-only: the stored outcome of a `done` row whose request hash matches.
+    /// An absent, `in_flight` or differently-bound row is `None`; this never
+    /// inserts, completes or releases anything.
+    fn completed_outcome(
+        &self,
+        guild_id: &str,
+        idempotency_key: &str,
+        request_hash: &str,
+    ) -> impl Future<Output = Result<Option<String>, StoreError>> + Send;
+
     /// Record the terminal result so a retry replays it (legacy `complete`).
     fn complete(
         &self,
@@ -744,6 +757,15 @@ pub struct MemberExecution {
     pub idempotency_key: String,
 }
 
+/// Current authority supplied at the dispatch boundary. Identities must match
+/// the immutable execution; only membership, roles and permissions may change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberAuthority {
+    pub actor: ModerationActor,
+    pub target: Option<ModerationTarget>,
+    pub bot_highest_role_position: i64,
+}
+
 /// Validated member request: policy passed, reason normalised, duration
 /// bounded per verb.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -775,6 +797,12 @@ pub enum MemberError {
     /// `moderation_idempotency_key_reused`).
     #[error("this idempotency key was used for a different moderation request")]
     KeyMismatch,
+    /// Current membership/role evidence could not be established. This is a
+    /// pre-dispatch refusal, not evidence about any earlier dispatched attempt.
+    #[error("Moderation command failed; try again.")]
+    AuthorityUnavailable,
+    #[error("That member is not in this server.")]
+    TargetNotMember,
     /// Scheduled unbans wait for the bot identity; they never run unattributed.
     #[error("the bot identity is unresolved; scheduled unbans wait for it")]
     BotIdentityUnknown,
@@ -822,6 +850,16 @@ pub fn validate_member_request(
         policy,
     )
     .map_err(MemberError::Policy)?;
+    validate_request_content(action, reason, duration_seconds)
+}
+
+/// The authority-free half of validation: the audit reason and duration bounds
+/// that, with the action and target, define a request's idempotency hash.
+fn validate_request_content(
+    action: ModerationAction,
+    reason: &str,
+    duration_seconds: Option<i64>,
+) -> Result<ValidatedMemberRequest, MemberError> {
     let reason = require_moderation_reason(reason).map_err(MemberError::Reason)?;
     let duration_seconds = match action {
         ModerationAction::TempBan => Some(bounded_duration(
@@ -840,6 +878,18 @@ pub fn validate_member_request(
         action,
         reason,
         duration_seconds,
+    })
+}
+
+/// The nonmutating result of a stored `done` outcome; an unreadable outcome is
+/// a store fault, never a guess.
+fn replayed_result(outcome: &str) -> Result<MemberResult, MemberError> {
+    let outcome = MemberOutcome::from_stored(outcome).ok_or(MemberError::Store(
+        StoreError::new(format!("stored unknown outcome: {outcome}")),
+    ))?;
+    Ok(MemberResult {
+        outcome,
+        replayed: true,
     })
 }
 
@@ -933,41 +983,40 @@ where
         exec: &'a MemberExecution,
     ) -> impl Future<Output = Result<MemberResult, MemberError>> + Send + 'a {
         async move {
-            let validated = match self.validate(exec) {
-                Ok(validated) => validated,
-                Err(err @ MemberError::Policy(_)) => {
-                    self.store
-                        .record_audit(&AuditRow {
-                            // A refusal must not mask a later accepted audit
-                            // when the caller retries with this request id.
-                            request_id: format!("{}:denied", exec.request_id),
-                            guild_id: exec.guild_id.clone(),
-                            actor_id: exec.actor.user_id.clone(),
-                            action: exec.action.action_name(),
-                            target_id: exec.target.as_ref().map(|target| target.user_id.clone()),
-                            reason: "Member moderation policy refused the request".to_owned(),
-                            outcome: "denied",
-                            idempotency_key: exec.idempotency_key.clone(),
-                            metadata_json: serde_json::json!({
-                                "stage": "policy",
-                                "request_id": exec.request_id,
-                            })
-                            .to_string(),
-                        })
-                        .await?;
-                    return Err(err);
-                }
-                Err(err) => return Err(err),
-            };
-            let hash = request_hash(
-                validated.action,
-                &exec.guild_id,
-                exec.target.as_ref().map(|t| t.user_id.as_str()),
-                &validated.reason,
-                validated.duration_seconds,
-            );
+            self.execute_with_authority(exec, || async {
+                Ok(MemberAuthority {
+                    actor: exec.actor.clone(),
+                    target: exec.target.clone(),
+                    bot_highest_role_position: exec.bot_highest_role_position,
+                })
+            })
+            .await
+        }
+    }
+
+    /// Resolve and validate current authority after the ban/tempban lane wait,
+    /// before claiming or preparing an effect. Other verbs resolve immediately
+    /// before the same validation/claim boundary. The resolver must use complete,
+    /// identity-bound current facts, not interaction snapshots. This closes the
+    /// local queue-wait window, not races with a later Discord-side role change.
+    ///
+    /// A failed read never releases a key: it proves nothing about an earlier
+    /// unknown dispatch. Existing callers of `execute` supply their own facts;
+    /// network-facing adapters should use this resolver boundary instead.
+    pub fn execute_with_authority<'a, R, RFut>(
+        &'a self,
+        exec: &'a MemberExecution,
+        refresh: R,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<MemberResult, MemberError>> + Send + 'a>>
+    where
+        R: FnOnce() -> RFut + Send + 'a,
+        RFut: Future<Output = Result<MemberAuthority, MemberError>> + Send + 'a,
+    {
+        // Erase the resolver future to preserve Send across generic lane
+        // callbacks and the runtime's detached interaction tasks.
+        Box::pin(async move {
             if matches!(
-                validated.action,
+                exec.action,
                 ModerationAction::Ban | ModerationAction::TempBan
             ) {
                 let target_id = exec
@@ -977,13 +1026,124 @@ where
                     .unwrap_or("");
                 self.store
                     .serialize_member(&exec.guild_id, target_id, || {
-                        self.execute_claimed(exec, &validated, &hash)
+                        self.execute_refreshed(exec, refresh)
                     })
                     .await
             } else {
-                self.execute_claimed(exec, &validated, &hash).await
+                self.execute_refreshed(exec, refresh).await
             }
-        }
+        })
+    }
+
+    async fn execute_refreshed<R, RFut>(
+        &self,
+        exec: &MemberExecution,
+        refresh: R,
+    ) -> Result<MemberResult, MemberError>
+    where
+        R: FnOnce() -> RFut + Send,
+        RFut: Future<Output = Result<MemberAuthority, MemberError>> + Send,
+    {
+        let authority = match refresh().await {
+            Ok(authority)
+                if authority.actor.user_id == exec.actor.user_id
+                    && authority.target.as_ref().map(|t| &t.user_id)
+                        == exec.target.as_ref().map(|t| &t.user_id) =>
+            {
+                authority
+            }
+            Ok(_) => {
+                self.audit_refused(exec, "authority").await?;
+                return Err(MemberError::AuthorityUnavailable);
+            }
+            Err(MemberError::TargetNotMember) => {
+                // A completed removal is the expected end state of a kick, so
+                // its redelivery must replay, not refuse. Only a stored,
+                // hash-matching `done` row does; anything else still refuses.
+                if let Some(replayed) = self.completed_replay(exec).await? {
+                    return Ok(replayed);
+                }
+                self.audit_refused(exec, "authority").await?;
+                return Err(MemberError::TargetNotMember);
+            }
+            Err(err) => {
+                self.audit_refused(exec, "authority").await?;
+                return Err(err);
+            }
+        };
+        let current = MemberExecution {
+            actor: authority.actor,
+            target: authority.target,
+            bot_highest_role_position: authority.bot_highest_role_position,
+            ..exec.clone()
+        };
+        let validated = match self.validate(&current) {
+            Ok(validated) => validated,
+            Err(err @ MemberError::Policy(_)) => {
+                self.audit_refused(exec, "policy").await?;
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+        };
+        let hash = request_hash(
+            validated.action,
+            &current.guild_id,
+            current.target.as_ref().map(|t| t.user_id.as_str()),
+            &validated.reason,
+            validated.duration_seconds,
+        );
+        self.execute_claimed(&current, &validated, &hash).await
+    }
+
+    /// Nonmutating replay of a completed request whose target has since left
+    /// the guild. Reads the existing row only: no claim, release, audit or
+    /// Discord call, and an invalid request cannot have a stored row.
+    async fn completed_replay(
+        &self,
+        exec: &MemberExecution,
+    ) -> Result<Option<MemberResult>, MemberError> {
+        let Ok(validated) =
+            validate_request_content(exec.action, &exec.reason, exec.duration_seconds)
+        else {
+            return Ok(None);
+        };
+        let hash = request_hash(
+            validated.action,
+            &exec.guild_id,
+            exec.target.as_ref().map(|t| t.user_id.as_str()),
+            &validated.reason,
+            validated.duration_seconds,
+        );
+        let Some(outcome) = self
+            .store
+            .completed_outcome(&exec.guild_id, &exec.idempotency_key, &hash)
+            .await?
+        else {
+            return Ok(None);
+        };
+        replayed_result(&outcome).map(Some)
+    }
+
+    async fn audit_refused(&self, exec: &MemberExecution, stage: &str) -> Result<(), MemberError> {
+        self.store
+            .record_audit(&AuditRow {
+                // A refusal must not mask a later accepted audit on retry.
+                request_id: format!("{}:denied", exec.request_id),
+                guild_id: exec.guild_id.clone(),
+                actor_id: exec.actor.user_id.clone(),
+                action: exec.action.action_name(),
+                target_id: exec.target.as_ref().map(|target| target.user_id.clone()),
+                reason: "Member moderation policy refused the request".to_owned(),
+                outcome: "denied",
+                idempotency_key: exec.idempotency_key.clone(),
+                metadata_json: serde_json::json!({
+                    "stage": stage,
+                    "request_id": exec.request_id,
+                })
+                .to_string(),
+            })
+            .await?;
+        Ok(())
     }
 
     /// Fire at most 25 due expiries for the owning guild. Claim immediately
@@ -1052,15 +1212,7 @@ where
             )
             .await?
         {
-            ClaimState::Replayed { outcome } => {
-                let outcome = MemberOutcome::from_stored(&outcome).ok_or(MemberError::Store(
-                    StoreError::new(format!("stored unknown outcome: {outcome}")),
-                ))?;
-                return Ok(MemberResult {
-                    outcome,
-                    replayed: true,
-                });
-            }
+            ClaimState::Replayed { outcome } => return replayed_result(&outcome),
             ClaimState::InFlight => return Err(MemberError::InFlight),
             ClaimState::Mismatch => return Err(MemberError::KeyMismatch),
             ClaimState::Claimed => {}
@@ -1683,6 +1835,20 @@ impl MemberModerationStore for MemMemberStore {
             },
         );
         Ok(ClaimState::Claimed)
+    }
+
+    async fn completed_outcome(
+        &self,
+        guild_id: &str,
+        idempotency_key: &str,
+        request_hash: &str,
+    ) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .lock()
+            .idempotency
+            .get(&(guild_id.to_owned(), idempotency_key.to_owned()))
+            .filter(|row| row.state == IdemState::Done && row.hash == request_hash)
+            .map(|row| row.outcome.clone().unwrap_or_else(|| "unknown".to_owned())))
     }
 
     async fn complete(
@@ -3971,6 +4137,17 @@ mod tests {
         ) -> Result<ClaimState, StoreError> {
             self.inner
                 .claim(guild_id, idempotency_key, action, request_hash, claimed_at)
+                .await
+        }
+
+        async fn completed_outcome(
+            &self,
+            guild_id: &str,
+            idempotency_key: &str,
+            request_hash: &str,
+        ) -> Result<Option<String>, StoreError> {
+            self.inner
+                .completed_outcome(guild_id, idempotency_key, request_hash)
                 .await
         }
 

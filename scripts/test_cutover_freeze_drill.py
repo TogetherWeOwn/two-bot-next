@@ -1,5 +1,6 @@
 """Offline cutover freeze-drill harness checks; stdlib only, no network access."""
 
+import copy
 import http.server
 import io
 import json
@@ -101,6 +102,120 @@ class DrillTests(unittest.TestCase):
         self.assertEqual(call.state["notices"], {})
         self.assertEqual(call.state["channel"]["rate_limit_per_user"], 0)
         self.assertEqual(call.state["channel"]["permission_overwrites"], [])
+
+    def test_notice_ack_without_creation_fails_post_and_attempts_cleanup(self):
+        inner = drill.mock_transport()
+        events = []
+        notice_id = "uncreated-notice-sentinel"
+
+        def call(op, **kw):
+            events.append((op, kw))
+            if op == "post_notice":
+                return {"id": notice_id}
+            return inner(op, **kw)
+
+        result = drill.run_drill(STAGING_GUILD, "mock-drill-channel", REASON, call)
+        self.assertEqual(result["result"], "fail")
+        failed = [s["name"] for s in result["steps"] if s["result"] == "fail"]
+        self.assertEqual(failed, ["freeze-notice-post"])
+        self.assertEqual([op for op, _ in events[:3]],
+                         ["get_channel", "post_notice", "get_notice"])
+        self.assertIn(("delete_notice", {"channel_id": "mock-drill-channel",
+                                        "notice_id": notice_id}), events)
+        self.assertNotIn(notice_id, json.dumps(result))
+        self.assertEqual(inner.state["notices"], {})
+        self.assertEqual(inner.state["channel"], drill.mock_channel())
+
+    def test_notice_presence_must_match_exact_identity_and_survive_read_failure(self):
+        for reply in (None, [], {}, {"code": 10008},
+                      {"id": "wrong-notice-sentinel", "channel_id": "mock-drill-channel"},
+                      {"id": "900000000000000001", "channel_id": "wrong-channel-sentinel"}):
+            with self.subTest(reply=reply):
+                inner = drill.mock_transport()
+                events = []
+                first_read = True
+
+                def call(op, **kw):
+                    nonlocal first_read
+                    events.append((op, kw))
+                    if op == "get_notice" and first_read:
+                        first_read = False
+                        if reply is None:
+                            raise drill.DrillError("discord answered 503 on GET")
+                        return reply
+                    return inner(op, **kw)
+
+                result = drill.run_drill(STAGING_GUILD, "mock-drill-channel", REASON, call)
+                self.assertEqual(result["result"], "fail")
+                self.assertEqual([s["name"] for s in result["steps"] if s["result"] == "fail"],
+                                 ["freeze-notice-post"])
+                posted_id = next(kw["notice_id"] for op, kw in events if op == "get_notice")
+                self.assertIn(("delete_notice", {"channel_id": "mock-drill-channel",
+                                                "notice_id": posted_id}), events)
+                self.assertEqual(inner.state["notices"], {})
+                self.assertEqual(inner.state["channel"], drill.mock_channel())
+                blob = json.dumps(drill.evidence_shape(result, drill.MOCK_TRANSPORT, "test"))
+                for forbidden in (TOKEN, posted_id, "wrong-notice-sentinel", "wrong-channel-sentinel"):
+                    self.assertNotIn(forbidden, blob)
+
+    def test_each_channel_readback_checks_identity_at_its_own_step(self):
+        steps = ("baseline-read", "slowmode-on", "lockdown", "slowmode-restore",
+                 "unlock-restore", "restore-verify")
+        for target, step in enumerate(steps, start=1):
+            for changes in ({"guild_id": OTHER_GUILD}, {"guild_id": None},
+                            {"id": "wrong-channel-sentinel"}, {"id": None}):
+                with self.subTest(step=step, changes=changes):
+                    inner = drill.mock_transport()
+                    reads = 0
+                    events = []
+
+                    def call(op, **kw):
+                        nonlocal reads
+                        events.append(op)
+                        result = inner(op, **kw)
+                        if op == "get_channel":
+                            reads += 1
+                            if reads == target:
+                                return {**result, **changes}
+                        return result
+
+                    result = drill.run_drill(STAGING_GUILD, "mock-drill-channel", REASON, call)
+                    self.assertEqual(result["result"], "fail")
+                    self.assertEqual([s["name"] for s in result["steps"] if s["result"] == "fail"],
+                                     [step])
+                    if target == 1:
+                        self.assertEqual(events, ["get_channel"])
+                    else:
+                        self.assertIn("restore-notice-delete", [s["name"] for s in result["steps"]])
+                    self.assertEqual(inner.state["channel"], drill.mock_channel())
+                    self.assertEqual(inner.state["notices"], {})
+                    self.assertNotIn("wrong-channel-sentinel", json.dumps(result))
+
+    def test_each_restore_readback_refuses_malformed_semantics_at_its_own_step(self):
+        cases = ((4, "slowmode-restore", {"rate_limit_per_user": "broken"}),
+                 (5, "unlock-restore", {"permission_overwrites": [
+                     {"id": STAGING_GUILD, "type": 0, "allow": "broken", "deny": "0"}]}),
+                 (6, "restore-verify", {"rate_limit_per_user": "broken"}))
+        for target, step, changes in cases:
+            with self.subTest(step=step):
+                inner = drill.mock_transport()
+                reads = 0
+
+                def call(op, **kw):
+                    nonlocal reads
+                    result = inner(op, **kw)
+                    if op == "get_channel":
+                        reads += 1
+                        if reads == target:
+                            return {**result, **changes}
+                    return result
+
+                result = drill.run_drill(STAGING_GUILD, "mock-drill-channel", REASON, call)
+                self.assertEqual(result["result"], "fail")
+                self.assertEqual([s["name"] for s in result["steps"] if s["result"] == "fail"],
+                                 [step])
+                self.assertEqual(inner.state["channel"], drill.mock_channel())
+                self.assertEqual(inner.state["notices"], {})
 
     def test_foreign_role_overwrite_is_skipped(self):
         channel = {"id": "chan", "guild_id": STAGING_GUILD,
@@ -219,6 +334,8 @@ def discord_routes(overrides):
         ("PUT", OVERWRITE_PATH): (204, {}, b""),
         ("DELETE", OVERWRITE_PATH): (204, {}, b""),
         ("DELETE", NOTICE_PATH): (204, {}, b""),
+        ("GET", NOTICE_PATH): (404, {}, json.dumps(
+            {"code": 10008, "message": "Unknown Message"}).encode()),
         ("GET", COMMANDS_PATH): (200, {}, json.dumps([{"id": "1", "name": "ping"}]).encode()),
     }
     routes.update(overrides)
@@ -226,21 +343,37 @@ def discord_routes(overrides):
 
 
 class LoopbackDiscord:
-    """127.0.0.1 stand-in for Discord: canned replies per (method, path), every hit recorded."""
+    """127.0.0.1 stand-in for Discord: stateful channel/notice, canned commands.
+
+    Acknowledged channel and notice writes apply to `channel`/`notices` so the
+    harness's independent GET readbacks observe them; an explicit override in
+    `routes` still wins so malformed-reply cases keep their canned bodies.
+    Every hit is recorded with its Authorization header.
+    """
 
     def __init__(self):
         self.routes = {}
         self.hits = []
+        self.channel = copy.deepcopy(CHANNEL_JSON)
+        self.notices = {}
+        self._defaults = discord_routes({})
         fixture = self
 
         class Handler(BaseHTTPRequestHandler):
             def serve(self):
                 length = int(self.headers.get("Content-Length") or 0)
-                if length:
-                    self.rfile.read(length)
+                raw = self.rfile.read(length) if length else b""
+                try:
+                    payload = json.loads(raw) if raw else None
+                except (ValueError, RecursionError):
+                    payload = None
                 fixture.hits.append((self.command, self.path, self.headers.get("Authorization")))
-                status, headers, body = fixture.routes.get(
-                    (self.command, self.path), (404, {}, b""))
+                key = (self.command, self.path)
+                override = fixture.routes.get(key)
+                if override is not None and override != fixture._defaults.get(key):
+                    status, headers, body = override
+                else:
+                    status, headers, body = fixture.stateful(key, payload)
                 self.send_response(status)
                 for name, value in headers.items():
                     self.send_header(name, value)
@@ -256,6 +389,43 @@ class LoopbackDiscord:
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def stateful(self, key, payload):
+        """Apply acknowledged writes; GETs observe the current fixture state."""
+        method, path = key
+        if key == ("GET", CHANNEL_PATH):
+            return 200, {}, json.dumps(self.channel).encode()
+        if key == ("PATCH", CHANNEL_PATH):
+            seconds = (payload or {}).get("rate_limit_per_user")
+            if isinstance(seconds, int):
+                self.channel["rate_limit_per_user"] = seconds
+            return 200, {}, json.dumps(self.channel).encode()
+        if key == ("PUT", OVERWRITE_PATH):
+            rows = [r for r in self.channel["permission_overwrites"]
+                    if r.get("id") != STAGING_GUILD]
+            rows.append({"id": STAGING_GUILD, "type": 0,
+                         "allow": (payload or {}).get("allow", "0"),
+                         "deny": (payload or {}).get("deny", "0")})
+            self.channel["permission_overwrites"] = rows
+            return 204, {}, b""
+        if key == ("DELETE", OVERWRITE_PATH):
+            self.channel["permission_overwrites"] = [
+                r for r in self.channel["permission_overwrites"]
+                if r.get("id") != STAGING_GUILD]
+            return 204, {}, b""
+        if key == ("POST", MESSAGES_PATH):
+            self.notices[NOTICE_ID] = {"id": NOTICE_ID, "channel_id": CHANNEL}
+            return 200, {}, json.dumps({"id": NOTICE_ID}).encode()
+        if key == ("DELETE", NOTICE_PATH):
+            self.notices.pop(NOTICE_ID, None)
+            return 204, {}, b""
+        if key == ("GET", NOTICE_PATH):
+            if NOTICE_ID in self.notices:
+                return 200, {}, json.dumps(self.notices[NOTICE_ID]).encode()
+            return self._defaults[("GET", NOTICE_PATH)]
+        if key in self.routes:
+            return self.routes[key]
+        return 404, {}, b""
 
     def close(self):
         self.server.shutdown()

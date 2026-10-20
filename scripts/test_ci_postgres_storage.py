@@ -166,8 +166,14 @@ class PostgresStorageTests(unittest.TestCase):
         # Nextest retains the larger budget. Compare its complete safety logic
         # too, and execute every copy in the behavioral tests below.
         self.assertEqual(len(NEXTEST_VERIFY_TAILS), 1)
+        nextest_max, nextest_min = WAL_BUDGETS["nextest"]
+        normalized_nextest = (
+            NEXTEST_SCRIPT.replace(
+                f"'max_wal_size': '{nextest_max}'", "'max_wal_size': '512MB'"
+            ).replace(f"'min_wal_size': '{nextest_min}'", "'min_wal_size': '64MB'")
+        )
         self.assertEqual(
-            NEXTEST_SCRIPT, scripts[0],
+            normalized_nextest, scripts[0],
             "the nextest verify probe drifted from the executed reference",
         )
 

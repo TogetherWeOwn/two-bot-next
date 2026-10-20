@@ -103,6 +103,25 @@ the Join channel. The join-request flow is in
   the room, a bot-member allow for exactly the missing bits is written first.
   `/public` removes only the Connect deny; an explicit @everyone Connect allow
   that `/private` stripped is not re-added.
+- **Snapshot fence.** Privacy bot/@everyone writes and approved-member grant/revoke
+  writes use the connection generation and the full, known permission-overwrite
+  snapshot they were planned from. Unknown overwrites are not an empty ACL. Each
+  transport guard rechecks readiness, generation, channel existence, the exact
+  overwrite set (order-independent) and the bot's View Channel + Manage Roles
+  permissions, including after REST backoff. A queued action plans from current
+  evidence at dispatch; a plan made stale during an await is refused rather than
+  sent over a newer observation. Retries plan again, preserving unrelated bits.
+  After a successful PUT or DELETE, local projection accepts only the expected
+  prior snapshot or the matching own-write gateway echo. Newer ACLs, deletion,
+  reconnect or observed permission loss stop the sequence: no next overwrite,
+  member move, privacy flag flip or Join-channel follow-up is justified by that
+  response. A landed grant keeps its durable witness even when projection is
+  refused; a stale/unknown revoke does not retire one. This does not change the
+  existing witness acquisition/retirement policy.
+  Discord provides no atomic compare-and-swap for these whole-entry writes:
+  changes after the last guard check may still race the transport, and gateway
+  observations may lag. The fence protects observed evidence and local cache
+  projection, not an upstream atomic transaction or exactly-once effects.
 - **The Join channel.** Created once in the room's category, directly after the
   room, with no overwrites (it syncs to the category). A retry after an unknown
   outcome adopts the channel the live snapshot shows instead of creating a second
@@ -183,8 +202,14 @@ the Join channel. The join-request flow is in
   is an access obligation, not proof of a new grant: an earlier PUT may have
   landed even if a retry returns AccessDenied, cancellation or another
   definitive refusal. Unknown grant outcomes retain the row through those
-  refusals and across restart hydration. A successful grant followed by a
-  failed move also retains it. A retained row can conservatively represent an
+  refusals and across restart hydration. When overwrite evidence is unknown,
+  the worker reads the existing grant witnesses: only confirmed absence for
+  this room and member releases the in-memory claim. A witness keeps the claim
+  and retries; a failed read also keeps it, using the normal persistence retry
+  or credential-refusal halt. The queue's attempt count is not evidence of
+  witness absence: a 429 from the PUT or the following move requeues without
+  consuming attempts. A successful grant followed by a failed move also
+  retains the witness. A retained row can conservatively represent an
   unsent earlier attempt; do not infer ownership from arbitrary Connect allows.
   `/public` still clears only the witnessed Connect allow, preserving unrelated
   member allow/deny bits and vote-kick denies. Refused or uncertain revocation
@@ -209,6 +234,8 @@ parity or staging readiness.
 cargo fmt --all -- --check
 python3 scripts/cargo_cache.py run -- check -p two-bot-core
 python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_private
+python3 scripts/cargo_cache.py run -- test -p two-bot fence_
+python3 scripts/cargo_cache.py run -- test -p two-bot overwrite_snapshot
 ```
 
 The acceptance fixture covers naming, both privacy toggles, Join-channel
@@ -217,3 +244,11 @@ deletion, invalid states, request-ID exhaustion, and property tests for the two
 rules: no sequence grants Connect to a blocked member, and a public room never
 has a Join channel. No tests in this fixture use a database, Redis, Discord, or
 a staging identity.
+
+The separate runtime snapshot acceptance module
+(`crates/bot/src/voice_snapshot_fence_acceptance_tests.rs`) records fake transport
+calls and cached masks while injecting overwrite edits, deletion, reconnect,
+permission loss and matching own echoes during writes. The supplemental
+`voice_overwrite_snapshot_tests.rs` exercises stale guards before transport and
+conditional projection directly. These are hermetic runtime tests, not evidence
+of production installation.

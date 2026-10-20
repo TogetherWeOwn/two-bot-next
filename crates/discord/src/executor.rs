@@ -59,7 +59,8 @@ use twilight_model::id::Id;
 use two_bot_core::{
     backoff_ms, classify_kick_status, pace_wait_ms, parse_retry_after_secs, plan_purge,
     retry_after_ms, retry_after_ms_unclamped, utf16_len, ActionOutcome, KickOutcome, KickResult,
-    KickStatus, ModerationExecution, MAX_HTTP_TRIES, MAX_RETRY_AFTER_MS, SEND_MESSAGES_BIT,
+    KickStatus, ModerationExecution, PurgeReport, PurgeStopReason, MAX_HTTP_TRIES,
+    MAX_RETRY_AFTER_MS, SEND_MESSAGES_BIT,
 };
 
 /// Minimum gap between paced requests, ms (legacy `rest.ts` default).
@@ -1616,7 +1617,8 @@ impl ActionExecutor {
         let reason = audit_reason(reason)?;
         let until = until_iso
             .map(|s| {
-                Timestamp::parse(s).map_err(|e| DiscordError::Rejected(format!("bad until: {e}")))
+                Timestamp::parse(&normalize_timeout_until(s))
+                    .map_err(|e| DiscordError::Rejected(format!("bad until: {e}")))
             })
             .transpose()?;
         let req = Self::request_of(
@@ -2493,14 +2495,14 @@ impl ActionExecutor {
     }
 
     /// Purge: list, then `POST .../bulk-delete` for recent messages and one
-    /// `DELETE` per older or lone message (legacy `ModerationDiscord::purge`
-    /// returns the affected count).
+    /// `DELETE` per older or lone message. Report the confirmed count and any
+    /// definitive refusal that stopped a later delete.
     pub async fn purge(
         &self,
         channel_id: &str,
         count: u64,
         reason: &str,
-    ) -> Result<u64, DiscordError> {
+    ) -> Result<PurgeReport, DiscordError> {
         // Keep reason validation before any I/O for the combined public call.
         audit_reason(reason)?;
         let ids = self.list_purge_messages(channel_id, count).await?;
@@ -2509,18 +2511,20 @@ impl ActionExecutor {
 
     /// Read-only purge phase. Even a timeout here proves no deletion was sent.
     /// Pinned messages and this bot's own posts (ticket, sticky and LFG panels)
-    /// are listed but never returned for deletion. The bot identity is read only
-    /// when a listed message was authored by some bot.
+    /// are listed but never returned for deletion. The bot identity is read unless
+    /// every listed message is explicitly marked as authored by a non-bot.
     pub(crate) async fn list_purge_messages(
         &self,
         channel_id: &str,
         count: u64,
     ) -> Result<Vec<Id<MessageMarker>>, DiscordError> {
+        if !(1..=100).contains(&count) {
+            return Err(DiscordError::Rejected(format!(
+                "purge out of range: {count}"
+            )));
+        }
         let channel: Id<ChannelMarker> = snowflake(channel_id)?;
-        let limit: u16 = count
-            .clamp(1, 100)
-            .try_into()
-            .map_err(|_| DiscordError::Rejected(format!("purge out of range: {count}")))?;
+        let limit = count as u16;
         let list_req = Self::request_of(self.inner.factory.channel_messages(channel).limit(limit))?;
         let res = self.call_once_raw(list_req, &[200]).await?;
         let unreadable =
@@ -2537,10 +2541,10 @@ impl ActionExecutor {
             }
             rows.push((id, row));
         }
-        let any_bot = rows
+        let needs_own_id = rows
             .iter()
-            .any(|(_, row)| row["author"]["bot"].as_bool() == Some(true));
-        let own_id = if any_bot {
+            .any(|(_, row)| row["author"]["bot"].as_bool() != Some(false));
+        let own_id = if needs_own_id {
             Some(self.current_bot_user_id().await?.to_string())
         } else {
             None
@@ -2556,14 +2560,14 @@ impl ActionExecutor {
     /// older ones, which make the whole bulk call fail with a 400, are deleted
     /// singly. Uncertain wire failures must retain caller fences. Once some
     /// message is gone, a failure that proves only the failing call had no
-    /// effect stops the purge and reports the count deleted so far; it must not
-    /// claim that no mutation was accepted.
+    /// effect stops the purge and reports the count deleted so far and why it
+    /// stopped; it must not claim that no mutation was accepted.
     pub(crate) async fn purge_messages(
         &self,
         channel_id: &str,
         ids: &[Id<MessageMarker>],
         reason: &str,
-    ) -> Result<u64, DiscordError> {
+    ) -> Result<PurgeReport, DiscordError> {
         let channel: Id<ChannelMarker> = snowflake(channel_id)?;
         let reason = audit_reason(reason)?;
         let raw: Vec<u64> = ids.iter().map(|id| id.get()).collect();
@@ -2593,10 +2597,21 @@ impl ActionExecutor {
                 Err(error @ (DiscordError::Timeout | DiscordError::Unavailable(_))) => {
                     return Err(error)
                 }
-                Err(_) => break,
+                Err(error) => {
+                    return Ok(PurgeReport {
+                        affected: deleted,
+                        stop_reason: Some(match error {
+                            DiscordError::RateLimited => PurgeStopReason::RateLimited,
+                            _ => PurgeStopReason::Refused,
+                        }),
+                    });
+                }
             }
         }
-        Ok(deleted)
+        Ok(PurgeReport {
+            affected: deleted,
+            stop_reason: None,
+        })
     }
 
     /// One purge delete. A 404 means the message vanished after the listing, so
@@ -3071,9 +3086,13 @@ impl ActionExecutor {
                 channel_id,
                 count,
                 reason,
-            } => Ok(ChannelCallOutcome::Purged {
-                affected: self.purge(channel_id, *count, reason).await?,
-            }),
+            } => {
+                let report = self.purge(channel_id, *count, reason).await?;
+                Ok(ChannelCallOutcome::Purged {
+                    affected: report.affected,
+                    stop_reason: report.stop_reason,
+                })
+            }
             ChannelCall::Slowmode {
                 channel_id,
                 seconds,
@@ -3713,12 +3732,14 @@ impl ActionExecutor {
                 self.unban(&exec.guild_id, user_id, &exec.reason).await?;
             }
             ActionOutcome::Purged { channel_id, .. } => {
-                let count = exec.count.unwrap_or(0);
-                let affected = self.purge(channel_id, count, &exec.reason).await?;
+                let count = exec
+                    .count
+                    .ok_or_else(|| DiscordError::Rejected("purge count required".into()))?;
+                let report = self.purge(channel_id, count, &exec.reason).await?;
                 return Ok(ActionOutcome::Purged {
                     channel_id: channel_id.clone(),
-                    // `purge` counts listed ids (≤100 by clamp); always fits.
-                    affected: affected as usize,
+                    // `purge` counts listed ids (≤100 by validated limit); always fits.
+                    affected: report.affected as usize,
                 });
             }
             ActionOutcome::SlowmodeUpdated {
@@ -3767,11 +3788,16 @@ impl ActionExecutor {
 /// Channel-verb outcome (affected counts for purge/post).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChannelCallOutcome {
-    Purged { affected: u64 },
+    Purged {
+        affected: u64,
+        stop_reason: Option<PurgeStopReason>,
+    },
     SlowmodeUpdated,
     OverwriteWritten,
     OverwriteDeleted,
-    Posted { message_id: String },
+    Posted {
+        message_id: String,
+    },
     MessageDeleted,
 }
 
@@ -3910,6 +3936,19 @@ fn audit_reason(reason: &str) -> Result<String, DiscordError> {
         )));
     }
     Ok(trimmed.to_owned())
+}
+
+/// Normalize service UTC expiries for pinned Twilight, which rejects short
+/// `Z` timestamps. Offset-bearing inputs keep their existing representation.
+pub(crate) fn normalize_timeout_until(until_iso: &str) -> String {
+    if let Some(core) = until_iso.strip_suffix(['Z', 'z']) {
+        let base = core
+            .split_once('.')
+            .map_or(core, |(date_time, _)| date_time);
+        format!("{base}+00:00")
+    } else {
+        until_iso.to_owned()
+    }
 }
 
 /// `timeout` until timestamp: now + duration, RFC 3339 (legacy
