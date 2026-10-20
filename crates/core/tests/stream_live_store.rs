@@ -65,6 +65,7 @@ fn live_test_options_require_the_approved_container() {
         "postgres://agent_test:@agent-testdb.production.example/agent_test",
         "postgres://agent_test:@localhost/agent_test",
         "postgres://agent_test:@127.0.0.1/agent_test",
+        "postgres://agent_test:@agent-testdb:5433/agent_test",
         "postgres://agent_test:@agent-testdb/agent_test?host=/var/run/postgresql",
         "postgres://agent_test:@agent-testdb/agent_test?port=5433",
         "postgres://agent_test:@agent-testdb/agent_test?sslmode=disable",
