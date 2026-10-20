@@ -154,6 +154,7 @@ impl BoundEventsubReceiver {
             (Ok(Err(error)), _) => Err(error),
             _ => {
                 tracing::error!(
+                    event = "eventsub_receiver",
                     msg = "eventsub_receiver_drain_deadline",
                     "receiver shutdown deadline exhausted; unfinished delivery claims remain fenced"
                 );
@@ -175,6 +176,7 @@ impl BoundEventsubReceiver {
             while let Some(result) = children.join_next().await {
                 if let Err(error) = result {
                     tracing::warn!(
+                        event = "eventsub_receiver",
                         msg = "eventsub_delivery_child_failed",
                         panicked = error.is_panic(),
                         cancelled = error.is_cancelled(),
@@ -192,6 +194,7 @@ impl BoundEventsubReceiver {
                 // than abort them; their durable started claims remain fenced.
                 children.detach_all();
                 tracing::error!(
+                    event = "eventsub_receiver",
                     msg = "eventsub_receiver_drain_deadline",
                     pending = pending,
                     "receiver shutdown deadline exhausted with delivery children unfinished"
@@ -369,6 +372,7 @@ async fn handle_notification(
         while let Some(result) = children.try_join_next() {
             if let Err(error) = result {
                 tracing::warn!(
+                    event = "eventsub_receiver",
                     msg = "eventsub_delivery_child_failed",
                     panicked = error.is_panic(),
                     cancelled = error.is_cancelled(),
