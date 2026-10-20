@@ -217,6 +217,8 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
     require(isinstance(image_entries[0], dict),
             "docker image inspect entry must be a JSON object")
     metadata = image_entries[0]
+    require("Id" in metadata, "docker image inspect entry has no Id")
+    require("Size" in metadata, "docker image inspect entry has no Size")
     # Resolve the tag once; measurement and every image probe use this ID.
     image = metadata["Id"]
     report(f"Docker storage-driver Size (diagnostic only): {metadata['Size']} bytes")
@@ -281,6 +283,7 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
                     break
                 require(time.monotonic() < deadline, "/health did not return 200 within 30s")
                 state = inspect_state(name)
+                require("Running" in state, "docker inspect State has no Running")
                 require(state["Running"], "container exited before becoming healthy")
                 time.sleep(0.25)
             code, body = http_response(url + "/readyz")
@@ -317,6 +320,7 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
             deadline = time.monotonic() + 30
             while True:
                 state = inspect_state(name)
+                require("Running" in state, "docker inspect State has no Running")
                 require(state["Running"], "container exited during healthcheck")
                 health = state.get("Health")
                 require(isinstance(health, dict), "docker inspect entry has no Health")
@@ -348,6 +352,8 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
             require(elapsed <= 10, f"SIGTERM took {elapsed:.3f}s (maximum 10s)")
             require(result.stdout.strip() == "0", f"SIGTERM exit code was {result.stdout.strip()}, expected 0")
             state = inspect_state(name)
+            require("Running" in state, "docker inspect State has no Running")
+            require("OOMKilled" in state, "docker inspect State has no OOMKilled")
             require(not state["Running"] and not state["OOMKilled"], "container failed to shut down cleanly")
             report(f"PASS SIGTERM exits 0 in {elapsed:.3f}s (maximum 10s); no OOM")
         except CleanupFailure:
