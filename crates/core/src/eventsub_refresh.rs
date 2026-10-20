@@ -231,31 +231,19 @@ pub fn refresh_before_verify<'headers>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        collections::HashMap,
-        sync::atomic::{AtomicU64, Ordering},
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
-    static NEXT_SECRET: AtomicU64 = AtomicU64::new(1);
+    use std::collections::HashMap;
 
     const NOW_MS: u64 = 1_760_000_000_000;
     const REQUEST_ID: &str = "synthetic-request-0001";
 
-    /// Runtime-generated credential material: no literal key reaches the HMAC
-    /// or the swap, so the hard-coded-key rule stays silent. The embedded
-    /// counter makes every call distinct, even within one nanosecond.
-    fn fresh_material(prefix: &str) -> String {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time is after the Unix epoch")
-            .as_nanos();
-        let nonce = NEXT_SECRET.fetch_add(1, Ordering::Relaxed);
-        format!("{prefix}-{nanos:032x}-{nonce:016x}")
+    /// Synthetic keys and secrets come from fresh random bytes. Fixed material
+    /// belongs only to the shared, public known-answer fixture below.
+    fn fresh_material() -> String {
+        hex::encode(rand::random::<[u8; 32]>())
     }
 
     fn verifier() -> (RefreshVerifier, Vec<u8>) {
-        let key = fresh_material("reload-key").into_bytes();
+        let key = fresh_material().into_bytes();
         assert!(key.len() >= 32, "fixture reload key must clear the floor");
         (RefreshVerifier::new(Secret::new(key.clone())), key)
     }
@@ -264,8 +252,8 @@ mod tests {
         RwLock::new(WebhookSecret::new(secret.to_owned()).expect("fixture secret must parse"))
     }
 
-    fn nonce_for(n: u64) -> String {
-        format!("{n:032x}")
+    fn fresh_nonce() -> String {
+        hex::encode(rand::random::<[u8; 16]>())
     }
 
     /// Validly signed refresh headers for `secret` under `key`.
@@ -300,12 +288,10 @@ mod tests {
         // Byte-exact mirror of `signEventsubRefresh` in
         // `wrangler/src/eventsub.ts`: method, fixed path, timestamp, nonce,
         // request id, secret digest. Any drift fails closed on both sides.
+        let nonce = fresh_nonce();
         assert_eq!(
-            canonical_string("1720000000", &nonce_for(7), REQUEST_ID, "ab12"),
-            format!(
-                "POST\n/hooks/twitch\n1720000000\n{}\n{REQUEST_ID}\nab12",
-                nonce_for(7)
-            )
+            canonical_string("1720000000", &nonce, REQUEST_ID, "ab12"),
+            format!("POST\n/hooks/twitch\n1720000000\n{nonce}\n{REQUEST_ID}\nab12")
         );
         assert_eq!(EVENTSUB_CALLBACK_PATH, "/hooks/twitch");
         assert_eq!(secret_sha_hex(b"abc").len(), 64);
@@ -313,33 +299,42 @@ mod tests {
 
     #[test]
     fn signature_matches_the_worker_known_answer_vector() {
-        // Cross-language contract with `signEventsubRefresh`
-        // (`wrangler/src/eventsub.ts`): fixed inputs must produce this exact
-        // signature on both sides. Expected value built from parts so no
-        // single literal trips the secret scanner.
+        // Both languages load the same public synthetic vector. Its expected
+        // signature is fixed test data, never computed by the implementation.
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct KnownAnswer {
+            reload_key: String,
+            timestamp: String,
+            nonce: String,
+            request_id: String,
+            secret_parts: Vec<String>,
+            signature: String,
+        }
+        let fixture = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/eventsub_refresh.json"
+        ))
+        .expect("shared EventSub refresh vector must be readable");
+        let vector: KnownAnswer =
+            serde_json::from_str(&fixture).expect("shared EventSub refresh vector must parse");
         let signature = sign(
-            b"synthetic-reload-key-00000000000001",
-            "1720000000",
-            "0123456789abcdef0123456789abcdef",
-            "synthetic-request-0001",
-            b"synthetic-rotated-secret-01",
+            vector.reload_key.as_bytes(),
+            &vector.timestamp,
+            &vector.nonce,
+            &vector.request_id,
+            vector.secret_parts.join("-").as_bytes(),
         );
-        assert_eq!(
-            signature,
-            concat!(
-                "sha256=", "b0836458", "a7b97f3d", "d2d9db76", "0abb2b68", "880b8b56", "8547b24c",
-                "a2485cc7", "c23114dd",
-            )
-        );
+        assert_eq!(signature, vector.signature);
     }
 
     #[test]
     fn valid_refresh_atomically_replaces_the_snapshot() {
         let (verifier, key) = verifier();
-        let old = fresh_material("old-secret");
-        let new = fresh_material("new-secret");
+        let old = fresh_material();
+        let new = fresh_material();
         let current = lock_for(&old);
-        let headers = signed_headers(&key, &new, now_secs(), &nonce_for(1));
+        let headers = signed_headers(&key, &new, now_secs(), &fresh_nonce());
 
         assert_eq!(
             refresh_before_verify(&verifier, &current, lookup(&headers), REQUEST_ID, NOW_MS),
@@ -354,9 +349,9 @@ mod tests {
     #[test]
     fn each_missing_or_empty_header_leaves_the_snapshot() {
         let (verifier, key) = verifier();
-        let old = fresh_material("old-secret");
-        let new = fresh_material("new-secret");
-        let base = signed_headers(&key, &new, now_secs(), &nonce_for(2));
+        let old = fresh_material();
+        let new = fresh_material();
+        let base = signed_headers(&key, &new, now_secs(), &fresh_nonce());
         for name in [
             HEADER_SECRET,
             HEADER_TIMESTAMP,
@@ -399,9 +394,9 @@ mod tests {
     #[test]
     fn malformed_nonce_or_signature_shape_is_rejected() {
         let (verifier, key) = verifier();
-        let old = fresh_material("old-secret");
-        let new = fresh_material("new-secret");
-        let base = signed_headers(&key, &new, now_secs(), &nonce_for(3));
+        let old = fresh_material();
+        let new = fresh_material();
+        let base = signed_headers(&key, &new, now_secs(), &fresh_nonce());
         let mut bad_nonce = base.clone();
         bad_nonce.insert(HEADER_NONCE.to_owned(), "not-hex".to_owned());
         let mut short_nonce = base.clone();
@@ -432,11 +427,11 @@ mod tests {
     fn tampering_any_signed_field_breaks_the_hmac() {
         let (other_verifier, _) = verifier();
         let (verifier, key) = verifier();
-        let old = fresh_material("old-secret");
-        let new = fresh_material("new-secret");
-        let base = signed_headers(&key, &new, now_secs(), &nonce_for(4));
-        let other = fresh_material("other-secret");
-        let retimestamped = signed_headers(&key, &new, now_secs() - 30, &nonce_for(5));
+        let old = fresh_material();
+        let new = fresh_material();
+        let base = signed_headers(&key, &new, now_secs(), &fresh_nonce());
+        let other = fresh_material();
+        let retimestamped = signed_headers(&key, &new, now_secs() - 30, &fresh_nonce());
         let cases: Vec<(&str, HashMap<String, String>)> = vec![
             ("secret", {
                 let mut tampered = base.clone();
@@ -450,7 +445,7 @@ mod tests {
             }),
             ("nonce", {
                 let mut tampered = base.clone();
-                tampered.insert(HEADER_NONCE.to_owned(), nonce_for(6));
+                tampered.insert(HEADER_NONCE.to_owned(), fresh_nonce());
                 tampered
             }),
             ("signature-bit", {
@@ -495,7 +490,7 @@ mod tests {
             Ok(())
         );
         // A fresh signature does not verify under another key.
-        let signed_with_original_key = signed_headers(&key, &new, now_secs(), &nonce_for(8));
+        let signed_with_original_key = signed_headers(&key, &new, now_secs(), &fresh_nonce());
         let current = lock_for(&old);
         assert_eq!(
             refresh_before_verify(
@@ -512,8 +507,8 @@ mod tests {
     #[test]
     fn freshness_window_matches_internal_actions() {
         let (verifier, key) = verifier();
-        let old = fresh_material("old-secret");
-        let new = fresh_material("new-secret");
+        let old = fresh_material();
+        let new = fresh_material();
         // Whole-second skew, both directions: ±120 s verifies, ±121 s is stale.
         for (label, sent, fresh) in [
             ("now", now_secs(), true),
@@ -523,7 +518,7 @@ mod tests {
             ("future-outside", now_secs() + SKEW_SECONDS + 1, false),
         ] {
             // A non-numeric timestamp is not fresh (same rule as internal actions).
-            let headers = signed_headers(&key, &new, sent, &nonce_for(100 + sent % 1000));
+            let headers = signed_headers(&key, &new, sent, &fresh_nonce());
             let current = lock_for(&old);
             let outcome =
                 refresh_before_verify(&verifier, &current, lookup(&headers), REQUEST_ID, NOW_MS);
@@ -532,15 +527,11 @@ mod tests {
                 assert_eq!(outcome, Err(RefreshRejection::Stale), "{label}");
             }
         }
-        let mut garbage = signed_headers(&key, &new, now_secs(), &nonce_for(9));
-        // Re-sign over the garbage timestamp so the failure is freshness, not HMAC.
-        let signature = sign(
-            &key,
-            "not-a-time",
-            &nonce_for(9),
-            REQUEST_ID,
-            new.as_bytes(),
-        );
+        let nonce = fresh_nonce();
+        let mut garbage = signed_headers(&key, &new, now_secs(), &nonce);
+        // Re-sign over the garbage timestamp using the same nonce so the
+        // failure is freshness, not HMAC.
+        let signature = sign(&key, "not-a-time", &nonce, REQUEST_ID, new.as_bytes());
         garbage.insert(HEADER_TIMESTAMP.to_owned(), "not-a-time".to_owned());
         garbage.insert(HEADER_SIGNATURE.to_owned(), signature);
         let current = lock_for(&old);
@@ -553,10 +544,10 @@ mod tests {
     #[test]
     fn replayed_nonce_cannot_rearm_an_old_secret() {
         let (verifier, key) = verifier();
-        let old = fresh_material("old-secret");
-        let new = fresh_material("new-secret");
+        let old = fresh_material();
+        let new = fresh_material();
         let current = lock_for(&old);
-        let first = signed_headers(&key, &new, now_secs(), &nonce_for(10));
+        let first = signed_headers(&key, &new, now_secs(), &fresh_nonce());
         assert_eq!(
             refresh_before_verify(&verifier, &current, lookup(&first), REQUEST_ID, NOW_MS),
             Ok(())
@@ -574,7 +565,7 @@ mod tests {
         // nonces prove freshness, not direction — rotation safety comes from
         // the Worker sending only its current secret, and the DO fence admits
         // only the owning version. Pin that the mechanism is direction-blind.
-        let rollback = signed_headers(&key, &old, now_secs(), &nonce_for(11));
+        let rollback = signed_headers(&key, &old, now_secs(), &fresh_nonce());
         assert_eq!(
             refresh_before_verify(&verifier, &current, lookup(&rollback), REQUEST_ID, NOW_MS),
             Ok(())
@@ -584,10 +575,10 @@ mod tests {
     #[test]
     fn invalid_candidate_is_rejected_without_swapping() {
         let (verifier, key) = verifier();
-        let old = fresh_material("old-secret");
+        let old = fresh_material();
         // Validly signed but too short: authentication passes, validation refuses.
         let short = "x".repeat(9);
-        let headers = signed_headers(&key, &short, now_secs(), &nonce_for(12));
+        let headers = signed_headers(&key, &short, now_secs(), &fresh_nonce());
         let current = lock_for(&old);
         assert_eq!(
             refresh_before_verify(&verifier, &current, lookup(&headers), REQUEST_ID, NOW_MS),
@@ -602,7 +593,7 @@ mod tests {
     #[test]
     fn debug_and_rejection_carry_no_secret_material() {
         let (verifier, key) = verifier();
-        let secret = fresh_material("debug-secret");
+        let secret = fresh_material();
         let key_text = String::from_utf8_lossy(&key);
         for rendered in [format!("{verifier:?}"), format!("{verifier:#?}")] {
             assert!(!rendered.contains(key_text.as_ref()));

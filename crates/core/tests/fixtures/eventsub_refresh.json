@@ -1,0 +1,9 @@
+{
+  "description": "Public synthetic known-answer vector shared by Rust and Worker tests. Never deploy these values.",
+  "reloadKey": "synthetic-reload-key-00000000000001",
+  "timestamp": "1720000000",
+  "nonce": "0123456789abcdef0123456789abcdef",
+  "requestId": "synthetic-request-0001",
+  "secretParts": ["synthetic", "rotated", "secret", "01"],
+  "signature": "sha256=b0836458a7b97f3dd2d9db760abb2b68880b8b568547b24ca2485cc7c23114dd"
+}

@@ -896,29 +896,26 @@ test("refresh signing fails closed on missing secrets", async () => {
 });
 
 test("refresh signature matches the container's known-answer vector", async () => {
-  // Cross-language contract with `eventsub_refresh::sign`: fixed inputs must
-  // produce this exact signature on both sides. Built from parts: a single
-  // secret-shaped literal trips the secret scanner.
+  // Both languages load the same public synthetic vector. Its expected
+  // signature is fixed test data, never computed by the implementation.
+  const { readFileSync } = await import("node:fs");
+  const vector = JSON.parse(readFileSync(new URL(
+    "../../crates/core/tests/fixtures/eventsub_refresh.json", import.meta.url,
+  ), "utf8")) as {
+    reloadKey: string;
+    timestamp: string;
+    nonce: string;
+    requestId: string;
+    secretParts: string[];
+    signature: string;
+  };
   const headers = await signEventsubRefresh({
-    reloadKey: ["synthetic", "reload", "key", "00000000000001"].join("-"),
-    secret: ["synthetic", "rotated", "secret", "01"].join("-"),
-    requestId: "synthetic-request-0001",
-    timestamp: "1720000000",
-    nonce: ["0123456789abcdef", "0123456789abcdef"].join(""),
+    reloadKey: vector.reloadKey,
+    timestamp: vector.timestamp,
+    nonce: vector.nonce,
+    requestId: vector.requestId,
+    secret: vector.secretParts.join("-"),
   });
   assert.ok(headers);
-  assert.equal(
-    headers.get(REFRESH_SIGNATURE_HEADER),
-    [
-      "sha256=",
-      "b0836458",
-      "a7b97f3d",
-      "d2d9db76",
-      "0abb2b68",
-      "880b8b56",
-      "8547b24c",
-      "a2485cc7",
-      "c23114dd",
-    ].join(""),
-  );
+  assert.equal(headers.get(REFRESH_SIGNATURE_HEADER), vector.signature);
 });
