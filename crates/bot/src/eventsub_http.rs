@@ -176,7 +176,8 @@ impl BoundEventsubReceiver {
                 if let Err(error) = result {
                     tracing::warn!(
                         msg = "eventsub_delivery_child_failed",
-                        error = %error,
+                        panicked = error.is_panic(),
+                        cancelled = error.is_cancelled(),
                         "delivery child failed; durable claim fences retain uncertainty"
                     );
                 }
@@ -369,7 +370,8 @@ async fn handle_notification(
             if let Err(error) = result {
                 tracing::warn!(
                     msg = "eventsub_delivery_child_failed",
-                    error = %error,
+                    panicked = error.is_panic(),
+                    cancelled = error.is_cancelled(),
                     "delivery child failed; durable claim fences retain uncertainty"
                 );
             }
