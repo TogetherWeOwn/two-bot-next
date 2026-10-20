@@ -289,6 +289,12 @@ def condition_holds(instance, condition, path, errors):
         return False
     for key, subschema in props.items():
         if not isinstance(subschema, dict):
+            errors.append(
+                f"{path}: unsupported condition in "
+                f"if.properties.{safe_key(key)} "
+                "(supported: an object with const)"
+            )
+            supported = False
             continue
         unknown = [op for op in subschema if op != "const"]
         for operator in unknown:
