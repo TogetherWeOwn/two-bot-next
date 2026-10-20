@@ -80,7 +80,7 @@ const SHUTDOWN_RS_EVENTS: [&str; 2] = [
 const JOBS_RS_EVENTS: [&str; 1] = ["periodic job failed"];
 
 /// `crates/bot/src/voice_rooms.rs`: the cataloged voice messages.
-const VOICE_RS_CATALOG_MESSAGES: [&str; 17] = [
+const VOICE_RS_CATALOG_MESSAGES: [&str; 18] = [
     "voice room rename decision",
     "voice join completed",
     "voice_operation succeeded",
@@ -98,6 +98,7 @@ const VOICE_RS_CATALOG_MESSAGES: [&str; 17] = [
     "voice creator refresh failed; keeping the cached view",
     "voice halt re-probe skipped: Discord credential latch set",
     "voice admin store failed",
+    "temp-voice boot setting invalid; refusing voice runtime",
 ];
 
 /// `voice_event` field values (`crates/bot/src/voice_rooms.rs`), the bounded
@@ -196,12 +197,13 @@ const MAIN_RS_ADJACENT: [&str; 14] = [
 
 // `crates/bot/src/voice_rooms.rs`: per-command voice UX receipts, not gateway
 // session events.
-const VOICE_RS_ADJACENT: [&str; 21] = [
+const VOICE_RS_ADJACENT: [&str; 22] = [
     "voice succession refused",
     "voice actor load failed; retrying with capped backoff",
     "voice actor load failed; credential refused, not retrying",
     "voice notice settings unreadable",
     "voice notice had no working destination",
+    "voice notice configured channel failed; trying fallback",
     "voice create reservation settle failed",
     "import preview planned an apply; refusing without writing",
     "voice vote response failed; not retried",

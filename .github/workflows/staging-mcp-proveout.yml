@@ -9,7 +9,7 @@ name: staging-mcp-proveout
 # credential and are printed (redacted commands) plus uploaded as a sanitized
 # artifact for the Paperclip post-back. Never runs automatically and has no
 # production path. While staging is fenced (/readyz 503 ownership_fenced),
-# the container-backed trio may return JSON-RPC -32000; that is expected.
+# the four container-backed tools may return JSON-RPC -32000; that is expected.
 on:
   workflow_dispatch:
 
