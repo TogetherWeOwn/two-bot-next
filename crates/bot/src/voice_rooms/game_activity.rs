@@ -1043,8 +1043,8 @@ pub enum PersistOutcome {
 /// aggregates. The guild voice toggle is independent per `docs/privacy.md`:
 /// when it is off, voice spans drain and drop while play aggregates still
 /// persist, so `in_voice_ms` stays 0. Gate queries fail closed — a database
-/// error leaves the buffers untouched for the next due tick. An upsert failure
-/// requeues the drained (bridged) buffers instead, so the outage loses
+/// error leaves the buffers untouched for the next due tick. An upsert or commit
+/// failure requeues the drained (bridged) buffers instead, so the outage loses
 /// nothing; the clip and carry points already advanced stay advanced, and
 /// the requeued spans cover the pre-flush portion, so the retry continues
 /// the same intervals without loss or double-count. The upsert itself stays
@@ -1074,7 +1074,7 @@ pub async fn persist_guild(
     // or waits for the commit. ROW EXCLUSIVE never blocks other writers, and
     // suppression is the only table this flush shares with the opt-out lock
     // set, so there is no lock-ordering hazard. Gate failures still fail
-    // closed (rollback, buffers untouched); an upsert failure rolls back and
+    // closed (rollback, buffers untouched); an upsert or commit failure
     // requeues as before.
     let mut tx = pool.begin().await?;
     sqlx::query("LOCK TABLE privacy_opt_outs IN ROW EXCLUSIVE MODE")
@@ -1123,7 +1123,9 @@ pub async fn persist_guild(
             spans = spans.len(),
             "game_activity_flush_empty"
         );
-        tx.rollback().await?;
+        // No writes to commit: queue rollback on drop so a cleanup error
+        // cannot bypass retention of the already-drained voice spans.
+        drop(tx);
         // Same span retention as [`GameActivityCollector::flush`]: with play
         // still carried, drained spans wait for the bridged session instead
         // of dropping covered voice time. Voice-off drops them above.
@@ -1133,13 +1135,18 @@ pub async fn persist_guild(
         return Ok(PersistOutcome::Empty);
     }
     let session_total: u64 = rows.iter().map(|row| row.session_count).sum();
-    match game_activity_store::upsert_guild_aggregates_in(&mut tx, &rows).await {
+    let persisted: Result<u64, GameActivityStoreError> = async {
+        let written = game_activity_store::upsert_guild_aggregates_in(&mut tx, &rows).await?;
+        tx.commit().await?;
+        Ok(written)
+    }
+    .await;
+    match persisted {
         Ok(written) => {
-            tx.commit().await?;
             // Busy-guild case (see `flush`): retain silent carried members'
             // spans even though other members persisted rows. Retention runs
-            // only on success so a failed upsert requeues the full drained
-            // buffers below without double-queueing the silent subset.
+            // only on success so a failed upsert or commit requeues the full
+            // drained buffers below without double-queueing the silent subset.
             if !voice_off && !spans.is_empty() && !collector.guild_carry(guild).is_empty() {
                 let (silent_spans, _): (Vec<VoiceSpan>, Vec<VoiceSpan>) = spans
                     .into_iter()
