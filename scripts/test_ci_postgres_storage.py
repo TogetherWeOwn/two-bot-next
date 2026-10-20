@@ -20,8 +20,8 @@ NEXTEST_WORKFLOW = (
 )
 NEXTEST_WORKFLOW_TEXT = NEXTEST_WORKFLOW.read_text()
 # The three Rust test lanes (rust-tests, ignored-db-stores, ignored-db-runtime)
-# each run their own copy of this service; the first one in the file is the
-# reference and the others must match it exactly.
+# each run their own copy of this service. The coverage lane has a narrower WAL
+# target; the two ignored-test lanes retain the shared 512MB target.
 SERVICES = [part.split("    steps:\n", 1)[0] for part in WORKFLOW_TEXT.split("      agent-testdb:\n")[1:]]
 SERVICE = SERVICES[0]
 TOKENS = shlex.split(SERVICE.split("        options: >-\n", 1)[1])
@@ -59,7 +59,7 @@ EXPECTED = {
     "fsync": "on",
     "full_page_writes": "on",
     "synchronous_commit": "on",
-    "max_wal_size": "512MB",
+    "max_wal_size": "256MB",
     "min_wal_size": "64MB",
 }
 
@@ -103,12 +103,17 @@ class PostgresStorageTests(unittest.TestCase):
         # Run 39209332791: only rust-tests bounded WAL while the ignored lanes
         # ran the PG18 default (max_wal_size 1GB) on the same 1 GiB tmpfs, and
         # the stores lane PANICed with ENOSPC mid-suite. Every lane that mounts
-        # the bounded service must carry the budget and verify it. Scope the
-        # checks per job: a global count lets one lane's two prepares satisfy
-        # another lane's missing one.
+        # the bounded service must carry its intended budget and verify it.
+        # Scope the checks per job: a global count lets one lane's two prepares
+        # satisfy another lane's missing one.
         self.assertEqual(len(PREPARE_TAILS), 3)
         self.assertEqual(len(VERIFY_TAILS), 3)
-        scripts = []
+        scripts = {}
+        wal_sizes = {
+            "rust-tests": "256MB",
+            "ignored-db-stores": "512MB",
+            "ignored-db-runtime": "512MB",
+        }
         for lane in POSTGRES_LANES:
             with self.subTest(lane=lane):
                 job = job_text(lane)
@@ -125,7 +130,8 @@ class PostgresStorageTests(unittest.TestCase):
                 prepare = job.split(
                     "      - name: Prepare isolated test databases\n", 1,
                 )[1].split("\n      - name: ", 1)[0]
-                self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare)
+                wal_size = wal_sizes[lane]
+                self.assertIn(f"ALTER SYSTEM SET max_wal_size = '{wal_size}'", prepare)
                 self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare)
                 self.assertIn("pg_reload_conf()", prepare)
                 self.assertLess(
@@ -142,18 +148,19 @@ class PostgresStorageTests(unittest.TestCase):
                 script = textwrap.dedent(
                     verify_tail.split("python3 - <<'PY'\n", 1)[1].split("\n          PY", 1)[0]
                 )
-                self.assertIn("'max_wal_size': '512MB'", script)
+                self.assertIn(f"'max_wal_size': '{wal_size}'", script)
                 self.assertIn("'min_wal_size': '64MB'", script)
-                scripts.append(script)
-        self.assertEqual(len(set(scripts)), 1, "the lanes' verify probes drifted apart")
-        # The nextest lane carries a fourth copy of this probe in the reusable
-        # workflow. It must stay identical to the executed reference, so the
-        # rejection tests below cover it too: without this, deleting the
-        # comparison in the nextest copy alone stays green everywhere.
+                scripts[lane] = script
+        self.assertEqual(
+            scripts["ignored-db-stores"], scripts["ignored-db-runtime"],
+            "the ignored-test lanes' verify probes drifted apart",
+        )
+        # The reusable nextest workflow retains the 512MB target and must match
+        # the ignored-test reference; rejection tests below cover its probe too.
         self.assertEqual(len(NEXTEST_VERIFY_TAILS), 1)
         self.assertEqual(
-            NEXTEST_SCRIPT, SCRIPT,
-            "the nextest verify probe drifted from the executed reference",
+            NEXTEST_SCRIPT, scripts["ignored-db-stores"],
+            "the nextest verify probe drifted from the ignored-test reference",
         )
 
     def test_probe_preserves_durability_and_uses_only_explicit_test_connection(self):
