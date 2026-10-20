@@ -99,6 +99,23 @@ async function abortable<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
   }
 }
 
+/** Cleanup never extends a deadline or replaces the intended refusal. */
+function cancelBestEffort(body: { cancel(): Promise<void> } | null): void {
+  try {
+    void body?.cancel().catch(() => {});
+  } catch {
+    // A synchronous cleanup failure is no more authoritative than a rejection.
+  }
+}
+
+function releaseReader(reader: ReadableStreamDefaultReader<Uint8Array>): void {
+  try {
+    reader.releaseLock();
+  } catch {
+    // Some runtimes cannot release a lock while a read is pending.
+  }
+}
+
 /** Read at most `limit` bytes; oversize returns null without buffering. */
 async function readBoundedText(
   response: Response,
@@ -130,8 +147,8 @@ async function readBoundedText(
     }
     return new TextDecoder().decode(bytes);
   } finally {
-    if (!complete) void reader.cancel().catch(() => {});
-    reader.releaseLock();
+    if (!complete) cancelBestEffort(reader);
+    releaseReader(reader);
   }
 }
 
@@ -240,7 +257,7 @@ async function readContainerJson(
   const botResponse =
     path === "/health" ? upstream.ok : isReadyzBotResponse(upstream.status, upstream.headers.get("content-type"));
   if (signal.aborted || !botResponse) {
-    await upstream.body?.cancel().catch(() => {});
+    cancelBestEffort(upstream.body);
     return { ok: false, oversize: false };
   }
   let body: string | null;
@@ -251,8 +268,8 @@ async function readContainerJson(
   }
   if (body === null || signal.aborted) {
     // Oversize (null) or a timeout that won the race during the read: never
-    // echo upstream bytes, just report the class.
-    await upstream.body?.cancel().catch(() => {});
+    // echo upstream bytes, just report the class. The reader already owns
+    // best-effort cleanup; do not cancel the same body a second time.
     return { ok: false, oversize: body === null };
   }
   try {
@@ -373,7 +390,8 @@ async function callTool(
  * Collect at most `limit` inbound bytes under `timeoutMs` before parsing.
  * The count is measured on the bytes actually read, never on Content-Length.
  * Oversize, deadline, client-abort and stream errors all resolve `ok: false`;
- * the reader is cancelled and released so the tail is never drained.
+ * cancellation is attempted once without awaiting its result, and the reader
+ * is released where legal so cleanup cannot hold the refusal or drain the tail.
  * Decoding happens once, after a complete read, so a multi-byte character
  * split across chunks still parses.
  */
@@ -390,63 +408,40 @@ async function readInboundText(
   let size = 0;
   // The deadline and the client abort share one mechanism: cancelling the
   // reader settles the pending read as done, and the flags below tell that
-  // apart from a genuine end of body. Cancelling directly (instead of racing
-  // the read against timer/abort promises) keeps each read to a single await
-  // hop, so an oversize stream is stopped before its tail is pulled.
+  // apart from a genuine end of body. Native stream cancellation closes pending
+  // reads before waiting for the underlying cancel hook; never await that hook.
+  // Keeping each read to one await also stops oversize intake before tail pulls.
   let expired = false;
+  let complete = false;
+  let cancelled = false;
+  const cancelOnce = () => {
+    if (cancelled) return;
+    cancelled = true;
+    cancelBestEffort(reader);
+  };
   const expire = () => {
     expired = true;
-    reader.cancel().catch(() => {});
+    cancelOnce();
   };
   const timer = setTimeout(expire, timeoutMs);
-  const onAbort = () => {
-    expired = true;
-    reader.cancel().catch(() => {});
-  };
-  clientSignal?.addEventListener("abort", onAbort, { once: true });
-  if (clientSignal?.aborted) {
-    clearTimeout(timer);
-    clientSignal.removeEventListener("abort", onAbort);
-    try {
-      await reader.cancel();
-    } catch {
-      // Reader already closed or errored; the refusal is the same.
-    }
-    reader.releaseLock();
-    return { ok: false };
-  }
+  clientSignal?.addEventListener("abort", expire, { once: true });
   try {
+    if (clientSignal?.aborted) return { ok: false };
     for (;;) {
       let next: ReadableStreamReadResult<Uint8Array>;
       try {
         next = await reader.read();
       } catch {
         // Stream error mid-body: same fixed refusal, never an echo.
-        try {
-          await reader.cancel();
-        } catch {
-          // Reader already closed or errored; the refusal is the same.
-        }
         return { ok: false };
       }
-      if (expired || clientSignal?.aborted) {
-        try {
-          await reader.cancel();
-        } catch {
-          // Cancellation itself failing changes nothing about the refusal.
-        }
-        return { ok: false };
+      if (expired || clientSignal?.aborted) return { ok: false };
+      if (next.done) {
+        complete = true;
+        break;
       }
-      if (next.done) break;
       size += next.value.byteLength;
-      if (size > limit) {
-        try {
-          await reader.cancel();
-        } catch {
-          // Cancellation itself failing changes nothing about the refusal.
-        }
-        return { ok: false };
-      }
+      if (size > limit) return { ok: false };
       chunks.push(next.value);
     }
     const bytes = new Uint8Array(size);
@@ -458,8 +453,9 @@ async function readInboundText(
     return { ok: true, text: new TextDecoder().decode(bytes) };
   } finally {
     clearTimeout(timer);
-    clientSignal?.removeEventListener("abort", onAbort);
-    reader.releaseLock();
+    clientSignal?.removeEventListener("abort", expire);
+    if (!complete) cancelOnce();
+    releaseReader(reader);
   }
 }
 

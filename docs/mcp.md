@@ -20,13 +20,22 @@ and rate gates, at most 64 KiB of request bytes are collected under a
 six-second body deadline before JSON parsing. The byte count is measured on
 the bytes actually read, never on Content-Length alone. Oversize,
 deadline-expired, aborted/errored and malformed bodies all produce the one
-fixed non-echoing `-32700 parse error` refusal (`id: null`), the body reader
-is cancelled/released, and no container request occurs.
+fixed non-echoing `-32700 parse error` refusal (`id: null`), and no container
+request occurs. Cancellation is attempted once without awaiting its result;
+reader locks are released where legal and the intake timer and client-abort
+listener are removed. A stalled or rejecting cleanup hook cannot delay the
+refusal or replace it with an exception, and the tail is never drained.
 
 Every container-backed tool call is bounded: 6 s timeout plus a 64 KiB body
 cap (same bound as the metrics scrape). Oversize surfaces a generic
 `-32000` JSON-RPC error without echoing upstream bytes; timeouts and
 non-bot upstreams surface a generic `-32000` without proxied error text.
+The outbound budget covers headers and body together, separately from intake:
+a valid intake can use nearly 6 s and then a healthy container read nearly
+another 6 s. Neither chunks nor cleanup renew either deadline. Rejected or
+aborted headers and incomplete/oversize bodies use best-effort non-awaited
+cancellation with rejection handling; reader cleanup is not retried by the
+caller. Cleanup failures never override the fixed tool failure.
 `/readyz` accepts 200 and its routine 503 JSON (any component not ready)
 only when the body is a readiness report (`components` is an array);
 ownership-fence and junk bodies (e.g. `{error:"ownership_fenced"}`),
