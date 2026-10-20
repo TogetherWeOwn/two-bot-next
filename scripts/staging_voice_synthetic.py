@@ -143,6 +143,13 @@ class RedirectRefused(ValueError):
     """An authenticated read answered a redirect (fixed vocabulary only)."""
 
 
+class GatewayShapeError(ValueError):
+    """A gateway hello or dispatch violates the expected shape.
+
+    Fixed vocabulary only, like BodyTooLarge and RedirectRefused.
+    """
+
+
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Turn every redirect into an HTTPError without contacting its target."""
 
@@ -577,8 +584,16 @@ class WebSocket:
             self.sock.sendall(head + mask + body)
 
     def recv(self):
-        """Next complete text message as JSON (answers pings; None on close)."""
+        """Next complete text message as JSON (answers pings; None on close).
+
+        Every frame payload and every reassembled message is capped at
+        MAX_BODY_BYTES, like the REST body cap: the declared length is
+        validated before the payload is read, so a huge length refuses
+        without an unbounded read, and continuation fragments refuse once
+        their running total passes the cap. Exact-cap input passes.
+        """
         parts = []
+        total = 0
         while True:
             b1, b2 = self._exact(2)
             op, fin, n = b1 & 0x0F, b1 & 0x80, b2 & 0x7F
@@ -586,6 +601,8 @@ class WebSocket:
                 n = struct.unpack(">H", self._exact(2))[0]
             elif n == 127:
                 n = struct.unpack(">Q", self._exact(8))[0]
+            if n > MAX_BODY_BYTES:
+                raise BodyTooLarge("gateway frame answered over the byte cap")
             mask = self._exact(4) if b2 & 0x80 else None
             data = self._exact(n)
             if mask:
@@ -599,6 +616,9 @@ class WebSocket:
                                       + bytes(b ^ m[i % 4] for i, b in enumerate(data)))
                 continue
             if op in (0x1, 0x0):
+                total += len(data)
+                if total > MAX_BODY_BYTES:
+                    raise BodyTooLarge("gateway message answered over the byte cap")
                 parts.append(data)
                 if fin:
                     return json.loads(b"".join(parts))
@@ -691,7 +711,11 @@ class Session:
         self.token, self.events, self.me = token, [], None
         self.ws = WebSocket(GATEWAY, "/?v=10&encoding=json")
         hello = self.ws.recv()
-        self.interval = hello["d"]["heartbeat_interval"] / 1000
+        data = hello.get("d") if isinstance(hello, dict) else None
+        interval = data.get("heartbeat_interval") if isinstance(data, dict) else None
+        if isinstance(interval, bool) or not isinstance(interval, (int, float)):
+            raise GatewayShapeError("gateway hello was malformed")
+        self.interval = interval / 1000
         self.seq, self.alive = None, True
         threading.Thread(target=self._beat, daemon=True).start()
         self.ws.send({"op": 2, "d": {"token": token, "intents": INTENTS,
@@ -716,14 +740,21 @@ class Session:
                 return None
             if msg is None:
                 raise ConnectionError("gateway closed the session")
+            if not isinstance(msg, dict):
+                raise GatewayShapeError("gateway dispatch was malformed")
             if msg.get("s") is not None:
                 self.seq = msg["s"]
             if msg.get("op") != 0:
                 continue
+            if not isinstance(msg.get("t"), str) or not isinstance(msg.get("d"), dict):
+                raise GatewayShapeError("gateway dispatch was malformed")
             event = {"t": msg["t"], "d": msg["d"]}
             self.events.append(event)
             if msg["t"] == "READY":
-                self.me = msg["d"]["user"]["id"]
+                user = msg["d"].get("user")
+                if not isinstance(user, dict) or "id" not in user:
+                    raise GatewayShapeError("gateway dispatch was malformed")
+                self.me = user["id"]
             if until(event):
                 return event
         return None

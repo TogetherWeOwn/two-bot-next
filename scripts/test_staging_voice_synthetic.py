@@ -692,7 +692,11 @@ class WebSocketFrameTest(unittest.TestCase):
         ours, theirs = socket.socketpair()
         ws = synth.WebSocket.__new__(synth.WebSocket)
         ws.sock, ws.lock = ours, threading.Lock()
-        message = json.dumps({"op": 0, "t": "GUILD_CREATE", "d": {"x": "y" * 70000}}).encode()
+        # Half the gateway message cap: fragmentation and ping coverage
+        # stay, while the cap boundary itself is pinned by the
+        # gateway-intake acceptance file.
+        message = json.dumps({"op": 0, "t": "GUILD_CREATE",
+                              "d": {"x": "y" * (synth.MAX_BODY_BYTES // 2)}}).encode()
         theirs.sendall(self.frame(0x9, b"hi") + self.frame(0x1, message[:100], fin=False)
                        + self.frame(0x0, message[100:]))
         got = ws.recv()

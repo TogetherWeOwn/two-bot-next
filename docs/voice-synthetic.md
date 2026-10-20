@@ -43,23 +43,38 @@ REST reads (`rest`) and the staging `/ops/metrics` read (`metrics_value`), on
 success and on HTTP error status alike. Intermediate redirect bodies are drained
 by urllib's redirect handler before the final response and are not capped,
 unlike `scripts/staging_probe.py`, which never follows redirects. The gateway
-WebSocket is not an HTTP body and is outside this cap.
+WebSocket is capped at the same value on two levels: every frame payload and
+every reassembled (continuation-joined) message. The declared frame length is
+validated before the payload is read, so a huge declared length refuses
+without an unbounded read.
 
 - Each read takes at most `MAX_BODY_BYTES + 1` bytes, so one extra byte exposes
   a hidden suffix without buffering an unbounded body.
-- A body of exactly 64 KiB passes. Anything longer is refused before it is
-  decoded or parsed, so the extra byte never reaches a successful JSON path.
+- A body, frame or message of exactly 64 KiB passes. Anything longer is refused
+  before it is decoded or parsed, so the extra byte never reaches a successful
+  JSON path.
 - The refusal is a `BodyTooLarge` error with a fixed message: `Discord REST read
-  answered over the body cap` or `metrics read answered over the body cap`. It
-  never echoes the body, headers, URL or a parse exception.
+  answered over the body cap`, `metrics read answered over the body cap`,
+  `gateway frame answered over the byte cap` or `gateway message answered over
+  the byte cap`. It never echoes the body, headers, URL or a parse exception.
 - A refused read fails the run: the `run` check reports `FAIL` with that fixed
   message, the evidence JSON still uploads, and the script exits 1. The
   workflow's retries apply as for any other failure.
 - A metrics read that answers an in-cap error status stays optional (`metrics`
   reports SKIP). Only an over-cap body is a failure.
 
-The offline suite (`scripts/test_staging_voice_synthetic.py`) pins the cap, the
-exact-cap pass, the cap-plus-one refusal on both paths and the fixed messages.
+A malformed hello (missing or non-object `d`, missing or non-numeric
+`heartbeat_interval`, close-before-hello) or a malformed dispatch (missing
+`t`/`d`, READY without `user.id`) raises `GatewayShapeError` with the fixed
+message `gateway hello was malformed` or `gateway dispatch was malformed`,
+and fails the run the same way: a `run` FAIL with that message, evidence
+uploaded, exit 1. No traceback reaches the output and no wire bytes are
+echoed. Valid hellos and dispatches behave byte-identically.
+
+The offline suites (`scripts/test_staging_voice_synthetic.py` and
+`scripts/test_staging_voice_synthetic_gateway_intake_acceptance.py`) pin the
+caps, the exact-cap passes, the cap-plus-one refusals on every path and the
+fixed messages.
 
 ## When it runs
 
