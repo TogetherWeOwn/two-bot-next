@@ -3312,6 +3312,18 @@ class WorkflowTests(unittest.TestCase):
             "--skip seeded_aggregates_render_exactly_guild_scoped_and_read_only",
             main_sweep,
         )
+        # Staging fixtures accept only the exact agent_test URL; they run in
+        # the dedicated staging_migrate_db re-run below, never in this
+        # two_bot_test_ci sweep. Enumerate from the Rust source so a future
+        # seventh fixture cannot silently rejoin.
+        staging_source = (ROOT / "crates/cutover/tests/staging_migrate_db.rs").read_text()
+        staging_names = set(re.findall(r'#\[ignore[^\]]*\]\s*async fn (\w+)\(', staging_source))
+        self.assertTrue(staging_names, "guarded ignored fixtures must be discovered")
+        # Match complete tokens: a suffixed filter would not skip the fixture.
+        broad_skips = set(re.findall(r"--skip (\S+)", ignored_sweeps[0]))
+        for name in sorted(staging_names):
+            with self.subTest(staging_skip=name):
+                self.assertIn(name, broad_skips)
         ignored_sweep = [run for run in sweeps if "-- --ignored" in run][0]
         self.assertIn(
             "--skip list_is_guild_scoped_selector_shaped_and_read_only",
@@ -3353,6 +3365,10 @@ class WorkflowTests(unittest.TestCase):
                     self.assertIn("--features db", matches[0])
                 else:
                     self.assertNotIn("--features db", matches[0])
+                if needle == "--test staging_migrate_db":
+                    for name in sorted(staging_names):
+                        with self.subTest(dedicated_no_skip=name):
+                            self.assertNotIn(f"--skip {name}", matches[0])
         env_wrapped = [
             run for run in cov_runs
             if run.startswith('cov_run env -u PGPASSWORD -u PGPASSFILE -u PGOPTIONS "$COV"')
