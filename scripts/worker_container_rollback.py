@@ -68,6 +68,26 @@ import staging_rollout as base
 GateError = base.GateError
 require = base.require
 
+
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    raised message is fixed vocabulary: it names no key, value or path.
+    """
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
+
+
 VERSION_ID = re.compile(base.UUID)
 SHA = re.compile(r"[0-9a-f]{40}")
 # Consecutive fully-passing gate polls required: ~10 s per poll, so 18 is the
@@ -394,7 +414,7 @@ def control_client(variant, token, worker_url, staging_url, actor, root=None):
             # step, which runs with release_fence=false by default.
             raise GateError("ownership_control_failed", detail)
         try:
-            return base.mapping(json.loads(result.stdout))
+            return base.mapping(json.loads(result.stdout, object_pairs_hook=_reject_duplicate_keys))
         except ValueError:
             raise GateError("ownership_control_invalid_response") from None
 
