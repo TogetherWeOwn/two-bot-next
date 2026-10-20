@@ -3249,6 +3249,14 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(ignored_sweeps), 1)
         self.assertIn("--test-threads=1", ignored_sweeps[0])
         self.assertIn("--skip regenerate_reference_docs", ignored_sweeps[0])
+        self.assertIn(
+            "--skip flags_are_guild_scoped_half_open_deduplicated_and_activity_protected",
+            ignored_sweeps[0],
+        )
+        self.assertIn(
+            "--skip list_is_guild_scoped_selector_shaped_and_read_only",
+            ignored_sweeps[0],
+        )
         # One MEMBER_TESTDB export serves both the ignored sweep and the
         # fail-closed member_moderation_db re-run. Pin its count and logical
         # command order so a redundant later export cannot mask a deleted or
