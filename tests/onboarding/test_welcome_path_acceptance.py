@@ -35,6 +35,14 @@ CASES = (
     "duplicate_control",
     "live_channel_denial",
     "unavailable_identity",
+    "roles_invalidation",
+    "channel_invalidation",
+    "guild_create_invalidation",
+    "bot_member_invalidation",
+    "roles_invalidation_revoked",
+    "channel_invalidation_revoked",
+    "roles_invalidation_exhausted",
+    "channel_invalidation_exhausted",
 )
 
 
