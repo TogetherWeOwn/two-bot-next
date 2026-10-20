@@ -267,7 +267,7 @@ impl RateLimitGuard {
         // stale-date the spacing and release every waiter together when the
         // pause ends, and refusals must not consume spacing at all. After
         // the turn, loop back through the gates — a restriction may have
-        // arrived during the (at most one-interval) pacing sleep — but
+        // arrived during the shared pacing wait — but
         // never pace twice for one admission.
         let mut paced = false;
         enum Step {
@@ -330,46 +330,41 @@ impl RateLimitGuard {
         }
     }
 
-    /// One shared pacing turn: reserve the next paced slot after the previous
-    /// turn's release on this guard, wait it out, and leave the reservation
-    /// for the next turn. Each slot is [`GLOBAL_MIN_INTERVAL`] plus
-    /// [`GLOBAL_PACING_SAFETY_PAD`]: the pad keeps wire spacing at or above
-    /// the documented floor under timer granularity and post-admission
-    /// dispatch overhead. The reservation is taken under the bookkeeping
-    /// lock and the sleep holds no lock, so a burst of admitters spaces
-    /// itself one interval at a time without ever parking on a shared async
-    /// gate: parallel paused-clock tests share the process guard, and
-    /// parking one runtime on another's turn advances the parked runtime
-    /// to its outer timeout while it makes no progress. A previous release
-    /// minted on another runtime's clock (foreign Instants name nothing on
-    /// this clock) starts a fresh chain here instead of waiting.
-    /// Same-runtime reservations chain behind each other, bounded by the
-    /// live concurrency times one interval.
+    /// One shared pacing turn, stamped only when it actually releases. Check
+    /// the previous release under the bookkeeping lock on every wake: several
+    /// overdue sleepers must not spend stale reservations together. Each turn
+    /// is [`GLOBAL_MIN_INTERVAL`] plus [`GLOBAL_PACING_SAFETY_PAD`] after the
+    /// last release; the sleep holds no lock and cancellation reserves nothing.
+    /// A previous release from another runtime starts a fresh chain, preserving
+    /// isolation between the clocks of parallel paused-clock tests without a
+    /// shared async gate that could park one runtime on another's progress.
     async fn pace_once(&self) {
         let runtime = tokio::runtime::Handle::try_current()
             .ok()
             .map(|handle| handle.id());
-        let wait = {
-            let mut state = self.state.lock().expect("Discord guard state");
-            let now = Instant::now();
-            match (state.last_pace_release, runtime) {
-                (Some((id, last)), Some(mine)) if id == mine => {
-                    let interval = GLOBAL_MIN_INTERVAL + GLOBAL_PACING_SAFETY_PAD;
-                    let earliest = last.checked_add(interval).unwrap_or(now);
-                    let wait = earliest.saturating_duration_since(now);
-                    state.last_pace_release = Some((mine, earliest.max(now)));
-                    wait
-                }
-                _ => {
-                    if let Some(mine) = runtime {
-                        state.last_pace_release = Some((mine, now));
+        loop {
+            let until = {
+                let mut state = self.state.lock().expect("Discord guard state");
+                let now = Instant::now();
+                match (state.last_pace_release, runtime) {
+                    (Some((id, last)), Some(mine)) if id == mine => {
+                        let interval = GLOBAL_MIN_INTERVAL + GLOBAL_PACING_SAFETY_PAD;
+                        let earliest = last.checked_add(interval).unwrap_or(now);
+                        if earliest <= now {
+                            state.last_pace_release = Some((mine, now));
+                            return;
+                        }
+                        earliest
                     }
-                    Duration::ZERO
+                    _ => {
+                        if let Some(mine) = runtime {
+                            state.last_pace_release = Some((mine, now));
+                        }
+                        return;
+                    }
                 }
-            }
-        };
-        if !wait.is_zero() {
-            tokio::time::sleep(wait).await;
+            };
+            tokio::time::sleep_until(until).await;
         }
     }
 

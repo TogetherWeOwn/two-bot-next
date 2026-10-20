@@ -17,13 +17,15 @@ live database or Discord to write it; see [Verification](#verification).
 ## 1. Rate limits: the 50/s budget and `Retry-After`
 
 Discord caps bots at 50 requests/second globally. Both REST paths below
-stay far under it with a 110 ms pacing floor (≈9/s per lane), and both
-honor the response's own wait on 429. Header-driven per-route buckets and
-`X-RateLimit-Reset-After` parsing are pinned only by the currently failing
-acceptance suite (`crates/discord/tests/backfill_ratelimit.rs`); the
-shipped code reads `Retry-After` / body `retry_after`, not `Reset-After`.
-Do not promise bucket-accurate pacing until that builder work lands and
-its flag names settle.
+have a 110 ms local pacing floor (≈9/s per lane), and both honor the
+response's own wait on 429. The runtime executor also shares a 20 ms global
+pacing floor plus a 2 ms safety pad across executors on one guard. It stamps
+actual pacing releases and rechecks the interval after every wake, so delayed
+waiters cannot spend overdue reservations together. Header-driven per-route
+buckets and `Retry-After` / `X-RateLimit-Reset-After` retries are covered by
+`crates/discord/tests/backfill_ratelimit.rs`, including delayed-observer and
+startup-delay regressions. These runtime guarantees do not add bucket handling
+to the separate cutover CLI client below.
 
 ### Cutover CLIs (`crates/cutover/src/rest.rs`)
 
