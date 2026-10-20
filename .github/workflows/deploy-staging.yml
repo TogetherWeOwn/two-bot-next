@@ -281,7 +281,7 @@ jobs:
     # Staging lifecycle exclusion: this job and the voice synthetic execution
     # job share one fixed non-cancelling group, so a deploy cannot restart the
     # container mid-lifecycle. Workflow-level serialization stays unchanged;
-    # the reusable caller must never hold this group (it waits on this job).
+    # the reusable caller must never hold this group in any form (it waits on this job).
     concurrency:
       group: staging-lifecycle
       cancel-in-progress: false
