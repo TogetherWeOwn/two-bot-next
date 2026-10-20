@@ -102,6 +102,13 @@ event receipts read back. Roll back in this order: disable the receiver (step 5)
 and deploy the previous binary, then drop the column. Dropping it while this
 binary runs fails every finish and every success replay, not only event receipts.
 
+Migration `0448` adds nullable `stop_reason` columns to `internal_idempotency`
+and `internal_action_log`, so a purge receipt and its terminal audit keep an
+early stop's reason for outer replays. Every finish writes the column and every
+replay reads it, so apply it before this binary and roll back in the same order
+as `0424`: disable the receiver and deploy the previous binary, then drop both
+columns.
+
 TOG-16851 proved a loopback-only receiver never becomes healthy: the Containers
 port check and `containerFetch` cannot reach it, so the container waited on 8091
 forever. The fix binds the wildcard behind the Worker-set container marker (the

@@ -155,6 +155,7 @@ impl ActionEffect for AnnouncementExecutor {
                         resource_id: Some(message_id),
                         affected: 1,
                         outcome: None,
+                        stop_reason: None,
                     }
                 }
                 ExecutionOutcome::NoEffect(refusal) => TerminalResponse::Failure(match refusal {
@@ -361,6 +362,7 @@ impl ModerationEffect for ModerationExecutor {
                         resource_id: Some(target_id),
                         affected: 1,
                         outcome: None,
+                        stop_reason: None,
                     })
                 }
                 Err(error) => match error.code {
@@ -1783,6 +1785,7 @@ async fn execute_member(
                 resource_id: None,
                 affected,
                 outcome: None,
+                stop_reason: None,
             };
             if let Err(finish_error) = state.store.finish(&claim, &response).await {
                 log_terminal_persist_failed(action, "finish", finish_error);
@@ -2117,6 +2120,7 @@ async fn moderate_channel(
                 resource_id: Some(channel_id),
                 affected: stored_affected,
                 outcome: None,
+                stop_reason: result.stop_reason,
             };
             if let Err(finish_error) = state.store.finish(&claim, &response).await {
                 log_terminal_persist_failed(action, "finish", finish_error);
@@ -2179,7 +2183,8 @@ async fn moderate_channel(
 /// path. A replayed outer receipt re-derives the outcome from the authorized
 /// action (which maps 1:1 to the planner outcome) and the affected count from
 /// the stored receipt, so the wire stays identical without trusting a second
-/// body parse.
+/// body parse. Fresh and replayed wires both take an early-stopped purge's
+/// `stop_reason` from the receipt; a completed purge omits the key.
 #[allow(clippy::too_many_arguments)]
 fn moderate_channel_terminal(
     state: &ReceiverState,
@@ -2195,6 +2200,7 @@ fn moderate_channel_terminal(
     match response {
         TerminalResponse::Success {
             affected: stored_affected,
+            stop_reason,
             ..
         } => {
             // Bounded receiver counter (TOG-20119): channel-moderation
@@ -2218,6 +2224,9 @@ fn moderate_channel_terminal(
             );
             if let Some(count) = count {
                 result["affected"] = json!(count);
+            }
+            if let Some(reason) = stop_reason {
+                result["stop_reason"] = json!(reason.name());
             }
             let mut wire = (
                 StatusCode::OK,
@@ -2385,6 +2394,7 @@ async fn mutate_event(
                 resource_id: Some(event_id),
                 affected: 1,
                 outcome: Some(outcome),
+                stop_reason: None,
             };
             if let Err(finish_error) = state.store.finish(&claim, &response).await {
                 // Do not return success before its audit/receipt is committed.
@@ -2520,6 +2530,7 @@ async fn write_setting(
                 resource_id: None,
                 affected: u32::from(!deleted),
                 outcome: None,
+                stop_reason: None,
             };
             if let Err(finish_error) = state.store.finish(&claim, &terminal).await {
                 log_terminal_persist_failed(action, "finish", finish_error);
@@ -2792,6 +2803,7 @@ async fn import_automations(
                 resource_id: None,
                 affected,
                 outcome: None,
+                stop_reason: None,
             };
             if let Err(finish_error) = state.store.finish(&claim, &terminal).await {
                 log_terminal_persist_failed(action, "finish", finish_error);
@@ -3160,6 +3172,7 @@ fn terminal_response(
             resource_id: Some(message_id),
             affected: 1,
             outcome: None,
+            stop_reason: None,
         } => Json(json!({
             "ok": true, "result": {"message_id": message_id.as_str()}, "request_id": id,
         }))
@@ -3168,6 +3181,7 @@ fn terminal_response(
             resource_id: Some(event_id),
             affected: 1,
             outcome: Some(outcome),
+            stop_reason: None,
         } => Json(json!({
             "ok": true,
             "result": {"outcome": outcome.as_str(), "event_id": event_id.as_str()},
@@ -3182,6 +3196,7 @@ fn terminal_response(
             resource_id: None,
             affected,
             outcome: None,
+            stop_reason: None,
         } => match (action.as_str(), affected) {
             ("role.assign", 1) => member_success("assigned", id),
             ("role.assign", 0) => member_success("already_held", id),

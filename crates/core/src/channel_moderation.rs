@@ -63,6 +63,16 @@ impl PurgeStopReason {
             Self::RateLimited => "rate_limited",
         }
     }
+
+    /// Inverse of [`Self::name`]; any other word is not a stop reason.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "refused" => Some(Self::Refused),
+            "rate_limited" => Some(Self::RateLimited),
+            _ => None,
+        }
+    }
 }
 
 /// Confirmed deletions, with a reason only when a later delete was refused.

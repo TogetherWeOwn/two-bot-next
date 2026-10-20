@@ -6,6 +6,7 @@
 use sqlx::{PgPool, Row};
 use std::str::FromStr as _;
 
+use crate::channel_moderation::PurgeStopReason;
 use crate::clock_guard::CLOCK_SKEW_TOLERANCE_MS;
 use crate::internal_actions::{
     body_hash, is_implemented, is_snowflake, valid_event_key, valid_idempotency_key,
@@ -156,6 +157,9 @@ pub enum TerminalResponse {
         resource_id: Option<DiscordId>,
         affected: u32,
         outcome: Option<EventOutcome>,
+        /// Why a channel purge stopped after at least one deletion. `None` for
+        /// a completed purge and every other receipt; feeds the wire envelope.
+        stop_reason: Option<PurgeStopReason>,
     },
     Failure(TerminalFailure),
 }
@@ -206,6 +210,13 @@ impl TerminalResponse {
         }
     }
 
+    fn stop_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Success { stop_reason, .. } => stop_reason.map(PurgeStopReason::name),
+            Self::Failure(_) => None,
+        }
+    }
+
     fn from_row(row: &sqlx::postgres::PgRow) -> Result<Self, InternalStoreError> {
         let code: &str = row.try_get("response_code")?;
         let response = match code {
@@ -220,6 +231,13 @@ impl TerminalResponse {
                 outcome: row
                     .try_get::<Option<&str>, _>("outcome")?
                     .map(EventOutcome::from_str)
+                    .transpose()?,
+                // An unknown word fails closed: never a completed replay.
+                stop_reason: row
+                    .try_get::<Option<&str>, _>("stop_reason")?
+                    .map(|name| {
+                        PurgeStopReason::from_name(name).ok_or(InternalStoreError::Unavailable)
+                    })
                     .transpose()?,
             },
             "malformed" => Self::Failure(TerminalFailure::Malformed),
@@ -648,7 +666,7 @@ impl InternalActionStore {
         sqlx::query(
             "UPDATE internal_idempotency SET state = 'completed', response_code = $2, \
              http_status = $3, resource_id = $4, affected = $5, outcome = $6, \
-             updated_at = clock_timestamp() WHERE intent_id = $1",
+             stop_reason = $7, updated_at = clock_timestamp() WHERE intent_id = $1",
         )
         .bind(intent_id)
         .bind(response.code())
@@ -656,6 +674,7 @@ impl InternalActionStore {
         .bind(response.resource_id())
         .bind(response.affected())
         .bind(response.outcome())
+        .bind(response.stop_reason())
         .execute(&mut *tx)
         .await?;
         Self::complete_locked(&mut tx, intent_id, response, evidence).await?;
@@ -675,7 +694,7 @@ impl InternalActionStore {
         sqlx::query(
             "UPDATE internal_idempotency SET state = 'completed', response_code = $2, \
              http_status = $3, resource_id = $4, affected = $5, outcome = $6, \
-             updated_at = clock_timestamp() WHERE intent_id = $1",
+             stop_reason = $7, updated_at = clock_timestamp() WHERE intent_id = $1",
         )
         .bind(intent_id)
         .bind(response.code())
@@ -683,6 +702,7 @@ impl InternalActionStore {
         .bind(response.resource_id())
         .bind(response.affected())
         .bind(response.outcome())
+        .bind(response.stop_reason())
         .execute(&mut **tx)
         .await?;
         Self::audit(
@@ -857,9 +877,9 @@ impl InternalActionStore {
         sqlx::query(
             "INSERT INTO internal_action_log \
              (intent_id, phase, caller_hash, action, guild_id, actor_id, target_id, resolved_role_id, \
-              response_code, http_status, evidence_code, resource_id, affected, outcome) \
+              response_code, http_status, evidence_code, resource_id, affected, outcome, stop_reason) \
              SELECT intent_id, $2, caller_hash, action, guild_id, actor_id, target_id, resolved_role_id, \
-                    response_code, http_status, $3, resource_id, affected, outcome \
+                    response_code, http_status, $3, resource_id, affected, outcome, stop_reason \
              FROM internal_idempotency WHERE intent_id = $1 \
              ON CONFLICT (intent_id, phase) DO NOTHING",
         )
