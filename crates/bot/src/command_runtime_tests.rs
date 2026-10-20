@@ -17,6 +17,9 @@
 
 #![cfg(test)]
 
+#[path = "member_dispatch_authority_acceptance.rs"]
+mod member_dispatch_authority_acceptance;
+
 use std::collections::VecDeque;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1407,21 +1410,28 @@ fn member_slash(name: &str) -> Interaction {
     interaction
 }
 
+async fn member_refusal_database() -> two_bot_testsupport::TestDatabase {
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("disposable test bootstrap");
+    two_bot_testsupport::TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+        .await
+        .expect("disposable member refusal fixture")
+}
+
 #[tokio::test]
-async fn member_verbs_reach_executor_facts_then_fail_closed_without_db() {
-    // Every member verb routes through the shared router into the member
-    // consumer, which reads live guild facts over REST before touching the
-    // ledger. The mock fails that first read, so each verb must fail closed
-    // with exactly three wire calls (defer, guild read, reply edit) and never
-    // reach the connectionless lazy pool.
+#[ignore = "requires disposable agent-testdb for refusal audits"]
+async fn member_verbs_reach_executor_facts_then_fail_closed_with_audit() {
+    let _metrics = MODERATION_METRICS_LOCK.lock().await;
+    let db = member_refusal_database().await;
+    // Identity resolution fails before any authority/mutation. The failure
+    // must still persist an attributable denial, so this now needs a ledger.
     for name in ["ban", "tempban", "kick", "timeout", "warn"] {
         let (mock, origin) = MockRest::start(vec![200, 500, 200]).await;
-        let runtime = runtime_with_member(member_gates(), origin, lazy_pool());
+        let runtime = runtime_with_member(member_gates(), origin, db.pool().clone());
         runtime.on_interaction(&member_slash(name)).await;
         let requests = mock.requests();
         assert_eq!(requests.len(), 3, "{name}: defer, guild read, reply edit");
         assert_eq!(requests[1].method, "GET");
-        assert_eq!(requests[1].path, format!("/api/v10/guilds/{GUILD_S}"));
+        assert_eq!(requests[1].path, "/api/v10/users/@me");
         let reply = mock.deferred_reply();
         assert!(
             reply
@@ -1431,16 +1441,21 @@ async fn member_verbs_reach_executor_facts_then_fail_closed_without_db() {
         );
         mock.shutdown().await;
     }
+    let denied: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM moderation_audit WHERE outcome = 'denied'")
+            .fetch_one(db.pool())
+            .await
+            .expect("refusal audit");
+    assert_eq!(denied, 5);
+    db.close().await.expect("dispose fixture");
 }
 
 #[tokio::test]
+#[ignore = "requires disposable agent-testdb for refusal audits"]
 async fn member_verbs_refuse_unknown_bot_hierarchy_before_claim_or_mutation() {
-    // Serialize with the website exact-delta `refused` tests in
-    // `internal_action_http::tests` (TOG-28482): this test records
-    // `kick/refused` (and the other member verbs) on the process-global
-    // registry via `preflight_refused`, and `cargo test --workspace --lib
-    // --bins` runs both modules as threads of one process.
+    // Keep process-global outcome assertions isolated from website tests.
     let _metrics = MODERATION_METRICS_LOCK.lock().await;
+    let db = member_refusal_database().await;
     for name in ["ban", "tempban", "kick", "timeout", "warn"] {
         let json_response = |body: serde_json::Value| RestResponse {
             status: 200,
@@ -1449,27 +1464,31 @@ async fn member_verbs_refuse_unknown_bot_hierarchy_before_claim_or_mutation() {
         };
         let (mock, origin) = MockRest::start_script(vec![
             RestResponse::status(200),
-            json_response(serde_json::json!({
-                "owner_id": "5555",
-                "roles": [{"id": GUILD_S, "position": 0}],
-            })),
-            json_response(serde_json::json!({"user": {"id": "3333", "bot": false}, "roles": []})),
             json_response(serde_json::to_value(user(4444, true)).unwrap()),
-            json_response(serde_json::json!({"user": {"id": "4444"}, "roles": ["missing-role"]})),
+            json_response(serde_json::json!({
+                "id": GUILD_S, "owner_id": "5555",
+                "roles": [
+                    {"id": GUILD_S, "position": 0, "permissions": "0"},
+                    {"id": "101", "position": 50, "permissions": Permissions::all().bits().to_string()},
+                ],
+            })),
+            json_response(serde_json::json!({"user": {"id": "88", "bot": false}, "roles": ["101"]})),
+            json_response(serde_json::json!({"user": {"id": "3333", "bot": false}, "roles": []})),
+            json_response(serde_json::json!({"user": {"id": "4444", "bot": true}, "roles": ["9999"]})),
             RestResponse::status(200),
         ])
         .await;
-        let runtime = runtime_with_member(member_gates(), origin, lazy_pool());
+        let runtime = runtime_with_member(member_gates(), origin, db.pool().clone());
         runtime.on_interaction(&member_slash(name)).await;
         let requests = mock.requests();
         assert_eq!(
             requests.len(),
-            6,
-            "{name}: facts only, no mutation or DB claim"
+            7,
+            "{name}: facts and refusal audit only, no mutation or DB claim"
         );
-        assert!(requests[1..5].iter().all(|request| request.method == "GET"));
+        assert!(requests[1..6].iter().all(|request| request.method == "GET"));
         assert_eq!(
-            requests[4].path,
+            requests[5].path,
             format!("/api/v10/guilds/{GUILD_S}/members/4444")
         );
         assert!(mock.deferred_reply()["content"]
@@ -1478,12 +1497,22 @@ async fn member_verbs_refuse_unknown_bot_hierarchy_before_claim_or_mutation() {
             .contains("Moderation command failed"));
         mock.shutdown().await;
     }
+    let denied: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM moderation_audit WHERE outcome = 'denied'")
+            .fetch_one(db.pool())
+            .await
+            .expect("refusal audit");
+    assert_eq!(denied, 5);
+    db.close().await.expect("dispose fixture");
 }
 
 #[tokio::test]
+#[ignore = "requires disposable agent-testdb for refusal audits"]
 async fn member_verbs_share_actor_cooldown_before_role_reads() {
+    let _metrics = MODERATION_METRICS_LOCK.lock().await;
+    let db = member_refusal_database().await;
     let (mock, origin) = MockRest::start(vec![200, 500, 200]).await;
-    let runtime = runtime_with_member(member_gates(), origin, lazy_pool());
+    let runtime = runtime_with_member(member_gates(), origin, db.pool().clone());
     runtime.on_interaction(&member_slash("ban")).await;
     for (index, name) in ["tempban", "kick", "timeout", "warn"]
         .into_iter()
@@ -1508,6 +1537,7 @@ async fn member_verbs_share_actor_cooldown_before_role_reads() {
         );
     }
     mock.shutdown().await;
+    db.close().await.expect("dispose fixture");
 }
 
 #[tokio::test]

@@ -8,10 +8,13 @@ executor merged.
 
 ## Integration contract
 
-- Feed current actor/target roles and permissions into `MemberExecution`.
-  `MemberModerationService::execute` reuses `assert_moderation_allowed`; it
-  validates before claiming or acting. Bot hierarchy is a required resolved
-  position; adapters must refuse unknown positions before constructing a request.
+- Network-facing adapters use `MemberModerationService::execute_with_authority`
+  with a resolver for current actor/target roles, permissions and bot hierarchy.
+  It acquires the ban/tempban member lane before invoking that resolver, then
+  reuses `assert_moderation_allowed` before claiming or preparing an effect.
+  Other verbs resolve immediately before validation/claim. The plain `execute`
+  seam remains available to trusted callers supplying their own authority facts;
+  it cannot make supplied snapshots fresh. Unknown positions must refuse.
   Protected-target refusals share one generic reply. Policy refusals persist the
   actor, target, action and `denied` outcome without claiming or acting; audit
   write failures fail closed. Reasons are trimmed and capped at 512
@@ -85,16 +88,32 @@ uncertain and keep the claim fenced; a rate limit proves no effect and
 releases only the failed attempt. The audit-log reason stays within the
 512-unit bound, enforced before any I/O.
 
-Interaction-to-`MemberExecution` mapping resolves live role facts (guild
-roles/owner, resolved-or-fetched target member, cached bot id); incomplete
-snapshots refuse fail-closed instead of guessing hierarchy. Actor and target
-membership are interaction-time snapshots; guild role positions and bot membership
-are fetched before execution, not atomically with the claim or Discord mutation.
-A role change during a queue wait can therefore race actor authorization. This
-residual TOCTOU risk is accepted only for the default-off, staging-only integration,
-not as production clearance; Discord's bot hierarchy check is not an actor-policy
-recheck. Production enablement requires an explicit security disposition or a fresh
-in-claim actor/target recheck.
+For slash commands, the interaction supplies identities and command content, never
+dispatch authority. This resolver is wired to the member-command runtime; the signed
+internal-action adapter retains its separately owned resolver/activation contract.
+After the ban/tempban member-lane wait, the runtime strictly reads the current guild
+(id, owner, complete role positions and permission bits), actor, target and bot
+memberships. The other verbs perform these same reads immediately before their
+validation/claim boundary. Actor permissions are the guild-wide union of current
+roles plus `@everyone`, not interaction permission bits or channel overwrites.
+Owner/administrator expansion bypasses only actor permission/hierarchy checks;
+self, protected-target and bot-hierarchy checks remain. Unknown held roles, missing
+role facts, mismatched identities and failed reads refuse with a fixed, attributable
+`denied` audit before any prepared intent, warning, expiry or Discord mutation.
+Audit-write failures also fail closed. Only a strict target-member 404 permits a
+nonmember ban or tempban; kick/timeout/warn require present membership. No 403,
+timeout, malformed response or server error is absence.
+
+This closes the avoidable interaction-snapshot and **local member-lane wait** stale
+window. The reads are sequential bounded GETs, not an atomic Discord snapshot:
+a remote role/membership change after its read (including REST pacing/dispatch
+waits) can still race the final effect. Discord's bot hierarchy check is not an
+actor-policy recheck. Completed replay remains nonmutating; a failed fresh read
+may refuse a redelivery but never releases its completed or unknown idempotency
+row, prepared intent or expiry fence. No distributed lock or new reconciliation
+rule is introduced. **This is not production activation/clearance**: moderation
+remains default-off and staging-only, and existing security/soak/release gates
+remain mandatory.
 
 All five member verbs share a process-local, per-guild actor cooldown: one new
 interaction per actor every 5 seconds, reserved before role REST reads. It applies
