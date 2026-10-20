@@ -9087,6 +9087,8 @@ async fn privacy_deletion_dispatch_binds_request_status_and_receipt_to_invoker()
     const PRIVACY_GUILD: u64 = 100000000000000431;
     const MEMBER_A: u64 = 100000000000000432;
     const MEMBER_B: u64 = 100000000000000433;
+    const DELETE_INTERACTION: u64 = 100000000000000434;
+    const NEXT_DELETE_INTERACTION: u64 = 100000000000000435;
     let (mock, origin) = MockRest::start(Vec::new()).await;
     let executor = ActionExecutor::with_proxy("mock-only-token".into(), Some(origin)).unwrap();
     let mut privacy_gates = gates(false, false);
@@ -9099,7 +9101,8 @@ async fn privacy_deletion_dispatch_binds_request_status_and_receipt_to_invoker()
         false,
     );
 
-    let delete = privacy_request_interaction_in(PRIVACY_GUILD, MEMBER_A, "delete", None);
+    let mut delete = privacy_request_interaction_in(PRIVACY_GUILD, MEMBER_A, "delete", None);
+    delete.id = Id::new(DELETE_INTERACTION);
     runtime.on_interaction(&delete).await;
     let request: (String, String, String, String) = sqlx::query_as(
         "SELECT request_id, guild_id, user_id, status FROM retention_deletion_requests \
@@ -9142,14 +9145,21 @@ async fn privacy_deletion_dispatch_binds_request_status_and_receipt_to_invoker()
     .execute(db.pool())
     .await
     .expect("fixture marks this disposable-ledger row completed");
-    runtime
-        .on_interaction(&privacy_request_interaction_in(
-            PRIVACY_GUILD,
-            MEMBER_A,
-            "delete",
-            None,
-        ))
-        .await;
+    runtime.on_interaction(&delete).await;
+    let retried_requests: Vec<(String, String)> = sqlx::query_as(
+        "SELECT request_id, status FROM retention_deletion_requests \
+         WHERE guild_id = $1 AND user_id = $2",
+    )
+    .bind(PRIVACY_GUILD.to_string())
+    .bind(MEMBER_A.to_string())
+    .fetch_all(db.pool())
+    .await
+    .expect("read ledger after retrying the same interaction");
+    assert_eq!(
+        retried_requests,
+        vec![(request.0.clone(), "completed".to_owned())],
+        "same-interaction retry reuses the completed request without inserting a row"
+    );
     runtime
         .on_interaction(&privacy_request_interaction_in(
             PRIVACY_GUILD,
@@ -9167,6 +9177,31 @@ async fn privacy_deletion_dispatch_binds_request_status_and_receipt_to_invoker()
         ))
         .await;
 
+    // Change only the interaction id: a new tap must not reuse the completed
+    // request even though the authenticated guild and member are unchanged.
+    let mut next_delete = delete.clone();
+    next_delete.id = Id::new(NEXT_DELETE_INTERACTION);
+    runtime.on_interaction(&next_delete).await;
+    let requests: Vec<(String, String)> = sqlx::query_as(
+        "SELECT request_id, status FROM retention_deletion_requests \
+         WHERE guild_id = $1 AND user_id = $2",
+    )
+    .bind(PRIVACY_GUILD.to_string())
+    .bind(MEMBER_A.to_string())
+    .fetch_all(db.pool())
+    .await
+    .expect("read ledger after a distinct deletion interaction");
+    assert_eq!(requests.len(), 2, "a distinct tap queues a second request");
+    assert!(
+        requests.contains(&(request.0.clone(), "completed".to_owned())),
+        "the original completed request remains settled"
+    );
+    let (next_request_id, next_status) = requests
+        .iter()
+        .find(|(request_id, _)| request_id != &request.0)
+        .expect("the new interaction has a different request id");
+    assert_eq!(next_status, "pending");
+
     let edits: Vec<serde_json::Value> = mock
         .requests()
         .iter()
@@ -9175,7 +9210,7 @@ async fn privacy_deletion_dispatch_binds_request_status_and_receipt_to_invoker()
         .collect();
     assert_eq!(
         edits.len(),
-        6,
+        7,
         "each dispatched command completes its defer"
     );
     assert!(edits[0]["content"].as_str().unwrap().contains("pending"));
@@ -9185,6 +9220,7 @@ async fn privacy_deletion_dispatch_binds_request_status_and_receipt_to_invoker()
         "another member cannot read the request status"
     );
     let retry_reply = edits[3]["content"].as_str().unwrap();
+    assert!(retry_reply.contains(&request.0));
     assert!(retry_reply.contains("already accepted"));
     assert!(retry_reply.contains("check its current status"));
     assert!(!retry_reply.contains("queued"));
@@ -9196,6 +9232,10 @@ async fn privacy_deletion_dispatch_binds_request_status_and_receipt_to_invoker()
         edits[5]["content"], "Privacy command failed; try again.",
         "another member cannot read the completion receipt"
     );
+    let next_reply = edits[6]["content"].as_str().unwrap();
+    assert!(next_reply.contains("queued as pending"));
+    assert!(next_reply.contains(next_request_id));
+    assert!(!next_reply.contains(&request.0));
     mock.shutdown().await;
     db.close().await.expect("drop own disposable database");
 }
