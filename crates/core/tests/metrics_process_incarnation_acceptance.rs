@@ -73,9 +73,10 @@ fn process_incarnation_is_shared_by_registries_global_and_threads() {
 #[test]
 fn process_incarnation_child_probe() {
     let words = incarnation(&Metrics::default().render(None));
+    // Libtest may leave its single-threaded test-name prefix on this line.
     writeln!(
         io::stdout().lock(),
-        "PROCESS_INCARNATION={:08x}{:08x}{:08x}{:08x}",
+        "\nPROCESS_INCARNATION={:08x}{:08x}{:08x}{:08x}",
         words[0],
         words[1],
         words[2],
@@ -86,7 +87,12 @@ fn process_incarnation_child_probe() {
 
 fn child_identity() -> String {
     let output = Command::new(std::env::current_exe().expect("test executable"))
-        .args(["--exact", "process_incarnation_child_probe", "--nocapture"])
+        .args([
+            "--exact",
+            "process_incarnation_child_probe",
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .output()
         .expect("run isolated process identity probe");
     assert!(output.status.success(), "child identity contract must pass");
@@ -96,7 +102,19 @@ fn child_identity() -> String {
         .filter_map(|line| line.strip_prefix("PROCESS_INCARNATION="))
         .collect();
     assert_eq!(identities.len(), 1, "exactly one child identity receipt");
-    identities[0].to_owned()
+    let identity = identities[0];
+    assert_eq!(identity.len(), 32, "child identity must be 32 hex digits");
+    assert!(
+        identity
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "child identity must be canonical lowercase hex"
+    );
+    assert!(
+        identity.bytes().any(|byte| byte != b'0'),
+        "child identity must not be all-zero"
+    );
+    identity.to_owned()
 }
 
 #[test]
