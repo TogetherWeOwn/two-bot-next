@@ -628,6 +628,17 @@ export function interruptCommunityFactsDrain(state: MetricsAlertState): MetricsA
   return { ...state, communityFactsDrainFailures: {}, communityFactsDrainStreak: 0 };
 }
 
+/** A failed scrape breaks verdict-growth evidence, never an active verdict ticket. */
+export function interruptPrefixVerdictRefusals(state: MetricsAlertState): MetricsAlertState {
+  // The verdict fields are optional: deleting them restores the absent shape
+  // legacy storage already has, so the next valid sample re-baselines.
+  const next = { ...state };
+  delete next.prefixVerdictRefused;
+  delete next.prefixVerdictStreak;
+  delete next.prefixVerdictSeen;
+  return next;
+}
+
 export function parseExposition(text: string): Sample[] {
   const samples: Sample[] = [];
   for (const line of text.split("\n")) {
