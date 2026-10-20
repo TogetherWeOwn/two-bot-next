@@ -266,8 +266,7 @@ impl CustomCommandRuntime {
                         false,
                         Some("delivery_failed"),
                     );
-                    self.audit(&record, &format!("custom:run:{}", interaction.id))
-                        .await?;
+                    self.audit_slash_run(&record, interaction.id.get()).await?;
                     return Err(CustomCommandError::Delivery);
                 }
                 let row = row.ok_or(CustomCommandError::Context)?;
@@ -307,8 +306,7 @@ impl CustomCommandRuntime {
                         None
                     }),
                 );
-                self.audit(&record, &format!("custom:run:{}", interaction.id))
-                    .await?;
+                self.audit_slash_run(&record, interaction.id.get()).await?;
                 result?;
                 Ok(true)
             }
@@ -514,6 +512,24 @@ impl CustomCommandRuntime {
             )
             .await
             .map_err(|_| CustomCommandError::Delivery)
+    }
+
+    // Explicit re-entry still attempts Discord delivery and returns that
+    // attempt's outcome. The immutable slash fact is first-write-wins across
+    // both refusal and completion, never an execution claim or a resend loop.
+    async fn audit_slash_run(
+        &self,
+        record: &AuditRecord,
+        interaction_id: u64,
+    ) -> Result<(), CustomCommandError> {
+        store::audit_once(
+            &self.pool,
+            record,
+            &format!("custom:run:{interaction_id}"),
+            &two_bot_core::now_iso(),
+        )
+        .await
+        .map_err(|_| CustomCommandError::Storage)
     }
 
     async fn audit(&self, record: &AuditRecord, id: &str) -> Result<(), CustomCommandError> {
