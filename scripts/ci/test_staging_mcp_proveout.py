@@ -260,7 +260,9 @@ class HostileBodyTests(unittest.TestCase):
             argv = ["staging_mcp_proveout.py", "--output", str(output)]
             env = {proveout.TOKEN_ENV: self.TOKEN,
                    proveout.URL_ENV: proveout.DEFAULT_URL}
-            stdout = io.StringIO()
+            raw_stdout = io.BytesIO()
+            stdout = io.TextIOWrapper(raw_stdout, encoding="utf-8", errors="strict",
+                                      write_through=True)
             with mock.patch.object(proveout, "do_post", side_effect=responses) as post, \
                     mock.patch.object(sys, "argv", argv), \
                     mock.patch.dict(os.environ, env), redirect_stdout(stdout):
@@ -270,7 +272,7 @@ class HostileBodyTests(unittest.TestCase):
         self.assertEqual(post.call_count, 10)
         self.assertEqual([p["name"] for p in artifact["probes"]], self.PROBES)
         self.assertEqual(artifact["schema_version"], proveout.SCHEMA_VERSION)
-        text = stdout.getvalue()
+        text = raw_stdout.getvalue().decode("utf-8")
         self.assertNotIn(self.TOKEN, text)
         self.assertNotIn(self.TOKEN.encode(), raw)
         return code, text, artifact, raw
@@ -330,6 +332,12 @@ class HostileBodyTests(unittest.TestCase):
             for error in ("x", ["x"], True, 1):
                 with self.subTest(index=index, error=error):
                     self.assert_shape_failure(index, json.dumps({"error": error}))
+
+    def test_non_integer_error_codes_are_shape_failures(self):
+        for index in range(2, 8):
+            for code in ("\ud800x", "-32000", -32000.0, True, ["x"]):
+                with self.subTest(index=index, code=code):
+                    self.assert_shape_failure(index, json.dumps({"error": {"code": code}}))
 
     def test_wrong_typed_audit_structured_content_is_shape_failure(self):
         for structured in (["x"], "x", True, 1):

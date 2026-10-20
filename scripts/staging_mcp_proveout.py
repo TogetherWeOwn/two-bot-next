@@ -303,6 +303,8 @@ def main():
         elif "error" in parsed and parsed["error"] is not None:
             err = parsed["error"] if isinstance(parsed["error"], dict) else {}
             code = err.get("code")
+            if not isinstance(code, int) or isinstance(code, bool):
+                code = None
             if tool in CONTAINER_BACKED and code == -32000:
                 print(f"NOTE: tools/call {tool} returned -32000 (fenced container); expected while staging is fenced.", flush=True)
             elif tool == "get_config":
