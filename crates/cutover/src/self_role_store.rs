@@ -333,9 +333,12 @@ pub struct SelfRoleStore {
 }
 
 /// Acknowledgement caps from the bounded durable acknowledgement decision:
-/// at most 500 unresolved ticket rows per guild, 50 per member, 20 per event,
-/// and 512 bytes per row. [`SelfRoleStore::journal_role_exchange`] refuses
-/// the insert that would exceed a cap before writing anything.
+/// 500 unresolved ticket rows per guild, 50 per member, 20 per event, and
+/// 512 bytes per row. [`SelfRoleStore::journal_role_exchange`] refuses the
+/// insert that would exceed a cap before writing anything. Best-effort under
+/// concurrent cross-event journals (only same-event journals serialize on the
+/// event lock); terminal repair journals bypass enforcement deliberately so
+/// backpressure never blocks recovery.
 const ACK_MAX_UNRESOLVED_PER_GUILD: u32 = 500;
 const ACK_MAX_UNRESOLVED_PER_MEMBER: u32 = 50;
 const ACK_MAX_UNRESOLVED_PER_EVENT: u32 = 20;
@@ -1266,8 +1269,10 @@ impl SelfRoleStore {
 
     /// Pure acknowledgement cap check (no database): allow the insert only when
     /// every unresolved count is strictly under its cap and the estimated row
-    /// fits the 512 B bound. Over any cap, refuse with an operator-visible
-    /// error naming the tripped dimension, never a silent substitution.
+    /// fits the 512 B bound. Over any cap, refuse at the store boundary with
+    /// an error naming the tripped dimension, never a silent substitution.
+    /// Mapping the refusal through the runtime error taxonomy so operators
+    /// see the dimension end to end is follow-up work.
     pub fn check_acknowledgement_caps(
         guild_unresolved: u32,
         member_unresolved: u32,
@@ -1782,7 +1787,9 @@ fn validate_exchange_intent(intent: &ExchangeIntent) -> Result<(), StoreError> {
 /// the insert that would exceed a cap. Unresolved means `pending`: nothing
 /// writes the acknowledgement settlement columns yet, so the predicate stays
 /// valid on databases with and without migration 0449. Runs inside the
-/// journal transaction after the event lock, before the insert.
+/// journal transaction after the event lock, before the insert. Same-event
+/// journals serialize on the event lock, so the event cap is exact; the
+/// guild/member counts are best-effort under concurrent cross-event journals.
 async fn enforce_acknowledgement_caps(
     conn: &mut PgConnection,
     claim: &EventClaim,
