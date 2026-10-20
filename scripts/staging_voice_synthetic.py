@@ -144,7 +144,7 @@ class RedirectRefused(ValueError):
 
 
 class GatewayShapeError(ValueError):
-    """A gateway hello or dispatch violates the expected shape.
+    """A gateway frame, hello or dispatch violates the expected shape.
 
     Fixed vocabulary only, like BodyTooLarge and RedirectRefused.
     """
@@ -549,12 +549,17 @@ class WebSocket:
         self.sock.sendall((f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
                            f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
                            "Sec-WebSocket-Version: 13\r\n\r\n").encode())
-        head = b""
-        while b"\r\n\r\n" not in head:
+        # Suffix-checked and byte-capped: the terminator can only complete at
+        # the end of a byte-at-a-time read, so endswith keeps a hostile
+        # header linear instead of rescanning the whole head per byte.
+        head = bytearray()
+        while not head.endswith(b"\r\n\r\n"):
             chunk = self.sock.recv(1)
             if not chunk:
                 raise ConnectionError("gateway closed during handshake")
             head += chunk
+            if len(head) > MAX_BODY_BYTES:
+                raise BodyTooLarge("gateway handshake answered over the byte cap")
         if b" 101 " not in head.split(b"\r\n", 1)[0]:
             raise ConnectionError("gateway refused the websocket upgrade")
         self.lock = threading.Lock()
@@ -591,6 +596,9 @@ class WebSocket:
         validated before the payload is read, so a huge length refuses
         without an unbounded read, and continuation fragments refuse once
         their running total passes the cap. Exact-cap input passes.
+        Control frames (ping, pong, close) carry at most 125 payload bytes
+        per RFC 6455 section 5.5; a longer control payload refuses as a
+        malformed frame instead of corrupting the pong encoder.
         """
         parts = []
         total = 0
@@ -603,6 +611,10 @@ class WebSocket:
                 n = struct.unpack(">Q", self._exact(8))[0]
             if n > MAX_BODY_BYTES:
                 raise BodyTooLarge("gateway frame answered over the byte cap")
+            if op & 0x8 and n > 125:
+                raise GatewayShapeError("gateway frame was malformed")
+            if op in (0x1, 0x0) and total + n > MAX_BODY_BYTES:
+                raise BodyTooLarge("gateway message answered over the byte cap")
             mask = self._exact(4) if b2 & 0x80 else None
             data = self._exact(n)
             if mask:
@@ -754,11 +766,14 @@ class Session:
                 continue
             if not isinstance(msg.get("t"), str) or not isinstance(msg.get("d"), dict):
                 raise GatewayShapeError("gateway dispatch was malformed")
+            if msg["t"] in ("GUILD_CREATE", "CHANNEL_DELETE"):
+                if not isinstance(msg["d"].get("id"), str):
+                    raise GatewayShapeError("gateway dispatch was malformed")
             event = {"t": msg["t"], "d": msg["d"]}
             self.events.append(event)
             if msg["t"] == "READY":
                 user = msg["d"].get("user")
-                if not isinstance(user, dict) or "id" not in user:
+                if not isinstance(user, dict) or not isinstance(user.get("id"), str):
                     raise GatewayShapeError("gateway dispatch was malformed")
                 self.me = user["id"]
             if until(event):
