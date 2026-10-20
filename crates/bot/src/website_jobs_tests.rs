@@ -292,6 +292,34 @@ async fn roster_paginates_and_rejects_failed_or_repeated_pages() {
 }
 
 #[tokio::test]
+async fn roster_errors_do_not_retry_member_page_requests() {
+    for (case, response) in [
+        ("403", ScriptedResponse::status(403)),
+        ("429", ScriptedResponse::status(429)),
+        ("500", ScriptedResponse::status(500)),
+        (
+            "malformed 200",
+            ScriptedResponse::json(200, json!({"not":"array"})),
+        ),
+    ] {
+        let mock = MockRest::start(vec![response], ScriptedResponse::status(500)).await;
+        assert_eq!(
+            roster(&executor(&mock), "2222", BOT_FLOOR_MAX_PAGES)
+                .await
+                .err(),
+            Some(ErrorClass::Rest),
+            "{case} member page",
+        );
+        assert_eq!(
+            mock.requests().len(),
+            1,
+            "{case} member page must not be retried",
+        );
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn bot_floor_scan_caps_requests_and_never_returns_a_partial_count() {
     use two_bot_core::BotFloorScan;
 
