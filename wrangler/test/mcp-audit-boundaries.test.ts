@@ -45,6 +45,26 @@ test("audit proxy rejects schema drift, private columns and invalid field types"
   }
 });
 
+test("audit proxy pins the Rust producer's millisecond UTC timestamp format", async () => {
+  for (const occurred_at of ["2026-10-19T00:00:02.000Z", "2026-10-19T00:00:01.123Z"]) {
+    const data = { ...excerpt, rows: [{ ...row, occurred_at }] };
+    const body = await (await call(() => Response.json(data))).json() as any;
+    assert.deepEqual(body.result?.structuredContent, data);
+    assert.equal(body.error, undefined);
+  }
+  for (const occurred_at of [
+    "2026-10-19T00:00:02Z",
+    "2026-10-19T00:00:01.12Z",
+    "2026-10-19T00:00:01.123+00:00",
+    "2026-10-19T00:00:01.123",
+  ]) {
+    const data = { ...excerpt, rows: [{ ...row, occurred_at }] };
+    const body = await (await call(() => Response.json(data))).json() as any;
+    assert.equal(body.error?.code, -32000);
+    assert.equal(body.result, undefined);
+  }
+});
+
 test("audit proxy requires JSON on an exact 200, including unavailable answers", async () => {
   for (const response of [
     Response.json(excerpt, { status: 503 }),

@@ -45,8 +45,9 @@ The container excerpt is a fixed, read-only `SELECT` from
 It reads at most 51 rows in one snapshot (50 returned, the extra row determines
 `truncated`) under a two-second database deadline. It never loads metadata,
 delivery nonces, claim tokens, error text or message bodies. Fields are limited
-to entry identity, kind, guild/member/channel/message IDs, UTC occurrence time,
-a fixed-vocabulary action and delivery state. Oversized or invalid stored
+to entry identity, kind, guild/member/channel/message IDs, UTC occurrence time
+(`YYYY-MM-DDTHH:mm:ss.sssZ`, including `.000Z` for whole seconds), a
+fixed-vocabulary action and delivery state. Oversized or invalid stored
 facts fail closed to `{available:false, rows:[], truncated:false}`; database
 absence, failure and timeout use that same unavailable result. No row claims,
 delivery updates or Discord calls occur. Responses are `no-store`; only GET
@@ -112,7 +113,11 @@ registered until that lands.
 3. With the staging `MCP_TOKEN`: `initialize` → `protocolVersion`,
    `tools/list` → exactly the five tools, `tools/call get_status` → the
    container `/health` JSON.
-4. `get_audit` reads the real container excerpt. The backfill tool remains
+4. `get_audit` reads the real container excerpt. The manual
+   `staging-mcp-proveout` workflow checks its `{available, rows, truncated}`
+   envelope, including explicit unavailable results. While staging is fenced,
+   all four container-backed tools may return the expected `-32000` refusal;
+   `get_config` must still succeed Worker-side. The backfill tool remains
    explicitly unimplemented; its readiness jobs excerpt is not backfill progress.
 
 No dashboard or admin UI duplication: MCP reuses the same container read

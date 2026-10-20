@@ -605,6 +605,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn audit_excerpt_timestamp_matches_worker_millisecond_utc_contract() {
+        let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
+            assert!(
+                std::env::var("GITHUB_ACTIONS").is_err(),
+                "CI must supply the guarded test database"
+            );
+            eprintln!("SKIP audit_excerpt_timestamp: TWO_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let db = two_bot_testsupport::TestDatabase::create(
+            &url,
+            &sqlx::migrate!("../cutover/migrations"),
+        )
+        .await
+        .expect("create migrated agent-testdb fixture");
+        sqlx::query(
+            "INSERT INTO operational_audit_log
+                (entry_id, event_kind, guild_id, occurred_at, metadata_json, created_at)
+             VALUES ('synthetic-whole-second', 'message_delete', '424242',
+                     TIMESTAMPTZ '2026-10-19T00:00:02Z', '{}',
+                     TIMESTAMPTZ '2026-10-19T00:00:02Z'),
+                    ('synthetic-fractional-second', 'message_delete', '424242',
+                     TIMESTAMPTZ '2026-10-19T02:00:01.123+02:00', '{}',
+                     TIMESTAMPTZ '2026-10-19T00:00:01Z')",
+        )
+        .execute(db.pool())
+        .await
+        .expect("seed exact timestamp fixtures");
+        let (status, json) = get(
+            app(
+                GatewayState::Connected,
+                Some(db.pool().clone()),
+                crate::jobs::statuses(&[], true),
+            ),
+            "/ops/audit",
+        )
+        .await;
+        // Close the disposable fixture even if the contract assertions fail.
+        db.close().await.expect("close fixture database");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["available"], true);
+        assert_eq!(json["rows"].as_array().unwrap().len(), 2);
+        assert_eq!(json["rows"][0]["entry_id"], "synthetic-whole-second");
+        assert_eq!(json["rows"][0]["occurred_at"], "2026-10-19T00:00:02.000Z");
+        assert_eq!(json["rows"][1]["entry_id"], "synthetic-fractional-second");
+        assert_eq!(json["rows"][1]["occurred_at"], "2026-10-19T00:00:01.123Z");
+    }
+
+    #[tokio::test]
     async fn audit_head_is_refused_without_reading_database() {
         let response = app(
             GatewayState::Connected,
