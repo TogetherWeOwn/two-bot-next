@@ -90,6 +90,9 @@ pub enum RuntimeError {
 }
 
 const BOT_ACCESS_TTL: Duration = Duration::from_secs(60);
+/// In-flight invalidations during identity load or a live channel check.
+/// The raced snapshot is never cached or used to post.
+const ACCESS_RELOAD_BOUND: u32 = 3;
 const MAX_ACCEPTED_WELCOMES: usize = 32;
 
 struct BotAccess {
@@ -527,59 +530,99 @@ impl OnboardingRuntime {
         if channels.is_empty() {
             return Ok(None);
         }
+        enum Probe {
+            Selected(String),
+            Denied,
+            Unavailable,
+            Stale,
+        }
         // One guild/bot snapshot, singleflight even when both workers miss.
-        // Only successful identity evidence is cached; channel overwrites stay live.
+        // Only a generation-stable success is cached; channel overwrites stay live.
+        // An invalidation during load or a live channel check discards that attempt
+        // and reloads. The raced snapshot is never cached or used to post.
+        // Sustained invalidation returns retryable Discord. A REST error or a
+        // missing identity is not a race: those return immediately.
         let mut cached = self.bot_access.lock().await;
-        let generation = self.access_generation.load(Ordering::SeqCst);
-        if cached.as_ref().is_some_and(|entry| {
-            entry.generation != generation || entry.loaded_at.elapsed() >= BOT_ACCESS_TTL
-        }) {
-            *cached = None;
-        }
-        if cached.is_none() {
-            let loaded_at = Instant::now();
-            let Some(access) = MemberAccess::load(&self.executor, config.guild_id, self.bot_id)
-                .await
-                .map_err(|_| RuntimeError::Discord)?
-            else {
-                return Ok(None);
-            };
-            if self.access_generation.load(Ordering::SeqCst) != generation {
-                return Err(RuntimeError::Discord);
+        for _ in 0..ACCESS_RELOAD_BOUND {
+            let generation = self.access_generation.load(Ordering::SeqCst);
+            if cached.as_ref().is_some_and(|entry| {
+                entry.generation != generation || entry.loaded_at.elapsed() >= BOT_ACCESS_TTL
+            }) {
+                *cached = None;
             }
-            *cached = Some(BotAccess {
-                access,
-                loaded_at,
-                generation,
-            });
-        }
-        let Some(entry) = cached.as_ref() else {
-            return Err(RuntimeError::Discord);
-        };
-        let mut selected = None;
-        let mut denied = false;
-        for channel in channels {
-            let channel = channel.to_string();
-            match entry.access.permits(&self.executor, &channel, true).await {
-                Ok(true) => {
-                    selected = Some(channel);
-                    break;
+            if cached.is_none() {
+                let loaded_at = Instant::now();
+                let Some(access) = MemberAccess::load(&self.executor, config.guild_id, self.bot_id)
+                    .await
+                    .map_err(|_| RuntimeError::Discord)?
+                else {
+                    return Ok(None);
+                };
+                if self.access_generation.load(Ordering::SeqCst) != generation {
+                    continue;
                 }
-                Ok(false) => denied = true,
-                Err(_) => {
+                *cached = Some(BotAccess {
+                    access,
+                    loaded_at,
+                    generation,
+                });
+            }
+            // End the cache borrow before a stale result clears it.
+            let probe = {
+                let Some(entry) = cached.as_ref() else {
+                    return Err(RuntimeError::Discord);
+                };
+                let mut selected = None;
+                let mut denied = false;
+                let mut unavailable = false;
+                for channel in channels {
+                    let channel = channel.to_string();
+                    match entry.access.permits(&self.executor, &channel, true).await {
+                        Ok(allowed) => {
+                            if self.access_generation.load(Ordering::SeqCst) != generation {
+                                selected = None;
+                                denied = false;
+                                break;
+                            }
+                            if allowed {
+                                selected = Some(channel);
+                                break;
+                            }
+                            denied = true;
+                        }
+                        Err(_) => {
+                            unavailable = true;
+                            break;
+                        }
+                    }
+                }
+                if unavailable {
+                    Probe::Unavailable
+                } else if self.access_generation.load(Ordering::SeqCst) != generation {
+                    Probe::Stale
+                } else if let Some(channel) = selected {
+                    Probe::Selected(channel)
+                } else if denied {
+                    Probe::Denied
+                } else {
+                    // The in-loop generation check cleared both flags. Reload.
+                    Probe::Stale
+                }
+            };
+            match probe {
+                Probe::Unavailable => {
                     *cached = None;
                     return Err(RuntimeError::Discord);
                 }
+                Probe::Stale => *cached = None,
+                Probe::Denied => {
+                    *cached = None;
+                    return Ok(None);
+                }
+                Probe::Selected(channel) => return Ok(Some(channel)),
             }
         }
-        if self.access_generation.load(Ordering::SeqCst) != generation {
-            *cached = None;
-            return Err(RuntimeError::Discord);
-        }
-        if denied {
-            *cached = None;
-        }
-        Ok(selected)
+        Err(RuntimeError::Discord)
     }
 
     async fn welcome(
