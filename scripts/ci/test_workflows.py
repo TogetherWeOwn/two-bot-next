@@ -3383,6 +3383,11 @@ class WorkflowTests(unittest.TestCase):
             "--skip seeded_aggregates_render_exactly_guild_scoped_and_read_only",
             main_sweep,
         )
+        ignored_sweep = [run for run in sweeps if "-- --ignored" in run][0]
+        self.assertIn(
+            "--skip list_is_guild_scoped_selector_shaped_and_read_only",
+            ignored_sweep,
+        )
         guarded = [run for run in cov_runs if "llvm-cov --no-report -p " in run]
         self.assertEqual(len(guarded), 14)
         for run in guarded:
