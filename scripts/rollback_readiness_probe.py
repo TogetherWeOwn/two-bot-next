@@ -92,7 +92,7 @@ USER_AGENT = "two-bot-next-staging-rollout/1.0"
 CREATED_AT_RE = re.compile(
     r"(?P<Y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})"
     r"T(?P<H>\d{2}):(?P<M>\d{2}):(?P<S>\d{2})"
-    r"(?:\.(?P<frac>\d{1,9}))?(?:Z|(?P<oh>[+-]\d{2}):(?P<om>\d{2}))")
+    r"(?:\.(?P<frac>\d{1,9}))?(?:Z|(?P<oh>[+-]\d{2}):(?P<om>\d{2}))", re.ASCII)
 CREATED_AT_MAX_LEN = 64
 # Component names from crates/bot/src/server.rs; the drift test pins them to the source.
 # Per-surface allowlist: exactly the four components the container serves.
@@ -199,6 +199,7 @@ class BudgetedStream:
         self.total = 0
 
     def readline(self, size):
+        size = min(size, DECOMPRESSED_CAP - self.total + 1)
         line = self._stream.readline(size)
         self.total += len(line)
         if self.total > DECOMPRESSED_CAP:
