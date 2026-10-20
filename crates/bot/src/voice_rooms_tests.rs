@@ -7,14 +7,24 @@ use std::sync::Mutex;
 mod admission_config_acceptance;
 #[path = "voice_admission_spawn_tests.rs"]
 mod admission_spawn;
+#[path = "voice_boot_settings_acceptance_tests.rs"]
+mod boot_settings_acceptance;
 #[path = "voice_cold_authority_tests.rs"]
 mod cold_authority;
+#[path = "voice_creation_receipt_acceptance_tests.rs"]
+mod creation_receipt_acceptance;
 #[path = "voice_delete_guard_tests.rs"]
 mod delete_guards;
 #[path = "voice_empty_grace_override_tests.rs"]
 mod empty_grace_override;
+#[path = "voice_invite_override_tests.rs"]
+mod invite_override;
+#[path = "voice_invite_responder_wiring_tests.rs"]
+mod invite_responder_wiring;
 #[path = "voice_join_requests_tests.rs"]
 mod join;
+#[path = "voice_join_grant_witness_acceptance_tests.rs"]
+mod join_grant_witness_acceptance;
 #[path = "voice_kick_tests.rs"]
 mod kick;
 #[path = "voice_rooms_limit_tests.rs"]
@@ -702,7 +712,12 @@ impl RoomPersistence for Store {
     async fn join_grants(&self, _: u64) -> Result<BTreeMap<u64, BTreeSet<u64>>, StoreError> {
         Ok(self.join_grants.lock().unwrap().clone())
     }
-    async fn save_join_grant(&self, _: u64, room: u64, member: u64) -> Result<bool, StoreError> {
+    async fn save_join_grant(
+        &self,
+        _: u64,
+        room: u64,
+        member: u64,
+    ) -> Result<JoinGrantIntent, StoreError> {
         self.trace
             .lock()
             .unwrap()
@@ -711,15 +726,20 @@ impl RoomPersistence for Store {
             return Err(error);
         }
         if !self.rooms.lock().unwrap().contains_key(&room) {
-            return Ok(false);
+            return Ok(JoinGrantIntent::RoomMissing);
         }
-        self.join_grants
+        let inserted = self
+            .join_grants
             .lock()
             .unwrap()
             .entry(room)
             .or_default()
             .insert(member);
-        Ok(true)
+        Ok(if inserted {
+            JoinGrantIntent::Fresh
+        } else {
+            JoinGrantIntent::Retained
+        })
     }
     async fn remove_join_grant(&self, _: u64, room: u64, member: u64) -> Result<(), StoreError> {
         self.trace
@@ -783,6 +803,8 @@ struct Http {
     written_overwrites: Mutex<Vec<(u64, PermissionOverwrite)>>,
     notices: Mutex<Vec<(NoticeTarget, String, Option<u64>)>>,
     refused_notices: Mutex<Vec<NoticeTarget>>,
+    /// Notice targets answering a per-route 429 instead of a refusal.
+    rate_limited_notices: Mutex<Vec<NoticeTarget>>,
     /// V3 join-request prompts posted in a room's chat, and the scripted
     /// errors (one per attempt) the next sends fail with.
     prompts: Mutex<Vec<SentPrompt>>,
@@ -847,6 +869,7 @@ impl Http {
             written_overwrites: Mutex::new(Vec::new()),
             notices: Mutex::new(Vec::new()),
             refused_notices: Mutex::new(Vec::new()),
+            rate_limited_notices: Mutex::new(Vec::new()),
             prompts: Mutex::new(Vec::new()),
             prompt_errors: Mutex::new(VecDeque::new()),
             next_message: Mutex::new(9_000),
@@ -1309,6 +1332,12 @@ impl RoomWrites for Http {
         content: &str,
         mention_role: Option<u64>,
     ) -> Result<(), RoomHttpError> {
+        if self.rate_limited_notices.lock().unwrap().contains(&target) {
+            return Err(RoomHttpError::RateLimited {
+                retry_after_ms: 1_000,
+                global: false,
+            });
+        }
         if self.refused_notices.lock().unwrap().contains(&target) {
             return Err(RoomHttpError::AccessDenied);
         }
@@ -6490,8 +6519,14 @@ async fn access_command_refuses_bad_input_without_changing_anything() {
     }
 }
 
+// These tests share the process-global log capture. Serialize every admin
+// store-failure emitter, including the two reply-only tests, so each capture
+// window contains only its own operation's warning. Hold the guard across await.
+static ADMIN_STORE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn access_command_reports_store_failures_and_changes_nothing() {
+    let _guard = ADMIN_STORE_TEST_LOCK.lock().await;
     let shared = Arc::new(Mutex::new(AccessControls::default()));
     let runtime = shared_runtime(
         Trace::default(),
@@ -6522,6 +6557,82 @@ async fn access_command_reports_store_failures_and_changes_nothing() {
     );
     let (_, response) = handle_capture(&unreadable, &disable()).await;
     assert!(response_text(&response.expect("reply")).contains("Nothing was changed"));
+}
+
+#[tokio::test]
+async fn access_read_store_failure_warns_and_keeps_reply() {
+    let _guard = ADMIN_STORE_TEST_LOCK.lock().await;
+    let runtime = gated_runtime(
+        Trace::default(),
+        AccessControls::default(),
+        Some(StoreError::Unavailable),
+    );
+    let global = tracing_capture::global();
+    let before = global.text().len();
+    let (_, response) = handle_capture(
+        &runtime,
+        &access_interaction(sub_option("show", vec![]), true),
+    )
+    .await;
+    assert_eq!(
+        response_text(&response.expect("reply")),
+        "Could not read the voice-room settings. Nothing was changed; try again."
+    );
+    let log = global.text()[before..].to_owned();
+    let lines: Vec<_> = log
+        .lines()
+        .filter(|line| line.contains("op=\"access_read\""))
+        .collect();
+    assert_eq!(lines.len(), 1, "expected one access_read warn in:\n{log}");
+    let line = lines[0];
+    assert!(line.starts_with("WARN "), "{line}");
+    assert!(line.contains("voice_admin_store"), "{line}");
+    assert!(line.contains("reason=\"unavailable\""), "{line}");
+    assert!(line.contains("guild_id=\"100\""), "{line}");
+    assert!(line.contains("voice admin store failed"), "{line}");
+    assert!(!line.contains("the store"), "{line}");
+}
+
+#[tokio::test]
+async fn access_save_store_failure_warns_and_keeps_reply() {
+    let _guard = ADMIN_STORE_TEST_LOCK.lock().await;
+    let shared = Arc::new(Mutex::new(AccessControls::default()));
+    let runtime = shared_runtime(
+        Trace::default(),
+        shared.clone(),
+        Some(StoreError::CredentialRefused),
+    );
+    let disable = access_interaction(
+        sub_option(
+            "creation",
+            vec![CommandDataOption {
+                name: "enabled".to_owned(),
+                value: CommandOptionValue::Boolean(false),
+            }],
+        ),
+        true,
+    );
+    let global = tracing_capture::global();
+    let before = global.text().len();
+    let (_, response) = handle_capture(&runtime, &disable).await;
+    assert_eq!(
+        response_text(&response.expect("reply")),
+        "Could not save the voice-room settings. Nothing was changed; try again."
+    );
+    assert_eq!(*shared.lock().unwrap(), AccessControls::default());
+    let log = global.text()[before..].to_owned();
+    let lines: Vec<_> = log
+        .lines()
+        .filter(|line| line.contains("op=\"access_save\""))
+        .collect();
+    assert_eq!(lines.len(), 1, "expected one access_save warn in:\n{log}");
+    let line = lines[0];
+    assert!(line.starts_with("WARN "), "{line}");
+    assert!(line.contains("voice_admin_store"), "{line}");
+    assert!(line.contains("reason=\"credential_refused\""), "{line}");
+    assert!(line.contains("guild_id=\"100\""), "{line}");
+    assert!(line.contains("voice admin store failed"), "{line}");
+    assert!(!line.contains("the store"), "{line}");
 }
 
 fn channel_option(name: &str, id: u64) -> CommandDataOption {
@@ -6955,6 +7066,7 @@ async fn logging_rejects_foreign_channel_and_disconnected_or_unidentified_actor(
 
 #[tokio::test]
 async fn logging_command_reports_store_failures_and_changes_nothing() {
+    let _guard = ADMIN_STORE_TEST_LOCK.lock().await;
     let level = || {
         logging_interaction(
             sub_option("level", vec![command_option("level", "off")]),
@@ -6973,6 +7085,105 @@ async fn logging_command_reports_store_failures_and_changes_nothing() {
     let (_, response) = handle_capture(&unreadable, &level()).await;
     assert!(response_text(&response.expect("reply")).contains("Nothing was changed"));
     assert_eq!(*shared.lock().unwrap(), LoggingSettings::default());
+}
+
+#[tokio::test]
+async fn logging_read_store_failure_warns_and_keeps_reply() {
+    let _guard = ADMIN_STORE_TEST_LOCK.lock().await;
+    let shared = Arc::new(Mutex::new(LoggingSettings::default()));
+    let runtime = logging_runtime(shared.clone(), Some(StoreError::Conflict), None);
+    assert!(runtime.publish_snapshot(GUILD, logging_snapshot()));
+    let level = logging_interaction(
+        sub_option("level", vec![command_option("level", "off")]),
+        true,
+    );
+    let global = tracing_capture::global();
+    let before = global.text().len();
+    let (_, response) = handle_capture(&runtime, &level).await;
+    assert_eq!(
+        response_text(&response.expect("reply")),
+        "Could not read the logging settings. Nothing was changed; try again."
+    );
+    assert_eq!(*shared.lock().unwrap(), LoggingSettings::default());
+    let log = global.text()[before..].to_owned();
+    let lines: Vec<_> = log
+        .lines()
+        .filter(|line| line.contains("op=\"logging_read\""))
+        .collect();
+    assert_eq!(lines.len(), 1, "expected one logging_read warn in:\n{log}");
+    let line = lines[0];
+    assert!(line.starts_with("WARN "), "{line}");
+    assert!(line.contains("voice_admin_store"), "{line}");
+    assert!(line.contains("reason=\"conflict\""), "{line}");
+    assert!(line.contains("guild_id=\"100\""), "{line}");
+    assert!(line.contains("voice admin store failed"), "{line}");
+    assert!(!line.contains("the store"), "{line}");
+}
+
+#[tokio::test]
+async fn logging_save_store_failure_warns_and_keeps_reply() {
+    let _guard = ADMIN_STORE_TEST_LOCK.lock().await;
+    let shared = Arc::new(Mutex::new(LoggingSettings::default()));
+    let runtime = logging_runtime(shared.clone(), None, Some(StoreError::Unavailable));
+    assert!(runtime.publish_snapshot(GUILD, logging_snapshot()));
+    let level = logging_interaction(
+        sub_option("level", vec![command_option("level", "off")]),
+        true,
+    );
+    let global = tracing_capture::global();
+    let before = global.text().len();
+    let (_, response) = handle_capture(&runtime, &level).await;
+    assert_eq!(
+        response_text(&response.expect("reply")),
+        "Could not save the logging settings. Nothing was changed; try again."
+    );
+    assert_eq!(*shared.lock().unwrap(), LoggingSettings::default());
+    let log = global.text()[before..].to_owned();
+    let lines: Vec<_> = log
+        .lines()
+        .filter(|line| line.contains("op=\"logging_save\""))
+        .collect();
+    assert_eq!(lines.len(), 1, "expected one logging_save warn in:\n{log}");
+    let line = lines[0];
+    assert!(line.starts_with("WARN "), "{line}");
+    assert!(line.contains("voice_admin_store"), "{line}");
+    assert!(line.contains("reason=\"unavailable\""), "{line}");
+    assert!(line.contains("guild_id=\"100\""), "{line}");
+    assert!(line.contains("voice admin store failed"), "{line}");
+    assert!(!line.contains("the store"), "{line}");
+}
+
+#[test]
+fn admin_store_error_tokens_cover_all_variants() {
+    assert_eq!(
+        admin_store_error_token(StoreError::Unavailable),
+        "unavailable"
+    );
+    assert_eq!(
+        admin_store_error_token(StoreError::CredentialRefused),
+        "credential_refused"
+    );
+    assert_eq!(admin_store_error_token(StoreError::Conflict), "conflict");
+}
+
+#[test]
+fn admin_store_failure_logs_one_warn_with_op_and_reason() {
+    tracing_capture::global();
+    let capture = tracing_capture::Capture::default();
+    tracing::subscriber::with_default(capture.clone(), || {
+        log_admin_store_failure("access_read", GUILD, StoreError::Unavailable);
+    });
+    let log = capture.text();
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 1, "{log}");
+    let line = lines[0];
+    assert!(line.starts_with("WARN "), "{line}");
+    assert!(line.contains("voice_event=\"voice_admin_store\""), "{line}");
+    assert!(line.contains("op=\"access_read\""), "{line}");
+    assert!(line.contains("reason=\"unavailable\""), "{line}");
+    assert!(line.contains("guild_id=\"100\""), "{line}");
+    assert!(line.contains("voice admin store failed"), "{line}");
+    assert!(!line.contains("the store"), "{line}");
 }
 
 #[tokio::test]
@@ -10201,6 +10412,83 @@ async fn export_and_import_refuse_without_guild_inventory() {
     assert!(response_text(&response.expect("refusal")).contains("unavailable"));
 }
 
+fn config_failure_runtime(trace: Trace, error: StoreError) -> VoiceRuntime<Store, Http> {
+    VoiceRuntime::new(
+        move || {
+            let mut store = Store::new(trace.clone());
+            store.config_error = Some(error);
+            (store, Http::new(trace.clone()))
+        },
+        Duration::from_millis(10),
+        true,
+    )
+}
+
+#[tokio::test]
+async fn export_read_store_failure_warns_and_keeps_reply() {
+    let _guard = ADMIN_STORE_TEST_LOCK.lock().await;
+    let trace = Trace::default();
+    let runtime = config_failure_runtime(trace.clone(), StoreError::CredentialRefused);
+    let interaction = with_user(
+        voice_interaction(Some(command_data("export", Vec::new())), manager(), true),
+        UPLOADER,
+    );
+    let inventory = config_inventory();
+    let global = tracing_capture::global();
+    let before = global.text().len();
+    let (owned, response) = handle_import_capture(&runtime, &interaction, Some(&inventory)).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(&response.expect("reply")),
+        "Could not read the voice configuration. Nothing was sent; try again."
+    );
+    assert!(trace.lock().unwrap().is_empty());
+    let log = global.text()[before..].to_owned();
+    let lines: Vec<_> = log
+        .lines()
+        .filter(|line| line.contains("op=\"export_read\""))
+        .collect();
+    assert_eq!(lines.len(), 1, "expected one export_read warn in:\n{log}");
+    let line = lines[0];
+    assert!(line.starts_with("WARN "), "{line}");
+    assert!(line.contains("voice_admin_store"), "{line}");
+    assert!(line.contains("reason=\"credential_refused\""), "{line}");
+    assert!(line.contains("guild_id=\"100\""), "{line}");
+    assert!(line.contains("voice admin store failed"), "{line}");
+    assert!(!line.contains("the store"), "{line}");
+}
+
+#[tokio::test]
+async fn import_read_store_failure_warns_and_keeps_reply() {
+    let _guard = ADMIN_STORE_TEST_LOCK.lock().await;
+    let trace = Trace::default();
+    let runtime = config_failure_runtime(trace.clone(), StoreError::Conflict);
+    let interaction = import_interaction(10, manager(), UPLOADER);
+    let inventory = config_inventory();
+    let global = tracing_capture::global();
+    let before = global.text().len();
+    let (owned, response) = handle_import_capture(&runtime, &interaction, Some(&inventory)).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(&response.expect("reply")),
+        "Could not read the current voice configuration. Nothing was changed; try again."
+    );
+    assert!(trace.lock().unwrap().is_empty());
+    let log = global.text()[before..].to_owned();
+    let lines: Vec<_> = log
+        .lines()
+        .filter(|line| line.contains("op=\"import_read\""))
+        .collect();
+    assert_eq!(lines.len(), 1, "expected one import_read warn in:\n{log}");
+    let line = lines[0];
+    assert!(line.starts_with("WARN "), "{line}");
+    assert!(line.contains("voice_admin_store"), "{line}");
+    assert!(line.contains("reason=\"conflict\""), "{line}");
+    assert!(line.contains("guild_id=\"100\""), "{line}");
+    assert!(line.contains("voice admin store failed"), "{line}");
+    assert!(!line.contains("the store"), "{line}");
+}
+
 #[tokio::test]
 async fn import_denied_without_manage_server() {
     let trace = Trace::default();
@@ -10909,6 +11197,77 @@ async fn notices_fall_back_from_system_channel_to_owner_dm_to_creator_chat() {
         .push(NoticeTarget::DirectMessage(OWNER));
     assert!(worker.send_notices(NOTICE_REPEAT_INTERVAL_MS).await);
     assert_eq!(sent(&worker)[1].0, NoticeTarget::Channel(CREATOR));
+}
+
+#[tokio::test]
+async fn configured_channel_failure_warns_then_falls_back() {
+    let settings = LoggingSettings {
+        channel_id: Some(650),
+        mention_role_id: Some(NOTICE_ROLE),
+        ..LoggingSettings::default()
+    };
+    let mut worker = failed_worker(settings, Some(SYSTEM_CHANNEL)).await;
+
+    // A working configured channel stays silent: no fallback warn.
+    let global = tracing_capture::global();
+    let before = global.text().len();
+    assert!(worker.send_notices(0).await);
+    assert_eq!(sent(&worker)[0].0, NoticeTarget::Channel(650));
+    let quiet = global.text()[before..].to_owned();
+    assert!(
+        !quiet.contains("voice notice configured channel failed; trying fallback"),
+        "success stays silent: {quiet}"
+    );
+
+    // A rate limit is a retry, not a misconfiguration: the fallback still
+    // delivers and no warn fires. Kept in this test because the capture is
+    // process-wide and only this test emits the warn, so a sibling's line
+    // cannot land in these silent windows.
+    worker
+        .http
+        .rate_limited_notices
+        .lock()
+        .unwrap()
+        .push(NoticeTarget::Channel(650));
+    let before = global.text().len();
+    assert!(worker.send_notices(NOTICE_REPEAT_INTERVAL_MS).await);
+    let notices = sent(&worker);
+    assert_eq!(notices.len(), 2);
+    assert_eq!(notices[1].0, NoticeTarget::Channel(SYSTEM_CHANNEL));
+    let throttled = global.text()[before..].to_owned();
+    assert!(
+        !throttled.contains("voice notice configured channel failed; trying fallback"),
+        "a rate limit stays silent: {throttled}"
+    );
+
+    // A failing configured channel warns once, then the fallback delivers
+    // with the mention intact.
+    worker.http.rate_limited_notices.lock().unwrap().clear();
+    worker
+        .http
+        .refused_notices
+        .lock()
+        .unwrap()
+        .push(NoticeTarget::Channel(650));
+    let before = global.text().len();
+    assert!(worker.send_notices(2 * NOTICE_REPEAT_INTERVAL_MS).await);
+    let notices = sent(&worker);
+    assert_eq!(notices.len(), 3);
+    assert_eq!(notices[2].0, NoticeTarget::Channel(SYSTEM_CHANNEL));
+    assert_eq!(notices[2].2, Some(NOTICE_ROLE));
+    let logged = global.text()[before..].to_owned();
+    let line = logged
+        .lines()
+        .find(|line| line.contains("voice notice configured channel failed; trying fallback"))
+        .expect("a configured-channel failure warns before falling back");
+    assert!(line.starts_with("WARN "), "{line}");
+    assert!(line.contains(&format!("guild=\"{GUILD}\"")), "{line}");
+    assert!(line.contains("op=\"send_notice\""), "{line}");
+    assert!(line.contains("outcome=\"discord\""), "{line}");
+    assert!(
+        !line.contains("/setup"),
+        "the warn carries no notice text: {line}"
+    );
 }
 
 #[tokio::test]

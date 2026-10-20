@@ -173,6 +173,7 @@ async function poll() {
     if (obsolete()) return;
     lastAppliedSeq = seq;
     status.textContent = "fetch failed";
+    el.innerHTML = '<p class="bad">summary unavailable: fetch failed</p>';
     return;
   }
   const contentType = res.headers.get("content-type") || "";
@@ -290,6 +291,18 @@ document.getElementById("disconnect").addEventListener("click", () => {
 </html>
 `;
 
+// Hash the exact inline block bytes, including their surrounding newlines.
+// The dashboard test checks these pins whenever the static page changes.
+const DASHBOARD_CSP = [
+  "default-src 'none'",
+  "connect-src 'self'",
+  "base-uri 'none'",
+  "form-action 'none'",
+  "frame-ancestors 'none'",
+  "script-src 'sha256-KakYnwlm90kiQyjP89ukbbsx3nu5UjTBJAfieSdbDR8='",
+  "style-src 'sha256-XfBF+coe4Stt3RC6YIku87CPj/YAhk41yequAyR3nkA='",
+].join("; ");
+
 /** Serve the static page: exact path, `GET` only, never cached. */
 export function dashboardPageResponse(): Response {
   return new Response(DASHBOARD_HTML, {
@@ -297,6 +310,7 @@ export function dashboardPageResponse(): Response {
     headers: withSecurityHeaders({
       "content-type": "text/html; charset=utf-8",
       "cache-control": "no-store",
+      "content-security-policy": DASHBOARD_CSP,
     }),
   });
 }

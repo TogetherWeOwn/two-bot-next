@@ -130,12 +130,16 @@ Per-delivery results are `ActivationOutcome`
 `Unavailable`, `Completed` (typed receipt; `deleted` is a confirmed REST
 result, never an intention) or `Retained`. A `Retained` claim waits for
 recorded reconciliation; nothing is retried, leased or resent automatically.
+Failed strict Discord facts reads have the sampled `automod_facts_read_failed`
+warning below as their `Unavailable` signal. A 404 or incomplete snapshot stays
+silent, so not every unavailable result has a matching warning.
 
 | Signal | Meaning | Triage |
 | --- | --- | --- |
 | `automod_config_invalid` (`gateway_failure`) | Boot rejected the automod environment | Check `TWO_AUTOMOD_*` values and `TWO_OWEN_USER_ID`; fix config, restart. Never bypass the gate. |
 | `automod_executor_failed` (`gateway_failure`) | REST executor failed to build | Check executor/token/network configuration; no Discord mutation was attempted. |
 | Boot warning `TWO_AUTOMOD_ENFORCE is set to a value other than 0 or 1` | Deployment value is neither `0` nor `1`; dry-run in effect | Set the deployment value to exactly `0` or `1`. The "automod activation wired" line (`crates/bot/src/main.rs:643`) reports the boot-resolved `mode` (`dry_run`/`enforce`). |
+| WARN `automod_facts_read_failed` with fixed `step` and `cause` | A strict facts read failed; automod keeps the existing `Unavailable`/fail-closed behavior. `step` is `guild`, `bot_member`, `target_member` (also enrichment's author membership) or `message`. First failure then at most one line per 60 s per resolver across all steps/guilds; not a per-delivery count. | For `rejected`, check bot permissions/access; for `rate_limited`, inspect Discord limits; for `unavailable`/`timeout`, inspect upstream/network health; for guard causes, inspect shared executor guard state. No retry or live activation is authorized by this signal. See the [event catalog](observability-event-catalog.md#automod-facts-read-warnings) for fields and sampling limits. |
 | `Retained(UncertainDelete)` | Delete response uncertain; no follow-up sanction sent | Recorded reconciliation case. Do not resend the sanction by hand; reconcile through the claim ledger. |
 | `Retained(UncertainTimeout)` | Delete confirmed, timeout uncertain | Same as above; the delete happened, the timeout is unknown. |
 | `Retained(Ledger)`, `Retained(CompletionRefused)` | Store write failed after possible counting | Inspect the claim ledger and DB health; duplicate suppression favors no repeated sanctions. |

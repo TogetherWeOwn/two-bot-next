@@ -619,6 +619,154 @@ mod tests {
     }
 
     #[test]
+    fn staff_message_full_text_is_pinned() {
+        // First alert, sub-second span: "within a second".
+        let fast = RaidAlert {
+            guild_id: "g".into(),
+            count: 2,
+            window_seconds: 60.0,
+            first_join_at: "1970-01-01T00:00:00.000Z".into(),
+            last_join_at: "1970-01-01T00:00:00.500Z".into(),
+            span_seconds: 1,
+            member_ids: vec!["a".into(), "b".into()],
+            truncated: false,
+            repeat: false,
+        };
+        let message = fast.staff_message();
+        assert_eq!(message.mentions, MentionPolicy::None);
+        assert_eq!(
+            message.content,
+            [
+                "**Join burst** - 2 accounts joined within a second (threshold: 5 in 60s).",
+                "First 1970-01-01T00:00:00.000Z, last 1970-01-01T00:00:00.500Z.",
+                "",
+                "IDs: `a` `b`",
+                "",
+                "This is an alert only - the bot has kicked, banned and messaged nobody.",
+                "Next: 1. Review join-attribution evidence to see which invite sent them.",
+                "2. If it is a raid, Server Settings -> Safety Setup -> pause invites.",
+            ]
+            .join("\n")
+        );
+
+        // Same-tick burst, zero-second span: still "within a second".
+        let instant = RaidAlert {
+            guild_id: "g".into(),
+            count: 2,
+            window_seconds: 60.0,
+            first_join_at: "1970-01-01T00:00:00.000Z".into(),
+            last_join_at: "1970-01-01T00:00:00.000Z".into(),
+            span_seconds: 0,
+            member_ids: vec!["a".into(), "b".into()],
+            truncated: false,
+            repeat: false,
+        };
+        let message = instant.staff_message();
+        assert_eq!(message.mentions, MentionPolicy::None);
+        assert_eq!(
+            message.content,
+            [
+                "**Join burst** - 2 accounts joined within a second (threshold: 5 in 60s).",
+                "First 1970-01-01T00:00:00.000Z, last 1970-01-01T00:00:00.000Z.",
+                "",
+                "IDs: `a` `b`",
+                "",
+                "This is an alert only - the bot has kicked, banned and messaged nobody.",
+                "Next: 1. Review join-attribution evidence to see which invite sent them.",
+                "2. If it is a raid, Server Settings -> Safety Setup -> pause invites.",
+            ]
+            .join("\n")
+        );
+
+        // First alert, multi-second span: "in Ns".
+        let slow = RaidAlert {
+            guild_id: "g".into(),
+            count: 5,
+            window_seconds: 60.0,
+            first_join_at: "1970-01-01T00:00:00.000Z".into(),
+            last_join_at: "1970-01-01T00:00:04.000Z".into(),
+            span_seconds: 4,
+            member_ids: vec!["0".into(), "1".into(), "2".into(), "3".into(), "4".into()],
+            truncated: false,
+            repeat: false,
+        };
+        let message = slow.staff_message();
+        assert_eq!(message.mentions, MentionPolicy::None);
+        assert_eq!(
+            message.content,
+            [
+                "**Join burst** - 5 accounts joined in 4s (threshold: 5 in 60s).",
+                "First 1970-01-01T00:00:00.000Z, last 1970-01-01T00:00:04.000Z.",
+                "",
+                "IDs: `0` `1` `2` `3` `4`",
+                "",
+                "This is an alert only - the bot has kicked, banned and messaged nobody.",
+                "Next: 1. Review join-attribution evidence to see which invite sent them.",
+                "2. If it is a raid, Server Settings -> Safety Setup -> pause invites.",
+            ]
+            .join("\n")
+        );
+
+        // Repeat alert: the sustained-burst head, no threshold clause.
+        let repeat = RaidAlert {
+            guild_id: "g".into(),
+            count: 3,
+            window_seconds: 60.0,
+            first_join_at: "1970-01-01T00:00:00.000Z".into(),
+            last_join_at: "1970-01-01T00:00:01.000Z".into(),
+            span_seconds: 1,
+            member_ids: vec!["a".into(), "b".into(), "c".into()],
+            truncated: false,
+            repeat: true,
+        };
+        let message = repeat.staff_message();
+        assert_eq!(message.mentions, MentionPolicy::None);
+        assert_eq!(
+            message.content,
+            [
+                "**Join burst still going** - 3 more joins within a second.",
+                "First 1970-01-01T00:00:00.000Z, last 1970-01-01T00:00:01.000Z.",
+                "",
+                "IDs: `a` `b` `c`",
+                "",
+                "This is an alert only - the bot has kicked, banned and messaged nobody.",
+                "Next: 1. Review join-attribution evidence to see which invite sent them.",
+                "2. If it is a raid, Server Settings -> Safety Setup -> pause invites.",
+            ]
+            .join("\n")
+        );
+
+        // Truncated alert: the IDs line carries the "...and N more" tail.
+        let truncated = RaidAlert {
+            guild_id: "g".into(),
+            count: 5,
+            window_seconds: 60.0,
+            first_join_at: "1970-01-01T00:00:00.000Z".into(),
+            last_join_at: "1970-01-01T00:00:07.000Z".into(),
+            span_seconds: 7,
+            member_ids: vec!["a".into(), "b".into()],
+            truncated: true,
+            repeat: false,
+        };
+        let message = truncated.staff_message();
+        assert_eq!(message.mentions, MentionPolicy::None);
+        assert_eq!(
+            message.content,
+            [
+                "**Join burst** - 5 accounts joined in 7s (threshold: 5 in 60s).",
+                "First 1970-01-01T00:00:00.000Z, last 1970-01-01T00:00:07.000Z.",
+                "",
+                "IDs: `a` `b` ...and 3 more",
+                "",
+                "This is an alert only - the bot has kicked, banned and messaged nobody.",
+                "Next: 1. Review join-attribution evidence to see which invite sent them.",
+                "2. If it is a raid, Server Settings -> Safety Setup -> pause invites.",
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
     fn tuning_is_read_per_call_and_fractional_values_survive() {
         let mut watch = RaidWatch::new(0.0, 50).unwrap();
         let old = RaidTuning::new(60.0, 5.0).unwrap();

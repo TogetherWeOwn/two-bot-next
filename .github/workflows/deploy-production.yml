@@ -1352,12 +1352,14 @@ jobs:
           # The same explicit agent name the staging gate sends (scripts/staging_rollout.py).
           agent="two-bot-next-production-rollout/1.0"
           poll() {
-            hcode=$(curl -s --max-time 10 -H "User-Agent: $agent" -o "$health" -w '%{http_code}' "$url/health" || true)
+            # Match production_deploy.py's 64 KiB cap. A failed transfer can
+            # still report 200 with a valid prefix: never grade that as a pass.
+            hcode=$(curl -s --max-time 10 --max-filesize 65536 -H "User-Agent: $agent" -o "$health" -w '%{http_code}' "$url/health") || hcode=000
             if [ "$hcode" != "200" ]; then
               state="/health -> $hcode"
               return 1
             fi
-            code=$(curl -s --max-time 10 -H "User-Agent: $agent" -o "$readyz" -w '%{http_code}' "$url/readyz" || true)
+            code=$(curl -s --max-time 10 --max-filesize 65536 -H "User-Agent: $agent" -o "$readyz" -w '%{http_code}' "$url/readyz") || code=000
             # The verdict follows the script's exit code; `state` carries its
             # fixed-vocabulary reason either way.
             if state=$(python3 ../tooling/scripts/production_deploy.py readyz --status "$code" --body "$readyz" --sha "$SHA" --mode "$MODE" --build-id "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" 2>&1); then

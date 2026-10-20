@@ -106,7 +106,7 @@ use two_bot_core::{
         OverwriteTarget as TextOverwriteTarget, TextChannelPlan, VoiceRoomFacts,
         DEFAULT_TEXT_CHANNEL_NAME, MAX_TEXT_CHANNEL_NAME_CHARS,
     },
-    voice_utilities::{invite_render, ping_render},
+    voice_utilities::{invite_render, is_valid_invite_code, ping_render},
     voice_vote_kick::{
         VoteBallot, VoteCancellation, VoteClock, VoteKickCore, VoteKickError, VoteKickRef,
         VoteKickStatus, VoteKickUpdate, VoteProgress, VoteRoomFacts,
@@ -118,7 +118,7 @@ use two_bot_core::{
     AutomodPolicy, CommandDefinition, OverwriteTarget, PermissionFinding,
     PermissionOverwrite as HealthOverwrite, Snowflake, VoicePermission, VoicePermissionScope,
 };
-use two_bot_cutover::voice_rooms::{CreateClaim, OwnerGrantIntent, PgRoomStore};
+use two_bot_cutover::voice_rooms::{CreateClaim, JoinGrantIntent, OwnerGrantIntent, PgRoomStore};
 use two_bot_discord::voice_rooms::{
     can_enforce_kick, can_manage_room, effective_permissions, MessageRef, RoomChannelAttributes,
     RoomHttp, RoomHttpError,
@@ -352,16 +352,16 @@ pub trait RoomPersistence: Send + Sync {
         &self,
         guild: Snowflake,
     ) -> impl Future<Output = Result<BTreeMap<Snowflake, BTreeSet<Snowflake>>, StoreError>> + Send;
-    /// Record an approval's intent before granting Connect. Idempotent; a
-    /// retried intent is a no-op. `Ok(false)` when the room has no database
-    /// row, so a grant never outlives its room.
+    /// Record an approval's intent before granting Connect, distinguishing a
+    /// fresh insert from an existing obligation that may already hold access.
+    /// A missing room writes nothing, so a grant never outlives its room.
     fn save_join_grant(
         &self,
         guild: Snowflake,
         room: Snowflake,
         member: Snowflake,
-    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
-    /// Retire a grant after its revocation landed (or its grant was refused).
+    ) -> impl Future<Output = Result<JoinGrantIntent, StoreError>> + Send;
+    /// Retire a grant after a safe revoke (or a fresh intent's PUT was refused).
     /// Idempotent: retiring an absent grant is success.
     fn remove_join_grant(
         &self,
@@ -601,7 +601,7 @@ impl RoomPersistence for PgRoomStore {
         guild: Snowflake,
         room: Snowflake,
         member: Snowflake,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<JoinGrantIntent, StoreError> {
         self.save_join_grant(guild, room, member)
             .await
             .map_err(store_error)
@@ -919,6 +919,34 @@ fn observe_voice_actor_load_failure_kind(guild: Snowflake, error: &str, retrying
             );
         }
     }
+}
+
+/// Fixed token naming a voice admin store failure without its internals.
+/// [`StoreError`] is already bounded to three variants with no driver detail,
+/// so the token is the variant in snake_case: rerun the failing admin command
+/// path for detail.
+fn admin_store_error_token(error: StoreError) -> &'static str {
+    match error {
+        StoreError::Unavailable => "unavailable",
+        StoreError::CredentialRefused => "credential_refused",
+        StoreError::Conflict => "conflict",
+    }
+}
+
+/// One operator signal per failed admin store read/write (`/access`,
+/// `/logging`, `/export`, `/import`): a fixed `op` per arm plus the bounded
+/// [`StoreError`] variant token. No settings, bytes or driver text: the reply
+/// already tells the member to retry, and the guild id plus op locate the outage.
+/// A single callsite, not one per arm: each `tracing` callsite costs
+/// release-binary bytes against the container size budget.
+fn log_admin_store_failure(op: &'static str, guild_id: Snowflake, error: StoreError) {
+    warn!(
+        voice_event = "voice_admin_store",
+        op,
+        reason = admin_store_error_token(error),
+        guild_id = guild_id.to_string(),
+        "voice admin store failed"
+    );
 }
 
 /// One structured line per executed rename decision, so a room that keeps
@@ -1536,6 +1564,7 @@ const EMPTY_ROOM_GRACE: Duration = Duration::from_secs(60);
 
 /// Boot-only infrastructure protection. Stored settings remain unwired; these
 /// already-forwarded process keys must never be inferred from room rows.
+/// On refusal, return only the fixed setting key, never its value or parser error.
 fn configured_protected_channels(
     env: impl Fn(&str) -> Option<String>,
 ) -> Result<HashSet<Snowflake>, &'static str> {
@@ -1551,11 +1580,9 @@ fn configured_protected_channels(
         };
         for value in raw.split(',') {
             let value = value.trim();
-            let id = value
-                .parse::<Snowflake>()
-                .map_err(|_| "invalid protected channel id")?;
+            let id = value.parse::<Snowflake>().map_err(|_| key)?;
             if id == 0 || value != id.to_string() || (!multiple && raw.contains(',')) {
-                return Err("invalid protected channel id");
+                return Err(key);
             }
             protected.insert(id);
         }
@@ -3138,8 +3165,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         // Hydrate approved Connect grants: a private room remembers its
         // approvals so a later `/public` revokes them; a grant whose room is
         // public or gone still needs its revocation, which the queue lost on
-        // restart, so it is re-queued here. The witness is retired only by a
-        // successful revoke (or a refused grant), never by this hydration.
+        // restart, so it is re-queued here. Only a safe revoke or a fresh
+        // intent's definitively refused PUT retires it, never this hydration.
         let mut pending_revokes = Vec::new();
         for (room, members) in &join_grants {
             match privacy.get_mut(room) {
@@ -4972,7 +4999,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// First working destination: the configured channel, then the guild
     /// system channel, a DM to the guild owner, and finally a creator
     /// channel's chat. A destination that fails is dropped and the next is
-    /// tried.
+    /// tried. A failing configured channel warns once (op name plus the
+    /// bounded outcome, never the notice text or the mention) so a
+    /// misconfigured channel is distinguishable from a working one; a
+    /// successful send stays silent, and so does a rate limit, which is a
+    /// retry rather than an outcome (the channel may be healthy).
     async fn deliver_notice(&self, settings: &LoggingSettings, text: &str) -> bool {
         let mention = settings
             .mention_role_id
@@ -4981,13 +5012,25 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .channel_id
             .filter(|channel| self.live.text_notice_channel(*channel))
         {
-            if self
+            match self
                 .http
                 .send_notice(NoticeTarget::Channel(channel), text, mention)
                 .await
-                .is_ok()
             {
-                return true;
+                Ok(()) => return true,
+                // Rate limits are retries, never outcomes: skip the warn
+                // before the classifier, like its other callers.
+                Err(RoomHttpError::RateLimited { .. }) => {}
+                Err(error) => {
+                    let guild = self.live.guild_id.to_string();
+                    let outcome = voice_outcome_from_http(&error);
+                    warn!(
+                        guild,
+                        op = "send_notice",
+                        outcome,
+                        "voice notice configured channel failed; trying fallback"
+                    );
+                }
             }
         }
         let Some((system_channel_id, owner_id)) = self.live.notice_context() else {
@@ -9286,6 +9329,16 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
     accepted_join
 }
 
+/// Name a refused boot setting without exposing configured values or parser errors.
+fn invalid_boot_setting(key: &'static str) -> RoomHttpError {
+    warn!(
+        key,
+        reason = "invalid_value",
+        "temp-voice boot setting invalid; refusing voice runtime"
+    );
+    RoomHttpError::InvalidRequest
+}
+
 /// Build the production sink: lifecycle actors plus the S4 responder.
 pub fn build_production_runtime(
     token: &str,
@@ -9293,24 +9346,20 @@ pub fn build_production_runtime(
     name_policy: AutomodPolicy,
     live_source: impl Fn() -> Option<two_bot_core::settings::LiveSettings> + Send + Sync + 'static,
 ) -> Result<VoiceResponder<PgRoomStore, RoomHttp, RoomHttp>, RoomHttpError> {
-    // Malformed protection IDs refuse the whole runtime. The gateway reports it
-    // through its cataloged `voice HTTP setup failed` event.
+    // Fatal settings name only the first refused key, in existing validation
+    // order, before the gateway's generic `voice HTTP setup failed` event.
     let protected = configured_protected_channels(|key| std::env::var(key).ok())
-        .map_err(|_| RoomHttpError::InvalidRequest)?;
+        .map_err(invalid_boot_setting)?;
     let generator = configured_generator_channel(|key| std::env::var(key).ok())
-        .map_err(|_| RoomHttpError::InvalidRequest)?;
-    let empty_grace = configured_empty_grace(
-        std::env::var("TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS")
-            .ok()
-            .as_deref(),
-    )
-    .map_err(|_| RoomHttpError::InvalidRequest)?;
+        .map_err(|_| invalid_boot_setting("TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID"))?;
+    let empty_grace = configured_empty_grace(std::env::var(EMPTY_GRACE_KEY).ok().as_deref())
+        .map_err(|_| invalid_boot_setting(EMPTY_GRACE_KEY))?;
     let synthetic_humans = configured_synthetic_humans(
         std::env::var("TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS")
             .ok()
             .as_deref(),
     )
-    .map_err(|_| RoomHttpError::InvalidRequest)?;
+    .map_err(|_| invalid_boot_setting("TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS"))?;
     let replies = RoomHttp::new(token.to_owned())?;
     let http = replies.clone();
     let store = PgRoomStore::new(pool);
@@ -9400,6 +9449,42 @@ pub(crate) fn stored_empty_grace_with(
                 reason = "out_of_range",
                 value = %value,
                 "stored empty-grace override out of range; using boot fallback"
+            );
+            fallback
+        }
+    }
+}
+
+/// The stored per-guild invite-code key served from the live settings snapshot.
+/// Store-only: no environment variable of this name is ever read.
+pub(crate) const INVITE_CODE_KEY: &str = "TWO_GUILD_INVITE_CODE";
+
+/// Effective guild invite code: the stored per-guild value wins over the
+/// gateway vanity fallback, an absent row or one for another guild keeps the
+/// fallback, and an invalid stored value fails closed to it (store-first, like
+/// the empty grace). Only a JSON string passing `is_valid_invite_code` can win;
+/// it passes through unchanged, never trimmed. The rejected value is never
+/// logged: a stale code may be a rotated secret. Pure for tests via `live`.
+pub(crate) fn stored_invite_code_with(
+    guild: &str,
+    fallback: Option<&str>,
+    live: Option<&two_bot_core::settings::LiveSettings>,
+) -> Option<String> {
+    let fallback = fallback.map(str::to_owned);
+    let Some(live) = live else {
+        return fallback;
+    };
+    let Some(value) = live.get(guild, INVITE_CODE_KEY) else {
+        return fallback;
+    };
+    match &value {
+        serde_json::Value::String(code) if is_valid_invite_code(code) => Some(code.clone()),
+        _ => {
+            warn!(
+                guild = guild.to_string(),
+                key = INVITE_CODE_KEY,
+                reason = "invalid_invite_code",
+                "stored invite-code override invalid; using vanity fallback"
             );
             fallback
         }
@@ -11687,9 +11772,13 @@ async fn execute_access<S: RoomPersistence>(
     action: AccessAction,
     on_saved: impl FnOnce(AccessControls),
 ) -> String {
-    let Ok(mut controls) = store.access_controls(guild_id).await else {
-        return "Could not read the voice-room settings. Nothing was changed; try again."
-            .to_owned();
+    let mut controls = match store.access_controls(guild_id).await {
+        Ok(controls) => controls,
+        Err(error) => {
+            log_admin_store_failure("access_read", guild_id, error);
+            return "Could not read the voice-room settings. Nothing was changed; try again."
+                .to_owned();
+        }
     };
     match action {
         AccessAction::Show => return access_summary(&controls),
@@ -11720,7 +11809,8 @@ async fn execute_access<S: RoomPersistence>(
             on_saved(controls);
             format!("Saved.\n{summary}")
         }
-        Err(_) => {
+        Err(error) => {
+            log_admin_store_failure("access_save", guild_id, error);
             "Could not save the voice-room settings. Nothing was changed; try again.".to_owned()
         }
     }
@@ -11751,8 +11841,13 @@ async fn execute_logging<S: RoomPersistence>(
     guild_id: Snowflake,
     action: LoggingAction,
 ) -> String {
-    let Ok(mut settings) = store.logging_settings(guild_id).await else {
-        return "Could not read the logging settings. Nothing was changed; try again.".to_owned();
+    let mut settings = match store.logging_settings(guild_id).await {
+        Ok(settings) => settings,
+        Err(error) => {
+            log_admin_store_failure("logging_read", guild_id, error);
+            return "Could not read the logging settings. Nothing was changed; try again."
+                .to_owned();
+        }
     };
     match action {
         LoggingAction::Show => return logging_summary(&settings),
@@ -11768,7 +11863,10 @@ async fn execute_logging<S: RoomPersistence>(
     }
     match store.save_logging_settings(guild_id, &settings).await {
         Ok(()) => format!("Saved.\n{}", logging_summary(&settings)),
-        Err(_) => "Could not save the logging settings. Nothing was changed; try again.".to_owned(),
+        Err(error) => {
+            log_admin_store_failure("logging_save", guild_id, error);
+            "Could not save the logging settings. Nothing was changed; try again.".to_owned()
+        }
     }
 }
 
@@ -12436,7 +12534,8 @@ where
             let (store, _) = runtime.make_pair();
             let config = match store.config_snapshot(guild_id).await {
                 Ok(config) => config,
-                Err(_) => {
+                Err(error) => {
+                    log_admin_store_failure("export_read", guild_id, error);
                     reply(ephemeral_response(
                         "Could not read the voice configuration. Nothing was sent; try again.",
                     ))
@@ -12540,7 +12639,8 @@ where
     let (store, http) = runtime.make_pair();
     let current = match store.config_snapshot(guild_id).await {
         Ok(config) => config,
-        Err(_) => {
+        Err(error) => {
+            log_admin_store_failure("import_read", guild_id, error);
             reply(ephemeral_response(
                 "Could not read the current voice configuration. Nothing was changed; try again.",
             ))
@@ -13116,7 +13216,24 @@ where
                 return;
             }
             let interaction = created.0.clone();
-            let invite_code = vanity_code_from_cache(cache, &interaction);
+            let vanity_code = vanity_code_from_cache(cache, &interaction);
+            // The stored override resolves only for `/invite` (the sole
+            // renderer of `invite_code`): other interactions keep the plain
+            // vanity code, so an invalid row warns on invites, not on every
+            // voice interaction.
+            let invite_code = if matches!(command, Some(VoiceCommand::Invite)) {
+                let snapshot = (self.runtime.live_source)();
+                stored_invite_code_with(
+                    &interaction
+                        .guild_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_default(),
+                    vanity_code.as_deref(),
+                    snapshot.as_ref(),
+                )
+            } else {
+                vanity_code
+            };
             let inventory = interaction_guild(&interaction)
                 .and_then(|guild_id| inventory_from_cache(cache, guild_id));
             let names = name_directory_from_cache(cache, &interaction);

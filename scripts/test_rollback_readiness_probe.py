@@ -782,5 +782,175 @@ class BodyCapRefusalTests(unittest.TestCase):
         self.assertEqual(seen, [probe.READYZ_BODY_CAP + 1])
 
 
+class DuplicateJsonKeyRefusalTests(unittest.TestCase):
+    """Duplicate JSON object keys refuse at every probe decode site.
+
+    Plain json.loads keeps the last duplicate, so a repeated manifest
+    ``version`` or ``components`` could mask a stale backup or a down
+    gateway. Every object at any depth is strict with fixed vocabulary
+    that never echoes keys or values.
+    """
+
+    ARCHIVE = "two-funnel-20261002T041700Z.ndjson.gz"
+    READY_PAIR = ('[["process", "ready"], ["gateway", "ready"], '
+                  '["database", "ready"], ["token_invalid", "ready"]]')
+    DOWN_PAIR = ('[["process", "ready"], ["gateway", "down"], '
+                 '["database", "ready"], ["token_invalid", "ready"]]')
+
+    def setUp(self):
+        guard = mock.patch.object(probe.urllib.request.OpenerDirector, "open",
+                                  side_effect=AssertionError("network access in a unit test"))
+        guard.start()
+        self.addCleanup(guard.stop)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.fx = Fixture(tmp.name)
+
+    def archive_path(self):
+        return self.fx.backups / self.ARCHIVE
+
+    def fetch(self, response=READY):
+        def fake(url):
+            if isinstance(response, Exception):
+                raise response
+            return response
+        return fake
+
+    def test_manifest_top_level_duplicate_refused_both_orders(self):
+        head = json.dumps(manifest()).encode()
+        marker = "SENTINEL_manifest_dup_abc123"
+        variants = [
+            head[:-1] + (', "version": "%s"}' % marker).encode(),
+            b'{"version": "%s", ' % marker.encode() + head[1:],
+        ]
+        for dup in variants:
+            with self.subTest(dup=dup[:44]):
+                self.fx.write_archive(self.ARCHIVE,
+                                      [dup, *archive_lines(manifest())[1:]])
+                with self.assertRaises(probe.ProbeError) as caught:
+                    probe.read_manifest(self.archive_path())
+                self.assertEqual(str(caught.exception),
+                                 f"{self.ARCHIVE} manifest line carries duplicate JSON object keys")
+                self.assertNotIn(marker, str(caught.exception))
+
+    def test_manifest_nested_duplicate_refused(self):
+        raw = json.dumps(manifest()).replace('"count": 2', '"count": 2, "count": 3', 1)
+        self.assertIn('"count": 2, "count": 3', raw)
+        self.fx.write_archive(self.ARCHIVE,
+                              [raw.encode(), *archive_lines(manifest())[1:]])
+        with self.assertRaises(probe.ProbeError) as caught:
+            probe.read_manifest(self.archive_path())
+        self.assertEqual(str(caught.exception),
+                         f"{self.ARCHIVE} manifest line carries duplicate JSON object keys")
+
+    def test_manifest_escaped_spelling_counts_as_duplicate(self):
+        raw = json.dumps(manifest()).replace('"version": 4',
+                                             '"version": 4, "\\u0076ersion": 5', 1)
+        self.assertIn("\\u0076ersion", raw)
+        self.fx.write_archive(self.ARCHIVE,
+                              [raw.encode(), *archive_lines(manifest())[1:]])
+        with self.assertRaises(probe.ProbeError) as caught:
+            probe.read_manifest(self.archive_path())
+        self.assertEqual(str(caught.exception),
+                         f"{self.ARCHIVE} manifest line carries duplicate JSON object keys")
+
+    def test_end_marker_duplicate_refused(self):
+        lines = [*archive_lines(manifest())[:-1], b'{"kind": "end", "rows": 3, "rows": 4}']
+        self.fx.write_archive(self.ARCHIVE, lines)
+        with self.assertRaises(probe.ProbeError) as caught:
+            probe.read_manifest(self.archive_path())
+        self.assertEqual(str(caught.exception),
+                         f"{self.ARCHIVE} end marker carries duplicate JSON object keys")
+
+    def test_live_sequences_duplicate_refused(self):
+        text = json.dumps(LIVE).replace('"readable": true',
+                                        '"readable": true, "readable": false', 1)
+        self.assertIn('"readable": true, "readable": false', text)
+        self.fx.sequences.write_text(text)
+        with self.assertRaises(probe.ProbeError) as caught:
+            probe.load_live_sequences(str(self.fx.sequences))
+        self.assertEqual(str(caught.exception),
+                         f"{self.fx.sequences} carries duplicate JSON object keys")
+
+    def test_live_sequences_escaped_spelling_counts_as_duplicate(self):
+        text = json.dumps(LIVE).replace('"readable": true',
+                                        '"readable": true, "\\u0072eadable": false', 1)
+        self.assertIn("\\u0072eadable", text)
+        self.fx.sequences.write_text(text)
+        with self.assertRaises(probe.ProbeError) as caught:
+            probe.load_live_sequences(str(self.fx.sequences))
+        self.assertEqual(str(caught.exception),
+                         f"{self.fx.sequences} carries duplicate JSON object keys")
+
+    def test_readyz_top_level_components_duplicate_refused(self):
+        for status, first, second in ((200, self.DOWN_PAIR, self.READY_PAIR),
+                                      (200, self.READY_PAIR, self.DOWN_PAIR),
+                                      (200, self.READY_PAIR, self.READY_PAIR),
+                                      (503, self.DOWN_PAIR, self.READY_PAIR)):
+            with self.subTest(status=status, first_down=first == self.DOWN_PAIR):
+                raw = ('{"components": %s, "jobs": {}, '
+                       '"build_revision": "unknown", "build_id": "unknown", '
+                       '"components": %s}' % (first, second)).encode()
+                with self.assertRaises(probe.ProbeError) as caught:
+                    probe.readyz_state(status, raw)
+                self.assertEqual(str(caught.exception),
+                                 f"/readyz {status} carries duplicate JSON object keys")
+
+    def test_readyz_nested_duplicate_refused(self):
+        raw = ('{"components": %s, "jobs": {"counter": {"parked": true, "parked": false}}, '
+               '"build_revision": "unknown", "build_id": "unknown"}' % self.READY_PAIR).encode()
+        with self.assertRaises(probe.ProbeError) as caught:
+            probe.readyz_state(200, raw)
+        self.assertEqual(str(caught.exception),
+                         "/readyz 200 carries duplicate JSON object keys")
+
+    def test_readyz_escaped_spelling_counts_as_duplicate(self):
+        raw = ('{"components": %s, "jobs": {"a": 1, "\\u0061": 2}, '
+               '"build_revision": "unknown", "build_id": "unknown"}' % self.READY_PAIR).encode()
+        with self.assertRaises(probe.ProbeError) as caught:
+            probe.readyz_state(200, raw)
+        self.assertEqual(str(caught.exception),
+                         "/readyz 200 carries duplicate JSON object keys")
+
+    def test_duplicate_manifest_fails_manifest_and_sequences_end_to_end(self):
+        head = json.dumps(manifest()).encode()
+        dup = head[:-1] + b', "version": 5}'
+        self.fx.write_archive(self.ARCHIVE, [dup, *archive_lines(manifest())[1:]])
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(out):
+            code = probe.main(self.fx.argv(), fetch_fn=self.fetch())
+        text = out.getvalue()
+        self.assertEqual(code, 1, text)
+        self.assertIn("FAIL manifest: two-funnel-20261002T041700Z.ndjson.gz manifest line "
+                      "carries duplicate JSON object keys", text)
+        self.assertIn("FAIL sequences: no valid backup manifest to compare against", text)
+        self.assertIn("PASS readyz", text)
+        self.assertIn("PASS deploy-config", text)
+
+    def test_duplicate_readyz_fails_only_readyz_end_to_end(self):
+        raw = ('{"components": %s, "jobs": {}, "build_revision": "unknown", "build_id": "unknown", '
+               '"components": %s}' % (self.DOWN_PAIR, self.READY_PAIR)).encode()
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(out):
+            code = probe.main(self.fx.argv(), fetch_fn=self.fetch((200, raw)))
+        text = out.getvalue()
+        self.assertEqual(code, 1, text)
+        self.assertIn("FAIL readyz: /readyz 200 carries duplicate JSON object keys", text)
+        self.assertIn("PASS manifest", text)
+
+    def test_unique_nested_documents_still_pass_end_to_end(self):
+        head = manifest()
+        head["note"] = {"a": 1, "b": [1, 2, {"c": 3}]}
+        self.fx.write_archive(self.ARCHIVE, archive_lines(head))
+        raw = ('{"components": %s, "jobs": {"counter": {"parked": false, "running": true}}, '
+               '"build_revision": "unknown", "build_id": "unknown"}' % self.READY_PAIR).encode()
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(out):
+            code = probe.main(self.fx.argv(), fetch_fn=self.fetch((200, raw)))
+        text = out.getvalue()
+        self.assertEqual(code, 0, text)
+        self.assertIn("rollback readiness: 4/4 checks passed", text)
+
+
 if __name__ == "__main__":
     unittest.main()
