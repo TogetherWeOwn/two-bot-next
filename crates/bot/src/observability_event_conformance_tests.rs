@@ -80,7 +80,7 @@ const SHUTDOWN_RS_EVENTS: [&str; 2] = [
 const JOBS_RS_EVENTS: [&str; 1] = ["periodic job failed"];
 
 /// `crates/bot/src/voice_rooms.rs`: the cataloged voice messages.
-const VOICE_RS_CATALOG_MESSAGES: [&str; 17] = [
+const VOICE_RS_CATALOG_MESSAGES: [&str; 18] = [
     "voice room rename decision",
     "voice join completed",
     "voice_operation succeeded",
@@ -98,6 +98,7 @@ const VOICE_RS_CATALOG_MESSAGES: [&str; 17] = [
     "voice creator refresh failed; keeping the cached view",
     "voice halt re-probe skipped: Discord credential latch set",
     "voice admin store failed",
+    "temp-voice boot setting invalid; refusing voice runtime",
 ];
 
 /// `voice_event` field values (`crates/bot/src/voice_rooms.rs`), the bounded

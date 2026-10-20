@@ -168,6 +168,42 @@ The approved exercise set—three redeploys, two drops, Neon idle-hit and actual
 restore arrangements before execution. This documentation does not authorize
 live faults, load, dispatch, or any new evidence/fault mechanism.
 
+## Offline gateway evidence field contract
+
+`scripts/soak_evidence.py` reconciles synthetic JSONL fixtures only. Dispatch
+`seq` must be a nonnegative integer, excluding booleans, nulls, strings,
+floats, arrays and objects. A supplied resume `seq` follows the same rule;
+only omission permits a sequence-less resume, retaining the previous baseline.
+Invalid sequences produce fixed UNKNOWN evidence without updating counters,
+sequence baselines, the accepted timestamp window or pending outages. A
+malformed resume cannot close a disconnect; a later valid recovery measures
+from the original disconnect, and an unrecovered outage remains open UNKNOWN.
+
+Only `connect`, `disconnect`, `resume`, `dispatch` and `unknown` event kinds
+are accepted. Missing or unrecognised kinds remain UNKNOWN evidence but cannot
+advance the accepted timestamp window or make later valid recovery appear
+regressed. In the committed sample, `heartbeat_oops` at 00:00:26 remains an
+UNKNOWN interval; the accepted window ends at the explicit `unknown` record's
+event timestamp, 00:00:22, not its interval endpoint or the rejected event.
+
+Event timestamps and explicit UNKNOWN start/end timestamps must normalize to
+representable UTC datetimes. UTC underflow/overflow becomes bounded malformed
+evidence, not a traceback or a diagnostic containing the rejected value;
+following valid records are still processed. Input is not sorted. Zero and
+positive sequences, ordered duplicates, equal timestamps and legitimate session
+resets retain their existing behavior.
+
+Run the bundled summarize/CLI matrix offline:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p '*soak*evidence*.py' -v
+```
+
+An offline PASS is only parser reconciliation, not a live soak verdict or proof
+of deployment. Empty or dispatch-free input still refuses PASS, and the existing
+under-60-second outage budget and all live acceptance requirements above remain
+unchanged.
+
 ## Waiver ledger (B4 parity sign-off)
 
 Cutover preconditions ([cutover.md](cutover.md)) require every non-DROP
