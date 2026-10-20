@@ -1,10 +1,8 @@
 #![cfg(test)]
 //! Builder-owned live settings, boot refusal and no-effect regression tests.
 
-#[path = "tuning_test_support.rs"]
-mod support;
-
 use super::*;
+use crate::tuning_test_support as support;
 use support::{closed_pool, snapshot, vars, Capture, GUILD, SENTINEL};
 use tracing::instrument::WithSubscriber;
 use tracing::Level;
