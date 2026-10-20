@@ -1616,7 +1616,8 @@ impl ActionExecutor {
         let reason = audit_reason(reason)?;
         let until = until_iso
             .map(|s| {
-                Timestamp::parse(s).map_err(|e| DiscordError::Rejected(format!("bad until: {e}")))
+                Timestamp::parse(&normalize_timeout_until(s))
+                    .map_err(|e| DiscordError::Rejected(format!("bad until: {e}")))
             })
             .transpose()?;
         let req = Self::request_of(
@@ -3910,6 +3911,19 @@ fn audit_reason(reason: &str) -> Result<String, DiscordError> {
         )));
     }
     Ok(trimmed.to_owned())
+}
+
+/// Normalize service UTC expiries for pinned Twilight, which rejects short
+/// `Z` timestamps. Offset-bearing inputs keep their existing representation.
+pub(crate) fn normalize_timeout_until(until_iso: &str) -> String {
+    if let Some(core) = until_iso.strip_suffix(['Z', 'z']) {
+        let base = core
+            .split_once('.')
+            .map_or(core, |(date_time, _)| date_time);
+        format!("{base}+00:00")
+    } else {
+        until_iso.to_owned()
+    }
 }
 
 /// `timeout` until timestamp: now + duration, RFC 3339 (legacy

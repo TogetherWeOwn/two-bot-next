@@ -17,6 +17,9 @@
 
 #![cfg(test)]
 
+#[path = "member_dispatch_authority_acceptance.rs"]
+mod member_dispatch_authority_acceptance;
+
 use std::collections::VecDeque;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1407,21 +1410,28 @@ fn member_slash(name: &str) -> Interaction {
     interaction
 }
 
+async fn member_refusal_database() -> two_bot_testsupport::TestDatabase {
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("disposable test bootstrap");
+    two_bot_testsupport::TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+        .await
+        .expect("disposable member refusal fixture")
+}
+
 #[tokio::test]
-async fn member_verbs_reach_executor_facts_then_fail_closed_without_db() {
-    // Every member verb routes through the shared router into the member
-    // consumer, which reads live guild facts over REST before touching the
-    // ledger. The mock fails that first read, so each verb must fail closed
-    // with exactly three wire calls (defer, guild read, reply edit) and never
-    // reach the connectionless lazy pool.
+#[ignore = "requires disposable agent-testdb for refusal audits"]
+async fn member_verbs_reach_executor_facts_then_fail_closed_with_audit() {
+    let _metrics = MODERATION_METRICS_LOCK.lock().await;
+    let db = member_refusal_database().await;
+    // Identity resolution fails before any authority/mutation. The failure
+    // must still persist an attributable denial, so this now needs a ledger.
     for name in ["ban", "tempban", "kick", "timeout", "warn"] {
         let (mock, origin) = MockRest::start(vec![200, 500, 200]).await;
-        let runtime = runtime_with_member(member_gates(), origin, lazy_pool());
+        let runtime = runtime_with_member(member_gates(), origin, db.pool().clone());
         runtime.on_interaction(&member_slash(name)).await;
         let requests = mock.requests();
         assert_eq!(requests.len(), 3, "{name}: defer, guild read, reply edit");
         assert_eq!(requests[1].method, "GET");
-        assert_eq!(requests[1].path, format!("/api/v10/guilds/{GUILD_S}"));
+        assert_eq!(requests[1].path, "/api/v10/users/@me");
         let reply = mock.deferred_reply();
         assert!(
             reply
@@ -1431,16 +1441,21 @@ async fn member_verbs_reach_executor_facts_then_fail_closed_without_db() {
         );
         mock.shutdown().await;
     }
+    let denied: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM moderation_audit WHERE outcome = 'denied'")
+            .fetch_one(db.pool())
+            .await
+            .expect("refusal audit");
+    assert_eq!(denied, 5);
+    db.close().await.expect("dispose fixture");
 }
 
 #[tokio::test]
+#[ignore = "requires disposable agent-testdb for refusal audits"]
 async fn member_verbs_refuse_unknown_bot_hierarchy_before_claim_or_mutation() {
-    // Serialize with the website exact-delta `refused` tests in
-    // `internal_action_http::tests` (TOG-28482): this test records
-    // `kick/refused` (and the other member verbs) on the process-global
-    // registry via `preflight_refused`, and `cargo test --workspace --lib
-    // --bins` runs both modules as threads of one process.
+    // Keep process-global outcome assertions isolated from website tests.
     let _metrics = MODERATION_METRICS_LOCK.lock().await;
+    let db = member_refusal_database().await;
     for name in ["ban", "tempban", "kick", "timeout", "warn"] {
         let json_response = |body: serde_json::Value| RestResponse {
             status: 200,
@@ -1449,27 +1464,31 @@ async fn member_verbs_refuse_unknown_bot_hierarchy_before_claim_or_mutation() {
         };
         let (mock, origin) = MockRest::start_script(vec![
             RestResponse::status(200),
-            json_response(serde_json::json!({
-                "owner_id": "5555",
-                "roles": [{"id": GUILD_S, "position": 0}],
-            })),
-            json_response(serde_json::json!({"user": {"id": "3333", "bot": false}, "roles": []})),
             json_response(serde_json::to_value(user(4444, true)).unwrap()),
-            json_response(serde_json::json!({"user": {"id": "4444"}, "roles": ["missing-role"]})),
+            json_response(serde_json::json!({
+                "id": GUILD_S, "owner_id": "5555",
+                "roles": [
+                    {"id": GUILD_S, "position": 0, "permissions": "0"},
+                    {"id": "101", "position": 50, "permissions": Permissions::all().bits().to_string()},
+                ],
+            })),
+            json_response(serde_json::json!({"user": {"id": "88", "bot": false}, "roles": ["101"]})),
+            json_response(serde_json::json!({"user": {"id": "3333", "bot": false}, "roles": []})),
+            json_response(serde_json::json!({"user": {"id": "4444", "bot": true}, "roles": ["9999"]})),
             RestResponse::status(200),
         ])
         .await;
-        let runtime = runtime_with_member(member_gates(), origin, lazy_pool());
+        let runtime = runtime_with_member(member_gates(), origin, db.pool().clone());
         runtime.on_interaction(&member_slash(name)).await;
         let requests = mock.requests();
         assert_eq!(
             requests.len(),
-            6,
-            "{name}: facts only, no mutation or DB claim"
+            7,
+            "{name}: facts and refusal audit only, no mutation or DB claim"
         );
-        assert!(requests[1..5].iter().all(|request| request.method == "GET"));
+        assert!(requests[1..6].iter().all(|request| request.method == "GET"));
         assert_eq!(
-            requests[4].path,
+            requests[5].path,
             format!("/api/v10/guilds/{GUILD_S}/members/4444")
         );
         assert!(mock.deferred_reply()["content"]
@@ -1478,12 +1497,22 @@ async fn member_verbs_refuse_unknown_bot_hierarchy_before_claim_or_mutation() {
             .contains("Moderation command failed"));
         mock.shutdown().await;
     }
+    let denied: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM moderation_audit WHERE outcome = 'denied'")
+            .fetch_one(db.pool())
+            .await
+            .expect("refusal audit");
+    assert_eq!(denied, 5);
+    db.close().await.expect("dispose fixture");
 }
 
 #[tokio::test]
+#[ignore = "requires disposable agent-testdb for refusal audits"]
 async fn member_verbs_share_actor_cooldown_before_role_reads() {
+    let _metrics = MODERATION_METRICS_LOCK.lock().await;
+    let db = member_refusal_database().await;
     let (mock, origin) = MockRest::start(vec![200, 500, 200]).await;
-    let runtime = runtime_with_member(member_gates(), origin, lazy_pool());
+    let runtime = runtime_with_member(member_gates(), origin, db.pool().clone());
     runtime.on_interaction(&member_slash("ban")).await;
     for (index, name) in ["tempban", "kick", "timeout", "warn"]
         .into_iter()
@@ -1508,6 +1537,181 @@ async fn member_verbs_share_actor_cooldown_before_role_reads() {
         );
     }
     mock.shutdown().await;
+    db.close().await.expect("dispose fixture");
+}
+
+fn scripted_json(body: serde_json::Value) -> RestResponse {
+    RestResponse {
+        status: 200,
+        body: Some(body.to_string()),
+        delay: Duration::ZERO,
+    }
+}
+
+/// The reads one member verb makes before it can act, in issue order: the bot
+/// identity (cached after the first command), the guild, then the actor. The
+/// actor holds every permission at position 50; the bot sits at 100.
+fn authority_reads(first_command: bool) -> Vec<RestResponse> {
+    let mut reads = Vec::new();
+    if first_command {
+        reads.push(scripted_json(
+            serde_json::to_value(user(4444, true)).unwrap(),
+        ));
+    }
+    reads.push(scripted_json(serde_json::json!({
+        "id": GUILD_S, "owner_id": "5555",
+        "roles": [
+            {"id": GUILD_S, "position": 0, "permissions": "0"},
+            {"id": "101", "position": 50, "permissions": Permissions::all().bits().to_string()},
+            {"id": "103", "position": 100, "permissions": "0"},
+        ],
+    })));
+    reads.push(scripted_json(
+        serde_json::json!({"user": {"id": "88", "bot": false}, "roles": ["101"]}),
+    ));
+    reads
+}
+
+fn timed_member_slash(name: &str) -> Interaction {
+    let mut interaction = member_slash(name);
+    if name == "timeout" {
+        let Some(InteractionData::ApplicationCommand(data)) = &mut interaction.data else {
+            panic!("command fixture")
+        };
+        data.options
+            .push(option("duration_seconds", CommandOptionValue::Integer(60)));
+    }
+    interaction
+}
+
+#[tokio::test]
+#[ignore = "requires disposable agent-testdb for refusal audits"]
+async fn member_verbs_that_need_a_present_target_refuse_a_departed_one_without_effects() {
+    let _metrics = MODERATION_METRICS_LOCK.lock().await;
+    let db = member_refusal_database().await;
+    for name in ["kick", "timeout", "warn"] {
+        let mut script = vec![RestResponse::status(200)];
+        script.extend(authority_reads(true));
+        // A strict target-member 404 is a confirmed departure.
+        script.push(RestResponse::status(404));
+        script.push(RestResponse::status(200));
+        let (mock, origin) = MockRest::start_script(script).await;
+        let runtime = runtime_with_member(member_gates(), origin, db.pool().clone());
+        runtime.on_interaction(&timed_member_slash(name)).await;
+        let requests = mock.requests();
+        assert_eq!(
+            requests.len(),
+            6,
+            "{name}: defer, bot, guild, actor, target, reply; no bot-member read or effect"
+        );
+        assert!(requests[1..5].iter().all(|request| request.method == "GET"));
+        assert_eq!(
+            requests[4].path,
+            format!("/api/v10/guilds/{GUILD_S}/members/3333")
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|r| r.method != "GET" && r.path.starts_with("/api/v10/guilds/")),
+            "{name}: a departed target is never dispatched against"
+        );
+        assert_eq!(
+            mock.deferred_reply()["content"],
+            "That member is not in this server."
+        );
+        mock.shutdown().await;
+    }
+    let denied: Vec<(String, String)> =
+        sqlx::query_as("SELECT action, outcome FROM moderation_audit ORDER BY action")
+            .fetch_all(db.pool())
+            .await
+            .expect("refusal audit");
+    assert_eq!(
+        denied,
+        ["moderation.kick", "moderation.timeout", "moderation.warn"]
+            .map(|action| (action.to_owned(), "denied".to_owned())),
+        "exactly one denial per verb and no accepted audit"
+    );
+    let claims: i64 = sqlx::query_scalar("SELECT count(*) FROM moderation_idempotency")
+        .fetch_one(db.pool())
+        .await
+        .expect("claim rows");
+    let warnings: i64 = sqlx::query_scalar("SELECT count(*) FROM moderation_warnings")
+        .fetch_one(db.pool())
+        .await
+        .expect("warning rows");
+    assert_eq!(
+        (claims, warnings),
+        (0, 0),
+        "refusal leaves no claim or warning"
+    );
+    db.close().await.expect("dispose fixture");
+}
+
+#[tokio::test]
+#[ignore = "requires disposable agent-testdb for refusal audits"]
+async fn a_completed_kick_replays_after_its_target_left_without_a_denial() {
+    let _metrics = MODERATION_METRICS_LOCK.lock().await;
+    let db = member_refusal_database().await;
+    let mut script = vec![RestResponse::status(200)];
+    script.extend(authority_reads(true));
+    script.push(scripted_json(serde_json::json!(
+        {"user": {"id": "3333", "bot": false}, "roles": []}
+    )));
+    script.push(scripted_json(
+        serde_json::json!({"user": {"id": "4444", "bot": true}, "roles": ["103"]}),
+    ));
+    script.push(RestResponse::status(204));
+    script.push(RestResponse::status(200));
+    // Redelivery of the same interaction: the kick removed the target, so its
+    // member read is now a strict 404.
+    script.push(RestResponse::status(200));
+    script.extend(authority_reads(false));
+    script.push(RestResponse::status(404));
+    script.push(RestResponse::status(200));
+    let (mock, origin) = MockRest::start_script(script).await;
+    let runtime = runtime_with_member(member_gates(), origin, db.pool().clone());
+    let interaction = member_slash("kick");
+    runtime.on_interaction(&interaction).await;
+    runtime.on_interaction(&interaction).await;
+    let requests = mock.requests();
+    let replies: Vec<String> = requests
+        .iter()
+        .filter(|r| r.method == "PATCH")
+        .map(|r| {
+            serde_json::from_slice::<serde_json::Value>(&r.body).unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(replies, ["Kicked.", "Kicked. Already applied."]);
+    let kicks: Vec<_> = requests
+        .iter()
+        .filter(|r| r.method == "DELETE" && r.path.starts_with("/api/v10/guilds/"))
+        .collect();
+    assert_eq!(kicks.len(), 1, "the replay dispatches nothing");
+    let audits: Vec<(String, String)> =
+        sqlx::query_as("SELECT action, outcome FROM moderation_audit")
+            .fetch_all(db.pool())
+            .await
+            .expect("audit rows");
+    assert_eq!(
+        audits,
+        [("moderation.kick".to_owned(), "kicked".to_owned())],
+        "one acceptance and no replay denial"
+    );
+    let state: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT state, outcome FROM moderation_idempotency WHERE guild_id = $1 AND idempotency_key = $2",
+    )
+    .bind(GUILD_S)
+    .bind(interaction.id.get().to_string())
+    .fetch_optional(db.pool())
+    .await
+    .expect("replay ledger");
+    assert_eq!(state, Some(("done".to_owned(), Some("kicked".to_owned()))));
+    mock.shutdown().await;
+    db.close().await.expect("dispose fixture");
 }
 
 #[tokio::test]
