@@ -250,6 +250,18 @@ def ignored_test_names(suite):
     return names
 
 
+def skip_blocks_test(skip, name):
+    """Whether a cargo `--skip` token blocks a bare test fn `name`.
+
+    Cargo matches `--skip` as a substring of the full test path (for
+    example `database::my_test`), but the sweep policy only knows the
+    bare fn name. A module-qualified token never occurs in the bare
+    name, so compare its last `::` segment instead. This over-blocks
+    when the module part would not match, which fails closed.
+    """
+    return skip.rsplit("::", 1)[-1] in name
+
+
 # Staging deploy push filter. Each deploy restarts the bot container and drops the
 # gateway for ~2 minutes, so a push that touches only non-runtime paths must not
 # start one (the B2 soak needs a stable staging). The filter is a deny-list so an
@@ -3715,7 +3727,10 @@ class WorkflowTests(unittest.TestCase):
             for name in names:
                 with self.subTest(suite=suite, test=name):
                     self.assertTrue(
-                        any(not any(skip in name for skip in skips) for skips in gates),
+                        any(
+                            not any(skip_blocks_test(skip, name) for skip in skips)
+                            for skips in gates
+                        ),
                         f"no fail-closed --test {suite} run executes {name}",
                     )
         [store_lane] = [line for line in runs if "--test backfill_audit_log" in line]
@@ -3735,6 +3750,56 @@ class WorkflowTests(unittest.TestCase):
         expected.add("database::actions_persist_rows_and_preserve_other_events_and_guilds")
         self.assertEqual(len(sweep_skips), len(set(sweep_skips)))
         self.assertEqual(set(sweep_skips) - {"regenerate_reference_docs"}, expected)
+
+    def test_fail_closed_gate_sees_qualified_skip_tokens(self):
+        # Cargo matches --skip against the full test path, so a qualified
+        # token on every fail-closed gate must read as blocking even though
+        # the bare fn name never contains the `::` qualifier.
+        name = "actions_persist_rows_and_preserve_other_events_and_guilds"
+        qualified = f"database::{name}"
+        self.assertIn(name, ignored_test_names("internal_events"))
+        self.assertTrue(skip_blocks_test(qualified, name))
+        self.assertTrue(skip_blocks_test(name, name))
+        self.assertFalse(skip_blocks_test("regenerate_reference_docs", name))
+        # The old `skip in name` check missed the qualified form entirely.
+        self.assertNotIn(qualified, name)
+        mutated = deepcopy(self.workflows)
+        jobs = mutated["check.yml"]["jobs"]
+        touched = 0
+        for job in jobs.values():
+            for candidate in job.get("steps", []):
+                run = str(candidate.get("run", ""))
+                if "--test internal_events" not in run:
+                    continue
+                rewritten = []
+                for line in shell_logical_lines(run):
+                    if ("--test internal_events" in line
+                            and "--ignore-run-fail" not in line
+                            and re.search(r"--(?:include-)?ignored\b", line)):
+                        line = f"{line} --skip {qualified}"
+                        touched += 1
+                    rewritten.append(line)
+                candidate["run"] = "\n".join(rewritten)
+        self.assertEqual(touched, 2)
+        runs = [
+            line
+            for job in jobs.values() for candidate in job.get("steps", [])
+            for line in shell_logical_lines(str(candidate.get("run", "")))
+            if "--ignore-run-fail" not in line
+        ]
+        target = re.compile(r"--test internal_events(?:\s|$)")
+        gates = [
+            re.findall(r"--skip (\S+)", line) for line in runs
+            if target.search(line) and re.search(r"--(?:include-)?ignored\b", line)
+        ]
+        self.assertEqual(len(gates), 2)
+        self.assertTrue(all(qualified in skips for skips in gates))
+        self.assertFalse(
+            any(
+                not any(skip_blocks_test(skip, name) for skip in skips)
+                for skips in gates
+            ),
+        )
 
     def test_coverage_replays_strict_agent_test_targets_and_fails_closed(self):
         job = self.workflows["check.yml"]["jobs"]["rust-tests"]
