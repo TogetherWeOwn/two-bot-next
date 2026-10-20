@@ -271,6 +271,10 @@ def condition_holds(instance, condition, path, errors):
     so `then` is skipped but validation still fails.
     """
     if not isinstance(condition, dict):
+        errors.append(
+            f"{path}: unsupported condition in if "
+            "(supported: an object of properties conditions)"
+        )
         return False
     supported = True
     for key in condition:
@@ -377,10 +381,12 @@ def check_instance(instance, schema, path, errors):
     if "format" in schema:
         check_format(instance, schema["format"], path, errors)
     for subschema in schema.get("allOf", []):
-        cond = subschema.get("if")
+        if "if" not in subschema:
+            continue
+        cond = subschema["if"]
         then = subschema.get("then")
-        if isinstance(cond, dict) and isinstance(then, dict):
-            if condition_holds(instance, cond, path, errors):
+        if condition_holds(instance, cond, path, errors):
+            if isinstance(then, dict):
                 check_instance(instance, then, path, errors)
 
 

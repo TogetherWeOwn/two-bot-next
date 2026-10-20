@@ -13,6 +13,33 @@ import check_run_record as checker
 
 
 class ConditionShapeTests(unittest.TestCase):
+    def test_non_object_outer_conditions_fail_before_then(self):
+        for condition in (42, False, True, "condition-value", [], None):
+            for then_fields in ({}, {"then": {}}, {"then": {"required": ["proof"]}}):
+                with self.subTest(condition=condition, then_fields=then_fields):
+                    schema = {"allOf": [{"if": condition} | then_fields]}
+                    self.assertEqual(
+                        checker.validate({}, schema),
+                        ["$: unsupported condition in if "
+                         "(supported: an object of properties conditions)"],
+                    )
+
+    def test_direct_non_object_condition_reports_error(self):
+        for condition in (42, False, True, "condition-value", [], None):
+            with self.subTest(condition=condition):
+                errors = []
+                self.assertFalse(checker.condition_holds({}, condition, "$", errors))
+                self.assertEqual(
+                    errors,
+                    ["$: unsupported condition in if "
+                     "(supported: an object of properties conditions)"],
+                )
+
+    def test_absent_if_and_supported_condition_without_then_remain_inert(self):
+        for subschema in ({}, {"then": {"required": ["proof"]}}, {"if": {}}):
+            with self.subTest(subschema=subschema):
+                self.assertEqual(checker.validate({}, {"allOf": [subschema]}), [])
+
     def test_non_object_property_subschemas_fail_before_then(self):
         for subschema in (42, False, True, "condition-value", [], None):
             for record in ({"mock": True}, {}):
@@ -81,6 +108,30 @@ class ConditionShapeTests(unittest.TestCase):
                     checker.validate({"mock": True}, schema, allow_mock=True),
                     ["$: missing required field 'proof'"] if applies else [],
                 )
+
+    def test_cli_refuses_non_object_outer_condition_without_echo(self):
+        value = "Bearer " + "syntheticConditionValue"
+        with tempfile.TemporaryDirectory(
+            dir=os.getenv("PAPERCLIP_RUN_SCRATCH_DIR")
+        ) as tmp:
+            record_path = Path(tmp) / "record.json"
+            schema_path = Path(tmp) / "schema.json"
+            record_path.write_text("{}", encoding="utf-8")
+            schema_path.write_text(json.dumps({"allOf": [{
+                "if": value, "then": {"required": ["proof"]},
+            }]}), encoding="utf-8")
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = checker.main([
+                    "--record", str(record_path), "--schema", str(schema_path),
+                ])
+            self.assertEqual(code, 1)
+            self.assertEqual(err.getvalue(), "")
+            self.assertEqual(
+                out.getvalue(),
+                f"{record_path}: $: unsupported condition in if "
+                "(supported: an object of properties conditions)\n",
+            )
 
     def test_cli_refuses_non_object_subschema_without_echo(self):
         key = "ghp_" + "syntheticConditionKey"
