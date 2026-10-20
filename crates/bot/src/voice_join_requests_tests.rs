@@ -29,8 +29,13 @@ fn parts() -> (LiveGuild, Store, Http, Trace) {
 
 /// Run every queued write to completion; each tick jumps past any backoff.
 async fn drain(worker: &mut Worker) {
+    drain_after(worker, 0).await;
+}
+
+/// Continue after an explicit dispatch clock without rewinding through a 429.
+async fn drain_after(worker: &mut Worker, now_ms: u64) {
     for step in 1..=40u64 {
-        if !worker.dispatch_one(step * 1_000_000).await {
+        if !worker.dispatch_one(now_ms + step * 1_000_000).await {
             return;
         }
     }
@@ -1390,11 +1395,15 @@ async fn a_rate_limited_approval_without_overwrite_evidence_keeps_its_witnessed_
         assert!(cached_outsider(&worker)
             .is_some_and(|entry| entry.allow.contains(Permissions::CONNECT)));
         assert_eq!(stored_grants(&worker), [OUTSIDER]);
-        worker.apply_privacy(OWNER, false, "Ana", PrivacyCommand::Public);
-        drain(&mut worker).await;
+        let reply = worker.apply_privacy(OWNER, false, "Ana", PrivacyCommand::Public);
+        assert!(reply.contains("public again"), "{reply}");
+        // The retained guild 429 deadline is still above 1_000_000: draining
+        // from zero would stop before `/public` or its revoke could dispatch.
+        drain_after(&mut worker, 20_000_000).await;
         assert!(calls(&trace).contains(&format!("delete_overwrite:{ROOM}:{OUTSIDER}")));
         assert!(cached_outsider(&worker).is_none());
         assert!(stored_grants(&worker).is_empty());
+        assert_eq!(worker.queue.pending_counts(GUILD), (0, 0));
     }
 }
 
