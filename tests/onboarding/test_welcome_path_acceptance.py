@@ -4,7 +4,10 @@ Run from the repository root:
   PYTHONDONTWRITEBYTECODE=1 python3 tests/onboarding/test_welcome_path_acceptance.py -v
 
 The example is deliberately built without cfg(test), avoiding the runtime's
-existing live-SQL/TCP test helpers. The build uses the bounded controller pool.
+existing live-SQL/TCP test helpers. The default build uses the bounded controller
+pool. Hosted CI must first build the example from the same checkout, then set
+WELCOME_PATH_ACCEPTANCE_EXECUTABLE to its executable path to run without a build.
+An explicit missing/nonexecutable path is an ERROR, never a skip or build fallback.
 A refused/failed build is an ERROR, never behavioral RED. No cargo run, private
 Cargo target, database URL, credential, listener, or network fixture is used.
 This suite is a test-author branch handoff; it must not merge while RED. The
@@ -12,6 +15,7 @@ implementation PR must route this command in CI as well as passing it locally.
 """
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -37,6 +41,16 @@ CASES = (
 class WelcomePathAcceptance(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        if "WELCOME_PATH_ACCEPTANCE_EXECUTABLE" in os.environ:
+            executable = Path(os.environ["WELCOME_PATH_ACCEPTANCE_EXECUTABLE"]).resolve()
+            if not executable.is_file() or not os.access(executable, os.X_OK):
+                raise RuntimeError(
+                    "INFRASTRUCTURE ERROR (not behavioral RED): "
+                    "WELCOME_PATH_ACCEPTANCE_EXECUTABLE must name an executable file"
+                )
+            cls.executable = str(executable)
+            print("PREBUILT: executing same-checkout acceptance cases", flush=True)
+            return
         command = [
             sys.executable, "scripts/cargo_cache.py", "run", "--", "build",
             "-p", "two-bot", "--example", "welcome_path_acceptance",
