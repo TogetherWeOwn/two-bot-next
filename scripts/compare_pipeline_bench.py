@@ -110,7 +110,9 @@ class BenchParser(argparse.ArgumentParser):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._negative_number_matcher = re.compile(
-            r"^-\d+$|^-\d*\.\d+$|^-\d+(\.\d*)?[eE][+-]?\d+$|^-inf(inity)?$|^-nan$",
+            r"^-\d+$|^-\d*\.\d+$|^-\d+\.$"
+            r"|^-\d+(\.\d*)?[eE][+-]?\d+$|^-(\.\d+)[eE][+-]?\d+$"
+            r"|^-inf(inity)?$|^-nan$",
             re.IGNORECASE,
         )
 
