@@ -60,6 +60,14 @@ IMAGE_MAX_BYTES = 112 * MIB
 # revisit if the binary approaches it.
 # The voice actor-init retry measured 16,782,904 bytes (+6,808, no new dependencies).
 BINARY_MAX_BYTES = 17 * MIB
+# CLI refusal bounds (not budget policy): --image-max-bytes/--binary-max-bytes
+# outside 1..cap are unusable — a non-positive budget can never pass and a
+# gigantic one silently disables the budget — so main() refuses them with a
+# fixed message before any Docker call. The caps sit far above any sane
+# override (defaults are 112 MiB/17 MiB) and far below budget-disabling
+# magnitudes; sane values pass through byte-identically.
+IMAGE_BUDGET_CAP_BYTES = 1024 * MIB
+BINARY_BUDGET_CAP_BYTES = 256 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
 # docker cp archives from a never-started container instead of exec helpers.
 BINARY = "/home/nonroot/two-bot"
@@ -85,6 +93,17 @@ class BodyTooLarge(RuntimeError):
 def require(condition, message):
     if not condition:
         raise RuntimeError(message)
+
+
+def check_budget(value, flag, cap, cap_label):
+    """Refuse an unusable CLI size budget before any Docker call.
+
+    Raises RuntimeError with a fixed message naming the flag; main()
+    reports it through the FAIL container smoke contract. The supplied
+    value is never echoed.
+    """
+    if not 1 <= value <= cap:
+        raise RuntimeError(f"refusing: {flag} must be a positive size within {cap_label}")
 
 
 def docker(*args, timeout=30, check=True, text=True):
@@ -340,6 +359,8 @@ def main():
     parser.add_argument("--binary-max-bytes", type=int, default=BINARY_MAX_BYTES)
     args = parser.parse_args()
     try:
+        check_budget(args.image_max_bytes, "--image-max-bytes", IMAGE_BUDGET_CAP_BYTES, "1 GiB")
+        check_budget(args.binary_max_bytes, "--binary-max-bytes", BINARY_BUDGET_CAP_BYTES, "256 MiB")
         smoke(args.image, args.image_max_bytes, args.binary_max_bytes)
     except (RuntimeError, subprocess.SubprocessError, ValueError, KeyError) as error:
         raise SystemExit(f"FAIL container smoke: {error}") from error
