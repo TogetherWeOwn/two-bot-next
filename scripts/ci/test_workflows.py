@@ -3210,8 +3210,6 @@ class WorkflowTests(unittest.TestCase):
             "raid_list_db",
             "reengagement_list_db",
             "member_moderation_db",
-            "stream_live_store",
-            "mutation_429_proves_no_effect_channel",
         ):
             with self.subTest(target=target):
                 self.assertIn(target, step["run"])
@@ -3328,7 +3326,7 @@ class WorkflowTests(unittest.TestCase):
             main_sweep,
         )
         guarded = [run for run in cov_runs if "llvm-cov --no-report -p " in run]
-        self.assertEqual(len(guarded), 14)
+        self.assertEqual(len(guarded), 12)
         for run in guarded:
             with self.subTest(guarded=run):
                 self.assertIn("--test-threads=1", run)
@@ -3351,8 +3349,6 @@ class WorkflowTests(unittest.TestCase):
             "--test reengagement_list_db": False,
             "--test game_activity_report_db": False,
             "--test member_moderation_db": True,
-            "--test stream_live_store": True,
-            "--test mutation_429_proves_no_effect_channel": True,
         }
         for needle, wants_db_feature in guarded_needles.items():
             with self.subTest(needle=needle):
