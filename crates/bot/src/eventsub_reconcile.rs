@@ -496,9 +496,13 @@ pub async fn reconcile_all_with_metrics<T: HelixTransport>(
 /// seeded at boot from the Operator-provisioned `TWO_TWITCH_WEBHOOK_SECRET`
 /// (via `EventsubReceiverConfig`) and swapped by armed refresh; the pass
 /// always signs with the secret the receiver is verifying against right now,
-/// never boot env directly. A poisoned lock refuses the pass (the next tick
-/// retries) rather than signing with a torn copy. The error names only the
-/// variable and the runtime cause, never secret material.
+/// never boot env directly. The clone is per pass, not per create: a pass
+/// that starts before an armed swap finishes with the old value, so rotation
+/// deletes only after the runbook's drain fence (a reconcile terminal line
+/// after the swap-confirming ack proves no stale pass is still in flight).
+/// A poisoned lock refuses the pass (the next tick retries) rather than
+/// signing with a torn copy. The error names only the variable and the
+/// runtime cause, never secret material.
 fn snapshot_secret(current: &RwLock<WebhookSecret>) -> Result<WebhookSecret, HelixError> {
     current
         .read()
@@ -634,22 +638,15 @@ async fn run_loop<P, Fut>(
 /// its handle so the owner can [`join`] it at shutdown instead of detaching
 /// it. `secret` is the bound receiver's live snapshot: every pass clones
 /// whatever it holds right now, so creates always carry the secret the
-/// receiver is verifying against. `None` (dark receiver, no snapshot) parks
-/// with an info log and no handle instead of a second secret source, never
-/// a silent downgrade of an enabled receiver.
+/// receiver is verifying against. The flag is checked first, so a dark boot
+/// keeps the `flag_dark` parked line its log consumers key on; `None` with
+/// the flag enabled (a snapshot missing while enabled) parks with
+/// `receiver_dark` instead of a second secret source, never a silent
+/// downgrade of an enabled receiver.
 pub fn spawn_if_enabled(
     shutdown: tokio::sync::watch::Receiver<bool>,
     secret: Option<Arc<RwLock<WebhookSecret>>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let Some(secret) = secret else {
-        tracing::info!(
-            event = "eventsub_reconcile",
-            status = "parked",
-            reason = "receiver_dark",
-            "eventsub reconcile parked: the EventSub receiver is dark, no shared secret snapshot"
-        );
-        return None;
-    };
     if !enabled() {
         tracing::info!(
             event = "eventsub_reconcile",
@@ -659,6 +656,15 @@ pub fn spawn_if_enabled(
         );
         return None;
     }
+    let Some(secret) = secret else {
+        tracing::info!(
+            event = "eventsub_reconcile",
+            status = "parked",
+            reason = "receiver_dark",
+            "eventsub reconcile parked: the EventSub receiver is dark, no shared secret snapshot"
+        );
+        return None;
+    };
     let pass_shutdown = shutdown.clone();
     Some(tokio::spawn(run_loop(
         shutdown,
@@ -916,13 +922,105 @@ mod tests {
         }
     }
 
+    /// Spawn-gate tests hold `TWO_EVENTSUB`, which is process-global, so
+    /// they serialize here and restore the prior value on the way out (the
+    /// voice boot-settings idiom). No other test in this binary reads the
+    /// flag from the process environment.
+    static SPAWN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Hold `TWO_EVENTSUB` at `value` (`None` clears it) until the guard
+    /// drops, restoring whatever was there before.
+    struct FlagHold {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prior: Option<String>,
+    }
+
+    impl Drop for FlagHold {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(value) => std::env::set_var("TWO_EVENTSUB", value),
+                None => std::env::remove_var("TWO_EVENTSUB"),
+            }
+        }
+    }
+
+    fn hold_eventsub_flag(value: Option<&str>) -> FlagHold {
+        let lock = SPAWN_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var("TWO_EVENTSUB").ok();
+        match value {
+            Some(value) => std::env::set_var("TWO_EVENTSUB", value),
+            None => std::env::remove_var("TWO_EVENTSUB"),
+        }
+        FlagHold { _lock: lock, prior }
+    }
+
+    /// The parked line `spawn_if_enabled` appended after `start`, read from
+    /// the process-wide capture (a scoped capture can miss events when
+    /// sibling tests run on other threads).
+    fn parked_line_since(capture: &crate::tracing_capture::Capture, start: usize) -> String {
+        capture.text()[start..].to_owned()
+    }
+
     #[test]
-    fn spawn_without_a_snapshot_parks_without_a_task() {
-        // No receiver snapshot means the receiver is dark: park with no
-        // handle rather than a second secret source. Needs no process
-        // environment, so it stays parallel-safe.
+    fn spawn_with_flag_dark_and_no_snapshot_parks_flag_dark() {
+        // Dark boots keep the `flag_dark` parked line even though no
+        // snapshot exists: the flag is checked before the snapshot.
+        let _flag = hold_eventsub_flag(None);
+        let capture = crate::tracing_capture::global();
+        let start = capture.text().len();
         let (_tx, rx) = tokio::sync::watch::channel(false);
         assert!(spawn_if_enabled(rx, None).is_none());
+        let logged = parked_line_since(capture, start);
+        assert!(
+            logged.contains("reason=\"flag_dark\""),
+            "dark boot must park flag_dark, not receiver_dark: {logged}"
+        );
+    }
+
+    #[test]
+    fn spawn_with_flag_dark_and_snapshot_parks_flag_dark() {
+        // An explicit `0` parks on the flag even when a snapshot handle
+        // exists: the gate stays closed.
+        let _flag = hold_eventsub_flag(Some("0"));
+        let capture = crate::tracing_capture::global();
+        let start = capture.text().len();
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let secret = Arc::new(RwLock::new(test_secret()));
+        assert!(spawn_if_enabled(rx, Some(secret)).is_none());
+        let logged = parked_line_since(capture, start);
+        assert!(
+            logged.contains("reason=\"flag_dark\""),
+            "flag 0 must park flag_dark: {logged}"
+        );
+    }
+
+    #[test]
+    fn spawn_with_flag_enabled_but_no_snapshot_parks_receiver_dark() {
+        // The discriminating cell: the flag gate is open, so only the
+        // snapshot guard parks. A second-source fallback mutant spawns here
+        // and fails the assertion below.
+        let _flag = hold_eventsub_flag(Some("1"));
+        let capture = crate::tracing_capture::global();
+        let start = capture.text().len();
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        assert!(spawn_if_enabled(rx, None).is_none());
+        let logged = parked_line_since(capture, start);
+        assert!(
+            logged.contains("reason=\"receiver_dark\""),
+            "enabled without a snapshot must park receiver_dark: {logged}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_with_flag_enabled_and_snapshot_spawns_a_task() {
+        let _flag = hold_eventsub_flag(Some("1"));
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let secret = Arc::new(RwLock::new(test_secret()));
+        let task = spawn_if_enabled(rx, Some(secret)).expect("enabled with a snapshot must spawn");
+        task.abort();
+        let _ = task.await;
     }
 
     #[test]
