@@ -92,6 +92,25 @@ class FenceError(ValueError):
     """The base URL is not an allowed staging target."""
 
 
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    raised message is fixed vocabulary: it names no key, value or path.
+    """
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
+
+
 def is_production_host(host: str) -> bool:
     label = host.split(".", 1)[0]
     return (
@@ -230,7 +249,9 @@ class Probe:
 
 def parse_json(reply: Reply) -> object:
     try:
-        return json.loads(reply.body)
+        return json.loads(reply.body, object_pairs_hook=_reject_duplicate_keys)
+    except DuplicateKeyError:
+        raise
     except (ValueError, RecursionError):
         # Deeply nested in-cap JSON exhausts the decoder recursion limit;
         # refuse it as malformed, same as any other unparseable body.
@@ -242,7 +263,11 @@ def probe_health(p: Probe) -> None:
     if reply is None:
         return
     p.expect(reply.status == 200, f"GET /health: expected 200, got {reply.status}")
-    body = parse_json(reply)
+    try:
+        body = parse_json(reply)
+    except DuplicateKeyError:
+        p.fail("GET /health: carries duplicate JSON object keys")
+        return
     p.expect(isinstance(body, dict) and body.get("status") == "ok", 'GET /health: body is not {"status":"ok"}')
 
 
@@ -252,7 +277,11 @@ def probe_readyz(p: Probe, require_ready: bool) -> None:
     if reply is None:
         return
     p.expect(reply.status in (200, 503), f"GET /readyz: expected 200 or 503, got {reply.status}")
-    body = parse_json(reply)
+    try:
+        body = parse_json(reply)
+    except DuplicateKeyError:
+        p.fail("GET /readyz: carries duplicate JSON object keys")
+        return
     components = body.get("components") if isinstance(body, dict) else None
     well_formed = (
         isinstance(components, list)

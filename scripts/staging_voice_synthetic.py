@@ -143,6 +143,25 @@ class RedirectRefused(ValueError):
     """An authenticated read answered a redirect (fixed vocabulary only)."""
 
 
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    raised message is fixed vocabulary: it names no key, value or path.
+    """
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
+
+
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Turn every redirect into an HTTPError without contacting its target."""
 
@@ -601,7 +620,12 @@ class WebSocket:
             if op in (0x1, 0x0):
                 parts.append(data)
                 if fin:
-                    return json.loads(b"".join(parts))
+                    try:
+                        return json.loads(b"".join(parts),
+                                          object_pairs_hook=_reject_duplicate_keys)
+                    except DuplicateKeyError:
+                        raise ValueError(
+                            "gateway frame carries duplicate JSON object keys") from None
 
     def close(self):
         try:
@@ -630,7 +654,10 @@ def rest(token, path, timeout=20):
         raise
     if len(raw) > MAX_BODY_BYTES:
         raise BodyTooLarge("Discord REST read answered over the body cap")
-    return json.loads(raw)
+    try:
+        return json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+    except DuplicateKeyError:
+        raise ValueError("Discord REST read carries duplicate JSON object keys") from None
 
 
 def rest_patch(token, path, payload, timeout=20):
@@ -658,7 +685,10 @@ def rest_patch(token, path, payload, timeout=20):
         return exc.code, None
     if len(raw) > MAX_BODY_BYTES:
         raise BodyTooLarge("Discord REST read answered over the body cap")
-    return status, json.loads(raw)
+    try:
+        return status, json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+    except DuplicateKeyError:
+        raise ValueError("Discord REST read carries duplicate JSON object keys") from None
 
 
 def metrics_value(staging_url, token):
