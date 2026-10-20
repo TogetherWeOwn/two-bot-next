@@ -341,7 +341,11 @@ def valid_envelope(kind, rpc_id):
             "jsonrpc": "2.0", "id": rpc_id,
             "result": {
                 "content": [{"type": "text", "text": "ok"}],
-                "structuredContent": {"implemented": False},
+                "structuredContent": (
+                    {"available": True, "rows": [], "truncated": False}
+                    if kind == "tools/call get_audit"
+                    else {"implemented": False}
+                ),
             },
         })
     if kind == "unknown":
