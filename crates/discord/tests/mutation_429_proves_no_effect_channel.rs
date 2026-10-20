@@ -57,10 +57,16 @@ async fn single_delete_429_releases_attempt_for_same_key_retry() {
     let mock = MockRest::start(
         vec![
             channel(None, "0"),
-            ScriptedResponse::json(200, json!([{"id": fresh_message_id(1)}])),
+            ScriptedResponse::json(
+                200,
+                json!([{"id": fresh_message_id(1), "author": {"bot": false}}]),
+            ),
             ScriptedResponse::status(429),
             channel(None, "0"),
-            ScriptedResponse::json(200, json!([{"id": fresh_message_id(1)}])),
+            ScriptedResponse::json(
+                200,
+                json!([{"id": fresh_message_id(1), "author": {"bot": false}}]),
+            ),
             ScriptedResponse::status(204),
             channel(None, "0"),
             ScriptedResponse::json(200, json!({"id": CHANNEL})),
@@ -113,13 +119,19 @@ async fn bulk_delete_429_releases_attempt_for_same_key_retry() {
             channel(None, "0"),
             ScriptedResponse::json(
                 200,
-                json!([{"id": fresh_message_id(1)}, {"id": fresh_message_id(2)}]),
+                json!([
+                    {"id": fresh_message_id(1), "author": {"bot": false}},
+                    {"id": fresh_message_id(2), "author": {"bot": false}}
+                ]),
             ),
             ScriptedResponse::status(429),
             channel(None, "0"),
             ScriptedResponse::json(
                 200,
-                json!([{"id": fresh_message_id(1)}, {"id": fresh_message_id(2)}]),
+                json!([
+                    {"id": fresh_message_id(1), "author": {"bot": false}},
+                    {"id": fresh_message_id(2), "author": {"bot": false}}
+                ]),
             ),
             ScriptedResponse::status(204),
         ],

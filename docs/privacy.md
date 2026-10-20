@@ -248,22 +248,25 @@ stay retryable. The existing `presence_probe`, funnel `events` and
 or database failures can retain those rows beyond their nominal windows until a
 later successful run. The cadence headroom below is specific to `event_store`.
 
-An authenticated erasure intake
-(`two-bot-cutover::deletion_intake`) exists for the published `/privacy`
-surface but is not yet invoked on live interactions, so members cannot yet
-submit requests through it. When wired, the request binds to the invoker's
-guild/member pair, acknowledges pending only, and persists to the same
-deletion-request ledger the scheduler drains — never the narrower opt-out
-purge. Status and completion receipts are readable by the requester without
-the interaction token; receipts name the guild/member footprint and the
-retained limits, never global erasure. Live-dispatch call sites that invoke
-the intake on real interactions are follow-up work. When the database is behind the binary (an unapplied
-migration or grant), the gateway acks dispatches whose queue write hits the
-schema gap instead of crash-looping, with one exception: a missing grant
-(`42501`) on an available rejoin holds the cursor (the gateway fails the
-dispatch and replays it) until the ACL plan is applied, because the queue
-may hold a pending purge for that guild. A missing queue table (`42P01`) on
-a rejoin is still skipped — an absent table holds nothing to cancel — and
+The authenticated erasure intake (`two-bot-cutover::deletion_intake`) is wired
+through `/privacy delete`, `/privacy deletion-status` and `/privacy deletion-receipt`.
+The handler derives the guild from `interaction.guild_id` and the requester from
+`actor_id(interaction)`; no command accepts a target member. Requests bind to
+that pair and the interaction id. Fresh requests acknowledge as pending;
+idempotent retries reuse the request without queueing it again and direct the
+member to status rather than claiming a new pending queue. Requests persist to
+the same deletion-request ledger the scheduler drains — never the narrower opt-out
+purge. Status and completion-receipt reads use the same authenticated pair plus
+the request id, without the interaction token. Receipts name the erasable rows
+in the member erasure plan, disclose the retained `retention_deletion_requests`
+request/receipt ledger and `privacy_opt_out_audit (member_id, actor)`, and do not
+claim the guild-purge queue. When the database is behind the binary (an unapplied migration or grant),
+the gateway acks dispatches whose queue write hits the schema gap instead of
+crash-looping, with one exception: a missing grant (`42501`) on an available
+rejoin holds the cursor (the gateway fails the dispatch and replays it) until
+the ACL plan is applied, because the queue may hold a pending purge for that
+guild. A missing queue table (`42P01`) on a rejoin is still skipped — an absent
+table holds nothing to cancel — and
 a skipped true guild removal is logged at error level with the guild id
 (`retention purge skipped; schema gap, operator replay required`), increments
 the pollable `retention_replay_needed` counter on `/metrics`

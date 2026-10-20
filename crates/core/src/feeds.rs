@@ -359,6 +359,12 @@ pub fn feed_removed_text(removed: bool) -> &'static str {
     }
 }
 
+/// Fixed reply when removal is refused: the relay exists but carries
+/// unresolved pending delivery evidence, so relay and ledger are retained
+/// for nonce reconciliation. The member waits for recovery; no repost.
+pub const FEED_REMOVAL_RECOVERY_REQUIRED_TEXT: &str =
+    "Feed relay kept: unresolved deliveries are still pending recovery.";
+
 const MAX_XML_DEPTH: usize = 64;
 const MAX_XML_ELEMENT_ATTRIBUTES: usize = 64;
 const MAX_XML_TOTAL_ATTRIBUTES: usize = 4096;
