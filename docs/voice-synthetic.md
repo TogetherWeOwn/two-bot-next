@@ -63,8 +63,9 @@ without an unbounded read.
 - A metrics read that answers an in-cap error status stays optional (`metrics`
   reports SKIP). Only an over-cap body is a failure.
 
-A malformed hello (missing or non-object `d`, missing or non-numeric
-`heartbeat_interval`, close-before-hello) or a malformed dispatch (missing
+A malformed hello (missing or non-object `d`, missing or invalid
+`heartbeat_interval` — non-numeric, non-finite, non-positive or above the
+600 s timing bound — close-before-hello) or a malformed dispatch (missing
 `t`/`d`, READY without `user.id`) raises `GatewayShapeError` with the fixed
 message `gateway hello was malformed` or `gateway dispatch was malformed`,
 and fails the run the same way: a `run` FAIL with that message, evidence
@@ -84,8 +85,9 @@ fixed messages.
 - Every 6 hours (`voice-synthetic.yml` schedule) to catch drift. A failed run on
   main is re-run once by the host flake ledger and opens a `[main-red]` card if
   it fails again.
-- On pull requests only the offline suite (`scripts/test_staging_voice_synthetic.py`)
-  runs, and only when voice inputs change (`scripts/job-inputs.py` `voice`). A
+- On pull requests only the offline suites (`scripts/test_staging_voice_synthetic.py`
+  and `scripts/test_staging_voice_synthetic_gateway_intake_acceptance.py`)
+  run, and only when voice inputs change (`scripts/job-inputs.py` `voice`). A
   PR's code is not deployed to staging before merge, so a live run would test
   main, not the PR.
 

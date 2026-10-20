@@ -715,7 +715,13 @@ class Session:
         interval = data.get("heartbeat_interval") if isinstance(data, dict) else None
         if isinstance(interval, bool) or not isinstance(interval, (int, float)):
             raise GatewayShapeError("gateway hello was malformed")
-        self.interval = interval / 1000
+        try:
+            seconds = interval / 1000
+        except OverflowError:
+            raise GatewayShapeError("gateway hello was malformed") from None
+        if not math.isfinite(seconds) or not 0 < seconds <= TIMING_CAP_SECONDS:
+            raise GatewayShapeError("gateway hello was malformed")
+        self.interval = seconds
         self.seq, self.alive = None, True
         threading.Thread(target=self._beat, daemon=True).start()
         self.ws.send({"op": 2, "d": {"token": token, "intents": INTENTS,

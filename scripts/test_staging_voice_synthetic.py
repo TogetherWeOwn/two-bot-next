@@ -895,5 +895,43 @@ class BodyCapTest(unittest.TestCase):
             self.assertEqual(req.get_header("User-agent"), self.EXPECTED_UA)
 
 
+class HelloIntervalTest(unittest.TestCase):
+    HELLO_MSG = "gateway hello was malformed"
+
+    def session_with_interval(self, interval):
+        hello = {"op": 10, "d": {"heartbeat_interval": interval}}
+
+        class _Gateway:
+            def __init__(self, *args):
+                self.sent = []
+
+            def recv(self):
+                return hello
+
+            def send(self, payload):
+                self.sent.append(payload)
+
+            def close(self):
+                pass
+
+        with mock.patch.object(synth, "WebSocket", _Gateway):
+            return synth.Session("TOK")
+
+    def test_valid_interval_becomes_seconds(self):
+        session = self.session_with_interval(41250)
+        try:
+            self.assertEqual(session.interval, 41.25)
+        finally:
+            session.close()
+
+    def test_invalid_intervals_fail_with_fixed_message(self):
+        for bad in (0, -41250, float("nan"), float("inf"),
+                    10 ** 1000, 1e300):
+            with self.subTest(interval=bad), \
+                    self.assertRaises(synth.GatewayShapeError) as ctx:
+                self.session_with_interval(bad)
+            self.assertEqual(str(ctx.exception), self.HELLO_MSG)
+
+
 if __name__ == "__main__":
     unittest.main()
