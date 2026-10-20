@@ -900,7 +900,8 @@ mod tests {
         let current = std::sync::RwLock::new(test_secret());
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = current.write().expect("snapshot lock must be writable");
-            panic!("poison the snapshot lock");
+            // Match the test-only panic injection used by the shutdown tests.
+            std::panic::panic_any("poison the snapshot lock");
         }));
         let error = snapshot_secret(&current).expect_err("poisoned snapshot must refuse");
         assert!(
