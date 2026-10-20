@@ -455,12 +455,15 @@ async fn seed_raid_members(pool: &PgPool, guild: &str) {
 }
 
 async fn rank_of(pool: &PgPool, guild: &str, member: &str) -> Option<String> {
-    sqlx::query_scalar("SELECT rank_key FROM member_ranks WHERE guild_id=$1 AND member_id=$2")
-        .bind(guild)
-        .bind(member)
-        .fetch_optional(pool)
-        .await
-        .unwrap()
+    sqlx::query_scalar::<_, Option<String>>(
+        "SELECT rank_key FROM member_ranks WHERE guild_id=$1 AND member_id=$2",
+    )
+    .bind(guild)
+    .bind(member)
+    .fetch_optional(pool)
+    .await
+    .unwrap()
+    .flatten()
 }
 
 async fn holders(pool: &PgPool, guild: &str, key: &str) -> i32 {
