@@ -7,7 +7,7 @@
 //! runtime lane. Do not move it into an unselected standalone ignored target.
 
 use super::*;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::sync::Notify;
 use two_bot_core::member_moderation::MemberModerationStore;
 use two_bot_testsupport::TestDatabase;
