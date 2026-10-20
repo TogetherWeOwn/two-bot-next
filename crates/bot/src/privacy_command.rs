@@ -126,9 +126,7 @@ pub(crate) fn deletion_request_id(interaction: &Interaction) -> Option<&str> {
     else {
         return None;
     };
-    let Some(first) = data.options.first() else {
-        return None;
-    };
+    let first = data.options.first()?;
     if !matches!(first.name.as_str(), "deletion-status" | "deletion-receipt") {
         return None;
     }
