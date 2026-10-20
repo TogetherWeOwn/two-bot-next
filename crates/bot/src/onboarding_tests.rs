@@ -1121,15 +1121,81 @@ async fn onboarding_runtime_anchor_route_insert_failure_rolls_back_prompt() {
             .unwrap()
             .expect("route failure did not consume the marker or lock");
         drop(guard);
+        // Discord and Postgres are not one transaction, but this runtime keeps
+        // the accepted receipt. A retry must reconcile recording, not send again.
+        // The former two-post oracle predates that same-runtime contract; this
+        // makes no restart or cross-runtime exactly-once claim.
+        assert!(runtime.handle(welcome(44), NOW + 1_000).await.is_err());
+        assert_eq!(posts(&mock).len(), 1, "failed reconciliation never reposts");
+        assert_eq!(db.count(EVENT_ONBOARDING_PROMPTED).await, 0);
+        assert_eq!(db.count(EVENT_CHANNEL_ROUTED).await, 0);
+        let guard = two_bot_core::onboarding_store::begin_prompt(&db.pool, "22", "44")
+            .await
+            .unwrap()
+            .expect("record-only retry also rolls back the marker and releases the lock");
+        drop(guard);
+
+        // A later settings change must not rewrite the accepted receipt's
+        // destination or timestamp when recording finally succeeds.
+        SettingsStore::new(&db.pool)
+            .set(
+                "22",
+                "DISCORD_ANCHOR_WELCOME_CHANNEL_ID",
+                Some(json!("12")),
+                "test",
+            )
+            .await
+            .unwrap();
         sqlx::query("ALTER TABLE events DROP CONSTRAINT reject_route")
             .execute(&db.pool)
             .await
             .unwrap();
-        // Discord and Postgres are not one transaction: the unrecorded send is
-        // eligible for retry, but a committed retry must suppress redelivery.
-        runtime.handle(welcome(44), NOW + 1).await.unwrap();
-        runtime.handle(welcome(44), NOW + 2).await.unwrap();
-        assert_eq!(posts(&mock).len(), 2);
+        runtime.handle(welcome(44), NOW + 2_000).await.unwrap();
+        assert_eq!(
+            posts(&mock).len(),
+            1,
+            "successful reconciliation is record-only"
+        );
+        assert_eq!(posts(&mock)[0].path, "/api/v10/channels/14/messages");
+        assert_eq!(db.count(EVENT_ONBOARDING_PROMPTED).await, 1);
+        assert_eq!(db.count(EVENT_CHANNEL_ROUTED).await, 1);
+        let receipt_rows: Vec<(String, String, String, i64, String, Option<String>)> =
+            sqlx::query_as(
+                "SELECT event_type, guild_id, member_id, \
+                 (extract(epoch FROM occurred_at) * 1000)::bigint, source, metadata \
+                 FROM events ORDER BY event_type",
+            )
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(receipt_rows.len(), 2, "prompt and route commit together");
+        for (_, guild, member, occurred_at_ms, _, _) in &receipt_rows {
+            assert_eq!((guild.as_str(), member.as_str()), ("22", "44"));
+            assert_eq!(*occurred_at_ms, NOW, "keep the accepted send's time");
+        }
+        assert_eq!(receipt_rows[0].0, EVENT_CHANNEL_ROUTED);
+        assert_eq!(receipt_rows[0].4, "picker");
+        assert_eq!(
+            serde_json::from_str::<Value>(receipt_rows[0].5.as_deref().unwrap()).unwrap(),
+            json!({"channels":["14"],"degraded":0}),
+            "route keeps the accepted send's channel, not the new setting"
+        );
+        assert_eq!(receipt_rows[1].0, EVENT_ONBOARDING_PROMPTED);
+        assert_eq!(receipt_rows[1].4, "channel:14");
+        assert!(receipt_rows[1].5.is_none());
+        assert!(
+            two_bot_core::onboarding_store::begin_prompt(&db.pool, "22", "44")
+                .await
+                .unwrap()
+                .is_none(),
+            "committed marker suppresses another prompt claim"
+        );
+        runtime.handle(welcome(44), NOW + 3_000).await.unwrap();
+        assert_eq!(
+            posts(&mock).len(),
+            1,
+            "committed receipt suppresses redelivery"
+        );
         assert_eq!(db.count(EVENT_ONBOARDING_PROMPTED).await, 1);
         assert_eq!(db.count(EVENT_CHANNEL_ROUTED).await, 1);
     })
