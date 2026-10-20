@@ -68,8 +68,8 @@ impl MockRest {
                         .expect("bounded mock request body")
                         .to_vec(),
                 };
+                requests.lock().expect("recorded").push(request.clone());
                 let response = responder(&request);
-                requests.lock().expect("recorded").push(request);
                 response.0
             }
         });
