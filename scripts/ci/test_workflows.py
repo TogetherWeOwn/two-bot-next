@@ -3249,6 +3249,18 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(ignored_sweeps), 1)
         self.assertIn("--test-threads=1", ignored_sweeps[0])
         self.assertIn("--skip regenerate_reference_docs", ignored_sweeps[0])
+        # staging_migrate_db has a fixture guard for its dedicated agent_test
+        # database; the broad sweep's workspace URL is intentionally different.
+        for name in (
+            "connection_count_sees_other_roles_from_plan_login",
+            "post_apply_unreadable_ledger_is_unknown_not_empty",
+            "post_failure_readable_ledger_keeps_array_output",
+            "post_failure_unreadable_ledger_is_unknown_not_empty",
+            "real_sqlx_runner_cases",
+            "store_failure_keeps_committed_cutover_evidence",
+        ):
+            with self.subTest(staging_migrate_test=name):
+                self.assertIn(f"--skip {name}", ignored_sweeps[0])
         # One MEMBER_TESTDB export serves both the ignored sweep and the
         # fail-closed member_moderation_db re-run. Pin its count and logical
         # command order so a redundant later export cannot mask a deleted or
