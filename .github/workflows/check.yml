@@ -1176,9 +1176,9 @@ jobs:
           # way mid-suite; run 39197217315 tore the service down and failed the
           # whole binary on DNS. max_wal_size is a soft checkpoint target, not
           # a hard ceiling: heavy WAL can exceed it, so keep recycling bounded
-          # with headroom for relation files and segment creation, mirroring
-          # the rust-tests lane. The pre/post suite reports bracket the run
-          # for future budget tuning.
+          # with headroom for relation files and segment creation. This lane
+          # retains 512/64 MB targets; coverage uses tighter 128/32 MB targets.
+          # The pre/post suite reports bracket the run for future budget tuning.
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_wal_size = '512MB'"
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET min_wal_size = '64MB'"
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c 'SELECT pg_reload_conf()'
@@ -1640,7 +1640,8 @@ jobs:
           # "pg_wal/xlogtemp.*": No space left on device`. max_wal_size is a
           # soft checkpoint target, not a hard ceiling: heavy WAL can exceed
           # it, so keep recycling bounded with headroom for relation files and
-          # segment creation (same bound as the rust-tests and stores lanes).
+          # segment creation (same 512/64 MB targets as the stores lane;
+          # coverage uses tighter 128/32 MB targets).
           # The pre/post suite reports bracket the run for future budget tuning.
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_wal_size = '512MB'"
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET min_wal_size = '64MB'"

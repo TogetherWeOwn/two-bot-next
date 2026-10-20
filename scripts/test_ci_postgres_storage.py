@@ -38,8 +38,8 @@ NEXTEST_SCRIPT = textwrap.dedent(
     NEXTEST_VERIFY_TAILS[0].split("python3 - <<'PY'\n", 1)[1].split("\n          PY", 1)[0]
 )
 POSTGRES_LANES = ("rust-tests", "ignored-db-stores", "ignored-db-runtime")
-# Coverage replay needs earlier checkpoints on the same 1 GiB tmpfs. Only
-# its WAL targets differ; all four probes must enforce the same safety checks.
+# Coverage replay retains earlier checkpoints on the expanded 2 GiB tmpfs.
+# WAL targets differ; all four probes must enforce the same safety checks.
 WAL_BUDGETS = {
     "rust-tests": ("128MB", "32MB"),
     "ignored-db-stores": ("512MB", "64MB"),
