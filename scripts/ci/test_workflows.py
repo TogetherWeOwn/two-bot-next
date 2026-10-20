@@ -3073,10 +3073,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
 
     def test_stores_postgres_wal_budget_is_bounded(self):
-        # Two prior main runs PANIC'd when the original 1 GiB tmpfs filled;
-        # keep WAL bounded despite the shared 2 GiB tmpfs / 3 GiB service cap.
-        # Runs 39149193652 and 39197217315 attempt 1 failed mid-suite, failing
-        # every test in internal_member_store.
+        # Keep the broader stores-lane budget from main; the smaller target is
+        # specific to the longer rust-tests coverage replay.
         job = self.workflows["check.yml"]["jobs"]["ignored-db-stores"]
         prepare = next(
             step for step in job["steps"]
@@ -3141,9 +3139,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
 
     def test_runtime_postgres_wal_budget_is_bounded(self):
-        # Same WAL budget as the stores lane: the runtime lane runs
-        # 26 sequential database suites against the same 2 GiB tmpfs service,
-        # so WAL recycling stays bounded with headroom for relation files.
+        # Keep the broader runtime-lane budget from main; the smaller target is
+        # specific to the longer rust-tests coverage replay.
         job = self.workflows["check.yml"]["jobs"]["ignored-db-runtime"]
         prepare = next(
             step for step in job["steps"]
@@ -3316,7 +3313,7 @@ class WorkflowTests(unittest.TestCase):
             main_sweep,
         )
         guarded = [run for run in cov_runs if "llvm-cov --no-report -p " in run]
-        self.assertEqual(len(guarded), 12)
+        self.assertEqual(len(guarded), 14)
         for run in guarded:
             with self.subTest(guarded=run):
                 self.assertIn("--test-threads=1", run)
@@ -3327,6 +3324,8 @@ class WorkflowTests(unittest.TestCase):
         # needle -> carries `--features db` (core/discord suites need the db
         # feature to build their guarded targets; cutover suites do not).
         guarded_needles = {
+            "--test stream_live_store": True,
+            "--test mutation_429_proves_no_effect_channel": True,
             "-- channel_moderation --include-ignored": True,
             "--test channel_moderation_runtime": True,
             "--test internal_channel_moderation": True,
@@ -3396,6 +3395,55 @@ class WorkflowTests(unittest.TestCase):
         )
         checkout = next(step for step in job["steps"] if step.get("uses", "").startswith("actions/checkout@"))
         self.assertEqual(checkout["with"]["fetch-depth"], "0")
+
+    def test_coverage_replays_strict_agent_test_targets_and_fails_closed(self):
+        job = self.workflows["check.yml"]["jobs"]["rust-tests"]
+        step = next(
+            step for step in job["steps"]
+            if step.get("name") == "Patch coverage (HARD, 80% of added lines)"
+        )
+        run = step["run"]
+        wrapper = run[run.index("cov_run() {"):run.index("# Main sweep")]
+        start = run.index("export TWO_TEST_DATABASE_URL=postgres://agent_test@")
+        end = run.index("export TWO_TEST_DATABASE_URL=postgres://agent_test:@", start)
+        # Execute the real replay block and failure wrapper, but replace Cargo
+        # with a fixture that records its arguments and effective target URL.
+        targets = ("stream_live_store", "mutation_429_proves_no_effect_channel")
+        with tempfile.TemporaryDirectory() as directory:
+            stub = Path(directory) / "cargo-llvm-cov"
+            stub.write_text(
+                '#!/bin/bash\nprintf "%s %s\\n" "$TWO_TEST_DATABASE_URL" "$*"\n'
+                'if [ -n "$FAIL_TARGET" ] && [[ " $* " == *" --test $FAIL_TARGET "* ]]; '
+                'then exit 23; fi\n'
+            )
+            stub.chmod(0o755)
+            for failure in ("", *targets):
+                with self.subTest(failure=failure):
+                    result = subprocess.run(
+                        ["bash", "-c", "set -euo pipefail; " + wrapper + run[start:end]],
+                        env=dict(os.environ, COV=str(stub), FAIL_TARGET=failure),
+                        capture_output=True, text=True, check=False,
+                    )
+                    if failure:
+                        self.assertEqual(result.returncode, 1)
+                        self.assertIn("patch coverage measurement failed", result.stderr)
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        for target in targets:
+                            matches = [
+                                line for line in result.stdout.splitlines()
+                                if f"--test {target} " in line
+                            ]
+                            self.assertEqual(len(matches), 1, target)
+                            self.assertTrue(matches[0].startswith(
+                                "postgres://agent_test@agent-testdb:5432/agent_test "
+                            ))
+                            self.assertIn("--no-report", matches[0])
+                            self.assertIn("--features db", matches[0])
+                            self.assertIn("--locked", matches[0])
+                            self.assertIn("--test-threads=1", matches[0])
+                            self.assertRegex(matches[0], r"-- --(?:include-)?ignored(?: |$)")
+                            self.assertNotIn("--ignore-run-fail", matches[0])
 
     def test_voice_synthetic_shape_is_pinned_and_mutations_fail(self):
         import copy
