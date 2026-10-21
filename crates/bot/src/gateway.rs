@@ -1309,6 +1309,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
     // socket before that write lands.
     let (opening_tx, opening_rx) = tokio::sync::watch::channel(false);
     let receive_generation = Arc::clone(&generation);
+    let receive_generation_wake = Arc::clone(&generation_wake);
     let automod_enabled = automod.is_some();
     // The worker dispatches text automations itself once automod has decided.
     let command_runtime = runtime.clone();
@@ -1328,6 +1329,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
         move |(mut shard, mut received, mut deadline, mut observer, mut bootstrap)| {
             let state = Arc::clone(&receive_state);
             let generation = Arc::clone(&receive_generation);
+            let generation_wake = Arc::clone(&receive_generation_wake);
             let runtime = runtime.clone();
             let interactions = interactions.clone();
             let rsvp_sender = receive_rsvp.clone();
