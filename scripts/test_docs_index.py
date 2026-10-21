@@ -89,13 +89,48 @@ class IndexFixtureTests(unittest.TestCase):
         self.assertEqual(check(self.root, large_docs={"docs/README.md": "fixture"})["oversize"], ["docs/README.md"])
 
     def test_malformed_empty_duplicate_or_escaping_rows_fail_closed(self):
-        for row in ("- [](nested/one.md)", "- [   ](nested/one.md)",
-                    "- [Escape](../outside.md)", "- [Absolute](/outside.md)",
-                    "- [URL](https://example.com/doc.md)", "- [No purpose] nested/one.md",
-                    "- [Duplicate](nested/one.md)"):
+        # Each malformed row that names a plain relative path gets a dedicated
+        # existing target, so a removed guard cannot hide behind the valid
+        # nested/one.md row; the assertion pins the exact stale line form.
+        cases = (
+            ("- [](fresh-blank.md)", "fresh-blank.md", False),
+            ("- [   ](fresh-spaces.md)", "fresh-spaces.md", False),
+            ("- [Escape](../outside.md)", None, False),
+            ("- [Absolute](/outside.md)", None, False),
+            ("- [URL](https://example.com/doc.md)", None, False),
+            ("- [No purpose] nested/one.md", None, False),
+            ("- [Fixture](fresh-trailing.md) trailing junk", "fresh-trailing.md", False),
+            ("- [Dot](nested/./one.md)", None, False),
+            ("- [Duplicate](nested/one.md)", None, True),
+        )
+        for row, fresh, keep_valid in cases:
             with self.subTest(row=row):
-                self.index.write_text("# Docs\n\n## Area\n- [Navigation](README.md)\n- [Fixture](nested/one.md)\n" + row + "\n")
-                self.assertTrue(check(self.root, large_docs={})["stale"])
+                if fresh:
+                    (self.root / "docs" / fresh).write_text("# Fresh\n")
+                body = "# Docs\n\n## Area\n- [Navigation](README.md)\n"
+                if keep_valid:
+                    body += "- [Fixture](nested/one.md)\n"
+                self.index.write_text(body + row + "\n")
+                self.assertEqual(check(self.root, large_docs={})["stale"],
+                                 [f"docs/README.md:{body.count(chr(10)) + 1}"])
+
+    def test_uppercase_extension_orphan_is_named_missing(self):
+        (self.root / "docs/UPPER.MD").write_text("# Upper\n")
+        self.assertEqual(check(self.root, large_docs={})["missing"], ["docs/UPPER.MD"])
+        self.index.write_text(self.index.read_text() + "- [Upper](UPPER.MD)\n")
+        report = check(self.root, large_docs={})
+        self.assertEqual(report["missing"], ["docs/UPPER.MD"])
+        self.assertEqual(report["stale"], ["docs/README.md:6"])
+
+    def test_undecodable_index_reports_stale_and_keeps_json_shape(self):
+        self.index.write_bytes(b"# Docs\n- [Bad](nested/one.md)\n\xff\xfe\n")
+        report = check(self.root, large_docs={})
+        self.assertIn("docs/README.md", report["stale"])
+        command = [sys.executable, str(ROOT / "scripts/check_docs_index.py"), "--root", str(self.root), "--json"]
+        failed = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 1, failed.stderr)
+        self.assertEqual(failed.stderr, "")
+        self.assertEqual(json.loads(failed.stdout), report)
 
     def test_json_cli_has_only_stable_arrays_and_nonzero_failure(self):
         command = [sys.executable, str(ROOT / "scripts/check_docs_index.py"), "--root", str(self.root), "--json"]

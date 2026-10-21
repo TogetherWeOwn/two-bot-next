@@ -3,6 +3,8 @@
 
 Run with --json for {missing,stale,oversize}: sorted arrays of repo-relative
 paths. Invalid/duplicate index rows appear in stale as docs/README.md:<line>.
+An undecodable index is stale as docs/README.md so --json keeps its shape.
+Uppercase .MD files are missing until renamed to lowercase .md targets.
 Exit 0 means all arrays are empty; exit 1 means repair the named index rows or
 split the oversized doc. --root selects a scratch checkout for mutation tests.
 Purposes live only in the index's link labels, never in a second manifest.
@@ -18,6 +20,7 @@ DOC_LIMIT = 64 * 1024
 INDEX_LIMIT = 12_000  # Strictly below 12 KB, including UTF-8 and Markdown syntax.
 LARGE_DOCS = {
     "docs/metrics.md": "Existing metric catalog; split by area in a separate content change.",
+    "docs/observability-event-catalog.md": "Existing observability event catalog; split by area in a separate content change.",
     "docs/parity.md": "Historical parity ledger; use the start-here section map.",
     "docs/runbook.md": "Existing operations guide; use section and alert navigation.",
     "docs/soak-checklist.md": "Generated coverage ledger; use the start-here section map.",
@@ -27,12 +30,23 @@ ROW = re.compile(r"- \[([^\]\n]+)\]\(([A-Za-z0-9_./-]+\.md)\)")
 
 def check(root=ROOT, large_docs=LARGE_DOCS):
     docs = root / "docs"
-    files = {p.relative_to(root).as_posix(): p for p in docs.rglob("*.md") if p.is_file()}
+    # Case-insensitive inventory: ROW only accepts lowercase .md targets, so an
+    # uppercase .MD file lands in missing until renamed, never silently ignored.
+    files = {
+        p.relative_to(root).as_posix(): p
+        for p in docs.rglob("*")
+        if p.is_file() and p.suffix.lower() == ".md"
+    }
     index = docs / "README.md"
     indexed = set()
     stale = set()
     if index.is_file():
-        for number, line in enumerate(index.read_text(encoding="utf-8").splitlines(), 1):
+        try:
+            text = index.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            stale.add("docs/README.md")
+            text = ""
+        for number, line in enumerate(text.splitlines(), 1):
             if not line.startswith("- "):
                 continue
             match = ROW.fullmatch(line)
