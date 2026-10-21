@@ -41,6 +41,9 @@ async fn cli(args: &[&str], database_url: Option<&str>) -> Output {
         .env("TWO_DATABASE_TLS", "local-only")
         .args(args)
         .kill_on_drop(true);
+    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        command.env("LLVM_PROFILE_FILE", profile);
+    }
     if let Some(url) = database_url {
         command.env("TWO_DATABASE_URL", url);
     }
