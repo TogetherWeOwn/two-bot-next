@@ -636,8 +636,11 @@ mod tests {
         let t = InviteTracker::new(ClampingSnapshots {
             inner: MemSnapshots::new(),
         });
+        // Baseline sits just below the clamp: the crossing below is genuine
+        // growth in the persisted domain (MAX-1 -> MAX), not an already
+        // saturated baseline (MAX -> MAX reads quiet, correctly).
         assert!(t
-            .diff_and_store(1, &[state("a", MAX_INVITE_USES)])
+            .diff_and_store(1, &[state("a", MAX_INVITE_USES - 1)])
             .is_empty());
         // Genuine growth across the clamp reads once...
         assert_eq!(
