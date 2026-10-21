@@ -7,6 +7,7 @@ database is touched.
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -18,7 +19,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY = ROOT / "deploy"
 HANDLER = "two-bot-next-failure@.service"
-ON_FAILURE = "OnFailure=two-bot-next-failure@%n.service"
+ON_FAILURE_TARGET = "two-bot-next-failure@%n.service"
+ON_FAILURE = f"OnFailure={ON_FAILURE_TARGET}"
+EXPECTED_HANDLER_EXECSTART = (
+    "/usr/bin/systemd-cat -t two-bot-next-unit-failed -p crit "
+    '/usr/bin/echo "unit failed: %i - inspect with journalctl -u %i"'
+)
 DRILL = "two-bot-next-restore-drill.service"
 UNIT_SECONDS = {"s": 1, "sec": 1, "min": 60, "m": 60, "h": 3600}
 MAX_START_S = 6 * 3600
@@ -52,20 +58,80 @@ def parse_sections(text):
     return sections
 
 
+def directive_parts(line):
+    """(key, value) with systemd whitespace around '=' ignored; None if no '='."""
+    if "=" not in line:
+        return None
+    key, value = line.split("=", 1)
+    return key.strip(), value.strip()
+
+
+def values_for(lines, key):
+    """Values for key in order; whitespace around '=' is ignored (systemd.syntax)."""
+    values = []
+    for line in lines:
+        parts = directive_parts(line)
+        if parts and parts[0] == key:
+            values.append(parts[1])
+    return values
+
+
 def timeout_start_s(lines):
     """Last TimeoutStartSec as seconds; None when unset, 0 for infinity."""
-    value = None
-    for line in lines:
-        if line.startswith("TimeoutStartSec="):
-            value = line.split("=", 1)[1].strip()
-    if value is None:
+    values = values_for(lines, "TimeoutStartSec")
+    if not values:
         return None
+    value = values[-1]
     if value == "infinity":
         return 0
     match = re.fullmatch(r"(\d+)\s*(s|sec|min|m|h)?", value)
     if not match:
         return 0
     return int(match[1]) * UNIT_SECONDS[match[2] or "s"]
+
+
+def unquoted(word):
+    """Strip one layer of matching systemd quotes; bare words pass through."""
+    bare = word.strip()
+    if len(bare) >= 2 and bare[0] == bare[-1] and bare[0] in ("'", '"'):
+        return bare[1:-1].strip()
+    return bare
+
+
+def effective_onfailure(unit_lines):
+    """Effective OnFailure targets; an empty assignment resets the list (systemd.unit)."""
+    effective = []
+    for value in values_for(unit_lines, "OnFailure"):
+        targets = unquoted(value)
+        if targets == "":
+            effective = []
+        else:
+            effective.extend(targets.split())
+    return effective
+
+
+def effective_environment(service_lines):
+    """(values, invalid) honouring empty resets, quoting and last-wins (systemd.exec)."""
+    values = {}
+    for rest in values_for(service_lines, "Environment"):
+        if rest == "":
+            values.clear()
+            continue
+        try:
+            assignments = shlex.split(rest)
+        except ValueError:
+            return values, True
+        if not assignments:
+            values.clear()
+            continue
+        for assignment in assignments:
+            if "=" not in assignment:
+                return values, True
+            var, val = assignment.split("=", 1)
+            if not var:
+                return values, True
+            values[var] = val
+    return values, False
 
 
 def lint(deploy_dir):
@@ -82,31 +148,39 @@ def lint(deploy_dir):
         seconds = timeout_start_s(service_lines)
         if not seconds or seconds > MAX_START_S:
             findings.append(f"{unit.name}: TimeoutStartSec must be finite and <= {MAX_START_S}s in [Service]")
-        if unit.name != HANDLER and ON_FAILURE not in unit_lines:
+        if unit.name != HANDLER and ON_FAILURE_TARGET not in effective_onfailure(unit_lines):
             findings.append(f"{unit.name}: missing {ON_FAILURE} in [Unit]")
-        if unit.name == HANDLER and any(line.startswith("OnFailure=") for line in all_lines):
-            findings.append(f"{unit.name}: the handler must not name an OnFailure=")
+        if unit.name == HANDLER:
+            if any(unquoted(value) != "" for value in values_for(all_lines, "OnFailure")):
+                findings.append(f"{unit.name}: the handler must not name an OnFailure=")
+            service_exec = values_for(service_lines, "ExecStart")
+            total_exec = values_for(all_lines, "ExecStart")
+            if service_exec != [EXPECTED_HANDLER_EXECSTART] or len(total_exec) != 1:
+                findings.append(
+                    f"{unit.name}: ExecStart must be the documented systemd-cat command in [Service]")
     drill = Path(deploy_dir) / DRILL
     if drill.exists():
         sections = parse_sections(drill.read_text())
         service_lines = sections.get("Service", [])
-        age_lines = [line for line in service_lines
-                     if line.startswith("Environment=TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S=")]
-        if not age_lines:
+        env_values, env_invalid = effective_environment(service_lines)
+        if env_invalid:
+            findings.append(f"{DRILL}: invalid Environment= assignment in [Service]")
+        age_text = env_values.get("TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S")
+        if age_text is None:
             findings.append(f"{DRILL}: missing the documented max archive age in [Service]")
         else:
             try:
-                age_value = int(age_lines[-1].split("=", 2)[2])
-            except (IndexError, ValueError):
+                age_value = int(age_text)
+            except ValueError:
                 findings.append(f"{DRILL}: max archive age must be a positive whole number of seconds")
             else:
                 if not 1 <= age_value <= MAX_ARCHIVE_AGE_S:
                     findings.append(
                         f"{DRILL}: max archive age must be 1..{MAX_ARCHIVE_AGE_S}s in [Service]")
-        exec_lines = [line for line in service_lines if line.startswith("ExecStart=")]
-        if len(exec_lines) != 1 or "archive_stale" not in exec_lines[0]:
+        exec_vals = values_for(service_lines, "ExecStart")
+        if len(exec_vals) != 1 or "archive_stale" not in exec_vals[0]:
             findings.append(f"{DRILL}: ExecStart must refuse a stale archive (archive_stale)")
-        elif exec_lines[0].find("archive_stale") > exec_lines[0].find("restore-drill"):
+        elif exec_vals[0].find("archive_stale") > exec_vals[0].find("restore-drill"):
             findings.append(f"{DRILL}: the age refusal must come before provisioning")
     return findings
 
@@ -142,9 +216,10 @@ def systemd_word(exec_line):
 
 
 def drill_script(text):
-    lines = [line for line in directives(text) if line.startswith("ExecStart=")]
-    assert len(lines) == 1, lines
-    return systemd_word(lines[0])
+    sections = parse_sections(text)
+    exec_vals = values_for(sections.get("Service", []), "ExecStart")
+    assert len(exec_vals) == 1, exec_vals
+    return systemd_word(f"ExecStart={exec_vals[0]}")
 
 
 class UnitLintTests(unittest.TestCase):
@@ -209,11 +284,45 @@ class UnitLintTests(unittest.TestCase):
         text = (DEPLOY / HANDLER).read_text()
         for forbidden in ["EnvironmentFile", "LoadCredential", "DATABASE", "TOKEN", "curl", "two-bot "]:
             self.assertNotIn(forbidden, "\n".join(directives(text)))
-        exec_lines = [line for line in directives(text) if line.startswith("ExecStart=")]
-        self.assertEqual(len(exec_lines), 1, exec_lines)
-        handler_cmd = exec_lines[0]
-        for required in ["systemd-cat", "-t two-bot-next-unit-failed", "-p crit", "%i"]:
-            self.assertIn(required, handler_cmd, handler_cmd)
+        sections = parse_sections(text)
+        service_exec = values_for(sections.get("Service", []), "ExecStart")
+        self.assertEqual(service_exec, [EXPECTED_HANDLER_EXECSTART], service_exec)
+        total_exec = values_for(
+            [line for lines in sections.values() for line in lines], "ExecStart")
+        self.assertEqual(len(total_exec), 1, total_exec)
+
+    def test_handler_execstart_section_and_command_are_pinned(self):
+        tmp = self.copy_deploy()
+        path = tmp / HANDLER
+        text = path.read_text()
+        exec_line = f"ExecStart={EXPECTED_HANDLER_EXECSTART}\n"
+        self.assertIn(exec_line, text)
+        moved = text.replace(exec_line, "", 1).replace("[Unit]\n", "[Unit]\n" + exec_line, 1)
+        path.write_text(moved)
+        self.assertTrue(any(f.startswith(HANDLER + ":") for f in lint(tmp)), lint(tmp))
+        tmp = self.copy_deploy()
+        path = tmp / HANDLER
+        text = path.read_text()
+        self.assertIn("/usr/bin/echo", text)
+        path.write_text(text.replace("/usr/bin/echo", "/usr/bin/true", 1))
+        self.assertTrue(any(f.startswith(HANDLER + ":") for f in lint(tmp)), lint(tmp))
+
+    def test_effective_systemd_values_are_honoured(self):
+        tmp = self.copy_deploy()
+        path = tmp / "two-bot-next-backup.service"
+        text = path.read_text()
+        self.assertIn(ON_FAILURE + "\n", text)
+        path.write_text(text.replace(ON_FAILURE + "\n", ON_FAILURE + "\nOnFailure=\n", 1))
+        self.assertTrue(
+            any(f.startswith("two-bot-next-backup.service:") for f in lint(tmp)), lint(tmp))
+        tmp = self.copy_deploy()
+        path = tmp / DRILL
+        text = path.read_text()
+        anchor = "Environment=TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S=172800\n"
+        self.assertIn(anchor, text)
+        path.write_text(text.replace(
+            anchor, anchor + 'Environment="TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S=999999999"\n', 1))
+        self.assertTrue(any(f.startswith(DRILL + ":") for f in lint(tmp)), lint(tmp))
 
     def test_misplaced_directive_is_refused(self):
         tmp = self.copy_deploy()
