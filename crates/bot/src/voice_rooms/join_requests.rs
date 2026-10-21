@@ -75,6 +75,10 @@ const NOT_PENDING: &str = "This join request is no longer pending.";
 /// channel, so the copy says how.
 const REJOIN_COPY: &str =
     "That join request is no longer pending \u{2014} leave the Join channel and rejoin to ask again.";
+/// A stale press for a request withdrawn without a leave (owner transfer,
+/// `/public`): no leave happened and no rejoin recovery applies, so the copy
+/// stays neutral on both sides.
+const WITHDRAWN_COPY: &str = "That join request is no longer pending \u{2014} it was withdrawn.";
 const CORRUPT: &str = "This room's privacy settings look corrupt. Ask an admin to check /setup.";
 const NEEDS_MANAGE_ROLES: &str = "I can't let anyone in: I need the Manage Roles permission on \
                                   this room. Ask an admin to check my permissions.";
@@ -108,7 +112,9 @@ impl JoinRequests {
 
 /// How a request that is no longer pending ended, with the member it was
 /// for. Recorded on every answer and withdrawal; read only to word a stale
-/// press.
+/// press. `left` distinguishes a member who left the Join channel (scan and
+/// press-time paths) from a worker-retired request (owner transfer, `/public`),
+/// whose stale copy must not claim a leave.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum JoinResolution {
     Answered {
@@ -117,6 +123,7 @@ pub(super) enum JoinResolution {
     },
     Withdrawn {
         member: Snowflake,
+        left: bool,
     },
 }
 
@@ -124,7 +131,7 @@ pub(super) enum JoinResolution {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StaleBecause {
     Answered(JoinDecision),
-    Withdrawn { member: Snowflake },
+    Withdrawn { member: Snowflake, left: bool },
     Restarted { legacy: bool },
     Unknown,
 }
@@ -450,7 +457,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 state.decide(state.owner_id, RequestId(request_id), JoinDecision::Deny)
             {
                 self.privacy.insert(room, plan.room);
-                self.record_join_resolution(room, request_id, JoinResolution::Withdrawn { member });
+                self.record_join_resolution(
+                    room,
+                    request_id,
+                    JoinResolution::Withdrawn { member, left: true },
+                );
                 self.retire_join_prompt(room, request_id);
             }
         }
@@ -538,9 +549,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 Some(JoinResolution::Answered { decision, .. }) => {
                     StaleBecause::Answered(*decision)
                 }
-                Some(JoinResolution::Withdrawn { member }) => {
-                    StaleBecause::Withdrawn { member: *member }
-                }
+                Some(JoinResolution::Withdrawn { member, left }) => StaleBecause::Withdrawn {
+                    member: *member,
+                    left: *left,
+                },
                 None => StaleBecause::Unknown,
             };
             return self.refuse_stale_join(click.room_id, click.request_id, actor_id, because);
@@ -562,7 +574,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     self.record_join_resolution(
                         click.room_id,
                         click.request_id,
-                        JoinResolution::Withdrawn { member },
+                        JoinResolution::Withdrawn { member, left: true },
                     );
                     self.join.prompts.remove(&(click.room_id, click.request_id));
                     return JoinReply::Decided(format!(
@@ -697,25 +709,37 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         because: StaleBecause,
     ) -> JoinReply {
         let owner = self.rooms.get(&room).map(|room| room.owner_id);
-        let requester = self
-            .privacy
-            .get(&room)
-            .and_then(|state| {
+        // After a restart the numeric counter starts over, so the stale id
+        // cannot name the requester: anyone still waiting for this room, or
+        // still sitting in its Join channel, is on the requester side.
+        let requester = if matches!(because, StaleBecause::Restarted { .. }) {
+            let waiting = self.privacy.get(&room).is_some_and(|state| {
                 state
                     .pending
                     .values()
-                    .find(|request| request.id.0 == request_id)
-                    .map(|request| request.member_id.0)
-            })
-            .or_else(|| {
-                self.join
-                    .resolved
-                    .get(&(room, request_id))
-                    .map(|resolution| match resolution {
-                        JoinResolution::Answered { member, .. }
-                        | JoinResolution::Withdrawn { member } => *member,
-                    })
-            });
+                    .any(|request| request.member_id.0 == actor_id)
+            }) || self.member_in_join(room, actor_id);
+            waiting.then_some(actor_id)
+        } else {
+            self.privacy
+                .get(&room)
+                .and_then(|state| {
+                    state
+                        .pending
+                        .values()
+                        .find(|request| request.id.0 == request_id)
+                        .map(|request| request.member_id.0)
+                })
+                .or_else(|| {
+                    self.join
+                        .resolved
+                        .get(&(room, request_id))
+                        .map(|resolution| match resolution {
+                            JoinResolution::Answered { member, .. }
+                            | JoinResolution::Withdrawn { member, .. } => *member,
+                        })
+                })
+        };
         if Some(actor_id) == owner {
             let text = match because {
                 StaleBecause::Answered(decision) => format!(
@@ -726,10 +750,16 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         JoinDecision::Block => "blocked",
                     }
                 ),
-                StaleBecause::Withdrawn { member } => format!(
-                    "That join request is no longer pending \u{2014} <@{member}> left the Join \
-                     channel, so it was withdrawn. Ask them to rejoin to ask again."
-                ),
+                StaleBecause::Withdrawn { member, left } => {
+                    if left {
+                        format!(
+                            "That join request is no longer pending \u{2014} <@{member}> left the Join \
+                             channel, so it was withdrawn. Ask them to rejoin to ask again."
+                        )
+                    } else {
+                        WITHDRAWN_COPY.to_owned()
+                    }
+                }
                 StaleBecause::Restarted { legacy: true } => {
                     "Those join buttons expired, so that request is no longer pending. If they \
                      are still waiting, a fresh prompt with new buttons is on its way \u{2014} \
@@ -747,6 +777,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             return JoinReply::Refused(text);
         }
         if Some(actor_id) == requester {
+            // A retired request (transfer, `/public`) leaves nothing to
+            // rejoin for: the member is either still waiting or the room is
+            // public now.
+            if matches!(because, StaleBecause::Withdrawn { left: false, .. }) {
+                return JoinReply::Refused(WITHDRAWN_COPY.to_owned());
+            }
             return JoinReply::Refused(REJOIN_COPY.to_owned());
         }
         JoinReply::Refused(NOT_OWNER.to_owned())
@@ -801,11 +837,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     );
                 }
                 PrivacyEffect::WithdrawRequest { request } => {
+                    // Retired by the worker (owner transfer, `/public`), not
+                    // by a leave: the stale copy must stay neutral.
                     self.record_join_resolution(
                         room,
                         request.id.0,
                         JoinResolution::Withdrawn {
                             member: request.member_id.0,
+                            left: false,
                         },
                     );
                     self.retire_join_prompt(room, request.id.0);

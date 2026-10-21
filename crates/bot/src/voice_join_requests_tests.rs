@@ -388,6 +388,32 @@ async fn approve_does_not_move_a_member_who_left_the_join_channel() {
 }
 
 #[tokio::test]
+async fn approve_pressed_after_a_leave_without_a_scan_withdraws_instead_of_claiming_movement() {
+    let (mut worker, trace) = private_room().await;
+    enter(&worker, OUTSIDER, 2_000);
+    worker.reconcile();
+    drain(&mut worker).await;
+    let request = request_of(&worker, OUTSIDER);
+    trace.lock().unwrap().clear();
+    // They leave after the last scan tick: the request is still pending when
+    // the owner presses, so the press itself must withdraw instead of
+    // claiming a move that cannot land.
+    leave(&worker, OUTSIDER, 3_000);
+    assert_eq!(pending(&worker), [request]);
+    let reply = press(&mut worker, OWNER, JoinDecision::Approve, request.id.0);
+    let text = decided(&reply);
+    assert!(text.contains("Not approved"), "{text}");
+    assert!(!text.contains("being let in and moved"), "{text}");
+    assert!(text.contains("rejoin"), "{text}");
+    assert!(pending(&worker).is_empty());
+    assert!(worker.privacy[&ROOM].granted.is_empty());
+    assert!(!worker.join.prompts.contains_key(&(ROOM, request.id.0)));
+    drain(&mut worker).await;
+    // Withdrawing queues nothing: no grant write, no move, no prompt edit.
+    assert!(calls(&trace).is_empty(), "{:?}", calls(&trace));
+}
+
+#[tokio::test]
 async fn approve_never_lifts_a_vote_kick_deny() {
     let (mut worker, trace) = private_room().await;
     enter(&worker, OUTSIDER, 2_000);
@@ -507,6 +533,20 @@ async fn an_ownership_transfer_withdraws_pending_requests_and_asks_the_new_owner
     // Its buttons answer nobody, whoever presses them.
     let by_new = press(&mut worker, GUEST, JoinDecision::Approve, old.id.0);
     assert!(refused(&by_new).contains("no longer pending"), "{by_new:?}");
+    // The withdrawal was the transfer, not a leave: the copy must not claim
+    // they left the Join channel.
+    assert!(!refused(&by_new).contains("left the Join"), "{by_new:?}");
+    // The still-waiting requester gets the neutral withdrawal, not an
+    // impossible leave-and-rejoin instruction.
+    let by_requester = press(&mut worker, OUTSIDER, JoinDecision::Approve, old.id.0);
+    assert!(
+        refused(&by_requester).contains("withdrawn"),
+        "{by_requester:?}"
+    );
+    assert!(
+        !refused(&by_requester).contains("current owner"),
+        "{by_requester:?}"
+    );
     let by_old = press(&mut worker, OWNER, JoinDecision::Approve, old.id.0);
     assert!(refused(&by_old).contains("current owner"), "{by_old:?}");
     // The member is still waiting, so the new owner is asked, and the old
@@ -596,9 +636,12 @@ async fn public_takes_approved_access_back_and_retires_open_prompts() {
     assert!(!live_overwrites
         .iter()
         .any(|overwrite| overwrite.id.get() == OUTSIDER));
-    // A button from before `/public` is dead.
+    // A button from before `/public` is dead. The withdrawal was the room
+    // going public, not a leave: the copy must not claim they left the Join
+    // channel they can no longer rejoin.
     let stale = press(&mut worker, OWNER, JoinDecision::Approve, open.id.0);
     assert!(refused(&stale).contains("no longer pending"), "{stale:?}");
+    assert!(!refused(&stale).contains("left the Join"), "{stale:?}");
 }
 
 #[tokio::test]
@@ -637,6 +680,55 @@ async fn a_button_from_before_a_restart_never_matches_a_request_raised_after() {
     // The new button works.
     let reply = press(&mut after, OWNER, JoinDecision::Approve, fresh.id.0);
     assert!(decided(&reply).contains("Approved"), "{reply:?}");
+}
+
+#[tokio::test]
+async fn an_epoch_rolled_press_still_finds_its_requester_when_ids_restarted() {
+    let (mut worker, _trace) = private_room().await;
+    enter(&worker, OUTSIDER, 2_000);
+    worker.reconcile();
+    drain(&mut worker).await;
+    let first = request_of(&worker, OUTSIDER);
+    let _ = press(&mut worker, OWNER, JoinDecision::Deny, first.id.0);
+    // They ask again under a later id, then the bot restarts and the counter
+    // starts over: the stale id matches no live request.
+    leave(&worker, OUTSIDER, 3_000);
+    worker.reconcile();
+    enter(&worker, OUTSIDER, 4_000);
+    worker.reconcile();
+    drain(&mut worker).await;
+    let before = request_of(&worker, OUTSIDER);
+    assert_eq!(before.id.0, 2);
+    let mut after = restarted(&worker).await;
+    assert_ne!(after.join.epoch, worker.join.epoch);
+    after.reconcile();
+    let fresh = request_of(&after, OUTSIDER);
+    assert_eq!(fresh.id.0, 1);
+    assert_ne!(fresh.id, before.id);
+    let old_id = join_requests::runtime_join_custom_id(
+        JoinDecision::Approve,
+        ROOM,
+        before.id.0,
+        worker.join.epoch,
+    );
+    let click = join_component_action(&component_interaction(&old_id, None, OUTSIDER))
+        .expect("old button still routed");
+    let stale = after.apply_join_decision(JoinDecisionCommand {
+        actor_id: OUTSIDER,
+        click,
+    });
+    let text = refused(&stale).to_lowercase();
+    assert!(
+        text.contains("leave") && text.contains("rejoin"),
+        "requester must learn to leave and rejoin, got: {text}"
+    );
+    assert!(
+        !text.contains("current owner"),
+        "requester stale copy must not be the owner-only refusal, got: {text}"
+    );
+    // No resurrection: the fresh request is still the only pending one.
+    assert_eq!(pending(&after), [fresh]);
+    assert!(after.privacy[&ROOM].granted.is_empty());
 }
 
 #[test]
