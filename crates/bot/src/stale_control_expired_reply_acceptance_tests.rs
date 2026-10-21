@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Protected acceptance: stale controls answer exactly one expired-control reply.
 //!
 //! Every test drives the production `CommandRuntime::on_interaction` dispatch
@@ -430,8 +432,8 @@ async fn foreign_application_stays_silent() {
     );
     mock.shutdown().await;
 
-    let mock = mock().await;
-    let runtime = roles_runtime(sr_gates(), mock.origin());
+    let mock_two = mock().await;
+    let runtime = roles_runtime(sr_gates(), mock_two.origin());
     runtime.set_identity(APP_ID, APP_ID);
     let mut stale = sr_button(
         SR_EVENT + 4,
@@ -442,10 +444,10 @@ async fn foreign_application_stays_silent() {
     stale.application_id = Id::new(9999);
     runtime.on_interaction(&stale).await;
     assert!(
-        mock.requests().is_empty(),
+        mock_two.requests().is_empty(),
         "stale reference under a foreign application stays silent"
     );
-    mock.shutdown().await;
+    mock_two.shutdown().await;
 }
 
 #[tokio::test]
@@ -470,8 +472,8 @@ async fn foreign_and_missing_guild_stay_silent() {
     );
     mock.shutdown().await;
 
-    let mock = mock().await;
-    let runtime = roles_runtime(sr_gates(), mock.origin());
+    let mock_two = mock().await;
+    let runtime = roles_runtime(sr_gates(), mock_two.origin());
     for (index, guild) in [Some(Id::new(9999)), None].into_iter().enumerate() {
         let mut stale = sr_button(
             SR_EVENT + 10 + index as u64,
@@ -483,10 +485,10 @@ async fn foreign_and_missing_guild_stay_silent() {
         runtime.on_interaction(&stale).await;
     }
     assert!(
-        mock.requests().is_empty(),
+        mock_two.requests().is_empty(),
         "stale reference outside the configured guild stays silent"
     );
-    mock.shutdown().await;
+    mock_two.shutdown().await;
 }
 
 #[tokio::test]
@@ -559,8 +561,8 @@ async fn bot_member_stays_silent() {
     );
     mock.shutdown().await;
 
-    let mock = mock().await;
-    let runtime = roles_runtime(sr_gates(), mock.origin());
+    let mock_two = mock().await;
+    let runtime = roles_runtime(sr_gates(), mock_two.origin());
     let mut stale = sr_button(
         SR_EVENT + 5,
         "two:self-role:retired:new",
@@ -577,10 +579,10 @@ async fn bot_member_stays_silent() {
         .bot = true;
     runtime.on_interaction(&stale).await;
     assert!(
-        mock.requests().is_empty(),
+        mock_two.requests().is_empty(),
         "bot-authored stale reference stays silent"
     );
-    mock.shutdown().await;
+    mock_two.shutdown().await;
 }
 
 #[tokio::test]
