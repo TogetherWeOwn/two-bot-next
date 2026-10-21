@@ -373,8 +373,18 @@ async fn approve_does_not_move_a_member_who_left_the_join_channel() {
         [
             format!("save_join_grant:{ROOM}:{OUTSIDER}"),
             format!("overwrite:{ROOM}:{OUTSIDER}:Member"),
+            format!("prompt:{ROOM}"),
         ]
     );
+    // The press claimed movement, so the owner learns they left plus the
+    // rejoin recovery.
+    let follow_up = prompts(&worker)
+        .last()
+        .expect("correction posted")
+        .content
+        .clone();
+    assert!(follow_up.contains("left"), "{follow_up}");
+    assert!(follow_up.contains("rejoin"), "{follow_up}");
 }
 
 #[tokio::test]
@@ -785,10 +795,20 @@ async fn a_failed_move_keeps_the_grant_that_landed() {
             format!("save_join_grant:{ROOM}:{OUTSIDER}"),
             format!("overwrite:{ROOM}:{OUTSIDER}:Member"),
             format!("move:{OUTSIDER}:{ROOM}"),
+            format!("prompt:{ROOM}"),
         ]
     );
     assert!(worker.privacy[&ROOM].granted.contains(&MemberId(OUTSIDER)));
     assert!(!worker.failures().is_empty());
+    // The press claimed movement, so the refusal reaches the owner with the
+    // rejoin recovery instead of staying a silent claim.
+    let follow_up = prompts(&worker)
+        .last()
+        .expect("correction posted")
+        .content
+        .clone();
+    assert!(follow_up.contains("couldn't move"), "{follow_up}");
+    assert!(follow_up.contains("rejoin"), "{follow_up}");
 }
 
 // --- the interaction surface --------------------------------------------------
