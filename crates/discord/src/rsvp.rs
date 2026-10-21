@@ -488,10 +488,14 @@ async fn execute(
             {
                 return Err("Unable to verify attendance member.".to_owned());
             }
-            let member_is_bot = live_user
-                .get("bot")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
+            let member_is_bot = match live_user.get("bot") {
+                // Discord omits this optional field for humans, but a present
+                // non-boolean value cannot establish a classification.
+                None => false,
+                Some(value) => value
+                    .as_bool()
+                    .ok_or("Unable to verify attendance member.")?,
+            };
             let verdict = classify(
                 classifier,
                 &ClassifyInput {

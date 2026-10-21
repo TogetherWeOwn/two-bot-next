@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import tomllib
 import unittest
+from unittest.mock import patch
 
 import yaml
 
@@ -69,8 +70,9 @@ JOB_INVENTORY = {
     # health-contract plus passive production probes; pinned shape below.
     "synthetic-user-flow.yml": {"staging", "prod-passive"},
     # Creator-join slow-burn card filer
-    # (docs/runbook.md#alert-voice-join-slow-burn); pinned shape below.
-    "slow-burn-tracker.yml": {"tracker"},
+    # (docs/runbook.md#alert-voice-join-slow-burn): live staging `tracker`
+    # plus the environment-free `fixture` proof job; pinned shape below.
+    "slow-burn-tracker.yml": {"tracker", "fixture"},
     # SDLC separation gate (org test-guard reusable, warn mode): one
     # reusable call, least-privilege grant pinned below.
     "test-guard.yml": {"test-guard"},
@@ -147,6 +149,117 @@ def load_workflows():
 def runner_allowed(job_id, runs_on):
     # The routing expression must name this job, so one job's switch cannot move another.
     return runs_on == ROUTED_RUNNER.format(job=job_id)
+
+
+def shell_logical_lines(script):
+    """Join backslash continuations so each shell command is one line."""
+    lines, pending = [], ""
+    for raw_line in script.splitlines():
+        stripped = raw_line.strip()
+        pending = f"{pending} {stripped}".strip() if pending else stripped
+        if stripped.endswith("\\"):
+            pending = pending[:-1].strip()
+            continue
+        lines.append(pending)
+        pending = ""
+    if pending:
+        lines.append(pending)
+    return lines
+
+
+# An `#[ignore ...]` line, further attributes or trivia, then the fn it marks.
+# A single regex with a block-comment alternative inside `(?:...)*` backtracks
+# exponentially (CodeQL `py/polynomial-regular-expression-used-on-uncontrolled-data`);
+# scan forward with string ops instead so each byte is visited once.
+IGNORE_MARK = re.compile(r"^[ \t]*#\[ignore\b", re.MULTILINE)
+
+
+def _skip_trivia(text, pos):
+    """Skip whitespace, line/block comments and `#[...]` lines from `pos`."""
+    end = len(text)
+    while pos < end:
+        char = text[pos]
+        if char.isspace():
+            pos += 1
+            continue
+        if text.startswith("//", pos):
+            newline = text.find("\n", pos + 2)
+            if newline == -1:
+                return end
+            pos = newline + 1
+            continue
+        if text.startswith("/*", pos):
+            close = text.find("*/", pos + 2)
+            if close == -1:
+                return end
+            pos = close + 2
+            continue
+        if text.startswith("#[", pos):
+            newline = text.find("\n", pos)
+            if newline == -1:
+                return end
+            pos = newline + 1
+            continue
+        return pos
+    return pos
+
+
+def _match_fn_name(text, pos):
+    """The fn name at `pos`, allowing an `async` prefix on the same line."""
+    end = len(text)
+    if text.startswith("async", pos) and pos + 5 < end and text[pos + 5] in " \t":
+        pos += 5
+        while pos < end and text[pos] in " \t":
+            pos += 1
+    if not text.startswith("fn", pos):
+        return None
+    pos += 2
+    if pos >= end or text[pos] not in " \t":
+        return None
+    while pos < end and text[pos] in " \t":
+        pos += 1
+    if pos >= end or not (text[pos].isalpha() or text[pos] == "_"):
+        return None
+    start = pos
+    pos += 1
+    while pos < end and (text[pos].isalnum() or text[pos] == "_"):
+        pos += 1
+    return text[start:pos]
+
+
+def ignored_test_names(suite):
+    """Find ignored test fns, refusing any ignore mark the scanner cannot map."""
+    [path] = ROOT.glob(f"crates/*/tests/{suite}.rs")
+    text = path.read_text(encoding="utf-8")
+    marks = list(IGNORE_MARK.finditer(text))
+    names = []
+    for mark in marks:
+        line_end = text.find("\n", mark.end())
+        if line_end == -1:
+            continue
+        name = _match_fn_name(text, _skip_trivia(text, line_end + 1))
+        if name is not None:
+            names.append(name)
+    # This is a source-style scanner, not a Rust parser. Unsupported syntax
+    # must fail policy validation, never silently shrink the sweep's skip set.
+    if len(names) != len(marks):
+        raise ValueError(
+            f"{path.name}: discovered {len(names)} of {len(marks)} ignored test functions; "
+            "extend the scanner for the unsupported declaration",
+        )
+    return names
+
+
+def skip_blocks_test(skip, name):
+    """Whether a cargo `--skip` token blocks a bare test fn `name`.
+
+    Cargo matches `--skip` as a substring of the full test path (for
+    example `database::my_test`), but the sweep policy only knows the
+    bare fn name. A module-qualified token never occurs in the bare
+    name, so compare its last `::` segment instead. This over-blocks
+    when the module part would not match, which fails closed.
+    """
+    return skip.rsplit("::", 1)[-1] in name
 
 
 # Staging deploy push filter. Each deploy restarts the bot container and drops the
@@ -337,16 +450,17 @@ ERROR_RATE_MARKERS = (
 
 
 def production_error_rate_gate_errors(workflow, name="deploy-production.yml"):
-    """The production error-rate gate mirrors staging against production.
+    """The production error-rate gate scrapes live production, never a rehearsal.
 
-    Exactly one expression in exactly one production step may read the
-    rehearsal input, it must use the pinned dispatch-only expression (an
-    automatic trigger never carries inputs), and that step must be the
-    error-rate gate step: it judges the rehearsal firing when armed and
-    scrapes live production /ops/metrics otherwise, failing the stage so
-    auto-rollback runs. The scrape token is the production binding only;
-    the staging token must never appear. Reviewed tooling runs from the
-    workflow commit (../tooling), never the guarded SHA.
+    Failure injection never runs against production (10-20 20:54Z forced
+    drill): the dispatch input stays declared (an opt-in boolean) only so the
+    guard can refuse it with a pointer to staging, and the input is read
+    exactly once, by the guard. No production step carries the drill switch
+    or a rehearsal flag. The error_rate_gate step scrapes live production
+    /ops/metrics and fails the stage so auto-rollback runs. The scrape token
+    is the production binding only; the staging token must never appear.
+    Reviewed tooling runs from the workflow commit (../tooling), never the
+    guarded SHA.
     """
     errors = []
     inputs = (((workflow.get("on") or {}).get("workflow_dispatch") or {}).get("inputs") or {})
@@ -354,31 +468,30 @@ def production_error_rate_gate_errors(workflow, name="deploy-production.yml"):
     if drill.get("type") != "boolean" or drill.get("default") not in (False, "false") \
             or str(drill.get("required")).lower() != "false":
         errors.append(f"{name}: inject_error_rate_spike must stay an opt-in boolean defaulting to false")
+    if str(workflow).count("inputs.inject_error_rate_spike") != 1:
+        errors.append(f"{name}: inject_error_rate_spike may be read only by the guard (which refuses it)")
     jobs = workflow.get("jobs", {}) or {}
     steps = ((jobs.get("production") or {}).get("steps") or [])
-    armed = [step for step in steps
-             if isinstance(step, dict) and "INJECT_ERROR_RATE_SPIKE" in str(step)]
-    if len(armed) != 1:
-        errors.append(f"{name}: exactly one production step may carry the error-rate drill switch")
+    for marker in ("INJECT_ERROR_RATE_SPIKE", "inject_error_rate_spike", "--rehearsal-firing", "rehearsal"):
+        if marker in str(jobs.get("production") or {}):
+            errors.append(f"{name}: production job must never carry the drill marker {marker}")
+    gates = [step for step in steps if isinstance(step, dict) and step.get("id") == "error_rate_gate"]
+    if len(gates) != 1:
+        errors.append(f"{name}: exactly one production step must be the error_rate_gate")
         return errors
-    step = armed[0]
-    if step.get("id") != "error_rate_gate":
-        errors.append(f"{name}: the error-rate drill switch must live on the error_rate_gate step")
+    step = gates[0]
     # After a rollback restore there is no snapshot to roll back to: the
     # gate must not fail the recovery run red with no action possible.
     if step.get("if") != "env.MODE == 'deploy'":
         errors.append(f"{name}: error_rate_gate must run in deploy mode only")
     env = step.get("env") or {}
-    if env.get("INJECT_ERROR_RATE_SPIKE") != ERROR_RATE_EXPRESSION:
-        errors.append(f"{name}: error-rate rehearsal must use the pinned dispatch-only expression")
     if env.get("METRICS_SCRAPE_TOKEN") != "${{ secrets.PRODUCTION_METRICS_SCRAPE_TOKEN }}":
         errors.append(f"{name}: error_rate_gate must bind the production scrape token by name")
     if env.get("PRODUCTION_URL") != "${{ vars.PRODUCTION_WORKER_URL }}":
         errors.append(f"{name}: error_rate_gate must read the production Worker URL from vars")
     run = str(step.get("run") or "")
     for needle in ("../tooling/wrangler/scripts/promotion-error-gate.mjs", "--metrics-url", "--evidence",
-                   "--sha", "--user-agent", "--rehearsal-firing",
-                   '[ "$INJECT_ERROR_RATE_SPIKE" = "true" ]'):
+                   "--sha", "--user-agent"):
         if run.count(needle) != 1:
             errors.append(f"{name}: error_rate_gate step must contain exactly one {needle}")
     # The evidence filename appears exactly twice: the --evidence write path
@@ -1716,10 +1829,10 @@ def production_errors(workflow):
         errors.append(f"{name}: production must run on dispatch, staging completion or schedule only")
     else:
         run_trigger = (on.get("workflow_run") or {})
-        if (run_trigger.get("workflows") != ["deploy-staging"]
+        if (run_trigger.get("workflows") != ["deploy-staging", "check"]
                 or run_trigger.get("types") != ["completed"]
                 or run_trigger.get("branches") != ["main"]):
-            errors.append(f"{name}: workflow_run must be a completed deploy-staging run on main only")
+            errors.append(f"{name}: workflow_run must be a completed deploy-staging or check run on main only")
         if not isinstance(on.get("schedule"), list) or not on.get("schedule"):
             errors.append(f"{name}: schedule must carry the daily backstop")
     jobs = workflow.get("jobs", {})
@@ -1831,17 +1944,39 @@ def production_errors(workflow):
                      'refuse("the production Environment has no required reviewers")'):
         if required not in script:
             errors.append(f"{name}:guard: missing check {required}")
-    # The rollback drill proves the fail-to-rollback chain, which exists
-    # only on a deploy-mode run with takeover: the guard receives the switch
-    # and refuses anything else, so the drill never leaves its build serving.
+    # Failure injection never runs against production (10-20 20:54Z): the
+    # guard receives the drill switch only to refuse it, pointing to staging.
     guard_env = (guard.get("steps") or [{}])[0].get("env", {})
     if guard_env.get("INJECT_ERROR_RATE_SPIKE") != "${{ inputs.inject_error_rate_spike }}":
         errors.append(f"{name}:guard: must receive the drill switch as an input env")
-    for required in ("inject_error_rate_spike needs deploy mode",
-                     "inject_error_rate_spike needs takeover true",
-                     "inject_error_rate_spike never applies to an automatic run"):
+    for required in ('if spike == "true":\n    refuse("failure injection never runs against production',
+                     "dispatch deploy-staging with inject_error_rate_spike true"):
         if required not in script:
-            errors.append(f"{name}:guard: missing drill refusal {required}")
+            errors.append(f"{name}:guard: missing production drill refusal {required!r}")
+    # A deploy always takes over (10-20 13:31Z: a manual deploy without
+    # takeover left production fenced); only the explicit cutover_hold
+    # input keeps the fence held.
+    inputs = ((on.get("workflow_dispatch") or {}).get("inputs") or {})
+    takeover_input = inputs.get("takeover") or {}
+    hold_input = inputs.get("cutover_hold") or {}
+    if takeover_input.get("type") != "boolean" or takeover_input.get("default") not in (True, "true"):
+        errors.append(f"{name}: takeover must be a boolean defaulting to true")
+    if hold_input.get("type") != "boolean" or hold_input.get("default") not in (False, "false"):
+        errors.append(f"{name}: cutover_hold must be an opt-in boolean defaulting to false")
+    if guard_env.get("CUTOVER_HOLD") != "${{ inputs.cutover_hold }}":
+        errors.append(f"{name}:guard: must receive cutover_hold as an input env")
+    if 'takeover = "false" if cutover_hold == "true" else "true"' not in script:
+        errors.append(f"{name}:guard: deploy mode must take over unless cutover_hold")
+    # Recovery never waits for a human: a reviewer-less rollback runs only
+    # on a verified production rollback snapshot of its exact target.
+    for required in ('snapshot_run = verified_rollback_snapshot() if not reviewers and mode == "rollback" else None',
+                     'collection(f"repos/{repo}/actions/artifacts"',
+                     "target != (version, image, sha)",
+                     'receipt.get("provenance_complete") is not True',
+                     'PRODUCTION_WORKFLOW = ".github/workflows/deploy-production.yml"',
+                     'origin.get("head_repository_id") != origin.get("repository_id")'):
+        if required not in script:
+            errors.append(f"{name}:guard: missing rollback snapshot check {required!r}")
     return errors
 
 
@@ -2409,18 +2544,59 @@ def synthetic_user_flow_errors(workflow):
     return errors
 
 
+# Live runs (schedule, or a dispatch left at fixture=live) and fixture proofs
+# (dispatched fire/clear) are disjoint jobs, so the staging bearer never
+# reaches a proof run.
+SLOW_BURN_LIVE_IF = "github.ref == 'refs/heads/main' && (github.event.inputs.fixture || 'live') == 'live'"
+SLOW_BURN_FIXTURE_IF = ("github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'"
+                        " && (github.event.inputs.fixture == 'fire' || github.event.inputs.fixture == 'clear')")
+SLOW_BURN_LIVE_ENV = {
+    "STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}",
+    "METRICS_SCRAPE_TOKEN": "${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}",
+    "GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
+    "RING_PATH": "slow-burn-ring.json",
+    "COVERAGE_PATH": "slow-burn-coverage.json",
+    "TRACKER_DRY_RUN": "${{ github.event.inputs.dry_run }}",
+}
+SLOW_BURN_FIXTURE_ENV = {
+    "GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
+    "TRACKER_FIXTURE": "${{ github.event.inputs.fixture }}",
+    "TRACKER_DRY_RUN": "${{ github.event.inputs.dry_run }}",
+}
+# Run scripts are pinned exactly: the tracker's argparse is last-wins, so an
+# appended --label, --title-prefix or --dry-run would silently override the
+# pinned flags (a proof filing a real card, or a live run that never writes).
+SLOW_BURN_RUN_TAIL = ('if [ "$TRACKER_DRY_RUN" = "true" ]; then\n'
+                      '  args+=(--dry-run)\n'
+                      'fi\n'
+                      'python3 scripts/slow_burn_tracker.py "${args[@]}"\n')
+SLOW_BURN_LIVE_RUN = ('set -euo pipefail\n'
+                      'args=(--ring "$RING_PATH" --coverage-path "$COVERAGE_PATH" '
+                      '--evidence-out slow-burn-tracker-evidence.json '
+                      '--exposition-out slow-burn-exposition.prom)\n' + SLOW_BURN_RUN_TAIL)
+SLOW_BURN_FIXTURE_RUN = ('set -euo pipefail\n'
+                         'args=(--fixture "$TRACKER_FIXTURE" --label slow-burn-test '
+                         "--title-prefix '[slow-burn-test]' --evidence-out slow-burn-tracker-evidence.json "
+                         '--exposition-out slow-burn-exposition.prom)\n' + SLOW_BURN_RUN_TAIL)
+
+
 def slow_burn_tracker_errors(workflow):
     """Creator-join slow-burn card filer (docs/runbook.md#alert-voice-join-slow-burn).
 
-    Runs on a 5-minute schedule and manual dispatch, only from main, through
-    the `slow-burn-tracker` environment. One job: `tracker` restores the
-    cached burn ring and coverage sidecar, runs the reviewed
-    scripts/slow_burn_tracker.py (staging scrape plus the checked-in
-    slow-burn verdict, then exactly one file/refresh/resolve issue write),
-    saves both on live runs and uploads the evidence receipt. The 5-minute
-    cadence is load-bearing for the slow long-window baseline. Dispatch takes
-    only the fixture choice (live/fire/clear proof runs file under a test
-    label without touching the ring or coverage) and the dry-run flag.
+    Runs on a 5-minute schedule and manual dispatch, only from main, as two
+    disjoint jobs. `tracker` takes the schedule and live dispatches through
+    the existing `staging` environment with `deployment: false` (no
+    deployment record per scrape; the main-only branch policy still applies)
+    and hands STAGING_METRICS_SCRAPE_TOKEN to the script as
+    METRICS_SCRAPE_TOKEN. It restores the cached burn ring and coverage
+    sidecar, runs the reviewed scripts/slow_burn_tracker.py (staging scrape
+    plus the checked-in slow-burn verdict, then exactly one
+    file/refresh/resolve issue write), saves both and uploads the evidence
+    receipt. `fixture` takes only dispatched fire/clear proofs: no
+    environment, no scrape bearer, no staging URL and no ring cache, filing
+    under the test label. The 5-minute cadence is load-bearing for the slow
+    long-window baseline. Dispatch takes only the fixture choice and the
+    dry-run flag.
     """
     name = "slow-burn-tracker.yml"
     errors = []
@@ -2451,78 +2627,101 @@ def slow_burn_tracker_errors(workflow):
     if workflow.get("concurrency") != {"group": "slow-burn-tracker", "cancel-in-progress": "false"}:
         errors.append(f"{name}: must use its own slow-burn-tracker group without cancelling")
     jobs = workflow.get("jobs") or {}
-    if set(jobs) != {"tracker"}:
-        errors.append(f"{name}: jobs must be exactly tracker")
+    if set(jobs) != {"tracker", "fixture"}:
+        errors.append(f"{name}: jobs must be exactly tracker and fixture")
         return errors
-    job = jobs["tracker"]
-    if job.get("name") != "slow-burn tracker":
-        errors.append(f"{name}:tracker: job name must stay slow-burn tracker")
-    if job.get("environment") != "slow-burn-tracker":
-        errors.append(f"{name}:tracker: must read only the slow-burn-tracker Environment")
-    if job.get("if") != "github.ref == 'refs/heads/main'":
-        errors.append(f"{name}:tracker: must run only from main")
-    if job.get("permissions") != {"contents": "read", "issues": "write"}:
-        errors.append(f"{name}:tracker: must keep contents:read plus issues:write only")
-    if job.get("timeout-minutes") != "10":
-        errors.append(f"{name}:tracker: timeout must stay 10 minutes")
-    if not runner_allowed("tracker", job.get("runs-on")):
-        errors.append(f"{name}:tracker: must use the routed runner expression for job 'tracker'")
-    for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
-        if key in job:
-            errors.append(f"{name}:tracker: must not set {key}")
-    steps = job.get("steps") or []
-    if len(steps) != 6:
-        errors.append(f"{name}:tracker: must run checkout, setup-node, restore, track, save and upload")
-        return errors
-    checkout, setup_node, restore, track, save, upload = steps
-    if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
-            or (checkout.get("with") or {}).get("persist-credentials") != "false":
-        errors.append(f"{name}:tracker: checkout must be pinned and must not persist credentials")
-    if not str(setup_node.get("uses", "")).startswith("actions/setup-node@") \
-            or (setup_node.get("with") or {}).get("node-version") != "24":
-        errors.append(f"{name}:tracker: setup-node must be pinned at node 24 for the verdict driver")
-    # Split restore/save: a full actions/cache step restores in its main
-    # phase, so the save step would overwrite the tracker's fresh ring with
-    # the stale cached copy before saving it back.
-    restore_with = restore.get("with") or {}
-    if (not str(restore.get("uses", "")).startswith("actions/cache/restore@")
-            or "slow-burn-ring-v1-" not in str(restore_with.get("key", ""))
-            or "slow-burn-ring-v1-" not in str(restore_with.get("restore-keys", ""))):
-        errors.append(f"{name}:tracker: ring restore must use actions/cache/restore "
-                      "with the rotating key and prefix fallback")
-    save_with = save.get("with") or {}
-    if (not str(save.get("uses", "")).startswith("actions/cache/save@")
-            or "slow-burn-ring-v1-" not in str(save_with.get("key", ""))
-            or "restore-keys" in save_with):
-        errors.append(f"{name}:tracker: ring save must use actions/cache/save "
-                      "with the rotating key and no restore")
-    if save.get("if") != "${{ !cancelled() && steps.track.outputs.fixture != 'fire' && steps.track.outputs.fixture != 'clear' }}":
-        errors.append(f"{name}:tracker: ring save must skip fixture proof runs")
-    if track.get("id") != "track":
-        errors.append(f"{name}:tracker: track step must expose id track for the save gate")
-    if "scripts/slow_burn_tracker.py" not in str(track.get("run", "")) or "uses" in track:
-        errors.append(f"{name}:tracker: track step must call scripts/slow_burn_tracker.py")
-    track_env = track.get("env") or {}
-    if (track_env.get("STAGING_WORKER_URL") != "${{ vars.STAGING_WORKER_URL }}"
-            or track_env.get("METRICS_SCRAPE_TOKEN") != "${{ secrets.METRICS_SCRAPE_TOKEN }}"
-            or track_env.get("GH_TOKEN") != "${{ secrets.GITHUB_TOKEN }}"
-            or "secrets." in str(track.get("run", ""))):
-        errors.append(f"{name}:tracker: track step must pass staging url, scrape token and GitHub token via env only")
-    if upload.get("if") != "always()":
-        errors.append(f"{name}:tracker: upload must run with if: always() so failures keep their artifact")
-    if not str(upload.get("uses", "")).startswith("actions/upload-artifact@"):
-        errors.append(f"{name}:tracker: must upload the run evidence artifact")
-    for step in steps:
-        if step is not track and "secrets." in str(step):
-            errors.append(f"{name}:tracker: only the track step may hold a secret")
-    text = str(job).lower().replace(" ", "")
-    for marker in ("wrangler", "production", "tojson(secrets", "secrets[", "set-x", "setx", "xtrace",
-                   "cloudflare_api_token", "ownership_control"):
-        if marker in text:
-            errors.append(f"{name}:tracker: must not contain {marker!r}")
-    secrets = set(re.findall(r"secrets\.([a-z0-9_]+)", text))
-    if secrets != {"metrics_scrape_token", "github_token"}:
-        errors.append(f"{name}: must read only the scrape bearer and the GitHub token")
+    shapes = (("tracker", "slow-burn tracker", SLOW_BURN_LIVE_IF, SLOW_BURN_LIVE_RUN, 6, 3),
+              ("fixture", "slow-burn fixture proof", SLOW_BURN_FIXTURE_IF, SLOW_BURN_FIXTURE_RUN, 4, 2))
+    for job_id, title, condition, command, step_count, run_index in shapes:
+        job = jobs[job_id]
+        if job.get("name") != title:
+            errors.append(f"{name}:{job_id}: job name must stay {title}")
+        if job.get("if") != condition:
+            errors.append(f"{name}:{job_id}: must keep its main-only {job_id} run condition")
+        if job.get("permissions") != {"contents": "read", "issues": "write"}:
+            errors.append(f"{name}:{job_id}: must keep contents:read plus issues:write only")
+        if job.get("timeout-minutes") != "10":
+            errors.append(f"{name}:{job_id}: timeout must stay 10 minutes")
+        if not runner_allowed(job_id, job.get("runs-on")):
+            errors.append(f"{name}:{job_id}: must use the routed runner expression for job '{job_id}'")
+        for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
+            if key in job:
+                errors.append(f"{name}:{job_id}: must not set {key}")
+        text = str(job).lower().replace(" ", "")
+        for marker in ("wrangler", "production", "tojson(secrets", "secrets[", "set-x", "setx", "xtrace",
+                       "cloudflare_api_token", "ownership_control"):
+            if marker in text:
+                errors.append(f"{name}:{job_id}: must not contain {marker!r}")
+        steps = job.get("steps") or []
+        if len(steps) != step_count:
+            errors.append(f"{name}:{job_id}: must keep exactly {step_count} steps")
+            continue
+        checkout, setup_node, run_step, upload = steps[0], steps[1], steps[run_index], steps[-1]
+        if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
+                or checkout.get("with") != {"persist-credentials": "false", "fetch-depth": "1"}:
+            errors.append(f"{name}:{job_id}: checkout must be pinned, must not persist credentials, "
+                          "and must not set ref or repository")
+        if not str(setup_node.get("uses", "")).startswith("actions/setup-node@") \
+                or (setup_node.get("with") or {}).get("node-version") != "24":
+            errors.append(f"{name}:{job_id}: setup-node must be pinned at node 24 for the verdict driver")
+        if run_step.get("run") != command or "uses" in run_step:
+            errors.append(f"{name}:{job_id}: run step must run exactly the reviewed tracker command, "
+                          "with inputs passed via env only")
+        if upload.get("if") != "always()":
+            errors.append(f"{name}:{job_id}: upload must run with if: always() so failures keep their artifact")
+        if not str(upload.get("uses", "")).startswith("actions/upload-artifact@"):
+            errors.append(f"{name}:{job_id}: must upload the run evidence artifact")
+        for step in steps:
+            if step is not run_step and "secrets." in str(step):
+                errors.append(f"{name}:{job_id}: only the run step may hold a secret")
+
+    live = jobs["tracker"]
+    # The existing staging Environment holds STAGING_METRICS_SCRAPE_TOKEN.
+    # deployment: false skips only the deployment record; the branch policy,
+    # reviewers and wait timers still gate the job.
+    if live.get("environment") != {"name": "staging", "deployment": "false"}:
+        errors.append(f"{name}:tracker: must read the existing staging Environment with deployment: false")
+    live_secrets = set(re.findall(r"secrets\.([a-z0-9_]+)", str(live).lower()))
+    if live_secrets != {"staging_metrics_scrape_token", "github_token"}:
+        errors.append(f"{name}:tracker: must read only the staging scrape bearer and the GitHub token")
+    live_steps = live.get("steps") or []
+    if len(live_steps) == 6:
+        restore, track, save = live_steps[2], live_steps[3], live_steps[4]
+        # Split restore/save: a full actions/cache step restores in its main
+        # phase, so the save step would overwrite the tracker's fresh ring with
+        # the stale cached copy before saving it back.
+        restore_with = restore.get("with") or {}
+        if (not str(restore.get("uses", "")).startswith("actions/cache/restore@")
+                or "slow-burn-ring-v1-" not in str(restore_with.get("key", ""))
+                or "slow-burn-ring-v1-" not in str(restore_with.get("restore-keys", ""))):
+            errors.append(f"{name}:tracker: ring restore must use actions/cache/restore "
+                          "with the rotating key and prefix fallback")
+        save_with = save.get("with") or {}
+        if (not str(save.get("uses", "")).startswith("actions/cache/save@")
+                or "slow-burn-ring-v1-" not in str(save_with.get("key", ""))
+                or "restore-keys" in save_with):
+            errors.append(f"{name}:tracker: ring save must use actions/cache/save "
+                          "with the rotating key and no restore")
+        if save.get("if") != "${{ !cancelled() }}":
+            errors.append(f"{name}:tracker: ring save must run unless the run was cancelled")
+        if track.get("env") != SLOW_BURN_LIVE_ENV:
+            errors.append(f"{name}:tracker: track step must pass exactly the staging url, the staging "
+                          "scrape bearer, the GitHub token, the cache paths and the dry-run flag via env")
+
+    fixture = jobs["fixture"]
+    # Proof runs bind no Environment, so they cannot read the staging bearer.
+    if "environment" in fixture:
+        errors.append(f"{name}:fixture: proof runs must bind no Environment")
+    fixture_text = str(fixture).lower().replace(" ", "")
+    for marker in ("staging", "metrics_scrape_token", "actions/cache", "--ring", "--coverage-path"):
+        if marker in fixture_text:
+            errors.append(f"{name}:fixture: proof runs must not reach {marker!r}")
+    if set(re.findall(r"secrets\.([a-z0-9_]+)", fixture_text)) != {"github_token"}:
+        errors.append(f"{name}:fixture: must read only the GitHub token")
+    fixture_steps = fixture.get("steps") or []
+    if len(fixture_steps) == 4 and fixture_steps[2].get("env") != SLOW_BURN_FIXTURE_ENV:
+        errors.append(f"{name}:fixture: proof step must take only the GitHub token and the "
+                      "dispatch inputs via env")
     return errors
 
 
@@ -2566,7 +2765,7 @@ def workflow_policy_errors(workflows):
             continue
         if name == "slow-burn-tracker.yml":
             # Pinned shape above; the generic environment/marker scan below
-            # would flag its slow-burn-tracker binding and staging probe URL.
+            # would flag its staging binding and staging probe URL.
             errors.extend(slow_burn_tracker_errors(workflow))
             continue
         if name == "staging-rollback-drill.yml":
@@ -3247,18 +3446,7 @@ class WorkflowTests(unittest.TestCase):
         # occurrence mask a flag dropped from another invocation (e.g.
         # --ignore-run-fail removed from either sweep). Join line
         # continuations, then assert flags on each cov_run separately.
-        logical_lines = []
-        pending = ""
-        for raw_line in step["run"].splitlines():
-            stripped = raw_line.strip()
-            pending = f"{pending} {stripped}".strip() if pending else stripped
-            if stripped.endswith("\\"):
-                pending = pending[:-1].strip()
-                continue
-            logical_lines.append(pending)
-            pending = ""
-        if pending:
-            logical_lines.append(pending)
+        logical_lines = shell_logical_lines(step["run"])
         cov_runs = [line for line in logical_lines if line.startswith("cov_run ")]
         # cov_run's failure annotation must go to stderr: the stdout report
         # retry redirects cov_run's stdout into the lcov file.
@@ -3279,6 +3467,68 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(ignored_sweeps), 1)
         self.assertIn("--test-threads=1", ignored_sweeps[0])
         self.assertIn("--skip regenerate_reference_docs", ignored_sweeps[0])
+        self.assertIn(
+            "--skip flags_are_guild_scoped_half_open_deduplicated_and_activity_protected",
+            ignored_sweeps[0],
+        )
+        self.assertIn(
+            "--skip list_is_guild_scoped_selector_shaped_and_read_only",
+            ignored_sweeps[0],
+        )
+        # The stream go-live ledger suite, the internal-events DB test, the
+        # legacy-verify/TLS-fence/migrate suites and the mutation-429 suite
+        # share the same strict agent_test guard: they run only in their
+        # dedicated agent_test runs below, never in the bootstrap sweep.
+        for skipped in (
+            "claim_is_owned_once_then_in_flight",
+            "failed_send_releases_the_claim_for_the_retry",
+            "delivered_rows_are_never_reclaimed",
+            "delivered_rows_expire_only_past_the_horizon_with_the_fence_intact",
+            "fresh_claim_cannot_be_reclaimed",
+            "stale_unposted_claim_is_taken_over_atomically",
+            "started_claim_is_never_reclaimed_even_when_stale",
+            "started_send_that_provably_failed_releases_for_the_retry",
+            "reclaiming_a_missing_key_claims_it_fresh",
+            "database::actions_persist_rows_and_preserve_other_events_and_guilds",
+            "parity_mismatch_cursor_and_read_only_acceptance",
+            "legacy_verify_policy_gates_the_real_test_endpoints",
+            "real_sqlx_runner_cases",
+            "post_failure_unreadable_ledger_is_unknown_not_empty",
+            "post_failure_readable_ledger_keeps_array_output",
+            "post_apply_unreadable_ledger_is_unknown_not_empty",
+            "store_failure_keeps_committed_cutover_evidence",
+            "connection_count_sees_other_roles_from_plan_login",
+            "single_delete_429_releases_attempt_for_same_key_retry",
+            "bulk_delete_429_releases_attempt_for_same_key_retry",
+            "channel_overwrite_429_releases_attempt_and_retires_only_its_seed",
+            "slowmode_429_releases_attempt_for_same_and_distinct_keys",
+            "unlock_429_releases_lane_but_preserves_recovery_seed",
+            "lockdown_429_preserves_prior_seed_while_releasing_the_lane",
+            "slowmode_5xx_and_unexpected_statuses_stay_fenced",
+            "slowmode_timeout_stays_fenced",
+            "cancelled_lockdown_stays_fenced_with_seed_retained",
+        ):
+            with self.subTest(skipped=skipped):
+                self.assertIn(f"--skip {skipped}", ignored_sweeps[0])
+        # The parity skip above keeps its unskipped, correctly ordered dedicated rerun.
+        parity_reruns = [run for run in cov_runs if "--test legacy_verify_db" in run]
+        self.assertEqual(len(parity_reruns), 1)
+        self.assertIn("-- --ignored --test-threads=1", parity_reruns[0])
+        self.assertNotIn(
+            "--skip parity_mismatch_cursor_and_read_only_acceptance",
+            parity_reruns[0],
+        )
+        # The parity guard accepts only the omitted-password URL. Its export
+        # must occur once, before the rerun and before the later URL switch.
+        parity_export = "export TWO_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test"
+        later_export = "export TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/agent_test"
+        self.assertEqual(logical_lines.count(parity_export), 1)
+        self.assertLess(
+            logical_lines.index(parity_export), logical_lines.index(parity_reruns[0])
+        )
+        self.assertLess(
+            logical_lines.index(parity_reruns[0]), logical_lines.index(later_export)
+        )
         # One MEMBER_TESTDB export serves both the ignored sweep and the
         # fail-closed member_moderation_db re-run. Pin its count and logical
         # command order so a redundant later export cannot mask a deleted or
@@ -3312,6 +3562,32 @@ class WorkflowTests(unittest.TestCase):
             "--skip seeded_aggregates_render_exactly_guild_scoped_and_read_only",
             main_sweep,
         )
+        # Staging fixtures accept only the exact agent_test URL; they run in
+        # the dedicated staging_migrate_db re-run below, never in this
+        # two_bot_test_ci sweep. Enumerate from the Rust source so a future
+        # seventh fixture cannot silently rejoin.
+        staging_source = (ROOT / "crates/cutover/tests/staging_migrate_db.rs").read_text()
+        staging_names = set(re.findall(r'#\[ignore[^\]]*\]\s*async fn (\w+)\(', staging_source))
+        self.assertTrue(staging_names, "guarded ignored fixtures must be discovered")
+        # Match complete tokens: a suffixed filter would not skip the fixture.
+        broad_skips = set(re.findall(r"--skip (\S+)", ignored_sweeps[0]))
+        for name in sorted(staging_names):
+            with self.subTest(staging_skip=name):
+                self.assertIn(name, broad_skips)
+        # Mutation-429 channel fixtures run in the dedicated
+        # mutation_429 rerun below, never in this two_bot_test_ci sweep.
+        # Enumerate from the Rust source so a future tenth fixture cannot
+        # silently rejoin.
+        channel_source = (
+            ROOT / "crates/discord/tests/mutation_429_proves_no_effect_channel.rs"
+        ).read_text()
+        channel_names = set(
+            re.findall(r'#\[ignore[^\]]*\]\s*async fn (\w+)\(', channel_source)
+        )
+        self.assertTrue(channel_names, "guarded ignored fixtures must be discovered")
+        for name in sorted(channel_names):
+            with self.subTest(channel_skip=name):
+                self.assertIn(name, broad_skips)
         ignored_sweep = [run for run in sweeps if "-- --ignored" in run][0]
         self.assertIn(
             "--skip list_is_guild_scoped_selector_shaped_and_read_only",
@@ -3353,6 +3629,14 @@ class WorkflowTests(unittest.TestCase):
                     self.assertIn("--features db", matches[0])
                 else:
                     self.assertNotIn("--features db", matches[0])
+                if needle == "--test staging_migrate_db":
+                    for name in sorted(staging_names):
+                        with self.subTest(dedicated_no_skip=name):
+                            self.assertNotIn(f"--skip {name}", matches[0])
+                if needle == "--test mutation_429_proves_no_effect_channel":
+                    for name in sorted(channel_names):
+                        with self.subTest(dedicated_no_skip=name):
+                            self.assertNotIn(f"--skip {name}", matches[0])
         env_wrapped = [
             run for run in cov_runs
             if run.startswith('cov_run env -u PGPASSWORD -u PGPASSFILE -u PGOPTIONS "$COV"')
@@ -3392,6 +3676,189 @@ class WorkflowTests(unittest.TestCase):
         )
         checkout = next(step for step in job["steps"] if step.get("uses", "").startswith("actions/checkout@"))
         self.assertEqual(checkout["with"]["fetch-depth"], "0")
+
+    def test_ignored_test_names_include_intervening_comments_and_blank_lines(self):
+        separators = (
+            "",
+            "\n \t\n",
+            "// first comment\n\n  // second comment\n",
+            "/* block comment\n   on two lines */\n",
+            "/* inline comment */ ",
+            "#[tokio::test]\n\n// between attribute and function\n",
+            "// before attribute\n#[tokio::test]\n/* after attribute */\n\n",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "crates/fixture/tests/discovery.rs"
+            source.parent.mkdir(parents=True)
+            for separator in separators:
+                for prefix in ("", "async "):
+                    with self.subTest(separator=separator, prefix=prefix):
+                        source.write_text(
+                            '#[test]\nfn ordinary_before() {}\n'
+                            '#[ignore = "requires disposable test database"]\n'
+                            + separator + prefix + 'fn selected() {}\n'
+                            '#[test]\nfn ordinary_after() {}\n'
+                            '#[ignore]\nfn other_ignored() {}\n'
+                            'struct NotAFunction;\nfn unrelated() {}\n',
+                            encoding="utf-8",
+                        )
+                        with patch(f"{__name__}.ROOT", root):
+                            self.assertEqual(
+                                ignored_test_names("discovery"), ["selected", "other_ignored"],
+                            )
+
+    def test_ignored_test_names_fail_closed_on_unsupported_forms(self):
+        unsupported = (
+            ("public function", '#[ignore]\npub async fn omitted() {}\n'),
+            ("multiline attribute", '#[ignore]\n#[cfg_attr(\n'
+             '    all(feature = "first", feature = "second"),\n'
+             '    tokio::test\n)]\nasync fn omitted() {}\n'),
+            ("nested block comment", '#[ignore]\n/* outer comment\n'
+             '   /* nested comment */\n*/\nasync fn omitted() {}\n'),
+            ("non-function item", '#[ignore]\nstruct NotAFunction;\nfn unrelated() {}\n'),
+            ("no following function", '#[ignore]\n'),
+            ("no final newline", '#[ignore]'),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "crates/fixture/tests/discovery.rs"
+            source.parent.mkdir(parents=True)
+            for label, declaration in unsupported:
+                with self.subTest(form=label):
+                    source.write_text(
+                        '#[ignore]\nfn discovered() {}\n' + declaration,
+                        encoding="utf-8",
+                    )
+                    with patch(f"{__name__}.ROOT", root):
+                        with self.assertRaisesRegex(
+                            ValueError, r"discovery\.rs: discovered 1 of 2 ignored test functions",
+                        ):
+                            ignored_test_names("discovery")
+
+    def test_patch_coverage_ignored_sweep_skips_tests_that_cannot_pass_there(self):
+        # The ignored sweep tolerates failures, but the flake ledger reads
+        # every FAILED line it prints as a flake. No ignored test in these
+        # suites can pass under its two_bot_test_ci URL, so the sweep skips
+        # each one. Names come from the sources: a new ignored test in one of
+        # these suites fails here until the sweep skips it too.
+        # Exact-URL suites: a fail-closed run elsewhere still executes them.
+        # The stream go-live ledger suite shares the strict agent_test
+        # guard; its dedicated replay below stays fail-closed.
+        refused_suites = (
+            "legacy_tls_fence", "legacy_verify_db", "raid_list_db",
+            "reengagement_list_db", "staging_migrate_db", "internal_events",
+            "mutation_429_proves_no_effect_channel", "stream_live_store",
+        )
+        # Red acceptance suites: the store lane skips every one of them too.
+        red_suites = (
+            "backfill_audit_log", "backfill_bans_invites_onboarding",
+            "backfill_event_users_reactions_pins",
+        )
+        jobs = self.workflows["check.yml"]["jobs"]
+        step = next(
+            step for step in jobs["rust-tests"]["steps"]
+            if step.get("name") == "Patch coverage (HARD, 80% of added lines)"
+        )
+        [sweep] = [
+            line for line in shell_logical_lines(step["run"])
+            if line.startswith("cov_run ") and "--workspace --lib --bins --tests" in line
+            and "-- --ignored" in line
+        ]
+        sweep_skips = re.findall(r"--skip (\S+)", sweep)
+        # Fail-closed command lines only: both tolerated sweeps drop out.
+        runs = [
+            line
+            for job in jobs.values() for candidate in job.get("steps", [])
+            for line in shell_logical_lines(str(candidate.get("run", "")))
+            if "--ignore-run-fail" not in line
+        ]
+        expected = set()
+        for suite in refused_suites:
+            names = ignored_test_names(suite)
+            self.assertTrue(names, suite)
+            expected.update(names)
+            target = re.compile(rf"--test {re.escape(suite)}(?:\s|$)")
+            gates = [
+                re.findall(r"--skip (\S+)", line) for line in runs
+                if target.search(line) and re.search(r"--(?:include-)?ignored\b", line)
+            ]
+            for name in names:
+                with self.subTest(suite=suite, test=name):
+                    self.assertTrue(
+                        any(
+                            not any(skip_blocks_test(skip, name) for skip in skips)
+                            for skips in gates
+                        ),
+                        f"no fail-closed --test {suite} run executes {name}",
+                    )
+        [store_lane] = [line for line in runs if "--test backfill_audit_log" in line]
+        store_skips = re.findall(r"--skip (\S+)", store_lane)
+        for suite in red_suites:
+            names = ignored_test_names(suite)
+            self.assertTrue(names, suite)
+            expected.update(names)
+            for name in names:
+                with self.subTest(suite=suite, test=name):
+                    self.assertIn(name, store_skips)
+        # The internal-events DB test is skipped by its module-qualified
+        # path: the bare function name would also match a same-named test
+        # in any other module swept here. The qualified pin in the
+        # coverage contract above keeps the narrower filter.
+        expected.discard("actions_persist_rows_and_preserve_other_events_and_guilds")
+        expected.add("database::actions_persist_rows_and_preserve_other_events_and_guilds")
+        self.assertEqual(len(sweep_skips), len(set(sweep_skips)))
+        self.assertEqual(set(sweep_skips) - {"regenerate_reference_docs"}, expected)
+
+    def test_fail_closed_gate_sees_qualified_skip_tokens(self):
+        # Cargo matches --skip against the full test path, so a qualified
+        # token on every fail-closed gate must read as blocking even though
+        # the bare fn name never contains the `::` qualifier.
+        name = "actions_persist_rows_and_preserve_other_events_and_guilds"
+        qualified = f"database::{name}"
+        self.assertIn(name, ignored_test_names("internal_events"))
+        self.assertTrue(skip_blocks_test(qualified, name))
+        self.assertTrue(skip_blocks_test(name, name))
+        self.assertFalse(skip_blocks_test("regenerate_reference_docs", name))
+        # The old `skip in name` check missed the qualified form entirely.
+        self.assertNotIn(qualified, name)
+        mutated = deepcopy(self.workflows)
+        jobs = mutated["check.yml"]["jobs"]
+        touched = 0
+        for job in jobs.values():
+            for candidate in job.get("steps", []):
+                run = str(candidate.get("run", ""))
+                if "--test internal_events" not in run:
+                    continue
+                rewritten = []
+                for line in shell_logical_lines(run):
+                    if ("--test internal_events" in line
+                            and "--ignore-run-fail" not in line
+                            and re.search(r"--(?:include-)?ignored\b", line)):
+                        line = f"{line} --skip {qualified}"
+                        touched += 1
+                    rewritten.append(line)
+                candidate["run"] = "\n".join(rewritten)
+        self.assertEqual(touched, 2)
+        runs = [
+            line
+            for job in jobs.values() for candidate in job.get("steps", [])
+            for line in shell_logical_lines(str(candidate.get("run", "")))
+            if "--ignore-run-fail" not in line
+        ]
+        target = re.compile(r"--test internal_events(?:\s|$)")
+        gates = [
+            re.findall(r"--skip (\S+)", line) for line in runs
+            if target.search(line) and re.search(r"--(?:include-)?ignored\b", line)
+        ]
+        self.assertEqual(len(gates), 2)
+        self.assertTrue(all(qualified in skips for skips in gates))
+        self.assertFalse(
+            any(
+                not any(skip_blocks_test(skip, name) for skip in skips)
+                for skips in gates
+            ),
+        )
 
     def test_coverage_replays_strict_agent_test_targets_and_fails_closed(self):
         job = self.workflows["check.yml"]["jobs"]["rust-tests"]
@@ -3721,30 +4188,30 @@ class WorkflowTests(unittest.TestCase):
                     label,
                 )
                 self.assertTrue(workflow_policy_errors(changed), label)
-        # Production holds the pinned mirror, not a forwarding route: an
-        # extra reader, an armed default, a staging token or unpinned
+        # Production carries no rehearsal path at all (10-20 20:54Z forced
+        # drill): the guard alone reads the switch, to refuse it. Re-arming
+        # any production step, an armed default, a staging token or unpinned
         # tooling there fails the policy.
         self.assertEqual(production_error_rate_gate_errors(workflows["deploy-production.yml"]), [])
         prod_steps = workflows["deploy-production.yml"]["jobs"]["production"]["steps"]
-        prod_armed = [s for s in prod_steps if "INJECT_ERROR_RATE_SPIKE" in str(s)]
-        self.assertEqual(len(prod_armed), 1)
-        self.assertEqual(prod_armed[0].get("id"), "error_rate_gate")
-        prod_index = prod_steps.index(prod_armed[0])
+        self.assertEqual([s for s in prod_steps if "INJECT_ERROR_RATE_SPIKE" in str(s)], [])
+        gate = [s for s in prod_steps if s.get("id") == "error_rate_gate"]
+        self.assertEqual(len(gate), 1)
+        prod_index = prod_steps.index(gate[0])
         prod_mutations = {
-            # An automatic trigger could read it / default armed.
-            "expression without dispatch guard": lambda w: w["jobs"]["production"]["steps"][prod_index]["env"]
-                .__setitem__("INJECT_ERROR_RATE_SPIKE", "${{ inputs.inject_error_rate_spike }}"),
-            "expression constant true": lambda w: w["jobs"]["production"]["steps"][prod_index]["env"]
+            "drill switch re-armed on the gate": lambda w: w["jobs"]["production"]["steps"][prod_index]["env"]
+                .__setitem__("INJECT_ERROR_RATE_SPIKE", ERROR_RATE_EXPRESSION),
+            "drill switch constant true": lambda w: w["jobs"]["production"]["steps"][prod_index]["env"]
                 .__setitem__("INJECT_ERROR_RATE_SPIKE", "true"),
-            "rehearsal flag unconditional": lambda w: w["jobs"]["production"]["steps"][prod_index]
-                .__setitem__("run", "node ../tooling/wrangler/scripts/promotion-error-gate.mjs "
-                             "--rehearsal-firing '[\"rest_5xx_rate\"]'"),
+            "rehearsal flag on the gate": lambda w: w["jobs"]["production"]["steps"][prod_index]
+                .__setitem__("run", str(w["jobs"]["production"]["steps"][prod_index]["run"])
+                             + " --rehearsal-firing '[\"rest_5xx_rate\"]'"),
             "input defaults true": lambda w: w["on"]["workflow_dispatch"]["inputs"]["inject_error_rate_spike"]
                 .__setitem__("default", True),
             "input removed": lambda w: w["on"]["workflow_dispatch"]["inputs"].pop("inject_error_rate_spike"),
-            "second reader step": lambda w: w["jobs"]["production"]["steps"][0]
-                .setdefault("env", {}).__setitem__("INJECT_ERROR_RATE_SPIKE", "true"),
-            "switch off the gate step": lambda w: w["jobs"]["production"]["steps"][prod_index]
+            "another production step reads it": lambda w: w["jobs"]["production"]["steps"][0]
+                .setdefault("env", {}).__setitem__("SPIKE", "${{ inputs.inject_error_rate_spike }}"),
+            "gate step removed": lambda w: w["jobs"]["production"]["steps"][prod_index]
                 .__setitem__("id", "unrelated"),
             "gate without the deploy-mode condition": lambda w: w["jobs"]["production"]["steps"][prod_index]
                 .pop("if"),
@@ -4280,6 +4747,48 @@ class WorkflowTests(unittest.TestCase):
                 workflows = deepcopy(self.workflows)
                 workflows["nightly.yml"]["jobs"]["pipeline-benchmark"]["uses"] = target
                 self.assertTrue(workflow_policy_errors(workflows))
+
+    def test_production_dispatch_safety_rules_are_pinned(self):
+        # 10-20 incidents: a manual deploy without takeover left production
+        # fenced (13:31Z), the rollback then refused for want of a human
+        # reviewer, and a forced drill degraded production (20:54Z).
+        production = self.workflows["deploy-production.yml"]
+        self.assertEqual(production_errors(production), [])
+        guard_step = production["jobs"]["guard"]["steps"][0]
+
+        def without(pin):
+            def change(w):
+                step = w["jobs"]["guard"]["steps"][0]
+                self.assertIn(pin, step["run"])
+                step["run"] = step["run"].replace(pin, "")
+            return change
+
+        mutations = {
+            "takeover defaults false": lambda w: w["on"]["workflow_dispatch"]["inputs"]["takeover"]
+                .__setitem__("default", False),
+            "cutover_hold removed": lambda w: w["on"]["workflow_dispatch"]["inputs"].pop("cutover_hold"),
+            "cutover_hold defaults true": lambda w: w["on"]["workflow_dispatch"]["inputs"]["cutover_hold"]
+                .__setitem__("default", True),
+            "cutover_hold not wired": lambda w: w["jobs"]["guard"]["steps"][0]["env"].pop("CUTOVER_HOLD"),
+            "deploy takeover default dropped":
+                without('takeover = "false" if cutover_hold == "true" else "true"'),
+            "production drill refusal dropped":
+                without('refuse("failure injection never runs against production'),
+            "snapshot path dropped":
+                without('snapshot_run = verified_rollback_snapshot() if not reviewers and mode == "rollback" else None'),
+            "snapshot pagination dropped":
+                without('collection(f"repos/{repo}/actions/artifacts"'),
+            "snapshot target binding dropped": without("target != (version, image, sha)"),
+            "snapshot provenance dropped": without('receipt.get("provenance_complete") is not True'),
+            "snapshot fork filter dropped":
+                without('origin.get("head_repository_id") != origin.get("repository_id")'),
+        }
+        self.assertIn("inputs.cutover_hold", str(guard_step))
+        for label, change in mutations.items():
+            with self.subTest(label):
+                workflow = deepcopy(production)
+                change(workflow)
+                self.assertTrue(production_errors(workflow), label)
 
     def test_production_route_is_automatic_or_dispatch_and_gated(self):
         production = self.workflows["deploy-production.yml"]
@@ -5010,6 +5519,145 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
 
+    def test_slow_burn_tracker_reads_staging_bearer_and_isolates_fixtures(self):
+        workflows = self.workflows
+        tracker = workflows["slow-burn-tracker.yml"]
+        live = tracker["jobs"]["tracker"]
+        # Live runs read the existing `staging` Environment bearer; the
+        # deployment: false form keeps the five-minute scrape out of the
+        # staging deployment history.
+        self.assertEqual(live.get("environment"), {"name": "staging", "deployment": "false"})
+        self.assertEqual(live["steps"][3]["env"]["METRICS_SCRAPE_TOKEN"],
+                         "${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}")
+        # Fixture proofs run in their own job: no Environment, only the job token.
+        self.assertIn("fixture", tracker["jobs"])
+        fixture = tracker["jobs"]["fixture"]
+        self.assertNotIn("environment", fixture)
+        self.assertEqual(set(re.findall(r"secrets\.(\w+)", str(fixture))), {"GITHUB_TOKEN"})
+        self.assertEqual(slow_burn_tracker_errors(tracker), [])
+
+        def mutate(change):
+            copy = deepcopy(tracker)
+            change(copy)
+            return slow_burn_tracker_errors(copy)
+
+        def live_job(copy):
+            return copy["jobs"]["tracker"]
+
+        def fixture_job(copy):
+            return copy["jobs"]["fixture"]
+
+        def live_run(copy, text):
+            live_job(copy)["steps"][3]["run"] = text(live_job(copy)["steps"][3]["run"])
+
+        def fixture_run(copy, text):
+            fixture_job(copy)["steps"][2]["run"] = text(fixture_job(copy)["steps"][2]["run"])
+
+        bearer = "${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}"
+        staging = {"name": "staging", "deployment": "false"}
+        changes = {
+            "pull_request trigger": lambda w: w["on"].update({"pull_request": None}),
+            "pull_request_target trigger": lambda w: w["on"].update({"pull_request_target": None}),
+            "workflow_run trigger": lambda w: w["on"].update({"workflow_run": {"workflows": ["check"]}}),
+            "workflow-level secret": lambda w: w.update({"env": {"T": bearer}}),
+            "third job": lambda w: w["jobs"].update({"again": deepcopy(live_job(w))}),
+            "fixture job dropped": lambda w: w["jobs"].pop("fixture"),
+            # Live job: exactly the existing staging bearer, from main only.
+            "old tracker environment": lambda w: live_job(w).update({"environment": "slow-burn-tracker"}),
+            "deployment-creating staging": lambda w: live_job(w).update({"environment": "staging"}),
+            "deployment true": lambda w: live_job(w).update(
+                {"environment": {"name": "staging", "deployment": "true"}}),
+            "production environment": lambda w: live_job(w).update(
+                {"environment": {"name": "production", "deployment": "false"}}),
+            "no live environment": lambda w: live_job(w).pop("environment"),
+            "unbound secret name": lambda w: live_job(w)["steps"][3]["env"].update(
+                {"METRICS_SCRAPE_TOKEN": "${{ secrets.METRICS_SCRAPE_TOKEN }}"}),
+            "production bearer": lambda w: live_job(w)["steps"][3]["env"].update(
+                {"METRICS_SCRAPE_TOKEN": "${{ secrets.PRODUCTION_METRICS_SCRAPE_TOKEN }}"}),
+            "dropped bearer": lambda w: live_job(w)["steps"][3]["env"].pop("METRICS_SCRAPE_TOKEN"),
+            # The script reads METRICS_SCRAPE_TOKEN: the bearer must keep that name.
+            "bearer under another name": lambda w: live_job(w)["steps"][3]["env"].update(
+                {"SCRAPE_TOKEN": live_job(w)["steps"][3]["env"].pop("METRICS_SCRAPE_TOKEN")}),
+            "dropped worker url": lambda w: live_job(w)["steps"][3]["env"].pop("STAGING_WORKER_URL"),
+            "bearer on the job": lambda w: live_job(w).update({"env": {"METRICS_SCRAPE_TOKEN": bearer}}),
+            "bearer on the restore": lambda w: live_job(w)["steps"][2].update(
+                {"env": {"METRICS_SCRAPE_TOKEN": bearer}}),
+            "extra staging secret": lambda w: live_job(w)["steps"][3]["env"].update(
+                {"X": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"}),
+            "blanket secrets": lambda w: live_job(w)["steps"][3]["env"].update(
+                {"ALL": "${{ toJSON(secrets) }}"}),
+            "live any branch": lambda w: live_job(w).update(
+                {"if": "(github.event.inputs.fixture || 'live') == 'live'"}),
+            "live runs fixtures": lambda w: live_job(w).update({"if": "github.ref == 'refs/heads/main'"}),
+            "live passes a fixture": lambda w: live_run(w, lambda run: run.replace(
+                "args=(", "args=(--fixture fire ")),
+            # argparse is last-wins: an appended flag overrides the pinned one.
+            "live forced dry run": lambda w: live_run(w, lambda run: run.replace(
+                '"${args[@]}"', '"${args[@]}" --dry-run')),
+            "live inline input": lambda w: live_run(w, lambda run: run + 'echo "${{ github.event.inputs.dry_run }}"\n'),
+            "live shell trace": lambda w: live_run(w, lambda run: "set -x\n" + run),
+            "live write grant": lambda w: live_job(w).update(
+                {"permissions": {"contents": "write", "issues": "write"}}),
+            "live persisted credentials": lambda w: live_job(w)["steps"][0]["with"].update(
+                {"persist-credentials": "true"}),
+            "live checkout ref swap": lambda w: live_job(w)["steps"][0]["with"].update(
+                {"ref": "evil-branch"}),
+            "live checkout repository swap": lambda w: live_job(w)["steps"][0]["with"].update(
+                {"repository": "evil/repo"}),
+            "live save only on success": lambda w: live_job(w)["steps"][4].update({"if": "success()"}),
+            # Fixture job: proof runs never reach the staging Environment.
+            "fixture binds staging": lambda w: fixture_job(w).update({"environment": deepcopy(staging)}),
+            "fixture binds deployment staging": lambda w: fixture_job(w).update({"environment": "staging"}),
+            "fixture binds tracker environment": lambda w: fixture_job(w).update(
+                {"environment": "slow-burn-tracker"}),
+            "fixture reads the bearer": lambda w: fixture_job(w)["steps"][2]["env"].update(
+                {"METRICS_SCRAPE_TOKEN": bearer}),
+            "fixture reads the old secret": lambda w: fixture_job(w)["steps"][2]["env"].update(
+                {"METRICS_SCRAPE_TOKEN": "${{ secrets.METRICS_SCRAPE_TOKEN }}"}),
+            "fixture reads the staging url": lambda w: fixture_job(w)["steps"][2]["env"].update(
+                {"STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}"}),
+            "fixture blanket secrets": lambda w: fixture_job(w)["steps"][2]["env"].update(
+                {"ALL": "${{ toJSON(secrets) }}"}),
+            "fixture job-level secret": lambda w: fixture_job(w).update({"env": {"T": bearer}}),
+            "fixture runs live": lambda w: fixture_job(w).update({"if": "github.ref == 'refs/heads/main'"}),
+            "fixture any branch": lambda w: fixture_job(w).update(
+                {"if": "github.event_name == 'workflow_dispatch' && (github.event.inputs.fixture == 'fire'"
+                       " || github.event.inputs.fixture == 'clear')"}),
+            "fixture drops the flag": lambda w: fixture_run(w, lambda run: run.replace(
+                '--fixture "$TRACKER_FIXTURE" ', "")),
+            "fixture live label": lambda w: fixture_run(w, lambda run: run.replace(
+                "--label slow-burn-test ", "")),
+            "fixture label override": lambda w: fixture_run(w, lambda run: run.replace(
+                '"${args[@]}"', '"${args[@]}" --label slow-burn')),
+            "fixture title override": lambda w: fixture_run(w, lambda run: run.replace(
+                '"${args[@]}"', "\"${args[@]}\" --title-prefix '[voice-join-slow-burn]'")),
+            "fixture inline input": lambda w: fixture_run(w, lambda run: run.replace(
+                '"$TRACKER_FIXTURE"', '"${{ github.event.inputs.fixture }}"')),
+            "fixture restores the ring": lambda w: fixture_job(w)["steps"].insert(
+                2, deepcopy(live_job(w)["steps"][2])),
+            "fixture saves the ring": lambda w: fixture_job(w)["steps"].insert(
+                3, deepcopy(live_job(w)["steps"][4])),
+            "fixture write grant": lambda w: fixture_job(w).update(
+                {"permissions": {"contents": "write", "issues": "write"}}),
+            "fixture persisted credentials": lambda w: fixture_job(w)["steps"][0]["with"].update(
+                {"persist-credentials": "true"}),
+            "fixture checkout ref swap": lambda w: fixture_job(w)["steps"][0]["with"].update(
+                {"ref": "evil-branch"}),
+            "fixture checkout repository swap": lambda w: fixture_job(w)["steps"][0]["with"].update(
+                {"repository": "evil/repo"}),
+            "fixture unrouted runner": lambda w: fixture_job(w).update({"runs-on": "ubuntu-latest"}),
+            "fixture on tracker routing": lambda w: fixture_job(w).update(
+                {"runs-on": ROUTED_RUNNER.format(job="tracker")}),
+        }
+        for label, change in changes.items():
+            with self.subTest(change=label):
+                self.assertTrue(mutate(change))
+        # The inventory pin fails closed if the workflow disappears or gains a job.
+        missing = deepcopy(workflows)
+        del missing["slow-burn-tracker.yml"]
+        self.assertTrue(workflow_policy_errors(missing))
+        self.assertEqual(workflow_policy_errors(workflows), [])
+
     def test_gradual_promote_proof_shape_is_pinned(self):
         workflows = self.workflows
         self.assertEqual(gradual_promote_proof_errors(workflows["gradual-promote-proof.yml"]), [])
@@ -5248,6 +5896,85 @@ class WorkflowTests(unittest.TestCase):
                         else:
                             self.assertEqual(defaults, [],
                                              f"failed retry must not default anything, got: {calls}")
+
+    def early_pinned_components_retry(self):
+        # This run-step installer is not a dtolnay action. Require exactly one
+        # so removing it (or changing its id) cannot make the guard vacuous.
+        steps = self.workflows["check.yml"]["jobs"]["check"]["steps"]
+        installers = [index for index, step in enumerate(steps)
+                      if step.get("id") == "pinned_components"]
+        self.assertEqual(len(installers), 1, "check must install pinned_components before pip")
+        index = installers[0]
+        installer = steps[index]
+        self.assertNotIn("uses", installer)
+        self.assertEqual(installer.get("run", "").strip(),
+                         "rustup toolchain install --no-self-update")
+        # UniqueKeyLoader is a BaseLoader: even 'false' is a truthy string.
+        self.assertEqual(installer.get("continue-on-error"), "true")
+        self.assertLess(index + 1, len(steps), "the early installer needs an immediate retry")
+        retry = steps[index + 1]
+        self.assertNotIn("uses", retry)
+        self.assertTrue(retry.get("run"), "the immediate retry must execute a script")
+        self.assertEqual(retry.get("if"), "steps.pinned_components.outcome == 'failure'")
+        self.assertEqual(retry.get("shell"), "bash")
+        self.assertEqual(retry.get("env", {}).get("RUSTUP_PERMIT_COPY_RENAME"), "1")
+        self.assertNotIn("continue-on-error", retry, "the early retry must not swallow failure")
+        pip_steps = [index for index, step in enumerate(steps)
+                     if "python3 -m pip" in step.get("run", "")]
+        self.assertTrue(pip_steps, "check must retain its Python tooling install")
+        self.assertLess(index + 1, min(pip_steps), "finish the toolchain before pip probes rustc")
+        return retry
+
+    def test_early_rust_toolchain_install_is_retry_guarded(self):
+        self.early_pinned_components_retry()
+
+    def test_early_rust_toolchain_retry_fails_closed_behaviorally(self):
+        # Execute the real retry, but never rustup or sleep: only those external
+        # effects are shimmed. The early install resolves rust-toolchain.toml;
+        # unlike the action retries it must not issue a new `rustup default`.
+        retry = self.early_pinned_components_retry()
+        fake_prelude = (
+            "FAKE_N=0\n"
+            "rustup() {\n"
+            "  printf '%s\\0' \"$@\" >> \"$FAKE_RUSTUP_CALLS\"\n"
+            "  printf '\\n' >> \"$FAKE_RUSTUP_CALLS\"\n"
+            "  FAKE_N=$((FAKE_N + 1))\n"
+            "  [ \"$FAKE_N\" -ge \"$FAKE_SUCCEED_ON\" ]\n"
+            "}\n"
+            "sleep() { :; }\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            calls_path = Path(tmp) / "rustup-calls.txt"
+            for case_name, succeed_on, expected_status, expected_installs in (
+                ("always-fails", "99", 1, 5),
+                ("succeeds-on-2", "2", 0, 2),
+            ):
+                with self.subTest(case=case_name):
+                    calls_path.write_bytes(b"")
+                    # No inherited credentials/startup hooks, real toolchain
+                    # directories or PATH tools, even if a script drifts.
+                    run_env = {
+                        "PATH": tmp,
+                        "HOME": tmp,
+                        "CARGO_HOME": str(Path(tmp) / "cargo"),
+                        "RUSTUP_HOME": str(Path(tmp) / "rustup"),
+                        "RUSTUP_PERMIT_COPY_RENAME": retry["env"]["RUSTUP_PERMIT_COPY_RENAME"],
+                        "FAKE_RUSTUP_CALLS": str(calls_path),
+                        "FAKE_SUCCEED_ON": succeed_on,
+                    }
+                    proc = subprocess.run(
+                        ["/bin/bash", "--noprofile", "--norc", "-eo", "pipefail",
+                         "-c", fake_prelude + retry["run"]],
+                        env=run_env, capture_output=True, text=True, timeout=5,
+                    )
+                    self.assertEqual(proc.returncode, expected_status,
+                                     f"unexpected early retry status: {proc.stderr}")
+                    self.assertEqual(
+                        calls_path.read_bytes().splitlines(),
+                        [b"toolchain\0install\0--no-self-update\0"] * expected_installs,
+                        "early retry must install exactly the repository-selected toolchain; "
+                        "no extra arguments or default command",
+                    )
 
     def test_overflow_runner_must_name_its_own_job(self):
         self.assertTrue(runner_allowed("worker", self.workflows["check.yml"]["jobs"]["worker"]["runs-on"]))
@@ -5723,9 +6450,11 @@ class WorkflowTests(unittest.TestCase):
                         # by size label.
                         expected = {"contents": "read", "issues": "read",
                                     "pull-requests": "read"}
-                    elif (name, job_id) == ("slow-burn-tracker.yml", "tracker"):
+                    elif (name, job_id) in (("slow-burn-tracker.yml", "tracker"),
+                                            ("slow-burn-tracker.yml", "fixture")):
                         # Slow-burn card filer: files, refreshes and resolves
-                        # the one tracking issue per firing key.
+                        # the one tracking issue per firing key (fixture
+                        # proofs under the test label).
                         expected = {"contents": "read", "issues": "write"}
                     self.assertEqual(job["permissions"], expected)
                     for step in job.get("steps", []):

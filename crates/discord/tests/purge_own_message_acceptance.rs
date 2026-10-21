@@ -61,11 +61,12 @@ async fn assert_unknown_flag_protects_own_message(flag: Option<Value>) {
     )
     .await;
     let result = executor_for(&mock).purge(CHANNEL, 4, REASON).await;
+    let report = result.expect("history with an unknown bot flag is usable");
     assert_eq!(
-        result.expect("history with an unknown bot flag is usable"),
-        2,
+        report.affected, 2,
         "own and pinned posts survive; another unknown author's post is eligible"
     );
+    assert_eq!(report.stop_reason, None);
     let requests = mock.requests();
     assert_eq!(requests.len(), 3, "history, identity, one bulk delete");
     assert_eq!(requests[0].method, "GET");
@@ -117,13 +118,12 @@ async fn array_bot_flag_protects_own_message() {
 async fn own_only_history_with_missing_flag_never_deletes() {
     let own = fresh_message_id(1);
     let mock = history_double(json!([{"id": own, "author": {"id": OWN_USER}}]), 200).await;
-    assert_eq!(
-        executor_for(&mock)
-            .purge(CHANNEL, 1, REASON)
-            .await
-            .expect("protected history"),
-        0
-    );
+    let report = executor_for(&mock)
+        .purge(CHANNEL, 1, REASON)
+        .await
+        .expect("protected history");
+    assert_eq!(report.affected, 0);
+    assert_eq!(report.stop_reason, None);
     let requests = mock.requests();
     assert_eq!(requests.len(), 2, "list and identity only");
     assert!(requests.iter().all(|request| request.method == "GET"));
@@ -167,13 +167,12 @@ async fn explicitly_non_bot_history_never_reads_identity() {
         503,
     )
     .await;
-    assert_eq!(
-        executor_for(&mock)
-            .purge(CHANNEL, 3, REASON)
-            .await
-            .expect("non-bot history"),
-        2
-    );
+    let report = executor_for(&mock)
+        .purge(CHANNEL, 3, REASON)
+        .await
+        .expect("non-bot history");
+    assert_eq!(report.affected, 2);
+    assert_eq!(report.stop_reason, None);
     let requests = mock.requests();
     assert_eq!(
         requests.len(),

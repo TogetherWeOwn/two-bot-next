@@ -812,9 +812,22 @@ async fn snapshot_once(
         if publication_stopped(shutdown) {
             return Ok(());
         }
-        return replace_events(pool, guild, &fetched_at, &events)
-            .await
-            .map_err(|_| ErrorClass::Database);
+        return match replace_events(pool, guild, &fetched_at, &events).await {
+            Ok(None) => Ok(()),
+            Ok(Some(skip)) => {
+                // Warn, not info: the runner never overlaps ticks
+                // (`jobs.rs` skips while one is active), so a lost claim
+                // means wall-clock skew froze the whole events mirror until
+                // real time passes the stored epoch.
+                tracing::warn!(
+                    job = "events",
+                    skip = ?skip,
+                    "stale snapshot lost the epoch claim; publication skipped"
+                );
+                Ok(())
+            }
+            Err(_) => Err(ErrorClass::Database),
+        };
     }
     // Both kinds publish the denominator. Hold one shared lane from the first
     // observation through commit so a slow rank tick cannot overwrite a newer

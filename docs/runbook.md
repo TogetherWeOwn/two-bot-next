@@ -555,11 +555,14 @@ spacings can also leave the baseline window empty — so the tracker records
 the most recent covered moment beside the ring, seeds the tracking start on
 the first live unknown run when it never covered, and warns once the slow
 windows go ~6.5 h uncovered: while coverage is gone genuine burns go unfiled
-and open cards stay unclosed. The tracker needs the `slow-burn-tracker` environment
-bearer for `/ops/metrics`; without it the run warns and stays green. Prove
-the path by dispatching the workflow with the fire and clear fixtures: they
-run the real verdict and the real issue calls under the `slow-burn-test`
-label without touching the live ring.
+and open cards stay unclosed. Live runs read the existing `staging`
+environment bearer `STAGING_METRICS_SCRAPE_TOKEN` for `/ops/metrics`, bound
+with `deployment: false` so the five-minute scrape adds no staging deployment
+record (the main-only branch policy still applies); without it the run warns
+and stays green. Prove the path by dispatching the workflow with the fire and
+clear fixtures: a separate `fixture` job, which binds no environment and
+holds no scrape bearer, runs the real verdict and the real issue calls under
+the `slow-burn-test` label without touching the live ring.
 
 #### Alert: voice creator-map stale
 
@@ -940,6 +943,41 @@ integration nor paging escalation: it labels the existing transition delivery
 as `(ticket)` and supplies this runbook. Persist sanitized incident evidence and
 route a continuing dispatch problem to the on-call engineer through the normal
 triage path. No new webhook, production activation or live load test is authorized.
+
+#### Alert: prefix trigger verdict refusals
+
+`two_bot_gateway_prefix_trigger_refused_total{reason="verdict"}` rose in
+three consecutive keepalive samples after a baseline.
+`prefix_trigger_verdict_refusals` is a **ticket, not a page**: in-scope
+prefix candidates were refused by the automod verdict before any trigger
+lookup, so a sustained rise means a verdict outage is refusing every prefix
+command — not that members are typing unknown commands. Unmatched content
+(no trigger), scope mismatches, bot/webhook messages and disabled
+text-command gates never increment this family, and `reason="other"` is
+normal refusal volume that never counts toward the streak. A single refusal
+or burst stays silent.
+
+First response: triage within the watch shift. Read the `verdict` series
+through the existing authorized `/ops/metrics` path and correlate the
+window with automod verdict health (contained, timed-out, uninspected,
+unrecorded or missing verdicts) and any deploy in progress — a fresh deploy
+can briefly refuse while verdicts backfill. Record only the fixed reason
+name and sanitized counts, never message content, verdict text or user
+labels.
+
+Flat samples and counter resets clear the streak and resolve the ticket.
+Missing/invalid series break the streak and discard the baseline, **not**
+the active ticket; the first valid sample after a gap is only a baseline,
+ongoing growth retains the ticket, and a subsequent valid flat/reset window
+proves recovery. A new DO field or legacy state starts unbaselined.
+
+Do not change verdict logic, moderation policy or prefix routing to clear
+this alert, and do not replay refused commands. This alert adds neither
+automatic ticket-system integration nor paging escalation: it labels the
+existing transition delivery as `(ticket)` and supplies this runbook.
+Route a continuing verdict outage to the on-call engineer through the
+normal triage path. No new webhook, production activation or live load test
+is authorized.
 
 #### Alert: community facts drain failures
 

@@ -197,7 +197,7 @@ const MAIN_RS_ADJACENT: [&str; 14] = [
 
 // `crates/bot/src/voice_rooms.rs`: per-command voice UX receipts, not gateway
 // session events.
-const VOICE_RS_ADJACENT: [&str; 22] = [
+const VOICE_RS_ADJACENT: [&str; 23] = [
     "voice succession refused",
     "voice actor load failed; retrying with capped backoff",
     "voice actor load failed; credential refused, not retrying",
@@ -210,6 +210,7 @@ const VOICE_RS_ADJACENT: [&str; 22] = [
     "voice ballot response failed; not retried",
     "voice name modal response failed; not retried",
     "voice acknowledgement failed; command not executed",
+    "voice responder saturated; interaction dropped without acknowledgement (sampled)",
     "voice response completion failed; not retried",
     "voice dispatch turn exceeded observe bound",
     "voice halt re-probe timed out",
@@ -727,12 +728,13 @@ fn eventsub_revocation_ack_carries_a_bounded_reason() {
 /// vocabulary. The file is permanent, so it is read at compile time; the
 /// message set, the bounded `event` field, the `error_class` tokens and the
 /// `status` tokens each fail closed when renamed or added without a catalog row.
-const EVENTSUB_RECONCILE_RS_EVENTS: [&str; 14] = [
+const EVENTSUB_RECONCILE_RS_EVENTS: [&str; 15] = [
     "eventsub reconcile parked: TWO_EVENTSUB is not exactly 1",
+    "eventsub reconcile parked: the EventSub receiver is dark, no shared secret snapshot",
     "eventsub reconcile refused: callback configuration is invalid",
     "eventsub reconcile parked: broadcaster allowlist is empty, no subscriptions mutated",
     "eventsub reconcile refused: Twitch credentials are missing or invalid",
-    "eventsub reconcile refused: webhook secret is missing or invalid",
+    "eventsub reconcile refused: webhook secret snapshot is unreadable",
     "eventsub reconcile found failed subscriptions on our callback; deleting and re-creating",
     "eventsub reconcile action failed; continuing with the rest of the plan",
     "eventsub reconcile did not converge: an action failed or a healthy subscription is missing",

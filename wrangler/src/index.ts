@@ -81,6 +81,7 @@ import {
   isEventsubRequest,
   readBody as readEventsubBody,
   relayEventsubResponse,
+  signEventsubRefresh,
 } from "./eventsub.ts";
 import {
   OPS_AUDIT_PATH,
@@ -107,6 +108,7 @@ import {
   interruptCommunityFactsDrain,
   interruptDispatchDrops,
   interruptAuditHalt,
+  interruptPrefixVerdictRefusals,
   sanitizeScrapeLossState,
   scrapeLossFiringMessage,
   scrapeLossResolvedMessage,
@@ -214,6 +216,11 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   TWO_EVENTSUB?: string;
   /** Operator-set Worker secret carrying the Twitch signing secret. Never flag-forwarded. */
   TWO_TWITCH_WEBHOOK_SECRET?: string;
+  /** Operator-set Worker secret: HMAC key authenticating the per-delivery
+   * secret refresh the DO attaches for no-restart rotation. Absent means
+   * rotation stays disarmed (legacy startup-secret behavior). Never
+   * flag-forwarded, never logged. */
+  TWO_EVENTSUB_RELOAD_KEY?: string;
   /** Operator-set reconcile callback URL. Forwarded on its own explicit containerEnvVars line while the EventSub receiver is forwarded, never flag-forwarded. */
   TWO_TWITCH_CALLBACK_URL?: string;
   /** Operator-set reconcile broadcaster allowlist. Forwarded on its own explicit containerEnvVars line while the EventSub receiver is forwarded, never flag-forwarded. */
@@ -767,6 +774,10 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
     vars["TWO_EVENTSUB_BIND"] = EVENTSUB_RECEIVER_BIND;
     vars[CONTAINER_MARKER] = CONTAINER_MARKER_VALUE;
     vars["TWO_TWITCH_WEBHOOK_SECRET"] = env.TWO_TWITCH_WEBHOOK_SECRET as string;
+    // No-restart rotation arming: only with the receiver forward, on its own
+    // explicit line. Absent stays absent, so rotation stays disarmed instead
+    // of failing the container boot.
+    if (env.TWO_EVENTSUB_RELOAD_KEY) vars["TWO_EVENTSUB_RELOAD_KEY"] = env.TWO_EVENTSUB_RELOAD_KEY;
     if (env.TWO_TWITCH_CALLBACK_URL) vars["TWO_TWITCH_CALLBACK_URL"] = env.TWO_TWITCH_CALLBACK_URL;
     if (env.TWO_TWITCH_BROADCASTERS) vars["TWO_TWITCH_BROADCASTERS"] = env.TWO_TWITCH_BROADCASTERS;
     if (env.TWO_TWITCH_CLIENT_ID) vars["TWO_TWITCH_CLIENT_ID"] = env.TWO_TWITCH_CLIENT_ID;
@@ -1152,6 +1163,22 @@ export class TwoBotContainer extends Container<Env> {
       body.bytes,
       AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     );
+    // No-restart rotation, when armed: attach the Worker's current secret
+    // with its refresh HMAC — all server-side values, bound to this
+    // delivery's request id. A missing secret, or a signing failure, fails
+    // closed to the fixed envelope (never serialized, never logged).
+    const reloadKey = this.env.TWO_EVENTSUB_RELOAD_KEY;
+    if (reloadKey) {
+      const secret = this.env.TWO_TWITCH_WEBHOOK_SECRET;
+      let refresh: Headers | null = null;
+      try {
+        refresh = secret ? await signEventsubRefresh({ reloadKey, secret, requestId }) : null;
+      } catch {
+        refresh = null;
+      }
+      if (!refresh) return envelope(503, "unavailable", true, {}, requestId);
+      refresh.forEach((value, name) => forward.headers.set(name, value));
+    }
     // Same bound as the actions path above: the existing receiver deadline on
     // `forward` covers the fetch AND the body relay, with no larger or
     // independent budget. Late bodies are released best-effort and never
@@ -1605,7 +1632,7 @@ export class TwoBotContainer extends Container<Env> {
         // if the webhook fails or an alarm is retried.
         await this.ctx.storage.put(
           METRICS_ALERT_KEY,
-          interruptAuditHalt(interruptCommunityFactsDrain(interruptDispatchDrops(previous))),
+          interruptPrefixVerdictRefusals(interruptAuditHalt(interruptCommunityFactsDrain(interruptDispatchDrops(previous)))),
         );
         await this.ctx.storage.put(SCRAPE_LOSS_KEY, { streak, firing });
         if (justFired) {

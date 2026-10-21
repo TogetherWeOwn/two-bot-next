@@ -35,6 +35,27 @@ import staging_rollout as rollout  # noqa: E402
 
 GateError = rollout.GateError
 require = rollout.require
+
+
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    raised message is fixed vocabulary: it names no key, value or path.
+    """
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
+
+
 WORKER = rollout.WORKER
 VERSION_ID = re.compile(rollout.UUID)
 READY_BUDGET_SECONDS = 60
@@ -50,6 +71,20 @@ SAFE_CONTROL_LINE = re.compile(r"(Ownership control failed \(HTTP [0-9]{3}\)|"
 AUTH_STATUSES = ("401", "403")
 # Above the client's takeover window plus one attempt of two 15 s requests, so a takeover POST is never killed mid-flight.
 OWNERSHIP_CONTROL_TIMEOUT_SECONDS = 420
+
+
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins, at any depth."""
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
 
 
 class DrillClient(rollout.Client):
@@ -88,10 +123,11 @@ class DrillClient(rollout.Client):
             # the HTTP status and integer error codes.
             codes = []
             try:
-                envelope = json.loads(error.read(rollout.MAX_BODY))
+                envelope = json.loads(error.read(rollout.MAX_BODY),
+                                        object_pairs_hook=_reject_duplicate_keys)
                 codes = [str(item["code"]) for item in envelope.get("errors", [])
                          if isinstance(item, dict) and type(item.get("code")) is int][:4]
-            except (OSError, ValueError, AttributeError, TypeError):
+            except (OSError, ValueError, AttributeError, TypeError, RecursionError):
                 pass
             raise GateError("api_http_failure", f"status={error.code} codes={','.join(codes) or 'none'}") from None
         except (URLError, TimeoutError, OSError):
@@ -328,8 +364,8 @@ def ownership_control(token, url, actor, root=None, expected_deployment=None):
                 raise GateError("ownership_auth_failed")
             raise GateError("ownership_control_failed", match.group(0) if match else None)
         try:
-            state = json.loads(result.stdout)
-        except ValueError:
+            state = json.loads(result.stdout, object_pairs_hook=_reject_duplicate_keys)
+        except (ValueError, RecursionError):
             raise GateError("ownership_control_invalid_response") from None
         return rollout.mapping(state)
 

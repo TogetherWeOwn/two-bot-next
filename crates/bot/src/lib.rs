@@ -10,3 +10,8 @@ pub mod voice_rooms;
 pub mod containment_runtime;
 pub mod join_risk_runtime;
 pub mod raid_runtime;
+
+// Shared by the raid/containment tuning test modules; declared once so the
+// file is not loaded as two modules (clippy::duplicate_mod).
+#[cfg(test)]
+mod tuning_test_support;

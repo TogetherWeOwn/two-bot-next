@@ -47,9 +47,47 @@ impl ChannelModerationVerb {
     }
 }
 
+/// A definitive refusal that ended a purge after at least one deletion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PurgeStopReason {
+    Refused,
+    RateLimited,
+}
+
+impl PurgeStopReason {
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Refused => "refused",
+            Self::RateLimited => "rate_limited",
+        }
+    }
+
+    /// Inverse of [`Self::name`]; any other word is not a stop reason.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "refused" => Some(Self::Refused),
+            "rate_limited" => Some(Self::RateLimited),
+            _ => None,
+        }
+    }
+}
+
+/// Confirmed deletions, with a reason only when a later delete was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PurgeReport {
+    pub affected: u64,
+    pub stop_reason: Option<PurgeStopReason>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelOutcome {
-    Purged { affected: u64 },
+    Purged {
+        affected: u64,
+        stop_reason: Option<PurgeStopReason>,
+    },
     SlowmodeUpdated,
     LockedDown,
     Unlocked,
@@ -264,9 +302,17 @@ pub fn plan_unlock(
 #[must_use]
 pub fn moderation_result_text(outcome: ChannelOutcome) -> String {
     match outcome {
-        ChannelOutcome::Purged { affected } => {
-            format!("Moderation action completed: purged ({affected}).")
-        }
+        ChannelOutcome::Purged {
+            affected,
+            stop_reason: Some(reason),
+        } => format!(
+            "Moderation action completed: purged ({affected}, stopped early: {}).",
+            reason.name()
+        ),
+        ChannelOutcome::Purged {
+            affected,
+            stop_reason: None,
+        } => format!("Moderation action completed: purged ({affected})."),
         other => format!("Moderation action completed: {}.", other.name()),
     }
 }
@@ -308,7 +354,14 @@ mod tests {
 
     #[test]
     fn outcome_names_match_audit_mapping() {
-        assert_eq!(ChannelOutcome::Purged { affected: 5 }.name(), "purged");
+        assert_eq!(
+            ChannelOutcome::Purged {
+                affected: 5,
+                stop_reason: None
+            }
+            .name(),
+            "purged"
+        );
         assert_eq!(ChannelOutcome::SlowmodeUpdated.name(), "slowmode_updated");
         assert_eq!(ChannelOutcome::LockedDown.name(), "locked_down");
         assert_eq!(ChannelOutcome::Unlocked.name(), "unlocked");
@@ -602,7 +655,10 @@ mod tests {
     #[test]
     fn result_text_matches_legacy_format() {
         assert_eq!(
-            moderation_result_text(ChannelOutcome::Purged { affected: 5 }),
+            moderation_result_text(ChannelOutcome::Purged {
+                affected: 5,
+                stop_reason: None
+            }),
             "Moderation action completed: purged (5)."
         );
         assert_eq!(

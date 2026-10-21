@@ -316,10 +316,19 @@ impl ChannelModerationRuntime {
         let (reply, cleanup) = match self.dispatch(&prepared.call).await {
             Ok(result) => {
                 let outcome = match result {
-                    ChannelCallOutcome::Purged { affected } => {
-                        request.row.metadata_json =
-                            json!({"count": request.numeric, "affected": affected}).to_string();
-                        ChannelOutcome::Purged { affected }
+                    ChannelCallOutcome::Purged {
+                        affected,
+                        stop_reason,
+                    } => {
+                        let mut metadata = json!({"count": request.numeric, "affected": affected});
+                        if let Some(reason) = stop_reason {
+                            metadata["stop_reason"] = json!(reason.name());
+                        }
+                        request.row.metadata_json = metadata.to_string();
+                        ChannelOutcome::Purged {
+                            affected,
+                            stop_reason,
+                        }
                     }
                     ChannelCallOutcome::SlowmodeUpdated => ChannelOutcome::SlowmodeUpdated,
                     ChannelCallOutcome::OverwriteWritten
@@ -395,7 +404,10 @@ impl ChannelModerationRuntime {
         self.executor
             .purge_messages(channel_id, &ids, reason)
             .await
-            .map(|affected| ChannelCallOutcome::Purged { affected })
+            .map(|report| ChannelCallOutcome::Purged {
+                affected: report.affected,
+                stop_reason: report.stop_reason,
+            })
             .map_err(CallFailure::of)
     }
 

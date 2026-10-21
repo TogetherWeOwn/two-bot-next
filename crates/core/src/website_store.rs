@@ -33,7 +33,7 @@
 use sqlx::{Pool, Postgres, Transaction};
 
 use super::community_snapshots::{window_bounds, CommunitySnapshot, RaidWindow, RAID_ANOMALIES};
-use super::scheduled_events::ScheduledEvent;
+use super::scheduled_events::{ScheduledEvent, ScheduledEventsSkip};
 
 /// The contract version this build implements. Must match the row seeded in
 /// migration 0300 and the changelog in `sql/web_v1.sql`.
@@ -283,13 +283,42 @@ pub async fn write_rank_snapshot(
 /// keeps its newer row (and a legitimately removed event is still deleted once
 /// the snapshot observing the removal is the newest writer). A stale snapshot
 /// replayed after a newer write changes nothing.
+///
+/// Epoch claim (whole-snapshot gate): before the DELETE, the swap claims the
+/// fetch's `observed_at` in `scheduled_events_claim` inside this same
+/// transaction. One conditional upsert, so concurrent first writes serialize
+/// on the guild row instead of racing: the first fetch for a guild inserts
+/// the row, a newer-or-equal fetch moves the epoch forward, and a strictly
+/// older fetch matches nothing — the whole transaction rolls back (rows,
+/// epoch and contract pin alike) and this reports
+/// `Some(ScheduledEventsSkip::StaleSnapshot)` having written nothing.
+/// Returns `Ok(None)` when the snapshot committed. Equal stamps still
+/// commit: idempotent writers share a millisecond, and the per-row guards
+/// below still protect newer rows from an equal-stamp replay.
 pub async fn replace_events(
     pool: &Pool<Postgres>,
     guild_id: &str,
     observed_at: &str,
     events: &[ScheduledEvent],
-) -> Result<(), sqlx::Error> {
+) -> Result<Option<ScheduledEventsSkip>, sqlx::Error> {
     let mut tx = pool.begin().await?;
+    // A conflicting row whose stored epoch is newer fails the WHERE, updates
+    // nothing and returns no row: that is the stale case. Genesis (no row)
+    // inserts and returns, as do newer and equal stamps.
+    let claimed = sqlx::query_scalar::<_, String>(
+        "INSERT INTO scheduled_events_claim (guild_id, epoch) VALUES ($1, $2)
+         ON CONFLICT (guild_id) DO UPDATE SET epoch = EXCLUDED.epoch
+         WHERE scheduled_events_claim.epoch <= EXCLUDED.epoch
+         RETURNING epoch",
+    )
+    .bind(guild_id)
+    .bind(observed_at)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if claimed.is_none() {
+        tx.rollback().await?;
+        return Ok(Some(ScheduledEventsSkip::StaleSnapshot));
+    }
     sqlx::query("DELETE FROM scheduled_events WHERE guild_id = $1 AND updated_at <= $2")
         .bind(guild_id)
         .bind(observed_at)
@@ -321,7 +350,8 @@ pub async fn replace_events(
         .bind(guild_id)
         .execute(&mut *tx)
         .await?;
-    tx.commit().await
+    tx.commit().await?;
+    Ok(None)
 }
 
 /// Internal event action write: refresh exactly one row before acknowledging

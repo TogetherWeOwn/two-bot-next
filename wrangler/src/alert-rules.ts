@@ -122,6 +122,8 @@ export const DB_ERROR_MIN_ERRORS = 3;
 export const SEND_BLOCKED_SAMPLES = 3;
 /** REST admission breaker openings must appear in this many consecutive samples. */
 export const REST_BREAKER_OPEN_SAMPLES = 3;
+/** Verdict-refused prefix candidates must rise in this many consecutive samples. */
+export const PREFIX_TRIGGER_VERDICT_SAMPLES = 3;
 /** Website-action receiver refusals must appear in this many consecutive samples. */
 export const RECEIVER_REFUSAL_SAMPLES = 3;
 /** EventSub tampered-signature deliveries must rise in this many consecutive samples. */
@@ -272,6 +274,7 @@ export const RULES: readonly RuleDef[] = [
   { id: "eventsub_tampered", summary: `EventSub tampered-signature deliveries rose in ${EVENTSUB_TAMPERED_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-eventsub-tampered" },
   { id: "eventsub_reconcile_failed", summary: `EventSub reconcile failed passes increased between samples`, runbook: "runbook.md#alert-eventsub-reconcile-failed", severity: "ticket" },
   { id: "event_store_consumer_lag", summary: `event-store consumer lag above ${EVENT_STORE_LAG_THRESHOLD_SECONDS} s sustained for ${EVENT_STORE_LAG_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-event-store-consumer-lag", severity: "ticket" },
+  { id: "prefix_trigger_verdict_refusals", summary: `prefix candidates refused by the automod verdict for ${PREFIX_TRIGGER_VERDICT_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-prefix-trigger-verdict-refusals", severity: "ticket" },
 ];
 
 /**
@@ -337,6 +340,16 @@ export interface MetricsAlertState {
    * versions; legacy storage reads as no streak, never as sustained evidence.
    */
   breakerOpenStreak?: number;
+  /**
+   * Latest `reason="verdict"` prefix-refusal count. Absent on state stored
+   * before this rule existed and after a missing/invalid sample: the next
+   * valid sample stores a new baseline instead of a rise.
+   */
+  prefixVerdictRefused?: number;
+  /** Consecutive rising verdict windows, capped at PREFIX_TRIGGER_VERDICT_SAMPLES. */
+  prefixVerdictStreak?: number;
+  /** False until the first valid sample stores a baseline: the first sample never fires. */
+  prefixVerdictSeen?: boolean;
   voiceOps: number;
   voiceFailures: number;
   voiceDeadLetters: number;
@@ -613,6 +626,17 @@ export function interruptAuditHalt(state: MetricsAlertState): MetricsAlertState 
 /** A failed scrape breaks drain-growth evidence, never an active drain ticket. */
 export function interruptCommunityFactsDrain(state: MetricsAlertState): MetricsAlertState {
   return { ...state, communityFactsDrainFailures: {}, communityFactsDrainStreak: 0 };
+}
+
+/** A failed scrape breaks verdict-growth evidence, never an active verdict ticket. */
+export function interruptPrefixVerdictRefusals(state: MetricsAlertState): MetricsAlertState {
+  // The verdict fields are optional: deleting them restores the absent shape
+  // legacy storage already has, so the next valid sample re-baselines.
+  const next = { ...state };
+  delete next.prefixVerdictRefused;
+  delete next.prefixVerdictStreak;
+  delete next.prefixVerdictSeen;
+  return next;
 }
 
 export function parseExposition(text: string): Sample[] {
@@ -1079,6 +1103,49 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   // extend the streak, so idle or self-clearing contention never pages.
   const sendBlockedStreak = sendReset || sendBlocked === prevSendBlocked ? 0 : (prev.sendBlockedStreak ?? 0) + 1;
   if (sendBlockedStreak >= SEND_BLOCKED_SAMPLES) firing.push("send_admission_blocked");
+
+  // Sustained automod-verdict refusal of in-scope prefix candidates (mirror
+  // `send_admission_blocked`): only `reason="verdict"` counts — `other` is
+  // normal refusal volume and never advances the streak. Three consecutive
+  // rising windows ticket (never page). The first valid sample only stores a
+  // baseline, flat samples and counter resets (process restarts) clear the
+  // streak and resolve, while missing/invalid samples break growth but hold
+  // an active ticket (the return sample re-baselines). Unknown or hostile
+  // reasons never fire and never enter messages: only the fixed enum value
+  // is read, so no message content, verdict text or user label can leak in.
+  const wasPrefixVerdictFiring = prev.firing.includes("prefix_trigger_verdict_refusals");
+  const prefixVerdict = exactSeries(gauge("two_bot_gateway_prefix_trigger_refused_total"), { reason: "verdict" });
+  // `??` covers DO storage written before these fields existed.
+  const prevPrefixVerdict = prev.prefixVerdictRefused ?? 0;
+  const prevPrefixVerdictSeen = prev.prefixVerdictSeen ?? false;
+  const prevPrefixVerdictStreak = prev.prefixVerdictStreak ?? 0;
+  let nextPrefixVerdict = prevPrefixVerdict;
+  let nextPrefixVerdictStreak = 0;
+  let nextPrefixVerdictSeen = prevPrefixVerdictSeen;
+  let prefixVerdictFiring = false;
+  if (prefixVerdict === undefined) {
+    // Missing/invalid evidence breaks consecutive growth and drops the
+    // baseline, but never falsely resolves an active ticket.
+    nextPrefixVerdictSeen = false;
+    prefixVerdictFiring = wasPrefixVerdictFiring;
+  } else if (!prevPrefixVerdictSeen) {
+    // The first valid sample (including after a gap) is only a baseline. A
+    // new baseline is not a quiet window, so a held ticket stays held.
+    nextPrefixVerdict = prefixVerdict;
+    nextPrefixVerdictSeen = true;
+    prefixVerdictFiring = wasPrefixVerdictFiring;
+  } else if (prefixVerdict < prevPrefixVerdict) {
+    // A backwards counter means the process restarted: re-baseline and resolve.
+    nextPrefixVerdict = prefixVerdict;
+  } else if (prefixVerdict === prevPrefixVerdict) {
+    // A flat valid sample proves recovery and resolves.
+    nextPrefixVerdict = prefixVerdict;
+  } else {
+    nextPrefixVerdictStreak = Math.min(prevPrefixVerdictStreak + 1, PREFIX_TRIGGER_VERDICT_SAMPLES);
+    nextPrefixVerdict = prefixVerdict;
+    prefixVerdictFiring = wasPrefixVerdictFiring || nextPrefixVerdictStreak >= PREFIX_TRIGGER_VERDICT_SAMPLES;
+  }
+  if (prefixVerdictFiring) firing.push("prefix_trigger_verdict_refusals");
 
   // REST admission breaker (local refusals before any REST wire attempt, so
   // the request counter and its 429/5xx rules never see them): three
@@ -1576,7 +1643,7 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     else if (!healthyGrew && wasReconcileFiring) firing.push(RECONCILE_FAILED_RULE);
   }
 
-  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, breakerOpenStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, voiceVoteKickFailures: voiceVoteKickFailures ?? prevVoiceVoteKickFailures, voiceVoteKickFailuresSeen: voiceVoteKickFailures !== undefined ? true : prevVoteKickSeen, voiceVoteKickFiring, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, gatewayNotReadySeen, gatewayNotReadyStreak, dispatchDrops, dispatchDropStreaks, communityFactsDrainFailures, communityFactsDrainStreak, auditHaltStreak, eventStoreLagStreak, reconcileHealthy, reconcilePending, reconcileFailed, reconcileSeen, joinBurn: joinBurn.ring, eventsubPosts, eventsubPostsSeen, errorBudgetBurn: errorBudgetBurn.ring, eventsubTampered, eventsubTamperedSeen, eventsubTamperedStreak }, joinHeld: joinBurn.held, joinSlowCovered: joinBurn.slowCovered };
+  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, prefixVerdictRefused: nextPrefixVerdict, prefixVerdictStreak: nextPrefixVerdictStreak, prefixVerdictSeen: nextPrefixVerdictSeen, breakerOpenStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, voiceVoteKickFailures: voiceVoteKickFailures ?? prevVoiceVoteKickFailures, voiceVoteKickFailuresSeen: voiceVoteKickFailures !== undefined ? true : prevVoteKickSeen, voiceVoteKickFiring, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, gatewayNotReadySeen, gatewayNotReadyStreak, dispatchDrops, dispatchDropStreaks, communityFactsDrainFailures, communityFactsDrainStreak, auditHaltStreak, eventStoreLagStreak, reconcileHealthy, reconcilePending, reconcileFailed, reconcileSeen, joinBurn: joinBurn.ring, eventsubPosts, eventsubPostsSeen, errorBudgetBurn: errorBudgetBurn.ring, eventsubTampered, eventsubTamperedSeen, eventsubTamperedStreak }, joinHeld: joinBurn.held, joinSlowCovered: joinBurn.slowCovered };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {

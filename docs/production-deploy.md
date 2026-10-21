@@ -19,9 +19,11 @@ since Environment settings can drift.
 1. The `production` GitHub Environment has at least one required reviewer
    with prevent self-review on, and restricts deployment branches to the
    single custom branch `main`. Live state checked 2026-10-15: no required
-   reviewers, only a branch policy. Add a required reviewer before any
-   rollback or live-SHA cure: the guard refuses staging-history waivers
-   without human reviewers even with `PRODUCTION_AUTO_APPROVE=true`.
+   reviewers, only a branch policy (the owner removed every human approval by
+   policy). With `PRODUCTION_AUTO_APPROVE=true` a rollback still runs without
+   a reviewer when its target is a verified rollback snapshot (see **Roll
+   back**); only the live-SHA cure (`allow_unstaged`) still needs a human
+   reviewer.
 2. The repository-level `PRODUCTION_WORKER_URL` variable holds the production
    Worker's `https://` URL. It must differ from `STAGING_WORKER_URL`. Keep this
    as the single source for both deploy and passive synthetic checks: remove any
@@ -39,10 +41,15 @@ reviewers and a main-only branch policy. `PRODUCTION_AUTO_APPROVE=true`
 excuses only the missing-reviewers refusal, and only when the latest
 `deploy-staging` run on the SHA is a completed success; the main-only branch
 policy stays mandatory with or without it
-(see [PRODUCTION_AUTO_APPROVE](#production_auto_approve)). A rollback or a
-live-SHA takeover redeploy waives staging history, so it still needs human
-reviewers even with auto-approve on: until a reviewer is added those two
-dispatches are refused. A job that
+(see [PRODUCTION_AUTO_APPROVE](#production_auto_approve)). A live-SHA
+takeover redeploy waives staging history, so it still needs human reviewers
+even with auto-approve on. A rollback with auto-approve on and no reviewers
+runs only when its `rollback`, `image` and `sha` together equal the complete
+provenance receipt (`has_previous`, `provenance_complete`) inside a
+`production-rollback-snapshot` artifact at most 14 days old, uploaded by a
+deploy-production run on `main` of this repository; anything else refuses
+(10-20 13:31Z: the designed rollback was refused for want of a reviewer
+while production stayed fenced). A job that
 names a missing Environment makes GitHub create it with no protection, so the
 guard checks before the deploy job can run. This repository is public, so
 required reviewers work on every plan; no Enterprise plan is needed.
@@ -118,7 +125,8 @@ and a redeploy of a prior good commit, must always set `sha` explicitly: an empt
 build that just broke production (the guard refuses a rollback without `sha`).
 Dispatch again with `rollback` set to the previous version ID
 from the failed run's summary, `image` set to the previous container image
-digest from the same summary's rollback-snapshot line, and `takeover: true`.
+digest from the same summary's rollback-snapshot line, and `takeover: true`
+(the default).
 Set `sha` to the commit that version was built
 from (full SHA or an unambiguous 7-40 character hex prefix; the guard resolves
 a prefix and records the full SHA): take all three from that summary line, which the pre-deploy snapshot
@@ -129,7 +137,10 @@ The three inputs are validated as one
 receipt before anything is restored: the rollback script refuses unless the
 Worker version's stamped deploy message (`wrangler deploy --message <sha>`)
 equals `sha` (the resolved full SHA), the version appears in the 100%-serving deployment history,
-and the image comes from a completed rollout. A merely CI-green SHA paired
+and the image comes from a completed rollout, or a replaced one whose
+record shows every step completed and every instance updated (a rollout
+can be replaced before it finishes, so status alone never proves the
+image served). A merely CI-green SHA paired
 with the wrong version therefore refuses before traffic moves instead of
 failing the gate after the restore; do not widen the guard to admit one.
 The `/readyz` gate after the
@@ -164,10 +175,11 @@ change with `--message` as above) before the deploy the snapshot precedes,
 or the next manual rollback to it will refuse. The
 rollback passes the same guard and the same Environment approval, except the
 guard never needs deploy-staging history for a rollback: aged-out staging
-runs must not block recovery. It still needs a human Environment reviewer:
-with no required reviewers the guard refuses the waiver even with
-`PRODUCTION_AUTO_APPROVE=true`, so add a reviewer before relying on
-rollback. The step restores BOTH the named Worker version
+runs must not block recovery. It needs no human reviewer when
+`PRODUCTION_AUTO_APPROVE=true` and the three inputs match a verified
+rollback snapshot (above) — the summary line names all three, so a rollback
+dispatched from it always matches; the guard records the snapshot's run in
+its summary. The step restores BOTH the named Worker version
 and the named container image (a Worker-only rollback leaves the new image
 serving), hands ownership to the restored version, and requires the same
 stable gateway-ready gate. Without the takeover the fence stays held,
@@ -179,7 +191,7 @@ not the container image.
 **Stale bot, live SHA.** When the bot is stale but the live build is good
 (the owner's first-response cure), re-serve it without staging history:
 dispatch in deploy mode with `sha` set to the currently live commit,
-`takeover: true`, and `allow_unstaged: true`. The guard still requires the
+`takeover: true` (the default), and `allow_unstaged: true`. The guard still requires the
 SHA on main with green `ci-ok`/`worker check` and the operator's confirmation
 that the SHA is live; it waives only the staging-history check. Like a
 rollback, it still needs a human Environment reviewer and is refused without
@@ -198,14 +210,23 @@ production drill record.
 ## Automatic promotion
 
 A green staging commit reaches production with nobody dispatching it. The
-workflow starts on every completed `deploy-staging` run on `main` and once
-daily as a backstop (a missed trigger, an expired hold, an incident pause).
+workflow starts on every completed `deploy-staging` run and every completed
+`check` run on `main`, and once daily as a backstop (a missed trigger, an
+expired hold, an incident pause). Staging and CI finish in either order on the
+same commit (on 10-20 staging went green ~23 minutes before CI, and 12 promotions
+in a row refused), so whichever finishes last promotes and the earlier one skips.
 An automatic run is exactly the empty-`sha` manual dispatch — the commit of
 the latest successful staging deploy — with takeover on, so the owned probes
-can certify it. Every guard still applies to it. Four skips keep it green
+can certify it. Every guard still applies to it. These skips keep it green
 while deploying nothing:
 
 - the triggering staging run did not succeed (`staging-not-green`);
+- the triggering `check` run did not succeed (`ci-not-green`) or was not a
+  push to `main` (`ci-not-push`);
+- CI finished on a commit that is not the latest successful staging deploy
+  (`staging-pending`): the staging completion promotes it;
+- `check.yml` is still running on the target (`ci-pending`): its completion
+  promotes it (a completed red CI still refuses);
 - the hold variable is still in the future (see below);
 - the target is already live: production `/readyz` already reports the SHA;
 - the live build already contains the target (`older-than-live`): an older
@@ -252,14 +273,16 @@ two-bot-next-production-rollout/1.0`): it scrapes live production
 auto-rollback below restores the pre-deploy snapshot (Worker version AND
 container image). Live enforcement needs the `PRODUCTION_METRICS_SCRAPE_TOKEN`
 secret (a `production` environment secret, 32+ chars); without it the step
-records a skip, never a pass. The dispatch-only `inject_error_rate_spike`
-input judges a rehearsal 5xx firing instead, proving the fail-to-rollback
-chain with no traffic — a push or an automatic trigger can never arm it.
-The drill needs `takeover: true` in deploy mode: without takeover a failed
-gate cannot roll back (so the drill would leave its build serving and prove
-nothing), and after a rollback restore there is nothing to roll back to (so
-the gate does not run in rollback mode at all). Any other combination
-refuses in the guard before anything deploys.
+records a skip, never a pass. The gate does not run in rollback mode (after
+a restore there is nothing to roll back to). **Failure injection never runs
+against production**: the guard refuses any run with
+`inject_error_rate_spike: true`, in every mode, and points to staging
+(`gh workflow run deploy-staging.yml --ref main -f inject_error_rate_spike=true`,
+see [staging-rollout-gate.md](staging-rollout-gate.md)). The production gate
+step has no rehearsal path left to arm. On 10-20 20:54Z a forced production
+drill deployed, failed the ownership read, and its auto-rollback refused on
+image provenance, leaving production degraded until the next automatic
+deploy.
 
 ## Build identity and the `/readyz` gate
 
@@ -365,11 +388,17 @@ relaxes the staging gate. This step never activates production: GO stays the
 cutover lead's separate decision on the B4 execution card
 ([cutover-sequence.md](cutover-sequence.md) §§4–5).
 
-**Requesting it.** Dispatch with `takeover: true` (default `false`). The guard
-validates the flag and records `Takeover: requested/not requested` in the run
-summary. With `false` the job deploys and stops: the fence stays held, fenced
-answers carry no build fields, and the gate fails without being a rollback
-signal.
+**Requesting it.** A deploy ALWAYS takes over, manual or automatic: a
+manual deploy can never leave production fenced (10-20 13:31Z: a manual
+dispatch without `takeover: true` served 503 `ownership_fenced`/`not_owner`
+for 23 minutes). `takeover` now defaults to `true`, and `takeover: false` no
+longer skips a deploy's takeover (the guard prints a notice). The only way to
+deploy without the takeover is the explicit B4 cutover hold,
+`cutover_hold: true` (deploy mode only, default `false`): the guard records
+`Takeover: SKIPPED by cutover_hold: the ownership fence STAYS HELD` in the
+run summary, the job deploys and stops, fenced answers carry no build
+fields, and the gate fails without being a rollback signal. In rollback mode
+`takeover` still selects the post-restore ownership read and confirmation.
 
 **Order inside the `production` job** (same Environment approval as the deploy):
 
@@ -436,11 +465,14 @@ exact value `true` changes the guard. With it set, the guard:
 - accepts a `production` Environment with no required reviewers, provided the
   latest `deploy-staging` run on the SHA is a completed success. With no
   reviewers and the variable unset, the guard refuses;
-- never applies to a rollback or a live-SHA takeover redeploy
-  (`allow_unstaged`): those waive the staging history the automated approval
-  vouches through, so they still need the human Environment reviewers.
-  Until a required reviewer is added, those two dispatches are refused;
-- records `Approval: automated (PRODUCTION_AUTO_APPROVE)` in the run summary.
+- accepts a rollback with no reviewers only when its `rollback`, `image` and
+  `sha` match a verified rollback snapshot (see **Roll back**); any other
+  rollback target still needs a human reviewer;
+- never applies to a live-SHA takeover redeploy (`allow_unstaged`): it waives
+  the staging history the automated approval vouches through, so it still
+  needs the human Environment reviewers and is refused until one is added;
+- records `Approval: automated (PRODUCTION_AUTO_APPROVE)` (or, for a
+  snapshot-backed rollback, `Approval: automated rollback`) in the run summary.
 
 It does not remove reviewers. If the Environment has required reviewers,
 GitHub still pauses the `production` job until one of them approves, and the

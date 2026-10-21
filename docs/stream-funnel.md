@@ -204,7 +204,17 @@ four values.
   the Operator-provisioned `TWO_TWITCH_WEBHOOK_SECRET`. Any other state is
   dark; an enabled-but-invalid config stops startup, never downgrades.
 - Runs `verify_delivery` plus `classify` with the Operator secret. Nothing
-  is parsed before verification passes.
+  is parsed before verification passes. When the Operator arms no-restart
+  rotation (`TWO_EVENTSUB_RELOAD_KEY` on both sides), the fenced DO attaches
+  the Worker's current secret to every delivery with a dedicated refresh HMAC
+  (`x-two-eventsub-*` headers, never caller-supplied — the edge ingress
+  refuses them), and the receiver authenticates, validates and atomically
+  swaps its in-memory snapshot before verifying that delivery
+  (`crates/core/src/eventsub_refresh.rs`). Any refresh failure answers
+  retryable 503 `unavailable` without verifying against the stale snapshot;
+  each request swaps-then-verifies, so concurrent deliveries each use one
+  consistent snapshot and a superseded in-flight delivery is a deterministic
+  401, never a 500.
 - Echoes `Delivery::Challenge` as `200 text/plain`; acknowledges
   `Revocation`, `Ignored` and deterministic classification
   errors (`WrongSubscription`, `InvalidBody`) as `200 {"ok":true}` so Twitch
@@ -230,8 +240,10 @@ four values.
   inputs (`TWO_TWITCH_CALLBACK_URL`, `TWO_TWITCH_BROADCASTERS`) and the Twitch
   credentials (`TWO_TWITCH_CLIENT_ID`, `TWO_TWITCH_CLIENT_SECRET`,
   `TWO_TWITCH_WEBHOOK_SECRET`) on explicit lines, and forwards nothing when
-  the secret is missing. The delivery gate and its channel/invite inputs
-  travel on their own explicit lines inside that forward, only while
+  the secret is missing. The refresh HMAC key (`TWO_EVENTSUB_RELOAD_KEY`)
+  travels on its own explicit line inside that forward when set; absent stays
+  absent and rotation stays disarmed. The delivery gate and its channel/invite
+  inputs travel on their own explicit lines inside that forward, only while
   `TWO_EVENTSUB_DELIVERY` is exactly `"1"`.
   `scripts/check-env-bindings.py` rejects any `TWO_EVENTSUB*` or
   `TWO_TWITCH_*` var in `wrangler.toml`.
@@ -249,7 +261,9 @@ four values.
 - The app token is cached and refreshed 60 s before its `expires_in`
   instant, plus once on a 401 with a single retry. The Helix calls have no
   timers of their own; the bot runtime (`crates/bot/src/eventsub_reconcile.rs`)
-  invokes them once at startup and on a bounded hourly interval.
+  invokes them once at startup and on a bounded hourly interval. Each pass
+  signs creates with the receiver's live snapshot, never boot env, so a
+  rotated secret signs the next creates with no restart.
 - `list_subscriptions` follows every `stream.online` page (up to a bounded
   limit); pass its complete result to `plan_boot_actions` for the deletes-first
   plan, then `execute_actions` runs it in order. A create that answers 409

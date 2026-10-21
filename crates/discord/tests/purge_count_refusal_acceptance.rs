@@ -144,13 +144,12 @@ async fn assert_valid_boundary(count: u64, through_outcome: bool) {
             }
         );
     } else {
-        assert_eq!(
-            executor
-                .purge(CHANNEL, count, REASON)
-                .await
-                .expect("valid purge"),
-            count
-        );
+        let report = executor
+            .purge(CHANNEL, count, REASON)
+            .await
+            .expect("valid purge");
+        assert_eq!(report.affected, count);
+        assert_eq!(report.stop_reason, None);
     }
     let requests = mock.requests();
     assert_eq!(requests.len(), 2, "history then deletion; no identity read");

@@ -136,6 +136,8 @@ All migrations are up-only; there are no down files. The `direction` column is
 | 0438_retention_queues | up | retention_guild_purge_queue, retention_deletion_requests | re-runnable | Drop both tables; queued guild purges and pending deletion requests are lost and must be re-enqueued, completed receipts are the only durable record. |
 | 0440_stream_live_claims | up | stream_live_claims | re-runnable | Drop the table; go-live dedup claims re-claim on the next `stream.online` event (delivered rows lose their restart-proof fence until re-posted). |
 | 0443_stream_live_send_started | up | stream_live_claims | re-runnable | Drop `send_started_at` and `claim_token`; in-flight sending markers and ownership tokens are lost (stale started rows become reclaimable until re-marked), delivered fences survive. |
+| 0448_internal_action_stop_reason | up | internal_idempotency, internal_action_log | backout-script | Unguarded `ADD COLUMN` with closed-set `CHECK`s. Backout: disable the receiver and deploy the previous binary, then drop both columns; dropping them under the reason-aware binary fails every finish and every success replay. Early-stopped purge receipts lose their reason. No member PII in the columns. |
+| 0450_scheduled_events_claim | up | scheduled_events_claim | backout-script | Guarded `CREATE TABLE IF NOT EXISTS`. Backout: deploy the previous binary, then drop the table; dropping it under the claim-aware binary fails every events swap. The mirror itself stays readable. No member PII in the table. |
 
 ## Notes
 
