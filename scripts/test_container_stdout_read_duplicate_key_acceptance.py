@@ -29,7 +29,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import container_stdout_read as reader  # noqa: E402
+import container_stdout_read as reader
 
 SERVICE = "11111111-2222-4333-8444-555555555555"
 ACCOUNT = "0123456789abcdef0123456789abcdef"
