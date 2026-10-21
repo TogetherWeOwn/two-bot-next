@@ -434,6 +434,15 @@ never retried; that actor respawns only on the next guild snapshot
 (`publish_snapshot` on `GuildCreate`/resumed replay), and voice, channel
 and role events for the guild are dropped until then.
 
+`voice succession handed the room to the longest-present member`
+(info; `apply_succession` in `crates/bot/src/voice_rooms.rs`): the
+reconcile pass handed an ownerless-but-occupied room to its
+longest-present member. Fields: `channel_id`, `previous_owner_id`,
+`next_owner_id` (IDs only, no member names). One line per handoff; the
+`voice_reconcile` aggregate counts it under `succession_enqueued`, and
+the next tick finds the new owner present and stays silent. The refused
+path keeps the existing `voice succession refused` warn.
+
 `voice live view was not ready on a connected gateway; republished from cache`
 (warn; `heal_not_ready` in `crates/bot/src/voice_rooms.rs`, guild-only field,
 no IDs): READY or RESUMED was handled but a guild's live voice view was still
