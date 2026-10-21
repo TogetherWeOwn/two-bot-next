@@ -398,9 +398,42 @@ def summary(evidence, failures):
     return "\n".join(lines) + "\n"
 
 
+def dry_run_plan(drill, target):
+    """Validate like the live path, print the ordered plan, mutate nothing.
+
+    Runs the same preflight the live legs run (reads only: deployments,
+    serving version, singleton status, baseline readiness), so every
+    invalid input refuses with the identical code before any change. On
+    success prints the fixed-vocabulary plan and exits 0 without POSTing,
+    fencing, taking over, or writing evidence.
+    """
+    try:
+        pre = drill.preflight(target)
+    except GateError as error:
+        drill.failed("drill", error)
+        return 1
+    except Exception:  # No traceback: it may carry request data.
+        drill.failed("drill", GateError("unexpected_error"))
+        return 1
+    print("\n".join([
+        "staging rollback drill dry-run plan",
+        f"target_version: {target}",
+        f"pre_version: {pre}",
+        "legs in order:",
+        f"1. drill: fence singleton, rollback Worker to {target}, "
+        f"takeover to {target}, wait first ready",
+        f"2. restore: fence singleton, rollback Worker to {pre}, "
+        f"takeover to {pre}, wait first ready",
+        "mutations: none (plan only; no POST, no fence, no takeover)",
+    ]))
+    return 0
+
+
 def main(argv=None, *, environ=None, make_control=ownership_control, client_factory=DrillClient):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target-version", required=True)
+    parser.add_argument("--dry-run", action="store_true",
+                        help="validate inputs and print the ordered plan without mutating anything")
     parser.add_argument("--evidence", default="staging-rollback-drill-evidence.json")
     args = parser.parse_args(argv)
     env = os.environ if environ is None else environ
@@ -415,6 +448,8 @@ def main(argv=None, *, environ=None, make_control=ownership_control, client_fact
         require(ACTOR.fullmatch(actor), "invalid_actor")
         client = client_factory(env.get("CLOUDFLARE_ACCOUNT_ID"), env.get("CLOUDFLARE_API_TOKEN"))
         drill = Drill(client, make_control(token, url, actor), url, run_id, log=print)
+        if args.dry_run:
+            return dry_run_plan(drill, args.target_version)
         failures = drill.run(args.target_version)
     except GateError as error:
         print(f"staging rollback drill refused before any change: {error}")
