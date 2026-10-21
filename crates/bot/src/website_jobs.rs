@@ -782,6 +782,55 @@ fn publication_stopped(shutdown: &watch::Receiver<bool>) -> bool {
     *shutdown.borrow() || shutdown.has_changed().is_err()
 }
 
+/// Raw scheduled-events response-body cap, 1 MiB (bounded-claim decision §4).
+/// Bodies over this refuse as [`ErrorClass::Rest`] before any row reaches
+/// storage; the last good snapshot is kept by construction.
+pub(crate) const MAX_SCHEDULED_EVENTS_BODY_BYTES: usize = 1_048_576;
+
+/// One Events snapshot attempt with the observation stamp injected.
+/// Production stamps `observed_at` from the real clock in [`snapshot_once`]
+/// immediately before the GET (TOG-20273); age-bound tests inject a fixed
+/// stamp here instead of racing the clock.
+///
+/// Whole-response gates, in order: the raw body cap (measured over the full
+/// response value, unknown fields included — never over known fields alone),
+/// then the existing shape/normalize/store path unchanged. The 5-minute
+/// staleness skip (decision §4) is NOT enforced here yet: the follow-up age
+/// slice pins it through this seam first, then wires the check.
+pub(crate) async fn snapshot_events_once(
+    pool: &PgPool,
+    rest: &ActionExecutor,
+    guild: &str,
+    shutdown: &watch::Receiver<bool>,
+    observed_at: &str,
+) -> Result<(), ErrorClass> {
+    let response = get(
+        rest,
+        &format!("/guilds/{guild}/scheduled-events?with_user_count=true"),
+    )
+    .await?;
+    // Measure the whole response, not the known fields: an unknown-field pad
+    // must count toward the cap exactly like a long description does. The
+    // executor yields parsed JSON only, so this re-serializes; shrinking the
+    // pre-parse window further belongs to the REST executor slice, not here.
+    if response.to_string().len() > MAX_SCHEDULED_EVENTS_BODY_BYTES {
+        return Err(ErrorClass::Rest);
+    }
+    let raw = response
+        .as_array()
+        .ok_or(ErrorClass::Rest)?
+        .iter()
+        .map(|value| raw_event(value, guild))
+        .collect::<Result<Vec<_>, _>>()?;
+    let events = normalize_events(&raw).ok_or(ErrorClass::Rest)?;
+    if publication_stopped(shutdown) {
+        return Ok(());
+    }
+    replace_events(pool, guild, observed_at, &events)
+        .await
+        .map_err(|_| ErrorClass::Database)
+}
+
 async fn snapshot_once(
     kind: Kind,
     pool: &PgPool,
@@ -797,24 +846,7 @@ async fn snapshot_once(
         // began, so a mutation that lands while the GET is in flight keeps
         // its newer row instead of being overwritten by this older fetch.
         let fetched_at = now_iso();
-        let response = get(
-            rest,
-            &format!("/guilds/{guild}/scheduled-events?with_user_count=true"),
-        )
-        .await?;
-        let raw = response
-            .as_array()
-            .ok_or(ErrorClass::Rest)?
-            .iter()
-            .map(|value| raw_event(value, guild))
-            .collect::<Result<Vec<_>, _>>()?;
-        let events = normalize_events(&raw).ok_or(ErrorClass::Rest)?;
-        if publication_stopped(shutdown) {
-            return Ok(());
-        }
-        return replace_events(pool, guild, &fetched_at, &events)
-            .await
-            .map_err(|_| ErrorClass::Database);
+        return snapshot_events_once(pool, rest, guild, shutdown, &fetched_at).await;
     }
     // Both kinds publish the denominator. Hold one shared lane from the first
     // observation through commit so a slow rank tick cannot overwrite a newer

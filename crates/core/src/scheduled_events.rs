@@ -25,6 +25,16 @@
 /// Poll cadence (legacy `SCHEDULED_EVENTS_INTERVAL_MS`).
 pub const SCHEDULED_EVENTS_INTERVAL_MS: u64 = 10 * 60 * 1000;
 
+/// Snapshot caps (bounded-claim decision §4): at most 100 rows per snapshot,
+/// and per-field `name` ≤ 100 / `description` ≤ 1000 / `channel_id` ≤ 32
+/// chars. Every violation refuses the whole snapshot (`None`, surfaced as
+/// [`ScheduledEventsSkip::InvalidResponse`]) — never a truncated prefix, never
+/// a clipped field.
+pub const MAX_SNAPSHOT_ROWS: usize = 100;
+pub const MAX_EVENT_NAME_CHARS: usize = 100;
+pub const MAX_EVENT_DESCRIPTION_CHARS: usize = 1000;
+pub const MAX_EVENT_CHANNEL_ID_CHARS: usize = 32;
+
 /// Discord event status (legacy `STATUS` map over the API integers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -118,13 +128,31 @@ pub enum ScheduledEventsSkip {
 /// Normalize one raw payload (legacy `normalize`): id, name,
 /// `scheduled_start_time` (any parseable date, rendered UTC millis) and a
 /// known status are all required. `channel_id` / `description` keep only
-/// string values, else `None`.
+/// string values, else `None`. Over-long fields refuse the row: limits count
+/// chars, not bytes, and a violation is never silently truncated.
 #[must_use]
 pub fn normalize_event(raw: &RawScheduledEvent) -> Option<ScheduledEvent> {
     let id = raw.id.as_deref().filter(|s| !s.is_empty())?;
     let name = raw.name.as_deref().filter(|s| !s.is_empty())?;
     let start = raw.scheduled_start_time.as_deref()?;
     let status = raw.status.and_then(EventStatus::from_api)?;
+    if name.chars().count() > MAX_EVENT_NAME_CHARS {
+        return None;
+    }
+    if raw
+        .description
+        .as_deref()
+        .is_some_and(|description| description.chars().count() > MAX_EVENT_DESCRIPTION_CHARS)
+    {
+        return None;
+    }
+    if raw
+        .channel_id
+        .as_deref()
+        .is_some_and(|channel| channel.chars().count() > MAX_EVENT_CHANNEL_ID_CHARS)
+    {
+        return None;
+    }
     Some(ScheduledEvent {
         id: id.to_owned(),
         name: name.to_owned(),
@@ -140,8 +168,13 @@ pub fn normalize_event(raw: &RawScheduledEvent) -> Option<ScheduledEvent> {
 /// repeated event ID also rejects the whole snapshot before any storage
 /// replacement, so conflicting duplicates have no order-dependent
 /// last-row-wins outcome and identical duplicates share the same refusal.
+/// More than [`MAX_SNAPSHOT_ROWS`] rows likewise rejects the whole snapshot:
+/// the tick must refuse over-cap input, never apply a truncated prefix.
 #[must_use]
 pub fn normalize_events(raw: &[RawScheduledEvent]) -> Option<Vec<ScheduledEvent>> {
+    if raw.len() > MAX_SNAPSHOT_ROWS {
+        return None;
+    }
     let events: Vec<ScheduledEvent> = raw.iter().map(normalize_event).collect::<Option<_>>()?;
     let mut seen = std::collections::HashSet::with_capacity(events.len());
     for event in &events {

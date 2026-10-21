@@ -1,7 +1,7 @@
 use super::*;
 use serde_json::json;
 use two_bot_core::{activation::LiveCapability, apply_web_contract, RankKey};
-use two_bot_testsupport::TestDatabase;
+use two_bot_testsupport::{guard_database_url, TestDatabase};
 
 use crate::{
     activation::fixtures,
@@ -1200,4 +1200,84 @@ async fn rank_tick_missing_rung_names_the_rung_and_writes_nothing() {
     for leaked in [probe_id, probe_name] {
         assert!(!logs.contains(leaked), "logs leaked {leaked:?}");
     }
+}
+
+/// A lazy pool that never connects: reaching storage surfaces `Database`, so
+/// a `Rest` outcome proves the refusal happened before any write. Mirrors the
+/// snapshot suite's poison pool (sibling test modules cannot share it).
+fn unconnected_pool() -> PgPool {
+    guard_database_url("postgres://agent_test:@agent-testdb:5432/two_bot_test_poison")
+        .expect("seam pool must reject ambient PostgreSQL connection settings");
+    PgPoolOptions::new()
+        .acquire_timeout(Duration::from_millis(20))
+        .connect_lazy_with(
+            PgConnectOptions::new_without_pgpass()
+                .host("agent-testdb")
+                .port(5432)
+                .username("agent_test")
+                .password("")
+                .database("two_bot_test_poison"),
+        )
+}
+
+/// The injected-stamp seam behaves exactly like the production `run_once`
+/// path (which stamps `now_iso()` before delegating): an in-bounds snapshot
+/// still attempts publication. The age bound itself is NOT asserted here —
+/// the follow-up age slice pins 5-minute staleness through this seam.
+#[tokio::test]
+async fn events_seam_with_injected_stamp_reaches_storage() {
+    let mock = MockRest::start(
+        vec![ScriptedResponse::json(200, json!([event()]))],
+        ScriptedResponse::status(403),
+    )
+    .await;
+    let pool = unconnected_pool();
+    let (_stop, shutdown) = watch::channel(false);
+    let outcome = snapshot_events_once(
+        &pool,
+        &executor(&mock),
+        "2222",
+        &shutdown,
+        "2026-10-01T18:00:00.000Z",
+    )
+    .await;
+    assert_eq!(
+        mock.requests().len(),
+        1,
+        "the seam must fetch before it can publish"
+    );
+    assert_eq!(
+        outcome,
+        Err(ErrorClass::Database),
+        "an in-bounds snapshot through the seam must still attempt publication"
+    );
+    mock.shutdown().await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn events_seam_refuses_malformed_before_storage() {
+    let mock = MockRest::start(
+        vec![ScriptedResponse::json(200, json!([event(), json!(null)]))],
+        ScriptedResponse::status(403),
+    )
+    .await;
+    let pool = unconnected_pool();
+    let (_stop, shutdown) = watch::channel(false);
+    let outcome = snapshot_events_once(
+        &pool,
+        &executor(&mock),
+        "2222",
+        &shutdown,
+        "2026-10-01T18:00:00.000Z",
+    )
+    .await;
+    assert_eq!(mock.requests().len(), 1);
+    assert_eq!(
+        outcome,
+        Err(ErrorClass::Rest),
+        "one malformed row through the seam must refuse before storage"
+    );
+    mock.shutdown().await;
+    pool.close().await;
 }
