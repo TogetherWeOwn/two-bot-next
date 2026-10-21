@@ -1033,7 +1033,7 @@ mod tests {
             "100",
             &[two_bot_core::leveling::LevelRoleReward {
                 level: 1,
-                role_id: "5555".into(),
+                role_id: "555555555555555555".into(),
             }],
         )
         .await
@@ -1100,7 +1100,7 @@ mod tests {
         );
         assert!(matches!(error, LevelingRuntimeError::RoleApplication {
             cause: RoleApplicationError::Refused { role_id, reason, applied, skipped }, ..
-        } if role_id == "5555" && reason.contains("403") && applied.is_empty() && skipped.is_empty()));
+        } if role_id == "555555555555555555" && reason.contains("403") && applied.is_empty() && skipped.is_empty()));
         assert_eq!(persisted, vec![("200".into(), 114), ("201".into(), 265)]);
         assert_eq!(
             *rest.requests.lock().unwrap(),
@@ -1108,12 +1108,12 @@ mod tests {
                 (Method::GET, "/api/v10/guilds/100/members/200".into()),
                 (
                     Method::PUT,
-                    "/api/v10/guilds/100/members/200/roles/5555".into()
+                    "/api/v10/guilds/100/members/200/roles/555555555555555555".into()
                 ),
                 (Method::GET, "/api/v10/guilds/100/members/201".into()),
                 (
                     Method::PUT,
-                    "/api/v10/guilds/100/members/201/roles/5555".into()
+                    "/api/v10/guilds/100/members/201/roles/555555555555555555".into()
                 ),
             ]
         );
