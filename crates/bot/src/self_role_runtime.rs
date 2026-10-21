@@ -1713,3 +1713,7 @@ mod tests;
 #[cfg(test)]
 #[path = "self_role_nonexclusive_acceptance_tests.rs"]
 mod nonexclusive_acceptance_tests;
+
+#[cfg(test)]
+#[path = "self_role_keeper_claim_acceptance_tests.rs"]
+mod keeper_claim_acceptance_tests;
