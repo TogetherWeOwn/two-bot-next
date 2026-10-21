@@ -39,7 +39,7 @@ sites across five runtimes, plus voice through the gateway closure):
 | audit | `audit_runtime.rs:308`, `:438` | 3 mirror destinations (`:60-63`) | every record (`:483`) and sweep (`:497`), once installed |
 | ticket | `ticket_runtime.rs:457`, `:981` | 3 ticket destinations (`:172-175`) | every execute/recovery and purge |
 | gateway classifier | `gateway.rs:818-833`, `:962` | human/welcome channel sets (`:844-861`) | every guild message; classifier + facts sink swap together (`leveling_runtime.rs:766`) |
-| voice | `gateway.rs:2138` closure | empty grace (`voice_rooms.rs:9415`), invite code (`:9460`) | spawn (`:7753-7757`), maintenance (`:3319`), `/invite` (`:13306-13307`) |
+| voice | `gateway.rs:2140` closure | empty grace (`voice_rooms.rs:9415`), invite code (`:9460`) | spawn (`:7753-7757`), maintenance (`:3319`), `/invite` (`:13306-13307`) |
 
 The thirty-six keys in `STORE_READ_KEYS`
 (`crates/core/tests/reference_docs.rs`) say “applied live by runtime refresh”
@@ -85,7 +85,7 @@ and the community-facts sink together before the message's channel class is
 stamped (`crates/bot/src/gateway.rs:818-833`, `:962`, `crates/discord/src/leveling_runtime.rs:766`), with malformed entries filtered silently so a wholly-malformed row applies as the empty set (`crates/core/src/community.rs:252-260`); the voice sweep applies `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` from the snapshot on spawn and every maintenance refresh, so a stored per-guild grace reaches the deletion sweep without a restart (`crates/bot/src/voice_rooms.rs:7753-7757`, `:3319`), and the invite responder applies `TWO_GUILD_INVITE_CODE` per `/invite` interaction (`crates/bot/src/voice_rooms.rs:13306-13307`), falling back to the live vanity code when the row is absent or invalid (`:9462-9467`). Two boot-only edges
 remain: the voice room-name policy is
 built once at boot from the process environment
-(`crates/bot/src/gateway.rs:2136`); and gateway intents plus ticket command
+(`crates/bot/src/gateway.rs:2138`); and gateway intents plus ticket command
 publication read the ticket destination keys once at boot
 (`crates/bot/src/gateway.rs:150`, `crates/bot/src/command_runtime.rs:431`), so a stored ticket
 destination reaches already-published commands only through the per-operation
