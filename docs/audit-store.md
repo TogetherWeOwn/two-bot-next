@@ -107,6 +107,17 @@ send capability. Opaque fencing prevents cross-generation writes, not misuse of
 a deliberately cloned claim by one consumer; downstream must keep one POST
 executor per successful preparation.
 
+## Operator handle
+
+The `audit_switch` binary (`crates/cutover/src/bin/audit_switch.rs`) engages,
+clears and reports the halt without hand SQL:
+
+`audit_switch --halt --actor <snowflake> | --resume | --status`
+
+`--halt` requires `--actor` (operator snowflake identity); `--resume` and
+`--status` take no actor. It connects only to disposable agent-testdb
+databases and refuses any other target before connecting.
+
 ## Crash and halt protocol for the service slice
 
 1. Route using the existing core guild/source/destination policies; record first.

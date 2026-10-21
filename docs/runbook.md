@@ -1995,8 +1995,10 @@ activation. Current activation admits these capabilities only for the staging
 guild/application pair; live flags alone cannot enable them. Registry entries
 do not prove every builtin has a handler. Internal-action HTTP is the
 dark-by-default private announcement receiver (see the Internal actions row).
-There is no binary audit-halt command or settings hot-reload/admin endpoint to
-recommend. See the [incident playbooks](#incident-playbooks) for persistent
+There is no settings hot-reload/admin endpoint to recommend; the audit halt
+handle is the `audit_switch` operator binary
+([usage](audit-store.md#operator-handle)). See the
+[incident playbooks](#incident-playbooks) for persistent
 ownership containment, actual degradation and stop boundaries.
 
 For unexpected writes: first identify the actual writer (legacy bot, next image,
@@ -2007,7 +2009,7 @@ tokens, or redeploy with an unreviewed wiring change during this docs procedure.
 
 | Control | Ported contract | Current operational boundary |
 |---|---|---|
-| Audit kill switch | Durable `audit_kill_switch`, singleton `id=1`; `engage_halt(actor_id)` / `disengage_halt()` library methods. Halt blocks queue discovery/claim/preparation, not fact recording or an already prepared/in-flight send. | Store and delivery sweep exist (`crates/bot/src/website_jobs.rs:289` registers `audit_runtime`; `crates/bot/src/audit_runtime.rs:141-159` installs the `audit_retry` sweep). Operator endpoint not wired: no supported command in this binary. Durable DB errors propagate; legacy pure-model read-fail-open is **not** send authorization. See [audit store](audit-store.md). |
+| Audit kill switch | Durable `audit_kill_switch`, singleton `id=1`; `engage_halt(actor_id)` / `disengage_halt()` library methods. Halt blocks queue discovery/claim/preparation, not fact recording or an already prepared/in-flight send. | Store and delivery sweep exist (`crates/bot/src/website_jobs.rs:294` registers `audit_runtime`; `crates/bot/src/audit_runtime.rs:141-159` installs the `audit_retry` sweep). Operator handle is the `audit_switch` binary ([usage](audit-store.md#operator-handle)); no command in the bot binary itself. Durable DB errors propagate; legacy pure-model read-fail-open is **not** send authorization. See [audit store](audit-store.md). |
 | Automod | Exact `TWO_AUTOMOD=1` enables config. Dry-run by default; exact `TWO_AUTOMOD_ENFORCE=1` selects enforce. | Forwarded and composed into the gateway when activation/configuration permit. Requires valid Owen/protected-role configuration; enforcement can sanction. `TWO_AUTOMOD=1` requests MESSAGE_CONTENT intent. Flags alone do not override identity/permission gates or stop the bot. Filter/effect semantics, repeat expiry, corpus care and triage: [automod operator guide](automod-operator-guide.md). |
 | Moderation | Exact `TWO_MODERATION=1`; enabled config requires `TWO_OWEN_USER_ID`; protected-role policy applies. | Forwarded; channel handlers `/purge`, `/slowmode`, `/lockdown`, `/unlock` are registered and subject to activation and permission checks. Do not infer every member-moderation builtin executes. No config toggle demonstrated as an emergency stop. |
 | Automations/announcements/text | `TWO_AUTOMATIONS=1`, `TWO_ANNOUNCEMENTS=1`; text needs automations **and** `TWO_TEXT_COMMANDS=1`. | Per-feature gates, not operational containment. Verify the affected deployed handler; registry publishing or a periodic job alone does not prove a specific action is active. |
@@ -2594,7 +2596,7 @@ into this Rust binary without an implemented dispatch path.
 | Redeploy/rollback/Coolify deployment | Replaced by explicit Wrangler environment/version/image procedure. Current production cutover remains separate; no Coolify action is prescribed here. |
 | Backup/restore, off-box storage, timers | Ported CLI/unit templates; [backup.md](backup.md). Only test-container rehearsals authorized here; no assertion timers are installed. |
 | Guild-config snapshot/restore/seal/drift | Ported staging-guarded CLI; not permission to run a real restore or use a live token. |
-| Operational audit kill switch/MAC reasons | Core/store port exists; delivery sweep wired (`crates/bot/src/website_jobs.rs:289`, `crates/bot/src/audit_runtime.rs:141-159`), operator control not wired. No fake SQL/CLI replacement. |
+| Operational audit kill switch/MAC reasons | Core/store port exists; delivery sweep wired (`crates/bot/src/website_jobs.rs:294`, `crates/bot/src/audit_runtime.rs:141-159`); operator handle is the `audit_switch` binary ([usage](audit-store.md#operator-handle)). No fake SQL replacement. |
 | Automod, moderation, feature toggles | Forwarded gates, channel-command handlers and gateway automod are implemented and identity/permission gated. This is not blanket builtin coverage or cutover approval; use the current containment table and verify the deployed writer. |
 | Health/REST rate limits/429 breaker | Liveness/readiness, durable token admission, executor-local pacing and process-wide guard are implemented. They differ from the legacy control topology; no manual reset endpoint. The private announcement receiver has a separate governor; a legacy writer uses its own runbook. |
 | Attribution/scorecard/plan/onboarding/automation reports | Legacy read-only reporting CLIs intentionally dropped by parity decision; core calculations/store presence does not add operator commands. |
