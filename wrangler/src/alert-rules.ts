@@ -203,6 +203,22 @@ export const CREATOR_MAP_REFRESH_SECONDS = 300;
  * interval never fires. Mirrors the `STALE_INTERVALS` two-interval rule.
  */
 export const CREATOR_MAP_STALE_SECONDS = 2 * CREATOR_MAP_REFRESH_SECONDS;
+/**
+ * Live-view not-ready bound in seconds: promotes the host watchdog's ">120 s"
+ * bound (`docs/observability-event-catalog.md`) into the standard alert
+ * pipeline. While the gauge is above 0 that guild's creator joins are
+ * dropped without an accept or refusal line; past this bound the runbook
+ * calls for a restart (fresh IDENTIFY + GUILD_CREATE) and a bug report.
+ */
+export const VOICE_LIVE_NOT_READY_THRESHOLD_SECONDS = 120;
+/**
+ * Queue-stall bound in seconds: mirrors the in-process stuck verdict
+ * (`watchdog_stuck_after` in `run_actor_with_limits`,
+ * `crates/bot/src/voice_rooms.rs`), which fires when queued actions see no
+ * completed dispatch turn for this long. An oldest-wait past it means a
+ * guild's queue has stalled or is draining unacceptably slowly.
+ */
+export const VOICE_QUEUE_STALL_THRESHOLD_SECONDS = 120;
 /** Error-budget ratio of the 48h watch: 99.9% SLO leaves 0.1% spendable. */
 export const ERROR_BUDGET_RATIO = 0.001;
 /** Fast burn: page when both the 15 min and 2 min windows burn faster than this. */
@@ -275,6 +291,10 @@ export const RULES: readonly RuleDef[] = [
   { id: "eventsub_reconcile_failed", summary: `EventSub reconcile failed passes increased between samples`, runbook: "runbook.md#alert-eventsub-reconcile-failed", severity: "ticket" },
   { id: "event_store_consumer_lag", summary: `event-store consumer lag above ${EVENT_STORE_LAG_THRESHOLD_SECONDS} s sustained for ${EVENT_STORE_LAG_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-event-store-consumer-lag", severity: "ticket" },
   { id: "prefix_trigger_verdict_refusals", summary: `prefix candidates refused by the automod verdict for ${PREFIX_TRIGGER_VERDICT_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-prefix-trigger-verdict-refusals", severity: "ticket" },
+  { id: "voice_worker_halted", summary: `voice worker halt latch engaged (a guild actor is halted)`, runbook: "runbook.md#alert-voice-worker-halted" },
+  { id: "voice_live_self_heal", summary: `live voice view self-heal repairs increased between samples`, runbook: "runbook.md#alert-voice-live-self-heal", severity: "ticket" },
+  { id: "voice_live_not_ready", summary: `voice live view not ready for more than ${VOICE_LIVE_NOT_READY_THRESHOLD_SECONDS} s on a connected gateway`, runbook: "runbook.md#alert-voice-live-not-ready" },
+  { id: "voice_queue_stall", summary: `oldest queued voice action waiting past ${VOICE_QUEUE_STALL_THRESHOLD_SECONDS} s`, runbook: "runbook.md#alert-voice-queue-stall", severity: "ticket" },
 ];
 
 /**
@@ -363,6 +383,10 @@ export interface MetricsAlertState {
   gatewayMissed: number;
   /** False until the first evaluation stores a baseline: the first sample never fires. */
   gatewayMissedSeen: boolean;
+  /** `two_bot_voice_live_self_heal_total` at the last valid sample. */
+  voiceLiveSelfHeal: number;
+  /** False until a valid sample stores the self-heal baseline: the first sample never fires. */
+  voiceLiveSelfHealSeen: boolean;
   checkpointFailures: number;
   /** False until the first evaluation stores a baseline: the first sample never fires. */
   checkpointFailuresSeen: boolean;
@@ -611,7 +635,7 @@ function errorBudgetBurnEvaluation(
   };
 }
 
-export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, breakerOpenStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, voiceVoteKickFailures: 0, voiceVoteKickFailuresSeen: false, voiceVoteKickFiring: false, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, gatewayNotReadySeen: false, gatewayNotReadyStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {}, communityFactsDrainFailures: {}, communityFactsDrainStreak: 0, eventsubPosts: {}, eventsubPostsSeen: false, eventStoreLagStreak: 0, eventsubTampered: 0, eventsubTamperedSeen: false, eventsubTamperedStreak: 0, reconcileHealthy: 0, reconcilePending: 0, reconcileFailed: 0, reconcileSeen: false };
+export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, breakerOpenStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, voiceVoteKickFailures: 0, voiceVoteKickFailuresSeen: false, voiceVoteKickFiring: false, gatewayMissed: 0, gatewayMissedSeen: false, voiceLiveSelfHeal: 0, voiceLiveSelfHealSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, gatewayNotReadySeen: false, gatewayNotReadyStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {}, communityFactsDrainFailures: {}, communityFactsDrainStreak: 0, eventsubPosts: {}, eventsubPostsSeen: false, eventStoreLagStreak: 0, eventsubTampered: 0, eventsubTamperedSeen: false, eventsubTamperedStreak: 0, reconcileHealthy: 0, reconcilePending: 0, reconcileFailed: 0, reconcileSeen: false };
 
 /** An unsuccessful scrape breaks the dispatch, breaker, and lag streaks, never an existing alert. */
 export function interruptDispatchDrops(state: MetricsAlertState): MetricsAlertState {
@@ -1288,6 +1312,84 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     firing.push("voice_creator_map_stale");
   }
 
+  // Voice worker halt latch: `two_bot_voice_worker_halted` reads 1 while any
+  // guild actor is halted by a store CredentialRefused or Discord 401, so the
+  // rule pages on a valid 1 and a valid 0 clears at once. Only store halts
+  // auto-recover (the 60 s credential re-probe); a 401 needs a token fix and a
+  // restart, so a latched 1 always names operator work. The latch is published
+  // every actor tick from live state and a halt is never a transient blip, so
+  // a single 1 reading pages without a streak. The gauge postdates older
+  // containers and is an optional scrape input: missing, malformed or
+  // non-boolean readings hold the previous firing state instead of resolving it.
+  const WORKER_HALTED_RULE = "voice_worker_halted";
+  const haltedRows = gauge("two_bot_voice_worker_halted");
+  const halted = haltedRows.length === 1 ? exactSeries(haltedRows, {}) : undefined;
+  if (halted === 1) {
+    firing.push(WORKER_HALTED_RULE);
+  } else if (halted !== 0 && prev.firing.includes(WORKER_HALTED_RULE)) {
+    firing.push(WORKER_HALTED_RULE);
+  }
+
+  // Live-view self-heal repairs (one ticket per covered fault): any increase
+  // of `two_bot_voice_live_self_heal_total` between two valid samples means a
+  // live view was left not ready on a connected gateway and was republished
+  // from the gateway cache. The first valid sample only stores the baseline
+  // and never fires, so lifetime counts predating the deploy stay silent; a
+  // counter that went backwards means the process restarted: no window. A
+  // missing or malformed family (older containers never emitted it) is no
+  // window either: it keeps the previous baseline and never fires on its own.
+  // `??` covers DO storage written before these fields existed.
+  const SELF_HEAL_RULE = "voice_live_self_heal";
+  const selfHealRows = gauge("two_bot_voice_live_self_heal_total");
+  const selfHeal = selfHealRows.length > 0 ? exactSeries(selfHealRows, {}) : undefined;
+  const prevSelfHeal = prev.voiceLiveSelfHeal ?? 0;
+  const selfHealSeen = prev.voiceLiveSelfHealSeen ?? false;
+  let voiceLiveSelfHeal = prevSelfHeal;
+  let voiceLiveSelfHealSeen = selfHealSeen;
+  if (selfHeal !== undefined) {
+    voiceLiveSelfHeal = selfHeal;
+    voiceLiveSelfHealSeen = true;
+    if (selfHealSeen && selfHeal > prevSelfHeal) firing.push(SELF_HEAL_RULE);
+  }
+
+  // Live-view not-ready age: `two_bot_voice_live_not_ready_seconds` is the
+  // maximum seconds a guild's live view has been not ready while the gateway
+  // is connected, republished every actor tick. While above 0 that guild's
+  // creator joins are dropped without an accept or refusal line; past
+  // VOICE_LIVE_NOT_READY_THRESHOLD_SECONDS the runbook calls for a restart
+  // and a bug report. The age itself is the sustainment: a single valid
+  // reading past the bound proves that many seconds of continuous not-ready,
+  // so the rule pages without a streak and a valid reading at or below the
+  // bound clears at once. The gauge is an optional scrape input, so older
+  // containers hold the previous firing state instead of resolving it.
+  const NOT_READY_RULE = "voice_live_not_ready";
+  const notReady = exactSeries(gauge("two_bot_voice_live_not_ready_seconds"), {});
+  if (notReady !== undefined) {
+    if (notReady > VOICE_LIVE_NOT_READY_THRESHOLD_SECONDS) firing.push(NOT_READY_RULE);
+  } else if (prev.firing.includes(NOT_READY_RULE)) {
+    firing.push(NOT_READY_RULE);
+  }
+
+  // Queue stall: `two_bot_voice_queue_oldest_age_seconds` is the maximum age
+  // of the oldest queued (not in-flight) voice action across all current
+  // guild actors. Past VOICE_QUEUE_STALL_THRESHOLD_SECONDS a guild's queue
+  // has stalled or is draining unacceptably slowly; the bound mirrors the
+  // in-process stuck verdict (`watchdog_stuck_after` in
+  // `run_actor_with_limits`). Ticket, not page: a slow-but-healthy drain can
+  // legitimately age past the bound under burst load, and member-visible join
+  // degradation already pages through the join-budget burn rules. A valid
+  // reading at or below the bound clears at once; the gauge is an optional
+  // scrape input, so older containers hold the previous firing state.
+  // Queue depth (`two_bot_voice_queue_pending{lane}`) is deliberately
+  // unconsumed: depth without age is not a failure signal (see the catalog).
+  const QUEUE_STALL_RULE = "voice_queue_stall";
+  const queueOldest = exactSeries(gauge("two_bot_voice_queue_oldest_age_seconds"), {});
+  if (queueOldest !== undefined) {
+    if (queueOldest > VOICE_QUEUE_STALL_THRESHOLD_SECONDS) firing.push(QUEUE_STALL_RULE);
+  } else if (prev.firing.includes(QUEUE_STALL_RULE)) {
+    firing.push(QUEUE_STALL_RULE);
+  }
+
   // Gateway missed events (sequence gaps inside one session): any increase
   // between two samples fails the zero-missed-events acceptance. The first
   // sample only stores the baseline and never fires; a counter that went
@@ -1643,7 +1745,7 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     else if (!healthyGrew && wasReconcileFiring) firing.push(RECONCILE_FAILED_RULE);
   }
 
-  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, prefixVerdictRefused: nextPrefixVerdict, prefixVerdictStreak: nextPrefixVerdictStreak, prefixVerdictSeen: nextPrefixVerdictSeen, breakerOpenStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, voiceVoteKickFailures: voiceVoteKickFailures ?? prevVoiceVoteKickFailures, voiceVoteKickFailuresSeen: voiceVoteKickFailures !== undefined ? true : prevVoteKickSeen, voiceVoteKickFiring, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, gatewayNotReadySeen, gatewayNotReadyStreak, dispatchDrops, dispatchDropStreaks, communityFactsDrainFailures, communityFactsDrainStreak, auditHaltStreak, eventStoreLagStreak, reconcileHealthy, reconcilePending, reconcileFailed, reconcileSeen, joinBurn: joinBurn.ring, eventsubPosts, eventsubPostsSeen, errorBudgetBurn: errorBudgetBurn.ring, eventsubTampered, eventsubTamperedSeen, eventsubTamperedStreak }, joinHeld: joinBurn.held, joinSlowCovered: joinBurn.slowCovered };
+  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, prefixVerdictRefused: nextPrefixVerdict, prefixVerdictStreak: nextPrefixVerdictStreak, prefixVerdictSeen: nextPrefixVerdictSeen, breakerOpenStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, voiceVoteKickFailures: voiceVoteKickFailures ?? prevVoiceVoteKickFailures, voiceVoteKickFailuresSeen: voiceVoteKickFailures !== undefined ? true : prevVoteKickSeen, voiceVoteKickFiring, gatewayMissed, gatewayMissedSeen: true, voiceLiveSelfHeal, voiceLiveSelfHealSeen, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, gatewayNotReadySeen, gatewayNotReadyStreak, dispatchDrops, dispatchDropStreaks, communityFactsDrainFailures, communityFactsDrainStreak, auditHaltStreak, eventStoreLagStreak, reconcileHealthy, reconcilePending, reconcileFailed, reconcileSeen, joinBurn: joinBurn.ring, eventsubPosts, eventsubPostsSeen, errorBudgetBurn: errorBudgetBurn.ring, eventsubTampered, eventsubTamperedSeen, eventsubTamperedStreak }, joinHeld: joinBurn.held, joinSlowCovered: joinBurn.slowCovered };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {
