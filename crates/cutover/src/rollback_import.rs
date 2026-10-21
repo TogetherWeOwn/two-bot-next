@@ -44,7 +44,9 @@ use std::collections::BTreeMap;
 
 use sqlx::{Executor, PgPool};
 use thiserror::Error;
-use two_bot_core::backup::dump_file::DESTINATION_OWNED_COLUMNS;
+use two_bot_core::backup::dump_file::{
+    is_canonical_tombstone_timestamp, DESTINATION_OWNED_COLUMNS,
+};
 use two_bot_core::backup::DUMP_TABLES;
 
 use crate::rollback_delta::{
@@ -74,6 +76,9 @@ pub enum ImportError {
     /// More rows for one table than the exporter ever writes per table.
     #[error("row cap exceeded for table '{table}': more than {MAX_EXPORT_ROWS_PER_TABLE} rows")]
     RowCap { table: String },
+    /// Tombstones use fixed-width UTC TEXT for chronological comparisons.
+    #[error("scheduled_events_tombstone row requires canonical millisecond UTC deleted_at")]
+    InvalidTombstoneTimestamp,
 }
 
 /// Apply-time failure. Database details are withheld; the CLI prints only
@@ -88,6 +93,8 @@ pub enum ImportApplyError {
     ConstraintViolation { table: String, constraint: String },
     #[error("invalid table name in validated import")]
     InvalidTable(String),
+    #[error("scheduled_events_tombstone row requires canonical millisecond UTC deleted_at")]
+    InvalidTombstoneTimestamp,
 }
 
 /// True when the exporter can emit rows for `table`: a measured table (one
@@ -150,6 +157,11 @@ pub fn parse_import(contents: &str) -> Result<Vec<ImportRow>, ImportError> {
             return Err(ImportError::UnknownTable {
                 table: table.to_owned(),
             });
+        }
+        if table == "scheduled_events_tombstone"
+            && !is_canonical_tombstone_timestamp(row.get("deleted_at"))
+        {
+            return Err(ImportError::InvalidTombstoneTimestamp);
         }
         let count = per_table.entry(table.to_owned()).or_insert(0);
         *count += 1;
@@ -507,6 +519,14 @@ pub async fn apply_import(
     pool: &PgPool,
     rows: &[ImportRow],
 ) -> Result<ApplyOutcome, ImportApplyError> {
+    // ImportRow is public: validate the whole batch before even opening the
+    // transaction, including a bad row after an otherwise valid prefix.
+    if rows.iter().any(|row| {
+        row.table == "scheduled_events_tombstone"
+            && !is_canonical_tombstone_timestamp(row.row.get("deleted_at"))
+    }) {
+        return Err(ImportApplyError::InvalidTombstoneTimestamp);
+    }
     let ordered = ordered_rows(rows);
     let mut tx = pool.begin().await?;
     // The exporter pins UTC (`legacy_verify::read_only_transaction`); pin it

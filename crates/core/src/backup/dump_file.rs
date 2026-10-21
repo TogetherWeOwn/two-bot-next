@@ -553,6 +553,24 @@ pub fn is_dump_table(name: &str) -> bool {
     DUMP_TABLES.contains(&name)
 }
 
+/// Tombstone high-water marks compare as TEXT, so restore must preserve the
+/// exact fixed-width millisecond UTC form, not merely a parseable instant.
+#[must_use]
+pub fn is_canonical_tombstone_timestamp(value: Option<&Value>) -> bool {
+    let Some(text) = value
+        .and_then(Value::as_str)
+        .filter(|text| text.len() == 24)
+    else {
+        return false;
+    };
+    let Ok(instant) =
+        time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
+    else {
+        return false;
+    };
+    crate::funnel::format_iso_millis((instant.unix_timestamp_nanos() / 1_000_000) as i64) == text
+}
+
 fn refuse(message: impl Into<String>) -> DumpError {
     DumpError::Refused(message.into())
 }
@@ -948,6 +966,13 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                     return Err(refuse(format!(
                         "{table} row on line {line_no} is missing a manifest column"
                     )));
+                }
+                if table == "scheduled_events_tombstone"
+                    && !is_canonical_tombstone_timestamp(data.get("deleted_at"))
+                {
+                    return Err(refuse(
+                        "scheduled_events_tombstone row requires canonical millisecond UTC deleted_at",
+                    ));
                 }
                 // Frozen v3 has native driver-decoded cells and no type metadata.
                 // This port's text-output encoding must remain strings/nulls.

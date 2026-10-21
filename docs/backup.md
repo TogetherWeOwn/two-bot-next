@@ -114,7 +114,12 @@ Restoring v9 without the claim guard clears both guard tables; the mirror
 re-fences on the next winning fetch. Use a v10 recovery point to preserve
 the monthly cap and the mirror fence. Current v10 archives must
 include the monthly cap and both mirror-fence tables, so routine restores
-retain their archived state.
+retain their archived state. Tombstone `deleted_at` cells must be real dates in
+exact `YYYY-MM-DDTHH:MM:SS.sssZ` form: inspection refuses missing, null,
+non-string or noncanonical values before restore opens a write transaction.
+Rollback-delta import enforces the same rule during parsing and revalidates the
+whole batch before applying constructed import rows. Values are not normalized;
+unrelated tables keep their existing timestamp behavior.
 An optional legacy table may be absent only when there are no archived rows for
 it. Nonempty legacy data without a matching target table refuses **before any
 truncate**, rather than silently discarding it.
