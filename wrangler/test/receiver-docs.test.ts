@@ -169,7 +169,18 @@ function conforms(markdown: string, evidence: Evidence): void {
   assert.match(releaseCell, /normalized.*unknown/i);
   const releaseRange = RELEASE_TOKEN.source.match(/\{(\d+),(\d+)\}/);
   assert.ok(releaseRange, "release token carries explicit bounds");
-  assert.match(releaseCell, new RegExp(`${releaseRange[1]}[–-]${releaseRange[2]}.*lowercase hex`, "i"));
+  const [releaseLow, releaseHigh] = [Number(releaseRange[1]), Number(releaseRange[2])];
+  // Digit boundaries: doc mutants "7–400" and "17–40" must not satisfy a 7–40 pin.
+  assert.match(releaseCell, new RegExp(`(?<!\\d)${releaseLow}[–-]${releaseHigh}(?!\\d).*lowercase hex`, "i"));
+  // Lowercase-only class, pinned from source and behavior: an uppercase-accepting
+  // RELEASE_TOKEN mutant must fail even though the doc wording still says lowercase.
+  assert.ok(RELEASE_TOKEN.source.includes("[0-9a-f]"), "release token is lowercase hex");
+  assert.ok(!RELEASE_TOKEN.source.includes("A-F"), "release token must not accept uppercase");
+  assert.equal(RELEASE_TOKEN.test("a".repeat(releaseLow)), true);
+  assert.equal(RELEASE_TOKEN.test("a".repeat(releaseLow - 1)), false);
+  assert.equal(RELEASE_TOKEN.test("a".repeat(releaseHigh)), true);
+  assert.equal(RELEASE_TOKEN.test("a".repeat(releaseHigh + 1)), false);
+  assert.equal(RELEASE_TOKEN.test("A".repeat(releaseLow)), false, "release token rejects uppercase");
   assert.doesNotMatch(markdown, /status.*and.*error_class.*only/i, "stale log-field promise");
   const wiring = table(markdown, "Name").map((row) => row[0]!);
   assert.deepEqual(wiring.sort(), Object.keys(evidence.env).filter((key) => key.startsWith("TWO_INTERNAL_")).sort());
@@ -177,7 +188,7 @@ function conforms(markdown: string, evidence: Evidence): void {
   for (const key of blocked) assert.equal(evidence.env[key], undefined, key);
   const gate = table(markdown, "Layer").find((row) => row[0] === "Gate")?.[1] ?? "";
   assert.match(gate, /INTERNAL_ACTIONS_INGRESS\s*=\s*"1"/, "missing staging var gate");
-  assert.match(gate, /TWO_INTERNAL_ACTIONS.*exactly 1/, "missing Operator secret gate");
+  assert.match(gate, /TWO_INTERNAL_ACTIONS.*exactly 1(?!\d)/, "missing Operator secret gate");
   const enable = markdown.split("### Enable order and rollback")[1]!.split("## Authentication")[0]!;
   assert.doesNotMatch(enable, /stages[^\n]*TWO_INTERNAL_ROLE_KEYS/, "ineffective role-key staging instruction");
   assert.match(markdown, /Adding secrets cannot enable unforwarded role\/capability gates/);
@@ -195,7 +206,12 @@ test("receiver runbook matches observed budgets, headers, logs and container wir
     ["forwarded role keys", doc.replace("| `TWO_INTERNAL_KEYS` |", "| `TWO_INTERNAL_ROLE_KEYS` | Worker secret |\n| `TWO_INTERNAL_KEYS` |")],
     ["stage role keys", doc.replace("2. Operator stages", "2. Operator stages `TWO_INTERNAL_ROLE_KEYS`, then stages")],
     ["wrong timeout code", doc.replace("| `upstream_timeout` | true |", "| `request_timeout` | true |")],
-    ["stale forwarded caps and release range", doc.replace(/^\| idempotency-key \|.*$/m, "| idempotency-key | Optional at ingress; at most 999 bytes. Receiver action rules still apply |").replace(/^\| content-type \|.*$/m, "| content-type | Required accepted JSON media type; at most 999 bytes |").replace("7–40", "7–99")],
+    ["stale idempotency cap", doc.replace(/^\| idempotency-key \|.*$/m, "| idempotency-key | Optional at ingress; at most 999 bytes. Receiver action rules still apply |")],
+    ["stale content-type cap", doc.replace(/^\| content-type \|.*$/m, "| content-type | Required accepted JSON media type; at most 999 bytes |")],
+    ["stale release range", doc.replace("7–40", "7–99")],
+    ["release range suffix mutant", doc.replace("7–40", "7–400")],
+    ["release range prefix mutant", doc.replace("7–40", "17–40")],
+    ["gate count prefix mutant", doc.replace("`TWO_INTERNAL_ACTIONS` exactly `1`", "`TWO_INTERNAL_ACTIONS` exactly `12`")],
     ["single-gate enablement", doc.replace("INTERNAL_ACTIONS_INGRESS", "REMOVED_GATE")],
   ];
   for (const [name, mutant] of stale) {
