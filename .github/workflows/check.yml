@@ -295,6 +295,8 @@ jobs:
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_synthetic_alert_duplicate_key_acceptance.py' -v
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_synthetic_alert_history_duplicate_key_acceptance.py' -v
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_slow_burn_tracker_duplicate_key_acceptance.py' -v
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_docker_manifests_no_assert_acceptance.py' -v
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docker_deps_no_assert.py' -v
 
       - name: soak evidence parser (offline, fixtures only)
         run: |
@@ -321,6 +323,12 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_run_record.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_run_record_no_echo_acceptance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_run_record_condition_shapes.py' -v
+
+      - name: SBOM intake refusal acceptance (offline)
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_validate_sbom_intake_refusal_acceptance.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_vulnerability_preflight_intake_refusal_acceptance.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_release_sbom_target_intake_refusal_acceptance.py' -v
 
       - name: Validate voice template fixtures (hermetic, no renderer)
         run: |

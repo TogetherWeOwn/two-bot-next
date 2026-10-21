@@ -22,7 +22,7 @@ pub const USAGE: &str = "\
       Fetch and compare the guild command list against the compiled, feature-gated
       builtins. Both commands are read-only unless publish receives --apply.
       Env: DISCORD_TOKEN, GUILD_ID, DISCORD_APPLICATION_ID; feature gates as on boot
-      (TWO_VOICE=1 adds the voice set; TWO_ASSISTANT_ENDPOINT also adds /templateassistant).
+      (TWO_VOICE=1 adds the voice set; /templateassistant stays unpublished until its slice lands).
       Live Discord targets additionally require TWO_DATABASE_URL (or DATABASE_URL
       when unset), the shared send-admission Postgres. No database is opened for
       loopback DISCORD_API_BASE fixtures, and no gateway is started.
@@ -468,11 +468,11 @@ mod tests {
 
     #[test]
     fn desired_registry_reads_voice_and_assistant_gates_without_io() {
-        for (voice, endpoint, assistant) in [
-            ("0", "https://example.invalid/assistant", false),
-            ("1", "", false),
-            ("1", "file:///assistant", false),
-            ("1", "https://example.invalid/assistant", true),
+        for (voice, endpoint) in [
+            ("0", "https://example.invalid/assistant"),
+            ("1", ""),
+            ("1", "file:///assistant"),
+            ("1", "https://example.invalid/assistant"),
         ] {
             let mut env = vars();
             env.insert("TWO_VOICE".into(), voice.into());
@@ -482,7 +482,12 @@ mod tests {
             for definition in two_bot_core::voice_rooms::voice_commands() {
                 assert_eq!(names.contains(&definition.name.as_str()), voice == "1");
             }
-            assert_eq!(names.contains(&"templateassistant"), assistant);
+            // Unpublished until the assistant slice lands with a handler: the
+            // endpoint currently publishes nothing.
+            assert!(
+                !names.contains(&"templateassistant"),
+                "voice={voice} endpoint={endpoint}"
+            );
         }
     }
 
