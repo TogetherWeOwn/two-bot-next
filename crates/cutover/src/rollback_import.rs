@@ -54,6 +54,12 @@ use crate::rollback_delta::{
 /// Plan format version, bumped only for breaking JSON changes.
 pub const IMPORT_PLAN_VERSION: u32 = 1;
 
+/// Maximum bytes for one NDJSON import line: 1 MiB. The 8 MiB file cap
+/// bounds the whole file but cannot refuse one huge line in an otherwise
+/// small file, so the row path enforces this per-line bound first; real
+/// export lines are hundreds of bytes.
+pub const MAX_IMPORT_LINE_BYTES: usize = 1024 * 1024;
+
 /// One validated export line: the target table and its full row object.
 #[derive(Debug, Clone)]
 pub struct ImportRow {
@@ -74,6 +80,9 @@ pub enum ImportError {
     /// More rows for one table than the exporter ever writes per table.
     #[error("row cap exceeded for table '{table}': more than {MAX_EXPORT_ROWS_PER_TABLE} rows")]
     RowCap { table: String },
+    /// One NDJSON line exceeds the per-line bound.
+    #[error("import line {line} exceeds the 1 MiB line limit ({len} bytes)")]
+    LineTooLong { line: usize, len: usize },
 }
 
 /// Apply-time failure. Database details are withheld; the CLI prints only
@@ -127,7 +136,8 @@ fn quote(name: &str) -> Result<String, ImportApplyError> {
 /// exporter can emit, and no table may exceed
 /// [`MAX_EXPORT_ROWS_PER_TABLE`] rows. Blank lines are skipped (the exporter
 /// terminates every line, including the last, with `\n`); line numbers are
-/// physical 1-based file lines. Returns the rows in file order.
+/// physical 1-based file lines. No line may exceed
+/// [`MAX_IMPORT_LINE_BYTES`]. Returns the rows in file order.
 pub fn parse_import(contents: &str) -> Result<Vec<ImportRow>, ImportError> {
     let mut rows = Vec::new();
     let mut per_table: BTreeMap<String, u64> = BTreeMap::new();
@@ -135,6 +145,12 @@ pub fn parse_import(contents: &str) -> Result<Vec<ImportRow>, ImportError> {
         let line_no = index + 1;
         if line.trim().is_empty() {
             continue;
+        }
+        if line.len() > MAX_IMPORT_LINE_BYTES {
+            return Err(ImportError::LineTooLong {
+                line: line_no,
+                len: line.len(),
+            });
         }
         let value: serde_json::Value =
             serde_json::from_str(line).map_err(|_| ImportError::Malformed { line: line_no })?;
@@ -657,6 +673,33 @@ mod tests {
         assert_eq!(rows[0].table, "member_levels");
         assert_eq!(rows[1].table, "members");
         assert_eq!(rows[2].table, "member_levels");
+    }
+
+    #[test]
+    fn overlong_line_refuses_with_the_line_bound() {
+        let overlong = format!(
+            "{{\"table\":\"events\",\"row\":{{\"pad\":\"{}\"}}}}",
+            "x".repeat(MAX_IMPORT_LINE_BYTES + 1)
+        );
+        let err = parse_import(&overlong).unwrap_err();
+        assert!(matches!(err, ImportError::LineTooLong { .. }));
+        let message = err.to_string();
+        assert!(message.contains("exceeds"), "{message}");
+        assert!(message.contains("line"), "{message}");
+    }
+
+    #[test]
+    fn line_at_the_line_bound_parses() {
+        let shell = "{\"table\":\"events\",\"row\":{\"id\":1,\"pad\":\"\"}}";
+        let pad_len = MAX_IMPORT_LINE_BYTES - shell.len();
+        let at_bound = shell.replacen(
+            "\"pad\":\"\"",
+            &format!("\"pad\":\"{}\"", "x".repeat(pad_len)),
+            1,
+        );
+        assert_eq!(at_bound.len(), MAX_IMPORT_LINE_BYTES);
+        let rows = parse_import(&at_bound).unwrap();
+        assert_eq!(rows.len(), 1);
     }
 
     #[test]

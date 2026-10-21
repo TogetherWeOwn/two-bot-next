@@ -8,6 +8,7 @@ use sqlx::{postgres::PgConnectOptions, ConnectOptions, Connection, PgConnection}
 use two_bot_core::database_tls::{self, TlsPolicy};
 use two_bot_cutover::legacy_mapping::MappingSpec;
 use two_bot_cutover::legacy_verify::{verify, DEFAULT_SAMPLE_LIMIT, MAX_SAMPLE_LIMIT};
+use two_bot_cutover::{over_cap_message, read_string_capped, IntakeReadError};
 use url::Url;
 
 const USAGE: &str =
@@ -15,6 +16,7 @@ const USAGE: &str =
     [--group <name>]... [--sample-limit <0..1000>]\n\
     Prefer --source-url-env <variable> and --target-url-env <variable> to keep\n\
     credentials out of process arguments. Reports JSON to stdout; writes no data.\n\
+    Intake cap: the mapping file must not exceed 8 MiB (exit 2, before any connection).\n\
     Exit codes: 0 equal, 1 mismatch, 2 refusal/error. No migrations or apply mode.";
 
 struct Args {
@@ -137,8 +139,13 @@ fn connection_options(text: &str, tls: TlsPolicy) -> Result<PgConnectOptions, &'
 }
 
 async fn run(args: Args) -> Result<bool, String> {
-    let text = std::fs::read_to_string(&args.mapping)
-        .map_err(|_| "cannot read mapping file".to_owned())?;
+    let text = match read_string_capped(&args.mapping) {
+        Ok(text) => text,
+        Err(IntakeReadError::OverCap) => return Err(over_cap_message("mapping file")),
+        Err(IntakeReadError::Unreadable(_)) => {
+            return Err("cannot read mapping file".to_owned());
+        }
+    };
     let spec = MappingSpec::parse(&text).map_err(|e| e.to_string())?;
     spec.select(&args.groups).map_err(|e| e.to_string())?;
     // Validate BOTH endpoints before connecting. Stop on the first connection

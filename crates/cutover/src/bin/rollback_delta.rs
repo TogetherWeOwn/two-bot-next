@@ -4,8 +4,10 @@
 use two_bot_cutover::{
     cli::{open_db, Args},
     legacy_copy::options::guarded_target,
+    over_cap_message, read_string_capped,
     rollback_delta::{export_delta, file_writer, parse_since, report},
     rollback_import::{apply_import, import_plan, parse_import},
+    IntakeReadError,
 };
 
 const IMPORT_HELP: &str =
@@ -28,7 +30,9 @@ divergent: the first run that drops updates is reported with its table:key
 entries and exits 3 unless `--acknowledge-divergent` is passed. The check is
 primary-keyed inside a UTC-pinned transaction. A failed insert names its
 table and constraint for integrity violations; other server errors stay
-redacted. No migrations are applied.";
+redacted. No migrations are applied. Intake caps: the file must not exceed
+8 MiB and no single line may exceed 1 MiB (both refuse with exit 2 before
+any parse).";
 
 #[tokio::main]
 async fn main() {
@@ -128,9 +132,16 @@ async fn run_import(args: Args) -> i32 {
             return 2;
         }
     };
-    let contents = match std::fs::read_to_string(&file) {
+    let contents = match read_string_capped(&file) {
         Ok(contents) => contents,
-        Err(_) => {
+        Err(IntakeReadError::OverCap) => {
+            eprintln!(
+                "rollback-delta import: {}",
+                over_cap_message("rollback delta import file")
+            );
+            return 2;
+        }
+        Err(IntakeReadError::Unreadable(_)) => {
             eprintln!("rollback-delta import: cannot read import file '{file}'");
             return 2;
         }
