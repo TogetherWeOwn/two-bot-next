@@ -1799,7 +1799,7 @@ async fn rejected_ban_through_command_path_logs_detail_with_ids_and_replies_fixe
     );
     let bans: Vec<_> = mock
         .requests()
-        .iter()
+        .into_iter()
         .filter(|r| r.method == "PUT" && r.path.contains("/bans/"))
         .collect();
     assert_eq!(bans.len(), 1, "one refused ban dispatch");
