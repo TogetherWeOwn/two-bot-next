@@ -89,6 +89,25 @@ class ProbeError(Exception):
     """A check's one-line failure reason (fixed vocabulary plus observed values)."""
 
 
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    raised message is fixed vocabulary: it names no key, value or path.
+    """
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
+
+
 @dataclass(frozen=True)
 class Result:
     name: str
@@ -163,7 +182,9 @@ def get_json(fetch_fn, url, name):
     if len(body) > BODY_CAP:
         raise ProbeError(f"{name} probe answered over the body cap")
     try:
-        value = json.loads(body)
+        value = json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+    except DuplicateKeyError:
+        raise ProbeError(f"{name} probe carries duplicate JSON object keys") from None
     except (ValueError, UnicodeDecodeError, RecursionError):
         # Deeply nested in-cap JSON exhausts the decoder recursion limit;
         # refuse it as malformed, same as any other unparseable body.

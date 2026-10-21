@@ -280,7 +280,7 @@ class ProbeTests(unittest.TestCase):
         self.server.fallback = "twoInvite"
         results = self.run_probes(expect_fallback_code="twoInvite")
         self.assertVerdicts(results)
-        self.assertEqual(results["fallback"]["observed"]["fallback_location"], "https://discord.gg/twoInvite")
+        self.assertEqual(results["fallback"]["observed"]["fallback_location"], "discord_invite")
         # Lookup outage: an unknown slug may redirect, but only to the fallback.
         self.server.overrides[f"/{SLUG}"] = (302, {"location": "https://discord.gg/twoInvite"}, "")
         results = self.run_probes()
@@ -444,6 +444,61 @@ class ProbeTests(unittest.TestCase):
                 contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(staging_probe.main(["--base-url", STAGING, "--worker-version", VERSION]), 1)
         self.assertEqual(json.loads(out.getvalue())["verdict"], "FAIL")
+
+
+def _boundary_healthy_fetch(method, path):
+    """A fully green staging surface with no Location headers anywhere."""
+    text = {"content-type": "text/plain"}
+    if path == "/health":
+        return staging_probe.Reply(200, {"content-type": "application/json"},
+                                   '{"status":"ok"}')
+    if path == "/readyz":
+        return staging_probe.Reply(200, {"content-type": "application/json"},
+                                   json.dumps(READY))
+    if path == "/healthz":
+        return staging_probe.Reply(200, text, "ok\n")
+    if path == "/ops/metrics":
+        return staging_probe.Reply(404, text, "not found")
+    if path in staging_probe.HEALTHZ_ALIASES or path in staging_probe.METRICS_ALIASES:
+        return staging_probe.Reply(404, text, "not found\n")
+    if method == "HEAD" and path == "/":
+        return staging_probe.Reply(404, text, "not found\n")
+    return staging_probe.Reply(404, text, "not found\n")
+
+
+class TimeoutCapBoundaryTests(unittest.TestCase):
+    """Pin the documented 60 s --timeout cap boundary in this suite.
+
+    The acceptance fixtures stop valid values at 30 and only refuse 1e9
+    over the cap, so a strict-< off-by-one or a raised cap would survive
+    there. These two cases sit exactly at the bound and just above it.
+    """
+
+    def test_timeout_cap_60_reaches_transport(self):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(staging_probe, "make_fetch") as transport, \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            transport.side_effect = lambda origin, timeout: _boundary_healthy_fetch
+            code = staging_probe.main(["--base-url", STAGING,
+                                       "--worker-version", VERSION,
+                                       "--timeout", "60"])
+        self.assertEqual(code, 0, err.getvalue())
+        transport.assert_called_once_with(STAGING, 60.0)
+        self.assertEqual(json.loads(out.getvalue())["verdict"], "PASS")
+
+    def test_timeout_just_over_cap_61_refuses_before_any_request(self):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(staging_probe, "make_fetch") as transport, \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            transport.side_effect = lambda origin, timeout: _boundary_healthy_fetch
+            code = staging_probe.main(["--base-url", STAGING,
+                                       "--worker-version", VERSION,
+                                       "--timeout", "61"])
+        self.assertEqual(code, 2)
+        transport.assert_not_called()
+        self.assertEqual(out.getvalue(), "", "a refusal must not write a report to stdout")
+        self.assertIn("--timeout", err.getvalue())
+        self.assertIn("at most 60", err.getvalue())
 
 
 class BodyCapRefusalTests(unittest.TestCase):
