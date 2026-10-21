@@ -347,9 +347,9 @@ async fn definitive_failure_preserves_first_fact_on_explicit_retry() {
         ScriptedResponse::status(500),
     )
     .await;
-    let runtime = runtime(pool.clone(), &mock);
+    let runtime1 = runtime(pool.clone(), &mock);
     assert!(matches!(
-        runtime
+        runtime1
             .handle_interaction(&slash(405, "faq"), Some("Test guild"))
             .await,
         Err(CustomCommandError::Delivery)
@@ -362,8 +362,8 @@ async fn definitive_failure_preserves_first_fact_on_explicit_retry() {
         ScriptedResponse::status(500),
     )
     .await;
-    let runtime = runtime(pool.clone(), &mock);
-    match runtime
+    let runtime2 = runtime(pool.clone(), &mock);
+    match runtime2
         .handle_interaction(&slash(405, "faq"), Some("Test guild"))
         .await
     {
@@ -389,10 +389,10 @@ async fn uncertain_completion_retry_records_only_its_own_outcome() {
         ScriptedResponse::status(500),
     )
     .await;
-    let runtime = runtime(pool.clone(), &mock);
+    let runtime1 = runtime(pool.clone(), &mock);
     // The variant is pinned by the 500 test above; here the attempt must only
     // fail without recording, so the retry below owns the fact.
-    assert!(runtime
+    assert!(runtime1
         .handle_interaction(&slash(406, "faq"), Some("Test guild"))
         .await
         .is_err());
@@ -402,8 +402,8 @@ async fn uncertain_completion_retry_records_only_its_own_outcome() {
         ScriptedResponse::status(500),
     )
     .await;
-    let runtime = runtime(pool.clone(), &mock);
-    match runtime
+    let runtime2 = runtime(pool.clone(), &mock);
+    match runtime2
         .handle_interaction(&slash(406, "faq"), Some("Test guild"))
         .await
     {
