@@ -866,7 +866,7 @@ def dry_run_plan(drill, pin):
     except GateError as error:
         drill.failed("drill", error)
         return 1
-    except Exception:  # noqa: BLE001 - no traceback: it may carry request data
+    except Exception:  # No traceback: it may carry request data.
         drill.failed("drill", GateError("unexpected_error"))
         return 1
     print("\n".join([
