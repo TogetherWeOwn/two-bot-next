@@ -2972,6 +2972,45 @@ mod tests {
         );
     }
 
+    fn global_drop_poison_count(guard: &str) -> u64 {
+        let prefix = format!("two_bot_drop_poison_total{{guard=\"{guard}\"}} ");
+        global()
+            .render(None)
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .and_then(|count| count.parse().ok())
+            .expect("allowlisted guard series renders")
+    }
+
+    #[test]
+    fn recover_drop_poison_counts_only_a_poisoned_lock() {
+        // Only this test touches the `schedule_run` series in the core lib
+        // test binary, so exact deltas on the process-global counter hold.
+        let lock = Mutex::new(7_u32);
+        let start = global_drop_poison_count("schedule_run");
+        {
+            let guard = recover_drop_poison(lock.lock(), "schedule_run");
+            assert_eq!(*guard, 7);
+        }
+        assert_eq!(global_drop_poison_count("schedule_run"), start);
+
+        let holder = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = lock.lock().expect("uncontended");
+            panic!("poison the lock");
+        }));
+        assert!(holder.is_err());
+        assert!(lock.is_poisoned());
+        {
+            let mut guard = recover_drop_poison(lock.lock(), "schedule_run");
+            assert_eq!(*guard, 7);
+            *guard = 8;
+        }
+        assert_eq!(global_drop_poison_count("schedule_run"), start + 1);
+        // Poison is sticky: a second recovery counts again.
+        drop(recover_drop_poison(lock.lock(), "schedule_run"));
+        assert_eq!(global_drop_poison_count("schedule_run"), start + 2);
+    }
+
     #[test]
     fn drop_poison_hostile_labels_collapse_without_new_series() {
         let metrics = Metrics::default();
