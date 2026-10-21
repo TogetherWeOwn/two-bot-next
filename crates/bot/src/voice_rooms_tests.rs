@@ -47,6 +47,8 @@ mod sink;
 mod snapshot_fence_acceptance;
 #[path = "../../core/tests/support/tracing_capture.rs"]
 mod tracing_capture;
+#[path = "voice_votekick_ballot_truth_acceptance_tests.rs"]
+mod votekick_ballot_truth_acceptance;
 
 const GUILD: u64 = 100;
 const CREATOR: u64 = 200;
