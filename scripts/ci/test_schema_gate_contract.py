@@ -60,6 +60,22 @@ class SchemaGateContractTests(unittest.TestCase):
                     self.terminal(outcome, "manifest_invalid")
                     self.assertIsNone(outcome.saved)
 
+    def test_exponent_overflow_wire_float_is_refused_as_malformed_output(self):
+        for target in ("staging", "production"):
+            with self.subTest(target=target, field="extra_metric"):
+                wire = json.dumps(fixtures.report(target))[:-1] + ', "extra_metric": 1e999}\n'
+                outcome = fixtures.invoke(target, stdout=wire)
+                self.terminal(outcome, "manifest_invalid")
+                self.assertIsNone(outcome.saved)
+            with self.subTest(target=target, field="audit.used"):
+                payload = fixtures.report(target)
+                payload["audit"] = {"connection_usage": {"used": 25, "max_connections": 25}}
+                wire = json.dumps(payload).replace('"used": 25', '"used": 1e999', 1)
+                self.assertIn("1e999", wire)
+                outcome = fixtures.invoke(target, stdout=wire)
+                self.terminal(outcome, "manifest_invalid")
+                self.assertIsNone(outcome.saved)
+
     def test_invalid_connection_counts_cannot_break_a_valid_gate(self):
         for target in ("staging", "production"):
             for field in ("used", "max_connections", "effective_max_connections", "reserved_connections"):

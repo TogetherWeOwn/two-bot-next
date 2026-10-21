@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -72,6 +73,16 @@ def invalid_constant(value):
     raise Refused("plan manifest is not valid JSON")
 
 
+def finite_float(raw):
+    """Refuse exponent-overflow wire numbers; json would decode them as inf."""
+    try:
+        value = float(raw)
+    except ValueError:
+        raise Refused("plan manifest is not valid JSON") from None
+    require(math.isfinite(value), "plan manifest is not valid JSON")
+    return value
+
+
 def pending_versions(manifest, key="pending_before"):
     """Return the strictly-ascending pending list; refuse malformed manifests."""
     require(isinstance(manifest, dict), "plan manifest is not an object")
@@ -136,7 +147,8 @@ def run_plan(argv, run):
     require(isinstance(proc.stdout, str), "plan manifest is not valid JSON")
     try:
         return json.loads(proc.stdout.strip().splitlines()[-1],
-                          object_pairs_hook=unique_object, parse_constant=invalid_constant)
+                          object_pairs_hook=unique_object, parse_constant=invalid_constant,
+                          parse_float=finite_float)
     except Refused:
         raise
     except (ValueError, IndexError, RecursionError):
