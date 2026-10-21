@@ -51,7 +51,10 @@ const BODY_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 struct ReceiverState {
-    secret: RwLock<two_bot_core::twitch_eventsub::WebhookSecret>,
+    /// The one live signing snapshot: seeded from the boot secret, swapped
+    /// by armed refresh, and shared (by [`Arc`] clone) with the reconcile
+    /// loop so creates always carry the secret verified here.
+    secret: Arc<RwLock<two_bot_core::twitch_eventsub::WebhookSecret>>,
     /// No-restart rotation, armed only when the Operator provisioned
     /// `TWO_EVENTSUB_RELOAD_KEY`. `None` keeps the legacy startup-secret
     /// behavior: the snapshot below never changes after bind.
@@ -71,7 +74,7 @@ impl ReceiverState {
         Self {
             // Keep one atomic secret snapshot in the state; handlers never
             // re-read the environment or observe partially replaced material.
-            secret: RwLock::new(config.secret().clone()),
+            secret: Arc::new(RwLock::new(config.secret().clone())),
             reload: config.reload_key().cloned().map(RefreshVerifier::new),
             capacity: Arc::new(Semaphore::new(MAX_REQUESTS)),
             delivery: delivery.map(Arc::new),
@@ -107,6 +110,14 @@ pub async fn bind_with_delivery(
 }
 
 impl BoundEventsubReceiver {
+    /// The live signing snapshot this receiver verifies against (and swaps
+    /// on armed refresh). The reconcile loop shares this handle so its
+    /// creates always carry the current secret: one snapshot for both
+    /// sides, never a split-brain copy.
+    pub fn secret_snapshot(&self) -> Arc<RwLock<two_bot_core::twitch_eventsub::WebhookSecret>> {
+        Arc::clone(&self.state.secret)
+    }
+
     /// Supervised alongside the public listener and the internal-actions
     /// receiver; first termination stops admission everywhere.
     pub async fn serve(self, shutdown: tokio::sync::watch::Receiver<bool>) -> std::io::Result<()> {
@@ -1588,6 +1599,37 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["error"]["code"], "upstream_timeout");
         assert_eq!(value["error"]["retryable"], true);
+    }
+
+    #[tokio::test]
+    async fn secret_snapshot_shares_the_live_handle() {
+        // The reconciler signs creates with the receiver's live snapshot, not
+        // a copy: the initial value is the boot secret, and a write through
+        // one handle is visible through the other. The listener binds an
+        // ephemeral loopback port and is never served.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral bind must succeed");
+        let config = config();
+        let bound = BoundEventsubReceiver {
+            listener,
+            state: Arc::new(ReceiverState::new(&config)),
+        };
+        let first = bound.secret_snapshot();
+        assert_eq!(
+            *first.read().expect("snapshot must be readable"),
+            *config.secret(),
+            "snapshot seeds from the boot secret"
+        );
+        let second = bound.secret_snapshot();
+        let rotated = two_bot_core::twitch_eventsub::WebhookSecret::new(fresh_reload_secret())
+            .expect("rotated secret must parse");
+        *first.write().expect("snapshot must be writable") = rotated.clone();
+        assert_eq!(
+            *second.read().expect("snapshot must be readable"),
+            rotated,
+            "the snapshot is shared, not copied"
+        );
     }
 
     // Webhook-secret reload coverage: the no-restart rotation contract.
