@@ -199,13 +199,15 @@ class SelectionTests(unittest.TestCase):
         # preflight) fall through to the worker-only docs rule.
         # docs/backup.md reads content in the voice owner-grant journal
         # regression, so it selects rust despite the preconditions
-        # existence check.
+        # existence check. docs/tickets.md is embedded by the ticket
+        # component admission acceptance suite.
         rust_docs = ["docs/cutover.md",
                      "docs/commands.md", "docs/configuration.md",
                      "docs/voice-rooms.md",
                      "docs/soak-checklist.json", "docs/soak-checklist.md",
                      "docs/privacy.md", "docs/database-roles.md",
-                     "docs/rollback-delta.md", "docs/backup.md"]
+                     "docs/rollback-delta.md", "docs/backup.md",
+                     "docs/tickets.md"]
         for path in rust_docs:
             with self.subTest(path=path):
                 self.assertEqual(inputs.classify(path), {RUST}, path)
