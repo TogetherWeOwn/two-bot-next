@@ -13,6 +13,7 @@ import sys
 OVER_CAP = "Release tag response exceeds the byte cap"
 DUP_KEYS = "Release tag response carries duplicate object keys"
 BAD_CONST = "Release tag response carries a non-finite number"
+TOO_DEEP = "Release tag response is too deeply nested"
 # Real gh responses are under 1 KiB; the 2 MiB fixture must refuse.
 RESPONSE_CAP = 1 << 20
 
@@ -47,12 +48,15 @@ def _reject_non_finite_float(text):
 def parse_response(raw):
     if len(raw.encode("utf-8")) > RESPONSE_CAP:
         raise ValueError(OVER_CAP)
-    return json.loads(
-        raw,
-        object_pairs_hook=_reject_duplicate_keys,
-        parse_constant=_reject_constant,
-        parse_float=_reject_non_finite_float,
-    )
+    try:
+        return json.loads(
+            raw,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_constant,
+            parse_float=_reject_non_finite_float,
+        )
+    except RecursionError:
+        raise ValueError(TOO_DEEP) from None
 
 
 def github_object(path):

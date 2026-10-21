@@ -52,12 +52,15 @@ def read_capped_text(path, cap):
 
 
 def parse_bom_text(text):
-    return json.loads(
-        text,
-        object_pairs_hook=_reject_duplicate_keys,
-        parse_constant=_reject_constant,
-        parse_float=_reject_non_finite_float,
-    )
+    try:
+        return json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_constant,
+            parse_float=_reject_non_finite_float,
+        )
+    except RecursionError:
+        raise ValueError(TOO_DEEP) from None
 
 
 def components(bom, _depth=0):
