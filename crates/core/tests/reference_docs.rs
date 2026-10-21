@@ -23,10 +23,11 @@ guild fences, feature gates and handler checks still apply. See [parity](parity.
 The router publishes one complete set: first definition wins, built-in names\n\
 are reserved, and Discord's 100-command limit applies. Database-backed custom\n\
 commands and optional text triggers are dynamic and are not listed here.\n\n\
-The voice commands publish only while `TWO_VOICE=1`, and `/templateassistant`\n\
-also needs `TWO_ASSISTANT_ENDPOINT`; both are enabled here. The voice `kick`\n\
-loses first-wins to moderation `/kick`, so the `/kick` below is the moderation\n\
-command and the vote-kick shape is not listed.\n\n\
+The voice commands publish only while `TWO_VOICE=1`, which is enabled\n\
+here. `/templateassistant` stays unpublished until its slice lands with a\n\
+handler, so `TWO_ASSISTANT_ENDPOINT` currently publishes nothing. The voice\n\
+`kick` loses first-wins to moderation `/kick`, so the `/kick` below is the\n\
+moderation command and the vote-kick shape is not listed.\n\n\
 Bounds below are registry bounds; a dash means no bound is declared there,\n\
 not that handler validation is unlimited. Permissions are Discord default\n\
 member-permission bitfields, not a replacement for runtime authorization.\n\n";
@@ -64,7 +65,7 @@ sites across five runtimes, plus voice through the gateway closure):\n\n\
 | --- | --- | --- | --- |\n\
 | automod | `automod_gateway.rs:211-223`, `:292` | 10 live lists, thresholds, enforce flag (`:116-127`) | every message delivery |\n\
 | feed | `feed_jobs.rs:235-237` | `TWO_FEED_POLL_SECONDS` (`:207`) | supervisor cadence + per-tick gate (`:246-289`) |\n\
-| audit | `audit_runtime.rs:308`, `:438` | 3 mirror destinations (`:60-63`) | every record (`:483`) and sweep (`:497`) |\n\
+| audit | `audit_runtime.rs:308`, `:438` | 3 mirror destinations (`:60-63`) | every record (`:483`) and sweep (`:497`), once installed |\n\
 | ticket | `ticket_runtime.rs:457`, `:981` | 3 ticket destinations (`:172-175`) | every execute/recovery and purge |\n\
 | gateway classifier | `gateway.rs:774-789`, `:918` | human/welcome channel sets (`:800-817`) | every guild message; classifier + facts sink swap together (`leveling_runtime.rs:766`) |\n\
 | voice | `gateway.rs:2082` closure | empty grace (`voice_rooms.rs:9415`), invite code (`:9460`) | spawn (`:7753-7757`), maintenance (`:3319`), `/invite` (`:13306-13307`) |\n\n\
@@ -98,7 +99,10 @@ reschedules the next run to last-run + new interval without a restart\n\
 `DISCORD_MODERATION_LOG_CHANNEL_ID` from the snapshot on every record and\n\
 sweep (`crates/bot/src/audit_runtime.rs:60-63`, `:308`, `:438`), where blanking\n\
 all three parks the mirror live and a malformed row keeps the last good\n\
-destinations; ticket operations apply\n\
+destinations; with no destination at boot, registration installs neither the\n\
+mirror handle nor the retry job, so a later stored destination cannot activate\n\
+that parked runtime (`crates/bot/src/audit_runtime.rs:137-161`); ticket\n\
+operations apply\n\
 `DISCORD_TICKET_CATEGORY_ID`, `DISCORD_TICKET_PANEL_CHANNEL_ID` and\n\
 `DISCORD_TICKET_STAFF_ROLE_ID` from the snapshot on every execute, recovery\n\
 and purge (`crates/bot/src/ticket_runtime.rs:172-175`, `:457`, `:981`), where a\n\

@@ -16,6 +16,8 @@ import tomllib
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, HTTPRedirectHandler, build_opener
 
+from build_identity import is_deploy_id_shape, parse_deploy_id
+
 WORKER = "two-bot-next-staging"
 APPLICATION = "two-bot-next-twobotcontainer-staging"
 CLASS = "TwoBotContainer"
@@ -189,9 +191,23 @@ class Client:
             return data["result"]
 
 
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins, at any depth."""
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
+
+
 def decode(body):
     try:
-        return json.loads(body)
+        return json.loads(body, object_pairs_hook=_reject_duplicate_keys)
     except (ValueError, UnicodeError, RecursionError):
         # Excessively nested input exhausts the decoder's recursion budget
         # below MAX_BODY; classify it as invalid_json like any malformed body.
@@ -306,12 +322,13 @@ def deploy_version(records, started):
     return version
 
 
-def image_receipt(tags, details, version, revision, build_id):
+def image_receipt(tags, details, version, revision, build_id, deploy_id):
     prefix = version.split("-")[0]
     pattern = rf"registry\.cloudflare\.com/[^/@\s]+/{APPLICATION}:{prefix}"
     selected = [tag for tag in tags if re.fullmatch(pattern, tag)]
     require(len(selected) == 1, "image_tag_missing_or_ambiguous")
-    require(details.get("revision") == revision and details.get("build_id") == build_id,
+    require(details.get("revision") == revision and details.get("build_id") == build_id
+            and details.get("deploy_id") == deploy_id,
             "image_build_mismatch")
     digests = [digest for digest in sequence(details.get("digests"))
                if isinstance(digest, str) and re.fullmatch(IMAGE, digest)]
@@ -320,7 +337,7 @@ def image_receipt(tags, details, version, revision, build_id):
     return digests[0]
 
 
-def docker_image(version, revision, build_id):
+def docker_image(version, revision, build_id, deploy_id):
     def docker(*args):
         try:
             result = subprocess.run(["docker", *args], capture_output=True, timeout=20, check=True)
@@ -333,12 +350,13 @@ def docker_image(version, revision, build_id):
     pattern = rf"registry\.cloudflare\.com/[^/@\s]+/{APPLICATION}:{version.split('-')[0]}"
     matches = [tag for tag in tags if re.fullmatch(pattern, tag)]
     require(len(matches) == 1, "image_tag_missing_or_ambiguous")
-    # Inspect only the two non-secret labels and RepoDigests, never Config.Env.
+    # Inspect only the three non-secret labels and RepoDigests, never Config.Env.
     format_string = ('{"revision":{{json (index .Config.Labels "org.opencontainers.image.revision")}},'
                      '"build_id":{{json (index .Config.Labels "com.togetherweown.build-id")}},'
+                     '"deploy_id":{{json (index .Config.Labels "com.togetherweown.deploy-id")}},'
                      '"digests":{{json .RepoDigests}}}')
     details = mapping(decode(docker("image", "inspect", matches[0], "--format", format_string)))
-    return image_receipt(tags, details, version, revision, build_id)
+    return image_receipt(tags, details, version, revision, build_id, deploy_id)
 
 
 def select_rollout(rows, baseline, image):
@@ -441,13 +459,14 @@ def active_worker(client, version):
             and versions[0].get("percentage") == 100, "worker_version_not_active")
 
 
-def runtime_ready(status, headers, body, version, revision, build_id):
+def runtime_ready(status, headers, body, version, revision, build_id, deploy_id):
     if status != 200:
         return False
     # Unknown/mismatched identities never pass, even for a healthy old process.
     require(headers.get("x-two-worker-version") == version, "serving_worker_mismatch")
     report = mapping(decode(body))
-    require(report.get("build_revision") == revision and report.get("build_id") == build_id,
+    require(report.get("build_revision") == revision and report.get("build_id") == build_id
+            and report.get("deploy_id") == deploy_id,
             "serving_image_mismatch")
     components = sequence(report.get("components"))
     return bool(components) and all(isinstance(part, list) and len(part) == 2 and part[1] == "ready"
@@ -489,7 +508,7 @@ def gateway_failure(report):
     return None
 
 
-def runtime_observation(status, headers, body, version, revision, build_id):
+def runtime_observation(status, headers, body, version, revision, build_id, deploy_id):
     # Only component names/states that fit a strict token are echoed; the probe
     # body and headers are service output and are otherwise discarded.
     parts = [f"readyz={status}"]
@@ -506,7 +525,8 @@ def runtime_observation(status, headers, body, version, revision, build_id):
         parts.append("components=" + ",".join(components))
     except GateError:
         pass
-    parts.append("identity=" + readiness_identity(headers, report, version, revision, build_id))
+    parts.append("identity=" + readiness_identity(headers, report, version, revision, build_id,
+                                                       deploy_id))
     token = readiness_token(report)
     if token:
         parts.append(f"token={token}")
@@ -516,12 +536,12 @@ def runtime_observation(status, headers, body, version, revision, build_id):
     return " ".join(parts)
 
 
-def readiness_identity(headers, report, version, revision, build_id):
+def readiness_identity(headers, report, version, revision, build_id, deploy_id):
     worker = headers.get("x-two-worker-version")
     if not isinstance(report, dict):
         return "mismatch" if worker is not None and worker != version else "absent"
-    observed = (worker, report.get("build_revision"), report.get("build_id"))
-    expected = (version, revision, build_id)
+    observed = (worker, report.get("build_revision"), report.get("build_id"), report.get("deploy_id"))
+    expected = (version, revision, build_id, deploy_id)
     if any(value is not None and value != target for value, target in zip(observed, expected)):
         return "mismatch"
     if any(value is None for value in observed):
@@ -542,8 +562,9 @@ def readiness_token(report):
     return None
 
 
-def zero_instance_readiness_observation(status, headers, report, version, revision, build_id):
-    if readiness_identity(headers, report, version, revision, build_id) != "match":
+def zero_instance_readiness_observation(status, headers, report, version, revision, build_id,
+                                          deploy_id):
+    if readiness_identity(headers, report, version, revision, build_id, deploy_id) != "match":
         return None
     components = report.get("components")
     if not isinstance(components, list):
@@ -591,7 +612,7 @@ def record_zero_instance_timeout(client, row, verification_started):
     client.observation += f" phase=rollout reason=zero_instances elapsed_s={elapsed}{details}"
 
 
-def unconverged_readiness(client, url, version, revision, build_id, zero_instances):
+def unconverged_readiness(client, url, version, revision, build_id, deploy_id, zero_instances):
     # Best effort from the existing readiness probe; logs contain only status,
     # identity class and fixed tokens, never upstream text or identifiers.
     status, headers, body = client.request(url + "/readyz")
@@ -600,7 +621,7 @@ def unconverged_readiness(client, url, version, revision, build_id, zero_instanc
         report = mapping(decode(body))
     except GateError:
         report = None
-    identity = readiness_identity(headers, report, version, revision, build_id)
+    identity = readiness_identity(headers, report, version, revision, build_id, deploy_id)
     parts = [f"readyz={status_code}", f"identity={identity}"]
     token = readiness_token(report)
     if token:
@@ -609,7 +630,7 @@ def unconverged_readiness(client, url, version, revision, build_id, zero_instanc
         return None, " ".join(parts)
     failure = gateway_failure(report)
     diagnostic = (zero_instance_readiness_observation(
-        status, headers, report, version, revision, build_id) if zero_instances else None)
+        status, headers, report, version, revision, build_id, deploy_id) if zero_instances else None)
     return failure, diagnostic or " ".join(parts)
 
 
@@ -706,8 +727,14 @@ def prepare(args, client):
     staging_url()
     revision = os.environ.get("GITHUB_SHA", "")
     build_id = f"{os.environ.get('GITHUB_RUN_ID', '')}-{os.environ.get('GITHUB_RUN_ATTEMPT', '')}"
-    require(re.fullmatch(r"[0-9a-f]{40}", revision) and re.fullmatch(r"[0-9]+-[0-9]+", build_id),
+    deploy_id = os.environ.get("DEPLOY_ID", "")
+    require(re.fullmatch(r"[0-9a-f]{40}", revision) and re.fullmatch(r"[0-9]+-[0-9]+", build_id)
+            and is_deploy_id_shape(deploy_id),
             "invalid_build_identity")
+    # The stamped ID must name this revision: an ID computed for another SHA
+    # (a wiring mistake between the compute and prepare steps) refuses here,
+    # not after the deploy, when the serving report cannot match it.
+    require(parse_deploy_id(deploy_id)[2] == revision[:7], "invalid_build_identity")
     started = time.time()
     app = application(client)
     rows = rollouts(client, app["id"])
@@ -727,7 +754,8 @@ def prepare(args, client):
                                                      for item in env.get("containers", [])]]:
         container["image"] = str((source.parent / container["image"]).resolve())
         container["image_build_context"] = str(source.parent.parent)
-    containers[0]["image_vars"] = {"BOT_BUILD_REVISION": revision, "BOT_BUILD_ID": build_id}
+    containers[0]["image_vars"] = {"BOT_BUILD_REVISION": revision, "BOT_BUILD_ID": build_id,
+                                      "BOT_DEPLOY_ID": deploy_id}
     containers[0]["rollout_kind"] = "full_auto"
     # The Worker edge has no container probe, so edge span lines would log the
     # visible `unknown` bucket; stamping the same commit here lets them carry
@@ -746,7 +774,7 @@ def prepare(args, client):
     save(args.receipt, {"started": started, "application_id": app["id"],
                         "namespace_id": app["durable_objects"]["namespace_id"],
                         "rollout_ids": [row["id"] for row in rows],
-                        "revision": revision, "build_id": build_id})
+                        "revision": revision, "build_id": build_id, "deploy_id": deploy_id})
     # This path must be fresh: Wrangler appends NDJSON across sessions.
     require(not Path(args.output).exists(), "deploy_output_not_fresh")
     print("staging rollout baseline recorded")
@@ -825,7 +853,7 @@ def verify(args, client):
     verification_started = time.monotonic()
     baseline = mapping(decode(Path(args.receipt).read_bytes()))
     version = deploy_version(read_records(args.output), baseline["started"])
-    image = docker_image(version, baseline["revision"], baseline["build_id"])
+    image = docker_image(version, baseline["revision"], baseline["build_id"], baseline["deploy_id"])
     require(worker_namespace(client, version) == baseline["namespace_id"], "worker_namespace_changed")
     url = staging_url()
     pinned = None
@@ -880,10 +908,12 @@ def verify(args, client):
                 probed = True
                 observed = "rollout=active_lag " if lag else "rollout=converged "
                 client.observation = observed + runtime_observation(
-                    status, headers, body, version, baseline["revision"], baseline["build_id"])
+                    status, headers, body, version, baseline["revision"], baseline["build_id"],
+                    baseline["deploy_id"])
                 if stale:
                     client.observation += f" application_image=stale polls={image_stale}"
-                if runtime_ready(status, headers, body, version, baseline["revision"], baseline["build_id"]):
+                if runtime_ready(status, headers, body, version, baseline["revision"], baseline["build_id"],
+                                   baseline["deploy_id"]):
                     health, health_headers, _ = client.request(url + "/health")
                     client.observation = f"{observed}readyz=200 health={health}"
                     if stale:
@@ -930,7 +960,9 @@ def verify(args, client):
                                         "rollout_id": pinned["id"],
                                         "target_version": pinned["target_version"],
                                         "image": image, "revision": baseline["revision"],
-                                        "build_id": baseline["build_id"], "readyz": 200, "health": 200}
+                                        "build_id": baseline["build_id"],
+                                        "deploy_id": baseline["deploy_id"],
+                                        "readyz": 200, "health": 200}
                             if listing_lag:
                                 evidence["application_listing_lag"] = True
                             if lag:
@@ -949,7 +981,7 @@ def verify(args, client):
             readiness = deadline_aware_read(
                 client, lambda: unconverged_readiness(
                     client, url, version, baseline["revision"], baseline["build_id"],
-                    completed_zero_instance_rollout(row)),
+                    baseline["deploy_id"], completed_zero_instance_rollout(row)),
                 app, row, image, drift_candidate, verification_started)
             if readiness:
                 failure, diagnostic = readiness

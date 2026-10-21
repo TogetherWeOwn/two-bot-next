@@ -12,7 +12,7 @@
 //! Distinct from `registry_golden.rs` (legacy parity axis: next vs the frozen
 //! legacy snapshot) — this is the staging publish axis (router vs manifest).
 
-use two_bot_core::commands::CustomCommand;
+use two_bot_core::commands::{CustomCommand, PERM_MANAGE_GUILD};
 use two_bot_core::router::{InteractionRouter, RouterGates};
 
 use serde_json::Value;
@@ -232,11 +232,20 @@ fn voice_kick_is_shadowed_by_moderation_kick() {
 }
 
 #[test]
-fn templateassistant_publishes_last_only_with_both_gates() {
+fn templateassistant_stays_unpublished_until_its_slice_lands() {
+    // The fixture keeps the assistant name (and its intended default gate)
+    // so the slice re-activates against the same shape; the router must not
+    // publish it in any gate state until then.
     let voice = voice_manifest();
     let assistant = &voice["assistant"];
     let name = assistant["name"].as_str().expect("assistant name");
-    for (voice_gate, assistant_gate) in [(false, false), (false, true), (true, false)] {
+    assert_eq!(
+        permission_cell(&assistant["default_member_permissions"]),
+        Some(PERM_MANAGE_GUILD.to_string()),
+        "fixture keeps the intended assistant gate",
+    );
+    for (voice_gate, assistant_gate) in [(false, false), (false, true), (true, false), (true, true)]
+    {
         let set = voice_router(voice_gate, assistant_gate)
             .publish_set(&[])
             .expect("staging set assembles");
@@ -245,15 +254,6 @@ fn templateassistant_publishes_last_only_with_both_gates() {
             "/{name} must not publish with voice={voice_gate} assistant={assistant_gate}",
         );
     }
-    let set = voice_router(true, true)
-        .publish_set(&[])
-        .expect("staging set assembles");
-    let last = set.last().expect("non-empty publish set");
-    assert_eq!(last.name, name, "/{name} publishes after the voice set");
-    assert_eq!(
-        last.default_member_permissions,
-        permission_cell(&assistant["default_member_permissions"]),
-    );
 }
 
 #[test]

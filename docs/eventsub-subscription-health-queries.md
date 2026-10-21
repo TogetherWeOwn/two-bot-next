@@ -444,3 +444,71 @@ planning error, acknowledged with 2xx so Twitch does not retry). The separate
 `eventsub startup refused` line is emitted from `crates/bot/src/main.rs` during
 receiver setup; it records a fatal config/bind failure before the process exits
 nonzero, not a receiver-request log.
+
+## Q5 — intake and reconcile counters (metrics scrape)
+
+Q1–Q4 read logs. Three counters in the same `/ops/metrics` scrape answer the
+aggregate direction — how many deliveries arrived, how many reconcile
+mutations landed, and where reconcile failed — with no log window to page.
+Series contract: [metrics](metrics.md). This section installs no monitor or
+rule; the only live reconcile rule is the failed-pass ticket
+(`eventsub_reconcile_failed`), and where this pack and a live rule disagree
+the live rule wins.
+
+Fetch one scrape (operator supplies the Worker URL and the
+already-provisioned scrape token; the token never goes in a PR or log):
+
+```bash
+curl --silent --show-error --max-time 10 \
+  -H "Authorization: Bearer ${METRICS_SCRAPE_TOKEN}" \
+  "${WORKER_URL}/ops/metrics" > /tmp/eventsub-start.txt
+```
+
+Repeat at the end of the window into a second file and diff the counters.
+A counter that reset to zero means the process restarted, not that the
+window was quiet — a fresh deploy runs a startup reconcile pass before the
+first scrape, so re-baseline both files after a reset.
+
+Copy-paste reads over the two scrapes (exact rendered names; label-free
+`received_total` takes a trailing space, the labelled families take `{`):
+
+```bash
+grep "^two_bot_eventsub_received_total " /tmp/eventsub-start.txt /tmp/eventsub-end.txt
+grep "^two_bot_eventsub_reconcile_actions_total{" /tmp/eventsub-start.txt /tmp/eventsub-end.txt
+grep "^two_bot_eventsub_reconcile_errors_total{" /tmp/eventsub-start.txt /tmp/eventsub-end.txt
+```
+
+PromQL equivalents for a Prometheus-compatible reader over the scrapes:
+
+```promql
+sum(increase(two_bot_eventsub_received_total[1h]))
+sum by (action) (increase(two_bot_eventsub_reconcile_actions_total[1h]))
+sum by (error_class) (increase(two_bot_eventsub_reconcile_errors_total[1h]))
+```
+
+Reading the result:
+
+- `two_bot_eventsub_received_total` (label-free scalar) counts deliveries
+  accepted for signature verification, including tampered signatures.
+  Requests refused before body intake are not deliveries, so a zero delta
+  beside expected traffic points at the Worker edge (dashboard
+  `eventsub_ingress` refusals) or the Q4 container refusals, not at a quiet
+  Twitch.
+- `two_bot_eventsub_reconcile_actions_total{action}` counts successful
+  mutations only: `action` is `create` (2xx creates) or `delete` (2xx
+  deletes, including already-gone deletes). 409 already-exists
+  confirmations fold into the pass outcome, not into actions. Deltas move
+  only when a pass mutates — startup plus the bounded hourly interval —
+  so a flat window with a healthy Q2 outcome is steady state, not a gap.
+- `two_bot_eventsub_reconcile_errors_total{error_class}` counts failure
+  sites by the same fixed strings as the Q2 log `error_class` field:
+  `reconcile_action_failed` (once per failed plan action),
+  `reconcile_prior_failed` (once per pass that found failed
+  subscriptions), `reconcile_unhealthy` (once per non-converged pass),
+  `reconcile_failed` (listing or plan failures), plus `other` for unknown
+  classes. Join a nonzero delta to the Q2 log lines by `error_class`;
+  `reconcile_pending`, config refusals and parked passes stay log-only
+  and never appear here. These counters add detail only and never
+  multiply the `eventsub_reconcile_failed` ticket (one ticket per failed
+  pass however many sites moved; see
+  [runbook](runbook.md#alert-eventsub-reconcile-failed)).

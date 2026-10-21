@@ -46,7 +46,7 @@ def components(gateway="ready"):
 
 
 def rollout_row(rollout_id, image, created="2026-10-15T00:00:00Z", status="completed",
-                target_version=7):
+                target_version=7, steps=None, progress=None):
     return {"id": rollout_id, "created_at": created, "status": status,
             "strategy": "rolling", "kind": "full_auto", "target_version": target_version,
             "current_version": target_version - 1,
@@ -55,8 +55,18 @@ def rollout_row(rollout_id, image, created="2026-10-15T00:00:00Z", status="compl
             "health": {"instances": {"active": 1, "healthy": 1, "failed": 0,
                                      "starting": 0, "scheduling": 0}},
             "progress": {"total_steps": 1, "current_step": 1, "total_instances": 1,
-                         "updated_instances": 1},
-            "steps": [{"status": "completed"}]}
+                         "updated_instances": 1} if progress is None else progress,
+            "steps": [{"status": "completed"}] if steps is None else steps}
+
+
+def unconverged_row(rollout_id, image, **overrides):
+    """A replaced rollout superseded in flight: steps still running, no
+    instance updated. Status alone must never prove the image served."""
+    overrides.setdefault("status", "replaced")
+    overrides.setdefault("steps", [{"status": "in_progress"}])
+    overrides.setdefault("progress", {"total_steps": 1, "current_step": 1,
+                                      "total_instances": 1, "updated_instances": 0})
+    return rollout_row(rollout_id, image, **overrides)
 
 
 class FakeClient(rollback.RollbackClient):
@@ -657,11 +667,11 @@ class MainProvenanceTests(unittest.TestCase):
             argv, self.live_routes(served_image=bad_image()),
             "provenance_image_never_served")
 
-    def test_manual_rollback_refuses_an_image_from_a_non_completed_rollout(self):
+    def test_manual_rollback_refuses_an_image_from_a_rollout_that_never_served(self):
         # The only rollout carrying the image never completed: without the
-        # completed-only filter it would pass as "served" and traffic would
-        # move to an image from a failed or reverted rollout.
-        for status in ("failed", "reverted"):
+        # served-before filter it would pass as "served" and traffic would
+        # move to an image from a failed, reverted or still-running rollout.
+        for status in ("failed", "reverted", "pending", "progressing"):
             with self.subTest(status=status):
                 served = rollout_row("r-prev", good_image(), status=status)
                 routes = self.live_routes()
@@ -675,6 +685,69 @@ class MainProvenanceTests(unittest.TestCase):
         receipt = rollback.ProvenanceReceipt(WORKER, APPLICATION, GOOD_VERSION,
                                              SHA, good_image())
         rollback.validate_receipt_against_live(FakeClient(self.live_routes()), receipt)
+
+    def test_complete_receipt_validates_when_the_image_rollout_was_superseded(self):
+        # Cloudflare flips a superseded rollout from completed to replaced,
+        # so after any deploy the previous image lives only in a replaced
+        # rollout. Served-before membership must accept it: the 10-20
+        # production drill refused its snapshot image here and restored
+        # nothing (provenance_image_never_served).
+        receipt = rollback.ProvenanceReceipt(WORKER, APPLICATION, GOOD_VERSION,
+                                             SHA, good_image())
+        routes = self.live_routes()
+        routes[("GET", f"/containers/applications/{APP_ID}/rollouts?limit=100")] = \
+            lambda: {"success": True, "result": [
+                rollout_row("r-newer", bad_image(),
+                            created="2026-10-15T01:00:00Z", status="completed"),
+                rollout_row("r-prev", good_image(), status="replaced")]}
+        rollback.validate_receipt_against_live(FakeClient(routes), receipt)
+
+    def test_receipt_refuses_an_image_from_a_replaced_rollout_still_in_flight(self):
+        # A rollout can be replaced before it finishes (superseded in
+        # flight), so a replaced row proves the image served only with
+        # convergence evidence: every step completed, every instance
+        # updated. The in-flight shape refuses like a never-served image.
+        receipt = rollback.ProvenanceReceipt(WORKER, APPLICATION, GOOD_VERSION,
+                                             SHA, good_image())
+        routes = self.live_routes()
+        served = unconverged_row("r-prev", good_image())
+        routes[("GET", f"/containers/applications/{APP_ID}/rollouts?limit=100")] = \
+            lambda served=served: {"success": True, "result": [served]}
+        with self.assertRaises(rollback.GateError) as caught:
+            rollback.validate_receipt_against_live(FakeClient(routes), receipt)
+        self.assertEqual(str(caught.exception), "provenance_image_never_served")
+
+    def test_receipt_refuses_a_replaced_rollout_without_convergence_evidence(self):
+        # Any malformed convergence shape reads as unconverged: fail
+        # closed instead of trusting status alone.
+        shapes = {
+            "no steps": {"steps": []},
+            "step pending": {"steps": [{"status": "pending"}]},
+            "step count mismatch": {
+                "steps": [{"status": "completed"}],
+                "progress": {"total_steps": 2, "current_step": 1,
+                             "total_instances": 1, "updated_instances": 1}},
+            "instances lagging": {
+                "progress": {"total_steps": 1, "current_step": 1,
+                             "total_instances": 2, "updated_instances": 1}},
+            "no instances": {
+                "progress": {"total_steps": 1, "current_step": 1,
+                             "total_instances": 0, "updated_instances": 0}},
+            "progress missing": {"progress": {}},
+        }
+        for name, shape in shapes.items():
+            with self.subTest(name=name):
+                receipt = rollback.ProvenanceReceipt(WORKER, APPLICATION, GOOD_VERSION,
+                                                     SHA, good_image())
+                routes = self.live_routes()
+                served = rollout_row("r-prev", good_image(), status="replaced",
+                                     **shape)
+                routes[("GET", f"/containers/applications/{APP_ID}/rollouts?limit=100")] = \
+                    lambda served=served: {"success": True, "result": [served]}
+                with self.assertRaises(rollback.GateError) as caught:
+                    rollback.validate_receipt_against_live(FakeClient(routes), receipt)
+                self.assertEqual(str(caught.exception),
+                                 "provenance_image_never_served")
 
     def snapshot_argv(self, path, *extra):
         return ["rollback", "--variant", "staging", "--worker-url", self.URL,
@@ -768,10 +841,11 @@ class MainProvenanceTests(unittest.TestCase):
             ("PROBE", "health"): health,
         }
 
-    def run_snapshot_main(self, tmp, revision):
+    def run_snapshot_main(self, tmp, revision, route_overrides=None):
         """Run main() on a complete snapshot with a stubbed ownership
         client and a scripted clock; capture the gate's expected SHA."""
         routes = self.snapshot_run_routes(revision)
+        routes.update(route_overrides or {})
         client = FakeClient(routes)
         control, _ = control_stub()
         clock = Clock()
@@ -812,6 +886,51 @@ class MainProvenanceTests(unittest.TestCase):
         self.assertEqual(record["provenance_sha"], SHA)
         self.assertTrue([call for call in client.calls if call[0] == "POST"],
                         client.calls)
+
+    def test_snapshot_rollback_restores_when_the_snapshot_rollout_was_superseded(self):
+        # Drill shape: the deploy completed a newer rollout, so the
+        # snapshot's rollout now reads replaced (same image) and the list
+        # carries the newer completed rollout beside it. The rollback must
+        # still validate the receipt and restore the snapshot image.
+        overrides = {
+            ("GET", f"/containers/applications/{APP_ID}/rollouts/r-prev"):
+                lambda: {"success": True, "result": rollout_row(
+                    "r-prev", good_image(), status="replaced")},
+            ("GET", f"/containers/applications/{APP_ID}/rollouts?limit=100"):
+                lambda: {"success": True, "result": [
+                    rollout_row("r-newer", bad_image(),
+                                created="2026-10-15T01:00:00Z",
+                                status="completed", target_version=8),
+                    rollout_row("r-prev", good_image(), status="replaced")]},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out, _, client, evidence = self.run_snapshot_main(
+                tmp, SHA, overrides)
+            self.assertEqual(code, 0, out)
+            record = json.loads(Path(evidence).read_text())
+        self.assertEqual(record["provenance"], "validated")
+        self.assertEqual(record["restored_image_digest"], "sha256:" + "a" * 64)
+        self.assertTrue([call for call in client.calls if call[0] == "POST"],
+                        client.calls)
+
+    def test_snapshot_rollback_refuses_when_the_snapshot_rollout_never_converged(self):
+        # Snapshot path of the in-flight replaced shape: the recorded
+        # image matches the live re-read (no drift), but the row never
+        # converged, so served-before membership still refuses before
+        # any POST.
+        row = unconverged_row("r-prev", good_image())
+        overrides = {
+            ("GET", f"/containers/applications/{APP_ID}/rollouts/r-prev"):
+                lambda row=row: {"success": True, "result": row},
+            ("GET", f"/containers/applications/{APP_ID}/rollouts?limit=100"):
+                lambda row=row: {"success": True, "result": [row]},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out, _, client, _ = self.run_snapshot_main(tmp, SHA, overrides)
+            self.assertEqual(code, 1, out)
+            self.assertIn("provenance_image_never_served", out)
+        self.assertFalse([call for call in client.calls if call[0] == "POST"],
+                         client.calls)
 
     def test_snapshot_rollback_gate_refuses_a_revision_other_than_the_receipt_sha(self):
         # Without the pin this answer passes on the version header alone;
@@ -893,6 +1012,25 @@ class ControlFenceHintTests(unittest.TestCase):
         error = self.refusal("Ownership transition not confirmed\n")
         self.assertEqual(error.detail, "Ownership transition not confirmed")
 
+    def test_transient_control_lines_reach_the_detail(self):
+        # The production client's classified request failures are fixed
+        # vocabulary with integers only, so the rollback log may carry the
+        # cause instead of dropping it: attempts/elapsed stay out.
+        cases = [
+            ("Ownership control request timeout attempts=3 elapsed=45s; stop, do not change credentials\n",
+             "Ownership control request timeout"),
+            ("Ownership control request failed attempts=1 elapsed=2s; stop, do not change credentials\n",
+             "Ownership control request failed"),
+            ("Ownership control invalid response attempts=2 elapsed=12s; stop, do not change credentials\n",
+             "Ownership control invalid response"),
+        ]
+        for stderr, prefix in cases:
+            with self.subTest(prefix=prefix):
+                error = self.refusal(stderr, variant="production", action="status")
+                self.assertEqual(str(error), "ownership_control_failed")
+                self.assertEqual(error.detail, prefix)
+                self.assertNotIn("secret-token", error.detail)
+
     def test_fence_env_contract_that_makes_the_hint_dead(self):
         # Pins the env contract behind the hint removal: takeover-style
         # actions release the fence, fence/status do not. A fenced refusal
@@ -913,6 +1051,42 @@ class ControlFenceHintTests(unittest.TestCase):
             control("status")
         self.assertEqual(seen, {"deployment-takeover": "true", "takeover": "true",
                                 "fence": "false", "status": "false"})
+
+
+class ControlDeepStdoutTests(unittest.TestCase):
+    # Depth-10000 nested objects exhaust the decoder recursion limit (the
+    # probe suite's nested_object_body precedent). The hooked status parse
+    # must map that to the fixed malformed-stdout refusal, not a traceback.
+    DEEP_STATUS = '{"a":' * 10000 + "1" + "}" * 10000
+
+    def control(self, stdout):
+        control = rollback.control_client(
+            "staging", "t" * 32, "https://w.example", "https://s.example", "actor")
+        done = rollback.subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=stdout, stderr="")
+        patcher = mock.patch.object(rollback.subprocess, "run", return_value=done)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return control
+
+    def test_deeply_nested_status_refuses_as_invalid_response(self):
+        with self.assertRaises(base.GateError) as caught:
+            self.control(self.DEEP_STATUS)("status")
+        self.assertEqual(str(caught.exception), "ownership_control_invalid_response")
+        self.assertIsNone(caught.exception.detail)
+
+    def test_deeply_nested_status_refuses_before_any_restore_post(self):
+        # BAD serves and GOOD is the restore target, so a parseable status
+        # would fence first and then POST; the deep stdout refuses instead.
+        routes = {("GET", f"/workers/scripts/{WORKER}/deployments"):
+                  lambda: {"success": True, "result": {"deployments": [
+                      {"versions": [{"version_id": BAD_VERSION,
+                                     "percentage": 100}]}]}}}
+        rb, client, _ = make_rollback(routes, control=self.control(self.DEEP_STATUS))
+        with self.assertRaises(base.GateError) as caught:
+            rb.run(GOOD_VERSION, good_image())
+        self.assertEqual(str(caught.exception), "ownership_control_invalid_response")
+        self.assertEqual([call for call in client.calls if call[0] == "POST"], [])
 
 
 if __name__ == "__main__":
