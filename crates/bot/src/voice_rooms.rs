@@ -8754,10 +8754,12 @@ fn snapshot_queue_age_secs(
 }
 
 /// Live-not-ready age on the sibling's own clock: seconds since the
-/// snapshot's not-ready-since stamp; 0 when the snapshot view was ready or
-/// the transport was down. Pure, unit-tested: a frozen snapshot (hung
-/// dispatch) still yields a climbing age. [`LiveGuild::not_ready_secs`]
-/// delegates here so the sibling can never drift from main-task semantics.
+/// live view's not-ready-since stamp; 0 when the view is ready or the
+/// transport was down. Pure, unit-tested: the watchdog sibling reads the
+/// shared live view directly (the gateway mutates it off the actor task),
+/// so a hung dispatch still yields a climbing age.
+/// [`LiveGuild::not_ready_secs`] delegates here so the sibling can never
+/// drift from main-task semantics.
 fn snapshot_not_ready_age_secs(
     not_ready_since: Option<tokio::time::Instant>,
     ready: bool,
@@ -8850,8 +8852,9 @@ fn publish_voice_gauges<S: RoomPersistence, H: RoomWrites>(
 
 /// Stall posture shared between the guild actor loop and its watchdog
 /// sibling. The main task owns `&mut worker` and refreshes the snapshot; the
-/// sibling only reads it, so the watchdog and the gauge publish keep running
-/// while a dispatch is hung inside an unbounded await. A hung dispatch still
+/// sibling only reads it (plus the shared live view), so the watchdog and
+/// the gauge publish keep running while a dispatch is hung inside an
+/// unbounded await. A hung dispatch still
 /// cannot answer inbox commands (the inbox consumer is the hung task) and
 /// still cannot recover the halt latch mid-hang: the sibling detects, the
 /// main task recovers once the write returns.
@@ -8865,6 +8868,13 @@ struct StallShared<H> {
     /// so no sibling publish can follow the contribution's removal.
     retired: AtomicBool,
     http: Arc<H>,
+    /// The actor's shared live view. The sibling reads readiness from this
+    /// directly instead of a snapshot copy, because the gateway mutates it
+    /// off the actor task (`publish` on GUILD_CREATE, `gateway_connected`
+    /// on READY/RESUMED) while a dispatch is hung: a copy would go stale
+    /// in both directions (false page after a republish, missed page after
+    /// a reconnect stamps a new not-ready clock).
+    live: LiveGuild,
     /// Actor start instant: the sibling computes the creator-map age from
     /// the stored merge stamp on this clock, so the age keeps climbing
     /// while the main task (and its snapshots) are hung in a dispatch.
@@ -8882,12 +8892,6 @@ struct StallState {
     /// was empty. The sibling recomputes the age on its own clock, so a
     /// frozen snapshot still yields a climbing age.
     oldest_enqueued_at: Option<std::time::Instant>,
-    /// Live-view readiness plus the not-ready-since stamp (tokio clock, as
-    /// the live view records it) at snapshot time. The sibling republishes
-    /// the not-ready age from these, so a hung dispatch no longer freezes
-    /// it at the snapshot-time value.
-    live_ready: bool,
-    not_ready_since: Option<tokio::time::Instant>,
     halted: bool,
     creators_generation: u64,
     creators_merged_ms: Option<u64>,
@@ -8902,17 +8906,11 @@ impl<H: RoomWrites> StallShared<H> {
         let guild = worker.live.guild_id;
         let (urgent, deferred) = worker.queue.pending_counts(guild);
         let oldest_enqueued_at = worker.queue.oldest_pending_at(guild);
-        let (live_ready, not_ready_since) = {
-            let live = worker.live.read_state();
-            (live.ready, live.not_ready_since)
-        };
         *self.state.lock().expect("stall snapshot lock") = StallState {
             last_progress,
             urgent,
             deferred,
             oldest_enqueued_at,
-            live_ready,
-            not_ready_since,
             halted: worker.halted(),
             creators_generation: worker.creators_generation,
             creators_merged_ms: worker.creators_merged_ms,
@@ -8926,14 +8924,23 @@ impl<H: RoomWrites> StallShared<H> {
         creator_map_age_secs(snap.creators_merged_ms, now_ms)
     }
 
-    /// Watchdog + gauge publish from the shared snapshot. Reads only: safe
-    /// to run on the sibling task while the main task is hung in dispatch.
+    /// Watchdog + gauge publish from the shared snapshot and live view.
+    /// Reads only: safe to run on the sibling task while the main task is
+    /// hung in dispatch.
     fn observe(&self, stuck_after: Duration, last_fire: &mut Option<tokio::time::Instant>) {
-        // Both ages derive from the snapshot's stamps on this task's own
-        // clocks, so a frozen snapshot (hung dispatch) still yields
-        // climbing ages and the hung case reaches the pipeline rules.
+        // The queue age derives from the snapshot's first-enqueue stamp on
+        // this task's own clock, so a frozen snapshot (hung dispatch) still
+        // yields a climbing age. Readiness comes from the live view instead:
+        // the gateway mutates it off the actor task, so a snapshot copy
+        // would go stale in both directions (false page after a republish,
+        // missed page after a reconnect stamps a new not-ready clock). Read
+        // the live view before the snapshot lock.
         let now = tokio::time::Instant::now();
         let queue_now = std::time::Instant::now();
+        let (live_ready, not_ready_since) = {
+            let live = self.live.read_state();
+            (live.ready, live.not_ready_since)
+        };
         // Publish under the snapshot lock: the metric guard sets `retired`
         // under the same lock before removing this actor's contribution,
         // so a publish either lands before that removal or not at all.
@@ -8959,7 +8966,7 @@ impl<H: RoomWrites> StallShared<H> {
             gauges.set_voice_actor_live_not_ready(
                 self.guild,
                 self.generation,
-                snapshot_not_ready_age_secs(snap.not_ready_since, snap.live_ready, now),
+                snapshot_not_ready_age_secs(not_ready_since, live_ready, now),
             );
             gauges.set_voice_creator_map(
                 snap.creators_generation,
@@ -9030,14 +9037,13 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
         generation,
         retired: AtomicBool::new(false),
         http: Arc::clone(&worker.http),
+        live: worker.live.clone(),
         start,
         state: Mutex::new(StallState {
             last_progress,
             urgent: 0,
             deferred: 0,
             oldest_enqueued_at: None,
-            live_ready: true,
-            not_ready_since: None,
             halted: false,
             creators_generation: 0,
             creators_merged_ms: None,

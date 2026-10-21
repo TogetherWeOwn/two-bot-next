@@ -210,8 +210,7 @@ export const CREATOR_MAP_STALE_SECONDS = 2 * CREATOR_MAP_REFRESH_SECONDS;
  * dropped without an accept or refusal line; past this bound the runbook
  * calls for a restart (fresh IDENTIFY + GUILD_CREATE) and a bug report. A
  * hung dispatch does not freeze the published age: the watchdog sibling
- * recomputes it from the snapshot's not-ready stamp on its own clock, so a
- * hang still pages past the bound.
+ * reads the shared live view directly, so a hang still pages past the bound.
  */
 export const VOICE_LIVE_NOT_READY_THRESHOLD_SECONDS = 120;
 /**
@@ -1372,8 +1371,8 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   // bound clears at once. The gauge is an optional scrape input, so older
   // containers hold the previous firing state instead of resolving it. A hung
   // dispatch does not freeze the published age: the watchdog sibling
-  // recomputes it from the snapshot's not-ready stamp on its own clock, so a
-  // hang still pages past the bound.
+  // reads the shared live view directly, so a hang still pages past the
+  // bound.
   const NOT_READY_RULE = "voice_live_not_ready";
   const notReady = exactSeries(gauge("two_bot_voice_live_not_ready_seconds"), {});
   if (notReady !== undefined) {
