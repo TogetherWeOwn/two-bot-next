@@ -845,7 +845,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s8-03: Audit kill switch (`audit_switch`, [usage](audit-store.md#operator-handle)) — presence = halt
 
 - **Method:** `waived` (not an execution verdict).
-- **Action:** Run `audit_switch` halt/status/resume ([usage](audit-store.md#operator-handle)) against local authorized test-container fixture only, never staging/production DB.
+- **Action:** Run `audit_switch --status`, `audit_switch --halt --actor <snowflake>`, `audit_switch --resume` ([usage](audit-store.md#operator-handle)) against local authorized test-container fixture only, never staging/production DB.
 - **Expected:** Switch presence halts, status reports accurately, resume clears only the fixture switch and pending audit resumes safely.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.

@@ -114,9 +114,11 @@ clears and reports the halt without hand SQL:
 
 `audit_switch --halt --actor <snowflake> | --resume | --status`
 
-`--halt` requires `--actor` (operator snowflake identity); `--resume` and
-`--status` take no actor. It connects only to disposable agent-testdb
-databases and refuses any other target before connecting.
+Env: `TWO_DATABASE_URL` (agent-testdb test databases only) and
+`TWO_DATABASE_TLS=local-only`. `--halt` requires `--actor` (operator
+snowflake identity); `--resume` and `--status` take no actor. It connects
+only to disposable agent-testdb databases and refuses any other target
+before connecting.
 
 ## Crash and halt protocol for the service slice
 
