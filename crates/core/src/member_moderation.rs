@@ -1083,7 +1083,10 @@ where
                 self.audit_refused(exec, "policy").await?;
                 return Err(err);
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                self.audit_refused(exec, "validation").await?;
+                return Err(err);
+            }
         };
         let hash = request_hash(
             validated.action,
@@ -1146,6 +1149,37 @@ where
         Ok(())
     }
 
+    // Failure audits are best effort: losing this write must never change the
+    // original error, release an uncertain claim or repeat an accepted effect.
+    async fn audit_failed(&self, exec: &MemberExecution, outcome: &'static str, stage: &str) {
+        if self
+            .store
+            .record_audit(&AuditRow {
+                request_id: format!("{}:{outcome}", exec.request_id),
+                guild_id: exec.guild_id.clone(),
+                actor_id: exec.actor.user_id.clone(),
+                action: exec.action.action_name(),
+                target_id: exec.target.as_ref().map(|target| target.user_id.clone()),
+                reason: "Member moderation did not complete".to_owned(),
+                outcome,
+                idempotency_key: exec.idempotency_key.clone(),
+                metadata_json: serde_json::json!({
+                    "stage": stage,
+                    "request_id": exec.request_id,
+                })
+                .to_string(),
+            })
+            .await
+            .is_err()
+        {
+            tracing::error!(
+                action = exec.action.action_name(),
+                stage,
+                "moderation_failure_audit_failed"
+            );
+        }
+    }
+
     /// Fire at most 25 due expiries for the owning guild. Claim immediately
     /// before each dispatch, not a whole batch before the first await. Stop
     /// on error: a definite rejection yields its durable queue position and
@@ -1201,7 +1235,7 @@ where
         hash: &str,
     ) -> Result<MemberResult, MemberError> {
         let now = format_iso_millis((self.now)());
-        match self
+        let claim = match self
             .store
             .claim(
                 &exec.guild_id,
@@ -1210,11 +1244,24 @@ where
                 hash,
                 &now,
             )
-            .await?
+            .await
         {
+            Ok(claim) => claim,
+            Err(err) => {
+                self.audit_failed(exec, "in_progress", "claim").await;
+                return Err(err.into());
+            }
+        };
+        match claim {
             ClaimState::Replayed { outcome } => return replayed_result(&outcome),
-            ClaimState::InFlight => return Err(MemberError::InFlight),
-            ClaimState::Mismatch => return Err(MemberError::KeyMismatch),
+            ClaimState::InFlight => {
+                self.audit_failed(exec, "in_progress", "claim").await;
+                return Err(MemberError::InFlight);
+            }
+            ClaimState::Mismatch => {
+                self.audit_refused(exec, "claim").await?;
+                return Err(MemberError::KeyMismatch);
+            }
             ClaimState::Claimed => {}
         }
 
@@ -1232,6 +1279,7 @@ where
                     MemberError::Store(s) if s.is_safe_pre_mutation() => Some("store_rolled_back"),
                     _ => None,
                 };
+                let mut audit_outcome = "in_progress";
                 if let Some(cause) = release_cause {
                     // A real second attempt, not a cached error. A failed
                     // release is never retried and never replaces `err`: the
@@ -1250,8 +1298,16 @@ where
                             cause,
                             "moderation_idempotency_release_failed"
                         );
+                    } else {
+                        audit_outcome = "failed";
                     }
                 }
+                let stage = if matches!(err, MemberError::Discord(_)) {
+                    "discord"
+                } else {
+                    "store"
+                };
+                self.audit_failed(exec, audit_outcome, stage).await;
                 return Err(err);
             }
         };
@@ -1265,7 +1321,8 @@ where
         ) {
             self.audit_accepted(exec, validated, outcome, None).await;
         }
-        self.store
+        if let Err(err) = self
+            .store
             .complete(
                 &exec.guild_id,
                 &exec.idempotency_key,
@@ -1273,7 +1330,11 @@ where
                 &serde_json::json!({ "outcome": outcome.as_str() }).to_string(),
                 &format_iso_millis((self.now)()),
             )
-            .await?;
+            .await
+        {
+            self.audit_failed(exec, "in_progress", "store").await;
+            return Err(err.into());
+        }
         Ok(MemberResult {
             outcome,
             replayed: false,
@@ -1885,7 +1946,15 @@ impl MemberModerationStore for MemMemberStore {
 
     async fn record_audit(&self, row: &AuditRow) -> Result<(), StoreError> {
         let mut inner = self.lock();
-        if !inner.audits.iter().any(|r| r.request_id == row.request_id) {
+        // A known accepted effect is stronger evidence than a later stuck
+        // completion/claim. Keep its byte-identical row, not a redundant one.
+        let accepted_id = (row.outcome == "in_progress")
+            .then(|| row.request_id.strip_suffix(":in_progress"))
+            .flatten();
+        if !inner.audits.iter().any(|r| {
+            r.request_id == row.request_id
+                || (r.guild_id == row.guild_id && Some(r.request_id.as_str()) == accepted_id)
+        }) {
             inner.audits.push(row.clone());
         }
         Ok(())
