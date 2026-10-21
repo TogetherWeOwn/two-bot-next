@@ -4284,14 +4284,18 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 _ = pump.as_mut() => false,
             };
             if expired {
-                let StagedOwnershipReply { reply, .. } = staged;
+                let StagedOwnershipReply { reply, waiter, .. } = staged;
+                // Close the waiter before the in-flight attempt reaches
+                // its store leg: the commit step only honors the reply
+                // deadline while a waiter is still listening, so the
+                // held write finishes unbounded instead of timing out
+                // against a budget nobody is waiting on.
+                drop(waiter);
                 let _ = reply.send(OWNERSHIP_FINALIZING.to_owned());
                 // The reply is out; the attempt still owns its queued
                 // action, so run it to completion instead of cancelling.
-                // The store leg sees the dropped waiter and finishes
-                // unbounded (see the commit deadline below). Awaiting
-                // consumes the heap-pinned pump, ending its borrow of
-                // `self` before the deadline is cleared.
+                // Awaiting consumes the heap-pinned pump, ending its
+                // borrow of `self` before the deadline is cleared.
                 pump.await;
                 self.ownership_commit_deadline = None;
                 return;

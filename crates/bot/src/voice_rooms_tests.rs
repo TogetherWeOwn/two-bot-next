@@ -172,6 +172,10 @@ struct Store {
     owner_revision: AtomicU64,
     prepare_errors: Mutex<VecDeque<StoreError>>,
     ownership_errors: Mutex<VecDeque<StoreError>>,
+    /// Times `update_ownership` yields before writing, consumed when the
+    /// write starts, so a test can prove an expired reply budget never
+    /// cancels an in-flight commit nobody is listening on.
+    update_ownership_yields: AtomicUsize,
     companions: Mutex<HashMap<(u64, u64), TextCompanion>>,
     persist_error: Option<StoreError>,
     access: Arc<Mutex<AccessControls>>,
@@ -251,6 +255,7 @@ impl Store {
             owner_revision: AtomicU64::new(0),
             prepare_errors: Mutex::new(VecDeque::new()),
             ownership_errors: Mutex::new(VecDeque::new()),
+            update_ownership_yields: AtomicUsize::new(0),
             companions: Mutex::new(HashMap::new()),
             persist_error: None,
             access: Arc::new(Mutex::new(AccessControls::default())),
@@ -431,6 +436,10 @@ impl RoomPersistence for Store {
         Ok(intent.clone())
     }
     async fn update_ownership(&self, room: &VoiceRoom, revision: &str) -> Result<bool, StoreError> {
+        if self.update_ownership_yields.load(Ordering::Relaxed) > 0 {
+            self.update_ownership_yields.fetch_sub(1, Ordering::Relaxed);
+            tokio::task::yield_now().await;
+        }
         self.trace.lock().unwrap().push(format!(
             "update_ownership:{}:{}",
             room.channel_id, room.owner_id
@@ -2706,6 +2715,55 @@ async fn held_owner_grant_reports_finalizing_before_the_write_finishes() {
             .unwrap()
             .contains(&"update_ownership:500:301".to_owned()),
         "the in-flight handoff must finish after its reply, not be cancelled"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn held_owner_grant_with_slow_store_still_commits_after_finalizing() {
+    let (live, store, mut http, trace) = owned_room();
+    let gate = Arc::new(OverwriteGate::default());
+    http.overwrites_gate = Some(gate.clone());
+    // A real Postgres write pends on its first poll: the expired reply
+    // budget must not cancel the in-flight commit once nobody listens.
+    store.update_ownership_yields.store(1, Ordering::Relaxed);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let (reply, inbox) = oneshot::channel();
+    apply_command(
+        &mut worker,
+        ActorCommand::Ownership {
+            actor_id: MEMBER,
+            is_admin: false,
+            command: OwnershipCommand::Transfer { target_id: 301 },
+            reply,
+        },
+        0,
+    );
+    let observe = async {
+        gate.sent.notified().await;
+        let response = tokio::time::timeout(Duration::from_millis(2_000), inbox).await;
+        // Release even on failure so the queued action can finish, rather
+        // than hiding a dropped in-flight dispatch behind test shutdown.
+        gate.release.notify_one();
+        let text = response
+            .expect("reply before the held grant finishes")
+            .unwrap();
+        assert!(
+            text.contains("Recorded") && text.contains("finalized"),
+            "{text}"
+        );
+        assert!(!text.contains("Transferred"), "{text}");
+    };
+    tokio::join!(worker.drive_staged_ownership(0), observe);
+    assert!(
+        trace
+            .lock()
+            .unwrap()
+            .contains(&"update_ownership:500:301".to_owned()),
+        "a Pending-first store write must run to completion after its reply, not be cancelled by the expired budget"
+    );
+    assert!(
+        !worker.ownership_queued.contains(&500),
+        "the committed handoff leaves the retry queue instead of failing back into it"
     );
 }
 
