@@ -17,6 +17,8 @@ mod backfill_retention_chains;
 mod backup_cli;
 #[cfg(test)]
 mod backup_cli_pool_open_tests;
+#[cfg(test)]
+mod backup_stable_error_codes_acceptance_tests;
 // Pure burn math: no runtime caller yet, the offline pin test is the consumer.
 #[allow(dead_code)]
 mod burn_rate;
