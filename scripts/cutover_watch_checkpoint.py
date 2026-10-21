@@ -33,7 +33,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import prod_passive_probe as prod_probe  # noqa: E402
+import prod_passive_probe as prod_probe
 import production_deploy as deploy_gate  # noqa: E402
 import rollback_readiness_probe as probe  # noqa: E402
 
