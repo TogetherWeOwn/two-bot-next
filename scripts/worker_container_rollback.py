@@ -596,15 +596,20 @@ def print_dry_run_plan(*, client, worker, restore_version, restore_image,
                      receipt_sha, log=print):
     """Print the ordered restore plan; reads only, never a POST or mutation.
 
-    The five lines name the fence, worker, image, takeover and gate steps in
-    the order the live path runs them, carrying the validated receipt members
-    (version UUID, image digest URL, SHA). Only allowlisted IDs reach the log.
+    The five lines name the fence, worker, image, takeover and gate steps,
+    carrying the validated receipt members (version UUID, image digest URL,
+    SHA). Only allowlisted IDs reach the log. The fence line mirrors the live
+    path: a pre-restore fence when the worker leg runs, otherwise deferred to
+    takeover, since the live path only fences inside takeover after the image
+    rollout when the worker already serves the restore version.
     """
     current = serving_version(client, worker)
-    log(f"dry-run plan: fence the singleton before restoring version {restore_version}")
     if current != restore_version:
+        log(f"dry-run plan: fence the singleton before restoring version {restore_version}")
         log(f"dry-run plan: worker POST deployments restoring version {restore_version}")
     else:
+        log("dry-run plan: fence deferred to takeover; no pre-restore fence "
+            "(worker leg skipped)")
         log(f"dry-run plan: worker already serves {restore_version}; image leg only")
     log(f"dry-run plan: image POST container rollout restoring image {restore_image}")
     log(f"dry-run plan: takeover ownership to version {restore_version}")
