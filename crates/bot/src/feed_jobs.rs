@@ -705,3 +705,7 @@ async fn audit(
 #[cfg(test)]
 #[path = "feed_jobs_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "feed_jobs_poison_acceptance.rs"]
+mod schedule_poison_acceptance;

@@ -2322,3 +2322,7 @@ pub(crate) fn publication_definitions(
         .map(Some)
         .map_err(|_| RegistrySyncError::Invalid)
 }
+
+#[cfg(test)]
+#[path = "command_runtime_poison_acceptance.rs"]
+mod dispatch_guard_poison_acceptance;
