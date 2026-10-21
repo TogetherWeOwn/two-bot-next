@@ -1352,7 +1352,8 @@ export class TwoBotContainer extends Container<Env> {
       });
     } catch (error) {
       if (error instanceof OwnershipRefused) return refused(error);
-      return opsRefused(error);
+      // GETs are reads; PUT/POST are mutations with reconcile-then-retry refusals.
+      return opsRefused(error, request.method === "GET");
     }
   }
 

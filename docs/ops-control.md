@@ -50,10 +50,14 @@ successful partial prefix. Fixed HTTP 503 JSON, no-store, under 1024 bytes:
 | `error` | `reason` and `code` | `next_action` | Operator response |
 | --- | --- | --- | --- |
 | `ops_unavailable` | `storage_invalid` | `escalate_storage` | Preserve evidence and escalate for authorized storage investigation; do not repair/delete via this read. |
-| `ops_unavailable` | `storage_unavailable` | `retry_read` | Retry only the read under the existing access policy. |
+| `ops_unavailable` | `storage_unavailable` | `retry_read` (GET reads) | Retry only the read under the existing access policy. |
+| `ops_unavailable` | `storage_unavailable` | `reconcile_then_retry` (PUT/POST mutations) | Re-read state, reconcile the intended change, then retry the mutation. |
 
-Neither refusal includes rows, exception text or raw stored content in JSON or
-logs. An oversized deployment envelope alone refuses with fixed
+The `storage_unavailable` token is scoped by operation kind so a machine
+consumer never answers a failed fence change with a plain read retry that
+would not re-apply it. Mutation refusals carry the same fixed `code` field
+as reads. Neither refusal includes rows, exception text or raw stored
+content in JSON or logs. An oversized deployment envelope alone refuses with fixed
 `reason=code=response_too_large` and `next_action=escalate_deployment` (investigate
 its deployment metadata under the existing policy); no oversized successful body is sent. Existing
 bearer, deployment, method and mutation refusals remain in force.
@@ -77,7 +81,9 @@ The protected ops-control tests exercise actual DO `Response` bytes, independent
 65,535/65,536/65,537-byte escape-heavy fixtures, hostile extra fields, malformed
 rows, list rejection, row boundaries and zero storage writes. The window tests
 cover invalid append keys/canonical timestamps, invalid lookahead, multibyte
-metadata and a too-large empty envelope. All use offline storage doubles, not
+metadata, a too-large empty envelope, after-drop exact-cap byte boundaries,
+kill_switch mixed-detail/extra-fence refusals and operation-scoped mutation
+refusals through actual DO fetches. All use offline storage doubles, not
 live services. These checks prove source behavior, not installed deployment.
 
 Source: [`ops-control.ts`](../wrangler/src/ops-control.ts),

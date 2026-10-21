@@ -480,17 +480,14 @@ export class OpsControl {
     const size = (value: unknown) => encoder.encode(JSON.stringify(value)).byteLength;
     const emptySize = size({ deploymentId, rows: [], truncated: history.truncated });
     if (emptySize > MAX_AUDIT_RESPONSE_BYTES) throw new OpsRefused("response_too_large", 503);
-    const rowSizes = history.rows.map(size);
-    let bytes = emptySize + rowSizes.reduce((total, n) => total + n, 0) + Math.max(0, rowSizes.length - 1);
-    if (bytes > MAX_AUDIT_RESPONSE_BYTES) {
-      // A complete envelope that overflows must lose a whole row, not merely
-      // gain a shorter boolean while claiming omitted history that doesn't exist.
-      do {
-        bytes -= rowSizes.pop()! + (history.rows.length > 1 ? 1 : 0);
-        history.rows.pop();
-        if (!history.truncated) bytes -= 1; // JSON true is one byte shorter than false.
-        history.truncated = true;
-      } while (bytes > MAX_AUDIT_RESPONSE_BYTES);
+    // Re-measure the actual envelope after every pop: the budget never
+    // hand-counts commas or the false/true delta, so the after-drop boundary
+    // is self-oracling. An overflowing envelope always loses a whole row, not
+    // merely a shorter boolean. Each pop strictly shrinks the body, and the
+    // empty-envelope check above guarantees termination with rows to spare.
+    while (size(history) > MAX_AUDIT_RESPONSE_BYTES && history.rows.length > 0) {
+      history.rows.pop();
+      history.truncated = true;
     }
     return history;
   }
@@ -566,7 +563,7 @@ export class OpsControl {
   }
 }
 
-export function opsRefused(error: unknown): Response {
+export function opsRefused(error: unknown, isRead: boolean): Response {
   if (error instanceof OpsRefused) {
     if (error.reason === "epoch_conflict") {
       console.warn(JSON.stringify({ event: "ops_control_refused", reason: error.reason }));
@@ -579,9 +576,17 @@ export function opsRefused(error: unknown): Response {
       });
     }
     if (error.reason === "storage_invalid" || error.reason === "storage_unavailable") {
+      // The storage_unavailable remediation is scoped by operation kind: a
+      // failed read retries the read, while a failed mutation must re-read
+      // and reconcile the intended change before retrying it. A shared
+      // retry_read token would steer a failed fence change into a GET that
+      // never re-applies it.
+      const nextAction = error.reason === "storage_invalid"
+        ? "escalate_storage"
+        : isRead ? "retry_read" : "reconcile_then_retry";
       return json(error.status, {
         error: "ops_unavailable", reason: error.reason, code: error.reason,
-        next_action: error.reason === "storage_invalid" ? "escalate_storage" : "retry_read",
+        next_action: nextAction,
       });
     }
     return json(error.status, { error: "ops_unavailable", reason: error.reason });
