@@ -576,37 +576,96 @@ pub fn accepted_text_trigger(
     trigger_word(content).filter(|word| !is_builtin_trigger(word, builtins))
 }
 
-/// `/command-list` reply lines (legacy `discord.ts`): one
-/// `/name [(or !trigger)] — on|off` per row, capped at Discord's ceiling.
+/// Actionable, input-independent refusal for malformed or unavailable pages.
+pub const INVALID_COMMAND_LIST_PAGE: &str =
+    "Invalid page. Run /command-list page:1, then use the next-page hint.";
+
+/// Legacy callers select the first whole-row page.
 #[must_use]
 pub fn format_command_list(rows: &[StoredCommand]) -> String {
-    if rows.is_empty() {
-        return "No custom commands defined.".to_owned();
+    format_command_list_page(rows, 1).unwrap_or_else(str::to_owned)
+}
+
+/// Pack the existing bounded guild snapshot in its stable store order. Reserve
+/// footer/navigation space using the row count: there cannot be more pages than
+/// rows, so every page number fits without changing page boundaries mid-render.
+/// No row is truncated, including defensive non-ASCII renderer inputs.
+pub fn format_command_list_page(
+    rows: &[StoredCommand],
+    page: usize,
+) -> Result<String, &'static str> {
+    if page == 0 {
+        return Err(INVALID_COMMAND_LIST_PAGE);
     }
-    let body = rows
+    if rows.is_empty() {
+        return if page == 1 {
+            Ok("No custom commands defined.".to_owned())
+        } else {
+            Err(INVALID_COMMAND_LIST_PAGE)
+        };
+    }
+    let lines: Vec<_> = rows
         .iter()
-        .map(|r| {
-            let trigger = r
+        .map(|row| {
+            let trigger = row
                 .text_trigger
                 .as_deref()
-                .map(|t| format!(" (or {t})"))
+                .map(|trigger| format!(" (or {trigger})"))
                 .unwrap_or_default();
             format!(
                 "/{}{} — {}",
-                r.name,
+                row.name,
                 trigger,
-                if r.enabled { "on" } else { "off" }
+                if row.enabled { "on" } else { "off" }
             )
         })
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect();
+    // A single page needs no next hint. Do not reject a complete snapshot
+    // that fits exactly with its shorter footer.
+    let single_page = format!("{}\n\nPage 1 of 1", lines.join("\n"));
+    if single_page.encode_utf16().count() <= MAX_RENDERED_CHARS {
+        return if page == 1 {
+            Ok(single_page)
+        } else {
+            Err(INVALID_COMMAND_LIST_PAGE)
+        };
+    }
+    let reserved = format!(
+        "\n\nPage {0} of {0}\nNext: /command-list page:{0}",
+        rows.len()
+    )
+    .encode_utf16()
+    .count();
+    let body_limit = MAX_RENDERED_CHARS.saturating_sub(reserved);
+    let mut pages = Vec::new();
+    let mut body = String::new();
     let mut units = 0;
-    body.chars()
-        .take_while(|ch| {
-            units += ch.len_utf16();
-            units <= MAX_RENDERED_CHARS
-        })
-        .collect()
+    for line in lines {
+        let line_units = line.encode_utf16().count();
+        if line_units > body_limit {
+            return Err(
+                "A custom-command row is too long to list. Ask a server admin to repair it, then run /command-list page:1.",
+            );
+        }
+        if units + usize::from(!body.is_empty()) + line_units > body_limit {
+            pages.push(std::mem::take(&mut body));
+            units = 0;
+        }
+        if !body.is_empty() {
+            body.push('\n');
+            units += 1;
+        }
+        body.push_str(&line);
+        units += line_units;
+    }
+    pages.push(body);
+    let total = pages.len();
+    let body = pages.get(page - 1).ok_or(INVALID_COMMAND_LIST_PAGE)?;
+    let mut reply = format!("{body}\n\nPage {page} of {total}");
+    if page < total {
+        reply.push_str(&format!("\nNext: /command-list page:{}", page + 1));
+    }
+    Ok(reply)
 }
 
 /// DB-backed delete set for disable-time deregistration, sorted and deduped
@@ -1246,7 +1305,7 @@ mod tests {
         let rows = vec![stored("faq"), off];
         assert_eq!(
             format_command_list(&rows),
-            "/faq — on\n/rules (or !rules) — off"
+            "/faq — on\n/rules (or !rules) — off\n\nPage 1 of 1"
         );
     }
 

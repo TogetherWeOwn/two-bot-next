@@ -30,7 +30,7 @@ Original registry surface: `CORE_COMMAND_DATA` (always published) = leveling onl
 | 13 | `/rota-acknowledge` | `message-link` String req | `ManageGuild` + must be configured primary actor | **DROP** — staging-only rota measurement experiment, never enabled in prod; post-cutover decision: stays dropped, re-enable only via a new staging-measurement card (staging guild only, never prod without a parity-row update) |
 | 14 | `/command` | `name` req ≤32, `template` req ≤2000 (`{user} {username} {server} {channel}`), `description` opt ≤100, `text-trigger` opt ≤33 | `ManageGuild` (builder + runtime) | **S4** |
 | 15 | `/command-remove` | `name` req ≤32 | `ManageGuild` | **S4** |
-| 16 | `/command-list` | none | `ManageGuild` | **S4** |
+| 16 | `/command-list` | `page` opt ≥1 (1-based, default 1) | `ManageGuild` | **S4** |
 | 17 | `/schedule` | `body` req ≤2000; `in-minutes` 1–525600 opt; `every-minutes` 60–525600 opt (one required) | `ManageGuild`, runs in invoking channel | **S4** |
 | 18 | `/schedule-remove` | non-empty `id` prefix req ≤128 | `ManageGuild` | **S4** |
 | 19 | `/schedule-list` | `page` opt ≥1 (1-based, default 1) | `ManageGuild` | **S4** |
@@ -88,6 +88,7 @@ golden exception or a claim of whole-baseline registry parity.
 | `lfg-close` | docs/parity.md §1 #27 copy | Picker copy only: `id` says it comes from the posted signup. Options and permissions stay legacy-identical except for its separately listed `max_length` bound. |
 | `command` | docs/parity.md §1 #14 caps | Advertise only `max_length` matching the runtime caps (`name` 32, `template` 2000, `description` 100, `text-trigger` 33); every other field stays legacy-identical. |
 | `command-remove` | docs/parity.md §1 #15 caps | Advertise only `max_length` 32 on `name`, matching the runtime cap; every other field stays legacy-identical. |
+| `command-list` | docs/parity.md §1 #16 page | Add the Next-only optional integer `page` (`min_value` 1, default 1) for whole-row pages including disabled commands and triggers. Command name, description and permissions stay legacy-identical; quota and registry behavior do not change. |
 | `schedule` | docs/parity.md §1 #17 caps | Advertise only `max_length` 2000 on `body`, matching the runtime cap; every other field stays legacy-identical. |
 | `schedule-remove` | docs/parity.md §1 #18 caps | Advertise only `max_length` 128 on `id`; empty and overlong prefixes are refused before resolution. |
 | `sticky` | docs/parity.md §1 #20 caps | Advertise only `max_length` 2000 on `body`, matching the runtime cap; every other field stays legacy-identical. |
