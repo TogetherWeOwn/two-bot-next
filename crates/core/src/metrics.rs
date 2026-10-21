@@ -5,7 +5,10 @@ use serde::Serialize;
 use std::{
     collections::HashMap,
     fmt::Write,
-    sync::{LockResult, Mutex, MutexGuard, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        LockResult, Mutex, MutexGuard, OnceLock,
+    },
     time::Duration,
 };
 
@@ -648,7 +651,6 @@ struct Values {
     prefix_trigger_refused: [u64; PREFIX_TRIGGER_REFUSED_REASONS.len()],
     dispatch_drops: [u64; DISPATCH_LANES.len()],
     checkpoint_failures: [u64; CHECKPOINT_FAILURE_STAGES.len()],
-    drop_poisons: [u64; DROP_POISON_GUARDS.len()],
     presence_capture: [u64; PRESENCE_CAPTURE_OUTCOMES.len()],
     feed_fetch: [u64; FEED_FETCH_OUTCOMES.len()],
     feed_fetch_errors: [u64; FEED_FETCH_ERROR_CLASSES.len()],
@@ -686,9 +688,12 @@ struct Values {
 
 /// Storage is fixed-size, except the per-actor voice stall map, which is
 /// bounded by the live guild-actor set. Unknown labels collapse to
-/// `other`, including hostile input.
+/// `other`, including hostile input. Drop-poison counts live outside the
+/// `Values` mutex in per-instance atomics: recording from a `Drop` body
+/// must complete even while another thread holds (or poisoned) that mutex,
+/// and must never block behind a scrape or an unrelated writer.
 #[derive(Default)]
-pub struct Metrics(Mutex<Values>);
+pub struct Metrics(Mutex<Values>, [AtomicU64; DROP_POISON_GUARDS.len()]);
 
 pub fn global() -> &'static Metrics {
     static METRICS: OnceLock<Metrics> = OnceLock::new();
@@ -701,7 +706,7 @@ pub fn global() -> &'static Metrics {
 /// Panicking inside `drop` aborts the process when the drop runs during
 /// unwinding; this helper is the only poison path a `Drop` body needs.
 /// `guard` must be a [`DROP_POISON_GUARDS`] member. Never panics and never
-/// blocks on another lock: the metrics mutex is a leaf.
+/// takes another lock: recording is a lock-free atomic increment.
 pub fn recover_drop_poison<'a, T>(
     result: LockResult<MutexGuard<'a, T>>,
     guard: &str,
@@ -1344,14 +1349,13 @@ impl Metrics {
     /// per poisoned drop, with a [`DROP_POISON_GUARDS`] member. Unknown
     /// guards collapse to `in_flight_guard` only when the allowlist grows;
     /// panic payloads are never labels. No IDs, tokens or bodies are
-    /// retained.
+    /// retained. Lock-free and saturating: safe to call from a `Drop` body
+    /// while any thread holds or poisoned the `Values` mutex.
     pub fn drop_poison(&self, guard: &str) {
-        let mut values = self
-            .0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let counter = &mut values.drop_poisons[bounded_index(guard, DROP_POISON_GUARDS)];
-        *counter = counter.saturating_add(1);
+        let counter = &self.1[bounded_index(guard, DROP_POISON_GUARDS)];
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            Some(count.saturating_add(1))
+        });
     }
 
     /// One signed website-action receiver execution (TOG-20119). Call exactly
@@ -2058,7 +2062,11 @@ impl Metrics {
             "counter",
             "Poisoned locks recovered by drop guards instead of panicking inside drop (which aborts during unwinding); every recovery also logs one warn with the guard name.",
         );
-        for (guard, count) in DROP_POISON_GUARDS.iter().zip(values.drop_poisons) {
+        let drop_poisons = self
+            .1
+            .each_ref()
+            .map(|counter| counter.load(Ordering::Relaxed));
+        for (guard, count) in DROP_POISON_GUARDS.iter().zip(drop_poisons) {
             writeln!(
                 out,
                 "two_bot_drop_poison_total{{guard=\"{guard}\"}} {count}"
@@ -3013,6 +3021,23 @@ mod tests {
         // Poison is sticky: a second recovery counts again.
         drop(recover_drop_poison(lock.lock(), "schedule_run"));
         assert_eq!(global_drop_poison_count("schedule_run"), start + 2);
+    }
+
+    #[test]
+    fn drop_poison_counters_saturate_at_u64_max() {
+        // Seeds the atomic seam directly: no stable public API sets a
+        // counter, and acceptance must not bind to the storage layout.
+        let metrics = Metrics::default();
+        let slot = bounded_index("user_slot", DROP_POISON_GUARDS);
+        metrics.1[slot].store(u64::MAX - 1, Ordering::Relaxed);
+        metrics.drop_poison("user_slot");
+        metrics.drop_poison("user_slot");
+        metrics.drop_poison("user_slot");
+        let text = metrics.render(None);
+        assert!(text.contains(&format!(
+            "two_bot_drop_poison_total{{guard=\"user_slot\"}} {}\n",
+            u64::MAX
+        )));
     }
 
     #[test]
