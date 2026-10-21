@@ -11,9 +11,13 @@
 //   rehearsal firing (a 5xx spike for the rollback proof) without touching
 //   the network, so the fail-to-rollback chain is provable with no live
 //   traffic and no new secret.
-// - live (default): scrapes staging /ops/metrics twice with
-//   METRICS_SCRAPE_TOKEN, evaluates the delta through evaluateMetrics, then
-//   gates. The scrape bearer floor (32 chars) mirrors wrangler/src/index.ts
+// - live (default): scrapes the configured staging or production Worker
+//   origin at /ops/metrics twice with METRICS_SCRAPE_TOKEN, evaluates the
+//   delta through evaluateMetrics, then gates. The destination is fenced:
+//   --metrics-url must be a bare https:// origin matching one of the
+//   configured staging/production Worker identities, redirects are refused,
+//   and failures carry a stable code plus a JSON error receipt.
+//   The scrape bearer floor (32 chars) mirrors wrangler/src/index.ts
 //   and docs/runbook.md; a missing or short token is a controlled skip,
 //   never a silent pass and never a failure: the gate enforces only once
 //   the Operator provisions the secret (see docs/runbook-observability.md).
@@ -41,13 +45,192 @@ const DEFAULT_SAMPLE_INTERVAL_SECONDS = 75;
 const DEFAULT_SCRAPE_TIMEOUT_SECONDS = 15;
 const SCRAPE_ATTEMPTS = 3;
 const SCRAPE_RETRY_SECONDS = 10;
+const EXIT_USAGE = 2;
+const EXIT_GATE = 1;
 // Intake cap mirrors the Worker scrape (MAX_METRICS_BODY_BYTES in
 // wrangler/src/index.ts) and the MCP container reads: every sibling
 // reader refuses expositions over 64 KiB.
 const MAX_EXPOSITION_BYTES = 64 * 1024;
+// Closed failure vocabulary. Every refusal carries one of these codes plus
+// its fixed next action; receipts and console text never carry remote
+// bodies, URL credentials, the bearer or exception messages.
+const FAILURE_CODES = [
+  "usage_error",
+  "invalid_metrics_origin",
+  "invalid_timeout",
+  "redirect_refused",
+  "auth_failed",
+  "transport_failed",
+  "decode_failed",
+];
+const NEXT_ACTIONS = {
+  usage_error: "Check the gate flags with --help and retry.",
+  invalid_metrics_origin: "Set --metrics-url to the configured staging or production Worker origin and retry.",
+  invalid_timeout: "Set --scrape-timeout-seconds to a finite positive value within the supported range and retry.",
+  redirect_refused: "Verify the Worker serves /ops/metrics directly without redirects and retry.",
+  auth_failed: "Verify METRICS_SCRAPE_TOKEN is current and retry.",
+  transport_failed: "Verify the Worker is reachable and retry.",
+  decode_failed: "Verify the Worker serves valid exposition at /ops/metrics and retry.",
+};
+const INPUT_REFUSAL_CODES = new Set(["usage_error", "invalid_metrics_origin", "invalid_timeout"]);
+const REDIRECT_REFUSED_MESSAGE =
+  "metrics scrape failed: redirect refused; the scrape bearer is never followed across redirects";
+const AUTH_FAILED_MESSAGE = "metrics scrape failed: the Worker refused the scrape credentials";
+const TRANSPORT_FAILED_MESSAGE = `metrics scrape failed after ${SCRAPE_ATTEMPTS} attempts: transport error`;
+const DECODE_FAILED_MESSAGE = "metrics scrape failed: exposition could not be decoded";
+const ORIGIN_REFUSED_MESSAGE =
+  "metrics origin refused: expected a bare https:// Worker origin from the configured staging/production identities";
+const TIMEOUT_REFUSED_MESSAGE = "scrape timeout refused: expected a finite positive timeout within the supported range";
 
-class UsageError extends Error {}
-class ScrapeError extends Error {}
+class UsageError extends Error {
+  constructor(message, code = "usage_error") {
+    super(message);
+    this.name = "UsageError";
+    this.code = code;
+  }
+}
+class ScrapeError extends Error {
+  constructor(message, code = "transport_failed") {
+    super(message);
+    this.name = "ScrapeError";
+    this.code = code;
+  }
+}
+
+/**
+ * True when `value` is a bare https:// origin: no userinfo, no explicit
+ * port, no path beyond an optional trailing slash, no query or fragment.
+ * The check never echoes the input; callers report a fixed refusal.
+ */
+function isBareHttpsOrigin(value) {
+  if (typeof value !== "string" || value === "") return false;
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== "https:") return false;
+  if (url.username !== "" || url.password !== "") return false;
+  if (url.port !== "") return false;
+  if (url.pathname !== "/" && url.pathname !== "") return false;
+  if (url.search !== "" || url.hash !== "") return false;
+  if (!url.hostname) return false;
+  return true;
+}
+
+/** Canonical origin (`https://host`) for a bare origin, else null. */
+function originOf(value) {
+  if (!isBareHttpsOrigin(value)) return null;
+  try {
+    return new URL(value).origin;
+  } catch {
+    return null;
+  }
+}
+
+// Largest delay the timer behind AbortSignal.timeout honors: above 2^31 - 1
+// ms Node clamps the timer, so the scrape would abort almost at once instead
+// of waiting out the configured timeout. The gate refuses such values as
+// invalid_timeout before any signal or network work.
+const MAX_TIMER_MS = 2_147_483_647;
+
+/** Whole-millisecond delay for a timeout in seconds; ceiling so sub-ms values still wait. */
+function timeoutMs(seconds) {
+  return Math.ceil(seconds * 1000);
+}
+
+function isSupportedTimeout(value) {
+  if (!Number.isFinite(value) || value <= 0) return false;
+  const ms = timeoutMs(value);
+  return ms >= 1 && ms <= MAX_TIMER_MS;
+}
+
+/**
+ * Normalize configured Worker identities to a set of canonical origins.
+ * Malformed entries are ignored, never fatal: an empty set refuses every
+ * live destination, which is the fail-closed posture.
+ */
+function normalizeAllowedOrigins(entries) {
+  const allowed = new Set();
+  if (!Array.isArray(entries)) return allowed;
+  for (const entry of entries) {
+    const origin = originOf(entry);
+    if (origin) allowed.add(origin);
+  }
+  return allowed;
+}
+
+/**
+ * Worker identities the gate may scrape, from the repository's existing
+ * staging/production origin configuration. The workflow passes the same
+ * values as STAGING_URL / PRODUCTION_URL for the gate step, so both
+ * spellings authorize the identical origin; nothing else does.
+ */
+function allowedOriginsFromEnv(env) {
+  return normalizeAllowedOrigins([
+    env.STAGING_WORKER_URL,
+    env.PRODUCTION_WORKER_URL,
+    env.STAGING_URL,
+    env.PRODUCTION_URL,
+  ]);
+}
+
+function nextActionFor(code) {
+  return NEXT_ACTIONS[code] ?? NEXT_ACTIONS.usage_error;
+}
+
+function codeOf(error, fallback = "transport_failed") {
+  const code = error instanceof Error ? error.code : undefined;
+  return typeof code === "string" && FAILURE_CODES.includes(code) ? code : fallback;
+}
+
+function isRedirectFailure(error) {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  if (/redirect/i.test(message)) return true;
+  const cause = error instanceof Error ? error.cause : undefined;
+  if (cause instanceof Error && /redirect/i.test(cause.message)) return true;
+  if (typeof cause === "string" && /redirect/i.test(cause)) return true;
+  return false;
+}
+
+function helpText() {
+  return `promotion error-rate gate: fence the scrape destination, judge the 5xx rate, fail closed
+
+Usage:
+  node wrangler/scripts/promotion-error-gate.mjs --metrics-url <origin> --evidence <path> [--sha <sha>]
+    [--rehearsal-firing <json>] [--sample-interval-seconds <n>] [--scrape-timeout-seconds <n>]
+    [--user-agent <name>]
+  node wrangler/scripts/promotion-error-gate.mjs --help
+
+Options:
+  --metrics-url <origin>          Bare https:// Worker origin from the configured
+                                  staging/production identities. No userinfo, port,
+                                  path, query or fragment. Anything else is refused
+                                  with zero fetches.
+  --evidence <path>               JSON evidence receipt to write, including for failures.
+  --sha <sha>                     Build under test (default: unknown).
+  --rehearsal-firing <json>       Offline drill input: judge a JSON array of rule names
+                                  with no network and no token.
+  --sample-interval-seconds <n>   Seconds between live scrapes (default: 75).
+  --scrape-timeout-seconds <n>    Per-scrape timeout in seconds: finite, positive, and
+                                  within the supported timer range (default: 15).
+  --user-agent <name>             Scrape user agent (default: ${USER_AGENT}).
+  --help                          Print this text and exit 0. No token, no network.
+
+Failure codes (receipt verdict "error", never a pass):
+  usage_error             Bad flags. ${NEXT_ACTIONS.usage_error}
+  invalid_metrics_origin  Destination refused. ${NEXT_ACTIONS.invalid_metrics_origin}
+  invalid_timeout         Timeout refused. ${NEXT_ACTIONS.invalid_timeout}
+  redirect_refused        Redirect refused. ${NEXT_ACTIONS.redirect_refused} Exit 1.
+  auth_failed             Credentials refused (401/403). ${NEXT_ACTIONS.auth_failed} Exit 1.
+  transport_failed        Scrape transport failed after ${SCRAPE_ATTEMPTS} attempts. ${NEXT_ACTIONS.transport_failed} Exit 1.
+  decode_failed           Exposition not decodable. ${NEXT_ACTIONS.decode_failed} Exit 1.
+
+Offline rehearsal (no network, no token):
+  node wrangler/scripts/promotion-error-gate.mjs --metrics-url https://two-bot-next-staging.5150.workers.dev --evidence /tmp/gate-evidence.json --rehearsal-firing '[]'
+`;
+}
 
 /**
  * Bounded exposition read: content-length precheck plus an incremental
@@ -114,10 +297,10 @@ export function parseRehearsalFiring(raw) {
   try {
     parsed = JSON.parse(raw);
   } catch {
-    throw new UsageError("rehearsal firing is not valid JSON");
+    throw new UsageError("rehearsal firing is not valid JSON", "usage_error");
   }
   if (!Array.isArray(parsed) || !parsed.every((entry) => typeof entry === "string")) {
-    throw new UsageError("rehearsal firing must be a JSON array of strings");
+    throw new UsageError("rehearsal firing must be a JSON array of strings", "usage_error");
   }
   return parsed;
 }
@@ -131,25 +314,65 @@ export function decideMode({ rehearsalFiring, token }) {
 
 async function fetchExposition({ metricsUrl, token, timeoutSeconds, fetchImpl, retrySleepSeconds = SCRAPE_RETRY_SECONDS, userAgent = USER_AGENT }) {
   const url = `${metricsUrl.replace(/\/$/, "")}/ops/metrics`;
-  let lastError;
+  const delayMs = timeoutMs(timeoutSeconds);
   for (let attempt = 1; attempt <= SCRAPE_ATTEMPTS; attempt += 1) {
+    let response;
     try {
-      const response = await fetchImpl(url, {
+      response = await fetchImpl(url, {
         headers: { authorization: `Bearer ${token}`, "user-agent": userAgent },
-        signal: AbortSignal.timeout(timeoutSeconds * 1000),
+        signal: AbortSignal.timeout(delayMs),
+        redirect: "error",
       });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const text = await readBoundedExposition(response, MAX_EXPOSITION_BYTES);
-      if (text === null) throw new Error(`exposition exceeds ${MAX_EXPOSITION_BYTES} byte cap`);
-      const samples = parseAlertScrape(text);
-      if (samples === null) throw new Error("unparseable exposition");
-      return { text, samples };
     } catch (error) {
-      lastError = error;
-      if (attempt < SCRAPE_ATTEMPTS) await new Promise((resolve) => setTimeout(resolve, retrySleepSeconds * 1000));
+      if (isRedirectFailure(error)) throw new ScrapeError(REDIRECT_REFUSED_MESSAGE, "redirect_refused");
+      if (attempt < SCRAPE_ATTEMPTS) {
+        await new Promise((resolve) => setTimeout(resolve, retrySleepSeconds * 1000));
+        continue;
+      }
+      throw new ScrapeError(TRANSPORT_FAILED_MESSAGE, "transport_failed");
     }
+    if (response.status >= 300 && response.status < 400) {
+      throw new ScrapeError(REDIRECT_REFUSED_MESSAGE, "redirect_refused");
+    }
+    if (response.status === 401 || response.status === 403) {
+      throw new ScrapeError(AUTH_FAILED_MESSAGE, "auth_failed");
+    }
+    if (!response.ok) {
+      // Only 5xx and 429 are transient. 429 is the endpoint's own designed
+      // refusal: /ops/metrics sheds a momentarily exhausted per-caller scrape
+      // bucket with `slow down` plus retry-after, expecting a correct bearer
+      // to wait it out (wrangler/src/index.ts). The fixed retry sleep already
+      // exceeds the refill, so the bounded retry recovers it. Every other 4xx
+      // is refused at once: a retry cannot fix a client error, and must not
+      // re-send the bearer against a request the Worker already refused.
+      if ((response.status === 429 || response.status >= 500) && attempt < SCRAPE_ATTEMPTS) {
+        await new Promise((resolve) => setTimeout(resolve, retrySleepSeconds * 1000));
+        continue;
+      }
+      throw new ScrapeError(TRANSPORT_FAILED_MESSAGE, "transport_failed");
+    }
+    let text;
+    try {
+      text = await readBoundedExposition(response, MAX_EXPOSITION_BYTES);
+    } catch {
+      // Body-phase transients (stalls, resets, the timeout firing mid-read)
+      // keep the same bounded retry as connect-phase ones.
+      if (attempt < SCRAPE_ATTEMPTS) {
+        await new Promise((resolve) => setTimeout(resolve, retrySleepSeconds * 1000));
+        continue;
+      }
+      throw new ScrapeError(TRANSPORT_FAILED_MESSAGE, "transport_failed");
+    }
+    // Over-cap is refused at once, like any other deterministic refusal: a
+    // retry re-sends the bearer against a body that will not shrink, so it
+    // must not loop. The code stays decode_failed with fixed text: the
+    // exposition could not be admitted for decoding.
+    if (text === null) throw new ScrapeError(DECODE_FAILED_MESSAGE, "decode_failed");
+    const samples = parseAlertScrape(text);
+    if (samples === null) throw new ScrapeError(DECODE_FAILED_MESSAGE, "decode_failed");
+    return { text, samples };
   }
-  throw new ScrapeError(`metrics scrape failed after ${SCRAPE_ATTEMPTS} attempts: ${lastError instanceof Error ? lastError.message : lastError}`);
+  throw new ScrapeError(TRANSPORT_FAILED_MESSAGE, "transport_failed");
 }
 
 /**
@@ -171,7 +394,15 @@ export async function runLiveGate({
   nowSeconds = () => Date.now() / 1000,
   retrySleepSeconds = SCRAPE_RETRY_SECONDS,
   userAgent = USER_AGENT,
+  allowedMetricsOrigins,
 }) {
+  if (!isSupportedTimeout(timeoutSeconds)) throw new UsageError(TIMEOUT_REFUSED_MESSAGE, "invalid_timeout");
+  if (!isBareHttpsOrigin(metricsUrl)) throw new UsageError(ORIGIN_REFUSED_MESSAGE, "invalid_metrics_origin");
+  if (allowedMetricsOrigins !== undefined) {
+    const allowed = normalizeAllowedOrigins(allowedMetricsOrigins);
+    const actual = originOf(metricsUrl);
+    if (!actual || !allowed.has(actual)) throw new UsageError(ORIGIN_REFUSED_MESSAGE, "invalid_metrics_origin");
+  }
   const scrape = () => fetchExposition({ metricsUrl, token, timeoutSeconds, fetchImpl, retrySleepSeconds, userAgent });
   const first = await scrape();
   const baseline = evaluateMetrics(first.samples, EMPTY_STATE, nowSeconds());
@@ -210,27 +441,34 @@ export function parseArgs(argv) {
     timeoutSeconds: DEFAULT_SCRAPE_TIMEOUT_SECONDS,
     userAgent: USER_AGENT,
   };
+  let hasMetricsUrl = false;
   for (let i = 0; i < argv.length; i += 1) {
     const flag = argv[i];
     const value = argv[i + 1];
-    if (value === undefined) throw new UsageError(`flag ${flag} needs a value`);
-    if (flag === "--metrics-url") config.metricsUrl = value;
-    else if (flag === "--evidence") config.evidence = value;
+    if (value === undefined) throw new UsageError(`flag ${flag} needs a value`, "usage_error");
+    if (flag === "--metrics-url") {
+      config.metricsUrl = value;
+      hasMetricsUrl = true;
+    } else if (flag === "--evidence") config.evidence = value;
     else if (flag === "--sha") config.sha = value;
     else if (flag === "--rehearsal-firing") config.rehearsalFiring = value;
     else if (flag === "--sample-interval-seconds") config.sampleIntervalSeconds = Number(value);
     else if (flag === "--scrape-timeout-seconds") config.timeoutSeconds = Number(value);
     else if (flag === "--user-agent") config.userAgent = value;
-    else throw new UsageError(`unknown flag ${flag}`);
+    else throw new UsageError(`unknown flag ${flag}`, "usage_error");
     i += 1;
   }
-  if (!config.metricsUrl) throw new UsageError("--metrics-url is required");
-  if (!config.evidence) throw new UsageError("--evidence is required");
+  if (!hasMetricsUrl) throw new UsageError("--metrics-url is required", "usage_error");
+  if (!isBareHttpsOrigin(config.metricsUrl)) throw new UsageError(ORIGIN_REFUSED_MESSAGE, "invalid_metrics_origin");
+  if (!config.evidence) throw new UsageError("--evidence is required", "usage_error");
   if (!Number.isFinite(config.sampleIntervalSeconds) || config.sampleIntervalSeconds <= 0) {
-    throw new UsageError("--sample-interval-seconds must be a positive number");
+    throw new UsageError("--sample-interval-seconds must be a positive number", "usage_error");
+  }
+  if (!isSupportedTimeout(config.timeoutSeconds)) {
+    throw new UsageError(TIMEOUT_REFUSED_MESSAGE, "invalid_timeout");
   }
   if (!config.userAgent) {
-    throw new UsageError("--user-agent must not be empty");
+    throw new UsageError("--user-agent must not be empty", "usage_error");
   }
   return config;
 }
@@ -239,8 +477,73 @@ function writeEvidence(path, evidence) {
   writeFileSync(path, `${JSON.stringify(evidence)}\n`, "utf8");
 }
 
-async function main(argv, env) {
-  const config = parseArgs(argv);
+function tryWriteEvidence(path, evidence) {
+  if (typeof path !== "string" || path === "") return false;
+  try {
+    writeEvidence(path, evidence);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function prescanFlag(argv, flag) {
+  const index = argv.indexOf(flag);
+  if (index < 0 || index + 1 >= argv.length) return undefined;
+  return argv[index + 1];
+}
+
+function reportFailure(code) {
+  console.log(`::error::promotion error-rate gate ${code}: ${nextActionFor(code)}`);
+}
+
+/**
+ * True when --help/-h appears in flag position. Every gate flag takes a
+ * value, so flags sit at even indices; a help token in a value slot (for
+ * example `--user-agent --help` from a templated variable) is data, not a
+ * help request, and must never exit 0 with no evidence.
+ */
+function wantsHelp(argv) {
+  for (let i = 0; i < argv.length; i += 2) {
+    if (argv[i] === "--help" || argv[i] === "-h") return true;
+  }
+  return false;
+}
+
+/**
+ * CLI entry with injectable deps for offline tests. Returns the process
+ * exit code: 0 pass/skip, 1 gate or scrape failure, 2 usage/input refusal.
+ * Failures write a deterministic fail-closed error receipt when the
+ * evidence path is usable; the console always carries the stable code.
+ */
+export async function runCli(argv, env, deps = {}) {
+  if (wantsHelp(argv)) {
+    console.log(helpText());
+    return 0;
+  }
+  const {
+    fetchImpl = fetch,
+    sleep = (s) => new Promise((resolve) => setTimeout(resolve, s * 1000)),
+    nowSeconds = () => Date.now() / 1000,
+    retrySleepSeconds = SCRAPE_RETRY_SECONDS,
+  } = deps;
+  let config;
+  try {
+    config = parseArgs(argv);
+  } catch (error) {
+    const code = codeOf(error, "usage_error");
+    const receipt = {
+      mode: "live",
+      sha: prescanFlag(argv, "--sha") ?? "unknown",
+      firing: [],
+      verdict: "error",
+      code,
+      nextAction: nextActionFor(code),
+    };
+    tryWriteEvidence(prescanFlag(argv, "--evidence"), receipt);
+    reportFailure(code);
+    return EXIT_USAGE;
+  }
   const { mode, reason } = decideMode({ rehearsalFiring: config.rehearsalFiring, token: env.METRICS_SCRAPE_TOKEN });
   if (mode === "skip") {
     const evidence = { mode, sha: config.sha, firing: [], verdict: "skip", reasons: [], detail: reason };
@@ -250,7 +553,22 @@ async function main(argv, env) {
     return 0;
   }
   if (mode === "rehearsal") {
-    const firing = parseRehearsalFiring(config.rehearsalFiring);
+    let firing;
+    try {
+      firing = parseRehearsalFiring(config.rehearsalFiring);
+    } catch (error) {
+      const code = codeOf(error, "usage_error");
+      tryWriteEvidence(config.evidence, {
+        mode,
+        sha: config.sha,
+        firing: [],
+        verdict: "error",
+        code,
+        nextAction: nextActionFor(code),
+      });
+      reportFailure(code);
+      return EXIT_USAGE;
+    }
     const { fail, reasons } = judgeFiring(firing);
     const evidence = {
       mode,
@@ -268,13 +586,33 @@ async function main(argv, env) {
     }
     return 0;
   }
-  const live = await runLiveGate({
-    metricsUrl: config.metricsUrl,
-    token: env.METRICS_SCRAPE_TOKEN,
-    sampleIntervalSeconds: config.sampleIntervalSeconds,
-    timeoutSeconds: config.timeoutSeconds,
-    userAgent: config.userAgent,
-  });
+  let live;
+  try {
+    live = await runLiveGate({
+      metricsUrl: config.metricsUrl,
+      token: env.METRICS_SCRAPE_TOKEN,
+      sampleIntervalSeconds: config.sampleIntervalSeconds,
+      timeoutSeconds: config.timeoutSeconds,
+      userAgent: config.userAgent,
+      fetchImpl,
+      sleep,
+      nowSeconds,
+      retrySleepSeconds,
+      allowedMetricsOrigins: [...allowedOriginsFromEnv(env)],
+    });
+  } catch (error) {
+    const code = codeOf(error);
+    tryWriteEvidence(config.evidence, {
+      mode,
+      sha: config.sha,
+      firing: [],
+      verdict: "error",
+      code,
+      nextAction: nextActionFor(code),
+    });
+    reportFailure(code);
+    return INPUT_REFUSAL_CODES.has(code) ? EXIT_USAGE : EXIT_GATE;
+  }
   const { fail, verdict, reasons } = decideLiveVerdict({ firing: live.firing, restDelta: live.restDelta });
   const evidence = {
     mode,
@@ -315,14 +653,10 @@ export function isDirectInvocation(argv1, moduleUrl) {
 }
 
 if (isDirectInvocation(process.argv[1], import.meta.url)) {
-  main(process.argv.slice(2), process.env).then(
+  runCli(process.argv.slice(2), process.env).then(
     (code) => process.exit(code),
-    (error) => {
-      if (error instanceof UsageError) {
-        console.log(`::error::promotion error-rate gate misconfigured: ${error.message}`);
-        process.exit(2);
-      }
-      console.log(`::error::promotion error-rate gate failed closed: ${error instanceof Error ? error.message : error}`);
+    () => {
+      console.log("::error::promotion error-rate gate failed closed: unexpected error");
       process.exit(1);
     },
   );
