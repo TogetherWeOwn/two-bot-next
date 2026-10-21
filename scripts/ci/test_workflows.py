@@ -6113,6 +6113,65 @@ class WorkflowTests(unittest.TestCase):
                         if step.get("uses", "").startswith("actions/checkout@"):
                             self.assertEqual(step["with"]["persist-credentials"], "false")
 
+    def test_every_job_declares_a_timeout(self):
+        # A job without `timeout-minutes` burns the six-hour runner default
+        # when it wedges; every job states its own ceiling instead. Numeric
+        # ceilings stay at or below the 360-minute default; expressions (the
+        # push-dependent lanes) only need to be present and non-blank.
+        for name, workflow in self.workflows.items():
+            for job_id, job in workflow["jobs"].items():
+                with self.subTest(workflow=name, job=job_id):
+                    self.assertIn("timeout-minutes", job)
+                    ceiling = job["timeout-minutes"]
+                    self.assertIsNotNone(ceiling)
+                    self.assertTrue(str(ceiling).strip())
+                    if re.fullmatch(r"\d+", str(ceiling)):
+                        self.assertGreaterEqual(int(ceiling), 1)
+                        self.assertLessEqual(int(ceiling), 360)
+
+    def test_own_trigger_workflows_serialize_at_the_top_level(self):
+        # A workflow with its own triggers (anything beyond a pure
+        # `workflow_call` callee) declares top-level `concurrency`, so two
+        # dispatches or pushes cannot race each other on the shared runners.
+        # Pure callees are serialized by their callers instead; the two
+        # deploy-side workflows below serialize at the lane jobs on purpose
+        # (a top-level group would queue work that must stay unqueued).
+        exempt = {
+            # Pure `workflow_call` callees: the caller holds the group.
+            "sbom.yml",
+            "reusable-rust-nextest.yml",
+            # Serializes at the `tag` job (`release` group) so the
+            # read-only dry-run/repair paths stay unserialized.
+            "release.yml",
+            # Serializes at the `production`/`release` lane jobs only, so a
+            # sleeping promotion can never queue an operator rollback
+            # behind it (see the header comment in the workflow).
+            "deploy-production.yml",
+        }
+        for name, workflow in self.workflows.items():
+            on = workflow.get("on") or {}
+            triggers = {on} if isinstance(on, str) else set(on)
+            if name in ("sbom.yml", "reusable-rust-nextest.yml"):
+                # Gaining an own trigger forces a concurrency decision here.
+                self.assertEqual(triggers, {"workflow_call"}, name)
+            if name == "release.yml":
+                self.assertEqual(
+                    workflow["jobs"]["tag"].get("concurrency", {}).get("group"),
+                    "release", name)
+            if name == "deploy-production.yml":
+                for job_id in ("production", "release"):
+                    self.assertEqual(
+                        workflow["jobs"][job_id].get("concurrency", {}).get("group"),
+                        "deploy-production", f"{name}:{job_id}")
+            if name in exempt:
+                continue
+            with self.subTest(workflow=name):
+                concurrency = workflow.get("concurrency")
+                self.assertIsInstance(concurrency, dict)
+                group = concurrency.get("group")
+                self.assertIsNotNone(group)
+                self.assertTrue(str(group).strip())
+
 
 if __name__ == "__main__":
     unittest.main()

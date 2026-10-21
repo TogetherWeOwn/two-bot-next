@@ -12,6 +12,8 @@ jobs:
   review-rules:
     permissions:
       contents: read
+    # Advisory shadow call; ceiling mirrors the supply-chain gitleaks gate.
+    timeout-minutes: 10
     uses: TogetherWeOwn/.github/.github/workflows/review-rules.yml@63699075b492914c137281acffd4c89e51cc1c4c
     with:
       packs: rust,security,python-shell-ci

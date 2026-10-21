@@ -71,6 +71,8 @@ jobs:
       contents: read
     needs: [job-inputs]
     if: needs.job-inputs.outputs.supply != 'false'
+    # Ceiling mirrors the rust-tests lane; the called sbom.yml chain runs 40+10.
+    timeout-minutes: 60
     uses: ./.github/workflows/sbom.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
     with:
       ref: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -992,6 +994,8 @@ jobs:
     # Skip when the selector sees no Rust inputs (docs-only, worker-UI-only PRs);
     # `ci-ok` only accepts the skip when the selector deselected the job.
     if: needs.job-inputs.outputs.rust != 'false'
+    # Ceiling mirrors the rust-tests lane with headroom over the reusable 45.
+    timeout-minutes: 60
     uses: ./.github/workflows/reusable-rust-nextest.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
     with:
       ref: ${{ github.event.pull_request.head.sha || github.sha }}

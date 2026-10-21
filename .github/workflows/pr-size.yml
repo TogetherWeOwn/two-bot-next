@@ -49,6 +49,8 @@ jobs:
       contents: read
       issues: write
       pull-requests: write
+    # Advisory label call; ceiling mirrors the supply-chain gitleaks gate.
+    timeout-minutes: 10
     uses: TogetherWeOwn/.github/.github/workflows/pr-size.yml@82c5b367c6e3e8032666029dc22d206fff39c3f2
     with:
       pr-number: ${{ inputs.pr_number || '' }}
@@ -65,4 +67,6 @@ jobs:
       contents: read
       issues: read
       pull-requests: read
+    # Advisory tally call; ceiling mirrors the supply-chain gitleaks gate.
+    timeout-minutes: 10
     uses: TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@82c5b367c6e3e8032666029dc22d206fff39c3f2

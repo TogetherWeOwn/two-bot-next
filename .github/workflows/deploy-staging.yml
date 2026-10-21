@@ -550,6 +550,8 @@ jobs:
     needs: deploy
     permissions:
       contents: read
+    # Ceiling mirrors the schema/roles gates with headroom over the callee 10.
+    timeout-minutes: 30
     uses: ./.github/workflows/voice-synthetic.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
     # By name, not `inherit`: only the test bot token crosses the boundary.
     secrets:
