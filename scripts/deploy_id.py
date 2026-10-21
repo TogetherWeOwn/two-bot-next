@@ -2,7 +2,9 @@
 """Deploy IDs (`YYYY.MM.DD.N+sha7`) for staging/production deploys.
 
 `next` derives N deterministically: one plus the count of that environment's
-GitHub Deployments created on today's UTC date. The deploy lanes serialize
+recorded deploy IDs created on today's UTC date (only Deployment rows whose
+description is a deploy ID count; Actions' automatic `environment:` rows
+carry none). The deploy lanes serialize
 deploys (the deploy-staging workflow concurrency, the deploy-production lane),
 so the count cannot race; the listing stops at the first row older than the
 date (the API returns newest first), and a same-day flood past the page cap

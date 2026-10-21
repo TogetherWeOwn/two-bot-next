@@ -772,8 +772,8 @@ def staging_deploy_id_errors(workflow, name="deploy-staging.yml"):
     """The staging deploy ID is derived in-lane and recorded as a Deployment.
 
     The compute step derives `YYYY.MM.DD.N+sha7` from the validated deploy
-    SHA inside the serialized staging lane (N counts today's staging
-    Deployments, so a queued entry cannot mint a duplicate) and exports it
+    SHA inside the serialized staging lane (N counts today's recorded staging
+    deploy IDs, so a queued entry cannot mint a duplicate) and exports it
     before the prepare step stamps it. Both ID steps run reviewed tooling
     from the workflow's own commit, since a pinned drill deploys a commit
     whose checkout may predate the script. The record step stores the deploy
@@ -1953,8 +1953,8 @@ def production_deploy_id_errors(workflow, name="deploy-production.yml"):
     """The production deploy ID is derived in-lane, stamped, gated and recorded.
 
     The compute step derives `YYYY.MM.DD.N+sha7` from the guarded SHA inside
-    the deploy-production lane (N counts today's production Deployments, so a
-    queued entry cannot mint a duplicate) before the render step stamps it;
+    the deploy-production lane (N counts today's recorded production deploy
+    IDs, so a queued entry cannot mint a duplicate) before the render step stamps it;
     the readyz gate judges it; the record step stores the deploy as a GitHub
     Deployment with environment=production carrying the ID — never a tag or
     Release — with success only when the readyz gate passed and the
@@ -1998,9 +1998,10 @@ def production_deploy_id_errors(workflow, name="deploy-production.yml"):
         lambda step: step.get("name") == "Gate on stable /health + /readyz gateway-ready")
     if gate is not None:
         run = str(gate.get("run") or "")
-        # The flag is conditional: real runs judge the computed ID, while a
-        # caller without an exported ID judges the legacy shape (the
-        # stamping-transition suites run the gate without one).
+        # The flag is conditional: real runs judge the computed ID only when
+        # the deployed Dockerfile can stamp it, while a caller without an
+        # exported ID (the stamping-transition suites run the gate without
+        # one) or a pre-stamping guarded SHA judges the legacy shape.
         for required in ('deploy_id_arg=(--deploy-id "$DEPLOY_ID")',
                          '"${deploy_id_arg[@]}"'):
             if required not in run:

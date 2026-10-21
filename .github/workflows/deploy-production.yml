@@ -1408,7 +1408,10 @@ jobs:
       # cannot certify. Any miss resets the streak. Rollback checks the
       # revision only (the serving version was built by an older run) and
       # accepts an unstamped pre-stamp target as a recorded outcome, never a
-      # different revision as a pass.
+      # different revision as a pass. A guarded SHA from before stamping (no
+      # BOT_DEPLOY_ID ARG in its Dockerfile) judges the legacy
+      # revision/build-ID shape in deploy mode too, since its binary can
+      # never report a deploy ID.
       - name: Gate on stable /health + /readyz gateway-ready
         id: gate
         env:
@@ -1420,11 +1423,12 @@ jobs:
           readyz="$RUNNER_TEMP/production-readyz.json"
           # The same explicit agent name the staging gate sends (scripts/staging_rollout.py).
           agent="two-bot-next-production-rollout/1.0"
-          # The compute step always exports DEPLOY_ID before this gate runs; a
-          # caller without one (the stamping-transition suites) judges the
-          # legacy revision/build-ID shape instead of failing on an unset var.
+          # The compute step always exports DEPLOY_ID, but a guarded SHA that
+          # predates stamping (its Dockerfile has no BOT_DEPLOY_ID ARG) can
+          # never report it: judge the legacy revision/build-ID shape then,
+          # exactly like a caller without an exported ID.
           deploy_id_arg=()
-          if [ -n "${DEPLOY_ID:-}" ]; then
+          if [ -n "${DEPLOY_ID:-}" ] && grep -q '^ARG BOT_DEPLOY_ID' ../Dockerfile; then
             deploy_id_arg=(--deploy-id "$DEPLOY_ID")
           fi
           poll() {

@@ -462,10 +462,12 @@ class StaticGuardTests(unittest.TestCase):
                       '--mode "$MODE" --build-id "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" '
                       '"${deploy_id_arg[@]}" 2>&1',
                       GATE)
-        # The flag is conditional: real runs always export DEPLOY_ID from the
-        # compute step, while callers without one judge the legacy shape.
+        # The flag is conditional: real runs judge the computed ID only when
+        # the deployed Dockerfile can stamp it; callers without an exported
+        # ID, or a guarded SHA from before stamping, judge the legacy shape.
         self.assertIn("deploy_id_arg=()", GATE)
-        self.assertIn('if [ -n "${DEPLOY_ID:-}" ]; then', GATE)
+        self.assertIn('if [ -n "${DEPLOY_ID:-}" ] && grep -q \'^ARG BOT_DEPLOY_ID\' '
+                      '../Dockerfile; then', GATE)
         self.assertIn('deploy_id_arg=(--deploy-id "$DEPLOY_ID")', GATE)
         for text in (RENDER, GATE):
             self.assertNotIn("secrets.", text)
@@ -2034,6 +2036,35 @@ class ShellStepTests(unittest.TestCase):
             deploy_id=None)
         self.assertEqual(code, 0, summary)
         self.assertIn("stable 18/18 polls", summary)
+
+    def test_gate_judges_the_legacy_shape_for_a_pre_stamping_dockerfile(self):
+        # A guarded SHA from before stamping has no BOT_DEPLOY_ID ARG in its
+        # Dockerfile and its binary reports no deploy_id; the gate judges the
+        # legacy revision/build-ID shape instead of failing every poll. The
+        # gate runs in a sandbox workspace so the fixture Dockerfile (not the
+        # checkout's) decides; reviewed tooling still resolves via a link.
+        for dockerfile, expected in (
+            ("FROM example.invalid/base\n", 0),
+            ("FROM example.invalid/base\nARG BOT_DEPLOY_ID=unknown\n", 1),
+        ):
+            with self.subTest(expected=expected):
+                with tempfile.TemporaryDirectory(
+                        dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
+                    ws = Path(tmp) / "ws"
+                    (ws / "wrangler").mkdir(parents=True)
+                    (ws / "Dockerfile").write_text(dockerfile)
+                    (ws / "tooling").symlink_to(ROOT, target_is_directory=True)
+                    with ScriptedWorker(
+                            {"/health": [(200, "{}")],
+                             "/readyz": [(200, report(deploy_id=None))]}) as worker:
+                        code, summary, _ = self.bash(
+                            GATE, cwd=ws / "wrangler", PRODUCTION_URL=worker.url,
+                            MODE="deploy", SHA=SHA,
+                            GITHUB_RUN_ID="700", GITHUB_RUN_ATTEMPT="1",
+                            DEPLOY_ID=DEPLOY_ID)
+                self.assertEqual(code, expected, summary)
+                self.assertIn("stable 18/18 polls" if expected == 0 else "roll back",
+                              summary)
 
     def test_readyz_that_moves_to_this_revision_passes(self):
         code, summary, worker = self.gate({

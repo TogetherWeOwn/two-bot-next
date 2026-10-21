@@ -373,10 +373,12 @@ Every staging and production deploy carries a deploy ID `YYYY.MM.DD.N+sha7`:
 the UTC calendar date, N = the Nth deploy of that environment that day
 (starting at 1), and the 7-character short SHA of the deployed commit. The
 compute step derives N inside the deploy lane as one plus the count of that
-environment's GitHub Deployments created on that UTC date
-(`scripts/deploy_id.py next`); the lanes serialize deploys, so the count
-cannot race. A malformed ID, or an ID naming another commit, refuses before
-anything is rendered or snapshotted.
+environment's recorded deploy IDs created on that UTC date
+(`scripts/deploy_id.py next`): only Deployment rows whose description is a
+deploy ID count, since Actions auto-creates `environment:` rows (each deploy
+job's own run included) that carry none. The lanes serialize deploys, so the
+count cannot race. A malformed ID, or an ID naming another commit, refuses
+before anything is rendered or snapshotted.
 
 The ID is stamped into the image as `BOT_DEPLOY_ID` next to the revision and
 build ID, compiled into the binary, and reported on `/readyz` as `deploy_id`
@@ -385,7 +387,9 @@ build ID, compiled into the binary, and reported on `/readyz` as `deploy_id`
 can read what serves without judging readiness). The Worker proxies
 `/version` like `/readyz`. A build from before stamping reports `unknown`;
 rollback mode ignores the reported ID because the restored build carries its
-original stamped ID.
+original stamped ID. Deploy mode likewise judges the legacy
+revision/build-ID shape for a guarded SHA whose Dockerfile predates the
+`BOT_DEPLOY_ID` ARG, since that binary can never report a deploy ID.
 
 After the gates judge, the record step stores the deploy as a GitHub
 Deployment with `environment` set to `staging` or `production`, the deploy

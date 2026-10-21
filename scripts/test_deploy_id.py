@@ -26,8 +26,11 @@ SHA7 = SHA[:7]
 DATE = "2026.10.21"
 
 
-def row(created_at, environment="staging"):
-    return {"created_at": created_at, "environment": environment}
+def row(created_at, environment="staging", description=f"{DATE}.1+{SHA7}"):
+    # A recorded deploy carries its ID as the description; pass description=None
+    # for an automatic `environment:` row, which carries none and never counts.
+    return {"created_at": created_at, "environment": environment,
+            "description": description}
 
 
 class FormatTests(unittest.TestCase):
@@ -136,6 +139,20 @@ class CountTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     count_deployments_for_date(deployments, "2026.10.21")
 
+    def test_ignores_same_day_rows_without_a_recorded_deploy_id(self):
+        # Actions auto-creates Deployment rows for `environment:` jobs (each
+        # deploy job's own run included); those carry no deploy ID and must
+        # never count toward N, or the first deploy of the day mints N=2.
+        deployments = [
+            row("2026-10-21T08:00:00Z"),
+            row("2026-10-21T09:00:00Z", description=None),
+            row("2026-10-21T10:00:00Z", description=""),
+            row("2026-10-21T11:00:00Z", description="not-an-id"),
+            row("2026-10-21T12:00:00Z", description="unknown"),
+            {"created_at": "2026-10-21T13:00:00Z", "environment": "staging"},
+        ]
+        self.assertEqual(count_deployments_for_date(deployments, "2026.10.21"), 1)
+
 
 class NextTests(unittest.TestCase):
     def test_first_deploy_of_the_day_is_one(self):
@@ -240,6 +257,24 @@ class GhTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(out, f"DEPLOY_ID={DATE}.101+{SHA7}\n")
         self.assertEqual(len(calls), 2)
+
+    def test_next_stops_mid_page_at_an_older_row_without_fetching_more(self):
+        # The early stop ends the listing at the first older row even when
+        # more rows follow on the same page: one API call, N counts only the
+        # pre-stop rows. Without the stop this fixture fetches page 2 and
+        # mints N from the whole page, so the test pins the stop itself, not
+        # the short-page rule.
+        page = ([row("2026-10-21T08:00:00Z"), row("2026-10-20T08:00:00Z")]
+                + [row("2026-10-21T09:00:00Z")] * 98)
+        older = [row("2026-10-20T08:00:00Z")]
+        with patch.dict("os.environ", {"GITHUB_REPOSITORY": "owner/repo"}, clear=False):
+            code, out, calls = self.run_cli(
+                ["next", "--environment", "staging", "--sha", SHA, "--date", DATE],
+                outputs=(page, older),
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, f"DEPLOY_ID={DATE}.2+{SHA7}\n")
+        self.assertEqual(len(calls), 1)
 
     def test_next_ignores_future_rows_without_counting_them(self):
         rows = [row("2026-10-22T08:00:00Z"), row("2026-10-21T08:00:00Z")]
