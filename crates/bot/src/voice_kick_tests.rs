@@ -676,7 +676,11 @@ async fn target_leaving_cancels_the_vote_without_enforcement() {
         worker.kick_refresh(3).is_empty(),
         "a finished vote is forgotten"
     );
-    assert!(!worker.dispatch_one(4).await);
+    assert!(
+        worker.dispatch_one(4).await,
+        "drain the terminal ballot edit"
+    );
+    assert!(!worker.dispatch_one(5).await);
     assert!(trace.lock().unwrap().is_empty());
 }
 
@@ -707,7 +711,11 @@ async fn vote_expires_after_two_minutes_without_enforcement() {
         .kick_cast(VOTE, VOTER_B, VoteBallot::Yes, VOTE_KICK_TTL_MS + 1)
         .unwrap();
     assert_eq!(late.status, VoteKickStatus::Expired);
-    assert!(!worker.dispatch_one(VOTE_KICK_TTL_MS + 2).await);
+    assert!(
+        worker.dispatch_one(VOTE_KICK_TTL_MS + 2).await,
+        "drain the terminal ballot edit"
+    );
+    assert!(!worker.dispatch_one(VOTE_KICK_TTL_MS + 3).await);
     assert!(trace.lock().unwrap().is_empty());
 }
 
