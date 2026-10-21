@@ -500,9 +500,11 @@ non-2xx stay 504. Auth failures are the route's indistinguishable 401; see
 
 - `GET /ops/summary`: readiness (`ready`, `components`), gateway state and
   failure, the informational `jobs` map, pool gauges (`size`/`idle`/`max`),
-  event-store lag (`restorable_point`, `max_lag`: the largest per-table lag)
-  and backfill progress (`tables_total`, `tables_at_point`: tables whose
-  lag is exactly 0), plus the build revision/id.
+  the rejected-duplicate-registration count
+  (`duplicate_pool_registrations`, always present, `0` on unconfigured
+  boots), event-store lag (`restorable_point`, `max_lag`: the largest
+  per-table lag) and backfill progress (`tables_total`, `tables_at_point`:
+  tables whose lag is exactly 0), plus the build revision/id.
 - `GET /ops/gateway`: shard state (`unconfigured`/`armed`/`connected`/
   `draining`), gateway status, the last gateway-task failure, reconnect /
   resume / disconnect / missed-event counters, `last_ready_unix` and
