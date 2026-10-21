@@ -341,7 +341,45 @@ def docker_image(version, revision, build_id):
     return image_receipt(tags, details, version, revision, build_id)
 
 
+BASELINE_IDENTITY = re.compile(r"[A-Za-z0-9_-]{1,128}")
+BASELINE_REVISION = re.compile(r"[0-9a-f]{40}")
+BASELINE_BUILD_ID = re.compile(r"[0-9]+-[0-9]+")
+
+
+def validate_baseline(baseline):
+    """Refuse a malformed local baseline receipt before anyone acts on it.
+
+    Mirrors `ProvenanceReceipt.__post_init__`: every member is type- and
+    shape-checked, and any failure raises the single fixed token
+    `invalid_baseline_receipt` with no upstream text. In particular
+    `rollout_ids` must be a list of identifier-shaped strings — a string
+    would silently flip `select_rollout`'s membership test from list- to
+    substring-matching. Valid receipts pass through untouched.
+    """
+    require(isinstance(baseline, dict), "invalid_baseline_receipt")
+    started = baseline.get("started")
+    require(isinstance(started, (int, float)) and not isinstance(started, bool),
+            "invalid_baseline_receipt")
+    for member in ("application_id", "namespace_id"):
+        value = baseline.get(member)
+        require(isinstance(value, str) and BASELINE_IDENTITY.fullmatch(value),
+                "invalid_baseline_receipt")
+    revision = baseline.get("revision")
+    require(isinstance(revision, str) and BASELINE_REVISION.fullmatch(revision),
+            "invalid_baseline_receipt")
+    build_id = baseline.get("build_id")
+    require(isinstance(build_id, str) and BASELINE_BUILD_ID.fullmatch(build_id),
+            "invalid_baseline_receipt")
+    rollout_ids = baseline.get("rollout_ids")
+    require(isinstance(rollout_ids, list), "invalid_baseline_receipt")
+    for member in rollout_ids:
+        require(isinstance(member, str) and BASELINE_IDENTITY.fullmatch(member),
+                "invalid_baseline_receipt")
+    return baseline
+
+
 def select_rollout(rows, baseline, image):
+    baseline = validate_baseline(baseline)
     candidates = []
     for row in rows:
         row = mapping(row)
@@ -759,6 +797,7 @@ def read_records(path):
 def receipt(args, client=None):
     """Network-free: accept the Wrangler deploy receipt before ownership moves."""
     baseline = mapping(decode(Path(args.receipt).read_bytes()))
+    validate_baseline(baseline)
     version = deploy_version(read_records(args.output), baseline["started"])
     save(args.evidence, {"worker_version": version})
     print("wrangler deploy receipt accepted")
@@ -824,6 +863,7 @@ def deadline_aware_read(client, read, app, row, image, drift_candidate, verifica
 def verify(args, client):
     verification_started = time.monotonic()
     baseline = mapping(decode(Path(args.receipt).read_bytes()))
+    validate_baseline(baseline)
     version = deploy_version(read_records(args.output), baseline["started"])
     image = docker_image(version, baseline["revision"], baseline["build_id"])
     require(worker_namespace(client, version) == baseline["namespace_id"], "worker_namespace_changed")

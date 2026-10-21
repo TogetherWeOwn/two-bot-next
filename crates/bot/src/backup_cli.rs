@@ -303,7 +303,7 @@ async fn cmd_backup() -> i32 {
     let url = match env_var("TWO_DATABASE_URL") {
         Some(url) if url.starts_with("postgres://") || url.starts_with("postgresql://") => url,
         _ => {
-            eprintln!("backup: TWO_DATABASE_URL must be set to a Postgres URL.");
+            eprintln!("backup: TWO_DATABASE_URL must be set to a Postgres URL. code=backup_missing_database_url");
             return 1;
         }
     };
@@ -314,14 +314,14 @@ async fn cmd_backup() -> i32 {
     let keep = match retention::parse_keep(env_var("TWO_BACKUP_KEEP").as_deref()) {
         Ok(keep) => keep,
         Err(err) => {
-            eprintln!("backup: {err}.");
-            eprintln!("        Refusing to run: every reading of that value prunes all backups.");
+            eprintln!("backup: {err}. code=backup_retention_refused");
+            eprintln!("        Refusing to run: every reading of that value prunes all backups. code=backup_retention_refused");
             return 1;
         }
     };
 
     if let Err(err) = std::fs::create_dir_all(&dest) {
-        eprintln!("backup: cannot create {dest}: {err}");
+        eprintln!("backup: cannot create {dest}: {err} code=backup_dest_create_failed");
         return 1;
     }
     let stamp = guild_config::filename_stamp();
@@ -332,7 +332,7 @@ async fn cmd_backup() -> i32 {
     let pool = match open_pool(&url).await {
         Ok(pool) => pool,
         Err(detail) => {
-            eprintln!("backup: {detail}");
+            eprintln!("backup: {detail} code=backup_pool_open_failed");
             return 1;
         }
     };
@@ -354,7 +354,10 @@ async fn cmd_backup() -> i32 {
                     meta.len() as f64 / 1024.0
                 ),
                 Err(err) => {
-                    eprintln!("backup: wrote {} but cannot stat it: {err}", out.display());
+                    eprintln!(
+                        "backup: wrote {} but cannot stat it: {err} code=backup_stat_failed",
+                        out.display()
+                    );
                     return 1;
                 }
             }
@@ -368,14 +371,14 @@ async fn cmd_backup() -> i32 {
             {
                 eprintln!(
                     "backup: the event log is empty. Refusing to call this a good backup: \
-                     keeping existing archives, skipping upload."
+                     keeping existing archives, skipping upload. code=backup_empty_event_log"
                 );
                 pool.close().await;
                 return 1;
             }
         }
         Err(err) => {
-            eprintln!("backup: dump failed: {err}");
+            eprintln!("backup: dump failed: {err} code=backup_dump_failed");
             return 1;
         }
     }
@@ -390,7 +393,7 @@ async fn cmd_backup() -> i32 {
             }
         }
         Err(err) => {
-            eprintln!("backup: prune failed: {err}");
+            eprintln!("backup: prune failed: {err} code=backup_prune_failed");
             return 1;
         }
     }
@@ -720,7 +723,7 @@ async fn cmd_restore_dry_run(file: &str, url: Option<&str>) -> i32 {
 async fn cmd_backup_upload(args: &[String]) -> i32 {
     if args.len() != 1 {
         eprintln!(
-            "backup-upload-s3: expected exactly one argument (the dump path), got {}",
+            "backup-upload-s3: expected exactly one argument (the dump path), got {} code=backup_upload_usage",
             args.len()
         );
         return 2;
@@ -730,7 +733,7 @@ async fn cmd_backup_upload(args: &[String]) -> i32 {
         Ok(meta) if meta.is_file() => meta.len(),
         _ => {
             eprintln!(
-                "backup-upload-s3: cannot read {}: not a regular file",
+                "backup-upload-s3: cannot read {}: not a regular file code=backup_upload_not_regular_file",
                 dump_path.display()
             );
             return 1;
@@ -739,7 +742,7 @@ async fn cmd_backup_upload(args: &[String]) -> i32 {
     // An empty dump would upload happily and restore to nothing.
     if size == 0 {
         eprintln!(
-            "backup-upload-s3: refusing to upload an empty file: {}",
+            "backup-upload-s3: refusing to upload an empty file: {} code=backup_upload_empty_file",
             dump_path.display()
         );
         return 1;
@@ -749,7 +752,7 @@ async fn cmd_backup_upload(args: &[String]) -> i32 {
     let target = match s3::load_s3_target(&std_env) {
         Ok(target) => target,
         Err(err) => {
-            eprintln!("backup-upload-s3: {err}");
+            eprintln!("backup-upload-s3: {err} code=backup_upload_s3_target");
             return 1;
         }
     };
@@ -762,7 +765,7 @@ async fn cmd_backup_upload(args: &[String]) -> i32 {
         Ok(body) => body,
         Err(err) => {
             eprintln!(
-                "backup-upload-s3: cannot read {}: {err}",
+                "backup-upload-s3: cannot read {}: {err} code=backup_upload_read_failed",
                 dump_path.display()
             );
             return 1;
@@ -795,7 +798,7 @@ async fn cmd_backup_upload(args: &[String]) -> i32 {
         Ok(res) => {
             if !(200..300).contains(&res.status.as_u16()) {
                 eprintln!(
-                    "backup-upload-s3: PUT {} {}{}",
+                    "backup-upload-s3: PUT {} {}{} code=backup_upload_put_status",
                     res.status.as_u16(),
                     res.status.canonical_reason().unwrap_or(""),
                     res.detail()
@@ -808,7 +811,7 @@ async fn cmd_backup_upload(args: &[String]) -> i32 {
             0
         }
         Err(err) => {
-            eprintln!("backup-upload-s3: PUT failed: {err}");
+            eprintln!("backup-upload-s3: PUT failed: {err} code=backup_upload_put_failed");
             1
         }
     }
@@ -848,16 +851,16 @@ fn upload_failure_message(
     match outcome {
         UploadOutcome::Success => None,
         UploadOutcome::ExitNonzero(status) => {
-            Some(format!("{scope}: upload failed: {cmd} exited {status}"))
+            Some(format!("{scope}: upload failed: {cmd} exited {status} code=upload_exit_nonzero"))
         }
         UploadOutcome::SpawnFailed(err) => {
-            Some(format!("{scope}: upload failed to start ({cmd}): {err}"))
+            Some(format!("{scope}: upload failed to start ({cmd}): {err} code=upload_spawn_failed"))
         }
         UploadOutcome::WaitFailed(err) => {
-            Some(format!("{scope}: upload wait failed ({cmd}): {err}"))
+            Some(format!("{scope}: upload wait failed ({cmd}): {err} code=upload_wait_failed"))
         }
         UploadOutcome::TimedOut => Some(format!(
-            "{scope}: upload timed out after {budget:?}; terminated upload child ({cmd})"
+            "{scope}: upload timed out after {budget:?}; terminated upload child ({cmd}) code=upload_timed_out"
         )),
     }
 }
@@ -998,19 +1001,19 @@ async fn cmd_guild_config_snapshot() -> i32 {
     let token = match staging_token() {
         Ok(token) => token,
         Err(message) => {
-            eprintln!("guild-config-snapshot: {message}");
+            eprintln!("guild-config-snapshot: {message} code=snapshot_token_load_failed");
             return 1;
         }
     };
     if let Err(message) = guild_config::check_staging_token(&token) {
-        eprintln!("guild-config-snapshot: {message}");
+        eprintln!("guild-config-snapshot: {message} code=snapshot_token_check_refused");
         return 2;
     }
     let std_env = |name: &str| env_var(name);
     let guild_id = match guild_config::staging_guild_id(&std_env) {
         Ok(guild_id) => guild_id,
         Err(message) => {
-            eprintln!("guild-config-snapshot: {message}");
+            eprintln!("guild-config-snapshot: {message} code=snapshot_guild_id_failed");
             return 2;
         }
     };
@@ -1018,19 +1021,19 @@ async fn cmd_guild_config_snapshot() -> i32 {
     let api = match governed_guild_config_api(token, guild_id.clone()).await {
         Ok(api) => api,
         Err(err) => {
-            eprintln!("guild-config-snapshot: {err}");
+            eprintln!("guild-config-snapshot: {err} code=snapshot_governed_api_failed");
             return 2;
         }
     };
     if let Err(err) = api.assert_identity().await {
-        eprintln!("guild-config-snapshot: {err}");
+        eprintln!("guild-config-snapshot: {err} code=snapshot_identity_failed");
         return 1;
     }
     // TOG-3513: seal the snapshot at capture so restore can refuse a tampered backup.
     let snapshot = match api.capture().await {
         Ok(snapshot) => guild_config::seal_snapshot(snapshot),
         Err(err) => {
-            eprintln!("guild-config-snapshot: capture failed: {err}");
+            eprintln!("guild-config-snapshot: capture failed: {err} code=snapshot_capture_failed");
             return 1;
         }
     };
@@ -1051,7 +1054,7 @@ async fn cmd_guild_config_snapshot() -> i32 {
         (&drift_path, report.clone()),
     ] {
         if let Err(err) = atomic_json(path, &value) {
-            eprintln!("guild-config-snapshot: {err}");
+            eprintln!("guild-config-snapshot: {err} code=snapshot_atomic_write_failed");
             return 1;
         }
     }
@@ -1065,7 +1068,7 @@ async fn cmd_guild_config_snapshot() -> i32 {
         Some(value) => value,
         None => {
             eprintln!(
-                "guild-config-snapshot: cannot re-read {}",
+                "guild-config-snapshot: cannot re-read {} code=snapshot_reread_failed",
                 snapshot_path.display()
             );
             return 1;
@@ -1079,7 +1082,7 @@ async fn cmd_guild_config_snapshot() -> i32 {
             .unwrap_or("")
     {
         eprintln!(
-            "guild-config-snapshot: snapshot hash changed after write: {}",
+            "guild-config-snapshot: snapshot hash changed after write: {} code=snapshot_hash_changed",
             snapshot_path.display()
         );
         return 1;
@@ -1088,7 +1091,7 @@ async fn cmd_guild_config_snapshot() -> i32 {
         Ok(guild_config::SealState::Sealed) => {}
         _ => {
             eprintln!(
-                "guild-config-snapshot: snapshot at {} is missing its integrity seal",
+                "guild-config-snapshot: snapshot at {} is missing its integrity seal code=snapshot_seal_missing",
                 snapshot_path.display()
             );
             return 1;
@@ -1120,7 +1123,7 @@ async fn cmd_guild_config_snapshot() -> i32 {
         env_var("TWO_GUILD_CONFIG_UPLOAD_CMD").or_else(|| env_var("TWO_BACKUP_UPLOAD_CMD"));
     for path in [&snapshot_path, &drift_path] {
         let Some((cmd, upload_args)) = snapshot_upload_argv(upload_raw.as_deref(), path) else {
-            eprintln!("guild-config-snapshot: TWO_GUILD_CONFIG_UPLOAD_CMD (or TWO_BACKUP_UPLOAD_CMD) is required; refusing a local-only snapshot");
+            eprintln!("guild-config-snapshot: TWO_GUILD_CONFIG_UPLOAD_CMD (or TWO_BACKUP_UPLOAD_CMD) is required; refusing a local-only snapshot code=snapshot_local_only_refused");
             return 2;
         };
         match run_upload_command(&cmd, &upload_args, UPLOAD_COMMAND_TIMEOUT).await {
