@@ -65,8 +65,9 @@ use two_bot_core::{
     automod_runtime::FunnelDisposition,
     commands::PERM_MANAGE_GUILD,
     feeds::{
-        feed_list_text, feed_removed_text, plan_command, FeedCommand, FeedCommandContext,
-        FeedCommandPlan, FeedError, FeedKind, FEED_REMOVAL_RECOVERY_REQUIRED_TEXT,
+        feed_list_page, feed_list_page_invalid_text, feed_list_page_underflow_text,
+        feed_removed_text, plan_command, FeedCommand, FeedCommandContext, FeedCommandPlan,
+        FeedError, FeedKind, FEED_REMOVAL_RECOVERY_REQUIRED_TEXT,
     },
     feeds_store::{add_feed, list_feeds, remove_feed, write_audit, FeedAudit, FeedRemoval},
     funnel::now_millis_for_test,
@@ -1934,27 +1935,43 @@ impl CommandRuntime {
         }
     }
 
-    /// `/feed-list`: plan → guild-scoped list → ephemeral text. Legacy
-    /// `listFeeds` lists every relay for the guild (not `enabled` only) and
-    /// writes no audit row.
+    /// `/feed-list`: plan → page decode → guild-scoped list → ephemeral
+    /// text. Legacy `listFeeds` lists every relay for the guild (not `enabled`
+    /// only) and writes no audit row. An omitted `page` means page 1; a
+    /// present-but-unusable option refuses without a store read, and
+    /// out-of-range refuses after the same bounded read every list uses.
     async fn feed_list(&self, interaction: &Interaction) {
         let channel_id = interaction_channel(interaction).unwrap_or_default();
         let inputs = self.feed_inputs(interaction);
         let context = inputs.context(&channel_id);
         match plan_command(&context, FeedCommand::List) {
             Ok(FeedCommandPlan::List { guild_id }) => {
-                match list_feeds(&self.pool, &guild_id, false).await {
-                    Ok(feeds) => self.finish(interaction, feed_list_text(&feeds)).await,
-                    Err(err) => {
-                        warn!(reason = feed_store_class(&err), "feed list failed");
-                        self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
+                let reply = match feed_list_page_request(interaction) {
+                    FeedListPage::Invalid => feed_list_page_invalid_text().to_owned(),
+                    FeedListPage::Default => self.list_feed_page(&guild_id, 1).await,
+                    FeedListPage::Page(page) if page < 1 => {
+                        feed_list_page_underflow_text().to_owned()
                     }
-                }
+                    FeedListPage::Page(page) => self.list_feed_page(&guild_id, page).await,
+                };
+                self.finish(interaction, reply).await;
             }
             Ok(plan) => {
                 warn!(?plan, "feed-list planned to a non-list variant");
             }
             Err(err) => self.finish(interaction, err.to_string()).await,
+        }
+    }
+
+    /// One bounded guild-scoped relay read rendered as the requested page.
+    /// A failed read keeps the fixed safe reply and writes no audit row.
+    async fn list_feed_page(&self, guild_id: &str, page: i64) -> String {
+        match list_feeds(&self.pool, guild_id, false).await {
+            Ok(feeds) => feed_list_page(&feeds, page),
+            Err(err) => {
+                warn!(reason = feed_store_class(&err), "feed list failed");
+                FEED_STORE_FAILURE_REPLY.to_owned()
+            }
         }
     }
 
@@ -2213,6 +2230,31 @@ pub(crate) fn feed_remove_option(interaction: &Interaction) -> Option<String> {
             ("id", CommandOptionValue::String(value)) => Some(value.clone()),
             _ => None,
         })
+}
+
+/// `/feed-list`'s optional 1-based `page` option, decoded by name first: an
+/// omitted option means page 1, while a present option with a non-integer
+/// wire value is unusable and must refuse rather than silently list page 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FeedListPage {
+    Default,
+    Page(i64),
+    Invalid,
+}
+
+pub(crate) fn feed_list_page_request(interaction: &Interaction) -> FeedListPage {
+    let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
+        &interaction.data
+    else {
+        return FeedListPage::Default;
+    };
+    match data.options.iter().find(|option| option.name == "page") {
+        None => FeedListPage::Default,
+        Some(option) => match &option.value {
+            CommandOptionValue::Integer(value) => FeedListPage::Page(*value),
+            _ => FeedListPage::Invalid,
+        },
+    }
 }
 
 /// Shared sticky/feed/channel/leveling registrations over the narrowed boot

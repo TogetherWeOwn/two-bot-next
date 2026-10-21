@@ -56,8 +56,8 @@ use two_bot_core::{
 use two_bot_discord::ActionExecutor;
 
 use crate::command_runtime::{
-    actor_id, ephemeral, feed_add_options, feed_remove_option, new_id, router_with_commands,
-    sticky_options, CommandRuntime, RegistrySyncError,
+    actor_id, ephemeral, feed_add_options, feed_list_page_request, feed_remove_option, new_id,
+    router_with_commands, sticky_options, CommandRuntime, FeedListPage, RegistrySyncError,
 };
 use crate::internal_action_http::MODERATION_METRICS_LOCK;
 use crate::member_runtime::MemberRuntime;
@@ -2742,6 +2742,36 @@ fn feed_remove_option_extracts_id() {
     assert_eq!(feed_remove_option(&interaction), Some("feed-1".to_owned()));
     let missing = slash("feed-remove", Some(CHANNEL), Vec::new());
     assert_eq!(feed_remove_option(&missing), None);
+}
+
+#[test]
+fn feed_list_page_request_defaults_and_refuses_unusable_values() {
+    let missing = slash("feed-list", Some(CHANNEL), Vec::new());
+    assert_eq!(feed_list_page_request(&missing), FeedListPage::Default);
+    for (value, expected) in [
+        (CommandOptionValue::Integer(1), FeedListPage::Page(1)),
+        (CommandOptionValue::Integer(2), FeedListPage::Page(2)),
+        (
+            CommandOptionValue::Integer(i64::MAX),
+            FeedListPage::Page(i64::MAX),
+        ),
+        // Range is refused by the reply composer, not the decoder.
+        (CommandOptionValue::Integer(0), FeedListPage::Page(0)),
+        (CommandOptionValue::Integer(-2), FeedListPage::Page(-2)),
+    ] {
+        let interaction = slash("feed-list", Some(CHANNEL), vec![option("page", value)]);
+        assert_eq!(feed_list_page_request(&interaction), expected);
+    }
+    // A present option with a non-integer wire value must refuse, never
+    // silently list the default page.
+    for value in [
+        CommandOptionValue::String("second".to_owned()),
+        CommandOptionValue::Number(1.5),
+        CommandOptionValue::Boolean(true),
+    ] {
+        let interaction = slash("feed-list", Some(CHANNEL), vec![option("page", value)]);
+        assert_eq!(feed_list_page_request(&interaction), FeedListPage::Invalid);
+    }
 }
 
 #[test]
@@ -5440,28 +5470,76 @@ async fn feed_list_at_capacity_keeps_every_configured_guild_id_discoverable() {
     assert_eq!(rows_before.len(), 25, "seeded capacity");
     let (runtime, mock) = db_runtime(&db, Vec::new()).await;
 
+    // Whole rows page instead of squeezing sources: the default reply is
+    // page 1 with navigation, and every id stays reachable exactly once
+    // across the reachable pages.
     runtime
         .on_interaction(&slash("feed-list", Some(CHANNEL), Vec::new()))
         .await;
+    let first = patch_contents(&mock)[0].clone();
+    let total: usize = first
+        .split("Page 1 of ")
+        .nth(1)
+        .expect("default reply announces its total")
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .expect("numeric total");
+    assert!((2..=25).contains(&total), "capacity pages: {first}");
+    for page in 2..=total as i64 {
+        runtime
+            .on_interaction(&slash(
+                "feed-list",
+                Some(CHANNEL),
+                vec![option("page", CommandOptionValue::Integer(page))],
+            ))
+            .await;
+    }
 
-    // deferred_reply pins the ephemeral defer (flags 64) and mention safety
-    // (allowed_mentions parse []) on the single completion.
-    let json = mock.deferred_reply();
-    let content = json["content"].as_str().expect("list content");
-    assert!(
-        content.encode_utf16().count() <= 2000,
-        "response exceeds the 2,000 UTF-16 unit limit ({} units): {content}",
-        content.encode_utf16().count()
+    // One ephemeral defer (flags 64) plus one mention-safe completion
+    // (allowed_mentions parse []) per invocation, no extra calls.
+    let requests = mock.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.method == "POST" && r.path.ends_with("/callback"))
+            .count(),
+        total,
+        "one defer per page"
     );
-    for id in &own_ids {
+    let contents = patch_contents(&mock);
+    assert_eq!(contents.len(), total, "one completion per page");
+    let mut seen = Vec::new();
+    for (index, content) in contents.iter().enumerate() {
+        let page = index + 1;
         assert!(
-            content.contains(&format!("`{id}`")),
-            "configured-guild relay {id} discoverable at capacity: {content}"
+            content.encode_utf16().count() <= 2000,
+            "page {page} exceeds the 2,000 UTF-16 unit limit ({} units): {content}",
+            content.encode_utf16().count()
+        );
+        assert!(
+            content.contains(&format!("Page {page} of {total}")),
+            "page {page} identifies itself: {content}"
+        );
+        assert!(
+            content.contains("/feed-list") && content.contains("page"),
+            "page {page} gives usable navigation: {content}"
+        );
+        assert!(
+            !content.contains(&foreign_id),
+            "other guild's relay never listed: {content}"
+        );
+        seen.extend(
+            content
+                .lines()
+                .filter_map(|line| line.strip_prefix('`')?.split_once('`').map(|(id, _)| id))
+                .map(str::to_owned),
         );
     }
-    assert!(
-        !content.contains(&foreign_id),
-        "other guild's relay never listed: {content}"
+    assert_eq!(
+        seen, own_ids,
+        "every configured-guild id reachable exactly once, in stable order"
     );
     assert_eq!(
         db.feed_rows().await,
@@ -5474,6 +5552,28 @@ async fn feed_list_at_capacity_keeps_every_configured_guild_id_discoverable() {
     );
     mock.shutdown().await;
     db.close().await;
+}
+
+/// Completion bodies for every invocation so far, pinning mention safety
+/// (`allowed_mentions` parse `[]`) on each PATCH the way `deferred_reply`
+/// does for the single-completion case.
+fn patch_contents(mock: &MockRest) -> Vec<String> {
+    mock.requests()
+        .iter()
+        .filter(|r| r.method == "PATCH")
+        .map(|r| {
+            let json: serde_json::Value = serde_json::from_slice(&r.body).expect("completion json");
+            assert_eq!(
+                json["allowed_mentions"]["parse"],
+                serde_json::json!([]),
+                "mention-safe completion"
+            );
+            json["content"]
+                .as_str()
+                .expect("completion content")
+                .to_owned()
+        })
+        .collect()
 }
 
 #[tokio::test]
