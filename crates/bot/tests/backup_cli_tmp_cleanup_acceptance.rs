@@ -84,7 +84,19 @@ fn fixture() -> Map<String, Value> {
         "version": 1,
         "applicationId": STAGING_BOT_APPLICATION_ID,
         "guildId": TWO_STAGING_GUILD_ID,
-        "guild": {"id": TWO_STAGING_GUILD_ID, "owner_id": "100000000000000099", "name": "Loopback guild"},
+        "guild": {
+            "id": TWO_STAGING_GUILD_ID,
+            "owner_id": "100000000000000099",
+            "name": "Loopback guild",
+            // Explicit nulls: the planner compares channel-id fields by value,
+            // and a missing key differs from null. Without these the identical
+            // fixture plans 1 settings op, `--apply` attempts a Discord write
+            // the loopback refuses (403), and the run never reaches `--evidence`.
+            "system_channel_id": null,
+            "rules_channel_id": null,
+            "public_updates_channel_id": null,
+            "afk_channel_id": null
+        },
         "roles": [
             {"id": TWO_STAGING_GUILD_ID, "name": "@everyone", "position": 0, "permissions": "0", "managed": false},
             {"id": BOT_ROLE, "name": "Owen managed role", "position": 10, "permissions": "8", "managed": true},
