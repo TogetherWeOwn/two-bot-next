@@ -169,7 +169,7 @@ fn rank_and_leaderboard_route_with_all_feature_gates_off() {
             custom_row: None,
         });
         assert!(
-            matches!(outcome, SlashOutcome::Handled { routed } if routed == handler),
+            matches!(outcome, SlashOutcome::Handled { handler: routed } if routed == handler),
             "{name} stays ungated with every feature off, got {outcome:?}"
         );
     }

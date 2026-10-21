@@ -607,13 +607,13 @@ async fn leaderboard_success_completes_via_edit_with_current_season_values() {
     assert_leaderboard_defer(&seen[0].body);
     let done = edits(&mock);
     assert_eq!(done.len(), 1, "the successful read completes via one edit");
-    let expected: Vec<LeaderboardEntry> = (79..89)
+    let expected: Vec<LeaderboardEntry> = (79_u64..89)
         .rev()
         .enumerate()
         .map(|(index, member)| LeaderboardEntry {
             member_id: member.to_string(),
-            xp: u64::from(member),
-            level: level_for_xp(u64::from(member)),
+            xp: member,
+            level: level_for_xp(member),
             rank: index as u64 + 1,
         })
         .collect();
