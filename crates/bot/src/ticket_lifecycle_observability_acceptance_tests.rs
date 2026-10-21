@@ -365,7 +365,8 @@ async fn retire_missing_open_counts_and_logs_once_with_cause() {
     let ticket = runtime.store.get("lc-retire-1").await.unwrap().unwrap();
 
     let start = capture().text().len();
-    runtime.recover_ticket(&ticket).await.unwrap();
+    let outcome = runtime.recover_ticket(&ticket).await;
+    assert!(outcome.is_ok(), "recover_ticket should succeed");
 
     // The retire itself still lands (proves the fixture drove a real retire).
     assert_eq!(
@@ -427,7 +428,8 @@ async fn abandon_stale_creating_counts_and_logs_once_with_cause() {
     let ticket = runtime.store.get("lc-abandon-1").await.unwrap().unwrap();
 
     let start = capture().text().len();
-    runtime.recover_ticket(&ticket).await.unwrap();
+    let outcome = runtime.recover_ticket(&ticket).await;
+    assert!(outcome.is_ok(), "recover_ticket should succeed");
 
     // The reservation is gone (proves the fixture drove a real abandon).
     assert!(runtime.store.get("lc-abandon-1").await.unwrap().is_none());
@@ -533,7 +535,8 @@ async fn abandon_creating_false_counts_already_gone_and_logs() {
     };
 
     let start = capture().text().len();
-    runtime.recover_ticket(&ticket).await.unwrap();
+    let outcome = runtime.recover_ticket(&ticket).await;
+    assert!(outcome.is_ok(), "recover_ticket should succeed");
 
     // Zero rows deleted, and no row invented (the false is handled, not
     // dropped and not mistaken for an abandon).
