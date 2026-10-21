@@ -271,6 +271,7 @@ mod tests {
             "two_bot_gateway_resumes_total",
             "two_bot_gateway_disconnects_total",
             "two_bot_gateway_missed_events_total",
+            "two_bot_gateway_rsvp_refused_total",
             "two_bot_gateway_events_total",
             "two_bot_handler_duration_seconds",
             "two_bot_rest_requests_total",

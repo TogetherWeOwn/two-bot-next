@@ -365,6 +365,40 @@ impl Drop for AckPermit {
     }
 }
 
+/// Cap on admitted in-flight RSVP work per shard runner: spawned-but-
+/// uncompleted prepares plus queued drain entries.
+const RSVP_IN_FLIGHT_LIMIT: usize = 32;
+
+/// Drop guard for the bounded RSVP admission counter
+/// (`RSVP_IN_FLIGHT_LIMIT`), in the [`AckPermit`] fail-closed shape. The
+/// permit travels with its [`AcceptedRsvp`] and releases when the serial
+/// drain completes it — including by panic unwind — so a stalled drain
+/// refuses new interactions instead of buffering them forever.
+struct RsvpPermit {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl RsvpPermit {
+    /// Admit one RSVP interaction, or `None` at capacity. A refused
+    /// admission rolls its optimistic increment back immediately; the
+    /// caller counts the refusal via `gateway_rsvp_refused`.
+    fn try_acquire(in_flight: &Arc<AtomicUsize>) -> Option<Self> {
+        if in_flight.fetch_add(1, Ordering::AcqRel) >= RSVP_IN_FLIGHT_LIMIT {
+            in_flight.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(Self {
+            in_flight: Arc::clone(in_flight),
+        })
+    }
+}
+
+impl Drop for RsvpPermit {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Dispatch-worker failures are recorded errors, never worker panics: the
 /// worker stops, already-accepted commands drain, and the runner surfaces
 /// these typed errors instead of a bare "dispatch worker failed". Each
@@ -520,6 +554,9 @@ async fn complete_acknowledgement(
 struct AcceptedRsvp {
     acknowledgement: RsvpAcknowledgement,
     completed: tokio::sync::oneshot::Sender<bool>,
+    /// Admission guard: releases when the drain completes this entry, so
+    /// in-flight RSVP work stays within [`RSVP_IN_FLIGHT_LIMIT`].
+    permit: RsvpPermit,
 }
 
 /// Reception acknowledges immediately; completion stays serial and supervised
@@ -1296,6 +1333,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
     let receive_state = Arc::clone(&state);
     let receive_onboarding = onboarding.clone();
     let in_flight_acks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let in_flight_rsvp = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let receive_pipeline = Arc::clone(&pipeline);
     let receive_voice = voice.clone();
     let events = futures_util::stream::unfold(
@@ -1315,6 +1353,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
             let ack_tracker = Arc::clone(&receive_acks);
             let onboarding = receive_onboarding.clone();
             let in_flight_acks = Arc::clone(&in_flight_acks);
+            let in_flight_rsvp = Arc::clone(&in_flight_rsvp);
             let pipeline = Arc::clone(&receive_pipeline);
             let voice = receive_voice.clone();
             let opening_tx = opening_tx.clone();
@@ -1454,22 +1493,34 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         }
                         if let (Some(runtime), Some(sender), Some(dispatch)) = (interactions.as_ref(), rsvp_sender.as_ref(), dispatch.as_mut()) {
                             if let Event::InteractionCreate(interaction) = &dispatch.event {
-                                let interaction = interaction.0.clone();
-                                let runtime = Arc::clone(runtime);
-                                let acknowledgement = tokio::spawn(async move { runtime.prepare(interaction).await });
-                                // Track owned acknowledgement work so the bounded
-                                // completion policy can cancel it on timeout or
-                                // shard cancellation instead of detaching it.
-                                if let Ok(mut owned) = ack_tracker.lock() {
-                                    owned.retain(|handle| !handle.is_finished());
-                                    owned.push(acknowledgement.abort_handle());
+                                match RsvpPermit::try_acquire(&in_flight_rsvp) {
+                                    Some(permit) => {
+                                        let interaction = interaction.0.clone();
+                                        let runtime = Arc::clone(runtime);
+                                        let acknowledgement = tokio::spawn(async move { runtime.prepare(interaction).await });
+                                        // Track owned acknowledgement work so the bounded
+                                        // completion policy can cancel it on timeout or
+                                        // shard cancellation instead of detaching it.
+                                        if let Ok(mut owned) = ack_tracker.lock() {
+                                            owned.retain(|handle| !handle.is_finished());
+                                            owned.push(acknowledgement.abort_handle());
+                                        }
+                                        let (completed, completion) = tokio::sync::oneshot::channel();
+                                        sender.send(AcceptedRsvp { acknowledgement, completed, permit })
+                                            .map_err(|_| {
+                                                sqlx::Error::InvalidArgument("interaction drain stopped".into())
+                                            })?;
+                                        dispatch.completion = Some(completion);
+                                    }
+                                    None => {
+                                        // At capacity: refuse without spawning or
+                                        // queueing. The dispatch advances with no
+                                        // RSVP completion (same as a non-interaction
+                                        // event) instead of wedging the funnel,
+                                        // checkpoint or dispatch worker.
+                                        two_bot_core::metrics::global().gateway_rsvp_refused();
+                                    }
                                 }
-                                let (completed, completion) = tokio::sync::oneshot::channel();
-                                sender.send(AcceptedRsvp { acknowledgement, completed })
-                                    .map_err(|_| {
-                                        sqlx::Error::InvalidArgument("interaction drain stopped".into())
-                                    })?;
-                                dispatch.completion = Some(completion);
                             }
                         }
                         // The only onboarding effect at reception is a bounded
@@ -4030,6 +4081,24 @@ mod tests {
             ),
             "capacity refusal must stay typed, got {error:?}"
         );
+    }
+
+    /// At capacity, RSVP admission refuses instead of spawning unbounded
+    /// prepare work; releasing one permit admits exactly one more.
+    #[test]
+    fn gateway_rsvp_permit_refuses_past_capacity() {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let mut held: Vec<_> = (0..RSVP_IN_FLIGHT_LIMIT)
+            .map(|_| RsvpPermit::try_acquire(&in_flight).expect("capacity must admit 32"))
+            .collect();
+        assert!(RsvpPermit::try_acquire(&in_flight).is_none());
+        assert_eq!(in_flight.load(Ordering::Acquire), RSVP_IN_FLIGHT_LIMIT);
+        held.pop();
+        let readmitted = RsvpPermit::try_acquire(&in_flight).expect("release must admit one more");
+        assert!(RsvpPermit::try_acquire(&in_flight).is_none());
+        drop(readmitted);
+        drop(held);
+        assert_eq!(in_flight.load(Ordering::Acquire), 0);
     }
 
     /// Every dispatch-worker failure site surfaces its own typed message, so an
