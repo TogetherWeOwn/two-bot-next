@@ -132,6 +132,8 @@ mod tuning_test_support;
 mod website_jobs;
 #[cfg(test)]
 mod website_roster_cap_acceptance_tests;
+#[cfg(test)]
+mod worker_supervision_acceptance_tests;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
