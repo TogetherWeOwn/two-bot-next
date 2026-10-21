@@ -7,7 +7,10 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
 };
-use two_bot_discord::{ratelimit_guard::GuardError, DiscordError};
+use two_bot_discord::{
+    ratelimit_guard::{GuardConfig, GuardError, RateLimitGuard},
+    DiscordError,
+};
 
 struct AuthorityRest {
     executor: ActionExecutor,
@@ -44,9 +47,16 @@ impl AuthorityRest {
                     .expect("fixture response");
             }
         });
+        // Synthetic 401s must latch only this fixture's guard, never the
+        // process guard shared by unrelated REST and readiness tests.
+        let guard = Arc::new(RateLimitGuard::new(GuardConfig::default()).expect("fixture guard"));
         Self {
-            executor: ActionExecutor::with_proxy("fixture-only-token".into(), Some(origin))
-                .expect("loopback executor"),
+            executor: ActionExecutor::with_proxy_and_guard(
+                "fixture-only-token".into(),
+                Some(origin),
+                guard,
+            )
+            .expect("loopback executor"),
             task,
         }
     }
@@ -203,6 +213,27 @@ async fn guild_reads_attribute_missing_mismatched_and_malformed_evidence() {
             matches!(guild_facts(&rest.executor, "2222").await, Err(cause) if cause == expected)
         );
     }
+}
+
+#[tokio::test]
+async fn synthetic_unauthorized_read_does_not_poison_another_authority_fixture() {
+    let healthy = AuthorityRest::start(vec![(
+        "/api/v10/guilds/2222/members/88",
+        200,
+        json!({"user":{"id":"88"}, "roles":[]}).to_string(),
+    )])
+    .await;
+    let unauthorized =
+        AuthorityRest::start(vec![("/api/v10/guilds/2222/members/88", 401, "{}".into())]).await;
+    assert_eq!(
+        fetched_member(&unauthorized.executor, "2222", "88").await,
+        Err(AuthorityCause::Transport)
+    );
+    assert_eq!(
+        fetched_member(&healthy.executor, "2222", "88").await,
+        Ok(Some((vec![], false))),
+        "a synthetic 401 must not disable another executor's REST reads"
+    );
 }
 
 #[tokio::test]
