@@ -825,7 +825,7 @@ async fn settlement_baseline_items_stay_live() -> TestResult {
             .expect("journal must succeed");
         let retry: Result<bool, StoreError> =
             <SelfRoleStore as BaselineSettlement>::note_wire_retry(&store, &ticket).await;
-        assert_eq!(retry.unwrap(), false);
+        assert!(!retry.unwrap());
         let noted: Result<bool, StoreError> =
             <SelfRoleStore as BaselineSettlement>::note_ambiguous_outcome(
                 &store,
@@ -833,13 +833,13 @@ async fn settlement_baseline_items_stay_live() -> TestResult {
                 "timeout_no_response",
             )
             .await;
-        assert_eq!(noted.unwrap(), false);
+        assert!(!noted.unwrap());
         let superseded: Result<bool, StoreError> =
             <SelfRoleStore as BaselineSettlement>::supersede_role_exchange(
                 &store, &ticket, &ticket,
             )
             .await;
-        assert_eq!(superseded.unwrap(), false);
+        assert!(!superseded.unwrap());
         let expired: Result<u64, StoreError> =
             <SelfRoleStore as BaselineSettlement>::expire_stale_exchanges(
                 &store,
