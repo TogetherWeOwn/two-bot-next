@@ -168,6 +168,30 @@ pub async fn begin_prompt(
     }))
 }
 
+/// Release one member's prompt guard after their leave was processed, so a
+/// rejoin is welcomed again. Returns whether a marker was removed. A single
+/// atomic DELETE: job order comes from the worker queue, and a suppressed
+/// pair never holds a row, so a concurrent opt-out can only turn this into a
+/// no-op. The next welcome re-runs the full [`begin_prompt`] gate
+/// (suppression, then the marker), so clearing never welcomes someone who
+/// opted out.
+pub async fn clear_onboarding_prompt(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    member_id: &str,
+) -> Result<bool, OnboardingStoreError> {
+    let removed = sqlx::query(
+        "DELETE FROM events WHERE guild_id = $1 AND member_id = $2 AND event_type = $3",
+    )
+    .bind(guild_id)
+    .bind(member_id)
+    .bind(EVENT_ONBOARDING_PROMPTED)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(removed > 0)
+}
+
 /// Idempotently import/record a welcome that has already been sent. Runtime
 /// senders should hold a `PromptGuard` instead of checking then sending.
 pub async fn record_prompted(
@@ -247,8 +271,10 @@ pub async fn record_channel_routed(
 }
 
 /// Stage both game success rows in the caller's role-write transaction.
-/// The caller must commit only after the deferred reply succeeds. Any insert,
-/// reply, or commit failure then leaves neither successful-selection row.
+/// The caller commits before replying, so the reply always describes committed
+/// state: an insert or commit failure yields the failure reply path with
+/// neither row, while a reply failure after commit leaves the committed rows
+/// and finishes the defer with the terminal error edit.
 /// An empty destination list records the granted games but no successful route.
 pub async fn record_game_selection_in_transaction(
     transaction: &mut Transaction<'_, Postgres>,
@@ -289,7 +315,41 @@ pub async fn record_game_selection_in_transaction(
     Ok(())
 }
 
-/// Stage roleless routing until the caller's deferred reply has succeeded.
+/// Stage the roles a partial game-picker failure already flipped, in the
+/// caller's role-write transaction. Only granted picks are recorded — the
+/// pending picks were never applied, and no route was delivered, so no
+/// `channel_routed` row is staged. The member's retry is a fresh whole-answer
+/// submission that converges to full success and records the complete
+/// selection alongside this partial row. An empty grant list stages nothing:
+/// revokes are never funnel events, matching the success path, where a clear
+/// records nothing. Suppressed pairs persist nothing
+/// (see [`record_game_selected`]).
+pub async fn record_game_partial_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    guild_id: &str,
+    member_id: &str,
+    applied_keys: &[String],
+    occurred_at: &str,
+) -> Result<(), OnboardingStoreError> {
+    if applied_keys.is_empty() {
+        return Ok(());
+    }
+    sqlx::query("LOCK TABLE events, privacy_opt_outs IN ROW EXCLUSIVE MODE")
+        .execute(&mut **transaction)
+        .await?;
+    if crate::privacy::suppressed_in(transaction, guild_id, member_id).await? {
+        return Ok(());
+    }
+    insert_row(
+        transaction,
+        &game_selected_row(guild_id, member_id, applied_keys, occurred_at),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Stage roleless routing in the caller's transaction. The caller commits
+/// before replying (see [`record_game_selection_in_transaction`]).
 pub async fn record_session_routed_in_transaction(
     transaction: &mut Transaction<'_, Postgres>,
     guild_id: &str,

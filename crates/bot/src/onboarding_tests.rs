@@ -3,6 +3,8 @@
 
 #[path = "onboarding_connect_acceptance_tests.rs"]
 mod connect_acceptance;
+#[path = "onboarding_durable_picker_rejoin_acceptance_tests.rs"]
+mod durable_picker_rejoin_acceptance;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -662,6 +664,9 @@ async fn onboarding_runtime_roleless_session_reselection_stale_menu_and_goodbye_
                     username: "@everyone <@44> <@&77>".into(),
                     bot: false,
                     joined_at_ms: Some(NOW - 2 * 86_400_000),
+                    // Unknown leaver: the goodbye posts, only the guard
+                    // clearing is skipped.
+                    member_id: None,
                 },
                 NOW + 3,
             )
@@ -923,6 +928,7 @@ async fn onboarding_runtime_goodbye_hot_setting_reaches_live_handler() {
             username: "dave".into(),
             bot: false,
             joined_at_ms: Some(NOW - 86_400_000),
+            member_id: None,
         };
         live.handle(goodbye(), NOW).await.unwrap();
         assert_eq!(
@@ -1077,6 +1083,13 @@ fn replies(mock: &MockRest) -> Vec<RestRequest> {
 async fn assert_picker_failure(db: &TestSchema, mock: &MockRest, reply_count: usize) {
     assert_eq!(db.count(EVENT_GAME_ROLES_SELECTED).await, 0);
     assert_eq!(db.count(EVENT_CHANNEL_ROUTED).await, 0);
+    assert_error_edit(mock, reply_count).await;
+}
+
+/// The terminal error-edit half of [`assert_picker_failure`], for failures
+/// that land after the success rows committed: the defer is still finished
+/// exactly once with the failure copy, but the rows stay.
+async fn assert_error_edit(mock: &MockRest, reply_count: usize) {
     let requests = mock.requests();
     let defer: Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(defer["type"], 5);
@@ -1209,7 +1222,10 @@ async fn onboarding_runtime_picker_insert_and_commit_failures_are_atomic_and_ter
                 let mock = discord(Arc::new(Mutex::new(DiscordState::default()))).await;
                 runtime(&db.pool, &mock, &vars(mode, false))
                     .handle(component(custom_id, &[key]), NOW).await.unwrap();
-                assert_picker_failure(&db, &mock, if deferred { 2 } else { 1 }).await;
+                // Both branches commit before replying: an immediate insert
+                // failure and a deferred commit failure both yield exactly one
+                // failure reply, never a success claim plus a correction.
+                assert_picker_failure(&db, &mock, 1).await;
             }
             if deferred {
                 sqlx::raw_sql("DROP TRIGGER reject_route ON events; DROP FUNCTION reject_route();")
@@ -1280,12 +1296,12 @@ async fn onboarding_runtime_picker_settings_and_lock_failures_finish_the_defer()
 
 #[tokio::test]
 #[ignore = "requires isolated agent-testdb; never live Discord or DATABASE_URL"]
-async fn onboarding_runtime_reply_failures_roll_back_success_and_attempt_one_error_edit() {
+async fn onboarding_runtime_reply_failures_keep_committed_success_and_attempt_one_error_edit() {
     let db = TestSchema::new().await;
     let result = std::panic::AssertUnwindSafe(async {
-        for (mode, custom_id, key) in [
-            ("legacy", GAME_SELECT_ID, "shooters"),
-            ("session", SESSION_SELECT_ID, "find-players"),
+        for (mode, custom_id, key, selected, routed) in [
+            ("legacy", GAME_SELECT_ID, "shooters", 1, 1),
+            ("session", SESSION_SELECT_ID, "find-players", 0, 1),
         ] {
             for reject_replies in [false, true] {
                 let mock = discord(Arc::new(Mutex::new(DiscordState {
@@ -1294,6 +1310,8 @@ async fn onboarding_runtime_reply_failures_roll_back_success_and_attempt_one_err
                     ..Default::default()
                 })))
                 .await;
+                let before_selected = db.count(EVENT_GAME_ROLES_SELECTED).await;
+                let before_routed = db.count(EVENT_CHANNEL_ROUTED).await;
                 let result = runtime(&db.pool, &mock, &vars(mode, false))
                     .handle(component(custom_id, &[key]), NOW)
                     .await;
@@ -1302,7 +1320,15 @@ async fn onboarding_runtime_reply_failures_roll_back_success_and_attempt_one_err
                     reject_replies,
                     "only an undelivered error reply remains retryable"
                 );
-                assert_picker_failure(&db, &mock, 2).await;
+                // Commit-before-reply: the success rows are already committed
+                // when the reply fails, so the terminal error edit finishes
+                // the defer without rolling anything back.
+                assert_eq!(
+                    db.count(EVENT_GAME_ROLES_SELECTED).await,
+                    before_selected + selected
+                );
+                assert_eq!(db.count(EVENT_CHANNEL_ROUTED).await, before_routed + routed);
+                assert_error_edit(&mock, 2).await;
             }
         }
     })
