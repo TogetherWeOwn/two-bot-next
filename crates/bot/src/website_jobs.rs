@@ -875,6 +875,14 @@ pub(crate) const MAX_SCHEDULED_EVENTS_BODY_BYTES: usize = 1_048_576;
 /// lifetime of the last good mirror between ticks.
 pub(crate) const MAX_SCHEDULED_EVENTS_SNAPSHOT_AGE: time::Duration = time::Duration::minutes(5);
 
+/// Strict five-minute age predicate: only observations strictly older than
+/// [`MAX_SCHEDULED_EVENTS_SNAPSHOT_AGE`] are stale. Exactly five minutes old
+/// is still fresh. Pure so the boundary pins deterministically; the seam
+/// samples `now` at the gate and passes it in.
+fn snapshot_age_exceeded(observed: time::OffsetDateTime, now: time::OffsetDateTime) -> bool {
+    now - observed > MAX_SCHEDULED_EVENTS_SNAPSHOT_AGE
+}
+
 /// One Events snapshot attempt with the observation stamp injected.
 /// Production stamps `observed_at` from the real clock in [`snapshot_once`]
 /// immediately before the GET; age-bound tests inject a fixed stamp here
@@ -918,7 +926,7 @@ pub(crate) async fn snapshot_events_once(
     let observed =
         time::OffsetDateTime::parse(observed_at, &time::format_description::well_known::Rfc3339)
             .map_err(|_| ErrorClass::Configuration)?;
-    if time::OffsetDateTime::now_utc() - observed > MAX_SCHEDULED_EVENTS_SNAPSHOT_AGE {
+    if snapshot_age_exceeded(observed, time::OffsetDateTime::now_utc()) {
         tracing::warn!(
             job = "events",
             skip = ?ScheduledEventsSkip::StaleSnapshot,

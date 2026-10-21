@@ -1582,3 +1582,32 @@ async fn events_seam_age_301_changed_rows_preserve_all_last_good_fields() {
 async fn events_seam_age_301_empty_response_preserves_all_last_good_fields() {
     assert_stale_events_preserve_last_good(json!([])).await;
 }
+
+/// The age bound is strictly greater than five minutes: exactly 300 s stays
+/// fresh, 300 s plus one nanosecond is stale. Deterministic pure-predicate
+/// pin; the seam suites cover 299/301 through `snapshot_events_once` but
+/// cannot hit exactly 300 s because the gate samples `now_utc()` internally.
+#[test]
+fn snapshot_age_bound_is_strictly_greater_than_five_minutes() {
+    let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+    for (age, exceeded) in [
+        (time::Duration::seconds(299), false),
+        (time::Duration::seconds(300), false),
+        (
+            time::Duration::seconds(300) + time::Duration::nanoseconds(1),
+            true,
+        ),
+        (time::Duration::seconds(301), true),
+    ] {
+        assert_eq!(
+            snapshot_age_exceeded(now - age, now),
+            exceeded,
+            "age {age:?} must {} the five-minute bound",
+            if exceeded { "exceed" } else { "not exceed" },
+        );
+    }
+    assert!(
+        !snapshot_age_exceeded(now + time::Duration::seconds(1), now),
+        "a future observation is never stale"
+    );
+}
