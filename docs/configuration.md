@@ -17,8 +17,11 @@ The Container registers a `guild_settings` poll job
 (`crates/bot/src/website_jobs.rs:207`) publishing a `SettingsCache`
 snapshot every 15 s through `settings_jobs::live`
 (`crates/bot/src/settings_jobs.rs:53`). Every consumer reads store-first:
-stored rows win, deleted or malformed rows fall back to the boot value,
-and `None` while parked or pre-first-poll layers nothing. Gateway
+a stored row wins and an absent row falls back to the boot value, except
+the invite responder, which falls back to the live vanity code; a malformed
+row falls back to a safe value, refuses, or filters entries depending on
+the runtime (see below), and `None` while parked or pre-first-poll layers
+nothing. Gateway
 feature gates still come from process environment only, so a
 database-only value such as `TWO_AUTOMATIONS=1` stays disabled
 (re-checked at `1643438`).
@@ -49,9 +52,15 @@ instead of “stored unwired”: containment applies `TWO_ANTI_NUKE_WINDOW_SECON
 (`crates/bot/src/join_risk_runtime.rs:66-70`, `:239-249`); raid applies
 `TWO_RAID_JOIN_THRESHOLD`, `TWO_RAID_WINDOW_SECONDS` and
 `DISCORD_STAFF_ALERT_CHANNEL_ID`
-(`crates/bot/src/raid_runtime.rs:45-48`, `:194-202`); onboarding merges its
+(`crates/bot/src/raid_runtime.rs:45-48`, `:194-202`); all three refuse
+malformed tuning instead of falling back, disabling observations/scoring
+while refused (`crates/bot/src/containment_runtime.rs:318-330`,
+`crates/bot/src/raid_runtime.rs:236-247`,
+`crates/bot/src/join_risk_runtime.rs:300-309`); onboarding merges its
 `CONFIG_KEYS` from a per-event snapshot
-(`crates/bot/src/onboarding.rs:21-30`, `:271`); message-path automod
+(`crates/bot/src/onboarding.rs:21-30`, `:271-295`), where only a malformed
+dry-run row keeps the boot value (`:159-168`) while a malformed channel row
+fails the job; message-path automod
 applies its ten live lists, thresholds and the enforce flag from the snapshot
 on every delivery (`crates/bot/src/automod_gateway.rs:116-127`, `:211-223`, `:292`);
 the feed poller applies `TWO_FEED_POLL_SECONDS` from the snapshot to the
@@ -65,11 +74,12 @@ all three parks the mirror live and a malformed row keeps the last good
 destinations; ticket operations apply
 `DISCORD_TICKET_CATEGORY_ID`, `DISCORD_TICKET_PANEL_CHANNEL_ID` and
 `DISCORD_TICKET_STAFF_ROLE_ID` from the snapshot on every execute, recovery
-and purge (`crates/bot/src/ticket_runtime.rs:172-175`, `:457`, `:981`); the gateway funnel applies
+and purge (`crates/bot/src/ticket_runtime.rs:172-175`, `:457`, `:981`), where a
+malformed row keeps the last good destinations like the audit mirror; the gateway funnel applies
 `TWO_COMMUNITY_HUMAN_CHANNEL_IDS` and `TWO_COMMUNITY_WELCOME_CHANNEL_IDS`
 from the snapshot on every guild message, refreshing the channel classifier
 and the community-facts sink together before the message's channel class is
-stamped (`crates/bot/src/gateway.rs:774-789`, `:918`, `crates/discord/src/leveling_runtime.rs:766`); the voice sweep applies `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` from the snapshot on spawn and every maintenance refresh, so a stored per-guild grace reaches the deletion sweep without a restart (`crates/bot/src/voice_rooms.rs:7753-7757`, `:3319`), and the invite responder applies `TWO_GUILD_INVITE_CODE` per `/invite` interaction (`crates/bot/src/voice_rooms.rs:13306-13307`). Two boot-only edges
+stamped (`crates/bot/src/gateway.rs:774-789`, `:918`, `crates/discord/src/leveling_runtime.rs:766`), with malformed entries filtered silently so a wholly-malformed row applies as the empty set (`crates/core/src/community.rs:252-260`); the voice sweep applies `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` from the snapshot on spawn and every maintenance refresh, so a stored per-guild grace reaches the deletion sweep without a restart (`crates/bot/src/voice_rooms.rs:7753-7757`, `:3319`), and the invite responder applies `TWO_GUILD_INVITE_CODE` per `/invite` interaction (`crates/bot/src/voice_rooms.rs:13306-13307`), falling back to the live vanity code when the row is absent or invalid (`:9462-9467`). Two boot-only edges
 remain: the voice room-name policy is
 built once at boot from the process environment
 (`crates/bot/src/gateway.rs:2080`); and gateway intents plus ticket command
@@ -96,8 +106,10 @@ When voice is enabled, `build_production_runtime` also reads
 `TWO_TEMP_VOICE_CATEGORY_ID` and `TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS` solely
 for delete protection, not creator provisioning. Its empty grace is fixed at
 60 seconds unless `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` (0 to 600) sets it at boot, and a stored per-guild row overrides that boot value live (out-of-range rows fail closed to the boot value).
-Onboarding, automod and scorecard typed loaders exist but are not
-called during boot; their defaults below come from empty-map calls. The
+Automod and scorecard typed loaders exist but are not
+called during boot; their defaults below come from empty-map calls.
+Onboarding gates are validated at boot (`OnboardingGates::from_env`,
+`crates/bot/src/main.rs:563`): an invalid `TWO_ONBOARDING_MODE` fails startup. The
 classifier loader runs when the ordered pipeline is built and again when
 community-facts capture is armed, then refreshes live per guild message as
 above. The separate

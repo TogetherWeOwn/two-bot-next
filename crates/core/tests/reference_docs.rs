@@ -47,8 +47,11 @@ a required value or an implemented consumer. Secret defaults are never rendered.
   (`crates/bot/src/website_jobs.rs:207`) publishing a `SettingsCache`\n\
   snapshot every 15 s through `settings_jobs::live`\n\
   (`crates/bot/src/settings_jobs.rs:53`). Every consumer reads store-first:\n\
-  stored rows win, deleted or malformed rows fall back to the boot value,\n\
-  and `None` while parked or pre-first-poll layers nothing. Gateway\n\
+  a stored row wins and an absent row falls back to the boot value, except\n\
+  the invite responder, which falls back to the live vanity code; a malformed\n\
+  row falls back to a safe value, refuses, or filters entries depending on\n\
+  the runtime (see below), and `None` while parked or pre-first-poll layers\n\
+  nothing. Gateway\n\
   feature gates still come from process environment only, so a\n\
   database-only value such as `TWO_AUTOMATIONS=1` stays disabled\n\
   (re-checked at `1643438`).\n\
@@ -76,9 +79,15 @@ instead of “stored unwired”: containment applies `TWO_ANTI_NUKE_WINDOW_SECON
 (`crates/bot/src/join_risk_runtime.rs:66-70`, `:239-249`); raid applies\n\
 `TWO_RAID_JOIN_THRESHOLD`, `TWO_RAID_WINDOW_SECONDS` and\n\
 `DISCORD_STAFF_ALERT_CHANNEL_ID`\n\
-(`crates/bot/src/raid_runtime.rs:45-48`, `:194-202`); onboarding merges its\n\
+(`crates/bot/src/raid_runtime.rs:45-48`, `:194-202`); all three refuse\n\
+malformed tuning instead of falling back, disabling observations/scoring\n\
+while refused (`crates/bot/src/containment_runtime.rs:318-330`,\n\
+`crates/bot/src/raid_runtime.rs:236-247`,\n\
+`crates/bot/src/join_risk_runtime.rs:300-309`); onboarding merges its\n\
 `CONFIG_KEYS` from a per-event snapshot\n\
-(`crates/bot/src/onboarding.rs:21-30`, `:271`); message-path automod\n\
+(`crates/bot/src/onboarding.rs:21-30`, `:271-295`), where only a malformed\n\
+dry-run row keeps the boot value (`:159-168`) while a malformed channel row\n\
+fails the job; message-path automod\n\
 applies its ten live lists, thresholds and the enforce flag from the snapshot\n\
 on every delivery (`crates/bot/src/automod_gateway.rs:116-127`, `:211-223`, `:292`);\n\
 the feed poller applies `TWO_FEED_POLL_SECONDS` from the snapshot to the\n\
@@ -92,11 +101,12 @@ all three parks the mirror live and a malformed row keeps the last good\n\
 destinations; ticket operations apply\n\
 `DISCORD_TICKET_CATEGORY_ID`, `DISCORD_TICKET_PANEL_CHANNEL_ID` and\n\
 `DISCORD_TICKET_STAFF_ROLE_ID` from the snapshot on every execute, recovery\n\
-and purge (`crates/bot/src/ticket_runtime.rs:172-175`, `:457`, `:981`); the gateway funnel applies\n\
+and purge (`crates/bot/src/ticket_runtime.rs:172-175`, `:457`, `:981`), where a\n\
+malformed row keeps the last good destinations like the audit mirror; the gateway funnel applies\n\
 `TWO_COMMUNITY_HUMAN_CHANNEL_IDS` and `TWO_COMMUNITY_WELCOME_CHANNEL_IDS`\n\
 from the snapshot on every guild message, refreshing the channel classifier\n\
 and the community-facts sink together before the message's channel class is\n\
-stamped (`crates/bot/src/gateway.rs:774-789`, `:918`, `crates/discord/src/leveling_runtime.rs:766`); the voice sweep applies `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` from the snapshot on spawn and every maintenance refresh, so a stored per-guild grace reaches the deletion sweep without a restart (`crates/bot/src/voice_rooms.rs:7753-7757`, `:3319`), and the invite responder applies `TWO_GUILD_INVITE_CODE` per `/invite` interaction (`crates/bot/src/voice_rooms.rs:13306-13307`). Two boot-only edges\n\
+stamped (`crates/bot/src/gateway.rs:774-789`, `:918`, `crates/discord/src/leveling_runtime.rs:766`), with malformed entries filtered silently so a wholly-malformed row applies as the empty set (`crates/core/src/community.rs:252-260`); the voice sweep applies `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` from the snapshot on spawn and every maintenance refresh, so a stored per-guild grace reaches the deletion sweep without a restart (`crates/bot/src/voice_rooms.rs:7753-7757`, `:3319`), and the invite responder applies `TWO_GUILD_INVITE_CODE` per `/invite` interaction (`crates/bot/src/voice_rooms.rs:13306-13307`), falling back to the live vanity code when the row is absent or invalid (`:9462-9467`). Two boot-only edges\n\
 remain: the voice room-name policy is\n\
 built once at boot from the process environment\n\
 (`crates/bot/src/gateway.rs:2080`); and gateway intents plus ticket command\n\
@@ -122,8 +132,10 @@ When voice is enabled, `build_production_runtime` also reads\n\
 `TWO_TEMP_VOICE_CATEGORY_ID` and `TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS` solely\n\
 for delete protection, not creator provisioning. Its empty grace is fixed at\n\
 60 seconds unless `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` (0 to 600) sets it at boot, and a stored per-guild row overrides that boot value live (out-of-range rows fail closed to the boot value).\n\
-Onboarding, automod and scorecard typed loaders exist but are not\n\
-called during boot; their defaults below come from empty-map calls. The\n\
+Automod and scorecard typed loaders exist but are not\n\
+called during boot; their defaults below come from empty-map calls.\n\
+Onboarding gates are validated at boot (`OnboardingGates::from_env`,\n\
+`crates/bot/src/main.rs:563`): an invalid `TWO_ONBOARDING_MODE` fails startup. The\n\
 classifier loader runs when the ordered pipeline is built and again when\n\
 community-facts capture is armed, then refreshes live per guild message as\n\
 above. The separate\n\
@@ -164,8 +176,9 @@ gates (`feature_commands.rs`), moderation (`moderation.rs`), onboarding\n\
 /// (`FeatureGates`/`ModerationGates` `from_env` and gateway intents). Every storable key
 /// outside `BOOT_ENV` and `STORE_READ_KEYS` has no runtime consumer: a
 /// database-only setting stays inert after restart, and
-/// onboarding/automod/scorecard/classifier loaders below supply defaults
-/// without being called during boot.
+/// automod/scorecard/classifier loaders below supply defaults
+/// without being called during boot (onboarding gates are validated
+/// at boot; see `CONFIG_INTRO`).
 const BOOT_ENV: &[&str] = &[
     "TWO_AUTOMATIONS",
     "TWO_ANNOUNCEMENTS",
