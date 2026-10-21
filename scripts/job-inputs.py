@@ -342,6 +342,7 @@ VOICE_EXACT = frozenset({
     "scripts/staging_voice_synthetic.py",
     "scripts/test_staging_voice_synthetic.py",
     "scripts/test_staging_voice_synthetic_gateway_intake_acceptance.py",
+    "scripts/test_staging_voice_synthetic_owned_room_acceptance.py",
     "wrangler/src/container-env.ts",
 })
 
