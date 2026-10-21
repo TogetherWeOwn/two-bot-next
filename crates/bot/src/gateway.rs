@@ -23,6 +23,7 @@ use futures_util::StreamExt as _;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use twilight_gateway::{Event, EventTypeFlags, Intents, Message, Session, Shard, ShardId};
+use two_bot::gateway_backoff::{reconnect_delay, ReconnectPolicy};
 use two_bot::voice_rooms::{build_production_runtime, VoiceEventSink};
 use two_bot_core::gateway_funnel::GatewayFunnelBuffer;
 use two_bot_core::gateway_session::{
@@ -1298,6 +1299,12 @@ pub async fn run_shard<I: InviteSource + 'static>(
     let in_flight_acks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let receive_pipeline = Arc::clone(&pipeline);
     let receive_voice = voice.clone();
+    // Reconnect pacing: consecutive `Reconnect` failures sleep the bounded
+    // schedule (reseeded per run) instead of hot-looping reception.
+    let reconnect_policy = ReconnectPolicy {
+        seed: two_bot_core::jitter_seed(),
+        ..ReconnectPolicy::default()
+    };
     let events = futures_util::stream::unfold(
         (
             shard,
@@ -1318,6 +1325,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
             let pipeline = Arc::clone(&receive_pipeline);
             let voice = receive_voice.clone();
             let opening_tx = opening_tx.clone();
+            let policy = reconnect_policy;
             async move {
                 // Failure is emitted to the ordered worker, never skipped past.
                 let work: Result<Option<ReceivedWork>, sqlx::Error> = async {
@@ -1335,6 +1343,9 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         shard = Shard::with_config(shard.id(), shard.config().clone());
                         info!("cold resume committed; requesting voice snapshot via identify");
                     }
+                    // Fresh per poll: a poll only ends by emitting work, so a
+                    // new poll means the transport delivered since.
+                    let mut reconnect_failures = 0u32;
                     loop {
                         let item = match shard.next().await {
                             Some(item) => item,
@@ -1346,10 +1357,24 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             Err(error) if matches!(error.kind(), twilight_gateway::error::ReceiveMessageErrorType::Reconnect) => {
                                 transport_disconnected(&state, &generation).await;
                                 voice_disconnected(voice.as_ref());
+                                // Pace the storm: consecutive Reconnect
+                                // failures sleep the bounded schedule instead
+                                // of hot-looping reception. Past the budget
+                                // the wait saturates at the max delay —
+                                // Twilight owns the reconnect, this only
+                                // floors the loop rate.
+                                reconnect_failures = reconnect_failures.saturating_add(1);
+                                let delay = reconnect_delay(
+                                    &policy,
+                                    reconnect_failures.saturating_sub(1),
+                                )
+                                .unwrap_or(policy.max_delay);
                                 warn!(
                                     msg = "gateway_reconnect_failed",
+                                    wait_ms = delay.as_millis().min(u128::from(u64::MAX)) as u64,
                                     "gateway reconnect failed; Twilight will retry"
                                 );
+                                tokio::time::sleep(delay).await;
                                 continue;
                             }
                             Err(_) => return Err(sqlx::Error::InvalidArgument("gateway receive failed".into())),
