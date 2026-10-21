@@ -1281,3 +1281,144 @@ async fn events_seam_refuses_malformed_before_storage() {
     mock.shutdown().await;
     pool.close().await;
 }
+
+/// One Events tick against raw wire bytes (not a re-serialized `Value`) and a
+/// poison pool. Returns the tick outcome plus the mock-side request count.
+async fn run_events_tick_raw(wire: Vec<u8>) -> (Result<(), ErrorClass>, usize) {
+    let mock = MockRest::start(
+        vec![ScriptedResponse {
+            body: wire,
+            ..ScriptedResponse::status(200)
+        }],
+        ScriptedResponse::status(403),
+    )
+    .await;
+    let pool = unconnected_pool();
+    let (_stop, shutdown) = watch::channel(false);
+    let outcome = run_once(
+        Kind::Events,
+        &pool,
+        &executor(&mock),
+        "2222",
+        &Mutex::new(()),
+        &shutdown,
+        false,
+    )
+    .await;
+    let requests = mock.requests().len();
+    mock.shutdown().await;
+    pool.close().await;
+    (outcome, requests)
+}
+
+/// One valid event wrapped in JSON-insignificant whitespace so the wire body is
+/// exactly `target_len` bytes while its re-serialization stays tiny. A cap
+/// measured over the re-serialized value would admit every leg below.
+fn whitespace_padded_wire(target_len: usize) -> Vec<u8> {
+    let compact = event().to_string();
+    let mut wire = Vec::with_capacity(target_len);
+    wire.push(b'[');
+    wire.extend(std::iter::repeat_n(
+        b' ',
+        target_len - compact.len() - 2, // '[' + event + ']'
+    ));
+    wire.extend_from_slice(compact.as_bytes());
+    wire.push(b']');
+    assert_eq!(wire.len(), target_len);
+    let reserialized: Value = serde_json::from_slice(&wire).unwrap();
+    assert!(
+        reserialized.to_string().len() < 1024,
+        "the re-serialization must stay far under the cap, or this leg \
+         cannot distinguish a wire measure from a re-serialized one"
+    );
+    wire
+}
+
+#[tokio::test]
+async fn events_tick_refuses_whitespace_padded_wire_body_over_cap() {
+    let (outcome, requests) =
+        run_events_tick_raw(whitespace_padded_wire(MAX_SCHEDULED_EVENTS_BODY_BYTES + 1)).await;
+    assert_eq!(requests, 1, "the tick must fetch before it can refuse");
+    assert_eq!(
+        outcome,
+        Err(ErrorClass::Rest),
+        "a wire body 1 byte over cap must refuse even when its re-serialization \
+         is tiny; reaching the poison pool would surface a database error instead"
+    );
+}
+
+#[tokio::test]
+async fn events_tick_accepts_whitespace_padded_wire_body_at_cap() {
+    let (outcome, requests) =
+        run_events_tick_raw(whitespace_padded_wire(MAX_SCHEDULED_EVENTS_BODY_BYTES)).await;
+    assert_eq!(requests, 1);
+    assert_eq!(
+        outcome,
+        Err(ErrorClass::Database),
+        "an exactly-at-cap wire body is in bounds and must still attempt publication"
+    );
+}
+
+/// The seam's injected stamp — not store time — is what the mirror stores and
+/// orders by. A fresh row must carry the injected stamp exactly, and a seeded
+/// newer row must survive a snapshot taken with an older injected stamp
+/// (TOG-20273 last-observed-wins through the seam). Stamping at store time
+/// instead of using the injected value fails both assertions.
+#[tokio::test]
+async fn events_seam_stores_the_injected_stamp_and_keeps_newer_rows() {
+    let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
+        assert!(
+            std::env::var("GITHUB_ACTIONS").is_err(),
+            "CI must supply the guarded test database"
+        );
+        eprintln!("SKIP seam stamp integration: TWO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let db = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+        .await
+        .expect("create migrated agent-testdb fixture");
+    let pool = db.pool();
+    apply_web_contract(pool).await.unwrap();
+    // Seed event 3000 with a stamp newer than the snapshot's injected stamp
+    // but older than any store-time stamp, so a store-time regression clobbers
+    // it while the injected stamp preserves it.
+    let seed = normalize_events(&[raw_event(&event(), "2222").unwrap()]).unwrap();
+    replace_events(pool, "2222", "2026-10-15T12:00:00.000Z", &seed)
+        .await
+        .unwrap();
+    let mut fresh = event();
+    fresh["id"] = json!("3001");
+    let mock = MockRest::start(
+        vec![ScriptedResponse::json(200, json!([event(), fresh]))],
+        ScriptedResponse::status(403),
+    )
+    .await;
+    let (_stop, shutdown) = watch::channel(false);
+    snapshot_events_once(
+        pool,
+        &executor(&mock),
+        "2222",
+        &shutdown,
+        "2026-10-01T18:00:00.000Z",
+    )
+    .await
+    .unwrap();
+    assert_eq!(mock.requests().len(), 1);
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT event_id, updated_at FROM scheduled_events WHERE guild_id='2222' ORDER BY event_id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        [
+            ("3000".to_owned(), "2026-10-15T12:00:00.000Z".to_owned(),),
+            ("3001".to_owned(), "2026-10-01T18:00:00.000Z".to_owned(),),
+        ],
+        "the seeded newer row must survive the older snapshot, and the fresh \
+         row must carry the injected stamp exactly (not store time)"
+    );
+    mock.shutdown().await;
+    db.close().await.unwrap();
+}

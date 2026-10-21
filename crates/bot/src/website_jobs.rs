@@ -501,6 +501,19 @@ pub(crate) async fn get(rest: &ActionExecutor, path: &str) -> Result<Value, Erro
         .ok_or(ErrorClass::Rest)
 }
 
+/// [`get`] plus the raw wire-body length, for callers enforcing a wire-body
+/// cap. The length is measured over the collected response bytes, never over
+/// a re-serialization of the parsed value.
+async fn get_with_body_len(
+    rest: &ActionExecutor,
+    path: &str,
+) -> Result<(Value, usize), ErrorClass> {
+    rest.get_json_with_body_len(path)
+        .await
+        .map_err(|_| ErrorClass::Rest)?
+        .ok_or(ErrorClass::Rest)
+}
+
 fn snowflake(value: &Value) -> Result<u64, ErrorClass> {
     value
         .as_str()
@@ -792,11 +805,12 @@ pub(crate) const MAX_SCHEDULED_EVENTS_BODY_BYTES: usize = 1_048_576;
 /// immediately before the GET (TOG-20273); age-bound tests inject a fixed
 /// stamp here instead of racing the clock.
 ///
-/// Whole-response gates, in order: the raw body cap (measured over the full
-/// response value, unknown fields included — never over known fields alone),
-/// then the existing shape/normalize/store path unchanged. The 5-minute
-/// staleness skip (decision §4) is NOT enforced here yet: the follow-up age
-/// slice pins it through this seam first, then wires the check.
+/// Whole-response gates, in order: the raw wire-body cap (measured over the
+/// collected response bytes — unknown fields and JSON-insignificant bytes
+/// included, never over known fields alone or a re-serialization), then the
+/// existing shape/normalize/store path unchanged. The 5-minute staleness skip
+/// (decision §4) is NOT enforced here yet: the follow-up age slice pins it
+/// through this seam first, then wires the check.
 pub(crate) async fn snapshot_events_once(
     pool: &PgPool,
     rest: &ActionExecutor,
@@ -804,16 +818,17 @@ pub(crate) async fn snapshot_events_once(
     shutdown: &watch::Receiver<bool>,
     observed_at: &str,
 ) -> Result<(), ErrorClass> {
-    let response = get(
+    let (response, body_len) = get_with_body_len(
         rest,
         &format!("/guilds/{guild}/scheduled-events?with_user_count=true"),
     )
     .await?;
-    // Measure the whole response, not the known fields: an unknown-field pad
-    // must count toward the cap exactly like a long description does. The
-    // executor yields parsed JSON only, so this re-serializes; shrinking the
-    // pre-parse window further belongs to the REST executor slice, not here.
-    if response.to_string().len() > MAX_SCHEDULED_EVENTS_BODY_BYTES {
+    // Measure the wire bytes, not the parsed value: an unknown-field pad must
+    // count toward the cap exactly like a long description does, and
+    // JSON-insignificant bytes (whitespace, duplicate keys, \uXXXX escapes)
+    // count as Discord sent them. A re-serialized measure would compact those
+    // away and admit an over-cap body.
+    if body_len > MAX_SCHEDULED_EVENTS_BODY_BYTES {
         return Err(ErrorClass::Rest);
     }
     let raw = response
