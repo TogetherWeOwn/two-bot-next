@@ -1,23 +1,18 @@
 """Protected acceptance: container-smoke refuses malformed inspect output.
 
 The four ``docker inspect`` chains (PID 1 identity, health-wait, health-status
-and shutdown) index ``[0]["State"]`` without shape validation, so a malformed
-daemon reply escapes as ``IndexError``/``TypeError``/``KeyError`` (a traceback)
-or as a caught ``ValueError``/``KeyError`` whose message echoes parser text or
-a key name. The fix must refuse every malformed reply with one fixed message:
-
-* ``INSPECT_SHAPE_REASON`` for structural failures: stdout that is not JSON,
-  not a list, an empty list, an element without a dict ``State``, or a
-  ``State`` missing the field the call site reads.
+and shutdown) share classified shape refusals. Non-JSON replies use the
+layered JSON guard; JSON-shaped failures keep the existing per-case vocabulary.
+Missing State fields use the fixed message for the field that call site needs.
 
 The refusal surfaces as ``RuntimeError`` from ``smoke()``/``pid1_uids()`` and
 as ``SystemExit("FAIL container smoke: <reason>")`` from ``main()`` (nonzero
 exit, no traceback, no echo of the daemon reply).
 
-One case accepts either of two fixed messages: a ``State`` without ``Pid``
-may refuse as ``INSPECT_SHAPE_REASON`` or as the pre-existing
-``"container PID 1 has no host process"``. Anything else (a traceback, parser
-text, an echoed key) fails.
+A ``State`` without ``Pid`` keeps ``"container PID 1 has no host process"``.
+A present ``Health: {}`` is not a shape refusal: without a healthy Status it
+must keep waiting and eventually refuse with the documented 30s timeout.
+Anything else (a traceback, parser text, an echoed key) fails.
 
 Passing controls pin the valid-input behavior byte-for-byte (same verdict
 lines, same PID 1 identity, same pre-existing value refusals) so the fix
@@ -47,33 +42,41 @@ smoke = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(smoke)
 
 
-INSPECT_SHAPE_REASON = "container inspect output has invalid shape"
+INVALID_JSON = "docker inspect output is not valid JSON"
+NO_ENTRIES = "docker inspect returned no entries"
+NON_OBJECT_ENTRY = "docker inspect entry must be a JSON object"
+NO_STATE = "docker inspect entry has no State"
+NO_RUNNING = "docker inspect State has no Running"
+NO_HEALTH = "docker inspect entry has no Health"
+NO_OOM = "docker inspect State has no OOMKilled"
+HEALTH_TIMEOUT = "Docker HEALTHCHECK did not become healthy within 30s"
 NO_HOST_PROCESS = "container PID 1 has no host process"
 TOP_MISSING_PID1 = "docker top did not report PID 1"
 CANARY = "INSPECT-CANARY-NEVER-ECHO-7Q3Z"
 
 # Structural failures: no call site can use these, whatever it reads.
 STRUCTURAL_MALFORMED = (
-    "not json " + CANARY,
-    "",
-    '{"State": {"Pid": 4242}}',
-    "[]",
-    "[{}]",
-    '[{"State": null}]',
-    '[{"State": "Running"}]',
-    '[{"State": []}]',
-    '{"State": {}, "note": "' + CANARY + '"}',
+    ("not json " + CANARY, INVALID_JSON),
+    ("", INVALID_JSON),
+    (b"\xff" + CANARY.encode(), INVALID_JSON),
+    ('{"State": {"Pid": 4242}}', NO_ENTRIES),
+    ("[]", NO_ENTRIES),
+    (json.dumps([CANARY]), NON_OBJECT_ENTRY),
+    ("[{}]", NO_STATE),
+    ('[{"State": null}]', NO_STATE),
+    ('[{"State": "Running"}]', NO_STATE),
+    ('[{"State": []}]', NO_STATE),
+    ('{"State": {}, "note": "' + CANARY + '"}', NO_ENTRIES),
 )
 
 EMPTY_STATE = json.dumps([{"State": {}, "note": CANARY}])
 MISSING_HEALTH = (
-    json.dumps([{"State": {"Running": True, "note": CANARY}}]),
-    json.dumps([{"State": {"Running": True, "Health": None}}]),
-    json.dumps([{"State": {"Running": True, "Health": {}}}]),
+    (json.dumps([{"State": {"Running": True, "note": CANARY}}]), NO_HEALTH),
+    (json.dumps([{"State": {"Running": True, "Health": None}}]), NO_HEALTH),
 )
-# Running False so the shutdown check reaches the OOMKilled index instead of
-# short-circuiting on "still running" (a pre-existing value refusal).
-MISSING_OOM = (json.dumps([{"State": {"Running": False, "note": CANARY}}]),)
+EMPTY_HEALTH = json.dumps([{"State": {
+    "Running": True, "Health": {}, "note": CANARY}}])
+MISSING_OOM = ((json.dumps([{"State": {"Running": False, "note": CANARY}}]), NO_OOM),)
 MISSING_PID = (json.dumps([{"State": {"Running": True, "note": CANARY}}]),)
 
 VALID_STATE = json.dumps([{"State": {
@@ -115,9 +118,10 @@ def tar_of(path, data, mode=0o644):
 class SmokeFixture:
     """Minimal valid docker surface; inspect replies are scripted."""
 
-    def __init__(self, inspect_outputs=()):
+    def __init__(self, inspect_outputs=(), *, repeat_last_inspect=False):
         self.calls = []
         self.inspect_outputs = list(inspect_outputs)
+        self.repeat_last_inspect = repeat_last_inspect
         self.image_id = "sha256:" + "a" * 64
         self.stopped = False
 
@@ -147,7 +151,10 @@ class SmokeFixture:
             output = "127.0.0.1:32768\n"
         elif args[0] == "inspect":
             if self.inspect_outputs:
-                output = self.inspect_outputs.pop(0)
+                if self.repeat_last_inspect and len(self.inspect_outputs) == 1:
+                    output = self.inspect_outputs[0]
+                else:
+                    output = self.inspect_outputs.pop(0)
             else:
                 output = json.dumps([{"State": {
                     "Running": not self.stopped, "OOMKilled": False,
@@ -198,31 +205,32 @@ class InspectRefusalAcceptanceTests(unittest.TestCase):
             smoke.smoke("two-bot:fixture")
         return output.getvalue()
 
-    def assert_shape_refusal(self, fixture, health_then, label):
+    def assert_inspect_refusal(self, fixture, health_then, label, reason):
         with self.assertRaises(RuntimeError,
                                msg=f"malformed inspect accepted in case {label}") as caught:
             self.run_smoke(fixture, health_then)
-        self.assertEqual(str(caught.exception), INSPECT_SHAPE_REASON,
+        self.assertEqual(str(caught.exception), reason,
                          msg=f"malformed inspect mis-refused in case {label}")
         self.assertNotIn(CANARY, str(caught.exception),
                          msg=f"daemon reply echoed in case {label}")
+        self.assertNotIn("Traceback", str(caught.exception))
 
-    # --- PID 1 identity (:107) -------------------------------------------
+    # --- PID 1 identity --------------------------------------------------
 
     def test_pid1_structural_inspect_refuses_with_fixed_vocabulary(self):
-        for bad in STRUCTURAL_MALFORMED + (EMPTY_STATE,):
+        for bad, reason in STRUCTURAL_MALFORMED + ((EMPTY_STATE, NO_HOST_PROCESS),):
             with self.subTest(stdout=bad[:40]):
                 def docker(*args, **kwargs):
                     return subprocess.CompletedProcess(args, 0, bad, "")
 
                 with patch.object(smoke, "docker", docker):
-                    with self.assertRaisesRegex(
-                            RuntimeError, "^" + re.escape(INSPECT_SHAPE_REASON) + "$"):
+                    with self.assertRaises(RuntimeError) as caught:
                         smoke.pid1_uids("two-bot-smoke-fixture")
+                self.assertEqual(str(caught.exception), reason)
+                self.assertNotIn(CANARY, str(caught.exception))
+                self.assertNotIn("Traceback", str(caught.exception))
 
     def test_pid1_missing_pid_refuses_without_echo_or_traceback(self):
-        # Either fixed message is accepted; parser text, an echoed key, or a
-        # traceback is not.
         for bad in MISSING_PID:
             with self.subTest(stdout=bad[:40]):
                 def docker(*args, **kwargs):
@@ -231,8 +239,9 @@ class InspectRefusalAcceptanceTests(unittest.TestCase):
                 with patch.object(smoke, "docker", docker):
                     with self.assertRaises(RuntimeError) as caught:
                         smoke.pid1_uids("two-bot-smoke-fixture")
-                self.assertIn(str(caught.exception), (INSPECT_SHAPE_REASON, NO_HOST_PROCESS))
+                self.assertEqual(str(caught.exception), NO_HOST_PROCESS)
                 self.assertNotIn(CANARY, str(caught.exception))
+                self.assertNotIn("Traceback", str(caught.exception))
 
     def test_pid1_structural_refusal_echoes_no_daemon_text(self):
         bad = "not json " + CANARY
@@ -240,45 +249,52 @@ class InspectRefusalAcceptanceTests(unittest.TestCase):
                            lambda *a, **k: subprocess.CompletedProcess(a, 0, bad, "")):
             with self.assertRaises(RuntimeError) as caught:
                 smoke.pid1_uids("two-bot-smoke-fixture")
-        self.assertEqual(str(caught.exception), INSPECT_SHAPE_REASON)
+        self.assertEqual(str(caught.exception), INVALID_JSON)
         self.assertNotIn(CANARY, str(caught.exception))
+        self.assertNotIn("Traceback", str(caught.exception))
 
-    # --- health-wait (:260) -----------------------------------------------
+    # --- health-wait -----------------------------------------------------
 
     def test_health_wait_malformed_inspect_refuses_with_fixed_vocabulary(self):
-        for bad in STRUCTURAL_MALFORMED + (EMPTY_STATE,):
+        for bad, reason in STRUCTURAL_MALFORMED + ((EMPTY_STATE, NO_RUNNING),):
             with self.subTest(stdout=bad[:40]):
                 fixture = SmokeFixture([bad])
-                self.assert_shape_refusal(fixture, [(500, {})], f"health-wait:{bad[:20]}")
+                self.assert_inspect_refusal(
+                    fixture, [(500, {})], f"health-wait:{bad[:20]}", reason)
                 self.assertEqual(fixture.calls[-1][0][:2], ("rm", "--force"))
 
-    # --- health-status (:293) ----------------------------------------------
+    # --- health-status ---------------------------------------------------
 
     def test_health_status_malformed_inspect_refuses_with_fixed_vocabulary(self):
-        cases = STRUCTURAL_MALFORMED + (EMPTY_STATE,) + MISSING_HEALTH
-        for bad in cases:
+        cases = (STRUCTURAL_MALFORMED + ((EMPTY_STATE, NO_RUNNING),)
+                 + MISSING_HEALTH + ((EMPTY_HEALTH, HEALTH_TIMEOUT),))
+        for bad, reason in cases:
             with self.subTest(stdout=bad[:40]):
-                # Health answers at once (no :260 inspect); PID 1 consumes the
-                # valid reply, then the health-status loop reads the malformed
-                # one.
-                fixture = SmokeFixture([VALID_STATE, bad])
-                self.assert_shape_refusal(fixture, [], f"health-status:{bad[:20]}")
+                # Health answers at once; PID 1 consumes the valid reply, then
+                # health-status reads the malformed one. Repeat it so Health:{}
+                # cannot exhaust the script and fall back to a healthy reply.
+                fixture = SmokeFixture([VALID_STATE, bad], repeat_last_inspect=True)
+                self.assert_inspect_refusal(fixture, [], f"health-status:{bad[:20]}", reason)
                 self.assertEqual(fixture.calls[-1][0][:2], ("rm", "--force"))
+                if reason == HEALTH_TIMEOUT:
+                    self.assertEqual(fixture.inspect_outputs, [bad])
+                    self.assertGreater(
+                        sum(args[0] == "inspect" for args, _ in fixture.calls), 2)
 
-    # --- shutdown (:322) ----------------------------------------------------
+    # --- shutdown --------------------------------------------------------
 
     def test_shutdown_malformed_inspect_refuses_with_fixed_vocabulary(self):
-        cases = STRUCTURAL_MALFORMED + (EMPTY_STATE,) + MISSING_OOM
-        for bad in cases:
+        cases = STRUCTURAL_MALFORMED + ((EMPTY_STATE, NO_RUNNING),) + MISSING_OOM
+        for bad, reason in cases:
             with self.subTest(stdout=bad[:40]):
                 fixture = SmokeFixture([VALID_STATE, VALID_STATE, bad])
-                self.assert_shape_refusal(fixture, [], f"shutdown:{bad[:20]}")
+                self.assert_inspect_refusal(fixture, [], f"shutdown:{bad[:20]}", reason)
                 self.assertEqual(fixture.calls[-1][0][:2], ("rm", "--force"))
 
     # --- CLI surface: nonzero exit, no traceback ------------------------------
 
     def test_main_reports_inspect_refusal_without_traceback(self):
-        for bad in ("not json " + CANARY, "[]", "[{}]", EMPTY_STATE):
+        for bad, reason in STRUCTURAL_MALFORMED + ((EMPTY_STATE, NO_RUNNING),):
             with self.subTest(stdout=bad[:40]):
                 fixture = SmokeFixture([bad])
                 with patch.object(smoke, "docker", fixture), \
@@ -292,9 +308,10 @@ class InspectRefusalAcceptanceTests(unittest.TestCase):
                     with self.assertRaises(SystemExit) as caught:
                         smoke.main()
                 self.assertEqual(caught.exception.code,
-                                 "FAIL container smoke: " + INSPECT_SHAPE_REASON)
+                                 "FAIL container smoke: " + reason)
                 self.assertNotIn("Traceback", str(caught.exception.code))
                 self.assertNotIn(CANARY, str(caught.exception.code))
+                self.assertEqual(fixture.calls[-1][0][:2], ("rm", "--force"))
 
     # --- passing controls: valid behavior byte-identical -----------------------
 
