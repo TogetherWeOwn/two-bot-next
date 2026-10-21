@@ -274,6 +274,7 @@ struct Summary {
     backfill: BackfillSummary,
     build_revision: &'static str,
     build_id: &'static str,
+    deploy_id: &'static str,
 }
 
 fn no_store_json<T: serde::Serialize>(
@@ -340,6 +341,7 @@ async fn summary(
         backfill,
         build_revision: report.build_revision,
         build_id: report.build_id,
+        deploy_id: report.deploy_id,
     })
 }
 
@@ -899,6 +901,10 @@ mod tests {
         assert_eq!(
             json["build_revision"],
             option_env!("BOT_BUILD_REVISION").unwrap_or("unknown")
+        );
+        assert_eq!(
+            json["deploy_id"],
+            option_env!("BOT_DEPLOY_ID").unwrap_or("unknown")
         );
     }
 
