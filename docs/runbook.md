@@ -361,6 +361,116 @@ deploy (a caller may be minting bad requests in a loop), or when the ticket
 coincides with missed gateway events or 5xx alerts suggesting a wider Discord
 or network incident.
 
+#### Alert: REST token invalid
+
+The bot-token latch read `1` (`two_bot_rest_guard_token_invalid`). A
+bot-authenticated 401 permanently latched `token_invalid` for this process:
+every new REST attempt, including essential interaction acknowledgements,
+refuses locally, and `/readyz` reports 503 until a restart with a corrected
+token. This pages on the first valid latched sample with no streak bound: the
+latch defaults to `0` at boot and is set only by a bot 401, so a `1` is never
+a boot artifact. A 401 on an interaction callback or original-response webhook
+edit counts as invalid but does not condemn the bot token (short-lived
+interaction token), so this page always means the bot credential itself. A
+valid `0` resolves (only a new process without the latch reads `0`); missing,
+malformed or failed scrapes hold the page without manufacturing recovery.
+
+First response: stop retries at once — every retry refuses and burns no
+budget, but it pages the same incident. Read the `discord_token_invalid` log
+line and confirm `/readyz` shows `token_invalid` down via the keepalive
+breakdown. Then follow the [fatal-token
+procedure](rest-guard.md#fatal-bot-token-and-readiness): the authorized
+credential operator verifies provisioning/token validity under the normal
+credential approval procedure, then restarts with the corrected configuration.
+Never log, swap in an unrelated credential, or automatically rotate a token.
+Expect [REST refusal surge](#alert-rest-refusal-surge) alongside: token-driven
+refusals grow that counter too, so treat the token page as the cause and the
+surge as its echo.
+
+Escalate when the latch re-arms right after a corrected restart (provisioning
+disagrees with the running configuration), or when the page coincides with a
+wider identity incident — the fix belongs to the credential owner, not another
+redeploy.
+
+#### Alert: REST refusal surge
+
+Combined guard invalid observations (401, 403 and 429 at response headers)
+plus local refusals (breaker, global-pause and token refusals, pre-wire)
+grew by 10 or more between two keepalive samples
+(`two_bot_rest_guard_invalid_requests_total` plus
+`two_bot_rest_guard_rejected_requests_total`). Healthy windows sit at zero,
+so 10 in one window is a loop, a bad deploy, or a Discord-side storm — never
+one operator mistake. Either family can surge alone: a 403 permission loop or
+a Discord 429 storm grows invalid, while a global pause or an open breaker
+grows rejected. Both burn the same IP-invalid budget toward the 5,000/600 s
+breaker trip and Discord's 10,000-invalid-requests/10-minute IP ban, so this
+pages while the budget still has headroom. The first valid sample only stores
+a baseline; a counter reset (process restart) re-baselines rather than firing;
+a below-threshold window resolves. Missing, malformed or failed scrapes hold
+a firing page.
+
+First response: scope the surge before touching the bot. Read both counters
+plus `two_bot_rest_guard_invalid_requests_in_window` via the authorized
+`/ops/metrics` scrape: invalid-heavy means the bot's requests are being
+rejected at headers (check the hot route on
+`two_bot_rest_requests_total{route,result}` and correlate with
+[REST 429](#alert-rest-429)/[REST 5xx](#alert-rest-5xx) — a 429-heavy surge
+with a firing 429 rule is a Discord-side storm, while a 403-heavy surge with
+no 429 page is a permission loop or a bad request shape from a fresh deploy);
+rejected-heavy means local refusals (correlate with the [breaker
+ticket](#alert-rest-admission-breaker-open) and the [token
+page](#alert-rest-token-invalid) — a surge beside a firing token page is
+token-driven and follows the token procedure; a surge during a Discord
+global pause is pause-driven backpressure, see the global-pause notes in the
+breaker section). Confirm no deploy is in
+progress; a fresh deploy shipping a bad token or a hot invalid route fills the
+window fast. Contain through the actual writer's verified control
+([containment](#containment-kill-switches-and-feature-flags)): stop the
+offending workload and fix the missing permission or caller bug rather than
+repeatedly restarting to erase the budget. Do not hammer Discord, replay
+uncertain writes, or invent a breaker-reset command — there is no manual
+reset.
+
+Escalate when the surge repeats across windows after containment, when invalid
+requests keep arriving with no suspect deploy (a caller may be minting bad
+requests in a loop, or an abuse pattern is driving the bot's sends), or when
+the surge coincides with missed gateway events or 5xx alerts suggesting a
+wider Discord or network incident.
+
+#### Alert: REST global responses stuck
+
+Global-pause response bodies stayed unresolved
+(`two_bot_rest_guard_pending_global_responses` nonzero) for three consecutive
+valid keepalive samples. A pending global body still blocks admission when its
+provisional remaining time is zero, so three stuck samples mean REST sends
+have been refused for minutes while no deadline elapses to release them. Body
+reads carry a 5-second deadline and expiry drops their accounting, so this is
+24-36x past the expected drain: the bodies are stuck, not slow. A valid zero
+sample proves the bodies drained and resolves; missing, malformed or failed
+samples break the streak but hold a firing page.
+
+The paused/remaining gauges deliberately have no rule of their own: a live
+global deadline is healthy Discord backpressure — pausing sends during a
+Discord global cooldown is the guard working as designed, not a fault — and
+the remaining countdown derives from a monotonic deadline that decreases
+every scrape and cannot wedge high, so no threshold on it could distinguish a
+long Discord cooldown from a fault. Only the pathological case, bodies that
+never resolve, pages here.
+
+First response: confirm the stall via the authorized `/ops/metrics` scrape —
+pending nonzero across samples while the pause countdown drains or sits at
+zero — then read the container logs for `discord_global_pause` lines and
+global-body expiry errors around the first stuck sample. Let any live Discord
+deadline elapse; do not bypass the guard or resubmit concurrent copies of the
+same action. Do not restart the container to "clear" the counter: a
+replacement resets the baseline without proving the bodies resolved, and the
+rule re-fires on three fresh stuck samples if the fault survives.
+
+Escalate when the stall survives a live-deadline expiry, when it coincides
+with missed gateway events or 5xx alerts, or when pending keeps climbing with
+no `discord_global_pause` line in the logs — the cause is then unexplained
+and the fix belongs to the on-call engineer, not another redeploy.
+
 #### Alert: DB pool
 
 The SQLx pool sat at its maximum with zero idle connections for three

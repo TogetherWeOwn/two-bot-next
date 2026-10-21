@@ -247,6 +247,13 @@ Private scrape series: `two_bot_rest_guard_breaker_open`,
 [REST admission guard](metrics.md#rest-admission-guard)). A zero
 `two_bot_rest_guard_global_pause_remaining_seconds` does not mean admission is
 open while `two_bot_rest_guard_pending_global_responses` is nonzero.
+Three metrics rules page on this family: [REST token
+invalid](runbook.md#alert-rest-token-invalid) on the latched token, [REST
+refusal surge](runbook.md#alert-rest-refusal-surge) on invalid/refused bursts,
+and [REST global responses
+stuck](runbook.md#alert-rest-global-responses-stuck) on unresolved pause
+bodies; the paused/remaining gauges stay rule-free by design (see the stuck
+rule's runbook).
 
 Admission lane state (durable gate in `public.discord_send_admission`: one row
 per credential fingerprint, 60 s self-heal lease on `in_flight`, no
