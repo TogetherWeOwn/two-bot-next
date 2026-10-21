@@ -135,6 +135,23 @@ Scalar gateway series pair with the labels above:
 | `two_bot_presence_capture_total{outcome}` | Presence-update capture decisions on the hot path; `outcome` is `inserted` (first delivery stored a row), `duplicate` (same-key retry absorbed by the dedup key) or `rejected` (refused before the insert) |
 | `two_bot_automod_decisions_total{outcome}` | Terminal automod inspection outcomes; `outcome` is `accepted`, `already_processed`, `dry_run`, `protected`, `deleted`, `warned`, `timed_out` or `sanction_refused`. Recorded once per committed `StoredOutcome` by the shared activation; replays and retained claims never count. Fixed eight series from process start; no message text, excerpts or user IDs become labels |
 
+## Raid and join-risk observer drops
+
+Source: `RaidRuntime::observe_join` in `crates/bot/src/raid_runtime.rs` and
+`JoinRiskRuntime::observe_join` in `crates/bot/src/join_risk_runtime.rs`.
+The fixed `JoinQueueDropReason` vocabulary and exposition live in
+`crates/core/src/metrics.rs` (`raid_dropped_join`, `join_risk_dropped_join`,
+`render_with_rest_guard`).
+
+| Series | Meaning |
+| --- | --- |
+| `two_bot_raid_dropped_joins_total{reason}` | Joins not enqueued for raid observation: `queue_full` (WARN, no wait) or `queue_closed` (ERROR with `error_class="raid_queue_closed"`). Each dropped join counts once; both series render zero initially and reset on process restart |
+| `two_bot_join_risk_dropped_joins_total{reason}` | Joins not enqueued for risk scoring: the same fixed reasons; Closed logs ERROR with `error_class="join_risk_queue_closed"`. Each dropped join counts once; both series render zero initially and reset on process restart |
+
+No guild/member/error-text labels or alert rules are added. Observer drops
+happen after gateway persistence and are not retried. See
+[queue triage](runbook-observability.md#raid-and-join-risk-queue-drops).
+
 ## Automod facts read warnings
 
 Source: `RestAutomodFacts::get` in `crates/discord/src/automod_activation.rs`.
