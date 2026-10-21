@@ -68,9 +68,16 @@ const moderationLines = (counts: Record<string, number>): string[] => {
   return lines;
 };
 
+const reconcileWindow = (healthy: number, pending: number, failed: number, prior: number): string[] => [
+  `${RECONCILE_PASSES_SERIES}{outcome="healthy"} ${healthy}`,
+  `${RECONCILE_PASSES_SERIES}{outcome="pending"} ${pending}`,
+  `${RECONCILE_PASSES_SERIES}{outcome="failed"} ${failed}`,
+  `${RECONCILE_ERRORS_SERIES}{error_class="reconcile_prior_failed"} ${prior}`,
+];
+
 const counterCases = [
   { id: FEED, series: FEED_SERIES, build: (n: number) => feedLines({ transport: n }), get: (s: MetricsAlertState) => s.feedFetchErrors },
-  { id: PRIOR, series: RECONCILE_ERRORS_SERIES, build: (n: number) => [`${RECONCILE_ERRORS_SERIES}{error_class="reconcile_prior_failed"} ${n}`, `${RECONCILE_PASSES_SERIES}{outcome="failed"} 0`], get: (s: MetricsAlertState) => s.reconcilePriorFailed },
+  { id: PRIOR, series: RECONCILE_ERRORS_SERIES, build: (n: number) => reconcileWindow(n, 0, 0, n), get: (s: MetricsAlertState) => s.reconcilePriorFailed },
   { id: SANCTION, series: AUTOMOD_SERIES, build: (n: number) => [`${AUTOMOD_SERIES}{outcome="sanction_refused"} ${n}`], get: (s: MetricsAlertState) => s.automodSanctionRefused },
   { id: MODERATION, series: MODERATION_SERIES, build: (n: number) => moderationLines({ "kick/discord_error": n }), get: (s: MetricsAlertState) => s.moderationEnforcementFailures },
   { id: BACKOFF, series: BACKOFF_SERIES, build: (n: number) => [`${BACKOFF_SERIES} ${n}`], get: (s: MetricsAlertState) => s.voiceBackoffCapped },
@@ -336,18 +343,15 @@ test("feed failures sum every error class, including unknown collapses", () => {
 });
 
 test("prior-failed findings stay silent on windows where a failed pass grew", () => {
-  const window = (healthy: number, pending: number, failed: number, prior: number) => ([
-    `${RECONCILE_PASSES_SERIES}{outcome="healthy"} ${healthy}`,
-    `${RECONCILE_PASSES_SERIES}{outcome="pending"} ${pending}`,
-    `${RECONCILE_PASSES_SERIES}{outcome="failed"} ${failed}`,
-    `${RECONCILE_ERRORS_SERIES}{error_class="reconcile_prior_failed"} ${prior}`,
-  ]);
+  const window = reconcileWindow;
   const baseline = ev(window(10, 2, 7, 3));
   assert.deepEqual(baseline.firing, []);
   // The pass found prior failures and failed to converge: the failed-pass
   // ticket already names this window, so the finding stays silent.
   const failed = ev(window(10, 2, 8, 5), baseline.state);
   assert.deepEqual(failed.firing, ["eventsub_reconcile_failed"], "one failed pass raises exactly one ticket");
+  assert.deepEqual(ev(window(11, 3, 8, 5), baseline.state).firing, ["eventsub_reconcile_failed"],
+    "failed growth suppresses findings even beside healthy and pending growth");
   // The same finding beside healthy growth tickets on its own: the repair
   // landed and no other rule names the window.
   const repaired = ev(window(11, 2, 8, 6), failed.state);
@@ -357,6 +361,90 @@ test("prior-failed findings stay silent on windows where a failed pass grew", ()
   const noPasses = ev([`${RECONCILE_ERRORS_SERIES}{error_class="reconcile_prior_failed"} 9`], repaired.state);
   assert.deepEqual(noPasses.firing, []);
   assert.deepEqual(ev(window(12, 2, 8, 10), noPasses.state).firing, [PRIOR], "growth after the gap tickets");
+});
+
+test("prior-failed findings wait for a completed pass across mid-pass scrapes", () => {
+  const baseline = ev(reconcileWindow(5, 0, 0, 0));
+  // The Rust producer records the finding before awaiting the repair and
+  // verification calls. Repeated mid-pass scrapes must not consume it.
+  let state = baseline.state;
+  for (let i = 0; i < 2; i++) {
+    const midPass = ev(reconcileWindow(5, 0, 0, 1), state);
+    assert.deepEqual(midPass.firing, [], "an in-progress repair is not a landed repair");
+    assert.equal(midPass.state.reconcilePriorFailed, 0, "retain the unjudged finding delta");
+    state = JSON.parse(JSON.stringify(midPass.state));
+  }
+  const failed = ev(reconcileWindow(5, 0, 1, 1), state);
+  assert.deepEqual(failed.firing, ["eventsub_reconcile_failed"], "one failed pass, one ticket");
+  assert.equal(failed.state.reconcilePriorFailed, 1, "failed completion consumes the finding");
+  assert.deepEqual(ev(reconcileWindow(6, 0, 1, 1), failed.state).firing, [],
+    "later recovery cannot re-ticket the failed pass's finding");
+  // A completed non-failed outcome judges the retained finding exactly once.
+  for (const completed of [reconcileWindow(6, 0, 0, 1), reconcileWindow(5, 1, 0, 1)]) {
+    const repaired = ev(completed, state);
+    assert.deepEqual(repaired.firing, [PRIOR], "healthy and pending completions both ticket");
+    assert.deepEqual(ev(completed, repaired.state).firing, [], "flat completed counts stay quiet");
+  }
+});
+
+test("prior-failed suppression re-baselines when any companion counter goes backwards", () => {
+  const baseline = ev(reconcileWindow(5, 2, 2, 0));
+  for (const [healthy, pending, failed] of [
+    [5, 2, 1], // failed counter reset, prior counter grew
+    [4, 3, 2], // healthy counter reset
+    [6, 1, 2], // pending counter reset
+  ] as const) {
+    const restarted = ev(reconcileWindow(healthy, pending, failed, 1), baseline.state);
+    assert.deepEqual(restarted.firing, ["eventsub_reconcile_failed"],
+      "only the failed-pass rule judges a failed startup pass");
+    assert.equal(restarted.state.reconcilePriorFailed, 1, "reset consumes the startup finding");
+    assert.deepEqual(ev(reconcileWindow(healthy + 1, pending, failed, 1), restarted.state).firing, [],
+      "recovery does not replay a startup finding");
+  }
+  const priorReset = ev(reconcileWindow(5, 0, 0, 3));
+  const restarted = ev(reconcileWindow(6, 0, 0, 1), priorReset.state);
+  assert.deepEqual(restarted.firing, [], "a prior-only reset also re-baselines silently");
+  assert.deepEqual(ev(reconcileWindow(7, 0, 0, 2), restarted.state).firing, [PRIOR]);
+});
+
+test("prior-failed windows require all pass outcomes and preserve baselines across missing rows", () => {
+  const baseline = ev(reconcileWindow(5, 2, 0, 0));
+  for (let missing = 0; missing < 4; missing++) {
+    const partial = reconcileWindow(6, 2, 0, 1).filter((_, i) => i !== missing);
+    const unknown = ev(partial, baseline.state);
+    assert.deepEqual(unknown.firing, [], "a partial outcome family cannot prove completion");
+    assert.equal(unknown.state.reconcilePriorFailed, 0, "retain the finding baseline");
+    assert.deepEqual(ev(reconcileWindow(6, 2, 0, 1), unknown.state).firing, [PRIOR],
+      "the complete return sample judges against the last complete window");
+  }
+});
+
+test("prior-failed windows reject invalid companion outcomes without consuming findings", () => {
+  const baseline = ev(reconcileWindow(5, 2, 0, 0));
+  for (let outcome = 0; outcome < 3; outcome++) {
+    for (const value of ["NaN", "-1", "1.5"]) {
+      const lines = reconcileWindow(6, 2, 0, 1);
+      lines[outcome] = lines[outcome]!.replace(/ \d+$/, ` ${value}`);
+      const unknown = ev(lines, baseline.state);
+      assert.deepEqual(unknown.firing, []);
+      assert.equal(unknown.state.reconcilePriorFailed, 0);
+      assert.deepEqual(ev(reconcileWindow(6, 2, 0, 1), unknown.state).firing, [PRIOR]);
+    }
+  }
+});
+
+test("prior-failed legacy suppression state safely initializes new companion baselines", () => {
+  const legacy: MetricsAlertState = {
+    ...EMPTY_STATE, reconcilePriorFailed: 0, reconcilePriorFailedPassFailed: 0, reconcilePriorFailedSeen: true,
+  };
+  delete legacy.reconcilePriorFailedPassHealthy;
+  delete legacy.reconcilePriorFailedPassPending;
+  const initialized = ev(reconcileWindow(5, 2, 0, 1), legacy);
+  assert.deepEqual(initialized.firing, [], "incomplete legacy baselines cannot judge a window");
+  assert.equal(initialized.state.reconcilePriorFailed, 1);
+  assert.equal(initialized.state.reconcilePriorFailedPassHealthy, 5);
+  assert.equal(initialized.state.reconcilePriorFailedPassPending, 2);
+  assert.deepEqual(ev(reconcileWindow(6, 2, 0, 2), initialized.state).firing, [PRIOR]);
 });
 
 test("moderation failures sum every verb and both failure outcomes", () => {
@@ -484,6 +572,43 @@ test("stuck REST: invalid samples break the streak but preserve a firing ticket"
   }
   assert.deepEqual(ev(age(0), fired.state).firing, [], "the return sample can still resolve");
 });
+
+for (const { id, bad, good, streak } of [
+  {
+    id: GAP,
+    bad: [`${RECEIVED_SERIES} 61`, ...classifiedLines({ notification: 50 })],
+    good: [`${RECEIVED_SERIES} 61`, ...classifiedLines({ notification: 61 })],
+    streak: (state: MetricsAlertState) => state.eventsubReceiveGapStreak,
+  },
+  {
+    id: STUCK,
+    bad: [`${STUCK_SERIES} 120`],
+    good: [`${STUCK_SERIES} 0`],
+    streak: (state: MetricsAlertState) => state.voiceRestStuckStreak,
+  },
+]) {
+  for (const interruption of ["failed scrape", "missing sample", "invalid sample"]) {
+    test(`${id}: still-bad evidence after a ${interruption} holds the active ticket`, () => {
+      let state = ev(good).state;
+      for (let i = 0; i < 3; i++) state = ev(bad, state).state;
+      assert.deepEqual(state.firing, [id]);
+      const held = interruption === "failed scrape" ? interruptDispatchDrops(state)
+        : ev(interruption === "missing sample" ? [] : bad.map((row) => row.replace(/ \d+$/, " NaN")), state).state;
+      assert.equal(streak(held), 0, "the interruption breaks consecutive evidence");
+      assert.deepEqual(held.firing, [id], "missing evidence cannot resolve");
+      assert.deepEqual(transitionMessages(state.firing, held.firing), []);
+      const resumed = ev(bad, JSON.parse(JSON.stringify(held)));
+      assert.equal(streak(resumed.state), 1, "one fresh sample is not a new three-sample streak");
+      assert.deepEqual(resumed.firing, [id], "an ongoing incident must not falsely resolve");
+      assert.deepEqual(transitionMessages(held.firing, resumed.firing), [], "no resolve or re-ticket");
+      const cleared = ev(good, resumed.state);
+      assert.deepEqual(cleared.firing, []);
+      assert.match(transitionMessages(resumed.firing, cleared.firing)[0]!, new RegExp(`RESOLVED ${id}\\.`));
+      assert.deepEqual(transitionMessages(cleared.firing, ev(good, cleared.state).firing), [],
+        "valid resolving evidence emits exactly one resolution");
+    });
+  }
+}
 
 test("a healthy guild exposition fires no rule at all", () => {
   const samples = parseAlertScrape(metricsBody());

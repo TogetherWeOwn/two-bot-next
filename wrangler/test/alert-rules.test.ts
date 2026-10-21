@@ -1287,7 +1287,10 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
   let gap = ev(gapLines(100, 100));
   for (const n of [101, 102, 103]) gap = ev(gapLines(n, 100), gap.state);
   firing.push(...gap.firing);
-  const priorFailed = (n: number) => [`two_bot_eventsub_reconcile_errors_total{error_class="reconcile_prior_failed"} ${n}`, `two_bot_eventsub_reconcile_passes_total{outcome="failed"} 0`];
+  const priorFailed = (n: number) => [
+    `two_bot_eventsub_reconcile_errors_total{error_class="reconcile_prior_failed"} ${n}`,
+    ...reconcilePasses(n, 0, 0),
+  ];
   firing.push(...ev(priorFailed(1), ev(priorFailed(0)).state).firing);
   const sanctionRefused = (n: number) => [`two_bot_automod_decisions_total{outcome="sanction_refused"} ${n}`];
   firing.push(...ev(sanctionRefused(1), ev(sanctionRefused(0)).state).firing);

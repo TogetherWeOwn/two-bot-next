@@ -1538,8 +1538,9 @@ fetches record nothing here, so any increase is a real failure, however
 small. The first sample after monitoring arms only stores the baseline and
 never fires, and a counter reset (process restart) skips the window rather
 than firing. This is a **ticket**, not a page: one dead source or one
-transient blip never pages, while a poller failing every window re-tickets
-every window until the source is fixed or removed.
+transient blip never pages, while a poller failing every window keeps the
+alert firing. The transition path sends one ticket when firing starts and
+does not re-notify while it remains firing.
 
 First response: read the `error_class` breakdown from the authorized
 `/ops/metrics` scrape, then the feed poller warn/error lines for the same
@@ -1595,14 +1596,16 @@ re-create). The repair already landed — this ticket fires even when the pass
 converges healthy and the failed-pass rule stays silent — but Twitch failing
 our subscriptions means the receiver was erroring (for example,
 notification failures from refused or slow deliveries), so the cause is
-worth a look. The ticket is suppressed on windows where the failed-pass
-counter also grew: one failed pass raises exactly one ticket (the
-failed-pass ticket, whose first response already names the prior finding),
-so this rule only fires where there was silence before. The first sample
-after monitoring arms only stores the baseline and never fires, and a
-counter reset (process restart) skips the window rather than firing. This
-is a **ticket**, not a page: no action is overdue, but every finding is a
-receiver-health question. Passes that never run (dark, parked or a wedged
+worth a look. The rule waits for healthy or pending pass growth before
+judging the finding: Rust counts the finding before awaiting the repair and
+verification, so mid-pass scrapes retain all baselines without firing. A
+failed completion consumes the finding silently; the failed-pass ticket
+already names it, even when the finding and the outcome land in different
+scrapes. The first complete sample only stores the baseline and never fires.
+A backwards finding or pass-outcome counter (process restart) re-baselines
+all four counters silently; missing or invalid rows preserve the baselines.
+This is a **ticket**, not a page: no action is overdue, but every finding is
+a receiver-health question. Passes that never run (dark, parked or a wedged
 scheduler) record nothing and cannot ticket — this rule watches findings,
 not the absence of passes.
 
@@ -1695,12 +1698,12 @@ keepalive samples. A voice REST attempt has been in flight for over a minute:
 every voice REST send wraps its wire attempt in a 10 s timeout with an
 in-flight guard that drops on timeout, completion or early return, so a
 healthy gauge never reads past ~10 s and a sustained high age means an
-attempt neither completed nor dropped its slot. The gauge publishes on REST
-begin/drop events rather than on a timer, so quiet periods hold the last
-value — a stuck reading that survives three scrapes is a wedged attempt,
-not a slow one. This is a **ticket**, not a page: one wedged attempt never
-pages, while member-visible join degradation already pages through the
-join-budget burn rules.
+attempt neither completed nor dropped its slot. REST begin/drop events,
+actor ticks and an independent observer republish the gauge, so the age
+keeps advancing even during a hung dispatch. A stuck reading that survives
+three scrapes is a wedged attempt, not a slow one. This is a **ticket**, not
+a page: one wedged attempt never pages, while member-visible join degradation
+already pages through the join-budget burn rules.
 
 First response: read the in-flight age from the authorized `/ops/metrics`
 scrape and confirm it is still climbing or pinned high, then check the
