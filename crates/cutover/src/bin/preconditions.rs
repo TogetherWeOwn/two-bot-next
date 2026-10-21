@@ -57,6 +57,34 @@ const REQUIRED_TIMERS: &[&str] = &[
 
 const REGISTRY_FIXTURE: &str = "crates/core/tests/fixtures/legacy_registry.json";
 
+/// Cap for any single input file buffered into memory: 8 MiB, matching the
+/// capped cutover siblings (`ghost_cleanup`, `raid-remove`). Reads use
+/// `.take(CAP + 1)` so an over-cap file is detected without ever buffering
+/// the whole file past the cap; the boundary is strict `>`.
+const MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
+
+enum InputError {
+    OverCap,
+    Unreadable,
+}
+
+/// Bounded read of one checker input. Over-cap files report `OverCap` so the
+/// caller can refuse them as a failed check naming the role and the cap;
+/// open/read failures stay opaque (`Unreadable`) like the old
+/// `read_to_string` path, including directories, which open but never read.
+fn read_input(path: &Path) -> Result<String, InputError> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|_| InputError::Unreadable)?;
+    let mut text = String::new();
+    file.take(MAX_INPUT_BYTES as u64 + 1)
+        .read_to_string(&mut text)
+        .map_err(|_| InputError::Unreadable)?;
+    if text.len() > MAX_INPUT_BYTES {
+        return Err(InputError::OverCap);
+    }
+    Ok(text)
+}
+
 struct Outcome {
     name: &'static str,
     ok: bool,
@@ -115,7 +143,7 @@ fn check(root: &Path) -> (Vec<Outcome>, Vec<String>) {
     let mut missing: Vec<String> = Vec::new();
 
     // --- 1. parity matrix zero-unmapped marker --------------------------------
-    match std::fs::read_to_string(root.join(PARITY_DOC)) {
+    match read_input(&root.join(PARITY_DOC)) {
         Ok(text) if text.contains(PARITY_MARKER) => outcomes.push(Outcome {
             name: "parity-zero-unmapped",
             ok: true,
@@ -129,7 +157,15 @@ fn check(root: &Path) -> (Vec<Outcome>, Vec<String>) {
             });
             missing.push(format!("{PARITY_DOC} section `{PARITY_MARKER}`"));
         }
-        Err(_) => {
+        Err(InputError::OverCap) => {
+            outcomes.push(Outcome {
+                name: "parity-zero-unmapped",
+                ok: false,
+                detail: format!("{PARITY_DOC} exceeds 8 MiB"),
+            });
+            missing.push(format!("{PARITY_DOC} exceeds 8 MiB"));
+        }
+        Err(InputError::Unreadable) => {
             outcomes.push(Outcome {
                 name: "parity-zero-unmapped",
                 ok: false,
@@ -166,7 +202,7 @@ fn check(root: &Path) -> (Vec<Outcome>, Vec<String>) {
     }
 
     // --- 3. required docs/cutover.md sections --------------------------------
-    match std::fs::read_to_string(root.join(CUTOVER_DOC)) {
+    match read_input(&root.join(CUTOVER_DOC)) {
         Ok(text) => {
             let absent: Vec<&str> = REQUIRED_SECTIONS
                 .iter()
@@ -196,7 +232,15 @@ fn check(root: &Path) -> (Vec<Outcome>, Vec<String>) {
                 );
             }
         }
-        Err(_) => {
+        Err(InputError::OverCap) => {
+            outcomes.push(Outcome {
+                name: "runbook-sections",
+                ok: false,
+                detail: format!("{CUTOVER_DOC} exceeds 8 MiB"),
+            });
+            missing.push(format!("{CUTOVER_DOC} exceeds 8 MiB"));
+        }
+        Err(InputError::Unreadable) => {
             outcomes.push(Outcome {
                 name: "runbook-sections",
                 ok: false,
@@ -211,10 +255,11 @@ fn check(root: &Path) -> (Vec<Outcome>, Vec<String>) {
     // --- 4. timer units -------------------------------------------------------
     let mut bad_timers = Vec::new();
     for &unit in REQUIRED_TIMERS {
-        match std::fs::read_to_string(root.join(unit)) {
+        match read_input(&root.join(unit)) {
             Ok(text) if text.contains("OnCalendar=") => {}
             Ok(_) => bad_timers.push(format!("{unit} (no OnCalendar= schedule)")),
-            Err(_) => bad_timers.push(unit.to_owned()),
+            Err(InputError::OverCap) => bad_timers.push(format!("{unit} exceeds 8 MiB")),
+            Err(InputError::Unreadable) => bad_timers.push(unit.to_owned()),
         }
     }
     if bad_timers.is_empty() {
@@ -237,7 +282,7 @@ fn check(root: &Path) -> (Vec<Outcome>, Vec<String>) {
     }
 
     // --- 5. registry fixture ---------------------------------------------------
-    match std::fs::read_to_string(root.join(REGISTRY_FIXTURE)) {
+    match read_input(&root.join(REGISTRY_FIXTURE)) {
         Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
             Ok(value)
                 if value
@@ -272,7 +317,15 @@ fn check(root: &Path) -> (Vec<Outcome>, Vec<String>) {
                 missing.push(format!("{REGISTRY_FIXTURE} (invalid JSON: {e})"));
             }
         },
-        Err(_) => {
+        Err(InputError::OverCap) => {
+            outcomes.push(Outcome {
+                name: "registry-fixture",
+                ok: false,
+                detail: format!("{REGISTRY_FIXTURE} exceeds 8 MiB"),
+            });
+            missing.push(format!("{REGISTRY_FIXTURE} exceeds 8 MiB"));
+        }
+        Err(InputError::Unreadable) => {
             outcomes.push(Outcome {
                 name: "registry-fixture",
                 ok: false,

@@ -201,6 +201,13 @@ impl RemovalRecord {
     }
 }
 
+/// Cap for the cross-run audit replay: 8 MiB, matching the capped cutover
+/// siblings (`ghost_cleanup`, `raid-remove`). The replay uses `.take(CAP + 1)`
+/// so an over-cap log is refused without ever buffering it whole; the
+/// boundary is strict `>`. The audit file is append-only across runs, so an
+/// unbounded read would grow every run.
+const MAX_AUDIT_BYTES: usize = 8 * 1024 * 1024;
+
 /// Lifetime inode lock and fsync-per-record. Never truncate prior evidence.
 pub struct FileAudit {
     file: File,
@@ -228,7 +235,7 @@ impl FileAudit {
             // the descriptor-level regular-file check can reject it.
             opts.mode(0o600).custom_flags(libc::O_NONBLOCK);
         }
-        let mut file = opts.open(path).map_err(|_| "cannot open audit file")?;
+        let file = opts.open(path).map_err(|_| "cannot open audit file")?;
         let metadata = file.metadata().map_err(|_| "cannot inspect audit file")?;
         if !metadata.is_file() {
             return Err("audit must be a regular file".into());
@@ -236,8 +243,17 @@ impl FileAudit {
         file.try_lock()
             .map_err(|_| "audit lock unavailable; inspect concurrent run")?;
         let mut text = String::new();
-        file.read_to_string(&mut text)
+        let mut capped = file.take(MAX_AUDIT_BYTES as u64 + 1);
+        capped
+            .read_to_string(&mut text)
             .map_err(|_| "cannot read audit file")?;
+        // Fail closed: dropping `capped` here releases the lock, so repaired
+        // evidence can resume. The refusal keeps the existing repair-evidence
+        // style and names the role and the cap.
+        if text.len() > MAX_AUDIT_BYTES {
+            return Err("audit file exceeds 8 MiB; repair evidence before resuming".into());
+        }
+        let file = capped.into_inner();
         if !text.is_empty() && !text.ends_with('\n') {
             return Err("unterminated audit record; repair evidence before resuming".into());
         }
