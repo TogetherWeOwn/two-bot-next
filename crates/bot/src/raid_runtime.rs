@@ -24,7 +24,8 @@ use std::time::{Duration, Instant};
 
 use futures_util::FutureExt as _;
 use sqlx::PgPool;
-use tokio::sync::{mpsc, Notified, Notify, OnceCell};
+use tokio::sync::futures::Notified;
+use tokio::sync::{mpsc, Notify, OnceCell};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 use two_bot_core::onboarding::MentionPolicy;
