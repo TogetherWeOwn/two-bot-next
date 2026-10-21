@@ -31,6 +31,7 @@ export const RUST_ALERT_AXES: Record<string, Record<string, string | readonly st
   two_bot_db_pool_max_connections: {},
   two_bot_db_errors_total: { op: "DB_ERROR_OPS" },
   two_bot_send_admissions_total: { outcome: "SEND_ADMISSION_OUTCOMES" },
+  two_bot_gateway_prefix_trigger_refused_total: { reason: "PREFIX_TRIGGER_REFUSED_REASONS" },
   two_bot_voice_operations_total: { op: "VOICE_OPERATIONS", outcome: "VOICE_OUTCOMES" },
   two_bot_voice_dead_letters_total: { action: "VOICE_DEAD_ACTIONS" },
   two_bot_voice_orphans_total: {},

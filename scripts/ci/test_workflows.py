@@ -3387,6 +3387,25 @@ class WorkflowTests(unittest.TestCase):
         ):
             with self.subTest(skipped=skipped):
                 self.assertIn(f"--skip {skipped}", ignored_sweeps[0])
+        # The parity skip above keeps its unskipped, correctly ordered dedicated rerun.
+        parity_reruns = [run for run in cov_runs if "--test legacy_verify_db" in run]
+        self.assertEqual(len(parity_reruns), 1)
+        self.assertIn("-- --ignored --test-threads=1", parity_reruns[0])
+        self.assertNotIn(
+            "--skip parity_mismatch_cursor_and_read_only_acceptance",
+            parity_reruns[0],
+        )
+        # The parity guard accepts only the omitted-password URL. Its export
+        # must occur once, before the rerun and before the later URL switch.
+        parity_export = "export TWO_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test"
+        later_export = "export TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/agent_test"
+        self.assertEqual(logical_lines.count(parity_export), 1)
+        self.assertLess(
+            logical_lines.index(parity_export), logical_lines.index(parity_reruns[0])
+        )
+        self.assertLess(
+            logical_lines.index(parity_reruns[0]), logical_lines.index(later_export)
+        )
         # One MEMBER_TESTDB export serves both the ignored sweep and the
         # fail-closed member_moderation_db re-run. Pin its count and logical
         # command order so a redundant later export cannot mask a deleted or
@@ -3432,6 +3451,20 @@ class WorkflowTests(unittest.TestCase):
         for name in sorted(staging_names):
             with self.subTest(staging_skip=name):
                 self.assertIn(name, broad_skips)
+        # Mutation-429 channel fixtures run in the dedicated
+        # mutation_429 rerun below, never in this two_bot_test_ci sweep.
+        # Enumerate from the Rust source so a future tenth fixture cannot
+        # silently rejoin.
+        channel_source = (
+            ROOT / "crates/discord/tests/mutation_429_proves_no_effect_channel.rs"
+        ).read_text()
+        channel_names = set(
+            re.findall(r'#\[ignore[^\]]*\]\s*async fn (\w+)\(', channel_source)
+        )
+        self.assertTrue(channel_names, "guarded ignored fixtures must be discovered")
+        for name in sorted(channel_names):
+            with self.subTest(channel_skip=name):
+                self.assertIn(name, broad_skips)
         ignored_sweep = [run for run in sweeps if "-- --ignored" in run][0]
         self.assertIn(
             "--skip list_is_guild_scoped_selector_shaped_and_read_only",
@@ -3475,6 +3508,10 @@ class WorkflowTests(unittest.TestCase):
                     self.assertNotIn("--features db", matches[0])
                 if needle == "--test staging_migrate_db":
                     for name in sorted(staging_names):
+                        with self.subTest(dedicated_no_skip=name):
+                            self.assertNotIn(f"--skip {name}", matches[0])
+                if needle == "--test mutation_429_proves_no_effect_channel":
+                    for name in sorted(channel_names):
                         with self.subTest(dedicated_no_skip=name):
                             self.assertNotIn(f"--skip {name}", matches[0])
         env_wrapped = [
