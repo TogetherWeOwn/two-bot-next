@@ -515,7 +515,7 @@ read `two_bot_voice_live_not_ready_seconds` (paged past 120 s by
 guild's live view is not ready on a connected gateway, so joins are dropped
 before a ticket. Every dispatch retries the cached snapshot
 (`two_bot_voice_live_self_heal_total` counts the repairs, ticketed by
-[voice live self heal](#alert-voice-live-self-heal)); a value that keeps
+[voice live self-heal](#alert-voice-live-self-heal)); a value that keeps
 climbing past 120 s needs a restart (fresh IDENTIFY + GUILD_CREATE) and a bug
 report with the logs around the last gateway close.
 
@@ -620,7 +620,7 @@ Escalate when the latch survives the re-probe interval, when the logs name
 the Discord latch, or when burn alerts join the page — the fix belongs to
 the on-call engineer, not another redeploy.
 
-#### Alert: voice live self heal
+#### Alert: voice live self-heal
 
 `two_bot_voice_live_self_heal_total` increased between samples: a guild's
 live voice view was left not ready on a connected gateway, so creator joins
@@ -633,9 +633,11 @@ verdict.
 First response: read the container logs for
 `voice live view was not ready on a connected gateway; republished from cache`
 (warn, one line per repair) to confirm the repair and its guild; then check
-`two_bot_voice_live_not_ready_seconds` — 0 means the view is ready again,
-still climbing means the self-heal is covering a view that will not stay
-ready (see [voice live not ready](#alert-voice-live-not-ready)).
+`two_bot_voice_live_not_ready_seconds` — 0 means the view is ready again
+or the gateway is down, so confirm gateway readiness via the `/readyz`
+breakdown before treating 0 as recovery; still climbing means the
+self-heal is covering a view that will not stay ready
+(see [voice live not ready](#alert-voice-live-not-ready)).
 
 Escalate when repairs repeat for the same guild, or when a repair coincides
 with gateway close/resume churn — the fix belongs to the on-call engineer,

@@ -1344,7 +1344,8 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   // and never fires, so lifetime counts predating the deploy stay silent; a
   // counter that went backwards means the process restarted: no window. A
   // missing or malformed family (older containers never emitted it) is no
-  // window either: it keeps the previous baseline and never fires on its own.
+  // window either: it keeps the previous baseline, never fires on its own,
+  // and holds a firing ticket instead of resolving it.
   // `??` covers DO storage written before these fields existed.
   const SELF_HEAL_RULE = "voice_live_self_heal";
   const selfHealRows = gauge("two_bot_voice_live_self_heal_total");
@@ -1357,6 +1358,8 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     voiceLiveSelfHeal = selfHeal;
     voiceLiveSelfHealSeen = true;
     if (selfHealSeen && selfHeal > prevSelfHeal) firing.push(SELF_HEAL_RULE);
+  } else if (prev.firing.includes(SELF_HEAL_RULE)) {
+    firing.push(SELF_HEAL_RULE);
   }
 
   // Live-view not-ready age: `two_bot_voice_live_not_ready_seconds` is the

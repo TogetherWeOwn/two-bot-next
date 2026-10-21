@@ -68,7 +68,7 @@ test("catalog: rule ids match the Rust evidence list, preserve append positions 
 test("runbook and metrics docs name each rule, its anchor and its next action", () => {
   const cases = [
     { id: HALTED, anchor: "alert-voice-worker-halted", heading: "Alert: voice worker halted", keyword: /CredentialRefused/ },
-    { id: SELF_HEAL, anchor: "alert-voice-live-self-heal", heading: "Alert: voice live self heal", keyword: /republished/ },
+    { id: SELF_HEAL, anchor: "alert-voice-live-self-heal", heading: "Alert: voice live self-heal", keyword: /republished/ },
     { id: NOT_READY, anchor: "alert-voice-live-not-ready", heading: "Alert: voice live not ready", keyword: /restart/ },
     { id: STALL, anchor: "alert-voice-queue-stall", heading: "Alert: voice queue stall", keyword: /watchdog/ },
   ] as const;
@@ -269,14 +269,22 @@ test("self-heal: a missing sample keeps the baseline but posts no window verdict
   const baseline = ev(heal(5));
   const fired = ev(heal(6), baseline.state);
   assert.deepEqual(fired.firing, [SELF_HEAL]);
-  // No window, no verdict: the ticket lifecycle is per increase, so a gap
-  // carries no evidence either way and the baseline survives it.
+  // No window, no verdict: a gap carries no evidence either way, so it holds
+  // the firing ticket (never a RESOLVED) and the baseline survives it. Only
+  // the next valid flat sample proves repairs stopped and resolves once.
   for (const gap of [[], [line(SELF_HEAL_SERIES, "NaN")]] as const) {
     const unknown = ev([...gap], fired.state);
-    assert.deepEqual(unknown.firing, []);
+    assert.deepEqual(unknown.firing, [SELF_HEAL], "a gap holds the ticket");
+    assert.deepEqual(transitionMessages(fired.firing, unknown.firing), [], "a gap posts no verdict");
     assert.equal(unknown.state.voiceLiveSelfHeal, 6, "the gap must not corrupt the baseline");
-    assert.deepEqual(ev(heal(7), unknown.state).firing, [SELF_HEAL], "growth after the gap tickets");
-    assert.deepEqual(ev(heal(6), unknown.state).firing, [], "flat after the gap stays silent");
+    const regrown = ev(heal(7), unknown.state);
+    assert.deepEqual(regrown.firing, [SELF_HEAL], "growth after the gap tickets");
+    assert.deepEqual(transitionMessages(unknown.firing, regrown.firing), [], "held growth is not a new ALERT");
+    const flat = ev(heal(6), unknown.state);
+    assert.deepEqual(flat.firing, [], "flat after the gap resolves");
+    const resolved = transitionMessages(unknown.firing, flat.firing);
+    assert.equal(resolved.length, 1, "the first valid flat sample resolves exactly once");
+    assert.match(resolved[0]!, new RegExp(`RESOLVED ${SELF_HEAL}\\.`));
   }
 });
 
