@@ -239,8 +239,10 @@ outcomes. See `docs/metrics.md` for the full label table.
 Label-free counter emitted by the retention purge-skip path in
 `crates/bot/src/gateway.rs` (`retention_lifecycle`) and rendered by
 `crates/core/src/metrics.rs`. No guild id, SQLSTATE or error text ever
-becomes a label. Manual check, not an alert input: consumed by no alert
-rule. Full semantics live in `docs/metrics.md`.
+becomes a label. Consumed by `retention_replay_needed`: tickets on any
+increase between valid samples (first sample is baseline-only, restarts
+re-baseline, missing family is no window). Full semantics live in
+`docs/metrics.md`.
 
 | Series | Meaning |
 | --- | --- |
@@ -294,6 +296,20 @@ is the single shared spelling also pinned in `evidence.rs`
 | `voice_live_self_heal` | `two_bot_voice_live_self_heal_total` | Ticket, not page: any increase between valid samples (one covered fault, already repaired); first sample is baseline-only, restarts re-baseline, a missing family is no window |
 | `voice_live_not_ready` | `two_bot_voice_live_not_ready_seconds` | Pages past 120 s, promoting the host-watchdog bound into the standard pipeline (joins are dropped while above 0); at or below clears, missing/invalid holds; a hung dispatch freezes the published age |
 | `voice_queue_stall` | `two_bot_voice_queue_oldest_age_seconds` | Ticket, not page: oldest-wait past 120 s (matches the in-process stuck horizon; a hung dispatch freezes publication below the bound); at or below clears, missing/invalid holds |
+| `retention_replay_needed` | `two_bot_retention_replay_needed_total` (label-free counter; optional scrape input, so older containers without it hold the previous state) | Ticket, not page: any increase between valid samples (one ticket per skipped purge); the first valid sample only stores the baseline, restarts re-baseline, and a missing or malformed family is no window |
+| `voice_dispatch_timeouts` | `two_bot_voice_dispatch_timeouts_total` (label-free counter; optional scrape input, so older containers without it hold the previous state) | Ticket, not page: any increase between valid samples (one ticket per over-budget turn); the turn ran to completion and the queue keeps its retries; baseline, restart and gap semantics mirror `retention_replay_needed` |
+| `voice_watchdog_stucks` | `two_bot_voice_watchdog_stucks_total` (label-free counter; optional scrape input, so older containers without it hold the previous state) | Ticket, not page: any increase between valid samples (one ticket per 120 s stuck window); baseline, restart and gap semantics mirror `retention_replay_needed` |
+| `voice_halt_recoveries` | `two_bot_voice_halt_recoveries_total` (label-free counter; optional scrape input, so older containers without it hold the previous state) | Ticket, not page: any increase between valid samples (one ticket per covered store halt, including brief halt/recover cycles the sampled halt latch never shows; Discord-401 halts never count); baseline, restart and gap semantics mirror `retention_replay_needed` |
+| `rest_breaker_opens` | `two_bot_rest_guard_breaker_opens_total` (label-free counter; optional scrape input, so older containers without it hold the previous state) | Ticket, not page: any increase between valid samples (one ticket per trip, like its sustained-open sibling); baseline, restart and gap semantics mirror `retention_replay_needed` |
+| `rest_global_pauses` | `two_bot_rest_guard_global_pauses_total` (label-free counter; optional scrape input, so older containers without it hold the previous state) | Ticket, not page: any increase between valid samples (one ticket per new episode; extensions never count); baseline, restart and gap semantics mirror `retention_replay_needed` |
+
+Deliberately unwatched: `two_bot_rest_guard_breaker_closes_total`. A close is
+the 600 s invalid-request window cooling below threshold after a trip — pure
+recovery, not a new fault. The opens ticket and the sustained-open ticket
+already name the episode, and a close cannot occur without an observed open
+(the guard toggles in-process; restarts re-baseline), so a closes rule would
+ticket on every cooling with zero new information. Closes stay resolution
+evidence: the open tickets clear plus the `discord_breaker_close` info log.
 
 ## Gateway failure classes (`/readyz` `gateway_failure`)
 
@@ -438,6 +454,9 @@ worker halted on a Discord 401 (or the writer latched one); the probe stays
 out because only a token fix and a restart clear that halt.
 `voice halt re-probe: store still refusing` / `voice halt re-probe timed out`
 (debug): the latch stays set; the next probe runs after the re-probe interval.
+The stuck, timeout and recovery counters feed the `voice_watchdog_stucks`,
+`voice_dispatch_timeouts` and `voice_halt_recoveries` tickets (any increase
+between valid samples); the re-probe skip/timeout lines stay log-only.
 
 Empty-grace override warning (in `stored_empty_grace_with` in
 `crates/bot/src/voice_rooms.rs`, guild-only fields, no IDs):
