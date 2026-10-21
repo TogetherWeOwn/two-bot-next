@@ -147,6 +147,13 @@ impl HistoryCapture {
         }
     }
 
+    /// Mark the capture as page-capped: the channel ran deeper than the fetch
+    /// cap, so `finish` carries the shared truncation marker even when the
+    /// retained text fits the transcript budget.
+    pub(super) fn mark_page_capped(&mut self) {
+        self.truncated = true;
+    }
+
     pub(super) fn finish(self) -> TranscriptSnapshot {
         let bytes: usize = self.lines.iter().map(|line| line.text.len()).sum();
         let mut content = String::with_capacity(
