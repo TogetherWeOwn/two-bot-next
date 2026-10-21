@@ -808,9 +808,11 @@ pub(crate) const MAX_SCHEDULED_EVENTS_BODY_BYTES: usize = 1_048_576;
 /// Whole-response gates, in order: the raw wire-body cap (measured over the
 /// collected response bytes — unknown fields and JSON-insignificant bytes
 /// included, never over known fields alone or a re-serialization), then the
-/// existing shape/normalize/store path unchanged. The 5-minute staleness skip
-/// (decision §4) is NOT enforced here yet: the follow-up age slice pins it
-/// through this seam first, then wires the check.
+/// existing shape/normalize/store path unchanged (including the epoch-claim
+/// StaleSnapshot gate: an older-than-committed fetch still rolls back and is
+/// logged here). The 5-minute age skip (decision §4) is NOT enforced here
+/// yet: the follow-up age slice pins it through this seam first, then wires
+/// the check.
 pub(crate) async fn snapshot_events_once(
     pool: &PgPool,
     rest: &ActionExecutor,
@@ -841,9 +843,25 @@ pub(crate) async fn snapshot_events_once(
     if publication_stopped(shutdown) {
         return Ok(());
     }
-    replace_events(pool, guild, observed_at, &events)
-        .await
-        .map_err(|_| ErrorClass::Database)
+    // Epoch-claim gate (main #1472): a strictly older fetch rolls the whole
+    // swap back and reports StaleSnapshot; the tick logs the skip and keeps
+    // the newer snapshot.
+    match replace_events(pool, guild, observed_at, &events).await {
+        Ok(None) => Ok(()),
+        Ok(Some(skip)) => {
+            // Warn, not info: the runner never overlaps ticks
+            // (`jobs.rs` skips while one is active), so a lost claim
+            // means wall-clock skew froze the whole events mirror until
+            // real time passes the stored epoch.
+            tracing::warn!(
+                job = "events",
+                skip = ?skip,
+                "stale snapshot lost the epoch claim; publication skipped"
+            );
+            Ok(())
+        }
+        Err(_) => Err(ErrorClass::Database),
+    }
 }
 
 async fn snapshot_once(

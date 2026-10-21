@@ -35,6 +35,7 @@ jobs:
         run: |
           python3 scripts/test-supply-chain.py
           python3 scripts/test-runtime-image-evidence.py
+          python3 scripts/test_runtime_image_inspect_acceptance.py
           python3 scripts/test-vulnerability-preflight.py
       # Keep the workflow's validation tools while inventorying a historical
       # release tag that may predate those tools.

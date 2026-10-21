@@ -27,8 +27,9 @@ The desired set is the compiled builtins enabled by the same publishing gates:
 `TWO_OWEN_USER_ID`/protected-role validation), and `TWO_COMMUNITY_SCORECARD=1`.
 `TWO_VOICE=1` adds the temporary-voice set after moderation (21 new names with
 moderation on, because the voice `kick` loses first-wins to moderation `/kick`;
-22 with moderation off), and `/templateassistant`
-joins it only when `TWO_ASSISTANT_ENDPOINT` is also configured. The running bot
+22 with moderation off). `/templateassistant` stays unpublished until its
+slice lands with a handler, so `TWO_ASSISTANT_ENDPOINT` currently publishes
+nothing. The running bot
 publishes the voice set only while its voice sink actually built; this CLI reads
 the same env flags and cannot see that, so a diff against a bot whose voice
 sink failed to start will show the voice commands as extra desired entries.

@@ -106,11 +106,16 @@ def classify_observation(observation):
 
     The observation is a dict with optional "reply" (user-facing text).
     Unknown shapes fall closed to generic_failure; the denied arms are
-    checked first so a fixed denied surface can never land there.
+    checked first so a fixed denied surface can never land there. Non-string
+    values never match an arm and never raise: only genuine strings are
+    compared, so a hostile int/list/dict (including a container holding a
+    denied surface as a member) classifies generic_failure.
     """
     if not isinstance(observation, dict):
         return GENERIC_FAILURE
-    reply = observation.get("reply") or ""
+    reply = observation.get("reply")
+    if not isinstance(reply, str):
+        reply = ""
     for outcome, exact in EXACT_REPLIES.items():
         if reply == exact:
             return outcome
@@ -120,10 +125,20 @@ def classify_observation(observation):
 
 
 def classify_pack(pack=None):
-    """Classify every fixture case; returns [(name, outcome, expected)]."""
+    """Classify every fixture case; returns [(name, outcome, expected)].
+
+    None loads the default fixture pack. Malformed packs and cases are
+    fixed ValueError refusals (naming "cases" and the "case"); the refusal
+    text never echoes pack contents. A missing or non-dict observation
+    stays lenient: the row classifies generic_failure.
+    """
     pack = pack if pack is not None else load_pack()
+    if not isinstance(pack, dict) or not isinstance(pack.get("cases"), list):
+        raise ValueError("denied-copy pack must be an object with a cases list")
     rows = []
     for case in pack["cases"]:
+        if not isinstance(case, dict) or "name" not in case:
+            raise ValueError("denied-copy pack case must be an object with a name")
         rows.append((case["name"], classify_observation(case.get("observation")),
                      case.get("expected_outcome")))
     return rows

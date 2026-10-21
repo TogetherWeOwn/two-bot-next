@@ -17,7 +17,9 @@
 //! SQL. The sqlx swap lives in [`crate::website_store::replace_events`]; the
 //! tick recipe is: acquire [`crate::community_snapshots::JobGate`] → fetch via
 //! REST → [`normalize_events`] (`None` = [`ScheduledEventsSkip::InvalidResponse`],
-//! fetch failure = `DiscordReadFailed`) → swap via the store → drop the guard.
+//! fetch failure = `DiscordReadFailed`) → swap via the store (`Some(StaleSnapshot)`
+//! = a newer tick already swapped; the tick logs the skip and keeps the newer
+//! snapshot) → drop the guard.
 //! A failed or malformed read leaves the last good snapshot in place rather
 //! than publishing "no events" as a transport error — including leaving it at
 //! zero rows. A successful empty response *does* delete the last event.
@@ -123,6 +125,10 @@ pub trait ScheduledEventMirror: Send + Sync {
 pub enum ScheduledEventsSkip {
     DiscordReadFailed,
     InvalidResponse,
+    /// The fetch's `observed_at` predates the guild's committed epoch: a newer
+    /// tick already swapped, so this tick's whole transaction rolled back and
+    /// wrote nothing. The mirror keeps the newer snapshot.
+    StaleSnapshot,
 }
 
 /// Normalize one raw payload (legacy `normalize`): id, name,

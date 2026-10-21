@@ -58,11 +58,11 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_voice_orphans_total` | Untracked creator-channel orphans needing manual deletion after failed `/create` compensation |
 | `two_bot_voice_joins_received_total` | Creator joins received by the guild actor; compare with create/move/refused outcomes — received persistently above handled means the actor is not processing joins |
 | `two_bot_voice_join_refused_total{reason}` | Actor-received creator joins refused before queueing; `reason` is `halted`, `access`, `unknown_creator`, `stale_ticket`, `duplicate`, `name_blocked` or `other` |
-| `two_bot_voice_worker_halted` | Guild-actor halt latch: 1 while any guild actor is halted by a store CredentialRefused or Discord 401 (only store halts auto-recover; 401s need a token fix + restart); aggregated over all current guild actors, so a healthy guild cannot hide another guild's halt |
-| `two_bot_voice_queue_pending{lane}` | Queued (not in-flight) voice actions, summed across all current guild actors per lane; `lane` is `urgent` or `deferred` |
-| `two_bot_voice_queue_oldest_age_seconds` | Age of the oldest queued voice action in seconds, the maximum across all current guild actors; 0 when every queue is empty |
-| `two_bot_voice_live_not_ready_seconds` | Seconds a guild's live voice view has been not ready while the gateway is connected (READY or RESUMED handled), the maximum across all current guild actors, republished every actor tick; 0 when every view is ready or the gateway is down. While above 0 creator joins in that guild are dropped without an accept or refusal line and `two_bot_voice_joins_received_total` stays flat; every dispatch retries the cached snapshot, so a value that keeps climbing past 120 s needs a restart and a bug report |
-| `two_bot_voice_live_self_heal_total` | Live voice views republished from the gateway cache because they were not ready on a connected gateway; any increase is a fault the self-heal covered, worth a look in the container logs (`voice live view was not ready on a connected gateway`) |
+| `two_bot_voice_worker_halted` | Guild-actor halt latch: 1 while any guild actor is halted by a store CredentialRefused or Discord 401 (only store halts auto-recover; 401s need a token fix + restart); aggregated over all current guild actors, so a healthy guild cannot hide another guild's halt; the `voice_worker_halted` rule pages while 1 (a valid 0 clears, missing holds) |
+| `two_bot_voice_queue_pending{lane}` | Queued (not in-flight) voice actions, summed across all current guild actors per lane; `lane` is `urgent` or `deferred`; deliberately unwatched — depth without age is not a failure signal (bursts queue legitimately, no code-grounded bound exists), so it stays a manual complement to the `voice_queue_stall` ticket |
+| `two_bot_voice_queue_oldest_age_seconds` | Age of the oldest queued voice action in seconds, the maximum across all current guild actors; 0 when every queue is empty; the `voice_queue_stall` rule tickets past 120 s (at or below clears, missing holds; a hung dispatch freezes publication below the bound) |
+| `two_bot_voice_live_not_ready_seconds` | Seconds a guild's live voice view has been not ready while the gateway is connected (READY or RESUMED handled), the maximum across all current guild actors, republished every actor tick; 0 when every view is ready or the gateway is down. While above 0 creator joins in that guild are dropped without an accept or refusal line and `two_bot_voice_joins_received_total` stays flat; every dispatch retries the cached snapshot, so a value that keeps climbing past 120 s needs a restart and a bug report; the `voice_live_not_ready` rule pages past 120 s (a hung dispatch freezes the published age) |
+| `two_bot_voice_live_self_heal_total` | Live voice views republished from the gateway cache because they were not ready on a connected gateway; any increase is a fault the self-heal covered, worth a look in the container logs (`voice live view was not ready on a connected gateway`); the `voice_live_self_heal` rule tickets on any increase |
 | `two_bot_voice_rest_in_flight_age_seconds` | Age of the oldest in-flight voice REST attempt in seconds; 0 when idle |
 | `two_bot_voice_creator_map_generation` | Last merged creator-map generation; 0 before the first merge — a flat line across reconnects means the map stopped converging |
 | `two_bot_voice_creator_map_age_seconds` | Seconds since the last successful creator-map merge, republished every actor tick; 0 when never merged — climbing past the 5 min refresh interval means merges stopped landing; the `voice_creator_map_stale` rule pages past 600 s once a merge has landed |
@@ -323,7 +323,10 @@ as dynamic labels.
   `verdict` or `other`. Recorded once on the verdict-refusal arm in
   `crates/discord/src/custom_commands.rs` for prefix candidates only: the arm
   still returns `Refused` for every contained create, but unmatched content,
-  scope mismatches and the disabled fast path never increment it.
+  scope mismatches and the disabled fast path never increment it. Alert rule
+  `prefix_trigger_verdict_refusals` tickets when the `verdict` series rises
+  in 3 consecutive keepalive samples (first sample is baseline-only;
+  `other` is normal refusal volume and never counts).
 - `two_bot_dispatch_drops_total{lane}` — `lane` is one of `messages`,
   `interactions`, `registry`, `privileged`, `busy` or `reactions`, in the
   bot's `DISPATCH_LIMITS` order (`crates/core/src/metrics.rs`
@@ -497,9 +500,11 @@ non-2xx stay 504. Auth failures are the route's indistinguishable 401; see
 
 - `GET /ops/summary`: readiness (`ready`, `components`), gateway state and
   failure, the informational `jobs` map, pool gauges (`size`/`idle`/`max`),
-  event-store lag (`restorable_point`, `max_lag`: the largest per-table lag)
-  and backfill progress (`tables_total`, `tables_at_point`: tables whose
-  lag is exactly 0), plus the build revision/id.
+  the rejected-duplicate-registration count
+  (`duplicate_pool_registrations`, always present, `0` on unconfigured
+  boots), event-store lag (`restorable_point`, `max_lag`: the largest
+  per-table lag) and backfill progress (`tables_total`, `tables_at_point`:
+  tables whose lag is exactly 0), plus the build revision/id.
 - `GET /ops/gateway`: shard state (`unconfigured`/`armed`/`connected`/
   `draining`), gateway status, the last gateway-task failure, reconnect /
   resume / disconnect / missed-event counters, `last_ready_unix` and
@@ -654,6 +659,7 @@ exposition proxy, and ownership and bearer controls are unchanged.
 | `voice_join_fast_burn` | creator-join budget (99.5% moved within 5 s) burning faster than 14.4x in both the 1 h and 5 min windows; each window requires at least 10 genuine joins and two bad moves; receive counts lag one scrape and incomplete post-restart windows stay inactive | [voice join fast burn](runbook.md#alert-voice-join-fast-burn) |
 | `voice_join_slow_burn` | **ticket**, not page: same budget burning faster than 6x in both the 6 h and 30 min windows, with the same per-window volume and bad-move floors (sustained grind the fast rule never catches) | [voice join slow burn](runbook.md#alert-voice-join-slow-burn) |
 | `voice_creator_map_stale` | `two_bot_voice_creator_map_age_seconds` > 600 (two missed 5 min refreshes) with `two_bot_voice_creator_map_generation` > 0; generation 0 (never merged) never fires, missing gauges on older containers hold the previous state | [voice creator-map stale](runbook.md#alert-voice-creator-map-stale) |
+| `prefix_trigger_verdict_refusals` | **ticket**, not page: `two_bot_gateway_prefix_trigger_refused_total{reason="verdict"}` rises in 3 consecutive keepalive samples; first sample is baseline, flat/reset clears, missing/invalid retains active alerts | [prefix trigger verdict refusals](runbook.md#alert-prefix-trigger-verdict-refusals) |
 | `community_facts_drain_failures` | **ticket**, not page: summed `two_bot_community_facts_drain_failures_total{reason}` growth in 3 consecutive completed windows; first sample is baseline, flat/reset clears, missing/invalid retains active tickets | [community facts drain failures](runbook.md#alert-community-facts-drain-failures) |
 | `eventsub_post_failed_share` | **ticket**, not page: failed `two_bot_eventsub_posts_total` > 10% of attempted posts, >= 10 attempted (sub-floor windows accumulate across consecutive valid samples until the floor is met; first sample is baseline, resets rebaseline, missing/invalid preserves, and flat/sub-floor windows hold an active ticket until a judged window clears it) | [EventSub post failed share](runbook.md#alert-eventsub-post-failed-share) |
 | `event_store_consumer_lag` | **ticket**, not page: `two_bot_event_store_consumer_lag_seconds` > 60 in 3 consecutive valid samples (fractional counts); a valid sample at or below 60 resolves and rebaselines, missing/invalid samples and failed scrapes break the streak but preserve a firing ticket | [event-store consumer lag](runbook.md#alert-event-store-consumer-lag) |
@@ -663,6 +669,10 @@ exposition proxy, and ownership and bearer controls are unchanged.
 | `audit_delivery_halt` | **ticket**, not page: label-free halt gauge `1` for 3 consecutive valid samples with no current `audit_retry` failure; valid `0` recovers once, missing/invalid data holds an active ticket | [audit delivery halt](runbook.md#alert-audit-delivery-halt) |
 | `eventsub_tampered` | `two_bot_eventsub_classified_total{kind="tampered"}` rises in 3 consecutive samples (first sample is baseline-only, flat resolves, resets rebaseline, missing/invalid preserves firing alerts) | [EventSub tampered](runbook.md#alert-eventsub-tampered) |
 | `eventsub_reconcile_failed` | **ticket**, not page: `two_bot_eventsub_reconcile_passes_total{outcome="failed"}` rises between samples (one ticket per failed pass however many error sites moved; first sample is baseline-only, a restart sample re-baselines and fires when the new process already counted a failed pass (failed startup pass) else holds a firing ticket, a healthy-pass increase with no failed increase resolves, flat/pending-only growth and missing/invalid samples hold) | [eventsub reconcile failed](runbook.md#alert-eventsub-reconcile-failed) |
+| `voice_worker_halted` | `two_bot_voice_worker_halted` reads 1 (any guild actor halted); a valid 0 clears at once, missing/invalid holds | [voice worker halted](runbook.md#alert-voice-worker-halted) |
+| `voice_live_self_heal` | **ticket**, not page: `two_bot_voice_live_self_heal_total` rises between valid samples (first sample is baseline-only, restarts re-baseline, a missing family is no window) | [voice live self-heal](runbook.md#alert-voice-live-self-heal) |
+| `voice_live_not_ready` | `two_bot_voice_live_not_ready_seconds` past 120 s on a connected gateway (promotes the host-watchdog bound; a hung dispatch freezes the published age); at or below clears, missing/invalid holds | [voice live not ready](runbook.md#alert-voice-live-not-ready) |
+| `voice_queue_stall` | **ticket**, not page: `two_bot_voice_queue_oldest_age_seconds` past 120 s (matches the in-process stuck horizon; a hung dispatch freezes publication below the bound); at or below clears, missing/invalid holds | [voice queue stall](runbook.md#alert-voice-queue-stall) |
 
 The halt gauge is optional-when-present for older containers, but strictly
 validated as label-free and boolean. Its streak is persisted with the existing

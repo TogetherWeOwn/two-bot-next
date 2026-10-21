@@ -20,6 +20,8 @@ import threading
 import tomllib
 import unittest
 import urllib.request
+import zipfile
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
@@ -182,6 +184,63 @@ def staging_run(run_id=501, number=5, status="completed", conclusion="success", 
     return {"id": run_id, "run_number": number, "head_sha": sha, "status": status, "conclusion": conclusion}
 
 
+SNAPSHOT_RUN_ID = 9100
+SNAPSHOT_ARTIFACT_ID = 7700
+
+
+def snapshot_receipt(version=VERSION, image=IMAGE, sha=SHA, complete=True):
+    """The pre-deploy rollback snapshot a production deploy uploads."""
+    return {"has_previous": True, "worker": "two-bot-next-production", "application": "app",
+            "serving_version": version, "serving_sha": sha, "provenance_complete": complete,
+            "serving_image": image}
+
+
+def snapshot_zip(receipt, name="production-rollback-snapshot.json"):
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(name, json.dumps(receipt))
+    return buffer.getvalue()
+
+
+def corrupt_deflate_zip(receipt, name="production-rollback-snapshot.json"):
+    """A snapshot zip whose member is corrupt deflate data.
+
+    Unlike b"not a zip" this parses as a zip and fails inside the
+    decompressor: 0xFF as the first stream byte sets the reserved block
+    type, so archive.read raises zlib.error, not BadZipFile.
+    """
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(name, json.dumps(receipt))
+    blob = bytearray(buffer.getvalue())
+    data = 30 + len(name.encode("utf-8"))  # local file header, no extra field
+    blob[data] = 0xFF
+    return bytes(blob)
+
+
+def snapshot_artifact(artifact_id=SNAPSHOT_ARTIFACT_ID, run_id=SNAPSHOT_RUN_ID, age_days=1,
+                      branch="main", head_repo=1, expired=False):
+    created = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=age_days)
+    return {"id": artifact_id, "name": "production-rollback-snapshot", "expired": expired,
+            "created_at": created.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "workflow_run": {"id": run_id, "repository_id": 1, "head_repository_id": head_repo,
+                             "head_branch": branch, "head_sha": "e" * 40}}
+
+
+def snapshot_origin_run(run_id=SNAPSHOT_RUN_ID, path=".github/workflows/deploy-production.yml",
+                        branch="main", event="workflow_run", repo=REPO):
+    return {"id": run_id, "path": path, "head_branch": branch, "event": event,
+            "repository": {"full_name": REPO}, "head_repository": {"full_name": repo}}
+
+
+def snapshot_responses(receipt=None, artifact=None, run=None):
+    """Guard responses holding one rollback snapshot artifact."""
+    artifact = artifact or snapshot_artifact()
+    return {"artifacts": {"total_count": 1, "artifacts": [artifact]},
+            f"artifact-zip-{artifact['id']}": snapshot_zip(receipt or snapshot_receipt()),
+            "snapshot-run": run or snapshot_origin_run()}
+
+
 def failed_call():
     return subprocess.CalledProcessError(1, ["gh", "api"], "gh: Not Found (HTTP 404)")
 
@@ -232,22 +291,32 @@ class StaticGuardTests(unittest.TestCase):
         self.assertEqual(value(children(inputs["rollback"][1:], 8)["required"]), "false")
         self.assertEqual(value(children(inputs["image"][1:], 8)["required"]), "false")
         self.assertEqual(value(children(inputs["image"][1:], 8)["default"]), '""')
-        # The takeover flag is opt-in: a routine deploy leaves the fence held.
+        # A deploy always takes over (10-20 13:31Z: a manual deploy without
+        # takeover left production fenced). The takeover flag defaults on;
+        # only the explicit, opt-in cutover_hold keeps the fence held.
         takeover = children(inputs["takeover"][1:], 8)
         self.assertEqual(value(takeover["required"]), "false")
         self.assertEqual(value(takeover["type"]), "boolean")
-        self.assertEqual(value(takeover["default"]), "false")
+        self.assertEqual(value(takeover["default"]), "true")
+        hold = children(inputs["cutover_hold"][1:], 8)
+        self.assertEqual(value(hold["required"]), "false")
+        self.assertEqual(value(hold["type"]), "boolean")
+        self.assertEqual(value(hold["default"]), "false")
+        self.assertIn("fence stays held", value(hold["description"]))
         # allow_unstaged re-serves the live SHA when staging history aged out.
         unstaged = children(inputs["allow_unstaged"][1:], 8)
         self.assertEqual(value(unstaged["required"]), "false")
         self.assertEqual(value(unstaged["type"]), "boolean")
         self.assertEqual(value(unstaged["default"]), "false")
-        # The error-rate drill switch is dispatch-only rehearsal input, the
-        # same shape as staging: a push can never arm it.
+        # The error-rate drill switch stays declared only so a dispatch that
+        # names it reaches the guard's refusal (pointing to staging) instead
+        # of a bare unexpected-input error.
         drill = children(inputs["inject_error_rate_spike"][1:], 8)
         self.assertEqual(value(drill["required"]), "false")
         self.assertEqual(value(drill["type"]), "boolean")
         self.assertEqual(value(drill["default"]), "false")
+        self.assertIn("REFUSED on production", value(drill["description"]))
+        self.assertIn("deploy-staging", value(drill["description"]))
         text = "\n".join(TOP["on"])
         for trigger in ("push", "pull_request", "pull_request_target", "workflow_call"):
             self.assertNotRegex(text, rf"(?m)^\s*{trigger}:", trigger)
@@ -359,16 +428,14 @@ class StaticGuardTests(unittest.TestCase):
                                        "IMAGE: ${{ inputs.image }}",
                                        "ALLOW_UNSTAGED: ${{ inputs.allow_unstaged }}",
                                        "TAKEOVER: ${{ inputs.takeover }}",
-                                       "INJECT_ERROR_RATE_SPIKE: ${{ inputs.inject_error_rate_spike }}",
-                                       "INJECT_ERROR_RATE_SPIKE: ${{ github.event_name == 'workflow_dispatch' "
-                                       "&& inputs.inject_error_rate_spike && 'true' || 'false' }}"])
+                                       "CUTOVER_HOLD: ${{ inputs.cutover_hold }}",
+                                       "INJECT_ERROR_RATE_SPIKE: ${{ inputs.inject_error_rate_spike }}"])
         production = "\n".join(JOBS["production"])
-        # The error-rate drill switch is the one exception: a pinned
-        # dispatch-only expression (a push or automatic trigger can never
-        # arm it), read by exactly one step.
-        drill_reads = [line for line in production.splitlines() if "inputs." in line]
-        self.assertEqual(len(drill_reads), 1)
-        self.assertIn("github.event_name == 'workflow_dispatch' && inputs.inject_error_rate_spike", drill_reads[0])
+        # No production step reads any input: the drill switch reaches the
+        # guard only, which refuses it (failure injection is staging-only).
+        self.assertEqual([line for line in production.splitlines() if "inputs." in line], [])
+        self.assertNotIn("INJECT_ERROR_RATE_SPIKE", production)
+        self.assertNotIn("--rehearsal-firing", production)
         self.assertIn("ref: ${{ needs.guard.outputs.sha }}", production)
         self.assertIn("persist-credentials: false", production)
         self.assertIn('git merge-base --is-ancestor "$SHA" origin/main', production)
@@ -614,21 +681,20 @@ class StaticGuardTests(unittest.TestCase):
                 self.assertIn(name, env)
                 self.assertEqual(value(env[name]), "${{ github.event.workflow_run." + field + " }}")
 
-    def test_drill_switch_reaches_the_guard_and_refuses_unrollbackable_runs(self):
-        # The drill proves the fail-to-rollback chain, which exists only on
-        # a deploy-mode run with takeover: anything else refuses in the
-        # guard instead of leaving the drill build serving.
+    def test_drill_switch_reaches_only_the_guard_which_refuses_it(self):
+        # Failure injection never runs against production (10-20 20:54Z):
+        # the guard receives the switch only to refuse it, and the error-rate
+        # gate step has no rehearsal path left to arm.
         guard_job = "\n".join(JOBS["guard"])
         self.assertIn("INJECT_ERROR_RATE_SPIKE: ${{ inputs.inject_error_rate_spike }}", guard_job)
-        for needle in ("inject_error_rate_spike needs deploy mode",
-                       "inject_error_rate_spike needs takeover true",
-                       "inject_error_rate_spike never applies to an automatic run"):
-            self.assertIn(needle, GUARD)
+        self.assertIn("failure injection never runs against production", GUARD)
+        self.assertIn("dispatch deploy-staging with inject_error_rate_spike true", GUARD)
         run = inline_script("Gate promotion on REST 5xx error rate")
         for needle in ('--metrics-url "$PRODUCTION_URL"', "--evidence",
-                       '--sha "$SHA"', '--user-agent "two-bot-next-production-rollout/1.0"',
-                       "--rehearsal-firing", '[ "$INJECT_ERROR_RATE_SPIKE" = "true" ]'):
+                       '--sha "$SHA"', '--user-agent "two-bot-next-production-rollout/1.0"'):
             self.assertIn(needle, run)
+        for needle in ("--rehearsal-firing", "INJECT_ERROR_RATE_SPIKE", "rehearsal"):
+            self.assertNotIn(needle, run)
         # The evidence filename appears exactly twice: the --evidence write
         # path and the read-back print, which must name the same file.
         self.assertEqual(run.count("production-error-rate-gate.json"), 2)
@@ -639,14 +705,18 @@ class GuardBehaviourTests(unittest.TestCase):
     def guard(self, sha=SHA, rollback="", image=None, takeover="false", allow_unstaged="false",
               ref="refs/heads/main", auto="", resolved_sha=None, event="workflow_dispatch",
               run_sha="", run_conclusion="", run_updated="", hold="", spike="",
-              run_path="", run_event="", **responses):
+              run_path="", run_event="", cutover_hold="", **responses):
         if image is None:
             image = IMAGE if rollback else ""
         api = {**green(), "staging-latest": {"total_count": 1, "workflow_runs": [staging_run()]},
                "production-readyz": {"status": 200, "build_revision": SHA},
                # Older-than-live compare (compare/{sha}...{live}): the default
                # live build is behind the target, so automatic runs proceed.
-               "compare-live": {"status": "behind"}, **responses}
+               "compare-live": {"status": "behind"},
+               # Rollback snapshots: none by default, so a reviewer-less
+               # rollback refuses unless a test supplies a verified receipt.
+               "artifacts": {"total_count": 0, "artifacts": []},
+               "snapshot-run": snapshot_origin_run(), **responses}
         calls = []
         resolved = sha.strip().lower() or (SHA if not rollback else "")
         # R1 short-SHA fixture routing: a 7-39 hex prefix of SHA (other than the
@@ -688,6 +758,8 @@ class GuardBehaviourTests(unittest.TestCase):
                 self.assertNotIn("status", query)
                 self.assertNotIn("branch", query)
                 key = "ci-runs"
+            elif path == f"repos/{REPO}/actions/runs/{SNAPSHOT_RUN_ID}":
+                key = "snapshot-run"
             elif re.fullmatch(rf"repos/{REPO}/actions/runs/[0-9]+", path):
                 key = "ci-run"
             elif re.fullmatch(rf"repos/{REPO}/actions/runs/[0-9]+/attempts/[0-9]+/jobs", path):
@@ -716,6 +788,14 @@ class GuardBehaviourTests(unittest.TestCase):
                 key = "environment"
             elif path == f"repos/{REPO}/environments/production/deployment-branch-policies":
                 key = "branches"
+            elif path == f"repos/{REPO}/actions/artifacts":
+                # Paginated like every other collection: the name filter is
+                # pinned, the page cursor passes through to the fixture.
+                self.assertEqual(query["name"], "production-rollback-snapshot")
+                self.assertEqual(query["per_page"], "100")
+                key = "artifacts"
+            elif re.fullmatch(rf"repos/{REPO}/actions/artifacts/[0-9]+/zip", path):
+                key = "artifact-zip-" + path.split("/")[-2]
             else:
                 self.fail(f"unexpected API call {path}")
             result = api[key]
@@ -723,6 +803,8 @@ class GuardBehaviourTests(unittest.TestCase):
                 result = result(path, query)
             if isinstance(result, Exception):
                 raise result
+            if isinstance(result, bytes):
+                return result
             if path.endswith("/check-runs") and isinstance(result, dict):
                 # Match the GitHub API's name/App filters, but never filter by
                 # status: a pending latest run must not disappear behind green.
@@ -744,7 +826,7 @@ class GuardBehaviourTests(unittest.TestCase):
                 "WORKFLOW_RUN_SHA": run_sha, "WORKFLOW_RUN_CONCLUSION": run_conclusion,
                 "WORKFLOW_RUN_UPDATED_AT": run_updated, "HOLD_UNTIL": hold,
                 "WORKFLOW_RUN_PATH": run_path, "WORKFLOW_RUN_EVENT": run_event,
-                "INJECT_ERROR_RATE_SPIKE": spike,
+                "INJECT_ERROR_RATE_SPIKE": spike, "CUTOVER_HOLD": cutover_hold,
                 "PRODUCTION_WORKER_URL": "https://production.example.test",
                 "AUTO_APPROVE": auto,
                 "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(summary),
@@ -818,10 +900,10 @@ class GuardBehaviourTests(unittest.TestCase):
         code, outputs, summary, calls, _ = self.guard()
         self.assertEqual(code, 0)
         self.assertEqual(outputs, {"sha": SHA, "mode": "deploy", "version": "", "restore_image": "",
-                                   "takeover": "false", "allow_unstaged": "false",
+                                   "takeover": "true", "allow_unstaged": "false",
                                    "skip": "", "soak_seconds": "0",
                                    "auto": "false", "green_at": ""})
-        self.assertIn("Takeover: not requested", summary)
+        self.assertIn("Takeover: on", summary)
         self.assertIn(SHA, summary)
         self.assertIn("full `ci-ok` verdict", summary)
         self.assertIn("green ci-ok", "\n".join(TOP["on"]))
@@ -1013,7 +1095,7 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertRefused(result, "unexpected status 500")
 
     def test_allow_unstaged_needs_takeover_and_deploy_mode(self):
-        result = self.guard(allow_unstaged="true")
+        result = self.guard(allow_unstaged="true", cutover_hold="true")
         self.assertRefused(result, "needs takeover true")
         self.assertEqual(result[3], [])
         result = self.guard(rollback=VERSION, allow_unstaged="true")
@@ -1034,7 +1116,7 @@ class GuardBehaviourTests(unittest.TestCase):
         code, outputs, summary, _, _ = self.guard(takeover="true")
         self.assertEqual(code, 0)
         self.assertEqual(outputs["takeover"], "true")
-        self.assertIn("Takeover: requested", summary)
+        self.assertIn("Takeover: on", summary)
 
     def test_dispatch_from_another_ref_is_refused(self):
         for ref in ("refs/heads/feature", "refs/tags/v1", "refs/heads/main2", ""):
@@ -1262,7 +1344,7 @@ class GuardBehaviourTests(unittest.TestCase):
         code, outputs, summary, calls, _ = self.guard(auto="true", environment=environment)
         self.assertEqual(code, 0)
         self.assertEqual(outputs, {"sha": SHA, "mode": "deploy", "version": "", "restore_image": "",
-                                   "takeover": "false", "allow_unstaged": "false",
+                                   "takeover": "true", "allow_unstaged": "false",
                                    "skip": "", "soak_seconds": "0",
                                    "auto": "false", "green_at": ""})
         self.assertIn("Approval: automated", summary)
@@ -1304,14 +1386,156 @@ class GuardBehaviourTests(unittest.TestCase):
                 self.assertRefused(self.guard(auto=flag, environment=environment), "no required reviewers")
 
     def test_staging_waivers_still_need_human_reviewers_with_auto_approve(self):
-        # Automated approval vouches through staging history; a rollback or
-        # a live-SHA redeploy waives that history, so auto-approve cannot
-        # replace the human Environment reviewers there.
+        # Automated approval vouches through staging history; a live-SHA
+        # redeploy waives that history, so auto-approve cannot replace the
+        # human Environment reviewers there. A rollback without a verified
+        # production snapshot of its target refuses the same way.
         environment = {**green()["environment"], "protection_rules": []}
         result = self.guard(auto="true", environment=environment, rollback=VERSION, takeover="true")
         self.assertRefused(result, "no required reviewers")
+        self.assertRefused(result, "matches no verified rollback snapshot")
         result = self.guard(auto="true", environment=environment, takeover="true", allow_unstaged="true")
         self.assertRefused(result, "no required reviewers")
+
+    # Rule 3 (10-20 13:31Z): recovery never waits for a human. With
+    # automated approval and zero reviewers, a rollback whose whole target is
+    # a verified production rollback snapshot runs.
+    def test_reviewerless_rollback_runs_from_a_verified_production_snapshot(self):
+        environment = {**green()["environment"], "protection_rules": [{"type": "branch_policy"}]}
+        code, outputs, summary, calls, _ = self.guard(
+            auto="true", environment=environment, rollback=VERSION, takeover="true",
+            **snapshot_responses())
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs["mode"], "rollback")
+        self.assertEqual(outputs["version"], VERSION)
+        self.assertEqual(outputs["restore_image"], IMAGE)
+        self.assertIn(f"verified rollback snapshot of deploy-production run `{SNAPSHOT_RUN_ID}`", summary)
+        self.assertIn(f"repos/{REPO}/actions/artifacts/{SNAPSHOT_ARTIFACT_ID}/zip", [path for path, _ in calls])
+        # The SHA still passed ancestry and the full CI verdict first.
+        paths = [path for path, _ in calls]
+        self.assertIn(f"repos/{REPO}/compare/{SHA}...main", paths)
+        self.assertTrue(any(path.endswith("/check-runs") for path in paths))
+
+    def test_reviewerless_rollback_refuses_any_unverified_snapshot(self):
+        environment = {**green()["environment"], "protection_rules": []}
+        other = "f" * 40
+        cases = {
+            "other version": snapshot_responses(receipt=snapshot_receipt(version=OLD_VERSION)),
+            "other image": snapshot_responses(receipt=snapshot_receipt(image=IMAGE.replace("c" * 64, "d" * 64))),
+            "other sha": snapshot_responses(receipt=snapshot_receipt(sha=other)),
+            "incomplete provenance": snapshot_responses(receipt=snapshot_receipt(complete=False)),
+            "no previous": snapshot_responses(receipt={**snapshot_receipt(), "has_previous": False}),
+            "too old": snapshot_responses(artifact=snapshot_artifact(age_days=15)),
+            "expired": snapshot_responses(artifact=snapshot_artifact(expired=True)),
+            "not main": snapshot_responses(artifact=snapshot_artifact(branch="feature")),
+            "fork run": snapshot_responses(artifact=snapshot_artifact(head_repo=2)),
+            "other workflow": snapshot_responses(run=snapshot_origin_run(path=".github/workflows/check.yml")),
+            "pull request run": snapshot_responses(run=snapshot_origin_run(event="pull_request")),
+            "run off main": snapshot_responses(run=snapshot_origin_run(branch="feature")),
+            "fork head repo": snapshot_responses(run=snapshot_origin_run(repo="evil/two-bot-next")),
+            "unreadable zip": {**snapshot_responses(), f"artifact-zip-{SNAPSHOT_ARTIFACT_ID}": failed_call()},
+            "not a zip": {**snapshot_responses(), f"artifact-zip-{SNAPSHOT_ARTIFACT_ID}": b"not a zip"},
+            "wrong file": {**snapshot_responses(),
+                           f"artifact-zip-{SNAPSHOT_ARTIFACT_ID}": snapshot_zip(snapshot_receipt(), name="x.json")},
+        }
+        for label, responses in cases.items():
+            with self.subTest(label):
+                result = self.guard(auto="true", environment=environment, rollback=VERSION,
+                                    takeover="true", **responses)
+                self.assertRefused(result, "matches no verified rollback snapshot")
+        # Without automated approval a snapshot never replaces reviewers.
+        result = self.guard(environment=environment, rollback=VERSION, **snapshot_responses())
+        self.assertRefused(result, "no required reviewers")
+        # The SHA/ancestry/CI checks still apply before any snapshot read.
+        result = self.guard(auto="true", environment=environment, rollback=VERSION,
+                            compare={"status": "diverged"}, **snapshot_responses())
+        self.assertRefused(result, "not an ancestor of origin/main")
+        self.assertFalse(any("artifacts" in path for path, _ in result[3]))
+
+    def test_reviewerless_rollback_picks_the_matching_snapshot_among_recent_ones(self):
+        environment = {**green()["environment"], "protection_rules": []}
+        newer = snapshot_artifact(artifact_id=7701, run_id=9101, age_days=0)
+        responses = {
+            **snapshot_responses(),
+            "artifacts": {"total_count": 2, "artifacts": [newer, snapshot_artifact()]},
+            "artifact-zip-7701": snapshot_zip(snapshot_receipt(version=OLD_VERSION)),
+        }
+        code, _, summary, _, _ = self.guard(auto="true", environment=environment, rollback=VERSION,
+                                            takeover="true", **responses)
+        self.assertEqual(code, 0)
+        self.assertIn(f"deploy-production run `{SNAPSHOT_RUN_ID}`", summary)
+
+    def test_reviewerless_rollback_skips_a_corrupt_deflate_snapshot(self):
+        # One corrupt-deflate snapshot must not abort the search: the newer
+        # corrupt zip is skipped and the older match still approves.
+        environment = {**green()["environment"], "protection_rules": []}
+        newer = snapshot_artifact(artifact_id=7701, run_id=9101, age_days=0)
+        responses = {
+            **snapshot_responses(),
+            "artifacts": {"total_count": 2, "artifacts": [newer, snapshot_artifact()]},
+            "artifact-zip-7701": corrupt_deflate_zip(snapshot_receipt()),
+        }
+        # The decoy must fail inside the decompressor, not zip parsing, or
+        # this test would pass on the pre-fix BadZipFile-only handler.
+        with self.assertRaises(zlib.error):
+            with zipfile.ZipFile(io.BytesIO(responses["artifact-zip-7701"])) as archive:
+                archive.read("production-rollback-snapshot.json")
+        code, _, summary, _, _ = self.guard(auto="true", environment=environment, rollback=VERSION,
+                                            takeover="true", **responses)
+        self.assertEqual(code, 0)
+        self.assertIn(f"deploy-production run `{SNAPSHOT_RUN_ID}`", summary)
+
+    def test_reviewerless_rollback_finds_a_match_past_the_first_page(self):
+        # A busy artifact history must not hide the snapshot: page 1 holds
+        # only newer non-matching snapshots, the match sits on page 2.
+        environment = {**green()["environment"], "protection_rules": []}
+        decoys = [snapshot_artifact(artifact_id=7800 + i, run_id=9200 + i, age_days=0)
+                  for i in range(3)]
+        pages = {"1": {"total_count": 4, "artifacts": decoys},
+                 "2": {"total_count": 4, "artifacts": [snapshot_artifact()]}}
+        responses = {**snapshot_responses(),
+                     "artifacts": lambda path, query: pages[query["page"]]}
+        for decoy in decoys:
+            responses[f"artifact-zip-{decoy['id']}"] = snapshot_zip(
+                snapshot_receipt(version=OLD_VERSION))
+        code, _, summary, calls, _ = self.guard(
+            auto="true", environment=environment, rollback=VERSION,
+            takeover="true", **responses)
+        self.assertEqual(code, 0)
+        self.assertIn(f"deploy-production run `{SNAPSHOT_RUN_ID}`", summary)
+        artifact_pages = [query["page"] for path, query in calls
+                          if path == f"repos/{REPO}/actions/artifacts"]
+        self.assertEqual(artifact_pages, ["1", "2"])
+
+    def test_reviewerless_rollback_checks_every_fresh_snapshot(self):
+        # No newest-N cap: 35 newer non-matching snapshots must not hide an
+        # older match in the same 14-day window.
+        environment = {**green()["environment"], "protection_rules": []}
+        decoys = [snapshot_artifact(artifact_id=7800 + i, run_id=9200 + i, age_days=0)
+                  for i in range(35)]
+        responses = {**snapshot_responses(),
+                     "artifacts": {"total_count": 36, "artifacts": [*decoys, snapshot_artifact()]}}
+        for decoy in decoys:
+            responses[f"artifact-zip-{decoy['id']}"] = snapshot_zip(
+                snapshot_receipt(version=OLD_VERSION))
+        code, _, summary, _, _ = self.guard(
+            auto="true", environment=environment, rollback=VERSION,
+            takeover="true", **responses)
+        self.assertEqual(code, 0)
+        self.assertIn(f"deploy-production run `{SNAPSHOT_RUN_ID}`", summary)
+
+    def test_reviewerless_rollback_refuses_an_unlistable_snapshot_history(self):
+        # Failing closed stays a refusal, but the summary distinguishes an
+        # unreadable history from an unmatched target.
+        environment = {**green()["environment"], "protection_rules": []}
+        result = self.guard(auto="true", environment=environment, rollback=VERSION,
+                            takeover="true", artifacts={"message": "nope"})
+        self.assertRefused(result, "could not enumerate the production rollback snapshots")
+
+    def test_reviewers_present_never_read_snapshots(self):
+        code, _, _, calls, _ = self.guard(rollback=VERSION, takeover="true")
+        self.assertEqual(code, 0)
+        self.assertFalse(any("artifacts" in path for path, _ in calls))
 
     def test_unexpected_trigger_is_refused(self):
         result = self.guard(event="push")
@@ -1480,27 +1704,66 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(outputs["skip"].startswith("held until"), outputs)
 
-    def test_drill_spike_without_takeover_is_refused(self):
-        # Without takeover a failed gate cannot roll back: the drill would
-        # leave its build serving and prove nothing.
-        result = self.guard(spike="true", takeover="false")
-        self.assertRefused(result, "inject_error_rate_spike needs takeover true")
+    # Rule 1 (10-20 20:54Z): failure injection never runs against
+    # production, in any mode or combination; the refusal points to staging.
+    def test_drill_spike_is_refused_in_every_production_combination(self):
+        for label, kwargs in {
+            "deploy with takeover (the 20:54Z drill)": {"takeover": "true"},
+            "deploy without takeover": {"takeover": "false"},
+            "deploy with cutover hold": {"cutover_hold": "true"},
+            "rollback": {"takeover": "true", "rollback": VERSION},
+            "live-SHA cure": {"takeover": "true", "allow_unstaged": "true"},
+            "automatic run": {"event": "schedule", "sha": ""},
+        }.items():
+            with self.subTest(label):
+                result = self.guard(spike="true", **kwargs)
+                self.assertRefused(result, "failure injection never runs against production")
+                self.assertRefused(result, "dispatch deploy-staging with inject_error_rate_spike true")
+                # Refused before any GitHub or production read.
+                self.assertFalse([c for c in result[3] if c[0] != f"repos/{REPO}/actions/workflows/deploy-staging.yml/runs"])
 
-    def test_drill_spike_in_rollback_mode_is_refused(self):
-        # After a restore there is nothing to roll back to: the drill would
-        # fail the recovery run red with no action possible.
-        result = self.guard(spike="true", takeover="true", rollback=VERSION)
-        self.assertRefused(result, "inject_error_rate_spike needs deploy mode")
+    def test_drill_spike_false_or_absent_still_deploys(self):
+        for spike in ("", "false"):
+            with self.subTest(spike=spike):
+                code, outputs, _, _, _ = self.guard(spike=spike)
+                self.assertEqual(code, 0)
+                self.assertEqual(outputs["skip"], "")
+        self.assertRefused(self.guard(spike="yes"), "inject_error_rate_spike must be true or false")
 
-    def test_drill_spike_on_an_automatic_run_is_refused(self):
-        result = self.guard(event="schedule", sha="", spike="true",
-                            **{"production-readyz": {"status": 200, "build_revision": "f" * 40}})
-        self.assertRefused(result, "inject_error_rate_spike never applies to an automatic run")
+    # Rule 2 (10-20 13:31Z): a manual deploy can never leave production
+    # fenced. Deploy mode takes over by default; only cutover_hold skips it.
+    def test_manual_deploy_always_takes_over_unless_cutover_hold(self):
+        for takeover in ("false", "true"):
+            with self.subTest(takeover=takeover):
+                code, outputs, summary, _, stdout = self.guard(takeover=takeover)
+                self.assertEqual(code, 0)
+                self.assertEqual(outputs["takeover"], "true")
+                self.assertIn("Takeover: on", summary)
+                self.assertNotIn("fence stays held", summary.lower())
+                if takeover == "false":
+                    self.assertIn("takeover=false no longer skips the deploy takeover", stdout)
+        for takeover in ("false", "true"):
+            with self.subTest(cutover_hold=True, takeover=takeover):
+                code, outputs, summary, _, _ = self.guard(takeover=takeover, cutover_hold="true")
+                self.assertEqual(code, 0)
+                self.assertEqual(outputs["takeover"], "false")
+                self.assertIn("SKIPPED by cutover_hold", summary)
+                self.assertIn("fence STAYS HELD", summary)
 
-    def test_drill_spike_with_takeover_in_deploy_mode_passes(self):
-        code, outputs, _, _, _ = self.guard(spike="true", takeover="true")
+    def test_cutover_hold_is_deploy_only_and_validated(self):
+        self.assertRefused(self.guard(rollback=VERSION, takeover="true", cutover_hold="true"),
+                           "cutover_hold applies to a deploy, never a rollback")
+        self.assertRefused(self.guard(event="schedule", sha="", cutover_hold="true"),
+                           "cutover_hold never applies to an automatic run")
+        for flag in ("yes", "True", "1"):
+            with self.subTest(flag=flag):
+                result = self.guard(cutover_hold=flag)
+                self.assertRefused(result, "cutover_hold must be true or false")
+                self.assertEqual(result[3], [])
+        # Rollback mode keeps its own takeover flag (read/confirm ownership).
+        code, outputs, _, _, _ = self.guard(rollback=VERSION, takeover="false")
         self.assertEqual(code, 0)
-        self.assertEqual(outputs["skip"], "")
+        self.assertEqual(outputs["takeover"], "false")
 
     def test_schedule_promotes_the_latest_staged_commit(self):
         code, outputs, _, calls, stdout = self.guard(event="schedule", sha="")
@@ -1560,7 +1823,7 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(outputs["skip"], "")
         self.assertEqual(outputs["soak_seconds"], "0")
-        self.assertEqual(outputs["takeover"], "false")
+        self.assertEqual(outputs["takeover"], "true")
 
     def test_recheck_passes_without_hold_and_fresh_live(self):
         code, outputs, summary, _, _ = self.recheck()

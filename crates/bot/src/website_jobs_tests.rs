@@ -1362,8 +1362,11 @@ async fn events_tick_accepts_whitespace_padded_wire_body_at_cap() {
 /// The seam's injected stamp — not store time — is what the mirror stores and
 /// orders by. A fresh row must carry the injected stamp exactly, and a seeded
 /// newer row must survive a snapshot taken with an older injected stamp
-/// (TOG-20273 last-observed-wins through the seam). Stamping at store time
-/// instead of using the injected value fails both assertions.
+/// (TOG-20273 last-observed-wins through the seam; the epoch-claim gate rolls
+/// the older snapshot back, so the newer row survives with its stamp
+/// untouched). Stamping at store time instead of using the injected value
+/// fails both assertions: the fresh row would carry now(), and the older
+/// snapshot would win the epoch claim and clobber the seeded row.
 #[tokio::test]
 async fn events_seam_stores_the_injected_stamp_and_keeps_newer_rows() {
     let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
@@ -1379,17 +1382,24 @@ async fn events_seam_stores_the_injected_stamp_and_keeps_newer_rows() {
         .expect("create migrated agent-testdb fixture");
     let pool = db.pool();
     apply_web_contract(pool).await.unwrap();
-    // Seed event 3000 with a stamp newer than the snapshot's injected stamp
-    // but older than any store-time stamp, so a store-time regression clobbers
-    // it while the injected stamp preserves it.
-    let seed = normalize_events(&[raw_event(&event(), "2222").unwrap()]).unwrap();
-    replace_events(pool, "2222", "2026-10-15T12:00:00.000Z", &seed)
+    // Guild 3333: seed event 3000 with a stamp newer than the snapshot's
+    // injected stamp but older than any store-time stamp, so a store-time
+    // regression wins the epoch claim and clobbers it while the injected
+    // stamp loses the claim and preserves it. Guild 2222 stays empty so the
+    // fresh row below witnesses a genesis claim through the seam.
+    let mut seeded = event();
+    seeded["guild_id"] = json!("3333");
+    let seed = normalize_events(&[raw_event(&seeded, "3333").unwrap()]).unwrap();
+    replace_events(pool, "3333", "2026-10-15T12:00:00.000Z", &seed)
         .await
         .unwrap();
     let mut fresh = event();
     fresh["id"] = json!("3001");
     let mock = MockRest::start(
-        vec![ScriptedResponse::json(200, json!([event(), fresh]))],
+        vec![
+            ScriptedResponse::json(200, json!([fresh])),
+            ScriptedResponse::json(200, json!([seeded])),
+        ],
         ScriptedResponse::status(403),
     )
     .await;
@@ -1403,9 +1413,21 @@ async fn events_seam_stores_the_injected_stamp_and_keeps_newer_rows() {
     )
     .await
     .unwrap();
-    assert_eq!(mock.requests().len(), 1);
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT event_id, updated_at FROM scheduled_events WHERE guild_id='2222' ORDER BY event_id",
+    // Older than guild 3333's committed epoch: the whole swap rolls back and
+    // the seam reports Ok (stale skip), writing nothing.
+    snapshot_events_once(
+        pool,
+        &executor(&mock),
+        "3333",
+        &shutdown,
+        "2026-10-01T18:00:00.000Z",
+    )
+    .await
+    .unwrap();
+    assert_eq!(mock.requests().len(), 2);
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT guild_id, event_id, updated_at FROM scheduled_events \
+         WHERE guild_id IN ('2222', '3333') ORDER BY guild_id, event_id",
     )
     .fetch_all(pool)
     .await
@@ -1413,11 +1435,19 @@ async fn events_seam_stores_the_injected_stamp_and_keeps_newer_rows() {
     assert_eq!(
         rows,
         [
-            ("3000".to_owned(), "2026-10-15T12:00:00.000Z".to_owned(),),
-            ("3001".to_owned(), "2026-10-01T18:00:00.000Z".to_owned(),),
+            (
+                "2222".to_owned(),
+                "3001".to_owned(),
+                "2026-10-01T18:00:00.000Z".to_owned(),
+            ),
+            (
+                "3333".to_owned(),
+                "3000".to_owned(),
+                "2026-10-15T12:00:00.000Z".to_owned(),
+            ),
         ],
-        "the seeded newer row must survive the older snapshot, and the fresh \
-         row must carry the injected stamp exactly (not store time)"
+        "the fresh row must carry the injected stamp exactly (not store time), \
+         and the seeded newer row must survive the older snapshot"
     );
     mock.shutdown().await;
     db.close().await.unwrap();

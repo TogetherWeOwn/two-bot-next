@@ -899,3 +899,50 @@ async fn at_cap_rows_and_fields_reach_storage() {
         "100 rows with at-cap fields are in bounds and must still attempt publication"
     );
 }
+
+#[tokio::test]
+async fn stale_tick_returns_ok_and_writes_nothing() {
+    let Some(db) = fixture().await else {
+        return;
+    };
+    let pool = db.pool();
+    // Seed a newer snapshot with a far-future stamp: the live tick stamps
+    // `now`, strictly older, so the epoch gate must roll the swap back.
+    let seed = normalize_events(&[raw_event(&event("3000"), "2222").unwrap()]).unwrap();
+    replace_events(pool, "2222", "2036-01-01T00:00:00.000Z", &seed)
+        .await
+        .unwrap();
+    let before = mirror(pool).await;
+    // The stale fetch carries a never-before-seen id: only the epoch gate
+    // stops the resurrection, and the tick still reports success.
+    let mock = MockRest::start(
+        vec![ScriptedResponse::json(
+            200,
+            json!([event("3000"), event("3009")]),
+        )],
+        ScriptedResponse::status(403),
+    )
+    .await;
+    let (_stop, shutdown) = watch::channel(false);
+    assert_eq!(
+        run_once(
+            Kind::Events,
+            pool,
+            &executor(&mock),
+            "2222",
+            &Mutex::new(()),
+            &shutdown,
+            false
+        )
+        .await,
+        Ok(())
+    );
+    assert_eq!(mock.requests().len(), 1);
+    assert_eq!(
+        mirror(pool).await,
+        before,
+        "stale tick changed rows/timestamps/contract pin"
+    );
+    mock.shutdown().await;
+    db.close().await.unwrap();
+}
