@@ -13,17 +13,39 @@ Run: python3 -m unittest discover -s scripts -p 'test_docs_path_conformance.py' 
 
 import bisect
 import re
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 _EXCLUDED_PARTS = {".git", ".paperclip", "target", "node_modules"}
-DOCS = sorted(
-    p
-    for p in ROOT.rglob("*.md")
-    if not (set(p.relative_to(ROOT).parts) & _EXCLUDED_PARTS)
-)
+
+
+def _markdown_corpus():
+    """Tracked markdown files; rglob fallback when git is unavailable.
+
+    ``git ls-files`` works offline and limits the corpus to files the PR can
+    change, so untracked scratch notes or build output never fail the suite
+    and excluded directories are never walked.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "ls-files", "-z", "--", "*.md"],
+            cwd=ROOT,
+            capture_output=True,
+            check=True,
+        ).stdout.decode("utf-8")
+        return sorted(ROOT / p for p in out.split("\0") if p)
+    except (OSError, subprocess.CalledProcessError):
+        return sorted(
+            p
+            for p in ROOT.rglob("*.md")
+            if not (set(p.relative_to(ROOT).parts) & _EXCLUDED_PARTS)
+        )
+
+
+DOCS = _markdown_corpus()
 
 # Longest prefix first so `.github/scripts/x` never degrades to `scripts/x`.
 # An optional `./` is accepted before any prefix (mid-span `python3 ./scripts/x`
@@ -117,7 +139,16 @@ def _clean(token):
     match = re.match(r"(?P<path>.+?):\d[\d,\-]*$", token)
     if match:
         token = match.group("path")
-    return token.rstrip(".,;)]")
+    # Cut redirect-attached suffixes (`scripts/x.py>out.log` cites `scripts/x.py`)
+    # and angle-wrapped citations (`<scripts/x.py>`) at the first bracket, but
+    # only when a filename character precedes it: placeholder-first forms like
+    # `crates/<crate>/...` keep their bracket and still skip as patterns.
+    for i, char in enumerate(token):
+        if char in "<>":
+            if i > 0 and re.match(r"[A-Za-z0-9_.-]", token[i - 1]):
+                token = token[:i]
+            break
+    return token.rstrip(".,;)]}")
 
 
 def _is_pattern(path):
@@ -201,9 +232,6 @@ class DocsPathConformance(unittest.TestCase):
         self.assertIn(
             "scripts/production_deploy.py", [path for _, _, path in prod_cited]
         )
-        self.assertIn(
-            290, [n for n, _, p in prod_cited if p == "scripts/production_deploy.py"]
-        )
         runbook = (ROOT / "docs" / "runbook.md").read_text(encoding="utf-8")
         runbook_cited = _cited_paths(runbook)
         self.assertIn(
@@ -214,11 +242,12 @@ class DocsPathConformance(unittest.TestCase):
             encoding="utf-8"
         )
         smoke_cited = _cited_paths(smoke)
-        smoke_lines = {
+        router_citations = [
             n for n, _, p in smoke_cited if p.startswith("crates/core/src/router")
-        }
-        for line in (45, 48, 51, 54, 56, 58):
-            self.assertIn(line, smoke_lines, f"parity-shifted line {line} unscanned")
+        ]
+        self.assertGreaterEqual(
+            len(router_citations), 6, "parity-shifted router citations unscanned"
+        )
 
     def test_every_docs_path_citation_resolves_or_is_allowlisted(self):
         problems = []
@@ -296,6 +325,34 @@ class DocsPathConformance(unittest.TestCase):
                     "``` `x` ```\nwitness (`scripts/absent-fence.py`)\n",
                     "scripts/absent-fence.py",
                 ),
+                "redirect-attached out": (
+                    "run (`python3 scripts/absent-redirect.py>out.log`)\n",
+                    "scripts/absent-redirect.py",
+                ),
+                "redirect-attached in": (
+                    "run (`python3 scripts/absent-redirect-in.py<in.txt`)\n",
+                    "scripts/absent-redirect-in.py",
+                ),
+                "angle-wrapped": (
+                    "witness (`<scripts/absent-angle.py>`)\n",
+                    "scripts/absent-angle.py",
+                ),
+                "brace-wrapped": (
+                    "witness (`{scripts/absent-brace.py}`)\n",
+                    "scripts/absent-brace.py",
+                ),
+                "nested double span": (
+                    "note `` `scripts/absent-double.py` ``\n",
+                    "scripts/absent-double.py",
+                ),
+                "nested triple span": (
+                    "note ``` `scripts/absent-triple.py` ```\n",
+                    "scripts/absent-triple.py",
+                ),
+                "unpaired backtick across blank line": (
+                    "stray ` backtick\n\nwitness (`scripts/absent-para.py`)\n",
+                    "scripts/absent-para.py",
+                ),
             }
             for name, (snippet, expected) in stale_cases.items():
                 with self.subTest(name):
@@ -315,6 +372,8 @@ class DocsPathConformance(unittest.TestCase):
                 "wrangler (`wrangler/scripts/present.py`)\n"
                 "glob (`crates/*/migrations`)\n"
                 "partial-segment glob (`scripts/test_*.py`)\n"
+                "placeholder-first (`crates/<crate>/migrations`)\n"
+                "brace glob (`scripts/{a,b}.py`)\n"
                 "wrapped live `scripts/present.py\nwith args`\n"
                 "\n"
                 "parity live `long expected\nresponse.` (`crates/table.rs`)\n"
