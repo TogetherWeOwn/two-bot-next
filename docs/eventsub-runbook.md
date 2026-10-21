@@ -129,16 +129,64 @@ Never use a test fixture as a runtime credential.
 
 Armed-refresh variant (staging only, needs its own authorization like any
 rotation): with `TWO_EVENTSUB_RELOAD_KEY` provisioned and unchanged, the
-verification side needs no restart — the running container swaps to the new
-secret on the first delivery served by the new Worker version, so a controlled delivery
-signed with the new secret verifies with no restart. The subscription
-creation side still reads the boot secret per pass
-(`crates/bot/src/eventsub_reconcile.rs`, `webhook_secret_from_env`), so a
-full rotation that re-creates subscriptions with the new secret still
-restarts the container before the delete step, exactly as above, until the
-reconciler learns the refreshed snapshot. Do not arm the reload key in
-staging while live subscriptions exist without that follow-up: the swap
-moves the 401 window to the Worker cutover instead of the restart.
+container needs no restart. Transfer Worker ownership first (as above):
+every delivery through the new Worker version then carries refresh headers
+with the Worker's current secret, and the armed receiver swaps its live
+snapshot from those headers *before* Twitch-signature verification,
+independent of the Twitch signature itself — the existing subscriptions
+stay signed with the old secret until they are re-created, so their live
+deliveries fail closed with `401 unauthorized` from the cutover until the
+re-created subscriptions verify. The reconciler creates with the same live
+snapshot (`secret_snapshot` in `crates/bot/src/eventsub_http.rs`, cloned
+per pass in `crates/bot/src/eventsub_reconcile.rs`), so a re-created
+subscription carries whatever the receiver is verifying against.
+Source: `crates/core/src/eventsub_refresh.rs:172-261`,
+`crates/bot/src/eventsub_http.rs:423-450`,
+`wrangler/src/eventsub.ts:99-106,325-346`.
+
+Force and confirm the swap with a crafted challenge, not a Twitch
+delivery: no existing subscription can produce a new-signed delivery
+before re-creation. POST a `webhook_callback_verification` delivery to
+the staging callback URL, signed with the new secret per the Challenge
+verification section below (`content-type: application/json`, a fresh
+timestamp, a unique `twitch-eventsub-message-id` of at most 128
+`[A-Za-z0-9_-]` characters, minimal body `{"challenge": "<printable
+ASCII, at most 256 chars>", "subscription": {"type": "stream.online",
+"version": "1"}}`; never send `x-two-eventsub-*` — the edge refuses it
+and the DO attaches the refresh headers itself). The challenge echo has
+no side effects: nothing is persisted or posted. Expect `200` with the
+challenge echoed plus a `challenge answered` container line — the HMAC
+verifies only against the snapshot the receiver holds, so the echo
+proves the running container now holds the new secret. A `401` means it
+does not (ownership transfer incomplete, or the wrong secret value):
+stop, fix that, do not delete. A `503` means the refresh itself failed:
+stop and triage per the `503 unavailable` list below, do not delete.
+Source: `crates/core/src/twitch_eventsub.rs:142-149,169-197,277-288`,
+`crates/bot/src/eventsub_http.rs:518-534`,
+`wrangler/src/eventsub.ts:198-235`.
+
+Drain in-flight passes before deleting: a pass clones the snapshot once
+at its start, so a pass that started before the swap still creates with
+the old secret. Note the echo time, then wait for the next reconcile
+terminal line (`subscriptions reconciled`, `re-created but not all
+verified yet`, `refused`, `parked`, `failed`, or `pass interrupted`)
+timestamped after it — passes run sequentially, so that line proves
+every pass that could hold the old snapshot has finished, and every
+later pass clones the new one — then delete promptly. The wait is up to
+about an hour plus pass time. If no terminal line appears within about
+an hour and a quarter of the echo, stop and work the no-terminal
+checklist (next section) instead of deleting.
+Source: `crates/bot/src/eventsub_reconcile.rs:609-635`.
+
+The delete step stays manual, the recreate does not: delete each
+`stream.online` v1 subscription on our callback (Helix DELETE,
+`delete_subscription_url`), then let the reconciler create the missing
+subscriptions with the new secret on its next pass — restart the
+container to run the startup pass promptly (safe once ownership
+transferred, since the new Worker version forwards the new secret to a
+fresh container). Confirm agreement by watching for `notification
+acknowledged` or `challenge answered` lines after the reconciler's
+recreated subscription verifies, not by printing either value.
 Source: `crates/core/src/twitch_eventsub.rs:542-545` (deletes first; a
 duplicate create answers `409`), `:559-563` (healthy wanted subscriptions
 on our callback are kept without comparing secrets), `:481-488`
@@ -175,8 +223,11 @@ Each pass, from the process environment:
 
 1. Refuse without any Helix call when the configuration is incomplete:
    `TWO_TWITCH_CALLBACK_URL` must be present and a plain `https` callback
-   with no port, query, or fragment, and the Operator Twitch client id,
-   client secret, and webhook secret must load. Any refusal logs
+   with no port, query, or fragment, and the Operator Twitch client id and
+   client secret must load. The webhook secret comes from the receiver's
+   live snapshot (seeded at boot from `TWO_TWITCH_WEBHOOK_SECRET`, swapped
+   by armed refresh), never boot env directly; an unreadable snapshot
+   refuses the same way. Any refusal logs
    `error_class="reconcile_config_invalid"` and mutates nothing. The Worker
    forwards the callback, the broadcaster allowlist, and the Helix
    credentials to the container only on explicit lines while the receiver
@@ -229,8 +280,10 @@ Health signal is the container log, scalar fields only
 - `error_class="reconcile_config_invalid"` or
   `error_class="reconcile_no_broadcasters"`: refused or parked before any
   mutation, per steps 1-2.
-- `status="parked"`, `reason="flag_dark"` (info, once at spawn time):
-  `TWO_EVENTSUB` is not exactly `1`; no pass ran.
+- `status="parked"`, `reason="receiver_dark"` (info, once at spawn time):
+  enabled but no shared snapshot exists, so no task spawned and no pass
+  ran. (The flag is checked first: a dark flag parks with
+  `reason="flag_dark"` at spawn and per pass, even with no snapshot.)
 
 Detail lines inside a pass: `reconcile_prior_failed` (pre-pass
 subscriptions on our callback already in `webhook_callback_verification_failed`,

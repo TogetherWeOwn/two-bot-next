@@ -587,8 +587,45 @@ fn channel(allow: Option<&str>, deny: &str) -> ScriptedResponse {
 }
 
 fn allowed_test_url(url: &str, ci: bool) -> bool {
+    // Also accept the workspace bootstrap URL used by the check.yml coverage
+    // sweep; callers still connect to `agent_test` with an isolated schema,
+    // so data never lands in the bootstrap database.
     url == "postgres://agent_test@agent-testdb:5432/agent_test"
+        || url == "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci"
         || (ci && url == "postgres://agent_test@127.0.0.1:5432/agent_test")
+        || (ci && url == "postgres://agent_test:@127.0.0.1:5432/two_bot_test_ci")
+}
+
+#[test]
+fn database_guard_refuses_credentials_and_non_test_targets() {
+    assert!(allowed_test_url(
+        "postgres://agent_test@agent-testdb:5432/agent_test",
+        false
+    ));
+    assert!(allowed_test_url(
+        "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
+        false
+    ));
+    assert!(allowed_test_url(
+        "postgres://agent_test@127.0.0.1:5432/agent_test",
+        true
+    ));
+    assert!(allowed_test_url(
+        "postgres://agent_test:@127.0.0.1:5432/two_bot_test_ci",
+        true
+    ));
+    for url in [
+        "postgres://agent_test@127.0.0.1:5432/agent_test",
+        "postgres://agent_test:@127.0.0.1:5432/two_bot_test_ci",
+        "postgres://agent_test@production:5432/agent_test",
+        "postgres://agent_test@staging:5432/agent_test",
+        "postgres://admin@agent-testdb:5432/agent_test",
+        "postgres://agent_test:password@agent-testdb:5432/agent_test",
+        "postgres://agent_test@agent-testdb:5432/production",
+        "postgres://agent_test@agent-testdb:5432/agent_test?host=production",
+    ] {
+        assert!(!allowed_test_url(url, false));
+    }
 }
 
 struct TestDb {
