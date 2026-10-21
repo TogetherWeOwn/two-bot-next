@@ -815,7 +815,11 @@ async fn snapshot_once(
         return match replace_events(pool, guild, &fetched_at, &events).await {
             Ok(None) => Ok(()),
             Ok(Some(skip)) => {
-                tracing::info!(
+                // Warn, not info: the runner never overlaps ticks
+                // (`jobs.rs` skips while one is active), so a lost claim
+                // means wall-clock skew froze the whole events mirror until
+                // real time passes the stored epoch.
+                tracing::warn!(
                     job = "events",
                     skip = ?skip,
                     "stale snapshot lost the epoch claim; publication skipped"
