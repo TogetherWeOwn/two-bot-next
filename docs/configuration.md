@@ -36,7 +36,7 @@ sites across five runtimes, plus voice through the gateway closure):
 | --- | --- | --- | --- |
 | automod | `automod_gateway.rs:211-223`, `:292` | 10 live lists, thresholds, enforce flag (`:116-127`) | every message delivery |
 | feed | `feed_jobs.rs:235-237` | `TWO_FEED_POLL_SECONDS` (`:207`) | supervisor cadence + per-tick gate (`:246-289`) |
-| audit | `audit_runtime.rs:308`, `:438` | 3 mirror destinations (`:60-63`) | every record (`:483`) and sweep (`:497`) |
+| audit | `audit_runtime.rs:308`, `:438` | 3 mirror destinations (`:60-63`) | every record (`:483`) and sweep (`:497`), once installed |
 | ticket | `ticket_runtime.rs:457`, `:981` | 3 ticket destinations (`:172-175`) | every execute/recovery and purge |
 | gateway classifier | `gateway.rs:774-789`, `:918` | human/welcome channel sets (`:800-817`) | every guild message; classifier + facts sink swap together (`leveling_runtime.rs:766`) |
 | voice | `gateway.rs:2082` closure | empty grace (`voice_rooms.rs:9415`), invite code (`:9460`) | spawn (`:7753-7757`), maintenance (`:3319`), `/invite` (`:13306-13307`) |
@@ -71,7 +71,10 @@ reschedules the next run to last-run + new interval without a restart
 `DISCORD_MODERATION_LOG_CHANNEL_ID` from the snapshot on every record and
 sweep (`crates/bot/src/audit_runtime.rs:60-63`, `:308`, `:438`), where blanking
 all three parks the mirror live and a malformed row keeps the last good
-destinations; ticket operations apply
+destinations; with no destination at boot, registration installs neither the
+mirror handle nor the retry job, so a later stored destination cannot activate
+that parked runtime (`crates/bot/src/audit_runtime.rs:137-161`); ticket
+operations apply
 `DISCORD_TICKET_CATEGORY_ID`, `DISCORD_TICKET_PANEL_CHANNEL_ID` and
 `DISCORD_TICKET_STAFF_ROLE_ID` from the snapshot on every execute, recovery
 and purge (`crates/bot/src/ticket_runtime.rs:172-175`, `:457`, `:981`), where a
