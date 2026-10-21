@@ -152,6 +152,18 @@ function latestDigestTag() {
 	return tags.length ? tags[tags.length - 1] : null;
 }
 
+// Latest digest tag strictly before a given tag (zero-padded dates sort
+// chronologically as strings), or null when there is none. The repair path
+// ranges its notes from this tag so a tag is never compared against itself.
+function latestDigestTagBefore(tag) {
+	const tags = git("tag", "--list", "v*")
+		.split("\n")
+		.map((t) => t.trim())
+		.filter((t) => parseDigestTag(t) && t < tag);
+	tags.sort();
+	return tags.length ? tags[tags.length - 1] : null;
+}
+
 function tagTarget(tag) {
 	return git("rev-list", "-n", "1", tag);
 }
@@ -220,48 +232,26 @@ function main() {
 	const lastTarget = lastDigest ? tagTarget(lastDigest) : null;
 	const prevTag = lastDigest || latestSemverReachable(sha);
 
-	if (lastTarget === sha) {
-		console.log(`${sha} already matches ${lastDigest}; quiet day, no new tag`);
-		output({
-			tag_name: "",
-			released: "false",
-			prod_changed: "false",
-			prev_tag: lastDigest,
-		});
-		return;
-	}
-	if (lastTarget && isAncestor(sha, lastTarget)) {
-		// Production serves an older commit than the last digest (a rollback
-		// or redeploy of a prior build). It is never tagged, mirroring the
-		// retired per-promote rollback guard; the next forward deploy digests.
-		console.log(
-			`${sha} is older than ${lastDigest}; rollback serving, no new tag`,
-		);
-		output({
-			tag_name: "",
-			released: "false",
-			prod_changed: "false",
-			prev_tag: lastDigest,
-		});
-		return;
-	}
+	// Probe for today's tag once; tagTarget throws when the ref is missing,
+	// which is the expected first-run path. Only the probe is guarded: a
+	// later failure must exit red for a clean retry, never fall through.
+	let existing = null;
 	try {
-		const existing = tagTarget(digestTag);
-		// Today's digest tag already exists (an earlier run cut it, or a manual
-		// repair). Repair a missing Release; otherwise tomorrow's digest covers
-		// any production move since. Never a second tag for the same day.
-		if (releaseExists(digestTag)) {
-			console.log(`${digestTag} already exists; no new tag today`);
-			output({
-				tag_name: "",
-				released: "false",
-				prod_changed: "false",
-				prev_tag: lastDigest || "",
-			});
-			return;
-		}
+		existing = tagTarget(digestTag);
+	} catch {
+		existing = null;
+	}
+
+	if (!dryRun && existing && !releaseExists(digestTag)) {
+		// Today's digest tag exists but its Release is missing (a manual tag
+		// or a failed create). Repair it before any skip: production may
+		// already serve this exact SHA (quiet-day shape) yet the Release is
+		// still owed. Notes range from the previous digest, never the tag
+		// against itself. Dry runs skip the repair (no `gh` calls offline).
+		const repairPrev =
+			latestDigestTagBefore(digestTag) || latestSemverReachable(existing);
 		const opts = loadOptions("release-please-config.json");
-		const range = prevTag ? `${prevTag}..${existing}` : existing;
+		const range = repairPrev ? `${repairPrev}..${existing}` : existing;
 		const commits = gitLog(range)
 			.split("\x1e")
 			.map((r) => r.trim())
@@ -273,22 +263,13 @@ function main() {
 			.filter(Boolean);
 		const notes = renderNotes({
 			tag: digestTag,
-			prevTag: prevTag || existing,
+			prevTag: repairPrev || existing,
 			date,
 			commits,
 			sections: opts.sections,
 			repoUrl,
 		});
 		console.log(notes);
-		if (dryRun) {
-			output({
-				tag_name: "",
-				released: "false",
-				prod_changed: "true",
-				prev_tag: lastDigest || "",
-			});
-			return;
-		}
 		const notesFile = `${process.env.RUNNER_TEMP || "/tmp"}/digest-notes-${digestTag}.md`;
 		fs.writeFileSync(notesFile, notes);
 		execFileSync(
@@ -314,9 +295,45 @@ function main() {
 			prev_tag: lastDigest || "",
 		});
 		return;
-	} catch {
-		// No tag for today yet; cut it below. tagTarget throws when the ref is
-		// missing, which is the expected first-run path.
+	}
+
+	if (lastTarget === sha) {
+		console.log(`${sha} already matches ${lastDigest}; quiet day, no new tag`);
+		output({
+			tag_name: "",
+			released: "false",
+			prod_changed: "false",
+			prev_tag: lastDigest,
+		});
+		return;
+	}
+	if (lastTarget && isAncestor(sha, lastTarget)) {
+		// Production serves an older commit than the last digest (a rollback
+		// or redeploy of a prior build). It is never tagged, mirroring the
+		// retired per-promote rollback guard; the next forward deploy digests.
+		console.log(
+			`${sha} is older than ${lastDigest}; rollback serving, no new tag`,
+		);
+		output({
+			tag_name: "",
+			released: "false",
+			prod_changed: "false",
+			prev_tag: lastDigest,
+		});
+		return;
+	}
+	if (existing) {
+		// Today's digest tag already exists with its Release (or a dry-run
+		// preview of either). Tomorrow's digest covers any production move
+		// since. Never a second tag for the same day.
+		console.log(`${digestTag} already exists; no new tag today`);
+		output({
+			tag_name: "",
+			released: "false",
+			prod_changed: "false",
+			prev_tag: lastDigest || "",
+		});
+		return;
 	}
 
 	const opts = loadOptions("release-please-config.json");

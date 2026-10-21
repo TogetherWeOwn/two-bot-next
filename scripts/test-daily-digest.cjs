@@ -195,4 +195,27 @@ assert.match(calls, new RegExp(`release create v2026\\.10\\.21 --target ${featSh
 assert.match(fs.readFileSync(cutOut, 'utf8'), /tag_name=v2026\.10\.21/);
 assert.match(fs.readFileSync(cutOut, 'utf8'), /released=true/);
 
+// Repair of a missing Release runs before the quiet-day skip, even when
+// production already serves the tag's SHA, and ranges its notes from the
+// previous digest rather than the tag against itself.
+g('tag', 'v2026.10.21', featSha);
+fs.writeFileSync(ghLog, '');
+const repairOut = path.join(dir, 'out-repair');
+fs.writeFileSync(repairOut, '');
+const repair = spawnSync('node', [SCRIPT], {
+  cwd: dir, encoding: 'utf8',
+  env: {
+    ...process.env, PROD_SHA: featSha, GH_REPO: 'o/r', DIGEST_DATE: '2026-10-21',
+    GITHUB_OUTPUT: repairOut, RUNNER_TEMP: dir,
+    PATH: `${mockBin}${path.delimiter}${process.env.PATH}`,
+  },
+});
+assert.equal(repair.status, 0, repair.stderr);
+assert.match(repair.stdout, /compare\/v2026\.10\.20\.\.\.v2026\.10\.21/);
+assert.doesNotMatch(repair.stdout, /compare\/v2026\.10\.21\.\.\.v2026\.10\.21/);
+const repairCalls = fs.readFileSync(ghLog, 'utf8');
+assert.match(repairCalls, new RegExp(`release create v2026\\.10\\.21 --target ${featSha} --title v2026\\.10\\.21 --notes-file .* --latest`));
+assert.match(fs.readFileSync(repairOut, 'utf8'), /tag_name=v2026\.10\.21/);
+assert.match(fs.readFileSync(repairOut, 'utf8'), /released=true/);
+
 console.log('daily-digest: all tests passed');

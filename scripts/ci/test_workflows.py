@@ -2170,10 +2170,11 @@ def daily_digest_errors(workflow):
         errors.append(f"{name}:alert: must wait for the digest job")
     expected_alert_if = ("${{ !cancelled() && needs.digest.result == 'success' && "
                          "needs.digest.outputs.prod_changed == 'true' && "
-                         "needs.digest.outputs.released != 'true' }}")
+                         "needs.digest.outputs.released != 'true' && "
+                         "inputs.dry_run != true }}")
     if alert.get("if") != expected_alert_if:
         errors.append(f"{name}:alert: must fire only when the digest succeeded yet production "
-                      "changed with nothing released")
+                      "changed with nothing released, never on a dry run")
     if alert.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:alert: must keep contents:read only")
     if alert.get("environment") != "synthetic-alerts":

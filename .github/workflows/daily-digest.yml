@@ -173,7 +173,7 @@ jobs:
     # production changed and no digest tag was made. A red digest job is
     # already visible; a quiet day, a rollback, an already-cut today, or a
     # dry run never alerts.
-    if: ${{ !cancelled() && needs.digest.result == 'success' && needs.digest.outputs.prod_changed == 'true' && needs.digest.outputs.released != 'true' }}
+    if: ${{ !cancelled() && needs.digest.result == 'success' && needs.digest.outputs.prod_changed == 'true' && needs.digest.outputs.released != 'true' && inputs.dry_run != true }}
     permissions:
       contents: read
     environment: synthetic-alerts
