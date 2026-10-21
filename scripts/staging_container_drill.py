@@ -71,6 +71,27 @@ from staging_rollback_drill import ownership_control  # noqa: E402
 
 GateError = rollout.GateError
 require = rollout.require
+
+
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    raised message is fixed vocabulary: it names no key, value or path.
+    """
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
+
+
 WORKER = rollout.WORKER
 APPLICATION = rollout.APPLICATION
 CLASS = rollout.CLASS
@@ -98,20 +119,6 @@ CONFIRM_PROBES = 2
 # so the two gates cannot drift apart again.
 STALE_IMAGE_POLLS = rollout.APPLICATION_IMAGE_STALE_POLLS
 WRANGLER_TIMEOUT_SECONDS = 600
-
-
-class DuplicateKeyError(ValueError):
-    """A JSON object repeats a key; the message never carries key/value data."""
-
-
-def _reject_duplicate_keys(pairs):
-    """object_pairs_hook refusing repeats instead of last-wins, at any depth."""
-    seen = set()
-    for key, _value in pairs:
-        if key in seen:
-            raise DuplicateKeyError("duplicate JSON object key")
-        seen.add(key)
-    return dict(pairs)
 
 
 class ContainerDrillClient(rollout.Client):
@@ -295,7 +302,9 @@ def validate_attestation(text):
     if text is None or text == "":
         return None
     try:
-        raw = json.loads(text)
+        raw = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+    except DuplicateKeyError:
+        raise GateError("invalid_session_attestation") from None
     except ValueError:
         raise GateError("invalid_session_attestation") from None
     require(isinstance(raw, dict), "invalid_session_attestation")

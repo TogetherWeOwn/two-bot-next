@@ -140,5 +140,117 @@ class DeniedCopyTests(unittest.TestCase):
         self.assertIn("ref 1a2b3c4d", raw)
 
 
+# A unique marker, readable on purpose so a leak is unmistakable and no
+# credential-shaped literal is stored anywhere in this file.
+HOSTILE_SENTINEL = "VoiceDeniedNeverEcho4Z"
+
+TRUTHY_NON_STRINGS = (123, -1, 4.5, True, b"reply-bytes", ["not", "a", "string"],
+                      {"text": "x"}, ("x",), {"x"})
+
+
+class HostileObservationTests(unittest.TestCase):
+    """Non-string replies never raise and never match a denied arm."""
+
+    def test_non_dict_observations_classify_generic_failure(self):
+        for observation in (None, 0, 123, 4.5, True, "reply text", b"reply-bytes",
+                            [], ["x"], (), ("x",), {1, 2}):
+            with self.subTest(observation=repr(observation)):
+                self.assertEqual(denied.classify_observation(observation),
+                                 denied.GENERIC_FAILURE)
+
+    def test_non_string_truthy_reply_classifies_generic_failure(self):
+        for reply in TRUTHY_NON_STRINGS:
+            with self.subTest(reply=repr(reply)):
+                self.assertEqual(
+                    denied.classify_observation({"reply": reply}),
+                    denied.GENERIC_FAILURE)
+
+    def test_reply_containers_holding_denied_surfaces_do_not_match(self):
+        # Membership against a container must not trip a denied arm: only a
+        # genuine string surface classifies away from generic_failure.
+        hostile = ([denied.CREATE_MEMBER_DENIAL], (denied.CREATE_BOT_DENIAL,),
+                   {denied.JOIN_NOT_OCCUPANT: True},
+                   [denied.MOVE_BOT_DENIED_LINE])
+        for reply in hostile:
+            with self.subTest(reply=repr(reply)):
+                self.assertEqual(denied.classify_observation({"reply": reply}),
+                                 denied.GENERIC_FAILURE)
+
+    def test_falsy_non_string_values_still_coerce_to_generic_failure(self):
+        for value in (0, 0.0, False, [], {}, (), set(), "", None):
+            with self.subTest(value=repr(value)):
+                self.assertEqual(
+                    denied.classify_observation({"reply": value}),
+                    denied.GENERIC_FAILURE)
+
+
+class HostilePackTests(unittest.TestCase):
+    """Malformed packs are fixed refusals that never echo hostile bytes."""
+
+    def assert_fixed_cases_refusal(self, pack, label):
+        with self.assertRaises(ValueError, msg=f"no fixed cases refusal in {label}") as caught:
+            denied.classify_pack(pack)
+        self.assertIn("cases", str(caught.exception),
+                      f"pack refusal does not name cases in {label}")
+        self.assertNotIn(HOSTILE_SENTINEL, str(caught.exception),
+                         f"pack refusal echoes hostile bytes in {label}")
+
+    def assert_fixed_case_refusal(self, pack, label):
+        with self.assertRaises(ValueError, msg=f"no fixed case refusal in {label}") as caught:
+            denied.classify_pack(pack)
+        self.assertIn("case", str(caught.exception).lower(),
+                      f"case refusal does not name the case in {label}")
+        self.assertNotIn(HOSTILE_SENTINEL, str(caught.exception),
+                         f"case refusal echoes hostile bytes in {label}")
+
+    def test_packs_without_cases_are_fixed_refusals(self):
+        for pack in ({}, {"version": 1}, {"version": 1, "evil": HOSTILE_SENTINEL}):
+            with self.subTest(pack=repr(pack)):
+                self.assert_fixed_cases_refusal(pack, repr(pack))
+
+    def test_non_dict_packs_are_fixed_refusals(self):
+        for pack in ([], "pack", 123, 4.5, True, b"pack"):
+            with self.subTest(pack=repr(pack)):
+                self.assert_fixed_cases_refusal(pack, repr(pack))
+
+    def test_non_list_cases_are_fixed_refusals(self):
+        for cases in (None, "ab", 123, {"a": 1}, HOSTILE_SENTINEL):
+            with self.subTest(cases=repr(cases)):
+                self.assert_fixed_cases_refusal({"cases": cases}, repr(cases))
+
+    def test_cases_without_name_are_fixed_refusals(self):
+        for case in ({}, {"observation": {"reply": "x"}},
+                     {"observation": {}, "evil": HOSTILE_SENTINEL}):
+            with self.subTest(case=repr(case)):
+                self.assert_fixed_case_refusal({"cases": [case]}, repr(case))
+
+    def test_non_dict_cases_are_fixed_refusals(self):
+        for case in (123, "x", None, ["name"], HOSTILE_SENTINEL):
+            with self.subTest(case=repr(case)):
+                self.assert_fixed_case_refusal({"cases": [case]}, repr(case))
+
+    def test_cases_with_hostile_observations_classify_generic_rows(self):
+        pack = {"cases": [
+            {"name": "hostile-reply", "observation": {"reply": 123},
+             "expected_outcome": "generic_failure"},
+            {"name": "hostile-bytes", "observation": {"reply": b"x"},
+             "expected_outcome": "generic_failure"},
+            {"name": "hostile-container", "observation": {"reply": ["r"]},
+             "expected_outcome": "generic_failure"},
+        ]}
+        self.assertEqual(
+            denied.classify_pack(pack),
+            [(case["name"], denied.GENERIC_FAILURE, "generic_failure")
+             for case in pack["cases"]])
+
+    def test_empty_cases_list_stays_valid(self):
+        self.assertEqual(denied.classify_pack({"cases": []}), [])
+
+    def test_none_loads_the_default_pack(self):
+        pack = denied.load_pack()
+        self.assertEqual(denied.classify_pack(None), denied.classify_pack(pack))
+        self.assertEqual(denied.classify_pack(), denied.classify_pack(pack))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -506,6 +506,26 @@ class LiveTransportTests(unittest.TestCase):
                 self.assertNotIn(TOKEN, blob)
                 self.assertNotIn(REMOTE_SENTINEL, blob)
 
+    def test_get_notice_valid_404_still_proves_absence(self):
+        self.origin.routes = discord_routes({})
+        result = drill.live_transport(TOKEN)(
+            "get_notice", channel_id=CHANNEL, notice_id=NOTICE_ID)
+        self.assertEqual(result, {"code": 10008, "message": "Unknown Message"})
+        self.assertTrue(drill._notice_is_absent(result))
+
+    def test_get_notice_404_duplicate_code_refuses_both_orders(self):
+        call = drill.live_transport(TOKEN)
+        for raw in (b'{"code": 99999, "code": 10008}',
+                    b'{"code": 10008, "code": 99999}'):
+            with self.subTest(raw=raw):
+                self.origin.routes = discord_routes({
+                    ("GET", NOTICE_PATH): (404, {}, raw)})
+                with self.assertRaises(drill.DrillError) as ctx:
+                    call("get_notice", channel_id=CHANNEL, notice_id=NOTICE_ID)
+                self.assertIn("duplicate", str(ctx.exception).lower())
+                self.assertNotIn("99999", str(ctx.exception))
+                self.assertNotIn("Unknown Message", str(ctx.exception))
+
     def test_surface_failure_sends_every_restore_request(self):
         self.origin.routes = discord_routes(
             {("GET", COMMANDS_PATH): (200, {}, b'{"commands": []}')})

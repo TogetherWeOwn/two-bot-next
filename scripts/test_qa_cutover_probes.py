@@ -7,7 +7,7 @@ import sys
 import threading
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -1036,6 +1036,50 @@ class FixedCadenceJobGradingTest(unittest.TestCase):
         code, out = self.probe({"counter": (False, 10)})
         self.assertEqual(code, 0, out)
         self.assertIn("1 jobs fresh within cadence", out)
+
+
+def counting_double():
+    inner = double({"/health": HEALTH, "/readyz": READY})
+    calls = []
+
+    def fetch(url):
+        calls.append(url)
+        return inner(url)
+
+    fetch.calls = calls
+    return fetch
+
+
+class TimeoutCapBoundaryTests(unittest.TestCase):
+    """Pin the documented 60 s --timeout cap boundary in this suite.
+
+    The acceptance fixtures stop valid values at 30 and only refuse 1e9
+    over the cap, so a strict-< off-by-one or a raised cap would survive
+    there. These two cases sit exactly at the bound and just above it.
+    """
+
+    def test_timeout_cap_60_fetches_both_routes(self):
+        fetch = counting_double()
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = probe.main(["--base-url", "http://h/", "--timeout", "60"],
+                              fetch_fn=fetch)
+        self.assertEqual(code, 0, out.getvalue() + err.getvalue())
+        self.assertEqual(len(fetch.calls), 2, "both routes must be fetched")
+
+    def test_timeout_just_over_cap_61_refuses_before_any_request(self):
+        fetch = counting_double()
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = probe.main(["--base-url", "http://h/", "--timeout", "61"],
+                              fetch_fn=fetch)
+        self.assertEqual(code, 2)
+        self.assertEqual(fetch.calls, [], "a refusal must attempt zero requests")
+        combined = out.getvalue() + err.getvalue()
+        self.assertIn("--timeout", combined)
+        self.assertIn("at most 60", combined)
+        self.assertNotIn("PASS", combined, "a refusal must not print check lines")
+        self.assertNotIn("FAIL", combined, "a refusal must not print check lines")
 
 
 class BodyCapRefusalTests(unittest.TestCase):
