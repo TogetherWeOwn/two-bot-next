@@ -779,8 +779,8 @@ def staging_deploy_id_errors(workflow, name="deploy-staging.yml"):
     whose checkout may predate the script. The record step stores the deploy
     as a GitHub Deployment carrying the ID — never a tag or Release — with
     success only when the rollout verify and the error-rate gate both
-    passed; its failure fails the run without rolling back. No other step
-    may call deploy_id.py.
+    passed; it runs after the auto-rollback so bookkeeping can never gate
+    recovery. No other step may call deploy_id.py.
     """
     errors = []
     jobs = workflow.get("jobs") or {}
@@ -821,8 +821,6 @@ def staging_deploy_id_errors(workflow, name="deploy-staging.yml"):
         "deployment record step",
         lambda step: step.get("name") == "Record the staging deployment")
     if record is not None:
-        if record.get("id") != "record":
-            errors.append(f"{name}:deploy: record step must carry id record for the rollback guard")
         if record.get("if") != "always() && steps.deploy.outcome == 'success'":
             errors.append(f"{name}:deploy: record step must run whenever a deploy went out")
         env = record.get("env") or {}
@@ -841,9 +839,11 @@ def staging_deploy_id_errors(workflow, name="deploy-staging.yml"):
             errors.append(f"{name}:deploy: staging has no rollback mode to record")
     if gate_at >= 0 and record_at >= 0 and record_at < gate_at:
         errors.append(f"{name}:deploy: record step must run after the error-rate gate judges")
-    rollback = [step for step in steps if step.get("id") == "auto_rollback"]
-    if len(rollback) == 1 and "steps.record.outcome != 'failure'" not in str(rollback[0].get("if") or ""):
-        errors.append(f"{name}:deploy: auto-rollback must stand down on a record-step failure")
+    rollback_at = next((index for index, step in enumerate(steps)
+                        if step.get("id") == "auto_rollback"), -1)
+    if rollback_at >= 0 and record_at >= 0 and record_at < rollback_at:
+        errors.append(f"{name}:deploy: record step must run after the auto-rollback "
+                      "so bookkeeping can never gate recovery")
     if str(deploy).count("deploy_id.py") != 2:
         errors.append(f"{name}:deploy: only the compute and record steps may call deploy_id.py")
     return errors
@@ -1958,10 +1958,10 @@ def production_deploy_id_errors(workflow, name="deploy-production.yml"):
     the readyz gate judges it; the record step stores the deploy as a GitHub
     Deployment with environment=production carrying the ID — never a tag or
     Release — with success only when the readyz gate passed and the
-    error-rate gate did not fail; a record-step failure fails the run
-    without rolling back. Rollbacks mint a fresh event ID and name
-    themselves, since the restored build keeps its original stamped ID. No
-    other step may call deploy_id.py.
+    error-rate gate did not fail. It runs after the auto-rollback so
+    bookkeeping can never gate recovery. Rollbacks mint a fresh event ID
+    and name themselves, since the restored build keeps its original
+    stamped ID. No other step may call deploy_id.py.
     """
     errors = []
     jobs = workflow.get("jobs") or {}
@@ -2012,9 +2012,6 @@ def production_deploy_id_errors(workflow, name="deploy-production.yml"):
         "deployment record step",
         lambda step: step.get("name") == "Record the production deployment")
     if record is not None:
-        if record.get("id") != "record":
-            errors.append(f"{name}:production: record step must carry id record "
-                          "for the rollback guard")
         condition = str(record.get("if") or "")
         if ("steps.deploy.outcome == 'success'" not in condition
                 or "steps.rollback.outcome == 'success'" not in condition):
@@ -2036,9 +2033,11 @@ def production_deploy_id_errors(workflow, name="deploy-production.yml"):
             errors.append(f"{name}:production: record step must name rollback records")
     if error_gate_at >= 0 and record_at >= 0 and record_at < error_gate_at:
         errors.append(f"{name}:production: record step must run after the error-rate gate judges")
-    rollback = [step for step in steps if step.get("id") == "auto_rollback"]
-    if len(rollback) == 1 and "steps.record.outcome != 'failure'" not in str(rollback[0].get("if") or ""):
-        errors.append(f"{name}:production: auto-rollback must stand down on a record-step failure")
+    rollback_at = next((index for index, step in enumerate(steps)
+                        if step.get("id") == "auto_rollback"), -1)
+    if rollback_at >= 0 and record_at >= 0 and record_at < rollback_at:
+        errors.append(f"{name}:production: record step must run after the auto-rollback "
+                      "so bookkeeping can never gate recovery")
     if str(production).count("deploy_id.py") != 2:
         errors.append(f"{name}:production: only the compute and record steps may call deploy_id.py")
     return errors

@@ -1526,35 +1526,6 @@ jobs:
           # Evidence carries the mode, firing list and verdict only.
           # No tokens, no raw exposition bodies.
           python3 -c 'import json, os; print(json.dumps(json.load(open(os.environ["RUNNER_TEMP"] + "/production-error-rate-gate.json")), sort_keys=True))'
-      # Record the deploy as a GitHub Deployment carrying the deploy ID (never
-      # a tag or Release): success only when the readyz gate passed and the
-      # error-rate gate did not fail (it skips in rollback mode). A rollback
-      # record names itself, since its event ID differs from the restored
-      # build's stamped ID. Without a deploy or rollback there is nothing to
-      # record.
-      - name: Record the production deployment
-        id: record
-        if: always() && (steps.deploy.outcome == 'success' || steps.rollback.outcome == 'success')
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GATE_OUTCOME: ${{ steps.gate.outcome }}
-          ERROR_GATE_OUTCOME: ${{ steps.error_rate_gate.outcome }}
-          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
-        run: |
-          set -euo pipefail
-          status=failure
-          if [ "$GATE_OUTCOME" = "success" ] && [ "$ERROR_GATE_OUTCOME" != "failure" ] \
-              && [ "$ERROR_GATE_OUTCOME" != "cancelled" ]; then
-            status=success
-          fi
-          rollback=()
-          if [ "$MODE" = "rollback" ]; then
-            rollback=(--rollback)
-          fi
-          python3 ../tooling/scripts/deploy_id.py record --environment production --sha "$SHA" \
-            --deploy-id "$DEPLOY_ID" --state "$status" "${rollback[@]}" --run-url "$RUN_URL" \
-            --environment-url "$WORKER_URL"
       # A failed gate after a takeover rolls back automatically to the
       # pre-deploy snapshot (Worker version AND container image, with
       # takeover). The run still fails red: the rollback restores service,
@@ -1562,9 +1533,7 @@ jobs:
       # without a deploy or a snapshot there is nothing to restore.
       - name: Auto-roll back Worker version and container image
         id: auto_rollback
-        # A failed record step fails the run without moving the service:
-        # bookkeeping never rolls back a healthy deploy.
-        if: failure() && env.MODE == 'deploy' && env.TAKEOVER == 'true' && steps.deploy.outcome == 'success' && steps.snapshot.outcome == 'success' && steps.record.outcome != 'failure'
+        if: failure() && env.MODE == 'deploy' && env.TAKEOVER == 'true' && steps.deploy.outcome == 'success' && steps.snapshot.outcome == 'success'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -1588,6 +1557,36 @@ jobs:
             --evidence "$RUNNER_TEMP/production-auto-rollback-evidence.json"
           python3 -c 'import json, os; print(json.dumps(json.load(open(os.environ["RUNNER_TEMP"] + "/production-auto-rollback-evidence.json")), sort_keys=True))'
           echo "- Auto-rollback: restored the pre-deploy Worker version and container image with takeover (the run still fails)" >> "$GITHUB_STEP_SUMMARY"
+      # Record the deploy as a GitHub Deployment carrying the deploy ID (never
+      # a tag or Release): success only when the readyz gate passed and the
+      # error-rate gate did not fail (it skips in rollback mode). A rollback
+      # record names itself, since its event ID differs from the restored
+      # build's stamped ID. Runs after the auto-rollback so bookkeeping can
+      # never gate recovery: a failed record fails the run red with the
+      # service already restored. Without a deploy or rollback there is
+      # nothing to record.
+      - name: Record the production deployment
+        if: always() && (steps.deploy.outcome == 'success' || steps.rollback.outcome == 'success')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GATE_OUTCOME: ${{ steps.gate.outcome }}
+          ERROR_GATE_OUTCOME: ${{ steps.error_rate_gate.outcome }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
+        run: |
+          set -euo pipefail
+          status=failure
+          if [ "$GATE_OUTCOME" = "success" ] && [ "$ERROR_GATE_OUTCOME" != "failure" ] \
+              && [ "$ERROR_GATE_OUTCOME" != "cancelled" ]; then
+            status=success
+          fi
+          rollback=()
+          if [ "$MODE" = "rollback" ]; then
+            rollback=(--rollback)
+          fi
+          python3 ../tooling/scripts/deploy_id.py record --environment production --sha "$SHA" \
+            --deploy-id "$DEPLOY_ID" --state "$status" "${rollback[@]}" --run-url "$RUN_URL" \
+            --environment-url "$WORKER_URL"
       - name: Upload the auto-rollback evidence
         if: always() && steps.auto_rollback.outcome == 'success'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

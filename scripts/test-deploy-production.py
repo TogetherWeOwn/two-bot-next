@@ -417,12 +417,12 @@ class StaticGuardTests(unittest.TestCase):
         }
         # Auto-rollback only after a takeover deploy actually replaced
         # something: the run still fails red, but service is restored first.
-        # A failed record step fails the run without moving the service.
+        # The record step runs after it, so bookkeeping can never gate
+        # recovery (pinned by test_workflows.py).
         self.assertEqual(
             conditions[f"      - name: {AUTO_ROLLBACK_STEP}"],
             ["if: failure() && env.MODE == 'deploy' && env.TAKEOVER == 'true' "
-             "&& steps.deploy.outcome == 'success' && steps.snapshot.outcome == 'success' "
-             "&& steps.record.outcome != 'failure'"],
+             "&& steps.deploy.outcome == 'success' && steps.snapshot.outcome == 'success'"],
         )
         production = "\n".join(JOBS["production"])
         self.assertIn("production-rollback-snapshot.json", production)

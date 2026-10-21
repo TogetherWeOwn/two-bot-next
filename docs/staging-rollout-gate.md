@@ -80,8 +80,9 @@ not production authorization or a migration tool.
    `CF_VERSION_METADATA` version-metadata binding in the staging config and sets
    `rollout_kind: full_auto`. After the gates judge, the record step stores the
    deploy as a GitHub Deployment with `environment` set to `staging` carrying
-   the deploy ID — never a tag or Release; its failure fails the run without
-   rolling back. Both ID steps run reviewed tooling from the workflow's own
+   the deploy ID — never a tag or Release — after the auto-rollback, so its
+   failure fails the run red with the service already restored. Both ID steps
+   run reviewed tooling from the workflow's own
    commit, so a pinned drill deploys a commit whose checkout may predate the
    script while the gate scripts stay on the deployed checkout.
 3. Read the **fresh** `WRANGLER_OUTPUT_FILE_PATH` NDJSON only after Wrangler exits
