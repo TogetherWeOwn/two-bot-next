@@ -449,8 +449,13 @@ async fn ballot_delivery_edit_failures_back_off_and_exhaust_a_finite_budget() {
 }
 
 #[tokio::test]
-async fn ballot_delivery_missing_message_and_unauthorized_edits_do_not_retry() {
+async fn ballot_delivery_terminal_edit_errors_do_not_retry() {
     for error in [
+        RoomHttpError::AccessDenied,
+        RoomHttpError::Rejected {
+            status: 400,
+            code: 50035,
+        },
         RoomHttpError::InvalidRequest,
         RoomHttpError::NotFound,
         RoomHttpError::Cancelled,

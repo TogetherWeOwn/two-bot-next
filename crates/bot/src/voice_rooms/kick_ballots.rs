@@ -136,12 +136,6 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .await;
         match result {
             Ok(()) | Err(RoomHttpError::NotFound | RoomHttpError::Cancelled) => {}
-            Err(RoomHttpError::InvalidRequest) => {
-                self.record(LifecycleFailure::Discord {
-                    channel_id: message.channel_id,
-                    error: RoomHttpError::InvalidRequest,
-                });
-            }
             Err(error) => {
                 self.record(LifecycleFailure::Discord {
                     channel_id: message.channel_id,
@@ -150,7 +144,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 if error == RoomHttpError::Unauthorized {
                     self.halted = true;
                     self.halted_by_discord = true;
-                } else if attempts.saturating_add(1) < QUEUE_MAX_ATTEMPTS {
+                } else if matches!(
+                    error,
+                    RoomHttpError::UnknownOutcome | RoomHttpError::RateLimited { .. }
+                ) && attempts.saturating_add(1) < QUEUE_MAX_ATTEMPTS
+                {
                     let delay = match error {
                         RoomHttpError::RateLimited { retry_after_ms, .. } => {
                             retry_after_ms.max(1_000)
