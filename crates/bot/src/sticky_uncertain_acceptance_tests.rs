@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -20,6 +21,10 @@ use tokio::net::TcpListener;
 use tokio::sync::Notify;
 use tokio::task::{JoinHandle, JoinSet};
 use two_bot_core::funnel::now_millis_for_test;
+use two_bot_core::send_admission::{
+    AdmissionError, AdmissionFuture, AdmissionPermit, SendAdmission, SendCompletion, SendCooldown,
+    TokenKey,
+};
 use two_bot_core::sticky::{store, PutSticky, RemoveOutcome};
 use two_bot_discord::ActionExecutor;
 use two_bot_testsupport::TestDatabase;
@@ -208,6 +213,11 @@ async fn fixture(
     run: impl for<'a> FnOnce(&'a TestDatabase) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>,
 ) {
     let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
+        assert_ne!(
+            std::env::var("GITHUB_ACTIONS").as_deref(),
+            Ok("true"),
+            "CI must configure sticky uncertainty acceptance: TWO_TEST_DATABASE_URL is not configured"
+        );
         eprintln!("SKIP sticky uncertainty acceptance: TWO_TEST_DATABASE_URL is not configured");
         return;
     };
@@ -236,6 +246,48 @@ async fn fixture(
         .expect("drop owned disposable database even on RED");
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
+    }
+}
+
+#[test]
+fn missing_database_url_fails_in_ci_but_explicitly_skips_locally() {
+    // Exercise the real fixture through an existing test in isolated processes;
+    // changing the environment of the concurrently running test binary is unsafe.
+    let module = module_path!()
+        .split_once("::")
+        .expect("nested test module")
+        .1;
+    let target =
+        format!("{module}::disabled_automation_and_ineligible_activity_touch_no_delivery_state");
+    for (ci, succeeds, diagnostic) in [
+        (
+            "true",
+            false,
+            "CI must configure sticky uncertainty acceptance",
+        ),
+        ("false", true, "SKIP sticky uncertainty acceptance"),
+    ] {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", &target, "--nocapture", "--test-threads=1"])
+            .env_remove("TWO_TEST_DATABASE_URL")
+            .env("GITHUB_ACTIONS", ci)
+            .output()
+            .expect("isolated fixture invocation");
+        let text = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            text.contains("running 1 test"),
+            "fixture must execute: {text}"
+        );
+        assert_eq!(
+            output.status.success(),
+            succeeds,
+            "missing database CI={ci} must not silently pass: {text}"
+        );
+        assert!(text.contains(diagnostic), "explicit diagnosis: {text}");
     }
 }
 
@@ -575,6 +627,125 @@ async fn obsolete_completion_with_failed_cleanup_after_admin_remove_cannot_resur
         })
     })
     .await;
+}
+
+#[derive(Debug)]
+struct RefusedAdmission {
+    key: TokenKey,
+    refusal: Mutex<Option<AdmissionError>>,
+    attempts: AtomicUsize,
+}
+
+struct CompletedAdmission;
+
+impl SendCompletion for CompletedAdmission {
+    fn complete(
+        self: Box<Self>,
+        _cooldown: Option<SendCooldown>,
+    ) -> AdmissionFuture<'static, Result<(), AdmissionError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl SendAdmission for RefusedAdmission {
+    fn token_key(&self) -> &TokenKey {
+        &self.key
+    }
+
+    fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        let refusal = *self.refusal.lock().expect("admission state");
+        Box::pin(async move {
+            match refusal {
+                Some(error) => Err(error),
+                None => Ok(AdmissionPermit::new(Box::new(CompletedAdmission))),
+            }
+        })
+    }
+}
+
+async fn admission_refusal_allows_retry(refusal: AdmissionError) {
+    fixture(move |db| {
+        Box::pin(async move {
+            let discord = Discord::start(FirstPost::Confirm, Cleanup::Deleted).await;
+            // Inject only the durable admission boundary. The HTTP executor,
+            // error conversion, sticky handler, fence and store remain real.
+            let admission = Arc::new(RefusedAdmission {
+                key: TokenKey::for_bot_token("test-token").expect("synthetic token key"),
+                refusal: Mutex::new(Some(refusal)),
+                attempts: AtomicUsize::new(0),
+            });
+            let executor = ActionExecutor::with_admission(
+                "test-token".into(),
+                Some(discord.origin.clone()),
+                admission.clone(),
+            )
+            .expect("governed loopback executor");
+            let runtime = CommandRuntime::new(
+                db.pool().clone(),
+                executor,
+                super::router_with_commands(gates(true, true)),
+                GUILD,
+                true,
+            );
+            assert_ne!(activity(&runtime, 90).await, ActivityOutcome::Reposted);
+            assert_eq!(
+                admission.attempts.load(Ordering::SeqCst),
+                1,
+                "sticky must reach the real executor's admission boundary"
+            );
+            assert!(
+                discord.posts().is_empty(),
+                "{refusal:?} is refused before any HTTP POST"
+            );
+            assert!(discord.state.lock().expect("state").deletes.is_empty());
+            assert_eq!(discord.live_ids(), [OLD]);
+            let persisted = row(db.pool()).await.expect("refused sticky retained");
+            assert_eq!(persisted["last_message_id"], OLD);
+            assert_eq!(
+                persisted["delivery_uncertain"], false,
+                "{refusal:?} proves no send and must release the delivery fence"
+            );
+            assert_eq!(
+                persisted["claim_token"],
+                serde_json::Value::Null,
+                "{refusal:?} must release the sticky claim"
+            );
+            assert_eq!(persisted["claimed_at"], serde_json::Value::Null);
+
+            *admission.refusal.lock().expect("admission state") = None;
+            assert_eq!(
+                activity(&runtime, 91).await,
+                ActivityOutcome::Reposted,
+                "later admitted activity must not remain wedged by {refusal:?}"
+            );
+            assert_one_attempt(&discord);
+            assert_eq!(discord.live_ids(), [ORPHAN]);
+            assert_eq!(discord.state.lock().expect("state").deletes, [OLD]);
+            assert_eq!(
+                row(db.pool()).await.expect("posted sticky")["last_message_id"],
+                ORPHAN
+            );
+            assert_ne!(activity(&runtime, 92).await, ActivityOutcome::Reposted);
+            assert_one_attempt(&discord);
+        })
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn admission_storage_refusal_releases_fence_without_posting() {
+    admission_refusal_allows_retry(AdmissionError::Storage).await;
+}
+
+#[tokio::test]
+async fn admission_configuration_refusal_releases_fence_without_posting() {
+    admission_refusal_allows_retry(AdmissionError::Configuration).await;
+}
+
+#[tokio::test]
+async fn admission_stale_claim_refusal_releases_fence_without_posting() {
+    admission_refusal_allows_retry(AdmissionError::StaleClaim).await;
 }
 
 #[tokio::test]

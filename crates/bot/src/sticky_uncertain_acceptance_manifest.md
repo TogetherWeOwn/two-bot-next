@@ -1,38 +1,47 @@
-# Protected sticky uncertainty acceptance handoff
+# Protected sticky uncertainty acceptance contract
 
-## Ownership and consumption
+## Ownership and combined change
 
-This is a deliberately RED, test-only handoff, not a standalone merge candidate.
-The implementation owner consumes the immutable handoff commit, preserves the
-protected corpus, and owns the combined passing PR. Do not merge these tests
-alone or weaken them to match the baseline's release-on-error behavior. Test
-corrections stay with the acceptance author.
-
-Public handoff ref: `test/sticky-uncertain-delivery`.
-The issue's branch/commit work products record the immutable SHA and observed
-execution evidence; this file does not contain a self-referential commit hash.
+This corpus protects the combined sticky uncertain-delivery change. The
+implementation owner preserves the protected files and owns the combined PR,
+passing CI, review and merge. Corrections to this corpus remain with its
+acceptance author; do not weaken assertions to match implementation behavior.
+A correction commit is an immutable test-only input, not a competing PR.
 
 Protected files:
 
 - `crates/bot/src/sticky_uncertain_acceptance_tests.rs` — behavioral corpus,
-  stateful local HTTP double, and disposable-DB helpers.
+  stateful local HTTP/admission doubles, and disposable-DB helpers.
 - `crates/bot/src/sticky_uncertain_acceptance_manifest.md` — this manifest.
 
-Minimal registration (not a production change): two lines in
-`crates/bot/src/command_runtime_tests.rs` include the new test module. When
-transplanting onto another head, retain its existing tests and add only this
-module registration; do not replace that large parent file wholesale.
+`crates/bot/src/command_runtime_tests.rs` registers the module. Preserve that
+registration and unrelated tests when consuming a correction; do not replace
+the large parent file wholesale.
+
+The combined change includes migration
+`crates/cutover/migrations/0452_sticky_delivery_uncertainty.sql` and its
+`crates/cutover/tests/sticky_delivery_uncertainty_migration.rs` coverage. The
+migration suite checks the file contract and exercises rollback/re-application
+in an owned disposable database. It demonstrates row preservation, fence-column
+removal, idempotent re-application and restoration of the certain default; it
+does not demonstrate safe live rollback while delivery is uncertain. The
+combined change also reconciles two obsolete non-protected expectations that
+released claims after unusable success responses or failed record completion.
+Neither the migration suite nor those reconciled tests replaces this corpus.
 
 ## Contract and mutation targets
 
 The real `CommandRuntime::on_message`, administrator command handler, Discord
-HTTP executor, sticky store and migration chain are exercised. Only Discord is
-a double: it records attempted nonces/POSTs, owns an independent live-message
-map, accepts a message before losing/holding its response, and removes an
-orphan only after a configured confirmed-absence response. All requests go to a
-loopback listener. No live Discord or application database is used.
+HTTP executor, sticky store and migration chain are exercised. A local Discord
+double records attempted nonces/POSTs, owns an independent live-message map,
+accepts a message before losing/holding its response, and removes an orphan
+only after a configured confirmed-absence response. A narrowly scoped admission
+double returns typed durable admission refusals before the real executor can
+send, then admits a later activity. No sticky/runtime outcome is injected.
+All HTTP requests go to loopback. No live Discord or application database is
+used.
 
-Twenty tests catch these breaks:
+Twenty-four tests protect the runtime contract and its CI execution guard:
 
 | Group | Tests | Wrong behavior caught |
 | --- | ---: | --- |
@@ -42,21 +51,33 @@ Twenty tests catch these breaks:
 | Record refusal + confirmed deletion / already-absent orphan | 2 | Overly conservative fencing prevents a proven-safe retry. |
 | Worker cancellation after acceptance + expired ordinary lease | 1 | Crash/lease expiry implicitly grants another worker permission to send. |
 | Administrator update / remove during in-flight POST | 2 | Obsolete completion overwrites new configuration or resurrects removed state. |
-| Explicit no-send rejection | 1 | Definitive 403 unnecessarily wedges future delivery. |
+| Explicit no-send HTTP rejection | 1 | Definitive 403 unnecessarily wedges future delivery. |
+| Pre-wire admission Storage / Configuration / StaleClaim refusals | 3 | A proven no-send refusal retains uncertainty or a claim, preventing one later admitted POST. |
 | Confirmed replacement and debounce | 1 | New fence prevents ordinary success, loses retirement, or bypasses debounce. |
 | Disabled automation, bot/foreign-guild/DM activity | 1 | Delivery machinery bypasses existing admission controls. |
 | Structured diagnosis and no false success | 1 | Uncertainty is silent, leaks payload/credentials, or is audited as success. |
+| Missing database URL in CI / local subprocesses | 1 | CI silently skips acceptance coverage, or local opt-out loses its explicit SKIP. |
 
 Uncertainty assertions include outbound POST/nonce count, live Discord state,
 persisted previous-message identity, a newly constructed runtime with an
 independent DB pool, and a direct store admission attempt at `now + 120s`.
-The crash test also ages `claimed_at` by two minutes without modifying any new
-uncertainty state. This is deterministic lease advancement, not a real-time
-sleep or a production clock change. Cancellation is a worker-death simulation,
-not an OS-process restart; new runtime and independent pool are the persistence
-witnesses. The double does not implement Discord's nonce TTL or reconciliation.
+The crash test also ages `claimed_at` by two minutes without modifying delivery
+uncertainty. This is deterministic lease advancement, not a real-time sleep or
+a production clock change. Cancellation simulates worker death, not an
+OS-process restart; new runtime and independent pool witness persistence. The
+double does not implement Discord's nonce TTL or reconciliation.
 
-The diagnostic test fixes a small structured vocabulary for this handoff:
+The three pre-wire controls pass `AdmissionError::Storage`, `Configuration`
+and `StaleClaim` through the real HTTP adapter's error conversion. Each requires
+zero first-attempt POSTs/deletes, unchanged previous-message identity, cleared
+`delivery_uncertain`, null `claim_token`/`claimed_at`, and exactly one later
+admitted POST that retires the previous message and debounces follow-up.
+These are exact authored no-send refusals, not permission to treat arbitrary
+`Unavailable` strings or ordinary `Timeout` as safe. The accepted-response-loss
+and held-response controls remain conservative. Ambiguous admission-timeout
+versus header-timeout representation is outside this bounded correction.
+
+The diagnostic vocabulary is:
 
 - `code = "sticky_delivery_uncertain"`
 - `retryable = false`
@@ -66,8 +87,8 @@ The recovery action means inspect the channel and resolve/delete any possible
 orphan before explicitly resetting/removing/reconfiguring the sticky. It must
 not recommend waiting out the lease or blind resending. This does not authorize
 a reset command, live cleanup, migration, or new platform. Operator guidance
-must explain the supported safe recovery path. No high-cardinality metric labels
-are introduced by this test-only branch; any implementation metrics need review.
+must explain the supported safe recovery path. Metrics label auditing is not
+covered by this corpus.
 
 ## Run and interpret
 
@@ -76,17 +97,21 @@ On the persistent controller, select the documented disposable bootstrap using
 
 ```sh
 python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot sticky_uncertain_acceptance_tests -- --test-threads=1
+python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test sticky_delivery_uncertainty_migration -- --test-threads=1
 cargo fmt --all -- --check
 python3 scripts/ci/check-floor-guard.py --base-ref origin/main
 python3 scripts/ci/check-test-inventory.py
 ```
 
-Use only a URL accepted by `two_bot_testsupport::TestDatabase`. The helper creates,
-migrates and explicitly drops a unique database per case, including assertion
-failures. It does not reset the bootstrap. If the variable is absent, tests print
-an explicit SKIP; that is not behavioral evidence. If configured but setup fails,
-the run fails instead of silently skipping. CI's existing unit/binary step sets
-this variable, so these unignored tests execute there without a new workflow.
+Use only a URL accepted by `two_bot_testsupport::TestDatabase`. The helper
+creates, migrates and explicitly drops a unique database per case, including
+assertion failures. It does not reset the bootstrap. A missing variable fails
+when `GITHUB_ACTIONS=true`; outside CI it prints an explicit SKIP, which is not
+behavioral evidence. A configured connection/setup failure fails the test. The
+CI-guard oracle runs an existing fixture test in isolated subprocesses with the
+URL absent, checking CI failure and local SKIP without changing process-wide
+environment in concurrent tests. CI's existing unit/binary step supplies the URL
+and executes these unignored tests without a new workflow.
 
 Interpret only actual command output:
 
@@ -94,17 +119,16 @@ Interpret only actual command output:
 - A compile error is not RED evidence; correct the test harness first.
 - A cache refusal (exit 75) or database setup error is infrastructure refusal,
   not observed behavioral RED and not GREEN.
+- Formatting/static checks do not establish compilation or runtime behavior.
 
-The baseline has older tests that explicitly require claim release after unusable
-200 responses or completion failure. Those expectations conflict with this new
-contract. The implementation owner must reconcile obsolete, non-protected tests;
-this test-only handoff does not edit them. No migration/schema is proposed here.
-If implementation adds schema support, its combined PR must add migration and
-rollback-compatibility tests; applying fresh migrations here alone does not prove
-rollback compatibility.
+At correction authoring, the focused runtime command was attempted against the
+documented disposable bootstrap, but the bounded cache refused it with exit 75:
+`no idle, below-budget slot; no per-worktree fallback`. No behavioral RED,
+compilation success, database execution, or migration round-trip result is
+claimed for that attempt. The consuming change must record its actual results
+on the final combined head.
 
-Scope excluded: implementation, live Discord, production/staging DBs, deployment,
-production migration, credentials/permissions, reconciliation platform, metrics
-label audit, full-workspace CI/review and a real OS-process restart proof.
-
-Skills used: paperclip, paperclip-superpowers-adapter, test-driven-development, verification-before-completion.
+Scope excluded: implementation changes by the acceptance correction, live
+Discord, production/staging DBs, deployment, production migration, credentials
+or permissions, a reconciliation platform, full-workspace CI/review, and a real
+OS-process restart proof.
