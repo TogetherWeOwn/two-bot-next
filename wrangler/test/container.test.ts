@@ -554,6 +554,7 @@ test("keepalive logs the gateway failure phase and class once, as strict tokens"
     failed_step: "unknown",
     error_code: "none",
     build_revision: "unknown",
+    deploy_id: "unknown",
     release: "unknown",
     worker_version: ID,
     log_url: "https://developers.cloudflare.com/workers/observability/logs/workers-logs/",
@@ -568,7 +569,7 @@ test("keepalive logs build revision plus failed step and SQLSTATE when served", 
       failed_step: "gateway_run",
       error_code: "42501",
     },
-    { build_revision: "abc1234", build_id: "build-1" },
+    { build_revision: "abc1234", build_id: "build-1", deploy_id: "2026.10.21.1+abc1234" },
   ));
   assert.deepEqual(gatewayFailureLogs(h.logs), [JSON.stringify({
     event: "container_gateway_failure",
@@ -577,6 +578,7 @@ test("keepalive logs build revision plus failed step and SQLSTATE when served", 
     failed_step: "gateway_run",
     error_code: "42501",
     build_revision: "abc1234",
+    deploy_id: "2026.10.21.1+abc1234",
     release: "abc1234",
     worker_version: ID,
     log_url: "https://developers.cloudflare.com/workers/observability/logs/workers-logs/",
@@ -635,6 +637,7 @@ test("keepalive logs only phase and class even when the failure object carries m
     failed_step: "unknown",
     error_code: "none",
     build_revision: "unknown",
+    deploy_id: "unknown",
     release: "unknown",
     worker_version: ID,
     log_url: "https://developers.cloudflare.com/workers/observability/logs/workers-logs/",
@@ -659,6 +662,7 @@ test("keepalive tags the gateway failure with the container release and worker v
     failed_step: "unknown",
     error_code: "none",
     build_revision: RELEASE_SHA,
+    deploy_id: "unknown",
     release: RELEASE_SHA,
     worker_version: ID,
     log_url: "https://developers.cloudflare.com/workers/observability/logs/workers-logs/",
@@ -733,6 +737,25 @@ test("keepalive tags an unparseable build revision as unknown without echoing it
   assert.equal(JSON.parse(line!).release, "unknown");
   assert.equal(JSON.parse(line!).worker_version, ID);
   assert.ok(h.logs.every((entry) => !entry.includes("hunter2")));
+});
+
+test("keepalive drops a hostile deploy_id to unknown, never logging it", async (t) => {
+  // Shape-only: the deploy gates own canonical validation (leading-zero N
+  // parses here and refuses there), this only gates log echo.
+  for (const deployId of [
+    "2026.10.21.1+ABC1234",
+    "2026-10-21.1+abc1234",
+    "2026.10.21.1+abc1234\ninjected",
+    7,
+    null,
+  ]) {
+    const h = await keepaliveSeeing(t, readyzWith(
+      { phase: "durable_gateway", class: "gateway_runtime_failed" },
+      { deploy_id: deployId },
+    ));
+    const [line] = gatewayFailureLogs(h.logs);
+    assert.ok(line.includes('"deploy_id":"unknown"'), `deploy_id leaked: ${line}`);
+  }
 });
 
 test("metrics alert lines carry the keepalive release and worker version", async (t) => {
