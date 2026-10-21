@@ -125,6 +125,8 @@ mod self_role_runtime;
 mod shutdown;
 #[cfg(test)]
 mod smoke_error_contract_tests;
+#[cfg(test)]
+mod starboard_runtime_acceptance_tests;
 mod ticket_runtime;
 #[cfg(test)]
 #[path = "../../core/tests/support/tracing_capture.rs"]
