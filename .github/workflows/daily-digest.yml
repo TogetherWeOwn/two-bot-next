@@ -1,0 +1,196 @@
+name: daily-digest
+
+# Daily digest release (docs/releases.md): one tag vYYYY.MM.DD per day,
+# covering the live production commit with notes from the Conventional Commit
+# subjects since the previous digest. Quiet days (production already matches
+# the last digest) skip green with no tag. Rollbacks serve an older commit and
+# are never tagged. When production changed but no digest tag was made — the
+# silent-failure mode that lost tags when the per-promote release job skipped
+# with no alert — the `alert` job posts one Discord ops-channel alert reusing
+# the existing synthetic-alert line.
+#
+# Production change detection reads the live production /readyz build revision
+# through PRODUCTION_WORKER_URL (the single source for deploy and passive
+# checks); when the probe is unreadable it falls back to the newest successful
+# production Deployment recorded by the deploy-ID slice. An unreadable live
+# revision with no successful Deployment fails red instead of reading green.
+# The digest tag then dispatches release.yml with release_tag, so the SBOM
+# chain attaches inventories to the digest release exactly as it did to the
+# retired per-promote tags.
+#
+# When it runs: daily at an off-minute on main, plus manual dispatch. The
+# dispatch `dry_run` input prints the notes without tagging, publishing,
+# dispatching SBOM or alerting.
+
+on:
+  schedule:
+    - cron: "23 6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Print the digest notes without tagging, publishing or alerting
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: daily-digest
+  cancel-in-progress: false
+
+jobs:
+  digest:
+    name: cut the daily digest tag and release
+    permissions:
+      contents: write # Create the vYYYY.MM.DD tag and its GitHub Release.
+      deployments: read # Fall back to the newest successful production Deployment when /readyz is unreadable.
+      actions: write # Dispatch release.yml for the digest tag (GITHUB_TOKEN dispatches do start runs).
+    if: github.ref == 'refs/heads/main'
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'digest') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 10
+    outputs:
+      released: ${{ steps.digest.outputs.released }}
+      tag_name: ${{ steps.digest.outputs.tag_name }}
+      prod_changed: ${{ steps.digest.outputs.prod_changed }}
+      live_sha: ${{ steps.resolve.outputs.live_sha }}
+      prev_tag: ${{ steps.digest.outputs.prev_tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          # Full history and tags: the notes come from the commits since the
+          # previous digest, and the digest tag must land on origin/main.
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: Resolve the live production SHA
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
+        shell: python3 {0}
+        run: |
+          import json, os, re, subprocess, sys, urllib.error, urllib.parse, urllib.request
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          sha = ""
+
+          def live_revision():
+              """The live /readyz build revision, or "" when it cannot be read."""
+              worker_url = os.environ.get("PRODUCTION_WORKER_URL", "").strip().rstrip("/")
+              parsed = urllib.parse.urlsplit(worker_url)
+              if parsed.scheme != "https" or not parsed.netloc or parsed.username:
+                  return ""
+              request = urllib.request.Request(
+                  worker_url + "/readyz",
+                  headers={"User-Agent": "two-bot-next-daily-digest/1.0"},
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=10) as response:
+                      status, body = response.status, response.read()
+              except urllib.error.HTTPError as error:
+                  if error.code != 503:
+                      return ""
+                  status, body = error.code, error.read()
+              except (OSError, urllib.error.URLError):
+                  return ""
+              if status not in (200, 503):
+                  return ""
+              try:
+                  report = json.loads(body)
+              except ValueError:
+                  return ""
+              revision = report.get("build_revision") if isinstance(report, dict) else None
+              return revision if isinstance(revision, str) and re.fullmatch(r"[0-9a-f]{40}", revision) else ""
+
+          def newest_success_deployment():
+              """The newest successful production Deployment SHA, or "" when unreadable."""
+              try:
+                  batch = json.loads(subprocess.check_output(
+                      ["gh", "api", "--method", "GET", f"repos/{repo}/deployments",
+                       "-f", "environment=production", "-f", "per_page=10"],
+                      text=True, timeout=30,
+                  ))
+              except (subprocess.CalledProcessError, ValueError, OSError):
+                  return ""
+              if not isinstance(batch, list):
+                  return ""
+              for row in batch:
+                  if not isinstance(row, dict):
+                      return ""
+                  dep_id, dep_sha = row.get("id"), row.get("sha")
+                  if type(dep_id) is not int or not isinstance(dep_sha, str):
+                      continue
+                  if not re.fullmatch(r"[0-9a-f]{40}", dep_sha):
+                      continue
+                  try:
+                      statuses = json.loads(subprocess.check_output(
+                          ["gh", "api", "--method", "GET",
+                           f"repos/{repo}/deployments/{dep_id}/statuses",
+                           "-f", "per_page=1"],
+                          text=True, timeout=30,
+                      ))
+                  except (subprocess.CalledProcessError, ValueError, OSError):
+                      return ""
+                  if (isinstance(statuses, list) and statuses
+                          and isinstance(statuses[0], dict)
+                          and statuses[0].get("state") == "success"):
+                      return dep_sha
+              return ""
+
+          sha = live_revision()
+          source = "readyz"
+          if not sha:
+              sha = newest_success_deployment()
+              source = "deployment"
+          if not sha:
+              print("::error::could not read the live production revision or a successful production Deployment; failing closed")
+              sys.exit(1)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"live_sha={sha}\n")
+          print(f"production SHA from {source}: {sha}")
+      - name: Cut the digest tag and publish its release
+        id: digest
+        env:
+          PROD_SHA: ${{ steps.resolve.outputs.live_sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: node .github/scripts/daily-digest.cjs
+      - name: Dispatch the SBOM chain for the digest tag
+        if: steps.digest.outputs.released == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.digest.outputs.tag_name }}
+        run: gh workflow run release.yml --ref main -f release_tag="$TAG"
+
+  alert:
+    name: alert on a missing digest
+    needs: digest
+    # The silent-failure mode only: the digest job succeeded (not red) yet
+    # production changed and no digest tag was made. A red digest job is
+    # already visible; a quiet day, a rollback, an already-cut today, or a
+    # dry run never alerts.
+    if: ${{ !cancelled() && needs.digest.result == 'success' && needs.digest.outputs.prod_changed == 'true' && needs.digest.outputs.released != 'true' }}
+    permissions:
+      contents: read
+    environment: synthetic-alerts
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'alert') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Alert the ops channel about the missing digest
+        env:
+          SYNTHETIC_ALERT_WEBHOOK_URL: ${{ secrets.SYNTHETIC_ALERT_WEBHOOK_URL }}
+          RUN_ID: ${{ github.run_id }}
+          LIVE_SHA: ${{ needs.digest.outputs.live_sha }}
+          PREV_TAG: ${{ needs.digest.outputs.prev_tag }}
+        run: |
+          set -euo pipefail
+          python3 scripts/digest_alert.py --live-sha "$LIVE_SHA" --prev-tag "$PREV_TAG"

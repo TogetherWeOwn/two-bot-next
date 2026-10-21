@@ -177,6 +177,7 @@ DOCS_PREFIX = "docs/"
 WORKER_WORKFLOWS = frozenset({
     ".github/workflows/supply-chain.yml",
     ".github/workflows/release.yml",
+    ".github/workflows/daily-digest.yml",
     ".github/workflows/deploy-production.yml",
     ".github/workflows/deploy-staging.yml",
 })
