@@ -212,7 +212,7 @@ fn assert_safe_read_only(observation: &Observation) {
         observation.contents.len() * 2,
         "no delivery, registration or extra reply REST calls"
     );
-    for pair in observation.wire.chunks_exact(2) {
+    for pair in observation.wire.as_chunks::<2>().0 {
         assert_eq!(pair[0].0, "POST");
         assert!(pair[0].1.ends_with("/callback"));
         assert_eq!(pair[0].2["type"], 5);
