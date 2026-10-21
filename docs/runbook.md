@@ -38,6 +38,9 @@ it runs the gateway/HTTP service; there is **no `serve` or `restart` subcommand*
 Use the top-level help above: backup subcommands do not implement per-command
 `--help`, despite the old comment in `backup_cli.rs`.
 
+For read-only admin change history, see the compact [ops audit contract](ops-control.md)
+(response allowlist, byte/row bounds, refusal actions and offline checks).
+
 ## Is it alive?
 
 ```bash

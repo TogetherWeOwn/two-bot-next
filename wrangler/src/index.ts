@@ -1345,8 +1345,8 @@ export class TwoBotContainer extends Container<Env> {
             headers: withSecurityHeaders({ "cache-control": "no-store" }),
           });
         }
-        const rows = await ops.listAudit();
-        return Response.json({ deploymentId: id, rows }, {
+        const history = await ops.readAudit(id);
+        return Response.json(history, {
           headers: withSecurityHeaders({ "cache-control": "no-store" }),
         });
       });
