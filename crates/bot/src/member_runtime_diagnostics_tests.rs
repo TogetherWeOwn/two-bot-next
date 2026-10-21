@@ -2,6 +2,7 @@
 #![cfg(test)]
 
 use super::*;
+use crate::internal_action_http::MODERATION_METRICS_LOCK;
 use serde_json::json;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -156,6 +157,44 @@ async fn current_authority_preserves_unknown_bot_and_unknown_held_roles_causes()
             Err(AuthorityError::Unavailable(cause)) => assert_eq!(cause, expected),
             _ => panic!("expected the pinned unavailable cause"),
         }
+    }
+}
+
+#[tokio::test]
+async fn current_authority_maps_absent_actor_and_bot_membership_to_fixed_causes() {
+    // The invoker left between the interaction and the authority refresh.
+    let rest = AuthorityRest::start(vec![
+        ("/api/v10/guilds/2222", 200, diagnostic_guild().to_string()),
+        ("/api/v10/guilds/2222/members/88", 404, "{}".to_string()),
+    ])
+    .await;
+    match current_authority(&rest.executor, &diagnostic_execution(), "4444").await {
+        Err(AuthorityError::Unavailable(cause)) => {
+            assert_eq!(cause, AuthorityCause::MalformedRoles)
+        }
+        _ => panic!("absent actor must refuse as malformed_roles"),
+    }
+    // The bot was removed from the guild while /users/@me still answers.
+    let rest = AuthorityRest::start(vec![
+        ("/api/v10/guilds/2222", 200, diagnostic_guild().to_string()),
+        (
+            "/api/v10/guilds/2222/members/88",
+            200,
+            json!({"user":{"id":"88"}, "roles":["101"]}).to_string(),
+        ),
+        (
+            "/api/v10/guilds/2222/members/3333",
+            200,
+            json!({"user":{"id":"3333"}, "roles":[]}).to_string(),
+        ),
+        ("/api/v10/guilds/2222/members/4444", 404, "{}".to_string()),
+    ])
+    .await;
+    match current_authority(&rest.executor, &diagnostic_execution(), "4444").await {
+        Err(AuthorityError::Unavailable(cause)) => {
+            assert_eq!(cause, AuthorityCause::UnknownBot)
+        }
+        _ => panic!("absent bot must refuse as unknown_bot"),
     }
 }
 
@@ -414,5 +453,72 @@ fn authority_warn_sampling_is_per_cause_and_reopens_at_sixty_seconds() {
         warnings.last.len(),
         5,
         "no member-keyed sampling allocation"
+    );
+}
+
+/// Total across every `moderation_enforcements_total` refused series for this
+/// verb, mirroring the protected acceptance counter so this offline module can
+/// assert the sampled warn path stays metric-free.
+fn refused_total(verb: &str) -> u64 {
+    let text = two_bot_core::metrics::global().render(None);
+    let verb_label = format!("verb=\"{verb}\"");
+    text.lines()
+        .filter(|line| {
+            line.starts_with("two_bot_moderation_enforcements_total{")
+                && line.contains(verb_label.as_str())
+                && line.contains("outcome=\"refused\"")
+        })
+        .filter_map(|line| line.rsplit(' ').next()?.parse::<u64>().ok())
+        .sum()
+}
+
+#[tokio::test]
+async fn repeated_same_cause_refusals_warn_once_per_runtime() {
+    // Runtime-level pin for the admit gate in `warn_authority_unavailable`:
+    // two same-cause refusals through ONE MemberRuntime emit exactly one
+    // refusal line. Bypassing the gate (warn on every refusal) or scoping the
+    // sampler per call must fail here with three lines. The warn path records
+    // no metric: execute() records every refusal unconditionally before the
+    // gate, pinned per refusal by the protected acceptance suite. A
+    // shared-runtime metric +2 needs a disposable database (every refusal
+    // persists a denial audit in core's refreshed-execution Err arm), so it
+    // cannot live in this offline module.
+    let _metrics = MODERATION_METRICS_LOCK.lock().await;
+    let capture = crate::tracing_capture::global();
+    let start = capture.text().len();
+    let before = refused_total("warn");
+    // This lazy pool is never queried by the warn path; no database is needed.
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test:@agent-testdb:5432/two_bot_test_unused")
+        .expect("lazy fixture");
+    let runtime = MemberRuntime::for_test(pool.clone(), "2222");
+    runtime.warn_authority_unavailable(AuthorityCause::Transport, ModerationAction::Warn);
+    runtime.warn_authority_unavailable(AuthorityCause::Transport, ModerationAction::Warn);
+    runtime.warn_authority_unavailable(AuthorityCause::Discord403, ModerationAction::Warn);
+    let logs = capture.text().split_off(start);
+    assert_eq!(
+        refused_total("warn") - before,
+        0,
+        "the sampled warn path records no metric"
+    );
+    pool.close().await;
+    let lines: Vec<&str> = logs
+        .lines()
+        .filter(|line| line.contains("member authority unavailable"))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "one refusal line per cause per runtime: {logs:?}"
+    );
+    assert!(
+        lines[0].contains("transport"),
+        "first line carries its cause: {:?}",
+        lines[0]
+    );
+    assert!(
+        lines[1].contains("discord_403"),
+        "a second cause still warns: {:?}",
+        lines[1]
     );
 }
