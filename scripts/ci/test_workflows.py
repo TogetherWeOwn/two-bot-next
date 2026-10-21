@@ -450,16 +450,17 @@ ERROR_RATE_MARKERS = (
 
 
 def production_error_rate_gate_errors(workflow, name="deploy-production.yml"):
-    """The production error-rate gate mirrors staging against production.
+    """The production error-rate gate scrapes live production, never a rehearsal.
 
-    Exactly one expression in exactly one production step may read the
-    rehearsal input, it must use the pinned dispatch-only expression (an
-    automatic trigger never carries inputs), and that step must be the
-    error-rate gate step: it judges the rehearsal firing when armed and
-    scrapes live production /ops/metrics otherwise, failing the stage so
-    auto-rollback runs. The scrape token is the production binding only;
-    the staging token must never appear. Reviewed tooling runs from the
-    workflow commit (../tooling), never the guarded SHA.
+    Failure injection never runs against production (10-20 20:54Z forced
+    drill): the dispatch input stays declared (an opt-in boolean) only so the
+    guard can refuse it with a pointer to staging, and the input is read
+    exactly once, by the guard. No production step carries the drill switch
+    or a rehearsal flag. The error_rate_gate step scrapes live production
+    /ops/metrics and fails the stage so auto-rollback runs. The scrape token
+    is the production binding only; the staging token must never appear.
+    Reviewed tooling runs from the workflow commit (../tooling), never the
+    guarded SHA.
     """
     errors = []
     inputs = (((workflow.get("on") or {}).get("workflow_dispatch") or {}).get("inputs") or {})
@@ -467,31 +468,30 @@ def production_error_rate_gate_errors(workflow, name="deploy-production.yml"):
     if drill.get("type") != "boolean" or drill.get("default") not in (False, "false") \
             or str(drill.get("required")).lower() != "false":
         errors.append(f"{name}: inject_error_rate_spike must stay an opt-in boolean defaulting to false")
+    if str(workflow).count("inputs.inject_error_rate_spike") != 1:
+        errors.append(f"{name}: inject_error_rate_spike may be read only by the guard (which refuses it)")
     jobs = workflow.get("jobs", {}) or {}
     steps = ((jobs.get("production") or {}).get("steps") or [])
-    armed = [step for step in steps
-             if isinstance(step, dict) and "INJECT_ERROR_RATE_SPIKE" in str(step)]
-    if len(armed) != 1:
-        errors.append(f"{name}: exactly one production step may carry the error-rate drill switch")
+    for marker in ("INJECT_ERROR_RATE_SPIKE", "inject_error_rate_spike", "--rehearsal-firing", "rehearsal"):
+        if marker in str(jobs.get("production") or {}):
+            errors.append(f"{name}: production job must never carry the drill marker {marker}")
+    gates = [step for step in steps if isinstance(step, dict) and step.get("id") == "error_rate_gate"]
+    if len(gates) != 1:
+        errors.append(f"{name}: exactly one production step must be the error_rate_gate")
         return errors
-    step = armed[0]
-    if step.get("id") != "error_rate_gate":
-        errors.append(f"{name}: the error-rate drill switch must live on the error_rate_gate step")
+    step = gates[0]
     # After a rollback restore there is no snapshot to roll back to: the
     # gate must not fail the recovery run red with no action possible.
     if step.get("if") != "env.MODE == 'deploy'":
         errors.append(f"{name}: error_rate_gate must run in deploy mode only")
     env = step.get("env") or {}
-    if env.get("INJECT_ERROR_RATE_SPIKE") != ERROR_RATE_EXPRESSION:
-        errors.append(f"{name}: error-rate rehearsal must use the pinned dispatch-only expression")
     if env.get("METRICS_SCRAPE_TOKEN") != "${{ secrets.PRODUCTION_METRICS_SCRAPE_TOKEN }}":
         errors.append(f"{name}: error_rate_gate must bind the production scrape token by name")
     if env.get("PRODUCTION_URL") != "${{ vars.PRODUCTION_WORKER_URL }}":
         errors.append(f"{name}: error_rate_gate must read the production Worker URL from vars")
     run = str(step.get("run") or "")
     for needle in ("../tooling/wrangler/scripts/promotion-error-gate.mjs", "--metrics-url", "--evidence",
-                   "--sha", "--user-agent", "--rehearsal-firing",
-                   '[ "$INJECT_ERROR_RATE_SPIKE" = "true" ]'):
+                   "--sha", "--user-agent"):
         if run.count(needle) != 1:
             errors.append(f"{name}: error_rate_gate step must contain exactly one {needle}")
     # The evidence filename appears exactly twice: the --evidence write path
@@ -1944,17 +1944,39 @@ def production_errors(workflow):
                      'refuse("the production Environment has no required reviewers")'):
         if required not in script:
             errors.append(f"{name}:guard: missing check {required}")
-    # The rollback drill proves the fail-to-rollback chain, which exists
-    # only on a deploy-mode run with takeover: the guard receives the switch
-    # and refuses anything else, so the drill never leaves its build serving.
+    # Failure injection never runs against production (10-20 20:54Z): the
+    # guard receives the drill switch only to refuse it, pointing to staging.
     guard_env = (guard.get("steps") or [{}])[0].get("env", {})
     if guard_env.get("INJECT_ERROR_RATE_SPIKE") != "${{ inputs.inject_error_rate_spike }}":
         errors.append(f"{name}:guard: must receive the drill switch as an input env")
-    for required in ("inject_error_rate_spike needs deploy mode",
-                     "inject_error_rate_spike needs takeover true",
-                     "inject_error_rate_spike never applies to an automatic run"):
+    for required in ('if spike == "true":\n    refuse("failure injection never runs against production',
+                     "dispatch deploy-staging with inject_error_rate_spike true"):
         if required not in script:
-            errors.append(f"{name}:guard: missing drill refusal {required}")
+            errors.append(f"{name}:guard: missing production drill refusal {required!r}")
+    # A deploy always takes over (10-20 13:31Z: a manual deploy without
+    # takeover left production fenced); only the explicit cutover_hold
+    # input keeps the fence held.
+    inputs = ((on.get("workflow_dispatch") or {}).get("inputs") or {})
+    takeover_input = inputs.get("takeover") or {}
+    hold_input = inputs.get("cutover_hold") or {}
+    if takeover_input.get("type") != "boolean" or takeover_input.get("default") not in (True, "true"):
+        errors.append(f"{name}: takeover must be a boolean defaulting to true")
+    if hold_input.get("type") != "boolean" or hold_input.get("default") not in (False, "false"):
+        errors.append(f"{name}: cutover_hold must be an opt-in boolean defaulting to false")
+    if guard_env.get("CUTOVER_HOLD") != "${{ inputs.cutover_hold }}":
+        errors.append(f"{name}:guard: must receive cutover_hold as an input env")
+    if 'takeover = "false" if cutover_hold == "true" else "true"' not in script:
+        errors.append(f"{name}:guard: deploy mode must take over unless cutover_hold")
+    # Recovery never waits for a human: a reviewer-less rollback runs only
+    # on a verified production rollback snapshot of its exact target.
+    for required in ('snapshot_run = verified_rollback_snapshot() if not reviewers and mode == "rollback" else None',
+                     'collection(f"repos/{repo}/actions/artifacts"',
+                     "target != (version, image, sha)",
+                     'receipt.get("provenance_complete") is not True',
+                     'PRODUCTION_WORKFLOW = ".github/workflows/deploy-production.yml"',
+                     'origin.get("head_repository_id") != origin.get("repository_id")'):
+        if required not in script:
+            errors.append(f"{name}:guard: missing rollback snapshot check {required!r}")
     return errors
 
 
@@ -4166,30 +4188,30 @@ class WorkflowTests(unittest.TestCase):
                     label,
                 )
                 self.assertTrue(workflow_policy_errors(changed), label)
-        # Production holds the pinned mirror, not a forwarding route: an
-        # extra reader, an armed default, a staging token or unpinned
+        # Production carries no rehearsal path at all (10-20 20:54Z forced
+        # drill): the guard alone reads the switch, to refuse it. Re-arming
+        # any production step, an armed default, a staging token or unpinned
         # tooling there fails the policy.
         self.assertEqual(production_error_rate_gate_errors(workflows["deploy-production.yml"]), [])
         prod_steps = workflows["deploy-production.yml"]["jobs"]["production"]["steps"]
-        prod_armed = [s for s in prod_steps if "INJECT_ERROR_RATE_SPIKE" in str(s)]
-        self.assertEqual(len(prod_armed), 1)
-        self.assertEqual(prod_armed[0].get("id"), "error_rate_gate")
-        prod_index = prod_steps.index(prod_armed[0])
+        self.assertEqual([s for s in prod_steps if "INJECT_ERROR_RATE_SPIKE" in str(s)], [])
+        gate = [s for s in prod_steps if s.get("id") == "error_rate_gate"]
+        self.assertEqual(len(gate), 1)
+        prod_index = prod_steps.index(gate[0])
         prod_mutations = {
-            # An automatic trigger could read it / default armed.
-            "expression without dispatch guard": lambda w: w["jobs"]["production"]["steps"][prod_index]["env"]
-                .__setitem__("INJECT_ERROR_RATE_SPIKE", "${{ inputs.inject_error_rate_spike }}"),
-            "expression constant true": lambda w: w["jobs"]["production"]["steps"][prod_index]["env"]
+            "drill switch re-armed on the gate": lambda w: w["jobs"]["production"]["steps"][prod_index]["env"]
+                .__setitem__("INJECT_ERROR_RATE_SPIKE", ERROR_RATE_EXPRESSION),
+            "drill switch constant true": lambda w: w["jobs"]["production"]["steps"][prod_index]["env"]
                 .__setitem__("INJECT_ERROR_RATE_SPIKE", "true"),
-            "rehearsal flag unconditional": lambda w: w["jobs"]["production"]["steps"][prod_index]
-                .__setitem__("run", "node ../tooling/wrangler/scripts/promotion-error-gate.mjs "
-                             "--rehearsal-firing '[\"rest_5xx_rate\"]'"),
+            "rehearsal flag on the gate": lambda w: w["jobs"]["production"]["steps"][prod_index]
+                .__setitem__("run", str(w["jobs"]["production"]["steps"][prod_index]["run"])
+                             + " --rehearsal-firing '[\"rest_5xx_rate\"]'"),
             "input defaults true": lambda w: w["on"]["workflow_dispatch"]["inputs"]["inject_error_rate_spike"]
                 .__setitem__("default", True),
             "input removed": lambda w: w["on"]["workflow_dispatch"]["inputs"].pop("inject_error_rate_spike"),
-            "second reader step": lambda w: w["jobs"]["production"]["steps"][0]
-                .setdefault("env", {}).__setitem__("INJECT_ERROR_RATE_SPIKE", "true"),
-            "switch off the gate step": lambda w: w["jobs"]["production"]["steps"][prod_index]
+            "another production step reads it": lambda w: w["jobs"]["production"]["steps"][0]
+                .setdefault("env", {}).__setitem__("SPIKE", "${{ inputs.inject_error_rate_spike }}"),
+            "gate step removed": lambda w: w["jobs"]["production"]["steps"][prod_index]
                 .__setitem__("id", "unrelated"),
             "gate without the deploy-mode condition": lambda w: w["jobs"]["production"]["steps"][prod_index]
                 .pop("if"),
@@ -4725,6 +4747,48 @@ class WorkflowTests(unittest.TestCase):
                 workflows = deepcopy(self.workflows)
                 workflows["nightly.yml"]["jobs"]["pipeline-benchmark"]["uses"] = target
                 self.assertTrue(workflow_policy_errors(workflows))
+
+    def test_production_dispatch_safety_rules_are_pinned(self):
+        # 10-20 incidents: a manual deploy without takeover left production
+        # fenced (13:31Z), the rollback then refused for want of a human
+        # reviewer, and a forced drill degraded production (20:54Z).
+        production = self.workflows["deploy-production.yml"]
+        self.assertEqual(production_errors(production), [])
+        guard_step = production["jobs"]["guard"]["steps"][0]
+
+        def without(pin):
+            def change(w):
+                step = w["jobs"]["guard"]["steps"][0]
+                self.assertIn(pin, step["run"])
+                step["run"] = step["run"].replace(pin, "")
+            return change
+
+        mutations = {
+            "takeover defaults false": lambda w: w["on"]["workflow_dispatch"]["inputs"]["takeover"]
+                .__setitem__("default", False),
+            "cutover_hold removed": lambda w: w["on"]["workflow_dispatch"]["inputs"].pop("cutover_hold"),
+            "cutover_hold defaults true": lambda w: w["on"]["workflow_dispatch"]["inputs"]["cutover_hold"]
+                .__setitem__("default", True),
+            "cutover_hold not wired": lambda w: w["jobs"]["guard"]["steps"][0]["env"].pop("CUTOVER_HOLD"),
+            "deploy takeover default dropped":
+                without('takeover = "false" if cutover_hold == "true" else "true"'),
+            "production drill refusal dropped":
+                without('refuse("failure injection never runs against production'),
+            "snapshot path dropped":
+                without('snapshot_run = verified_rollback_snapshot() if not reviewers and mode == "rollback" else None'),
+            "snapshot pagination dropped":
+                without('collection(f"repos/{repo}/actions/artifacts"'),
+            "snapshot target binding dropped": without("target != (version, image, sha)"),
+            "snapshot provenance dropped": without('receipt.get("provenance_complete") is not True'),
+            "snapshot fork filter dropped":
+                without('origin.get("head_repository_id") != origin.get("repository_id")'),
+        }
+        self.assertIn("inputs.cutover_hold", str(guard_step))
+        for label, change in mutations.items():
+            with self.subTest(label):
+                workflow = deepcopy(production)
+                change(workflow)
+                self.assertTrue(production_errors(workflow), label)
 
     def test_production_route_is_automatic_or_dispatch_and_gated(self):
         production = self.workflows["deploy-production.yml"]
