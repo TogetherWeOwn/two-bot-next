@@ -116,6 +116,12 @@ pub const DUMP_TABLES: &[&str] = &[
     // restore and let a stale in-flight fetch resurrect rows); see
     // [`V10_ADDED_TABLES`]. No foreign keys, so order beside the mirror is free.
     "scheduled_events_claim",
+    // Scheduled-event mirror delete tombstones (0452/0453, v10): one row per
+    // removed id, suppressing equal-stamp stale replays. Archived so a
+    // restore stays fail-closed (an excluded tombstone set would let a stale
+    // in-flight fetch resurrect rows); see [`V10_ADDED_TABLES`]. No foreign
+    // keys, so order beside the mirror is free.
+    "scheduled_events_tombstone",
     "counter_snapshots",
     "member_exclusions",
     "presence_probe",
@@ -241,10 +247,11 @@ pub const V9_ADDED_TABLES: &[&str] =
     &["game_activity_guild_aggregates", "assistant_monthly_builds"];
 
 /// Tables first covered by v10 (scheduled-event mirror epoch-claim guard,
-/// migrations 0450/0451). Older archives may omit the guard; restore clears
-/// the destination rows, as for every versioned addition. New archives must
-/// contain the guard so a restored mirror keeps its stale-fetch fence.
-pub const V10_ADDED_TABLES: &[&str] = &["scheduled_events_claim"];
+/// migrations 0450/0451, plus its delete tombstones, migrations 0452/0453).
+/// Older archives may omit the guard tables; restore clears the destination
+/// rows, as for every versioned addition. New archives must contain both
+/// tables so a restored mirror keeps its stale-fetch fence.
+pub const V10_ADDED_TABLES: &[&str] = &["scheduled_events_claim", "scheduled_events_tombstone"];
 
 /// Covered tables not created by the current cutover migration set, if any.
 /// Keep legacy data when such tables exist, but do not require nonexistent
@@ -1955,6 +1962,7 @@ mod tests {
                 "assistant_monthly_builds",
                 "member_season_xp",
                 "scheduled_events_claim",
+                "scheduled_events_tombstone",
                 "stream_live_claims",
                 "voice_create_reservations",
                 "retention_guild_purge_queue",

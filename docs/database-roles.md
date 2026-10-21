@@ -79,6 +79,13 @@ per-guild epoch row through the app pool inside its snapshot-swap
 transaction. The table carries no member column, so there is nothing to
 erase and no reader grant beyond the app pool.
 
+The scheduled-event delete-tombstone table (`scheduled_events_tombstone`) is
+ordinary `table` kind for the same reason: `replace_events` writes one row
+per DELETE-removed id through the app pool inside its snapshot-swap
+transaction, and reads the guild high-water back through it before touching
+the mirror. The table carries no member column, so there is nothing to
+erase and no reader grant beyond the app pool.
+
 The reader cannot read bot base tables, including through inherited/public or
 column-level grants. Normal PostgreSQL views deliberately run with their owner's
 base-table privileges: only the reviewed `web_v1` projection is exposed. Do not
