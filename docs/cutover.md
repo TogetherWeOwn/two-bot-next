@@ -215,6 +215,28 @@ Do not use `dedupe-events` during cutover: it defaults to deletion and has no
 guild fence. Their exact behavior is in the
 [cutover CLI sources](../crates/cutover/src/bin) and is outside this procedure.
 
+#### Cutover CLI input preflight
+
+`capture` and `backfill-messages` validate `DISCORD_GUILD_ID` as a canonical
+Discord snowflake before the live-guild fence, admission or database bootstrap.
+Signed and zero-padded IDs refuse even with `--allow-live-guild`; the existing
+canonical live-guild opt-in is unchanged.
+
+Both scan tools accept `--max-pages` in `1..=10000`, defaulting to 25 for
+`backfill` and 60 for `backfill-messages`. Re-run hints use saturating arithmetic
+and never exceed that cap. At the cap, review scan scope rather than expecting a
+larger page budget. A supplied `backfill-messages --since` must be RFC3339;
+omitting it still selects unbounded history.
+
+All shared cutover CLI consumers preflight `TWO_DB_POOL_MAX` in `1..=32`
+(default 5) before I/O. This includes `rollback-delta import` in both modes,
+before file reads or plan output; valid dry-run imports still stay offline.
+These input refusals exit 2 with empty stdout and a fixed `input error: `
+diagnostic containing `code=` and `next_action=`, never the rejected value.
+The four tools' `--help` (including `rollback-delta import --help`) is
+credential-free and documents the ranges. Input validation grants no new live
+access, deployment or rollback authority.
+
 ### Merged copy, registry and preflight tools
 
 The following are merged in this baseline (re-checked at `bce86a791`); do not

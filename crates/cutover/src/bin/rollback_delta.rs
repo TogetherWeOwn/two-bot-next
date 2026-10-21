@@ -2,7 +2,7 @@
 #![allow(clippy::print_stdout)]
 
 use two_bot_cutover::{
-    cli::{open_db, Args},
+    cli::{open_db, Args, DB_POOL_HELP},
     legacy_copy::options::guarded_target,
     rollback_delta::{export_delta, file_writer, parse_since, report},
     rollback_import::{apply_import, import_plan, parse_import},
@@ -35,7 +35,7 @@ async fn main() {
     let args = Args::parse(&std::env::args().skip(1).collect::<Vec<_>>());
     if args.positionals.first().is_some_and(|p| p == "import") {
         if args.has("help") {
-            println!("{IMPORT_HELP}");
+            println!("{IMPORT_HELP}\n{DB_POOL_HELP}");
             return;
         }
         std::process::exit(run_import(args).await);
@@ -44,7 +44,7 @@ async fn main() {
         println!(
             "Usage: rollback-delta --since <RFC3339 T_f> [--export <path>]\n\
              Read-only Next-window delta report; stdout carries the JSON summary. \
-             TWO_DATABASE_URL required; no migrations are applied."
+             TWO_DATABASE_URL required; no migrations are applied.\n{DB_POOL_HELP}"
         );
         return;
     }
@@ -173,11 +173,7 @@ async fn run_import(args: Args) -> i32 {
         eprintln!("rollback-delta import: {error}");
         return 2;
     }
-    let pool_max: u32 = std::env::var("TWO_DB_POOL_MAX")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(two_bot_cutover::DB_POOL_MAX_DEFAULT);
-    let db = match two_bot_cutover::connect(&url, pool_max, true).await {
+    let db = match two_bot_cutover::connect(&url, args.db_pool_max(), true).await {
         Ok(db) => db,
         Err(_) => {
             eprintln!("rollback-delta import: cannot open database; connection details redacted");

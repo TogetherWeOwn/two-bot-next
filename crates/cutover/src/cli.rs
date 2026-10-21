@@ -11,6 +11,41 @@ use crate::{is_snowflake, CutoverDb, ScanCompletion, DB_POOL_MAX_DEFAULT, LIVE_G
 #[path = "safety_flag_refusal_matrix_tests.rs"]
 mod safety_flag_refusal_matrix_tests;
 
+/// Finite operator scan budget, independent of the host's integer width.
+pub const MAX_SCAN_PAGES: usize = 10_000;
+/// Cutover tools must not exhaust the shared database with an oversized pool.
+pub const MAX_DB_POOL: u32 = 32;
+/// Shared credential-free help for every cutover pool consumer.
+pub const DB_POOL_HELP: &str = "TWO_DB_POOL_MAX: integer 1..=32 (default 5).";
+
+const GUILD_INPUT_ERROR: &str = "code=invalid_guild DISCORD_GUILD_ID must be a canonical Discord snowflake; next_action=set DISCORD_GUILD_ID to an unsigned, unpadded snowflake";
+const PAGE_INPUT_ERROR: &str = "code=invalid_max_pages --max-pages must be an integer in 1..=10000; next_action=provide --max-pages 1..=10000 or omit it for the default";
+const SINCE_INPUT_ERROR: &str = "code=invalid_since --since must be RFC3339; next_action=provide --since with a valid RFC3339 timestamp or omit the option";
+const POOL_INPUT_ERROR: &str = "code=invalid_pool_max TWO_DB_POOL_MAX must be an integer in 1..=32; next_action=set TWO_DB_POOL_MAX to 1..=32 or unset it for the default";
+
+fn bounded_integer(raw: &str, max: u64) -> Option<u64> {
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    raw.parse::<u64>()
+        .ok()
+        .filter(|value| (1..=max).contains(value))
+}
+
+/// Validate before constructing a Twilight ID or comparing the live-guild fence.
+pub fn parse_env_guild(raw: &str) -> Result<u64, &'static str> {
+    if !is_snowflake(raw) {
+        return Err(GUILD_INPUT_ERROR);
+    }
+    raw.parse().map_err(|_| GUILD_INPUT_ERROR)
+}
+
+/// Next page-cap hint for both history CLIs.
+#[must_use]
+pub fn scan_page_hint(pages: usize) -> usize {
+    pages.saturating_mul(4).min(MAX_SCAN_PAGES)
+}
+
 /// Shared completion accounting for both history CLIs. Probes are recorded only
 /// when interrupted; their intentional one-page cap is not a backfill outcome.
 #[derive(Debug, Default)]
@@ -52,11 +87,23 @@ impl ScanReport {
 }
 
 /// Parsed `--name value` / `--name=value` / bare `--flag` arguments.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Args {
     pub positionals: Vec<String>,
     pub flags: std::collections::HashSet<String>,
     pub values: std::collections::HashMap<String, String>,
+    pool_max: u32,
+}
+
+impl Default for Args {
+    fn default() -> Self {
+        Self {
+            positionals: Vec::new(),
+            flags: std::collections::HashSet::new(),
+            values: std::collections::HashMap::new(),
+            pool_max: DB_POOL_MAX_DEFAULT,
+        }
+    }
 }
 
 impl Args {
@@ -115,7 +162,40 @@ impl Args {
         if out.has("apply") && out.has("dry-run") {
             return Err("--apply conflicts with --dry-run".to_owned());
         }
+        // Preflight every shared consumer before admission, file reads or DB
+        // access, including rollback import and consumers that ignore --help.
+        // No credentials are needed; an absent pool setting retains the default.
+        out.pool_max = match std::env::var("TWO_DB_POOL_MAX") {
+            Ok(raw) => {
+                bounded_integer(&raw, u64::from(MAX_DB_POOL)).ok_or(POOL_INPUT_ERROR)? as u32
+            }
+            Err(std::env::VarError::NotPresent) => DB_POOL_MAX_DEFAULT,
+            Err(std::env::VarError::NotUnicode(_)) => return Err(POOL_INPUT_ERROR.to_owned()),
+        };
         Ok(out)
+    }
+
+    /// Pool size preflighted at argument parsing, before any consumer I/O.
+    #[must_use]
+    pub fn db_pool_max(&self) -> u32 {
+        self.pool_max
+    }
+
+    /// Absent page caps retain the caller's default; malformed values refuse.
+    pub fn max_pages(&self, default: usize) -> Result<usize, &'static str> {
+        match self.get("max-pages") {
+            None => Ok(default),
+            Some(raw) => bounded_integer(raw, MAX_SCAN_PAGES as u64)
+                .map(|pages| pages as usize)
+                .ok_or(PAGE_INPUT_ERROR),
+        }
+    }
+
+    /// Do not turn a malformed requested window into an unbounded history scan.
+    pub fn since_millis(&self) -> Result<Option<i64>, &'static str> {
+        self.get("since")
+            .map(|raw| crate::iso_to_millis(raw).ok_or(SINCE_INPUT_ERROR))
+            .transpose()
     }
 
     #[must_use]
@@ -174,20 +254,16 @@ pub fn require_guild_read(args: &Args, flag: &str) -> String {
     guild.clone()
 }
 
-/// Open the database (`TWO_DATABASE_URL` required, pool max from
-/// `TWO_DB_POOL_MAX ?? 5`). `migrations_off` mirrors the probe's
-/// `skipMigrations` (a read-only tool must not build schema by accident).
-pub async fn open_db(_args: &Args, migrations_off: bool) -> CutoverDb {
+/// Open the database (`TWO_DATABASE_URL` required, pool max preflighted by
+/// `Args`). `migrations_off` mirrors the probe's `skipMigrations` (a read-only
+/// tool must not build schema by accident).
+pub async fn open_db(args: &Args, migrations_off: bool) -> CutoverDb {
     let url = std::env::var("TWO_DATABASE_URL").unwrap_or_default();
     if url.trim().is_empty() {
         eprintln!("TWO_DATABASE_URL is required.");
         std::process::exit(2);
     }
-    let pool_max: u32 = std::env::var("TWO_DB_POOL_MAX")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DB_POOL_MAX_DEFAULT);
-    match crate::connect(&url, pool_max, migrations_off).await {
+    match crate::connect(&url, args.db_pool_max(), migrations_off).await {
         Ok(db) => db,
         Err(_) => {
             eprintln!("cannot open database; connection details redacted");
@@ -224,6 +300,14 @@ pub fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use super::Args;
+
+    #[test]
+    fn scan_page_hint_saturates_and_stays_within_the_cli_range() {
+        assert_eq!(super::scan_page_hint(25), 100);
+        assert_eq!(super::scan_page_hint(60), 240);
+        assert_eq!(super::scan_page_hint(usize::MAX), 10_000);
+        assert_eq!(super::scan_page_hint(10_000), 10_000);
+    }
 
     fn parse(argv: &[&str]) -> Result<Args, String> {
         Args::try_parse(&argv.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>())
