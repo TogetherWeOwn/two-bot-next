@@ -214,6 +214,10 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     // enqueue; a purge deletes the row, so only enqueues are measurable.
     TableSpec { table: "retention_guild_purge_queue", measure: TableMeasure::Columns(&["enqueued_at"]) },
     TableSpec { table: "scheduled_events", measure: TableMeasure::Columns(&["updated_at"]) },
+    // Epoch-claim guard for the scheduled-event mirror (0450/0451): every
+    // winning fetch rewrites epoch inside the swap transaction, so its
+    // maximum is the row's last write.
+    TableSpec { table: "scheduled_events_claim", measure: TableMeasure::Columns(&["epoch"]) },
     TableSpec { table: "scheduled_messages", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "self_role_audit", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec {

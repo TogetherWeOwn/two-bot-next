@@ -6,8 +6,9 @@
  * `received_at - event_time` spread is always slightly positive from insert
  * latency, so any-positive would fire forever once the setter has a caller):
  * - New Worker alert rule `event_store_consumer_lag`, severity `ticket`,
- *   appended last to `RULES` and to the Rust `ALERT_RULE_IDS` list, with
- *   runbook anchor `runbook.md#alert-event-store-consumer-lag`.
+ *   appended after the existing catalog in `RULES` and Rust `ALERT_RULE_IDS`,
+ *   preserving those positions when later rules append, with runbook anchor
+ *   `runbook.md#alert-event-store-consumer-lag`.
  * - Input series `two_bot_event_store_consumer_lag_seconds`: the label-free
  *   f64 gauge from `crates/core/src/metrics.rs` (`0` when unobserved; the
  *   Rust setter already clamps non-finite/negative input to `0`). It is an
@@ -61,16 +62,51 @@ function firingState(): MetricsAlertState {
   return fired.state;
 }
 
-test("rule catalog: lag rule is appended last, ticket severity, shared spelling with Rust", () => {
+test("rule catalog: lag preserves the existing catalog prefix, ticket severity, shared spelling with Rust", () => {
   const samples = (alertRules as unknown as Record<string, unknown>)["EVENT_STORE_LAG_SAMPLES"];
   assert.equal(samples, 3, "sustained means 3 consecutive valid samples, like the other sustained rules");
   const threshold = (alertRules as unknown as Record<string, unknown>)["EVENT_STORE_LAG_THRESHOLD_SECONDS"];
   assert.equal(threshold, 60, "only lag above one keepalive window counts: healthy insert latency is always slightly positive");
-  const last = RULES[RULES.length - 1]!;
-  assert.equal(last.id, RULE);
-  assert.equal(last.severity, "ticket", "sustained lag tickets, never pages");
-  assert.equal(last.runbook, "runbook.md#alert-event-store-consumer-lag");
-  assert.match(last.summary, /lag/i);
+  // Pin the historical prefix, not the global tail: later additions must not
+  // displace any existing id, but may append after this rule.
+  const catalogPrefix = [
+    "job_stale",
+    "job_consecutive_failures",
+    "rest_429_rate",
+    "rest_5xx_rate",
+    "db_pool_saturated",
+    "db_errors",
+    "send_admission_blocked",
+    "voice_failures",
+    "gateway_missed_events",
+    "gateway_unpaired_disconnect",
+    "gateway_not_ready",
+    "ticker_stale",
+    "receiver_refusals",
+    "dispatch_drops",
+    "job_unknown_stale",
+    "gateway_checkpoint_failures",
+    "voice_join_fast_burn",
+    "voice_join_slow_burn",
+    "voice_creator_map_stale",
+    "community_facts_drain_failures",
+    "eventsub_post_failed_share",
+    "error_budget_fast_burn",
+    "error_budget_slow_burn",
+    "audit_delivery_halt",
+    "rest_admission_breaker_open",
+    "eventsub_tampered",
+    "eventsub_reconcile_failed",
+    RULE,
+  ];
+  assert.deepEqual(RULES.slice(0, catalogPrefix.length).map((r) => r.id), catalogPrefix);
+  assert.equal(RULES.filter((r) => r.id === RULE).length, 1, "lag is catalogued exactly once");
+  const rule = ruleFor(RULE);
+  assert.ok(rule, "lag rule resolves independently of later catalog additions");
+  assert.equal(rule.id, RULE);
+  assert.equal(rule.severity, "ticket", "sustained lag tickets, never pages");
+  assert.equal(rule.runbook, "runbook.md#alert-event-store-consumer-lag");
+  assert.match(rule.summary, /lag/i);
   const rust = /pub const ALERT_RULE_IDS: \[&str; \d+\] = \[([\s\S]*?)\];/.exec(read("crates/core/src/evidence.rs"));
   assert.ok(rust);
   assert.deepEqual(RULES.map((r) => r.id), [...rust[1]!.matchAll(/"([^"]+)"/g)].map((m) => m[1]!));

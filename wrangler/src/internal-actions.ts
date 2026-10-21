@@ -23,7 +23,7 @@
 import { TokenBuckets } from "./redirect.ts";
 import { LOG_QUERY_URL } from "./alert-rules.ts";
 import { UNKNOWN_RELEASE, normalizeRelease } from "./error-events.ts";
-import { REQUEST_ID_HEADER, ensureRequestId, newRequestId } from "./request-id.ts";
+import { REQUEST_ID_HEADER, ensureRequestId, isRequestId, newRequestId } from "./request-id.ts";
 import { applySecurityHeaders, withSecurityHeaders } from "./security-headers.ts";
 
 export const ACTIONS_PATH = "/internal/actions";
@@ -383,10 +383,111 @@ function releaseReader(reader: ReadableStreamDefaultReader<Uint8Array>): void {
 }
 
 /**
- * Only the receiver's own JSON envelope may leave. SDK 0.3.7 synthesizes text
- * 429/500/503 bodies from startup failures (raw `e.message`), and a wrong
- * listener could answer anything else; both become the fixed unavailable
- * envelope. Allowlisted headers only.
+ * The receiver's refusal vocabulary, mirrored from its constructors and call
+ * sites (`crates/core/src/internal_actions.rs`: `ErrorCode::as_str/status/
+ * retryable`; `crates/bot/src/internal_action_http.rs`: `Failure::response`,
+ * boundary `not_found`/`handle`/`receive`, terminal `needs_reconciliation`/
+ * `no_effect`): each code is emitted with exactly one status and one retry
+ * policy. `payload_too_large` and `unsupported_media_type` are EventSub-only
+ * wire codes, and `unavailable` is Worker-only, so none of the three is
+ * relayable here. A `Map` (not a plain object) keeps inherited names like
+ * `toString` from matching as codes.
+ */
+const RECEIVER_REFUSALS: ReadonlyMap<string, { status: number; retryable: boolean }> = new Map([
+  ["malformed", { status: 400, retryable: false }],
+  ["unauthorized", { status: 401, retryable: false }],
+  ["stale_request", { status: 401, retryable: false }],
+  ["action_not_allowed", { status: 403, retryable: false }],
+  ["not_found", { status: 404, retryable: false }],
+  ["method_not_allowed", { status: 405, retryable: false }],
+  ["request_timeout", { status: 408, retryable: true }],
+  ["replayed", { status: 409, retryable: false }],
+  ["version_conflict", { status: 409, retryable: false }],
+  ["in_progress", { status: 409, retryable: true }],
+  ["needs_reconciliation", { status: 409, retryable: false }],
+  ["discord_rejected", { status: 422, retryable: false }],
+  ["rate_limited", { status: 429, retryable: true }],
+  ["internal", { status: 500, retryable: true }],
+  ["discord_unavailable", { status: 502, retryable: true }],
+  ["no_effect", { status: 502, retryable: false }],
+  ["busy", { status: 503, retryable: true }],
+  ["upstream_timeout", { status: 504, retryable: true }],
+]);
+
+/** True for a JSON object: objects only, never null or an array. */
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Project one collected JSON body to the receiver's supported envelope, or
+ * `null` when it is not one. Successes keep only `{ok: true, request_id,
+ * result}` at status 200 with the action-specific result verbatim plus the
+ * optional top-level settings `version` beside it (never inside the result);
+ * refusals keep only `{ok: false, request_id, error: {code, retryable}}` with
+ * their table status and the fixed refusal message. Extra top-level or nested
+ * fields and the upstream message text never leave. The id must be the
+ * generated shape AND the id actually forwarded, so a foreign or mismatched id
+ * fails closed. This is schema/outflow enforcement, not proof of upstream
+ * authenticity.
+ */
+function projectReceiverJson(
+  status: number,
+  body: Uint8Array,
+  requestId: string,
+): { ok: true; request_id: string; result: Record<string, unknown>; version?: number } | {
+  ok: false;
+  request_id: string;
+  error: { code: string; message: string; retryable: boolean };
+} | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(body));
+  } catch {
+    return null;
+  }
+  if (!isJsonObject(parsed)) return null;
+  if (typeof parsed["request_id"] !== "string") return null;
+  const upstreamId = parsed["request_id"];
+  if (!isRequestId(upstreamId) || upstreamId !== requestId) return null;
+  if (parsed["ok"] === true) {
+    if (status !== 200 || "error" in parsed) return null;
+    const result = parsed["result"];
+    if (!isJsonObject(result)) return null;
+    const projected: { ok: true; request_id: string; result: Record<string, unknown>; version?: number } = {
+      ok: true, request_id: requestId, result,
+    };
+    if ("version" in parsed) {
+      const version = parsed["version"];
+      if (typeof version !== "number" || !Number.isInteger(version)) return null;
+      projected.version = version;
+    }
+    return projected;
+  }
+  if (parsed["ok"] !== false) return null;
+  const error = parsed["error"];
+  if (!isJsonObject(error)) return null;
+  const { code, retryable } = error;
+  if (typeof code !== "string" || typeof retryable !== "boolean") return null;
+  const verdict = RECEIVER_REFUSALS.get(code);
+  if (verdict === undefined || verdict.status !== status || verdict.retryable !== retryable) return null;
+  return {
+    ok: false,
+    request_id: requestId,
+    error: { code, message: "request refused", retryable },
+  };
+}
+
+/**
+ * Only the receiver's own JSON envelope may leave, validated against the
+ * receiver's constructors and projected to the supported contract: successes
+ * keep their action-specific result verbatim beside the correlated id (plus
+ * the optional top-level settings version), refusals keep their table
+ * status/code/retryability with the fixed message, and anything else becomes
+ * the fixed unavailable envelope. SDK 0.3.7 synthesizes text 429/500/503
+ * bodies from startup failures (raw `e.message`), and a wrong listener could
+ * answer anything else; both become the fixed unavailable envelope.
+ * Allowlisted headers only.
  *
  * The 64 KiB cap is enforced incrementally while reading: the reader is
  * cancelled the moment the cap is crossed, so no tail past the cap is
@@ -420,8 +521,10 @@ export async function relayReceiverResponse(
   }
   const reader = upstream.body?.getReader();
   if (!reader) {
-    const headers = relayHeaders(upstream.headers);
-    return new Response(new Uint8Array(), { status: upstream.status, headers });
+    // The receiver always answers with a body: a bodiless JSON response is
+    // not an envelope, so it fails closed.
+    releaseUpstream(upstream);
+    return refuse(503, "unavailable", true, undefined, requestId, release);
   }
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -455,8 +558,12 @@ export async function relayReceiverResponse(
     body.set(chunk, offset);
     offset += chunk.byteLength;
   }
+  const projected = projectReceiverJson(upstream.status, body, requestId);
+  if (projected === null) {
+    return refuse(503, "unavailable", true, undefined, requestId, release);
+  }
   const headers = relayHeaders(upstream.headers);
-  return new Response(body, { status: upstream.status, headers });
+  return Response.json(projected, { status: upstream.status, headers });
 }
 
 function relayHeaders(source: Headers): Headers {

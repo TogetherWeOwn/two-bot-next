@@ -59,8 +59,15 @@ test("status reads without starting and refuses deployment or running mismatches
   const running = sender({ epoch: 3, deploymentId: "B", phase: "active" }, "B", true);
   await assert.rejects(control({ ...args, action: "status" }, running.send), /not confirmed/);
   assert.equal(running.calls.length, 1);
-  // Malformed control response: refused.
-  await assert.rejects(control({ ...args, action: "status" }, async () => Response.json({ bogus: true })));
+  // Malformed control response: retried inside the status budget like any
+  // transient failure, then refused with the classified cause. The no-op
+  // wait keeps the suite fast: the default 10 s wait would sleep ~330 s.
+  let bogusCalls = 0;
+  await assert.rejects(control({ ...args, action: "status" }, async () => {
+    bogusCalls++;
+    return Response.json({ bogus: true });
+  }, async () => {}), /Ownership control invalid response attempts=34 /);
+  assert.equal(bogusCalls, 34);
 });
 
 test("takeover posts exactly the read epoch and confirms the transition", async () => {

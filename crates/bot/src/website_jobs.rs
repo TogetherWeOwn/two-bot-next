@@ -501,6 +501,19 @@ pub(crate) async fn get(rest: &ActionExecutor, path: &str) -> Result<Value, Erro
         .ok_or(ErrorClass::Rest)
 }
 
+/// [`get`] plus the raw wire-body length, for callers enforcing a wire-body
+/// cap. The length is measured over the collected response bytes, never over
+/// a re-serialization of the parsed value.
+async fn get_with_body_len(
+    rest: &ActionExecutor,
+    path: &str,
+) -> Result<(Value, usize), ErrorClass> {
+    rest.get_json_with_body_len(path)
+        .await
+        .map_err(|_| ErrorClass::Rest)?
+        .ok_or(ErrorClass::Rest)
+}
+
 fn snowflake(value: &Value) -> Result<u64, ErrorClass> {
     value
         .as_str()
@@ -782,6 +795,75 @@ fn publication_stopped(shutdown: &watch::Receiver<bool>) -> bool {
     *shutdown.borrow() || shutdown.has_changed().is_err()
 }
 
+/// Raw scheduled-events response-body cap, 1 MiB (bounded-claim decision §4).
+/// Bodies over this refuse as [`ErrorClass::Rest`] before any row reaches
+/// storage; the last good snapshot is kept by construction.
+pub(crate) const MAX_SCHEDULED_EVENTS_BODY_BYTES: usize = 1_048_576;
+
+/// One Events snapshot attempt with the observation stamp injected.
+/// Production stamps `observed_at` from the real clock in [`snapshot_once`]
+/// immediately before the GET (TOG-20273); age-bound tests inject a fixed
+/// stamp here instead of racing the clock.
+///
+/// Whole-response gates, in order: the raw wire-body cap (measured over the
+/// collected response bytes — unknown fields and JSON-insignificant bytes
+/// included, never over known fields alone or a re-serialization), then the
+/// existing shape/normalize/store path unchanged (including the epoch-claim
+/// StaleSnapshot gate: an older-than-committed fetch still rolls back and is
+/// logged here). The 5-minute age skip (decision §4) is NOT enforced here
+/// yet: the follow-up age slice pins it through this seam first, then wires
+/// the check.
+pub(crate) async fn snapshot_events_once(
+    pool: &PgPool,
+    rest: &ActionExecutor,
+    guild: &str,
+    shutdown: &watch::Receiver<bool>,
+    observed_at: &str,
+) -> Result<(), ErrorClass> {
+    let (response, body_len) = get_with_body_len(
+        rest,
+        &format!("/guilds/{guild}/scheduled-events?with_user_count=true"),
+    )
+    .await?;
+    // Measure the wire bytes, not the parsed value: an unknown-field pad must
+    // count toward the cap exactly like a long description does, and
+    // JSON-insignificant bytes (whitespace, duplicate keys, \uXXXX escapes)
+    // count as Discord sent them. A re-serialized measure would compact those
+    // away and admit an over-cap body.
+    if body_len > MAX_SCHEDULED_EVENTS_BODY_BYTES {
+        return Err(ErrorClass::Rest);
+    }
+    let raw = response
+        .as_array()
+        .ok_or(ErrorClass::Rest)?
+        .iter()
+        .map(|value| raw_event(value, guild))
+        .collect::<Result<Vec<_>, _>>()?;
+    let events = normalize_events(&raw).ok_or(ErrorClass::Rest)?;
+    if publication_stopped(shutdown) {
+        return Ok(());
+    }
+    // Epoch-claim gate (main #1472): a strictly older fetch rolls the whole
+    // swap back and reports StaleSnapshot; the tick logs the skip and keeps
+    // the newer snapshot.
+    match replace_events(pool, guild, observed_at, &events).await {
+        Ok(None) => Ok(()),
+        Ok(Some(skip)) => {
+            // Warn, not info: the runner never overlaps ticks
+            // (`jobs.rs` skips while one is active), so a lost claim
+            // means wall-clock skew froze the whole events mirror until
+            // real time passes the stored epoch.
+            tracing::warn!(
+                job = "events",
+                skip = ?skip,
+                "stale snapshot lost the epoch claim; publication skipped"
+            );
+            Ok(())
+        }
+        Err(_) => Err(ErrorClass::Database),
+    }
+}
+
 async fn snapshot_once(
     kind: Kind,
     pool: &PgPool,
@@ -797,24 +879,7 @@ async fn snapshot_once(
         // began, so a mutation that lands while the GET is in flight keeps
         // its newer row instead of being overwritten by this older fetch.
         let fetched_at = now_iso();
-        let response = get(
-            rest,
-            &format!("/guilds/{guild}/scheduled-events?with_user_count=true"),
-        )
-        .await?;
-        let raw = response
-            .as_array()
-            .ok_or(ErrorClass::Rest)?
-            .iter()
-            .map(|value| raw_event(value, guild))
-            .collect::<Result<Vec<_>, _>>()?;
-        let events = normalize_events(&raw).ok_or(ErrorClass::Rest)?;
-        if publication_stopped(shutdown) {
-            return Ok(());
-        }
-        return replace_events(pool, guild, &fetched_at, &events)
-            .await
-            .map_err(|_| ErrorClass::Database);
+        return snapshot_events_once(pool, rest, guild, shutdown, &fetched_at).await;
     }
     // Both kinds publish the denominator. Hold one shared lane from the first
     // observation through commit so a slow rank tick cannot overwrite a newer

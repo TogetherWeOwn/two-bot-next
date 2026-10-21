@@ -506,6 +506,26 @@ class LiveTransportTests(unittest.TestCase):
                 self.assertNotIn(TOKEN, blob)
                 self.assertNotIn(REMOTE_SENTINEL, blob)
 
+    def test_get_notice_valid_404_still_proves_absence(self):
+        self.origin.routes = discord_routes({})
+        result = drill.live_transport(TOKEN)(
+            "get_notice", channel_id=CHANNEL, notice_id=NOTICE_ID)
+        self.assertEqual(result, {"code": 10008, "message": "Unknown Message"})
+        self.assertTrue(drill._notice_is_absent(result))
+
+    def test_get_notice_404_duplicate_code_refuses_both_orders(self):
+        call = drill.live_transport(TOKEN)
+        for raw in (b'{"code": 99999, "code": 10008}',
+                    b'{"code": 10008, "code": 99999}'):
+            with self.subTest(raw=raw):
+                self.origin.routes = discord_routes({
+                    ("GET", NOTICE_PATH): (404, {}, raw)})
+                with self.assertRaises(drill.DrillError) as ctx:
+                    call("get_notice", channel_id=CHANNEL, notice_id=NOTICE_ID)
+                self.assertIn("duplicate", str(ctx.exception).lower())
+                self.assertNotIn("99999", str(ctx.exception))
+                self.assertNotIn("Unknown Message", str(ctx.exception))
+
     def test_surface_failure_sends_every_restore_request(self):
         self.origin.routes = discord_routes(
             {("GET", COMMANDS_PATH): (200, {}, b'{"commands": []}')})
@@ -654,6 +674,81 @@ class RedirectTransportTests(unittest.TestCase):
                 call("get_channel", channel_id="denied")
         self.assertEqual(str(raised.exception), "discord answered 401 on GET")
         self.assertEqual([auth for _, _, auth in origin.hits], ["Bot " + TOKEN] * 2)
+
+
+class DryRunBaselineTests(unittest.TestCase):
+    """Builder pins: --dry-run runs the read-only baseline before planning."""
+
+    MUTATING = ("post_notice", "patch_slowmode", "patch_overwrite",
+                "delete_overwrite", "delete_notice")
+    CHANNEL = "1234567890123456789"
+
+    def setUp(self):
+        guard = mock.patch("urllib.request.OpenerDirector.open",
+                           side_effect=AssertionError("network in a unit test"))
+        guard.start()
+        self.addCleanup(guard.stop)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.evidence = str(Path(tmp.name) / "evidence.json")
+
+    def double_for(self, payload):
+        calls = []
+
+        def call(op, **kw):
+            calls.append(op)
+            if op == "get_channel":
+                return dict(payload)
+            raise AssertionError(f"unexpected dry-run op {op}")
+
+        call.calls = calls
+        return call
+
+    def dry_run(self, payload):
+        double = self.double_for(payload)
+        argv = ["--guild-id", STAGING_GUILD, "--channel-id", self.CHANNEL,
+               "--reason", REASON, "--dry-run", "--evidence", self.evidence]
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = drill.main(argv, call=double)
+        return code, out.getvalue(), double
+
+    def open_channel(self):
+        return {"id": self.CHANNEL, "guild_id": STAGING_GUILD,
+                "rate_limit_per_user": 0, "permission_overwrites": []}
+
+    def test_valid_channel_prints_plan_after_read_only_baseline(self):
+        code, out, double = self.dry_run(self.open_channel())
+        self.assertEqual(code, 0)
+        self.assertIn("dry-run plan", out)
+        self.assertIn(self.CHANNEL, out)
+        self.assertIn(STAGING_GUILD, out)
+        self.assertEqual(double.calls, ["get_channel"])
+        self.assertFalse(Path(self.evidence).exists())
+
+    def test_locked_channel_refuses_like_live_step_one(self):
+        payload = self.open_channel()
+        payload["permission_overwrites"] = [
+            {"id": STAGING_GUILD, "type": 0, "allow": "0",
+             "deny": str(drill.SEND_MESSAGES_BIT)}]
+        code, out, double = self.dry_run(payload)
+        self.assertEqual(code, 1)
+        self.assertIn("baseline-read", out)
+        self.assertIn("already locked", out)
+        for op in double.calls:
+            self.assertNotIn(op, self.MUTATING)
+        self.assertFalse(Path(self.evidence).exists())
+
+    def test_wrong_guild_channel_refuses_like_live_step_one(self):
+        payload = self.open_channel()
+        payload["guild_id"] = OTHER_GUILD
+        code, out, double = self.dry_run(payload)
+        self.assertEqual(code, 1)
+        self.assertIn("baseline-read", out)
+        self.assertIn("staging guild", out)
+        for op in double.calls:
+            self.assertNotIn(op, self.MUTATING)
+        self.assertFalse(Path(self.evidence).exists())
 
 
 if __name__ == "__main__":

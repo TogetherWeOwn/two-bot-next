@@ -27,11 +27,14 @@
  * (windows stay inactive until history covers them, never a false fire).
  */
 
-import { closeSync, openSync, readFileSync, readSync } from "node:fs";
+import { closeSync, openSync, readSync } from "node:fs";
 import { EMPTY_STATE, evaluateMetrics } from "../src/alert-rules.ts";
 import { parseAlertScrape } from "../src/metrics-scrape.ts";
 
 const MAX_CACHE_BYTES = 1024 * 1024;
+// Exposition cap mirrors the Worker scrape (MAX_METRICS_BODY_BYTES in
+// wrangler/src/index.ts): every sibling reader refuses bodies over 64 KiB.
+const MAX_EXPOSITION_BYTES = 64 * 1024;
 
 function usage() {
   console.error(
@@ -96,6 +99,30 @@ function loadRing(path) {
   return ring;
 }
 
+/**
+ * Bounded exposition read matching loadRing's capped pattern. Returns
+ * null when the file exceeds MAX_EXPOSITION_BYTES; the caller holds the
+ * verdict exactly like a Worker-refused scrape. IO errors propagate so a
+ * missing file still crashes instead of reading as a refusal.
+ */
+function loadExposition(path) {
+  let fd;
+  try {
+    fd = openSync(path, "r");
+    const buffer = Buffer.alloc(MAX_EXPOSITION_BYTES + 1);
+    let size = 0;
+    while (size < buffer.length) {
+      const count = readSync(fd, buffer, size, buffer.length - size, null);
+      if (count === 0) break;
+      size += count;
+    }
+    if (size > MAX_EXPOSITION_BYTES) return null;
+    return buffer.subarray(0, size).toString("utf8");
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
 const args = process.argv.slice(2);
 const expositionPath = argValue(args, "--exposition");
 const ringPath = argValue(args, "--ring");
@@ -106,8 +133,8 @@ if (!expositionPath || !ringPath || !Number.isFinite(now)) {
   process.exit(2);
 }
 
-const exposition = readFileSync(expositionPath, "utf8");
-const samples = parseAlertScrape(exposition);
+const exposition = loadExposition(expositionPath);
+const samples = exposition === null ? null : parseAlertScrape(exposition);
 const ring = loadRing(ringPath);
 const previous = { ...EMPTY_STATE, joinBurn: ring };
 let verdict = { slow: false, fast: false, held: true, slowCovered: false, ring };

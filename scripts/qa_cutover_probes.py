@@ -94,6 +94,10 @@ import urllib.request
 
 BODY_CAP = 64 << 10
 DEFAULT_TIMEOUT_SECONDS = 10
+# Per-request timeout cap: --timeout must be finite and within (0, 60].
+# 60 s is 6x the 10 s default and covers the slowest healthy surface;
+# anything larger is a misconfiguration, not a slower check.
+TIMEOUT_MAX_SECONDS = 60
 # Cloudflare rejects the default "Python-urllib/x.y" agent at the edge with 403
 # (error 1010), so an explicit agent is required for the probe to reach the Worker.
 USER_AGENT = "two-bot-next-staging-rollout/1.0"
@@ -212,6 +216,11 @@ SRC_HEALTH = "crates/core/src/health.rs"
 SRC_GATEWAY = "crates/bot/src/gateway.rs"
 SRC_JOBS = "crates/bot/src/jobs.rs"
 SRC_FENCE = "wrangler/src/ownership.ts"
+
+
+def valid_timeout(value):
+    """A --timeout is usable only when finite and within (0, 60]."""
+    return math.isfinite(value) and 0 < value <= TIMEOUT_MAX_SECONDS
 
 
 def normalize_base(url):
@@ -570,7 +579,8 @@ def parse_args(argv):
                         help="fail gateway-state unless the service is ready "
                              "(default: a truthful parked 503 stays green)")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS,
-                        help=f"seconds per GET (default: {DEFAULT_TIMEOUT_SECONDS})")
+                        help=f"seconds per GET, finite and within (0, 60] "
+                             f"(default: {DEFAULT_TIMEOUT_SECONDS})")
     parser.add_argument("--evidence", default=None,
                         help="receipt path written when both routes answer")
     return parser.parse_args(argv)
@@ -578,6 +588,10 @@ def parse_args(argv):
 
 def main(argv=None, fetch_fn=None):
     args = parse_args(argv)
+    if not valid_timeout(args.timeout):
+        print("qa_cutover_probes: --timeout must be a finite number of seconds "
+              "greater than 0 and at most 60", file=sys.stderr)
+        return 2
     report, results = run(args, fetch_fn)
     for result in results:
         print(result.line())
