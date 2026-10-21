@@ -522,12 +522,13 @@ impl RestClient {
     /// Follows the listing's own continuation the way Discord documents it:
     /// each page carries `has_more`, and the next page passes `before` with
     /// the oldest thread's `archive_timestamp` (listings run newest-first).
-    /// Returns every thread exactly once by snowflake; a refused page
+    /// Returns every thread exactly once by snowflake; a refused first page
     /// reports `Ok(None)` (legacy: an unreadable channel is a normal
-    /// condition), while a repeated or non-progressing continuation and a
-    /// spent page budget report [`ArchivedThreadsOutcome::Incomplete`] with
-    /// the threads seen so far — never an infinite loop or a silently
-    /// complete result. A spent 5xx budget propagates as an error.
+    /// condition), while a refused later page, a repeated or
+    /// non-progressing continuation and a spent page budget report
+    /// [`ArchivedThreadsOutcome::Incomplete`] with the threads seen so
+    /// far — never an infinite loop or a silently complete result. A
+    /// spent 5xx budget propagates as an error.
     pub async fn public_archived_threads(
         &self,
         channel_id: Id<ChannelMarker>,
@@ -543,7 +544,9 @@ impl RestClient {
     /// hitting it reports `incomplete` rather than dropping older threads
     /// silently. Reports `Ok(None)` when the first page is refused, so
     /// the compat helper keeps the legacy no-listing contract; a later
-    /// refused page ends the walk with the threads seen so far.
+    /// refused page ends the walk [`ArchivedThreadsOutcome::Incomplete`]
+    /// with [`ArchiveIncompleteReason::AccessLost`] and the threads seen
+    /// so far, so the caller records the truncation.
     pub async fn list_all_archived_threads(
         &self,
         channel_id: Id<ChannelMarker>,
@@ -554,6 +557,7 @@ impl RestClient {
         let mut before: Option<String> = None;
         let mut pages = 0usize;
         let mut last_cursor: Option<String> = None;
+        let mut refused = false;
 
         loop {
             if pages >= max_pages {
@@ -580,19 +584,32 @@ impl RestClient {
                 .await
             {
                 Ok(page) => page,
-                // Lost access ends the walk where it stands (legacy walk-end:
-                // no listing when the first page refuses, the threads seen so
-                // far afterwards). A spent retry budget is transient sickness,
-                // not stable unreadability, so it propagates as an error.
-                Err(RestError::Refused { .. }) => None,
+                // Lost access ends the walk where it stands: no listing when
+                // the first page refuses (legacy walk-end), an incomplete
+                // walk with a refusal reason afterwards. A spent retry
+                // budget is transient sickness, not stable unreadability,
+                // so it propagates as an error.
+                Err(RestError::Refused { .. }) => {
+                    refused = true;
+                    None
+                }
                 Err(error) => return Err(error),
             };
             let Some(listing) = page else {
                 // Nothing was readable at all: stay `None`, exactly like the
-                // legacy single-page consumer. A later unreadable page ends
-                // the walk with the threads seen so far.
+                // legacy single-page consumer. A later refused page ends the
+                // walk incomplete — `has_more` never cleared, so reporting
+                // `Complete` would silently drop the unseen remainder. A
+                // later absent page (404: the channel is gone, not hidden)
+                // keeps the legacy complete-with-seen walk-end.
                 if threads.is_empty() {
                     return Ok(None);
+                }
+                if refused {
+                    return Ok(Some(ArchivedThreadsOutcome::Incomplete {
+                        threads,
+                        reason: ArchiveIncompleteReason::AccessLost,
+                    }));
                 }
                 return Ok(Some(ArchivedThreadsOutcome::Complete { threads }));
             };
@@ -801,6 +818,9 @@ pub enum ArchiveIncompleteReason {
     PageBudget,
     /// The next cursor repeated or the listing offered no cursor to follow.
     NoProgress,
+    /// Discord refused a later page (403): access was lost after threads
+    /// were already collected, so the unseen remainder is unknown.
+    AccessLost,
 }
 
 /// Bounded archived-thread discovery outcome: either every page through
@@ -1228,9 +1248,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unreadable_second_page_ends_walk_with_threads_seen() {
+    async fn refused_second_page_ends_walk_incomplete_with_threads_seen() {
         // First page readable with `has_more`, second page 403: the walk
-        // ends `Complete` with page one's threads instead of failing.
+        // ends `Incomplete` with `AccessLost` and page one's threads, so
+        // the caller records the truncation instead of reading a partial
+        // walk as complete.
         let all = forum_130();
         let (mock, origin) = ArchiveMock::start_script(vec![
             Scripted::Page(page(all[..100].to_vec(), true)),
@@ -1245,9 +1267,15 @@ mod tests {
             .expect("partial walk is not an error")
             .expect("first page was readable");
 
-        assert!(outcome.is_complete());
-        assert_eq!(outcome.threads().len(), 100);
-        assert_eq!(mock.befores().len(), 2, "walked until unreadable");
+        assert_eq!(
+            outcome,
+            ArchivedThreadsOutcome::Incomplete {
+                threads: all[..100].to_vec(),
+                reason: ArchiveIncompleteReason::AccessLost,
+            }
+        );
+        assert!(!outcome.is_complete());
+        assert_eq!(mock.befores().len(), 2, "walked until refused");
         mock.shutdown();
     }
 

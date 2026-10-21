@@ -1811,6 +1811,15 @@ jobs:
       - name: containment runtime acceptance (mock Discord and CI service only)
         run: cargo test -p two-bot --locked --lib --bins containment_worker_ -- --include-ignored
 
+      # Fail-closed gate for the fail-open refusal acceptance: the
+      # `fail_open_containment_acceptance` tests are `#[ignore]`d and their
+      # paths do not match the `containment_worker_` filter above, so without
+      # this step a revert of the outcome-unknown + metrics change stays
+      # green. The protected acceptance file owns the test names; this step
+      # selects them by module path instead of renaming them.
+      - name: containment fail-open refusal acceptance (mock Discord and CI service only)
+        run: cargo test -p two-bot --locked --lib --bins fail_open_containment_acceptance -- --include-ignored
+
       - name: containment worker-path soak (mock Discord and CI service only)
         run: cargo test -p two-bot --locked --test containment_worker_soak -- --include-ignored
 
