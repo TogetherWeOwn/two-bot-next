@@ -1013,7 +1013,7 @@ async fn governed_guild_config_api(
 /// where the interpolated message is known to embed newlines (every
 /// `check_staging_token` refusal does).
 fn single_line(message: &str) -> String {
-    message.replace('\n', " ").replace('\r', " ")
+    message.replace(['\n', '\r'], " ")
 }
 
 async fn cmd_guild_config_snapshot() -> i32 {
