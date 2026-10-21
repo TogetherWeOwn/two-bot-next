@@ -65,6 +65,13 @@ export const RUST_ALERT_AXES: Record<string, Record<string, string | readonly st
   two_bot_voice_halt_recoveries_total: {},
   two_bot_rest_guard_breaker_opens_total: {},
   two_bot_rest_guard_global_pauses_total: {},
+  two_bot_gateway_latency_seconds: {},
+  two_bot_gateway_reconnects_total: {},
+  // Handler buckets render from the private BUCKETS_MICROS (no pub label
+  // const like VOICE_JOIN_TO_MOVE_BUCKET_LE), so the wire `le` spellings are
+  // literal here, pinned against the validator and the rule below.
+  two_bot_handler_duration_seconds_bucket: { le: ["0.001", "0.005", "0.01", "0.05", "0.1", "0.5", "1", "5", "+Inf"] },
+  two_bot_job_runs_total: { job: "JOBS", outcome: "JOB_OUTCOMES" },
   two_bot_feed_fetch_errors_total: { error_class: "FEED_FETCH_ERROR_CLASSES" },
   two_bot_eventsub_received_total: {},
   two_bot_eventsub_reconcile_errors_total: { error_class: "EVENTSUB_RECONCILE_ERROR_CLASSES" },
@@ -93,5 +100,5 @@ export function metricsLines(rankFailures = 0): string[] {
 }
 
 export function metricsBody(rankFailures = 0): string {
-  return [...metricsLines(rankFailures), "two_bot_gateway_latency_seconds NaN", ""].join("\n");
+  return [...metricsLines(rankFailures), ""].join("\n");
 }

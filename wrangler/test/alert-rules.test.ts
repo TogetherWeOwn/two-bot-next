@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import worker, { type Env } from "../src/index.ts";
 import {
-  EMPTY_STATE, JOB_ERROR_CLASSES, PROMOTION_ERROR_GATE_RULES, RULES, RUNBOOK_BASE_URL, evaluateMetrics, evaluatePromotionGate, packetFilename, parseExposition, ruleFor, runbookUrl, transitionMessages,
+  EMPTY_STATE, JOB_ERROR_CLASSES, JOB_RUNS_JOBS, PROMOTION_ERROR_GATE_RULES, RULES, RUNBOOK_BASE_URL, evaluateMetrics, evaluatePromotionGate, packetFilename, parseExposition, ruleFor, runbookUrl, transitionMessages,
   type MetricsAlertState,
 } from "../src/alert-rules.ts";
 
@@ -983,6 +983,10 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "voice_halt_recoveries",
     "rest_breaker_opens",
     "rest_global_pauses",
+    "gateway_latency_dead",
+    "gateway_reconnect_flapping",
+    "handler_duration_saturated",
+    "job_failure_share",
     "feed_fetch_failures",
     "eventsub_receive_gap",
     "eventsub_reconcile_prior_failed",
@@ -1030,6 +1034,10 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("voice_halt_recoveries", window), `evidence-voice_halt_recoveries-${window}.json`);
   assert.equal(packetFilename("rest_breaker_opens", window), `evidence-rest_breaker_opens-${window}.json`);
   assert.equal(packetFilename("rest_global_pauses", window), `evidence-rest_global_pauses-${window}.json`);
+  assert.equal(packetFilename("gateway_latency_dead", window), `evidence-gateway_latency_dead-${window}.json`);
+  assert.equal(packetFilename("gateway_reconnect_flapping", window), `evidence-gateway_reconnect_flapping-${window}.json`);
+  assert.equal(packetFilename("handler_duration_saturated", window), `evidence-handler_duration_saturated-${window}.json`);
+  assert.equal(packetFilename("job_failure_share:counter", window), `evidence-job_failure_share-${window}.json`);
   assert.equal(packetFilename("feed_fetch_failures", window), `evidence-feed_fetch_failures-${window}.json`);
   assert.equal(packetFilename("eventsub_receive_gap", window), `evidence-eventsub_receive_gap-${window}.json`);
   assert.equal(packetFilename("eventsub_reconcile_prior_failed", window), `evidence-eventsub_reconcile_prior_failed-${window}.json`);
@@ -1275,6 +1283,37 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
   ]) {
     firing.push(...ev([`${series} 1`], ev([`${series} 0`]).state).firing);
   }
+  // Gateway transport rules carry fresh latency in every multi-sample chain
+  // except the dead-gateway battery itself, whose NaN streak is the signal.
+  let dead = ev(["two_bot_gateway_latency_seconds NaN"]);
+  dead = ev(["two_bot_gateway_latency_seconds NaN"], dead.state);
+  dead = ev(["two_bot_gateway_latency_seconds NaN"], dead.state);
+  firing.push(...dead.firing);
+  let flap = ev(["two_bot_gateway_latency_seconds 0.011", "two_bot_gateway_reconnects_total 0"]);
+  for (const [n, latency] of [[1, "0.012"], [2, "0.013"], [3, "0.014"]] as const) {
+    flap = ev([`two_bot_gateway_latency_seconds ${latency}`, `two_bot_gateway_reconnects_total ${n}`], flap.state);
+  }
+  firing.push(...flap.firing);
+  const handlerLines = (fast: number, total: number, latency: string) => [
+    `two_bot_gateway_latency_seconds ${latency}`,
+    ...["0.001", "0.005", "0.01", "0.05", "0.1", "0.5", "1"].map((le) =>
+      `two_bot_handler_duration_seconds_bucket{le="${le}"} ${fast}`),
+    `two_bot_handler_duration_seconds_bucket{le="5"} ${total}`,
+    `two_bot_handler_duration_seconds_bucket{le="+Inf"} ${total}`,
+  ];
+  let saturated = ev(handlerLines(100, 100, "0.011"));
+  saturated = ev(handlerLines(110, 120, "0.012"), saturated.state);
+  saturated = ev(handlerLines(120, 140, "0.013"), saturated.state);
+  saturated = ev(handlerLines(130, 160, "0.014"), saturated.state);
+  firing.push(...saturated.firing);
+  const jobLines = (counterSuccess: number, counterFailure: number, latency: string) => [
+    `two_bot_gateway_latency_seconds ${latency}`,
+    ...JOB_RUNS_JOBS.flatMap((job) => [
+      `two_bot_job_runs_total{job="${job}",outcome="success"} ${job === "counter" ? counterSuccess : 0}`,
+      `two_bot_job_runs_total{job="${job}",outcome="failure"} ${job === "counter" ? counterFailure : 0}`,
+    ]),
+  ];
+  firing.push(...ev(jobLines(8, 2, "0.012"), ev(jobLines(0, 0, "0.011")).state).firing);
   const feedErrors = (transport: number) => [
     "invalid_source", "non_public_address", "redirect_refused", "too_large", "invalid_encoding", "unsupported_content_type", "unsupported_encoding", "resolve", "transport", "deadline", "http_error", "other",
   ].map((c) => `two_bot_feed_fetch_errors_total{error_class="${c}"} ${c === "transport" ? transport : 0}`);
