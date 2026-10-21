@@ -50,6 +50,14 @@ fn tls_policy_from_env() -> Result<two_bot_core::database_tls::TlsPolicy, &'stat
     )
 }
 
+/// Backup/restore pool shape: max 5 (legacy `TWO_DB_POOL_MAX` parity) with a
+/// 10 s acquire timeout and a 15 s statement timeout. The CLI runs sequential
+/// backup steps, so one small pool suffices; a hung database refuses with the
+/// fixed `cannot connect` constant instead of hanging the operator command.
+const BACKUP_POOL_MAX: u32 = 5;
+const BACKUP_ACQUIRE_TIMEOUT_SECS: u64 = 10;
+const BACKUP_STATEMENT_TIMEOUT_MS: u64 = 15_000;
+
 /// Open a Postgres pool through the shared redacting parse path
 /// (`two_bot_core::database_url`): unsupported query keys are refused before
 /// the pinned driver's parser can WARN-log their values, the driver's passfile
@@ -57,8 +65,9 @@ fn tls_policy_from_env() -> Result<two_bot_core::database_tls::TlsPolicy, &'stat
 /// a constant message that never echoes the URL. Threat-model F6: the
 /// `TWO_DATABASE_TLS` policy (unset means `required`) refuses
 /// plaintext/unverified modes and the wrong host class before SQLx parses the
-/// URL (see `docs/database-tls.md`). Same default pool options as
-/// `PgPool::connect`, so this only changes what failures can disclose.
+/// URL (see `docs/database-tls.md`). The pool carries the documented
+/// backup triple (`BACKUP_POOL_MAX`, `BACKUP_ACQUIRE_TIMEOUT_SECS`,
+/// `BACKUP_STATEMENT_TIMEOUT_MS`) instead of the SQLx defaults.
 async fn open_pool(url: &str) -> Result<sqlx::PgPool, &'static str> {
     open_pool_with_tls(url, tls_policy_from_env()?).await
 }
@@ -76,7 +85,13 @@ async fn open_pool_with_tls(
         two_bot_core::database_url::connect_options(url).map_err(|_| "invalid database URL")?,
         tls,
     );
+    let options = options.options([(
+        "statement_timeout",
+        format!("{}ms", BACKUP_STATEMENT_TIMEOUT_MS),
+    )]);
     sqlx::postgres::PgPoolOptions::new()
+        .max_connections(BACKUP_POOL_MAX)
+        .acquire_timeout(std::time::Duration::from_secs(BACKUP_ACQUIRE_TIMEOUT_SECS))
         .connect_with(options)
         .await
         .map_err(|_| "cannot connect; database details redacted")

@@ -328,6 +328,13 @@ impl Failure {
 
 type Result<T> = std::result::Result<T, Failure>;
 
+/// Maximum history pages fetched per capture (100 messages each): fetching
+/// stops at the cap even when the channel runs deeper, so a huge channel
+/// cannot page Discord without bound. The capture still validates every
+/// fetched page and completes with the shared truncation marker; histories
+/// under the cap are byte-identical.
+const MAX_HISTORY_PAGES: usize = 10;
+
 impl TicketRuntime {
     pub fn new(
         pool: PgPool,
@@ -728,11 +735,13 @@ impl TicketRuntime {
     pub(crate) async fn capture_history(&self, channel: &str) -> Result<TranscriptSnapshot> {
         let mut before: Option<String> = None;
         let mut capture = history::HistoryCapture::default();
+        let mut pages = 0;
         loop {
             let page = self
                 .executor
                 .fetch_channel_messages(channel, before.as_deref(), 100)
                 .await?;
+            pages += 1;
             if page.len() > 100 {
                 return Err(Failure::InvalidEvidence);
             }
@@ -758,6 +767,10 @@ impl TicketRuntime {
                     .map_err(|_| Failure::InvalidEvidence)?;
             }
             if count < 100 {
+                break;
+            }
+            if pages >= MAX_HISTORY_PAGES {
+                capture.mark_page_capped();
                 break;
             }
             before = Some(floor.ok_or(Failure::InvalidEvidence)?.to_string());
