@@ -88,8 +88,9 @@ Usage:
 Origin admission contract: the base URL must be a usable nonempty bare
 http(s) origin before either route is fetched. A refusal names only a
 fixed-vocabulary reason (missing, malformed, unusable port, non-http(s)
-scheme, credentials, path/query/fragment present, or empty host); it never
-echoes the rejected URL, not even truncated, and attempts zero requests.
+scheme, credentials, path/query/fragment present, empty host, or unusable
+host); it never echoes the rejected URL, not even truncated, and attempts
+zero requests.
 
 Build identity contract: /readyz build_revision/build_id must be the
 canonical stamped shape (40-char lowercase hex revision, digits-digits
@@ -342,6 +343,16 @@ def normalize_base(url):
         raise ProbeError("refusing: base URL has no host",
                          code="origin_missing_host",
                          next_action="pass a bare http(s) origin with a nonempty host")
+    try:
+        host.encode("idna")
+    except UnicodeError:
+        # Mirrors the IDNA encoding socket.getaddrinfo applies before any
+        # packet: an overlong label would otherwise escape the fetch guards
+        # (UnicodeError is a ValueError, not an OSError) with a traceback.
+        raise ProbeError("refusing: base URL host is not usable",
+                         code="origin_bad_host",
+                         next_action="pass a bare http(s) origin with a usable "
+                                     "DNS host") from None
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
     port_suffix = f":{port}" if port else ""
@@ -738,13 +749,13 @@ def run(args, fetch_fn=None):
     unreachable = "check the probe target is reachable and re-run the probe"
     try:
         health_status, health_body = fetch_one(base + "/health")
-    except (OSError, http.client.HTTPException) as e:
+    except (OSError, http.client.HTTPException, UnicodeError) as e:
         return None, [Result("liveness", False,
                              f"/health did not respond ({e.__class__.__name__})",
                              SRC_SERVER, "liveness_no_response", unreachable)]
     try:
         readyz_status, readyz_body = fetch_one(base + "/readyz")
-    except (OSError, http.client.HTTPException) as e:
+    except (OSError, http.client.HTTPException, UnicodeError) as e:
         record("liveness", SRC_SERVER, check_liveness, health_status,
                health_body, ok_code="liveness_ok")
         results.append(Result("readiness-shape", False,

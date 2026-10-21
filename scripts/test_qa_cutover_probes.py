@@ -94,6 +94,37 @@ class BaseUrlTest(unittest.TestCase):
         base = probe.normalize_base("http://[::1]:8080/")
         self.assertEqual(base, "http://[::1]:8080")
 
+    def test_unusable_host_refused_before_any_fetch(self):
+        # An overlong DNS label would raise UnicodeError inside getaddrinfo
+        # (a ValueError, not an OSError), escaping the fetch guards with a
+        # traceback; refuse it at admission with fixed vocabulary instead.
+        args = probe.parse_args(["--base-url", f"http://{'a' * 70}/"])
+        _, results = probe.run(args, fetch_fn=double({}))
+        self.assertFalse(results[0].ok)
+        self.assertIn("refusing", results[0].reason)
+        self.assertNotIn("a" * 16, results[0].reason)
+        self.assertEqual(results[0].code, "origin_bad_host")
+
+    def test_usable_edge_hosts_still_admitted(self):
+        for raw, host in ((f"http://{'a' * 63}/", 'a' * 63),
+                          ("http://under_score.example/", "under_score.example"),
+                          ("http://example./", "example."),
+                          ("http://PROBE.EXAMPLE/", "probe.example")):
+            with self.subTest(raw=raw):
+                self.assertEqual(probe.normalize_base(raw), f"http://{host}")
+
+    def test_transport_unicode_error_is_a_fixed_liveness_fail(self):
+        def failing_fetch(url):
+            raise UnicodeEncodeError("idna", "x" * 70, 0, 70, "label too long")
+
+        args = probe.parse_args(["--base-url", "http://h/"])
+        _, results = probe.run(args, fetch_fn=failing_fetch)
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0].ok)
+        self.assertIn("did not respond", results[0].reason)
+        self.assertNotIn("Traceback", results[0].reason)
+        self.assertEqual(results[0].code, "liveness_no_response")
+
     def test_truthful_503_with_gateway_ready_stays_green(self):
         body = (503, json.dumps({
             "components": [["process", "ready"], ["gateway", "ready"],
