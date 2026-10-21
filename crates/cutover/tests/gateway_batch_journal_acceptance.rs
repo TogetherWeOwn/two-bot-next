@@ -9,8 +9,8 @@
 //!   entries and the row and its evidence commit atomically (no crash
 //!   window between a primary commit and a second journal transaction).
 //! - Journal failure is evidence-only: the primary batch write (event rows,
-//!   members projection, checkpoint) still commits, a WARN-or-above
-//!   diagnostic naming the rollback journal is emitted, and the next batch
+//!   members projection, checkpoint) still commits, the gateway's WARN
+//!   `rollback_journal record failed` diagnostic is emitted, and the next batch
 //!   on a healed schema journals normally (the writer is not latched off).
 //! - Duplicates journal nothing: replayed events that lose
 //!   `ON CONFLICT DO NOTHING` add no journal rows, and a duplicate dispatch
@@ -221,6 +221,37 @@ async fn batch_commit_journals_every_inserted_row() {
     test_db.close().await.unwrap();
 }
 
+fn is_journal_warning(line: &str) -> bool {
+    line.starts_with("WARN two_bot_cutover::gateway_session ")
+        && line.contains(" message=rollback_journal record failed")
+}
+
+#[test]
+fn diagnostic_oracle_rejects_lower_levels_and_sqlx_noise() {
+    let warning = "WARN two_bot_cutover::gateway_session message=rollback_journal record failed error=missing relation";
+    assert!(is_journal_warning(warning));
+    for level in ["DEBUG", "INFO"] {
+        let downgraded = warning.replacen("WARN", level, 1);
+        assert!(
+            !is_journal_warning(&downgraded),
+            "a {level} message with an error field is not a WARN diagnostic"
+        );
+    }
+    for noise in [
+        "DEBUG sqlx::query message=ROLLBACK TO SAVEPOINT rollback_journal error=missing relation",
+        "WARN sqlx::query message=rollback_journal record failed error=missing relation",
+        "WARN two_bot_cutover::gateway_session message=unrelated warning error=missing relation",
+        "WARN two_bot_cutover::gateway_session_extra message=rollback_journal record failed",
+    ] {
+        assert!(!is_journal_warning(noise), "unrelated diagnostic: {noise}");
+    }
+    let split = "WARN two_bot_cutover::gateway_session message=unrelated warning\nDEBUG sqlx::query message=rollback_journal record failed error=missing relation";
+    assert!(
+        !split.lines().any(is_journal_warning),
+        "the level, target and message must belong to the same log line"
+    );
+}
+
 /// Journal-error injection: the primary batch write survives, a diagnostic
 /// names the failure, and the healed writer journals again.
 #[tokio::test]
@@ -270,12 +301,12 @@ async fn journal_write_failure_keeps_primary_batch_write_with_diagnostic() {
             .unwrap();
     assert_eq!(checkpoint, 1, "the checkpoint is part of the primary write");
 
-    // The failure is evidence-only, not silent: a WARN-or-above diagnostic
-    // naming the rollback journal was emitted for the faulted batch.
-    let logged = capture.text()[log_start..].to_lowercase();
+    // Require the level, target and message on one line: SQLx DEBUG query
+    // text and an `error=` field are not a gateway WARN diagnostic.
+    let logged = capture.text()[log_start..].to_owned();
     assert!(
-        logged.contains("rollback") && (logged.contains("warn") || logged.contains("error")),
-        "faulted batch must emit a rollback-journal diagnostic, got: {logged}"
+        logged.lines().any(is_journal_warning),
+        "faulted batch must emit the gateway rollback-journal WARN diagnostic, got: {logged}"
     );
 
     // No partial evidence survived the fault: no journal row, no watermark.
@@ -292,6 +323,7 @@ async fn journal_write_failure_keeps_primary_batch_write_with_diagnostic() {
         events: vec![join(MEMBER, T3)],
         ..Default::default()
     };
+    let healed_log_start = capture.text().len();
     assert_eq!(
         dispatcher.commit(healed).await,
         DispatchAction::Apply,
@@ -303,6 +335,11 @@ async fn journal_write_failure_keeps_primary_batch_write_with_diagnostic() {
         "writer recovers after the fault"
     );
     assert_eq!(event_count(&db).await, 3);
+    let healed_logged = capture.text()[healed_log_start..].to_owned();
+    assert!(
+        !healed_logged.lines().any(is_journal_warning),
+        "healed batch must not emit the journal failure WARN diagnostic, got: {healed_logged}"
+    );
 
     test_db.close().await.unwrap();
 }
