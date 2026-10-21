@@ -1003,10 +1003,13 @@ class MalformedInspectRegressionTests(unittest.TestCase):
             (json.dumps([{"Id": "sha256:" + "a" * 64}]), "missing-size"),
             # A wrong-typed Id must not reach subprocess argv (TypeError
             # traceback): it fails at validation before any history call.
-            (json.dumps([{"Id": 123, "Size": 1}]), "numeric-id"),
-            (json.dumps([{"Id": None, "Size": 1}]), "null-id"),
-            (json.dumps([{"Id": ["sha256:" + "b" * 64], "Size": 1}]), "list-id"),
-            (json.dumps([{"Id": "", "Size": 1}]), "empty-id"),
+            # Each fixture carries a valid Config so the Id require is the
+            # only line stopping the history call (individually pinned).
+            (json.dumps([{"Id": 123, "Size": 1, "Config": {}}]), "numeric-id"),
+            (json.dumps([{"Id": None, "Size": 1, "Config": {}}]), "null-id"),
+            (json.dumps([{"Id": ["sha256:" + "b" * 64], "Size": 1,
+                          "Config": {}}]), "list-id"),
+            (json.dumps([{"Id": "", "Size": 1, "Config": {}}]), "empty-id"),
             # A missing or wrong-typed Config (or Healthcheck) must fail at
             # validation too, not as AttributeError at config.get below.
             (json.dumps([{"Id": "sha256:" + "a" * 64, "Size": 1}]),
