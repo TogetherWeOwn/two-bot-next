@@ -782,6 +782,35 @@ class WebSocketFrameTest(unittest.TestCase):
             ours.close()
             theirs.close()
 
+    def test_continuation_over_cap_refuses_before_payload_read(self):
+        cap = synth.MAX_BODY_BYTES
+        first = b"j" * (cap - 100)
+        # Over-cap continuation header declaring 200 bytes, payload never sent:
+        # the pre-read check must refuse without requesting those bytes.
+        data = (self.frame(0x1, first, fin=False)
+                + bytes([0x80, 126]) + struct.pack(">H", 200))
+        ws = synth.WebSocket.__new__(synth.WebSocket)
+        sock = _RecordingSocket(data)
+        ws.sock, ws.lock = sock, threading.Lock()
+        with self.assertRaises(synth.BodyTooLarge) as ctx:
+            ws.recv()
+        self.assertEqual(str(ctx.exception),
+                         "gateway message answered over the byte cap")
+        self.assertEqual(sock.requested, [2, 2, cap - 100, 2, 2])
+
+    def test_continuation_exact_cap_passes(self):
+        cap = synth.MAX_BODY_BYTES
+        payload = json.dumps({"op": 0, "t": "READY",
+                              "d": {"user": {"id": "900"}}}).encode()
+        payload += b" " * (cap - len(payload))
+        self.assertEqual(len(payload), cap)
+        first, rest = payload[:-100], payload[-100:]
+        data = self.frame(0x1, first, fin=False) + self.frame(0x0, rest)
+        ws = synth.WebSocket.__new__(synth.WebSocket)
+        sock = _RecordingSocket(data)
+        ws.sock, ws.lock = sock, threading.Lock()
+        self.assertEqual(ws.recv(), json.loads(payload))
+
 
 class _HandshakeScript:
     """Scripted socket for the websocket handshake: bytes, then EOF."""
@@ -791,6 +820,27 @@ class _HandshakeScript:
         self.sent = []
 
     def recv(self, n):
+        chunk = bytes(self._buf[:n])
+        del self._buf[:n]
+        return chunk
+
+    def sendall(self, data):
+        self.sent.append(bytes(data))
+
+    def close(self):
+        pass
+
+
+class _RecordingSocket:
+    """Scripted socket logging every requested read size; EOF when exhausted."""
+
+    def __init__(self, data):
+        self._buf = bytearray(data)
+        self.requested = []
+        self.sent = []
+
+    def recv(self, n):
+        self.requested.append(n)
         chunk = bytes(self._buf[:n])
         del self._buf[:n]
         return chunk
@@ -830,6 +880,27 @@ class WebSocketHandshakeTest(unittest.TestCase):
             self.connect(head)
         self.assertEqual(str(ctx.exception), self.HANDSHAKE_MSG)
         self.assertNotIn(sentinel, str(ctx.exception))
+
+    def test_handshake_exact_cap_passes(self):
+        cap = synth.MAX_BODY_BYTES
+        status = b"HTTP/1.1 101 Switching Protocols\r\n"
+        head = status + b"X" * (cap - len(status) - 4) + b"\r\n\r\n"
+        self.assertEqual(len(head), cap)
+        self.assertNotIn(b"\r\n\r\n", head[:-4])
+        ws = self.connect(head)
+        self.assertTrue(ws.sock.sent[0].startswith(
+            b"GET /?v=10&encoding=json HTTP/1.1\r\n"))
+        ws.close()
+
+    def test_handshake_cap_plus_one_refuses_with_fixed_message(self):
+        cap = synth.MAX_BODY_BYTES
+        status = b"HTTP/1.1 101 Switching Protocols\r\n"
+        head = status + b"X" * (cap + 1 - len(status) - 4) + b"\r\n\r\n"
+        self.assertEqual(len(head), cap + 1)
+        self.assertNotIn(b"\r\n\r\n", head[:-4])
+        with self.assertRaises(synth.BodyTooLarge) as ctx:
+            self.connect(head)
+        self.assertEqual(str(ctx.exception), self.HANDSHAKE_MSG)
 
     def test_handshake_eof_refuses_without_hanging(self):
         with self.assertRaises(ConnectionError) as ctx:
