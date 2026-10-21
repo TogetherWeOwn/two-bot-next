@@ -15,9 +15,17 @@
 use std::collections::BTreeMap;
 use twilight_model::id::Id;
 use two_bot_cutover::cli::{now_iso, open_db, Args};
+use two_bot_cutover::rest::RestError;
 use two_bot_cutover::{
     attribute_joins, invite_growth, mark_bot, record_event, FunnelWrite, InviteState, RestClient,
 };
+
+/// Fold a guild read into vanity-URL presence. A refused read is lost
+/// access, not an absent vanity URL: the error propagates so the run
+/// stops instead of baselining against an unreadable guild.
+fn vanity_presence(code: Result<Option<String>, RestError>) -> Result<bool, RestError> {
+    code.map(|code| code.is_some())
+}
 
 #[tokio::main]
 async fn main() {
@@ -128,13 +136,19 @@ async fn main() {
         eprintln!("Read zero members. That is Server Members Intent being OFF.");
         std::process::exit(1);
     }
-    let has_vanity = rest
+    // A refused guild read is lost access, not an absent vanity URL: refuse
+    // to baseline against an unreadable guild.
+    let code = rest
         .guild(guild)
         .await
-        .ok()
-        .flatten()
-        .and_then(|g| g.vanity_url_code)
-        .is_some();
+        .map(|guild| guild.and_then(|g| g.vanity_url_code));
+    let has_vanity = match vanity_presence(code) {
+        Ok(present) => present,
+        Err(error) => {
+            eprintln!("Guild read refused ({error}); capture stopped.");
+            std::process::exit(1);
+        }
+    };
 
     let mut new_joins: Vec<(String, String)> = Vec::new();
     let mut bots = 0usize;
@@ -293,4 +307,31 @@ async fn store_counters(
             eprintln!("invite snapshot write failed: {e}");
             std::process::exit(1);
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vanity_presence_distinguishes_absence_from_refusal() {
+        assert_eq!(
+            vanity_presence(Ok(Some("two".to_owned()))),
+            Ok(true),
+            "a vanity code reads present"
+        );
+        assert_eq!(
+            vanity_presence(Ok(None)),
+            Ok(false),
+            "genuine absence reads absent"
+        );
+        assert!(
+            vanity_presence(Err(RestError::Refused { status: 403 })).is_err(),
+            "lost access refuses instead of reading as absent"
+        );
+        assert!(
+            vanity_presence(Err(RestError::Wire("HTTP 5xx retry exhausted".to_owned()))).is_err(),
+            "a spent retry budget refuses instead of reading as absent"
+        );
+    }
 }

@@ -7389,16 +7389,23 @@ fn plan_creator(plan: TextChannelsPlan) -> CreatorChannel {
 }
 
 #[test]
-fn decide_text_channels_defaults_to_on_and_keeps_unset_fields() {
+fn decide_text_channels_absent_toggle_keeps_the_stored_value() {
     let base = CreatorChannel::new(GUILD, CREATOR);
     let creator = plan_creator(decide_text_channels(
         Some(base.clone()),
         &request(None, None, None),
     ));
-    assert!(creator.text_channels, "omitted toggle turns companions on");
+    assert!(
+        !creator.text_channels,
+        "absent toggle preserves stored off, never enables"
+    );
     assert_eq!(creator.text_channel_name, None);
     assert_eq!(creator.text_viewer_role_id, None);
     assert_eq!(creator.name_template, base.name_template);
+    let mut on = CreatorChannel::new(GUILD, CREATOR);
+    on.text_channels = true;
+    let kept = plan_creator(decide_text_channels(Some(on), &request(None, None, None)));
+    assert!(kept.text_channels, "absent toggle preserves stored on");
 }
 
 #[test]
@@ -7782,15 +7789,14 @@ fn decide_position_refuses_empty_and_bad_numbers() {
 }
 
 #[test]
-fn decide_group_defaults_to_on() {
-    let on = match decide_group(
+fn decide_group_refuses_without_a_toggle() {
+    let GroupPlan::Refuse { message } = decide_group(
         Some(CreatorChannel::new(GUILD, CREATOR)),
         &GroupRequest { enabled: None },
-    ) {
-        GroupPlan::Update(creator) => creator,
-        GroupPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    ) else {
+        panic!("absent toggle refuses, never enables by default");
     };
-    assert!(on.group_by_category);
+    assert!(message.contains("group"), "{message}");
     let off = match decide_group(
         Some(CreatorChannel::new(GUILD, CREATOR)),
         &GroupRequest {
@@ -7960,15 +7966,14 @@ fn decide_default_limit_sets_and_clears() {
 }
 
 #[test]
-fn decide_always_private_defaults_to_on() {
-    let on = match decide_always_private(
+fn decide_always_private_refuses_without_a_toggle() {
+    let AlwaysPrivatePlan::Refuse { message } = decide_always_private(
         Some(CreatorChannel::new(GUILD, CREATOR)),
         &AlwaysPrivateRequest { enabled: None },
-    ) {
-        AlwaysPrivatePlan::Update(creator) => creator,
-        AlwaysPrivatePlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    ) else {
+        panic!("absent toggle refuses, never enables by default");
     };
-    assert!(on.private_default);
+    assert!(message.contains("private"), "{message}");
     let off = match decide_always_private(
         Some(CreatorChannel::new(GUILD, CREATOR)),
         &AlwaysPrivateRequest {

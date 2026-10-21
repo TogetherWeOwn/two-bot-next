@@ -149,9 +149,38 @@ fn text_automations_run_only_for_accepted_or_unscreened_messages() {
 }
 
 #[test]
-fn receipt_clock_parses_or_falls_back_to_zero() {
-    assert_eq!(receipt_ms("2026-10-02T00:00:00.000Z"), 1_790_899_200_000);
-    assert_eq!(receipt_ms("garbage"), 0);
+fn receipt_clock_parses_or_refuses() {
+    assert_eq!(
+        receipt_ms("2026-10-02T00:00:00.000Z"),
+        Some(1_790_899_200_000)
+    );
+    assert_eq!(receipt_ms("garbage"), None);
+}
+
+#[test]
+fn received_clock_refuses_garbage_for_a_delivery() {
+    assert_eq!(
+        received_at_ms("2026-10-02T00:00:00.000Z"),
+        Some(1_790_899_200_000)
+    );
+    assert_eq!(received_at_ms("garbage"), None);
+    assert_eq!(received_at_ms(""), None);
+}
+
+#[test]
+fn partial_edit_received_refuses_a_garbage_clock() {
+    let minimal = json!({
+        "op": 0, "s": 7, "t": "MESSAGE_UPDATE",
+        "d": {"id": "9", "channel_id": "8", "guild_id": "7",
+              "edited_timestamp": "2026-10-02T00:00:01.000000+00:00",
+              "content": "edited"}
+    })
+    .to_string();
+    assert!(partial_edit_received(&minimal, "garbage").is_none());
+    let delivery = partial_edit_received(&minimal, "2026-10-02T00:00:00.000Z")
+        .expect("well-formed clock decodes");
+    assert_eq!(delivery.kind, MessageDeliveryKind::Update);
+    assert_eq!(delivery.observed_timestamp_ms, 1_790_899_200_000);
 }
 
 struct HangingLedger;
