@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! Protected acceptance: the unban sweep finishes every due job and says
 //! what happened, even when one job fails.
 //!
@@ -74,6 +75,9 @@ use crate::ModerationPolicy;
 
 const GUILD: &str = "100000000000000001";
 const NOW: &str = "2023-11-14T22:13:20.000Z";
+/// Backdated expiry: safely under the fixed test clock (`NOW`), so every
+/// staged job is due without depending on `<=`-at-equality.
+const DUE: &str = "2023-11-14T22:00:00.000Z";
 
 /// Hostile/verbose Discord detail: mentions, pill, newlines, a long run and
 /// a provider-shaped code. It must never reach a reply or an audit row; only
@@ -226,8 +230,11 @@ impl MemberDiscord for FailUserDiscord {
     }
 }
 
-/// Stage and accept three due unbans in generation order: user-1, user-2,
-/// user-3 with request ids req-1, req-2, req-3.
+/// Stage, accept and activate three due unbans in generation order: user-1,
+/// user-2, user-3 with request ids req-1, req-2, req-3. This mirrors the end
+/// state of the real TempBan execute path: `stage_unban` leaves `staged`,
+/// `confirm_ban_attempt` accepts the ban intent, and `activate_staged_unban`
+/// moves the expiry to `pending` (see the `sweep_requeues_*` setups).
 async fn stage_three_pending(store: &MemMemberStore) {
     for (user, req) in [
         ("user-1", "req-1"),
@@ -235,13 +242,17 @@ async fn stage_three_pending(store: &MemMemberStore) {
         ("user-3", "req-3"),
     ] {
         let attempt = store
-            .stage_unban(GUILD, user, NOW, "expiry", req, NOW)
+            .stage_unban(GUILD, user, DUE, "expiry", req, NOW)
             .await
             .expect("stage");
         store
             .confirm_ban_attempt(GUILD, user, req, attempt, NOW)
             .await
             .expect("confirm");
+        store
+            .activate_staged_unban(GUILD, user, req, NOW)
+            .await
+            .expect("activate");
         assert_eq!(store.unban_state(req).as_deref(), Some("pending"));
     }
 }
@@ -520,13 +531,17 @@ async fn postgres_sweep_continues_past_rejected_job() {
         ("user-3", "req-3"),
     ] {
         let attempt = store
-            .stage_unban(GUILD, user, NOW, "expiry", req, NOW)
+            .stage_unban(GUILD, user, DUE, "expiry", req, NOW)
             .await
             .expect("stage");
         store
             .confirm_ban_attempt(GUILD, user, req, attempt, NOW)
             .await
             .expect("confirm");
+        store
+            .activate_staged_unban(GUILD, user, req, NOW)
+            .await
+            .expect("activate");
     }
     let discord = FailUserDiscord::failing_for(
         "user-2",
