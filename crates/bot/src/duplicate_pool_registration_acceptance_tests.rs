@@ -206,7 +206,11 @@ async fn duplicate_pool_child_probe_zero() {
 }
 
 fn run_child_probe(child_fn: &str) -> (String, String, bool) {
-    let test_path = format!("{}::{child_fn}", module_path!());
+    // Literal path, like the `backup_cli` / `admission_test_support` recipe:
+    // libtest names exclude the crate name, while `module_path!()` includes
+    // it (`two_bot::...`), which `--exact` then never matches (infra RED:
+    // `running 0 tests`, everything filtered out).
+    let test_path = format!("duplicate_pool_registration_acceptance_tests::{child_fn}");
     let output = Command::new(std::env::current_exe().expect("test executable"))
         .args([&test_path, "--exact", "--nocapture"])
         .env(PROBE_ENV, "1")
@@ -216,7 +220,7 @@ fn run_child_probe(child_fn: &str) -> (String, String, bool) {
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     assert!(
         stdout.contains("running 1 test"),
-        "child probe filter must select exactly the probe (infra: filter missed); stderr:\n{stderr}\nstdout:\n{stdout}"
+        "child probe filter `{test_path}` must select exactly the probe (infra: filter missed); stderr:\n{stderr}\nstdout:\n{stdout}"
     );
     (stdout, stderr, output.status.success())
 }
