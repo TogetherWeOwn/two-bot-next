@@ -241,9 +241,18 @@ fn route(subcommand: &str, rest: &[String]) -> Route {
         return Route::Help;
     }
     match (subcommand, rest.first()) {
-        ("backup" | "guild-config-snapshot", Some(extra)) => Route::Usage(format!(
-            "{subcommand}: unexpected argument {extra:?}.\n{USAGE}"
-        )),
+        ("backup" | "guild-config-snapshot", Some(extra)) => {
+            // One stable token per subcommand, kept literal so the frozen
+            // source pins keep resolving.
+            let code = if subcommand == "backup" {
+                "code=backup_usage"
+            } else {
+                "code=snapshot_usage"
+            };
+            Route::Usage(format!(
+                "{subcommand}: unexpected argument {extra:?}. {code}\n{USAGE}"
+            ))
+        }
         _ => Route::Run,
     }
 }
@@ -997,6 +1006,16 @@ async fn governed_guild_config_api(
     .map_err(|error| error.to_string())
 }
 
+/// Collapse embedded newlines so a failure stays one physical line.
+///
+/// The stable failure token is appended to the failure line; a multi-line
+/// message would leave the earlier lines uncoded for per-line matchers. Used
+/// where the interpolated message is known to embed newlines (every
+/// `check_staging_token` refusal does).
+fn single_line(message: &str) -> String {
+    message.replace('\n', " ").replace('\r', " ")
+}
+
 async fn cmd_guild_config_snapshot() -> i32 {
     let token = match staging_token() {
         Ok(token) => token,
@@ -1006,6 +1025,7 @@ async fn cmd_guild_config_snapshot() -> i32 {
         }
     };
     if let Err(message) = guild_config::check_staging_token(&token) {
+        let message = single_line(&message);
         eprintln!("guild-config-snapshot: {message} code=snapshot_token_check_refused");
         return 2;
     }
@@ -1695,6 +1715,13 @@ mod tests {
     #[test]
     fn extra_argument_to_argumentless_subcommand_is_a_usage_error() {
         for subcommand in ["backup", "guild-config-snapshot"] {
+            // Literal tokens: the frozen vocabulary scan reads this file, so
+            // the assertion spells out the same literals production emits.
+            let code = if subcommand == "backup" {
+                "code=backup_usage"
+            } else {
+                "code=snapshot_usage"
+            };
             for extra in ["now", "--force", "--"] {
                 let Route::Usage(message) = route(subcommand, &strings(&[extra])) else {
                     panic!("{subcommand} {extra} must refuse");
@@ -1702,6 +1729,11 @@ mod tests {
                 assert!(message.starts_with(&format!("{subcommand}: unexpected argument")));
                 assert!(message.contains(&format!("{extra:?}")));
                 assert!(message.ends_with(super::USAGE));
+                let first = message.lines().next().unwrap();
+                assert!(
+                    first.ends_with(code),
+                    "{subcommand} {extra}: first line must end with the code: {first:?}"
+                );
             }
             assert_eq!(route(subcommand, &[]), Route::Run);
         }
@@ -2192,6 +2224,32 @@ mod tests {
         let exit = super::cmd_guild_config_snapshot().await;
         assert_eq!(exit, 2);
         clear_stable_code_env();
+    }
+
+    #[test]
+    fn single_line_flattens_every_token_check_refusal() {
+        // Every `check_staging_token` refusal embeds a newline; the snapshot
+        // site flattens it so the stable token lands on the only line.
+        // Segments are base64 app ids; no usable credential.
+        for token in [
+            "MTUzOTcxMTY4Mzg5ODExODE1NA.unit-test.not-a-secret",
+            "MTUzNzYyOTY4MjQ0OTY0OTcyNA.unit-test.not-a-secret",
+            "MTIzNDU2Nzg5MDEyMzQ1Njc4OQ.unit-test.not-a-secret",
+            "invalid-token",
+        ] {
+            let message =
+                two_bot_core::backup::guild_config::check_staging_token(token).unwrap_err();
+            assert!(message.contains('\n'), "{token}: expected a newline hazard");
+            let flat = super::single_line(&message);
+            assert!(!flat.contains('\n') && !flat.contains('\r'), "{flat:?}");
+            assert!(flat.contains("Refusing to run"), "{flat:?}");
+        }
+    }
+
+    #[test]
+    fn single_line_keeps_single_line_text_verbatim() {
+        assert_eq!(super::single_line("plain message"), "plain message");
+        assert_eq!(super::single_line("a\nb\rc"), "a b c");
     }
 
     #[tokio::test]

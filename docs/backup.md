@@ -26,6 +26,7 @@ code and are byte-identical.
 
 `two-bot backup`:
 
+- `backup_usage` — unexpected extra argument (usage refusal, exit 2).
 - `backup_missing_database_url` — `TWO_DATABASE_URL` unset or not Postgres.
 - `backup_retention_refused` — `TWO_BACKUP_KEEP` would prune every backup.
 - `backup_dest_create_failed` — cannot create the destination directory.
@@ -47,6 +48,7 @@ code and are byte-identical.
 
 `two-bot guild-config-snapshot`:
 
+- `snapshot_usage` — unexpected extra argument (usage refusal, exit 2).
 - `snapshot_token_load_failed` — cannot load the staging token.
 - `snapshot_token_check_refused` — the token failed the staging check.
 - `snapshot_guild_id_failed` — `DISCORD_STAGING_GUILD_ID` missing/wrong.

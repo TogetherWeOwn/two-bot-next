@@ -7,6 +7,7 @@ bodies can contain secrets: never print them, including in exception messages.
 import argparse
 from datetime import datetime
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -360,6 +361,10 @@ def validate_baseline(baseline):
     started = baseline.get("started")
     require(isinstance(started, (int, float)) and not isinstance(started, bool),
             "invalid_baseline_receipt")
+    # `prepare` writes `started=time.time()`, always finite and positive. A
+    # hand-edited zero/negative value would accept pre-baseline rollouts as
+    # new; NaN/inf would fail later under a misleading stale token.
+    require(math.isfinite(started) and started > 0, "invalid_baseline_receipt")
     for member in ("application_id", "namespace_id"):
         value = baseline.get(member)
         require(isinstance(value, str) and BASELINE_IDENTITY.fullmatch(value),
@@ -796,8 +801,10 @@ def read_records(path):
 
 def receipt(args, client=None):
     """Network-free: accept the Wrangler deploy receipt before ownership moves."""
-    baseline = mapping(decode(Path(args.receipt).read_bytes()))
-    validate_baseline(baseline)
+    # Decoded-but-wrong shapes (a JSON list, null, a string) refuse with the
+    # single baseline token; undecodable input still raises `invalid_json`
+    # from `decode` first.
+    baseline = validate_baseline(decode(Path(args.receipt).read_bytes()))
     version = deploy_version(read_records(args.output), baseline["started"])
     save(args.evidence, {"worker_version": version})
     print("wrangler deploy receipt accepted")
@@ -862,8 +869,7 @@ def deadline_aware_read(client, read, app, row, image, drift_candidate, verifica
 
 def verify(args, client):
     verification_started = time.monotonic()
-    baseline = mapping(decode(Path(args.receipt).read_bytes()))
-    validate_baseline(baseline)
+    baseline = validate_baseline(decode(Path(args.receipt).read_bytes()))
     version = deploy_version(read_records(args.output), baseline["started"])
     image = docker_image(version, baseline["revision"], baseline["build_id"])
     require(worker_namespace(client, version) == baseline["namespace_id"], "worker_namespace_changed")
