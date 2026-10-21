@@ -97,20 +97,28 @@ where
         .sort_unstable_by(|a, b| (a.created_at, a.id.as_str()).cmp(&(b.created_at, b.id.as_str())));
     let after = cursor.lock().expect("ticket recovery cursor").clone();
     if let Some((created_at, id)) = after {
-        let start = tickets
+        // No row newer than the cursor is a skip, not a replay: rows at or
+        // behind the cursor are never attempted again.
+        let skipped = tickets
             .iter()
             .position(|ticket| (ticket.created_at, ticket.id.as_str()) > (created_at, id.as_str()))
-            .unwrap_or(0);
-        tickets.rotate_left(start);
+            .unwrap_or(tickets.len());
+        if skipped > 0 {
+            tracing::info!(skipped, "ticket recovery skipped behind-cursor rows");
+            tickets.drain(..skipped);
+        }
     }
     let deadline = Instant::now() + RECOVERY_ROWS_BUDGET;
     let mut failed = None;
-    for ticket in tickets {
+    let total = tickets.len();
+    for (index, ticket) in tickets.into_iter().enumerate() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
+            let dropped = total - index;
+            tracing::warn!(dropped, "ticket recovery budget exhausted");
             break;
         }
-        // Advance before await: even whole-scope cancellation rotates past
+        // Advance before await: even whole-scope cancellation skips past
         // this row next time. The durable row, not this cursor, remains truth.
         *cursor.lock().expect("ticket recovery cursor") =
             Some((ticket.created_at, ticket.id.clone()));
