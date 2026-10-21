@@ -71,9 +71,6 @@ EXEMPT_SERIES = {
     "two_bot_db_pool_connections": _POOL_REASON,
     "two_bot_db_pool_idle_connections": _POOL_REASON,
     "two_bot_db_pool_max_connections": _POOL_REASON,
-    "two_bot_handler_duration_seconds": (
-        "latency histogram documented in docs/metrics.md; consumed by no alert rule"
-    ),
     "two_bot_voice_operations_total": _VOICE_SERIES_REASON + "; alert input for voice_failures",
     "two_bot_voice_dead_letters_total": _VOICE_SERIES_REASON + "; alert input for voice_failures",
     "two_bot_voice_orphans_total": _VOICE_SERIES_REASON + "; alert input for voice_failures",
@@ -107,6 +104,15 @@ EXEMPT_SERIES = {
         "two_bot_voice_join_to_move_seconds family; alert input for "
         "voice_join_fast_burn and voice_join_slow_burn (cumulative le=\"5\" "
         "count); documented in docs/metrics.md and the catalog alert-rule rows"
+    ),
+    # Same `_bucket`-child spelling rule as the voice join family above: the
+    # base two_bot_handler_duration_seconds family stays exempt while the
+    # raw alert-input name needs its own exemption.
+    "two_bot_handler_duration_seconds_bucket": (
+        "histogram _bucket child of the exempt "
+        "two_bot_handler_duration_seconds family; alert input for "
+        "handler_duration_saturated (per-le deltas with the p99 bound); "
+        "documented in docs/metrics.md and the catalog alert-rule rows"
     ),
 }
 

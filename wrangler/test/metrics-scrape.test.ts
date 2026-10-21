@@ -42,9 +42,13 @@ test("every consumed series rejects nonfinite, negative, fractional and nonnumer
     const index = lines.findIndex((line) => line.startsWith(`${name}{`) || line.startsWith(`${name} `));
     // The lag gauge is a duration, not a counter: fractional positives are
     // valid samples, while non-finite, negative and non-numeric stay rejected.
+    // The latency gauge additionally accepts NaN (no ACK yet on this
+    // connection); infinities, negatives and non-numeric stay rejected.
     const values = name === "two_bot_event_store_consumer_lag_seconds"
       ? ["NaN", "+Inf", "-Inf", "Infinity", "1e999", "-1", "0x10", "garbage", "1e20"]
-      : ["NaN", "+Inf", "-Inf", "Infinity", "1e999", "-1", "0.5", "0x10", "garbage", "1e20"];
+      : name === "two_bot_gateway_latency_seconds"
+        ? ["+Inf", "-Inf", "Infinity", "1e999", "-1", "0x10", "garbage", "1e20"]
+        : ["NaN", "+Inf", "-Inf", "Infinity", "1e999", "-1", "0.5", "0x10", "garbage", "1e20"];
     for (const value of values) {
       const bad = [...lines];
       bad[index] = bad[index]!.replace(/ 0$/, ` ${value}`);
@@ -91,7 +95,13 @@ test("additional series, new dimensions, reordered labels and unrelated NaN/Inf 
     + 'two_bot_internal_actions_total{family="new_family",outcome="new_outcome"} 0\n';
   const samples = parseAlertScrape(text);
   assert.ok(samples);
-  assert.ok(Number.isNaN(samples.find((s) => s.name === "two_bot_gateway_latency_seconds")?.value));
+  assert.equal(samples.find((s) => s.name === "two_bot_gateway_latency_seconds")?.value, 0);
+  // The validated latency gauge accepts its unknown marker and fractional
+  // seconds; both are ordinary exposition, not malformed rows.
+  const nanLatency = parseAlertScrape(valid.replace("two_bot_gateway_latency_seconds 0", "two_bot_gateway_latency_seconds NaN"));
+  assert.ok(nanLatency);
+  assert.ok(Number.isNaN(nanLatency.find((s) => s.name === "two_bot_gateway_latency_seconds")?.value));
+  assert.ok(parseAlertScrape(valid.replace("two_bot_gateway_latency_seconds 0", "two_bot_gateway_latency_seconds 0.012")));
   assert.equal(samples.find((s) => s.name === "future_metric")?.value, Infinity);
   assert.equal(samples.find((s) => s.name === "future_metric")?.labels.escaped, 'quote" brace} slash\\ newline\n');
   assert.ok(parseAlertScrape(valid.replace("two_bot_gateway_missed_events_total 0", "two_bot_gateway_missed_events_total 18446744073709551615")));
