@@ -1147,10 +1147,12 @@ where
     }
 
     /// Fire at most 25 due expiries for the owning guild. Claim immediately
-    /// before each dispatch, not a whole batch before the first await. Stop
-    /// on error: a definite rejection yields its durable queue position and
-    /// is requeued for the NEXT sweep, never retried automatically in this one.
-    /// Other members can progress on later ticks. Uncertain running claims need
+    /// before each dispatch, not a whole batch before the first await. A
+    /// per-job Discord failure is recorded with its bounded cause and the
+    /// sweep continues: a definite rejection yields its durable queue
+    /// position and is requeued for the NEXT sweep, never retried
+    /// automatically in this one. Only fatal errors abort the tick: unknown
+    /// bot identity and store failures. Uncertain running claims need
     /// reconciliation; other undispatched jobs stay pending.
     #[expect(
         clippy::manual_async_fn,
@@ -1161,23 +1163,60 @@ where
         guild_id: &'a str,
     ) -> impl Future<Output = Result<usize, MemberError>> + Send + 'a {
         async move {
-            let Some(bot_id) = self.policy.bot_user_id.as_deref() else {
-                return Err(MemberError::BotIdentityUnknown);
-            };
-            let now = format_iso_millis((self.now)());
-            let mut completed = 0usize;
-            for _ in 0..UNBAN_SWEEP_CLAIM_LIMIT {
-                let Some(job) = self.store.claim_due_unbans(guild_id, &now, 1).await?.pop() else {
-                    break;
-                };
-                match self.run_unban_job(&job, bot_id).await {
-                    Ok(true) => completed += 1,
-                    Ok(false) => {}
-                    Err(err) => return Err(err),
-                }
-            }
+            let (completed, _) = self.run_due_unbans_inner(guild_id).await?;
             Ok(completed)
         }
+    }
+
+    /// The same continuing sweep as [`Self::run_due_unbans`], reporting both
+    /// counts: jobs whose DELETE landed, and jobs that failed (requeued for
+    /// the next sweep or fenced for reconciliation). The bot tick logs both.
+    #[expect(
+        clippy::manual_async_fn,
+        reason = "explicit Send preserves spawnability through the generic queue callback"
+    )]
+    pub fn run_due_unbans_summary<'a>(
+        &'a self,
+        guild_id: &'a str,
+    ) -> impl Future<Output = Result<(usize, usize), MemberError>> + Send + 'a {
+        async move { self.run_due_unbans_inner(guild_id).await }
+    }
+
+    async fn run_due_unbans_inner(&self, guild_id: &str) -> Result<(usize, usize), MemberError> {
+        let Some(bot_id) = self.policy.bot_user_id.as_deref() else {
+            return Err(MemberError::BotIdentityUnknown);
+        };
+        let now = format_iso_millis((self.now)());
+        let mut completed = 0usize;
+        let mut failed = 0usize;
+        // Jobs attempted on this tick. A requeued refusal stays due, so
+        // without this set a lone failing job would be re-claimed until the
+        // claim limit burned out; the retry belongs to the next tick.
+        let mut attempted = std::collections::HashSet::new();
+        for _ in 0..UNBAN_SWEEP_CLAIM_LIMIT {
+            let Some(job) = self.store.claim_due_unbans(guild_id, &now, 1).await?.pop() else {
+                break;
+            };
+            if !attempted.insert(job.request_id.clone()) {
+                // Lapped an already-attempted job: the retry sorts behind
+                // never-attempted work, so everything else due was already
+                // tried. Hand the claim back and end the tick.
+                self.store
+                    .requeue_unban(&job.request_id, &job.claim_token)
+                    .await?;
+                break;
+            }
+            match self.run_unban_job(&job, bot_id).await {
+                Ok(true) => completed += 1,
+                Ok(false) => {}
+                Err(MemberError::Discord(discord_err)) => {
+                    failed += 1;
+                    self.audit_unban_failure(&job, bot_id, &discord_err).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Ok((completed, failed))
     }
 
     // -- internals ----------------------------------------------------------
@@ -1522,6 +1561,41 @@ where
                 outcome: MemberOutcome::Unbanned.as_str(),
                 idempotency_key: job.request_id.clone(),
                 metadata_json: "{}".to_owned(),
+            })
+            .await
+        {
+            tracing::error!(
+                request_id = job.request_id.as_str(),
+                error = err.message.as_str(),
+                "moderation_unban_audit_failed"
+            );
+        }
+    }
+
+    /// Best-effort audit of a failed scheduled unban:
+    /// `{request}:unban-failed` / `"unban_failed"` with a bounded `cause`
+    /// naming the failure class. The raw Discord detail never reaches the
+    /// row. Idempotent on the derived request id, so a retrying job records
+    /// once; loss is logged, never fatal, and never repeats the DELETE.
+    async fn audit_unban_failure(&self, job: &UnbanJob, bot_id: &str, err: &DiscordError) {
+        let cause = match err {
+            DiscordError::Rejected(_) => "rejected",
+            DiscordError::RateLimited => "rate_limited",
+            DiscordError::Timeout => "timeout",
+            DiscordError::Unavailable(_) => "unavailable",
+        };
+        if let Err(err) = self
+            .store
+            .record_audit(&AuditRow {
+                request_id: format!("{}:unban-failed", job.request_id),
+                guild_id: job.guild_id.clone(),
+                actor_id: bot_id.to_owned(),
+                action: "moderation.unban_scheduled",
+                target_id: Some(job.user_id.clone()),
+                reason: format!("scheduled unban failed: {cause}"),
+                outcome: "unban_failed",
+                idempotency_key: format!("{}:unban-failed", job.request_id),
+                metadata_json: format!(r#"{{"cause":"{cause}"}}"#),
             })
             .await
         {
@@ -3487,14 +3561,17 @@ mod tests {
             "unban",
             DiscordError::Rejected("already unbanned".to_owned()),
         );
-        let err = svc
-            .run_due_unbans(GUILD)
-            .await
-            .expect_err("first error rethrown");
-        assert!(matches!(
-            err,
-            MemberError::Discord(DiscordError::Rejected(_))
-        ));
+        // The refusal is recorded and the sweep completes: one job attempted,
+        // none landed.
+        assert_eq!(svc.run_due_unbans(GUILD).await.expect("continues"), 0);
+        let failure = svc
+            .store
+            .audits()
+            .iter()
+            .find(|row| row.request_id == "req-tempban-3:unban-failed")
+            .expect("refused job is recorded")
+            .clone();
+        assert_eq!(failure.outcome, "unban_failed");
         // Requeued as pending: the next sweep retries the exact job.
         assert_eq!(
             svc.store.unban_state("req-tempban-3"),
@@ -3524,11 +3601,9 @@ mod tests {
             row.execute_at = "2023-11-14T22:00:00.000Z".to_owned();
         }
         svc.discord.fail_with("unban", DiscordError::RateLimited);
-        let err = svc
-            .run_due_unbans(GUILD)
-            .await
-            .expect_err("first error rethrown");
-        assert_eq!(err, MemberError::Discord(DiscordError::RateLimited));
+        // The rate limit is recorded and the sweep completes: one job
+        // attempted, none landed.
+        assert_eq!(svc.run_due_unbans(GUILD).await.expect("continues"), 0);
         assert_eq!(
             svc.store.unban_state("req-tempban-429"),
             Some("pending".to_owned())
@@ -3701,10 +3776,10 @@ mod tests {
         }
         // The sweep dispatches the DELETE; the remote effect times out.
         discord.fail_with("unban", DiscordError::Timeout);
-        let err = svc.run_due_unbans(GUILD).await.expect_err("timeout");
-        assert!(
-            matches!(err, MemberError::Discord(DiscordError::Timeout)),
-            "timed-out DELETE must surface, got {err:?}"
+        assert_eq!(
+            svc.run_due_unbans(GUILD).await.expect("timeout fenced"),
+            0,
+            "a timed-out DELETE fences its row and the sweep completes"
         );
         discord.clear_failure("unban");
         assert_eq!(store.unban_state("old").as_deref(), Some("running"));
@@ -4023,10 +4098,7 @@ mod tests {
             .expect("accepted tempban");
         store.lock().unbans.get_mut("old").unwrap().execute_at = NOW.to_owned();
         discord.fail_with("unban", DiscordError::Timeout);
-        assert!(matches!(
-            svc.run_due_unbans(GUILD).await,
-            Err(MemberError::Discord(DiscordError::Timeout))
-        ));
+        assert_eq!(svc.run_due_unbans(GUILD).await.expect("timeout fenced"), 0);
         let token = store.lock().unbans["old"].claim_token.clone().unwrap();
         assert!(store
             .resolve_uncertain_unban("old", "wrong", UnbanResolution::Void)
@@ -4787,3 +4859,7 @@ mod tests {
         assert_eq!(discord.call_count("ban"), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "member_moderation_resilient_sweep_acceptance_tests.rs"]
+mod resilient_sweep_acceptance_tests;

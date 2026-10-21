@@ -1685,7 +1685,9 @@ async fn a_completed_kick_replays_after_its_target_left_without_a_denial() {
                 .to_owned()
         })
         .collect();
-    assert_eq!(replies, ["Kicked.", "Kicked. Already applied."]);
+    // The fixture interaction carries no resolved user block, so the reply
+    // slot falls back to the raw target user id.
+    assert_eq!(replies, ["Kicked 3333.", "Kicked 3333. Already applied."]);
     let kicks: Vec<_> = requests
         .iter()
         .filter(|r| r.method == "DELETE" && r.path.starts_with("/api/v10/guilds/"))

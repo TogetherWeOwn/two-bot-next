@@ -65,6 +65,11 @@ const NO_MEMBER_REPLY: &str = "That member is not in this server.";
 /// Reply when Discord left the outcome unknowable: the claim stays fenced,
 /// so a blind retry could double-moderate. Reconciliation owns the next step.
 const UNCERTAIN_REPLY: &str = "Discord did not confirm the action. It may still land; ask an operator to reconcile before retrying.";
+/// Fixed reply when Discord refuses the request: identical for every detail,
+/// naming Discord with a next action. The full detail goes to the server log
+/// with the interaction/request ids, never to the reply.
+const REJECTED_REPLY: &str =
+    "Discord refused the request; nothing was applied. Check the bot's permissions or ask an operator.";
 const ACTOR_COOLDOWN: Duration = Duration::from_secs(5);
 const ACTOR_COOLDOWN_CAPACITY: usize = 1024;
 const COOLDOWN_REPLY: &str = "Wait 5 seconds before using another member moderation command.";
@@ -180,6 +185,47 @@ impl MemberRuntime {
             })
             .await
             .map(String::as_str)
+    }
+
+    /// User-facing error copy with server-side truth: a Discord failure logs
+    /// its full detail at WARN with the interaction and request ids on the
+    /// same event, then returns exactly [`error_text`]. The `?` sigil keeps
+    /// multi-line detail on one log line. Non-Discord arms carry no hidden
+    /// detail, so they log nothing.
+    pub(crate) fn error_text_with_log(
+        err: MemberError,
+        interaction_id: u64,
+        request_id: &str,
+    ) -> String {
+        if let MemberError::Discord(discord_err) = &err {
+            tracing::warn!(
+                interaction_id,
+                request_id,
+                detail = ?discord_err,
+                "member moderation discord failure"
+            );
+        }
+        error_text(err)
+    }
+
+    /// Success reply naming the sanitized target: the verb base first, the
+    /// [`sanitize_target_display`] slot next, and exactly ` Already applied.`
+    /// last on replay.
+    pub(crate) fn outcome_text_with_target(result: &MemberResult, target_display: &str) -> String {
+        let base = match result.outcome {
+            MemberOutcome::Banned => "Banned",
+            MemberOutcome::TemporarilyBanned => "Temporarily banned",
+            MemberOutcome::Kicked => "Kicked",
+            MemberOutcome::TimedOut => "Timed out",
+            MemberOutcome::Warned => "Warned",
+            MemberOutcome::Unbanned => "Unbanned",
+        };
+        let target = sanitize_target_display(target_display);
+        if result.replayed {
+            format!("{base} {target}. Already applied.")
+        } else {
+            format!("{base} {target}.")
+        }
     }
 }
 
@@ -375,7 +421,10 @@ pub(crate) async fn handle_command(
     action: ModerationAction,
 ) {
     let reply = match execute(member, executor, interaction, action).await {
-        Ok(result) => outcome_text(&result),
+        Ok(result) => {
+            let target = target_display(interaction);
+            MemberRuntime::outcome_text_with_target(&result, &target)
+        }
         Err(reply) => reply,
     };
     if let Err(err) = executor
@@ -386,20 +435,35 @@ pub(crate) async fn handle_command(
     }
 }
 
-fn outcome_text(result: &MemberResult) -> String {
-    let base = match result.outcome {
-        MemberOutcome::Banned => "Banned.",
-        MemberOutcome::TemporarilyBanned => "Temporarily banned.",
-        MemberOutcome::Kicked => "Kicked.",
-        MemberOutcome::TimedOut => "Timed out.",
-        MemberOutcome::Warned => "Warned.",
-        MemberOutcome::Unbanned => "Unbanned.",
-    };
-    if result.replayed {
-        format!("{base} Already applied.")
-    } else {
-        base.to_owned()
+/// Moderator-visible target slot: the resolved interaction user's display
+/// name when Discord sent it, else the raw target user id. The reply
+/// sanitizer neutralizes anything hostile in either.
+fn target_display(interaction: &Interaction) -> String {
+    let target = command_options(interaction).0;
+    if let (Some(id), Some(InteractionData::ApplicationCommand(data))) =
+        (target, interaction.data.as_ref())
+    {
+        if let Some(user) = data.resolved.as_ref().and_then(|r| r.users.get(&id)) {
+            return user.global_name.as_deref().unwrap_or(&user.name).to_owned();
+        }
+        return id.get().to_string();
     }
+    String::new()
+}
+
+/// Ephemeral-reply sanitizer for a moderator-visible display name: fold
+/// newlines to one space, neutralize mass mentions through the shared
+/// helper, split mention pills so they render literally, then cap the slot
+/// at 512 chars on char boundaries. Markdown-escaping is NOT applied here.
+fn sanitize_target_display(display: &str) -> String {
+    let folded = display.replace("\r\n", " ").replace(['\r', '\n'], " ");
+    let neutralized = two_bot_core::message_safety::neutralize_mentions(&folded);
+    let split = neutralized
+        .replace("<@", "<\u{200b}@")
+        .replace("<#", "<\u{200b}#")
+        .replace("<:", "<\u{200b}:")
+        .replace("<a:", "<\u{200b}a:");
+    split.chars().take(512).collect()
 }
 
 fn error_text(err: MemberError) -> String {
@@ -413,9 +477,7 @@ fn error_text(err: MemberError) -> String {
         MemberError::KeyMismatch => {
             "This moderation request was already submitted with different details.".to_owned()
         }
-        MemberError::Discord(MemberDiscordError::Rejected(detail)) => {
-            format!("Discord refused the request: {detail}")
-        }
+        MemberError::Discord(MemberDiscordError::Rejected(_)) => REJECTED_REPLY.to_owned(),
         MemberError::Discord(MemberDiscordError::RateLimited) => {
             "Discord rate-limited the request; nothing was applied. Try again shortly.".to_owned()
         }
@@ -500,7 +562,11 @@ async fn execute(
         Err(err) => {
             two_bot_core::metrics::global()
                 .moderation_enforcement(action.command_name(), err.enforcement_outcome());
-            Err(error_text(err))
+            Err(MemberRuntime::error_text_with_log(
+                err,
+                interaction.id.get(),
+                &execution.request_id,
+            ))
         }
     }
 }
@@ -581,8 +647,9 @@ fn target_membership(
 
 /// The supervised unban sweep for the configured guild: claim one due job
 /// immediately before each dispatch (at most 25 per tick, enforced inside
-/// `run_due_unbans`), stop on failure. Definite refusals requeue for the
-/// next tick; uncertain dispatches stay fenced for reconciliation.
+/// `run_due_unbans_summary`), recording per-job failures and continuing.
+/// Definite refusals requeue for the next tick; uncertain dispatches stay
+/// fenced for reconciliation.
 pub(crate) fn sweep_job(member: Arc<MemberRuntime>, rest: ActionExecutor) -> Job {
     let cadence = Duration::from_secs(UNBAN_SWEEP_INTERVAL_SECONDS);
     Job {
@@ -608,10 +675,10 @@ async fn tick(member: &MemberRuntime, rest: &ActionExecutor) -> Result<(), Error
         member.policy(bot_id),
         now_millis_i64,
     );
-    match service.run_due_unbans(&member.guild_id).await {
-        Ok(completed) => {
-            if completed > 0 {
-                tracing::info!(completed, guild = %member.guild_id, "member unban sweep completed jobs");
+    match service.run_due_unbans_summary(&member.guild_id).await {
+        Ok((completed, failed)) => {
+            if completed > 0 || failed > 0 {
+                tracing::info!(completed, failed, guild = %member.guild_id, "member unban sweep completed jobs");
             }
             Ok(())
         }
@@ -846,13 +913,19 @@ mod tests {
     }
 
     #[test]
-    fn rejected_detail_passthrough_is_pinned() {
-        // Representative fixed detail: a Discord 4xx refusal names its cause.
+    fn rejected_detail_renders_fixed_actionable_copy() {
+        // Rejections never paste the provider detail: every detail renders
+        // the same fixed copy naming Discord with a next action.
+        let first = error_text(MemberError::Discord(MemberDiscordError::Rejected(
+            "missing permissions".to_owned(),
+        )));
+        let second = error_text(MemberError::Discord(MemberDiscordError::Rejected(
+            "totally different 50013 @everyone".to_owned(),
+        )));
+        assert_eq!(first, second);
         assert_eq!(
-            error_text(MemberError::Discord(MemberDiscordError::Rejected(
-                "missing permissions".to_owned()
-            ))),
-            "Discord refused the request: missing permissions"
+            first,
+            "Discord refused the request; nothing was applied. Check the bot's permissions or ask an operator."
         );
     }
 
@@ -872,144 +945,193 @@ mod tests {
 
     #[test]
     fn ban_success_confirmation_copy_is_pinned() {
-        // Reply layer only: `MemberResult` carries no member data, so the
-        // pinned copy cannot paste any.
+        // Reply layer only: `handle_command` renders through
+        // `outcome_text_with_target`, so this pins the exact `/ban` success
+        // copy with its sanitized target slot.
         assert_eq!(
-            outcome_text(&MemberResult {
-                outcome: MemberOutcome::Banned,
-                replayed: false,
-            }),
-            "Banned."
+            MemberRuntime::outcome_text_with_target(
+                &MemberResult {
+                    outcome: MemberOutcome::Banned,
+                    replayed: false,
+                },
+                "dave"
+            ),
+            "Banned dave."
         );
         assert_eq!(
-            outcome_text(&MemberResult {
-                outcome: MemberOutcome::Banned,
-                replayed: true,
-            }),
-            "Banned. Already applied."
+            MemberRuntime::outcome_text_with_target(
+                &MemberResult {
+                    outcome: MemberOutcome::Banned,
+                    replayed: true,
+                },
+                "dave"
+            ),
+            "Banned dave. Already applied."
         );
     }
 
     #[test]
     fn tempban_success_confirmation_copy_is_pinned() {
         // Same reply layer as `/ban`: `handle_command` renders through
-        // `outcome_text`, so this pins the exact `/tempban` success copy.
+        // `outcome_text_with_target`, so this pins the exact `/tempban`
+        // success copy.
         assert_eq!(
-            outcome_text(&MemberResult {
-                outcome: MemberOutcome::TemporarilyBanned,
-                replayed: false,
-            }),
-            "Temporarily banned."
+            MemberRuntime::outcome_text_with_target(
+                &MemberResult {
+                    outcome: MemberOutcome::TemporarilyBanned,
+                    replayed: false,
+                },
+                "dave"
+            ),
+            "Temporarily banned dave."
         );
         assert_eq!(
-            outcome_text(&MemberResult {
-                outcome: MemberOutcome::TemporarilyBanned,
-                replayed: true,
-            }),
-            "Temporarily banned. Already applied."
+            MemberRuntime::outcome_text_with_target(
+                &MemberResult {
+                    outcome: MemberOutcome::TemporarilyBanned,
+                    replayed: true,
+                },
+                "dave"
+            ),
+            "Temporarily banned dave. Already applied."
         );
     }
 
     #[test]
     fn kick_success_confirmation_copy_is_pinned() {
         // Same reply layer as `/ban`: `handle_command` renders through
-        // `outcome_text`, so this pins the exact `/kick` success copy.
+        // `outcome_text_with_target`, so this pins the exact `/kick` success
+        // copy.
         assert_eq!(
-            outcome_text(&MemberResult {
-                outcome: MemberOutcome::Kicked,
-                replayed: false,
-            }),
-            "Kicked."
+            MemberRuntime::outcome_text_with_target(
+                &MemberResult {
+                    outcome: MemberOutcome::Kicked,
+                    replayed: false,
+                },
+                "dave"
+            ),
+            "Kicked dave."
         );
         assert_eq!(
-            outcome_text(&MemberResult {
-                outcome: MemberOutcome::Kicked,
-                replayed: true,
-            }),
-            "Kicked. Already applied."
+            MemberRuntime::outcome_text_with_target(
+                &MemberResult {
+                    outcome: MemberOutcome::Kicked,
+                    replayed: true,
+                },
+                "dave"
+            ),
+            "Kicked dave. Already applied."
         );
     }
 
     #[test]
     fn timeout_success_confirmation_copy_is_pinned() {
         // Same reply layer as `/ban`: `handle_command` renders through
-        // `outcome_text`, so this pins the exact `/timeout` success copy.
+        // `outcome_text_with_target`, so this pins the exact `/timeout`
+        // success copy.
         assert_eq!(
-            outcome_text(&MemberResult {
-                outcome: MemberOutcome::TimedOut,
-                replayed: false,
-            }),
-            "Timed out."
+            MemberRuntime::outcome_text_with_target(
+                &MemberResult {
+                    outcome: MemberOutcome::TimedOut,
+                    replayed: false,
+                },
+                "dave"
+            ),
+            "Timed out dave."
         );
         assert_eq!(
-            outcome_text(&MemberResult {
-                outcome: MemberOutcome::TimedOut,
-                replayed: true,
-            }),
-            "Timed out. Already applied."
+            MemberRuntime::outcome_text_with_target(
+                &MemberResult {
+                    outcome: MemberOutcome::TimedOut,
+                    replayed: true,
+                },
+                "dave"
+            ),
+            "Timed out dave. Already applied."
         );
     }
 
     #[test]
     fn warn_success_confirmation_copy_is_pinned() {
         // Same reply layer as `/ban`: `handle_command` renders through
-        // `outcome_text`, so this pins the exact `/warn` success copy.
+        // `outcome_text_with_target`, so this pins the exact `/warn` success
+        // copy.
         assert_eq!(
-            outcome_text(&MemberResult {
-                outcome: MemberOutcome::Warned,
-                replayed: false,
-            }),
-            "Warned."
+            MemberRuntime::outcome_text_with_target(
+                &MemberResult {
+                    outcome: MemberOutcome::Warned,
+                    replayed: false,
+                },
+                "dave"
+            ),
+            "Warned dave."
         );
         assert_eq!(
-            outcome_text(&MemberResult {
-                outcome: MemberOutcome::Warned,
-                replayed: true,
-            }),
-            "Warned. Already applied."
+            MemberRuntime::outcome_text_with_target(
+                &MemberResult {
+                    outcome: MemberOutcome::Warned,
+                    replayed: true,
+                },
+                "dave"
+            ),
+            "Warned dave. Already applied."
         );
     }
 
     #[test]
     fn unban_success_confirmation_copy_is_pinned() {
         // Same reply layer as `/ban`: `handle_command` renders through
-        // `outcome_text`, so this pins the exact unban-sweep success copy.
+        // `outcome_text_with_target`, so this pins the exact unban success
+        // copy.
         assert_eq!(
-            outcome_text(&MemberResult {
-                outcome: MemberOutcome::Unbanned,
-                replayed: false,
-            }),
-            "Unbanned."
+            MemberRuntime::outcome_text_with_target(
+                &MemberResult {
+                    outcome: MemberOutcome::Unbanned,
+                    replayed: false,
+                },
+                "dave"
+            ),
+            "Unbanned dave."
         );
         assert_eq!(
-            outcome_text(&MemberResult {
-                outcome: MemberOutcome::Unbanned,
-                replayed: true,
-            }),
-            "Unbanned. Already applied."
+            MemberRuntime::outcome_text_with_target(
+                &MemberResult {
+                    outcome: MemberOutcome::Unbanned,
+                    replayed: true,
+                },
+                "dave"
+            ),
+            "Unbanned dave. Already applied."
         );
     }
 
     #[test]
     fn replay_suffix_confirmation_copy_is_pinned() {
         // The replay suffix is one uniform arm: every outcome replays by
-        // appending exactly ` Already applied.` to its fresh copy.
+        // appending exactly ` Already applied.` after its named target.
         let fresh = [
-            (MemberOutcome::Banned, "Banned."),
-            (MemberOutcome::TemporarilyBanned, "Temporarily banned."),
-            (MemberOutcome::Kicked, "Kicked."),
-            (MemberOutcome::TimedOut, "Timed out."),
-            (MemberOutcome::Warned, "Warned."),
-            (MemberOutcome::Unbanned, "Unbanned."),
+            (MemberOutcome::Banned, "Banned"),
+            (MemberOutcome::TemporarilyBanned, "Temporarily banned"),
+            (MemberOutcome::Kicked, "Kicked"),
+            (MemberOutcome::TimedOut, "Timed out"),
+            (MemberOutcome::Warned, "Warned"),
+            (MemberOutcome::Unbanned, "Unbanned"),
         ];
         for (outcome, base) in fresh {
             assert_eq!(
-                outcome_text(&MemberResult {
-                    outcome,
-                    replayed: true,
-                }),
-                format!("{base} Already applied.")
+                MemberRuntime::outcome_text_with_target(
+                    &MemberResult {
+                        outcome,
+                        replayed: true,
+                    },
+                    "dave"
+                ),
+                format!("{base} dave. Already applied.")
             );
         }
     }
 }
+
+#[cfg(test)]
+#[path = "member_moderation_truthful_replies_acceptance_tests.rs"]
+mod truthful_replies_acceptance_tests;
