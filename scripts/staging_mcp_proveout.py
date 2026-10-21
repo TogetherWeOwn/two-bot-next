@@ -213,15 +213,56 @@ def _bounded_text_fallback(body, secret=None):
         # Rejected JSON can still reflect an escaped bearer. Redact individual
         # string literals without collapsing duplicate keys or rewriting safe
         # escapes: recording must retain the ambiguity that admission refused.
+        # Malformed bodies (stray quotes, raw controls, invalid escapes) can
+        # hide an escaped bearer outside decodable literals, so redaction also
+        # substitutes the secret in any raw-or-\uXXXX mix independent of quote
+        # alignment, and undecodable literals become a placeholder.
         def redact_literal(match):
             literal = match.group()
             try:
-                decoded = json.loads(literal)
+                decoded = json.loads(literal, strict=False)
             except ValueError:
-                return literal
+                return '"***"'
             return json.dumps(decoded.replace(secret, "***")) if secret in decoded else literal
 
         body = re.sub(r'"(?:[^"\\]|\\.)*"', redact_literal, body)
+        # Alignment-independent escaped-bearer substitution: each secret char
+        # may appear raw or as \uXXXX (either u case, any hex case), plus the
+        # short JSON escapes. This catches stray-quote misalignment where the
+        # literal regex cannot align into decodable spans.
+        short_forms = {
+            '"': '\\"', "\\": "\\\\", "/": "\\/",
+            "\b": "\\b", "\f": "\\f", "\n": "\\n",
+            "\r": "\\r", "\t": "\\t",
+        }
+
+        def _hex_pattern(code):
+            return "".join(
+                f"[{h}{h.upper()}]" if h in "abcdef" else h
+                for h in f"{code:04x}"
+            )
+
+        parts = []
+        for char in secret:
+            alternatives = [re.escape(char)]
+            point = ord(char)
+            if point <= 0xFFFF:
+                alternatives.append(f"\\\\[uU]{_hex_pattern(point)}")
+            else:
+                code = point - 0x10000
+                high = 0xD800 + (code >> 10)
+                low = 0xDC00 + (code & 0x3FF)
+                alternatives.append(
+                    f"\\\\[uU]{_hex_pattern(high)}\\\\[uU]{_hex_pattern(low)}"
+                )
+            short = short_forms.get(char)
+            if short is not None:
+                escaped_short = re.escape(short)
+                if escaped_short not in alternatives:
+                    alternatives.append(escaped_short)
+            parts.append(f"(?:{'|'.join(alternatives)})")
+        if parts:
+            body = re.sub("".join(parts), "***", body)
         body = body.replace(secret, "***")
     candidate = body[:MAX_BODY_BYTES]
     envelope_bytes = len(b'{"_text":""}')

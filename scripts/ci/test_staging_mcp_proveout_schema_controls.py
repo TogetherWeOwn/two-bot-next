@@ -53,5 +53,33 @@ class DuplicateRecordingTests(NegotiationHelpers):
                 self.assertIn("[JSON_DUPLICATE_KEY]", artifact["failures"][0])
 
 
+class MalformedRedactionTests(NegotiationHelpers):
+    def test_malformed_bodies_redact_raw_and_escaped_bearer(self):
+        lower = ''.join('\\u%04x' % ord(c) for c in BEARER)
+        upper = ''.join('\\u%04X' % ord(c) for c in BEARER)
+        bodies = {
+            "stray-quote": 'upstream failure " {"note":"' + lower + '"}',
+            "raw-control": '{"note":"a\n' + lower + '"}',
+            "invalid-escape": '{"note":"' + lower + '\\q"}',
+            "stray-quote-upper": 'upstream failure " {"note":"' + upper + '"}',
+        }
+        for name, body in bodies.items():
+            with self.subTest(shape=name):
+                receipt = run_proof({0: body})
+                artifact = self.assert_receipt(receipt, 1)
+                _code, stdout, _artifact, raw, _calls = receipt
+                recorded = artifact["probes"][0]["body"]["_text"]
+                for form in (BEARER, lower, upper):
+                    with self.subTest(form=form[:12]):
+                        self.assertNotIn(form, recorded)
+                        self.assertNotIn(form, stdout)
+                        self.assertNotIn(form.encode(), raw)
+                        # stdout and the artifact JSON escape backslashes, so
+                        # a leaked escaped bearer appears double-escaped there.
+                        double = form.replace("\\", "\\\\")
+                        self.assertNotIn(double, stdout)
+                        self.assertNotIn(double.encode(), raw)
+
+
 if __name__ == "__main__":
     unittest.main()
