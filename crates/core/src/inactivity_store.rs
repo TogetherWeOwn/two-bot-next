@@ -43,7 +43,9 @@ const SWEEP_PAGE_ROWS: usize = 4_096;
 /// [`SweepCursor`] back as `resume`.
 #[derive(Debug, Clone, Copy)]
 pub struct SweepBudget {
-    /// Maximum keyset selects this pass reads.
+    /// Maximum keyset selects this pass reads. Clamped to at least one: a
+    /// zero budget still reads a single page, so a resume loop always makes
+    /// progress instead of reporting more work with an unchanged cursor.
     pub max_pages: usize,
     /// Wall-clock budget for this pass, checked before every select.
     pub deadline: std::time::Instant,
@@ -145,7 +147,10 @@ async fn run_sweep_inner(
     let mut pages: usize = 0;
     let finished = loop {
         if let Some((max_pages, deadline)) = budget {
-            if pages >= max_pages || std::time::Instant::now() >= deadline {
+            // A zero page budget still reads one page: stopping before the
+            // first select would report more work with an unchanged cursor,
+            // and a resume loop would spin on it forever.
+            if pages >= max_pages.max(1) || std::time::Instant::now() >= deadline {
                 break false;
             }
         }
@@ -454,6 +459,52 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed member");
+    }
+
+    /// A synthetic pool that can never touch the network: lazy, then closed.
+    /// Budget-shape tests take it to prove they stop before any select — a
+    /// regression that queries would fail here instead of hanging on I/O.
+    async fn closed_lazy_pool() -> Pool<Postgres> {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://agent_test:@agent-testdb:5432/agent_test")
+            .expect("synthetic lazy pool");
+        pool.close().await;
+        pool
+    }
+
+    /// An expired deadline stops the budgeted pass before any select: the
+    /// pass reports more work with an empty outcome. Offline (closed pool):
+    /// this also executes the real `run_sweep_budgeted` entry and budget
+    /// check in-process, which the child-compiled acceptance binary cannot
+    /// cover.
+    #[tokio::test]
+    async fn budgeted_pass_with_expired_deadline_reports_more_work_without_selects() {
+        let pool = closed_lazy_pool().await;
+        let budget = SweepBudget {
+            max_pages: 10_000,
+            deadline: std::time::Instant::now(),
+        };
+        let (outcome, resume) =
+            run_sweep_budgeted(&pool, "2026-09-07T00:00:00.000Z", 14, budget, None)
+                .await
+                .expect("budgeted pass");
+        assert!(outcome.flagged.is_empty());
+        assert!(resume.is_some());
+    }
+
+    /// An unparseable sweep time fails the budgeted pass before any query,
+    /// like the complete sweep.
+    #[tokio::test]
+    async fn budgeted_pass_with_unparseable_now_fails_before_any_query() {
+        let pool = closed_lazy_pool().await;
+        let budget = SweepBudget {
+            max_pages: 10_000,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
+        };
+        assert!(matches!(
+            run_sweep_budgeted(&pool, "not-a-time", 14, budget, None).await,
+            Err(InactivityStoreError::InvalidTimestamp(_))
+        ));
     }
 
     #[tokio::test]

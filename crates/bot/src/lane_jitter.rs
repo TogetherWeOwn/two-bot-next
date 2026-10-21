@@ -18,9 +18,13 @@
 
 use std::time::Duration;
 
+/// Base contention step in milliseconds: the integer the jitter samples, and
+/// the single source of [`LANE_BACKOFF_BASE`].
+const LANE_BACKOFF_BASE_MS: u64 = 100;
+
 /// Base contention step: every jittered sleep stays within this bound.
 /// Mirrors the private `LANE_BACKOFF` const at the two Busy arms.
-pub const LANE_BACKOFF_BASE: Duration = Duration::from_millis(100);
+pub const LANE_BACKOFF_BASE: Duration = Duration::from_millis(LANE_BACKOFF_BASE_MS);
 
 /// Deterministic 64-bit mixer (splitmix64) for jitter without a global RNG.
 ///
@@ -43,13 +47,11 @@ fn jitter_stream(seed: u64, retry: u32) -> u64 {
 /// bounds without a clock.
 #[must_use]
 pub fn lane_backoff_jittered(retry: u32, seed: u64) -> Duration {
-    let base = LANE_BACKOFF_BASE.as_millis();
+    let base = LANE_BACKOFF_BASE_MS;
     let half = base / 2;
     let span = base - half + 1;
-    let extra = u128::from(jitter_stream(seed, retry)) % span;
-    // The sample never exceeds the 100 ms base; the cast cannot truncate.
-    #[allow(clippy::cast_possible_truncation)]
-    Duration::from_millis((half + extra) as u64)
+    let extra = jitter_stream(seed, retry) % span;
+    Duration::from_millis(half + extra)
 }
 
 #[cfg(test)]
