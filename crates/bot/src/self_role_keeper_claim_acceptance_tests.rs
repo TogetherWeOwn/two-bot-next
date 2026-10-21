@@ -141,6 +141,18 @@ fn event_claim(renew_after_ms: u64) -> EventClaim {
     }
 }
 
+/// Render a caught panic payload. Match-based (never `expect`) so the tests
+/// need no `Debug` on keeper types.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = payload.downcast_ref::<&str>() {
+        message.to_string()
+    } else {
+        "<non-string panic>".to_owned()
+    }
+}
+
 /// The typed-refusal shape from contract item 2: a real error type whose
 /// renderings name the claim-shape problem and never echo claim tokens.
 fn assert_claim_shape_refusal(error: &impl std::error::Error) {
@@ -167,9 +179,19 @@ async fn neither_claim_construction_refuses_with_typed_error() {
     let attempt = catch_unwind(AssertUnwindSafe(|| {
         LeaseKeeper::try_start(store, None, None, Arc::clone(&lost))
     }));
-    let result = attempt.expect("construction must refuse with a typed error, not panic");
-    let error = result.expect_err("neither-claim construction must refuse");
-    assert_claim_shape_refusal(&error);
+    let result = match attempt {
+        Ok(result) => result,
+        Err(payload) => {
+            let what = panic_message(&payload);
+            panic!(
+                "construction must refuse with a typed error, not panic (panicked with: {what})"
+            );
+        }
+    };
+    match result {
+        Err(error) => assert_claim_shape_refusal(&error),
+        Ok(_) => panic!("neither-claim construction must refuse"),
+    }
     assert!(
         !lost.load(Ordering::SeqCst),
         "a refused keeper spawns no renewal"
@@ -187,9 +209,19 @@ async fn both_claims_construction_refuses() {
     let attempt = catch_unwind(AssertUnwindSafe(|| {
         LeaseKeeper::try_start(store, Some(event), Some(panel), Arc::clone(&lost))
     }));
-    let result = attempt.expect("construction must refuse with a typed error, not panic");
-    let error = result.expect_err("both-claims construction must refuse");
-    assert_claim_shape_refusal(&error);
+    let result = match attempt {
+        Ok(result) => result,
+        Err(payload) => {
+            let what = panic_message(&payload);
+            panic!(
+                "construction must refuse with a typed error, not panic (panicked with: {what})"
+            );
+        }
+    };
+    match result {
+        Err(error) => assert_claim_shape_refusal(&error),
+        Ok(_) => panic!("both-claims construction must refuse"),
+    }
     assert!(
         !lost.load(Ordering::SeqCst),
         "a refused keeper spawns no renewal"
