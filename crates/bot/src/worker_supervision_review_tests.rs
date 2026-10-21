@@ -167,11 +167,12 @@ async fn service_join_expired_budget_aborts_the_nested_worker_through_its_superv
 
 #[test]
 fn join_budget_covers_a_latched_containment_drain() {
-    // A latched containment worker starts no new Discord step (the plan-start
-    // and per-removal latch checks), so the drain that remains is at most one
-    // in-flight call plus the settings tail and one bounded staff post. The
-    // floor is computed from those named bounds; lowering the budget below it
-    // aborts slow-but-healthy containment as wedged.
+    // A latched containment worker starts no new Discord step (a latch check
+    // before each of the three plan reads and between removals), so the drain
+    // that remains is at most one in-flight call plus the settings tail and
+    // one bounded staff post. The floor is computed from those named bounds;
+    // lowering the budget below it aborts slow-but-healthy containment as
+    // wedged. The behavioral pins live in `containment_latch_tests.rs`.
     let floor = crate::containment_runtime::SETTINGS_READ_MAX
         + Duration::from_millis(two_bot_discord::executor::MODERATION_TIMEOUT_MS)
         + crate::raid_runtime::DELIVERY_MAX;
@@ -182,11 +183,17 @@ fn join_budget_covers_a_latched_containment_drain() {
         crate::raid_runtime::WORKER_JOIN_BUDGET,
         floor,
     );
-    // The floor holds only while the plan actually stops between steps: the
-    // plan-start check and the per-removal check must both stay in the code.
+    // Supplement to the behavioral latch tests: the floor holds only while the
+    // plan keeps one latch check per Discord step (three reads) and the
+    // per-removal check.
+    let code = code_only(CONTAINMENT_SOURCE);
     assert!(
-        occurrences(&code_only(CONTAINMENT_SOURCE), "is_latched") >= 2,
-        "containment plan must keep its latch checks (plan start and per removal)"
+        occurrences(&code, "self.latched_plan(dry_run)") >= 3,
+        "containment plan must latch-check before each of its three reads"
+    );
+    assert!(
+        occurrences(&code, "is_latched") >= 2,
+        "containment plan must keep its per-removal latch check"
     );
 }
 

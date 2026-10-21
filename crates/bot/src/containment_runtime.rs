@@ -615,6 +615,23 @@ impl<S: CheckedSettingsSource> ContainmentWorker<S> {
         self.finish(settings, event, incident, completion).await;
     }
 
+    /// The plan's shutdown interrupt, checked before each Discord step. A
+    /// disarmed plan removes nothing, so its end state is known and it still
+    /// completes as a dry run (released at cooldown); an armed plan stopped
+    /// before any removal is uncertain and held, never released.
+    fn latched_plan(&self, dry_run: bool) -> Option<PlanOutcome> {
+        self.shutdown.is_latched().then(|| {
+            if dry_run {
+                PlanOutcome::DryRun
+            } else {
+                PlanOutcome::Removed {
+                    removed: Vec::new(),
+                    failure: Some(QuarantineFailure::Shutdown),
+                }
+            }
+        })
+    }
+
     /// Snapshot roles and plan. Armed execution of removals happens in
     /// [`Self::contain`]; this only reads.
     async fn plan(&self, guild_id: &str, executor_id: &str, dry_run: bool) -> PlanOutcome {
@@ -639,15 +656,13 @@ impl<S: CheckedSettingsSource> ContainmentWorker<S> {
                 return PlanOutcome::Failed;
             }
         };
-        // A latched shutdown starts no new Discord step: the incident is
-        // uncertain with nothing removed yet, and `finish` still persists it.
-        // Without this (and the per-removal check below) a slow-but-healthy
-        // plan outlives the drain budget and the abort strands the incident.
-        if self.shutdown.is_latched() {
-            return PlanOutcome::Removed {
-                removed: Vec::new(),
-                failure: Some(QuarantineFailure::Shutdown),
-            };
+        // A latched shutdown starts no new Discord step (checked before every
+        // read and between removals), so the drain after the latch is one
+        // in-flight call plus the outcome persist. Without it a slow-but-
+        // healthy plan outlives the drain budget and the abort strands the
+        // incident in `Containing`.
+        if let Some(outcome) = self.latched_plan(dry_run) {
+            return outcome;
         }
         let executor_roles = match self.executor.member_role_ids(guild, executor).await {
             Ok(roles) => roles,
@@ -656,6 +671,9 @@ impl<S: CheckedSettingsSource> ContainmentWorker<S> {
                 return PlanOutcome::Failed;
             }
         };
+        if let Some(outcome) = self.latched_plan(dry_run) {
+            return outcome;
+        }
         let bot_roles = match self.executor.member_role_ids(guild, bot).await {
             Ok(roles) => roles,
             Err(_) => {
@@ -663,6 +681,9 @@ impl<S: CheckedSettingsSource> ContainmentWorker<S> {
                 return PlanOutcome::Failed;
             }
         };
+        if let Some(outcome) = self.latched_plan(dry_run) {
+            return outcome;
+        }
         let snapshot = match self
             .executor
             .get_json(&format!("/guilds/{guild}/roles"))
@@ -1030,3 +1051,7 @@ fn start_from_vars(
 #[cfg(test)]
 #[path = "containment_tuning_runtime_tests.rs"]
 mod tuning_runtime_tests;
+
+#[cfg(test)]
+#[path = "containment_latch_tests.rs"]
+mod latch_tests;
