@@ -166,6 +166,42 @@ process list, runs every statement in a `READ ONLY` transaction, never echoes
 the client's error text, and writes only an ordinal, `event_type` and
 `recorded_at` per row.
 
+## Staging retention census (manual)
+
+`staging-retention-census.yml` is a manual, staging-only, read-only workflow
+that reports the event-store retention-expiry evidence (migration ledger and
+expiry-index presence, eligible-old vs fresh counts by retention family, and
+a bounded stable-cohort digest before and after one natural ~900 s DryRun
+interval) without handing any agent a database credential. The regression
+pins it as `workflow_dispatch`-only with no inputs. Its single `census` job
+runs only from `main`, in the existing no-reviewer `staging-migrate-plan`
+environment, on the routed runner for job `census`, with `contents: read`, a
+30-minute timeout covering the script's single in-job sleep, and its own
+non-cancelling concurrency group. It has exactly two unconditional steps:
+pinned checkout without persisted credentials, and one bash Run step that
+calls `scripts/staging_retention_census.py` with the plan secret plus the
+three non-secret staging pins via the environment only. There is no artifact
+upload: counts, digests and timestamps never leave the run log and summary.
+No `set -x`, no wrangler, no apply route, no production path.
+
+The script refuses before connecting unless the login is a bare staging
+login on the pinned staging database at the pinned staging host (pooler
+endpoints and production-like names refuse; a PlanetScale host requires a
+matching branch pin). The login is a separate identity holding only
+`two_bot_migrator_ro` (that group is `NOLOGIN`), mirroring the plan binary:
+every connection runs `SET ROLE two_bot_migrator_ro` before its `READ ONLY`
+transaction, the server must then report that role and database, and a
+login holding `two_bot_migrator` refuses. It forces libpq
+`sslmode=verify-full` with the runner's system CA bundle, keeps the
+password out of the process list, runs every statement in a `READ ONLY`
+transaction with statement and lock timeouts, runs no DDL (no `CREATE
+EXTENSION`: a missing pgcrypto yields count/min/max without a digest),
+never echoes the client's error text, and never invokes retention or
+activates Execute. The ledger scope is exactly the two expiry migrations
+(444/445); both cohort captures reuse one server-anchored window, so the
+bounds cannot move between them. An empty cohort or empty family is a
+reported limitation, never a pass.
+
 ## Production route
 
 `deploy-production.yml` (main #243) is the one live deployment workflow. The

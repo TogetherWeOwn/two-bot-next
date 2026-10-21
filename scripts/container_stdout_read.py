@@ -128,6 +128,25 @@ class ReadFailed(Exception):
     """The read failed; the message is fixed vocabulary, never a response body."""
 
 
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    raised message is fixed vocabulary: it names no key, value or path.
+    """
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
+
+
 def redact(text):
     """Return (text with secret-like values replaced, number of replacements)."""
     count = 0
@@ -265,7 +284,7 @@ class HttpTransport:
         if status != 200:
             raise ReadFailed(status_class(status))
         try:
-            return json.loads(raw)
+            return json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
         except (ValueError, RecursionError):
             raise ReadFailed("bad_response") from None
 

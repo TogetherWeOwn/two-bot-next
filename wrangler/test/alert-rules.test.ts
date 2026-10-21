@@ -973,6 +973,10 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "eventsub_reconcile_failed",
     "event_store_consumer_lag",
     "prefix_trigger_verdict_refusals",
+    "voice_worker_halted",
+    "voice_live_self_heal",
+    "voice_live_not_ready",
+    "voice_queue_stall",
     "feed_fetch_failures",
     "eventsub_receive_gap",
     "eventsub_reconcile_prior_failed",
@@ -1010,6 +1014,10 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("eventsub_tampered", window), `evidence-eventsub_tampered-${window}.json`);
   assert.equal(packetFilename("eventsub_reconcile_failed", window), `evidence-eventsub_reconcile_failed-${window}.json`);
   assert.equal(packetFilename("prefix_trigger_verdict_refusals", window), `evidence-prefix_trigger_verdict_refusals-${window}.json`);
+  assert.equal(packetFilename("voice_worker_halted", window), `evidence-voice_worker_halted-${window}.json`);
+  assert.equal(packetFilename("voice_live_self_heal", window), `evidence-voice_live_self_heal-${window}.json`);
+  assert.equal(packetFilename("voice_live_not_ready", window), `evidence-voice_live_not_ready-${window}.json`);
+  assert.equal(packetFilename("voice_queue_stall", window), `evidence-voice_queue_stall-${window}.json`);
   assert.equal(packetFilename("feed_fetch_failures", window), `evidence-feed_fetch_failures-${window}.json`);
   assert.equal(packetFilename("eventsub_receive_gap", window), `evidence-eventsub_receive_gap-${window}.json`);
   assert.equal(packetFilename("eventsub_reconcile_prior_failed", window), `evidence-eventsub_reconcile_prior_failed-${window}.json`);
@@ -1236,6 +1244,15 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
     prefix = ev([`two_bot_gateway_prefix_trigger_refused_total{reason="verdict"} ${n}`], prefix.state);
   }
   firing.push(...prefix.firing);
+  firing.push(...ev(["two_bot_voice_worker_halted 1"]).firing);
+  firing.push(
+    ...ev(
+      [`two_bot_voice_live_self_heal_total 6`],
+      ev([`two_bot_voice_live_self_heal_total 5`]).state,
+    ).firing,
+  );
+  firing.push(...ev(["two_bot_voice_live_not_ready_seconds 121"]).firing);
+  firing.push(...ev(["two_bot_voice_queue_oldest_age_seconds 121"]).firing);
   const feedErrors = (transport: number) => [
     "invalid_source", "non_public_address", "redirect_refused", "too_large", "invalid_encoding", "unsupported_content_type", "unsupported_encoding", "resolve", "transport", "deadline", "http_error", "other",
   ].map((c) => `two_bot_feed_fetch_errors_total{error_class="${c}"} ${c === "transport" ? transport : 0}`);
