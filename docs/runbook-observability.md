@@ -110,7 +110,9 @@ deployment/schema/ACL issue for the authorized Operator,
 not something to repair with a production query or restart.
 
 Every alert message and alert log line carries the container build revision and
-a log-query link; a crash-loop or unhandled exception surfaces as a sustained
+a log-query link (`Build: <sha>` + `Logs: <url>` via `alertContextSuffix`,
+`wrangler/src/alert-rules.ts:311-320`; `unknown` when the `/readyz` probe
+failed); a crash-loop or unhandled exception surfaces as a sustained
 `/readyz` red, which alerts after the readiness threshold below.
 
 If `/readyz` remains red, the Worker/DO readiness transition alerts after its
@@ -197,9 +199,6 @@ ids: they join to themselves, not to an inbound request.
 These are deliberate, visible limits of the current implementation; do not
 claim them as shipped acceptance:
 
-- Worker/DO alert log lines and Discord messages do not yet consistently carry
-  the Container Git SHA and a direct log-query URL. Use the build/deploy
-  correlation procedure above.
 - Worker/DO request-span and dispatch lines (`internal_actions_ingress`,
   `eventsub_ingress`) carry `release` (the container Git SHA, deploy-stamped
   on the Worker edge and probe-read on the DO relay, `"unknown"` when neither
