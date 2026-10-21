@@ -2389,6 +2389,14 @@ def voice_synthetic_errors(workflow):
     return errors
 
 
+SYNTHETIC_MISSING_BINDING_RUN = {
+    "staging": ('echo "::error::staging synthetic misconfigured: STAGING_WORKER_URL is unset"\n'
+                'exit 1\n'),
+    "prod-passive": ('echo "::error::production synthetic misconfigured: PRODUCTION_WORKER_URL is unset"\n'
+                     'exit 1\n'),
+}
+
+
 def synthetic_user_flow_errors(workflow):
     """Five-minute user-flow synthetic (docs/synthetic-user-flow.md).
 
@@ -2407,6 +2415,8 @@ def synthetic_user_flow_errors(workflow):
     """
     name = "synthetic-user-flow.yml"
     errors = []
+    if "defaults" in workflow:
+        errors.append(f"{name}: workflow-level defaults must stay absent (fail-closed shell)")
     if "env" in workflow:
         errors.append(f"{name}: workflow-level env must stay absent")
     on = workflow.get("on") or {}
@@ -2446,7 +2456,7 @@ def synthetic_user_flow_errors(workflow):
             errors.append(f"{name}:{job_id}: timeout must stay 10 minutes")
         if not runner_allowed(job_id, job.get("runs-on")):
             errors.append(f"{name}:{job_id}: must use the routed runner expression for job '{job_id}'")
-        for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
+        for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy", "defaults"):
             if key in job:
                 errors.append(f"{name}:{job_id}: must not set {key}")
         steps = job.get("steps") or []
@@ -2462,13 +2472,11 @@ def synthetic_user_flow_errors(workflow):
         expected_target = "STAGING_WORKER_URL" if job_id == "staging" else "PRODUCTION_WORKER_URL"
         if probe_step.get("id") != "probe" or expected_target not in str(probe_step.get("if", "")):
             errors.append(f"{name}:{job_id}: probe must be skipped when {expected_target} is unset")
-        expected_notice = expected_target + " is unset"
-        notice_run = str(notice.get("run", ""))
-        if expected_notice not in notice_run or "::error::" not in notice_run:
-            errors.append(f"{name}:{job_id}: missing-binding skip must fail with an error naming the binding")
-        if "exit 1" not in shell_logical_lines(notice_run):
-            errors.append(f"{name}:{job_id}: missing-binding skip must exit 1 on its own line "
-                          "so the run fails closed")
+        if notice.get("run") != SYNTHETIC_MISSING_BINDING_RUN[job_id]:
+            errors.append(f"{name}:{job_id}: missing-binding notice must run exactly the "
+                          "reviewed error and exit 1 command (fail closed)")
+        if "shell" in notice:
+            errors.append(f"{name}:{job_id}: missing-binding notice must not override shell")
         expected_notice_if = (
             f"steps.probe.outcome == 'skipped' && vars.{expected_target} == ''"
             + (" && !inputs.force_fail" if job_id == "staging" else ""))
@@ -2791,23 +2799,32 @@ def scheduled_binding_audit_errors(workflows):
                 or "METRICS_SCRAPE_TOKEN" not in out):
             errors.append(f"{name}: slow-burn-tracker.yml: an unconfigured tracker run "
                           "must exit non-zero with an ::error:: naming the unset bindings")
-    synthetic = ((workflows.get("synthetic-user-flow.yml") or {}).get("jobs") or {})
+    synthetic_workflow = workflows.get("synthetic-user-flow.yml") or {}
+    if "defaults" in synthetic_workflow:
+        errors.append(f"{name}: synthetic-user-flow.yml: workflow-level defaults must "
+                      "stay absent (fail-closed shell)")
+    synthetic = synthetic_workflow.get("jobs") or {}
     targets = (("staging", "STAGING_WORKER_URL"),
                ("prod-passive", "PRODUCTION_WORKER_URL"))
     for job_id, target in targets:
-        steps = (synthetic.get(job_id) or {}).get("steps") or []
+        job = synthetic.get(job_id) or {}
+        if "defaults" in job:
+            errors.append(f"{name}: synthetic-user-flow.yml:{job_id}: job-level defaults "
+                          "must stay absent (fail-closed shell)")
+        steps = job.get("steps") or []
         notices = [step for step in steps
                    if str(step.get("name", "")).startswith("Notice missing ")]
         if len(notices) != 1:
             errors.append(f"{name}: synthetic-user-flow.yml:{job_id}: must keep its "
                           "missing-binding notice step")
             continue
-        run = str(notices[0].get("run", ""))
-        if (target not in run or "::error::" not in run
-                or "exit 1" not in shell_logical_lines(run)):
+        if notices[0].get("run") != SYNTHETIC_MISSING_BINDING_RUN[job_id]:
             errors.append(f"{name}: synthetic-user-flow.yml:{job_id}: missing-binding "
-                          f"notice must fail with an ::error:: naming {target} "
-                          "and exit 1 on its own line")
+                          f"notice must run exactly the reviewed ::error:: naming {target} "
+                          "and exit 1 command")
+        if "shell" in notices[0]:
+            errors.append(f"{name}: synthetic-user-flow.yml:{job_id}: missing-binding "
+                          "notice must not override shell")
         notice_if = str(notices[0].get("if", ""))
         if "steps.probe.outcome" not in notice_if or target not in notice_if:
             errors.append(f"{name}: synthetic-user-flow.yml:{job_id}: missing-binding "
@@ -5709,6 +5726,49 @@ class WorkflowTests(unittest.TestCase):
         del missing["slow-burn-tracker.yml"]
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
+
+    def test_synthetic_missing_binding_notices_cannot_hide_failure(self):
+        mutations = {
+            "dead branch": lambda run: run.replace(
+                "exit 1", "if false; then\nexit 1\nfi"),
+            "early success": lambda run: run.replace("exit 1", "exit 0\nexit 1"),
+            "uncalled function": lambda run: run.replace(
+                "exit 1", "unused() {\nexit 1\n}"),
+            "heredoc": lambda run: run.replace(
+                "exit 1", "cat <<'EOF'\nexit 1\nEOF"),
+        }
+        for job_id in ("staging", "prod-passive"):
+            original = self.workflows["synthetic-user-flow.yml"]["jobs"][job_id]["steps"][2]
+            baseline = subprocess.run(
+                ["bash", "--noprofile", "--norc", "-c", original["run"]],
+                env={"PATH": os.defpath}, capture_output=True, text=True, timeout=5)
+            self.assertEqual(baseline.returncode, 1)
+            self.assertIn("::error::", baseline.stdout)
+            for label, transform in mutations.items():
+                with self.subTest(job=job_id, mutation=label):
+                    changed = deepcopy(self.workflows)
+                    notice = changed["synthetic-user-flow.yml"]["jobs"][job_id]["steps"][2]
+                    notice["run"] = transform(notice["run"])
+                    result = subprocess.run(
+                        ["bash", "--noprofile", "--norc", "-c", notice["run"]],
+                        env={"PATH": os.defpath}, capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, 0)
+                    self.assertTrue(scheduled_binding_audit_errors(changed), label)
+                    self.assertTrue(synthetic_user_flow_errors(changed["synthetic-user-flow.yml"]), label)
+                    self.assertTrue(workflow_policy_errors(changed), label)
+            for scope in ("step", "job", "workflow"):
+                with self.subTest(job=job_id, mutation="shell override", scope=scope):
+                    changed = deepcopy(self.workflows)
+                    workflow = changed["synthetic-user-flow.yml"]
+                    job = workflow["jobs"][job_id]
+                    if scope == "step":
+                        job["steps"][2]["shell"] = "echo {0}"
+                    else:
+                        holder = job if scope == "job" else workflow
+                        holder["defaults"] = {"run": {"shell": "echo {0}"}}
+                    self.assertTrue(scheduled_binding_audit_errors(changed))
+                    self.assertTrue(synthetic_user_flow_errors(workflow))
+                    self.assertTrue(workflow_policy_errors(changed))
 
     def test_five_minute_schedulers_fail_closed_on_missing_bindings(self):
         workflows = self.workflows

@@ -112,6 +112,8 @@ class TrackerUnitTests(unittest.TestCase):
                 self.assertIn("::error::", out)
                 for name in missing:
                     self.assertIn(name, out)
+                for name in set(extra) - set(missing):
+                    self.assertNotIn(name, out)
                 stored = json.loads(Path(evidence).read_text())
                 self.assertEqual(stored["verdict"], "unconfigured")
                 self.assertEqual(stored["action"], "none")
