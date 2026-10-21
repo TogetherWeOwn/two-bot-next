@@ -232,7 +232,7 @@ fn hostile_rank_name_renders_neutralized_single_line() {
         3,
         Some(1),
         9,
-        1500,
+        500,
     );
     assert_eq!(
         rendered.lines().count(),
@@ -257,13 +257,13 @@ fn hostile_rank_name_renders_neutralized_single_line() {
 
 #[test]
 fn overlong_rank_name_is_capped_within_discord_bounds() {
-    let rendered = rank_text(&"x".repeat(3000), 3, Some(1), 9, 1500);
+    let rendered = rank_text(&"x".repeat(3000), 3, Some(1), 9, 500);
     assert!(
         rendered.len() <= 2000,
         "an overlong name cannot overflow the reply, got {} chars",
         rendered.len()
     );
-    let plain = rank_text("x", 3, Some(1), 9, 1500);
+    let plain = rank_text("x", 3, Some(1), 9, 500);
     assert!(
         rendered.len() <= plain.len() + RANK_DISPLAY_NAME_LIMIT,
         "the name contributes at most the documented cap"
