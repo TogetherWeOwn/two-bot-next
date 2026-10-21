@@ -415,6 +415,7 @@ def check_cargo_test(args, root, packages):
         raise ValueError(f"automated verification must be `cargo test`: {' '.join(args)}")
     names, selectors, filters, skips = [], [], [], []
     exact, ignored_only, include_ignored, libtest = False, False, False, False
+    test_threads_seen = False
     pre_filters = 0
     words = iter(args[1:])
     for word in words:
@@ -425,6 +426,10 @@ def check_cargo_test(args, root, packages):
                     f"NOEXEC: refusing non-executing mode {option!r} as automated coverage; "
                     f"next: remove {option} so the command actually runs tests")
             if option in LIBTEST_VALUE_OPTIONS:
+                if option == "--test-threads" and test_threads_seen:
+                    raise ValueError(
+                        f"UNSUPPORTED: libtest option '--test-threads' is single-use "
+                        f"but was repeated; next: pass --test-threads at most once")
                 if has_value:
                     if not value:
                         raise ValueError(
@@ -445,6 +450,7 @@ def check_cargo_test(args, root, packages):
                             f"INVALID_VALUE: option '--test-threads' needs a positive integer "
                             f"but got {value!r}; next: pass a positive integer like "
                             f"`--test-threads 2`")
+                    test_threads_seen = True
                 else:
                     skips.append(value)
             elif option in LIBTEST_FLAG_OPTIONS:
@@ -453,10 +459,32 @@ def check_cargo_test(args, root, packages):
                         f"INVALID_VALUE: flag {option!r} takes no value but got {value!r}; "
                         f"next: drop `={value}` and pass {option} alone")
                 if option == "--exact":
+                    if exact:
+                        raise ValueError(
+                            f"UNSUPPORTED: libtest option '--exact' is single-use "
+                            f"but was repeated; next: pass --exact at most once")
                     exact = True
                 elif option == "--ignored":
+                    if ignored_only:
+                        raise ValueError(
+                            f"UNSUPPORTED: libtest option '--ignored' is single-use "
+                            f"but was repeated; next: pass --ignored at most once")
+                    if include_ignored:
+                        raise ValueError(
+                            f"UNSUPPORTED: conflicting ignore modes '--ignored' and "
+                            f"'--include-ignored' cannot combine; next: pass at most "
+                            f"one of --ignored, --include-ignored")
                     ignored_only = True
                 elif option == "--include-ignored":
+                    if include_ignored:
+                        raise ValueError(
+                            f"UNSUPPORTED: libtest option '--include-ignored' is single-use "
+                            f"but was repeated; next: pass --include-ignored at most once")
+                    if ignored_only:
+                        raise ValueError(
+                            f"UNSUPPORTED: conflicting ignore modes '--ignored' and "
+                            f"'--include-ignored' cannot combine; next: pass at most "
+                            f"one of --ignored, --include-ignored")
                     include_ignored = True
             elif option in CARGO_KNOWN:
                 raise ValueError(
