@@ -56,6 +56,9 @@ and the Worker (`packetFilename` in `wrangler/src/alert-rules.ts`).
 | `voice_live_self_heal` | **ticket**: self-heal repairs rise between valid samples (first sample is baseline-only, restarts re-baseline, missing family is no window) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-live-self-heal) |
 | `voice_live_not_ready` | **page**: live view not ready past 120 s on a connected gateway (promotes the host-watchdog bound; hung dispatch freezes the published age); at or below clears, missing/invalid holds | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-live-not-ready) |
 | `voice_queue_stall` | **ticket**: oldest queued action waiting past 120 s (matches the stuck horizon; hung dispatch freezes publication below the bound); at or below clears, missing/invalid holds | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-queue-stall) |
+| `rest_token_invalid` | **page**: bot-token latch reads 1 on any valid sample (credential death; first sample may fire, only a corrected restart clears) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-rest-token-invalid) |
+| `rest_refusal_surge` | **page**: guard invalid + refused requests grow 10+ between samples (first sample is baseline-only, a backwards counter re-baselines only that family, quiet windows resolve) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-rest-refusal-surge) |
+| `rest_global_responses_stuck` | **page**: global-pause response bodies unresolved for 3 consecutive valid samples (a valid zero resolves; paused/remaining gauges stay rule-free by design) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-rest-global-responses-stuck) |
 
 Out of scope for paging (log-only findings, still recorded on the watch log):
 gateway session starts, handler-latency quantiles, unban-queue depth via
