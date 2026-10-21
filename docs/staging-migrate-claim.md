@@ -10,6 +10,17 @@ environment, `migration_target` and
 `PRODUCTION_HOST`/`PRODUCTION_DATABASE`/`PRODUCTION_BRANCH_ID` pins (a
 PlanetScale plan without the pinned branch id, or a request pin that does not
 match the plan, refuses); a staging claim never satisfies it and vice versa.
+Both gates require the explicit `migration_target` the producer emits
+(`staging` here, `production` there); a field-less or wrong-target manifest
+refuses with fixed vocabulary, and the marker sits outside the projection
+hash. The host denylists are intentionally mirror-image rather than
+identical: the staging gate refuses prod-like hosts and databases, while the
+production gate refuses staging-like hosts (staging label, Neon, test
+database, pooler). Each gate therefore refuses the other's label-bearing
+canonical test host; label-free targets such as identical PlanetScale hosts
+are distinguished by the explicit marker, workflow identity and pin match,
+not the denylist. The explicit-target acceptance tests pin both
+directions.
 
 ## Available before environment approval
 

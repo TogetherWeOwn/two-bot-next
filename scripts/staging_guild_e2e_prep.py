@@ -23,6 +23,20 @@ command resource):
                 (`core_commands` in crates/core/src/commands.rs): proves the
                 list-plus-resource shape a second time.
 
+Registration identity contract: the list is admitted for every targeted
+name before any resource is read: the name must appear on exactly one
+entry, its id must be a canonical snowflake (ASCII decimal 1..2**64-1,
+no sign, padding or path/query characters) carried by no other entry,
+and the entry must name the fenced guild (when it names one) and a
+canonical version. One malformed or ambiguous targeted entry fails that
+command and leaves every other admitted command unread, so no resource
+URL is built from an unadmitted id; a missing name fails only that
+command. The resource read must repeat the admitted id and name and
+pass the same identity checks independently. Valid version drift
+between the two reads is allowed and the receipt records the resource
+(detail) version. Failure reasons are fixed vocabulary; stdout and the
+receipt carry only admitted ids and versions, never remote text.
+
 The live Discord transport (authed GETs against discord.com/api/v10) arrives
 with the full staging suite; this skeleton never reads a token and sends no
 credentials anywhere.
@@ -35,6 +49,7 @@ import argparse
 from dataclasses import dataclass
 import json
 import os
+import re
 import sys
 import time
 
@@ -136,30 +151,78 @@ def check_identity(fetch_fn):
     return me["id"]
 
 
-def check_command(fetch_fn, app_id, guild_id, entries, name):
-    """Read one command's registration: list entry plus its own resource."""
-    entry = next((c for c in entries if isinstance(c, dict) and c.get("name") == name), None)
-    if entry is None:
-        return Result(name, False, "not registered in the staging guild")
+NOT_REGISTERED = "not registered in the staging guild"
+
+# Discord snowflakes are unsigned 64-bit ids sent as decimal strings.
+SNOWFLAKE_RE = re.compile(r"[1-9][0-9]{0,19}")
+SNOWFLAKE_MAX = (1 << 64) - 1
+
+
+def is_snowflake(value):
+    """Canonical ASCII decimal 1..2**64-1 only: safe in a URL path and a receipt."""
+    return (isinstance(value, str) and SNOWFLAKE_RE.fullmatch(value) is not None
+            and int(value) <= SNOWFLAKE_MAX)
+
+
+def identity_fault(command, guild_id):
+    """Fixed phrase for a command object with no usable identity, or None.
+
+    E1 scope is the registration binding (guild scope when named, canonical
+    version); the staging-application and slash-type pins stay on the
+    automation copy.
+    """
+    if "guild_id" in command and command["guild_id"] != guild_id:
+        return "is not scoped to the staging guild"
+    if not is_snowflake(command.get("version")):
+        return "carries no valid version"
+    return None
+
+
+def admit_entry(guild_id, entries, name):
+    """List-stage admission: (command id, None) or (None, fixed failure reason)."""
+    matches = [c for c in entries if isinstance(c, dict) and c.get("name") == name]
+    if not matches:
+        return None, NOT_REGISTERED
+    if len(matches) > 1:
+        return None, "registered more than once under this name"
+    entry = matches[0]
     command_id = entry.get("id")
-    if not isinstance(command_id, str) or not command_id:
-        return Result(name, False, "registered entry carries no command id")
+    if not is_snowflake(command_id):
+        return None, "registered entry carries no valid command id"
+    if sum(isinstance(c, dict) and c.get("id") == command_id for c in entries) > 1:
+        return None, "registered command id is shared with another entry"
+    fault = identity_fault(entry, guild_id)
+    if fault is not None:
+        return None, "registered entry " + fault
+    return command_id, None
+
+
+def read_command(fetch_fn, app_id, guild_id, name, command_id):
+    """Read an admitted command's own resource and bind it to the list entry."""
     detail = get_json(
         fetch_fn,
         f"{API}/applications/{app_id}/guilds/{guild_id}/commands/{command_id}",
     )
-    if not isinstance(detail, dict) or detail.get("name") != name:
+    if (not isinstance(detail, dict) or detail.get("name") != name
+            or detail.get("id") != command_id):
         return Result(name, False, "command resource disagrees with the list entry",
                       command_id=command_id)
-    if detail.get("guild_id") != guild_id:
-        return Result(name, False, "command resource is not scoped to the staging guild",
-                      command_id=command_id)
-    version = detail.get("version")
-    version_text = version if isinstance(version, str) and version else "unversioned"
+    fault = identity_fault(detail, guild_id)
+    if fault is not None:
+        return Result(name, False, "command resource " + fault, command_id=command_id)
+    # The detail version is admitted on its own; drift from the list is allowed.
+    version = detail["version"]
     return Result(name, True,
-                  f"registered in the staging guild (version {version_text})",
-                  command_id=command_id,
-                  version=version if isinstance(version, str) else None)
+                  f"registered in the staging guild (version {version})",
+                  command_id=command_id, version=version)
+
+
+def check_command(fetch_fn, app_id, guild_id, entries, name):
+    """Read one command's registration: list entry plus its own resource."""
+    command_id, reason = admit_entry(guild_id, entries, name)
+    if command_id is None:
+        return Result(name, False, reason)
+    return read_command(fetch_fn, app_id, guild_id, name, command_id)
 
 
 def run(guild_id, fetch_fn):
@@ -176,9 +239,22 @@ def run(guild_id, fetch_fn):
         entries = get_json(fetch_fn, f"{API}/applications/{app_id}/guilds/{guild}/commands")
         if not isinstance(entries, list):
             raise PrepError("command list answered 200 without a list")
-        results = [check_command(fetch_fn, app_id, guild, entries, CONTROL_COMMAND)]
-        results += [check_command(fetch_fn, app_id, guild, entries, name)
-                    for name in PREP_COMMANDS]
+        # Admit every target before the first resource read: one malformed or
+        # ambiguous entry means the list itself is not trusted for any URL.
+        targets = (CONTROL_COMMAND, *PREP_COMMANDS)
+        admitted = [admit_entry(guild, entries, name) for name in targets]
+        trusted = all(command_id is not None or reason == NOT_REGISTERED
+                      for command_id, reason in admitted)
+        results = []
+        for name, (command_id, reason) in zip(targets, admitted):
+            if command_id is None:
+                results.append(Result(name, False, reason))
+            elif not trusted:
+                results.append(Result(name, False,
+                                      "not read: another targeted entry failed list admission",
+                                      command_id=command_id))
+            else:
+                results.append(read_command(fetch_fn, app_id, guild, name, command_id))
     except PrepError as error:
         return None, [Result("interactions", False, str(error))]
     return {"application_id": app_id, "guild_id": guild}, results
