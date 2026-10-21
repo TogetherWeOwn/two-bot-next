@@ -341,6 +341,7 @@ VOICE_EXACT = frozenset({
     "scripts/job-inputs.py",
     "scripts/staging_voice_synthetic.py",
     "scripts/test_staging_voice_synthetic.py",
+    "scripts/test_staging_voice_synthetic_dry_run_acceptance.py",
     "scripts/test_staging_voice_synthetic_gateway_intake_acceptance.py",
     "wrangler/src/container-env.ts",
 })

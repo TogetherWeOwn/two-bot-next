@@ -64,7 +64,6 @@ use super::feature_commands::{
 };
 use super::moderation::{ModerationAction, ModerationGates};
 use super::onboarding::{GAME_SELECT_ID, SESSION_SELECT_ID};
-use super::voice_assistant::assistant_commands;
 use super::voice_rooms::voice_commands;
 
 /// Names of the voice command set, computed once: the router consults them on
@@ -180,8 +179,9 @@ pub struct RouterGates {
     /// `/kick`; the bot-crate voice sink answers every voice name, so the
     /// router yields silently for them.
     pub voice: bool,
-    /// Assistant endpoint configured (`TWO_ASSISTANT_ENDPOINT`). Publishes
-    /// `/templateassistant`, and only while `voice` is also on.
+    /// Assistant endpoint configured (`TWO_ASSISTANT_ENDPOINT`). Kept for
+    /// the assistant slice; `/templateassistant` stays unpublished until
+    /// that slice lands with a handler.
     pub voice_assistant: bool,
     /// Ticket env triple set (category + staff role + panel channel).
     pub tickets: bool,
@@ -362,6 +362,99 @@ impl InteractionRouter {
         self.gates
     }
 
+    /// Conformance seam: the full production registration set, readable
+    /// without the binary crates. `router_with_commands` (bot) plus the
+    /// member verbs (`CommandRuntime::build`, while the member consumer
+    /// exists) plus the LFG pair (`InteractionRuntime::with_router`)
+    /// register the same [`HandlerId`] set; the bot-crate
+    /// `production_router_matches_composed_production_wiring` test fails on
+    /// any drift between that composition and this seam. Registrations here
+    /// are marker ids (execution lives in the slices); only
+    /// [`InteractionRouter::handler_for`] presence is meaningful.
+    #[must_use]
+    pub fn production_router(gates: RouterGates, member_present: bool) -> InteractionRouter {
+        #[derive(Debug)]
+        struct ProductionMarker(HandlerId);
+        impl InteractionHandler for ProductionMarker {
+            fn id(&self) -> HandlerId {
+                self.0
+            }
+        }
+        let mut router = InteractionRouter::new(gates);
+        let mut register = |id: HandlerId| router.register(Box::new(ProductionMarker(id)));
+        if gates.moderation {
+            // Channel slice: the non-member verbs (`register_channel_handlers`).
+            for action in ModerationAction::ALL
+                .into_iter()
+                .filter(|a| !a.targets_member())
+            {
+                register(HandlerId::Moderation(action));
+            }
+        }
+        if gates.automations {
+            // Sticky/admin plus custom rows (`CustomCommandRuntime::register`).
+            register(HandlerId::AutomationAdmin);
+            register(HandlerId::AutomationCustom);
+        }
+        if gates.announcements {
+            for id in [
+                HandlerId::FeedAdd,
+                HandlerId::FeedRemove,
+                HandlerId::FeedList,
+                HandlerId::Rsvp,
+                HandlerId::RsvpAttendance,
+            ] {
+                register(id);
+            }
+        }
+        if gates.scorecard {
+            register(HandlerId::ScorecardAttendance);
+        }
+        for id in [
+            HandlerId::Rank,
+            HandlerId::Leaderboard,
+            HandlerId::Help,
+            HandlerId::Privacy,
+        ] {
+            register(id);
+        }
+        if member_present {
+            // Member verbs (`CommandRuntime::build`, while the consumer exists).
+            for action in [
+                ModerationAction::Ban,
+                ModerationAction::TempBan,
+                ModerationAction::Kick,
+                ModerationAction::Timeout,
+                ModerationAction::Warn,
+            ] {
+                register(HandlerId::Moderation(action));
+            }
+        }
+        // LFG pair (`InteractionRuntime::with_router`, ungated).
+        register(HandlerId::Lfg);
+        register(HandlerId::LfgClose);
+        router
+    }
+
+    /// The single place blessing routeable ids that intentionally stay
+    /// unregistered: the five member verbs while no member consumer exists
+    /// (their owner-map entries guard on the same condition, so the gap keeps
+    /// the unavailable-reply shape instead of executing).
+    #[must_use]
+    pub fn intentional_registration_exceptions(member_present: bool) -> Vec<HandlerId> {
+        if member_present {
+            Vec::new()
+        } else {
+            vec![
+                HandlerId::Moderation(ModerationAction::Ban),
+                HandlerId::Moderation(ModerationAction::TempBan),
+                HandlerId::Moderation(ModerationAction::Kick),
+                HandlerId::Moderation(ModerationAction::Timeout),
+                HandlerId::Moderation(ModerationAction::Warn),
+            ]
+        }
+    }
+
     /// Whether an active voice sink owns this slash name before shared
     /// interaction admission. Builtins stay with the router (notably `/kick`).
     #[must_use]
@@ -413,10 +506,12 @@ impl InteractionRouter {
         if self.gates.voice && voice_command_names().contains(ctx.name) {
             return SlashOutcome::Ignore;
         }
-        // The published assistant has no handler yet. Keep the explicit
-        // unknown-command reply, rather than executing a pre-existing custom
-        // row under a name won by the compiled assistant definition.
-        if self.gates.voice && self.gates.voice_assistant && ctx.name == "templateassistant" {
+        // The assistant has no handler yet and stays unpublished until its
+        // slice lands. Keep the explicit unknown-command reply in every gate
+        // state, rather than executing a pre-existing custom row under the
+        // squatted name (publish withholds it via `reserved_names`, and
+        // custom-command validation rejects new rows).
+        if ctx.name == "templateassistant" {
             return if self.guild_ok(ctx.guild_id) {
                 SlashOutcome::Unknown
             } else {
@@ -683,21 +778,26 @@ impl InteractionRouter {
     /// Builtin names plus the voice names while `TWO_VOICE=1`: a published
     /// voice command shadows a same-named custom row exactly like a builtin
     /// (dispatch yields to the voice sink above), but with the gate off the
-    /// names stay free for custom commands.
+    /// names stay free for custom commands. `/templateassistant` is squatted
+    /// unconditionally until its slice lands: dispatch shadows the name (see
+    /// `route_slash`), so a custom row under it could publish yet never
+    /// execute.
     fn reserved_names(&self) -> HashSet<String> {
         let mut reserved = Self::all_builtin_names();
         if self.gates.voice {
             reserved.extend(voice_command_names().iter().cloned());
         }
+        reserved.insert("templateassistant".to_owned());
         reserved
     }
 
     /// Assemble the ONE complete guild command set for publish-on-ready
     /// (legacy `CommandRegistry::sync` order: community, automation,
-    /// announcement, moderation, then the voice set and `/templateassistant`
-    /// — then DB custom commands). First-wins dedupe and the 100-command
-    /// ceiling come from `merge_commands`; voice `kick` loses to moderation
-    /// `/kick` there.
+    /// announcement, moderation, then the voice set — then DB custom
+    /// commands). `/templateassistant` stays unpublished until its slice
+    /// lands with a handler: no published command may lack one. First-wins
+    /// dedupe and the 100-command ceiling come from `merge_commands`; voice
+    /// `kick` loses to moderation `/kick` there.
     ///
     /// Two publish/routing agreements keep a published command executable:
     /// - custom rows publish only while automations are on. Every custom
@@ -726,9 +826,9 @@ impl InteractionRouter {
         }
         if self.gates.voice {
             extra.push(voice_commands());
-            if self.gates.voice_assistant {
-                extra.push(assistant_commands());
-            }
+            // No assistant push: the name stays reserved (see
+            // `reserved_names`) and dispatch keeps shadowing it, so the
+            // slice re-activates by publishing again.
         }
         // `merge_commands` reserves the active builtins; the router additionally
         // withholds disabled builtin names (same precedence as dispatch) and
@@ -1554,33 +1654,28 @@ mod tests {
     }
 
     #[test]
-    fn templateassistant_needs_both_voice_gates() {
-        use crate::commands::PERM_MANAGE_GUILD;
-        for (voice, assistant, expected) in [
-            (false, false, false),
-            (false, true, false),
-            (true, false, false),
-            (true, true, true),
-        ] {
+    fn templateassistant_stays_unpublished_until_its_slice_lands() {
+        // No handler yet, so no publish in any gate state; the slice
+        // re-activates by publishing again (dispatch keeps shadowing the
+        // squatted name, and the reservation keeps custom rows out).
+        for (voice, assistant) in [(false, false), (false, true), (true, false), (true, true)] {
             let set = published(RouterGates {
                 voice,
                 voice_assistant: assistant,
                 ..all_on()
             });
-            let found = set.iter().any(|c| c.name == "templateassistant");
-            assert_eq!(found, expected, "voice={voice} assistant={assistant}");
+            assert!(
+                !set.iter().any(|c| c.name == "templateassistant"),
+                "voice={voice} assistant={assistant}"
+            );
         }
+        // Both gates on is the full voice set without the assistant: 29
+        // builtins plus the 21 surviving voice names.
         let both = published(RouterGates {
             voice_assistant: true,
             ..voice_on()
         });
-        assert_eq!(both.len(), 51);
-        let last = both.last().expect("non-empty");
-        assert_eq!(last.name, "templateassistant");
-        assert_eq!(
-            last.default_member_permissions,
-            Some(PERM_MANAGE_GUILD.to_string())
-        );
+        assert_eq!(both.len(), 50);
     }
 
     #[test]
@@ -1612,16 +1707,22 @@ mod tests {
                 handler: HandlerId::Moderation(ModerationAction::Kick)
             }
         );
-        // `/templateassistant` has no handler yet: the unknown-command reply,
-        // never silence.
-        let assistant = InteractionRouter::new(RouterGates {
-            voice_assistant: true,
-            ..voice_on()
-        });
-        assert_eq!(
-            assistant.route_slash(&ctx("templateassistant", Some(GUILD), Some(u64::MAX))),
-            SlashOutcome::Unknown
-        );
+        // `/templateassistant` has no handler yet and stays unpublished:
+        // the unknown-command reply in every gate state, never silence
+        // and never a stored custom row.
+        for (voice, voice_assistant) in [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let router = InteractionRouter::new(RouterGates {
+                voice,
+                voice_assistant,
+                ..all_on()
+            });
+            assert_eq!(
+                router.route_slash(&ctx("templateassistant", Some(GUILD), Some(u64::MAX))),
+                SlashOutcome::Unknown,
+                "voice={voice} voice_assistant={voice_assistant}"
+            );
+        }
     }
 
     #[test]
@@ -1663,7 +1764,7 @@ mod tests {
     }
 
     #[test]
-    fn published_assistant_never_executes_a_stored_custom_row() {
+    fn unpublished_assistant_never_publishes_nor_runs_a_stored_custom_row() {
         for (voice, voice_assistant) in [(false, false), (false, true), (true, false), (true, true)]
         {
             let router = InteractionRouter::new(RouterGates {
@@ -1676,28 +1777,24 @@ mod tests {
                 description: "Stored custom row".to_owned(),
                 enabled: true,
             };
+            // The squatted name never publishes, so the stored row stays out
+            // in every gate state.
             let definitions = router.publish_set(&[row]).unwrap();
-            let assistant = definitions
-                .iter()
-                .find(|def| def.name == "templateassistant")
-                .unwrap();
-            assert_eq!(
-                assistant.description == "Stored custom row",
-                !(voice && voice_assistant)
+            assert!(
+                !definitions
+                    .iter()
+                    .any(|def| def.name == "templateassistant"),
+                "voice={voice} voice_assistant={voice_assistant}"
             );
+            // ... and dispatch never runs it either.
             let context = SlashContext {
                 custom_row: Some(true),
                 ..ctx("templateassistant", Some(GUILD), Some(0))
             };
             assert_eq!(
                 router.route_slash(&context),
-                if voice && voice_assistant {
-                    SlashOutcome::Unknown
-                } else {
-                    SlashOutcome::Handled {
-                        handler: HandlerId::AutomationCustom,
-                    }
-                }
+                SlashOutcome::Unknown,
+                "voice={voice} voice_assistant={voice_assistant}"
             );
         }
     }

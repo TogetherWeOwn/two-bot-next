@@ -23,10 +23,11 @@ guild fences, feature gates and handler checks still apply. See [parity](parity.
 The router publishes one complete set: first definition wins, built-in names\n\
 are reserved, and Discord's 100-command limit applies. Database-backed custom\n\
 commands and optional text triggers are dynamic and are not listed here.\n\n\
-The voice commands publish only while `TWO_VOICE=1`, and `/templateassistant`\n\
-also needs `TWO_ASSISTANT_ENDPOINT`; both are enabled here. The voice `kick`\n\
-loses first-wins to moderation `/kick`, so the `/kick` below is the moderation\n\
-command and the vote-kick shape is not listed.\n\n\
+The voice commands publish only while `TWO_VOICE=1`, which is enabled\n\
+here. `/templateassistant` stays unpublished until its slice lands with a\n\
+handler, so `TWO_ASSISTANT_ENDPOINT` currently publishes nothing. The voice\n\
+`kick` loses first-wins to moderation `/kick`, so the `/kick` below is the\n\
+moderation command and the vote-kick shape is not listed.\n\n\
 Bounds below are registry bounds; a dash means no bound is declared there,\n\
 not that handler validation is unlimited. Permissions are Discord default\n\
 member-permission bitfields, not a replacement for runtime authorization.\n\n";
@@ -44,63 +45,86 @@ a required value or an implemented consumer. Secret defaults are never rendered.
 - `env_only`: never dashboard-stored. Unknown names and `TWO_INTERNAL_*` fail closed.\n\
 - `cold` / `hot`: legacy-catalog storage classes, not application promises.\n\
   The Container registers a `guild_settings` poll job\n\
-  (`crates/bot/src/website_jobs.rs:152`) publishing through\n\
-  `settings_jobs::live` (`crates/bot/src/settings_jobs.rs:53`). Message-path\n\
-  automod refreshes its lists, thresholds and enforce flag from that snapshot\n\
-  on every delivery (`automod_gateway.rs:211-222`, `:292`); the feed poller\n\
-  re-reads its interval from the snapshot before every tick\n\
-  (`feed_jobs.rs:235-287`). Other stored reads happen through per-runtime\n\
-  store refreshes (`raid_runtime.rs:136`,\n\
-  `containment_runtime.rs:186`, `join_risk_runtime.rs:198`) and onboarding's\n\
-  per-event refresh (`onboarding.rs:167`). Gateway feature gates still come\n\
-  from process environment only, so a database-only value such as\n\
-  `TWO_AUTOMATIONS=1` stays disabled (re-checked at `bce86a791`).\n\
+  (`crates/bot/src/website_jobs.rs:207`) publishing a `SettingsCache`\n\
+  snapshot every 15 s through `settings_jobs::live`\n\
+  (`crates/bot/src/settings_jobs.rs:53`). Every consumer reads store-first:\n\
+  a stored row wins and an absent row falls back to the boot value, except\n\
+  the invite responder, which falls back to the live vanity code; a malformed\n\
+  row falls back to a safe value, refuses, or filters entries depending on\n\
+  the runtime (see below), and `None` while parked or pre-first-poll layers\n\
+  nothing. Gateway\n\
+  feature gates still come from process environment only, so a\n\
+  database-only value such as `TWO_AUTOMATIONS=1` stays disabled\n\
+  (re-checked at `1643438`).\n\
   Keys in\n\
   legacy `HOT_WIRED` are labeled “reload-report hot” (the `RefreshReport::hot`\n\
   partition in `settings.rs`); every other storable key reports cold.\n\n\
-The thirty-five keys in `STORE_READ_KEYS`\n\
+Live snapshot consumers at `1643438` (canonical table; eight `live()` call\n\
+sites across five runtimes, plus voice through the gateway closure):\n\n\
+| Runtime | Call sites | Reads | When |\n\
+| --- | --- | --- | --- |\n\
+| automod | `automod_gateway.rs:211-223`, `:292` | 10 live lists, thresholds, enforce flag (`:116-127`) | every message delivery |\n\
+| feed | `feed_jobs.rs:235-237` | `TWO_FEED_POLL_SECONDS` (`:207`) | supervisor cadence + per-tick gate (`:246-289`) |\n\
+| audit | `audit_runtime.rs:308`, `:438` | 3 mirror destinations (`:60-63`) | every record (`:483`) and sweep (`:497`), once installed |\n\
+| ticket | `ticket_runtime.rs:457`, `:981` | 3 ticket destinations (`:172-175`) | every execute/recovery and purge |\n\
+| gateway classifier | `gateway.rs:774-789`, `:918` | human/welcome channel sets (`:800-817`) | every guild message; classifier + facts sink swap together (`leveling_runtime.rs:766`) |\n\
+| voice | `gateway.rs:2082` closure | empty grace (`voice_rooms.rs:9415`), invite code (`:9460`) | spawn (`:7753-7757`), maintenance (`:3319`), `/invite` (`:13306-13307`) |\n\n\
+The thirty-six keys in `STORE_READ_KEYS`\n\
 (`crates/core/tests/reference_docs.rs`) say “applied live by runtime refresh”\n\
 instead of “stored unwired”: containment applies `TWO_ANTI_NUKE_WINDOW_SECONDS`,\n\
 `TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS`, `TWO_ANTI_NUKE_HEAT_THRESHOLD` and\n\
 `DISCORD_STAFF_ALERT_CHANNEL_ID`\n\
-(`crates/bot/src/containment_runtime.rs:61-67`, `:227`); join-risk applies\n\
+(`crates/bot/src/containment_runtime.rs:61-67`, `:278-286`); join-risk applies\n\
 `TWO_JOIN_RISK_THRESHOLD`, `TWO_JOIN_RISK_WINDOW_SECONDS`,\n\
 `TWO_BULK_JOIN_WINDOW_UNTIL` and `DISCORD_STAFF_ALERT_CHANNEL_ID`\n\
-(`crates/bot/src/join_risk_runtime.rs:66-70`, `:239`); raid applies\n\
+(`crates/bot/src/join_risk_runtime.rs:66-70`, `:239-249`); raid applies\n\
 `TWO_RAID_JOIN_THRESHOLD`, `TWO_RAID_WINDOW_SECONDS` and\n\
 `DISCORD_STAFF_ALERT_CHANNEL_ID`\n\
-(`crates/bot/src/raid_runtime.rs:45-48`, `:177`); onboarding merges its\n\
-`CONFIG_KEYS` from the snapshot on each relevant\n\
-event (`crates/bot/src/onboarding.rs:21-30`, `:175-182`); message-path automod\n\
+(`crates/bot/src/raid_runtime.rs:45-48`, `:194-202`); all three refuse\n\
+malformed tuning instead of falling back, disabling observations/scoring\n\
+while refused (`crates/bot/src/containment_runtime.rs:318-330`,\n\
+`crates/bot/src/raid_runtime.rs:236-247`,\n\
+`crates/bot/src/join_risk_runtime.rs:300-309`); onboarding merges its\n\
+`CONFIG_KEYS` from a per-event snapshot\n\
+(`crates/bot/src/onboarding.rs:21-30`, `:271-295`), where only a malformed\n\
+dry-run row keeps the boot value (`:159-168`) while a malformed channel row\n\
+fails the job; message-path automod\n\
 applies its ten live lists, thresholds and the enforce flag from the snapshot\n\
-on every delivery (`crates/bot/src/automod_gateway.rs:211-222`, `:292`);\n\
+on every delivery (`crates/bot/src/automod_gateway.rs:116-127`, `:211-223`, `:292`);\n\
 the feed poller applies `TWO_FEED_POLL_SECONDS` from the snapshot to the\n\
 supervisor cadence and its per-tick schedule gate, so a changed interval\n\
 reschedules the next run to last-run + new interval without a restart\n\
 (`crates/bot/src/feed_jobs.rs:235-287`); the audit mirror applies\n\
 `DISCORD_AUDIT_LOG_CHANNEL_ID`, `DISCORD_VOICE_LOG_CHANNEL_ID` and\n\
 `DISCORD_MODERATION_LOG_CHANNEL_ID` from the snapshot on every record and\n\
-sweep (`crates/bot/src/audit_runtime.rs`), where blanking all three parks the\n\
-mirror live and a malformed row keeps the last good destinations; ticket operations apply\n\
+sweep (`crates/bot/src/audit_runtime.rs:60-63`, `:308`, `:438`), where blanking\n\
+all three parks the mirror live and a malformed row keeps the last good\n\
+destinations; with no destination at boot, registration installs neither the\n\
+mirror handle nor the retry job, so a later stored destination cannot activate\n\
+that parked runtime (`crates/bot/src/audit_runtime.rs:137-161`); ticket\n\
+operations apply\n\
 `DISCORD_TICKET_CATEGORY_ID`, `DISCORD_TICKET_PANEL_CHANNEL_ID` and\n\
 `DISCORD_TICKET_STAFF_ROLE_ID` from the snapshot on every execute, recovery\n\
-and purge (`crates/bot/src/ticket_runtime.rs`); the gateway funnel applies\n\
+and purge (`crates/bot/src/ticket_runtime.rs:172-175`, `:457`, `:981`), where a\n\
+malformed row keeps the last good destinations like the audit mirror; the gateway funnel applies\n\
 `TWO_COMMUNITY_HUMAN_CHANNEL_IDS` and `TWO_COMMUNITY_WELCOME_CHANNEL_IDS`\n\
 from the snapshot on every guild message, refreshing the channel classifier\n\
 and the community-facts sink together before the message's channel class is\n\
-stamped (`crates/bot/src/gateway.rs`, `crates/discord/src/leveling_runtime.rs`); the voice sweep applies `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` from the snapshot on spawn and every maintenance refresh, so a stored per-guild grace reaches the deletion sweep without a restart (`crates/bot/src/voice_rooms.rs:3070-3093`, `:8741`). Two boot-only edges\n\
+stamped (`crates/bot/src/gateway.rs:774-789`, `:918`, `crates/discord/src/leveling_runtime.rs:766`), with malformed entries filtered silently so a wholly-malformed row applies as the empty set (`crates/core/src/community.rs:252-260`); the voice sweep applies `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` from the snapshot on spawn and every maintenance refresh, so a stored per-guild grace reaches the deletion sweep without a restart (`crates/bot/src/voice_rooms.rs:7753-7757`, `:3319`), and the invite responder applies `TWO_GUILD_INVITE_CODE` per `/invite` interaction (`crates/bot/src/voice_rooms.rs:13306-13307`), falling back to the live vanity code when the row is absent or invalid (`:9462-9467`). Two boot-only edges\n\
 remain: the voice room-name policy is\n\
 built once at boot from the process environment\n\
-(`crates/bot/src/gateway.rs:1608`); and gateway intents plus ticket command\n\
-publication read the ticket destination keys once at boot, so a stored ticket\n\
+(`crates/bot/src/gateway.rs:2080`); and gateway intents plus ticket command\n\
+publication read the ticket destination keys once at boot\n\
+(`crates/bot/src/gateway.rs:150`, `crates/bot/src/command_runtime.rs:431`), so a stored ticket\n\
 destination reaches already-published commands only through the per-operation\n\
 refresh above. Every other\n\
 storable row's stored value is unwired.\n\n\
 Gateway boot reads process environment only, through a fixed set of loaders:\n\
 `Config::from_env` (`DISCORD_TOKEN`, `DATABASE_URL`, `LISTEN_ADDR`, `GUILD_ID`),\n\
-`StickyRuntime::from_env` (`FeatureGates`: `TWO_AUTOMATIONS`, `TWO_ANNOUNCEMENTS`,\n\
-`TWO_TEXT_COMMANDS`, `TWO_FEED_POLL_SECONDS`; `ModerationGates`: `TWO_MODERATION`,\n\
-`TWO_OWEN_USER_ID`, `TWO_MODERATION_PROTECTED_ROLE_IDS`; plus `DISCORD_API_BASE`),\n\
+`FeatureGates::from_env` (`TWO_AUTOMATIONS`, `TWO_ANNOUNCEMENTS`,\n\
+`TWO_TEXT_COMMANDS`, `TWO_FEED_POLL_SECONDS`), `ModerationGates::from_env`\n\
+(`TWO_MODERATION`, `TWO_OWEN_USER_ID`, `TWO_MODERATION_PROTECTED_ROLE_IDS`),\n\
+a direct `DISCORD_API_BASE` env read,\n\
 and `intents_from_env` (`TWO_AUTOMOD`, `DISCORD_TICKET_CATEGORY_ID`,\n\
 `DISCORD_TICKET_STAFF_ROLE_ID`, `DISCORD_TICKET_PANEL_CHANNEL_ID`), with\n\
 `DISCORD_GATEWAY_URL` as a loopback-only test override. Rows for storable keys\n\
@@ -112,8 +136,10 @@ When voice is enabled, `build_production_runtime` also reads\n\
 `TWO_TEMP_VOICE_CATEGORY_ID` and `TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS` solely\n\
 for delete protection, not creator provisioning. Its empty grace is fixed at\n\
 60 seconds unless `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` (0 to 600) sets it at boot, and a stored per-guild row overrides that boot value live (out-of-range rows fail closed to the boot value).\n\
-Onboarding, automod and scorecard typed loaders exist but are not\n\
-called during boot; their defaults below come from empty-map calls. The\n\
+Automod and scorecard typed loaders exist but are not\n\
+called during boot; their defaults below come from empty-map calls.\n\
+Onboarding gates are validated at boot (`OnboardingGates::from_env`,\n\
+`crates/bot/src/main.rs:563`): an invalid `TWO_ONBOARDING_MODE` fails startup. The\n\
 classifier loader runs when the ordered pipeline is built and again when\n\
 community-facts capture is armed, then refreshes live per guild message as\n\
 above. The separate\n\
@@ -151,11 +177,12 @@ gates (`feature_commands.rs`), moderation (`moderation.rs`), onboarding\n\
 (`community.rs`). An empty ID list never contains a live ID.\n\n";
 
 /// Catalog keys with an implemented boot-time process-environment read
-/// (`StickyRuntime::from_env` gates and gateway intents). Every storable key
+/// (`FeatureGates`/`ModerationGates` `from_env` and gateway intents). Every storable key
 /// outside `BOOT_ENV` and `STORE_READ_KEYS` has no runtime consumer: a
 /// database-only setting stays inert after restart, and
-/// onboarding/automod/scorecard/classifier loaders below supply defaults
-/// without being called during boot.
+/// automod/scorecard/classifier loaders below supply defaults
+/// without being called during boot (onboarding gates are validated
+/// at boot; see `CONFIG_INTRO`).
 const BOOT_ENV: &[&str] = &[
     "TWO_AUTOMATIONS",
     "TWO_ANNOUNCEMENTS",
@@ -176,16 +203,18 @@ const BOOT_ENV: &[&str] = &[
 ];
 
 /// Catalog keys whose dashboard-stored values are applied at runtime through
-/// per-runtime store refreshes, not boot env or the reload-report path:
-/// containment (`containment_runtime.rs:61-67`, `:226`), join-risk
-/// (`join_risk_runtime.rs:66-70`, `:238`), raid (`raid_runtime.rs:45-46`,
-/// `:170`), onboarding's per-event `CONFIG_KEYS` merge
-/// (`onboarding.rs:21-30`, `:175-182`), message-path automod's per-delivery
-/// live refresh (`automod_gateway.rs:211-222`, `:292`), the feed poller's
-/// per-tick schedule gate (`feed_jobs.rs:235-287`), the voice sweep's
-/// per-guild empty-grace refresh (`voice_rooms.rs:3070-3093`, `:8741`) and
-/// the invite responder's per-interaction code resolution
-/// (`stored_invite_code_with`).
+/// the live snapshot or per-runtime store refreshes, not boot env or the
+/// reload-report path: automod's per-delivery live refresh
+/// (`automod_gateway.rs:211-223`, `:292`), the feed poller's per-tick gate
+/// (`feed_jobs.rs:235-237`), the audit mirror's per-record/sweep refresh
+/// (`audit_runtime.rs:308`, `:438`), ticket's per-operation refresh
+/// (`ticket_runtime.rs:457`, `:981`), the gateway classifier's per-message
+/// refresh (`gateway.rs:774-789`, `:918`), voice grace/invite through the
+/// gateway closure (`gateway.rs:2082`), containment
+/// (`containment_runtime.rs:61-67`, `:278-286`), join-risk
+/// (`join_risk_runtime.rs:66-70`, `:239-249`), raid
+/// (`raid_runtime.rs:45-48`, `:194-202`) and onboarding's per-event
+/// `CONFIG_KEYS` merge (`onboarding.rs:21-30`, `:271`).
 /// These rows say “applied live by runtime refresh” in the table below;
 /// every other storable key keeps the legacy `HOT_WIRED`/boot-env labels.
 const STORE_READ_KEYS: &[&str] = &[

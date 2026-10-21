@@ -494,7 +494,8 @@ production revision) through the watch deadline `T_0 + 48 h`:
 ```sh
 python3 scripts/cutover_watch_checkpoint.py --checkpoint +15m \
     --expected-sha <40-hex> --expected-build-id <run-id>-<attempt> \
-    --production-url https://<production-worker>/
+    --production-url https://<production-worker>/ \
+    --format markdown
 ```
 
 `--checkpoint` is one of the five labels `+15m`, `+1h`, `+6h`, `+24h`,
@@ -507,6 +508,13 @@ revision/build-ID match; anything short of a full match is EXTEND, never
 GO, and a ROLLBACK decision stays human. Checkpoints follow
 [cutover.md](cutover.md) §48-hour watch. Poll read-only on a short cadence
 (suggested 60 s); record findings, not every healthy poll.
+
+`--format json` emits the same checkpoint as a one-line machine receipt
+instead of the table row, with stable `reason` ids and a `next_action`:
+
+```json
+{"checkpoint": "+15m", "verdict": "GO", "reason": "ready_match", "reason_detail": "/readyz 200: all 4 components ready, revision matches the SHA, build 700-1", "origin": "https://two-bot-next-production.<sub>.workers.dev", "expected": {"build_revision": "<40-hex>", "build_id": "<run>-<attempt>"}, "observed": {"build_revision": "<40-hex>", "build_id": "<run>-<attempt>"}, "next_action": "paste the GO row onto the execution card and continue the watch"}
+```
 
 ### Watch header (record once at T_0)
 

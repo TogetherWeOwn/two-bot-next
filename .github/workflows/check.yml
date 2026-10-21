@@ -276,6 +276,9 @@ jobs:
       - name: Cutover runbook links resolve (offline)
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cutover_doc_links.py' -v
 
+      - name: Docs script/workflow path citations resolve (offline)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docs_path_conformance.py' -v
+
       - name: parity soak checklist coverage (offline)
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py
@@ -283,6 +286,7 @@ jobs:
 
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_staging_probe.py' -v
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_probe_timeout_location_acceptance.py' -v
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_staging_evidence_duplicate_key_refusal_acceptance.py' -v
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_synthetic_alert_redirect_refusal.py' -v
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_synthetic_alert_history_redirect_refusal.py' -v
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_staging_voice_synthetic_redirect_refusal.py' -v
@@ -291,6 +295,8 @@ jobs:
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_synthetic_alert_duplicate_key_acceptance.py' -v
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_synthetic_alert_history_duplicate_key_acceptance.py' -v
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_slow_burn_tracker_duplicate_key_acceptance.py' -v
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_docker_manifests_no_assert_acceptance.py' -v
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docker_deps_no_assert.py' -v
 
       - name: soak evidence parser (offline, fixtures only)
         run: |
@@ -317,6 +323,12 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_run_record.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_run_record_no_echo_acceptance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_run_record_condition_shapes.py' -v
+
+      - name: SBOM intake refusal acceptance (offline)
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_validate_sbom_intake_refusal_acceptance.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_vulnerability_preflight_intake_refusal_acceptance.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_release_sbom_target_intake_refusal_acceptance.py' -v
 
       - name: Validate voice template fixtures (hermetic, no renderer)
         run: |
@@ -794,12 +806,25 @@ jobs:
       - name: cargo test (unit and binary, including RSVP store)
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-        run: cargo test --workspace --lib --bins --features two-bot-core/db --locked
+        # The ticket skip/budget log-assertion modules assert exact counts via
+        # first-match on the process-wide tracing capture; they run serially
+        # in their own step below, so skip them here where sibling and
+        # revision tests emit the same messages concurrently.
+        run: cargo test --workspace --lib --bins --features two-bot-core/db --locked -- --skip ticket_runtime::cursor_budget
 
       # Global metric deltas must not be satisfied by a sibling hostile-name test.
       # Reuse the compiled feature graph, in a fresh process with serial tests.
       - name: cargo test (isolated voice-name filter acceptance)
         run: cargo test -p two-bot --lib --features two-bot-core/db --locked voice_rooms::tests::name_filter_acceptance -- --test-threads=1
+
+      # Ticket skip/budget log-assertion modules assert exact skip/dropped
+      # counts via first-match on the process-wide tracing capture, while
+      # sibling and revision tests calling recovery_batch emit the same
+      # messages with different counts. Run these modules alone, serially, in
+      # a fresh process (skipped in the parallel step above); reused feature
+      # graph, no DB.
+      - name: cargo test (isolated ticket skip/budget acceptance)
+        run: cargo test -p two-bot --bin two-bot --features two-bot-core/db --locked ticket_runtime::cursor_budget -- --test-threads=1
 
       # The standalone backup fixture has its own scratch-only URL guard.
       # Supplying it here executes the round trip rather than its local skip.
@@ -2062,6 +2087,8 @@ jobs:
           save-if: ${{ github.event_name == 'push' }}
       - name: self-role claim, renewal, recovery and fencing tests
         run: cargo test -p two-bot-cutover --test self_role_store --locked -- --ignored
+      - name: self-role ticket acknowledgement columns and caps
+        run: cargo test -p two-bot-cutover --test self_role_ack_acceptance --locked -- --ignored
       - name: self-role runtime admission and immutable snapshots (mock REST and isolated schema)
         run: >-
           cargo test -p two-bot --locked self_role_runtime:: -- --include-ignored --test-threads=1
@@ -2201,6 +2228,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_smoke_fail_paths_acceptance.py' -v
       - name: Offline smoke inspect-fields regressions
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_smoke_inspect_fields_regression.py' -v
+      - name: Offline smoke dry-run acceptance
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_smoke_dry_run_acceptance.py' -v
       - name: Offline JSON-log smoke parser regressions
         run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-logging-container.py --self-test
       # A skipped build still reports success: the offline tests above ran,
@@ -2488,8 +2517,17 @@ jobs:
       - name: Ticket lifecycle and migration integration tests
         run: cargo test -p two-bot-cutover --locked --test tickets_store -- --ignored
       - name: Ticket shared router and mock Discord lifecycle acceptance
+        # The ticket skip/budget log-assertion modules assert exact counts via
+        # first-match on the process-wide tracing capture; they run serially
+        # in the isolated step below, so skip them here where the revision
+        # tests emit the same messages concurrently.
         run: >-
-          cargo test -p two-bot --locked --bin two-bot ticket_runtime:: -- --include-ignored
+          cargo test -p two-bot --locked --bin two-bot ticket_runtime:: -- --include-ignored --skip ticket_runtime::cursor_budget
+      # Same serial isolation as the check job: the skip/budget modules share
+      # one process-wide capture with the revision tests above, so they run
+      # alone with --test-threads=1 in a fresh process.
+      - name: cargo test (isolated ticket skip/budget log assertions)
+        run: cargo test -p two-bot --locked --bin two-bot ticket_runtime::cursor_budget -- --test-threads=1
 
   fuzz-compile:
     name: fuzz compile
@@ -2682,6 +2720,9 @@ jobs:
       - name: Verify staging voice synthetic (offline fixtures)
         if: needs.job-inputs.outputs.voice != 'false'
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_voice_synthetic.py -v
+      - name: Verify staging voice synthetic dry-run (offline fixtures)
+        if: needs.job-inputs.outputs.voice != 'false'
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_voice_synthetic_dry_run_acceptance.py -v
       - name: Verify staging voice synthetic gateway intake (offline fixtures)
         if: needs.job-inputs.outputs.voice != 'false'
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_voice_synthetic_gateway_intake_acceptance.py -v
@@ -2699,6 +2740,10 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_prod_passive_probe_duplicate_key_acceptance.py -v
       - name: Verify synthetic alert delivery (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_synthetic_alert.py -v
+      - name: Verify synthetic alert dry-run (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_synthetic_alert_dry_run_acceptance.py -v
+      - name: Verify dry-run exit-code pins (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_dry_run_exit_code_pins.py -v
       - name: Verify synthetic alert history rollover (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_synthetic_alert_history_rollover.py -v
       - name: Verify slow-burn card filer (offline fixtures)
@@ -2725,6 +2770,10 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_rollback_readiness_probe.py -v
       - name: Verify cutover watch checkpoint (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_cutover_watch_checkpoint.py -v
+      - name: Verify cutover watch checkpoint origin admission (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_cutover_watch_checkpoint_origin_acceptance.py -v
+      - name: Verify cutover watch checkpoint structured receipt (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_cutover_watch_checkpoint_receipt_acceptance.py -v
       - name: Verify runner routing for every workflow job
         if: needs.job-inputs.outputs.worker != 'false'
         run: python3 ../scripts/test-runner-routing.py
