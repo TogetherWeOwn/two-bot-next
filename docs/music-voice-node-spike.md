@@ -77,7 +77,7 @@ Placement and secrecy rules:
   built today by `crates/core/src/music_voice.rs` (pure, unit-tested).
 - Staging-only follows the `TWO_VOICE` precedent: `TWO_MUSIC=1` in
   `[env.staging.vars]` only, forwarded via `FORWARDED_FLAGS`, refused
-  top-level and in production by `scripts/check-env-bindings.py`. Rollback
+  top-level and in production by `wrangler/scripts/check-env-bindings.py`. Rollback
   is delete-the-line plus redeploy. Every forward additionally checks the
   dispatch guild against the configured staging `GUILD_ID`
   (`music_voice::is_staging_guild`).
