@@ -41,6 +41,7 @@ code and are byte-identical.
 - `backup_upload_usage` — expected exactly one argument.
 - `backup_upload_not_regular_file` — the path is not a regular file.
 - `backup_upload_empty_file` — refusing to upload an empty file.
+- `backup_upload_dump_too_large` — the dump exceeds the 1 GiB cap.
 - `backup_upload_s3_target` — S3 target/env misconfigured.
 - `backup_upload_read_failed` — cannot read the dump file.
 - `backup_upload_put_status` — PUT returned a non-2xx status.
@@ -385,7 +386,8 @@ roles; missing managed resources cannot silently become unresolved late writes.
 
 Restore: `two-bot guild-config-restore --snapshot FILE` plans (prints
 `WOULD …`); add `--confirm-staging-guild --apply` to write, `--evidence
-FILE` for the hash-proven receipt. Tampered backups are refused (exit 3)
+FILE` for the hash-proven receipt. Snapshots past 8 MiB are refused (exit 2)
+before buffering or any Discord read. Tampered backups are refused (exit 3)
 before any Discord read or write; pre-seal snapshots warn and proceed.
 Apply ends with the post-restore hash compared against the remapped source:
 mismatch → exit 1 with the residual operations listed.
