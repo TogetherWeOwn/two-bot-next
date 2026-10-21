@@ -327,13 +327,27 @@ impl GatewaySessionStore {
                             .inviter_id
                             .map(|id| id.to_string())
                             .filter(|id| !suppressed.contains(id.as_str()));
+                        // Discord counters are `u64`; the column is INTEGER.
+                        // Saturate instead of failing the whole dispatch: the
+                        // buffer already clamped at ingest, so this warn fires
+                        // only for batches that bypassed it.
+                        let saturated = two_bot_core::invites::saturate_invite_uses(state.uses);
+                        if saturated != state.uses {
+                            tracing::warn!(
+                                guild_id = %self.guild_id,
+                                code = %state.code,
+                                "invite uses saturated at i32::MAX",
+                            );
+                        }
+                        // `saturated <= i32::MAX`, so the cast cannot truncate.
+                        let uses = saturated as i32;
                         sqlx::query(
                             "INSERT INTO invite_snapshots (guild_id, code, uses, inviter_id, channel_id, updated_at)
                              VALUES ($1, $2, $3, $4, $5, to_timestamp($6::double precision / 1000))
                              ON CONFLICT (guild_id, code) DO UPDATE SET uses = EXCLUDED.uses,
                              inviter_id = EXCLUDED.inviter_id, channel_id = EXCLUDED.channel_id, updated_at = EXCLUDED.updated_at",
                         ).bind(&self.guild_id).bind(state.code)
-                            .bind(i32::try_from(state.uses).map_err(|e| sqlx::Error::Decode(Box::new(e)))?)
+                            .bind(uses)
                             .bind(inviter)
                             .bind(state.channel_id.map(|id| id.to_string()))
                             .bind(session.updated_at_ms).execute(&mut *tx).await?;
@@ -433,8 +447,18 @@ impl GatewaySessionStore {
             }
             let mut live_codes = Vec::with_capacity(snapshot.states.len());
             for state in snapshot.states {
-                let uses =
-                    i32::try_from(state.uses).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+                // Same saturation as the `SnapshotWrite` flush above: a
+                // poison counter must degrade, never roll back the dispatch.
+                let saturated = two_bot_core::invites::saturate_invite_uses(state.uses);
+                if saturated != state.uses {
+                    tracing::warn!(
+                        guild_id = %self.guild_id,
+                        code = %state.code,
+                        "invite uses saturated at i32::MAX",
+                    );
+                }
+                // `saturated <= i32::MAX`, so the cast cannot truncate.
+                let uses = saturated as i32;
                 // Suppressed inviters keep the aggregate `uses` count but
                 // lose the per-user attribution.
                 let inviter = state
