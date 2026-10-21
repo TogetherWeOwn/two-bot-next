@@ -1,7 +1,7 @@
 //! Bounded retry for the sync store seam.
 //!
 //! The core seams are sync, so a transient DB error inside
-//! [`block_on_retry`] cannot surface as a value the hot task could act on:
+//! `block_on_retry` cannot surface as a value the hot task could act on:
 //! reads degrade to fail-closed defaults and writes panic. Retrying first
 //! keeps a momentary blip (failover, pool churn, a dropped handshake) from
 //! ever reaching that terminal step.
