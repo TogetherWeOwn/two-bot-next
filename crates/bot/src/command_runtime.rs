@@ -1686,7 +1686,14 @@ impl CommandRuntime {
                 // admission refusal — none of them reached Discord as a
                 // mutation). Timeouts, transport losses and ambiguous
                 // statuses keep the fence: the post may be live.
-                if err.is_admission_blocked() || err.proves_no_effect() {
+                let admission_refused = err.is_admission_blocked()
+                    || matches!(
+                        discord_class(&err),
+                        "admission_storage_unavailable"
+                            | "admission_configuration_invalid"
+                            | "admission_stale_claim"
+                    );
+                if admission_refused || err.proves_no_effect() {
                     self.release(&guild_id, &channel_id, &claim_token).await;
                     self.audit(
                         &guild_id,
