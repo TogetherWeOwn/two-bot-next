@@ -1,0 +1,59 @@
+name: staging-retention-census
+
+# Manual, staging-only, read-only event-store retention census for the
+# event-store retention expiry (PR #1006). Dispatch-only; never runs
+# automatically; no production path. It runs three pinned aggregate groups
+# (migration ledger plus expiry-index presence, eligible-old vs fresh counts
+# by retention family, and a bounded stable-cohort digest before and after
+# one natural ~900s DryRun interval with an in-job sleep) through the
+# existing no-reviewer `staging-migrate-plan` environment binding
+# TWO_BOT_STAGING_PLAN_DATABASE_URL (a login holding only
+# two_bot_migrator_ro, physically read-only). It creates or changes no
+# credential; a missing binding is refused before any connection. The
+# expected staging host, database and branch pins are that environment's
+# existing non-secret vars. Output is counts, digests and timestamps only
+# (log only, no artifact): no raw rows, member IDs, payloads or connection
+# strings. It never invokes retention, never activates Execute and never
+# changes a mode.
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: staging-retention-census
+  cancel-in-progress: false
+
+jobs:
+  census:
+    name: staging retention census
+    permissions:
+      contents: read
+    # Dispatch from main only. The binding is scoped to the
+    # staging-migrate-plan environment (no reviewer: this job only reads;
+    # main-only deployment branches) so a workflow edited on another branch
+    # cannot read it.
+    if: github.ref == 'refs/heads/main'
+    environment: staging-migrate-plan
+    # Runner routing: see the note on `check` in check.yml. The script needs
+    # `psql`, which GitHub-hosted runners ship.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'census') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Run the read-only retention census
+        env:
+          # Must already exist as staging-migrate-plan environment bindings;
+          # absent means refusal before any connection. The secret prints as
+          # ***; the host, database and branch pins are non-secret vars.
+          TWO_BOT_STAGING_PLAN_DATABASE_URL: ${{ secrets.TWO_BOT_STAGING_PLAN_DATABASE_URL }}
+          TWO_BOT_STAGING_HOST: ${{ vars.TWO_BOT_STAGING_HOST }}
+          TWO_BOT_STAGING_DATABASE: ${{ vars.TWO_BOT_STAGING_DATABASE }}
+          TWO_BOT_STAGING_BRANCH_ID: ${{ vars.TWO_BOT_STAGING_BRANCH_ID }}
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 scripts/staging_retention_census.py

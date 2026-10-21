@@ -105,7 +105,8 @@ from `T_0` through `T_0 + 48 h`:
 ```sh
 python3 scripts/cutover_watch_checkpoint.py --checkpoint +15m \
     --expected-sha <40-hex> --expected-build-id <run-id>-<attempt> \
-    --production-url https://<production-worker>/
+    --production-url https://<production-worker>/ \
+    --format markdown
 ```
 
 `--checkpoint` is one of the five labels `+15m`, `+1h`, `+6h`, `+24h`,
@@ -115,6 +116,9 @@ run summary. The script is read-only: one GET to `/readyz`, no writes,
 migrates, or DB connections. It emits GO only on a 200 with every
 component ready and an exact revision/build-ID match; anything short of a
 full match is EXTEND, never GO, and a ROLLBACK decision stays human.
+`--format` selects the output shape: `markdown` (default) emits the
+checkpoint table row for the execution card, while `--format json` emits
+the same checkpoint as a one-line machine receipt with stable reason ids.
 
 - Header: `T_0`, deployed SHA, new and previous Worker version IDs (the
   previous ID is the rollback dispatch `<version-id>`), watch deadline,

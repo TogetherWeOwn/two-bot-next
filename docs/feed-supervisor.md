@@ -166,7 +166,7 @@ two-bot commands publish [--apply] [--guild-id ID] [--application-id ID] [--allo
     Fetch and compare the guild command list against the compiled, feature-gated
     builtins. Both commands are read-only unless publish receives --apply.
     Env: DISCORD_TOKEN, GUILD_ID, DISCORD_APPLICATION_ID; feature gates as on boot
-    (TWO_VOICE=1 adds the voice set; TWO_ASSISTANT_ENDPOINT also adds /templateassistant).
+    (TWO_VOICE=1 adds the voice set; /templateassistant stays unpublished until its slice lands).
     Live Discord targets additionally require TWO_DATABASE_URL (or DATABASE_URL
     when unset), the shared send-admission Postgres. No database is opened for
     loopback DISCORD_API_BASE fixtures, and no gateway is started.
