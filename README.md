@@ -54,13 +54,12 @@ claim. Staging deploys from `main`; production deploys through the manual
 - [Configuration](docs/configuration.md): all catalog keys/classes, known parsed
   defaults and descriptions. Classes are legacy-catalog labels only: gateway
   boot reads a fixed set of process-environment keys, and the Container's
-  `guild_settings` poll (`crates/bot/src/website_jobs.rs:152`) publishes through
-  `settings_jobs::live` (`crates/bot/src/settings_jobs.rs:53`) with no feature
-  runtime reading that snapshot yet, so stored values reach the runtime only
-  through per-runtime `StoreSettings::refresh` calls (`raid_runtime.rs`,
-  `containment_runtime.rs`, `join_risk_runtime.rs`) and onboarding's
-  per-event refresh (`onboarding.rs:167`), if at all (see the reference;
-  re-checked at `bce86a791`).
+  `guild_settings` poll (`crates/bot/src/website_jobs.rs:207`) publishes a
+  snapshot every 15 s through `settings_jobs::live`
+  (`crates/bot/src/settings_jobs.rs:53`); the live-snapshot consumer table in
+  the reference names every reader — automod, feed, audit, ticket, gateway
+  classifier and voice — alongside the per-runtime store and per-event
+  refresh paths (re-checked at `1643438`).
 - [Feed supervisor](docs/feed-supervisor.md): running feed delivery —
   source configuration, fetch cadence as-coded, failure signals and triage,
   read-only guarantees, and worked examples.
