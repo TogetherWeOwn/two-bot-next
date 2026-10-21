@@ -42,12 +42,11 @@ const EDIT_B: &str = r#"{"id":"10","channel_id":"11","content":"other"}"#;
 
 /// Assert the dispatch is refused (`None`); the label names the shape.
 fn assert_refused(text: &str, label: &str) {
-    match partial_edit(text, 0) {
-        Some(delivery) => panic!(
+    if let Some(delivery) = partial_edit(text, 0) {
+        panic!(
             "{label}: duplicate keys must be refused, got delivery for message {}",
             delivery.message_id
-        ),
-        None => {}
+        );
     }
 }
 

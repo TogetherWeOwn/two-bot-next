@@ -145,18 +145,14 @@ fn envelope_nested_duplicate_is_refused() {
 fn content_duplicate_suggestions_is_refused_in_both_orders() {
     // Both winners are valid suggestion lists, so last-wins proposes one of
     // them today — a different suggestion per order.
-    let a_first = format!(
-        r###"{{"suggestions":[{{"template":"##","explanation":"why-a"}}],"suggestions":[{{"template":"##","explanation":"why-b"}}]}}"###
-    );
-    let b_first = format!(
-        r###"{{"suggestions":[{{"template":"##","explanation":"why-b"}}],"suggestions":[{{"template":"##","explanation":"why-a"}}]}}"###
-    );
+    let a_first = r###"{"suggestions":[{"template":"##","explanation":"why-a"}],"suggestions":[{"template":"##","explanation":"why-b"}]}"###;
+    let b_first = r###"{"suggestions":[{"template":"##","explanation":"why-b"}],"suggestions":[{"template":"##","explanation":"why-a"}]}"###;
     let a = refused(
-        envelope(&a_first).as_slice(),
+        envelope(a_first).as_slice(),
         "suggestions duplicate, A first",
     );
     let b = refused(
-        envelope(&b_first).as_slice(),
+        envelope(b_first).as_slice(),
         "suggestions duplicate, B first",
     );
     assert_eq!(a, b, "both orders share one fixed refusal");

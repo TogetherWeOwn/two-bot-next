@@ -97,6 +97,17 @@ fn assert_refused<E: std::fmt::Display + std::fmt::Debug>(
     }
 }
 
+/// Assert `error` is not a duplicate refusal: pre-existing failures keep
+/// their own vocabulary. Generic over the error type like `assert_refused`:
+/// `String` on the baseline, the builder's inherent error after GREEN.
+fn assert_not_duplicate_refusal<E: std::fmt::Display>(error: &E, label: &str) {
+    let display = format!("{error}");
+    assert!(
+        !display.contains(DUP_TOKEN),
+        "{label} is not a duplicate refusal: {display}"
+    );
+}
+
 #[test]
 fn session_flag_duplicate_is_refused_in_both_orders() {
     // Today each order resumes differently: the refusal removes an
@@ -219,13 +230,7 @@ fn valid_session_flag_parses_byte_identically() {
     ] {
         match Header::parse_session_resumable(&frame) {
             Ok(resumable) => panic!("{label} must fail, got resumable={resumable}"),
-            Err(error) => {
-                let display = format!("{error}");
-                assert!(
-                    !display.contains(DUP_TOKEN),
-                    "{label} is not a duplicate refusal: {display}"
-                );
-            }
+            Err(error) => assert_not_duplicate_refusal(&error, label),
         }
     }
 }

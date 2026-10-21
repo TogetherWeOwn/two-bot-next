@@ -209,9 +209,7 @@ async fn listing_identical_duplicate_is_refused() {
 async fn listing_nested_entry_duplicate_is_refused() {
     // The per-entry parser is lenient, so a nested duplicate still lists
     // today; refusal is decoder-level, any depth.
-    let nested = format!(
-        r#"{{"id":"sub-1","id":"sub-2","status":"enabled","type":"stream.online","version":"1","condition":{{"broadcaster_user_id":"1337"}},"transport":{{"method":"webhook","callback":"https://hooks.example.com/twitch"}}}}"#
-    );
+    let nested = r#"{"id":"sub-1","id":"sub-2","status":"enabled","type":"stream.online","version":"1","condition":{"broadcaster_user_id":"1337"},"transport":{"method":"webhook","callback":"https://hooks.example.com/twitch"}}"#;
     let body = format!(r#"{{"data":[{nested}]}}"#);
     let (mut client, _) = client_for(vec![
         token_answer(),
@@ -307,10 +305,9 @@ async fn every_duplicate_shape_shares_one_fixed_error() {
         ),
         (
             "nested",
-            format!(
-                r#"{{"data":[{{"id":"sub-1","id":"sub-2","status":"enabled","type":"stream.online","version":"1","condition":{{"broadcaster_user_id":"1337"}},"transport":{{"method":"webhook","callback":"https://hooks.example.com/twitch"}}}}]}}"#
-            )
-            .into_bytes(),
+            r#"{"data":[{"id":"sub-1","id":"sub-2","status":"enabled","type":"stream.online","version":"1","condition":{"broadcaster_user_id":"1337"},"transport":{"method":"webhook","callback":"https://hooks.example.com/twitch"}}]}"#
+                .as_bytes()
+                .to_vec(),
         ),
         (
             "escaped",
