@@ -1,10 +1,10 @@
-//! Bounded gateway reconnect schedule: the gateway retry contract.
+//! Bounded supervised reconnect schedule and Twilight reconnect spread.
 //!
 //! A dead gateway process exits and the container supervisor restarts it, but
 //! a restart hot loop is unbounded work (the October crash-loop week). The
-//! gateway receive loop paces `Reconnect` failures on this schedule instead
-//! of spinning, and gives up the episode after [`ReconnectPolicy`] attempts
-//! instead of spinning forever.
+//! supervised runner paces retries on this schedule and gives up the episode
+//! after [`ReconnectPolicy`] attempts. Twilight owns its separate receive-loop
+//! reconnect backoff; [`wait_reconnect_spread`] adds only a non-growing spread.
 //!
 //! Growth is `base_delay * 2^attempt`, saturated and capped at `max_delay`,
 //! with equal jitter: each wait lies in `[capped/2, capped]`, drawn
@@ -68,6 +68,18 @@ pub(crate) fn jitter_stream(seed: u64, attempt: u32) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
     z ^ (z >> 31)
+}
+
+/// Await a non-growing 500 ms–1 s spread before polling Twilight again.
+///
+/// Twilight already backs off its connection attempts. The attempt index only
+/// varies the deterministic draw: it never grows the delay or exhausts a budget.
+/// Returns the requested wait after the timer completes, for bounded logging.
+pub async fn wait_reconnect_spread(seed: u64, attempt: u32) -> Duration {
+    let delay = Duration::from_millis(500)
+        + Duration::from_nanos(jitter_stream(seed, attempt) % 500_000_001);
+    tokio::time::sleep(delay).await;
+    delay
 }
 
 /// Wait before retrying `attempt` (0-based), or `None` past the budget.
