@@ -162,6 +162,13 @@ def _reject_duplicate_keys(pairs):
     return dict(pairs)
 
 
+class GatewayShapeError(ValueError):
+    """A gateway frame, hello or dispatch violates the expected shape.
+
+    Fixed vocabulary only, like BodyTooLarge and RedirectRefused.
+    """
+
+
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Turn every redirect into an HTTPError without contacting its target."""
 
@@ -561,12 +568,17 @@ class WebSocket:
         self.sock.sendall((f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
                            f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
                            "Sec-WebSocket-Version: 13\r\n\r\n").encode())
-        head = b""
-        while b"\r\n\r\n" not in head:
+        # Suffix-checked and byte-capped: the terminator can only complete at
+        # the end of a byte-at-a-time read, so endswith keeps a hostile
+        # header linear instead of rescanning the whole head per byte.
+        head = bytearray()
+        while not head.endswith(b"\r\n\r\n"):
             chunk = self.sock.recv(1)
             if not chunk:
                 raise ConnectionError("gateway closed during handshake")
             head += chunk
+            if len(head) > MAX_BODY_BYTES:
+                raise BodyTooLarge("gateway handshake answered over the byte cap")
         if b" 101 " not in head.split(b"\r\n", 1)[0]:
             raise ConnectionError("gateway refused the websocket upgrade")
         self.lock = threading.Lock()
@@ -596,8 +608,19 @@ class WebSocket:
             self.sock.sendall(head + mask + body)
 
     def recv(self):
-        """Next complete text message as JSON (answers pings; None on close)."""
+        """Next complete text message as JSON (answers pings; None on close).
+
+        Every frame payload and every reassembled message is capped at
+        MAX_BODY_BYTES, like the REST body cap: the declared length is
+        validated before the payload is read, so a huge length refuses
+        without an unbounded read, and continuation fragments refuse once
+        their running total passes the cap. Exact-cap input passes.
+        Control frames (ping, pong, close) carry at most 125 payload bytes
+        per RFC 6455 section 5.5; a longer control payload refuses as a
+        malformed frame instead of corrupting the pong encoder.
+        """
         parts = []
+        total = 0
         while True:
             b1, b2 = self._exact(2)
             op, fin, n = b1 & 0x0F, b1 & 0x80, b2 & 0x7F
@@ -605,6 +628,12 @@ class WebSocket:
                 n = struct.unpack(">H", self._exact(2))[0]
             elif n == 127:
                 n = struct.unpack(">Q", self._exact(8))[0]
+            if n > MAX_BODY_BYTES:
+                raise BodyTooLarge("gateway frame answered over the byte cap")
+            if op & 0x8 and n > 125:
+                raise GatewayShapeError("gateway frame was malformed")
+            if op in (0x1, 0x0) and total + n > MAX_BODY_BYTES:
+                raise BodyTooLarge("gateway message answered over the byte cap")
             mask = self._exact(4) if b2 & 0x80 else None
             data = self._exact(n)
             if mask:
@@ -618,6 +647,9 @@ class WebSocket:
                                       + bytes(b ^ m[i % 4] for i, b in enumerate(data)))
                 continue
             if op in (0x1, 0x0):
+                total += len(data)
+                if total > MAX_BODY_BYTES:
+                    raise BodyTooLarge("gateway message answered over the byte cap")
                 parts.append(data)
                 if fin:
                     try:
@@ -721,7 +753,17 @@ class Session:
         self.token, self.events, self.me = token, [], None
         self.ws = WebSocket(GATEWAY, "/?v=10&encoding=json")
         hello = self.ws.recv()
-        self.interval = hello["d"]["heartbeat_interval"] / 1000
+        data = hello.get("d") if isinstance(hello, dict) else None
+        interval = data.get("heartbeat_interval") if isinstance(data, dict) else None
+        if isinstance(interval, bool) or not isinstance(interval, (int, float)):
+            raise GatewayShapeError("gateway hello was malformed")
+        try:
+            seconds = interval / 1000
+        except OverflowError:
+            raise GatewayShapeError("gateway hello was malformed") from None
+        if not math.isfinite(seconds) or not 0 < seconds <= TIMING_CAP_SECONDS:
+            raise GatewayShapeError("gateway hello was malformed")
+        self.interval = seconds
         self.seq, self.alive = None, True
         threading.Thread(target=self._beat, daemon=True).start()
         self.ws.send({"op": 2, "d": {"token": token, "intents": INTENTS,
@@ -746,14 +788,24 @@ class Session:
                 return None
             if msg is None:
                 raise ConnectionError("gateway closed the session")
+            if not isinstance(msg, dict):
+                raise GatewayShapeError("gateway dispatch was malformed")
             if msg.get("s") is not None:
                 self.seq = msg["s"]
             if msg.get("op") != 0:
                 continue
+            if not isinstance(msg.get("t"), str) or not isinstance(msg.get("d"), dict):
+                raise GatewayShapeError("gateway dispatch was malformed")
+            if msg["t"] in ("GUILD_CREATE", "CHANNEL_DELETE"):
+                if not isinstance(msg["d"].get("id"), str):
+                    raise GatewayShapeError("gateway dispatch was malformed")
             event = {"t": msg["t"], "d": msg["d"]}
             self.events.append(event)
             if msg["t"] == "READY":
-                self.me = msg["d"]["user"]["id"]
+                user = msg["d"].get("user")
+                if not isinstance(user, dict) or not isinstance(user.get("id"), str):
+                    raise GatewayShapeError("gateway dispatch was malformed")
+                self.me = user["id"]
             if until(event):
                 return event
         return None

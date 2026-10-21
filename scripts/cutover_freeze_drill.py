@@ -67,6 +67,25 @@ class DrillError(Exception):
     """A step's one-line failure reason (fixed vocabulary only)."""
 
 
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    raised message is fixed vocabulary: it names no key, value or path.
+    """
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
+
+
 def guild_fence(guild_id):
     """Allowlist exactly the TWO Staging guild; refuse everything else unread."""
     if not guild_id:
@@ -257,7 +276,11 @@ def live_transport(token):
         if len(body) > BODY_CAP:
             raise DrillError("discord answered over the body cap")
         try:
-            value = json.loads(body) if body else expect()
+            value = (json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+                     if body else expect())
+        except DuplicateKeyError:
+            raise DrillError(
+                f"discord answered duplicate JSON object keys on {method}") from None
         except (ValueError, RecursionError):
             raise DrillError(f"discord answered a non-JSON body on {method}") from None
         if not isinstance(value, expect):
@@ -291,7 +314,11 @@ def live_transport(token):
                 if len(body) > BODY_CAP:
                     raise DrillError("discord answered over the body cap")
                 try:
-                    value = json.loads(body) if body else {}
+                    value = (json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+                             if body else {})
+                except DuplicateKeyError:
+                    raise DrillError(
+                        "discord answered duplicate JSON object keys on GET") from None
                 except (ValueError, RecursionError):
                     raise DrillError("discord answered a non-JSON body on GET") from None
                 if isinstance(value, dict) and value.get("code") == UNKNOWN_MESSAGE_CODE:
@@ -303,7 +330,11 @@ def live_transport(token):
         if len(body) > BODY_CAP:
             raise DrillError("discord answered over the body cap")
         try:
-            value = json.loads(body) if body else {}
+            value = (json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+                     if body else {})
+        except DuplicateKeyError:
+            raise DrillError(
+                "discord answered duplicate JSON object keys on GET") from None
         except (ValueError, RecursionError):
             raise DrillError("discord answered a non-JSON body on GET") from None
         if not isinstance(value, dict):
