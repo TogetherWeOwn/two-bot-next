@@ -51,6 +51,8 @@ claim. Staging deploys from `main`; production deploys through the manual
 
 - [Commands](docs/commands.md): built-ins, options, registry bounds and default
   Discord permissions, rendered from the compiled all-enabled registry.
+- [Sticky delivery recovery](docs/sticky-debounce-acceptance.md#uncertain-delivery-recovery):
+  inspect uncertain re-posts before resetting the durable delivery fence.
 - [Configuration](docs/configuration.md): all catalog keys/classes, known parsed
   defaults and descriptions. Classes are legacy-catalog labels only: gateway
   boot reads a fixed set of process-environment keys, and the Container's
