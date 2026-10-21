@@ -287,7 +287,7 @@ unit that drops a directive fails CI naming the file.
 | Unit | `TimeoutStartSec` | Why this long |
 |---|---|---|
 | `two-bot-next-backup.service` | 2 h | dump plus the 30-minute upload deadline |
-| `two-bot-next-guild-config-backup.service` | 30 min | Discord REST reads plus one upload |
+| `two-bot-next-guild-config-backup.service` | 2 h | Discord REST reads plus two sequential uploads (snapshot and drift report, 30 min each) |
 | `two-bot-next-restore-drill.service` | 2 h | scratch provision, migrate and restore |
 | `two-bot-next-failure@.service` | 30 s | the handler only writes one log line |
 
@@ -325,7 +325,7 @@ fires `OnFailure=`):
 | `archive_fresh` | pass | none; the restore proceeds |
 | `archive_stale` | refuse | the nightly backup stopped: `journalctl -u two-bot-next-backup`, fix it, take a fresh backup, rerun the drill |
 | `archive_missing` | refuse | no archive exists (`archive_age_s` is `null`): run the backup service first |
-| `archive_unreadable` | refuse | the archive cannot be inspected: check backup directory permissions |
+| `archive_unreadable` | refuse | the archive cannot be inspected or opened for reading: check backup directory permissions and file ownership |
 | `archive_from_future` | refuse | the file is dated ahead of the host clock: check the clock |
 | `max_age_invalid` | refuse | set the variable to a positive whole number of seconds (no leading zero, at most 9 digits) |
 

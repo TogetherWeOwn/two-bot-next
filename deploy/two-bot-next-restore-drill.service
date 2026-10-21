@@ -43,8 +43,8 @@ Environment=TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S=172800
 ReadWritePaths=/var/lib/two-bot-next-restore-drills
 
 # Newest backup in the directory, refused BEFORE any database is provisioned
-# when it is missing or older than TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S (set
-# above; a silently stopped nightly backup must not pass against an old file).
+# when it is missing, unreadable, or older than TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S
+# (set above; a silently stopped nightly backup must not pass against an old file).
 # It prints one JSON verdict {"verdict","code","archive_age_s"} and a refusal
 # also prints the next action to stderr and exits 1. Codes: archive_fresh,
 # archive_stale, archive_missing, archive_unreadable, archive_from_future,
@@ -63,6 +63,7 @@ ExecStart=/usr/bin/bash -o pipefail -c '\
   latest=$(ls -1t /var/backups/two-bot-next/two-funnel-*.ndjson.gz 2>/dev/null | head -1) || true; \
   [ -n "$latest" ] || refuse archive_missing null "no two-funnel archive exists; run the nightly backup service and check its journal before the drill"; \
   mtime=$(stat -c %%Y "$latest") || refuse archive_unreadable null "the newest archive cannot be inspected; check the backup directory permissions"; \
+  head -c 1 "$latest" >/dev/null 2>&1 || refuse archive_unreadable null "the newest archive cannot be read; check the backup directory permissions and file ownership"; \
   age=$(( $(date +%%s) - mtime )); \
   [ "$age" -ge 0 ] || refuse archive_from_future "$age" "the newest archive is dated in the future; check the host clock and the backup directory"; \
   [ "$age" -le "$((10#$max))" ] || refuse archive_stale "$age" "the newest archive is older than the limit, so the nightly backup has stopped; fix it (journalctl -u two-bot-next-backup) and take a fresh backup, then start the drill again"; \

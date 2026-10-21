@@ -22,6 +22,8 @@ ON_FAILURE = "OnFailure=two-bot-next-failure@%n.service"
 DRILL = "two-bot-next-restore-drill.service"
 UNIT_SECONDS = {"s": 1, "sec": 1, "min": 60, "m": 60, "h": 3600}
 MAX_START_S = 6 * 3600
+MAX_ARCHIVE_AGE_S = 3 * 86400
+SHIPPED_MAX_ARCHIVE_AGE_S = 172800
 
 
 def directives(text):
@@ -29,6 +31,25 @@ def directives(text):
     joined = text.replace("\\\n", " ")
     return [line.strip() for line in joined.splitlines()
             if line.strip() and not line.lstrip().startswith(("#", ";"))]
+
+
+def parse_sections(text):
+    """Map section name to directive lines; systemd ignores misplaced directives."""
+    joined = text.replace("\\\n", " ")
+    sections = {}
+    current = None
+    for raw in joined.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current = line[1:-1]
+            sections.setdefault(current, [])
+            continue
+        if current is None:
+            continue
+        sections[current].append(line)
+    return sections
 
 
 def timeout_start_s(lines):
@@ -54,20 +75,35 @@ def lint(deploy_dir):
     if not any(unit.name == HANDLER for unit in units):
         findings.append(f"{HANDLER}: failure handler is missing")
     for unit in units:
-        lines = directives(unit.read_text())
-        seconds = timeout_start_s(lines)
+        sections = parse_sections(unit.read_text())
+        service_lines = sections.get("Service", [])
+        unit_lines = sections.get("Unit", [])
+        all_lines = [line for lines in sections.values() for line in lines]
+        seconds = timeout_start_s(service_lines)
         if not seconds or seconds > MAX_START_S:
-            findings.append(f"{unit.name}: TimeoutStartSec must be finite and <= {MAX_START_S}s")
-        if unit.name != HANDLER and ON_FAILURE not in lines:
-            findings.append(f"{unit.name}: missing {ON_FAILURE}")
-        if unit.name == HANDLER and any(line.startswith("OnFailure=") for line in lines):
+            findings.append(f"{unit.name}: TimeoutStartSec must be finite and <= {MAX_START_S}s in [Service]")
+        if unit.name != HANDLER and ON_FAILURE not in unit_lines:
+            findings.append(f"{unit.name}: missing {ON_FAILURE} in [Unit]")
+        if unit.name == HANDLER and any(line.startswith("OnFailure=") for line in all_lines):
             findings.append(f"{unit.name}: the handler must not name an OnFailure=")
     drill = Path(deploy_dir) / DRILL
     if drill.exists():
-        lines = directives(drill.read_text())
-        if not any(line.startswith("Environment=TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S=") for line in lines):
-            findings.append(f"{DRILL}: missing the documented max archive age")
-        exec_lines = [line for line in lines if line.startswith("ExecStart=")]
+        sections = parse_sections(drill.read_text())
+        service_lines = sections.get("Service", [])
+        age_lines = [line for line in service_lines
+                     if line.startswith("Environment=TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S=")]
+        if not age_lines:
+            findings.append(f"{DRILL}: missing the documented max archive age in [Service]")
+        else:
+            try:
+                age_value = int(age_lines[-1].split("=", 2)[2])
+            except (IndexError, ValueError):
+                findings.append(f"{DRILL}: max archive age must be a positive whole number of seconds")
+            else:
+                if not 1 <= age_value <= MAX_ARCHIVE_AGE_S:
+                    findings.append(
+                        f"{DRILL}: max archive age must be 1..{MAX_ARCHIVE_AGE_S}s in [Service]")
+        exec_lines = [line for line in service_lines if line.startswith("ExecStart=")]
         if len(exec_lines) != 1 or "archive_stale" not in exec_lines[0]:
             findings.append(f"{DRILL}: ExecStart must refuse a stale archive (archive_stale)")
         elif exec_lines[0].find("archive_stale") > exec_lines[0].find("restore-drill"):
@@ -136,7 +172,7 @@ class UnitLintTests(unittest.TestCase):
     def test_deleting_a_directive_names_the_unit(self):
         for unit, directive in [
             ("two-bot-next-backup.service", "TimeoutStartSec=2h"),
-            ("two-bot-next-guild-config-backup.service", "TimeoutStartSec=30min"),
+            ("two-bot-next-guild-config-backup.service", "TimeoutStartSec=2h"),
             (DRILL, "TimeoutStartSec=2h"),
             ("two-bot-next-backup.service", ON_FAILURE),
             ("two-bot-next-guild-config-backup.service", ON_FAILURE),
@@ -173,6 +209,42 @@ class UnitLintTests(unittest.TestCase):
         text = (DEPLOY / HANDLER).read_text()
         for forbidden in ["EnvironmentFile", "LoadCredential", "DATABASE", "TOKEN", "curl", "two-bot "]:
             self.assertNotIn(forbidden, "\n".join(directives(text)))
+        exec_lines = [line for line in directives(text) if line.startswith("ExecStart=")]
+        self.assertEqual(len(exec_lines), 1, exec_lines)
+        handler_cmd = exec_lines[0]
+        for required in ["systemd-cat", "-t two-bot-next-unit-failed", "-p crit", "%i"]:
+            self.assertIn(required, handler_cmd, handler_cmd)
+
+    def test_misplaced_directive_is_refused(self):
+        tmp = self.copy_deploy()
+        path = tmp / "two-bot-next-backup.service"
+        text = path.read_text()
+        moved = text.replace("TimeoutStartSec=2h\n", "", 1).replace(
+            "[Unit]\n", "[Unit]\nTimeoutStartSec=2h\n", 1)
+        path.write_text(moved)
+        self.assertTrue(
+            any(f.startswith("two-bot-next-backup.service:") for f in lint(tmp)), lint(tmp))
+        tmp = self.copy_deploy()
+        path = tmp / "two-bot-next-backup.service"
+        text = path.read_text()
+        moved = text.replace(ON_FAILURE + "\n", "", 1) + ON_FAILURE + "\n"
+        path.write_text(moved)
+        self.assertTrue(
+            any(f.startswith("two-bot-next-backup.service:") for f in lint(tmp)), lint(tmp))
+
+    def test_shipped_max_archive_age_is_pinned_and_capped(self):
+        unit = (DEPLOY / DRILL).read_text()
+        shipped = int(re.search(
+            r"^Environment=TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S=(\d+)$", unit, re.M)[1])
+        self.assertEqual(shipped, SHIPPED_MAX_ARCHIVE_AGE_S)
+        for value in ["0", "999999999"]:
+            with self.subTest(value=value):
+                tmp = self.copy_deploy()
+                path = tmp / DRILL
+                path.write_text(path.read_text().replace(
+                    f"TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S={shipped}",
+                    f"TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S={value}"))
+                self.assertTrue(any(f.startswith(DRILL + ":") for f in lint(tmp)), lint(tmp))
 
 
 class DrillAgeTests(unittest.TestCase):
@@ -250,6 +322,16 @@ class DrillAgeTests(unittest.TestCase):
     def test_missing_archive_refuses(self):
         (self.archives / "unrelated.txt").write_text("x")
         verdict = self.assert_refused(self.run_drill(), "archive_missing")
+        self.assertIsNone(verdict["archive_age_s"])
+
+    def test_unreadable_archive_refuses(self):
+        path = self.archive("two-funnel-unreadable.ndjson.gz", 60)
+        path.chmod(0)
+        probe = subprocess.run(["/usr/bin/head", "-c", "1", str(path)],
+                               capture_output=True, timeout=10)
+        if probe.returncode == 0:
+            self.skipTest("unreadable fixture needs a non-root user")
+        verdict = self.assert_refused(self.run_drill(), "archive_unreadable")
         self.assertIsNone(verdict["archive_age_s"])
 
     def test_future_archive_refuses(self):
