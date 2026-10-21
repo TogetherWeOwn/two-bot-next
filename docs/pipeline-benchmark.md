@@ -39,9 +39,13 @@ python3 scripts/compare_pipeline_bench.py pipeline-benchmark.json
 The existing `two-bot-testsupport::TestDatabase` guard runs before connection:
 exact test hostname/port/user, explicit empty password, test DB prefix, no URL
 query/fragment or libpq environment overrides. No `DATABASE_URL` fallback exists.
-The driver creates and migrates a uniquely named disposable database and verifies
-its drop before emitting a success report. It never migrates/resets the bootstrap
-DB. On timeout/error the fixture still schedules cleanup; CI service teardown
+The driver creates a uniquely named disposable database, applies both the cutover
+and store migration chains (including the rollback journal), and verifies its drop
+before emitting a success report. After replay, outside the measured query window,
+it requires exactly one insert journal entry per durable event and reports both
+journal-row and distinct journaled-event counts. Missing schema or incomplete
+journal coverage fails rather than measuring the journal's best-effort failure
+path. It never migrates/resets the bootstrap DB. On timeout/error the fixture still schedules cleanup; CI service teardown
 is the final containment. No connection credentials are created or substituted.
 
 Default parameters (all integer-valued) are equivalent to:
