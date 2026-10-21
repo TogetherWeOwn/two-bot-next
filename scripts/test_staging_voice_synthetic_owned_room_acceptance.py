@@ -60,7 +60,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import staging_voice_synthetic as synth  # noqa: E402
+import staging_voice_synthetic as synth
 
 FAKE_TOKEN = "TOK"
 GUILD = synth.STAGING_GUILD_ID
