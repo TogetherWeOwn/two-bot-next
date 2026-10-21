@@ -97,15 +97,33 @@ where
         .sort_unstable_by(|a, b| (a.created_at, a.id.as_str()).cmp(&(b.created_at, b.id.as_str())));
     let after = cursor.lock().expect("ticket recovery cursor").clone();
     if let Some((created_at, id)) = after {
-        // No row newer than the cursor is a skip, not a replay: rows at or
-        // behind the cursor are never attempted again.
-        let skipped = tickets
+        // Steady state is a skip, not a replay: behind-cursor Open rows are
+        // settled and never attempted again. Any other status is an in-flight
+        // workflow whose immutable created_at key can sit behind the cursor
+        // while the row is still unfinished — a Creating row turns actionable
+        // only after the 15-minute stale cutoff, an Open row can move to
+        // Closing/CleanupPending after a pass attempted it, and a failed or
+        // cancelled attempt leaves the row behind the cursor — so those rows
+        // are always re-attempted, keeping the cursor monotonic.
+        let behind = tickets
             .iter()
             .position(|ticket| (ticket.created_at, ticket.id.as_str()) > (created_at, id.as_str()))
             .unwrap_or(tickets.len());
+        let skipped = tickets[..behind]
+            .iter()
+            .filter(|ticket| ticket.status == TicketStatus::Open)
+            .count();
         if skipped > 0 {
             tracing::info!(skipped, "ticket recovery skipped behind-cursor rows");
-            tickets.drain(..skipped);
+        }
+        if behind > 0 {
+            let mut kept = Vec::with_capacity(tickets.len() - skipped);
+            for (index, ticket) in tickets.into_iter().enumerate() {
+                if index >= behind || ticket.status != TicketStatus::Open {
+                    kept.push(ticket);
+                }
+            }
+            tickets = kept;
         }
     }
     let deadline = Instant::now() + RECOVERY_ROWS_BUDGET;
@@ -120,8 +138,15 @@ where
         }
         // Advance before await: even whole-scope cancellation skips past
         // this row next time. The durable row, not this cursor, remains truth.
-        *cursor.lock().expect("ticket recovery cursor") =
-            Some((ticket.created_at, ticket.id.clone()));
+        // Never move backwards: a re-attempted behind-cursor row must not
+        // rewind past newer rows the cursor already passed.
+        {
+            let mut guard = cursor.lock().expect("ticket recovery cursor");
+            let key = (ticket.created_at, ticket.id.clone());
+            if guard.as_ref().is_none_or(|current| key > *current) {
+                *guard = Some(key);
+            }
+        }
         if let Err(error) = bounded(remaining.min(RECOVERY_ITEM_TIMEOUT), action(ticket)).await {
             failed = Some(error.class());
             tracing::warn!(error_class = ?error.class(), "ticket recovery deferred");
@@ -1126,3 +1151,7 @@ mod failure_class_tests;
 #[cfg(test)]
 #[path = "ticket_cursor_budget_acceptance_tests.rs"]
 mod cursor_budget_acceptance_tests;
+
+#[cfg(test)]
+#[path = "ticket_cursor_budget_interaction_tests.rs"]
+mod cursor_budget_interaction_tests;

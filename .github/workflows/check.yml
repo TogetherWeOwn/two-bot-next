@@ -788,24 +788,25 @@ jobs:
       - name: cargo test (unit and binary, including RSVP store)
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-        # The ticket skip/budget acceptance module asserts exact counts via
-        # first-match on the process-wide tracing capture; it runs serially
-        # in its own step below, so skip it here where sibling and revision
-        # tests emit the same messages concurrently.
-        run: cargo test --workspace --lib --bins --features two-bot-core/db --locked -- --skip ticket_runtime::cursor_budget_acceptance_tests
+        # The ticket skip/budget log-assertion modules assert exact counts via
+        # first-match on the process-wide tracing capture; they run serially
+        # in their own step below, so skip them here where sibling and
+        # revision tests emit the same messages concurrently.
+        run: cargo test --workspace --lib --bins --features two-bot-core/db --locked -- --skip ticket_runtime::cursor_budget
 
       # Global metric deltas must not be satisfied by a sibling hostile-name test.
       # Reuse the compiled feature graph, in a fresh process with serial tests.
       - name: cargo test (isolated voice-name filter acceptance)
         run: cargo test -p two-bot --lib --features two-bot-core/db --locked voice_rooms::tests::name_filter_acceptance -- --test-threads=1
 
-      # Ticket skip/budget acceptance asserts exact skip/dropped counts via
-      # first-match on the process-wide tracing capture, while sibling and
-      # revision tests calling recovery_batch emit the same messages with
-      # different counts. Run this module alone, serially, in a fresh process
-      # (skipped in the parallel step above); reused feature graph, no DB.
+      # Ticket skip/budget log-assertion modules assert exact skip/dropped
+      # counts via first-match on the process-wide tracing capture, while
+      # sibling and revision tests calling recovery_batch emit the same
+      # messages with different counts. Run these modules alone, serially, in
+      # a fresh process (skipped in the parallel step above); reused feature
+      # graph, no DB.
       - name: cargo test (isolated ticket skip/budget acceptance)
-        run: cargo test -p two-bot --bin two-bot --features two-bot-core/db --locked ticket_runtime::cursor_budget_acceptance_tests -- --test-threads=1
+        run: cargo test -p two-bot --bin two-bot --features two-bot-core/db --locked ticket_runtime::cursor_budget -- --test-threads=1
 
       # The standalone backup fixture has its own scratch-only URL guard.
       # Supplying it here executes the round trip rather than its local skip.
@@ -2468,8 +2469,17 @@ jobs:
       - name: Ticket lifecycle and migration integration tests
         run: cargo test -p two-bot-cutover --locked --test tickets_store -- --ignored
       - name: Ticket shared router and mock Discord lifecycle acceptance
+        # The ticket skip/budget log-assertion modules assert exact counts via
+        # first-match on the process-wide tracing capture; they run serially
+        # in the isolated step below, so skip them here where the revision
+        # tests emit the same messages concurrently.
         run: >-
-          cargo test -p two-bot --locked --bin two-bot ticket_runtime:: -- --include-ignored
+          cargo test -p two-bot --locked --bin two-bot ticket_runtime:: -- --include-ignored --skip ticket_runtime::cursor_budget
+      # Same serial isolation as the check job: the skip/budget modules share
+      # one process-wide capture with the revision tests above, so they run
+      # alone with --test-threads=1 in a fresh process.
+      - name: cargo test (isolated ticket skip/budget log assertions)
+        run: cargo test -p two-bot --locked --bin two-bot ticket_runtime::cursor_budget -- --test-threads=1
 
   fuzz-compile:
     name: fuzz compile
