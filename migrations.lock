@@ -69,6 +69,10 @@
       "sha256": "d4f98434aa21dca034e64f3e0a766539450deaeb9fc4aff2fc1f7c7f48a11d6e",
       "justification": "Upgrade existing legacy scheduled queues to BIGINT and add claim/nonce columns for TOG-10081 without changing locked migration 0140 or row facts."
     },
+    "crates/cutover/migrations/0142_scheduled_delivery_uncertainty.sql": {
+      "sha256": "941f5ec8e504cf16a426bdbc5d59a2ab94b89abf726c00b9310de73089f55f67",
+      "justification": "Fence possibly accepted scheduled occurrences durably and conservatively preserve pending legacy sends."
+    },
     "crates/cutover/migrations/0150_sticky_messages.sql": {
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes.",
       "sha256": "17d867f772c9f37325c50be959d9f184958e1a632eb47a000ac9ec13b9c30f57"

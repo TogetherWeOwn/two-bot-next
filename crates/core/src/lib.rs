@@ -415,9 +415,10 @@ pub use scheduled_events::{
 };
 #[cfg(feature = "db")]
 pub use scheduled_store::{
-    audit_scheduled, claim_due, complete_run, delete_scheduled, get_scheduled, list_scheduled,
-    put_scheduled, resolve_scheduled_id as resolve_scheduled_id_store, retry_scheduled,
-    ScheduledAuditInput, ScheduledMessageRow, ScheduledStoreError, ScheduledWrite,
+    audit_scheduled, begin_scheduled_delivery, claim_due, complete_run, delete_scheduled,
+    get_scheduled, list_scheduled, put_scheduled,
+    resolve_scheduled_id as resolve_scheduled_id_store, retry_scheduled, ScheduledAuditInput,
+    ScheduledMessageRow, ScheduledStoreError, ScheduledWrite,
 };
 pub use self_roles::{
     emoji_identity, event_order_for_event_id, event_order_from_snowflake,

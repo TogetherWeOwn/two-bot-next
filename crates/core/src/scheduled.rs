@@ -750,18 +750,18 @@ pub fn schedule_list_text(lines: &[String]) -> String {
 pub enum OccurrenceOutcome {
     /// Posted and the run recorded; recurring rows advance, one-shots disable.
     Posted { message_id: Option<String> },
-    /// Transient failure (`retryable`): re-queue at `retry_at_ms`, keeping the
-    /// occurrence nonce so the retry cannot double-post.
+    /// Proven no-effect transient refusal: safely re-queue at `retry_at_ms`.
     Retryable { retry_at_ms: u64 },
+    /// Possibly accepted delivery: hold the occurrence without resend/advance.
+    DeliveryUncertain,
     /// Permanent failure (deleted channel, 4xx): advance/disable like a run so
     /// a dead row cannot wedge the queue.
     FailedPermanent,
     /// The definition changed or was cancelled while Discord was posting: the
     /// completion no longer owns the row (legacy `stale_completion`).
     StaleCompletion,
-    /// Discord accepted the post but recording the run failed: the orphan was
-    /// (`cleaned`) deleted, or the delete failed and the nonce is retained so
-    /// the retry stays idempotent.
+    /// Discord accepted the post but recording the run failed: confirmed
+    /// cleanup permits retry; otherwise retain the durable uncertainty fence.
     PostedUnrecorded { cleaned: bool },
 }
 
@@ -772,10 +772,11 @@ impl OccurrenceOutcome {
         match self {
             Self::Posted { .. } => "ok",
             Self::Retryable { .. } => "retry_scheduled",
+            Self::DeliveryUncertain => "delivery_uncertain",
             Self::FailedPermanent => "post_failed",
             Self::StaleCompletion => "stale_completion",
             Self::PostedUnrecorded { cleaned: true } => "persistence_failed_cleaned",
-            Self::PostedUnrecorded { cleaned: false } => "persistence_failed_retry_idempotent",
+            Self::PostedUnrecorded { cleaned: false } => "persistence_failed_uncertain",
         }
     }
 }

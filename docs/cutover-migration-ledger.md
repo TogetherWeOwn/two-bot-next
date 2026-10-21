@@ -73,6 +73,7 @@ All migrations are up-only; there are no down files. The `direction` column is
 | 0130_custom_commands | up | automation_commands, automation_audit_log | re-runnable | Drop both tables; command definitions are re-creatable by owners. |
 | 0140_scheduled_messages | up | scheduled_messages, automation_audit_log | re-runnable | Drop `scheduled_messages`; drain pending sends first. |
 | 0141_scheduled_messages_legacy_upgrade | up | scheduled_messages | backout-script | Type change (`interval_seconds` to BIGINT) plus claim columns: backout restores the old type with an explicit cast and drops the claim columns. |
+| 0142_scheduled_delivery_uncertainty | up | scheduled_messages | backout-script | Additive fence; existing nonce/claim rows backfill uncertain. Retain the column and fence on rollback; never downgrade to a blind-replay writer or clear pending uncertainty. Stop older writers before rollout. |
 | 0150_sticky_messages | up | sticky_messages, automation_audit_log | backout-script | TEXT-to-timestamptz conversions plus claim columns: backout restores TEXT columns and drops the claim columns. |
 | 0160_rsvp | up | event_rsvps, community_facts, announcements_audit_log | re-runnable | Drop the three tables; RSVP state is re-collectable from events. |
 | 0170_lfg | up | lfg_posts, lfg_roles, lfg_signups | re-runnable | Drop the three tables; open groups must close first. |

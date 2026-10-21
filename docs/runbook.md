@@ -2358,6 +2358,31 @@ Source: [`automation_quota.rs`](../crates/core/src/automation_quota.rs),
 [`feeds_store.rs`](../crates/core/src/feeds_store.rs),
 [`lfg_store.rs`](../crates/core/src/lfg_store.rs).
 
+### Scheduled delivery uncertainty
+
+Before a scheduled POST, the store arms `delivery_uncertain` under the current
+claim token. Timeout/transport loss, an unusable receipt, or failed completion
+with unconfirmed cleanup retains that fence and occurrence nonce. Restart and
+lease expiry never authorize another POST or advance a one-shot/recurring run.
+Only proven no-effect refusal or confirmed cleanup permits retry. Admission
+completion must be confirmed too; an accepted DELETE or missing id is not proof
+of cleanup.
+
+Diagnostic: `scheduled_delivery_uncertain`; safe next action:
+`inspect_channel_before_cancel_or_replace`. The attempt audit uses
+`delivery_uncertain` or `persistence_failed_uncertain`, never clean success.
+Inspect the target channel and the schedule's audit first. An already-authorized
+administrator may then cancel with `/schedule-remove`, or intentionally replace
+the definition through the existing schedule workflow. Replacement is a **new
+send** and can duplicate a surviving old message. Do not clear the fence, force
+retry, or infer absence from missing/unreadable/bounded channel history. This
+slice performs no automatic history scan, even for a positive receipt.
+
+Migration 0142 is additive and conservatively fences existing nonce/claim rows;
+NULL fences fail closed. Rollout must stop old blind-replay writers first. Do
+not downgrade to a binary that ignores the fence; retain it when reverting code.
+This is source behavior, not evidence of a migration or live release.
+
 ## Backup, restore and drill commands
 
 [Backup procedures and formats](backup.md) are the detailed contract. These
