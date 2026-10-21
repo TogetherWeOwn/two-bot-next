@@ -820,7 +820,7 @@ async fn serve_jobs_fails_fast_on_an_unregistered_name() {
         action: Arc::new(|| Box::pin(async { Ok(()) })),
     };
     let status = crate::jobs::statuses(&["good"], false);
-    let (shutdown, _) = watch::channel(false);
+    let (shutdown, stopping) = watch::channel(false);
     // Never-resolving HTTP: the registration check must fire before any drain.
     let http = std::future::pending::<std::io::Result<()>>();
     let error = tokio::time::timeout(
@@ -831,4 +831,8 @@ async fn serve_jobs_fails_fast_on_an_unregistered_name() {
     .expect("registration fails fast, without draining HTTP")
     .expect_err("an unregistered name fails at spawn");
     assert_eq!(error.to_string(), "unregistered job: ghost");
+    assert!(
+        *stopping.borrow(),
+        "registration failure must latch shutdown before returning to the reconcile owner"
+    );
 }
