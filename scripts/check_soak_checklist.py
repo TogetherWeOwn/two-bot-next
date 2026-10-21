@@ -1,5 +1,24 @@
 #!/usr/bin/env python3
-"""Offline parity/checklist coverage and rendered-document guard (stdlib only)."""
+"""Offline parity/checklist coverage and rendered-document guard (stdlib only).
+
+Supported automated verification runs Cargo through the controller cache
+wrapper only: `python3 scripts/cargo_cache.py run -- test -p <package>
+[--lib | --test <target> | --tests] [filters] [-- <libtest>]`. The supported
+option vocabulary is bounded: Cargo side `-p`/`--package`, `--test`,
+`--lib`, `--tests`, `--all-targets`, `--features`; libtest side (after `--`)
+`--exact`, `--ignored`, `--include-ignored`, `--skip <pattern>`
+(repeatable), `--test-threads <n>`. Cargo `--no-run` and libtest `--list`
+never execute tests and are refused as automated coverage, as are unknown
+flags, missing or invalid option values, and known options in the wrong
+position. Effective selection is the union of positive filters (exact when
+`--exact`, else substring) minus `--skip` patterns, read offline from
+source and never run; it must be nonempty. Static executable selection is
+not an execution verdict: attach actual run evidence separately.
+
+Offline regression: `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py`
+plus `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p
+'test_soak_checklist.py' -v` and `-p 'test_soak_checklist_noexec_acceptance.py' -v`.
+"""
 
 import argparse
 from collections import Counter
@@ -23,13 +42,17 @@ CARD = re.compile(r"\bTOG-\d+\b")
 SCRIPT_REF = re.compile(r"(?<![\w/.-])((?:\.{1,2}/)*(?:\.github/)?scripts/[\w./-]+\.\w+)")
 # Automated rows run Cargo through the controller cache wrapper only.
 WRAPPER = ("python3", "scripts/cargo_cache.py", "run", "--")
-CARGO_VALUE_OPTIONS = ("-p", "--package", "--test", "-F", "--features", "--target",
-                       "--target-dir", "--manifest-path", "-j", "--jobs", "--profile",
-                       "--message-format", "--color", "--config", "-Z")
-LIBTEST_VALUE_OPTIONS = ("--test-threads", "--skip", "--format", "--color", "--logfile",
-                         "--shuffle-seed", "-Z")
+CARGO_VALUE_OPTIONS = ("-p", "--package", "--test", "--features")
+CARGO_FLAG_OPTIONS = ("--lib", "--tests", "--all-targets")
+LIBTEST_VALUE_OPTIONS = ("--skip", "--test-threads")
+LIBTEST_FLAG_OPTIONS = ("--exact", "--ignored", "--include-ignored")
+# Cargo --no-run and libtest --list never execute tests; both are refused
+# as automated coverage wherever they appear.
+NOEXEC_OPTIONS = ("--no-run", "--list")
 UNSUPPORTED_TARGETS = ("--bin", "--bins", "--example", "--examples", "--bench",
                        "--benches", "--doc")
+CARGO_KNOWN = CARGO_VALUE_OPTIONS + CARGO_FLAG_OPTIONS + UNSUPPORTED_TARGETS
+LIBTEST_KNOWN = LIBTEST_VALUE_OPTIONS + LIBTEST_FLAG_OPTIONS
 RUST_TOKEN = re.compile(r"""
     (?P<space>\s+|//[^\n]*)
   | (?P<block>/\*)
@@ -362,31 +385,92 @@ def check_cargo_test(args, root, packages):
     """Fail unless `cargo test` args name a real package, target and tests."""
     if args[:1] != ["test"]:
         raise ValueError(f"automated verification must be `cargo test`: {' '.join(args)}")
-    names, selectors, filters, exact, libtest = [], [], [], False, False
+    names, selectors, filters, skips, exact, libtest = [], [], [], [], False, False
     words = iter(args[1:])
     for word in words:
         option, has_value, value = word.partition("=")
         if libtest:
-            if word == "--exact":
-                exact = True
-            elif option in LIBTEST_VALUE_OPTIONS and not has_value:
-                next(words, None)
+            if option in NOEXEC_OPTIONS:
+                raise ValueError(
+                    f"NOEXEC: refusing non-executing mode {option!r} as automated coverage; "
+                    f"next: remove {option} so the command actually runs tests")
+            if option in LIBTEST_VALUE_OPTIONS:
+                if has_value:
+                    if not value:
+                        raise ValueError(
+                            f"INVALID_VALUE: option {option!r} got an empty value after `=`; "
+                            f"next: give a nonempty value or drop `=value`")
+                else:
+                    value = next(words, None)
+                    if value is None:
+                        raise ValueError(
+                            f"MISSING_VALUE: option {option!r} needs a value but none followed; "
+                            f"next: add a value, e.g. `{option} <value>` or `{option}=<value>`")
+                if option == "--test-threads":
+                    if not value.isdigit() or int(value) <= 0:
+                        raise ValueError(
+                            f"INVALID_VALUE: option '--test-threads' needs a positive integer "
+                            f"but got {value!r}; next: pass a positive integer like "
+                            f"`--test-threads 2`")
+                else:
+                    skips.append(value)
+            elif option in LIBTEST_FLAG_OPTIONS:
+                if has_value:
+                    raise ValueError(
+                        f"INVALID_VALUE: flag {option!r} takes no value but got {value!r}; "
+                        f"next: drop `={value}` and pass {option} alone")
+                if option == "--exact":
+                    exact = True
+            elif option in CARGO_KNOWN:
+                raise ValueError(
+                    f"UNSUPPORTED: known Cargo option {option!r} after `--`; "
+                    f"next: move Cargo options before `--` and libtest options after it")
             elif not word.startswith("-"):
                 filters.append(word)
+            else:
+                raise ValueError(
+                    f"UNKNOWN_OPTION: unsupported flag {word!r} after `--`; "
+                    f"next: use only --exact, --ignored, --include-ignored, --skip, --test-threads")
         elif word == "--":
             libtest = True
+        elif option in NOEXEC_OPTIONS:
+            raise ValueError(
+                f"NOEXEC: refusing non-executing mode {option!r} as automated coverage; "
+                f"next: remove {option} so the command actually runs tests")
         elif option in UNSUPPORTED_TARGETS:
             raise ValueError(f"unsupported target selector {option}")
+        elif option in LIBTEST_KNOWN:
+            raise ValueError(
+                f"UNSUPPORTED: known libtest option {option!r} before `--`; "
+                f"next: move libtest options after `--`")
         elif option in CARGO_VALUE_OPTIONS:
-            value = value if has_value else next(words, "")
+            if has_value:
+                if not value:
+                    raise ValueError(
+                        f"INVALID_VALUE: option {option!r} got an empty value after `=`; "
+                        f"next: give a nonempty value or drop `=value`")
+            else:
+                value = next(words, None)
+                if value is None:
+                    raise ValueError(
+                        f"MISSING_VALUE: option {option!r} needs a value but none followed; "
+                        f"next: add a value, e.g. `{option} <value>` or `{option}=<value>`")
             if option in ("-p", "--package"):
                 names.append(value)
             elif option == "--test":
                 selectors.append(("test", value))
-        elif word in ("--lib", "--tests", "--all-targets"):
-            selectors.append((word, None))
+        elif option in CARGO_FLAG_OPTIONS:
+            if has_value:
+                raise ValueError(
+                    f"INVALID_VALUE: flag {option!r} takes no value but got {value!r}; "
+                    f"next: drop `={value}` and pass {option} alone")
+            selectors.append((option, None))
         elif not word.startswith("-"):
             filters.append(word)
+        else:
+            raise ValueError(
+                f"UNKNOWN_OPTION: unsupported flag {word!r} before `--`; "
+                f"next: use only -p/--package, --test, --lib, --tests, --all-targets, --features")
     if len(names) != 1:
         raise ValueError(f"name exactly one -p package, got {names}")
     if names[0] not in packages:
@@ -414,6 +498,21 @@ def check_cargo_test(args, root, packages):
         if not (pattern in tests if exact else any(pattern in name for name in tests)):
             raise ValueError(
                 f"no test {'named' if exact else 'matching'} {pattern!r} in the selected targets")
+    if filters:
+        matched = {candidate for candidate in tests
+                   if any(candidate == pattern if exact else pattern in candidate
+                          for pattern in filters)}
+    else:
+        matched = set(tests)
+    if skips:
+        matched -= {candidate for candidate in matched
+                    if any(candidate == skip if exact else skip in candidate
+                           for skip in skips)}
+    if not matched:
+        raise ValueError(
+            f"EMPTY_SELECTION: no effective tests remain after filters {filters!r} with "
+            f"--exact={exact} and --skip {skips!r}; next: narrow --skip or add a positive "
+            f"filter that selects a real test")
 
 
 def check_verification(entry_id, verification, root=ROOT):
