@@ -1299,6 +1299,10 @@ async fn onboarding_runtime_picker_settings_and_lock_failures_finish_the_defer()
 async fn onboarding_runtime_reply_failures_keep_committed_success_and_attempt_one_error_edit() {
     let db = TestSchema::new().await;
     let result = std::panic::AssertUnwindSafe(async {
+        // Each submission carries its own timestamp: funnel rows are
+        // idempotent on guild/member/type/timestamp, so reusing one NOW
+        // would dedupe every submission after the first into zero new rows.
+        let mut tick = 0i64;
         for (mode, custom_id, key, selected, routed) in [
             ("legacy", GAME_SELECT_ID, "shooters", 1, 1),
             ("session", SESSION_SELECT_ID, "find-players", 0, 1),
@@ -1313,7 +1317,7 @@ async fn onboarding_runtime_reply_failures_keep_committed_success_and_attempt_on
                 let before_selected = db.count(EVENT_GAME_ROLES_SELECTED).await;
                 let before_routed = db.count(EVENT_CHANNEL_ROUTED).await;
                 let result = runtime(&db.pool, &mock, &vars(mode, false))
-                    .handle(component(custom_id, &[key]), NOW)
+                    .handle(component(custom_id, &[key]), NOW + tick)
                     .await;
                 assert_eq!(
                     result.is_err(),
@@ -1329,6 +1333,7 @@ async fn onboarding_runtime_reply_failures_keep_committed_success_and_attempt_on
                 );
                 assert_eq!(db.count(EVENT_CHANNEL_ROUTED).await, before_routed + routed);
                 assert_error_edit(&mock, 2).await;
+                tick += 1;
             }
         }
     })

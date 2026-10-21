@@ -841,11 +841,13 @@ impl OnboardingRuntime {
                     .game_partial_failure(
                         interaction,
                         lock,
-                        &guild,
-                        &member,
+                        GameSelectionTarget {
+                            guild: &guild,
+                            member: &member,
+                            at,
+                        },
                         &applied,
                         &writes[index..],
-                        at,
                     )
                     .await;
             }
@@ -921,11 +923,9 @@ impl OnboardingRuntime {
         &self,
         interaction: &Interaction,
         lock: sqlx::Transaction<'_, sqlx::Postgres>,
-        guild: &str,
-        member: &str,
+        target: GameSelectionTarget<'_>,
         applied: &[(&str, bool)],
         pending: &[(&str, bool)],
-        at: &str,
     ) -> Result<(), RuntimeError> {
         if applied.is_empty() {
             return Err(RuntimeError::Role);
@@ -937,18 +937,20 @@ impl OnboardingRuntime {
             .filter_map(|(role, _)| pick_for_role(role))
             .map(|pick| pick.key.to_owned())
             .collect();
-        record_game_partial_in_transaction(&mut lock, guild, member, &applied_keys, at)
-            .await
-            .map_err(|_| RuntimeError::Store)?;
+        record_game_partial_in_transaction(
+            &mut lock,
+            target.guild,
+            target.member,
+            &applied_keys,
+            target.at,
+        )
+        .await
+        .map_err(|_| RuntimeError::Store)?;
         lock.commit().await.map_err(|_| RuntimeError::Store)?;
         let labels = |writes: &[(&str, bool)]| {
             writes
                 .iter()
-                .map(|(role, _)| {
-                    pick_for_role(role)
-                        .map(|pick| pick.label.to_owned())
-                        .unwrap_or_else(|| (*role).to_owned())
-                })
+                .map(|(role, add)| partial_failure_label(role, *add))
                 .collect::<Vec<_>>()
         };
         self.reply(
@@ -970,6 +972,27 @@ impl OnboardingRuntime {
         .await
         .map_err(|_| RuntimeError::Discord)?
         .map_err(|_| RuntimeError::Discord)
+    }
+}
+
+/// Where-and-when for one game-picker submission, threaded to the
+/// partial-failure finisher as a single argument.
+struct GameSelectionTarget<'a> {
+    guild: &'a str,
+    member: &'a str,
+    at: &'a str,
+}
+
+/// Member-facing label for one game-picker role write. Revokes carry their
+/// direction: without it a completed revoke reads as `Applied: Shooters`.
+fn partial_failure_label(role: &str, add: bool) -> String {
+    let label = pick_for_role(role)
+        .map(|pick| pick.label.to_owned())
+        .unwrap_or_else(|| role.to_owned());
+    if add {
+        label
+    } else {
+        format!("{label} (removed)")
     }
 }
 
@@ -1029,6 +1052,27 @@ mod tests {
         let pc = pick_by_key("pc").expect("catalog");
         assert_eq!(pick_for_role(pc.role_id).map(|pick| pick.key), Some("pc"));
         assert_eq!(pick_for_role("9999999999999999999"), None);
+    }
+
+    /// Revoked picks carry their direction in the partial-failure reply, so a
+    /// completed revoke never reads as an applied grant. Grants keep the bare
+    /// catalog label the acceptance tests pin.
+    #[test]
+    fn partial_failure_labels_mark_revoked_picks() {
+        let shooters = pick_by_key("shooters").expect("catalog");
+        assert_eq!(partial_failure_label(shooters.role_id, true), "Shooters");
+        assert_eq!(
+            partial_failure_label(shooters.role_id, false),
+            "Shooters (removed)"
+        );
+        assert_eq!(
+            partial_failure_label("9999999999999999999", true),
+            "9999999999999999999"
+        );
+        assert_eq!(
+            partial_failure_label("9999999999999999999", false),
+            "9999999999999999999 (removed)"
+        );
     }
 
     /// Goodbye payloads captured before the clearing path existed carry no
