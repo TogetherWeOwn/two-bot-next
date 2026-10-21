@@ -17,6 +17,8 @@ mod creation_receipt_acceptance;
 mod delete_guards;
 #[path = "voice_empty_grace_override_tests.rs"]
 mod empty_grace_override;
+#[path = "voice_actor_fair_scheduling_acceptance_tests.rs"]
+mod fair_scheduling_acceptance;
 #[path = "voice_invite_override_tests.rs"]
 mod invite_override;
 #[path = "voice_invite_responder_wiring_tests.rs"]
@@ -15008,6 +15010,54 @@ fn creator_map_age_climbs_between_merges_and_starts_at_zero() {
     assert_eq!(creator_map_age_secs(Some(90_000), 20_000), 0);
 }
 
+#[test]
+fn snapshot_queue_age_climbs_from_the_stored_enqueue_stamp() {
+    // Sibling-clock queue age: whole seconds since the snapshot's oldest
+    // first-enqueue stamp; an empty snapshot reads 0, sub-second remainders
+    // truncate, and a stamp in the future saturates instead of wrapping.
+    let now = std::time::Instant::now();
+    assert_eq!(snapshot_queue_age_secs(None, now), 0);
+    assert_eq!(snapshot_queue_age_secs(Some(now), now), 0);
+    assert_eq!(
+        snapshot_queue_age_secs(Some(now - Duration::from_secs(400)), now),
+        400
+    );
+    assert_eq!(
+        snapshot_queue_age_secs(
+            Some(now - Duration::from_secs(400) - Duration::from_millis(999)),
+            now
+        ),
+        400
+    );
+    assert_eq!(
+        snapshot_queue_age_secs(Some(now + Duration::from_secs(5)), now),
+        0
+    );
+}
+
+#[test]
+fn snapshot_not_ready_age_matches_the_live_view_semantics() {
+    // The sibling's not-ready age mirrors `not_ready_secs`: 0 while the
+    // live view is ready or the transport is down (`None` stamp),
+    // climbing whole seconds otherwise, saturating on a future stamp.
+    let now = tokio::time::Instant::now();
+    assert_eq!(snapshot_not_ready_age_secs(None, false, now), 0);
+    assert_eq!(snapshot_not_ready_age_secs(Some(now), true, now), 0);
+    assert_eq!(snapshot_not_ready_age_secs(Some(now), false, now), 0);
+    assert_eq!(
+        snapshot_not_ready_age_secs(
+            Some(now - Duration::from_secs(400) - Duration::from_millis(999)),
+            false,
+            now
+        ),
+        400
+    );
+    assert_eq!(
+        snapshot_not_ready_age_secs(Some(now + Duration::from_secs(5)), false, now),
+        0
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn watchdog_creator_map_age_climbs_from_a_frozen_snapshot() {
     // While a dispatch is hung the main task takes no new snapshots, so the
@@ -15021,12 +15071,13 @@ async fn watchdog_creator_map_age_climbs_from_a_frozen_snapshot() {
         generation: next_voice_actor_generation(),
         retired: AtomicBool::new(false),
         http: Arc::clone(&worker.http),
+        live: worker.live.clone(),
         start: tokio::time::Instant::now(),
         state: Mutex::new(StallState {
             last_progress: tokio::time::Instant::now(),
             urgent: 0,
             deferred: 0,
-            oldest_age_secs: 0,
+            oldest_enqueued_at: None,
             halted: false,
             creators_generation: 0,
             creators_merged_ms: None,
@@ -15039,6 +15090,173 @@ async fn watchdog_creator_map_age_climbs_from_a_frozen_snapshot() {
     // No new snapshot (the hung-dispatch case): the age still climbs.
     tokio::time::advance(Duration::from_secs(400)).await;
     assert_eq!(stall.snapshot_creator_map_age_secs(&snap), 400);
+}
+
+#[tokio::test(start_paused = true)]
+async fn watchdog_queue_age_climbs_from_a_frozen_snapshot() {
+    // While a dispatch is hung the main task takes no new snapshots, so the
+    // watchdog sibling must derive the queue age from the stored
+    // first-enqueue stamp on its own clock: the same frozen snapshot yields
+    // a climbing age. The std clock ignores paused tokio time, so the test
+    // reads the stored stamp at a fabricated later `now`, then pins the
+    // full chain end to end through observe().
+    const QUEUE_GUILD: u64 = 9_100_006;
+    let (live, store, http, _) = fixture_for_guild(QUEUE_GUILD);
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker
+        .queue
+        .enqueue(QUEUE_GUILD, RoomAction::DeleteRoom { channel_id: 501 });
+    let generation = next_voice_actor_generation();
+    let stall = StallShared {
+        guild: QUEUE_GUILD,
+        generation,
+        retired: AtomicBool::new(false),
+        http: Arc::clone(&worker.http),
+        live: worker.live.clone(),
+        start: tokio::time::Instant::now(),
+        state: Mutex::new(StallState {
+            last_progress: tokio::time::Instant::now(),
+            urgent: 0,
+            deferred: 0,
+            oldest_enqueued_at: None,
+            halted: false,
+            creators_generation: 0,
+            creators_merged_ms: None,
+        }),
+    };
+    stall.snapshot(&worker, tokio::time::Instant::now());
+    let snap = *stall.state.lock().unwrap();
+    assert_eq!((snap.urgent, snap.deferred), (1, 0));
+    assert_eq!(
+        snap.oldest_enqueued_at,
+        worker.queue.oldest_pending_at(QUEUE_GUILD),
+        "the snapshot keeps the queue's own first-enqueue stamp"
+    );
+    let stamp = snap
+        .oldest_enqueued_at
+        .expect("the snapshot keeps the enqueue stamp");
+    // No new snapshot (the hung-dispatch case): the age still climbs.
+    assert_eq!(snapshot_queue_age_secs(Some(stamp), stamp), 0);
+    assert_eq!(
+        snapshot_queue_age_secs(Some(stamp), stamp + Duration::from_secs(400)),
+        400
+    );
+    // End to end through observe(): a 400 s-old stamp lands as a climbing
+    // queue age under the shared generation. (The std clock ignores paused
+    // tokio time, so the old stamp is fabricated, not advanced.)
+    {
+        let mut state = stall.state.lock().unwrap();
+        state.oldest_enqueued_at = Some(std::time::Instant::now() - Duration::from_secs(400));
+    }
+    let mut last_fire = None;
+    stall.observe(Duration::from_secs(3600), &mut last_fire);
+    assert_eq!(
+        metrics::global().voice_actor_contribution(QUEUE_GUILD),
+        Some((generation, false, [1, 0], 400)),
+        "observe() publishes the climbing queue age from the frozen snapshot"
+    );
+    metrics::global().remove_voice_actor(QUEUE_GUILD, generation);
+}
+
+#[tokio::test(start_paused = true)]
+async fn watchdog_not_ready_age_climbs_from_a_frozen_snapshot() {
+    // The sibling reads readiness from the shared live view, not the
+    // snapshot: a reconnect that stamps the not-ready clock after the last
+    // snapshot still yields a climbing age through a hung dispatch, and
+    // observe() lands it under the shared generation.
+    const NOT_READY_GUILD: u64 = 9_100_005;
+    let (live, store, http, _) = fixture_for_guild(NOT_READY_GUILD);
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let generation = next_voice_actor_generation();
+    let stall = StallShared {
+        guild: NOT_READY_GUILD,
+        generation,
+        retired: AtomicBool::new(false),
+        http: Arc::clone(&worker.http),
+        live: worker.live.clone(),
+        start: tokio::time::Instant::now(),
+        state: Mutex::new(StallState {
+            last_progress: tokio::time::Instant::now(),
+            urgent: 0,
+            deferred: 0,
+            oldest_enqueued_at: None,
+            halted: false,
+            creators_generation: 0,
+            creators_merged_ms: None,
+        }),
+    };
+    // Snapshot first, while the view is ready: the hung-dispatch case takes
+    // no further snapshots.
+    stall.snapshot(&worker, tokio::time::Instant::now());
+    // Transport loss then reconnect while the dispatch is hung: the gateway
+    // task stamps the not-ready clock on the live view after the last
+    // snapshot.
+    worker.live.transport_lost();
+    worker.live.gateway_connected(tokio::time::Instant::now());
+    assert_eq!(worker.live.not_ready_secs(tokio::time::Instant::now()), 0);
+    // No new snapshot (the hung-dispatch case): the age still climbs.
+    tokio::time::advance(Duration::from_secs(400)).await;
+    let mut last_fire = None;
+    stall.observe(Duration::from_secs(3600), &mut last_fire);
+    assert_eq!(
+        metrics::global().voice_actor_live_not_ready_secs(NOT_READY_GUILD),
+        Some(400),
+        "the sibling republishes the climbing not-ready age"
+    );
+    assert_eq!(
+        metrics::global()
+            .voice_actor_contribution(NOT_READY_GUILD)
+            .map(|(_, _, _, age)| age),
+        Some(0),
+        "an empty snapshot queue still publishes age 0"
+    );
+    metrics::global().remove_voice_actor(NOT_READY_GUILD, generation);
+}
+
+#[tokio::test(start_paused = true)]
+async fn watchdog_not_ready_age_tracks_a_live_republish_to_ready() {
+    // The sibling reads readiness from the shared live view: a GUILD_CREATE
+    // republish that flips the view ready after the last snapshot must
+    // clear the age, not keep climbing from a stale not-ready copy past the
+    // 120 s page bound.
+    const REPUBLISH_GUILD: u64 = 9_100_007;
+    let (live, store, http, _) = fixture_for_guild(REPUBLISH_GUILD);
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.live.transport_lost();
+    worker.live.gateway_connected(tokio::time::Instant::now());
+    let generation = next_voice_actor_generation();
+    let stall = StallShared {
+        guild: REPUBLISH_GUILD,
+        generation,
+        retired: AtomicBool::new(false),
+        http: Arc::clone(&worker.http),
+        live: worker.live.clone(),
+        start: tokio::time::Instant::now(),
+        state: Mutex::new(StallState {
+            last_progress: tokio::time::Instant::now(),
+            urgent: 0,
+            deferred: 0,
+            oldest_enqueued_at: None,
+            halted: false,
+            creators_generation: 0,
+            creators_merged_ms: None,
+        }),
+    };
+    stall.snapshot(&worker, tokio::time::Instant::now());
+    // The gateway task republishes the view ready while the dispatch is
+    // hung: no new snapshot follows.
+    assert!(worker
+        .live
+        .publish(snapshot_for_guild(REPUBLISH_GUILD, &[], vec![])));
+    tokio::time::advance(Duration::from_secs(400)).await;
+    let mut last_fire = None;
+    stall.observe(Duration::from_secs(3600), &mut last_fire);
+    assert_eq!(
+        metrics::global().voice_actor_live_not_ready_secs(REPUBLISH_GUILD),
+        Some(0),
+        "a live republish to ready clears the sibling-published age"
+    );
+    metrics::global().remove_voice_actor(REPUBLISH_GUILD, generation);
 }
 
 #[test]
@@ -15493,12 +15711,13 @@ async fn watchdog_observe_publishes_nothing_after_retirement() {
         generation,
         retired: AtomicBool::new(false),
         http: Arc::clone(&worker.http),
+        live: worker.live.clone(),
         start: tokio::time::Instant::now(),
         state: Mutex::new(StallState {
             last_progress: tokio::time::Instant::now(),
             urgent: 2,
             deferred: 3,
-            oldest_age_secs: 44,
+            oldest_enqueued_at: Some(std::time::Instant::now() - Duration::from_secs(44)),
             halted: true,
             creators_generation: 0,
             creators_merged_ms: None,
@@ -15540,12 +15759,13 @@ async fn metric_guard_drop_sets_the_retired_fence() {
         generation,
         retired: AtomicBool::new(false),
         http: Arc::clone(&worker.http),
+        live: worker.live.clone(),
         start: tokio::time::Instant::now(),
         state: Mutex::new(StallState {
             last_progress: tokio::time::Instant::now(),
             urgent: 1,
             deferred: 0,
-            oldest_age_secs: 7,
+            oldest_enqueued_at: Some(std::time::Instant::now() - Duration::from_secs(7)),
             halted: true,
             creators_generation: 0,
             creators_merged_ms: None,

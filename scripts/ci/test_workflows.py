@@ -29,8 +29,11 @@ JOB_INVENTORY = {
     "check.yml": {"check", "moderation-db", "parity-docs", "self-role-store", "job-inputs", "container-inputs", "container",
                   "community-db", "feeds-db", "tickets-postgres", "worker", "supply-chain", "ci-ok",
                   # `check` is now the lint lane; the test steps it used to
-                  # carry run in these three parallel lanes, all gated by ci-ok.
-                  "rust-tests", "ignored-db-stores", "ignored-db-runtime",
+                  # carry run in these parallel lanes, all gated by ci-ok.
+                  # `patch-coverage` is the HARD patch-coverage measurement,
+                  # split out of `rust-tests` so the two signals fail
+                  # independently.
+                  "rust-tests", "patch-coverage", "ignored-db-stores", "ignored-db-runtime",
                   # Compile-only libFuzzer build, gated by ci-ok like the Rust lanes.
                   "fuzz-compile",
                   # Promoted nextest lane (shared reusable), gated by ci-ok
@@ -3272,14 +3275,66 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(step["env"][base_key], expected_base)
                 self.assertEqual(step["env"][head_key], expected_head)
 
-    def test_rust_tests_timeout_leaves_headroom_for_coverage_measurement(self):
-        # The HARD patch-coverage step re-runs the suite under llvm-cov, and
-        # the suite has grown past the old 60-minute ceiling (five recent
-        # main runs took 49-60 min), so every event keeps 75 minutes: a slow
-        # runner reports a coverage verdict, not a job timeout.
+    def test_rust_tests_timeout_leaves_headroom_for_the_suite(self):
+        # Suite-only since the HARD patch-coverage measurement split into its
+        # own job: the combined job outgrew 60 minutes (59m54s on main, one
+        # 60m07s mid-measurement kill), while the replay alone measured ~30
+        # min of a 42m16s job. 45 minutes keeps comfortable headroom for a
+        # cache-cold or slow runner without letting a hung suite burn an hour.
         job = self.workflows["check.yml"]["jobs"]["rust-tests"]
-        # BaseLoader keeps scalars as strings; "75" is the 75-minute limit.
-        self.assertEqual(job["timeout-minutes"], "75")
+        # BaseLoader keeps scalars as strings; "45" is the 45-minute limit.
+        self.assertEqual(job["timeout-minutes"], "45")
+        # The measurement lives in `patch-coverage` now: no step there may
+        # re-merge it into this lane.
+        names = [step.get("name") for step in job["steps"]]
+        self.assertNotIn("Patch coverage (HARD, 80% of added lines)", names)
+
+    def test_patch_coverage_timeout_covers_the_measurement(self):
+        # The HARD patch-coverage measurement keeps the 60-minute ceiling the
+        # combined job needed: the llvm-cov replay alone measured ~30 min of
+        # a 42m16s job, and main heads have since reached 59m54s combined.
+        # A slow runner reports a coverage verdict, not a job timeout.
+        job = self.workflows["check.yml"]["jobs"]["patch-coverage"]
+        # BaseLoader keeps scalars as strings; "60" is the 60-minute limit.
+        self.assertEqual(job["timeout-minutes"], "60")
+
+    def test_rust_lane_cargo_cache_entries_are_pinned(self):
+        # The `check` entry is written by `rust-tests` and restored by the two
+        # ignored-db lanes, which rebuild the same non-instrumented graph. The
+        # `patch-coverage` lane builds a unique instrumented graph under
+        # `target/llvm-cov-target` that no other lane produces, so it owns a
+        # separate writable `coverage` entry: restore-only would cold-build the
+        # instrumented dependencies on every run after a cache rotation and
+        # erode the 60-minute ceiling the split exists to protect. Two writers
+        # must never share one entry (no concurrent save race on `check`).
+        jobs = self.workflows["check.yml"]["jobs"]
+        # (shared-key, save-if); BaseLoader keeps scalars as strings.
+        expected = {
+            "check": ("lint", "${{ github.event_name == 'push' }}"),
+            "rust-tests": ("check", "${{ github.event_name == 'push' }}"),
+            "patch-coverage": ("coverage", "${{ github.event_name == 'push' }}"),
+            "ignored-db-stores": ("check", "false"),
+            "ignored-db-runtime": ("check", "false"),
+        }
+        writers = []
+        for job_id, (shared_key, save_if) in expected.items():
+            cache = next(
+                (step for step in jobs[job_id]["steps"]
+                 if step.get("name") == "Restore cargo cache"),
+                None,
+            )
+            with self.subTest(job=job_id):
+                self.assertIsNotNone(cache, "Restore cargo cache step is missing")
+                self.assertEqual(cache["with"]["shared-key"], shared_key)
+                self.assertEqual(cache["with"]["save-if"], save_if)
+            if save_if != "false":
+                writers.append((job_id, shared_key))
+        seen = set()
+        for job_id, shared_key in writers:
+            self.assertNotIn(
+                shared_key, seen,
+                f"{job_id} races another writer on shared-key {shared_key}")
+            seen.add(shared_key)
 
     def test_rust_test_container_pins_disposable_database_service_address(self):
         job = self.workflows["check.yml"]["jobs"]["rust-tests"]
@@ -3288,7 +3343,27 @@ class WorkflowTests(unittest.TestCase):
             if step.get("name") == "Job-container prerequisites (loopback forward to agent-testdb)"
         )
         self.assertEqual(prerequisites.get("shell"), "bash")
-        run = prerequisites["run"]
+        self.assert_loopback_forward_is_pinned(prerequisites["run"])
+
+    def test_patch_coverage_container_pins_disposable_database_service_address(self):
+        # Same hardening as rust-tests: the coverage replay runs long database
+        # suites, and a main run lost service-alias DNS mid-suite. The block
+        # stays byte-identical to the rust-tests copy: shared setup, not a
+        # forked copy that can drift.
+        jobs = self.workflows["check.yml"]["jobs"]
+        runs = {}
+        for job_id in ("rust-tests", "patch-coverage"):
+            prerequisites = next(
+                step for step in jobs[job_id]["steps"]
+                if step.get("name") == "Job-container prerequisites (loopback forward to agent-testdb)"
+            )
+            self.assertEqual(prerequisites.get("shell"), "bash")
+            runs[job_id] = prerequisites["run"]
+        self.assert_loopback_forward_is_pinned(runs["patch-coverage"])
+        self.assertEqual(runs["rust-tests"], runs["patch-coverage"],
+                         "the lanes' loopback-forward blocks drifted apart")
+
+    def assert_loopback_forward_is_pinned(self, run):
         self.assertIn("set -e", run)
         hosts_tmp = run.index('hosts_tmp="${RUNNER_TEMP:?RUNNER_TEMP must be set}/hosts"')
         resolve = run.index("getent ahostsv4 agent-testdb")
@@ -3369,10 +3444,13 @@ class WorkflowTests(unittest.TestCase):
         # ran the PG18 default (max_wal_size 1GB) on the same 1 GiB tmpfs, and
         # the stores lane PANICed with ENOSPC mid-suite. Every lane that mounts
         # the bounded service must carry its own budget and verify it.
-        # rust-tests is tighter because its coverage replay exhausted 1 GiB at
-        # 512 MB (run 39360867142). The other lanes stay at 512/64 MB.
+        # rust-tests and patch-coverage are tighter because the coverage replay
+        # exhausted 1 GiB at 512 MB (run 39360867142); rust-tests keeps the
+        # budget the replay needed when it ran there. The other lanes stay at
+        # 512/64 MB.
         budgets = {
             "rust-tests": ("128MB", "32MB"),
+            "patch-coverage": ("128MB", "32MB"),
             "ignored-db-stores": ("512MB", "64MB"),
             "ignored-db-runtime": ("512MB", "64MB"),
         }
@@ -3494,12 +3572,13 @@ class WorkflowTests(unittest.TestCase):
             for workflow, job_id in (
                 ("check.yml", "check"),
                 ("check.yml", "rust-tests"),
+                ("check.yml", "patch-coverage"),
                 ("check.yml", "ignored-db-stores"),
                 ("check.yml", "ignored-db-runtime"),
                 ("reusable-rust-nextest.yml", "nextest"),
             )
         ]
-        self.assertEqual(len(lanes), 5)
+        self.assertEqual(len(lanes), 6)
         guards = []
         for workflow, job_id in lanes:
             with self.subTest(workflow=workflow, job=job_id):
@@ -3531,7 +3610,7 @@ class WorkflowTests(unittest.TestCase):
                 self.assertIn('if [ "$free_bytes" -lt "$floor" ]', run)
                 self.assertIn("exit 1", run)
                 guards.append((workflow, job_id, run))
-        # All five copies stay byte-identical: a single-copy exit-1 removal or
+        # All six copies stay byte-identical: a single-copy exit-1 removal or
         # -lt/-gt inversion must fail offline instead of silently disabling
         # the only fail-fast protection for that lane.
         bodies = [run for _, _, run in guards]
@@ -3586,7 +3665,7 @@ class WorkflowTests(unittest.TestCase):
         # max_wal_size is a soft checkpoint target, not a hard ceiling: the
         # pre-suite report cannot show peak WAL. Every Postgres lane brackets
         # its run with an always-runs post-suite report for ENOSPC triage.
-        for job_id in ("rust-tests", "ignored-db-stores", "ignored-db-runtime"):
+        for job_id in ("rust-tests", "patch-coverage", "ignored-db-stores", "ignored-db-runtime"):
             with self.subTest(job=job_id):
                 job = self.workflows["check.yml"]["jobs"][job_id]
                 steps = job["steps"]
@@ -3597,9 +3676,12 @@ class WorkflowTests(unittest.TestCase):
                     if step.get("name") == "Report Postgres storage headroom (post-suite)"
                 )
                 self.assertEqual(post.get("if"), "always()")
+                # patch-coverage runs no plain `cargo test` step: its suite is
+                # the llvm-cov replay inside the Patch coverage step.
                 test_steps = [
                     index for index, candidate in enumerate(steps)
                     if "cargo test" in str(candidate.get("run", ""))
+                    or "Patch coverage" in str(candidate.get("name", ""))
                 ]
                 self.assertTrue(test_steps)
                 self.assertGreater(steps.index(post), max(test_steps))
@@ -3757,7 +3839,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("'min_wal_size': '64MB'", verify["run"])
 
     def test_patch_coverage_runs_with_db_and_includes_ignored_tests(self):
-        job = self.workflows["check.yml"]["jobs"]["rust-tests"]
+        job = self.workflows["check.yml"]["jobs"]["patch-coverage"]
         step = next(
             step for step in job["steps"]
             if step.get("name") == "Patch coverage (HARD, 80% of added lines)"
@@ -4049,12 +4131,13 @@ class WorkflowTests(unittest.TestCase):
             "always() && !cancelled() && steps.prepare_test_databases.outcome == 'success' "
             "&& steps.verify_disposable_postgres.outcome == 'success'",
         )
-        test_steps = [
-            index for index, candidate in enumerate(job["steps"])
-            if "cargo test" in str(candidate.get("run", ""))
-        ]
-        self.assertTrue(test_steps)
-        self.assertGreater(job["steps"].index(step), max(test_steps))
+        # The measurement rides alone in its own job: no plain `cargo test`
+        # step may re-merge the suite signal into this lane.
+        self.assertEqual(
+            [candidate.get("name") for candidate in job["steps"]
+             if "cargo test" in str(candidate.get("run", ""))],
+            [],
+        )
         self.assertEqual(
             next(candidate for candidate in job["steps"]
                  if candidate.get("name") == "Prepare isolated test databases")["id"],
@@ -4148,7 +4231,7 @@ class WorkflowTests(unittest.TestCase):
         )
         jobs = self.workflows["check.yml"]["jobs"]
         step = next(
-            step for step in jobs["rust-tests"]["steps"]
+            step for step in jobs["patch-coverage"]["steps"]
             if step.get("name") == "Patch coverage (HARD, 80% of added lines)"
         )
         [sweep] = [
@@ -4252,7 +4335,7 @@ class WorkflowTests(unittest.TestCase):
         )
 
     def test_coverage_replays_strict_agent_test_targets_and_fails_closed(self):
-        job = self.workflows["check.yml"]["jobs"]["rust-tests"]
+        job = self.workflows["check.yml"]["jobs"]["patch-coverage"]
         step = next(
             step for step in job["steps"]
             if step.get("name") == "Patch coverage (HARD, 80% of added lines)"
@@ -6197,7 +6280,7 @@ class WorkflowTests(unittest.TestCase):
         }
         installers = {job: steps for job, steps in installers.items() if steps}
         self.assertEqual(set(installers), {
-            "check", "rust-tests", "ignored-db-stores", "ignored-db-runtime",
+            "check", "rust-tests", "patch-coverage", "ignored-db-stores", "ignored-db-runtime",
             "moderation-db", "self-role-store", "community-db", "tickets-postgres", "feeds-db",
             "fuzz-compile",
         })
@@ -6934,6 +7017,70 @@ class WorkflowTests(unittest.TestCase):
                     for step in job.get("steps", []):
                         if step.get("uses", "").startswith("actions/checkout@"):
                             self.assertEqual(step["with"]["persist-credentials"], "false")
+
+    def test_every_job_declares_a_timeout(self):
+        # Direct jobs state a ceiling instead of burning the six-hour default.
+        # Reusable callers cannot declare timeout-minutes: execution ceilings
+        # belong to the callee jobs. Local callees are also in self.workflows;
+        # pinned organization callees own their ceilings in their source repo.
+        # Numeric ceilings stay at or below 360; expressions (the push-dependent
+        # lanes) only need to be present and non-blank.
+        for name, workflow in self.workflows.items():
+            for job_id, job in workflow["jobs"].items():
+                with self.subTest(workflow=name, job=job_id):
+                    if "uses" in job:
+                        self.assertNotIn("timeout-minutes", job)
+                        continue
+                    self.assertIn("timeout-minutes", job)
+                    ceiling = job["timeout-minutes"]
+                    self.assertIsNotNone(ceiling)
+                    self.assertTrue(str(ceiling).strip())
+                    if re.fullmatch(r"\d+", str(ceiling)):
+                        self.assertGreaterEqual(int(ceiling), 1)
+                        self.assertLessEqual(int(ceiling), 360)
+
+    def test_own_trigger_workflows_serialize_at_the_top_level(self):
+        # A workflow with its own triggers (anything beyond a pure
+        # `workflow_call` callee) declares top-level `concurrency`, so two
+        # dispatches or pushes cannot race each other on the shared runners.
+        # Pure callees are serialized by their callers instead; the two
+        # deploy-side workflows below serialize at the lane jobs on purpose
+        # (a top-level group would queue work that must stay unqueued).
+        exempt = {
+            # Pure `workflow_call` callees: the caller holds the group.
+            "sbom.yml",
+            "reusable-rust-nextest.yml",
+            # Serializes at the `tag` job (`release` group) so the
+            # read-only dry-run/repair paths stay unserialized.
+            "release.yml",
+            # Serializes at the `production`/`release` lane jobs only, so a
+            # sleeping promotion can never queue an operator rollback
+            # behind it (see the header comment in the workflow).
+            "deploy-production.yml",
+        }
+        for name, workflow in self.workflows.items():
+            on = workflow.get("on") or {}
+            triggers = {on} if isinstance(on, str) else set(on)
+            if name in ("sbom.yml", "reusable-rust-nextest.yml"):
+                # Gaining an own trigger forces a concurrency decision here.
+                self.assertEqual(triggers, {"workflow_call"}, name)
+            if name == "release.yml":
+                self.assertEqual(
+                    workflow["jobs"]["tag"].get("concurrency", {}).get("group"),
+                    "release", name)
+            if name == "deploy-production.yml":
+                for job_id in ("production", "release"):
+                    self.assertEqual(
+                        workflow["jobs"][job_id].get("concurrency", {}).get("group"),
+                        "deploy-production", f"{name}:{job_id}")
+            if name in exempt:
+                continue
+            with self.subTest(workflow=name):
+                concurrency = workflow.get("concurrency")
+                self.assertIsInstance(concurrency, dict)
+                group = concurrency.get("group")
+                self.assertIsNotNone(group)
+                self.assertTrue(str(group).strip())
 
 
 if __name__ == "__main__":
