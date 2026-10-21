@@ -81,7 +81,7 @@ Rules for the signing secret:
   renders `[REDACTED]`, and it leaves that wrapper only at the HMAC boundary
   and inside the create-subscription body, which is itself a `Secret`.
   Source: `crates/core/src/twitch_eventsub.rs:101-127`,
-  `crates/core/src/twitch_eventsub.rs:441-460`.
+  `crates/core/src/twitch_eventsub.rs:457-476`.
 - The handler never re-reads the environment: the secret is cloned into
   receiver state at bind time. Unarmed, a new value takes effect on container
   restart, not on secret edit alone. Armed (the Operator provisioned
@@ -161,7 +161,7 @@ proves the running container now holds the new secret. A `401` means it
 does not (ownership transfer incomplete, or the wrong secret value):
 stop, fix that, do not delete. A `503` means the refresh itself failed:
 stop and triage per the `503 unavailable` list below, do not delete.
-Source: `crates/core/src/twitch_eventsub.rs:144-151,169-197,277-288`,
+Source: `crates/core/src/twitch_eventsub.rs:142-159,171-199,282-292`,
 `crates/bot/src/eventsub_http.rs:518-534`,
 `wrangler/src/eventsub.ts:198-235`.
 
@@ -365,11 +365,11 @@ Classification after verification:
 - A well-formed challenge (nonempty, at most 256 printable ASCII characters)
   on a `stream.online` v1 subscription is echoed as the `200 text/plain`
   body with `Cache-Control: no-store`.
-  Source: `crates/core/src/twitch_eventsub.rs:247-277`,
+  Source: `crates/core/src/twitch_eventsub.rs:243-249,263-292`,
   `crates/bot/src/eventsub_http.rs:350-366`.
 - Only `stream.online` version `1` is accepted; any other subscription type
   or version is a deterministic `WrongSubscription` error.
-  Source: `crates/core/src/twitch_eventsub.rs:227-233`.
+  Source: `crates/core/src/twitch_eventsub.rs:243-249,275-280`.
 - An empty, oversized, or non-graphic challenge is `InvalidChallenge` and
   answers `400 malformed`, never an echo.
   Source: `crates/bot/src/eventsub_http.rs:412-425`.
@@ -380,7 +380,7 @@ secret agreement (401s in the logs?), a `200 delivery ignored` right after
 the subscription creation (the challenge was not echoed — delete and
 recreate the subscription, see below), and only then the callback URL shape
 (plain `https`, no port, query, fragment, or userinfo; canonical form).
-Source: `crates/core/src/twitch_eventsub.rs:405-436`,
+Source: `crates/core/src/twitch_eventsub.rs:428-446`,
 `crates/bot/src/eventsub_http.rs:403-411`.
 
 ## Refusal matrix
