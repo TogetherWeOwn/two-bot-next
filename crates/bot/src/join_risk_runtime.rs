@@ -506,11 +506,13 @@ impl JoinRiskRuntime {
     }
 
     /// Dequeued joins handled to completion, caught panics included.
+    #[cfg_attr(not(test), allow(dead_code))] // Drain counter observed by the acceptance tests.
     pub fn finished(&self) -> u64 {
         self.shutdown.finished()
     }
 
     /// Queued joins dropped without starting after a latched shutdown.
+    #[cfg_attr(not(test), allow(dead_code))] // Drain counter observed by the acceptance tests.
     pub fn dropped_shutdown(&self) -> u64 {
         self.shutdown.dropped()
     }
