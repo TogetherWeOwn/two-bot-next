@@ -4269,13 +4269,13 @@ async fn settlement_timeout_note_and_ambiguous_class(pool: &PgPool) -> TestResul
     mock.shutdown().await;
     // Ambiguous: a received 500 completes with its outcome class.
     let clock = Arc::new(AtomicI64::new(NOW));
-    let mut panel = panel(PanelMode::Select);
+    let mut panel = self::panel(PanelMode::Select);
     panel.id = "settlement-ambiguous-class".into();
     let mut script = snapshot(&[OLD_ROLE, OTHER]);
     script.push(ScriptedResponse::status(500));
     let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
     let feature = runtime(pool, &clock, &mock);
-    let request = request(
+    let request = self::request(
         &panel.id,
         Selection::Select {
             option_keys: vec!["new".into()],

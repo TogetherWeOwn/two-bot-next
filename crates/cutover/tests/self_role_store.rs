@@ -2772,7 +2772,7 @@ async fn exercise_settlement_legacy_fallback(pool: &PgPool) -> TestResult {
         .await?
         .expect("fresh audit must claim");
     let intent = ExchangeIntent {
-        role_id: "role-a".into(),
+        role_id: "101".into(),
         adding: true,
         compensating: false,
     };
@@ -2872,7 +2872,7 @@ async fn exercise_settlement_link_guards(pool: &PgPool) -> TestResult {
     }
     let store = SelfRoleStore::new(pool.clone());
     let intent = ExchangeIntent {
-        role_id: "role-a".into(),
+        role_id: "101".into(),
         adding: true,
         compensating: false,
     };

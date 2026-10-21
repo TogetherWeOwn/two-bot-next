@@ -20,7 +20,7 @@ use std::sync::{
     Arc,
 };
 
-use sqlx::{PgConnection, PgPool};
+use sqlx::{Connection, PgConnection, PgPool};
 use time::{Duration, OffsetDateTime};
 use two_bot_core::self_roles::{
     event_order_from_snowflake, self_role_renew_after_ms, PanelMode, RoleOperation, SettledOutcome,
@@ -2252,6 +2252,9 @@ async fn retire_exchange_evidence(
     // rows keep settled_* NULL and already-settled rows keep their decision.
     // Evidence semantics above are unchanged: settlement never clears
     // uncertainty, it only records that the ticket stopped being probed.
+    // Missing columns abort a PostgreSQL transaction. Isolate the new-column
+    // write in a savepoint so the legacy fallback can use the enclosing one.
+    let mut settlement = conn.begin().await?;
     let retired = sqlx::query(
         "UPDATE self_role_exchanges SET retired_at=$2,retired_generation=$3,
          settled_at=CASE WHEN outcome_class IS NOT NULL AND settled_at IS NULL
@@ -2264,22 +2267,24 @@ async fn retire_exchange_evidence(
     .bind(now)
     .bind(claim.generation)
     .bind(SETTLED_EXPIRED_UNKNOWN)
-    .execute(&mut *conn)
+    .execute(&mut *settlement)
     .await;
-    if let Err(error) = retired {
-        if !is_undefined_column(&error) {
-            return Err(error.into());
+    match retired {
+        Ok(_) => settlement.commit().await?,
+        Err(error) if is_undefined_column(&error) => {
+            settlement.rollback().await?;
+            warn_ack_legacy_lane();
+            sqlx::query(
+                "UPDATE self_role_exchanges SET retired_at=$2,retired_generation=$3
+                 WHERE event_id=$1 AND retired_at IS NULL AND disposition <> 'pending'",
+            )
+            .bind(&claim.event_id)
+            .bind(now)
+            .bind(claim.generation)
+            .execute(&mut *conn)
+            .await?;
         }
-        warn_ack_legacy_lane();
-        sqlx::query(
-            "UPDATE self_role_exchanges SET retired_at=$2,retired_generation=$3
-             WHERE event_id=$1 AND retired_at IS NULL AND disposition <> 'pending'",
-        )
-        .bind(&claim.event_id)
-        .bind(now)
-        .bind(claim.generation)
-        .execute(&mut *conn)
-        .await?;
+        Err(error) => return Err(error.into()),
     }
     let mut query = sqlx::query(
         "UPDATE self_role_audit SET attempted_added_role_ids=$1,attempted_removed_role_ids=$2,

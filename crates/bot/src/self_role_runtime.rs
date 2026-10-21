@@ -524,7 +524,7 @@ impl SelfRoleRuntime {
             if !store_io(self.store.complete_role_exchange(ticket, receipt)).await? {
                 return Err(RuntimeError::Store(StoreErrorKind::UnmatchedReceipt));
             }
-        } else if matches!(exchange, Ok(_)) {
+        } else if exchange.is_ok() {
             store_io(
                 self.store
                     .note_ambiguous_outcome(ticket, "timeout_no_response"),
