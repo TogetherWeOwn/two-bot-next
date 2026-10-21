@@ -2631,6 +2631,32 @@ async fn transfer_hands_room_to_occupant_and_remembers_creator() {
         .contains(&"update_ownership:500:301".to_owned()));
 }
 
+#[tokio::test(start_paused = true)]
+async fn suspended_room_transfer_reports_finalizing_and_keeps_the_handoff_queued() {
+    let (live, store, http, _) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // Suspend the room so the queued handoff is never due: the staged reply
+    // must answer from the pump deadline, not hang on the queue.
+    assert!(worker.queue.suspend(GUILD, 500));
+    let (reply, inbox) = oneshot::channel();
+    apply_command(
+        &mut worker,
+        ActorCommand::Ownership {
+            actor_id: MEMBER,
+            is_admin: false,
+            command: OwnershipCommand::Transfer { target_id: 301 },
+            reply,
+        },
+        0,
+    );
+    worker.drive_staged_ownership(0).await;
+    assert_eq!(inbox.await.unwrap(), OWNERSHIP_FINALIZING);
+    assert!(
+        worker.ownership_queued.contains(&500),
+        "an unconfirmed handoff stays queued for retry"
+    );
+}
+
 fn owner_overwrite(member: u64) -> PermissionOverwrite {
     PermissionOverwrite {
         id: Id::new(member),
