@@ -977,6 +977,12 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "voice_live_self_heal",
     "voice_live_not_ready",
     "voice_queue_stall",
+    "retention_replay_needed",
+    "voice_dispatch_timeouts",
+    "voice_watchdog_stucks",
+    "voice_halt_recoveries",
+    "rest_breaker_opens",
+    "rest_global_pauses",
     "feed_fetch_failures",
     "eventsub_receive_gap",
     "eventsub_reconcile_prior_failed",
@@ -1018,6 +1024,12 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("voice_live_self_heal", window), `evidence-voice_live_self_heal-${window}.json`);
   assert.equal(packetFilename("voice_live_not_ready", window), `evidence-voice_live_not_ready-${window}.json`);
   assert.equal(packetFilename("voice_queue_stall", window), `evidence-voice_queue_stall-${window}.json`);
+  assert.equal(packetFilename("retention_replay_needed", window), `evidence-retention_replay_needed-${window}.json`);
+  assert.equal(packetFilename("voice_dispatch_timeouts", window), `evidence-voice_dispatch_timeouts-${window}.json`);
+  assert.equal(packetFilename("voice_watchdog_stucks", window), `evidence-voice_watchdog_stucks-${window}.json`);
+  assert.equal(packetFilename("voice_halt_recoveries", window), `evidence-voice_halt_recoveries-${window}.json`);
+  assert.equal(packetFilename("rest_breaker_opens", window), `evidence-rest_breaker_opens-${window}.json`);
+  assert.equal(packetFilename("rest_global_pauses", window), `evidence-rest_global_pauses-${window}.json`);
   assert.equal(packetFilename("feed_fetch_failures", window), `evidence-feed_fetch_failures-${window}.json`);
   assert.equal(packetFilename("eventsub_receive_gap", window), `evidence-eventsub_receive_gap-${window}.json`);
   assert.equal(packetFilename("eventsub_reconcile_prior_failed", window), `evidence-eventsub_reconcile_prior_failed-${window}.json`);
@@ -1253,6 +1265,16 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
   );
   firing.push(...ev(["two_bot_voice_live_not_ready_seconds 121"]).firing);
   firing.push(...ev(["two_bot_voice_queue_oldest_age_seconds 121"]).firing);
+  for (const series of [
+    "two_bot_retention_replay_needed_total",
+    "two_bot_voice_dispatch_timeouts_total",
+    "two_bot_voice_watchdog_stucks_total",
+    "two_bot_voice_halt_recoveries_total",
+    "two_bot_rest_guard_breaker_opens_total",
+    "two_bot_rest_guard_global_pauses_total",
+  ]) {
+    firing.push(...ev([`${series} 1`], ev([`${series} 0`]).state).firing);
+  }
   const feedErrors = (transport: number) => [
     "invalid_source", "non_public_address", "redirect_refused", "too_large", "invalid_encoding", "unsupported_content_type", "unsupported_encoding", "resolve", "transport", "deadline", "http_error", "other",
   ].map((c) => `two_bot_feed_fetch_errors_total{error_class="${c}"} ${c === "transport" ? transport : 0}`);

@@ -49,6 +49,11 @@ export const ALERT_INPUT_LABELS: Record<string, Record<string, readonly string[]
  * queue oldest age) is optional for the same reason: an older container
  * without it must still scrape, with the stall rules held rather than every
  * rule silenced. Queue depth (`two_bot_voice_queue_pending{lane}`) stays
+ * unvalidated: no rule consumes it (see the catalog deferral). The safety
+ * family below (retention purge-skip counter, voice dispatch-timeout,
+ * watchdog-stuck and halt-recovery counters, breaker opens and global-pause
+ * counters) is optional for the same reason, with the safety-series tickets
+ * held. Breaker closes (`two_bot_rest_guard_breaker_closes_total`) stays
  * unvalidated: no rule consumes it (see the catalog deferral). The
  * domain-outcome family below (feed-fetch errors, EventSub received and
  * reconcile errors, automod decisions, moderation enforcements, voice REST
@@ -76,6 +81,13 @@ export const ALERT_OPTIONAL_INPUT_LABELS: Record<string, Record<string, readonly
   two_bot_voice_live_self_heal_total: {},
   two_bot_voice_live_not_ready_seconds: {},
   two_bot_voice_queue_oldest_age_seconds: {},
+  // Safety/liveness family; old containers may omit the whole family.
+  two_bot_retention_replay_needed_total: {},
+  two_bot_voice_dispatch_timeouts_total: {},
+  two_bot_voice_watchdog_stucks_total: {},
+  two_bot_voice_halt_recoveries_total: {},
+  two_bot_rest_guard_breaker_opens_total: {},
+  two_bot_rest_guard_global_pauses_total: {},
   // Domain-outcome and voice-liveness family; old containers may omit the whole family.
   two_bot_feed_fetch_errors_total: { error_class: ["invalid_source", "non_public_address", "redirect_refused", "too_large", "invalid_encoding", "unsupported_content_type", "unsupported_encoding", "resolve", "transport", "deadline", "http_error", "other"] },
   two_bot_eventsub_received_total: {},

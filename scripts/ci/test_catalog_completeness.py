@@ -62,9 +62,6 @@ _ALERT_INPUT_REASON = (
 EXEMPT_SERIES = {
     "two_bot_rest_guard_invalid_requests_total": _GUARD_REASON,
     "two_bot_rest_guard_rejected_requests_total": _GUARD_REASON,
-    "two_bot_rest_guard_breaker_opens_total": _GUARD_REASON,
-    "two_bot_rest_guard_breaker_closes_total": _GUARD_REASON,
-    "two_bot_rest_guard_global_pauses_total": _GUARD_REASON,
     "two_bot_rest_guard_invalid_requests_in_window": _GUARD_REASON,
     "two_bot_rest_guard_token_invalid": _GUARD_REASON,
     "two_bot_rest_guard_pending_global_responses": _GUARD_REASON,

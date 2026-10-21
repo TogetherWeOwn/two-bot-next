@@ -86,11 +86,12 @@ test("catalog: rule ids match the Rust evidence list, preserve append positions 
   const rustIds = /pub const ALERT_RULE_IDS: \[&str; \d+\] = \[([\s\S]*?)\];/.exec(evidence);
   assert.ok(rustIds, "ALERT_RULE_IDS not found in crates/core/src/evidence.rs");
   assert.deepEqual(RULES.map((r) => r.id), [...rustIds[1]!.matchAll(/"([^"]+)"/g)].map((m) => m[1]!));
-  // The 33-rule historical prefix ends with the voice stall ticket; the
+  // The 39-rule historical prefix ends with the global-pause ticket; the
   // seven domain-outcome rules append after it without displacing anything.
   assert.equal(RULES[28]?.id, "prefix_trigger_verdict_refusals");
   assert.equal(RULES[32]?.id, "voice_queue_stall");
-  NEW_RULES.forEach((id, i) => assert.equal(RULES[33 + i]?.id, id));
+  assert.equal(RULES[38]?.id, "rest_global_pauses");
+  NEW_RULES.forEach((id, i) => assert.equal(RULES[39 + i]?.id, id));
   for (const id of NEW_RULES) {
     assert.equal(RULES.filter((r) => r.id === id).length, 1, `${id} is catalogued exactly once`);
     assert.equal(
