@@ -1262,8 +1262,10 @@ with DB-error or pool-saturation alerts suggesting a wider database incident.
 `two_bot_voice_dispatch_timeouts_total` increased between two keepalive
 samples. One actor dispatch turn ran past the 60 s observe bound. The turn ran
 to completion and the queue keeps its retries, so a single overrun is
-slowness, not loss — but an over-budget turn means a constituent await has no
-cap, and repeats mean the actor is overloaded. The first sample after
+slowness, not loss — but an over-budget turn proves only that the total turn
+exceeded 60 s, which bounded awaits, lock contention, scheduling delay, or
+downstream latency can also produce, and repeats mean the actor is not
+keeping up. The first sample after
 monitoring arms only stores the baseline and never fires, and a counter reset
 (process restart) skips the window rather than firing. This is a **ticket**,
 not a page: one slow turn never pages, while member-visible join degradation
@@ -1273,9 +1275,9 @@ First response: read the warn log line `voice dispatch turn exceeded observe
 bound` for the guild and elapsed seconds, plus the queue-side posture from the
 authorized `/ops/metrics` scrape (`two_bot_voice_queue_oldest_age_seconds`,
 `two_bot_voice_live_not_ready_seconds`). A lone overrun next to a healthy
-queue is one slow constituent await — note it and watch the next windows. Do
+queue is one slow turn — note it and watch the next windows. Do
 not restart the container to "clear" the counter; a replacement resets the
-baseline without capping the await.
+baseline without addressing the slowness.
 
 Escalate when overruns repeat across windows, when they coincide with
 watchdog-stuck or queue-stall tickets (the actor is not keeping up), or when
@@ -1299,8 +1301,11 @@ First response: read the error log line `voice worker stuck: queued actions
 with no progress` (at most one per stuck window), then check the sibling
 posture from the authorized `/ops/metrics` scrape: the halt latch
 (`two_bot_voice_worker_halted`), the live-not-ready age, the queue oldest age
-and the join-budget burn rules. A stuck window next to a halted latch is the
-halt, not the queue — follow the halted-worker section. A stuck window with a
+and the join-budget burn rules. A stuck window next to a halted latch suggests
+the halt rather than the queue — but both signals aggregate across all guild
+actors with no guild labels, so co-occurrence alone does not prove the halt
+caused this stuck window; confirm attribution in the guild-scoped log lines,
+then follow the halted-worker section. A stuck window with a
 hung dispatch is the in-process verdict; anything else points at a slow drain.
 Do not restart the container to "clear" the counter; a replacement resets the
 baseline without draining the queue.
@@ -1330,8 +1335,10 @@ credentials healthy` for the guild, plus any `voice halt re-probe: store
 still refusing` or `timed out` lines around it from the container logs. A lone
 recovery after one refusing probe is a transient store blip — note it and
 watch the next windows. Confirm the halt latch reads 0 on the authorized
-`/ops/metrics` scrape; a latched 1 next to a recovery means another guild is
-still halted (the latch aggregates all current guild actors). Do not restart
+`/ops/metrics` scrape; a latched 1 next to a recovery means some guild actor is
+still halted — possibly the same guild re-halted, possibly another (the latch
+aggregates all current guild actors with no guild labels); use the
+guild-scoped log lines for attribution. Do not restart
 the container to "clear" the counter; a replacement resets the baseline
 without explaining the refusal.
 
@@ -1394,8 +1401,9 @@ wait, plus `two_bot_rest_guard_global_paused`,
 `/ops/metrics` scrape; confirm whether a deploy is in progress (a fresh
 deploy shipping a request storm trips the global limit fast). There is no
 manual pause release: do not restart the container to "clear" it — a restart
-only resets the counters and destroys the evidence, and the new process
-re-learns the same deadline. Read the remaining duration together with
+resets the counters, drops pending response state, and loses the in-memory
+deadline; the new process does not retain the pause unless it observes another
+global 429. Read the remaining duration together with
 `global_paused` and pending responses, not as a standalone readiness signal.
 
 Escalate when new episodes arrive back-to-back across windows with no
