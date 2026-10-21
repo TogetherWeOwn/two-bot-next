@@ -143,7 +143,7 @@ async fn insert_or_select_post(
     .await
     .unwrap();
     sqlx::query_as(
-        "SELECT board_message_id, state FROM starboard_posts
+        "SELECT board_message_id, state::text FROM starboard_posts
          WHERE guild_id = $1 AND source_message_id = $2",
     )
     .bind(guild_id)
@@ -591,7 +591,7 @@ async fn post_state_lifecycle_columns() {
         .await
         .unwrap();
         let row: (Option<i64>, i64, String) = sqlx::query_as(
-            "SELECT board_message_id, star_count::bigint, state FROM starboard_posts
+            "SELECT board_message_id, star_count::bigint, state::text FROM starboard_posts
              WHERE guild_id = $1 AND source_message_id = $2",
         )
         .bind(GUILD)
