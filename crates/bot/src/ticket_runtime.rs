@@ -762,8 +762,7 @@ impl TicketRuntime {
             .ok_or(Failure::InvalidEvidence)?;
         self.set_writes(&doc, channel, &ticket.opener_id, false)
             .await?;
-        let snapshot = self.capture_history(channel).await?;
-        let truncated = snapshot.content.ends_with(history::TRUNCATION_MARKER);
+        let (snapshot, truncated) = self.capture_history(channel).await?;
         self.store
             .save_transcript(&ticket.id, started_at, now_millis_for_test(), snapshot)
             .await?;
@@ -816,7 +815,10 @@ impl TicketRuntime {
         Ok(())
     }
 
-    pub(crate) async fn capture_history(&self, channel: &str) -> Result<TranscriptSnapshot> {
+    pub(crate) async fn capture_history(
+        &self,
+        channel: &str,
+    ) -> Result<(TranscriptSnapshot, bool)> {
         let mut before: Option<String> = None;
         let mut capture = history::HistoryCapture::default();
         loop {

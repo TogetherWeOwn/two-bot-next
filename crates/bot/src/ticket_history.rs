@@ -12,7 +12,7 @@ use two_bot_core::{
     tickets::{TranscriptSnapshot, MAX_TRANSCRIPT_UTF16_UNITS},
 };
 
-pub(super) const TRUNCATION_MARKER: &str = "\n[transcript truncated]";
+const TRUNCATION_MARKER: &str = "\n[transcript truncated]";
 
 #[derive(Default)]
 pub(super) struct HistoryCapture {
@@ -147,11 +147,12 @@ impl HistoryCapture {
         }
     }
 
-    pub(super) fn finish(self) -> TranscriptSnapshot {
+    pub(super) fn finish(self) -> (TranscriptSnapshot, bool) {
+        let truncated = self.truncated;
         let bytes: usize = self.lines.iter().map(|line| line.text.len()).sum();
         let mut content = String::with_capacity(
             bytes
-                + if self.truncated {
+                + if truncated {
                     TRUNCATION_MARKER.len()
                 } else {
                     0
@@ -160,13 +161,16 @@ impl HistoryCapture {
         for line in self.lines {
             content.push_str(&line.text);
         }
-        if self.truncated {
+        if truncated {
             content.push_str(TRUNCATION_MARKER);
         }
-        TranscriptSnapshot {
-            content,
-            message_count: self.message_count,
-        }
+        (
+            TranscriptSnapshot {
+                content,
+                message_count: self.message_count,
+            },
+            truncated,
+        )
     }
 }
 
@@ -268,7 +272,8 @@ mod tests {
             assert_bounded(&capture);
             assert_eq!(capture.lines.len(), 1);
         }
-        let snapshot = capture.finish();
+        let (snapshot, truncated) = capture.finish();
+        assert!(truncated);
         assert_eq!(snapshot.message_count, 256);
         assert!(snapshot.content.ends_with(TRUNCATION_MARKER));
         assert_eq!(
@@ -321,7 +326,8 @@ mod tests {
             .unwrap();
         assert_bounded(&capture);
         assert_eq!(capture.lines.len(), 1);
-        let snapshot = capture.finish();
+        let (snapshot, truncated) = capture.finish();
+        assert!(truncated);
         assert_eq!(snapshot.message_count, 20_001);
     }
 
@@ -351,7 +357,9 @@ mod tests {
         let mut capture = HistoryCapture::default();
         capture.push(1, &wire).unwrap();
         assert_bounded(&capture);
-        assert_eq!(capture.finish(), expected);
+        let (snapshot, truncated) = capture.finish();
+        assert!(!truncated);
+        assert_eq!(snapshot, expected);
 
         for (content, urls, discriminator) in [
             ("  text \n ", json!([]), json!("0")),
@@ -371,7 +379,9 @@ mod tests {
             wire["author"]["discriminator"] = discriminator;
             let mut capture = HistoryCapture::default();
             capture.push(1, &wire).unwrap();
-            assert_eq!(capture.finish(), format_transcript(vec![domain(&wire)]));
+            let (snapshot, truncated) = capture.finish();
+            assert!(!truncated);
+            assert_eq!(snapshot, format_transcript(vec![domain(&wire)]));
         }
     }
 
@@ -390,7 +400,8 @@ mod tests {
         capture.push(2, &newer).unwrap();
         capture.push(1, &older).unwrap();
         assert_bounded(&capture);
-        let snapshot = capture.finish();
+        let (snapshot, truncated) = capture.finish();
+        assert!(truncated);
         assert_eq!(
             snapshot,
             format_transcript(vec![domain(&older), domain(&newer)])
@@ -422,7 +433,9 @@ mod tests {
                 .map(|id| domain(&message(&format!("message {id}"))))
                 .collect(),
         );
-        assert_eq!(capture.finish(), expected);
+        let (snapshot, truncated) = capture.finish();
+        assert!(!truncated);
+        assert_eq!(snapshot, expected);
 
         let mut capture = HistoryCapture::default();
         for id in [3, 2, 1] {
@@ -431,7 +444,8 @@ mod tests {
                 .unwrap();
         }
         assert_bounded(&capture);
-        let snapshot = capture.finish();
+        let (snapshot, truncated) = capture.finish();
+        assert!(truncated);
         let expected = format_transcript(
             (1..=3)
                 .map(|id| domain(&message(&format!("{id}{}", "x".repeat(100_000)))))
@@ -510,7 +524,9 @@ mod tests {
             assert_eq!(capture.previous.unwrap().0, 3);
             assert_bounded(&capture);
             capture.push(2, &message("valid older message")).unwrap();
-            assert_eq!(capture.finish().message_count, 2);
+            let (snapshot, truncated) = capture.finish();
+            assert!(truncated);
+            assert_eq!(snapshot.message_count, 2);
         }
         for field in ["timestamp", "author", "content", "attachments"] {
             let mut wire = message("text");
@@ -532,24 +548,43 @@ mod tests {
         let mut older = message("older");
         older["timestamp"] = json!("2026-09-30T23:59:59.999Z");
         capture.push(2, &older).unwrap();
+        let (snapshot, truncated) = capture.finish();
+        assert!(!truncated);
         assert_eq!(
-            capture.finish(),
+            snapshot,
             format_transcript(vec![domain(&older), domain(&newer)])
         );
     }
 
     #[test]
     fn empty_history_and_saturating_message_count() {
-        assert_eq!(
-            HistoryCapture::default().finish(),
-            format_transcript(vec![])
-        );
+        let (snapshot, truncated) = HistoryCapture::default().finish();
+        assert!(!truncated);
+        assert_eq!(snapshot, format_transcript(vec![]));
         let mut capture = HistoryCapture {
             message_count: i32::MAX - 1,
             ..HistoryCapture::default()
         };
         capture.push(2, &message("newer")).unwrap();
         capture.push(1, &message("older")).unwrap();
-        assert_eq!(capture.finish().message_count, i32::MAX);
+        let (snapshot, truncated) = capture.finish();
+        assert!(!truncated);
+        assert_eq!(snapshot.message_count, i32::MAX);
+    }
+
+    #[test]
+    fn marker_text_in_complete_history_does_not_report_truncation() {
+        // A complete capture whose newest message ends with the literal
+        // marker text must report truncated=false: the flag, not a suffix
+        // match on user-controlled content, is the source of truth.
+        let mut capture = HistoryCapture::default();
+        capture
+            .push(1, &message("ok\n[transcript truncated]"))
+            .unwrap();
+        assert!(!capture.truncated);
+        let (snapshot, truncated) = capture.finish();
+        assert!(!truncated);
+        assert!(snapshot.content.ends_with(TRUNCATION_MARKER));
+        assert_eq!(snapshot.message_count, 1);
     }
 }

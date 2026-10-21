@@ -185,11 +185,12 @@ async fn ticket_history_fetches_all_pages_and_keeps_attachments_and_total_count(
         ScriptedResponse::status(500),
     )
     .await;
-    let snapshot = runtime(&mock)
+    let (snapshot, truncated) = runtime(&mock)
         .capture_history("600")
         .await
         .ok()
         .expect("complete history");
+    assert!(!truncated);
     assert_eq!(snapshot.message_count, 102);
     assert!(snapshot
         .content
@@ -218,11 +219,12 @@ async fn truncated_transcript_still_fetches_later_pages_and_counts_every_message
         ScriptedResponse::status(500),
     )
     .await;
-    let snapshot = runtime(&mock)
+    let (snapshot, truncated) = runtime(&mock)
         .capture_history("600")
         .await
         .ok()
         .expect("complete capped history");
+    assert!(truncated);
     assert_eq!(snapshot.message_count, 101);
     let retained = snapshot
         .content
@@ -271,13 +273,38 @@ async fn exact_full_page_requires_a_final_empty_page() {
         ScriptedResponse::status(500),
     )
     .await;
-    let snapshot = runtime(&mock)
+    let (snapshot, truncated) = runtime(&mock)
         .capture_history("600")
         .await
         .ok()
         .expect("final empty page");
+    assert!(!truncated);
     assert_eq!(snapshot.message_count, 100);
     assert_eq!(mock.requests().len(), 2);
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn marker_text_in_complete_history_reports_not_truncated() {
+    let mut newest = message(2);
+    newest["content"] = json!("ok\n[transcript truncated]");
+    newest["attachments"] = json!([]);
+    let mock = MockRest::start(
+        vec![ScriptedResponse::json(200, json!([newest, message(1)]))],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let (snapshot, truncated) = runtime(&mock)
+        .capture_history("600")
+        .await
+        .ok()
+        .expect("complete history");
+    assert!(
+        !truncated,
+        "user-controlled marker text must not report truncation"
+    );
+    assert!(snapshot.content.ends_with("\n[transcript truncated]"));
+    assert_eq!(snapshot.message_count, 2);
     mock.shutdown().await;
 }
 
