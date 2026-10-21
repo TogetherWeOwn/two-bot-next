@@ -128,6 +128,19 @@ async fn await_creators(rx: oneshot::Receiver<Vec<Snowflake>>, label: &str) -> V
         .expect("creators oneshot must deliver")
 }
 
+/// Await a naming probe (settings plus a directory snapshot) with the same
+/// wedge guard. Only the directory is pinned; the settings travel along.
+async fn await_naming(
+    rx: oneshot::Receiver<(NameSettings, NameDirectory)>,
+    label: &str,
+) -> NameDirectory {
+    tokio::time::timeout(Duration::from_secs(10), rx)
+        .await
+        .unwrap_or_else(|_| panic!("{label} must reply within 10 s"))
+        .expect("naming oneshot must deliver")
+        .1
+}
+
 /// Spawn the actor loop on `worker` with the standard 100 ms tick. The first
 /// timer tick is immediately ready, so timer/maintenance tests need no clock
 /// advance on live time.
@@ -393,7 +406,11 @@ async fn scheduling_bound_and_diagnosis_exposed() {
 async fn control_fifo_and_latest_state_preserved_under_churn() {
     // Fair scheduling must not reorder the inbox: two joins separated by
     // churn still create in arrival order, and the later Display for one
-    // member still wins.
+    // member still wins. The directory is snapshotted with a NamingProbe in
+    // FIFO order behind the churn: the timer naming pass prunes entries for
+    // members outside voice, so the post-exit directory depends on whether
+    // a timer turn ran before close and only the probe snapshot pins exact
+    // contents.
     let (live, store, http, trace) = fixture();
     let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     let first_ticket = creator_ticket(&worker, MEMBER);
@@ -412,8 +429,27 @@ async fn control_fifo_and_latest_state_preserved_under_churn() {
         display: "second".to_owned(),
     })
     .unwrap();
+    let (naming_tx, naming_rx) = oneshot::channel();
+    tx.send(ActorCommand::NamingProbe(naming_tx)).unwrap();
 
     let handle = spawn_actor(worker, rx);
+    // FIFO order guarantees every churn Display and both joins were applied
+    // before the probe replies, and no dispatch, timer or maintenance turn
+    // can interleave while the preloaded inbox drains.
+    let probed = await_naming(naming_rx, "naming probe").await;
+    let mut expected = NameDirectory::default();
+    for offset in 0..50 {
+        let member = CHURN_BASE + offset;
+        expected.insert(member, format!("churn {member}"));
+    }
+    expected.insert(DIRECTORY_TARGET, "second".to_owned());
+    // Accepted joins also record the join display in the directory.
+    expected.insert(MEMBER, "first room".to_owned());
+    expected.insert(MEMBER + 1, "second room".to_owned());
+    assert_eq!(
+        probed, expected,
+        "the later Display for one member still wins"
+    );
     // The inbox stays open while dispatch drains: closing it first would
     // break the actor loop before any dispatch turn runs.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -450,19 +486,8 @@ async fn control_fifo_and_latest_state_preserved_under_churn() {
         ],
         "joins separated by churn still create in arrival order"
     );
-    let mut expected = NameDirectory::default();
-    for offset in 0..50 {
-        let member = CHURN_BASE + offset;
-        expected.insert(member, format!("churn {member}"));
-    }
-    expected.insert(DIRECTORY_TARGET, "second".to_owned());
-    // Accepted joins also record the join display in the directory.
-    expected.insert(MEMBER, "first room".to_owned());
-    expected.insert(MEMBER + 1, "second room".to_owned());
-    assert_eq!(
-        worker.name_directory, expected,
-        "the later Display for one member still wins"
-    );
+    // No post-exit directory pin: refresh_template_names prunes non-voice
+    // entries on the timer branch, which may or may not run before close.
 }
 
 #[tokio::test]
