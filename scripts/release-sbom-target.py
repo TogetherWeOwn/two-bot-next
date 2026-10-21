@@ -10,6 +10,8 @@ import subprocess
 import sys
 
 
+SHAPE_REASON = "Release tag response has invalid shape"
+LOOKUP_REASON = "Release tag lookup failed"
 OVER_CAP = "Release tag response exceeds the byte cap"
 DUP_KEYS = "Release tag response carries duplicate object keys"
 BAD_CONST = "Release tag response carries a non-finite number"
@@ -62,22 +64,50 @@ def parse_response(raw):
 
 
 def github_object(path):
+    """Fetch one git ref object; refuse transport, intake and shape failures with fixed vocabulary.
+
+    gh stderr is discarded so service diagnostics never precede the fixed
+    refusal, and undecodable stdout refuses as invalid shape. The reply is
+    parsed with the intake guard (byte cap, duplicate keys, non-finite
+    numbers, nesting depth), whose refusals propagate; any other parse
+    failure (malformed JSON, over-limit integer tokens) refuses as
+    invalid shape, never raw parser text.
+    Returns the full ``gh api`` response dict; the ``object`` member is
+    guaranteed present and a dict. Callers index ``["object"]`` as before,
+    so the pre-existing mock contract (outer shape) is preserved.
+    """
     repo = os.environ.get("GH_REPO")
     if repo is None:
         raise ValueError("GH_REPO is not set")
-    return parse_response(subprocess.check_output(
-        ["gh", "api", f"repos/{repo}/git/{path}"],
-        text=True, timeout=30,
-    ))
+    try:
+        raw = subprocess.check_output(
+            ["gh", "api", f"repos/{repo}/git/{path}"],
+            text=True, timeout=30, stderr=subprocess.DEVNULL,
+        )
+    except UnicodeDecodeError:
+        raise ValueError(SHAPE_REASON) from None
+    except (subprocess.SubprocessError, OSError):
+        raise ValueError(LOOKUP_REASON) from None
+    try:
+        response = parse_response(raw)
+    except ValueError as error:
+        if str(error) in (OVER_CAP, DUP_KEYS, BAD_CONST, TOO_DEEP):
+            raise
+        raise ValueError(SHAPE_REASON) from None
+    if not isinstance(response, dict) or not isinstance(response.get("object"), dict):
+        raise ValueError(SHAPE_REASON)
+    return response
 
 
 def resolve_tag(tag):
     if not re.fullmatch(r"v\d+\.\d+\.\d+", tag):
         raise ValueError("Publication requires a stable vX.Y.Z release tag")
     # The Git refs API names only tags: a same-named branch cannot win checkout.
+    # github_object() guarantees the outer shape, so this index cannot KeyError.
     obj = github_object(f"ref/tags/{tag}")["object"]
     for _ in range(8):
-        if not re.fullmatch(r"[0-9a-f]{40}", obj.get("sha", "")):
+        sha = obj.get("sha", "")
+        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
             raise ValueError("Invalid release tag object SHA")
         if obj.get("type") == "commit":
             return obj["sha"]
