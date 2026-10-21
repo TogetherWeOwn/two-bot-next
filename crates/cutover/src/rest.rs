@@ -667,10 +667,14 @@ impl RestClient {
                 Err(RestError::Body(_)) => break ScanCompletion::InvalidResponse,
                 Err(RestError::Twilight(_)) => break ScanCompletion::RequestFailed,
                 Err(RestError::Wire(_)) => break ScanCompletion::RequestFailed,
-                // Member-pagination errors never come from `exec_list`;
-                // propagate rather than mislabel a scan completion.
+                // Member-pagination errors and single-model refusals never come
+                // from `exec_list`; propagate rather than mislabel a scan
+                // completion. A refusal is lost access: failing the scan is
+                // fail-closed, never end-of-history.
                 Err(
-                    e @ (RestError::MemberCursorStalled | RestError::MemberCeilingExceeded { .. }),
+                    e @ (RestError::MemberCursorStalled
+                    | RestError::MemberCeilingExceeded { .. }
+                    | RestError::Refused { .. }),
                 ) => return Err(e),
             };
             if batch.is_empty() {

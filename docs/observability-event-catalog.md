@@ -246,6 +246,20 @@ rule. Full semantics live in `docs/metrics.md`.
 | --- | --- |
 | `two_bot_retention_replay_needed_total` | Skipped retention purges needing Operator replay: one per real guild removal whose purge-queue write hit the schema gap; successful queue writes and rejoin-cancel skips never increment it |
 
+## Containment store error series
+
+Counter emitted by the containment completion path in
+`crates/bot/src/containment_runtime.rs` (`finish`) and rendered by
+`crates/core/src/metrics.rs` (`render`). A failed `complete_incident` also
+surfaces as outcome-unknown in the staff alert, so the alert and the durable
+record never silently disagree. Unknown ops collapse to `other`; no error
+text, query or identifier ever becomes a label. Manual check, not an alert
+input: consumed by no alert rule. Full semantics live in `docs/metrics.md`.
+
+| Series | Meaning |
+| --- | --- |
+| `two_bot_containment_store_errors_total{op}` | Containment-store failures by bounded operation; `op` is `complete_incident` or `other` |
+
 ## Scheduled job labels
 
 Each label owns independent `two_bot_job_runs_total{job,outcome}`,
