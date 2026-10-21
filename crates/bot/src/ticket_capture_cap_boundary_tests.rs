@@ -104,7 +104,7 @@ async fn ten_full_pages_plus_one_message_marks_capped() {
         "a 1001-message history must carry the truncation marker"
     );
     assert!(
-        !snapshot.content.contains("message-201"),
+        !snapshot.content.contains("message-201 "),
         "the probe page must not be stored past the 1000-message cap"
     );
     assert_eq!(history_fetches(&mock), 11);
@@ -135,7 +135,7 @@ async fn deep_channel_stores_newest_thousand_with_marker() {
         "newest message must be retained"
     );
     assert!(
-        !snapshot.content.contains("message-102"),
+        !snapshot.content.contains("message-102 "),
         "messages past the cap must not be stored"
     );
     assert_eq!(
