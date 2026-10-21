@@ -454,7 +454,12 @@ def check_cargo_test(args, root, packages):
                         f"next: give a nonempty value or drop `=value`")
             else:
                 value = next(words, None)
-                if value is None:
+                # Cargo value options never take option-like values: a
+                # following flag (or `--`) is a missing value, not a
+                # consumed token. Scoped to the Cargo side only: the
+                # libtest branch must keep accepting dash-prefixed
+                # --skip patterns, which getopts permits.
+                if value is None or value.startswith("-"):
                     raise ValueError(
                         f"MISSING_VALUE: option {option!r} needs a value but none followed; "
                         f"next: add a value, e.g. `{option} <value>` or `{option}=<value>`")
