@@ -145,10 +145,11 @@ class ContainerDrillClient(rollout.Client):
         except HTTPError as error:
             codes = []
             try:
-                envelope = json.loads(error.read(rollout.MAX_BODY))
+                envelope = json.loads(error.read(rollout.MAX_BODY),
+                                        object_pairs_hook=_reject_duplicate_keys)
                 codes = [str(item["code"]) for item in envelope.get("errors", [])
                          if isinstance(item, dict) and type(item.get("code")) is int][:4]
-            except (OSError, ValueError, AttributeError, TypeError):
+            except (OSError, ValueError, AttributeError, TypeError, RecursionError):
                 pass
             raise GateError("api_http_failure",
                             f"status={error.code} codes={','.join(codes) or 'none'}") from None

@@ -636,6 +636,24 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(caught.exception.detail, "status=409 codes=10220")
         self.assertNotIn(SENTINEL, repr(caught.exception.detail))
 
+    def test_deeply_nested_error_envelope_keeps_401_codes_none(self):
+        depth = 10000
+        deep_object = b'{"a":' * depth + b"0" + b"}" * depth
+        deep_array = b"[" * depth + b"]" * depth
+        for nested in (deep_object, deep_array):
+            with self.subTest(length=len(nested)):
+                envelope = b'{"probe": ' + nested + b', "errors": []}'
+                self.assertLessEqual(len(envelope), container_drill.rollout.MAX_BODY)
+                client = container_drill.ContainerDrillClient(ACCOUNT, SENTINEL)
+                error = HTTPError("https://api.cloudflare.com", 401, "Unauthorized",
+                                  {}, io.BytesIO(envelope))
+                client.opener = MagicMock()
+                client.opener.open.side_effect = error
+                with self.assertRaises(GateError) as caught:
+                    client.api("/workers/scripts/two-bot-next-staging/deployments")
+                self.assertEqual(str(caught.exception), "api_http_failure")
+                self.assertEqual(caught.exception.detail, "status=401 codes=none")
+
     def test_api_sends_bearer_to_the_account_path_only(self):
         client = container_drill.ContainerDrillClient(ACCOUNT, SENTINEL)
         response = MagicMock()

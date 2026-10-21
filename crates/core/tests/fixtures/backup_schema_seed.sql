@@ -248,6 +248,9 @@ INSERT INTO scheduled_events
     (guild_id, event_id, name, starts_at, channel_id, description, status, updated_at)
 VALUES ('100000000000000001', '100000000000000011', 'Backup event', '2026-08-02T18:00:00.000Z',
         '100000000000000003', E'Event | NULL\n雪', 'scheduled', '2026-08-01T10:00:00.000Z');
+INSERT INTO scheduled_events_claim (guild_id, epoch)
+VALUES ('100000000000000001', '2026-08-01T10:00:00.000Z'),
+       ('100000000000000002', '2026-08-01T11:00:00.000Z');
 INSERT INTO counter_snapshots
     (guild_id, human_member_count, human_member_count_at, online_count, online_count_at)
 VALUES ('100000000000000001', 123, '2026-08-01T09:00:00.000Z', 13, '2026-08-01T09:01:00.000Z');
