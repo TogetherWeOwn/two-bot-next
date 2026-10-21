@@ -43,15 +43,19 @@
 //! 4. Success audits are unchanged (`{request}:unban` / `"unbanned"`).
 //!
 //! Offline: the MemMemberStore tests below need no database. The Postgres
-//! test at the bottom is `#[ignore]` and needs the approved disposable test
+//! test at the bottom self-skips without the approved disposable test
 //! database (`MEMBER_TESTDB=agent-testdb` or `ci` in GitHub Actions); it
 //! never touches staging or production.
 //!
-//! Expected results on the baseline: every `sweep_continues_*`,
-//! `run_due_unbans_continues_*` and `failing_job_is_recorded_*` test RED
-//! (the sweep returns `Err` after one Discord call and writes no failure
-//! audit); the `*_control` tests GREEN (all-success and empty sweeps already
-//! return counts). The Postgres test RED for the same abort reason.
+//! Expected results on the baseline: `sweep_continues_past_rejected_job_
+//! and_reports_counts`, `sweep_continues_past_rate_limited_job_and_requeues_
+//! it`, `sweep_fences_uncertain_timeout_and_completes_the_rest` and
+//! `run_due_unbans_continues_and_returns_completed` RED (the sweep returns
+//! `Err` after one Discord call and writes no failure audit); the
+//! `*_control` tests GREEN (all-success and empty sweeps already return
+//! counts). The Postgres test REDs for the same abort reason wherever the
+//! `MEMBER_TESTDB` guard is set, and self-skips (pass with a message)
+//! elsewhere.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -422,7 +426,7 @@ async fn empty_sweep_reports_zero_zero_control() {
     assert_eq!(summary, (0, 0));
 }
 
-// --- Disposable-DB sweep proof (ignored, CI Postgres service only) ----------
+// --- Disposable-DB sweep proof (self-skips without MEMBER_TESTDB) -------------
 
 #[cfg(feature = "db")]
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -434,11 +438,11 @@ use std::time::Duration;
 use two_bot_core::member_moderation_store::PgMemberModerationStore;
 
 #[cfg(feature = "db")]
-async fn db_pool() -> (PgPool, PgPool, String) {
+async fn db_pool() -> Option<(PgPool, PgPool, String)> {
     let host = match std::env::var("MEMBER_TESTDB").as_deref() {
         Ok("agent-testdb") => "agent-testdb",
         Ok("ci") if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") => "localhost",
-        _ => panic!("set MEMBER_TESTDB=agent-testdb (or ci inside GitHub Actions)"),
+        _ => return None,
     };
     let options = PgConnectOptions::new()
         .host(host)
@@ -487,7 +491,7 @@ async fn db_pool() -> (PgPool, PgPool, String) {
             .await
             .expect("migration");
     }
-    (admin, pool, schema)
+    Some((admin, pool, schema))
 }
 
 #[cfg(feature = "db")]
@@ -501,9 +505,11 @@ async fn db_unban_state(pool: &PgPool, req: &str) -> String {
 
 #[cfg(feature = "db")]
 #[tokio::test]
-#[ignore = "requires approved agent-testdb or CI Postgres service"]
 async fn postgres_sweep_continues_past_rejected_job() {
-    let (admin, pool, schema) = db_pool().await;
+    let Some((admin, pool, schema)) = db_pool().await else {
+        eprintln!("skipping member-moderation sweep test: MEMBER_TESTDB not set");
+        return;
+    };
     let store = PgMemberModerationStore::new(pool.clone(), GUILD.to_owned());
     for (user, req) in [
         ("user-1", "req-1"),
@@ -537,7 +543,7 @@ async fn postgres_sweep_continues_past_rejected_job() {
     // The refused job requeues for the next sweep; its bounded-cause audit is
     // asserted offline above (same record path through the shared trait).
     assert_eq!(db_unban_state(&pool, "req-2").await, "pending");
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&admin)
         .await
         .expect("drop test schema");

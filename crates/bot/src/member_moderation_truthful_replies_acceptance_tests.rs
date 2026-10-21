@@ -56,10 +56,15 @@
 //! Offline: pure reply rendering plus the process-wide tracing capture. No
 //! database, no Discord calls, no `#[ignore]`.
 //!
-//! Expected results on the baseline: every `rejected_*`, `success_*`,
-//! `overlong_*` and `hostile_*` test RED (raw detail leaks into replies,
-//! no log line, no target in success copy); the `*_control` tests GREEN
-//! (rate-limited/uncertain copy and normal names already behave).
+//! Expected results on the baseline (10 RED, 4 GREEN): every `rejected_*`,
+//! `hostile_*`, `zero_width_*`, `mention_pills_*`, `newlines_*`,
+//! `overlong_*`, `success_replay_*` and `replay_with_hostile_*` test RED
+//! (raw detail leaks into replies, no log line, hostile names unsanitized,
+//! replay marker misplaced); `rate_limited_copy_preserved_as_control`,
+//! `uncertain_copy_preserved_as_control`,
+//! `normal_names_and_punctuation_render_verbatim_as_control` and
+//! `success_replies_name_the_sanitized_target_for_every_verb` GREEN (the
+//! last pins the verb-base + plain-name shape, which already behaves).
 
 use super::MemberRuntime;
 use two_bot_core::member_moderation::{
