@@ -147,12 +147,18 @@ pub struct PlayerVoiceUpdate {
     pub channel_id: Snowflake,
 }
 
+/// `PATCH`/`DELETE` path for `guild_id` on a Lavalink session. Free so the
+/// node client shares the shape for `DELETE` without a handshake value.
+#[must_use]
+pub fn player_path(lavalink_session: &str, guild_id: Snowflake) -> String {
+    format!("/v4/sessions/{lavalink_session}/players/{guild_id}")
+}
+
 impl PlayerVoiceUpdate {
     /// `PATCH` path for this guild on a Lavalink session.
     #[must_use]
     pub fn player_path(&self, lavalink_session: &str) -> String {
-        let guild_id = self.guild_id;
-        format!("/v4/sessions/{lavalink_session}/players/{guild_id}")
+        player_path(lavalink_session, self.guild_id)
     }
 
     /// Request body: `{"voice": {token, endpoint, sessionId, channelId}}`.

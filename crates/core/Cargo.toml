@@ -27,6 +27,9 @@ subtle = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
+# Lavalink session WebSocket (music_node.rs): the `client` flip adds no new
+# crates (base64/http/httparse + tokio net/io-util are already locked).
+tokio-websockets = { workspace = true, features = ["client"] }
 tower-service = { workspace = true }
 tracing = { workspace = true }
 unicode-normalization = { workspace = true }
@@ -48,6 +51,10 @@ db = ["dep:sqlx"]
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+# Mock Lavalink session server (music_node.rs tests): `server` unions with
+# the `client` feature above for test builds only.
+tokio-websockets = { workspace = true, features = ["server"] }
+futures-util = { workspace = true, features = ["sink"] }
 two-bot-testsupport = { path = "../testsupport", version = "0.4.0" }
 # Pure, bounded properties: no fork/timeout helpers or temporary-file dependency.
 proptest = { version = "1.11", default-features = false, features = ["std"] }
