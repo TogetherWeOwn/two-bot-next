@@ -132,8 +132,8 @@ Scalar gateway series pair with the labels above:
 | `two_bot_gateway_missed_events_total` | Sequence gaps inside one session; any nonzero increase fails the zero-missed-events acceptance |
 | `two_bot_gateway_latency_seconds` | Last heartbeat ACK round-trip; `NaN` until measured |
 | `two_bot_gateway_prefix_trigger_refused_total{reason="verdict"}` | In-scope prefix candidates refused by the automod verdict; the worker records candidates even when its capture-only gate prevents detached dispatch. Unmatched content, scope mismatches, bot/webhook messages and disabled text-command gates never increment it |
-| `two_bot_presence_capture_total{outcome}` | Presence-update capture decisions on the hot path; `outcome` is `inserted` (first delivery stored a row), `duplicate` (same-key retry absorbed by the dedup key) or `rejected` (refused before the insert) |
-| `two_bot_automod_decisions_total{outcome}` | Terminal automod inspection outcomes; `outcome` is `accepted`, `already_processed`, `dry_run`, `protected`, `deleted`, `warned`, `timed_out` or `sanction_refused`. Recorded once per committed `StoredOutcome` by the shared activation; replays and retained claims never count. Fixed eight series from process start; no message text, excerpts or user IDs become labels |
+| `two_bot_presence_capture_total{outcome}` | Presence-update capture decisions on the hot path; `outcome` is `inserted` (first delivery stored a row), `duplicate` (same-key retry absorbed by the dedup key) or `rejected` (refused before the insert). Deliberately unconsumed: no production callsite records the family yet |
+| `two_bot_automod_decisions_total{outcome}` | Terminal automod inspection outcomes; `outcome` is `accepted`, `already_processed`, `dry_run`, `protected`, `deleted`, `warned`, `timed_out` or `sanction_refused`. Recorded once per committed `StoredOutcome` by the shared activation; replays and retained claims never count. Fixed eight series from process start; no message text, excerpts or user IDs become labels. `sanction_refused` is consumed by `automod_sanction_refused` (tickets on any increase); the other seven outcomes are policy working as designed |
 
 ## Automod facts read warnings
 
@@ -200,12 +200,12 @@ body, broadcaster, subscription or secret data reaches any label.
 
 | Series | Meaning |
 | --- | --- |
-| `two_bot_eventsub_received_total` | Verified-shape EventSub deliveries accepted for signature verification, including tampered signatures; requests rejected before body intake are not deliveries |
+| `two_bot_eventsub_received_total` | Verified-shape EventSub deliveries accepted for signature verification, including tampered signatures; requests rejected before body intake are not deliveries. Consumed by `eventsub_receive_gap`: tickets when received exceeds the summed classified kinds for 3 consecutive samples |
 | `two_bot_eventsub_classified_total{kind}` | Deliveries by bounded receiver classification; `kind` is `challenge`, `notification`, `revocation`, `tampered`, `ignored` or `other`; `other` marks unknown/future classification errors returned as retryable 503 |
 | `two_bot_eventsub_posts_total{outcome}` | Go-live post attempts by bounded outcome; `outcome` is `attempted`, `succeeded`, `failed` or `other`; zero until the go-live sender slice is wired |
 | `two_bot_eventsub_reconcile_passes_total{outcome}` | Reconcile passes by bounded outcome; `outcome` is `healthy`, `pending` or `failed`; exactly one sample per pass that reaches Helix, parked or refused startup passes stay log-only |
-| `two_bot_eventsub_reconcile_actions_total{action}` | Successful reconcile mutations by bounded action; `action` is `create` or `delete`; 409 already-exists confirmations fold into the pass outcome |
-| `two_bot_eventsub_reconcile_errors_total{error_class}` | Reconcile failure sites by bounded log `error_class`; `error_class` is `reconcile_action_failed`, `reconcile_prior_failed`, `reconcile_unhealthy`, `reconcile_failed` or `other`; no status, body or response bytes in labels |
+| `two_bot_eventsub_reconcile_actions_total{action}` | Successful reconcile mutations by bounded action; `action` is `create` or `delete`; 409 already-exists confirmations fold into the pass outcome. Deliberately unconsumed: successes are the healthy signal |
+| `two_bot_eventsub_reconcile_errors_total{error_class}` | Reconcile failure sites by bounded log `error_class`; `error_class` is `reconcile_action_failed`, `reconcile_prior_failed`, `reconcile_unhealthy`, `reconcile_failed` or `other`; no status, body or response bytes in labels. `reconcile_prior_failed` is consumed by `eventsub_reconcile_prior_failed` (tickets on any increase); the other sites pair with a failed pass and ticket through `eventsub_reconcile_failed` |
 
 ## Feed fetch series
 
@@ -215,8 +215,8 @@ source URL, host, header, body or feed id reaches any label.
 
 | Series | Meaning |
 | --- | --- |
-| `two_bot_feed_fetches_total{outcome}` | Feed fetch attempts by bounded outcome; `outcome` is `success` (2xx fetch), `invalid_source` (source refused before dialling), `refused_redirect` (redirect refused by policy) or `failure` (every other failure, including non-2xx HTTP) |
-| `two_bot_feed_fetch_errors_total{error_class}` | Failed feed fetches by bounded error class; `error_class` is `invalid_source`, `non_public_address`, `redirect_refused`, `too_large`, `invalid_encoding`, `unsupported_content_type`, `unsupported_encoding`, `resolve`, `transport`, `deadline`, `http_error` (completed non-2xx fetch) or `other`; successes record nothing here |
+| `two_bot_feed_fetches_total{outcome}` | Feed fetch attempts by bounded outcome; `outcome` is `success` (2xx fetch), `invalid_source` (source refused before dialling), `refused_redirect` (redirect refused by policy) or `failure` (every other failure, including non-2xx HTTP). Deliberately unconsumed: the errors sum below carries the same signal with finer reason codes |
+| `two_bot_feed_fetch_errors_total{error_class}` | Failed feed fetches by bounded error class; `error_class` is `invalid_source`, `non_public_address`, `redirect_refused`, `too_large`, `invalid_encoding`, `unsupported_content_type`, `unsupported_encoding`, `resolve`, `transport`, `deadline`, `http_error` (completed non-2xx fetch) or `other`; successes record nothing here. Consumed by `feed_fetch_failures`: tickets on any summed increase between valid samples |
 
 ## Moderation enforcement series
 
@@ -232,7 +232,7 @@ outcomes. See `docs/metrics.md` for the full label table.
 
 | Series | Meaning |
 | --- | --- |
-| `two_bot_moderation_enforcements_total{verb,outcome}` | Terminal moderation enforcements by bounded verb and outcome |
+| `two_bot_moderation_enforcements_total{verb,outcome}` | Terminal moderation enforcements by bounded verb and outcome. `discord_error`/`storage_error` are consumed by `moderation_enforcement_failures` (tickets on any summed increase); `success`, `refused` and `other` stay quiet |
 
 ## Retention replay series
 
@@ -290,6 +290,26 @@ is the single shared spelling also pinned in `evidence.rs`
 | `eventsub_tampered` | `two_bot_eventsub_classified_total{kind="tampered"}` | Pages when the `tampered` counter (only `BadSignature`) rises in 3 consecutive samples; the first sample only baselines, a flat window resolves, a reset rebaselines, and missing/invalid scrapes hold firing |
 | `eventsub_reconcile_failed` | `two_bot_eventsub_reconcile_passes_total{outcome}` with the fixed `healthy`/`pending`/`failed` outcomes | Ticket, not page: fires when the failed-pass counter grows between valid samples, even beside healthy growth; the first valid sample only stores a baseline, healthy-only or pending-only growth never fires, and a flat failed counter never recovers (only healthy growth with no failed growth resolves, once); any backwards counter re-baselines: the reset sample fires when the new process already counted a failed pass (failed startup pass) and otherwise holds a firing ticket instead of fabricating a transition; missing or invalid samples hold the previous state; the family is an optional scrape input, so older containers hold the previous state |
 | `prefix_trigger_verdict_refusals` | `two_bot_gateway_prefix_trigger_refused_total{reason="verdict"}` | Ticket when the verdict-refused prefix count rises in 3 consecutive keepalive samples after a baseline; first sample and restarts clear the streak; `other` is normal refusal volume and never counts; missing inputs hold the previous state |
+| `feed_fetch_failures` | `two_bot_feed_fetch_errors_total{error_class}` summed over the twelve fixed classes (optional scrape input, so older containers without it hold the previous state) | Ticket, not page: any summed increase between valid samples (one ticket per window with new failures); the family records failures only, so even `other` counts; the first valid sample only stores the baseline, restarts re-baseline, and a missing or malformed family is no window |
+| `eventsub_receive_gap` | `two_bot_eventsub_received_total` against summed `two_bot_eventsub_classified_total{kind}` (both optional scrape inputs) | Ticket, not page: received ahead of classified for 3 consecutive valid samples (one gapped scrape can land mid-delivery); a closed gap or joint reset resolves, a negative gap is corrupt input and no window, and missing/invalid samples break the streak but preserve a firing ticket |
+| `eventsub_reconcile_prior_failed` | `two_bot_eventsub_reconcile_errors_total{error_class="reconcile_prior_failed"}` with `two_bot_eventsub_reconcile_passes_total{outcome="failed"}` for same-window suppression (both optional scrape inputs) | Ticket, not page: any increase between valid samples on windows where the failed-pass counter did not grow (one ticket per window with new findings; suppressed where a failed pass grew, so one failed pass still raises exactly one ticket); the other error sites pair with a failed pass in the same run; baseline, restart and gap semantics mirror `feed_fetch_failures` |
+| `automod_sanction_refused` | `two_bot_automod_decisions_total{outcome="sanction_refused"}` (optional scrape input, so older containers without it hold the previous state) | Ticket, not page: any increase between valid samples (one ticket per window with new refusals); the other seven outcomes are policy working as designed; unknown outcomes collapse to `sanction_refused` in Rust, so a ticket can also mean a new outcome needs classification; baseline, restart and gap semantics mirror `feed_fetch_failures` |
+| `moderation_enforcement_failures` | `two_bot_moderation_enforcements_total` summed over every verb and `discord_error`/`storage_error` (optional scrape input, so older containers without it hold the previous state) | Ticket, not page: any summed increase between valid samples (one ticket per window with new failures); `success` landed, `refused` is policy proving no mutation, and `other` is an unknown collapse that is not evidence of failure; baseline, restart and gap semantics mirror `feed_fetch_failures` |
+| `voice_rest_stuck` | `two_bot_voice_rest_in_flight_age_seconds` (optional scrape input, so older containers without it hold the previous state) | Ticket, not page: age above 60 s (six times the 10 s wire timeout) in 3 consecutive valid samples; a valid sample at or below 60 s resolves, and missing/invalid samples break the streak but preserve a firing ticket |
+| `voice_global_backoff_capped` | `two_bot_voice_global_backoff_capped_total` (optional scrape input, so older containers without it hold the previous state) | Ticket, not page: any increase between valid samples (one ticket per window with new caps); the shed is the designed backpressure shape under a past-30 s global wait; baseline, restart and gap semantics mirror `feed_fetch_failures` |
+
+Deliberately unwatched: `two_bot_feed_fetches_total` (every non-success
+attempt pairs 1:1 with an errors increment in `record_feed_fetch`, so the
+errors sum carries the same signal with finer reason codes while `success`
+is volume, not a fault), `two_bot_presence_capture_total` (no production
+callsite records the family yet; the rule lands with the event-store S3
+producer rather than watching zeros), `two_bot_voice_join_occupancy_total`
+(distribution telemetry for capacity curves; no bucket is a fault), and
+`two_bot_eventsub_reconcile_actions_total` (successful mutations are the
+healthy signal; failures ticket through the failed-pass rule). Within
+consumed families, `success`/`refused` moderation outcomes, non-refusal
+automod outcomes, and the paired reconcile error sites stay quiet for the
+reasons their rule rows name.
 
 ## Gateway failure classes (`/readyz` `gateway_failure`)
 

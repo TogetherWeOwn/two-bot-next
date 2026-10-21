@@ -44,8 +44,13 @@ export const ALERT_INPUT_LABELS: Record<string, Record<string, readonly string[]
  * still scrape, with the failed-pass ticket held rather than every rule
  * silenced. The EventSub delivery-kind counters are optional for the same
  * reason: an older container without them must still scrape, with the
- * tampered-signature page held rather than every rule silenced. The evaluator
- * already tolerates their absence.
+ * tampered-signature page held rather than every rule silenced. The
+ * domain-outcome family below (feed-fetch errors, EventSub received and
+ * reconcile errors, automod decisions, moderation enforcements, voice REST
+ * in-flight age and global-backoff caps) is optional for the same reason: an
+ * older container without it must still scrape, with the domain-outcome
+ * tickets held rather than every rule silenced. The evaluator already
+ * tolerates their absence.
  */
 export const ALERT_OPTIONAL_INPUT_LABELS: Record<string, Record<string, readonly string[]>> = {
   two_bot_gateway_prefix_trigger_refused_total: { reason: ["verdict", "other"] },
@@ -61,6 +66,17 @@ export const ALERT_OPTIONAL_INPUT_LABELS: Record<string, Record<string, readonly
   two_bot_voice_vote_kick_total: { outcome: ["started", "evidence_unavailable", "not_a_room", "initiator_not_occupant", "target_not_occupant", "self_target", "protected_target", "privileged_target", "authority_unavailable", "active_vote_exists", "cooldown", "initiator_limited", "reused_vote_id", "unknown_vote", "wrong_vote_boundary", "ineligible_voter", "repeated_vote", "invalid_time", "connect_denied_and_disconnected", "connect_denied_target_absent", "skipped_room_gone", "skipped_target_protected", "permission_missing", "discord_error", "gave_up", "other"] },
   two_bot_eventsub_classified_total: { kind: ["challenge", "notification", "revocation", "tampered", "ignored", "other"] },
   two_bot_event_store_consumer_lag_seconds: {},
+  // Domain-outcome and voice-liveness family; old containers may omit the whole family.
+  two_bot_feed_fetch_errors_total: { error_class: ["invalid_source", "non_public_address", "redirect_refused", "too_large", "invalid_encoding", "unsupported_content_type", "unsupported_encoding", "resolve", "transport", "deadline", "http_error", "other"] },
+  two_bot_eventsub_received_total: {},
+  two_bot_eventsub_reconcile_errors_total: { error_class: ["reconcile_action_failed", "reconcile_prior_failed", "reconcile_unhealthy", "reconcile_failed", "other"] },
+  two_bot_automod_decisions_total: { outcome: ["accepted", "already_processed", "dry_run", "protected", "deleted", "warned", "timed_out", "sanction_refused"] },
+  two_bot_moderation_enforcements_total: {
+    verb: ["ban", "tempban", "kick", "timeout", "warn", "purge", "slowmode", "lockdown", "unlock"],
+    outcome: ["success", "refused", "discord_error", "storage_error", "other"],
+  },
+  two_bot_voice_rest_in_flight_age_seconds: {},
+  two_bot_voice_global_backoff_capped_total: {},
   // Same-scrape lifecycle evidence; old containers may omit the whole family.
   two_bot_process_incarnation: { part: ["0", "1", "2", "3"] },
 };

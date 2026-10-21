@@ -55,6 +55,13 @@ export const RUST_ALERT_AXES: Record<string, Record<string, string | readonly st
   two_bot_eventsub_reconcile_passes_total: { outcome: "EVENTSUB_RECONCILE_OUTCOMES" },
   two_bot_eventsub_classified_total: { kind: "EVENTSUB_DELIVERY_KINDS" },
   two_bot_event_store_consumer_lag_seconds: {},
+  two_bot_feed_fetch_errors_total: { error_class: "FEED_FETCH_ERROR_CLASSES" },
+  two_bot_eventsub_received_total: {},
+  two_bot_eventsub_reconcile_errors_total: { error_class: "EVENTSUB_RECONCILE_ERROR_CLASSES" },
+  two_bot_automod_decisions_total: { outcome: "AUTOMOD_DECISION_OUTCOMES" },
+  two_bot_moderation_enforcements_total: { verb: "MODERATION_VERBS", outcome: "MODERATION_ENFORCEMENT_OUTCOMES" },
+  two_bot_voice_rest_in_flight_age_seconds: {},
+  two_bot_voice_global_backoff_capped_total: {},
 };
 
 /** Complete consumed-input fixture generated from the Rust label contract, not the validator. */

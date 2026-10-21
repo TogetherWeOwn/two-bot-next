@@ -1225,6 +1225,227 @@ reconcile-failure alerts, or when `notification` traffic for the same window
 collapses while tampered rises — the receiver may be refusing legitimate work
 and the fix belongs to the on-call engineer, not another redeploy.
 
+#### Alert: feed fetch failures
+
+`two_bot_feed_fetch_errors_total` summed over the twelve fixed `error_class`
+values increased between two keepalive samples. A feed poll failed: the
+`error_class` names the cause (`transport`, `deadline`, `http_error` for a
+completed non-2xx fetch, `resolve`, source-policy refusals, or `other` for
+an unknown class), and every failed fetch counts exactly once. Successful
+fetches record nothing here, so any increase is a real failure, however
+small. The first sample after monitoring arms only stores the baseline and
+never fires, and a counter reset (process restart) skips the window rather
+than firing. This is a **ticket**, not a page: one dead source or one
+transient blip never pages, while a poller failing every window re-tickets
+every window until the source is fixed or removed.
+
+First response: read the `error_class` breakdown from the authorized
+`/ops/metrics` scrape, then the feed poller warn/error lines for the same
+window — they carry the failing source and the attempt detail the
+per-outcome (never per-feed) counter omits. A lone `transport` or `deadline`
+blip next to healthy polls is one slow origin — note it and watch the next
+windows. A stuck `invalid_source` or `non_public_address` class means the
+configured source can never succeed: fix or remove the source rather than
+watching the ticket repeat. Do not restart the container to "clear" the
+counter; a replacement resets the baseline without healing the source.
+
+Escalate when failures repeat across windows on many classes at once (the
+poller or the network path is down, not one source), when they coincide with
+`feeds` job failures or DB-error alerts suggesting a wider incident, or when
+`http_error` persists after the origin recovered — the fetch shape may be
+broken and the fix belongs to the on-call engineer, not another redeploy.
+
+#### Alert: EventSub receive gap
+
+`two_bot_eventsub_received_total` exceeded the summed
+`two_bot_eventsub_classified_total{kind}` rows for 3 consecutive keepalive
+samples. Deliveries are accepted at body intake but never classified: the
+receiver counts each delivery at intake and exactly one classification
+(`challenge`, `notification`, `revocation`, `tampered`, `ignored` or `other`)
+before answering, with no await between the two, so a healthy scrape shows
+the two sides equal. One gapped scrape can land mid-delivery; a gap that
+persists across three scrapes (~2 min) means intake outruns classification.
+This is a **ticket**, not a page: no delivery is refused or lost by the gap
+itself, but unclassified deliveries are unanswered Twitch traffic.
+
+First response: read the received counter and the six classified-kind rows
+from the authorized `/ops/metrics` scrape and confirm the gap is still open,
+then read the container logs for `eventsub delivery refused` and
+`eventsub_receiver` lines over the same window — panics or wedged tasks
+between intake and classification leave traces there, while a quiet log next
+to a steady gap points at the classification path itself. Confirm no deploy
+is in progress (a fresh deploy restarts the process and resets both
+counters, which closes the gap). Do not restart the container to "clear" the
+gap; a replacement resets the counters without explaining the stall.
+
+Escalate when the gap grows across windows (intake keeps outrunning
+classification), when it coincides with tampered-signature or reconcile
+alerts suggesting receiver trouble, or when classified counts freeze
+entirely while received climbs — the classification path is then wedged and
+the fix belongs to the on-call engineer, not another redeploy.
+
+#### Alert: EventSub reconcile prior failed
+
+`two_bot_eventsub_reconcile_errors_total{error_class="reconcile_prior_failed"}`
+increased between two keepalive samples. A reconcile pass found Twitch-side
+subscriptions on our callback already failing and repaired them (delete +
+re-create). The repair already landed — this ticket fires even when the pass
+converges healthy and the failed-pass rule stays silent — but Twitch failing
+our subscriptions means the receiver was erroring (for example,
+notification failures from refused or slow deliveries), so the cause is
+worth a look. The ticket is suppressed on windows where the failed-pass
+counter also grew: one failed pass raises exactly one ticket (the
+failed-pass ticket, whose first response already names the prior finding),
+so this rule only fires where there was silence before. The first sample
+after monitoring arms only stores the baseline and never fires, and a
+counter reset (process restart) skips the window rather than firing. This
+is a **ticket**, not a page: no action is overdue, but every finding is a
+receiver-health question. Passes that never run (dark, parked or a wedged
+scheduler) record nothing and cannot ticket — this rule watches findings,
+not the absence of passes.
+
+First response: read-only diagnosis only — no Helix request and no
+reconciliation behavior change. Read the `prior_failed` count from the
+authorized `/ops/metrics` scrape, then the `eventsub reconcile found failed
+subscriptions` error lines for the window (bounded broadcaster and
+prior-failed counts only, never subscription IDs), and correlate with
+receiver refusals and tampered-signature traffic over the same window: a
+finding next to refused deliveries explains itself. Confirm the following
+passes converge healthy. Do not retry Helix calls, re-list subscriptions,
+or restart the container to "clear" the counter; a replacement resets the
+baseline without answering why Twitch failed the subscriptions.
+
+Escalate when findings repeat across passes (subscriptions keep failing
+faster than reconcile repairs them), when they coincide with failed-pass
+tickets (the repair itself is failing), or when a finding names
+notification failures with no matching receiver refusal — deliveries may be
+failing downstream of the ack and the fix belongs to the on-call engineer,
+not another redeploy.
+
+#### Alert: automod sanction refused
+
+`two_bot_automod_decisions_total{outcome="sanction_refused"}` increased
+between two keepalive samples. An inspection concluded but its
+delete-adjacent sanction could not run: the content decision still recorded,
+but the ladder step (delete, warn or timeout follow-through) never landed.
+The other seven outcomes stay silent — clean, exempt, dry-run and
+already-processed verdicts plus landed ladders are policy working as
+designed — so this ticket always means enforcement fell short. Unknown
+outcomes collapse to `sanction_refused` in Rust, so a ticket can also mean a
+new outcome needs classification rather than a failed sanction. The first
+sample after monitoring arms only stores the baseline and never fires, and
+a counter reset (process restart) skips the window rather than firing. This
+is a **ticket**, not a page: one refused sanction never pages, while a
+refusal every window means the ladder is broken for a live abuse class.
+
+First response: read the sanction-refused count from the authorized
+`/ops/metrics` scrape, then the automod decision warn/error lines for the
+window — they carry the fixed refusal reason (missing permission, lost
+race with a manual delete, store write refused) without message text or
+user IDs. A lone refusal next to landed deletes is one lost race — note it
+and watch the next windows. A refusal naming a missing permission needs the
+bot role fixed, not the rule. Do not restart the container to "clear" the
+counter; a replacement resets the baseline without landing the sanction.
+
+Escalate when refusals repeat across windows on the same reason (the ladder
+is systematically broken), when they coincide with Discord-error or
+store-error alerts suggesting the sanction path is down, or when the
+refusal reason is unfamiliar — a new outcome may be collapsing into the
+watched bucket and the classification belongs to the on-call engineer, not
+another redeploy.
+
+#### Alert: moderation enforcement failures
+
+`two_bot_moderation_enforcements_total` summed over every verb and the
+`discord_error`/`storage_error` outcomes increased between two keepalive
+samples. An enforcement never completed: `discord_error` is an uncertain
+Discord failure (timeout, unreachable, rate-limited — the mutation may or
+may not have landed), and `storage_error` is a persistence failure. Landed
+enforcements (`success`), policy refusals proving no mutation (`refused`),
+and unknown collapses (`other`) stay silent. The first sample after
+monitoring arms only stores the baseline and never fires, and a counter
+reset (process restart) skips the window rather than firing. This is a
+**ticket**, not a page: one rate-limited kick never pages, while failures
+every window mean moderation is not landing.
+
+First response: read the verb/outcome breakdown from the authorized
+`/ops/metrics` scrape, then the moderation enforcement error lines for the
+window — they carry the fixed failure reason without member IDs or reason
+text. `discord_error` first: check the REST 429/5xx rules for the same
+window (backpressure explains timeouts and rate-limited writes); `403` or
+`404` shapes inside `discord_error` mean a lost permission or a
+manually-removed target, not an outage. `storage_error` points at the
+database path — check the DB-error and pool rules. Do not retry the
+enforcement by hand on an uncertain `discord_error` without checking
+whether it landed; do not restart the container to "clear" the counter — a
+replacement resets the baseline without completing the enforcement.
+
+Escalate when failures repeat across windows on many verbs at once (the
+Discord or store path is down, not one target), when `storage_error`
+coincides with DB-error or pool-saturation alerts, or when `discord_error`
+persists with no 429/5xx explanation — the request shape may be broken and
+the fix belongs to the on-call engineer, not another redeploy.
+
+#### Alert: voice REST stuck
+
+`two_bot_voice_rest_in_flight_age_seconds` read above 60 s for 3 consecutive
+keepalive samples. A voice REST attempt has been in flight for over a minute:
+every voice REST send wraps its wire attempt in a 10 s timeout with an
+in-flight guard that drops on timeout, completion or early return, so a
+healthy gauge never reads past ~10 s and a sustained high age means an
+attempt neither completed nor dropped its slot. The gauge publishes on REST
+begin/drop events rather than on a timer, so quiet periods hold the last
+value — a stuck reading that survives three scrapes is a wedged attempt,
+not a slow one. This is a **ticket**, not a page: one wedged attempt never
+pages, while member-visible join degradation already pages through the
+join-budget burn rules.
+
+First response: read the in-flight age from the authorized `/ops/metrics`
+scrape and confirm it is still climbing or pinned high, then check the
+sibling posture from the same scrape: the queue oldest age, the live
+not-ready age, dispatch-timeout tickets and the join-budget burn rules. A
+stuck age next to a healthy queue and quiet burn rules is one wedged wire
+attempt — note it and watch the next windows. Do not restart the container
+to "clear" the gauge; a replacement drops the slot without explaining the
+wedge.
+
+Escalate when the age stays pinned across windows with no dispatch progress
+(the REST path is wedged, not one attempt), when it coincides with
+dispatch-timeout or watchdog-stuck tickets, or when it coincides with
+sustained join-budget burn — queued members are then waiting on the wedged
+path and the fix belongs to the on-call engineer, not another redeploy.
+
+#### Alert: voice global backoff capped
+
+`two_bot_voice_global_backoff_capped_total` increased between two keepalive
+samples. A voice action hit a Discord global rate-limit wait past
+`GLOBAL_BACKOFF_MAX` (30 s) and shed to tick-driven queue backoff
+(`RateLimited` for the action queue) instead of parking the guild actor.
+The shed is the designed backpressure shape — the actor stays live and the
+gauges stay visible — and no operator action shortens Discord-side limits,
+which is why this is a **ticket**, never a page. But every cap is a voice
+action deferred by a far-future global limit, and a storm of caps points at
+our own request pattern tripping the global limit. The first sample after
+monitoring arms only stores the baseline and never fires, and a counter
+reset (process restart) skips the window rather than firing.
+
+First response: read the `voice global backoff capped; returning RateLimited
+for queue backoff` warn lines for the window (bounded wait seconds only),
+plus the global-pause and 429 posture from the authorized `/ops/metrics`
+scrape; confirm whether a deploy is in progress (a fresh deploy shipping a
+request storm trips the global limit fast). A lone cap next to a Discord-side
+limit episode is expected backpressure — note it and watch the next
+windows. There is no manual backoff release: do not restart the container
+to "clear" it — a restart only resets the counter and the new process
+re-learns the same global deadline.
+
+Escalate when caps arrive back-to-back across windows with no Discord-side
+incident (our own request pattern may be tripping the global limit), when
+they coincide with breaker trips and sustained 429 rates, or when caps
+coincide with sustained join-budget burn — deferred voice actions are then
+member-visible and the fix belongs to the on-call engineer, not another
+redeploy.
+
 #### Auto-remediation: guarded stall and crash-loop response
 
 Execution-path decision: the Worker cannot restart containers, so remediation
