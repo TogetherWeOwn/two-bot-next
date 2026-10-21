@@ -385,7 +385,7 @@ async fn join_worker<R>(handle: JoinHandle<R>, what: &str) -> R {
 
 fn assert_quiet(rx: &mut mpsc::UnboundedReceiver<()>) {
     assert!(
-        matches!(rx.try_recv(), Err(_)),
+        rx.try_recv().is_err(),
         "no further items may start after the drain"
     );
 }
