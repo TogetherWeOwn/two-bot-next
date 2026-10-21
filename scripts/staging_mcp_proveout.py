@@ -9,8 +9,9 @@ logged command shows the bearer as ***.
 
 Probes against $STAGING_MCP_URL (default the staging Worker /mcp) with
 `User-Agent: two-bot-next-staging-rollout/1.0`:
-  * initialize -> result must carry a non-empty protocolVersion.
-  * tools/list -> result.tools must be exactly the five read-only tools.
+  * initialize -> result must carry a shipped supported string protocolVersion.
+  * tools/list -> exactly five unique read-only tools with their shipped
+    zero-argument object input schemas.
   * tools/call each of the five -> bodies are recorded. A container-backed
     -32000 (get_status, get_gateway, get_backfill_progress, get_audit) is
     only an expected fence when the dispatcher explicitly corroborates it
@@ -32,7 +33,11 @@ a valid result stays success). Tool results must carry content as a list
 of typed blocks (empty allowed) without isError. Violations fail the
 stage with a fixed reason code and next action:
 ENVELOPE_VERSION, ENVELOPE_ID, ENVELOPE_FRAMING, CONTENT_INVALID,
-FENCE_UNCORROBORATED. The JSON artifact carries proof_disposition
+FENCE_UNCORROBORATED, JSON_DUPLICATE_KEY, PROTOCOL_UNSUPPORTED,
+TOOL_SCHEMA_INVALID. Duplicate decoded object keys at any depth are refused
+before admission, including escape-equivalent names and identical values;
+recording retains bounded redacted text, never a last-key-wins dictionary.
+The JSON artifact carries proof_disposition
 (proved iff exit 0, else failed).
 
 Output: redacted commands and safely redacted responses on stdout, plus a
@@ -49,7 +54,7 @@ Usage (the workflow supplies the environment):
   python3 scripts/staging_mcp_proveout.py --output staging-mcp-proveout-<run_id>.json
 
 Offline contract check (no network, no staging calls, no secrets):
-  PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts.ci.test_staging_mcp_proveout_envelope_acceptance -v
+  PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_staging_mcp_proveout*.py' -v
 """
 
 import argparse
@@ -84,6 +89,16 @@ MAX_BODY_BYTES = 64 * 1024
 MAX_JSON_DEPTH = 32
 REQUEST_TIMEOUT_SECONDS = 25
 SCHEMA_VERSION = 1
+# Mirror wrangler/src/mcp.ts: initialize requests the preferred version, but
+# proof also accepts the other shipped version negotiated by the server.
+PROTOCOL_VERSION = "2025-06-18"
+SUPPORTED_PROTOCOL_VERSIONS = (PROTOCOL_VERSION, "2025-03-26")
+# Only this fixed schema dialect is proved. Metadata and unused definitions
+# cannot change which arguments are accepted; unknown constraints can.
+SCHEMA_METADATA = {
+    "title", "description", "$comment", "$schema", "$id", "$defs", "definitions",
+    "default", "examples", "deprecated", "readOnly", "writeOnly",
+}
 
 EXPECTED_TOOLS = [
     "get_status",
@@ -195,6 +210,18 @@ def do_post(url, payload, token_or_none, timeout=REQUEST_TIMEOUT_SECONDS):
 
 def _bounded_text_fallback(body, secret=None):
     if secret:
+        # Rejected JSON can still reflect an escaped bearer. Redact individual
+        # string literals without collapsing duplicate keys or rewriting safe
+        # escapes: recording must retain the ambiguity that admission refused.
+        def redact_literal(match):
+            literal = match.group()
+            try:
+                decoded = json.loads(literal)
+            except ValueError:
+                return literal
+            return json.dumps(decoded.replace(secret, "***")) if secret in decoded else literal
+
+        body = re.sub(r'"(?:[^"\\]|\\.)*"', redact_literal, body)
         body = body.replace(secret, "***")
     candidate = body[:MAX_BODY_BYTES]
     envelope_bytes = len(b'{"_text":""}')
@@ -223,25 +250,55 @@ def _reject_json_constant(_value):
     raise ValueError("non-standard JSON constant")
 
 
-def load_bounded_json(body):
-    """Load JSON if it passes the depth and finite-number bounds."""
-    try:
-        parsed = json.loads(body, parse_constant=_reject_json_constant)
-    except Exception:
-        return False, None
+class DuplicateJsonKey(ValueError):
+    """Repeated decoded member name (never include remote keys or values)."""
+
+
+def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise DuplicateJsonKey("duplicate JSON member")
+        result[key] = value
+    return result
+
+
+def _decode_bounded_json(body):
+    parsed = json.loads(body, parse_constant=_reject_json_constant,
+                        object_pairs_hook=_unique_object)
     # Decoder and encoder recursion limits differ. Check iteratively before
     # handing parsed containers to either the stdout or artifact encoder.
     pending = [(parsed, 0)]
     while pending:
         value, depth = pending.pop()
         if isinstance(value, float) and not math.isfinite(value):
-            return False, None
+            raise ValueError("non-finite JSON number")
         if isinstance(value, (dict, list)):
             if depth >= MAX_JSON_DEPTH:
-                return False, None
+                raise ValueError("JSON depth over the cap")
             children = value.values() if isinstance(value, dict) else value
             pending.extend((child, depth + 1) for child in children)
-    return True, parsed
+    return parsed
+
+
+def load_bounded_json(body):
+    """Load unambiguous JSON within the depth and finite-number bounds."""
+    try:
+        return True, _decode_bounded_json(body)
+    except Exception:
+        return False, None
+
+
+def parse_rpc_reply(stage, shape, body, rpc_id):
+    """Admit original JSON, independently of bounded/redacted recording."""
+    try:
+        parsed = _decode_bounded_json(body)
+    except DuplicateJsonKey:
+        return None, (f"{stage}: repeated JSON member [JSON_DUPLICATE_KEY] "
+                      f"next: verify the Worker returns unique JSON object keys")
+    except Exception:
+        parsed = None
+    return parsed, envelope_failure(stage, shape, parsed, rpc_id)
 
 
 def parse_json_or_text(body, secret=None):
@@ -316,6 +373,21 @@ def envelope_failure(stage, shape, parsed, rpc_id):
                 f"error for {shape} [ENVELOPE_FRAMING] next: verify the "
                 f"reply carries exactly one well-formed result or error")
     return None
+
+
+def is_zero_argument_schema(schema):
+    """Match the shipped toolEntries contract, not arbitrary JSON Schema."""
+    return (
+        isinstance(schema, dict)
+        and schema.get("type") == "object"
+        and isinstance(schema.get("properties"), dict)
+        and not schema["properties"]
+        and schema.get("additionalProperties") is False
+        and schema.get("required", []) == []
+        and not (set(schema) - SCHEMA_METADATA - {
+            "type", "properties", "additionalProperties", "required",
+        })
+    )
 
 
 def tool_content_failure(stage, result):
@@ -430,22 +502,25 @@ def main():
         "id": rpc_id,
         "method": "initialize",
         "params": {
-            "protocolVersion": "2025-06-18",
+            "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {},
             "clientInfo": {"name": "staging-mcp-proveout", "version": "1.0"},
         },
     }
     status, headers, body = fetch("initialize", redacted_request_line("initialize", rpc_id, '"params":{...}'), payload, token)
     if body is not None:
-        _valid_json, parsed = load_bounded_json(body)
         if status != 200:
             failure = f"initialize: expected HTTP 200, got HTTP {status}"
         else:
-            failure = envelope_failure("initialize", "result.protocolVersion", parsed, rpc_id)
+            parsed, failure = parse_rpc_reply(
+                "initialize", "result.protocolVersion", body, rpc_id)
         if failure is None:
             result = parsed.get("result")
-            if not isinstance(result, dict) or not result.get("protocolVersion"):
-                failure = "initialize: expected result.protocolVersion"
+            version = result.get("protocolVersion") if isinstance(result, dict) else None
+            if not isinstance(version, str) or version not in SUPPORTED_PROTOCOL_VERSIONS:
+                failure = ("initialize: expected a shipped string protocolVersion "
+                           "[PROTOCOL_UNSUPPORTED] next: verify supported protocol "
+                           "negotiation against the Worker contract")
         if failure is not None:
             failures.append(failure)
     rpc_id += 1
@@ -454,11 +529,10 @@ def main():
     payload = {"jsonrpc": "2.0", "id": rpc_id, "method": "tools/list", "params": {}}
     status, headers, body = fetch("tools/list", redacted_request_line("tools/list", rpc_id), payload, token)
     if body is not None:
-        _valid_json, parsed = load_bounded_json(body)
         if status != 200:
             failure = f"tools/list: expected HTTP 200, got HTTP {status}"
         else:
-            failure = envelope_failure("tools/list", "result.tools", parsed, rpc_id)
+            parsed, failure = parse_rpc_reply("tools/list", "result.tools", body, rpc_id)
         if failure is None:
             result = parsed.get("result")
             tools = result.get("tools") if isinstance(result, dict) else None
@@ -471,6 +545,10 @@ def main():
                     "tools/list: expected exactly "
                     f"{','.join(sorted(EXPECTED_TOOLS))}, got unexpected tool names"
                 )
+            elif not all(is_zero_argument_schema(t.get("inputSchema")) for t in tools):
+                failure = ("tools/list: expected shipped zero-argument input schemas "
+                           "[TOOL_SCHEMA_INVALID] next: verify each tool advertises "
+                           "the Worker's zero-argument object contract")
         if failure is not None:
             failures.append(failure)
     rpc_id += 1
@@ -492,12 +570,11 @@ def main():
         if body is None:
             rpc_id += 1
             continue
-        _valid_json, parsed = load_bounded_json(body)
         stage = f"tools/call {tool}"
         if status != 200:
             failure = f"{stage}: expected HTTP 200, got HTTP {status}"
         else:
-            failure = envelope_failure(stage, "result.content", parsed, rpc_id)
+            parsed, failure = parse_rpc_reply(stage, "result.content", body, rpc_id)
         if failure is None:
             if "error" in parsed and parsed["error"] is not None:
                 # The envelope check above guarantees a dict with an int
@@ -539,11 +616,10 @@ def main():
         token,
     )
     if body is not None:
-        _valid_json, parsed = load_bounded_json(body)
         if status != 200:
             failure = f"tools/call unknown: expected HTTP 200, got HTTP {status}"
         else:
-            failure = envelope_failure("tools/call unknown", "error -32601", parsed, rpc_id)
+            parsed, failure = parse_rpc_reply("tools/call unknown", "error -32601", body, rpc_id)
         if failure is None:
             err = parsed.get("error")
             err = err if isinstance(err, dict) else {}
