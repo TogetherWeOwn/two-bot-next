@@ -46,6 +46,11 @@ pub enum OnboardingJob {
         username: String,
         bot: bool,
         joined_at_ms: Option<i64>,
+        /// Who left, so the completed goodbye can release their prompt guard
+        /// and a rejoin is welcomed again. `None` for payloads captured
+        /// before the clearing path existed (serde leaves a missing `Option`
+        /// as `None`): the goodbye still posts, only the clearing is skipped.
+        member_id: Option<u64>,
     },
     #[serde(skip)]
     Interaction(Box<Interaction>),
@@ -336,6 +341,7 @@ impl OnboardingRuntime {
                         .member(member.guild_id, member.user.id)
                         .and_then(|old| old.joined_at())
                         .map(|at| at.as_micros() / 1000),
+                    member_id: Some(member.user.id.get()),
                 })
             }
             Event::InteractionCreate(interaction) if self.accepts_interaction(&interaction.0) => {
@@ -474,12 +480,27 @@ impl OnboardingRuntime {
                 username,
                 bot,
                 joined_at_ms,
+                member_id,
             } => {
-                if guild_id != config.guild_id
-                    || bot
-                    || config.gates.mode != OnboardingMode::Session
-                    || config.gates.dry_run
-                {
+                if guild_id != config.guild_id || bot {
+                    return Ok(());
+                }
+                // Release the prompt guard first, whatever the goodbye-post
+                // settings: a rejoin is welcomed again in every mode, since
+                // welcomes post in all of them. The DELETE is idempotent, so
+                // a failed clear retries before anything is public and a
+                // failed post below retries with nothing to undo. The next
+                // welcome re-runs the full suppression gate.
+                if let Some(member_id) = member_id {
+                    clear_onboarding_prompt(
+                        &self.pool,
+                        &guild_id.to_string(),
+                        &member_id.to_string(),
+                    )
+                    .await
+                    .map_err(|_| RuntimeError::Store)?;
+                }
+                if config.gates.mode != OnboardingMode::Session || config.gates.dry_run {
                     return Ok(());
                 }
                 let channel = self
@@ -694,6 +715,23 @@ impl OnboardingRuntime {
                 ?handler,
                 "onboarding picker failed; attempting deferred error reply"
             );
+            // The success rows commit before the reply, so a reply that never
+            // reached the member (or a timeout past the commit) must not leave
+            // them counted for a selection the member is told failed. Keys
+            // are per submission, so this is a no-op when nothing committed.
+            if let Err(retract) = retract_picker_rows(
+                &self.pool,
+                &config.guild_id.to_string(),
+                &user.id.get().to_string(),
+                at,
+            )
+            .await
+            {
+                tracing::warn!(
+                    ?retract,
+                    "could not retract picker rows after a failed reply"
+                );
+            }
             let content = if matches!(error, RuntimeError::Role) {
                 PICKER_ROLE_FAILURE_REPLY
             } else if handler == ComponentHandler::GamePicker {
@@ -755,11 +793,15 @@ impl OnboardingRuntime {
                 )
                 .await
                 .map_err(|_| RuntimeError::Store)?;
-                self.reply(interaction, &outcome.reply).await?;
+                // Commit before replying: the reply describes committed state,
+                // so a commit failure yields the failure path, never a false
+                // routed claim. A reply that then fails is retracted in
+                // `interaction`.
                 transaction
                     .commit()
                     .await
                     .map_err(|_| RuntimeError::Store)?;
+                self.reply(interaction, &outcome.reply).await?;
             } else {
                 self.reply(interaction, &outcome.reply).await?;
             }
@@ -793,20 +835,40 @@ impl OnboardingRuntime {
         ) else {
             return Err(RuntimeError::Config);
         };
-        for (role, add) in outcome
+        let writes: Vec<(&str, bool)> = outcome
             .add_role_ids
             .iter()
-            .map(|role| (role, true))
-            .chain(outcome.remove_role_ids.iter().map(|role| (role, false)))
-        {
+            .map(|role| (role.as_str(), true))
+            .chain(
+                outcome
+                    .remove_role_ids
+                    .iter()
+                    .map(|role| (role.as_str(), false)),
+            )
+            .collect();
+        let mut applied: Vec<(&str, bool)> = Vec::with_capacity(writes.len());
+        for (index, (role, add)) in writes.iter().enumerate() {
             if self
                 .executor
-                .set_member_role(&guild, &member, role, add, "member selected games")
+                .set_member_role(&guild, &member, role, *add, "member selected games")
                 .await
                 .is_err()
             {
-                return Err(RuntimeError::Role);
+                return self
+                    .game_partial_failure(
+                        interaction,
+                        lock,
+                        GameSelectionTarget {
+                            guild: &guild,
+                            member: &member,
+                            at,
+                        },
+                        &applied,
+                        &writes[index..],
+                    )
+                    .await;
             }
+            applied.push((*role, *add));
         }
         if !outcome.record_selected {
             return self.reply(interaction, &outcome.reply).await;
@@ -861,9 +923,59 @@ impl OnboardingRuntime {
         record_game_selection_in_transaction(&mut lock, &guild, &member, &selected, &plan, at)
             .await
             .map_err(|_| RuntimeError::Store)?;
-        self.reply(interaction, &reply).await?;
+        // Commit before replying: the reply describes committed state, so a
+        // commit failure yields the failure path, never a false saved claim.
+        // A reply that then fails is retracted in `interaction`.
         lock.commit().await.map_err(|_| RuntimeError::Store)?;
+        self.reply(interaction, &reply).await?;
         Ok(())
+    }
+
+    /// Finish a game-picker role loop that failed partway with some roles
+    /// already flipped. With nothing applied this is the legacy total failure
+    /// (generic role reply, nothing recorded). Otherwise the applied grants
+    /// are committed as the durable record of what flipped, and the failure
+    /// reply names applied vs pending picks, so the member's retry — a fresh
+    /// whole-answer submission — converges to full success.
+    async fn game_partial_failure(
+        &self,
+        interaction: &Interaction,
+        lock: sqlx::Transaction<'_, sqlx::Postgres>,
+        target: GameSelectionTarget<'_>,
+        applied: &[(&str, bool)],
+        pending: &[(&str, bool)],
+    ) -> Result<(), RuntimeError> {
+        if applied.is_empty() {
+            return Err(RuntimeError::Role);
+        }
+        let mut lock = lock;
+        let applied_keys: Vec<String> = applied
+            .iter()
+            .filter(|(_, add)| *add)
+            .filter_map(|(role, _)| pick_for_role(role))
+            .map(|pick| pick.key.to_owned())
+            .collect();
+        record_game_partial_in_transaction(
+            &mut lock,
+            target.guild,
+            target.member,
+            &applied_keys,
+            target.at,
+        )
+        .await
+        .map_err(|_| RuntimeError::Store)?;
+        lock.commit().await.map_err(|_| RuntimeError::Store)?;
+        let labels = |writes: &[(&str, bool)]| {
+            writes
+                .iter()
+                .map(|(role, add)| partial_failure_label(role, *add))
+                .collect::<Vec<_>>()
+        };
+        self.reply(
+            interaction,
+            &game_partial_failure_reply(&labels(applied), &labels(pending)),
+        )
+        .await
     }
 
     async fn reply(&self, interaction: &Interaction, content: &str) -> Result<(), RuntimeError> {
@@ -881,9 +993,128 @@ impl OnboardingRuntime {
     }
 }
 
+/// Where-and-when for one game-picker submission, threaded to the
+/// partial-failure finisher as a single argument.
+struct GameSelectionTarget<'a> {
+    guild: &'a str,
+    member: &'a str,
+    at: &'a str,
+}
+
+/// Member-facing label for one game-picker role write. Revokes carry their
+/// direction: without it a completed revoke reads as `Applied: Shooters`.
+fn partial_failure_label(role: &str, add: bool) -> String {
+    let label = pick_for_role(role)
+        .map(|pick| pick.label.to_owned())
+        .unwrap_or_else(|| role.to_owned());
+    if add {
+        label
+    } else {
+        format!("{label} (removed)")
+    }
+}
+
+/// Catalog pick behind one game-picker role write, for member-facing naming.
+/// Searches games and platforms, like the submission lookup: either can ride a
+/// whole-answer write list.
+fn pick_for_role(role_id: &str) -> Option<&'static GamePick> {
+    GAME_PICKS
+        .iter()
+        .chain(PLATFORM_PICKS.iter())
+        .find(|pick| pick.role_id == role_id)
+}
+
+/// Member-facing partial-failure copy: which picks landed vs which still need
+/// a retry. Labels, not ids: the member picked "Shooters", not a snowflake.
+/// Deliberately not [`PICKER_ROLE_FAILURE_REPLY`]: that copy promises nothing
+/// was applied, which is false once earlier roles already flipped.
+fn game_partial_failure_reply(applied: &[String], pending: &[String]) -> String {
+    format!(
+        "I couldn't set all of those roles. Applied: {}. Still pending: {}. Open the menu and submit again to finish the rest.",
+        applied.join(", "),
+        pending.join(", ")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The partial-failure reply names applied vs pending picks by label, and
+    /// is never the generic role copy (which promises nothing was applied).
+    #[test]
+    fn partial_failure_reply_names_applied_vs_pending_labels() {
+        let reply = game_partial_failure_reply(&["Shooters".to_owned()], &["Survival".to_owned()]);
+        assert!(reply.contains("Shooters"), "{reply}");
+        assert!(reply.contains("Survival"), "{reply}");
+        assert!(reply.contains("Applied:"), "{reply}");
+        assert!(reply.contains("Still pending:"), "{reply}");
+        assert_ne!(reply, PICKER_ROLE_FAILURE_REPLY);
+        let multi = game_partial_failure_reply(
+            &["Shooters".to_owned(), "Horror".to_owned()],
+            &["Survival".to_owned(), "PC".to_owned()],
+        );
+        assert!(multi.contains("Shooters, Horror"), "{multi}");
+        assert!(multi.contains("Survival, PC"), "{multi}");
+    }
+
+    /// Role-to-pick lookup covers games and platforms; unknown ids stay
+    /// unknown so the caller can fall back to the raw id.
+    #[test]
+    fn role_lookup_resolves_catalog_picks() {
+        let shooters = pick_by_key("shooters").expect("catalog");
+        assert_eq!(
+            pick_for_role(shooters.role_id).map(|pick| pick.key),
+            Some("shooters")
+        );
+        let pc = pick_by_key("pc").expect("catalog");
+        assert_eq!(pick_for_role(pc.role_id).map(|pick| pick.key), Some("pc"));
+        assert_eq!(pick_for_role("9999999999999999999"), None);
+    }
+
+    /// Revoked picks carry their direction in the partial-failure reply, so a
+    /// completed revoke never reads as an applied grant. Grants keep the bare
+    /// catalog label the acceptance tests pin.
+    #[test]
+    fn partial_failure_labels_mark_revoked_picks() {
+        let shooters = pick_by_key("shooters").expect("catalog");
+        assert_eq!(partial_failure_label(shooters.role_id, true), "Shooters");
+        assert_eq!(
+            partial_failure_label(shooters.role_id, false),
+            "Shooters (removed)"
+        );
+        assert_eq!(
+            partial_failure_label("9999999999999999999", true),
+            "9999999999999999999"
+        );
+        assert_eq!(
+            partial_failure_label("9999999999999999999", false),
+            "9999999999999999999 (removed)"
+        );
+    }
+
+    /// Goodbye payloads captured before the clearing path existed carry no
+    /// member id; they still recover (with an unknown member) instead of
+    /// poisoning restart recovery.
+    #[test]
+    fn goodbye_payloads_from_before_member_identity_still_recover() {
+        let payload =
+            r#"{"Goodbye":{"guild_id":22,"username":"dave","bot":false,"joined_at_ms":123}}"#;
+        let recovered = OnboardingJob::recover(payload).expect("old payload parses");
+        assert!(
+            matches!(recovered, Some(OnboardingJob::Goodbye { .. })),
+            "an old goodbye payload must recover as a goodbye job"
+        );
+        if let Some(OnboardingJob::Goodbye {
+            member_id,
+            username,
+            ..
+        }) = recovered
+        {
+            assert_eq!(member_id, None);
+            assert_eq!(username, "dave");
+        }
+    }
 
     /// A legacy stored `TWO_ONBOARDING_DRY_RUN` row must never fail the
     /// hot-refresh path closed: only an exact `"0"`/`"1"` overrides the

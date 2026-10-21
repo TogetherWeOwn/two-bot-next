@@ -623,6 +623,19 @@ struct Values {
     voice_watchdog_stucks: u64,
     /// Halt-latch recoveries via credential re-probe.
     voice_halt_recoveries: u64,
+    /// Fair-scheduling bound: at most this many consecutive guild-actor
+    /// inbox turns before a ready dispatch, timer or maintenance branch
+    /// runs. Published by each actor at startup from its single source of
+    /// truth; 0 until the first actor publishes. Label-free gauge.
+    voice_actor_inbox_turn_bound: u64,
+    /// Guild-actor inbox commands processed, across all guild actors.
+    /// Compare with dispatch turns: inbox turns climbing while dispatch
+    /// turns stay flat means the actor is draining churn without
+    /// dispatching. Label-free counter.
+    voice_actor_inbox_turns: u64,
+    /// Guild-actor dispatch turns that ran, across all guild actors,
+    /// whether or not the turn progressed. Label-free counter.
+    voice_actor_dispatch_turns: u64,
     /// Live views republished by the not-ready-while-connected self-heal.
     voice_live_self_heals: u64,
     voice_vote_kick: [u64; VOICE_VOTE_KICK_OUTCOMES.len()],
@@ -1153,6 +1166,23 @@ impl Metrics {
         })
     }
 
+    /// One actor's recorded live-not-ready age in seconds, or `None` when
+    /// the actor has no recorded contribution. Test/diagnostic seam only:
+    /// the actor key is process-local and this lookup is never rendered,
+    /// labelled or persisted. Pins the watchdog sibling's not-ready
+    /// republication per actor, where the public maximum cannot.
+    #[doc(hidden)]
+    pub fn voice_actor_live_not_ready_secs(&self, actor: u64) -> Option<u64> {
+        let values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values
+            .voice_actors
+            .get(&actor)
+            .map(|entry| entry.live_not_ready_secs)
+    }
+
     /// Age of the oldest in-flight voice REST attempt in seconds; 0 idles it.
     /// Last writer wins.
     pub fn set_voice_rest_in_flight_age_secs(&self, age_secs: u64) {
@@ -1212,6 +1242,35 @@ impl Metrics {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         values.voice_halt_recoveries = values.voice_halt_recoveries.saturating_add(1);
+    }
+
+    /// Publish the fair-scheduling bound: at most `bound` consecutive
+    /// guild-actor inbox turns before a ready dispatch, timer or
+    /// maintenance branch runs. Called once per actor at startup with the
+    /// actor's single source of truth; last writer wins.
+    pub fn set_voice_actor_inbox_turn_bound(&self, bound: u64) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .voice_actor_inbox_turn_bound = bound;
+    }
+
+    /// One guild-actor inbox command processed.
+    pub fn voice_actor_inbox_turn(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.voice_actor_inbox_turns = values.voice_actor_inbox_turns.saturating_add(1);
+    }
+
+    /// One guild-actor dispatch turn that ran, whether or not it progressed.
+    pub fn voice_actor_dispatch_turn(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.voice_actor_dispatch_turns = values.voice_actor_dispatch_turns.saturating_add(1);
     }
 
     /// One untracked creator-channel orphan needing manual deletion after
@@ -1909,6 +1968,30 @@ impl Metrics {
             "two_bot_voice_halt_recoveries_total",
             "counter",
             values.voice_halt_recoveries,
+        );
+        header(
+            &mut out,
+            "two_bot_voice_actor_inbox_turn_bound",
+            "gauge",
+            "At most this many consecutive guild-actor inbox turns before a ready dispatch, timer or maintenance branch runs; 0 until the first actor publishes.",
+        );
+        writeln!(
+            out,
+            "two_bot_voice_actor_inbox_turn_bound {}",
+            values.voice_actor_inbox_turn_bound
+        )
+        .unwrap();
+        scalar(
+            &mut out,
+            "two_bot_voice_actor_inbox_turns_total",
+            "counter",
+            values.voice_actor_inbox_turns,
+        );
+        scalar(
+            &mut out,
+            "two_bot_voice_actor_dispatch_turns_total",
+            "counter",
+            values.voice_actor_dispatch_turns,
         );
         header(
             &mut out,
@@ -3102,6 +3185,38 @@ mod tests {
     }
 
     #[test]
+    fn voice_actor_fair_scheduling_series_are_label_free() {
+        // The fair-scheduling diagnosis is one gauge (the bound) plus two
+        // counters (inbox turns vs dispatch turns), all label-free, so no
+        // guild, member or channel label can reach exposition. The bound
+        // reads 0 until the first actor publishes; the counters only move
+        // when their turn kind runs.
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("# TYPE two_bot_voice_actor_inbox_turn_bound gauge\n"));
+        assert!(text.contains("two_bot_voice_actor_inbox_turn_bound 0\n"));
+        assert!(text.contains("# TYPE two_bot_voice_actor_inbox_turns_total counter\n"));
+        assert!(text.contains("two_bot_voice_actor_inbox_turns_total 0\n"));
+        assert!(text.contains("# TYPE two_bot_voice_actor_dispatch_turns_total counter\n"));
+        assert!(text.contains("two_bot_voice_actor_dispatch_turns_total 0\n"));
+        metrics.set_voice_actor_inbox_turn_bound(32);
+        metrics.voice_actor_inbox_turn();
+        metrics.voice_actor_inbox_turn();
+        metrics.voice_actor_dispatch_turn();
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_actor_inbox_turn_bound 32\n"));
+        assert!(text.contains("two_bot_voice_actor_inbox_turns_total 2\n"));
+        assert!(text.contains("two_bot_voice_actor_dispatch_turns_total 1\n"));
+        assert!(!text.contains("two_bot_voice_actor_inbox_turn_bound{"));
+        assert!(!text.contains("two_bot_voice_actor_inbox_turns_total{"));
+        assert!(!text.contains("two_bot_voice_actor_dispatch_turns_total{"));
+        // Last writer wins for the gauge.
+        metrics.set_voice_actor_inbox_turn_bound(8);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_actor_inbox_turn_bound 8\n"));
+    }
+
+    #[test]
     fn event_store_consumer_lag_gauge_is_a_label_free_duration() {
         // S1 AC 4: the consumer lag setter renders as one label-free gauge
         // series — the newest observed `received_at - event_time` spread, 0
@@ -3197,6 +3312,9 @@ mod tests {
         assert!(text.contains("two_bot_voice_live_self_heal_total 0\n"));
         metrics.set_voice_actor_live_not_ready(1, 1, 0);
         metrics.set_voice_actor_live_not_ready(2, 1, 95);
+        assert_eq!(metrics.voice_actor_live_not_ready_secs(1), Some(0));
+        assert_eq!(metrics.voice_actor_live_not_ready_secs(2), Some(95));
+        assert_eq!(metrics.voice_actor_live_not_ready_secs(3), None);
         let text = metrics.render(None);
         assert!(text.contains("two_bot_voice_live_not_ready_seconds 95\n"));
         assert!(!text.contains("two_bot_voice_live_not_ready_seconds{"));
