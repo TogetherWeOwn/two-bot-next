@@ -85,14 +85,20 @@ fn assert_absent(rendered: &str, sentinels: &[&str], surface: &str) {
 /// Every formatting surface of one value: normal/pretty Debug, plus the
 /// nested shapes (`Option`, `Vec`, tuple) diagnostics actually compose.
 fn assert_debug_clean(value: &AssistantConfig, sentinels: &[&str]) {
-    // Only ever Debug-formatted; dead_code fires because derived Debug is
-    // intentionally ignored during dead code analysis.
+    // Derived Debug is intentionally ignored during dead code analysis,
+    // so both fields are read below instead of waiving the lint.
     #[derive(Debug)]
-    #[allow(dead_code)]
     struct Nested {
         config: AssistantConfig,
         again: Vec<AssistantConfig>,
     }
+
+    let nested = Nested {
+        config: value.clone(),
+        again: vec![value.clone()],
+    };
+    assert_eq!(nested.again.len(), 1);
+    assert!(!format!("{:?}", &nested.config).is_empty());
 
     let renderings = [
         format!("{value:?}"),
@@ -100,20 +106,8 @@ fn assert_debug_clean(value: &AssistantConfig, sentinels: &[&str]) {
         format!("{:?}", Some(value.clone())),
         format!("{:?}", vec![value.clone(), value.clone()]),
         format!("{:?}", (value.clone(), "diagnostic context")),
-        format!(
-            "{:?}",
-            Nested {
-                config: value.clone(),
-                again: vec![value.clone()],
-            }
-        ),
-        format!(
-            "{:#?}",
-            Nested {
-                config: value.clone(),
-                again: vec![value.clone()],
-            }
-        ),
+        format!("{nested:?}"),
+        format!("{nested:#?}"),
     ];
     for rendered in &renderings {
         assert_absent(rendered, sentinels, "Debug");
