@@ -1851,13 +1851,15 @@ async fn sweep_tick_reports_a_failed_unban_as_a_rest_job_failure() {
     ));
     runtime.on_interaction(&interaction).await;
     assert_eq!(mock.deferred_reply()["content"], "Temporarily banned 3333.");
-    let staged: (String,) =
+    // The successful PUT activates the row staged -> pending; the sweep
+    // claims pending rows whose execute_at has passed.
+    let scheduled: (String,) =
         sqlx::query_as("SELECT state FROM moderation_scheduled_unbans WHERE guild_id = $1")
             .bind(GUILD_S)
             .fetch_one(db.pool())
             .await
             .expect("tempban stages its unban");
-    assert_eq!(staged.0, "staged");
+    assert_eq!(scheduled.0, "pending");
     sqlx::query(
         "UPDATE moderation_scheduled_unbans SET execute_at = '2020-01-01T00:00:00+00:00' WHERE guild_id = $1",
     )
