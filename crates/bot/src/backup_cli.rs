@@ -790,6 +790,19 @@ async fn cmd_backup_upload(args: &[String]) -> i32 {
             return 1;
         }
     };
+    // Re-check after the read: a dump that grew past the cap between the
+    // metadata precheck and the read is still refused before signing or any
+    // S3 PUT. (The read call shape above is pinned by the frozen
+    // stable-codes suite, so bounded streaming needs test-author
+    // coordination and stays a follow-up.)
+    if body.len() as u64 > dump_file::MAX_DUMP_BYTES {
+        eprintln!(
+            "backup-upload-s3: {} exceeds the {}-byte dump cap; refusing to sign or upload it code=backup_upload_dump_too_large",
+            dump_path.display(),
+            dump_file::MAX_DUMP_BYTES
+        );
+        return 1;
+    }
 
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -935,7 +948,8 @@ fn snapshot_upload_argv(upload_raw: Option<&str>, path: &Path) -> Option<(String
 /// Removes the pid temp unless a successful rename disarms it. Every
 /// post-create failure path (write, permissions, fsync, rename) drops through
 /// here, so no `.tmp` partial survives a failed write. Only our own temp is
-/// removed; siblings are never touched.
+/// removed; siblings are never touched. The guard arms only after the temp is
+/// created, so a creation failure never deletes a pre-existing path.
 struct TmpGuard<'a> {
     tmp: &'a Path,
     armed: bool,
@@ -955,15 +969,20 @@ fn atomic_json(path: &Path, value: &serde_json::Value) -> Result<(), String> {
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     }
     let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    // Stays unarmed until the temp exists: a creation failure returns the
+    // existing error without removing a pre-existing path. Truncating
+    // `create` (not `create_new`) is kept so a stale temp from a crashed
+    // same-pid run is recovered, not a fatal error.
     let mut guard = TmpGuard {
         tmp: &tmp,
-        armed: true,
+        armed: false,
     };
     let text = serde_json::to_string_pretty(value).map_err(|e| format!("cannot serialise: {e}"))?;
     {
         use std::io::Write;
         let mut file = std::fs::File::create(&tmp)
             .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        guard.armed = true;
         #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         #[cfg(unix)]
@@ -1256,9 +1275,25 @@ async fn cmd_guild_config_restore(args: &[String]) -> i32 {
         return 2;
     }
 
-    // Refuse an over-cap operator file before buffering it; a missing file
-    // still falls through to the existing read error below.
-    if let Ok(meta) = std::fs::metadata(&snapshot_arg) {
+    // Open once: a missing file keeps the existing read error, a non-regular
+    // file (device/FIFO) is refused before any read, and an over-cap file is
+    // refused before buffering. The bounded `take` read mirrors the restore
+    // drill, so a file that grows past the cap mid-read is still refused
+    // before parsing.
+    let snapshot_file = match std::fs::File::open(&snapshot_arg) {
+        Ok(file) => file,
+        Err(err) => {
+            eprintln!("guild-config-restore: cannot read snapshot {snapshot_arg}: {err}");
+            return 2;
+        }
+    };
+    if let Ok(meta) = snapshot_file.metadata() {
+        if !meta.is_file() {
+            eprintln!(
+                "guild-config-restore: cannot read snapshot {snapshot_arg}: not a regular file"
+            );
+            return 2;
+        }
         if meta.len() > MAX_SNAPSHOT_BYTES {
             eprintln!(
                 "guild-config-restore: snapshot {snapshot_arg} is {} bytes, exceeding the {MAX_SNAPSHOT_BYTES}-byte snapshot cap; refusing rather than buffering it",
@@ -1267,8 +1302,25 @@ async fn cmd_guild_config_restore(args: &[String]) -> i32 {
             return 2;
         }
     }
-
-    let text = match std::fs::read_to_string(&snapshot_arg) {
+    let bytes = {
+        use std::io::Read as _;
+        let mut limited = snapshot_file.take(MAX_SNAPSHOT_BYTES + 1);
+        let mut bytes = Vec::new();
+        match limited.read_to_end(&mut bytes) {
+            Ok(_) => bytes,
+            Err(err) => {
+                eprintln!("guild-config-restore: cannot read snapshot {snapshot_arg}: {err}");
+                return 2;
+            }
+        }
+    };
+    if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
+        eprintln!(
+            "guild-config-restore: snapshot {snapshot_arg} grew past the {MAX_SNAPSHOT_BYTES}-byte snapshot cap; refusing to parse it"
+        );
+        return 2;
+    }
+    let text = match String::from_utf8(bytes) {
         Ok(text) => text,
         Err(err) => {
             eprintln!("guild-config-restore: cannot read snapshot {snapshot_arg}: {err}");

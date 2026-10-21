@@ -387,7 +387,8 @@ roles; missing managed resources cannot silently become unresolved late writes.
 Restore: `two-bot guild-config-restore --snapshot FILE` plans (prints
 `WOULD …`); add `--confirm-staging-guild --apply` to write, `--evidence
 FILE` for the hash-proven receipt. Snapshots past 8 MiB are refused (exit 2)
-before buffering or any Discord read. Tampered backups are refused (exit 3)
+before buffering or any Discord read; non-regular `--snapshot` inputs
+(devices, FIFOs) are refused the same way. Tampered backups are refused (exit 3)
 before any Discord read or write; pre-seal snapshots warn and proceed.
 Apply ends with the post-restore hash compared against the remapped source:
 mismatch → exit 1 with the residual operations listed.
