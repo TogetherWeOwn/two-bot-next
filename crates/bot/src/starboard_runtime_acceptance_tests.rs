@@ -683,7 +683,7 @@ fn body_json(body: &[u8]) -> Value {
 /// All embed text surfaces joined: title, description, author name, footer,
 /// field names and values. The live count must render inside the embed.
 fn embed_text(embed: &Value) -> String {
-    let mut parts = vec![
+    let mut parts = [
         embed["title"].as_str().unwrap_or(""),
         embed["description"].as_str().unwrap_or(""),
         embed["author"]["name"].as_str().unwrap_or(""),
