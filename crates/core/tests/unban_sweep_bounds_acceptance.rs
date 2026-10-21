@@ -5,8 +5,10 @@
 //! fetch (same clamp family as the candidates query: `limit.clamp(0, 25)`)
 //! without editing this file. Contract pinned here:
 //!
-//! - One `claim_due_unbans` call over 30 due staged expiries leaves at least 5
-//!   staged (no single unbounded fetch); repeated passes claim all 30.
+//! - One `claim_due_unbans` call over 30 equally due staged expiries claims the
+//!   oldest 25 generations and leaves at least 5 staged; repeated passes claim all 30.
+//! - A limit-one pass prioritizes the earliest due staged expiry even when older
+//!   generations expire later; future expiries cannot consume a due claim.
 //! - Claim tokens stay 32-hex and unique; intent generations, `execute_at`
 //!   schedule positions and quarantined imports are unchanged by the sweep;
 //!   fresh claims take no retry position (`retry_generation` stays NULL).
@@ -53,8 +55,17 @@ fn member_user(i: usize) -> String {
 }
 
 async fn seed_accepted(store: &PgMemberModerationStore, request: &str, user: &str) {
+    seed_accepted_at(store, request, user, NOW).await;
+}
+
+async fn seed_accepted_at(
+    store: &PgMemberModerationStore,
+    request: &str,
+    user: &str,
+    execute_at: &str,
+) {
     let attempt = store
-        .stage_unban(GUILD, user, NOW, "expiry", request, NOW)
+        .stage_unban(GUILD, user, execute_at, "expiry", request, NOW)
         .await
         .expect("expiry stages");
     store
@@ -93,8 +104,14 @@ async fn sweep_single_pass_leaves_staged_rows_beyond_the_bound() {
     };
     let db = fixture(&bootstrap).await;
     let store = PgMemberModerationStore::new(db.pool().clone(), GUILD);
-    for i in 0..STAGED {
-        seed_accepted(&store, &format!("bound-due-{i:02}"), &member_user(i)).await;
+    // Seed newest lexical identities first so request-id sorting cannot stand
+    // in for the oldest-generation tie-break at the activation boundary.
+    let requests: Vec<String> = (0..STAGED)
+        .rev()
+        .map(|i| format!("bound-due-{i:02}"))
+        .collect();
+    for (i, request) in requests.iter().enumerate() {
+        seed_accepted(&store, request, &member_user(i)).await;
     }
     assert_eq!(staged_count(db.pool()).await, STAGED as i64);
     let jobs = store
@@ -111,6 +128,101 @@ async fn sweep_single_pass_leaves_staged_rows_beyond_the_bound() {
         remaining >= STAGED as i64 - BOUND,
         "one pass activates at most {BOUND} staged rows, {remaining} of {STAGED} still staged"
     );
+    // Pin membership, not the candidate query's return order: exactly the
+    // first 25 seeded generations must cross the staged activation boundary.
+    let mut claimed: Vec<&str> = jobs.iter().map(|job| job.request_id.as_str()).collect();
+    claimed.sort_unstable();
+    let mut oldest: Vec<&str> = requests[..BOUND as usize]
+        .iter()
+        .map(String::as_str)
+        .collect();
+    oldest.sort_unstable();
+    assert_eq!(
+        claimed, oldest,
+        "equal-time activation chooses oldest intents"
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn sweep_limit_one_claims_earliest_due_before_older_future_staged_expiries() {
+    let Some(bootstrap) = bootstrap_url("staged due-time priority") else {
+        return;
+    };
+    let db = fixture(&bootstrap).await;
+    let store = PgMemberModerationStore::new(db.pool().clone(), GUILD);
+    const FUTURE: &str = "2023-11-15T00:13:20.000Z";
+    // Both generation and request-id order oppose due-time priority.
+    for (i, (request, execute_at)) in [
+        ("mixed-a-future", FUTURE),
+        ("mixed-b-later-due", "2023-11-14T23:00:00.000Z"),
+        ("mixed-z-earliest-due", "2023-11-14T22:30:00.000Z"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        seed_accepted_at(&store, request, &member_user(i), execute_at).await;
+    }
+    assert_eq!(
+        staged_count(db.pool()).await,
+        3,
+        "all fixtures start staged"
+    );
+    let generations = intent_generations(db.pool()).await;
+    let schedule = unban_schedule(db.pool()).await;
+
+    for expected in ["mixed-z-earliest-due", "mixed-b-later-due"] {
+        let jobs = store
+            .claim_due_unbans(GUILD, DUE, 1)
+            .await
+            .expect("limit-one due claim");
+        assert_eq!(
+            jobs.iter()
+                .map(|job| job.request_id.as_str())
+                .collect::<Vec<_>>(),
+            [expected],
+            "each bounded call must immediately claim the earliest remaining due expiry"
+        );
+        store
+            .complete_unban(&jobs[0].request_id, &jobs[0].claim_token)
+            .await
+            .expect("complete due claim");
+    }
+    assert!(
+        store
+            .claim_due_unbans(GUILD, DUE, 1)
+            .await
+            .expect("future-only pass")
+            .is_empty(),
+        "a future expiry is never claimed before its execute_at"
+    );
+    let future_unclaimed: bool = sqlx::query_scalar(
+        "SELECT claimed_at IS NULL AND claim_token IS NULL
+         FROM moderation_scheduled_unbans WHERE request_id = 'mixed-a-future'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(future_unclaimed, "future expiry retains no claim");
+    assert_eq!(intent_generations(db.pool()).await, generations);
+    assert_eq!(unban_schedule(db.pool()).await, schedule);
+
+    let future = store
+        .claim_due_unbans(GUILD, FUTURE, 1)
+        .await
+        .expect("future expiry becomes due");
+    assert_eq!(
+        future
+            .iter()
+            .map(|job| job.request_id.as_str())
+            .collect::<Vec<_>>(),
+        ["mixed-a-future"],
+        "deferred expiry is preserved and claimable when due"
+    );
+    store
+        .complete_unban(&future[0].request_id, &future[0].claim_token)
+        .await
+        .expect("complete deferred expiry");
     db.close().await.unwrap();
 }
 
