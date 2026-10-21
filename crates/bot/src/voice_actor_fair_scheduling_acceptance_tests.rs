@@ -441,9 +441,13 @@ async fn control_fifo_and_latest_state_preserved_under_churn() {
         .expect("actor must exit after inbox close")
         .unwrap();
     assert_eq!(worker.tracked().len(), 2);
+    // V1 naming renders `<display>'s room`; the pin is the arrival order.
     assert_eq!(
         *worker.http.created_names.lock().unwrap(),
-        ["first room".to_owned(), "second room".to_owned()],
+        [
+            "first room's room".to_owned(),
+            "second room's room".to_owned()
+        ],
         "joins separated by churn still create in arrival order"
     );
     let mut expected = NameDirectory::default();
@@ -539,7 +543,10 @@ async fn control_create_move_adjacency_no_maintenance_between() {
         .await
         .expect("actor must exit after inbox close")
         .unwrap();
-    assert_eq!(worker.tracked().len(), 2);
+    // The persist failure compensated the first room (create then delete), so
+    // only the second room is tracked; its create->move pair is the adjacency
+    // the probe pins.
+    assert_eq!(worker.tracked().len(), 1);
     assert_eq!(
         *move_saw_reads.lock().unwrap(),
         Some(reads_before),
