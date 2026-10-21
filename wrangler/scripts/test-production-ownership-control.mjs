@@ -17,11 +17,12 @@ function owner(epoch, deploymentId = 'new-deployment') {
 }
 
 // Each scripted entry is one response; a string body is sent verbatim, anything else as JSON.
-function fixture(script) {
+function fixture(script, hooks = {}) {
   const calls = [];
   const waits = [];
   const send = async (_endpoint, init) => {
     calls.push(init.method);
+    hooks.onSend?.();
     const entry = script[calls.length - 1] ?? {};
     if (entry.throws) throw entry.throws;
     const { status, body } = entry;
@@ -29,10 +30,10 @@ function fixture(script) {
     return new Response(typeof body === 'string' ? body : JSON.stringify(body), { status });
   };
   const wait = async (ms) => { waits.push(ms); };
-  const invoke = (params) => control({
+  const invoke = (params, now) => control({
     url: PRODUCTION, productionUrl: PRODUCTION, stagingUrl: STAGING,
     token: TOKEN, actor: ACTOR, ...params,
-  }, send, wait);
+  }, send, wait, now);
   return { calls, waits, invoke };
 }
 
@@ -47,7 +48,10 @@ async function failure(promise) {
 
 const ok = (epoch) => ({ status: 200, body: { deploymentId: 'new-deployment', owner: owner(epoch), running: false } });
 const http = (status, reason = 'deployment_mismatch') => ({ status, body: { error: 'ownership_fenced', reason } });
-const timeout = () => ({ throws: new DOMException('The operation was aborted', 'AbortError') });
+// AbortSignal.timeout rejects with TimeoutError (what fetch throws on a real
+// 15 s timeout); a manual AbortController would reject with AbortError.
+const timeout = () => ({ throws: new DOMException('The operation timed out', 'TimeoutError') });
+const abort = () => ({ throws: new DOMException('The operation was aborted', 'AbortError') });
 const transport = (text = 'fetch failed') => ({ throws: new TypeError(text) });
 
 test('status succeeds first try without waiting', async () => {
@@ -113,6 +117,28 @@ test('status reports a persistent timeout with attempts and elapsed time', async
   assert.match(message, /^Ownership control request timeout attempts=3 elapsed=\d+s; stop, do not change credentials$/);
   assert.deepEqual(f.calls, ['GET', 'GET', 'GET']);
   assert.deepEqual(f.waits, [10000, 10000]);
+});
+
+test('status classifies a manual abort as a timeout', async () => {
+  const f = fixture([abort()]);
+  const message = await failure(f.invoke({ action: 'status', statusAttempts: 1 }));
+  assert.match(message, /^Ownership control request timeout attempts=1 elapsed=\d+s; stop, do not change credentials$/);
+  assert.deepEqual(f.calls, ['GET']);
+  assert.deepEqual(f.waits, []);
+});
+
+test('status stops retrying once the next wait would exceed the status window', async () => {
+  // The rollback path reads status through a subprocess capped at 420 s; a
+  // hanging endpoint must not outlive the caller. Wall time, not attempts,
+  // ends this loop: each attempt consumes over a minute here.
+  let now = 0;
+  const script = [transport(), transport(), transport(), transport(),
+    transport(), transport(), transport(), transport()];
+  const f = fixture(script, { onSend: () => { now += 65000; } });
+  const message = await failure(f.invoke({ action: 'status', statusAttempts: 34 }, () => now));
+  assert.match(message, /^Ownership control request failed attempts=5 elapsed=325s; stop, do not change credentials$/);
+  assert.deepEqual(f.calls, ['GET', 'GET', 'GET', 'GET', 'GET']);
+  assert.deepEqual(f.waits, [10000, 10000, 10000, 10000]);
 });
 
 test('status reports a persistent transport failure with attempts and elapsed time', async () => {

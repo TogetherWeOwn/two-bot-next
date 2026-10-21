@@ -29,8 +29,10 @@ version to SHA; the snapshot records that SHA beside the serving version
 and image. Before any restore POST, the receipt is validated against live
 Cloudflare state: the version's annotated SHA must equal the receipt SHA,
 the version must appear in the 100%-serving deployment history, and the
-image must appear in a completed or replaced (served, then superseded)
-rollout for the application. A missing or mismatched member refuses the
+image must appear in a completed rollout for the application, or a
+replaced one with convergence evidence (every step completed, every
+instance updated: a rollout can be replaced before it finishes). A missing or
+mismatched member refuses the
 rollback: a merely CI-green SHA paired with some other version is never
 admitted.
 
@@ -316,16 +318,43 @@ def version_sha(client, worker, version):
     return message if isinstance(message, str) and SHA.fullmatch(message) else None
 
 
+def replaced_converged(row):
+    """Convergence evidence for a `replaced` provenance row.
+
+    A rollout can be `replaced` before it finishes (superseded in flight),
+    so status alone never proves the image rolled out. Accept only rows
+    whose record shows every step completed and every instance updated.
+    Any malformed shape reads as unconverged: fail closed. Mirrors the
+    staging drill's replaced_converged (scripts/staging_container_drill.py).
+    """
+    try:
+        record = base.mapping(row)
+        steps = base.sequence(record.get("steps"))
+        progress = base.mapping(record.get("progress"))
+        total_steps = base.number(progress.get("total_steps"))
+        total = base.number(progress.get("total_instances"))
+        updated = base.number(progress.get("updated_instances"))
+        steps_done = all(base.mapping(step).get("status") == "completed"
+                         for step in steps)
+    except GateError:
+        return False
+    if not steps or total_steps <= 0 or len(steps) != total_steps:
+        return False
+    if not steps_done:
+        return False
+    return total > 0 and total == updated
+
+
 def validate_receipt_against_live(client, receipt):
     """Bind a receipt to live Cloudflare state with reads only, before any
     restore POST: the version must have been deployed from the receipt
     SHA and must have served 100% before, and the image must come from a
     rollout of this application that completed (status completed, or
-    replaced after completing: Cloudflare flips every superseded rollout
-    to replaced, so after any deploy the previous image lives only
-    there). Rollout images carry no version link, so served-before
-    membership is the strongest image binding the API offers; version
-    and SHA bind exactly."""
+    replaced with convergence evidence: Cloudflare flips every superseded
+    rollout to replaced, so after any deploy the previous image lives only
+    there, but a rollout can also be replaced before it finishes). Rollout
+    images carry no version link, so served-before membership is the
+    strongest image binding the API offers; version and SHA bind exactly."""
     require(version_sha(client, receipt.worker, receipt.version) == receipt.sha,
             "provenance_mismatch", "member=sha")
     require(receipt.version in deployments(client, receipt.worker),
@@ -335,7 +364,10 @@ def validate_receipt_against_live(client, receipt):
     for row in app_rollouts(client, app["id"]):
         row = base.mapping(row)
         image = base.mapping(row.get("target_configuration")).get("image")
-        if (row.get("status") in ("completed", "replaced") and isinstance(image, str)
+        status = row.get("status")
+        proven = (status == "completed"
+                  or (status == "replaced" and replaced_converged(row)))
+        if (proven and isinstance(image, str)
                 and re.fullmatch(image_pattern(receipt.application), image)):
             served.add(image)
     require(receipt.image in served, "provenance_image_never_served")

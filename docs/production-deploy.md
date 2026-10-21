@@ -129,8 +129,10 @@ The three inputs are validated as one
 receipt before anything is restored: the rollback script refuses unless the
 Worker version's stamped deploy message (`wrangler deploy --message <sha>`)
 equals `sha` (the resolved full SHA), the version appears in the 100%-serving deployment history,
-and the image comes from a completed or replaced (served, then superseded)
-rollout. A merely CI-green SHA paired
+and the image comes from a completed rollout, or a replaced one whose
+record shows every step completed and every instance updated (a rollout
+can be replaced before it finishes, so status alone never proves the
+image served). A merely CI-green SHA paired
 with the wrong version therefore refuses before traffic moves instead of
 failing the gate after the restore; do not widen the guard to admit one.
 The `/readyz` gate after the

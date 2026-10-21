@@ -46,7 +46,7 @@ def components(gateway="ready"):
 
 
 def rollout_row(rollout_id, image, created="2026-10-15T00:00:00Z", status="completed",
-                target_version=7):
+                target_version=7, steps=None, progress=None):
     return {"id": rollout_id, "created_at": created, "status": status,
             "strategy": "rolling", "kind": "full_auto", "target_version": target_version,
             "current_version": target_version - 1,
@@ -55,8 +55,18 @@ def rollout_row(rollout_id, image, created="2026-10-15T00:00:00Z", status="compl
             "health": {"instances": {"active": 1, "healthy": 1, "failed": 0,
                                      "starting": 0, "scheduling": 0}},
             "progress": {"total_steps": 1, "current_step": 1, "total_instances": 1,
-                         "updated_instances": 1},
-            "steps": [{"status": "completed"}]}
+                         "updated_instances": 1} if progress is None else progress,
+            "steps": [{"status": "completed"}] if steps is None else steps}
+
+
+def unconverged_row(rollout_id, image, **overrides):
+    """A replaced rollout superseded in flight: steps still running, no
+    instance updated. Status alone must never prove the image served."""
+    overrides.setdefault("status", "replaced")
+    overrides.setdefault("steps", [{"status": "in_progress"}])
+    overrides.setdefault("progress", {"total_steps": 1, "current_step": 1,
+                                      "total_instances": 1, "updated_instances": 0})
+    return rollout_row(rollout_id, image, **overrides)
 
 
 class FakeClient(rollback.RollbackClient):
@@ -692,6 +702,53 @@ class MainProvenanceTests(unittest.TestCase):
                 rollout_row("r-prev", good_image(), status="replaced")]}
         rollback.validate_receipt_against_live(FakeClient(routes), receipt)
 
+    def test_receipt_refuses_an_image_from_a_replaced_rollout_still_in_flight(self):
+        # A rollout can be replaced before it finishes (superseded in
+        # flight), so a replaced row proves the image served only with
+        # convergence evidence: every step completed, every instance
+        # updated. The in-flight shape refuses like a never-served image.
+        receipt = rollback.ProvenanceReceipt(WORKER, APPLICATION, GOOD_VERSION,
+                                             SHA, good_image())
+        routes = self.live_routes()
+        served = unconverged_row("r-prev", good_image())
+        routes[("GET", f"/containers/applications/{APP_ID}/rollouts?limit=100")] = \
+            lambda served=served: {"success": True, "result": [served]}
+        with self.assertRaises(rollback.GateError) as caught:
+            rollback.validate_receipt_against_live(FakeClient(routes), receipt)
+        self.assertEqual(str(caught.exception), "provenance_image_never_served")
+
+    def test_receipt_refuses_a_replaced_rollout_without_convergence_evidence(self):
+        # Any malformed convergence shape reads as unconverged: fail
+        # closed instead of trusting status alone.
+        shapes = {
+            "no steps": {"steps": []},
+            "step pending": {"steps": [{"status": "pending"}]},
+            "step count mismatch": {
+                "steps": [{"status": "completed"}],
+                "progress": {"total_steps": 2, "current_step": 1,
+                             "total_instances": 1, "updated_instances": 1}},
+            "instances lagging": {
+                "progress": {"total_steps": 1, "current_step": 1,
+                             "total_instances": 2, "updated_instances": 1}},
+            "no instances": {
+                "progress": {"total_steps": 1, "current_step": 1,
+                             "total_instances": 0, "updated_instances": 0}},
+            "progress missing": {"progress": {}},
+        }
+        for name, shape in shapes.items():
+            with self.subTest(name=name):
+                receipt = rollback.ProvenanceReceipt(WORKER, APPLICATION, GOOD_VERSION,
+                                                     SHA, good_image())
+                routes = self.live_routes()
+                served = rollout_row("r-prev", good_image(), status="replaced",
+                                     **shape)
+                routes[("GET", f"/containers/applications/{APP_ID}/rollouts?limit=100")] = \
+                    lambda served=served: {"success": True, "result": [served]}
+                with self.assertRaises(rollback.GateError) as caught:
+                    rollback.validate_receipt_against_live(FakeClient(routes), receipt)
+                self.assertEqual(str(caught.exception),
+                                 "provenance_image_never_served")
+
     def snapshot_argv(self, path, *extra):
         return ["rollback", "--variant", "staging", "--worker-url", self.URL,
                 "--snapshot", str(path), "--actor", "a:b", "--evidence", "e.json",
@@ -855,6 +912,25 @@ class MainProvenanceTests(unittest.TestCase):
         self.assertEqual(record["restored_image_digest"], "sha256:" + "a" * 64)
         self.assertTrue([call for call in client.calls if call[0] == "POST"],
                         client.calls)
+
+    def test_snapshot_rollback_refuses_when_the_snapshot_rollout_never_converged(self):
+        # Snapshot path of the in-flight replaced shape: the recorded
+        # image matches the live re-read (no drift), but the row never
+        # converged, so served-before membership still refuses before
+        # any POST.
+        row = unconverged_row("r-prev", good_image())
+        overrides = {
+            ("GET", f"/containers/applications/{APP_ID}/rollouts/r-prev"):
+                lambda row=row: {"success": True, "result": row},
+            ("GET", f"/containers/applications/{APP_ID}/rollouts?limit=100"):
+                lambda row=row: {"success": True, "result": [row]},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out, _, client, _ = self.run_snapshot_main(tmp, SHA, overrides)
+            self.assertEqual(code, 1, out)
+            self.assertIn("provenance_image_never_served", out)
+        self.assertFalse([call for call in client.calls if call[0] == "POST"],
+                         client.calls)
 
     def test_snapshot_rollback_gate_refuses_a_revision_other_than_the_receipt_sha(self):
         # Without the pin this answer passes on the version header alone;
