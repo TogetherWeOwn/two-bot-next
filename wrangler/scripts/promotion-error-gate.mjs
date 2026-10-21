@@ -41,9 +41,62 @@ const DEFAULT_SAMPLE_INTERVAL_SECONDS = 75;
 const DEFAULT_SCRAPE_TIMEOUT_SECONDS = 15;
 const SCRAPE_ATTEMPTS = 3;
 const SCRAPE_RETRY_SECONDS = 10;
+// Intake cap mirrors the Worker scrape (MAX_METRICS_BODY_BYTES in
+// wrangler/src/index.ts) and the MCP container reads: every sibling
+// reader refuses expositions over 64 KiB.
+const MAX_EXPOSITION_BYTES = 64 * 1024;
 
 class UsageError extends Error {}
 class ScrapeError extends Error {}
+
+/**
+ * Bounded exposition read: content-length precheck plus an incremental
+ * streaming cap, so an over-cap body never buffers fully. Returns null
+ * when the body exceeds `limit`. Minimal fetch stubs without a body
+ * stream fall back to text() with a post-read byte check.
+ */
+async function readBoundedExposition(response, limit) {
+  const declared = response.headers?.get?.("content-length");
+  if (declared !== undefined && declared !== null) {
+    const parsed = Number(declared);
+    if (Number.isFinite(parsed) && parsed > limit) return null;
+  }
+  const reader = response.body?.getReader?.();
+  if (!reader) {
+    const text = await response.text();
+    return Buffer.byteLength(text, "utf8") > limit ? null : text;
+  }
+  const chunks = [];
+  let size = 0;
+  let complete = false;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        complete = true;
+        break;
+      }
+      size += value.byteLength;
+      if (size > limit) return null;
+      chunks.push(value);
+    }
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return new TextDecoder().decode(bytes);
+  } finally {
+    // A hostile cancel hook can itself stall or reject. Do not await it.
+    if (!complete) void reader.cancel().catch(() => {});
+    try {
+      reader.releaseLock();
+    } catch {
+      // Some runtimes cannot release a lock while a read is pending.
+    }
+  }
+}
 
 /**
  * Firing verdict over an evaluateMetrics firing list. `fail` true means the
@@ -86,7 +139,8 @@ async function fetchExposition({ metricsUrl, token, timeoutSeconds, fetchImpl, r
         signal: AbortSignal.timeout(timeoutSeconds * 1000),
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const text = await response.text();
+      const text = await readBoundedExposition(response, MAX_EXPOSITION_BYTES);
+      if (text === null) throw new Error(`exposition exceeds ${MAX_EXPOSITION_BYTES} byte cap`);
       const samples = parseAlertScrape(text);
       if (samples === null) throw new Error("unparseable exposition");
       return { text, samples };

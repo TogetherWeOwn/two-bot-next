@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -11,20 +12,74 @@ import sys
 
 SHAPE_REASON = "Release tag response has invalid shape"
 LOOKUP_REASON = "Release tag lookup failed"
+OVER_CAP = "Release tag response exceeds the byte cap"
+DUP_KEYS = "Release tag response carries duplicate object keys"
+BAD_CONST = "Release tag response carries a non-finite number"
+TOO_DEEP = "Release tag response is too deeply nested"
+SOURCE_OVER_CAP = "SBOM source file exceeds the byte cap"
+SOURCE_MISSING = "SBOM source file is missing or unreadable"
+# Real gh responses are under 1 KiB; the 2 MiB fixture must refuse.
+RESPONSE_CAP = 1 << 20
+
+
+def require_env(name):
+    value = os.environ.get(name)
+    if value is None:
+        raise ValueError(f"{name} is not set")
+    return value
+
+
+def _reject_duplicate_keys(pairs):
+    seen = set()
+    for key, _ in pairs:
+        if key in seen:
+            raise ValueError(DUP_KEYS)
+        seen.add(key)
+    return dict(pairs)
+
+
+def _reject_constant(value):
+    raise ValueError(BAD_CONST)
+
+
+def _reject_non_finite_float(text):
+    number = float(text)
+    if not math.isfinite(number):
+        raise ValueError(BAD_CONST)
+    return number
+
+
+def parse_response(raw):
+    if len(raw.encode("utf-8")) > RESPONSE_CAP:
+        raise ValueError(OVER_CAP)
+    try:
+        return json.loads(
+            raw,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_constant,
+            parse_float=_reject_non_finite_float,
+        )
+    except RecursionError:
+        raise ValueError(TOO_DEEP) from None
 
 
 def github_object(path):
-    """Fetch one git ref object; refuse transport and shape failures with fixed vocabulary.
+    """Fetch one git ref object; refuse transport, intake and shape failures with fixed vocabulary.
 
     gh stderr is discarded so service diagnostics never precede the fixed
-    refusal, and undecodable stdout refuses as invalid shape. Returns the
-    full ``gh api`` response dict; the ``object`` member is guaranteed
-    present and a dict. Callers index ``["object"]`` as before, so the
-    pre-existing mock contract (outer shape) is preserved.
+    refusal, and undecodable stdout refuses as invalid shape. The reply is
+    parsed with the intake guard (byte cap, duplicate keys, non-finite
+    numbers, nesting depth); unparseable JSON refuses as invalid shape.
+    Returns the full ``gh api`` response dict; the ``object`` member is
+    guaranteed present and a dict. Callers index ``["object"]`` as before,
+    so the pre-existing mock contract (outer shape) is preserved.
     """
+    repo = os.environ.get("GH_REPO")
+    if repo is None:
+        raise ValueError("GH_REPO is not set")
     try:
         raw = subprocess.check_output(
-            ["gh", "api", f"repos/{os.environ['GH_REPO']}/git/{path}"],
+            ["gh", "api", f"repos/{repo}/git/{path}"],
             text=True, timeout=30, stderr=subprocess.DEVNULL,
         )
     except UnicodeDecodeError:
@@ -32,8 +87,8 @@ def github_object(path):
     except (subprocess.SubprocessError, OSError):
         raise ValueError(LOOKUP_REASON) from None
     try:
-        response = json.loads(raw)
-    except ValueError:
+        response = parse_response(raw)
+    except json.JSONDecodeError:
         raise ValueError(SHAPE_REASON) from None
     if not isinstance(response, dict) or not isinstance(response.get("object"), dict):
         raise ValueError(SHAPE_REASON)
@@ -66,8 +121,17 @@ def select_target(dry_run, tag, sha):
     return {"ref": resolve_tag(tag), "tag": tag}
 
 
+def read_capped_source(path):
+    try:
+        if path.stat().st_size > RESPONSE_CAP:
+            raise ValueError(SOURCE_OVER_CAP)
+        return path.read_text()
+    except OSError:
+        raise ValueError(SOURCE_MISSING) from None
+
+
 def verify_source(tag, expected_sha, source):
-    if not re.fullmatch(r"[0-9a-f]{40}", expected_sha) or source.read_text().strip() != expected_sha:
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_sha) or read_capped_source(source).strip() != expected_sha:
         raise ValueError("SBOM source differs from the selected release commit")
     if resolve_tag(tag) != expected_sha:
         raise ValueError("Release tag moved since SBOM source selection")
@@ -79,10 +143,14 @@ if __name__ == "__main__":
     args = parser.parse_args()
     try:
         if args.verify_source:
-            verify_source(os.environ["RELEASE_TAG"], os.environ["EXPECTED_SHA"], args.verify_source)
+            verify_source(require_env("RELEASE_TAG"), require_env("EXPECTED_SHA"),
+                            args.verify_source)
         else:
-            target = select_target(os.environ.get("DRY_RUN", ""), os.environ.get("RELEASE_TAG", ""), os.environ["GITHUB_SHA"])
-            with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+            dry_run = os.environ.get("DRY_RUN", "")
+            sha = require_env("GITHUB_SHA")
+            output_path = require_env("GITHUB_OUTPUT")
+            target = select_target(dry_run, os.environ.get("RELEASE_TAG", ""), sha)
+            with open(output_path, "a") as output:
                 for name, value in target.items():
                     output.write(f"{name}={value}\n")
     except ValueError as error:
