@@ -1,4 +1,5 @@
 #![cfg(test)]
+#![forbid(dead_code)]
 //! Protected acceptance: the unban sweep finishes every due job and says
 //! what happened, even when one job fails.
 //!
@@ -438,6 +439,53 @@ async fn empty_sweep_reports_zero_zero_control() {
         .await
         .expect("empty sweep");
     assert_eq!(summary, (0, 0));
+}
+
+// Explicit trait calls keep the baseline adapter exercised after the inherent
+// summary shadows it. Acceptance assertions above must keep using method syntax.
+#[tokio::test]
+async fn legacy_summary_fallback_counts_completed_control() {
+    let store = MemMemberStore::new();
+    stage_three_pending(&store).await;
+    let discord = FailUserDiscord::default();
+    let svc = MemberModerationService::new(discord.clone(), store.clone(), policy(), || {
+        1_700_000_000_000
+    });
+    let summary = SweepSummaryFallback::run_due_unbans_summary(&svc, GUILD)
+        .await
+        .expect("legacy adapter forwards a successful sweep");
+    assert_eq!(summary, (3, 0));
+    assert_eq!(discord.unban_user_ids(), vec!["user-1", "user-2", "user-3"]);
+    for req in ["req-1", "req-2", "req-3"] {
+        assert_eq!(store.unban_state(req).as_deref(), Some("done"));
+    }
+    assert_eq!(
+        SweepSummaryFallback::run_due_unbans_summary(&svc, GUILD)
+            .await
+            .expect("legacy adapter forwards an empty sweep"),
+        (0, 0)
+    );
+}
+
+#[tokio::test]
+async fn legacy_summary_fallback_preserves_fatal_error_control() {
+    let store = MemMemberStore::new();
+    stage_three_pending(&store).await;
+    let discord = FailUserDiscord::default();
+    let mut unknown_identity = policy();
+    unknown_identity.bot_user_id = None;
+    let svc =
+        MemberModerationService::new(discord.clone(), store.clone(), unknown_identity, || {
+            1_700_000_000_000
+        });
+    assert!(matches!(
+        SweepSummaryFallback::run_due_unbans_summary(&svc, GUILD).await,
+        Err(MemberError::BotIdentityUnknown)
+    ));
+    assert!(discord.unban_calls().is_empty());
+    for req in ["req-1", "req-2", "req-3"] {
+        assert_eq!(store.unban_state(req).as_deref(), Some("pending"));
+    }
 }
 
 // --- Disposable-DB sweep proof (self-skips without MEMBER_TESTDB) -------------
