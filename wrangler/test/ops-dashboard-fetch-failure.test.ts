@@ -181,7 +181,7 @@ function makePage(script: string) {
     clearInterval: (id: number) => {
       intervals.delete(id);
     },
-    setTimeout,
+    setTimeout: (fn: () => void, ms: number) => setTimeout(fn, ms).unref(),
     clearTimeout,
     AbortController,
     localStorage: storage,
@@ -449,14 +449,19 @@ test("control: an obsolete-generation rejection cannot clear the reconnected rep
   assert.deepEqual(page.snapshot(), beforeStale);
 });
 
-test("control: an obsolete-generation rejection cannot pre-empt a pending reconnect poll", async () => {
+test("an obsolete-generation rejection cannot pre-empt a visibly nonfresh reconnect poll", async () => {
   const page = makePage(await dashboardScript());
   await page.clickConnect();
   await page.clickDisconnect();
   page.setCredentials(ID_2, SECRET_2);
   await page.clickConnect();
   const beforeStale = page.snapshot();
-  assert.equal(beforeStale.status, "disconnected", "reconnect has not rendered yet");
+  assert.ok(!beforeStale.status.startsWith("updated "), "reconnect has no fresh report yet");
+  assert.match(beforeStale.summary, /connecting|pending|waiting|unavailable|stale/i);
+  assert.ok(!beforeStale.summary.includes(">READY<"), "pending reconnect is not fresh readiness");
+  assert.ok(!beforeStale.summary.includes('class="ok"'), "pending reconnect is not success");
+  assert.equal(page.fetches[0]!.init?.signal?.aborted, true, "old connection work is cancelled");
+  assert.equal(page.fetches[1]!.init?.signal?.aborted, false, "reconnect poll remains active");
   page.fetches[0]!.reject(new Error("synthetic network failure"));
   await flush();
   assert.deepEqual(page.snapshot(), beforeStale);
