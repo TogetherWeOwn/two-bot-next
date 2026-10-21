@@ -13,6 +13,7 @@ OVER_CAP = "SBOM input exceeds the byte cap"
 DUP_KEYS = "SBOM JSON carries duplicate object keys"
 BAD_CONST = "SBOM JSON carries a non-finite number"
 TOO_DEEP = "SBOM components exceed the nesting bound"
+LOCK_TOO_DEEP = "SBOM lockfile exceeds the nesting bound"
 MISSING_FILE = "SBOM input file is missing or unreadable"
 # Real intake is ~17 KiB BOM / ~66 KiB lockfile / <100 B provenance; the
 # 8 MiB JSON / 1 MiB text fixtures must refuse, and the <64 KiB nesting
@@ -63,6 +64,13 @@ def parse_bom_text(text):
         raise ValueError(TOO_DEEP) from None
 
 
+def parse_lockfile_text(text):
+    try:
+        return tomllib.loads(text)
+    except RecursionError:
+        raise ValueError(LOCK_TOO_DEEP) from None
+
+
 def components(bom, _depth=0):
     if _depth > MAX_DEPTH:
         raise ValueError(TOO_DEEP)
@@ -83,7 +91,7 @@ def read_bom(path):
 
 def validate(lockfile, directory):
     rust = read_bom(directory / "rust-workspace.cdx.json")
-    expected = {(pkg["name"], pkg["version"]) for pkg in tomllib.loads(
+    expected = {(pkg["name"], pkg["version"]) for pkg in parse_lockfile_text(
         read_capped_text(lockfile, JSON_CAP))["package"]}
     actual = {(pkg.get("name"), pkg.get("version")) for pkg in rust}
     missing = expected - actual

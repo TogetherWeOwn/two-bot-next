@@ -14,6 +14,8 @@ OVER_CAP = "Release tag response exceeds the byte cap"
 DUP_KEYS = "Release tag response carries duplicate object keys"
 BAD_CONST = "Release tag response carries a non-finite number"
 TOO_DEEP = "Release tag response is too deeply nested"
+SOURCE_OVER_CAP = "SBOM source file exceeds the byte cap"
+SOURCE_MISSING = "SBOM source file is missing or unreadable"
 # Real gh responses are under 1 KiB; the 2 MiB fixture must refuse.
 RESPONSE_CAP = 1 << 20
 
@@ -93,8 +95,17 @@ def select_target(dry_run, tag, sha):
     return {"ref": resolve_tag(tag), "tag": tag}
 
 
+def read_capped_source(path):
+    try:
+        if path.stat().st_size > RESPONSE_CAP:
+            raise ValueError(SOURCE_OVER_CAP)
+        return path.read_text()
+    except OSError:
+        raise ValueError(SOURCE_MISSING) from None
+
+
 def verify_source(tag, expected_sha, source):
-    if not re.fullmatch(r"[0-9a-f]{40}", expected_sha) or source.read_text().strip() != expected_sha:
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_sha) or read_capped_source(source).strip() != expected_sha:
         raise ValueError("SBOM source differs from the selected release commit")
     if resolve_tag(tag) != expected_sha:
         raise ValueError("Release tag moved since SBOM source selection")
