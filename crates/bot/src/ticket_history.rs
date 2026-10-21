@@ -12,7 +12,7 @@ use two_bot_core::{
     tickets::{TranscriptSnapshot, MAX_TRANSCRIPT_UTF16_UNITS},
 };
 
-const TRUNCATION_MARKER: &str = "\n[transcript truncated]";
+pub(super) const TRUNCATION_MARKER: &str = "\n[transcript truncated]";
 
 #[derive(Default)]
 pub(super) struct HistoryCapture {

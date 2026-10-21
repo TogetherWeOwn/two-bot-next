@@ -314,6 +314,8 @@ pub(crate) enum Failure {
     Timeout,
     LaneBusy,
     NoTicket,
+    TicketClaimedBy(String),
+    TicketNotOpen,
 }
 
 impl From<StoreError> for Failure {
@@ -343,6 +345,15 @@ impl Failure {
             // operation: name the refusal specifically without promising
             // recovery or exposing storage details.
             Self::NoTicket => "This channel is not a ticket.".into(),
+            // A lost claim race names the durable winner. The id is
+            // Discord-owned, never a user-controlled name, and the shared
+            // router suppresses the mention, so this cannot ping.
+            Self::TicketClaimedBy(winner) => {
+                format!("This ticket is already claimed by <@{winner}>.")
+            }
+            // Claiming a closing or otherwise non-open ticket is a lifecycle
+            // refusal, never an ownership conflict or a recovery promise.
+            Self::TicketNotOpen => "This ticket is not open.".into(),
             _ => {
                 "Ticket action failed; recovery will retry unfinished work. Try again later.".into()
             }
@@ -354,7 +365,11 @@ impl Failure {
             Self::Timeout | Self::LaneBusy | Self::Rest(DiscordError::Timeout) => {
                 ErrorClass::Timeout
             }
-            Self::Rest(_) | Self::InvalidEvidence | Self::NoTicket => ErrorClass::Rest,
+            Self::Rest(_)
+            | Self::InvalidEvidence
+            | Self::NoTicket
+            | Self::TicketClaimedBy(_)
+            | Self::TicketNotOpen => ErrorClass::Rest,
         }
     }
 }
@@ -580,13 +595,24 @@ impl TicketRuntime {
                     .await?
                     .ok_or(Failure::NoTicket)?;
                 match action {
-                    TicketAction::Claim => {
-                        self.store.claim(&ticket.id, &actor).await?;
-                        Ok("Ticket claimed.".into())
-                    }
+                    TicketAction::Claim => match self.store.claim(&ticket.id, &actor).await {
+                        Ok(_) => {
+                            self.post_claim_marker(&channel, &actor).await;
+                            Ok("Ticket claimed.".into())
+                        }
+                        Err(StoreError::Domain(TicketError::AlreadyClaimed)) => {
+                            Err(self.claim_refusal(&ticket.id).await)
+                        }
+                        Err(error) => Err(error.into()),
+                    },
                     TicketAction::Close => {
-                        self.close(&ticket).await?;
-                        Ok("Ticket closed; transcript saved for up to 90 days.".into())
+                        let truncated = self.close(&ticket).await?;
+                        Ok(if truncated {
+                            "Ticket closed; transcript was truncated, saved for up to 90 days."
+                                .into()
+                        } else {
+                            "Ticket closed; transcript saved for up to 90 days.".into()
+                        })
                     }
                     TicketAction::Open => unreachable!(),
                 }
@@ -662,7 +688,37 @@ impl TicketRuntime {
         Ok(format!("Your ticket is ready: <#{channel}>."))
     }
 
-    async fn close(&self, ticket: &Ticket) -> Result<()> {
+    /// Best-effort visibility for a committed claim: the store row is truth,
+    /// so a rejected post is counted once and never un-claims or retries.
+    /// The remote response body is never logged.
+    async fn post_claim_marker(&self, channel: &str, staff_id: &str) {
+        if self
+            .executor
+            .post_ticket_message(channel, TicketMessage::Claimed { staff_id })
+            .await
+            .is_err()
+        {
+            let failed = 1;
+            tracing::warn!(failed, "ticket claim marker failed");
+        }
+    }
+
+    /// A lost claim names its reason from a fresh read: lifecycle state wins
+    /// over ownership, and an unknown row keeps the domain refusal.
+    async fn claim_refusal(&self, ticket_id: &str) -> Failure {
+        match self.store.get(ticket_id).await {
+            Ok(Some(current)) if current.status != TicketStatus::Open => Failure::TicketNotOpen,
+            Ok(Some(current)) => match current.claimed_by {
+                Some(winner) => Failure::TicketClaimedBy(winner),
+                None => Failure::Store(StoreError::Domain(TicketError::AlreadyClaimed)),
+            },
+            _ => Failure::Store(StoreError::Domain(TicketError::AlreadyClaimed)),
+        }
+    }
+
+    /// Runs the full close workflow. Returns whether the saved transcript was
+    /// truncated, so the member-visible reply can say so.
+    async fn close(&self, ticket: &Ticket) -> Result<bool> {
         // State first: a repeat Close on a non-Open ticket (or a ticket with
         // no channel) must fail with the state error before any Discord I/O,
         // preserving the pre-gate behavior (no GET, InvalidTransition copy).
@@ -707,11 +763,13 @@ impl TicketRuntime {
         self.set_writes(&doc, channel, &ticket.opener_id, false)
             .await?;
         let snapshot = self.capture_history(channel).await?;
+        let truncated = snapshot.content.ends_with(history::TRUNCATION_MARKER);
         self.store
             .save_transcript(&ticket.id, started_at, now_millis_for_test(), snapshot)
             .await?;
         // The store call above returns only after INSERT + cleanup state COMMIT.
-        self.cleanup(&ticket.id, channel).await
+        self.cleanup(&ticket.id, channel).await?;
+        Ok(truncated)
     }
 
     async fn channel_document(&self, channel: &str) -> Result<Value> {
