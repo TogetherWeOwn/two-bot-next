@@ -840,6 +840,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_admits_exactly_max_players() {
+        let mut export = String::from("[");
+        for index in 0..MAX_MEE6_PLAYERS {
+            if index > 0 {
+                export.push(',');
+            }
+            export.push_str(&format!(
+                "{{\"id\":\"{}\",\"xp\":1}}",
+                100_000_000_000_000_000u64 + index as u64
+            ));
+        }
+        export.push(']');
+        let rows = parse_mee6_export(&export).unwrap();
+        assert_eq!(rows.len(), MAX_MEE6_PLAYERS);
+    }
+
+    #[test]
     fn parse_truncates_problems_with_a_count_receipt() {
         let mut export = String::from("[0");
         export.push_str(&",0".repeat(MAX_KEPT_PROBLEMS + 50));

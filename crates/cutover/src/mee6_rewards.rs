@@ -615,6 +615,22 @@ mod tests {
     }
 
     #[test]
+    fn rewards_parse_admits_exactly_max_rewards() {
+        let mut export = String::from("{\"role_rewards\":[");
+        for rank in 1..=MAX_MEE6_REWARDS {
+            if rank > 1 {
+                export.push(',');
+            }
+            export.push_str(&format!(
+                "{{\"rank\":{rank},\"role_id\":\"900000000000000020\"}}"
+            ));
+        }
+        export.push_str("]}");
+        let rewards = parse_mee6_role_rewards(&export).unwrap();
+        assert_eq!(rewards.len(), MAX_MEE6_REWARDS);
+    }
+
+    #[test]
     fn rewards_parse_truncates_problems_with_a_count_receipt() {
         let mut export = String::from("{\"role_rewards\":[0");
         export.push_str(&",0".repeat(MAX_KEPT_PROBLEMS + 50));

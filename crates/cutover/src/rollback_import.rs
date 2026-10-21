@@ -143,14 +143,14 @@ pub fn parse_import(contents: &str) -> Result<Vec<ImportRow>, ImportError> {
     let mut per_table: BTreeMap<String, u64> = BTreeMap::new();
     for (index, line) in contents.lines().enumerate() {
         let line_no = index + 1;
-        if line.trim().is_empty() {
-            continue;
-        }
         if line.len() > MAX_IMPORT_LINE_BYTES {
             return Err(ImportError::LineTooLong {
                 line: line_no,
                 len: line.len(),
             });
+        }
+        if line.trim().is_empty() {
+            continue;
         }
         let value: serde_json::Value =
             serde_json::from_str(line).map_err(|_| ImportError::Malformed { line: line_no })?;
@@ -686,6 +686,38 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("exceeds"), "{message}");
         assert!(message.contains("line"), "{message}");
+    }
+
+    #[test]
+    fn whitespace_only_overlong_line_refuses_with_the_line_bound() {
+        // A blank-looking line still counts toward the per-line bound: the
+        // length check runs before the blank-line skip.
+        let blank = " ".repeat(MAX_IMPORT_LINE_BYTES + 1);
+        let err = parse_import(&blank).unwrap_err();
+        assert_eq!(
+            err,
+            ImportError::LineTooLong {
+                line: 1,
+                len: MAX_IMPORT_LINE_BYTES + 1
+            }
+        );
+
+        // Interleaved between valid rows, the overlong blank refuses at its
+        // physical line number.
+        let contents = format!(
+            "{}\n{}\n{}\n",
+            line("members", r#"{"guild_id":"g","member_id":"m"}"#),
+            " ".repeat(MAX_IMPORT_LINE_BYTES + 1),
+            line("members", r#"{"guild_id":"g","member_id":"m2"}"#),
+        );
+        let err = parse_import(&contents).unwrap_err();
+        assert_eq!(
+            err,
+            ImportError::LineTooLong {
+                line: 2,
+                len: MAX_IMPORT_LINE_BYTES + 1
+            }
+        );
     }
 
     #[test]
