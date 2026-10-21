@@ -41,9 +41,11 @@ executor merged.
   across several guilds but still scopes every sweep to its supplied guild.
 - Drive `run_due_unbans(guild_id)` every `UNBAN_SWEEP_INTERVAL_SECONDS` (30),
   with at most 25 jobs per sweep. Each is claimed immediately before processing,
-  not in a bulk reservation before the first Discord await. A failure stops the
-  sweep; a definite rejection is requeued under the member queue for the next
-  tick, never retried within this sweep. Undispatched later jobs stay pending.
+  not in a bulk reservation before the first Discord await. A per-job Discord
+  failure is recorded with its bounded cause and the sweep continues; a
+  definite rejection is requeued under the member queue for the next tick,
+  never retried within this sweep. Only unknown bot identity and store
+  failures stop the sweep. Undispatched later jobs stay pending.
   The policy must carry the resolved `bot_user_id`: without it the sweep returns
   `BotIdentityUnknown` before claiming any job, so no unban runs unattributed.
 - Surface prepared/uncertain ban intents and `running` jobs for reconciliation.
