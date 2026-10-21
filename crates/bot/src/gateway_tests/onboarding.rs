@@ -710,10 +710,11 @@ async fn onboarding_gateway_session_goodbye_restart_keeps_captured_joined_at() {
                 username: name,
                 bot,
                 joined_at_ms,
+                member_id,
             } => {
                 assert_eq!(
-                    (guild_id, name.as_str(), bot, joined_at_ms),
-                    (2222, username, false, Some(joined_ms))
+                    (guild_id, name.as_str(), bot, joined_at_ms, member_id),
+                    (2222, username, false, Some(joined_ms), Some(77))
                 );
             }
             _ => panic!("expected captured goodbye"),
