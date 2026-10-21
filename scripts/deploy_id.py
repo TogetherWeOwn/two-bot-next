@@ -2,7 +2,9 @@
 """Deploy IDs (`YYYY.MM.DD.N+sha7`) for staging/production deploys.
 
 `next` derives N deterministically: one plus the count of that environment's
-GitHub Deployments created on today's UTC date. The deploy lanes serialize
+recorded deploy IDs created on today's UTC date (only Deployment rows whose
+description is a deploy ID count; Actions' automatic `environment:` rows
+carry none). The deploy lanes serialize
 deploys (the deploy-staging workflow concurrency, the deploy-production lane),
 so the count cannot race; the listing stops at the first row older than the
 date (the API returns newest first), and a same-day flood past the page cap
@@ -19,11 +21,9 @@ from datetime import datetime, timezone
 import json
 import os
 import subprocess
-import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from build_identity import (  # noqa: E402
+from build_identity import (
     count_deployments_for_date,
     deployment_utc_date,
     format_deploy_id,

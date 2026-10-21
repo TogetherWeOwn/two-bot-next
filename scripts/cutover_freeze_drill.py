@@ -67,6 +67,25 @@ class DrillError(Exception):
     """A step's one-line failure reason (fixed vocabulary only)."""
 
 
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    raised message is fixed vocabulary: it names no key, value or path.
+    """
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
+
+
 def guild_fence(guild_id):
     """Allowlist exactly the TWO Staging guild; refuse everything else unread."""
     if not guild_id:
@@ -257,7 +276,11 @@ def live_transport(token):
         if len(body) > BODY_CAP:
             raise DrillError("discord answered over the body cap")
         try:
-            value = json.loads(body) if body else expect()
+            value = (json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+                     if body else expect())
+        except DuplicateKeyError:
+            raise DrillError(
+                f"discord answered duplicate JSON object keys on {method}") from None
         except (ValueError, RecursionError):
             raise DrillError(f"discord answered a non-JSON body on {method}") from None
         if not isinstance(value, expect):
@@ -291,7 +314,11 @@ def live_transport(token):
                 if len(body) > BODY_CAP:
                     raise DrillError("discord answered over the body cap")
                 try:
-                    value = json.loads(body) if body else {}
+                    value = (json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+                             if body else {})
+                except DuplicateKeyError:
+                    raise DrillError(
+                        "discord answered duplicate JSON object keys on GET") from None
                 except (ValueError, RecursionError):
                     raise DrillError("discord answered a non-JSON body on GET") from None
                 if isinstance(value, dict) and value.get("code") == UNKNOWN_MESSAGE_CODE:
@@ -303,7 +330,11 @@ def live_transport(token):
         if len(body) > BODY_CAP:
             raise DrillError("discord answered over the body cap")
         try:
-            value = json.loads(body) if body else {}
+            value = (json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+                     if body else {})
+        except DuplicateKeyError:
+            raise DrillError(
+                "discord answered duplicate JSON object keys on GET") from None
         except (ValueError, RecursionError):
             raise DrillError("discord answered a non-JSON body on GET") from None
         if not isinstance(value, dict):
@@ -573,6 +604,28 @@ def evidence_shape(outcome, transport, run_id):
             "restore": outcome.get("restore")}
 
 
+# Ordered step names printed by the dry-run plan. Mirrors the nine
+# timer.run calls in run_drill; the dry-run acceptance suite pins both
+# surfaces to this order.
+DRY_RUN_STEPS = ("baseline-read", "freeze-notice-post", "slowmode-on",
+                 "lockdown", "command-surface-verify", "slowmode-restore",
+                 "unlock-restore", "notice-delete", "restore-verify")
+
+
+def dry_run_plan_text(guild_id, channel_id, reason, transport):
+    """Fixed-vocabulary ordered plan; no timestamps, no transport calls."""
+    lines = ["cutover freeze drill dry-run plan",
+             f"guild_id: {guild_id}",
+             f"channel_id: {channel_id}",
+             f"reason: {reason}",
+             f"transport: {transport}",
+             "steps in order:"]
+    lines += [f"{index}. {step}" for index, step in enumerate(DRY_RUN_STEPS, 1)]
+    lines.append("mutations: none (plan only; no notice, no slowmode, "
+                 "no overwrite, no delete)")
+    return "\n".join(lines)
+
+
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--guild-id",
@@ -586,6 +639,8 @@ def parse_args(argv):
                         help="drive local fixtures (no network, no token)")
     parser.add_argument("--live", action="store_true",
                         help="drive the real staging REST transport")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="validate inputs and print the ordered plan without mutating anything")
     parser.add_argument("--confirm-staging", action="store_true",
                         help="explicit live-run confirmation")
     parser.add_argument("--evidence", default="cutover-freeze-drill-evidence.json",
@@ -627,6 +682,19 @@ def main(argv=None, call=None):
     else:
         transport = MOCK_TRANSPORT
     channel = args.channel_id or "mock-drill-channel"
+    if args.dry_run:
+        # Guards above already validated guild, reason, transport mode and
+        # (for live) confirm, channel and token exactly like the live path.
+        # Run the read-only baseline step so a wrong-guild or already-locked
+        # channel refuses exactly like live step 1, then print the plan.
+        try:
+            _read_baseline(call, channel)
+        except DrillError as error:
+            print(f"FAIL baseline-read: {error}")
+            return 1
+        print(dry_run_plan_text(args.guild_id, channel,
+                                check_reason(args.reason), transport))
+        return 0
     outcome = run_drill(args.guild_id, channel, args.reason, call)
     for step in outcome["steps"]:
         print(f"{'PASS' if step['result'] == 'pass' else 'FAIL'} "

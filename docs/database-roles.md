@@ -73,6 +73,12 @@ row lock, and the V12a cap check reads it back through it. The table carries
 no member column, so there is nothing to erase and no reader grant beyond
 the app pool.
 
+The scheduled-event epoch-claim table (`scheduled_events_claim`) is ordinary
+`table` kind for the same reason: `replace_events` conditionally upserts the
+per-guild epoch row through the app pool inside its snapshot-swap
+transaction. The table carries no member column, so there is nothing to
+erase and no reader grant beyond the app pool.
+
 The reader cannot read bot base tables, including through inherited/public or
 column-level grants. Normal PostgreSQL views deliberately run with their owner's
 base-table privileges: only the reviewed `web_v1` projection is exposed. Do not

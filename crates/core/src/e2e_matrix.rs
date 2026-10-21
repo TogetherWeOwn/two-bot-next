@@ -13,8 +13,9 @@
 //! scorecard + automation + announcement + moderation). Out of scope on
 //! purpose: voice commands (`voice_commands`, separate slice with its own
 //! `TWO_VOICE` gate and a `kick` name collision resolved first-wins in favour
-//! of moderation), `/templateassistant` (voice + assistant gates; both are
-//! pinned by the `voice` section of `staging_published_commands.json`), DB-backed
+//! of moderation), `/templateassistant` (unpublished until its slice lands;
+//! the name and intended gate stay pinned by the `voice` section of
+//! `staging_published_commands.json`), DB-backed
 //! custom commands and `!` prefix triggers (dynamic), component/modal
 //! surfaces, and the dropped `/rota-acknowledge` row. The human-readable
 //! rendering lives in `docs/staging-e2e-command-matrix.md`; the

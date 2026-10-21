@@ -17,6 +17,8 @@ mod backfill_retention_chains;
 mod backup_cli;
 #[cfg(test)]
 mod backup_cli_pool_open_tests;
+#[cfg(test)]
+mod backup_stable_error_codes_acceptance_tests;
 // Pure burn math: no runtime caller yet, the offline pin test is the consumer.
 #[allow(dead_code)]
 mod burn_rate;
@@ -39,6 +41,8 @@ mod db_log;
 #[path = "../../discord/tests/common/mod.rs"]
 mod discord_test_common;
 mod dispatch;
+#[cfg(test)]
+mod duplicate_pool_registration_acceptance_tests;
 mod erasure_cli;
 mod event_cli;
 mod eventsub_delivery;
@@ -488,11 +492,17 @@ async fn run(cli_args: &[String]) {
     let (shutdown, stopping) = tokio::sync::watch::channel(false);
 
     // M3.3 reconcile: once at startup plus a bounded interval while
-    // `TWO_EVENTSUB` is exactly `1`. Dark parks with an info log;
-    // enabled-but-invalid configuration logs with an error class and never
-    // mutates. The handle is retained and joined after the supervisor
-    // drains below, never detached.
-    let reconcile_task = eventsub_reconcile::spawn_if_enabled(shutdown.subscribe());
+    // `TWO_EVENTSUB` is exactly `1`. The loop shares the bound receiver's
+    // live signing snapshot, so creates always carry the secret the
+    // receiver is verifying against (including after an armed refresh);
+    // a dark receiver means no snapshot and the task parks with an info
+    // log. Enabled-but-invalid configuration logs with an error class and
+    // never mutates. The handle is retained and joined after the
+    // supervisor drains below, never detached.
+    let webhook_secret = eventsub_receiver
+        .as_ref()
+        .map(|receiver| receiver.secret_snapshot());
+    let reconcile_task = eventsub_reconcile::spawn_if_enabled(shutdown.subscribe(), webhook_secret);
     // Record when the shutdown watch latches so the reconcile join below
     // shares the same `SHUTDOWN_TIMEOUT_SECONDS` budget instead of starting
     // a second drain after the service drain has spent it.

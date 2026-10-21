@@ -123,14 +123,20 @@ def deployment_utc_date(row):
 
 
 def count_deployments_for_date(deployments, date_text):
-    """How many deployment rows were created on a UTC `YYYY.MM.DD` date.
+    """How many recorded deploy IDs went out on a UTC `YYYY.MM.DD` date.
 
     `deployments` are GitHub deployment mappings with `created_at` ISO-8601
-    timestamps. A row without a parseable zoned timestamp fails closed
+    timestamps. Only rows carrying a canonical deploy ID as their
+    description count: those are the records `deploy_id.py record` minted.
+    GitHub Actions also auto-creates Deployment rows for `environment:` jobs
+    (each deploy job's own run included); those carry no deploy ID and never
+    count toward N. A row without a parseable zoned timestamp fails closed
     (ValueError): silently skipping it could mint a duplicate N.
     """
     try:
         want = datetime.strptime(date_text, "%Y.%m.%d").date()
     except (ValueError, TypeError):
         raise ValueError("date must be a real YYYY.MM.DD calendar date") from None
-    return sum(1 for row in deployments if deployment_utc_date(row) == want)
+    return sum(1 for row in deployments
+               if deployment_utc_date(row) == want
+               and is_deploy_id_shape(row.get("description")))

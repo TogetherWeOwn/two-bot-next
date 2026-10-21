@@ -5,9 +5,9 @@ Two consecutive main `check` failures died in the `cargo test --workspace
 ran out of space (98 MB left), then `rust-lld` bus error. Unit tests passed
 in the same jobs; infra disk-fit, not a code regression.
 
-The old single `check` job is now four parallel lanes (`check` lints,
-`rust-tests`, `ignored-db-stores` and `ignored-db-runtime` test); each runs in
-its own job container, so each keeps the guards (TOG-12134):
+The old single `check` job is now five parallel lanes (`check` lints,
+`rust-tests`, `patch-coverage`, `ignored-db-stores` and `ignored-db-runtime`
+test); each runs in its own job container, so each keeps the guards (TOG-12134):
 - every lane pins dev/test debuginfo to `line-tables-only`: smaller linked
   binaries, backtraces stay useful.
 - every lane disables dev/test incremental compilation: a cold CI link never
@@ -95,7 +95,7 @@ def step_body(body, step_name):
     return "\n".join(taken)
 
 
-LANES = ("check", "rust-tests", "ignored-db-stores", "ignored-db-runtime")
+LANES = ("check", "rust-tests", "patch-coverage", "ignored-db-stores", "ignored-db-runtime")
 PREREQUISITES = "Job-container prerequisites"
 GUARD = "Guard runner disk headroom"
 VERIFY = "Verify disposable Postgres defaults"
@@ -189,7 +189,7 @@ class CheckDiskHygieneTests(unittest.TestCase):
                 self.assertIn("Infra flake: rerun the job.", guard)
                 # Pin the rejection path: floor plus error text alone pass if
                 # the guard stops comparing free_bytes. The executed rejection
-                # test lives in scripts/ci/test_workflows.py across all five
+                # test lives in scripts/ci/test_workflows.py across all six
                 # lanes; here require the comparison fragments and identical
                 # bodies so a single-lane edit fails offline.
                 self.assertIn('for mount in / "$GITHUB_WORKSPACE"', guard)

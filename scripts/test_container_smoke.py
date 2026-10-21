@@ -969,5 +969,67 @@ class ContainerSmokeTests(unittest.TestCase):
             self.assertEqual(path.read_text(), "image: 115343360 bytes\n\n")
 
 
+class MalformedInspectRegressionTests(unittest.TestCase):
+    """Review regression: malformed `image inspect` FAILs clean, never tracebacks."""
+
+    def run_cli(self, stdout):
+        calls = []
+
+        def docker(*args, **kwargs):
+            calls.append(args)
+            if args[:2] == ("image", "inspect"):
+                return subprocess.CompletedProcess(args, 0, stdout, "")
+            raise AssertionError(f"unexpected docker call: {args!r}")
+
+        with patch.object(smoke, "docker", docker), \
+                patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}), \
+                patch.object(sys, "argv", ["container-smoke.py", "two-bot:fixture"]), \
+                contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()) as err, \
+                self.assertRaises(SystemExit) as caught:
+            smoke.main()
+        return caught.exception, out.getvalue(), err.getvalue(), calls
+
+    def test_malformed_inspect_fails_clean_without_containers(self):
+        for stdout, label in (
+            ("[]", "empty-array"),
+            ("[null]", "null-element"),
+            ("123", "non-list"),
+            ("[[]]", "nested-array"),
+            ('["hi"]', "string-element"),
+            ("{}", "non-list-object"),
+            ("not json", "non-json"),
+            (json.dumps([{"Size": 1}]), "missing-id"),
+            (json.dumps([{"Id": "sha256:" + "a" * 64}]), "missing-size"),
+            # A wrong-typed Id must not reach subprocess argv (TypeError
+            # traceback): it fails at validation before any history call.
+            # Each fixture carries a valid Config so the Id require is the
+            # only line stopping the history call (individually pinned).
+            (json.dumps([{"Id": 123, "Size": 1, "Config": {}}]), "numeric-id"),
+            (json.dumps([{"Id": None, "Size": 1, "Config": {}}]), "null-id"),
+            (json.dumps([{"Id": ["sha256:" + "b" * 64], "Size": 1,
+                          "Config": {}}]), "list-id"),
+            (json.dumps([{"Id": "", "Size": 1, "Config": {}}]), "empty-id"),
+            # A missing or wrong-typed Config (or Healthcheck) must fail at
+            # validation too, not as AttributeError at config.get below.
+            (json.dumps([{"Id": "sha256:" + "a" * 64, "Size": 1}]),
+             "missing-config"),
+            (json.dumps([{"Id": "sha256:" + "a" * 64, "Size": 1,
+                          "Config": None}]), "null-config"),
+            (json.dumps([{"Id": "sha256:" + "a" * 64, "Size": 1,
+                          "Config": "x"}]), "string-config"),
+            (json.dumps([{"Id": "sha256:" + "a" * 64, "Size": 1,
+                          "Config": {"User": "65532:65532",
+                                     "Healthcheck": "x"}}]),
+             "string-healthcheck"),
+        ):
+            with self.subTest(label=label):
+                error, out, err, calls = self.run_cli(stdout)
+                self.assertIsInstance(error.code, str, label)
+                self.assertTrue(error.code.startswith("FAIL container smoke:"), label)
+                self.assertNotIn("Traceback", out + err, label)
+                self.assertEqual(calls, [("image", "inspect", "two-bot:fixture")], label)
+
+
 if __name__ == "__main__":
     unittest.main()

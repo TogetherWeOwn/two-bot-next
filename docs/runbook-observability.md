@@ -34,6 +34,30 @@ No Gatus or third-party monitor is used.
   revision. The Worker version ID is distinct from the Git SHA. Production
   release tags are created by the successful promotion flow, not by hand.
 
+## Log retention for postmortems
+
+Postmortems query Workers Logs directly; no separate log export exists.
+Both named environments keep unsampled Worker, Durable Object, and container
+logs for seven days on the Workers Paid plan (20 million events per month
+included; the Free plan keeps three days). Seven days is the Cloudflare-side
+maximum, so an incident's log window must be captured — queries plus the
+quoted lines — in the incident record within that week; it cannot be
+re-queried later. Sources: the Workers Logs
+[limits](https://developers.cloudflare.com/workers/observability/logs/workers-logs/#limits)
+and [pricing](https://developers.cloudflare.com/workers/observability/logs/workers-logs/#pricing)
+tables, and the [dataset retention table](https://developers.cloudflare.com/observability/logs/datasets/)
+(workers and containers: 7 days). From December 1, 2026 Workers Logs moves to
+[Observability pricing](https://developers.cloudflare.com/observability/pricing/),
+which keeps a default seven-day retention for the shared allowance.
+
+No Logpush job or Tail Worker export is planned: the
+[October production postmortem](production-incident-2026-10-15-postmortem.md)
+was written from same-day log queries plus deploy run receipts, and every
+signal in this runbook (alert to log window to build SHA to change) resolves
+within days of the incident. Revisit only on a concrete trigger: a postmortem
+that misses its log window, a compliance rule that needs longer retention, or
+a Cloudflare pricing change that moves the seven-day default.
+
 ## From an alert to the responsible change
 
 1. Record the alert's environment, rule/class, timestamp, and runbook link. Do
@@ -86,7 +110,9 @@ deployment/schema/ACL issue for the authorized Operator,
 not something to repair with a production query or restart.
 
 Every alert message and alert log line carries the container build revision and
-a log-query link; a crash-loop or unhandled exception surfaces as a sustained
+a log-query link (`Build: <sha>` + `Logs: <url>` via `alertContextSuffix`,
+`wrangler/src/alert-rules.ts:311-320`; `unknown` when the `/readyz` probe
+failed); a crash-loop or unhandled exception surfaces as a sustained
 `/readyz` red, which alerts after the readiness threshold below.
 
 If `/readyz` remains red, the Worker/DO readiness transition alerts after its
@@ -173,9 +199,6 @@ ids: they join to themselves, not to an inbound request.
 These are deliberate, visible limits of the current implementation; do not
 claim them as shipped acceptance:
 
-- Worker/DO alert log lines and Discord messages do not yet consistently carry
-  the Container Git SHA and a direct log-query URL. Use the build/deploy
-  correlation procedure above.
 - Worker/DO request-span and dispatch lines (`internal_actions_ingress`,
   `eventsub_ingress`) carry `release` (the container Git SHA, deploy-stamped
   on the Worker edge and probe-read on the DO relay, `"unknown"` when neither
@@ -221,8 +244,9 @@ claim them as shipped acceptance:
   the `production` job against live production `/ops/metrics` (evidence
   `production-error-rate-gate.json`), failing the stage into the same
   auto-rollback; live enforcement needs the `PRODUCTION_METRICS_SCRAPE_TOKEN`
-  secret, else a recorded skip, and the `inject_error_rate_spike` dispatch
-  input proves the chain with a rehearsal firing.
+  secret, else a recorded skip. Production has no rehearsal path: its guard
+  refuses `inject_error_rate_spike` (failure injection runs on staging only,
+  after the 10-20 20:54Z forced production drill).
 - The shared central gradual-promotion action promotes 5-50-100% with
   per-stage health gates and automatic rollback to the recorded pre-promote
   version. The caller contract is implemented (`bin/smoke.mjs`, contract-tested
@@ -235,6 +259,35 @@ claim them as shipped acceptance:
   before any Cloudflare call until its isolated synthetic fixture lands, and
   production has no gradual caller. Do not treat the existing gated readiness
   check plus manual rollback as proof of a gradual traffic rollout here.
+
+## Promotion gate failure codes
+
+The promotion error-rate gate (`wrangler/scripts/promotion-error-gate.mjs`)
+fences its scrape destination to the configured staging/production Worker
+origins and fails closed with a stable code, a fixed next action and a JSON
+error receipt (`verdict: "error"`) when it cannot judge. The closed code
+vocabulary:
+
+- `usage_error` — bad flags; check the gate flags with `--help` and retry. Exit 2.
+- `invalid_metrics_origin` — `--metrics-url` is not a bare `https://` Worker
+  origin from the configured identities; fix the origin and retry. Exit 2.
+- `invalid_timeout` — `--scrape-timeout-seconds` is not a finite positive
+  value within the supported timer range; fix the value and retry. Exit 2.
+- `redirect_refused` — the scrape refused a redirect; the bearer is never
+  followed across redirects. Verify direct `/ops/metrics` and retry. Exit 1.
+- `auth_failed` — the Worker refused the scrape credentials (401/403);
+  verify the token is current and retry. Exit 1.
+- `transport_failed` — the scrape transport failed after 3 attempts; verify
+  the Worker is reachable and retry. Exit 1.
+- `decode_failed` — the exposition could not be decoded; verify valid output
+  at `/ops/metrics` and retry. Exit 1.
+
+Receipts and console text never carry remote bodies, URL credentials, the
+bearer or exception messages. Offline rehearsal (no network, no token):
+
+```sh
+node wrangler/scripts/promotion-error-gate.mjs --metrics-url https://two-bot-next-staging.5150.workers.dev --evidence /tmp/gate-evidence.json --rehearsal-firing '[]'
+```
 
 For the full health, metrics, and rollback procedures, see the
 [operations runbook](runbook.md), [metrics reference](metrics.md), and

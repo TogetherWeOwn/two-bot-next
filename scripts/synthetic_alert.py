@@ -36,6 +36,25 @@ class AlertError(Exception):
     """A fixed-vocabulary alert failure (never carries the webhook URL)."""
 
 
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    raised message is fixed vocabulary: it names no key, value or path.
+    """
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
+
+
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Turn every redirect into an HTTPError without contacting its target."""
 
@@ -46,8 +65,10 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 def load_evidence(path):
     try:
         with open(path, encoding="utf-8") as handle:
-            value = json.load(handle)
-    except (OSError, ValueError):
+            value = json.load(handle, object_pairs_hook=_reject_duplicate_keys)
+    except DuplicateKeyError:
+        raise AlertError("evidence refused: duplicate JSON object key") from None
+    except (OSError, ValueError, RecursionError):
         return None
     return value if isinstance(value, dict) else None
 
@@ -63,14 +84,18 @@ def summarize(evidence):
     checks = evidence.get("checks")
     if not isinstance(checks, list) or not checks:
         return "probe failed"
+    # Evidence-derived names pass through printable(), like the revision
+    # fields below: a crafted check name with control characters is dropped
+    # (fail-closed to "probe failed") instead of reaching Discord content.
     failed = [c for c in checks
               if isinstance(c, dict) and c.get("verdict") == "fail"
-              and isinstance(c.get("check"), str)]
+              and isinstance(c.get("check"), str)
+              and printable(c["check"]) is not None]
     if not failed:
         return "probe failed"
     names = ", ".join(c["check"] for c in failed[:4])
     first_shape = failed[0].get("shape")
-    detail = f": {first_shape}" if isinstance(first_shape, str) and first_shape else ""
+    detail = f": {first_shape}" if printable(first_shape) else ""
     text = f"{names} failed{detail}"
     return text if len(text) <= 300 else text[:297] + "..."
 
@@ -174,7 +199,11 @@ def post_event(env, environment, evidence_path, event):
     if not webhook_url:
         print("synthetic_alert: SYNTHETIC_ALERT_WEBHOOK_URL is not set", file=sys.stderr)
         return 1
-    evidence = load_evidence(evidence_path)
+    try:
+        evidence = load_evidence(evidence_path)
+    except AlertError as error:
+        print(f"synthetic_alert: {error}", file=sys.stderr)
+        return 1
     content = build_content(environment, evidence,
                             env.get("GIT_SHA") or env.get("GITHUB_SHA"),
                             run_link(), event)
@@ -188,6 +217,56 @@ def post_event(env, environment, evidence_path, event):
     return 0
 
 
+def webhook_validity(webhook_url):
+    """Validity label for the dry-run plan; never echoes the URL itself."""
+    if not webhook_url:
+        return "missing"
+    return "valid" if WEBHOOK.fullmatch(webhook_url) else "invalid"
+
+
+def dry_run_plan(environment, evidence_path):
+    """Print the delivery plan without posting or contacting Discord.
+
+    Runs the same decide step as the live path (the read-only GitHub
+    history read is included, fail-open as live) so the planned event
+    matches what a live run would deliver, then reports the webhook shape
+    before any send. A missing webhook or a missing probe sample is a plan
+    line, never a failure: a preview is not a delivery. Refused evidence
+    (for example duplicate JSON keys) fails closed with the same clean
+    refusal as the live post path, never a traceback.
+    """
+    env = os.environ
+    current = env.get("PROBE_OUTCOME")
+    if current not in ("success", "failure"):
+        event = None
+    else:
+        event = decide_event(env, environment)
+    try:
+        evidence = load_evidence(evidence_path)
+    except AlertError as error:
+        print(f"synthetic_alert: {error}", file=sys.stderr)
+        return 1
+    if event == "alert":
+        summary = summarize(evidence)
+    elif event == "recovery":
+        summary = "the probe is healthy again"
+    else:
+        summary = "no alert transition"
+    print("synthetic_alert dry-run plan (no mutations performed)")
+    print(f"env: {environment}")
+    print(f"evidence: {summary}")
+    print(f"event: {event or 'none'}")
+    print(f"webhook: {webhook_validity(env.get('SYNTHETIC_ALERT_WEBHOOK_URL'))}")
+    if event in ("alert", "recovery"):
+        content = build_content(environment, evidence,
+                                env.get("GIT_SHA") or env.get("GITHUB_SHA"),
+                                run_link(), event)
+        print(f"content: {content}")
+    else:
+        print("content: (nothing would be sent)")
+    return 0
+
+
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--env", required=True, choices=("staging", "prod"),
@@ -198,6 +277,8 @@ def parse_args(argv):
                         help="only compute the transition and write event to GITHUB_OUTPUT")
     parser.add_argument("--post-only", action="store_true",
                         help="only post ALERT_EVENT without reading workflow history")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="print the delivery plan without posting anything")
     return parser.parse_args(argv)
 
 
@@ -206,13 +287,20 @@ def main(argv=None):
     if args.decide_only and args.post_only:
         print("synthetic_alert: --decide-only and --post-only are exclusive", file=sys.stderr)
         return 2
+    if args.dry_run:
+        return dry_run_plan(args.env, args.evidence)
     if args.decide_only:
         # Decide step: compute the transition, never post, never need webhook.
-        # A missing/skipped probe is not a sample and writes an empty event.
+        # A missing/skipped probe is not a sample: write the empty event that
+        # keeps the post step skipped, then fail the step so a zero-sample
+        # run never reads as a healthy pass.
         event, history_known = _decide(os.environ, args.env)
-        if event is None and os.environ.get("PROBE_OUTCOME") not in ("success", "failure"):
-            print("synthetic_alert: no probe sample; no alert transition", file=sys.stderr)
+        no_sample = os.environ.get("PROBE_OUTCOME") not in ("success", "failure")
+        if event is None and no_sample:
+            print("synthetic_alert: no probe sample; failing closed", file=sys.stderr)
         write_event(event)
+        if no_sample:
+            return 1
         if not history_known and os.environ.get("PROBE_OUTCOME") == "success":
             # Record "history unknown" explicitly in this run's step
             # conclusions: a failed decide step keeps later reconstruction
@@ -232,10 +320,11 @@ def main(argv=None):
         return post_event(os.environ, args.env, args.evidence, event)
     current = os.environ.get("PROBE_OUTCOME")
     # A missing/skipped probe (for example, an unset optional target binding)
-    # is not a sample and must not create an alert or recovery transition.
+    # is not a sample and must not create an alert or recovery transition;
+    # fail closed so a zero-sample run never reads as a healthy pass.
     if current not in ("success", "failure"):
-        print("synthetic_alert: no probe sample; no alert transition", file=sys.stderr)
-        return 0
+        print("synthetic_alert: no probe sample; failing closed", file=sys.stderr)
+        return 1
     event = decide_event(os.environ, args.env)
     if event is None:
         print("synthetic_alert: no alert transition", file=sys.stderr)

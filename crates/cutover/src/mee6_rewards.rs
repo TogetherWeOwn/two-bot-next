@@ -15,10 +15,20 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use thiserror::Error;
 
-use crate::is_snowflake;
+use crate::{
+    intake_cap::{truncation_receipt, MAX_KEPT_PROBLEMS},
+    is_snowflake,
+};
 
 /// Report version (legacy `REWARD_REPORT_VERSION`).
 pub const REWARD_REPORT_VERSION: u32 = 1;
+
+/// Maximum rewards accepted from one MEE6 export: 50,000, matching the
+/// cutover per-table row cap
+/// ([`crate::rollback_delta::MAX_EXPORT_ROWS_PER_TABLE`]). Real ladders are
+/// dozens of rows; anything past this bound is a hostile export, refused
+/// before any plan allocation.
+pub const MAX_MEE6_REWARDS: usize = 50_000;
 
 /// One level → role pair as it appeared in the export (legacy
 /// `Mee6RoleReward`). Ids are the identity; names are advisory.
@@ -194,6 +204,11 @@ fn as_level(v: &serde_json::Value) -> Option<u64> {
 /// Parse and fully validate the `role_rewards` section of a MEE6 export. An
 /// export with no `role_rewards` key parses to an empty list; a present but
 /// non-array key is malformed.
+///
+/// Intake bounds: more than [`MAX_MEE6_REWARDS`] valid rewards refuses with
+/// a bound refusal before any plan allocation, and accumulated problems
+/// truncate after [`MAX_KEPT_PROBLEMS`] with a receipt preserving the total,
+/// so a hostile export fails closed without OOM.
 pub fn parse_mee6_role_rewards(text: &str) -> Result<Vec<Mee6RoleReward>, Mee6RewardExportError> {
     let parsed: serde_json::Value =
         serde_json::from_str(text).map_err(|e| Mee6RewardExportError {
@@ -211,67 +226,90 @@ pub fn parse_mee6_role_rewards(text: &str) -> Result<Vec<Mee6RoleReward>, Mee6Re
         problems: vec!["role_rewards must be an array".to_owned()],
     })?;
 
-    let mut problems = Vec::new();
-    let mut rewards = Vec::new();
+    let mut problems: Vec<String> = Vec::new();
+    let mut problem_total: usize = 0;
+    let mut rewards: Vec<Mee6RoleReward> = Vec::new();
+    let mut valid_total: usize = 0;
+    let mut report = |problem: String| {
+        problem_total += 1;
+        if problems.len() < MAX_KEPT_PROBLEMS {
+            problems.push(problem);
+        }
+    };
     for (index, raw) in arr.iter().enumerate() {
         let at = format!("role_rewards[{index}]");
         let entry: RawReward = match serde_json::from_value(raw.clone()) {
             Ok(e) => e,
             Err(_) => {
-                problems.push(format!("{at} is not an object"));
+                report(format!("{at} is not an object"));
                 continue;
             }
         };
         if !raw.is_object() {
-            problems.push(format!("{at} is not an object"));
+            report(format!("{at} is not an object"));
             continue;
         }
         let level_raw = entry.rank.as_ref().or(entry.level.as_ref());
         let Some(level_raw) = level_raw else {
-            problems.push(format!("{at} has no rank or level"));
+            report(format!("{at} has no rank or level"));
             continue;
         };
         let level = as_level(level_raw).filter(|l| *l > 0);
         let Some(level) = level else {
-            problems.push(format!("{at} has an invalid level: {level_raw}"));
+            report(format!("{at} has an invalid level: {level_raw}"));
             continue;
         };
         let (id, name) = read_role_id(&entry);
         let Some(id) = id else {
-            problems.push(format!("{at} has no role id"));
+            report(format!("{at} has no role id"));
             continue;
         };
         if !is_snowflake(&id) {
-            problems.push(format!("{at} has an invalid Discord role id: {id}"));
+            report(format!("{at} has an invalid Discord role id: {id}"));
             continue;
         }
-        rewards.push(Mee6RoleReward {
-            level,
-            role_id: id,
-            role_name: name,
+        valid_total += 1;
+        if rewards.len() <= MAX_MEE6_REWARDS {
+            rewards.push(Mee6RoleReward {
+                level,
+                role_id: id,
+                role_name: name,
+            });
+        }
+    }
+    if valid_total > MAX_MEE6_REWARDS {
+        return Err(Mee6RewardExportError {
+            problems: vec![format!(
+                "MEE6 role_rewards exceed the {MAX_MEE6_REWARDS}-reward limit: {valid_total} rewards submitted"
+            )],
         });
     }
-    if !problems.is_empty() {
+    if problem_total > 0 {
+        if problem_total > problems.len() {
+            problems.push(truncation_receipt(problem_total));
+        }
         return Err(Mee6RewardExportError { problems });
     }
     Ok(rewards)
 }
 
 /// Parse a roles snapshot: a bare array (as `audit/raw/roles.json` is) or a
-/// `{roles:[...]}` envelope.
+/// `{roles:[...]}` envelope. Accumulated problems truncate after
+/// [`MAX_KEPT_PROBLEMS`] with a receipt preserving the total.
 pub fn parse_roles_snapshot(text: &str) -> Result<Vec<SnapshotRole>, String> {
     let parsed: serde_json::Value =
         serde_json::from_str(text).map_err(|e| format!("roles snapshot is not valid JSON: {e}"))?;
-    let arr = if let Some(a) = parsed.as_array() {
-        a.clone()
+    let arr: &Vec<serde_json::Value> = if let Some(a) = parsed.as_array() {
+        a
     } else if let Some(a) = parsed.get("roles").and_then(|r| r.as_array()) {
-        a.clone()
+        a
     } else {
         return Err(
             "roles snapshot must be an array of roles or an object with a roles array".to_owned(),
         );
     };
-    let mut problems = Vec::new();
+    let mut problems: Vec<String> = Vec::new();
+    let mut problem_total: usize = 0;
     let mut out = Vec::new();
     for (index, raw) in arr.iter().enumerate() {
         match serde_json::from_value::<SnapshotRole>(raw.clone()) {
@@ -284,6 +322,10 @@ pub fn parse_roles_snapshot(text: &str) -> Result<Vec<SnapshotRole>, String> {
                     .and_then(|o| o.get("name"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("?");
+                problem_total += 1;
+                if problems.len() >= MAX_KEPT_PROBLEMS {
+                    continue;
+                }
                 if !raw.is_object() {
                     problems.push(format!("roles[{index}] is not an object"));
                 } else if !has_id || !has_name {
@@ -296,7 +338,10 @@ pub fn parse_roles_snapshot(text: &str) -> Result<Vec<SnapshotRole>, String> {
             }
         }
     }
-    if !problems.is_empty() {
+    if problem_total > 0 {
+        if problem_total > problems.len() {
+            problems.push(truncation_receipt(problem_total));
+        }
         return Err(format!(
             "roles snapshot is malformed:\n  {}",
             problems.join("\n  ")
@@ -548,6 +593,53 @@ mod tests {
 
     fn roles() -> Vec<SnapshotRole> {
         parse_roles_snapshot(ROLES).unwrap()
+    }
+
+    #[test]
+    fn rewards_parse_refuses_more_than_max_rewards_with_a_bound() {
+        let mut export = String::from("{\"role_rewards\":[");
+        for rank in 1..=MAX_MEE6_REWARDS + 1 {
+            if rank > 1 {
+                export.push(',');
+            }
+            export.push_str(&format!(
+                "{{\"rank\":{rank},\"role_id\":\"900000000000000020\"}}"
+            ));
+        }
+        export.push_str("]}");
+        let err = parse_mee6_role_rewards(&export).unwrap_err();
+        assert_eq!(err.problems.len(), 1);
+        let message = err.to_string();
+        assert!(message.contains("exceed"), "{message}");
+        assert!(message.contains("reward"), "{message}");
+    }
+
+    #[test]
+    fn rewards_parse_admits_exactly_max_rewards() {
+        let mut export = String::from("{\"role_rewards\":[");
+        for rank in 1..=MAX_MEE6_REWARDS {
+            if rank > 1 {
+                export.push(',');
+            }
+            export.push_str(&format!(
+                "{{\"rank\":{rank},\"role_id\":\"900000000000000020\"}}"
+            ));
+        }
+        export.push_str("]}");
+        let rewards = parse_mee6_role_rewards(&export).unwrap();
+        assert_eq!(rewards.len(), MAX_MEE6_REWARDS);
+    }
+
+    #[test]
+    fn rewards_parse_truncates_problems_with_a_count_receipt() {
+        let mut export = String::from("{\"role_rewards\":[0");
+        export.push_str(&",0".repeat(MAX_KEPT_PROBLEMS + 50));
+        export.push_str("]}");
+        let err = parse_mee6_role_rewards(&export).unwrap_err();
+        assert_eq!(err.problems.len(), MAX_KEPT_PROBLEMS + 1);
+        let receipt = err.problems.last().unwrap();
+        assert!(receipt.contains("more"), "{receipt}");
+        assert!(receipt.contains("151"), "{receipt}");
     }
 
     #[test]
@@ -882,6 +974,27 @@ mod tests {
         assert!(err.problems[1].contains("invalid Discord role id: not-a-snowflake"));
         assert!(err.problems[2].contains("no role id"));
         assert!(err.problems[3].contains("is not an object"));
+    }
+
+    #[test]
+    fn reward_without_rank_or_level_names_the_gap() {
+        let err = parse_mee6_role_rewards(r#"{"role_rewards":[{"role_id":"900000000000000020"}]}"#)
+            .unwrap_err();
+        assert_eq!(err.problems.len(), 1);
+        assert!(err.problems[0].contains("no rank or level"), "{err}");
+    }
+
+    #[test]
+    fn roles_snapshot_truncates_problems_with_a_count_receipt() {
+        let mut snapshot = String::from("[0");
+        snapshot.push_str(&",0".repeat(MAX_KEPT_PROBLEMS + 50));
+        snapshot.push(']');
+        let err = parse_roles_snapshot(&snapshot).unwrap_err();
+        let problems: Vec<&str> = err.split("\n  ").skip(1).collect();
+        assert_eq!(problems.len(), MAX_KEPT_PROBLEMS + 1);
+        let receipt = problems.last().unwrap();
+        assert!(receipt.contains("more"), "{receipt}");
+        assert!(receipt.contains("151"), "{receipt}");
     }
 
     #[test]

@@ -71,6 +71,27 @@ from staging_rollback_drill import ownership_control  # noqa: E402
 
 GateError = rollout.GateError
 require = rollout.require
+
+
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    raised message is fixed vocabulary: it names no key, value or path.
+    """
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
+
+
 WORKER = rollout.WORKER
 APPLICATION = rollout.APPLICATION
 CLASS = rollout.CLASS
@@ -124,10 +145,11 @@ class ContainerDrillClient(rollout.Client):
         except HTTPError as error:
             codes = []
             try:
-                envelope = json.loads(error.read(rollout.MAX_BODY))
+                envelope = json.loads(error.read(rollout.MAX_BODY),
+                                        object_pairs_hook=_reject_duplicate_keys)
                 codes = [str(item["code"]) for item in envelope.get("errors", [])
                          if isinstance(item, dict) and type(item.get("code")) is int][:4]
-            except (OSError, ValueError, AttributeError, TypeError):
+            except (OSError, ValueError, AttributeError, TypeError, RecursionError):
                 pass
             raise GateError("api_http_failure",
                             f"status={error.code} codes={','.join(codes) or 'none'}") from None
@@ -280,7 +302,9 @@ def validate_attestation(text):
     if text is None or text == "":
         return None
     try:
-        raw = json.loads(text)
+        raw = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+    except DuplicateKeyError:
+        raise GateError("invalid_session_attestation") from None
     except ValueError:
         raise GateError("invalid_session_attestation") from None
     require(isinstance(raw, dict), "invalid_session_attestation")
@@ -828,6 +852,43 @@ def summary(evidence, failures):
     return "\n".join(lines) + "\n"
 
 
+def dry_run_plan(drill, pin):
+    """Validate like the live path, print the ordered plan, mutate nothing.
+
+    Runs the same preflight the live legs run (reads only: application,
+    deployments, serving image, rollouts, worker namespace, singleton
+    status, baseline readiness), so every invalid pin or input refuses
+    with the identical code before any change. On success prints the
+    fixed-vocabulary plan and exits 0 without deploying, fencing, taking
+    over, or writing evidence.
+    """
+    try:
+        baseline = drill.preflight(pin)
+    except GateError as error:
+        drill.failed("drill", error)
+        return 1
+    except Exception:  # No traceback: it may carry request data.
+        drill.failed("drill", GateError("unexpected_error"))
+        return 1
+    print("\n".join([
+        "staging container drill dry-run plan",
+        f"backout source_sha: {pin['source_sha']}",
+        f"backout build_id: {pin['build_id']}",
+        f"backout image: {pin['image']}",
+        f"backout worker_version: {pin['worker_version']}",
+        f"backout rollout_id: {pin['rollout_id']}",
+        f"baseline worker_version: {baseline['worker_version']}",
+        f"baseline image: {baseline['image']}",
+        "legs in order:",
+        f"1. drill: fence singleton, deploy {pin['image']}, "
+        f"takeover to {pin['worker_version']}, wait converged ready",
+        f"2. restore: fence singleton, deploy {baseline['image']}, "
+        f"takeover to {baseline['worker_version']}, wait converged ready",
+        "mutations: none (plan only; no deploy, no fence, no takeover)",
+    ]))
+    return 0
+
+
 def main(argv=None, *, environ=None, make_control=ownership_control,
          client_factory=ContainerDrillClient, deploy_factory=wrangler_deploy):
     parser = argparse.ArgumentParser(description=__doc__)
@@ -839,6 +900,8 @@ def main(argv=None, *, environ=None, make_control=ownership_control,
     parser.add_argument("--backout-review-ref", required=True)
     parser.add_argument("--backout-staging-run-id", required=True)
     parser.add_argument("--compatibility-note", required=True)
+    parser.add_argument("--dry-run", action="store_true",
+                        help="validate inputs and print the ordered plan without mutating anything")
     parser.add_argument("--session-attestation", default="")
     parser.add_argument("--evidence", default="staging-container-drill-evidence.json")
     parser.add_argument("--deploy-config", default="staging-container-deploy.json")
@@ -874,6 +937,8 @@ def main(argv=None, *, environ=None, make_control=ownership_control,
                        deploy_factory(args.wrangler_bin, wrangler_dir, env),
                        wrangler_dir),
                       log=print)
+        if args.dry_run:
+            return dry_run_plan(drill, pin)
         failures = drill.run(pin, attestation)
     except GateError as error:
         print(f"staging container drill refused before any change: {error}")

@@ -483,6 +483,24 @@ class ClientAndControlTests(unittest.TestCase):
         self.assertEqual(caught.exception.detail, "status=409 codes=10220")
         self.assertNotIn(SENTINEL, repr(caught.exception.detail))
 
+    def test_post_deeply_nested_error_envelope_keeps_401_codes_none(self):
+        depth = 10000
+        deep_object = b'{"a":' * depth + b"0" + b"}" * depth
+        deep_array = b"[" * depth + b"]" * depth
+        for nested in (deep_object, deep_array):
+            with self.subTest(length=len(nested)):
+                envelope = b'{"probe": ' + nested + b', "errors": []}'
+                self.assertLessEqual(len(envelope), drill.rollout.MAX_BODY)
+                client = self.client()
+                error = HTTPError("https://api.cloudflare.com", 401, "Unauthorized",
+                                  {}, io.BytesIO(envelope))
+                client.opener = MagicMock()
+                client.opener.open.side_effect = error
+                with self.assertRaises(GateError) as caught:
+                    client.post("/workers/scripts/two-bot-next-staging/deployments", {})
+                self.assertEqual(str(caught.exception), "api_http_failure")
+                self.assertEqual(caught.exception.detail, "status=401 codes=none")
+
     def test_post_sends_bearer_json_to_the_account_path_only(self):
         client = self.client()
         response = MagicMock()
@@ -530,6 +548,37 @@ class ClientAndControlTests(unittest.TestCase):
         env = run.call_args.kwargs["env"]
         self.assertEqual(env["OWNERSHIP_EXPECTED_DEPLOYMENT"], TARGET)
         self.assertNotIn(TARGET, " ".join(run.call_args.args[0]))
+
+    def test_deeply_nested_status_stdout_refuses_as_invalid_response(self):
+        # Depth-10000 nested objects exhaust the decoder recursion limit (the
+        # probe suite's nested_object_body precedent). The hooked status parse
+        # must map that to the fixed malformed-stdout refusal, not
+        # drill:unexpected_error and not a traceback.
+        deep = '{"a":' * 10000 + "1" + "}" * 10000
+        done = subprocess.CompletedProcess([], 0, stdout=deep, stderr="")
+        control = drill.ownership_control(SENTINEL, URL, "github-actions:1:rollback-drill",
+                                          root="/repo")
+        with patch.object(drill.subprocess, "run", return_value=done):
+            with self.assertRaises(GateError) as caught:
+                control("status")
+        self.assertEqual(str(caught.exception), "ownership_control_invalid_response")
+        self.assertIsNone(caught.exception.detail)
+
+    def test_deeply_nested_status_stdout_fails_the_drill_with_the_exact_code(self):
+        world = World()
+        deep = '{"a":' * 10000 + "1" + "}" * 10000
+        done = subprocess.CompletedProcess([], 0, stdout=deep, stderr="")
+        control = drill.ownership_control(SENTINEL, URL, "github-actions:1:rollback-drill",
+                                          root="/repo")
+        logs = []
+        with patch.object(drill.subprocess, "run", return_value=done):
+            instance = drill.Drill(FakeClient(world), control, URL, "123456",
+                                   now=lambda: world.t, sleep=world.tick,
+                                   log=logs.append)
+            failures = instance.run(TARGET)
+        self.assertEqual(failures, ["drill:ownership_control_invalid_response"])
+        self.assertEqual(world.posts, [])
+        self.assertNotIn("Traceback", "\n".join(logs))
 
     def test_takeover_legs_pin_the_target_and_restore_versions(self):
         world = World()
@@ -689,6 +738,49 @@ class OwnershipControlTimeoutTests(unittest.TestCase):
         with patch.object(drill.subprocess, "run", return_value=done) as run:
             control("status")
         self.assertEqual(run.call_args.kwargs["timeout"], drill.OWNERSHIP_CONTROL_TIMEOUT_SECONDS)
+
+
+class DryRunPlanPinTests(unittest.TestCase):
+    """Builder pins: --dry-run binds each version to its label and leg."""
+
+    def environ(self):
+        return {"STAGING_WORKER_URL": URL, "OWNERSHIP_CONTROL_TOKEN": SENTINEL,
+                "GITHUB_RUN_ID": "123456", "CLOUDFLARE_ACCOUNT_ID": ACCOUNT,
+                "CLOUDFLARE_API_TOKEN": "t" * 40}
+
+    def dry_run(self):
+        world = World()
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory) / "evidence.json"
+            output = io.StringIO()
+            with patch("builtins.print",
+                       lambda *a, **k: output.write(" ".join(map(str, a)) + "\n")), \
+                    patch.object(drill, "POLL_SECONDS", 0):
+                code = drill.main(
+                    ["--target-version", TARGET, "--dry-run",
+                     "--evidence", str(evidence)],
+                    environ=self.environ(),
+                    make_control=lambda token, url, actor: make_control(world),
+                    client_factory=lambda account, token: FakeClient(world))
+        return code, output.getvalue(), world
+
+    def test_plan_pins_labeled_versions_and_numbered_leg_order(self):
+        code, out, world = self.dry_run()
+        self.assertEqual(code, 0)
+        lines = out.splitlines()
+        self.assertIn(f"target_version: {TARGET}", lines)
+        self.assertIn(f"pre_version: {PRE}", lines)
+        drill_lines = [line for line in lines if line.startswith("1. drill")]
+        restore_lines = [line for line in lines if line.startswith("2. restore")]
+        self.assertEqual(len(drill_lines), 1)
+        self.assertEqual(len(restore_lines), 1)
+        self.assertIn(TARGET, drill_lines[0])
+        self.assertIn(PRE, restore_lines[0])
+        self.assertLess(out.index("1. drill"), out.index("2. restore"))
+        self.assertEqual(world.posts, [])
+        mutating = [call for call in world.calls
+                    if call[0] in ("fence", "deployment-takeover")]
+        self.assertEqual(mutating, [])
 
 
 if __name__ == "__main__":
