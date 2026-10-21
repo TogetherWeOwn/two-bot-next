@@ -2394,6 +2394,69 @@ mod tests {
         clear_stable_code_env();
     }
 
+    #[tokio::test]
+    async fn read_cap_cover_restore_missing_snapshot() {
+        // A missing --snapshot keeps the pre-existing read error (exit 2):
+        // the open-once refactor must not change that message.
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        std::env::set_var("DISCORD_STAGING_BOT_TOKEN", TOKEN);
+        std::env::set_var(
+            "DISCORD_STAGING_GUILD_ID",
+            two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID,
+        );
+        let dir = Credentials::new();
+        let missing = dir.0.join("no-such-snapshot.json");
+        let args = vec![
+            "--snapshot".to_owned(),
+            missing.to_string_lossy().into_owned(),
+        ];
+        let exit = super::cmd_guild_config_restore(&args).await;
+        assert_eq!(exit, 2);
+        clear_stable_code_env();
+    }
+
+    #[tokio::test]
+    async fn read_cap_cover_restore_non_regular_snapshot() {
+        // A directory passed as --snapshot is refused before any read: the
+        // metadata check sees a non-regular file and exits 2.
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        std::env::set_var("DISCORD_STAGING_BOT_TOKEN", TOKEN);
+        std::env::set_var(
+            "DISCORD_STAGING_GUILD_ID",
+            two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID,
+        );
+        let dir = Credentials::new();
+        let args = vec![
+            "--snapshot".to_owned(),
+            dir.0.to_string_lossy().into_owned(),
+        ];
+        let exit = super::cmd_guild_config_restore(&args).await;
+        assert_eq!(exit, 2);
+        clear_stable_code_env();
+    }
+
+    #[tokio::test]
+    async fn read_cap_cover_restore_invalid_utf8_snapshot() {
+        // Non-UTF-8 bytes keep the pre-existing read error (exit 2): the
+        // bounded take-read plus from_utf8 must match read_to_string here.
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        std::env::set_var("DISCORD_STAGING_BOT_TOKEN", TOKEN);
+        std::env::set_var(
+            "DISCORD_STAGING_GUILD_ID",
+            two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID,
+        );
+        let dir = Credentials::new();
+        let path = dir.0.join("binary.json");
+        std::fs::write(&path, [0xffu8, 0xfe, 0x00, 0x62]).unwrap();
+        let args = vec!["--snapshot".to_owned(), path.to_string_lossy().into_owned()];
+        let exit = super::cmd_guild_config_restore(&args).await;
+        assert_eq!(exit, 2);
+        clear_stable_code_env();
+    }
+
     struct StableCodeFake {
         base: String,
         task: tokio::task::JoinHandle<()>,
