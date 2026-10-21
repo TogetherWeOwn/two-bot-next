@@ -38,10 +38,7 @@ use tokio::sync::RwLock;
 
 use super::gateway::GatewayState;
 
-pub use two_bot::gateway_backoff::{
-    reconnect_delay, ReconnectPolicy, DEFAULT_BASE_DELAY, DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_DELAY,
-    DEFAULT_SEED,
-};
+pub use two_bot::gateway_backoff::{reconnect_delay, ReconnectPolicy};
 
 /// Outcome of one connect attempt, as reported by the injected connector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
