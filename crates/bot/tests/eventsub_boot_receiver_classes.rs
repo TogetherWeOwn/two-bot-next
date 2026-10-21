@@ -148,48 +148,59 @@ fn refused_identity_refuses_with_the_identity_class_before_key_derivation() {
     // A refused identity fails before any key derivation, so even a token the
     // admission would reject still reports the identity cause.
     for token in ["synthetic-delivery-token", "has space"] {
-        assert_eq!(
-            eventsub_delivery::build_delivery_deps(
-                lazy_pool(),
-                token,
-                None,
-                &delivery_config(),
-                false,
+        match eventsub_delivery::build_delivery_deps(
+            lazy_pool(),
+            token,
+            None,
+            &delivery_config(),
+            false,
+        ) {
+            Err(class) => assert_eq!(
+                class, RECEIVER_IDENTITY_REFUSED,
+                "token {token:?} under a refused identity"
             ),
-            Err(RECEIVER_IDENTITY_REFUSED),
-            "token {token:?} under a refused identity"
-        );
+            Ok(_) => panic!(
+                "token {token:?} under a refused identity must refuse with \
+                 {RECEIVER_IDENTITY_REFUSED}, but it built"
+            ),
+        }
     }
 }
 
 #[test]
 fn admission_rejection_refuses_with_the_admission_class() {
     gateway::ensure_crypto_provider();
-    assert_eq!(
-        eventsub_delivery::build_delivery_deps(
-            lazy_pool(),
-            "has space",
-            None,
-            &delivery_config(),
-            true,
+    match eventsub_delivery::build_delivery_deps(
+        lazy_pool(),
+        "has space",
+        None,
+        &delivery_config(),
+        true,
+    ) {
+        Err(class) => assert_eq!(class, RECEIVER_ADMISSION_REJECTED),
+        Ok(_) => panic!(
+            "admission-rejected token must refuse with \
+             {RECEIVER_ADMISSION_REJECTED}, but it built"
         ),
-        Err(RECEIVER_ADMISSION_REJECTED)
-    );
+    }
 }
 
 #[test]
 fn malformed_proxy_refuses_with_the_proxy_class() {
     gateway::ensure_crypto_provider();
-    assert_eq!(
-        eventsub_delivery::build_delivery_deps(
-            lazy_pool(),
-            "synthetic-delivery-token",
-            Some("http://exa mple.com".to_owned()),
-            &delivery_config(),
-            true,
+    match eventsub_delivery::build_delivery_deps(
+        lazy_pool(),
+        "synthetic-delivery-token",
+        Some("http://exa mple.com".to_owned()),
+        &delivery_config(),
+        true,
+    ) {
+        Err(class) => assert_eq!(class, RECEIVER_PROXY_INVALID),
+        Ok(_) => panic!(
+            "malformed proxy must refuse with {RECEIVER_PROXY_INVALID}, \
+             but it built"
         ),
-        Err(RECEIVER_PROXY_INVALID)
-    );
+    }
 }
 
 #[test]
@@ -310,7 +321,10 @@ fn assert_refused_with(exit: &SpawnedExit, expected: &str) {
         exit.logs
     );
     // Exactly one class on the line: no sibling cause and no legacy class.
-    for other in PENNED_CLASSES.iter().chain([LEGACY_SHARED_CLASS]) {
+    for other in PENNED_CLASSES
+        .iter()
+        .chain(std::iter::once(&LEGACY_SHARED_CLASS))
+    {
         if *other == expected {
             continue;
         }
