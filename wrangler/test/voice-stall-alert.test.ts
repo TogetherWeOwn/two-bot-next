@@ -209,7 +209,7 @@ test("live-not-ready pages past 120 s and clears at or below it", () => {
 });
 
 test("queue stall tickets past 120 s and clears at or below it", () => {
-  assert.equal(VOICE_QUEUE_STALL_THRESHOLD_SECONDS, 120, "mirrors the in-process stuck verdict");
+  assert.equal(VOICE_QUEUE_STALL_THRESHOLD_SECONDS, 120, "matches the in-process stuck horizon");
   const age = (n: number | string) => [line(STALL_SERIES, n)];
   assert.deepEqual(ev(age(0)).firing, [], "an empty queue never fires");
   assert.deepEqual(ev(age(119)).firing, []);

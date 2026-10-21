@@ -208,15 +208,21 @@ export const CREATOR_MAP_STALE_SECONDS = 2 * CREATOR_MAP_REFRESH_SECONDS;
  * bound (`docs/observability-event-catalog.md`) into the standard alert
  * pipeline. While the gauge is above 0 that guild's creator joins are
  * dropped without an accept or refusal line; past this bound the runbook
- * calls for a restart (fresh IDENTIFY + GUILD_CREATE) and a bug report.
+ * calls for a restart (fresh IDENTIFY + GUILD_CREATE) and a bug report. A
+ * hung dispatch freezes the published age (the watchdog sibling never
+ * republishes this gauge); the rule promotes the host-watchdog signal
+ * faithfully, frozen-publish limitation included.
  */
 export const VOICE_LIVE_NOT_READY_THRESHOLD_SECONDS = 120;
 /**
- * Queue-stall bound in seconds: mirrors the in-process stuck verdict
+ * Queue-stall bound in seconds: matches the in-process stuck horizon
  * (`watchdog_stuck_after` in `run_actor_with_limits`,
  * `crates/bot/src/voice_rooms.rs`), which fires when queued actions see no
  * completed dispatch turn for this long. An oldest-wait past it means a
- * guild's queue has stalled or is draining unacceptably slowly.
+ * guild's queue is draining unacceptably slowly. A hung dispatch freezes
+ * publication below the bound (the watchdog sibling republishes the last
+ * snapshot's age verbatim), so the hung case stays with the in-process
+ * stuck verdict (error log plus `voice_watchdog_stucks_total`).
  */
 export const VOICE_QUEUE_STALL_THRESHOLD_SECONDS = 120;
 /** Error-budget ratio of the 48h watch: 99.9% SLO leaves 0.1% spendable. */
@@ -1361,7 +1367,10 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   // reading past the bound proves that many seconds of continuous not-ready,
   // so the rule pages without a streak and a valid reading at or below the
   // bound clears at once. The gauge is an optional scrape input, so older
-  // containers hold the previous firing state instead of resolving it.
+  // containers hold the previous firing state instead of resolving it. A hung
+  // dispatch freezes the published age (the watchdog sibling never
+  // republishes this gauge), so a not-ready view that predates a hang stays
+  // with the in-process signals; the runbook names that backstop.
   const NOT_READY_RULE = "voice_live_not_ready";
   const notReady = exactSeries(gauge("two_bot_voice_live_not_ready_seconds"), {});
   if (notReady !== undefined) {
@@ -1373,13 +1382,15 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   // Queue stall: `two_bot_voice_queue_oldest_age_seconds` is the maximum age
   // of the oldest queued (not in-flight) voice action across all current
   // guild actors. Past VOICE_QUEUE_STALL_THRESHOLD_SECONDS a guild's queue
-  // has stalled or is draining unacceptably slowly; the bound mirrors the
-  // in-process stuck verdict (`watchdog_stuck_after` in
-  // `run_actor_with_limits`). Ticket, not page: a slow-but-healthy drain can
-  // legitimately age past the bound under burst load, and member-visible join
-  // degradation already pages through the join-budget burn rules. A valid
-  // reading at or below the bound clears at once; the gauge is an optional
-  // scrape input, so older containers hold the previous firing state.
+  // is draining unacceptably slowly. Ticket, not page: a slow-but-healthy
+  // drain can legitimately age past the bound under burst load, and
+  // member-visible join degradation already pages through the join-budget
+  // burn rules. A valid reading at or below the bound clears at once; the
+  // gauge is an optional scrape input, so older containers hold the previous
+  // firing state. A hung dispatch freezes publication below the bound (the
+  // watchdog sibling republishes the last snapshot's age verbatim), so the
+  // hung case stays with the in-process stuck verdict (error log plus
+  // `voice_watchdog_stucks_total`); the runbook names that backstop.
   // Queue depth (`two_bot_voice_queue_pending{lane}`) is deliberately
   // unconsumed: depth without age is not a failure signal (see the catalog).
   const QUEUE_STALL_RULE = "voice_queue_stall";
