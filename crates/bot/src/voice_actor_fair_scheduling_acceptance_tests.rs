@@ -245,7 +245,7 @@ async fn fair_empty_room_delete_within_bounded_inbox_turns() {
     // must happen within the chained bound under churn. S1 (after 64 churn
     // turns) already sees zero tracked rooms.
     let (live, store, http, _) = owned_room();
-    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     worker.live.voice_update(MEMBER, None, Some(false));
     worker.live.voice_update(301, None, Some(false));
     worker.live.set_empty_grace(Duration::ZERO);
@@ -317,7 +317,7 @@ async fn scheduling_bound_and_diagnosis_exposed() {
     let inbox_before = global_series("two_bot_voice_actor_inbox_turns_total");
     let dispatch_before = global_series("two_bot_voice_actor_dispatch_turns_total");
     let (live, store, http, _) = fixture();
-    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     let ticket = creator_ticket(&worker, MEMBER);
     let (tx, rx) = mpsc::unbounded_channel();
     send_join(&tx, ticket, "new room", 7);
@@ -377,7 +377,7 @@ async fn control_fifo_and_latest_state_preserved_under_churn() {
     // churn still create in arrival order, and the later Display for one
     // member still wins.
     let (live, store, http, _) = fixture();
-    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     let first_ticket = creator_ticket(&worker, MEMBER);
     let second_ticket = creator_ticket(&worker, MEMBER + 1);
     let (tx, rx) = mpsc::unbounded_channel();
@@ -424,7 +424,7 @@ async fn control_stale_ticket_fenced_under_churn() {
     // A ticket for a member who already left is refused against current live
     // state even with churn ahead of it: no room is created.
     let (live, store, http, trace) = fixture();
-    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     let ticket = creator_ticket(&worker, MEMBER);
     worker.live.voice_update(MEMBER, None, Some(false));
     let (tx, rx) = mpsc::unbounded_channel();
@@ -541,8 +541,7 @@ async fn control_in_flight_dispatch_not_dropped_for_fairness() {
     let handle = spawn_actor(worker, rx);
     tokio::time::timeout(Duration::from_secs(5), gate.sent.notified())
         .await
-        .expect("the limit write must go live")
-        .unwrap();
+        .expect("the limit write must go live");
     // Churn lands while the write is held.
     send_churn(&tx, CHURN_BASE, 200);
     gate.release.notify_one();
