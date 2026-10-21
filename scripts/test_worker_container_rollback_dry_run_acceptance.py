@@ -385,8 +385,8 @@ class PlanLiveParityTests(DryRunCase):
             with mock.patch.object(rollback, "control_client",
                                    lambda *a, **k: control):
                 code, out = self.run_dry(snapshot_argv(path, evidence), client)
+            recorded = json.loads(Path(path).read_text())
         self.assertEqual(code, 0, out)
-        recorded = json.loads(Path(path).read_text())
         for member in (recorded["serving_version"], recorded["serving_sha"],
                        recorded["serving_image"]):
             self.assertIn(member, out, f"plan must carry recorded member {member[:24]}")
