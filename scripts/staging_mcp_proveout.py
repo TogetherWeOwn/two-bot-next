@@ -11,16 +11,29 @@ Probes against $STAGING_MCP_URL (default the staging Worker /mcp) with
 `User-Agent: two-bot-next-staging-rollout/1.0`:
   * initialize -> result must carry a non-empty protocolVersion.
   * tools/list -> result.tools must be exactly the five read-only tools.
-  * tools/call each of the five -> bodies are recorded. While staging is
-    fenced (/readyz 503 ownership_fenced/not_owner) the container-backed tools
-    (get_status, get_gateway, get_backfill_progress, get_audit) may return
-    JSON-RPC -32000 "container request failed"; that is expected, not a failure.
-    A successful get_audit must carry the bounded {available, rows, truncated}
-    excerpt envelope. get_config (redacted Worker snapshot), initialize,
-    tools/list and unknown-tool -32601 are Worker-side and must succeed regardless.
+  * tools/call each of the five -> bodies are recorded. A container-backed
+    -32000 (get_status, get_gateway, get_backfill_progress, get_audit) is
+    only an expected fence when the dispatcher explicitly corroborates it
+    with STAGING_MCP_EXPECT_FENCE=1; without that flag a -32000 fails proof
+    as uncorroborated, because the same code also covers timeout, oversize
+    and malformed-upstream failures. A successful get_audit must carry the
+    bounded {available, rows, truncated} excerpt envelope. get_config
+    (redacted Worker snapshot), initialize, tools/list and unknown-tool
+    -32601 are Worker-side and must succeed regardless.
   * tools/call unknown tool -> JSON-RPC -32601.
   * wrong bearer (fixed dummy, never the real token) and no bearer ->
     HTTP 401 with WWW-Authenticate: Bearer.
+
+Every authenticated JSON-RPC reply is bound to its request before any
+nested field is trusted: the envelope must be a JSON-RPC 2.0 object whose
+numeric id matches the request exactly (probe order 1-8) and that carries
+exactly one well-formed result or error (an explicit error:null alongside
+a valid result stays success). Tool results must carry content as a list
+of typed blocks (empty allowed) without isError. Violations fail the
+stage with a fixed reason code and next action:
+ENVELOPE_VERSION, ENVELOPE_ID, ENVELOPE_FRAMING, CONTENT_INVALID,
+FENCE_UNCORROBORATED. The JSON artifact carries proof_disposition
+(proved iff exit 0, else failed).
 
 Output: redacted commands and safely redacted responses on stdout, plus a
 sanitized JSON artifact with the same bounded response bodies. The bearer is
@@ -34,6 +47,9 @@ refusal (nothing was sent).
 
 Usage (the workflow supplies the environment):
   python3 scripts/staging_mcp_proveout.py --output staging-mcp-proveout-<run_id>.json
+
+Offline contract check (no network, no staging calls, no secrets):
+  PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts.ci.test_staging_mcp_proveout_envelope_acceptance -v
 """
 
 import argparse
@@ -51,6 +67,11 @@ UA = "two-bot-next-staging-rollout/1.0"
 DEFAULT_URL = "https://two-bot-next-staging.5150.workers.dev/mcp"
 TOKEN_ENV = "STAGING_MCP_TOKEN"
 URL_ENV = "STAGING_MCP_URL"
+# Explicit fence corroboration: only the exact value "1" lets a
+# container-backed -32000 pass as the expected fence. Unset, empty or any
+# other value fails proof. The flag never touches the staging-host fence,
+# the auth probes or any production path.
+EXPECT_FENCE_ENV = "STAGING_MCP_EXPECT_FENCE"
 MIN_TOKEN_LENGTH = 32
 STAGING_HOST = re.compile(r"two-bot-next-staging\.[a-z0-9-]+\.workers\.dev")
 # Response bound (64 KiB, matching MCP_MAX_BODY_BYTES in wrangler/src/mcp.ts
@@ -259,6 +280,68 @@ def jsonrpc_code(err):
     return code if isinstance(code, int) and not isinstance(code, bool) else None
 
 
+def envelope_failure(stage, shape, parsed, rpc_id):
+    """Bind an authenticated reply to its request; None when bound.
+
+    Checks, in order: the reply is a JSON-RPC 2.0 object, its numeric id
+    matches the request exactly, and it carries exactly one well-formed
+    result or error (explicit null members count as absent, so error:null
+    alongside a valid result stays success). `shape` names the stage's
+    expected payload so the failure stays actionable. Failures carry the
+    stage id, a fixed reason code and a next action, and never echo remote
+    bytes or the bearer.
+    """
+    if not isinstance(parsed, dict):
+        return (f"{stage}: expected {shape} in a JSON-RPC 2.0 reply "
+                f"[ENVELOPE_FRAMING] next: verify the Worker answered "
+                f"with a JSON-RPC reply")
+    if parsed.get("jsonrpc") != "2.0":
+        return (f"{stage}: expected {shape} in a JSON-RPC 2.0 reply "
+                f"[ENVELOPE_VERSION] next: verify the Worker answers "
+                f"JSON-RPC 2.0")
+    reply_id = parsed.get("id")
+    if type(reply_id) is not int or reply_id != rpc_id:
+        return (f"{stage}: reply id must match request id {rpc_id} for "
+                f"{shape} [ENVELOPE_ID] next: verify the reply id "
+                f"matches the request id")
+    has_result = "result" in parsed and parsed["result"] is not None
+    has_error = "error" in parsed and parsed["error"] is not None
+    error = parsed.get("error")
+    if has_result == has_error or (
+            has_error and (not isinstance(error, dict)
+                           or jsonrpc_code(error) is None)):
+        return (f"{stage}: expected exactly one well-formed result or "
+                f"error for {shape} [ENVELOPE_FRAMING] next: verify the "
+                f"reply carries exactly one well-formed result or error")
+    return None
+
+
+def tool_content_failure(stage, result):
+    """Validate the emitted tool-content contract; None when valid.
+
+    Content must be a list of blocks (empty allowed; each non-empty entry
+    a dict with a string type), and an explicit isError:true always fails,
+    even with otherwise valid content.
+    """
+    if not isinstance(result, dict):
+        return (f"{stage}: expected result.content as a list of typed "
+                f"blocks [CONTENT_INVALID] next: verify the tool result "
+                f"carries a content block list without isError")
+    if result.get("isError") is True:
+        return (f"{stage}: tool result reports isError [CONTENT_INVALID] "
+                f"next: verify the tool result carries a content block "
+                f"list without isError")
+    content = result.get("content")
+    if not isinstance(content, list) or any(
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("type"), str)
+            for entry in content):
+        return (f"{stage}: expected result.content as a list of typed "
+                f"blocks [CONTENT_INVALID] next: verify the tool result "
+                f"carries a content block list without isError")
+    return None
+
+
 def is_audit_excerpt(value):
     """Check the bounded envelope; the Worker enforces the row-field allowlist."""
     return (
@@ -286,6 +369,9 @@ def main():
         return fail_refusal(
             "staging MCP URL must be the exact staging https URL "
             "two-bot-next-staging.<sub>.workers.dev/mcp; nothing sent")
+    # Explicit fence corroboration from the dispatcher; anything but the
+    # exact value "1" leaves generic -32000 uncorroborated (proof failure).
+    expect_fence = os.environ.get(EXPECT_FENCE_ENV) == "1"
 
     probes = []
     failures = []
@@ -346,9 +432,13 @@ def main():
     status, headers, body = fetch("initialize", redacted_request_line("initialize", rpc_id, '"params":{...}'), payload, token)
     if body is not None:
         _valid_json, parsed = load_bounded_json(body)
-        result = parsed.get("result") if isinstance(parsed, dict) else None
-        if status != 200 or not isinstance(result, dict) or not result.get("protocolVersion"):
-            failures.append("initialize: expected HTTP 200 with result.protocolVersion")
+        failure = envelope_failure("initialize", "result.protocolVersion", parsed, rpc_id)
+        if failure is None:
+            result = parsed.get("result")
+            if status != 200 or not isinstance(result, dict) or not result.get("protocolVersion"):
+                failure = "initialize: expected HTTP 200 with result.protocolVersion"
+        if failure is not None:
+            failures.append(failure)
     rpc_id += 1
 
     # 2. tools/list (authenticated).
@@ -356,17 +446,21 @@ def main():
     status, headers, body = fetch("tools/list", redacted_request_line("tools/list", rpc_id), payload, token)
     if body is not None:
         _valid_json, parsed = load_bounded_json(body)
-        result = parsed.get("result") if isinstance(parsed, dict) else None
-        tools = result.get("tools") if isinstance(result, dict) else None
-        names = None
-        if isinstance(tools, list) and all(
-                isinstance(t, dict) and isinstance(t.get("name"), str) for t in tools):
-            names = sorted(t["name"] for t in tools)
-        if status != 200 or names != sorted(EXPECTED_TOOLS):
-            failures.append(
-                "tools/list: expected exactly "
-                f"{','.join(sorted(EXPECTED_TOOLS))}, got unexpected tool names"
-            )
+        failure = envelope_failure("tools/list", "result.tools", parsed, rpc_id)
+        if failure is None:
+            result = parsed.get("result")
+            tools = result.get("tools") if isinstance(result, dict) else None
+            names = None
+            if isinstance(tools, list) and all(
+                    isinstance(t, dict) and isinstance(t.get("name"), str) for t in tools):
+                names = sorted(t["name"] for t in tools)
+            if status != 200 or names != sorted(EXPECTED_TOOLS):
+                failure = (
+                    "tools/list: expected exactly "
+                    f"{','.join(sorted(EXPECTED_TOOLS))}, got unexpected tool names"
+                )
+        if failure is not None:
+            failures.append(failure)
     rpc_id += 1
 
     # 3-7. tools/call each of the five (authenticated, bodies recorded).
@@ -387,24 +481,34 @@ def main():
             rpc_id += 1
             continue
         _valid_json, parsed = load_bounded_json(body)
-        if status != 200 or not isinstance(parsed, dict):
-            failures.append(f"tools/call {tool}: expected HTTP 200 JSON-RPC envelope")
-        elif "error" in parsed and parsed["error"] is not None:
-            err = parsed["error"] if isinstance(parsed["error"], dict) else {}
-            code = jsonrpc_code(err)
-            if tool in CONTAINER_BACKED and code == -32000:
-                print(f"NOTE: tools/call {tool} returned -32000 (fenced container); expected while staging is fenced.", flush=True)
-            elif tool == "get_config":
-                failures.append(f"tools/call get_config: must succeed Worker-side, got error {code}")
+        stage = f"tools/call {tool}"
+        failure = envelope_failure(stage, "result.content", parsed, rpc_id)
+        if failure is None:
+            if status != 200:
+                failure = f"{stage}: expected HTTP 200 JSON-RPC envelope"
+            elif "error" in parsed and parsed["error"] is not None:
+                # The envelope check above guarantees a dict with an int code.
+                code = jsonrpc_code(parsed["error"])
+                if tool in CONTAINER_BACKED and code == -32000:
+                    if expect_fence:
+                        print(f"NOTE: tools/call {tool} returned -32000 (fenced container); expected while staging is fenced.", flush=True)
+                    else:
+                        failure = (f"{stage}: container error -32000 without corroborated "
+                                   f"fence evidence [FENCE_UNCORROBORATED] next: rerun with "
+                                   f"STAGING_MCP_EXPECT_FENCE=1 only while staging is fenced, "
+                                   f"else investigate the container error")
+                elif tool == "get_config":
+                    failure = f"tools/call get_config: must succeed Worker-side, got error {code}"
+                else:
+                    failure = f"tools/call {tool}: unexpected JSON-RPC error code {code}"
             else:
-                failures.append(f"tools/call {tool}: unexpected JSON-RPC error code {code}")
-        else:
-            result = parsed.get("result") if isinstance(parsed, dict) else None
-            if not isinstance(result, dict) or "content" not in result:
-                failures.append(f"tools/call {tool}: expected result.content envelope")
-            elif tool == "get_audit":
-                if not is_audit_excerpt(result.get("structuredContent")):
-                    failures.append("tools/call get_audit: expected bounded audit excerpt envelope")
+                result = parsed.get("result")
+                failure = tool_content_failure(stage, result)
+                if failure is None and tool == "get_audit":
+                    if not is_audit_excerpt(result.get("structuredContent")):
+                        failure = "tools/call get_audit: expected bounded audit excerpt envelope"
+        if failure is not None:
+            failures.append(failure)
         rpc_id += 1
 
     # 8. tools/call unknown tool (authenticated) -> -32601.
@@ -422,14 +526,18 @@ def main():
     )
     if body is not None:
         _valid_json, parsed = load_bounded_json(body)
-        err = parsed.get("error") if isinstance(parsed, dict) else None
-        err = err if isinstance(err, dict) else {}
-        code = jsonrpc_code(err)
-        if status != 200 or code != -32601:
-            failures.append(
-                "tools/call unknown: expected JSON-RPC -32601, "
-                f"got HTTP {status}, JSON-RPC code {code}"
-            )
+        failure = envelope_failure("tools/call unknown", "error -32601", parsed, rpc_id)
+        if failure is None:
+            err = parsed.get("error")
+            err = err if isinstance(err, dict) else {}
+            code = jsonrpc_code(err)
+            if status != 200 or code != -32601:
+                failure = (
+                    "tools/call unknown: expected JSON-RPC -32601, "
+                    f"got HTTP {status}, JSON-RPC code {code}"
+                )
+        if failure is not None:
+            failures.append(failure)
     rpc_id += 1
 
     # 9. Wrong bearer (fixed dummy, never the real token) -> 401 Bearer.
@@ -465,6 +573,7 @@ def main():
         "mcp_url": url,
         "user_agent": UA,
         "expected_tools": sorted(EXPECTED_TOOLS),
+        "proof_disposition": "proved" if not failures else "failed",
         "note": "Bearer redacted from logged, stored and uploaded response values.",
         "probes": probes,
         "failures": failures,
