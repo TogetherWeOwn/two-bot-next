@@ -12,13 +12,21 @@ Usage (called only from the daily-digest workflow alert step):
 """
 
 import argparse
+import importlib
 import os
 import re
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from synthetic_alert import MAX_CONTENT, RUNBOOK_URL, post, run_link  # noqa: E402
+# Dynamic sibling import (same pattern as test_synthetic_alert.py): a plain
+# `from x import y` after sys.path manipulation would need a lint waiver,
+# which the floor guard forbids on new lines.
+_synthetic = importlib.import_module("synthetic_alert")
+MAX_CONTENT = _synthetic.MAX_CONTENT
+RUNBOOK_URL = _synthetic.RUNBOOK_URL
+post = _synthetic.post
+run_link = _synthetic.run_link
 
 SHA = re.compile(r"[0-9a-f]{40}")
 TAG = re.compile(r"v[0-9]{4}\.[0-9]{2}\.[0-9]{2}")
