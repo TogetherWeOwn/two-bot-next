@@ -21,6 +21,7 @@ import tomllib
 import unittest
 import urllib.request
 import zipfile
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
@@ -199,6 +200,22 @@ def snapshot_zip(receipt, name="production-rollback-snapshot.json"):
     with zipfile.ZipFile(buffer, "w") as archive:
         archive.writestr(name, json.dumps(receipt))
     return buffer.getvalue()
+
+
+def corrupt_deflate_zip(receipt, name="production-rollback-snapshot.json"):
+    """A snapshot zip whose member is corrupt deflate data.
+
+    Unlike b"not a zip" this parses as a zip and fails inside the
+    decompressor: 0xFF as the first stream byte sets the reserved block
+    type, so archive.read raises zlib.error, not BadZipFile.
+    """
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(name, json.dumps(receipt))
+    blob = bytearray(buffer.getvalue())
+    data = 30 + len(name.encode("utf-8"))  # local file header, no extra field
+    blob[data] = 0xFF
+    return bytes(blob)
 
 
 def snapshot_artifact(artifact_id=SNAPSHOT_ARTIFACT_ID, run_id=SNAPSHOT_RUN_ID, age_days=1,
@@ -1443,6 +1460,26 @@ class GuardBehaviourTests(unittest.TestCase):
             "artifacts": {"total_count": 2, "artifacts": [newer, snapshot_artifact()]},
             "artifact-zip-7701": snapshot_zip(snapshot_receipt(version=OLD_VERSION)),
         }
+        code, _, summary, _, _ = self.guard(auto="true", environment=environment, rollback=VERSION,
+                                            takeover="true", **responses)
+        self.assertEqual(code, 0)
+        self.assertIn(f"deploy-production run `{SNAPSHOT_RUN_ID}`", summary)
+
+    def test_reviewerless_rollback_skips_a_corrupt_deflate_snapshot(self):
+        # One corrupt-deflate snapshot must not abort the search: the newer
+        # corrupt zip is skipped and the older match still approves.
+        environment = {**green()["environment"], "protection_rules": []}
+        newer = snapshot_artifact(artifact_id=7701, run_id=9101, age_days=0)
+        responses = {
+            **snapshot_responses(),
+            "artifacts": {"total_count": 2, "artifacts": [newer, snapshot_artifact()]},
+            "artifact-zip-7701": corrupt_deflate_zip(snapshot_receipt()),
+        }
+        # The decoy must fail inside the decompressor, not zip parsing, or
+        # this test would pass on the pre-fix BadZipFile-only handler.
+        with self.assertRaises(zlib.error):
+            with zipfile.ZipFile(io.BytesIO(responses["artifact-zip-7701"])) as archive:
+                archive.read("production-rollback-snapshot.json")
         code, _, summary, _, _ = self.guard(auto="true", environment=environment, rollback=VERSION,
                                             takeover="true", **responses)
         self.assertEqual(code, 0)

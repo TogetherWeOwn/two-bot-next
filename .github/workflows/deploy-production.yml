@@ -167,7 +167,7 @@ jobs:
         shell: python3 {0}
         run: |
           import datetime
-          import io, json, os, re, subprocess, sys, time, urllib.error, urllib.parse, urllib.request, zipfile
+          import io, json, os, re, subprocess, sys, time, urllib.error, urllib.parse, urllib.request, zipfile, zlib
 
           repo = os.environ["GITHUB_REPOSITORY"]
           event = os.environ.get("EVENT_NAME", "")
@@ -598,7 +598,9 @@ jobs:
                           if archive.getinfo(SNAPSHOT_FILE).file_size > SNAPSHOT_MAX_BYTES:
                               continue
                           receipt = json.loads(archive.read(SNAPSHOT_FILE))
-                  except (subprocess.CalledProcessError, OSError, KeyError, ValueError, zipfile.BadZipFile):
+                  except (subprocess.CalledProcessError, OSError, KeyError, ValueError,
+                          zipfile.BadZipFile, zipfile.LargeZipFile, zlib.error,
+                          EOFError, RuntimeError, NotImplementedError):
                       continue
                   if not isinstance(receipt, dict) or receipt.get("has_previous") is not True \
                           or receipt.get("provenance_complete") is not True:
