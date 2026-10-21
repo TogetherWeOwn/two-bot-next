@@ -719,12 +719,10 @@ impl MemberModerationStore for PgMemberModerationStore {
         limit: i64,
     ) -> Result<Vec<UnbanJob>, StoreError> {
         self.ensure_guild(guild)?;
-        // Both phases honor the same bound: staged activation takes the oldest
-        // rows first so the sweep — which claims one job per iteration and
-        // stops on empty — always progresses from the same end of the queue
-        // the candidates query dispatches from. Newest-first under a bound
-        // would stall behind one future-dated row and starve old rows under
-        // churn; oldest-first completes every due unban across passes.
+        // Both phases honor the same bound. Activate earliest expiries first
+        // so future rows cannot consume a limit-one pass and stop the sweep
+        // while due rows remain staged. Equal expiries take oldest intents
+        // first; candidate dispatch keeps its generation/retry ordering.
         let staged = sqlx::query(
             "SELECT job.request_id, job.user_id FROM moderation_scheduled_unbans AS job
              JOIN moderation_member_bans AS intent ON intent.request_id = job.request_id
@@ -742,7 +740,7 @@ impl MemberModerationStore for PgMemberModerationStore {
                    AND ((newer.state = 'prepared' AND newer.request_id <> intent.request_id)
                      OR (newer.generation > intent.generation AND newer.state <> 'rejected'))
                )
-             ORDER BY intent.generation ASC, job.request_id ASC LIMIT $2",
+             ORDER BY job.execute_at ASC, intent.generation ASC, job.request_id ASC LIMIT $2",
         )
         .bind(&self.guild_id)
         .bind(limit.clamp(0, 25))
