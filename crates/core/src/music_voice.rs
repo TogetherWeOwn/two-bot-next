@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use crate::Snowflake;
+use crate::{Secret, Snowflake};
 
 /// `TWO_MUSIC=1` — attach the music voice-update forwarder (staging only).
 pub struct MusicGates {
@@ -49,7 +49,8 @@ pub struct VoicePairing {
 
 #[derive(Debug, Default)]
 struct PartialVoice {
-    token: Option<String>,
+    /// Redacted under `Debug`: the voice token authenticates the node.
+    token: Option<Secret<String>>,
     endpoint: Option<String>,
     session_id: Option<String>,
     channel_id: Option<Snowflake>,
@@ -66,13 +67,20 @@ impl VoicePairing {
     /// server half (Discord rotates the endpoint on region moves).
     pub fn observe_server(&mut self, guild_id: Snowflake, token: &str, endpoint: &str) {
         let entry = self.by_guild.entry(guild_id).or_default();
-        entry.token = Some(token.to_owned());
+        entry.token = Some(Secret::new(token.to_owned()));
         entry.endpoint = Some(endpoint.to_owned());
     }
 
     /// Record a self `VoiceStateUpdate` half. `None` channel means the bot
     /// left voice: the guild entry is dropped (the follow-up slice destroys
     /// the player instead of PATCHing).
+    ///
+    /// A new session id starts a new handshake generation: the server half
+    /// paired with the previous session is stale and is dropped, so the new
+    /// session can never reuse the prior token or endpoint. A pending server
+    /// half with no session yet is kept as the matching half (initial join
+    /// server-first), and a repeated same-session state keeps the pair
+    /// (mute/deafen frames carry the same session).
     pub fn observe_state(
         &mut self,
         guild_id: Snowflake,
@@ -82,6 +90,14 @@ impl VoicePairing {
         match channel_id {
             Some(channel) => {
                 let entry = self.by_guild.entry(guild_id).or_default();
+                let fresh_session = entry
+                    .session_id
+                    .as_deref()
+                    .is_some_and(|previous| previous != session_id);
+                if fresh_session {
+                    entry.token = None;
+                    entry.endpoint = None;
+                }
                 entry.session_id = Some(session_id.to_owned());
                 entry.channel_id = Some(channel);
             }
@@ -89,6 +105,16 @@ impl VoicePairing {
                 self.by_guild.remove(&guild_id);
             }
         }
+    }
+
+    /// Drop any pending handshake for `guild_id`. The REST/WS slice calls
+    /// this before sending `UpdateVoiceState` (join/move): our own join
+    /// always brings fresh halves, so resetting first means a rejoin can
+    /// never emit a stale mix whichever half arrives first. A rejoin whose
+    /// server half arrives first without a reset would pair a fresh server
+    /// half with the previous session, so the reset call is load-bearing.
+    pub fn reset(&mut self, guild_id: Snowflake) {
+        self.by_guild.remove(&guild_id);
     }
 
     /// The complete handshake for `guild_id`, if both halves arrived.
@@ -110,8 +136,9 @@ impl VoicePairing {
 pub struct PlayerVoiceUpdate {
     /// Guild the player belongs to.
     pub guild_id: Snowflake,
-    /// Discord voice token (`VoiceServerUpdate`).
-    pub token: String,
+    /// Discord voice token (`VoiceServerUpdate`), redacted under `Debug`.
+    /// Exposed only into the PATCH body at the send site.
+    pub token: Secret<String>,
     /// Discord voice endpoint (`VoiceServerUpdate`).
     pub endpoint: String,
     /// Bot voice session id (self `VoiceStateUpdate`).
@@ -130,11 +157,12 @@ impl PlayerVoiceUpdate {
 
     /// Request body: `{"voice": {token, endpoint, sessionId, channelId}}`.
     /// Snowflakes stay strings, matching every other Lavalink v4 id field.
+    /// The token is exposed only here, into the PATCH body.
     #[must_use]
     pub fn voice_body(&self) -> serde_json::Value {
         serde_json::json!({
             "voice": {
-                "token": self.token.clone(),
+                "token": self.token.expose(),
                 "endpoint": self.endpoint.clone(),
                 "sessionId": self.session_id.clone(),
                 "channelId": self.channel_id.to_string(),
@@ -183,7 +211,7 @@ mod tests {
             pairing.complete(10),
             Some(PlayerVoiceUpdate {
                 guild_id: 10,
-                token: String::from("token"),
+                token: Secret::new(String::from("token")),
                 endpoint: String::from("endpoint"),
                 session_id: String::from("session"),
                 channel_id: 30,
@@ -199,7 +227,7 @@ mod tests {
         pairing.observe_server(10, "token", "endpoint");
         let update = pairing.complete(10).expect("both halves arrived");
         assert_eq!(update.session_id, "session");
-        assert_eq!(update.token, "token");
+        assert_eq!(update.token.expose(), "token");
     }
 
     #[test]
@@ -232,7 +260,7 @@ mod tests {
     fn player_path_shape() {
         let update = PlayerVoiceUpdate {
             guild_id: 10,
-            token: String::from("token"),
+            token: Secret::new(String::from("token")),
             endpoint: String::from("endpoint"),
             session_id: String::from("session"),
             channel_id: 30,
@@ -247,7 +275,7 @@ mod tests {
     fn voice_body_carries_dave_fields() {
         let update = PlayerVoiceUpdate {
             guild_id: 10,
-            token: String::from("token"),
+            token: Secret::new(String::from("token")),
             endpoint: String::from("endpoint"),
             session_id: String::from("session"),
             channel_id: 30,
@@ -271,5 +299,89 @@ mod tests {
             !is_staging_guild(10, None),
             "unconfigured guild never forwards"
         );
+    }
+
+    #[test]
+    fn debug_redacts_voice_token() {
+        let mut pairing = VoicePairing::new();
+        pairing.observe_server(10, "secret-voice-token", "endpoint");
+        pairing.observe_state(10, "session", Some(30));
+        for output in [
+            format!("{pairing:?}"),
+            format!("{pairing:#?}"),
+            format!("{:?}", pairing.complete(10).expect("complete pair")),
+            format!("{:#?}", pairing.complete(10).expect("complete pair")),
+        ] {
+            assert!(
+                !output.contains("secret-voice-token"),
+                "Debug must never print the voice token: {output}"
+            );
+            assert!(
+                output.contains("[REDACTED]"),
+                "Debug marks the redacted token: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn new_session_starts_new_handshake_generation() {
+        let mut pairing = VoicePairing::new();
+        pairing.observe_server(10, "old-token", "old-endpoint");
+        pairing.observe_state(10, "old-session", Some(30));
+        assert!(pairing.complete(10).is_some());
+        // A rejoin brings a new session: the prior server half is stale and
+        // must not combine with it, in either arrival order.
+        pairing.observe_state(10, "new-session", Some(30));
+        assert_eq!(
+            pairing.complete(10),
+            None,
+            "new session drops the stale server half"
+        );
+        pairing.observe_server(10, "new-token", "new-endpoint");
+        let update = pairing.complete(10).expect("fresh halves pair");
+        assert_eq!(update.session_id, "new-session");
+        assert_eq!(update.token.expose(), "new-token");
+        assert_eq!(update.endpoint, "new-endpoint");
+    }
+
+    #[test]
+    fn same_session_reobserve_keeps_server_half() {
+        let mut pairing = VoicePairing::new();
+        pairing.observe_server(10, "token", "endpoint");
+        pairing.observe_state(10, "session", Some(30));
+        // Redelivered self state (mute/deafen frames carry the same session)
+        // must not invalidate the handshake.
+        pairing.observe_state(10, "session", Some(30));
+        assert!(
+            pairing.complete(10).is_some(),
+            "same-session redelivery keeps the pair"
+        );
+    }
+
+    #[test]
+    fn reset_drops_pending_handshake() {
+        let mut pairing = VoicePairing::new();
+        pairing.observe_server(10, "token", "endpoint");
+        pairing.observe_state(10, "session", Some(30));
+        pairing.observe_server(11, "token", "endpoint");
+        pairing.reset(10);
+        assert_eq!(pairing.complete(10), None, "reset clears the guild entry");
+        pairing.observe_state(11, "session", Some(31));
+        assert!(
+            pairing.complete(11).is_some(),
+            "sibling guild keeps its entry"
+        );
+        // Reset is the rejoin generation boundary: after it, fresh halves
+        // pair in either order with no stale mix.
+        pairing.observe_server(10, "rejoin-token", "rejoin-endpoint");
+        assert_eq!(
+            pairing.complete(10),
+            None,
+            "server-first rejoin waits for its state"
+        );
+        pairing.observe_state(10, "rejoin-session", Some(30));
+        let update = pairing.complete(10).expect("reset halves pair");
+        assert_eq!(update.session_id, "rejoin-session");
+        assert_eq!(update.token.expose(), "rejoin-token");
     }
 }
