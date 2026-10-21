@@ -2248,12 +2248,12 @@ pub(crate) fn feed_list_page_request(interaction: &Interaction) -> FeedListPage 
     else {
         return FeedListPage::Default;
     };
-    match data.options.iter().find(|option| option.name == "page") {
-        None => FeedListPage::Default,
-        Some(option) => match &option.value {
-            CommandOptionValue::Integer(value) => FeedListPage::Page(*value),
-            _ => FeedListPage::Invalid,
-        },
+    let Some(page) = data.options.iter().find(|option| option.name == "page") else {
+        return FeedListPage::Default;
+    };
+    match &page.value {
+        CommandOptionValue::Integer(value) => FeedListPage::Page(*value),
+        _ => FeedListPage::Invalid,
     }
 }
 
