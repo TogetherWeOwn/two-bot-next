@@ -58,6 +58,10 @@ COPY . .
 # target check must refuse it.
 BROKEN_TARGET_DOCKER = FIXTURE_DOCKER.replace(
     " && echo '' > crates/a/src/lib.rs", "")
+# Same layer, but the member manifest is never copied: the per-member
+# manifest check must refuse it.
+BROKEN_MANIFEST_DOCKER = FIXTURE_DOCKER.replace(
+    "COPY crates/a/Cargo.toml crates/a/\n", "")
 # Same layer, but the RUN no longer ends in the pinned locked-fetch suffix:
 # the suffix pin must refuse it before running anything.
 BROKEN_SUFFIX_DOCKER = FIXTURE_DOCKER.replace(
@@ -123,6 +127,16 @@ class BrokenLayerTests(unittest.TestCase):
         # prints PASS.
         proc = self.check_broken(BROKEN_TARGET_DOCKER, "-O")
         self.assertIn("Missing dependency-layer target: crates/a", proc.stderr)
+
+    def test_missing_manifest_refuses(self):
+        proc = self.check_broken(BROKEN_MANIFEST_DOCKER)
+        self.assertIn("Refusal: crates/a", proc.stderr)
+
+    def test_missing_manifest_refuses_under_optimization(self):
+        # RED on a neutralised manifest require: -O or not, the mutant
+        # prints PASS for the missing manifest.
+        proc = self.check_broken(BROKEN_MANIFEST_DOCKER, "-O")
+        self.assertIn("Refusal: crates/a", proc.stderr)
 
     def test_unpinned_suffix_refuses(self):
         self.check_broken(BROKEN_SUFFIX_DOCKER)
