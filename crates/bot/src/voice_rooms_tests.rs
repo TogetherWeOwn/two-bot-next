@@ -17,6 +17,8 @@ mod creation_receipt_acceptance;
 mod delete_guards;
 #[path = "voice_empty_grace_override_tests.rs"]
 mod empty_grace_override;
+#[path = "voice_actor_fair_scheduling_acceptance_tests.rs"]
+mod fair_scheduling_acceptance;
 #[path = "voice_invite_override_tests.rs"]
 mod invite_override;
 #[path = "voice_invite_responder_wiring_tests.rs"]
