@@ -160,7 +160,8 @@ function conforms(markdown: string, evidence: Evidence): void {
   assert.match(forwarded.find((row) => row[0] === IDEMPOTENCY_HEADER[0])?.[1] ?? "", new RegExp(`at most ${IDEMPOTENCY_HEADER[1]} bytes`));
   assert.match(forwarded.find((row) => row[0] === "content-type")?.[1] ?? "", new RegExp(`at most ${CONTENT_TYPE_MAX_BYTES} bytes`));
   const requestId = forwarded.find((row) => row[0] === REQUEST_ID_HEADER)!;
-  assert.match(requestId[1]!, new RegExp(`validated or minted.*${REQUEST_ID_LEN}-character Crockford.*not identity`, "i"));
+  // Digit boundary: doc mutant "126-character" must not satisfy a 26 pin.
+  assert.match(requestId[1]!, new RegExp(`validated or minted.*(?<!\\d)${REQUEST_ID_LEN}-character Crockford.*not identity`, "i"));
   assert.doesNotMatch(markdown, /Only .*X-TWO-Key-Id.*reach the container/);
   const fields = table(markdown, "Log field");
   assert.deepEqual(fields.map((row) => row[0]).sort(), Object.keys(evidence.log).sort());
@@ -212,6 +213,7 @@ test("receiver runbook matches observed budgets, headers, logs and container wir
     ["release range suffix mutant", doc.replace("7–40", "7–400")],
     ["release range prefix mutant", doc.replace("7–40", "17–40")],
     ["gate count prefix mutant", doc.replace("`TWO_INTERNAL_ACTIONS` exactly `1`", "`TWO_INTERNAL_ACTIONS` exactly `12`")],
+    ["request-id length prefix mutant", doc.replace(`${REQUEST_ID_LEN}-character`, `1${REQUEST_ID_LEN}-character`)],
     ["single-gate enablement", doc.replace("INTERNAL_ACTIONS_INGRESS", "REMOVED_GATE")],
   ];
   for (const [name, mutant] of stale) {
