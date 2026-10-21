@@ -162,7 +162,7 @@ impl tracing::Subscriber for Capture {
 }
 
 impl Capture {
-    fn capture() -> Self {
+    fn shared() -> Self {
         static CAPTURE: OnceLock<Capture> = OnceLock::new();
         let capture = CAPTURE
             .get_or_init(|| {
@@ -263,7 +263,7 @@ async fn saturated_write_warns_with_identifiers_and_no_raw_counter() {
     let Some(fixture) = Fixture::new("invite_saturation").await else {
         return;
     };
-    let capture = Capture::capture();
+    let capture = Capture::shared();
     let snapshots = fixture.snapshots();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         snapshots.store_all(GUILD, &[invite("saturate-warn", u64::MAX)]);
@@ -329,7 +329,7 @@ async fn exact_i32_max_writes_without_saturation_warn() {
     let Some(fixture) = Fixture::new("invite_saturation").await else {
         return;
     };
-    let capture = Capture::capture();
+    let capture = Capture::shared();
     let snapshots = fixture.snapshots();
     store_all_guarded(&snapshots, GUILD, &[invite("exact-max-quiet", SATURATED)]);
     fixture.finish().await;
