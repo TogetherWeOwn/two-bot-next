@@ -4221,7 +4221,10 @@ async fn unusable_success_receipt_retains_uncertainty_fence() {
         r#"{"id":""}"#,
         r#"{"id":"0"}"#,
         r#"{"id":"abc"}"#,
-        r#"{"id":"+123"}"#,
+        // "+123" is covered by its own seeded test below: the executor
+        // accepts it (`u64` parses a leading '+') while the runtime
+        // all-digits guard rejects it, so only a fresh fence exercises
+        // the Ok(_) unusable-receipt branch.
         r#"{"id":"18446744073709551616"}"#,
     ]
     .into_iter()
@@ -4283,6 +4286,77 @@ async fn unusable_success_receipt_retains_uncertainty_fence() {
     assert_eq!(
         runtime
             .on_message(&message(25, CHANNEL, false, Some(GUILD)))
+            .await,
+        ActivityOutcome::Held
+    );
+    assert!(
+        mock.posts_to("/messages").await.is_empty(),
+        "fenced channel sends no duplicate"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn plus_prefixed_receipt_id_retains_uncertainty_fence() {
+    // The executor accepts "+123" (`u64::from_str` allows a leading '+')
+    // but the runtime all-digits guard routes it to the Ok(_) branch. A
+    // fresh fence is required: sharing the loop above would hold before
+    // the wire and never execute that branch.
+    let db = TestDb::new().await;
+    db.seed(Some("8888"), 120_000, 5).await;
+    let (runtime, mock) = db_runtime_script(
+        &db,
+        vec![RestResponse {
+            status: 200,
+            body: Some(r#"{"id":"+123"}"#.into()),
+            delay: Duration::ZERO,
+        }],
+    )
+    .await;
+    assert_eq!(
+        runtime
+            .on_message(&message(26, CHANNEL, false, Some(GUILD)))
+            .await,
+        ActivityOutcome::Held,
+    );
+    let (remembered, last_id, claim) = db.row().await.expect("row retained");
+    assert_eq!(remembered, "remember this");
+    assert_eq!(last_id.as_deref(), Some("8888"));
+    assert!(claim.is_some(), "unusable receipt keeps the fence armed");
+    assert_eq!(
+        mock.posts_to("/messages").await.len(),
+        1,
+        "the POST reaches the wire before the receipt is judged unusable"
+    );
+    assert!(mock.deletes().is_empty(), "no retirement");
+    assert_eq!(
+        db.audits().await,
+        vec![("sticky.run".to_owned(), "post_failed".to_owned())],
+    );
+    // The fence outlives the 60s claim lease: a probe past expiry is held,
+    // and the next accepted message holds without posting a duplicate.
+    // (Reverting the Ok(_) branch to release would turn the claim, probe
+    // and follow-up assertions red.)
+    assert!(
+        store::claim_sticky_post(
+            &db.pool,
+            GUILD_S,
+            CHANNEL_S,
+            "plus-probe",
+            now_millis_for_test() + 120_000,
+        )
+        .await
+        .expect("lease probe")
+        .is_none(),
+        "uncertainty survives lease expiry"
+    );
+    mock.shutdown().await;
+    let (runtime, mock) = db_runtime(&db, vec![]).await;
+    assert_eq!(
+        runtime
+            .on_message(&message(27, CHANNEL, false, Some(GUILD)))
             .await,
         ActivityOutcome::Held
     );
@@ -4513,6 +4587,119 @@ async fn obsolete_post_after_admin_update_preserves_admin_state() {
     assert!(
         db.audits().await.is_empty(),
         "lost claim writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn obsolete_post_after_admin_update_with_failed_cleanup_rearms_fence() {
+    let db = TestDb::new().await;
+    db.seed(Some("8000000000000000013"), 120_000, 5).await;
+    // Hold the accepted POST open so the administrator update lands between
+    // the wire post and the store record; the orphan DELETE then fails
+    // (403), leaving a possibly-live replacement that must re-arm the
+    // fence. The script is consumed in request order: POST, then DELETE.
+    let (runtime, mock) = db_runtime_script(
+        &db,
+        vec![
+            RestResponse {
+                status: 200,
+                body: None,
+                delay: Duration::from_millis(1000),
+            },
+            RestResponse::status(403),
+        ],
+    )
+    .await;
+    let msg = message(32, CHANNEL, false, Some(GUILD));
+    let (outcome, _) = tokio::join!(runtime.on_message(&msg), async {
+        wait_for(
+            || {
+                mock.requests()
+                    .iter()
+                    .any(|r| r.method == "POST" && r.path.ends_with("/messages"))
+            },
+            "replacement POST entered",
+        )
+        .await;
+        // Independent administrator path: the upsert clears the claim and
+        // disarms the fence but preserves the live post columns.
+        let updated = store::put_sticky(
+            &db.pool,
+            &PutSticky {
+                guild_id: GUILD_S,
+                channel_id: CHANNEL_S,
+                body: "admin v2",
+                debounce_seconds: 5,
+                enabled: true,
+                actor_id: "admin-9",
+                now_ms: now_millis_for_test(),
+            },
+        )
+        .await
+        .expect("admin update");
+        assert!(!updated, "seed row already existed");
+    });
+    assert_eq!(outcome, ActivityOutcome::Held, "lost claim reports held");
+
+    // The orphan replacement cleanup was attempted exactly once.
+    let deletes = mock.deletes();
+    assert_eq!(deletes.len(), 1, "one orphan cleanup: {deletes:?}");
+    assert_eq!(
+        deletes[0].path, "/api/v10/channels/3333/messages/9000000000000000000",
+        "orphan id from the held POST",
+    );
+
+    // Administrator state wins on the row, but the unconfirmed cleanup
+    // re-arms the fence: the claim stays cleared (the re-arm is
+    // claim-blind) while delivery_uncertain blocks the next window.
+    let (body, last_id, claim) = db.row().await.expect("row exists");
+    assert_eq!(body, "admin v2");
+    assert_eq!(
+        last_id.as_deref(),
+        Some("8000000000000000013"),
+        "obsolete record cannot overwrite the live post",
+    );
+    assert_eq!(
+        claim, None,
+        "admin update cleared the claim; the re-arm adds none"
+    );
+    assert_eq!(
+        db.audits().await,
+        vec![("sticky.run".to_owned(), "post_failed".to_owned())],
+        "unconfirmed cleanup audits failure, never success"
+    );
+
+    // The re-armed fence outlives the 60s claim lease: a probe past expiry
+    // is held, and the next accepted message holds without posting a
+    // duplicate. (Deleting the moved-on fence_uncertain call turns the
+    // probe red and lets the follow-up duplicate.)
+    assert!(
+        store::claim_sticky_post(
+            &db.pool,
+            GUILD_S,
+            CHANNEL_S,
+            "rearm-probe",
+            now_millis_for_test() + 120_000,
+        )
+        .await
+        .expect("lease probe")
+        .is_none(),
+        "moved-on re-arm survives lease expiry"
+    );
+    mock.shutdown().await;
+    let (runtime, mock) = db_runtime(&db, vec![]).await;
+    assert_eq!(
+        runtime
+            .on_message(&message(33, CHANNEL, false, Some(GUILD)))
+            .await,
+        ActivityOutcome::Held
+    );
+    assert!(
+        mock.posts_to("/messages").await.is_empty(),
+        "fenced channel sends no duplicate"
     );
     mock.shutdown().await;
     db.close().await;
