@@ -2,7 +2,7 @@
 //!
 //! FROZEN HANDOFF FILE. The paired builder consumes the branch head carrying
 //! this file and must keep it byte-identical: no edits, no renames, no
-//! `#[ignore]`, no weakening an assertion. Test corrections go back to the
+//! ignored tests, no weakening an assertion. Test corrections go back to the
 //! test author; the builder never edits this file.
 //!
 //! Scope: `two-bot restore` must refuse a target that normalizes to the live
@@ -222,7 +222,9 @@ async fn fake_discord(
                 Json(json!({"message": "loopback induced failure"})),
             );
         }
-        return (StatusCode::OK, Json(json!({})));
+        // Discord role PATCH success returns the role object; an empty
+        // object is a malformed receipt, not a landed write.
+        return (StatusCode::OK, Json(json!({"id": TARGET_ROLE})));
     }
     let guild_path = format!("/guilds/{TWO_STAGING_GUILD_ID}");
     let body = match path.as_str() {
