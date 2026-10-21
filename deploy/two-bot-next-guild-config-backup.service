@@ -8,9 +8,12 @@
 Description=Back up TWO Staging Discord configuration (two-bot-next)
 After=network-online.target
 Wants=network-online.target
+OnFailure=two-bot-next-failure@%n.service
 
 [Service]
 Type=oneshot
+# Discord REST reads plus one upload; a hung call is killed after 30 minutes.
+TimeoutStartSec=30min
 User=twobot
 Group=twobot
 WorkingDirectory=/opt/two-bot-next

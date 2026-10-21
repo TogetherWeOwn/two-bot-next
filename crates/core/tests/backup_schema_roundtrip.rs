@@ -1761,6 +1761,23 @@ fn shipped_drill_script(archives: &Path, binary: &Path) -> String {
         .strip_prefix("/usr/bin/bash -o pipefail -c '")
         .and_then(|rest| rest.strip_suffix('\''))
         .expect("drill runs one single-quoted bash -o pipefail script");
+    // systemd also unquotes C escapes in the word and turns `%%` into `%`.
+    let mut unescaped = String::new();
+    let mut chars = script.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (c, chars.peek().copied()) {
+            ('\\', Some(next @ ('\\' | '"'))) => {
+                unescaped.push(next);
+                chars.next();
+            }
+            ('%', Some('%')) => {
+                unescaped.push('%');
+                chars.next();
+            }
+            _ => unescaped.push(c),
+        }
+    }
+    let script = unescaped.as_str();
     for shipped in ["/var/backups/two-bot-next/", "/opt/two-bot-next/two-bot "] {
         assert_eq!(script.matches(shipped).count(), 1, "{shipped} in {script}");
     }
@@ -1927,7 +1944,9 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
                     "TWO_RESTORE_DRILL_BOOTSTRAP_URL",
                     "postgres://agent_test:@agent-testdb:5432/postgres",
                 )
-                .env("TWO_RESTORE_DRILL_EVIDENCE_DIR", &evidence_root),
+                .env("TWO_RESTORE_DRILL_EVIDENCE_DIR", &evidence_root)
+                // The unit's own `Environment=` bound; the archive is seconds old.
+                .env("TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S", "172800"),
             &format!("restore drill, month {month}"),
         );
         let dir = assert_drill_verified(&drill, archive);
