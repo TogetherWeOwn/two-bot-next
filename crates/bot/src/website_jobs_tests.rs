@@ -175,7 +175,7 @@ fn event() -> Value {
 
 #[tokio::test]
 async fn recovery_registration_does_not_unpark_unavailable_jobs() {
-    let empty = registered_statuses(&[], &[]).await;
+    let empty = registered_statuses(&[], &[]).await.unwrap();
     assert!(empty.read().await.values().all(|entry| entry.parked));
     let recovery = Job {
         name: RECOVERY_JOB_NAME,
@@ -185,13 +185,29 @@ async fn recovery_registration_does_not_unpark_unavailable_jobs() {
         timeout: Duration::from_secs(25),
         action: Arc::new(|| Box::pin(async { Ok(()) })),
     };
-    let status = registered_statuses(&[recovery], &[]).await;
+    let status = registered_statuses(&[recovery], &[]).await.unwrap();
     let entries = status.read().await;
     assert!(!entries[RECOVERY_JOB_NAME].parked);
     for name in NAMES.into_iter().chain(community_jobs::NAMES) {
         assert!(entries[name].parked);
         assert!(!entries[name].running);
     }
+}
+
+#[tokio::test]
+async fn registered_statuses_fails_fast_on_an_unknown_job_name() {
+    let ghost = Job {
+        name: "ghost",
+        cadence: Duration::from_secs(30),
+        cadence_source: None,
+        startup_jitter: Duration::ZERO,
+        timeout: Duration::from_secs(25),
+        action: Arc::new(|| Box::pin(async { Ok(()) })),
+    };
+    let error = registered_statuses(&[ghost], &[])
+        .await
+        .expect_err("an unknown job name fails at registration, never at unpark");
+    assert_eq!(error.to_string(), "unregistered job: ghost");
 }
 
 /// TOG-15758: a job the identity fence refuses is absent from the supervised
@@ -223,7 +239,7 @@ async fn refused_identity_parks_the_posting_jobs_in_the_readyz_status_map() {
     let posting = [scheduled_jobs::NAMES[0], feed_jobs::NAME];
 
     let registered = register(&fixtures::staging());
-    let status = registered_statuses(&registered, &[]).await;
+    let status = registered_statuses(&registered, &[]).await.unwrap();
     let entries = status.read().await;
     for name in posting {
         assert!(
@@ -235,7 +251,7 @@ async fn refused_identity_parks_the_posting_jobs_in_the_readyz_status_map() {
 
     let registered = register(&fixtures::live());
     assert!(registered.is_empty(), "live identity builds no posting job");
-    let status = registered_statuses(&registered, &[]).await;
+    let status = registered_statuses(&registered, &[]).await.unwrap();
     let entries = status.read().await;
     for name in posting {
         assert!(entries[name].parked, "{name} is parked on the live pair");
@@ -489,7 +505,7 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
         .await
         .unwrap();
         stop.send(true).unwrap();
-        task.await.unwrap();
+        task.await.unwrap().unwrap();
     }
     let count: i32 =
         sqlx::query_scalar("SELECT human_member_count FROM guild_counters WHERE guild_id=$1")
