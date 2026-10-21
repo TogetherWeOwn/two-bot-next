@@ -329,6 +329,44 @@ mod tests {
         }
     }
 
+    fn offline_args(mapping: &str) -> Args {
+        Args {
+            source: "postgres://operator:explicit@agent-testdb:5432/bot".to_owned(),
+            target: "postgres://operator:explicit@agent-testdb:5432/bot".to_owned(),
+            mapping: mapping.to_owned(),
+            groups: Vec::new(),
+            sample_limit: DEFAULT_SAMPLE_LIMIT,
+        }
+    }
+
+    fn scratch_mapping(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("legacy-verify-cap-{}-{tag}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("spec.json")
+    }
+
+    #[tokio::test]
+    async fn over_cap_mapping_refuses_before_any_connection() {
+        // Content never parses: the cap fires on byte length alone.
+        let path = scratch_mapping("over-cap");
+        std::fs::write(&path, vec![b' '; two_bot_cutover::INTAKE_CAP_BYTES + 1]).unwrap();
+        let err = run(offline_args(&path.to_string_lossy()))
+            .await
+            .unwrap_err();
+        assert!(err.contains("exceeds"), "{err}");
+        assert!(err.contains("mapping"), "{err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn missing_mapping_reports_cannot_read() {
+        let err = run(offline_args("/nonexistent-legacy-verify-mapping-spec.json"))
+            .await
+            .unwrap_err();
+        assert_eq!(err, "cannot read mapping file");
+    }
+
     #[test]
     fn unknown_flags_and_invalid_sample_limits_are_refused() {
         for argv in [

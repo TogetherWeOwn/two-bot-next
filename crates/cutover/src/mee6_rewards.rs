@@ -961,6 +961,27 @@ mod tests {
     }
 
     #[test]
+    fn reward_without_rank_or_level_names_the_gap() {
+        let err = parse_mee6_role_rewards(r#"{"role_rewards":[{"role_id":"900000000000000020"}]}"#)
+            .unwrap_err();
+        assert_eq!(err.problems.len(), 1);
+        assert!(err.problems[0].contains("no rank or level"), "{err}");
+    }
+
+    #[test]
+    fn roles_snapshot_truncates_problems_with_a_count_receipt() {
+        let mut snapshot = String::from("[0");
+        snapshot.push_str(&",0".repeat(MAX_KEPT_PROBLEMS + 50));
+        snapshot.push(']');
+        let err = parse_roles_snapshot(&snapshot).unwrap_err();
+        let problems: Vec<&str> = err.split("\n  ").skip(1).collect();
+        assert_eq!(problems.len(), MAX_KEPT_PROBLEMS + 1);
+        let receipt = problems.last().unwrap();
+        assert!(receipt.contains("more"), "{receipt}");
+        assert!(receipt.contains("151"), "{receipt}");
+    }
+
+    #[test]
     fn missing_and_nonarray_sections() {
         assert!(parse_mee6_role_rewards(r#"{"players":[]}"#)
             .unwrap()

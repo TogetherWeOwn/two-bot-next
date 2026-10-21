@@ -852,6 +852,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_names_a_non_numeric_level() {
+        let err = parse_mee6_export(r#"[{"id":"100000000000000001","xp":100,"level":"high"}]"#)
+            .unwrap_err();
+        assert_eq!(err.problems, ["row 1 has invalid level"]);
+    }
+
+    #[test]
     fn parse_reports_every_problem() {
         let err = parse_mee6_export(
             r#"[{"xp":1},{"id":"nope","xp":1},{"id":"100000000000000001","xp":-1},{"id":"100000000000000001","xp":100,"level":9}]"#,
