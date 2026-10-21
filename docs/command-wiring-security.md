@@ -9,8 +9,8 @@ open. Slash-command input-handling PRs touching `/lfg`, `/command`, `/schedule*`
 ## Source boundary
 
 At source revision `b846a6094`, vote-kick and RSVP/attendance have runtime
-handlers; they are not wholly unwired. `/templateassistant` can be published
-but has no handler or HTTP transport. Apply these gates to hardening existing
+handlers; they are not wholly unwired. `/templateassistant` stays unpublished
+until its slice lands, and has no handler or HTTP transport yet. Apply these gates to hardening existing
 paths as well as new wiring. This is source inspection, not live verification.
 
 ## Vote-kick

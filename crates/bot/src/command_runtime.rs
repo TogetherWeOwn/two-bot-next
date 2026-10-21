@@ -1370,8 +1370,9 @@ impl CommandRuntime {
             self.answer(interaction, response).await;
             return;
         }
+        // No `"help"` entry: the help arm above owns `/help` and returns
+        // first, so an owner-map entry could never execute.
         let owner = match name.as_str() {
-            "help" => Some(HandlerId::Help),
             "privacy" => Some(HandlerId::Privacy),
             "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list" => {
                 Some(HandlerId::AutomationAdmin)
@@ -2236,9 +2237,16 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
             HandlerId::FeedAdd,
             HandlerId::FeedRemove,
             HandlerId::FeedList,
+            // The ordered RSVP surface executes these ids; registration
+            // documents the ownership the router outcome names.
+            HandlerId::Rsvp,
+            HandlerId::RsvpAttendance,
         ] {
             router.register(Box::new(SliceHandler(id)));
         }
+    }
+    if gates.scorecard {
+        router.register(Box::new(SliceHandler(HandlerId::ScorecardAttendance)));
     }
     // Leveling is not an activation-fenced capability: the core rank and
     // leaderboard commands stay available to every permitted identity.

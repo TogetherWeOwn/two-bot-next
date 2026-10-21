@@ -57,14 +57,19 @@ test("catalog: rule ids match the Rust evidence list, preserve append positions 
   assert.ok(rustIds, "ALERT_RULE_IDS not found in crates/core/src/evidence.rs");
   assert.deepEqual(RULES.map((r) => r.id), [...rustIds[1]!.matchAll(/"([^"]+)"/g)].map((m) => m[1]!));
   // The 29-rule historical prefix ends with the prefix-verdict ticket; the
-  // six safety-series rules append after it without displacing anything.
+  // voice-stall quartet appends at 29-32 and the six safety-series rules
+  // stack after it at 33-38 without displacing anything.
   assert.equal(RULES[28]?.id, "prefix_trigger_verdict_refusals");
-  assert.equal(RULES[29]?.id, RETENTION);
-  assert.equal(RULES[30]?.id, TIMEOUTS);
-  assert.equal(RULES[31]?.id, STUCKS);
-  assert.equal(RULES[32]?.id, RECOVERIES);
-  assert.equal(RULES[33]?.id, OPENS);
-  assert.equal(RULES[34]?.id, PAUSES);
+  assert.equal(RULES[29]?.id, "voice_worker_halted");
+  assert.equal(RULES[30]?.id, "voice_live_self_heal");
+  assert.equal(RULES[31]?.id, "voice_live_not_ready");
+  assert.equal(RULES[32]?.id, "voice_queue_stall");
+  assert.equal(RULES[33]?.id, RETENTION);
+  assert.equal(RULES[34]?.id, TIMEOUTS);
+  assert.equal(RULES[35]?.id, STUCKS);
+  assert.equal(RULES[36]?.id, RECOVERIES);
+  assert.equal(RULES[37]?.id, OPENS);
+  assert.equal(RULES[38]?.id, PAUSES);
   for (const id of [RETENTION, TIMEOUTS, STUCKS, RECOVERIES, OPENS, PAUSES]) {
     assert.equal(RULES.filter((r) => r.id === id).length, 1, `${id} is catalogued exactly once`);
     assert.equal(

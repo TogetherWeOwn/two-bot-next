@@ -44,7 +44,7 @@ Production has no ingress, route, variable or secret for this receiver.
 | Body | Forwarded byte for byte; the signature covers the raw bytes. Never re-serialized. |
 | Fence | Forwarded only inside the Durable Object's ownership gate. A stale, fenced or missing deployment answers 503 `unavailable` and never reaches the container. |
 | Startup | Public ingress never starts the container; probes and the keepalive do. While the container is not running the answer is 503 `unavailable`. |
-| Answers | The receiver's own JSON envelope is relayed with `Content-Type`, `Idempotent-Replay` and `Retry-After` only, `Cache-Control: no-store`. Any non-JSON, oversize or transport-failure answer (including SDK startup text that embeds error messages) becomes the fixed `unavailable` envelope. Worker refusals use the same envelope with a fixed message. |
+| Answers | The receiver's JSON envelope is validated against the [relayed answer contract](#relayed-answer-contract) and projected: successes keep their action-specific result verbatim beside the correlated id (plus the optional top-level settings version), refusals keep their table status/code/retryability with the fixed message. Headers relayed are `Content-Type`, `Idempotent-Replay` and `Retry-After` only, `Cache-Control: no-store`. Any non-JSON, oversize, transport-failure, malformed, contradictory or unknown-code answer (including SDK startup text that embeds error messages) becomes the fixed `unavailable` envelope. Worker refusals use the same envelope with a fixed message. |
 | Logs | Scalar `internal_actions_ingress` events: `status` and `error_class` only. Never header values, nonce, signature, body or query. |
 
 Authentication is unchanged: legacy v1 HMAC and a durable nonce burn at the
@@ -315,6 +315,63 @@ re-derived), `result.outcome` (membership: `assigned`/`already_held`,
 adds
 `Idempotent-Replay: true`; inbound bucket refusal carries `Retry-After`.
 Messages are fixed/redacted and all envelopes use `Cache-Control: no-store`.
+
+## Relayed answer contract
+
+The Worker relays only envelopes the receiver's constructors emit
+(`crates/core/src/internal_actions.rs`, `crates/bot/src/internal_action_http.rs`).
+Every relayed body carries the forwarded `request_id` (generated shape, echoed
+by the receiver); a missing, misshapen or mismatched id fails closed. Extra
+fields and the receiver's message text never leave: callers see the shapes
+below and nothing else.
+
+Success (`200` only, `result` always an object, no `error` key):
+
+| Family | `result` | Notes |
+| --- | --- | --- |
+| announcement.post | `{message_id}` | |
+| event.upsert/cancel | `{outcome, event_id}` | `outcome` replayed from the stored receipt |
+| event.read | full observed event | behind its allowlist flag |
+| settings.get/set | `{key, ...}` plus top-level integer `version` | `version` beside `result`, never inside |
+| automations.export/import | command document / `{imported, skipped, conflicts}` | |
+| role.assign / guild.add_member | `{outcome}` | `assigned`/`already_held`, `added`/`already_member` |
+| moderation.\* | `{outcome[, affected]}` | |
+
+Refusals keep their code, status and retry policy with the fixed message
+`request refused`:
+
+| Code | Status | Retryable |
+| --- | --- | --- |
+| malformed | 400 | no |
+| unauthorized | 401 | no |
+| stale_request | 401 | no |
+| action_not_allowed | 403 | no |
+| not_found | 404 | no |
+| method_not_allowed | 405 | no |
+| request_timeout | 408 | yes |
+| replayed | 409 | no |
+| version_conflict | 409 | no |
+| in_progress | 409 | yes |
+| needs_reconciliation | 409 | no |
+| discord_rejected | 422 | no |
+| rate_limited | 429 | yes |
+| internal | 500 | yes |
+| discord_unavailable | 502 | yes |
+| no_effect | 502 | no |
+| busy | 503 | yes |
+| upstream_timeout | 504 | yes |
+
+Compact next-action map (the `retryable` flag is the machine rule; the map is
+the human gloss):
+
+| Situation | Next action |
+| --- | --- |
+| `retryable: true` (408, 409 `in_progress`, 429, 500, 502 `discord_unavailable`, 503 `busy`, 504) | Retry the same `Idempotency-Key`; never mint a new key for an unknown outcome. Honor `Retry-After` when present. |
+| `needs_reconciliation` (409) | Reconcile by hand first (see the event rules above); never re-submit under a new key. |
+| `replayed` / `version_conflict` (409) | Same key already decided or superseded: read the stored outcome, use a new key only for a new intent. |
+| 401 / 403 | Fix the caller: signing key, timestamp/nonce freshness, action allowlist. Do not retry the bytes. |
+| `malformed` (400), `not_found` (404), `method_not_allowed` (405), `discord_rejected` (422), `no_effect` (502) | Fix the request: shape, route, verb, payload or target state. |
+| `unavailable` (503, Worker-only) | Staging/Operator state: dark route, cold container, fenced deployment, oversize or an unusable receiver answer. Not a receiver verdict. |
 
 ## Tests
 
