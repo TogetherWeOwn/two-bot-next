@@ -18,7 +18,9 @@ proxy configuration, unchanged by this slice.
   booleans, numbers, arrays and objects are invalid binding types. Each row
   requires a unique canonical lowercase `slug` (2–40 ASCII alphanumeric/internal-hyphen characters) and a
   valid `invite_code`. `label`, when supplied, must be a string; `disabled_at`
-  must be absent, null or a string. Retired campaigns still redirect. Extra
+  must be absent, null or a string. At most 1024 rows are accepted (the same
+  bound the live lookup cache enforces); a larger snapshot is invalid and the
+  whole configuration is rejected. Retired campaigns still redirect. Extra
   database export fields are ignored, as before.
 - `healthz` and `metrics` are reserved campaign inputs. Case, slash and encoded
   aliases cannot become campaign redirects. Only exact `/healthz` serves the

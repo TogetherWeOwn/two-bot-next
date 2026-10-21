@@ -3439,6 +3439,68 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(ignored_sweeps), 1)
         self.assertIn("--test-threads=1", ignored_sweeps[0])
         self.assertIn("--skip regenerate_reference_docs", ignored_sweeps[0])
+        self.assertIn(
+            "--skip flags_are_guild_scoped_half_open_deduplicated_and_activity_protected",
+            ignored_sweeps[0],
+        )
+        self.assertIn(
+            "--skip list_is_guild_scoped_selector_shaped_and_read_only",
+            ignored_sweeps[0],
+        )
+        # The stream go-live ledger suite, the internal-events DB test, the
+        # legacy-verify/TLS-fence/migrate suites and the mutation-429 suite
+        # share the same strict agent_test guard: they run only in their
+        # dedicated agent_test runs below, never in the bootstrap sweep.
+        for skipped in (
+            "claim_is_owned_once_then_in_flight",
+            "failed_send_releases_the_claim_for_the_retry",
+            "delivered_rows_are_never_reclaimed",
+            "delivered_rows_expire_only_past_the_horizon_with_the_fence_intact",
+            "fresh_claim_cannot_be_reclaimed",
+            "stale_unposted_claim_is_taken_over_atomically",
+            "started_claim_is_never_reclaimed_even_when_stale",
+            "started_send_that_provably_failed_releases_for_the_retry",
+            "reclaiming_a_missing_key_claims_it_fresh",
+            "database::actions_persist_rows_and_preserve_other_events_and_guilds",
+            "parity_mismatch_cursor_and_read_only_acceptance",
+            "legacy_verify_policy_gates_the_real_test_endpoints",
+            "real_sqlx_runner_cases",
+            "post_failure_unreadable_ledger_is_unknown_not_empty",
+            "post_failure_readable_ledger_keeps_array_output",
+            "post_apply_unreadable_ledger_is_unknown_not_empty",
+            "store_failure_keeps_committed_cutover_evidence",
+            "connection_count_sees_other_roles_from_plan_login",
+            "single_delete_429_releases_attempt_for_same_key_retry",
+            "bulk_delete_429_releases_attempt_for_same_key_retry",
+            "channel_overwrite_429_releases_attempt_and_retires_only_its_seed",
+            "slowmode_429_releases_attempt_for_same_and_distinct_keys",
+            "unlock_429_releases_lane_but_preserves_recovery_seed",
+            "lockdown_429_preserves_prior_seed_while_releasing_the_lane",
+            "slowmode_5xx_and_unexpected_statuses_stay_fenced",
+            "slowmode_timeout_stays_fenced",
+            "cancelled_lockdown_stays_fenced_with_seed_retained",
+        ):
+            with self.subTest(skipped=skipped):
+                self.assertIn(f"--skip {skipped}", ignored_sweeps[0])
+        # The parity skip above keeps its unskipped, correctly ordered dedicated rerun.
+        parity_reruns = [run for run in cov_runs if "--test legacy_verify_db" in run]
+        self.assertEqual(len(parity_reruns), 1)
+        self.assertIn("-- --ignored --test-threads=1", parity_reruns[0])
+        self.assertNotIn(
+            "--skip parity_mismatch_cursor_and_read_only_acceptance",
+            parity_reruns[0],
+        )
+        # The parity guard accepts only the omitted-password URL. Its export
+        # must occur once, before the rerun and before the later URL switch.
+        parity_export = "export TWO_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test"
+        later_export = "export TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/agent_test"
+        self.assertEqual(logical_lines.count(parity_export), 1)
+        self.assertLess(
+            logical_lines.index(parity_export), logical_lines.index(parity_reruns[0])
+        )
+        self.assertLess(
+            logical_lines.index(parity_reruns[0]), logical_lines.index(later_export)
+        )
         # One MEMBER_TESTDB export serves both the ignored sweep and the
         # fail-closed member_moderation_db re-run. Pin its count and logical
         # command order so a redundant later export cannot mask a deleted or
@@ -3484,6 +3546,20 @@ class WorkflowTests(unittest.TestCase):
         for name in sorted(staging_names):
             with self.subTest(staging_skip=name):
                 self.assertIn(name, broad_skips)
+        # Mutation-429 channel fixtures run in the dedicated
+        # mutation_429 rerun below, never in this two_bot_test_ci sweep.
+        # Enumerate from the Rust source so a future tenth fixture cannot
+        # silently rejoin.
+        channel_source = (
+            ROOT / "crates/discord/tests/mutation_429_proves_no_effect_channel.rs"
+        ).read_text()
+        channel_names = set(
+            re.findall(r'#\[ignore[^\]]*\]\s*async fn (\w+)\(', channel_source)
+        )
+        self.assertTrue(channel_names, "guarded ignored fixtures must be discovered")
+        for name in sorted(channel_names):
+            with self.subTest(channel_skip=name):
+                self.assertIn(name, broad_skips)
         ignored_sweep = [run for run in sweeps if "-- --ignored" in run][0]
         self.assertIn(
             "--skip list_is_guild_scoped_selector_shaped_and_read_only",
@@ -3527,6 +3603,10 @@ class WorkflowTests(unittest.TestCase):
                     self.assertNotIn("--features db", matches[0])
                 if needle == "--test staging_migrate_db":
                     for name in sorted(staging_names):
+                        with self.subTest(dedicated_no_skip=name):
+                            self.assertNotIn(f"--skip {name}", matches[0])
+                if needle == "--test mutation_429_proves_no_effect_channel":
+                    for name in sorted(channel_names):
                         with self.subTest(dedicated_no_skip=name):
                             self.assertNotIn(f"--skip {name}", matches[0])
         env_wrapped = [

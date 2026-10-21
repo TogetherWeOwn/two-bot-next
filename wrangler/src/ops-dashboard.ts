@@ -218,6 +218,12 @@ async function poll() {
 function esc(s) {
   return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
+// Intake bounds: current reports carry a handful of each, so 256 is 10x+
+// headroom while bounding rendered rows. Each collection is capped
+// independently: either one over its cap refuses the whole report before
+// render, so a hostile or bloated summary can never render unbounded rows.
+const MAX_COMPONENTS = 256;
+const MAX_JOBS = 256;
 function isValidReport(data) {
   // Mirror the server summary shape: an object whose components (when
   // present) are [name, state] string pairs and whose jobs (when present)
@@ -227,6 +233,7 @@ function isValidReport(data) {
   if (!data || typeof data !== "object" || Array.isArray(data)) return false;
   if (data.components !== undefined) {
     if (!Array.isArray(data.components)) return false;
+    if (data.components.length > MAX_COMPONENTS) return false;
     for (const entry of data.components) {
       if (!Array.isArray(entry) || entry.length !== 2
         || typeof entry[0] !== "string" || typeof entry[1] !== "string") return false;
@@ -234,6 +241,7 @@ function isValidReport(data) {
   }
   if (data.jobs !== undefined) {
     if (!data.jobs || typeof data.jobs !== "object" || Array.isArray(data.jobs)) return false;
+    if (Object.keys(data.jobs).length > MAX_JOBS) return false;
     for (const job of Object.values(data.jobs)) {
       if (!job || typeof job !== "object" || Array.isArray(job)) return false;
     }
@@ -299,7 +307,7 @@ const DASHBOARD_CSP = [
   "base-uri 'none'",
   "form-action 'none'",
   "frame-ancestors 'none'",
-  "script-src 'sha256-KakYnwlm90kiQyjP89ukbbsx3nu5UjTBJAfieSdbDR8='",
+  "script-src 'sha256-sbPuAjAIyFmK05CEmJH0aG8J07NSV0pLMxptYsiWXQI='",
   "style-src 'sha256-XfBF+coe4Stt3RC6YIku87CPj/YAhk41yequAyR3nkA='",
 ].join("; ");
 
