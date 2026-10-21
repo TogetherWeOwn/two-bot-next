@@ -15,6 +15,23 @@ import { OWNER_KEY, AUDIT_PREFIX, DEPLOYMENT_HEADER, CONTROL_PATH } from "../src
 import { EMPTY_STATE, LOG_QUERY_URL, type MetricsAlertState } from "../src/alert-rules.ts";
 import { metricsBody, metricsLines } from "./fixtures/metrics.ts";
 
+let scrapeSerial = 0;
+/**
+ * Full fixture exposition with a fresh ACK latency per serve. The harnesses
+ * below serve a static exposition across many keepalive ticks; without a
+ * moving latency those ticks would (correctly) trip gateway_latency_dead on
+ * the third consecutive serve, since a healthy gateway ACKs every heartbeat
+ * interval. Dead-gateway behavior itself is pinned in
+ * gateway-transport-alert.test.ts against static expositions.
+ */
+function liveMetricsBody(rankFailures = 0): string {
+  scrapeSerial += 1;
+  return metricsBody(rankFailures).replace(
+    "two_bot_gateway_latency_seconds 0",
+    `two_bot_gateway_latency_seconds 0.0${10 + (scrapeSerial % 50)}`,
+  );
+}
+
 const ID = "deployment-A";
 const CONTROL_TOKEN = "synthetic-control-token-not-a-secret-12345";
 const ACTIVE_OWNER = {
@@ -706,7 +723,7 @@ test("container_error during a probe fetch stamps unknown, not the previous rele
   ));
   t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
     const path = new URL(typeof input === "string" ? input : input.url).pathname;
-    if (path === "/metrics") return new Response(metricsBody(0));
+    if (path === "/metrics") return new Response(liveMetricsBody(0));
     // The SDK awaits onError from startup/port checks inside containerFetch
     // (SDK 0.3.7 waitForPort), before the fetch settles; handler errors are
     // ignored and the original failure propagates.
@@ -738,11 +755,11 @@ test("keepalive tags an unparseable build revision as unknown without echoing it
 test("metrics alert lines carry the keepalive release and worker version", async (t) => {
   const h = await harness(t);
   const rankClass = `two_bot_job_last_error_class{job="rank",class="database"} 1`;
-  const failing = metricsBody(3).replace(
+  const failing = () => liveMetricsBody(3).replace(
     'two_bot_job_last_error_class{job="rank",class="database"} 0', rankClass);
   t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
     const path = new URL(typeof input === "string" ? input : input.url).pathname;
-    if (path === "/metrics") return new Response(failing);
+    if (path === "/metrics") return new Response(failing());
     return new Response(JSON.stringify({
       components: [["process", "ready"]],
       build_revision: RELEASE_SHA, build_id: "123-1",
@@ -778,7 +795,7 @@ test("keepalive pages gateway_not_ready on the third tick with the gateway compo
   let gatewayStatus = "down";
   t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
     const path = new URL(typeof input === "string" ? input : input.url).pathname;
-    if (path === "/metrics") return new Response(metricsBody(0));
+    if (path === "/metrics") return new Response(liveMetricsBody(0));
     return new Response(JSON.stringify({
       components: [["process", "ready"], ["gateway", gatewayStatus]],
       build_revision: RELEASE_SHA, build_id: "123-1",
@@ -1729,7 +1746,7 @@ async function alertHarness(t: TestContext, env: Partial<Env> = {}, values?: Map
     // quiet so sustained scrape-loss tickets never ride along. Tests that
     // exercise scrape failure override this mock with their own /metrics.
     const path = new URL(typeof input === "string" ? input : input.url).pathname;
-    if (path === "/metrics") return new Response(metricsBody());
+    if (path === "/metrics") return new Response(liveMetricsBody());
     return new Response(null, { status });
   });
   await h.bot.onStart();
@@ -1768,7 +1785,7 @@ for (const failure of ["http", "fetch", "body", "missing", "invalid"] as const) 
     let failed = false;
     // Complete scrapes: the background validator rejects partial bodies, so the
     // streak grows from full exposition with only the reactions lane rising.
-    const reactions = (value: string) => metricsBody().replace(
+    const reactions = (value: string) => liveMetricsBody().replace(
       'two_bot_dispatch_drops_total{lane="reactions"} 0',
       `two_bot_dispatch_drops_total{lane="reactions"} ${value}`,
     );
@@ -1832,7 +1849,7 @@ for (const failure of ["missing", "invalid", "fetch"] as const) {
         if (path !== "/metrics") return new Response(null, { status: 200 });
         if (failed && failure === "fetch") throw new Error("synthetic metrics transport failure");
         const row = failed ? (failure === "missing" ? "" : `${gauge} 2`) : `${gauge} ${open}`;
-        return new Response(metricsBody().replace(`${gauge} 0`, row));
+        return new Response(liveMetricsBody().replace(`${gauge} 0`, row));
       });
       const state = () => h.values.get("two-bot:metrics-alerts") as MetricsAlertState;
       const transitions = () => h.events().filter((event) => event.event === "metrics_alert");
@@ -1889,7 +1906,7 @@ for (const forwarding of ["on", "off"] as const) {
         if (failed && gap === "body") return new Response(new ReadableStream({ start(controller) {
           controller.error(new Error("synthetic body failure"));
         } }));
-        let body = metricsBody().replace("two_bot_audit_delivery_halt 0", `two_bot_audit_delivery_halt ${value}`).replace(
+        let body = liveMetricsBody().replace("two_bot_audit_delivery_halt 0", `two_bot_audit_delivery_halt ${value}`).replace(
           'two_bot_job_last_success_timestamp_seconds{job="audit_retry"} 0',
           `two_bot_job_last_success_timestamp_seconds{job="audit_retry"} ${Math.floor(Date.now() / 1000)}`,
         );
@@ -1952,7 +1969,7 @@ test("DO failed EventSub reconcile passes ticket once, survive a failed scrape, 
   let failedPasses = 4;
   let scrapeFails = false;
   // Complete scrapes from the shared fixture with only the pass counters moving.
-  const bodyWithPasses = () => metricsBody()
+  const bodyWithPasses = () => liveMetricsBody()
     .replace('two_bot_eventsub_reconcile_passes_total{outcome="healthy"} 0', `two_bot_eventsub_reconcile_passes_total{outcome="healthy"} ${healthy}`)
     .replace('two_bot_eventsub_reconcile_passes_total{outcome="pending"} 0', `two_bot_eventsub_reconcile_passes_total{outcome="pending"} ${pending}`)
     .replace('two_bot_eventsub_reconcile_passes_total{outcome="failed"} 0', `two_bot_eventsub_reconcile_passes_total{outcome="failed"} ${failedPasses}`);
@@ -2005,9 +2022,9 @@ async function senderHarness(t: TestContext, sender: AlertSender, env: Partial<E
       // The readiness sender keeps a healthy quiet scrape: its subject is
       // readiness forwarding, and a permanently failed scrape would now
       // (by design) ticket its own sustained-loss incident mid-test.
-      if (sender !== "metrics") return new Response(metricsBody());
+      if (sender !== "metrics") return new Response(liveMetricsBody());
       const rankClass = `two_bot_job_last_error_class{job="rank",class="database"} ${failing ? 1 : 0}`;
-      return new Response(metricsBody(failing ? 3 : 0).replace('two_bot_job_last_error_class{job="rank",class="database"} 0', rankClass));
+      return new Response(liveMetricsBody(failing ? 3 : 0).replace('two_bot_job_last_error_class{job="rank",class="database"} 0', rankClass));
     }
     return new Response(null, { status: sender === "readiness" && failing ? 503 : 200 });
   });
@@ -2057,7 +2074,7 @@ test("real SDK keeps one persistent chain across concurrent health traffic, rest
   t.mock.method(h.bot, "containerFetch", (...args: Parameters<typeof containerFetch>) => {
     const input = args[0];
     const url = typeof input === "string" ? input : input.url;
-    if (new URL(url).pathname === "/metrics") return Promise.resolve(new Response(metricsBody()));
+    if (new URL(url).pathname === "/metrics") return Promise.resolve(new Response(liveMetricsBody()));
     return containerFetch(...args);
   });
   await h.bot.onStart();
@@ -2517,7 +2534,7 @@ test("keepalive pulls /metrics, alerts once on a failing job and resolves", asyn
   let failures = 3;
   t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
     const path = new URL(typeof input === "string" ? input : input.url).pathname;
-    if (path === "/metrics") return new Response(metricsBody(failures));
+    if (path === "/metrics") return new Response(liveMetricsBody(failures));
     return new Response(null, { status: 200 });
   });
   await h.tick();
@@ -2548,7 +2565,7 @@ async function backgroundMetricsHarness(t: TestContext) {
   const previous = structuredClone(PRIOR_METRICS);
   h.values.set(METRICS_KEY, previous);
   const puts = t.mock.method(h.ctx.storage, "put");
-  let response = (_signal: AbortSignal): Promise<Response> => Promise.resolve(new Response(metricsBody()));
+  let response = (_signal: AbortSignal): Promise<Response> => Promise.resolve(new Response(liveMetricsBody()));
   t.mock.method(h.bot, "containerFetch", async (input: string | Request, init?: RequestInit) => {
     const path = new URL(typeof input === "string" ? input : input.url).pathname;
     return path === "/metrics" ? response(init!.signal!) : new Response(null, { status: 200 });
@@ -2710,7 +2727,7 @@ test("background metrics: transport rejection is bounded and never throws", asyn
 
 test("background metrics: valid scrape persists before resolving, notifies once and supports extra series", async (t) => {
   const h = await backgroundMetricsHarness(t);
-  h.setMetricsResponse(async () => new Response(metricsBody()
+  h.setMetricsResponse(async () => new Response(liveMetricsBody()
     + 'new_metric{version="future"} 1\nnew_histogram_bucket{le="+Inf"} 0\n'));
   const webhook = t.mock.method(globalThis, "fetch", async () => {
     assert.deepEqual(h.values.get(METRICS_KEY)?.firing, [], "persisted before notifying");

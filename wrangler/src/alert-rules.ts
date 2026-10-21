@@ -267,6 +267,43 @@ export const ERROR_BUDGET_SLOW_SHORT_SECONDS = 900;
 export const ERROR_BUDGET_SLOW_MIN_EVENTS = 10;
 /** A slow-burn window with fewer budget errors than this never fires. */
 export const ERROR_BUDGET_SLOW_MIN_ERRORS = 2;
+/** Consecutive valid samples with no heartbeat-ACK evidence before the dead-gateway page; bound justified in the runbook. */
+export const GATEWAY_LATENCY_DEAD_SAMPLES = 3;
+/** Consecutive rising reconnect windows before the flap page; single blips stay silent. */
+export const GATEWAY_RECONNECT_FLAP_SAMPLES = 3;
+/**
+ * Rendered `le` spellings of `two_bot_handler_duration_seconds_bucket`, from
+ * the private BUCKETS_MICROS bounds in crates/core/src/metrics.rs (seconds
+ * rendering, plus `+Inf`). No pub label const exists (unlike
+ * VOICE_JOIN_TO_MOVE_BUCKET_LE), so the validator, the fixture and this list
+ * carry the same literal, pinned equal in tests.
+ */
+export const HANDLER_DURATION_BUCKET_LE: readonly string[] = ["0.001", "0.005", "0.01", "0.05", "0.1", "0.5", "1", "5", "+Inf"];
+/**
+ * Handler-tail bound in seconds: a window whose p99 crosses it is saturated.
+ * The first seconds-scale bucket; a healthy parse/pipeline/commit p99 sits
+ * in the millisecond buckets, so a sustained crossing means second-scale
+ * tail work (slow commits, contention), not ordinary jitter.
+ */
+export const HANDLER_SATURATED_P99_SECONDS = 1;
+/** A saturated window needs at least this many completed dispatches; quiet windows stay silent. */
+export const HANDLER_SATURATED_MIN_OBS = 10;
+/** ...and at least this many dispatches past the bound; one slow dispatch stays silent. */
+export const HANDLER_SATURATED_MIN_SLOW = 2;
+/** ...and the past-bound share must exceed this (tail share past 1% reads as p99 past the bound). */
+export const HANDLER_SATURATED_SHARE = 0.01;
+/** Consecutive saturated handler windows before the ticket. */
+export const HANDLER_SATURATED_SAMPLES = 3;
+/** Fixed job labels for `two_bot_job_runs_total`, pinned to Rust `JOBS`. */
+export const JOB_RUNS_JOBS: readonly string[] = ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "other"];
+/** Fixed outcomes for `two_bot_job_runs_total`, pinned to Rust `JOB_OUTCOMES`. */
+export const JOB_RUNS_OUTCOMES: readonly string[] = ["success", "failure"];
+/** Failed runs must exceed this share of a judged window... */
+export const JOB_FAILURE_SHARE_RATIO = 0.1;
+/** ...covering at least this many completed runs (sub-floor windows accumulate)... */
+export const JOB_FAILURE_SHARE_MIN_RUNS = 10;
+/** ...with at least this many failures; one bad run never tickets. */
+export const JOB_FAILURE_SHARE_MIN_FAILURES = 2;
 
 export const RULES: readonly RuleDef[] = [
   { id: "job_stale", summary: `scheduled job has no success for more than ${STALE_INTERVALS} intervals`, runbook: "runbook.md#alert-job-stale" },
@@ -302,6 +339,10 @@ export const RULES: readonly RuleDef[] = [
   { id: "voice_live_self_heal", summary: `live voice view self-heal repairs increased between samples`, runbook: "runbook.md#alert-voice-live-self-heal", severity: "ticket" },
   { id: "voice_live_not_ready", summary: `voice live view not ready for more than ${VOICE_LIVE_NOT_READY_THRESHOLD_SECONDS} s on a connected gateway`, runbook: "runbook.md#alert-voice-live-not-ready" },
   { id: "voice_queue_stall", summary: `oldest queued voice action waiting past ${VOICE_QUEUE_STALL_THRESHOLD_SECONDS} s`, runbook: "runbook.md#alert-voice-queue-stall", severity: "ticket" },
+  { id: "gateway_latency_dead", summary: `no gateway heartbeat-ACK evidence for ${GATEWAY_LATENCY_DEAD_SAMPLES} consecutive samples (unknown or unchanged latency)`, runbook: "runbook.md#alert-gateway-latency-dead" },
+  { id: "gateway_reconnect_flapping", summary: `gateway reconnects rose in ${GATEWAY_RECONNECT_FLAP_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-gateway-reconnect-flapping" },
+  { id: "handler_duration_saturated", summary: `handler dispatch tail past ${HANDLER_SATURATED_P99_SECONDS} s (p99) for ${HANDLER_SATURATED_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-handler-duration-saturated", severity: "ticket" },
+  { id: "job_failure_share", summary: `job failures exceed ${JOB_FAILURE_SHARE_RATIO * 100}% of recent runs (min ${JOB_FAILURE_SHARE_MIN_RUNS} runs)`, runbook: "runbook.md#alert-job-failure-share", severity: "ticket" },
 ];
 
 /**
@@ -443,6 +484,30 @@ export interface MetricsAlertState {
   reconcileFailed?: number;
   /** False until a valid sample stores the reconcile baseline: the first sample never fires. */
   reconcileSeen?: boolean;
+  /**
+   * Last finite gateway latency reading in seconds; absent when the last
+   * valid sample was unknown (NaN/absent). NaN is never stored: JSON state
+   * cannot round-trip it, so unknown clears this field instead.
+   */
+  gatewayLatencyLast?: number | undefined;
+  /** Consecutive valid samples with no fresh ACK evidence (unknown or unchanged), capped at GATEWAY_LATENCY_DEAD_SAMPLES; absent in legacy storage. */
+  gatewayLatencyDeadStreak?: number;
+  /** False until the first valid latency sample: the first sample never fires. */
+  gatewayLatencySeen?: boolean;
+  /** `two_bot_gateway_reconnects_total` at the last valid sample; absent in legacy storage. */
+  gatewayReconnects?: number;
+  /** False until a valid sample stores the reconnect baseline: the first sample never fires. */
+  gatewayReconnectsSeen?: boolean;
+  /** Consecutive rising reconnect windows, capped at GATEWAY_RECONNECT_FLAP_SAMPLES. */
+  gatewayReconnectStreak?: number;
+  /** Per-`le` handler bucket baseline; absent after a missing/invalid sample or in legacy storage. */
+  handlerBuckets?: Record<string, number>;
+  /** Consecutive saturated handler windows, capped at HANDLER_SATURATED_SAMPLES. */
+  handlerStreak?: number;
+  /** Per-job accumulated run baseline since the last judged window; absent in legacy storage. */
+  jobShareBase?: Record<string, { failure: number; total: number }>;
+  /** False until the first valid job-runs sample: the first sample never fires. */
+  jobShareSeen?: boolean;
   /**
    * Creator-join burn snapshots for the SLO windows, oldest first. Each entry
    * carries the scrape time plus cumulative counters (received joins,
@@ -642,11 +707,10 @@ function errorBudgetBurnEvaluation(
   };
 }
 
-export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, breakerOpenStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, voiceVoteKickFailures: 0, voiceVoteKickFailuresSeen: false, voiceVoteKickFiring: false, gatewayMissed: 0, gatewayMissedSeen: false, voiceLiveSelfHeal: 0, voiceLiveSelfHealSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, gatewayNotReadySeen: false, gatewayNotReadyStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {}, communityFactsDrainFailures: {}, communityFactsDrainStreak: 0, eventsubPosts: {}, eventsubPostsSeen: false, eventStoreLagStreak: 0, eventsubTampered: 0, eventsubTamperedSeen: false, eventsubTamperedStreak: 0, reconcileHealthy: 0, reconcilePending: 0, reconcileFailed: 0, reconcileSeen: false };
-
-/** An unsuccessful scrape breaks the dispatch, breaker, and lag streaks, never an existing alert. */
+export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, breakerOpenStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, voiceVoteKickFailures: 0, voiceVoteKickFailuresSeen: false, voiceVoteKickFiring: false, gatewayMissed: 0, gatewayMissedSeen: false, voiceLiveSelfHeal: 0, voiceLiveSelfHealSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, gatewayNotReadySeen: false, gatewayNotReadyStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {}, communityFactsDrainFailures: {}, communityFactsDrainStreak: 0, eventsubPosts: {}, eventsubPostsSeen: false, eventStoreLagStreak: 0, eventsubTampered: 0, eventsubTamperedSeen: false, eventsubTamperedStreak: 0, reconcileHealthy: 0, reconcilePending: 0, reconcileFailed: 0, reconcileSeen: false, gatewayLatencyDeadStreak: 0, gatewayLatencySeen: false, gatewayReconnects: 0, gatewayReconnectsSeen: false, gatewayReconnectStreak: 0, handlerBuckets: {}, handlerStreak: 0, jobShareBase: {}, jobShareSeen: false };
+/** An unsuccessful scrape breaks the dispatch, breaker, lag, latency, reconnect and handler streaks, never an existing alert. */
 export function interruptDispatchDrops(state: MetricsAlertState): MetricsAlertState {
-  return { ...state, dispatchDrops: {}, dispatchDropStreaks: {}, breakerOpenStreak: 0, eventStoreLagStreak: 0 };
+  return { ...state, dispatchDrops: {}, dispatchDropStreaks: {}, breakerOpenStreak: 0, eventStoreLagStreak: 0, gatewayLatencyDeadStreak: 0, gatewayLatencySeen: false, gatewayReconnectStreak: 0, gatewayReconnectsSeen: false, handlerBuckets: {}, handlerStreak: 0 };
 }
 
 /** A failed scrape breaks the engaged run, but cannot prove a halt cleared. */
@@ -1762,8 +1826,260 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     else if (!healthyGrew && wasReconcileFiring) firing.push(RECONCILE_FAILED_RULE);
   }
 
-  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, prefixVerdictRefused: nextPrefixVerdict, prefixVerdictStreak: nextPrefixVerdictStreak, prefixVerdictSeen: nextPrefixVerdictSeen, breakerOpenStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, voiceVoteKickFailures: voiceVoteKickFailures ?? prevVoiceVoteKickFailures, voiceVoteKickFailuresSeen: voiceVoteKickFailures !== undefined ? true : prevVoteKickSeen, voiceVoteKickFiring, gatewayMissed, gatewayMissedSeen: true, voiceLiveSelfHeal, voiceLiveSelfHealSeen, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, gatewayNotReadySeen, gatewayNotReadyStreak, dispatchDrops, dispatchDropStreaks, communityFactsDrainFailures, communityFactsDrainStreak, auditHaltStreak, eventStoreLagStreak, reconcileHealthy, reconcilePending, reconcileFailed, reconcileSeen, joinBurn: joinBurn.ring, eventsubPosts, eventsubPostsSeen, errorBudgetBurn: errorBudgetBurn.ring, eventsubTampered, eventsubTamperedSeen, eventsubTamperedStreak }, joinHeld: joinBurn.held, joinSlowCovered: joinBurn.slowCovered };
-}
+  // Dead gateway (no heartbeat-ACK evidence): the label-free latency gauge
+  // reads NaN until the first ACK lands on the current connection
+  // (metrics.rs resets it to None on every reconnect), so NaN or a finite
+  // value unchanged since the previous valid sample both mean no fresh ACK
+  // arrived this window. Healthy connections ACK every heartbeat interval
+  // (~41 s), well inside the ~60 s scrape cadence, so three consecutive
+  // evidenceless samples (~2-3 min, the sibling gateway bound) page. Any
+  // fresh evidence (a finite change, or a finite value after unknown)
+  // clears at once. A clean boot (Connected within ~1 min, first ACK within
+  // another interval) never reaches the third sample; a boot or outage
+  // already past three samples pages here alongside gateway_not_ready,
+  // which owns the never-connected case. A missing row holds like a
+  // malformed one (duplicated, labeled, negative, infinite): missing input
+  // never manufactures a page, matching every sibling rule, and a missing
+  // required series in a real scrape fails the whole scrape anyway (the
+  // metrics_scrape_lost path). The first valid sample only stores the
+  // baseline and never fires.
+  const GATEWAY_LATENCY_DEAD_RULE = "gateway_latency_dead";
+  const latencyWasFiring = prev.firing.includes(GATEWAY_LATENCY_DEAD_RULE);
+  const latencyRows = gauge("two_bot_gateway_latency_seconds");
+  let latencyReading: number | "unknown" | "invalid";
+  if (latencyRows.length === 0) {
+    latencyReading = "invalid";
+  } else if (latencyRows.length !== 1 || Object.keys(latencyRows[0]!.labels).length !== 0) {
+    latencyReading = "invalid";
+  } else {
+    const latencyValue = latencyRows[0]!.value;
+    latencyReading = Number.isNaN(latencyValue) ? "unknown"
+      : (Number.isFinite(latencyValue) && latencyValue >= 0 ? latencyValue : "invalid");
+  }
+  const prevLatencySeen = prev.gatewayLatencySeen ?? false;
+  const prevLatencyLast = prev.gatewayLatencyLast;
+  const prevLatencyStreak = prev.gatewayLatencyDeadStreak ?? 0;
+  let gatewayLatencyLast = prevLatencyLast;
+  let gatewayLatencyDeadStreak = prevLatencyStreak;
+  let gatewayLatencySeen = prevLatencySeen;
+  if (latencyReading === "invalid") {
+    if (latencyWasFiring) firing.push(GATEWAY_LATENCY_DEAD_RULE);
+  } else if (!prevLatencySeen) {
+    // The first valid sample (including after a gap) is only a baseline. A
+    // new baseline is not a quiet window, so a held page stays held.
+    gatewayLatencySeen = true;
+    if (latencyReading === "unknown") {
+      gatewayLatencyDeadStreak = 1;
+      gatewayLatencyLast = undefined;
+    } else {
+      gatewayLatencyDeadStreak = 0;
+      gatewayLatencyLast = latencyReading;
+    }
+    if (latencyWasFiring) firing.push(GATEWAY_LATENCY_DEAD_RULE);
+  } else if (latencyReading === "unknown" || (prevLatencyLast !== undefined && latencyReading === prevLatencyLast)) {
+    // Unknown clears the last finite value: the next finite reading is
+    // always fresh evidence, even when its micros repeat the stale one.
+    if (latencyReading === "unknown") gatewayLatencyLast = undefined;
+    gatewayLatencyDeadStreak = Math.min(prevLatencyStreak + 1, GATEWAY_LATENCY_DEAD_SAMPLES);
+    if (latencyWasFiring || gatewayLatencyDeadStreak >= GATEWAY_LATENCY_DEAD_SAMPLES) firing.push(GATEWAY_LATENCY_DEAD_RULE);
+  } else {
+    gatewayLatencyDeadStreak = 0;
+    gatewayLatencyLast = latencyReading;
+  }
+
+  // Gateway reconnect flapping: `two_bot_gateway_reconnects_total` counts
+  // successful transport reconnections (new HELLOs after the first), so one
+  // blip is a clean recovery and only a sustained rise means the session
+  // cannot stay up. Three consecutive rising windows page (the sibling
+  // gateway bound); a flat window resolves, a backwards counter (process
+  // restart) rebaselines, the first valid sample only stores the baseline,
+  // and missing/invalid samples hold a firing page without manufacturing
+  // evidence. Any sequence gap the flapping causes still pages immediately
+  // via gateway_missed_events.
+  const GATEWAY_RECONNECT_FLAP_RULE = "gateway_reconnect_flapping";
+  const flapValue = exactSeries(gauge("two_bot_gateway_reconnects_total"), {});
+  const prevFlap = prev.gatewayReconnects ?? 0;
+  const flapSeen = prev.gatewayReconnectsSeen ?? false;
+  const prevFlapStreak = prev.gatewayReconnectStreak ?? 0;
+  const wasFlapFiring = prev.firing.includes(GATEWAY_RECONNECT_FLAP_RULE);
+  let gatewayReconnects = prevFlap;
+  let gatewayReconnectsSeen = flapSeen;
+  let gatewayReconnectStreak = prevFlapStreak;
+  if (flapValue === undefined) {
+    if (wasFlapFiring) firing.push(GATEWAY_RECONNECT_FLAP_RULE);
+  } else if (!flapSeen) {
+    // The first valid sample (including after a gap) is only a baseline. A
+    // new baseline is not a quiet window, so a held page stays held.
+    gatewayReconnects = flapValue;
+    gatewayReconnectsSeen = true;
+    gatewayReconnectStreak = 0;
+    if (wasFlapFiring) firing.push(GATEWAY_RECONNECT_FLAP_RULE);
+  } else if (flapValue < prevFlap) {
+    // A backwards counter means the process restarted: re-baseline and resolve.
+    gatewayReconnects = flapValue;
+    gatewayReconnectsSeen = true;
+    gatewayReconnectStreak = 0;
+  } else if (flapValue > prevFlap) {
+    gatewayReconnects = flapValue;
+    gatewayReconnectsSeen = true;
+    gatewayReconnectStreak = Math.min(prevFlapStreak + 1, GATEWAY_RECONNECT_FLAP_SAMPLES);
+    if (wasFlapFiring || gatewayReconnectStreak >= GATEWAY_RECONNECT_FLAP_SAMPLES) firing.push(GATEWAY_RECONNECT_FLAP_RULE);
+  } else {
+    // A flat valid sample proves recovery and resolves.
+    gatewayReconnects = flapValue;
+    gatewayReconnectsSeen = true;
+    gatewayReconnectStreak = 0;
+  }
+
+  // Handler saturation is a ticket, not a page: the dispatch pipeline still
+  // works, but its tail crossed into seconds. A window is saturated when its
+  // p99 crosses HANDLER_SATURATED_P99_SECONDS, read exactly from the bucket
+  // deltas: the share of completed dispatches past the 1 s bucket exceeds
+  // 1%. The window also needs HANDLER_SATURATED_MIN_OBS completions (quiet
+  // windows stay silent) and HANDLER_SATURATED_MIN_SLOW slow ones (one slow
+  // dispatch in a quiet window stays silent). Three consecutive saturated
+  // windows ticket; any judged-quiet window or counter reset (process
+  // restart) clears at once. The first valid sample only stores the
+  // baseline; missing/invalid samples drop the baseline and hold a firing
+  // ticket without manufacturing evidence. Routine quantile movement stays
+  // log-only in the query pack; this rule is the saturation backstop.
+  const HANDLER_SATURATED_RULE = "handler_duration_saturated";
+  const handlerSamples = gauge("two_bot_handler_duration_seconds_bucket");
+  const handlerCounts: Record<string, number> = {};
+  let handlerValid = true;
+  for (const le of HANDLER_DURATION_BUCKET_LE) {
+    const rows = handlerSamples.filter((s) => s.labels["le"] === le);
+    const sample = rows[0];
+    if (rows.length !== 1 || !sample || Object.keys(sample.labels).length !== 1
+      || !Number.isSafeInteger(sample.value) || sample.value < 0) {
+      handlerValid = false;
+      break;
+    }
+    handlerCounts[le] = sample.value;
+  }
+  const wasHandlerFiring = prev.firing.includes(HANDLER_SATURATED_RULE);
+  let handlerBuckets: Record<string, number> = {};
+  let handlerStreak = 0;
+  if (!handlerValid) {
+    // Missing/invalid evidence drops the baseline, never the active ticket.
+    if (wasHandlerFiring) firing.push(HANDLER_SATURATED_RULE);
+  } else {
+    const prevHandler = prev.handlerBuckets;
+    const hasHandlerBaseline = prevHandler !== undefined
+      && HANDLER_DURATION_BUCKET_LE.every((le) => {
+        const count = prevHandler[le];
+        return typeof count === "number" && Number.isSafeInteger(count) && count >= 0;
+      });
+    if (!hasHandlerBaseline) {
+      // The first valid sample (including after a gap or from legacy state)
+      // is only a baseline; it never resolves an active ticket on its own.
+      handlerBuckets = { ...handlerCounts };
+      if (wasHandlerFiring) firing.push(HANDLER_SATURATED_RULE);
+    } else {
+      // Any backwards bucket means the process restarted: re-baseline with a
+      // clear streak, even when another bucket's new count overtook its old
+      // one. A reset window is valid recovery evidence, so it resolves.
+      const handlerReset = HANDLER_DURATION_BUCKET_LE.some((le) => handlerCounts[le]! < (prevHandler[le] ?? 0));
+      handlerBuckets = { ...handlerCounts };
+      if (handlerReset) {
+        handlerStreak = 0;
+      } else {
+        // Window counts come from cumulative-bucket deltas; the `+Inf`
+        // bucket delta is the completed-dispatch count, no `_count` row
+        // needed. Past-bound observations are the count the 1 s bucket did
+        // not absorb.
+        const obs = handlerCounts["+Inf"]! - (prevHandler["+Inf"] ?? 0);
+        const slow = obs - (handlerCounts["1"]! - (prevHandler["1"] ?? 0));
+        if (obs >= HANDLER_SATURATED_MIN_OBS && slow >= HANDLER_SATURATED_MIN_SLOW
+          && slow / obs > HANDLER_SATURATED_SHARE) {
+          handlerStreak = Math.min((prev.handlerStreak ?? 0) + 1, HANDLER_SATURATED_SAMPLES);
+          if (wasHandlerFiring || handlerStreak >= HANDLER_SATURATED_SAMPLES) firing.push(HANDLER_SATURATED_RULE);
+        } else {
+          handlerStreak = 0;
+        }
+      }
+    }
+  }
+
+  // Intermittent job failures ticket per job: `job_consecutive_failures`
+  // pages when one job fails three times in a row, but a job failing every
+  // other run never trips it. Each job accumulates completed runs across
+  // consecutive valid samples until the window holds
+  // JOB_FAILURE_SHARE_MIN_RUNS runs; the judged window tickets when failures
+  // exceed JOB_FAILURE_SHARE_RATIO of runs with at least
+  // JOB_FAILURE_SHARE_MIN_FAILURES failures (mirroring
+  // `eventsub_post_failed_share`). Only a judged window (floor met) at or
+  // below the line resolves; flat or sub-floor windows hold an active
+  // ticket, missing/invalid samples preserve firing and baseline, and any
+  // backwards counter (restart) rebaselines. The first valid sample only
+  // stores the baseline and never fires. Unknown job labels are ignored,
+  // never subjects; a Rust job addition fails loud via the catalog job-label
+  // gate until the fixed list names it. A job dead enough to page
+  // `job_consecutive_failures` tickets here too: co-firing means continuous
+  // outage, this ticket alone means intermittent sickness.
+  const JOB_SHARE_RULE = "job_failure_share";
+  const jobRunsRows = gauge("two_bot_job_runs_total");
+  const jobRunsNow: Record<string, { failure: number; total: number }> | undefined = (() => {
+    const acc: Record<string, { failure: number; total: number }> = Object.create(null);
+    for (const job of JOB_RUNS_JOBS) {
+      const success = exactSeries(jobRunsRows, { job, outcome: "success" });
+      const failure = exactSeries(jobRunsRows, { job, outcome: "failure" });
+      if (success === undefined || failure === undefined || !Number.isSafeInteger(success + failure)) return undefined;
+      acc[job] = { failure, total: success + failure };
+    }
+    return acc;
+  })();
+  const prevJobShareBase = prev.jobShareBase;
+  const prevJobShareSeen = prev.jobShareSeen ?? false;
+  const jobShareBase: Record<string, { failure: number; total: number }> = Object.create(null);
+  let jobShareSeen = prevJobShareSeen;
+  if (jobRunsNow === undefined) {
+    if (prevJobShareBase !== undefined) {
+      for (const [job, base] of Object.entries(prevJobShareBase)) jobShareBase[job] = { ...base };
+    }
+    for (const key of prev.firing) {
+      if (key === JOB_SHARE_RULE || key.startsWith(`${JOB_SHARE_RULE}:`)) firing.push(key);
+    }
+  } else if (!prevJobShareSeen || prevJobShareBase === undefined) {
+    for (const [job, counts] of Object.entries(jobRunsNow)) jobShareBase[job] = { ...counts };
+    jobShareSeen = true;
+  } else {
+    jobShareSeen = true;
+    for (const job of JOB_RUNS_JOBS) {
+      const now = jobRunsNow[job]!;
+      const base = prevJobShareBase[job];
+      const key = `${JOB_SHARE_RULE}:${job}`;
+      const wasShareFiring = prev.firing.includes(key);
+      if (base === undefined || typeof base.failure !== "number" || typeof base.total !== "number"
+        || !Number.isSafeInteger(base.failure) || !Number.isSafeInteger(base.total)) {
+        jobShareBase[job] = { ...now };
+        if (wasShareFiring) firing.push(key);
+        continue;
+      }
+      if (now.failure < base.failure || now.total < base.total) {
+        // A backwards counter means the process restarted: re-baseline and resolve.
+        jobShareBase[job] = { ...now };
+        continue;
+      }
+      const dFail = now.failure - base.failure;
+      const dTotal = now.total - base.total;
+      if (dTotal >= JOB_FAILURE_SHARE_MIN_RUNS) {
+        if (dFail >= JOB_FAILURE_SHARE_MIN_FAILURES && dFail / dTotal > JOB_FAILURE_SHARE_RATIO) {
+          firing.push(key);
+        }
+        jobShareBase[job] = { ...now };
+      } else {
+        // Sub-floor windows stay quiet and hold the baseline so runs
+        // accumulate toward the floor across consecutive valid samples.
+        // An active ticket survives them: only a judged window clears it,
+        // otherwise a sick job flaps ALERT/RESOLVED every window.
+        jobShareBase[job] = { ...base };
+        if (wasShareFiring) firing.push(key);
+      }
+    }
+  }
+
+  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, prefixVerdictRefused: nextPrefixVerdict, prefixVerdictStreak: nextPrefixVerdictStreak, prefixVerdictSeen: nextPrefixVerdictSeen, breakerOpenStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, voiceVoteKickFailures: voiceVoteKickFailures ?? prevVoiceVoteKickFailures, voiceVoteKickFailuresSeen: voiceVoteKickFailures !== undefined ? true : prevVoteKickSeen, voiceVoteKickFiring, gatewayMissed, gatewayMissedSeen: true, voiceLiveSelfHeal, voiceLiveSelfHealSeen, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, gatewayNotReadySeen, gatewayNotReadyStreak, dispatchDrops, dispatchDropStreaks, communityFactsDrainFailures, communityFactsDrainStreak, auditHaltStreak, eventStoreLagStreak, reconcileHealthy, reconcilePending, reconcileFailed, reconcileSeen, joinBurn: joinBurn.ring, eventsubPosts, eventsubPostsSeen, errorBudgetBurn: errorBudgetBurn.ring, eventsubTampered, eventsubTamperedSeen, eventsubTamperedStreak, gatewayLatencyLast, gatewayLatencyDeadStreak, gatewayLatencySeen, gatewayReconnects, gatewayReconnectsSeen, gatewayReconnectStreak, handlerBuckets, handlerStreak, jobShareBase, jobShareSeen }, joinHeld: joinBurn.held, joinSlowCovered: joinBurn.slowCovered };}
 
 export function ruleFor(key: string): RuleDef | undefined {
   const id = key.split(":")[0];

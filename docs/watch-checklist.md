@@ -56,11 +56,18 @@ and the Worker (`packetFilename` in `wrangler/src/alert-rules.ts`).
 | `voice_live_self_heal` | **ticket**: self-heal repairs rise between valid samples (first sample is baseline-only, restarts re-baseline, missing family is no window) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-live-self-heal) |
 | `voice_live_not_ready` | **page**: live view not ready past 120 s on a connected gateway (promotes the host-watchdog bound; hung dispatch freezes the published age); at or below clears, missing/invalid holds | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-live-not-ready) |
 | `voice_queue_stall` | **ticket**: oldest queued action waiting past 120 s (matches the stuck horizon; hung dispatch freezes publication below the bound); at or below clears, missing/invalid holds | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-queue-stall) |
+| `gateway_latency_dead` | no heartbeat-ACK evidence (NaN or unchanged latency) for 3 consecutive valid samples (first sample is baseline, fresh readings clear at once; co-firing with `gateway_not_ready` means never-connected) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-gateway-latency-dead) |
+| `gateway_reconnect_flapping` | successful transport reconnections rise in 3 consecutive samples (single blips stay log-only; first sample is baseline, flat/reset clears) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-gateway-reconnect-flapping) |
+| `handler_duration_saturated` | **ticket**: handler p99 past 1 s (tail above 1% with >= 10 completions, >= 2 slow) in 3 consecutive windows | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-handler-duration-saturated) |
+| `job_failure_share:<job>` | **ticket**: per-job failures above 10% of recent runs (>= 10 runs, >= 2 failures; sub-floor windows accumulate) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-job-failure-share) |
 
 Out of scope for paging (log-only findings, still recorded on the watch log):
-gateway session starts, handler-latency quantiles, unban-queue depth via
-`moderation_scheduled_unbans` counts (test-container copy or backup artifact
-only, never staging/production), and restart counts. See the query pack.
+single gateway session starts (sustained reconnect flapping pages via
+`gateway_reconnect_flapping`), routine handler-latency quantile movement
+(sustained p99 saturation tickets via `handler_duration_saturated`),
+unban-queue depth via `moderation_scheduled_unbans` counts (test-container
+copy or backup artifact only, never staging/production), and restart counts.
+See the query pack.
 
 ## 2. Dashboards and read paths
 
