@@ -11,9 +11,10 @@ use two_bot_core::{
     build_community_snapshot, build_counter_reading,
     database_tls::{self, TlsPolicy},
     diagnose_rank_roles, match_rank_roles, normalize_events, now_iso, plan_rank_heal,
-    read_raid_windows, replace_events, write_counter, write_rank_snapshot, Config, RankHeal,
-    RankRungProblem, RawScheduledEvent, RosterMember, ScheduledEventsSkip, WebsiteStoreError,
-    LIVE_COUNTER_INTERVAL_MS, RANK_SNAPSHOT_INTERVAL_MS, SCHEDULED_EVENTS_INTERVAL_MS,
+    read_raid_windows, replace_events, write_counter, write_rank_snapshot, Config, JobGate,
+    RankHeal, RankRungProblem, RawScheduledEvent, RosterMember, ScheduledEventsSkip,
+    WebsiteStoreError, LIVE_COUNTER_INTERVAL_MS, RANK_SNAPSHOT_INTERVAL_MS,
+    SCHEDULED_EVENTS_INTERVAL_MS,
 };
 use two_bot_discord::executor::{ActionExecutor, DiscordError};
 use two_bot_discord::internal_events::canonical_snowflake;
@@ -50,11 +51,50 @@ mod snapshot_tests;
 #[path = "website_event_identity_acceptance_tests.rs"]
 mod event_identity_acceptance_tests;
 
+#[cfg(test)]
+#[path = "website_jobgate_acceptance_tests.rs"]
+mod jobgate_acceptance_tests;
+
+#[cfg(test)]
+#[path = "website_events_dispatch_tests.rs"]
+mod events_dispatch_tests;
+
 #[derive(Clone, Copy)]
 pub enum Kind {
     Counter,
     Rank,
     Events,
+}
+
+impl Kind {
+    /// Whole-tick Events entry point with [`JobGate`] single-flight: a tick
+    /// that cannot acquire the gate skips at once (`Ok`, no fetch, no
+    /// publish, no queue, no error); otherwise the guard is held across the
+    /// delegated tick, so overlapping ticks cannot both run. Counter and rank
+    /// ticks never take this path.
+    pub async fn run_events_tick(
+        pool: &PgPool,
+        rest: &ActionExecutor,
+        guild: &str,
+        observation: &Mutex<()>,
+        shutdown: &watch::Receiver<bool>,
+        rank_heal: bool,
+        gate: &JobGate,
+    ) -> Result<(), ErrorClass> {
+        let Some(_guard) = gate.try_acquire() else {
+            return Ok(());
+        };
+        snapshot_once(
+            Kind::Events,
+            pool,
+            rest,
+            guild,
+            observation,
+            shutdown,
+            rank_heal,
+        )
+        .await
+    }
 }
 
 /// Cadence overrides are compiled only into tests, never the deployed binary.
@@ -89,6 +129,7 @@ pub(crate) struct Context {
     pub(crate) rest: ActionExecutor,
     pub(crate) guild: String,
     observation: Mutex<()>,
+    events_gate: JobGate,
 }
 
 impl Context {
@@ -105,6 +146,42 @@ impl Context {
                 Ok(db.pool().clone())
             })
             .await
+    }
+
+    /// One supervised website tick: Events ticks run through the shared
+    /// [`JobGate`] single-flight entry point, so overlapping Events ticks
+    /// cannot both run; every other kind runs direct via [`run_once`] and
+    /// never touches the gate. The scheduler closure calls this instead of
+    /// branching itself, so the routing stays unit-testable next to the tick
+    /// it guards.
+    async fn run_tick(
+        &self,
+        kind: Kind,
+        shutdown: &watch::Receiver<bool>,
+        rank_heal: bool,
+    ) -> Result<(), ErrorClass> {
+        if matches!(kind, Kind::Events) {
+            return Kind::run_events_tick(
+                self.pool().await?,
+                &self.rest,
+                &self.guild,
+                &self.observation,
+                shutdown,
+                rank_heal,
+                &self.events_gate,
+            )
+            .await;
+        }
+        run_once(
+            kind,
+            self.pool().await?,
+            &self.rest,
+            &self.guild,
+            &self.observation,
+            shutdown,
+            rank_heal,
+        )
+        .await
     }
 }
 
@@ -218,6 +295,7 @@ pub async fn serve(
                     rest,
                     guild: guild.to_string(),
                     observation: Mutex::new(()),
+                    events_gate: JobGate::default(),
                 });
                 // The rank tick is the only website job with a Discord write
                 // path: the ladder self-heal grants roles under the bot
@@ -252,15 +330,7 @@ pub async fn serve(
                                     biased;
                                     _ = server::shutdown_requested(shutdown.clone()) => Ok(()),
                                     result = async {
-                                        run_once(
-                                            kind,
-                                            context.pool().await?,
-                                            &context.rest,
-                                            &context.guild,
-                                            &context.observation,
-                                            &shutdown,
-                                            rank_heal,
-                                        ).await
+                                        context.run_tick(kind, &shutdown, rank_heal).await
                                     } => result,
                                 }
                             })
