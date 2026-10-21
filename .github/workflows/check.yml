@@ -3028,6 +3028,12 @@ jobs:
       # pins this step with no `if:` (test_required_worker_ci_runs_this_offline_suite).
       - name: Verify staging rollout provenance (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollout.py -v
+      - name: Verify staging rollout receipt validation (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollout_receipt_validation_acceptance.py -v
+      - name: Verify staging rollout baseline domain (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollout_baseline_domain.py -v
+      - name: Verify staging rollout baseline deploy ID (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollout_baseline_deploy_id.py -v
       - name: Verify deploy ID format and Deployment record (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_deploy_id.py -v
       - name: Verify staging rollback drill (offline fixtures)
