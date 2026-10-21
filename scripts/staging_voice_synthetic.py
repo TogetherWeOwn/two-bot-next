@@ -1031,7 +1031,33 @@ def parse_args(argv=None):
     p.add_argument("--delete-slack", type=timing_seconds, default=20.0,
                    metavar="SECONDS")
     p.add_argument("--evidence", default=None)
+    p.add_argument("--dry-run", action="store_true",
+                   help="print the mutation plan without contacting Discord")
     return p.parse_args(argv)
+
+
+def print_dry_run_plan(args):
+    """Print the mutation plan without contacting Discord or the network.
+
+    Static text plus the fenced guild/creator: no room ids, tokens or
+    timestamps are generated, so the plan is byte-identical across runs.
+    Fences and timing validation run exactly as on the live path before
+    this prints; only the bot-token gate is skipped (a preview needs no
+    secret), and no token is ever echoed.
+    """
+    print("\n".join((
+        "dry-run plan for staging voice synthetic (no mutations performed)",
+        f"guild: {args.guild}",
+        f"creator: {args.creator}",
+        f"1. rename: REST PATCH /channels/{args.creator} appends "
+        f"{RENAME_MARKER!r} to the creator name, then PATCHes the original "
+        "name back (restore)",
+        "2. lifecycle: join the creator over the gateway, assert the room "
+        "create/move, leave (no channel writes)",
+        "3. user_limit: REST PATCH /channels/<room> sets user_limit to the "
+        "probed value with a read-back, then PATCHes the initial value "
+        "back (restore)",
+    )))
 
 
 def main(argv=None):
@@ -1039,11 +1065,14 @@ def main(argv=None):
     token = os.environ.get("TWO_VOICE_SYNTHETIC_BOT_TOKEN", "").strip()
     try:
         fence(args.guild, args.creator, args.staging_url)
-        if not token:
+        if not args.dry_run and not token:
             raise Refusal("TWO_VOICE_SYNTHETIC_BOT_TOKEN is not set (dedicated test bot, see docs/voice-synthetic.md)")
     except Refusal as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 2
+    if args.dry_run:
+        print_dry_run_plan(args)
+        return 0
     try:
         obs = run_live(args, token)
         checks = evaluate(obs)

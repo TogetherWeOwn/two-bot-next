@@ -2220,6 +2220,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_smoke_fail_paths_acceptance.py' -v
       - name: Offline smoke inspect-fields regressions
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_smoke_inspect_fields_regression.py' -v
+      - name: Offline smoke dry-run acceptance
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_smoke_dry_run_acceptance.py' -v
       - name: Offline JSON-log smoke parser regressions
         run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-logging-container.py --self-test
       # A skipped build still reports success: the offline tests above ran,
@@ -2710,6 +2712,9 @@ jobs:
       - name: Verify staging voice synthetic (offline fixtures)
         if: needs.job-inputs.outputs.voice != 'false'
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_voice_synthetic.py -v
+      - name: Verify staging voice synthetic dry-run (offline fixtures)
+        if: needs.job-inputs.outputs.voice != 'false'
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_voice_synthetic_dry_run_acceptance.py -v
       - name: Verify staging voice synthetic gateway intake (offline fixtures)
         if: needs.job-inputs.outputs.voice != 'false'
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_voice_synthetic_gateway_intake_acceptance.py -v
@@ -2727,6 +2732,10 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_prod_passive_probe_duplicate_key_acceptance.py -v
       - name: Verify synthetic alert delivery (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_synthetic_alert.py -v
+      - name: Verify synthetic alert dry-run (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_synthetic_alert_dry_run_acceptance.py -v
+      - name: Verify dry-run exit-code pins (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_dry_run_exit_code_pins.py -v
       - name: Verify synthetic alert history rollover (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_synthetic_alert_history_rollover.py -v
       - name: Verify slow-burn card filer (offline fixtures)
