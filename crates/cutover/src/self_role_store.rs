@@ -295,6 +295,27 @@ pub struct PanelClaim {
     maintenance: bool,
 }
 
+impl PanelClaim {
+    /// Synthetic claim for offline renewal tests against an already-closed pool.
+    /// This fixture does not acquire a database lease or confer ownership.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn offline_fixture(renew_after_ms: u64) -> Self {
+        Self {
+            key: PanelKey {
+                guild_id: "keeper-offline-guild".to_owned(),
+                member_id: "keeper-offline-member".to_owned(),
+                panel_id: "keeper-offline-panel".to_owned(),
+            },
+            token: Secret::new("keeper-offline-panel-sentinel".to_owned()),
+            generation: 1,
+            target: PanelTarget::default(),
+            renew_after_ms,
+            maintenance: false,
+        }
+    }
+}
+
 /// A superseded event has no ownership; do not confuse it with a claim.
 #[derive(Debug, Clone)]
 pub enum PanelClaimResult {
