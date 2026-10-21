@@ -14,7 +14,12 @@ LOOKUP_REASON = "Release tag lookup failed"
 
 
 def github_object(path):
-    """Fetch one git object; refuse transport and shape failures with fixed vocabulary."""
+    """Fetch one git ref object; refuse transport and shape failures with fixed vocabulary.
+
+    Returns the full ``gh api`` response dict; the ``object`` member is
+    guaranteed present and a dict. Callers index ``["object"]`` as before,
+    so the pre-existing mock contract (outer shape) is preserved.
+    """
     try:
         raw = subprocess.check_output(
             ["gh", "api", f"repos/{os.environ['GH_REPO']}/git/{path}"],
@@ -28,14 +33,15 @@ def github_object(path):
         raise ValueError(SHAPE_REASON) from None
     if not isinstance(response, dict) or not isinstance(response.get("object"), dict):
         raise ValueError(SHAPE_REASON)
-    return response["object"]
+    return response
 
 
 def resolve_tag(tag):
     if not re.fullmatch(r"v\d+\.\d+\.\d+", tag):
         raise ValueError("Publication requires a stable vX.Y.Z release tag")
     # The Git refs API names only tags: a same-named branch cannot win checkout.
-    obj = github_object(f"ref/tags/{tag}")
+    # github_object() guarantees the outer shape, so this index cannot KeyError.
+    obj = github_object(f"ref/tags/{tag}")["object"]
     for _ in range(8):
         sha = obj.get("sha", "")
         if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
@@ -44,7 +50,7 @@ def resolve_tag(tag):
             return obj["sha"]
         if obj.get("type") != "tag":
             raise ValueError("Release tag does not resolve to a commit")
-        obj = github_object(f"tags/{obj['sha']}")
+        obj = github_object(f"tags/{obj['sha']}")["object"]
     raise ValueError("Release tag nesting exceeds the resolution bound")
 
 

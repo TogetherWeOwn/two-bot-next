@@ -312,13 +312,14 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_run_record_no_echo_acceptance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_run_record_condition_shapes.py' -v
 
-      # The bench suite below is also matched by pipeline-benchmark.yml's
+      # The bench suites below are also matched by pipeline-benchmark.yml's
       # wildcard, but that job is evidence-only (not required) and path-gated;
-      # this line gates the PR.
+      # these lines gate the PR.
       - name: CI tooling input-refusal acceptance (offline)
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_release_sbom_target_shape_refusal_acceptance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_compare_pipeline_bench_argparse_refusal_acceptance.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_compare_pipeline_bench_negative_spellings.py' -v
 
       - name: Validate voice template fixtures (hermetic, no renderer)
         run: |
