@@ -756,6 +756,16 @@ async fn cmd_backup_upload(args: &[String]) -> i32 {
         );
         return 1;
     }
+    // Mirror the restore drill: refuse an over-cap dump before buffering it
+    // in memory for signing. Strict `>` so an exactly-at-cap dump uploads.
+    if size > dump_file::MAX_DUMP_BYTES {
+        eprintln!(
+            "backup-upload-s3: {} is {size} bytes, exceeding the {}-byte dump cap; refusing rather than buffering it code=backup_upload_dump_too_large",
+            dump_path.display(),
+            dump_file::MAX_DUMP_BYTES
+        );
+        return 1;
+    }
 
     let std_env = |name: &str| env_var(name);
     let target = match s3::load_s3_target(&std_env) {
@@ -922,12 +932,33 @@ fn snapshot_upload_argv(upload_raw: Option<&str>, path: &Path) -> Option<(String
 // guild-config-snapshot
 // ---------------------------------------------------------------------------
 
+/// Removes the pid temp unless a successful rename disarms it. Every
+/// post-create failure path (write, permissions, fsync, rename) drops through
+/// here, so no `.tmp` partial survives a failed write. Only our own temp is
+/// removed; siblings are never touched.
+struct TmpGuard<'a> {
+    tmp: &'a Path,
+    armed: bool,
+}
+
+impl Drop for TmpGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(self.tmp);
+        }
+    }
+}
+
 fn atomic_json(path: &Path, value: &serde_json::Value) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     }
     let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let mut guard = TmpGuard {
+        tmp: &tmp,
+        armed: true,
+    };
     let text = serde_json::to_string_pretty(value).map_err(|e| format!("cannot serialise: {e}"))?;
     {
         use std::io::Write;
@@ -944,6 +975,7 @@ fn atomic_json(path: &Path, value: &serde_json::Value) -> Result<(), String> {
             .map_err(|e| format!("cannot fsync {}: {e}", tmp.display()))?;
     }
     std::fs::rename(&tmp, path).map_err(|e| format!("cannot rename to {}: {e}", path.display()))?;
+    guard.armed = false;
     if let Some(parent) = path.parent() {
         let dir = std::fs::File::open(parent).map_err(|e| e.to_string())?;
         dir.sync_all().map_err(|e| e.to_string())?;
@@ -1169,6 +1201,11 @@ async fn cmd_guild_config_snapshot() -> i32 {
 // guild-config-restore
 // ---------------------------------------------------------------------------
 
+/// Operator-supplied guild snapshots refuse past 8 MiB, mirroring
+/// `http::MAX_RESPONSE_BYTES`. Guild snapshots are KB-scale; the boundary is
+/// strict `>` so an exactly-at-cap snapshot still restores.
+const MAX_SNAPSHOT_BYTES: u64 = 8 * 1024 * 1024;
+
 async fn cmd_guild_config_restore(args: &[String]) -> i32 {
     let apply = args.iter().any(|a| a == "--apply");
     let confirmed = args.iter().any(|a| a == "--confirm-staging-guild");
@@ -1217,6 +1254,18 @@ async fn cmd_guild_config_restore(args: &[String]) -> i32 {
             guild_config::LIVE_GUILD_ID
         );
         return 2;
+    }
+
+    // Refuse an over-cap operator file before buffering it; a missing file
+    // still falls through to the existing read error below.
+    if let Ok(meta) = std::fs::metadata(&snapshot_arg) {
+        if meta.len() > MAX_SNAPSHOT_BYTES {
+            eprintln!(
+                "guild-config-restore: snapshot {snapshot_arg} is {} bytes, exceeding the {MAX_SNAPSHOT_BYTES}-byte snapshot cap; refusing rather than buffering it",
+                meta.len()
+            );
+            return 2;
+        }
     }
 
     let text = match std::fs::read_to_string(&snapshot_arg) {
