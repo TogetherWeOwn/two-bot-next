@@ -326,6 +326,11 @@
       "table": "privacy_opt_out_audit",
       "column": "actor",
       "reason": "Operator accountability for opt-out purges: actor and time only, never subject content. Retained independently of member activity, like member_erasure_audit.actor."
+    },
+    {
+      "table": "self_role_exchanges",
+      "column": "superseded_by",
+      "reason": "Replacement-ticket reference on self-role acknowledgement tickets: holds the opaque gen_random_uuid exchange_id of the superseding ticket, never a member identity, so there is no member PII to erase. The value is deleted with its ticket row by the self_role_exchanges plan predicate."
     }
   ]
 }

@@ -143,6 +143,32 @@ class RedirectRefused(ValueError):
     """An authenticated read answered a redirect (fixed vocabulary only)."""
 
 
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    raised message is fixed vocabulary: it names no key, value or path.
+    """
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
+
+
+class GatewayShapeError(ValueError):
+    """A gateway frame, hello or dispatch violates the expected shape.
+
+    Fixed vocabulary only, like BodyTooLarge and RedirectRefused.
+    """
+
+
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Turn every redirect into an HTTPError without contacting its target."""
 
@@ -542,12 +568,17 @@ class WebSocket:
         self.sock.sendall((f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
                            f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
                            "Sec-WebSocket-Version: 13\r\n\r\n").encode())
-        head = b""
-        while b"\r\n\r\n" not in head:
+        # Suffix-checked and byte-capped: the terminator can only complete at
+        # the end of a byte-at-a-time read, so endswith keeps a hostile
+        # header linear instead of rescanning the whole head per byte.
+        head = bytearray()
+        while not head.endswith(b"\r\n\r\n"):
             chunk = self.sock.recv(1)
             if not chunk:
                 raise ConnectionError("gateway closed during handshake")
             head += chunk
+            if len(head) > MAX_BODY_BYTES:
+                raise BodyTooLarge("gateway handshake answered over the byte cap")
         if b" 101 " not in head.split(b"\r\n", 1)[0]:
             raise ConnectionError("gateway refused the websocket upgrade")
         self.lock = threading.Lock()
@@ -577,8 +608,19 @@ class WebSocket:
             self.sock.sendall(head + mask + body)
 
     def recv(self):
-        """Next complete text message as JSON (answers pings; None on close)."""
+        """Next complete text message as JSON (answers pings; None on close).
+
+        Every frame payload and every reassembled message is capped at
+        MAX_BODY_BYTES, like the REST body cap: the declared length is
+        validated before the payload is read, so a huge length refuses
+        without an unbounded read, and continuation fragments refuse once
+        their running total passes the cap. Exact-cap input passes.
+        Control frames (ping, pong, close) carry at most 125 payload bytes
+        per RFC 6455 section 5.5; a longer control payload refuses as a
+        malformed frame instead of corrupting the pong encoder.
+        """
         parts = []
+        total = 0
         while True:
             b1, b2 = self._exact(2)
             op, fin, n = b1 & 0x0F, b1 & 0x80, b2 & 0x7F
@@ -586,6 +628,12 @@ class WebSocket:
                 n = struct.unpack(">H", self._exact(2))[0]
             elif n == 127:
                 n = struct.unpack(">Q", self._exact(8))[0]
+            if n > MAX_BODY_BYTES:
+                raise BodyTooLarge("gateway frame answered over the byte cap")
+            if op & 0x8 and n > 125:
+                raise GatewayShapeError("gateway frame was malformed")
+            if op in (0x1, 0x0) and total + n > MAX_BODY_BYTES:
+                raise BodyTooLarge("gateway message answered over the byte cap")
             mask = self._exact(4) if b2 & 0x80 else None
             data = self._exact(n)
             if mask:
@@ -599,9 +647,17 @@ class WebSocket:
                                       + bytes(b ^ m[i % 4] for i, b in enumerate(data)))
                 continue
             if op in (0x1, 0x0):
+                total += len(data)
+                if total > MAX_BODY_BYTES:
+                    raise BodyTooLarge("gateway message answered over the byte cap")
                 parts.append(data)
                 if fin:
-                    return json.loads(b"".join(parts))
+                    try:
+                        return json.loads(b"".join(parts),
+                                          object_pairs_hook=_reject_duplicate_keys)
+                    except DuplicateKeyError:
+                        raise ValueError(
+                            "gateway frame carries duplicate JSON object keys") from None
 
     def close(self):
         try:
@@ -630,7 +686,10 @@ def rest(token, path, timeout=20):
         raise
     if len(raw) > MAX_BODY_BYTES:
         raise BodyTooLarge("Discord REST read answered over the body cap")
-    return json.loads(raw)
+    try:
+        return json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+    except DuplicateKeyError:
+        raise ValueError("Discord REST read carries duplicate JSON object keys") from None
 
 
 def rest_patch(token, path, payload, timeout=20):
@@ -658,7 +717,10 @@ def rest_patch(token, path, payload, timeout=20):
         return exc.code, None
     if len(raw) > MAX_BODY_BYTES:
         raise BodyTooLarge("Discord REST read answered over the body cap")
-    return status, json.loads(raw)
+    try:
+        return status, json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+    except DuplicateKeyError:
+        raise ValueError("Discord REST read carries duplicate JSON object keys") from None
 
 
 def metrics_value(staging_url, token):
@@ -691,7 +753,17 @@ class Session:
         self.token, self.events, self.me = token, [], None
         self.ws = WebSocket(GATEWAY, "/?v=10&encoding=json")
         hello = self.ws.recv()
-        self.interval = hello["d"]["heartbeat_interval"] / 1000
+        data = hello.get("d") if isinstance(hello, dict) else None
+        interval = data.get("heartbeat_interval") if isinstance(data, dict) else None
+        if isinstance(interval, bool) or not isinstance(interval, (int, float)):
+            raise GatewayShapeError("gateway hello was malformed")
+        try:
+            seconds = interval / 1000
+        except OverflowError:
+            raise GatewayShapeError("gateway hello was malformed") from None
+        if not math.isfinite(seconds) or not 0 < seconds <= TIMING_CAP_SECONDS:
+            raise GatewayShapeError("gateway hello was malformed")
+        self.interval = seconds
         self.seq, self.alive = None, True
         threading.Thread(target=self._beat, daemon=True).start()
         self.ws.send({"op": 2, "d": {"token": token, "intents": INTENTS,
@@ -716,14 +788,24 @@ class Session:
                 return None
             if msg is None:
                 raise ConnectionError("gateway closed the session")
+            if not isinstance(msg, dict):
+                raise GatewayShapeError("gateway dispatch was malformed")
             if msg.get("s") is not None:
                 self.seq = msg["s"]
             if msg.get("op") != 0:
                 continue
+            if not isinstance(msg.get("t"), str) or not isinstance(msg.get("d"), dict):
+                raise GatewayShapeError("gateway dispatch was malformed")
+            if msg["t"] in ("GUILD_CREATE", "CHANNEL_DELETE"):
+                if not isinstance(msg["d"].get("id"), str):
+                    raise GatewayShapeError("gateway dispatch was malformed")
             event = {"t": msg["t"], "d": msg["d"]}
             self.events.append(event)
             if msg["t"] == "READY":
-                self.me = msg["d"]["user"]["id"]
+                user = msg["d"].get("user")
+                if not isinstance(user, dict) or not isinstance(user.get("id"), str):
+                    raise GatewayShapeError("gateway dispatch was malformed")
+                self.me = user["id"]
             if until(event):
                 return event
         return None
@@ -949,7 +1031,33 @@ def parse_args(argv=None):
     p.add_argument("--delete-slack", type=timing_seconds, default=20.0,
                    metavar="SECONDS")
     p.add_argument("--evidence", default=None)
+    p.add_argument("--dry-run", action="store_true",
+                   help="print the mutation plan without contacting Discord")
     return p.parse_args(argv)
+
+
+def print_dry_run_plan(args):
+    """Print the mutation plan without contacting Discord or the network.
+
+    Static text plus the fenced guild/creator: no room ids, tokens or
+    timestamps are generated, so the plan is byte-identical across runs.
+    Fences and timing validation run exactly as on the live path before
+    this prints; only the bot-token gate is skipped (a preview needs no
+    secret), and no token is ever echoed.
+    """
+    print("\n".join((
+        "dry-run plan for staging voice synthetic (no mutations performed)",
+        f"guild: {args.guild}",
+        f"creator: {args.creator}",
+        f"1. rename: REST PATCH /channels/{args.creator} appends "
+        f"{RENAME_MARKER!r} to the creator name, then PATCHes the original "
+        "name back (restore)",
+        "2. lifecycle: join the creator over the gateway, assert the room "
+        "create/move, leave (no channel writes)",
+        "3. user_limit: REST PATCH /channels/<room> sets user_limit to the "
+        "probed value with a read-back, then PATCHes the initial value "
+        "back (restore)",
+    )))
 
 
 def main(argv=None):
@@ -957,11 +1065,14 @@ def main(argv=None):
     token = os.environ.get("TWO_VOICE_SYNTHETIC_BOT_TOKEN", "").strip()
     try:
         fence(args.guild, args.creator, args.staging_url)
-        if not token:
+        if not args.dry_run and not token:
             raise Refusal("TWO_VOICE_SYNTHETIC_BOT_TOKEN is not set (dedicated test bot, see docs/voice-synthetic.md)")
     except Refusal as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 2
+    if args.dry_run:
+        print_dry_run_plan(args)
+        return 0
     try:
         obs = run_live(args, token)
         checks = evaluate(obs)

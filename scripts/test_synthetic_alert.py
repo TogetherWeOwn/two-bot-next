@@ -509,15 +509,36 @@ class SyntheticAlertTests(unittest.TestCase):
         self.assertIn("not set", err.getvalue())
 
     def test_missing_probe_sample_and_non_transition_do_not_post(self):
-        for outcome, previous in (("skipped", []), ("failure", [])):
+        # A skipped probe is zero samples: fail closed (exit 1) with no post,
+        # distinct from a healthy pass. A lone failure below the two-failure
+        # threshold still decides no transition and stays green.
+        for outcome, previous, expected_code in (("skipped", [], 1), ("failure", [], 0)):
             env = {**self.base_env(), "PROBE_OUTCOME": outcome, "FORCE_FAIL": "false"}
             with self.subTest(outcome=outcome), mock.patch.dict(os.environ, env, clear=True), \
                     redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()), \
                     mock.patch.object(alert, "previous_probe_outcomes", return_value=previous), \
                     mock.patch.object(alert, "post") as post:
                 code = alert.main(["--env", "staging", "--evidence", self.evidence])
-            self.assertEqual(code, 0)
+            self.assertEqual(code, expected_code)
             post.assert_not_called()
+        # The live decide-step path fails the same way on zero samples while
+        # still writing the empty event that keeps the post step skipped, and
+        # without spending a history read on a non-sample.
+        with tempfile.NamedTemporaryFile(mode="w+", delete=False) as output:
+            output_path = output.name
+        try:
+            env = {**self.base_env(), "PROBE_OUTCOME": "skipped",
+                   "FORCE_FAIL": "false", "GITHUB_OUTPUT": output_path}
+            with mock.patch.dict(os.environ, env, clear=True), \
+                    redirect_stderr(io.StringIO()), \
+                    mock.patch.object(alert, "previous_probe_outcomes",
+                                      side_effect=AssertionError("no sample must not read history")):
+                code = alert.main(["--env", "staging", "--evidence", self.evidence,
+                                   "--decide-only"])
+            self.assertEqual(code, 1)
+            self.assertEqual(Path(output_path).read_text(), "event=\n")
+        finally:
+            Path(output_path).unlink(missing_ok=True)
 
     def test_history_error_does_not_suppress_failure_alert(self):
         out, err = io.StringIO(), io.StringIO()
@@ -589,6 +610,58 @@ class SyntheticAlertTests(unittest.TestCase):
             code = alert.main(["--env", "prod", "--evidence", self.evidence])
         self.assertEqual(code, 1)
         self.assertIn("status 500", err.getvalue())
+
+    def test_deeply_nested_history_body_is_unknown_history_not_a_crash(self):
+        # A response far under the size cap can still nest past the JSON
+        # recursion limit: it must map to the fixed HistoryError vocabulary
+        # (fail-open on a failed probe), never escape as a traceback.
+        body = '{"a":' * 10000 + '1' + '}' * 10000
+        self.assertLess(len(body.encode("utf-8")), history.MAX_RESPONSE_BYTES)
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, _n):
+                return body.encode("utf-8")
+
+        opener = mock.Mock()
+        opener.open.return_value = FakeResponse()
+        env = {**self.base_env(), "GITHUB_REPOSITORY": "owner/repo",
+               "GITHUB_RUN_ID": "999"}
+        with mock.patch.object(history.urllib.request, "build_opener",
+                               return_value=opener):
+            with self.assertRaises(history.HistoryError) as raised:
+                history._get("/repos/owner/repo/actions/runs", "test-token")
+            self.assertEqual(
+                str(raised.exception),
+                "could not read recent synthetic workflow history (RecursionError)")
+            err = io.StringIO()
+            with redirect_stderr(err):
+                event = alert.decide_event({**env, "PROBE_OUTCOME": "failure",
+                                            "FORCE_FAIL": "false"}, "staging")
+        self.assertEqual(event, "alert")
+        self.assertNotIn("Traceback", err.getvalue())
+
+    def test_deeply_nested_evidence_reads_as_unknown_build(self):
+        # An unparseably deep receipt follows the existing malformed-evidence
+        # channel (unknown build, still posts), never a traceback.
+        deep = '{"a":' * 10000 + '1' + '}' * 10000
+        path = str(self.dir / "deep-evidence.json")
+        Path(path).write_text(deep, encoding="utf-8")
+        self.assertIsNone(alert.load_evidence(path))
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err), \
+                mock.patch.dict(os.environ, self.base_env(), clear=True), \
+                mock.patch.object(alert, "post") as post:
+            code = alert.post_event(self.base_env(), "staging", path, "alert")
+        self.assertEqual(code, 0)
+        post.assert_called_once()
+        self.assertIn("unknown", post.call_args.args[1])
+        self.assertNotIn("Traceback", out.getvalue() + err.getvalue())
 
 
 if __name__ == "__main__":

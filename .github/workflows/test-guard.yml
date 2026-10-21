@@ -32,6 +32,4 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
-    # Advisory gate call; ceiling mirrors the supply-chain gitleaks gate.
-    timeout-minutes: 10
     uses: TogetherWeOwn/.github/.github/workflows/test-guard.yml@3fffeb9f9465f371763fcc3c789ed4baefe38f95

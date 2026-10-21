@@ -145,11 +145,18 @@ def build_claim(manifest, env):
             == manifest.get("store_plan_manifest_sha256") == store_digest,
             "store plan projection hash does not match the request")
     require(manifest.get("source_sha") == env.get("SOURCE_SHA"), "source SHA does not match the request")
-    require(manifest.get("migration_target", "staging") == "staging",
+    require(manifest.get("migration_target") == "staging",
             "manifest is not a staging plan")
     target = manifest.get("target")
     require(isinstance(target, dict) and set(target) == {"host", "database", "branch_id"},
             "plan target is invalid")
+    # Mirror-image denylist, intentionally different from the production
+    # gate: staging refuses prod-like hosts and databases, while production
+    # refuses staging-like hosts (staging label, Neon, test database,
+    # pooler). Each gate refuses the other's label-bearing canonical test
+    # host; label-free targets are distinguished by the explicit marker,
+    # workflow identity and pin match, not this list. Pinned by the
+    # explicit-target acceptance tests; see docs/staging-migrate-claim.md.
     require(isinstance(target.get("host"), str)
             and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}", target["host"])
             and isinstance(target.get("database"), str)

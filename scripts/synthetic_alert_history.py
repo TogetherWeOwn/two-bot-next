@@ -62,6 +62,25 @@ class HistoryError(Exception):
     """A safe-to-report failure reading probe history."""
 
 
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    raised message is fixed vocabulary: it names no key, value or path.
+    """
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
+
+
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Turn every redirect into an HTTPError without contacting its target."""
 
@@ -209,8 +228,8 @@ def _get(path, token):
         raise HistoryError("could not read recent synthetic workflow history "
                            "(response exceeds the size cap)")
     try:
-        return json.loads(body)
-    except ValueError as error:
+        return json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+    except (ValueError, RecursionError) as error:
         raise HistoryError("could not read recent synthetic workflow history ("
                            + error.__class__.__name__ + ")") from None
 

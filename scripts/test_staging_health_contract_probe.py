@@ -387,8 +387,8 @@ class HealthContractProbeTests(unittest.TestCase):
                     nested = [nested]
                 report = dict(READY, **{field: nested})
 
-                def parse(raw, report=report):
-                    return report if raw == b"READYZ" else real_loads(raw)
+                def parse(raw, *args, report=report, **kwargs):
+                    return report if raw == b"READYZ" else real_loads(raw, *args, **kwargs)
 
                 routes = {STAGING + "/health": body({"status": "ok"}),
                           STAGING + "/readyz": (200, {}, b"READYZ")}

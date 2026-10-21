@@ -65,9 +65,9 @@ pub(crate) fn replace_pool(pool: PgPool) {
     install_replace(pool_slot(), pool);
 }
 
-/// In-memory rejection count for introspection. No production reader yet;
-/// kept alongside the counter so the diagnostic stays queryable.
-#[allow(dead_code)]
+/// In-memory rejection count for introspection, surfaced as the
+/// top-level `duplicate_pool_registrations` field on `/ops/summary`.
+/// Always present (zero on unconfigured boots), never null or absent.
 pub(crate) fn duplicate_registration_count() -> u64 {
     DUPLICATE_REGISTRATIONS.load(Ordering::Relaxed)
 }
