@@ -4862,4 +4862,8 @@ mod tests {
 
 #[cfg(test)]
 #[path = "member_moderation_resilient_sweep_acceptance_tests.rs"]
+// The protected acceptance module keeps baseline fallback traits that the
+// inherent items shadow once the builder lands; they are intentionally dead
+// on a GREEN head, and the builder must not edit that file.
+#[allow(dead_code)]
 mod resilient_sweep_acceptance_tests;
