@@ -34,6 +34,30 @@ No Gatus or third-party monitor is used.
   revision. The Worker version ID is distinct from the Git SHA. Production
   release tags are created by the successful promotion flow, not by hand.
 
+## Log retention for postmortems
+
+Postmortems query Workers Logs directly; no separate log export exists.
+Both named environments keep unsampled Worker, Durable Object, and container
+logs for seven days on the Workers Paid plan (20 million events per month
+included; the Free plan keeps three days). Seven days is the Cloudflare-side
+maximum, so an incident's log window must be captured — queries plus the
+quoted lines — in the incident record within that week; it cannot be
+re-queried later. Sources: the Workers Logs
+[limits](https://developers.cloudflare.com/workers/observability/logs/workers-logs/#limits)
+and [pricing](https://developers.cloudflare.com/workers/observability/logs/workers-logs/#pricing)
+tables, and the [dataset retention table](https://developers.cloudflare.com/observability/logs/datasets/)
+(workers and containers: 7 days). From December 1, 2026 Workers Logs moves to
+[Observability pricing](https://developers.cloudflare.com/observability/pricing/),
+which keeps a default seven-day retention for the shared allowance.
+
+No Logpush job or Tail Worker export is planned: the
+[October production postmortem](production-incident-2026-10-15-postmortem.md)
+was written from same-day log queries plus deploy run receipts, and every
+signal in this runbook (alert to log window to build SHA to change) resolves
+within days of the incident. Revisit only on a concrete trigger: a postmortem
+that misses its log window, a compliance rule that needs longer retention, or
+a Cloudflare pricing change that moves the seven-day default.
+
 ## From an alert to the responsible change
 
 1. Record the alert's environment, rule/class, timestamp, and runbook link. Do
