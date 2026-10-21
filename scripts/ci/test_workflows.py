@@ -266,8 +266,9 @@ def skip_blocks_test(skip, name):
 # in NO lane — skipped in the check.yml coverage sweep, the check.yml store
 # lane and the nightly sweep — because their builders have not landed yet.
 # Each entry maps the test fn to the build card tracking it. Shrink-only: a
-# builder PR un-skips its family in all three lanes AND ratchets this pin
-# down in the same PR. Growth fails closed; see backfill_quarantine_errors.
+# builder PR removes the "quarantined red" marker (keeping the DB ignore),
+# un-skips its family in all three lanes AND ratchets this pin down in the
+# same PR. Growth fails closed; see backfill_quarantine_errors.
 BACKFILL_QUARANTINE = {
     # Audit-log family: TOG-22948 lands the fetcher + backfill_audit_entries.
     "audit_log_pagination_limit_1_to_100_before_after_covers_45d_window": "TOG-22948",
@@ -322,15 +323,23 @@ def ignored_test_reasons(suite):
     return reasons
 
 
+def backfill_quarantine_members(reasons):
+    """Select explicit quarantine markers, not passing tests' DB opt-ins."""
+    return {name: reason for name, reason in reasons.items() if "quarantined red" in reason}
+
+
 def backfill_quarantine_errors(pinned, current):
     """Shrink-only tripwire for the quarantined red backfill tests.
 
     `pinned` maps test fn -> tracking ref (BACKFILL_QUARANTINE); `current`
     maps test fn -> ignore-mark line, derived from the suite sources.
+    Only reasons marked "quarantined red" are quarantine members. A fixed
+    test can retain its plain DB ignore while leaving quarantine.
     Growth is blocked outright; shrinkage must ratchet the pin down in the
     same PR; every surviving member must carry its tracking ref in its
     ignore reason. Returns a list of error strings (empty when clean).
     """
+    current = backfill_quarantine_members(current)
     errors = []
     for name in sorted(set(current) - set(pinned)):
         errors.append(
@@ -3806,10 +3815,9 @@ class WorkflowTests(unittest.TestCase):
 
     def test_patch_coverage_ignored_sweep_skips_tests_that_cannot_pass_there(self):
         # The ignored sweep tolerates failures, but the flake ledger reads
-        # every FAILED line it prints as a flake. No ignored test in these
-        # suites can pass under its two_bot_test_ci URL, so the sweep skips
-        # each one. Names come from the sources: a new ignored test in one of
-        # these suites fails here until the sweep skips it too.
+        # every FAILED line it prints as a flake. Skip exact-URL opt-ins and
+        # explicitly quarantined red tests, not passing DB opt-ins in those
+        # backfill suites. Names and quarantine markers come from the sources.
         # Exact-URL suites: a fail-closed run elsewhere still executes them.
         # The stream go-live ledger suite shares the strict agent_test
         # guard; its dedicated replay below stays fail-closed.
@@ -3863,8 +3871,7 @@ class WorkflowTests(unittest.TestCase):
         [store_lane] = [line for line in runs if "--test backfill_audit_log" in line]
         store_skips = re.findall(r"--skip (\S+)", store_lane)
         for suite in red_suites:
-            names = ignored_test_names(suite)
-            self.assertTrue(names, suite)
+            names = backfill_quarantine_members(ignored_test_reasons(suite))
             expected.update(names)
             for name in names:
                 with self.subTest(suite=suite, test=name):
@@ -3895,10 +3902,44 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("shrank", shrinkage)
         self.assertIn("BACKFILL_QUARANTINE", shrinkage)
         self.assertIn("beta", shrinkage)
-        untracked = dict(clean, alpha="#[ignore = \"requires authorized TEST_DATABASE_URL\"]")
+        untracked = dict(clean, alpha='#[ignore = "quarantined red, requires authorized TEST_DATABASE_URL"]')
         [missing] = backfill_quarantine_errors(pinned, untracked)
         self.assertIn("alpha", missing)
         self.assertIn("TOG-1", missing)
+
+    def test_fixed_backfill_test_can_keep_database_ignore_after_quarantine_ratchet(self):
+        reason = '#[ignore = "requires authorized TEST_DATABASE_URL"]'
+        [shrinkage] = backfill_quarantine_errors({"alpha": "TOG-1"}, {"alpha": reason})
+        self.assertIn("shrank", shrinkage)
+        self.assertIn("alpha", shrinkage)
+        self.assertEqual(backfill_quarantine_errors({}, {"alpha": reason}), [])
+
+    def test_fixed_backfill_family_can_leave_coverage_and_store_skip_sets(self):
+        suite = "backfill_bans_invites_onboarding"
+        fixed = set(ignored_test_names(suite))
+        reasons = ignored_test_reasons
+        current = {}
+        for candidate in BACKFILL_QUARANTINE_SUITES:
+            current.update(reasons(candidate))
+        for name in fixed:
+            current[name] = '#[ignore = "requires authorized TEST_DATABASE_URL"]'
+        pinned = {name: ref for name, ref in BACKFILL_QUARANTINE.items() if name not in fixed}
+        mutated = deepcopy(self.workflows)
+        for job in mutated["check.yml"]["jobs"].values():
+            for step in job.get("steps", []):
+                if "run" in step:
+                    for name in fixed:
+                        step["run"] = step["run"].replace(f"--skip {name}", "")
+        with patch.object(self, "workflows", mutated), patch(
+            f"{__name__}.ignored_test_reasons",
+            side_effect=lambda candidate: (
+                {name: current[name] for name in fixed}
+                if candidate == suite else reasons(candidate)
+            ),
+        ):
+            # Exercise the neighboring exact sweep pin, not just the helper.
+            self.test_patch_coverage_ignored_sweep_skips_tests_that_cannot_pass_there()
+        self.assertEqual(backfill_quarantine_errors(pinned, current), [])
 
     def test_backfill_quarantine_is_tracked_counted_and_shrink_only(self):
         # TOG-34944: the 15 nowhere-run red backfill tests are quarantined,
