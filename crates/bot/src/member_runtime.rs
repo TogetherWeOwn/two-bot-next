@@ -1013,3 +1013,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "member_moderation_truthful_replies_acceptance_tests.rs"]
+mod truthful_replies_acceptance_tests;
