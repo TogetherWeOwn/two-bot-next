@@ -1,7 +1,7 @@
 # Backups, restore drills, and sealed guild-config snapshots (TOG-9881)
 
 Rust port of the legacy `two-bot` cutover-data surface (frozen source
-`two-bot` `main @ d5d11793`): v10 dump format with v3/v4/v5/v6/v7/v8/v9 read compatibility,
+`two-bot` `main @ d5d11793`): v11 dump format with v3/v4/v5/v6/v7/v8/v9/v10 read compatibility,
 SigV4 off-box upload, retention
 math, sealed guild-config snapshot + restore planner, and the three timer
 equivalents. Code: `crates/core/src/backup/`, CLI: `two-bot backup |
@@ -17,7 +17,7 @@ require `--force`. This confirmation is not authorization to target production.
 ## The format
 
 Gzipped NDJSON, one object per line: `manifest` / `row` / `end`. New dumps
-write **v10** (including durable voice-create reservations, the retention
+write **v11** (including durable voice-create reservations, the retention
 queues, the seasonal XP projection, the event store: voice capture plus
 presence capture plus member-capture deltas plus message/reaction capture
 plus thread lifecycle plus stage/interaction-observe/audit-log capture plus
@@ -25,7 +25,8 @@ invite/scheduled-event capture, the stream go-live ledger, guild game-activity
 aggregates, the assistant monthly-cap ledger, the scheduled-event
 epoch-claim guard and the scheduled-event delete tombstones); the reader also accepts
 frozen **v3**, pre-reservation **v4**, pre-v6-tables **v5**, pre-seasonal **v6**,
-pre-stream-ledger **v7**, pre-guild-counters **v8** and pre-epoch-claim **v9**.
+pre-stream-ledger **v7**, pre-guild-counters **v8**, pre-epoch-claim **v9** and
+pre-tombstone **v10**.
 Other versions refuse.
 The manifest carries per-table `{name, columns, column_types, count}` taken
 inside one `REPEATABLE READ` transaction, the `events` high-water mark, the
@@ -58,7 +59,7 @@ unsupported. A failed write or validation leaves existing published recovery
 points untouched; a crash may leave a temporary file, but retention and drill
 selectors ignore it.
 
-### Coverage and recovery semantics (v4, v5, v6, v7, v8, v9 and v10)
+### Coverage and recovery semantics (v4, v5, v6, v7, v8, v9, v10 and v11)
 
 `DUMP_TABLES` in `crates/core/src/backup/dump_file.rs` is the single ordered
 inventory for both dump and restore. It includes **98 durable tables from the
@@ -93,26 +94,28 @@ versioned additions introduced later:
 
 | Version | Tables it may omit |
 | --- | --- |
-| v4 | `V5_ADDED_TABLES` (reservations and privacy controls), `V6_ADDED_TABLES` (event store), `V7_ADDED_TABLES` (seasonal XP and retention queues), `V8_ADDED_TABLES` (stream ledger), `V9_ADDED_TABLES` (guild counters), `V10_ADDED_TABLES` (epoch-claim guard and delete tombstones) |
-| v5 | `V6_ADDED_TABLES`, `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES` |
-| v6 | `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES` |
-| v7 | `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES` |
-| v8 | `V9_ADDED_TABLES`, `V10_ADDED_TABLES` |
-| v9 | `V10_ADDED_TABLES`: `scheduled_events_claim`, `scheduled_events_tombstone` |
-| v10 | None: the full current inventory is required |
+| v4 | `V5_ADDED_TABLES` (reservations and privacy controls), `V6_ADDED_TABLES` (event store), `V7_ADDED_TABLES` (seasonal XP and retention queues), `V8_ADDED_TABLES` (stream ledger), `V9_ADDED_TABLES` (guild counters), `V10_ADDED_TABLES` (epoch-claim guard), `V11_ADDED_TABLES` (delete tombstones) |
+| v5 | `V6_ADDED_TABLES`, `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES` |
+| v6 | `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES` |
+| v7 | `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES` |
+| v8 | `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES` |
+| v9 | `V10_ADDED_TABLES`, `V11_ADDED_TABLES`: `scheduled_events_claim`, `scheduled_events_tombstone` |
+| v10 | `V11_ADDED_TABLES`: `scheduled_events_tombstone` |
+| v11 | None: the full current inventory is required |
 
 These are narrow waivers, not permission to omit arbitrary tables. An
 incomplete new archive refuses at inspection. The frozen 85-table v4 fixture
-is unchanged from before these additions; older v4–v9 archives need not
+is unchanged from before these additions; older v4–v10 archives need not
 invent entries for the v9 guild counters, the v10 epoch-claim guard or the
-v10 delete tombstones.
+v11 delete tombstones.
 Restoring an older archive clears
 destination rows for every omitted later table instead of retaining unrelated
 target state. In particular, restoring v8 without guild counters clears both
 counters; it cannot recover assistant usage that predates its persistence.
-Restoring v9 without the claim guard clears both guard tables; the mirror
-re-fences on the next winning fetch. Use a v10 recovery point to preserve
-the monthly cap and the mirror fence. Current v10 archives must
+Restoring v9 without the claim guard clears the guard and the tombstones; the
+mirror re-fences on the next winning fetch. Restoring a claim-only v10 clears
+the tombstones while keeping the epoch fence. Use a v11 recovery point to
+preserve the monthly cap and both mirror fences. Current v11 archives must
 include the monthly cap and both mirror-fence tables, so routine restores
 retain their archived state. Tombstone `deleted_at` cells must be real dates in
 exact `YYYY-MM-DDTHH:MM:SS.sssZ` form: inspection refuses missing, null,

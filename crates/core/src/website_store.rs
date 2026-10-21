@@ -303,9 +303,8 @@ pub async fn write_rank_snapshot(
 /// mirror writes while still purging tombstones older than 24 h, trimming the
 /// guild to its newest 1,000 tombstones, and pinning the contract. Otherwise
 /// the DELETE reports its removed ids and each id absent from the incoming
-/// snapshot earns a tombstone stamped with this tick's `observed_at`; the
-/// per-row upserts below additionally refuse a conflicting row when a newer
-/// tombstone guards that id. Suppression is tick-level, not per-id: a stale
+/// snapshot earns a tombstone stamped with this tick's `observed_at`.
+/// Suppression is tick-level, not per-id: a stale
 /// replay may also carry never-before-seen ids with no tombstone of their
 /// own. The mutation path ([`upsert_event`]) is untouched: an internal action
 /// completing after a delete still lands its row.
@@ -388,13 +387,7 @@ pub async fn replace_events(
                    name = EXCLUDED.name, starts_at = EXCLUDED.starts_at,
                    channel_id = EXCLUDED.channel_id, description = EXCLUDED.description,
                    status = EXCLUDED.status, updated_at = EXCLUDED.updated_at
-                 WHERE scheduled_events.updated_at <= EXCLUDED.updated_at
-                   AND NOT EXISTS (
-                     SELECT 1 FROM scheduled_events_tombstone AS tomb
-                      WHERE tomb.guild_id = EXCLUDED.guild_id
-                        AND tomb.event_id = EXCLUDED.event_id
-                        AND tomb.deleted_at > EXCLUDED.updated_at
-                   )",
+                 WHERE scheduled_events.updated_at <= EXCLUDED.updated_at",
             )
             .bind(guild_id)
             .bind(&event.id)
