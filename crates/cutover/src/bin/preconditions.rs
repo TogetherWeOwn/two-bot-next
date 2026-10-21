@@ -58,9 +58,9 @@ const REQUIRED_TIMERS: &[&str] = &[
 const REGISTRY_FIXTURE: &str = "crates/core/tests/fixtures/legacy_registry.json";
 
 /// Cap for any single input file buffered into memory: 8 MiB, matching the
-/// capped cutover siblings (`ghost_cleanup`, `raid-remove`). Reads use
-/// `.take(CAP + 1)` so an over-cap file is detected without ever buffering
-/// the whole file past the cap; the boundary is strict `>`.
+/// capped cutover siblings (`ghost_cleanup`, `raid-remove`). Reads go through
+/// `cli::read_text_capped`, which detects an over-cap file without ever
+/// buffering past the cap; the boundary is strict `>`.
 const MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug)]
@@ -74,16 +74,10 @@ enum InputError {
 /// open/read failures stay opaque (`Unreadable`) like the old
 /// `read_to_string` path, including directories, which open but never read.
 fn read_input(path: &Path) -> Result<String, InputError> {
-    use std::io::Read;
     let file = std::fs::File::open(path).map_err(|_| InputError::Unreadable)?;
-    let mut text = String::new();
-    file.take(MAX_INPUT_BYTES as u64 + 1)
-        .read_to_string(&mut text)
-        .map_err(|_| InputError::Unreadable)?;
-    if text.len() > MAX_INPUT_BYTES {
-        return Err(InputError::OverCap);
-    }
-    Ok(text)
+    two_bot_cutover::cli::read_text_capped(file, MAX_INPUT_BYTES)
+        .map_err(|_| InputError::Unreadable)?
+        .ok_or(InputError::OverCap)
 }
 
 struct Outcome {
