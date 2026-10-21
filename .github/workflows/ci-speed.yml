@@ -90,6 +90,7 @@ jobs:
               - 'docs/database-roles.md'
               - 'docs/rollback-delta.md'
               - 'docs/backup.md'
+              - 'docs/tickets.md'
               - 'docs/metrics.md'
               - 'docs/startup-diagnostics.md'
               - 'wrangler/wrangler.toml'
