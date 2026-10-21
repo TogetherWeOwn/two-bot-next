@@ -2750,6 +2750,10 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_rollback_readiness_probe.py -v
       - name: Verify cutover watch checkpoint (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_cutover_watch_checkpoint.py -v
+      - name: Verify cutover watch checkpoint origin admission (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_cutover_watch_checkpoint_origin_acceptance.py -v
+      - name: Verify cutover watch checkpoint structured receipt (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_cutover_watch_checkpoint_receipt_acceptance.py -v
       - name: Verify runner routing for every workflow job
         if: needs.job-inputs.outputs.worker != 'false'
         run: python3 ../scripts/test-runner-routing.py
