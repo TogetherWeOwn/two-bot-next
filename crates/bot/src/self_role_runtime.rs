@@ -7,6 +7,7 @@
 use std::{
     collections::HashSet,
     future::Future,
+    hash::BuildHasher,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
