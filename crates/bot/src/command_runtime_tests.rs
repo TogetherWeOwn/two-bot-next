@@ -31,6 +31,9 @@ mod sticky_uncertain_acceptance_tests;
 #[path = "custom_command_list_pages_acceptance.rs"]
 mod custom_command_list_pages_acceptance;
 
+#[path = "giveaway_create_entry_acceptance_tests.rs"]
+mod giveaway_create_entry_acceptance_tests;
+
 use std::collections::VecDeque;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
