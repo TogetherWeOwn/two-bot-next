@@ -115,6 +115,28 @@ class TrackerUnitTests(unittest.TestCase):
         self.assertEqual(stored["verdict"], "unknown")
         self.assertEqual(stored["action"], "none")
 
+    def test_scrape_names_its_user_agent(self):
+        seen = {}
+
+        def fake_open(request, timeout=None):
+            seen["agent"] = request.get_header("User-agent")
+            seen["auth"] = request.get_header("Authorization")
+            response = mock.MagicMock()
+            response.status = 200
+            response.read.return_value = b"# expo\n"
+            response.__enter__.return_value = response
+            return response
+
+        opener = mock.Mock()
+        opener.open.side_effect = fake_open
+        with mock.patch.object(tracker.urllib.request, "build_opener",
+                               return_value=opener):
+            body = tracker.scrape_metrics("https://staging.example", "token")
+        self.assertEqual(body, "# expo\n")
+        self.assertEqual(seen["agent"], tracker.USER_AGENT)
+        self.assertNotIn("Python-urllib", seen["agent"])
+        self.assertEqual(seen["auth"], "Bearer token")
+
     def test_fire_creates_one_issue(self):
         fake = FakeGh()
         with mock.patch("subprocess.run", fake):
