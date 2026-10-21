@@ -44,7 +44,7 @@
 //!   reachable offline — raid tuning refusal, alert evidence, undeliverable,
 //!   post failure, worker panic; join-risk tuning refusal, worker panic,
 //!   store failure; and both Full/Closed counters per runtime.
-//! - Source pins (`include_str!`, exact `error_class`/`msg` token): the six
+//! - Source pins (`include_str!`, exact `error_class`/`msg` token): the seven
 //!   sites no offline behavior can reach — the two mention-refusal guards
 //!   (both `staff_message` constructors hardcode `MentionPolicy::None`), the
 //!   policy-rejection guard (it re-validates an already-valid `RaidTuning`),
@@ -70,7 +70,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::body::to_bytes;
 use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -113,8 +112,10 @@ fn assert_tagged(logs: &str, stem: &str) {
     let error_class = format!("error_class=\"{stem}\"");
     let msg = format!("msg=\"{stem}\"");
     assert!(
-        logs.contains(&error_class) || logs.contains(&msg),
-        "site {stem} must log error_class or msg; delta:\n{logs}"
+        logs.lines().any(|line| {
+            line.starts_with("ERROR ") && (line.contains(&error_class) || line.contains(&msg))
+        }),
+        "site {stem} must log error_class or msg at ERROR level; delta:\n{logs}"
     );
 }
 
@@ -172,8 +173,6 @@ fn ensure_crypto_provider() {
 struct RestRequest {
     method: String,
     path: String,
-    #[allow(dead_code)]
-    body: Vec<u8>,
 }
 
 struct ScriptedResponse(Response);
@@ -217,14 +216,9 @@ impl MockRest {
             let requests = Arc::clone(&requests);
             let responder = Arc::clone(&responder);
             async move {
-                let (parts, body) = request.into_parts();
                 let request = RestRequest {
-                    method: parts.method.to_string(),
-                    path: parts.uri.path().to_owned(),
-                    body: to_bytes(body, 1024 * 1024)
-                        .await
-                        .expect("bounded mock request body")
-                        .to_vec(),
+                    method: request.method().to_string(),
+                    path: request.uri().path().to_owned(),
                 };
                 requests.lock().expect("recorded").push(request.clone());
                 responder(&request).0
