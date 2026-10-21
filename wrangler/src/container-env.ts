@@ -98,9 +98,15 @@ export const FORWARDED_FLAGS = [
   "TWO_TEMP_VOICE_SWEEP_SECONDS",
   // Staging-only music voice-node spike (docs/music-voice-node-spike.md):
   // attaches the Lavalink voice-update forwarder. Staging vars only, same
-  // treatment as TWO_VOICE; the node password travels as its own Container
-  // secret, never through this flag allowlist.
+  // treatment as TWO_VOICE; the node URL and password travel as their own
+  // Container secrets on explicit lines, never through this flag allowlist.
   "TWO_MUSIC",
+  // Staging-only music auto-join target: the voice channel the staging bot
+  // joins on READY while the spike runs. A non-secret snowflake like the
+  // temp-voice channel IDs above; staging-only, enforced by
+  // scripts/check-env-bindings.py. Unset (or invalid) disables auto-join;
+  // the PATCH path still serves operator drag-ins.
+  "TWO_MUSIC_CHANNEL_ID",
   // Template assistant (V12): non-secret endpoint URL + model name; the
   // endpoint credential (if any) travels as its own Container secret, never
   // through this flag allowlist.
@@ -293,6 +299,8 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_TWITCH_CLIENT_ID: "Twitch Helix credential secret; reaches the Container only through its own explicit containerEnvVars line while the EventSub receiver is forwarded, never this flag allowlist",
   TWO_TWITCH_CLIENT_SECRET: "Twitch Helix credential secret; reaches the Container only through its own explicit containerEnvVars line while the EventSub receiver is forwarded, never this flag allowlist",
   TWO_TWITCH_WEBHOOK_SECRET: SECRET,
+  TWO_LAVALINK_URL: "music node base URL (docs/music-voice-node-spike.md); Operator-set staging secret, forwarded on its own explicit containerEnvVars line only with TWO_MUSIC=1 and the node password present, never this flag allowlist and never a committed wrangler.toml var (check-env-bindings.py)",
+  TWO_LAVALINK_PASSWORD: "music node password; Operator-set staging secret, forwarded on its own explicit containerEnvVars line only with TWO_MUSIC=1 and the node URL present, never this flag allowlist and never a committed wrangler.toml var (check-env-bindings.py)",
   TWO_DB_POOL_MAX: "cutover CLI pool size, not read by the Container runtime",
   TWO_DATABASE_TLS: "cutover/operator CLI TLS policy for database_tls::enforce (default required); not read by the Container runtime",
   TWO_ERASURE_ACTOR: "erase-member operator CLI audit actor, set per invocation; not read by the Container runtime",

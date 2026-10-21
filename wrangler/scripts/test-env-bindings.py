@@ -197,6 +197,46 @@ class AlertBindingTests(unittest.TestCase):
                 config = BASE.replace("[env.staging.vars]", f"[env.staging.vars]\nTWO_MUSIC = {value}", 1)
                 self.assertTrue(any('must be exactly "1"' in e for e in self.check_config(config)))
 
+    def test_lavalink_node_secrets_are_never_committed_vars(self):
+        for name in ["TWO_LAVALINK_URL", "TWO_LAVALINK_PASSWORD"]:
+            for section in ["vars", "env.staging.vars", "env.production.vars"]:
+                with self.subTest(name=name, section=section):
+                    config = BASE.replace(f"[{section}]", f'[{section}]\n{name} = "synthetic"', 1)
+                    errors = self.check_config(config)
+                    self.assertTrue(
+                        any("Operator-set Worker secret" in e for e in errors), errors
+                    )
+
+    def test_music_channel_id_is_staging_only_and_a_snowflake(self):
+        staging_ok = BASE.replace(
+            "[env.staging.vars]",
+            '[env.staging.vars]\nTWO_MUSIC_CHANNEL_ID = "123456789012345678"',
+            1,
+        )
+        self.assertEqual(self.check_config(staging_ok), [])
+        for section in ["vars", "env.production.vars"]:
+            with self.subTest(section=section):
+                config = BASE.replace(
+                    f"[{section}]",
+                    f'[{section}]\nTWO_MUSIC_CHANNEL_ID = "123456789012345678"',
+                    1,
+                )
+                errors = self.check_config(config)
+                self.assertTrue(
+                    any("TWO_MUSIC_CHANNEL_ID is staging-only" in e for e in errors),
+                    errors,
+                )
+        for value in ['"0"', '"abc"', '"12a34"', '""', '" 123"', '"18446744073709551616"', "123"]:
+            with self.subTest(value=value):
+                config = BASE.replace(
+                    "[env.staging.vars]",
+                    f"[env.staging.vars]\nTWO_MUSIC_CHANNEL_ID = {value}",
+                    1,
+                )
+                self.assertTrue(
+                    any("must be a Discord snowflake" in e for e in self.check_config(config))
+                )
+
     def test_deploy_env_marker_is_staging_only_and_exact(self):
         staging = BASE.split("[env.staging.vars]", 1)[1].split("\n[", 1)[0]
         self.assertIn('TWO_DEPLOY_ENV = "staging"', staging)

@@ -106,6 +106,15 @@ VOICE_PRESENCE_ENVS = {"staging"}
 # never a committed var.
 MUSIC_GATE_VAR = "TWO_MUSIC"
 MUSIC_GATE_ENVS = {"staging"}
+# The music node URL and password are Operator-set Worker secrets for the
+# staging spike (docs/music-voice-node-spike.md): they travel on explicit
+# containerEnvVars lines only, never as committed vars anywhere.
+LAVALINK_SECRET_PREFIX = "TWO_LAVALINK_"
+# The music auto-join target channel is a non-secret snowflake, committable
+# for staging only like the music gate it depends on; the spike commits no
+# value yet, so the Operator sets it when the node is up.
+MUSIC_CHANNEL_VAR = "TWO_MUSIC_CHANNEL_ID"
+MUSIC_CHANNEL_ENVS = {"staging"}
 # TOG-22862 (CISO AC4): the mutating admin controls (PUT /ops/config,
 # POST /ops/kill-switch) stay dark unless the environment opts in with these
 # exact-"1" switches. A top-level var would be required in every environment,
@@ -234,6 +243,19 @@ def _collect_errors(cfg: dict) -> list[str]:
             )
         if variables.get(MUSIC_GATE_VAR, "1") != "1":
             errors.append(f'{prefix}: {MUSIC_GATE_VAR} must be exactly "1" or absent')
+        if MUSIC_CHANNEL_VAR in variables and env_name not in MUSIC_CHANNEL_ENVS:
+            errors.append(
+                f"{prefix}: {MUSIC_CHANNEL_VAR} is staging-only "
+                "(top-level vars are required in every env; production music is a follow-up, never a committed var)"
+            )
+        channel = variables.get(MUSIC_CHANNEL_VAR)
+        if channel is not None and (
+            not isinstance(channel, str)
+            or not channel.isascii()
+            or not channel.isdecimal()
+            or not 1 <= int(channel) <= 18446744073709551615
+        ):
+            errors.append(f"{prefix}: {MUSIC_CHANNEL_VAR} must be a Discord snowflake or absent")
         if OPS_CONFIG_WRITES_VAR in variables and env_name not in OPS_CONFIG_WRITES_ENVS:
             errors.append(
                 f"{prefix}: {OPS_CONFIG_WRITES_VAR} is staging-only "
@@ -271,7 +293,9 @@ def _collect_errors(cfg: dict) -> list[str]:
         for key in sorted(
             k
             for k in variables
-            if k.startswith(EVENTSUB_RECEIVER_PREFIX) or k.startswith(TWITCH_SECRET_PREFIX)
+            if k.startswith(EVENTSUB_RECEIVER_PREFIX)
+            or k.startswith(TWITCH_SECRET_PREFIX)
+            or k.startswith(LAVALINK_SECRET_PREFIX)
         ):
             errors.append(f"{prefix}: {key} is an Operator-set Worker secret, never a wrangler.toml var")
         threshold = variables.get("UNREADY_ALERT_FAILURES")

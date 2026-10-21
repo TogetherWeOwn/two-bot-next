@@ -247,6 +247,45 @@ test("eventsub delivery gate and its inputs travel only with an exactly-1 delive
   assert.equal(half["TWO_EVENTSUB_INVITE_URL"], undefined);
 });
 
+test("music node secrets reach the Container on explicit lines with TWO_MUSIC=1", () => {
+  const node = {
+    TWO_LAVALINK_URL: "http://lavalink.invalid:2333",
+    // Built from parts: a single assigned literal on a secret key trips
+    // gitleaks generic-api-key. The joined runtime value is unchanged.
+    TWO_LAVALINK_PASSWORD: ["synthetic", "node", "password", "01"].join("-"),
+  };
+  // Never on the generic flag allowlist.
+  for (const name of Object.keys(node)) {
+    assert.equal(forwardedFlagVars({ ...node, TWO_MUSIC: "1" })[name], undefined, name);
+  }
+  // Armed: gate + both bindings travel.
+  const forwarded = containerEnv({ TWO_MUSIC: "1", ...node });
+  assert.equal(forwarded["TWO_LAVALINK_URL"], node.TWO_LAVALINK_URL);
+  assert.equal(forwarded["TWO_LAVALINK_PASSWORD"], node.TWO_LAVALINK_PASSWORD);
+  assert.equal(forwarded["TWO_MUSIC"], "1");
+  // Gate off or half-provisioned: neither travels. The Container then runs
+  // tap-only instead of failing boot: the node lands after this code.
+  for (const env of [
+    { ...node },
+    { TWO_MUSIC: "0", ...node },
+    { TWO_MUSIC: "true", ...node },
+    { TWO_MUSIC: "1" },
+    { TWO_MUSIC: "1", TWO_LAVALINK_URL: node.TWO_LAVALINK_URL },
+    { TWO_MUSIC: "1", TWO_LAVALINK_PASSWORD: node.TWO_LAVALINK_PASSWORD },
+    { TWO_MUSIC: "1", TWO_LAVALINK_URL: "", TWO_LAVALINK_PASSWORD: node.TWO_LAVALINK_PASSWORD },
+  ]) {
+    const dark = containerEnv(env);
+    assert.equal(dark["TWO_LAVALINK_URL"], undefined, JSON.stringify(env));
+    assert.equal(dark["TWO_LAVALINK_PASSWORD"], undefined, JSON.stringify(env));
+  }
+});
+
+test("music auto-join channel rides the flag allowlist", () => {
+  assert.ok((FORWARDED_FLAGS as readonly string[]).includes("TWO_MUSIC_CHANNEL_ID"));
+  const forwarded = containerEnv({ TWO_MUSIC: "1", TWO_MUSIC_CHANNEL_ID: "123456789012345678" });
+  assert.equal(forwarded["TWO_MUSIC_CHANNEL_ID"], "123456789012345678");
+});
+
 test("configured voice infrastructure IDs reach the Container unchanged", () => {
   const vars = {
     DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID: "600",

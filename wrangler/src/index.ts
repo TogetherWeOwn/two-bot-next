@@ -235,6 +235,10 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID?: string;
   /** Operator-set Discord invite URL for go-live posts. Forwarded on its own explicit containerEnvVars line while the delivery gate travels, never flag-forwarded. */
   TWO_EVENTSUB_INVITE_URL?: string;
+  /** Operator-set music node base URL (docs/music-voice-node-spike.md). Forwarded on its own explicit containerEnvVars line only with TWO_MUSIC=1 and the node password present, never flag-forwarded, never a committed var. */
+  TWO_LAVALINK_URL?: string;
+  /** Operator-set music node password. Forwarded on its own explicit containerEnvVars line only with TWO_MUSIC=1 and the node URL present, never flag-forwarded, never a committed var, never logged. */
+  TWO_LAVALINK_PASSWORD?: string;
   /** Staging rollback-drill switch (docs/staging-rollout-gate.md). Set only
    * in the generated staging deploy config by a manual deploy-staging
    * dispatch, never a committed var (check-env-bindings.py). Reaches the
@@ -716,6 +720,17 @@ function eventsubReceiverForwarded(env: Env): boolean {
   return eventsubReceiverEnabled(env) && !!env.TWO_TWITCH_WEBHOOK_SECRET;
 }
 
+/**
+ * The music node client needs its base URL and password together: the Worker
+ * forwards both only with TWO_MUSIC=1 and both bindings present. Anything
+ * else forwards nothing and the Container runs tap-only (it must boot before
+ * the Operator provisions the node, so a half-provisioned enable never fails
+ * startup — unlike the all-or-nothing private receivers above).
+ */
+function musicNodeForwarded(env: Env): boolean {
+  return env.TWO_MUSIC === "1" && !!env.TWO_LAVALINK_URL && !!env.TWO_LAVALINK_PASSWORD;
+}
+
 /** Readonly view of the secrets/vars the DO forwards into the container. */
 function containerEnvVars(env: Env, port: number): Record<string, string> {
   const vars: Record<string, string> = {
@@ -800,6 +815,14 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
       if (env.TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID) vars["TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID"] = env.TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID;
       if (env.TWO_EVENTSUB_INVITE_URL) vars["TWO_EVENTSUB_INVITE_URL"] = env.TWO_EVENTSUB_INVITE_URL;
     }
+  }
+  // Staging music node (docs/music-voice-node-spike.md): base URL and
+  // password travel only together with TWO_MUSIC=1, each on its own
+  // explicit line, never flag-forwarded (NOT_FORWARDED in container-env.ts)
+  // and never logged. Absent stays absent: the Container runs tap-only.
+  if (musicNodeForwarded(env)) {
+    vars["TWO_LAVALINK_URL"] = env.TWO_LAVALINK_URL as string;
+    vars["TWO_LAVALINK_PASSWORD"] = env.TWO_LAVALINK_PASSWORD as string;
   }
   return vars;
 }
