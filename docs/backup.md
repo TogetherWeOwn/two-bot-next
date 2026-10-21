@@ -122,11 +122,10 @@ target cooldowns), `discord_send_admission` (per-credential lane state that a
 recovered process re-learns) and `gateway_onboarding_jobs` (a restart-recovery
 queue bound to a gateway session). The store chain's `rollback_journal` and
 `rollback_watermarks` are excluded too: the journal is append-only
-cutover evidence (the `PgFunnelStore` funnel append — not yet the production
-gateway batch writer in `crates/cutover/src/gateway_session.rs`, which needs
-its own slice — journals each `events` insert inside the primary transaction
-under a savepoint best-effort via `journal::record_in`, and its rows stay
-re-capturable
+cutover evidence (the `PgFunnelStore` funnel append and the production
+gateway batch writer in `crates/cutover/src/gateway_session.rs` journal each
+`events` insert inside the primary transaction under a savepoint best-effort
+via `journal::record_in`, and their rows stay re-capturable
 during the watch window), and restoring pre-backup watermarks could mark
 post-backup writes as already journaled, silently breaking rollback coverage.
 Migration ledgers (`_sqlx_migrations`, `schema_migrations` and the store
