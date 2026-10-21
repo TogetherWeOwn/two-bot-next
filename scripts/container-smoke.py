@@ -377,12 +377,39 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
             raise
 
 
+def dry_run_plan(image):
+    """Print the container-mutation plan without touching Docker or the network.
+
+    Static text plus the image under test: no container names, ports or
+    timestamps are generated, so the plan is byte-identical across runs.
+    Size budgets are never enforced here because nothing is measured.
+    """
+    print("\n".join((
+        "dry-run plan for container smoke (no mutations performed)",
+        f"image: {image}",
+        "1. measure: docker create a measurement container (--memory 256m, "
+        "--network none), read the binary and CA bundle, then remove it",
+        "2. main run: docker run --detach --memory 256m "
+        "--publish 127.0.0.1::8080, then probe /health until 200 and assert "
+        "/readyz 503 parked over loopback HTTP",
+        "3. health-probe: docker run --network none --memory 256m <image> "
+        "--healthcheck (expects exit 1), then remove the probe container",
+        "4. shutdown: docker kill --signal TERM, docker wait (10s budget), "
+        "then remove every owned container",
+    )))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image")
     parser.add_argument("--image-max-bytes", type=int, default=IMAGE_MAX_BYTES)
     parser.add_argument("--binary-max-bytes", type=int, default=BINARY_MAX_BYTES)
+    parser.add_argument("--dry-run", action="store_true",
+                        help="print the container-mutation plan without running anything")
     args = parser.parse_args()
+    if args.dry_run:
+        dry_run_plan(args.image)
+        return
     try:
         smoke(args.image, args.image_max_bytes, args.binary_max_bytes)
     except (RuntimeError, subprocess.SubprocessError, ValueError, KeyError) as error:

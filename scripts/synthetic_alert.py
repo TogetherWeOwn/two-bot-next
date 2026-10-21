@@ -63,14 +63,18 @@ def summarize(evidence):
     checks = evidence.get("checks")
     if not isinstance(checks, list) or not checks:
         return "probe failed"
+    # Evidence-derived names pass through printable(), like the revision
+    # fields below: a crafted check name with control characters is dropped
+    # (fail-closed to "probe failed") instead of reaching Discord content.
     failed = [c for c in checks
               if isinstance(c, dict) and c.get("verdict") == "fail"
-              and isinstance(c.get("check"), str)]
+              and isinstance(c.get("check"), str)
+              and printable(c["check"]) is not None]
     if not failed:
         return "probe failed"
     names = ", ".join(c["check"] for c in failed[:4])
     first_shape = failed[0].get("shape")
-    detail = f": {first_shape}" if isinstance(first_shape, str) and first_shape else ""
+    detail = f": {first_shape}" if printable(first_shape) else ""
     text = f"{names} failed{detail}"
     return text if len(text) <= 300 else text[:297] + "..."
 
@@ -188,6 +192,49 @@ def post_event(env, environment, evidence_path, event):
     return 0
 
 
+def webhook_validity(webhook_url):
+    """Validity label for the dry-run plan; never echoes the URL itself."""
+    if not webhook_url:
+        return "missing"
+    return "valid" if WEBHOOK.fullmatch(webhook_url) else "invalid"
+
+
+def dry_run_plan(environment, evidence_path):
+    """Print the delivery plan without posting or opening any connection.
+
+    Runs the same decide step as the live path (history read included) so
+    the planned event matches what a live run would deliver, then reports
+    the webhook shape before any send. A missing webhook or a missing probe
+    sample is a plan line, never a failure: a preview is not a delivery.
+    """
+    env = os.environ
+    current = env.get("PROBE_OUTCOME")
+    if current not in ("success", "failure"):
+        event = None
+    else:
+        event = decide_event(env, environment)
+    evidence = load_evidence(evidence_path)
+    if event == "alert":
+        summary = summarize(evidence)
+    elif event == "recovery":
+        summary = "the probe is healthy again"
+    else:
+        summary = "no alert transition"
+    print("synthetic_alert dry-run plan (no mutations performed)")
+    print(f"env: {environment}")
+    print(f"evidence: {summary}")
+    print(f"event: {event or 'none'}")
+    print(f"webhook: {webhook_validity(env.get('SYNTHETIC_ALERT_WEBHOOK_URL'))}")
+    if event in ("alert", "recovery"):
+        content = build_content(environment, evidence,
+                                env.get("GIT_SHA") or env.get("GITHUB_SHA"),
+                                run_link(), event)
+        print(f"content: {content}")
+    else:
+        print("content: (nothing would be sent)")
+    return 0
+
+
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--env", required=True, choices=("staging", "prod"),
@@ -198,6 +245,8 @@ def parse_args(argv):
                         help="only compute the transition and write event to GITHUB_OUTPUT")
     parser.add_argument("--post-only", action="store_true",
                         help="only post ALERT_EVENT without reading workflow history")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="print the delivery plan without posting anything")
     return parser.parse_args(argv)
 
 
@@ -206,6 +255,8 @@ def main(argv=None):
     if args.decide_only and args.post_only:
         print("synthetic_alert: --decide-only and --post-only are exclusive", file=sys.stderr)
         return 2
+    if args.dry_run:
+        return dry_run_plan(args.env, args.evidence)
     if args.decide_only:
         # Decide step: compute the transition, never post, never need webhook.
         # A missing/skipped probe is not a sample and writes an empty event.
