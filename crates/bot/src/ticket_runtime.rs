@@ -1114,3 +1114,7 @@ mod no_work_acceptance_tests;
 #[cfg(test)]
 #[path = "ticket_failure_class_tests.rs"]
 mod failure_class_tests;
+
+#[cfg(test)]
+#[path = "ticket_capture_cap_acceptance_tests.rs"]
+mod capture_cap_acceptance_tests;

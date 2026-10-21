@@ -2054,3 +2054,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "backup_pool_timeout_acceptance_tests.rs"]
+mod pool_timeout_acceptance_tests;
