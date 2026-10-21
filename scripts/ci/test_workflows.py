@@ -42,7 +42,7 @@ JOB_INVENTORY = {
                            "pinned-history-guard"},
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
-    "release.yml": {"tag", "sbom-target", "release-sbom", "attach-sbom"},
+    "release.yml": {"tag", "sbom-target", "release-sbom", "attach-sbom", "verdict"},
     "staging-migrate.yml": {"plan", "claim", "apply"},
     "production-migrate.yml": {"plan", "claim", "apply"},
     # TOG-14008: manual staging-only Worker rollback drill; pinned shape below.
@@ -1820,6 +1820,97 @@ def gradual_promote_proof_errors(workflow):
     return errors
 
 
+def release_errors(workflow):
+    """The release chain fails closed on an empty dispatch, never as a quiet green.
+
+    release.yml is dispatch-only with the sha, dry_run and release_tag
+    inputs, and every job but the verdict is input-guarded: an all-default
+    dispatch skips tag, sbom-target, release-sbom and attach-sbom and would
+    read green with nothing published. One verdict job runs after all four
+    (no input guard, always() so failures still judge): it fails the run
+    with an error naming the skipped jobs and why when every input sits at
+    its default, fails on any failed or cancelled dependency, and passes
+    otherwise, so the sha, dry_run and release_tag dispatches behave exactly
+    as before (their designed skips stay green). Every real job carries an
+    explicit timeout: tag 10 minutes, the SBOM plumbing (sbom-target,
+    attach-sbom) and the verdict 5.
+    """
+    name = "release.yml"
+    errors = []
+    if "env" in workflow:
+        errors.append(f"{name}: workflow-level env must stay absent")
+    on = workflow.get("on") or {}
+    if set(on) != {"workflow_dispatch"}:
+        errors.append(f"{name}: must be dispatch-only (no push/pull_request/schedule)")
+    else:
+        dispatch = on.get("workflow_dispatch") or {}
+        inputs = (dispatch.get("inputs") or {}) if isinstance(dispatch, dict) else {}
+        if set(dispatch) != {"inputs"} or set(inputs) != {"sha", "dry_run", "release_tag"}:
+            errors.append(f"{name}: workflow_dispatch must carry exactly sha, dry_run and release_tag")
+        else:
+            sha = inputs.get("sha") or {}
+            dry_run = inputs.get("dry_run") or {}
+            release_tag = inputs.get("release_tag") or {}
+            if sha.get("type") != "string" or sha.get("default") != "":
+                errors.append(f"{name}: sha must be a string defaulting to empty")
+            if dry_run.get("type") != "boolean" or dry_run.get("default") not in (False, "false"):
+                errors.append(f"{name}: dry_run must be an opt-in boolean defaulting to false")
+            if release_tag.get("type") != "string" or release_tag.get("default") != "":
+                errors.append(f"{name}: release_tag must be a string defaulting to empty")
+    if workflow.get("permissions") != {}:
+        errors.append(f"{name}: top-level permissions must stay empty")
+    jobs = workflow.get("jobs") or {}
+    if set(jobs) != {"tag", "sbom-target", "release-sbom", "attach-sbom", "verdict"}:
+        errors.append(f"{name}: jobs must be exactly tag, sbom-target, release-sbom, attach-sbom and verdict")
+        return errors
+    for job_id, expected_timeout in (("tag", "10"), ("sbom-target", "5"), ("attach-sbom", "5")):
+        if jobs[job_id].get("timeout-minutes") != expected_timeout:
+            errors.append(f"{name}:{job_id}: timeout must stay {expected_timeout} minutes")
+    verdict = jobs["verdict"]
+    if verdict.get("name") != "release verdict (fail closed on empty dispatch)":
+        errors.append(f"{name}:verdict: consumer job identity changed")
+    if verdict.get("needs") != ["tag", "sbom-target", "release-sbom", "attach-sbom"]:
+        errors.append(f"{name}:verdict: must run after tag, sbom-target, release-sbom and attach-sbom")
+    if verdict.get("if") != "${{ always() }}":
+        errors.append(f"{name}:verdict: must run with if: always() so failures still judge")
+    if verdict.get("permissions") != {"contents": "read"}:
+        errors.append(f"{name}:verdict: must keep contents:read only")
+    if not runner_allowed("verdict", verdict.get("runs-on")):
+        errors.append(f"{name}:verdict: must use the routed runner expression for job 'verdict'")
+    if verdict.get("timeout-minutes") != "5":
+        errors.append(f"{name}:verdict: timeout must stay 5 minutes")
+    for key in ("uses", "environment", "services", "container",
+                "continue-on-error", "strategy", "env"):
+        if key in verdict:
+            errors.append(f"{name}:verdict: must not set {key} (it judges with inputs and results only)")
+    if "secrets." in str(verdict):
+        errors.append(f"{name}:verdict: must never read a secret")
+    steps = verdict.get("steps", [])
+    if len(steps) != 1 or any("if" in step or "continue-on-error" in step for step in steps):
+        errors.append(f"{name}:verdict: must run exactly one unconditional verdict step")
+        return errors
+    step = steps[0]
+    if step.get("env") != {"DISPATCH_SHA": "${{ inputs.sha }}",
+                           "DRY_RUN": "${{ inputs.dry_run }}",
+                           "RELEASE_TAG": "${{ inputs.release_tag }}",
+                           "TAG_RESULT": "${{ needs.tag.result }}",
+                           "SBOM_TARGET_RESULT": "${{ needs.sbom-target.result }}",
+                           "RELEASE_SBOM_RESULT": "${{ needs.release-sbom.result }}",
+                           "ATTACH_SBOM_RESULT": "${{ needs.attach-sbom.result }}"}:
+        errors.append(f"{name}:verdict: step must bind exactly the dispatch inputs and job results "
+                      "via the environment")
+    run = str(step.get("run") or "")
+    for needle in ("DISPATCH_SHA", "DRY_RUN", "RELEASE_TAG", "skipped",
+                   "failure", "cancelled", "::error::"):
+        if needle not in run:
+            errors.append(f"{name}:verdict: missing pin {needle}")
+    if run.count("sys.exit(1)") != 1:
+        errors.append(f"{name}:verdict: must fail exactly once, on an empty dispatch or a failed dependency")
+    if "uses" in step or "${{" in run:
+        errors.append(f"{name}:verdict: step must use the environment only, never an inline expression")
+    return errors
+
+
 def production_errors(workflow):
     """deploy-production is the one live route: dispatch, green-staging completion or schedule, chained to staging."""
     name = "deploy-production.yml"
@@ -2392,8 +2483,9 @@ def synthetic_user_flow_errors(workflow):
     the `synthetic-alerts` environment. Two jobs: `staging` runs the reviewed
     staging health-contract probe, `prod-passive` runs the reviewed passive
     production probe (observe and alert only, never a deploy gate). Each job
-    has an optional target probe, a notice when its binding is absent, an
-    always() evidence upload, an always() decide step, and a gated post step.
+    has an optional target probe, a fail-closed error when its binding is
+    absent (zero samples never read green), an always() evidence upload, an
+    always() decide step, and a gated post step.
     The decide step reads recent run history with actions:read, alerts after
     two failures, and writes the event to GITHUB_OUTPUT; the post step runs
     only when an event is due so a no-op is skipped (never success), and only
@@ -2458,8 +2550,10 @@ def synthetic_user_flow_errors(workflow):
         if probe_step.get("id") != "probe" or expected_target not in str(probe_step.get("if", "")):
             errors.append(f"{name}:{job_id}: probe must be skipped when {expected_target} is unset")
         expected_notice = expected_target + " is unset"
-        if expected_notice not in str(notice.get("run", "")) or "::warning::" not in str(notice.get("run", "")):
-            errors.append(f"{name}:{job_id}: missing-binding skip must emit a notice")
+        if expected_notice not in str(notice.get("run", "")) or "::error::" not in str(notice.get("run", "")):
+            errors.append(f"{name}:{job_id}: missing-binding skip must fail with an error naming the unset variable")
+        if "exit 1" not in str(notice.get("run", "")):
+            errors.append(f"{name}:{job_id}: missing-binding skip must fail the job, never warn and stay green")
         if upload.get("if") != "always()":
             errors.append(f"{name}:{job_id}: upload must run with if: always() so failures keep their artifact")
         if not str(upload.get("uses", "")).startswith("actions/upload-artifact@"):
@@ -2731,6 +2825,8 @@ def workflow_policy_errors(workflows):
             errors.extend(pinned_history_guard_errors(workflow))
             errors.extend(schema_gate_errors(workflow))
             errors.extend(roles_gate_errors(workflow))
+        if name == "release.yml":
+            errors.extend(release_errors(workflow))
         if name == "voice-synthetic.yml":
             # Pinned shape above; the generic environment scan below would
             # flag its voice-synthetic Environment binding.
