@@ -567,12 +567,6 @@ async fn safe_create_rejection_releases_reservation_but_failed_controls_cleanup_
     db.close().await;
 }
 
-fn own_controls() -> Value {
-    json!({"author":{"id":"400"},"components":[{"type":1,"components":[
-        {"type":2,"custom_id":TICKET_CLAIM_ID}, {"type":2,"custom_id":TICKET_CLOSE_ID}
-    ]}]})
-}
-
 fn own_panel() -> Value {
     json!({"author":{"id":"400"},"components":[{"type":1,"components":[
         {"type":2,"custom_id":TICKET_OPEN_ID}
@@ -593,8 +587,8 @@ async fn ready_recovers_controls_and_panel_without_duplicates_and_purges_expired
             ScriptedResponse::json(200, panel_channel.clone()),
             ScriptedResponse::json(200, json!([])),
             ScriptedResponse::json(200, json!({"id":"801"})),
-            ScriptedResponse::json(200, channel()),
-            ScriptedResponse::json(200, json!([own_controls()])),
+            // The explicit second recover() below skips the behind-cursor row
+            // and re-checks only the panel, so no row replay reads are scripted.
             ScriptedResponse::json(200, panel_channel),
             ScriptedResponse::json(200, json!([own_panel()])),
         ],
@@ -627,7 +621,7 @@ async fn ready_recovers_controls_and_panel_without_duplicates_and_purges_expired
     drop(recovery_guard);
     drop(purge_guard);
     assert!(runtime.recover().await.is_ok());
-    assert_eq!(mock.requests().len(), 10);
+    assert_eq!(mock.requests().len(), 8);
     assert_eq!(
         mock.requests()
             .iter()

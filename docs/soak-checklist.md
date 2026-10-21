@@ -1051,7 +1051,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Reason:** Proposed staging-execution waiver: this store, gate-diagnostic, failure-path, test-only, standards-only or CI-only slice is reproducible only with local mock fixtures or isolated test containers under the safety contract (no live fault injection, clock change, staging/production SQL or credential handling); the owning slice's exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
 - **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
-### s12-18: Durable join-risk event claim store over the existing flags table (unwired, no new migration)
+### s12-18: Durable join-risk event claim store over the existing flags table (no new migration), wired via the join-risk runtime
 
 - **Method:** `waived` (not an execution verdict).
 - **Action:** Run the #362 join-risk claim fixture on authorized test containers: 10-way concurrent exactly-once claims, serialized burst scoring with threshold-equality bonus, old-account evidence, cross-guild isolation, out-of-window exclusion, bulk-suppression persistence, duplicate replay and the legacy-0015 upgrade shape.
@@ -1182,11 +1182,11 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Owner:** [TOG-10119](/TOG/issues/TOG-10119), [TOG-13123](/TOG/issues/TOG-13123)
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
-### s12-32: EventSub subscription reconcile at startup plus a bounded hourly interval (#989, open)
+### s12-32: EventSub subscription reconcile at startup plus a bounded hourly interval (#989)
 
 - **Method:** `manual` (not an execution verdict).
-- **Action:** After the open reconcile slice merges, first re-verify the flag names and cited file:line at its merge head and refresh the parity row; then on staging with the receiver enabled, restart the container and observe one bounded reconcile interval tick with an empty and a populated broadcaster allowlist.
-- **Expected:** Reconcile runs at startup and on the hourly interval only while the receiver flag is exactly on, an empty allowlist parks without subscriptions, and no reconcile runs while the flag is off; until the slice lands, HEAD runs no reconcile (library-only planner; the receiver only acks revocations).
+- **Action:** On staging with the receiver enabled, restart the container and observe one bounded reconcile interval tick with an empty and a populated broadcaster allowlist.
+- **Expected:** Reconcile runs at startup and on the hourly interval only while the receiver flag is exactly on, an empty allowlist parks without subscriptions, and no reconcile runs while the flag is off.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 - **Owner:** [TOG-13123](/TOG/issues/TOG-13123)
 
@@ -1237,7 +1237,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 - **Method:** `automated` (not an execution verdict).
 - **Action:** Run the voice publish pins: the router merge and yield tests in `crates/core/src/router.rs`, the staging manifest drift tests in `crates/core/tests/staging_publish_manifest.rs`, and the generated command reference check in `crates/core/tests/reference_docs.rs`.
-- **Expected:** With `TWO_VOICE=1` the merged publish set carries the 29 builtins then the 21 voice names (voice `kick` loses first-wins to moderation `/kick`), `/templateassistant` only with the assistant gate too, names and default permissions equal the manifest, and none publish with the gate off.
+- **Expected:** With `TWO_VOICE=1` the merged publish set carries the 29 builtins then the 21 voice names (voice `kick` loses first-wins to moderation `/kick`), `/templateassistant` unpublished in every gate state until its slice lands, names and default permissions equal the manifest, and none publish with the gate off.
 - **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result; fixture proof only. Deployed `/voice` registry read-back and the temp-voice staging scenario stay on [TOG-10119](/TOG/issues/TOG-10119) and are not covered by this row.
 - **Owner:** [TOG-10093](/TOG/issues/TOG-10093), [TOG-10119](/TOG/issues/TOG-10119)
 - **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib router::tests::voice && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib router::tests::templateassistant && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test staging_publish_manifest && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test reference_docs committed_references_match_compiled_metadata

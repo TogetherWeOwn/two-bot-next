@@ -115,6 +115,25 @@ class SmokeError(Exception):
     """A check's one-line failure reason (fixed vocabulary only)."""
 
 
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    raised message is fixed vocabulary: it names no key, value or path.
+    """
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
+
+
 @dataclass(frozen=True)
 class Result:
     name: str
@@ -233,7 +252,9 @@ def get_json(fetch_fn, url):
     if len(body) > BODY_CAP:
         raise SmokeError("interactions endpoint answered over the body cap")
     try:
-        return json.loads(body)
+        return json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+    except DuplicateKeyError:
+        raise SmokeError("interactions endpoint answered 200 with duplicate JSON object keys")
     except (ValueError, UnicodeDecodeError, RecursionError):
         raise SmokeError("interactions endpoint answered 200 with invalid JSON")
 
@@ -379,7 +400,10 @@ def check_worker(origin):
     if len(body) > BODY_CAP:
         return [Result("worker-health", "fail", "GET /health answered over the body cap")], None
     try:
-        health = json.loads(body)
+        health = json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+    except DuplicateKeyError:
+        return [Result("worker-health", "fail",
+                       "GET /health carries duplicate JSON object keys")], None
     except (ValueError, UnicodeDecodeError, RecursionError):
         return [Result("worker-health", "fail", "GET /health answered without JSON")], None
     results = []
@@ -399,7 +423,11 @@ def check_worker(origin):
         results.append(Result("worker-readyz", "fail", "GET /readyz answered over the body cap"))
         return results, None
     try:
-        report = json.loads(body)
+        report = json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+    except DuplicateKeyError:
+        results.append(Result("worker-readyz", "fail",
+                              "GET /readyz carries duplicate JSON object keys"))
+        return results, None
     except (ValueError, UnicodeDecodeError, RecursionError):
         results.append(Result("worker-readyz", "fail", "GET /readyz answered without JSON"))
         return results, None

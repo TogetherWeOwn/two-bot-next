@@ -104,7 +104,8 @@ async function harness(t: TestContext, env: Record<string, unknown>, options: { 
   const seen: Seen[] = [];
   const values = new Map<string, unknown>([[OWNER_KEY, "owner" in options ? options.owner : OWNER]]);
   const listening = new Set<number>();
-  let receiver: (request: Seen) => Response | Promise<Response> = () => Response.json({ ok: true, result: { message_id: "1" } });
+  let receiver: (request: Seen) => Response | Promise<Response> = (request) =>
+    Response.json({ ok: true, request_id: request.headers["x-request-id"], result: { message_id: "1" } });
   const runtime = {
     running: false,
     async destroy() { this.running = false; },
@@ -423,9 +424,11 @@ test("forwards exactly the allowlisted headers and unchanged bytes to the fixed 
   });
   const response = await h.call(request);
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { ok: true, result: { message_id: "1" } });
   const [call, ...rest] = h.receiverCalls();
   assert.equal(rest.length, 0);
+  assert.deepEqual(await response.json(), {
+    ok: true, request_id: call?.headers["x-request-id"], result: { message_id: "1" },
+  });
   assert.ok(call?.body);
   assert.equal(call.port, RECEIVER_PORT);
   assert.equal(call.method, "POST");
@@ -455,7 +458,7 @@ test("receiver answers relay with allowlisted headers only; container error text
   const h = await harness(t, ENABLED_ENV);
   await h.warm();
 
-  h.setReceiver(() => new Response(JSON.stringify({ ok: false, request_id: "r1", error: { code: "unauthorized", message: "unauthorized", retryable: false } }), {
+  h.setReceiver((seen) => new Response(JSON.stringify({ ok: false, request_id: seen.headers["x-request-id"], error: { code: "unauthorized", message: "Signature verification failed", retryable: false } }), {
     status: 401,
     headers: {
       "content-type": "application/json",
@@ -908,9 +911,11 @@ async function fixedEnvelope(response: Response) {
   return body;
 }
 
-test("relay preserves below-cap bytes, allowlisted headers and retry-after validation", async (t) => {
+test("relay admits a below-cap envelope, projects it and filters headers with retry-after validation", async (t) => {
   t.mock.method(console, "warn", () => {});
-  const payload = new TextEncoder().encode(JSON.stringify({ ok: true, result: { message_id: "1" } }));
+  const requestId = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+  const envelope = { ok: true, request_id: requestId, result: { message_id: "1" } };
+  const payload = new TextEncoder().encode(JSON.stringify(envelope));
   const { stream, state } = trackedChunks([payload]);
   const upstream = jsonResponse(stream, 200, {
     "idempotent-replay": "true",
@@ -919,33 +924,36 @@ test("relay preserves below-cap bytes, allowlisted headers and retry-after valid
     "x-secret": "leak",
     "cache-control": "public, max-age=999",
   });
-  const relayed = await relayReceiverResponse(upstream);
+  const relayed = await relayReceiverResponse(upstream, requestId);
   assert.equal(relayed.status, 200);
   assert.equal(relayed.headers.get("idempotent-replay"), "true");
   assert.equal(relayed.headers.get("retry-after"), "7");
   assert.equal(relayed.headers.get("cache-control"), "no-store");
   assert.equal(relayed.headers.get("set-cookie"), null);
   assert.equal(relayed.headers.get("x-secret"), null);
-  assert.equal(Buffer.compare(new Uint8Array(await relayed.arrayBuffer()), payload), 0);
+  assert.deepEqual(await relayed.json(), envelope);
   assert.equal(state.cancelled, false);
 
   // Invalid retry-after is stripped, not forwarded.
   const { stream: badRetry } = trackedChunks([payload]);
-  const invalid = await relayReceiverResponse(jsonResponse(badRetry, 200, { "retry-after": "7.5" }));
+  const invalid = await relayReceiverResponse(jsonResponse(badRetry, 200, { "retry-after": "7.5" }), requestId);
   assert.equal(invalid.status, 200);
   assert.equal(invalid.headers.get("retry-after"), null);
-  await invalid.arrayBuffer();
+  assert.deepEqual(await invalid.json(), envelope);
 });
 
-test("relay preserves exactly the 64 KiB cap byte for byte", async (t) => {
+test("relay admits a valid envelope at exactly the 64 KiB cap", async (t) => {
   t.mock.method(console, "warn", () => {});
-  const first = new Uint8Array(32 * 1024).fill(0x61);
-  const second = new Uint8Array(MAX_RESPONSE_BYTES - first.byteLength).fill(0x62);
-  const { stream, state } = trackedChunks([first, second]);
-  const relayed = await relayReceiverResponse(jsonResponse(stream));
+  const requestId = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+  const envelope = { ok: true, request_id: requestId, result: { message_id: "1" } };
+  // Whitespace fills the byte budget without changing the envelope.
+  const padded = JSON.stringify(envelope).padEnd(MAX_RESPONSE_BYTES, " ");
+  assert.equal(padded.length, MAX_RESPONSE_BYTES);
+  const bytes = new TextEncoder().encode(padded);
+  const { stream, state } = trackedChunks([bytes.subarray(0, 32 * 1024), bytes.subarray(32 * 1024)]);
+  const relayed = await relayReceiverResponse(jsonResponse(stream), requestId);
   assert.equal(relayed.status, 200);
-  const body = new Uint8Array(await relayed.arrayBuffer());
-  assert.equal(body.byteLength, MAX_RESPONSE_BYTES);
+  assert.deepEqual(await relayed.json(), envelope);
   assert.equal(state.cancelled, false);
   assert.equal(state.delivered, 2);
 });
