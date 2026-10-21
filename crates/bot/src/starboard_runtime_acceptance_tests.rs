@@ -84,7 +84,7 @@ const MISSING_MESSAGE: u64 = 6063;
 const BOARD_MESSAGE: u64 = 8080;
 
 const AUTHOR_NAME: &str = "member";
-const AVATAR_HASH: &str = "abcdef";
+const AVATAR_HASH: &str = "abcdefabcdefabcdefabcdefabcdefab";
 const MESSAGE_TEXT: &str = "hello starboard world";
 const STAMP: &str = "2026-09-28T00:00:00.000000+00:00";
 const STAMP_DAY: &str = "2026-09-28";
