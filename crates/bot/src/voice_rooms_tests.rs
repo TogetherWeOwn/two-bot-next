@@ -2657,6 +2657,56 @@ async fn suspended_room_transfer_reports_finalizing_and_keeps_the_handoff_queued
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn held_owner_grant_reports_finalizing_before_the_write_finishes() {
+    let (live, store, mut http, trace) = owned_room();
+    let gate = Arc::new(OverwriteGate::default());
+    http.overwrites_gate = Some(gate.clone());
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let (reply, inbox) = oneshot::channel();
+    apply_command(
+        &mut worker,
+        ActorCommand::Ownership {
+            actor_id: MEMBER,
+            is_admin: false,
+            command: OwnershipCommand::Transfer { target_id: 301 },
+            reply,
+        },
+        0,
+    );
+    let observe = async {
+        gate.sent.notified().await;
+        let response = tokio::time::timeout(Duration::from_millis(2_000), inbox).await;
+        // Release even on failure so the queued action can finish, rather
+        // than hiding a dropped in-flight dispatch behind test shutdown.
+        gate.release.notify_one();
+        let text = response
+            .expect("reply before the held grant finishes")
+            .unwrap();
+        assert!(
+            text.contains("Recorded") && text.contains("finalized"),
+            "{text}"
+        );
+        assert!(!text.contains("Transferred"), "{text}");
+        assert!(
+            !trace
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call.starts_with("update_ownership:")),
+            "the reply must precede the held grant's durable completion"
+        );
+    };
+    tokio::join!(worker.drive_staged_ownership(0), observe);
+    assert!(
+        trace
+            .lock()
+            .unwrap()
+            .contains(&"update_ownership:500:301".to_owned()),
+        "the in-flight handoff must finish after its reply, not be cancelled"
+    );
+}
+
 fn owner_overwrite(member: u64) -> PermissionOverwrite {
     PermissionOverwrite {
         id: Id::new(member),
