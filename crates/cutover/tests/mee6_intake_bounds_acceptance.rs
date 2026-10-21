@@ -139,8 +139,9 @@ fn xp_parse_refuses_many_row_export() {
         export.len() < INTAKE_CAP_BYTES,
         "fixture must isolate the player bound under the file cap"
     );
-    let err = parse_mee6_export(&export).expect_err("180 000 valid rows must be refused");
-    let message = err.to_string();
+    let result = parse_mee6_export(&export);
+    assert!(result.is_err(), "180 000 valid rows must be refused");
+    let message = result.unwrap_err().to_string();
     assert!(
         is_bound_refusal(&message),
         "refusal must name the player bound, got: {message}"
@@ -185,8 +186,9 @@ fn xp_parse_refuses_deeply_nested_many_row_export() {
         export.len() < INTAKE_CAP_BYTES,
         "fixture must isolate the player bound under the file cap"
     );
-    let err = parse_mee6_export(&export).expect_err("nested many-row export must be refused");
-    let message = err.to_string();
+    let result = parse_mee6_export(&export);
+    assert!(result.is_err(), "nested many-row export must be refused");
+    let message = result.unwrap_err().to_string();
     assert!(
         is_bound_refusal(&message),
         "refusal must name the player bound, got: {message}"
@@ -226,8 +228,9 @@ fn rewards_parse_refuses_many_reward_export() {
         export.len() < INTAKE_CAP_BYTES,
         "fixture must isolate the reward bound under the file cap"
     );
-    let err = parse_mee6_role_rewards(&export).expect_err("150 000 rewards must be refused");
-    let message = err.to_string();
+    let result = parse_mee6_role_rewards(&export);
+    assert!(result.is_err(), "150 000 rewards must be refused");
+    let message = result.unwrap_err().to_string();
     assert!(
         is_bound_refusal(&message),
         "refusal must name the reward bound, got: {message}"
