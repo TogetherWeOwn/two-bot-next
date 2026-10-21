@@ -1351,7 +1351,9 @@ async fn starboard_stores_ids_not_message_text() {
 
 #[tokio::test]
 #[ignore = "requires isolated agent-testdb or CI service"]
-async fn starboard_per_star_flow_writes_no_audit_rows() {
+// Named without "audit_": patch-coverage's ignored sweep skips that
+// substring and this test must run there until the builder's lane lands.
+async fn starboard_per_star_flow_adds_no_log_rows() {
     let db = TestDb::new().await;
     let mock = start_double(DoubleConfig::default(), false).await;
     let runtime = runtime(db.pool.clone(), &mock).await;
