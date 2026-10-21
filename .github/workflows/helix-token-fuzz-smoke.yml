@@ -9,6 +9,12 @@ on:
 
 permissions: {}
 
+# Serialize manual fuzz runs per ref (nightly.yml shape): a queued dispatch
+# waits instead of racing a running smoke for the runner build cache.
+concurrency:
+  group: helix-token-fuzz-smoke-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   helix-token-smoke:
     name: helix_token 60 s smoke
