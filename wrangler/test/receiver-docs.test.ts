@@ -7,11 +7,11 @@ import { DatabaseSync } from "node:sqlite";
 import { TwoBotContainer, type Env } from "../src/index.ts";
 import { NOT_FORWARDED } from "../src/container-env.ts";
 import {
-  ACTIONS_PATH, BODY_TIMEOUT_MS, REQUEST_TIMEOUT_MS, SIGNING_HEADERS,
+  ACTIONS_PATH, BODY_TIMEOUT_MS, CONTENT_TYPE_MAX_BYTES, IDEMPOTENCY_HEADER, REQUEST_TIMEOUT_MS, SIGNING_HEADERS,
   allowlistedHeaders, handleActionsIngress, resetIngressLimits,
 } from "../src/internal-actions.ts";
 import { REQUEST_ID_HEADER, REQUEST_ID_LEN, isRequestId, newRequestId } from "../src/request-id.ts";
-import { normalizeRelease } from "../src/error-events.ts";
+import { RELEASE_TOKEN, normalizeRelease } from "../src/error-events.ts";
 import { LOG_QUERY_URL } from "../src/alert-rules.ts";
 
 const doc = readFileSync(new URL("../../docs/internal-actions-receiver.md", import.meta.url), "utf8");
@@ -157,18 +157,27 @@ function conforms(markdown: string, evidence: Evidence): void {
   for (const [name, cap] of SIGNING_HEADERS) {
     assert.match(forwarded.find((row) => row[0] === name)?.[1] ?? "", new RegExp(`at most ${cap} bytes`));
   }
+  assert.match(forwarded.find((row) => row[0] === IDEMPOTENCY_HEADER[0])?.[1] ?? "", new RegExp(`at most ${IDEMPOTENCY_HEADER[1]} bytes`));
+  assert.match(forwarded.find((row) => row[0] === "content-type")?.[1] ?? "", new RegExp(`at most ${CONTENT_TYPE_MAX_BYTES} bytes`));
   const requestId = forwarded.find((row) => row[0] === REQUEST_ID_HEADER)!;
   assert.match(requestId[1]!, new RegExp(`validated or minted.*${REQUEST_ID_LEN}-character Crockford.*not identity`, "i"));
   assert.doesNotMatch(markdown, /Only .*X-TWO-Key-Id.*reach the container/);
   const fields = table(markdown, "Log field");
   assert.deepEqual(fields.map((row) => row[0]).sort(), Object.keys(evidence.log).sort());
   assert.equal(fields.find((row) => row[0] === "log_url")?.[1], evidence.log["log_url"]);
-  assert.match(fields.find((row) => row[0] === "release")?.[1] ?? "", /normalized.*unknown/i);
+  const releaseCell = fields.find((row) => row[0] === "release")?.[1] ?? "";
+  assert.match(releaseCell, /normalized.*unknown/i);
+  const releaseRange = RELEASE_TOKEN.source.match(/\{(\d+),(\d+)\}/);
+  assert.ok(releaseRange, "release token carries explicit bounds");
+  assert.match(releaseCell, new RegExp(`${releaseRange[1]}[–-]${releaseRange[2]}.*lowercase hex`, "i"));
   assert.doesNotMatch(markdown, /status.*and.*error_class.*only/i, "stale log-field promise");
   const wiring = table(markdown, "Name").map((row) => row[0]!);
   assert.deepEqual(wiring.sort(), Object.keys(evidence.env).filter((key) => key.startsWith("TWO_INTERNAL_")).sort());
   assert.deepEqual(table(markdown, "Not forwarded").map((row) => row[0]).sort(), blocked.sort());
   for (const key of blocked) assert.equal(evidence.env[key], undefined, key);
+  const gate = table(markdown, "Layer").find((row) => row[0] === "Gate")?.[1] ?? "";
+  assert.match(gate, /INTERNAL_ACTIONS_INGRESS\s*=\s*"1"/, "missing staging var gate");
+  assert.match(gate, /TWO_INTERNAL_ACTIONS.*exactly 1/, "missing Operator secret gate");
   const enable = markdown.split("### Enable order and rollback")[1]!.split("## Authentication")[0]!;
   assert.doesNotMatch(enable, /stages[^\n]*TWO_INTERNAL_ROLE_KEYS/, "ineffective role-key staging instruction");
   assert.match(markdown, /Adding secrets cannot enable unforwarded role\/capability gates/);
@@ -186,6 +195,8 @@ test("receiver runbook matches observed budgets, headers, logs and container wir
     ["forwarded role keys", doc.replace("| `TWO_INTERNAL_KEYS` |", "| `TWO_INTERNAL_ROLE_KEYS` | Worker secret |\n| `TWO_INTERNAL_KEYS` |")],
     ["stage role keys", doc.replace("2. Operator stages", "2. Operator stages `TWO_INTERNAL_ROLE_KEYS`, then stages")],
     ["wrong timeout code", doc.replace("| `upstream_timeout` | true |", "| `request_timeout` | true |")],
+    ["stale forwarded caps and release range", doc.replace(/^\| idempotency-key \|.*$/m, "| idempotency-key | Optional at ingress; at most 999 bytes. Receiver action rules still apply |").replace(/^\| content-type \|.*$/m, "| content-type | Required accepted JSON media type; at most 999 bytes |").replace("7–40", "7–99")],
+    ["single-gate enablement", doc.replace("INTERNAL_ACTIONS_INGRESS", "REMOVED_GATE")],
   ];
   for (const [name, mutant] of stale) {
     await t.test(`rejects ${name}`, () => {
