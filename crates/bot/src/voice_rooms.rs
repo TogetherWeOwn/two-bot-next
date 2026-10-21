@@ -8679,8 +8679,10 @@ async fn load_actor_worker<S: RoomPersistence, H: RoomWrites>(
 /// consecutive inbox turns before a ready dispatch, timer or maintenance
 /// branch runs. The inbox branch is parked once the count is reached, so
 /// sustained benign churn cannot starve already-ready dispatch or due
-/// maintenance; the count resets on any timer, maintenance or
-/// queue-draining dispatch turn. Exposed as the
+/// maintenance; the count resets on any timer or maintenance turn, or on
+/// a dispatch turn that neither progresses nor leaves maintenance due,
+/// while a progressing dispatch keeps the inbox parked so a create runs
+/// with its priority move. Exposed as the
 /// `two_bot_voice_actor_inbox_turn_bound` gauge; the inbox/dispatch turn
 /// counters beside it tell inbox activity apart from dispatch progress.
 const VOICE_ACTOR_MAX_CONSECUTIVE_INBOX_TURNS: u8 = 32;
@@ -9061,8 +9063,9 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
             biased;
             // Fair scheduling: park the inbox once the consecutive-turn
             // bound is reached so a ready dispatch, timer or maintenance
-            // branch runs instead. The count resets on any timer,
-            // maintenance or progressing dispatch turn (see below).
+            // branch runs instead. The count resets on any timer or
+            // maintenance turn, or on a no-op dispatch with none due; a
+            // progressing dispatch keeps the park (see below).
             command = inbox.recv(), if consecutive_inbox_turns < VOICE_ACTOR_MAX_CONSECUTIVE_INBOX_TURNS => {
                 let Some(command) = command else { break };
                 let now_ms = start
