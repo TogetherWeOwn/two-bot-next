@@ -85,7 +85,10 @@ fn assert_absent(rendered: &str, sentinels: &[&str], surface: &str) {
 /// Every formatting surface of one value: normal/pretty Debug, plus the
 /// nested shapes (`Option`, `Vec`, tuple) diagnostics actually compose.
 fn assert_debug_clean(value: &AssistantConfig, sentinels: &[&str]) {
+    // Only ever Debug-formatted; dead_code fires because derived Debug is
+    // intentionally ignored during dead code analysis.
     #[derive(Debug)]
+    #[allow(dead_code)]
     struct Nested {
         config: AssistantConfig,
         again: Vec<AssistantConfig>,
