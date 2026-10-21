@@ -54,6 +54,9 @@ JOB_INVENTORY = {
     "staging-container-drill.yml": {"container-drill"},
     # Manual read-only staging events read for the B2 soak; pinned shape below.
     "staging-events-read.yml": {"read"},
+    # Manual read-only staging event-store retention census (counts, digests
+    # and timestamps only, log only); pinned shape below.
+    "staging-retention-census.yml": {"census"},
     # Manual read-only authenticated MCP prove-out (TOG-23456); pinned shape below.
     "staging-mcp-proveout.yml": {"proveout"},
     # Manual read-only staging ownership status read; pinned shape below.
@@ -453,16 +456,17 @@ ERROR_RATE_MARKERS = (
 
 
 def production_error_rate_gate_errors(workflow, name="deploy-production.yml"):
-    """The production error-rate gate mirrors staging against production.
+    """The production error-rate gate scrapes live production, never a rehearsal.
 
-    Exactly one expression in exactly one production step may read the
-    rehearsal input, it must use the pinned dispatch-only expression (an
-    automatic trigger never carries inputs), and that step must be the
-    error-rate gate step: it judges the rehearsal firing when armed and
-    scrapes live production /ops/metrics otherwise, failing the stage so
-    auto-rollback runs. The scrape token is the production binding only;
-    the staging token must never appear. Reviewed tooling runs from the
-    workflow commit (../tooling), never the guarded SHA.
+    Failure injection never runs against production (10-20 20:54Z forced
+    drill): the dispatch input stays declared (an opt-in boolean) only so the
+    guard can refuse it with a pointer to staging, and the input is read
+    exactly once, by the guard. No production step carries the drill switch
+    or a rehearsal flag. The error_rate_gate step scrapes live production
+    /ops/metrics and fails the stage so auto-rollback runs. The scrape token
+    is the production binding only; the staging token must never appear.
+    Reviewed tooling runs from the workflow commit (../tooling), never the
+    guarded SHA.
     """
     errors = []
     inputs = (((workflow.get("on") or {}).get("workflow_dispatch") or {}).get("inputs") or {})
@@ -470,31 +474,30 @@ def production_error_rate_gate_errors(workflow, name="deploy-production.yml"):
     if drill.get("type") != "boolean" or drill.get("default") not in (False, "false") \
             or str(drill.get("required")).lower() != "false":
         errors.append(f"{name}: inject_error_rate_spike must stay an opt-in boolean defaulting to false")
+    if str(workflow).count("inputs.inject_error_rate_spike") != 1:
+        errors.append(f"{name}: inject_error_rate_spike may be read only by the guard (which refuses it)")
     jobs = workflow.get("jobs", {}) or {}
     steps = ((jobs.get("production") or {}).get("steps") or [])
-    armed = [step for step in steps
-             if isinstance(step, dict) and "INJECT_ERROR_RATE_SPIKE" in str(step)]
-    if len(armed) != 1:
-        errors.append(f"{name}: exactly one production step may carry the error-rate drill switch")
+    for marker in ("INJECT_ERROR_RATE_SPIKE", "inject_error_rate_spike", "--rehearsal-firing", "rehearsal"):
+        if marker in str(jobs.get("production") or {}):
+            errors.append(f"{name}: production job must never carry the drill marker {marker}")
+    gates = [step for step in steps if isinstance(step, dict) and step.get("id") == "error_rate_gate"]
+    if len(gates) != 1:
+        errors.append(f"{name}: exactly one production step must be the error_rate_gate")
         return errors
-    step = armed[0]
-    if step.get("id") != "error_rate_gate":
-        errors.append(f"{name}: the error-rate drill switch must live on the error_rate_gate step")
+    step = gates[0]
     # After a rollback restore there is no snapshot to roll back to: the
     # gate must not fail the recovery run red with no action possible.
     if step.get("if") != "env.MODE == 'deploy'":
         errors.append(f"{name}: error_rate_gate must run in deploy mode only")
     env = step.get("env") or {}
-    if env.get("INJECT_ERROR_RATE_SPIKE") != ERROR_RATE_EXPRESSION:
-        errors.append(f"{name}: error-rate rehearsal must use the pinned dispatch-only expression")
     if env.get("METRICS_SCRAPE_TOKEN") != "${{ secrets.PRODUCTION_METRICS_SCRAPE_TOKEN }}":
         errors.append(f"{name}: error_rate_gate must bind the production scrape token by name")
     if env.get("PRODUCTION_URL") != "${{ vars.PRODUCTION_WORKER_URL }}":
         errors.append(f"{name}: error_rate_gate must read the production Worker URL from vars")
     run = str(step.get("run") or "")
     for needle in ("../tooling/wrangler/scripts/promotion-error-gate.mjs", "--metrics-url", "--evidence",
-                   "--sha", "--user-agent", "--rehearsal-firing",
-                   '[ "$INJECT_ERROR_RATE_SPIKE" = "true" ]'):
+                   "--sha", "--user-agent"):
         if run.count(needle) != 1:
             errors.append(f"{name}: error_rate_gate step must contain exactly one {needle}")
     # The evidence filename appears exactly twice: the --evidence write path
@@ -1494,6 +1497,92 @@ def staging_events_read_errors(workflow):
     return errors
 
 
+CENSUS_ENV = {
+    "TWO_BOT_STAGING_PLAN_DATABASE_URL": "${{ secrets.TWO_BOT_STAGING_PLAN_DATABASE_URL }}",
+    "TWO_BOT_STAGING_HOST": "${{ vars.TWO_BOT_STAGING_HOST }}",
+    "TWO_BOT_STAGING_DATABASE": "${{ vars.TWO_BOT_STAGING_DATABASE }}",
+    "TWO_BOT_STAGING_BRANCH_ID": "${{ vars.TWO_BOT_STAGING_BRANCH_ID }}",
+}
+CENSUS_COMMAND = "set -o pipefail\npython3 scripts/staging_retention_census.py\n"
+
+
+def staging_retention_census_errors(workflow):
+    """Manual staging-only read-only event-store retention census.
+
+    Dispatch-only with no inputs. One job runs only from main through the
+    existing no-reviewer `staging-migrate-plan` environment (the plan
+    binding's login holds only two_bot_migrator_ro), on the routed runner
+    for job `census`, with its own non-cancelling concurrency group and a
+    30 minute timeout covering the script's single ~900 s in-job sleep.
+    Exactly two unconditional steps: pinned checkout without persisted
+    credentials, and one bash Run step that calls the reviewed script with
+    the secret plus the three non-secret staging pins via the environment
+    only. Log only, no artifact upload: counts, digests and timestamps
+    never leave the run log and summary. No wrangler, no production path,
+    no apply route, no `set -x`.
+    """
+    name = "staging-retention-census.yml"
+    errors = []
+    if "env" in workflow:
+        errors.append(f"{name}: workflow-level env must stay absent; bindings belong only on the Run step")
+    on = workflow.get("on") or {}
+    if set(on) != {"workflow_dispatch"}:
+        errors.append(f"{name}: must be dispatch-only (no push/pull_request/schedule)")
+    elif on.get("workflow_dispatch") not in (None, {}, ""):
+        errors.append(f"{name}: workflow_dispatch must take no inputs")
+    if workflow.get("permissions") != {}:
+        errors.append(f"{name}: top-level permissions must stay empty")
+    if workflow.get("concurrency") != {"group": "staging-retention-census", "cancel-in-progress": "false"}:
+        errors.append(f"{name}: must use its own staging-retention-census group without cancelling")
+    jobs = workflow.get("jobs") or {}
+    if set(jobs) != {"census"}:
+        errors.append(f"{name}: jobs must be exactly census")
+        return errors
+    job = jobs["census"]
+    if job.get("environment") != "staging-migrate-plan":
+        errors.append(f"{name}:census: must read the staging-migrate-plan Environment binding")
+    if job.get("if") != "github.ref == 'refs/heads/main'":
+        errors.append(f"{name}:census: must run only from main")
+    if job.get("permissions") != {"contents": "read"}:
+        errors.append(f"{name}:census: must keep contents:read only")
+    if job.get("timeout-minutes") != "30":
+        errors.append(f"{name}:census: timeout must stay 30 minutes")
+    if not runner_allowed("census", job.get("runs-on")):
+        errors.append(f"{name}:census: must use the routed runner expression for job 'census'")
+    for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
+        if key in job:
+            errors.append(f"{name}:census: must not set {key} (bindings stay on the single Run step)")
+    text = str(job).lower().replace(" ", "")
+    for marker in ("wrangler", "production", "tojson(secrets", "secrets[", "set-x", "setx", "xtrace",
+                   "inputs.", "migrator_database_url", "--apply", "upload-artifact",
+                   "download-artifact", "createextension"):
+        if marker in text:
+            errors.append(f"{name}:census: must not contain {marker!r}")
+    secrets = set(re.findall(r"secrets\.([a-z0-9_]+)", text))
+    if secrets != {"two_bot_staging_plan_database_url"}:
+        errors.append(f"{name}:census: must read exactly the plan-database secret")
+    steps = job.get("steps") or []
+    if len(steps) != 2 or any(key in step for step in steps for key in ("if", "continue-on-error")):
+        errors.append(f"{name}:census: must run exactly checkout and the census, unconditionally")
+        return errors
+    checkout, run = steps
+    # Scoped to the Run step: the routed runner expression names its own
+    # CI_OVERFLOW_* vars, which must not count as census pins.
+    if set(re.findall(r"vars\.([a-z0-9_]+)", str(run).lower())) != {"two_bot_staging_host",
+                                                                   "two_bot_staging_database",
+                                                                   "two_bot_staging_branch_id"}:
+        errors.append(f"{name}:census: Run step may reference only the three staging pins")
+    if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
+            or (checkout.get("with") or {}).get("persist-credentials") != "false" \
+            or (checkout.get("with") or {}).get("fetch-depth") != "1":
+        errors.append(f"{name}:census: checkout must be pinned, shallow and must not persist credentials")
+    if run.get("env") != CENSUS_ENV:
+        errors.append(f"{name}:census: Run step must bind exactly the plan secret and the three pins")
+    if run.get("run") != CENSUS_COMMAND or "uses" in run or run.get("shell") != "bash":
+        errors.append(f"{name}:census: Run step must call the script over bash with pipefail")
+    return errors
+
+
 MCP_PROVEOUT_ENV = {
     "STAGING_MCP_TOKEN": "${{ secrets.STAGING_MCP_TOKEN }}",
     "STAGING_MCP_URL": "https://two-bot-next-staging.5150.workers.dev/mcp",
@@ -1947,17 +2036,39 @@ def production_errors(workflow):
                      'refuse("the production Environment has no required reviewers")'):
         if required not in script:
             errors.append(f"{name}:guard: missing check {required}")
-    # The rollback drill proves the fail-to-rollback chain, which exists
-    # only on a deploy-mode run with takeover: the guard receives the switch
-    # and refuses anything else, so the drill never leaves its build serving.
+    # Failure injection never runs against production (10-20 20:54Z): the
+    # guard receives the drill switch only to refuse it, pointing to staging.
     guard_env = (guard.get("steps") or [{}])[0].get("env", {})
     if guard_env.get("INJECT_ERROR_RATE_SPIKE") != "${{ inputs.inject_error_rate_spike }}":
         errors.append(f"{name}:guard: must receive the drill switch as an input env")
-    for required in ("inject_error_rate_spike needs deploy mode",
-                     "inject_error_rate_spike needs takeover true",
-                     "inject_error_rate_spike never applies to an automatic run"):
+    for required in ('if spike == "true":\n    refuse("failure injection never runs against production',
+                     "dispatch deploy-staging with inject_error_rate_spike true"):
         if required not in script:
-            errors.append(f"{name}:guard: missing drill refusal {required}")
+            errors.append(f"{name}:guard: missing production drill refusal {required!r}")
+    # A deploy always takes over (10-20 13:31Z: a manual deploy without
+    # takeover left production fenced); only the explicit cutover_hold
+    # input keeps the fence held.
+    inputs = ((on.get("workflow_dispatch") or {}).get("inputs") or {})
+    takeover_input = inputs.get("takeover") or {}
+    hold_input = inputs.get("cutover_hold") or {}
+    if takeover_input.get("type") != "boolean" or takeover_input.get("default") not in (True, "true"):
+        errors.append(f"{name}: takeover must be a boolean defaulting to true")
+    if hold_input.get("type") != "boolean" or hold_input.get("default") not in (False, "false"):
+        errors.append(f"{name}: cutover_hold must be an opt-in boolean defaulting to false")
+    if guard_env.get("CUTOVER_HOLD") != "${{ inputs.cutover_hold }}":
+        errors.append(f"{name}:guard: must receive cutover_hold as an input env")
+    if 'takeover = "false" if cutover_hold == "true" else "true"' not in script:
+        errors.append(f"{name}:guard: deploy mode must take over unless cutover_hold")
+    # Recovery never waits for a human: a reviewer-less rollback runs only
+    # on a verified production rollback snapshot of its exact target.
+    for required in ('snapshot_run = verified_rollback_snapshot() if not reviewers and mode == "rollback" else None',
+                     'collection(f"repos/{repo}/actions/artifacts"',
+                     "target != (version, image, sha)",
+                     'receipt.get("provenance_complete") is not True',
+                     'PRODUCTION_WORKFLOW = ".github/workflows/deploy-production.yml"',
+                     'origin.get("head_repository_id") != origin.get("repository_id")'):
+        if required not in script:
+            errors.append(f"{name}:guard: missing rollback snapshot check {required!r}")
     return errors
 
 
@@ -2764,6 +2875,12 @@ def workflow_policy_errors(workflows):
             # Manual read-only events read: pinned shape above; the generic
             # environment scan below would flag its Environment binding.
             errors.extend(staging_events_read_errors(workflow))
+            continue
+        if name == "staging-retention-census.yml":
+            # Manual read-only retention census: pinned shape above; the
+            # generic environment scan below would flag its Environment
+            # binding.
+            errors.extend(staging_retention_census_errors(workflow))
             continue
         if name == "staging-mcp-proveout.yml":
             # Manual read-only authenticated MCP prove-out: pinned shape
@@ -4249,30 +4366,30 @@ class WorkflowTests(unittest.TestCase):
                     label,
                 )
                 self.assertTrue(workflow_policy_errors(changed), label)
-        # Production holds the pinned mirror, not a forwarding route: an
-        # extra reader, an armed default, a staging token or unpinned
+        # Production carries no rehearsal path at all (10-20 20:54Z forced
+        # drill): the guard alone reads the switch, to refuse it. Re-arming
+        # any production step, an armed default, a staging token or unpinned
         # tooling there fails the policy.
         self.assertEqual(production_error_rate_gate_errors(workflows["deploy-production.yml"]), [])
         prod_steps = workflows["deploy-production.yml"]["jobs"]["production"]["steps"]
-        prod_armed = [s for s in prod_steps if "INJECT_ERROR_RATE_SPIKE" in str(s)]
-        self.assertEqual(len(prod_armed), 1)
-        self.assertEqual(prod_armed[0].get("id"), "error_rate_gate")
-        prod_index = prod_steps.index(prod_armed[0])
+        self.assertEqual([s for s in prod_steps if "INJECT_ERROR_RATE_SPIKE" in str(s)], [])
+        gate = [s for s in prod_steps if s.get("id") == "error_rate_gate"]
+        self.assertEqual(len(gate), 1)
+        prod_index = prod_steps.index(gate[0])
         prod_mutations = {
-            # An automatic trigger could read it / default armed.
-            "expression without dispatch guard": lambda w: w["jobs"]["production"]["steps"][prod_index]["env"]
-                .__setitem__("INJECT_ERROR_RATE_SPIKE", "${{ inputs.inject_error_rate_spike }}"),
-            "expression constant true": lambda w: w["jobs"]["production"]["steps"][prod_index]["env"]
+            "drill switch re-armed on the gate": lambda w: w["jobs"]["production"]["steps"][prod_index]["env"]
+                .__setitem__("INJECT_ERROR_RATE_SPIKE", ERROR_RATE_EXPRESSION),
+            "drill switch constant true": lambda w: w["jobs"]["production"]["steps"][prod_index]["env"]
                 .__setitem__("INJECT_ERROR_RATE_SPIKE", "true"),
-            "rehearsal flag unconditional": lambda w: w["jobs"]["production"]["steps"][prod_index]
-                .__setitem__("run", "node ../tooling/wrangler/scripts/promotion-error-gate.mjs "
-                             "--rehearsal-firing '[\"rest_5xx_rate\"]'"),
+            "rehearsal flag on the gate": lambda w: w["jobs"]["production"]["steps"][prod_index]
+                .__setitem__("run", str(w["jobs"]["production"]["steps"][prod_index]["run"])
+                             + " --rehearsal-firing '[\"rest_5xx_rate\"]'"),
             "input defaults true": lambda w: w["on"]["workflow_dispatch"]["inputs"]["inject_error_rate_spike"]
                 .__setitem__("default", True),
             "input removed": lambda w: w["on"]["workflow_dispatch"]["inputs"].pop("inject_error_rate_spike"),
-            "second reader step": lambda w: w["jobs"]["production"]["steps"][0]
-                .setdefault("env", {}).__setitem__("INJECT_ERROR_RATE_SPIKE", "true"),
-            "switch off the gate step": lambda w: w["jobs"]["production"]["steps"][prod_index]
+            "another production step reads it": lambda w: w["jobs"]["production"]["steps"][0]
+                .setdefault("env", {}).__setitem__("SPIKE", "${{ inputs.inject_error_rate_spike }}"),
+            "gate step removed": lambda w: w["jobs"]["production"]["steps"][prod_index]
                 .__setitem__("id", "unrelated"),
             "gate without the deploy-mode condition": lambda w: w["jobs"]["production"]["steps"][prod_index]
                 .pop("if"),
@@ -4808,6 +4925,48 @@ class WorkflowTests(unittest.TestCase):
                 workflows = deepcopy(self.workflows)
                 workflows["nightly.yml"]["jobs"]["pipeline-benchmark"]["uses"] = target
                 self.assertTrue(workflow_policy_errors(workflows))
+
+    def test_production_dispatch_safety_rules_are_pinned(self):
+        # 10-20 incidents: a manual deploy without takeover left production
+        # fenced (13:31Z), the rollback then refused for want of a human
+        # reviewer, and a forced drill degraded production (20:54Z).
+        production = self.workflows["deploy-production.yml"]
+        self.assertEqual(production_errors(production), [])
+        guard_step = production["jobs"]["guard"]["steps"][0]
+
+        def without(pin):
+            def change(w):
+                step = w["jobs"]["guard"]["steps"][0]
+                self.assertIn(pin, step["run"])
+                step["run"] = step["run"].replace(pin, "")
+            return change
+
+        mutations = {
+            "takeover defaults false": lambda w: w["on"]["workflow_dispatch"]["inputs"]["takeover"]
+                .__setitem__("default", False),
+            "cutover_hold removed": lambda w: w["on"]["workflow_dispatch"]["inputs"].pop("cutover_hold"),
+            "cutover_hold defaults true": lambda w: w["on"]["workflow_dispatch"]["inputs"]["cutover_hold"]
+                .__setitem__("default", True),
+            "cutover_hold not wired": lambda w: w["jobs"]["guard"]["steps"][0]["env"].pop("CUTOVER_HOLD"),
+            "deploy takeover default dropped":
+                without('takeover = "false" if cutover_hold == "true" else "true"'),
+            "production drill refusal dropped":
+                without('refuse("failure injection never runs against production'),
+            "snapshot path dropped":
+                without('snapshot_run = verified_rollback_snapshot() if not reviewers and mode == "rollback" else None'),
+            "snapshot pagination dropped":
+                without('collection(f"repos/{repo}/actions/artifacts"'),
+            "snapshot target binding dropped": without("target != (version, image, sha)"),
+            "snapshot provenance dropped": without('receipt.get("provenance_complete") is not True'),
+            "snapshot fork filter dropped":
+                without('origin.get("head_repository_id") != origin.get("repository_id")'),
+        }
+        self.assertIn("inputs.cutover_hold", str(guard_step))
+        for label, change in mutations.items():
+            with self.subTest(label):
+                workflow = deepcopy(production)
+                change(workflow)
+                self.assertTrue(production_errors(workflow), label)
 
     def test_production_route_is_automatic_or_dispatch_and_gated(self):
         production = self.workflows["deploy-production.yml"]
@@ -5471,6 +5630,78 @@ class WorkflowTests(unittest.TestCase):
         # The inventory pin fails closed if the workflow disappears or gains a job.
         missing = deepcopy(workflows)
         del missing["staging-events-read.yml"]
+        self.assertTrue(workflow_policy_errors(missing))
+        self.assertEqual(workflow_policy_errors(workflows), [])
+
+    def test_staging_retention_census_shape_is_pinned(self):
+        workflows = self.workflows
+        self.assertEqual(staging_retention_census_errors(workflows["staging-retention-census.yml"]), [])
+
+        def mutate(change):
+            copy = deepcopy(workflows["staging-retention-census.yml"])
+            change(copy)
+            return staging_retention_census_errors(copy)
+
+        def job(copy):
+            return copy["jobs"]["census"]
+
+        changes = {
+            "push trigger": lambda w: w["on"].update({"push": {"branches": ["main"]}}),
+            "schedule trigger": lambda w: w["on"].update({"schedule": [{"cron": "0 * * * *"}]}),
+            "dispatch input": lambda w: w["on"].update(
+                {"workflow_dispatch": {"inputs": {"mode": {"type": "string"}}}}),
+            "top-level permissions": lambda w: w.update({"permissions": {"contents": "read"}}),
+            "workflow-level secret": lambda w: w.update(
+                {"env": {"T": "${{ secrets.TWO_BOT_STAGING_PLAN_DATABASE_URL }}"}}),
+            "cancelling concurrency": lambda w: w["concurrency"].update({"cancel-in-progress": "true"}),
+            "shared concurrency group": lambda w: w["concurrency"].update({"group": "deploy-staging"}),
+            "second job": lambda w: w["jobs"].update({"again": deepcopy(job(w))}),
+            "wrong environment": lambda w: job(w).update({"environment": "staging"}),
+            "production environment": lambda w: job(w).update({"environment": "production"}),
+            "no environment": lambda w: job(w).pop("environment"),
+            "branch condition removed": lambda w: job(w).pop("if"),
+            "any branch": lambda w: job(w).update({"if": "github.ref != ''"}),
+            "write grant": lambda w: job(w).update({"permissions": {"contents": "write"}}),
+            "shorter timeout": lambda w: job(w).update({"timeout-minutes": "5"}),
+            "longer timeout": lambda w: job(w).update({"timeout-minutes": "60"}),
+            "unrouted runner": lambda w: job(w).update({"runs-on": "ubuntu-latest"}),
+            "other job's routing": lambda w: job(w).update(
+                {"runs-on": ROUTED_RUNNER.format(job="check")}),
+            "job-level secret": lambda w: job(w).update(
+                {"env": {"T": "${{ secrets.TWO_BOT_STAGING_PLAN_DATABASE_URL }}"}}),
+            "container": lambda w: job(w).update({"container": {"image": "postgres"}}),
+            "step condition": lambda w: job(w)["steps"][1].update({"if": "always()"}),
+            "continue on error": lambda w: job(w)["steps"][1].update({"continue-on-error": "true"}),
+            "artifact upload": lambda w: job(w)["steps"].append(
+                {"uses": "actions/upload-artifact@pinned"}),
+            "persisted credentials": lambda w: job(w)["steps"][0]["with"].update(
+                {"persist-credentials": "true"}),
+            "extra secret": lambda w: job(w)["steps"][1]["env"].update(
+                {"X": "${{ secrets.TWO_BOT_STAGING_MIGRATOR_DATABASE_URL }}"}),
+            "dropped login secret": lambda w: job(w)["steps"][1]["env"].pop(
+                "TWO_BOT_STAGING_PLAN_DATABASE_URL"),
+            "dropped host pin": lambda w: job(w)["steps"][1]["env"].pop(
+                "TWO_BOT_STAGING_HOST"),
+            "blanket secrets": lambda w: job(w)["steps"][1]["env"].update({"ALL": "${{ toJSON(secrets) }}"}),
+            "pin as input": lambda w: job(w)["steps"][1]["env"].update(
+                {"TWO_BOT_STAGING_HOST": "${{ inputs.host }}"}),
+            "inline expression": lambda w: job(w)["steps"][1].update(
+                {"run": "set -o pipefail\npython3 scripts/staging_retention_census.py ${{ vars.X }}\n"}),
+            "missing pipefail": lambda w: job(w)["steps"][1].update(
+                {"run": "python3 scripts/staging_retention_census.py\n"}),
+            "missing shell": lambda w: job(w)["steps"][1].pop("shell"),
+            "shell trace": lambda w: job(w)["steps"][1].update({"run": "set -x\n" + CENSUS_COMMAND}),
+            "other script": lambda w: job(w)["steps"][1].update(
+                {"run": CENSUS_COMMAND.replace("staging_retention_census", "other")}),
+            "wrangler action": lambda w: job(w)["steps"].insert(
+                1, {"uses": "cloudflare/wrangler-action@pinned"}),
+        }
+        for label, change in changes.items():
+            with self.subTest(change=label):
+                self.assertTrue(mutate(change))
+        # The inventory pin fails closed if the workflow disappears or gains a job.
+        missing = deepcopy(workflows)
+        del missing["staging-retention-census.yml"]
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
 

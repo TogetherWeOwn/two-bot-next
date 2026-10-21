@@ -39,6 +39,8 @@ mod db_log;
 #[path = "../../discord/tests/common/mod.rs"]
 mod discord_test_common;
 mod dispatch;
+#[cfg(test)]
+mod duplicate_pool_registration_acceptance_tests;
 mod erasure_cli;
 mod event_cli;
 mod eventsub_delivery;

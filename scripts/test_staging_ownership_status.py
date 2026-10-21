@@ -100,17 +100,32 @@ class WorkflowSurfaceTests(unittest.TestCase):
         self.assertIn("OWNERSHIP_CONTROL_TOKEN", source)
 
 
+def worker_steps(source):
+    worker = source.split("  worker:\n", 1)[1]
+    return re.split(r"(?m)^      - ", worker)[1:]
+
+
+def assert_pinned(steps, needle, case):
+    matching = [step for step in steps if needle in step]
+    case.assertEqual(len(matching), 1, needle)
+    case.assertNotRegex(matching[0], r"(?m)^\s*(?:if|continue-on-error):")
+    case.assertNotIn("|| true", matching[0])
+
+
 class CheckWiringTests(unittest.TestCase):
     def test_required_worker_ci_runs_this_offline_suite(self):
-        source = CHECK.read_text()
-        worker = source.split("  worker:\n", 1)[1]
+        steps = worker_steps(CHECK.read_text())
         for needle in ("scripts/test-staging-ownership-status.mjs",
                        "test_staging_ownership_status.py"):
-            steps = re.split(r"(?m)^      - ", worker)[1:]
-            matching = [step for step in steps if needle in step]
-            self.assertEqual(len(matching), 1, needle)
-            self.assertNotRegex(matching[0], r"(?m)^\s*(?:if|continue-on-error):")
-            self.assertNotIn("|| true", matching[0])
+            assert_pinned(steps, needle, self)
+
+    def test_required_worker_ci_runs_the_production_status_suite(self):
+        # The production ownership-status retry suite lives beside the
+        # staging suites in the worker job; deleting its step (or gating
+        # it) must fail here instead of silently dropping the coverage.
+        steps = worker_steps(CHECK.read_text())
+        assert_pinned(steps, "scripts/test-production-ownership-control.mjs",
+                      self)
 
 
 if __name__ == "__main__":

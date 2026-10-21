@@ -151,7 +151,7 @@ const ROUTES: Route[] = [
     timeoutMs: ACTIONS_REQUEST_TIMEOUT_MS,
     maxResponseBytes: ACTIONS_MAX_RESPONSE_BYTES,
     request: () => directRequest(ACTIONS_PATH, ACTIONS_HEADERS, ACTIONS_BODY),
-    validUpstream: () => Response.json({ ok: true, result: { message_id: "1" } }),
+    validUpstream: () => Response.json({ ok: true, request_id: SENT_ID, result: { message_id: "1" } }),
   },
   {
     label: "eventsub",
@@ -449,6 +449,11 @@ for (const route of ROUTES) {
       // arbitrary binary JSON. Whitespace fills the byte budget without
       // introducing unsupported fields or requiring raw JSON reflection.
       payload = new TextEncoder().encode(JSON.stringify({ ok: true, request_id: SENT_ID }).padEnd(route.maxResponseBytes, " "));
+    } else {
+      // The signed-action receiver emits a correlated envelope with its
+      // action-specific result, never arbitrary bytes. Whitespace fills the
+      // byte budget; the relay projects the envelope it parses.
+      payload = new TextEncoder().encode(JSON.stringify({ ok: true, request_id: SENT_ID, result: { message_id: "1" } }).padEnd(route.maxResponseBytes, " "));
     }
     assert.equal(payload.byteLength, route.maxResponseBytes, "fixture reaches the input byte cap");
     stubFetch(t, h.bot, async () => new Response(payload, {
@@ -460,8 +465,7 @@ for (const route of ROUTES) {
     if (route.label === "eventsub") {
       assert.deepEqual(JSON.parse(new TextDecoder().decode(body)), { ok: true, request_id: SENT_ID });
     } else {
-      assert.equal(body.byteLength, route.maxResponseBytes);
-      assert.equal(Buffer.compare(body, payload), 0, "cap-exact internal-actions bytes unchanged");
+      assert.deepEqual(JSON.parse(new TextDecoder().decode(body)), { ok: true, request_id: SENT_ID, result: { message_id: "1" } });
     }
   });
 
@@ -508,7 +512,7 @@ for (const route of ROUTES) {
 test("internal-actions (preserved): relayed 401 keeps idempotent-replay/retry-after and drops secret headers", async (t) => {
   const h = await harness(t);
   stubFetch(t, h.bot, async () => new Response(
-    JSON.stringify({ ok: false, request_id: "r1", error: { code: "unauthorized", message: "unauthorized", retryable: false } }),
+    JSON.stringify({ ok: false, request_id: SENT_ID, error: { code: "unauthorized", message: "unauthorized", retryable: false } }),
     {
       status: 401,
       headers: {

@@ -26,6 +26,17 @@ TOOL_DIRS = ("usr/local/sbin", "usr/local/bin", "usr/sbin", "usr/bin", "sbin", "
 TOOLS = ("sh", "bash", "dash", "ash", "busybox", "apt", "apt-get", "dpkg", "perl",
          "python3", "openssl", "mount", "nsenter", "su", "sudo", "getcap", "setcap")
 CAPABILITY = "SCHILY.xattr.security.capability"
+LIMITATIONS = [
+    "Raw observations only: no vulnerability acceptance or suppression.",
+    "Read from an exported, never-started container; nothing executed inside the image.",
+    "Package rows come from distroless status.d control files, which carry no dpkg Status field.",
+    "Only the security.capability extended attribute is recorded; other xattrs and runtime privileges are not.",
+    "File presence and ELF linkage do not establish application input reachability.",
+]
+# Fixed vocabulary for unparseable `docker image inspect` output. The raw
+# stdout is never echoed: like every collection_error, it names the failed
+# observation, not the bytes.
+UNPARSEABLE_INSPECTION = "Image inspection output is unparseable"
 
 
 def docker(*args, timeout=30):
@@ -284,28 +295,55 @@ def collect(image, directory):
     inspection = docker("image", "inspect", image)
     if inspection.returncode != 0:
         raise RuntimeError(f"Image inspection failed: {inspection.stderr}")
-    metadata = json.loads(inspection.stdout)[0]
-    if metadata["Id"] != image_id:
+    try:
+        metadata = json.loads(inspection.stdout)[0]
+        inspected_id = metadata["Id"]
+        config = metadata["Config"]
+        architecture = metadata["Architecture"]
+        os_name = metadata["Os"]
+        configured_user = config.get("User")
+        entrypoint = config.get("Entrypoint")
+        cmd = config.get("Cmd")
+        if not (isinstance(inspected_id, str) and isinstance(architecture, str)
+                and isinstance(os_name, str)
+                and isinstance(configured_user, (str, type(None)))
+                and isinstance(entrypoint, (list, type(None)))
+                and isinstance(cmd, (list, type(None)))
+                and (entrypoint is None
+                     or all(isinstance(item, str) for item in entrypoint))
+                and (cmd is None or all(isinstance(item, str) for item in cmd))):
+            raise TypeError("unexpected inspection field type")
+    except (ValueError, KeyError, IndexError, TypeError, AttributeError, RecursionError):
+        # Malformed inspection fails closed through the collection_error path
+        # (the inspect_filesystem precedent below), never as a traceback. The
+        # architecture and config fields are unknown, so they are omitted
+        # rather than fabricated; no container is created.
+        report = {
+            "schema_version": 2,
+            "complete": False,
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "source_sha": source_sha,
+            "image_id": image_id,
+            "limitations": list(LIMITATIONS),
+            "collection_error": UNPARSEABLE_INSPECTION,
+        }
+        destination = directory / "runtime-image-evidence.json"
+        destination.write_text(json.dumps(report, indent=2) + "\n")
+        return report
+    if inspected_id != image_id:
         raise ValueError("Image identity differs from the scanned image provenance")
-    config = metadata["Config"]
     report = {
         "schema_version": 2,
         "complete": False,
         "observed_at": datetime.now(timezone.utc).isoformat(),
         "source_sha": source_sha,
         "image_id": image_id,
-        "architecture": metadata["Architecture"],
-        "os": metadata["Os"],
-        "configured_user": config.get("User"),
-        "entrypoint": config.get("Entrypoint"),
-        "cmd": config.get("Cmd"),
-        "limitations": [
-            "Raw observations only: no vulnerability acceptance or suppression.",
-            "Read from an exported, never-started container; nothing executed inside the image.",
-            "Package rows come from distroless status.d control files, which carry no dpkg Status field.",
-            "Only the security.capability extended attribute is recorded; other xattrs and runtime privileges are not.",
-            "File presence and ELF linkage do not establish application input reachability.",
-        ],
+        "architecture": architecture,
+        "os": os_name,
+        "configured_user": configured_user,
+        "entrypoint": entrypoint,
+        "cmd": cmd,
+        "limitations": list(LIMITATIONS),
     }
     destination = directory / "runtime-image-evidence.json"
     destination.write_text(json.dumps(report, indent=2) + "\n")
