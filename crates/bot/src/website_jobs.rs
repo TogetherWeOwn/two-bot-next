@@ -11,9 +11,9 @@ use two_bot_core::{
     build_community_snapshot, build_counter_reading,
     database_tls::{self, TlsPolicy},
     diagnose_rank_roles, match_rank_roles, normalize_events, now_iso, plan_rank_heal,
-    read_raid_windows, replace_events, write_counter, write_rank_snapshot, Config, RankHeal,
-    RankRungProblem, RawScheduledEvent, RosterMember, WebsiteStoreError, LIVE_COUNTER_INTERVAL_MS,
-    RANK_SNAPSHOT_INTERVAL_MS, SCHEDULED_EVENTS_INTERVAL_MS,
+    read_raid_windows, replace_events, write_counter, write_rank_snapshot, Config, JobGate,
+    RankHeal, RankRungProblem, RawScheduledEvent, RosterMember, WebsiteStoreError,
+    LIVE_COUNTER_INTERVAL_MS, RANK_SNAPSHOT_INTERVAL_MS, SCHEDULED_EVENTS_INTERVAL_MS,
 };
 use two_bot_discord::executor::{ActionExecutor, DiscordError};
 use two_bot_discord::internal_events::canonical_snowflake;
@@ -61,6 +61,37 @@ pub enum Kind {
     Events,
 }
 
+impl Kind {
+    /// Whole-tick Events entry point with [`JobGate`] single-flight: a tick
+    /// that cannot acquire the gate skips at once (`Ok`, no fetch, no
+    /// publish, no queue, no error); otherwise the guard is held across the
+    /// delegated tick, so overlapping ticks cannot both run. Counter and rank
+    /// ticks never take this path.
+    pub async fn run_events_tick(
+        pool: &PgPool,
+        rest: &ActionExecutor,
+        guild: &str,
+        observation: &Mutex<()>,
+        shutdown: &watch::Receiver<bool>,
+        rank_heal: bool,
+        gate: &JobGate,
+    ) -> Result<(), ErrorClass> {
+        let Some(_guard) = gate.try_acquire() else {
+            return Ok(());
+        };
+        snapshot_once(
+            Kind::Events,
+            pool,
+            rest,
+            guild,
+            observation,
+            shutdown,
+            rank_heal,
+        )
+        .await
+    }
+}
+
 /// Cadence overrides are compiled only into tests, never the deployed binary.
 fn cadence(kind: Kind) -> Duration {
     let millis = match kind {
@@ -93,6 +124,7 @@ pub(crate) struct Context {
     pub(crate) rest: ActionExecutor,
     pub(crate) guild: String,
     observation: Mutex<()>,
+    events_gate: JobGate,
 }
 
 impl Context {
@@ -222,6 +254,7 @@ pub async fn serve(
                     rest,
                     guild: guild.to_string(),
                     observation: Mutex::new(()),
+                    events_gate: JobGate::default(),
                 });
                 // The rank tick is the only website job with a Discord write
                 // path: the ladder self-heal grants roles under the bot
@@ -256,6 +289,18 @@ pub async fn serve(
                                     biased;
                                     _ = server::shutdown_requested(shutdown.clone()) => Ok(()),
                                     result = async {
+                                        if matches!(kind, Kind::Events) {
+                                            return Kind::run_events_tick(
+                                                context.pool().await?,
+                                                &context.rest,
+                                                &context.guild,
+                                                &context.observation,
+                                                &shutdown,
+                                                rank_heal,
+                                                &context.events_gate,
+                                            )
+                                            .await;
+                                        }
                                         run_once(
                                             kind,
                                             context.pool().await?,
