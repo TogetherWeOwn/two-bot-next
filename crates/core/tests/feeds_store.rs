@@ -186,7 +186,10 @@ async fn feed_crud_audit_scope_and_timestamp_roundtrip() {
     let mut hijack = feed.clone();
     hijack.guild_id = "other".into();
     assert!(add_feed(&pool, &hijack).await.is_err());
-    assert!(!remove_feed(&pool, "other", &feed.id).await.unwrap());
+    assert_eq!(
+        remove_feed(&pool, "other", &feed.id).await.unwrap(),
+        FeedRemoval::Missing
+    );
     let now = feed.created_at + 1234;
     mark_checked(&pool, "guild-1", &feed.id, now).await.unwrap();
     assert_eq!(
@@ -220,12 +223,26 @@ async fn feed_crud_audit_scope_and_timestamp_roundtrip() {
         .await
         .unwrap()
         .is_some());
-    assert!(remove_feed(&pool, "guild-1", &feed.id).await.unwrap());
+    assert_eq!(
+        remove_feed(&pool, "guild-1", &feed.id).await.unwrap(),
+        FeedRemoval::RecoveryRequired,
+        "unresolved pending evidence refuses removal and retains the ledger"
+    );
+    assert!(
+        mark_delivered(&pool, "guild-1", &p, "claim-1", "9001", now)
+            .await
+            .unwrap(),
+        "settle the only delivery"
+    );
+    assert_eq!(
+        remove_feed(&pool, "guild-1", &feed.id).await.unwrap(),
+        FeedRemoval::Removed
+    );
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM feed_deliveries")
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(count, 0, "cascade deleted this relay's ledger");
+    assert_eq!(count, 0, "cascade deleted this relay's settled ledger");
     cleanup(pool, &schema).await;
 }
 

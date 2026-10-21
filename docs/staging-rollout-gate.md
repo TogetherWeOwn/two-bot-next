@@ -21,7 +21,10 @@ recovers service, it never certifies the failed build. Without a successful
 deploy and snapshot there is nothing to restore, so no rollback is attempted.
 The gate does not
 accept a health response from an old singleton. This is a **staging-only** gate,
-not production authorization or a migration tool.
+not production authorization or a migration tool. Operators can preview the
+ordered restore plan for a receipt without any mutation via
+`scripts/worker_container_rollback.py rollback ... --dry-run`, which validates
+the receipt identically to the live path and exits 0.
 
 ## Step order and why
 

@@ -469,7 +469,10 @@ async fn purge_and_slowmode_success_audit_and_replay_without_repeating_effects()
         vec![
             ScriptedResponse::json(
                 200,
-                json!([{"id":fresh_message_id(1)},{"id":fresh_message_id(2)}]),
+                json!([
+                    {"id":fresh_message_id(1),"author":{"bot":false}},
+                    {"id":fresh_message_id(2),"author":{"bot":false}}
+                ]),
             ),
             ScriptedResponse::status(204),
             patched(),
@@ -532,7 +535,13 @@ async fn purge_of_messages_older_than_fourteen_days_deletes_them_singly() {
     let (old_a, old_b) = (aged_message_id(1), aged_message_id(2));
     let mock = MockRest::start(
         vec![
-            ScriptedResponse::json(200, json!([{"id": old_a}, {"id": old_b}])),
+            ScriptedResponse::json(
+                200,
+                json!([
+                    {"id": old_a, "author": {"bot": false}},
+                    {"id": old_b, "author": {"bot": false}}
+                ]),
+            ),
             ScriptedResponse::status(204),
             ScriptedResponse::status(204),
         ],
@@ -1036,7 +1045,10 @@ async fn purge_delete_failure_still_retains_the_lane() {
             vec![
                 ScriptedResponse::json(
                     200,
-                    json!([{"id":"600000000000000001"},{"id":"600000000000000002"}]),
+                    json!([
+                        {"id":"600000000000000001","author":{"bot":false}},
+                        {"id":"600000000000000002","author":{"bot":false}}
+                    ]),
                 ),
                 failure,
             ],
@@ -1332,6 +1344,99 @@ async fn stale_tickets_and_action_only_mismatch_never_admit_runtime_effects() {
         "refused"
     );
     assert!(mock.requests().is_empty());
+    mock.shutdown().await;
+    db.close().await;
+}
+
+/// Acceptance: a purge Discord cuts short after one successful single
+/// delete says so. The member reply and the audit metadata both carry the
+/// fixed stop reason next to the count actually deleted, and a replay
+/// returns the same reply without repeating any delete.
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service"]
+async fn purge_stopped_early_reports_the_reason_in_the_reply_and_the_audit_row() {
+    let db = Database::open().await;
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(
+                200,
+                json!([
+                    {"id": aged_message_id(1), "author": {"bot": false}},
+                    {"id": aged_message_id(2), "author": {"bot": false}},
+                    {"id": aged_message_id(3), "author": {"bot": false}}
+                ]),
+            ),
+            ScriptedResponse::status(204),
+            ScriptedResponse::status(403),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(&db, &mock);
+    let router = router(true);
+    let purge = interaction(90, "purge", options(Some(("count", 3))), PERMISSIONS);
+    let result = runtime.execute(&router, &purge).await.unwrap().unwrap();
+    assert_eq!(result.outcome, "purged");
+    assert_eq!(
+        result.text,
+        "Moderation action completed: purged (1, stopped early: refused)."
+    );
+    let replay = runtime.execute(&router, &purge).await.unwrap().unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.text, result.text);
+    let metadata: String =
+        sqlx::query_scalar("SELECT metadata_json FROM moderation_audit WHERE request_id = '90'")
+            .fetch_one(db.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        metadata,
+        r#"{"count":3,"affected":1,"stop_reason":"refused"}"#
+    );
+    assert_eq!(
+        mock.requests().len(),
+        3,
+        "list, one successful delete, the refused delete; the replay sent nothing"
+    );
+    assert_eq!(db.count("moderation_audit").await, 1);
+    assert_eq!(db.count("moderation_channel_executions").await, 0);
+    mock.shutdown().await;
+    db.close().await;
+}
+
+/// Acceptance control: a purge that runs to completion keeps today's reply
+/// text and audit metadata byte for byte, with no stop-reason key.
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service"]
+async fn full_purge_reply_and_audit_metadata_are_byte_identical_to_before() {
+    let db = Database::open().await;
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(
+                200,
+                json!([
+                    {"id": fresh_message_id(1), "author": {"bot": false}},
+                    {"id": fresh_message_id(2), "author": {"bot": false}}
+                ]),
+            ),
+            ScriptedResponse::status(204),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(&db, &mock);
+    let router = router(true);
+    let purge = interaction(91, "purge", options(Some(("count", 2))), PERMISSIONS);
+    let result = runtime.execute(&router, &purge).await.unwrap().unwrap();
+    assert_eq!(result.outcome, "purged");
+    assert_eq!(result.text, "Moderation action completed: purged (2).");
+    let metadata: String =
+        sqlx::query_scalar("SELECT metadata_json FROM moderation_audit WHERE request_id = '91'")
+            .fetch_one(db.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(metadata, r#"{"count":2,"affected":2}"#);
+    assert_eq!(mock.requests().len(), 2, "list, then one bulk delete");
     mock.shutdown().await;
     db.close().await;
 }

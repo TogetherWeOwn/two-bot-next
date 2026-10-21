@@ -103,6 +103,25 @@ the Join channel. The join-request flow is in
   the room, a bot-member allow for exactly the missing bits is written first.
   `/public` removes only the Connect deny; an explicit @everyone Connect allow
   that `/private` stripped is not re-added.
+- **Snapshot fence.** Privacy bot/@everyone writes and approved-member grant/revoke
+  writes use the connection generation and the full, known permission-overwrite
+  snapshot they were planned from. Unknown overwrites are not an empty ACL. Each
+  transport guard rechecks readiness, generation, channel existence, the exact
+  overwrite set (order-independent) and the bot's View Channel + Manage Roles
+  permissions, including after REST backoff. A queued action plans from current
+  evidence at dispatch; a plan made stale during an await is refused rather than
+  sent over a newer observation. Retries plan again, preserving unrelated bits.
+  After a successful PUT or DELETE, local projection accepts only the expected
+  prior snapshot or the matching own-write gateway echo. Newer ACLs, deletion,
+  reconnect or observed permission loss stop the sequence: no next overwrite,
+  member move, privacy flag flip or Join-channel follow-up is justified by that
+  response. A landed grant keeps its durable witness even when projection is
+  refused; a stale/unknown revoke does not retire one. This does not change the
+  existing witness acquisition/retirement policy.
+  Discord provides no atomic compare-and-swap for these whole-entry writes:
+  changes after the last guard check may still race the transport, and gateway
+  observations may lag. The fence protects observed evidence and local cache
+  projection, not an upstream atomic transaction or exactly-once effects.
 - **The Join channel.** Created once in the room's category, directly after the
   room, with no overwrites (it syncs to the category). A retry after an unknown
   outcome adopts the channel the live snapshot shows instead of creating a second
@@ -124,7 +143,7 @@ the Join channel. The join-request flow is in
   authoritative snapshot that still shows the room.
 - **Grants are durable.** Approved members' Connect allows are witnessed in
   `voice_join_grants` (one row per room member, written before the grant PUT
-  and retired only after the revoke lands or the grant is refused), so a
+  and retired only after a safe revoke or a fresh intent's PUT is refused), so a
   restart cannot strand a Connect allow past `/public`. Worker load hydrates
   private rooms' grants and re-queues revocations for grants whose room is
   public or gone. Revocation clears only the Connect bit and keeps every other
@@ -160,7 +179,8 @@ the Join channel. The join-request flow is in
     only (never Manage Roles, other bits kept), then a move from the Join
     channel, but only if the member is still there. It refuses when the member
     carries a Connect deny from a passed vote-kick: an owner cannot undo a vote.
-    A refused grant is not claimed, so the member can ask again.
+    A fresh intent whose first PUT is definitively refused is not claimed, so
+    the member can ask again. A later refusal cannot clear an older witness.
   - *Deny* writes nothing.
   - *Block* persists through the privacy record (`voice_room_blocks`), so it
     survives a restart and `/public`.
@@ -169,17 +189,34 @@ the Join channel. The join-request flow is in
   waiting. `/public` takes approved members' Connect allow back and retires
   open prompts. A room delete forgets the state; its prompts go with the
   channel.
-- **Request ids.** Pending requests, grants and prompts are runtime-only. Each
-  button appends the worker's fresh 128-bit CSPRNG epoch to the numeric core
+- **Request ids.** Pending requests and prompts are runtime-only; grants are
+  durable. Each button appends the worker's fresh 128-bit CSPRNG epoch to the numeric core
   request id. The worker refuses a different or missing epoch before deciding,
   so a reset counter or a repeated/backward wall clock cannot revive an old
   button. Epochs are collision-resistant, not clock-based; ids remain within
   Discord's 100-character limit even with maximum-width numeric fields.
-- **Grants are durable.** The approval intent is recorded in
-  `voice_join_grants` before the Connect PUT; a refused grant retires its row
-  so the member can ask again, while an unknown grant or revoke outcome keeps
-  its row so a retry or a restart can still revoke. Only a successful revoke
-  (or a refused grant) retires the witness.
+- **Grant-witness failure contract.** The approval intent is recorded in
+  `voice_join_grants` before the Connect PUT. The existing insert boundary
+  reports `Fresh`, `Retained` or `RoomMissing`; only the call that inserts a
+  fresh row may unwind it after a proven-unsent PUT refusal. An existing row
+  is an access obligation, not proof of a new grant: an earlier PUT may have
+  landed even if a retry returns AccessDenied, cancellation or another
+  definitive refusal. Unknown grant outcomes retain the row through those
+  refusals and across restart hydration. When overwrite evidence is unknown,
+  the worker reads the existing grant witnesses: only confirmed absence for
+  this room and member releases the in-memory claim. A witness keeps the claim
+  and retries; a failed read also keeps it, using the normal persistence retry
+  or credential-refusal halt. The queue's attempt count is not evidence of
+  witness absence: a 429 from the PUT or the following move requeues without
+  consuming attempts. A successful grant followed by a failed move also
+  retains the witness. A retained row can conservatively represent an
+  unsent earlier attempt; do not infer ownership from arbitrary Connect allows.
+  `/public` still clears only the witnessed Connect allow, preserving unrelated
+  member allow/deny bits and vote-kick denies. Refused or uncertain revocation
+  retains the row. Successful revocation, authoritative absence under the
+  existing revoke path, or room deletion resolves it; a refused grant retry
+  cannot resolve a retained witness. No schema migration or new grant/release
+  authority is introduced.
 
 ## Residual parent work
 
@@ -197,6 +234,8 @@ parity or staging readiness.
 cargo fmt --all -- --check
 python3 scripts/cargo_cache.py run -- check -p two-bot-core
 python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_private
+python3 scripts/cargo_cache.py run -- test -p two-bot fence_
+python3 scripts/cargo_cache.py run -- test -p two-bot overwrite_snapshot
 ```
 
 The acceptance fixture covers naming, both privacy toggles, Join-channel
@@ -205,3 +244,11 @@ deletion, invalid states, request-ID exhaustion, and property tests for the two
 rules: no sequence grants Connect to a blocked member, and a public room never
 has a Join channel. No tests in this fixture use a database, Redis, Discord, or
 a staging identity.
+
+The separate runtime snapshot acceptance module
+(`crates/bot/src/voice_snapshot_fence_acceptance_tests.rs`) records fake transport
+calls and cached masks while injecting overwrite edits, deletion, reconnect,
+permission loss and matching own echoes during writes. The supplemental
+`voice_overwrite_snapshot_tests.rs` exercises stale guards before transport and
+conditional projection directly. These are hermetic runtime tests, not evidence
+of production installation.

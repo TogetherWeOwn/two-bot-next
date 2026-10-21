@@ -37,7 +37,16 @@ pub enum CommunityStoreError {
     UnknownFactType(String),
     #[error("scorecard build failed: {0}")]
     Build(String),
+    #[error(
+        "scorecard week holds more than {ceiling} facts: unrepresentative sample, refusing the run"
+    )]
+    TooManyFacts { ceiling: usize },
 }
+
+/// Weekly fact ceiling for the Monday scorecard load. The store fetches at
+/// most `WEEK_FACT_CEILING + 1` rows; a week that exceeds the ceiling refuses
+/// the run as unrepresentative instead of silently truncating.
+pub const WEEK_FACT_CEILING: usize = 10_000;
 
 /// One fact write. The classifier verdict travels with the row so the store
 /// stays a thin transliteration; S3 supplies it via [`crate::community::classify`].
@@ -448,14 +457,21 @@ pub async fn load_scorecard_inputs(
                 classifier_version, classification, matched_rule, metadata, idempotency_key
            FROM community_facts
           WHERE guild_id = $1 AND occurred_at >= $2 AND occurred_at < $3 AND id <= $4
-          ORDER BY id",
+          ORDER BY id
+          LIMIT $5",
     )
     .bind(&load.guild_id)
     .bind(&load.week_start)
     .bind(&load.week_end)
     .bind(load.watermark)
+    .bind((WEEK_FACT_CEILING + 1) as i64)
     .fetch_all(pool)
     .await?;
+    if rows.len() > WEEK_FACT_CEILING {
+        return Err(CommunityStoreError::TooManyFacts {
+            ceiling: WEEK_FACT_CEILING,
+        });
+    }
     let mut facts = Vec::with_capacity(rows.len());
     for (
         id,

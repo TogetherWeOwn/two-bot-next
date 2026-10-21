@@ -74,11 +74,12 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 | `revocation acknowledged` | `crates/bot/src/eventsub_http.rs` (`receive`) | Revocation verified and acknowledged; boot/periodic reconcile owns re-subscription; bounded `reason` (`user_removed` / `authorization_revoked` / `notification_failures_exceeded` / `version_removed` / `other`) answers counts by reason |
 | `delivery ignored` | `crates/bot/src/eventsub_http.rs` (`receive`, two info sites) | Known ignored delivery or deterministic planning error acknowledged with 2xx; unknown/future classification errors are counted as `other` and refused with retryable 503 |
 | `event = "eventsub_receiver"` | `crates/bot/src/eventsub_http.rs` (`refuse`, `receive`, `handle_notification`) | Bounded `event` field value every receiver emission carries; no header, token or body leaves the process |
-| `eventsub reconcile parked: TWO_EVENTSUB is not exactly 1` | `crates/bot/src/eventsub_reconcile.rs` (`startup_reconcile`, `spawn_if_enabled`) | Info; gate dark, no subscription is listed or mutated (`status = "parked"`, `reason = "flag_dark"`) |
+| `eventsub reconcile parked: TWO_EVENTSUB is not exactly 1` | `crates/bot/src/eventsub_reconcile.rs` (`startup_reconcile`, `spawn_if_enabled`) | Info; gate dark at spawn or per pass, no subscription is listed or mutated (`status = "parked"`, `reason = "flag_dark"`) |
+| `eventsub reconcile parked: the EventSub receiver is dark, no shared secret snapshot` | `crates/bot/src/eventsub_reconcile.rs` (`spawn_if_enabled`) | Info; enabled but no receiver snapshot at spawn, so no task and no pass (`status = "parked"`, `reason = "receiver_dark"`) |
 | `eventsub reconcile refused: callback configuration is invalid` | `crates/bot/src/eventsub_reconcile.rs` (`startup_reconcile`) | Error; `TWO_TWITCH_CALLBACK_URL` missing or not an https callback, no Helix call (`error_class = "reconcile_config_invalid"`) |
 | `eventsub reconcile parked: broadcaster allowlist is empty, no subscriptions mutated` | `crates/bot/src/eventsub_reconcile.rs` (`startup_reconcile`) | Warn; `TWO_TWITCH_BROADCASTERS` empty, pass parked without mutation (`error_class = "reconcile_no_broadcasters"`) |
 | `eventsub reconcile refused: Twitch credentials are missing or invalid` | `crates/bot/src/eventsub_reconcile.rs` (`startup_reconcile`) | Error; Operator Twitch client credentials unreadable, no Helix call (`error_class = "reconcile_config_invalid"`) |
-| `eventsub reconcile refused: webhook secret is missing or invalid` | `crates/bot/src/eventsub_reconcile.rs` (`startup_reconcile`) | Error; signing secret unreadable, no Helix call (`error_class = "reconcile_config_invalid"`) |
+| `eventsub reconcile refused: webhook secret snapshot is unreadable` | `crates/bot/src/eventsub_reconcile.rs` (`startup_reconcile`) | Error; live signing snapshot unreadable, no Helix call (`error_class = "reconcile_config_invalid"`) |
 | `eventsub reconcile found failed subscriptions on our callback; deleting and re-creating` | `crates/bot/src/eventsub_reconcile.rs` (`reconcile_all_with_metrics`) | Error; failed subscriptions on our callback counted before the pass (`error_class = "reconcile_prior_failed"`), then deleted and re-created |
 | `eventsub subscriptions re-created but not all verified yet` | `crates/bot/src/eventsub_reconcile.rs` (`reconcile_all_with_metrics`) | Warn; pass re-created subscriptions but at least one desired broadcaster is not `enabled` yet (`status = "pending"`, `error_class = "reconcile_pending"`) |
 | `eventsub subscriptions reconciled` | `crates/bot/src/eventsub_reconcile.rs` (`reconcile_all_with_metrics`) | Info; every desired broadcaster holds an `enabled` subscription on our callback (`status = "healthy"`) |
@@ -124,6 +125,7 @@ Scalar gateway series pair with the labels above:
 
 | Series | Meaning |
 | --- | --- |
+| `two_bot_process_incarnation{part}` | Process-lifetime gauge: four fixed `part` labels (`0`, `1`, `2`, `3`) carry unsigned 32-bit numeric limbs of a nonzero random identity, stable across renders and new on process replacement. No PID, timestamp, build or identity-valued label. Optional for older containers; partial, duplicate, mislabeled or invalid parts invalidate the scrape. A validated same-scrape identity attributes gateway pairing windows, not health or recovery; full semantics live in `docs/metrics.md` |
 | `two_bot_gateway_reconnects_total` | New HELLOs after the first in the running loop |
 | `two_bot_gateway_resumes_total` | Received RESUMED dispatches |
 | `two_bot_gateway_disconnects_total` | Transport losses through the shard supervisor; each must pair with a later RESUME or fresh READY |
@@ -132,6 +134,26 @@ Scalar gateway series pair with the labels above:
 | `two_bot_gateway_prefix_trigger_refused_total{reason="verdict"}` | In-scope prefix candidates refused by the automod verdict; the worker records candidates even when its capture-only gate prevents detached dispatch. Unmatched content, scope mismatches, bot/webhook messages and disabled text-command gates never increment it |
 | `two_bot_presence_capture_total{outcome}` | Presence-update capture decisions on the hot path; `outcome` is `inserted` (first delivery stored a row), `duplicate` (same-key retry absorbed by the dedup key) or `rejected` (refused before the insert) |
 | `two_bot_automod_decisions_total{outcome}` | Terminal automod inspection outcomes; `outcome` is `accepted`, `already_processed`, `dry_run`, `protected`, `deleted`, `warned`, `timed_out` or `sanction_refused`. Recorded once per committed `StoredOutcome` by the shared activation; replays and retained claims never count. Fixed eight series from process start; no message text, excerpts or user IDs become labels |
+
+## Automod facts read warnings
+
+Source: `RestAutomodFacts::get` in `crates/discord/src/automod_activation.rs`.
+
+| Event | Callsite (stable anchor) | Level | Fields | Meaning |
+| --- | --- | --- | --- | --- |
+| `automod_facts_read_failed` | `crates/discord/src/automod_activation.rs` (`RestAutomodFacts::get`) | WARN | `step`: `guild`, `bot_member`, `target_member` or `message`; `cause`: the fixed vocabulary from `DiscordError::cause()` in `crates/discord/src/executor.rs` | A strict Discord facts read failed; the caller still returns unavailable facts and preserves the existing fail-closed decision. Enrichment's author-member read uses `target_member`. |
+
+Only `Err` emits: successful reads and 404 (`Ok(None)`) stay silent and do not
+consume the warning window. The first failure emits immediately, then at most
+one warning per 60 seconds per facts resolver, shared across all steps and
+guilds. This constant-memory sampler also bounds each guild's warnings; a
+failure in one guild can suppress another guild's warning in the same window.
+Suppressed failures do not extend the window. The event carries no path,
+guild/member/message IDs, response body or formatted error. It adds no metric
+or retry and does not change `ActivationOutcome::Unavailable` or the eight
+terminal decision outcomes above. Missing or incomplete facts can still yield
+`Unavailable` without this warning; the warning is a sampled error signal,
+not a count of unavailable decisions.
 
 ## Voice stall gauge series
 
@@ -164,11 +186,11 @@ actor, guild, channel, member, token or body content ever reaches a label.
 
 | Series | Labels | Scrape inputs | Alert usage | Meaning |
 | --- | --- | --- | --- | --- |
-| `two_bot_voice_worker_halted` | None (label-free gauge) | Additional series: accepted but not required by the scrape validator, which pins only the alert-input label sets; read manually from the container exposition or the authenticated pull | Consumed by no alert rule; manual check named in the runbook fast-burn, slow-burn and creator-map-stale first responses | 1 while any current guild actor is halted by a store CredentialRefused or Discord 401, otherwise 0; a healthy guild cannot hide another guild's halt |
-| `two_bot_voice_queue_pending` | Fixed `lane`: `urgent` or `deferred` (exactly two series) | Same additional-series handling as above | Consumed by no alert rule; manual queue-side complement to the join-budget burn rules | Queued (not in-flight) voice actions per lane, saturating-summed across all current guild actors |
-| `two_bot_voice_queue_oldest_age_seconds` | None (label-free gauge) | Same additional-series handling as above | Consumed by no alert rule; manual queue-side complement to the join-budget burn rules | Age in seconds of the oldest queued voice action, the maximum across all current guild actors; 0 when every queue is empty |
-| `two_bot_voice_live_not_ready_seconds` | None (label-free gauge) | Same additional-series handling as above | Consumed by no alert rule yet; the host watchdog reads it directly (alert when it stays above 120 s) | Seconds a guild's live voice view has been not ready while the gateway is connected (READY or RESUMED handled), the maximum across all current guild actors; 0 when every view is ready or the gateway is down. While above 0 that guild's creator joins are dropped without an accept or refusal line |
-| `two_bot_voice_live_self_heal_total` | None (label-free counter) | Same additional-series handling as above | Consumed by no alert rule; any increase means a live view was left not ready on a connected gateway and was republished from the gateway cache | Live voice views republished by the not-ready-while-connected self-heal |
+| `two_bot_voice_worker_halted` | None (label-free gauge) | Optional scrape input: validated when present (`ALERT_OPTIONAL_INPUT_LABELS`, pinned 0/1); older containers without it still scrape | Consumed by `voice_worker_halted`: pages while 1; a valid 0 clears, missing/invalid holds | 1 while any current guild actor is halted by a store CredentialRefused or Discord 401, otherwise 0; a healthy guild cannot hide another guild's halt |
+| `two_bot_voice_queue_pending` | Fixed `lane`: `urgent` or `deferred` (exactly two series) | Additional series: accepted but not required by the scrape validator, which pins only the alert-input label sets; read manually from the container exposition or the authenticated pull | Deferred: depth without age is not a failure signal — bursts queue legitimately and no code-grounded bound exists (depths are unbounded saturating sums); member impact is covered by the join-budget burn rules and `voice_queue_stall`. Manual depth complement to the stall ticket; revisit when production depth distribution justifies a bound | Queued (not in-flight) voice actions per lane, saturating-summed across all current guild actors |
+| `two_bot_voice_queue_oldest_age_seconds` | None (label-free gauge) | Optional scrape input: validated when present (`ALERT_OPTIONAL_INPUT_LABELS`); older containers without it still scrape | Consumed by `voice_queue_stall`: tickets past 120 s (matches the in-process stuck horizon; a hung dispatch freezes publication below the bound, so the hung case stays with the in-process stuck verdict); at or below clears, missing/invalid holds | Age in seconds of the oldest queued voice action, the maximum across all current guild actors; 0 when every queue is empty |
+| `two_bot_voice_live_not_ready_seconds` | None (label-free gauge) | Optional scrape input: validated when present (`ALERT_OPTIONAL_INPUT_LABELS`); older containers without it still scrape | Consumed by `voice_live_not_ready`: pages past 120 s, promoting the host-watchdog bound into the standard pipeline; at or below clears, missing/invalid holds; a hung dispatch freezes the published age (the sibling never republishes it) | Seconds a guild's live voice view has been not ready while the gateway is connected (READY or RESUMED handled), the maximum across all current guild actors; 0 when every view is ready or the gateway is down. While above 0 that guild's creator joins are dropped without an accept or refusal line |
+| `two_bot_voice_live_self_heal_total` | None (label-free counter) | Optional scrape input: validated when present (`ALERT_OPTIONAL_INPUT_LABELS`); older containers without it still scrape | Consumed by `voice_live_self_heal`: tickets on any increase between valid samples; first sample baselines, restarts re-baseline, a missing family is no window | Live voice views republished by the not-ready-while-connected self-heal |
 
 ## EventSub delivery series
 
@@ -253,7 +275,7 @@ is the single shared spelling also pinned in `evidence.rs`
 | --- | --- | --- |
 | `rest_5xx_rate` | `two_bot_rest_requests_total{result="5xx"}` and all `two_bot_rest_requests_total` samples | Pages when at least 10 new REST requests arrive between samples and more than 10% are 5xx; a counter reset suppresses the window. |
 | `job_unknown_stale` | `two_bot_job_last_success_timestamp_seconds{job}` for labels outside `JOB_INTERVAL_SECONDS`, `TICKER_STALE_JOBS` and `UNKNOWN_STALE_EXCLUDED` | Ticket when a job without a cadence entry has a nonzero success timestamp older than 2 hours; never-succeeded stays silent; `session_checkpoint` is event-driven and excluded |
-| `gateway_unpaired_disconnect` | `two_bot_gateway_disconnects_total` against `two_bot_gateway_resumes_total` plus fresh `two_bot_gateway_events_total{event="READY"}` | Pages after 3 consecutive samples with disconnect growth and no RESUMED or fresh READY growth (pairing in `pairGatewayDisconnects`); any recovery growth clears at once; the disconnect counter increments in `gateway.rs` (`transport_disconnected`) |
+| `gateway_unpaired_disconnect` | `two_bot_gateway_disconnects_total` against `two_bot_gateway_resumes_total` plus fresh `two_bot_gateway_events_total{event="READY"}`, attributed by optional `two_bot_process_incarnation{part}` | Pages after 3 consecutive valid outstanding-loss samples: disconnect growth opens the loss and flat counters keep it outstanding until RESUMED or fresh READY growth clears it (pairing in `pairGatewayDisconnects`); readiness alone never clears it. When the validated process identity changes or a counter decreases, the evaluator re-baselines and holds an existing page for one sample; the next valid flat sample clears it. First identity adoption into legacy state is not recovery; missing identity after attribution or invalid inputs hold the previous state. The disconnect counter increments in `gateway.rs` (`transport_disconnected`) |
 | `gateway_not_ready` | `/readyz` `components` gateway entry (parsed by the keepalive probe, not a `/metrics` series) with the pairing counters as the restart signal | Pages after 3 consecutive valid samples with the gateway component `starting`/`down` and no disconnect edge required (stuck starting, parked, or draining); any ready sample clears at once; invalid probes and failed scrapes hold the previous state |
 | `voice_join_fast_burn` | `two_bot_voice_joins_received_total` minus benign `duplicate` refusals in `two_bot_voice_join_refused_total` against `two_bot_voice_join_to_move_seconds_bucket{le="5"}` | Pages when the creator-join budget (99.5% moved within 5 s) burns faster than 14.4x in both the 1 h and 5 min windows; every non-duplicate refusal, failed move and slow (>5 s) move is burn; each window needs at least 10 genuine joins and two bad moves, receive counts lag one scrape, and incomplete post-restart windows stay inactive; missing inputs hold the previous state |
 | `voice_join_slow_burn` | Same inputs as `voice_join_fast_burn` | Ticket, not page: same budget burning faster than 6x in both the 6 h and 30 min windows with the same per-window volume and bad-move floors; catches the sustained grind the fast rule never spikes on; do not close as "fast burn resolved" |
@@ -267,6 +289,11 @@ is the single shared spelling also pinned in `evidence.rs`
 | `audit_delivery_halt` | `two_bot_audit_delivery_halt` with `two_bot_job_consecutive_failures{job="audit_retry"}` and `two_bot_job_last_success_timestamp_seconds{job="audit_retry"}` | Ticket when the label-free halt gauge reads `1` for 3 consecutive valid samples (about two minutes at the 60 s cadence); any nonzero `audit_retry` failure count vetoes both firing and recovery, and missing, duplicate, labeled or non-boolean readings break the streak while holding an active ticket; a valid `0` after a healthy sweep resolves once, and a boot-default zero cannot resolve until `audit_retry` has a nonzero success timestamp |
 | `eventsub_tampered` | `two_bot_eventsub_classified_total{kind="tampered"}` | Pages when the `tampered` counter (only `BadSignature`) rises in 3 consecutive samples; the first sample only baselines, a flat window resolves, a reset rebaselines, and missing/invalid scrapes hold firing |
 | `eventsub_reconcile_failed` | `two_bot_eventsub_reconcile_passes_total{outcome}` with the fixed `healthy`/`pending`/`failed` outcomes | Ticket, not page: fires when the failed-pass counter grows between valid samples, even beside healthy growth; the first valid sample only stores a baseline, healthy-only or pending-only growth never fires, and a flat failed counter never recovers (only healthy growth with no failed growth resolves, once); any backwards counter re-baselines: the reset sample fires when the new process already counted a failed pass (failed startup pass) and otherwise holds a firing ticket instead of fabricating a transition; missing or invalid samples hold the previous state; the family is an optional scrape input, so older containers hold the previous state |
+| `prefix_trigger_verdict_refusals` | `two_bot_gateway_prefix_trigger_refused_total{reason="verdict"}` | Ticket when the verdict-refused prefix count rises in 3 consecutive keepalive samples after a baseline; first sample and restarts clear the streak; `other` is normal refusal volume and never counts; missing inputs hold the previous state |
+| `voice_worker_halted` | `two_bot_voice_worker_halted` | Pages while the latch reads 1 (any guild actor halted by a store CredentialRefused or Discord 401); a valid 0 clears at once; missing/invalid holds the previous state |
+| `voice_live_self_heal` | `two_bot_voice_live_self_heal_total` | Ticket, not page: any increase between valid samples (one covered fault, already repaired); first sample is baseline-only, restarts re-baseline, a missing family is no window |
+| `voice_live_not_ready` | `two_bot_voice_live_not_ready_seconds` | Pages past 120 s, promoting the host-watchdog bound into the standard pipeline (joins are dropped while above 0); at or below clears, missing/invalid holds; a hung dispatch freezes the published age |
+| `voice_queue_stall` | `two_bot_voice_queue_oldest_age_seconds` | Ticket, not page: oldest-wait past 120 s (matches the in-process stuck horizon; a hung dispatch freezes publication below the bound); at or below clears, missing/invalid holds |
 
 ## Gateway failure classes (`/readyz` `gateway_failure`)
 
@@ -296,6 +323,19 @@ Startup `error_class` values logged before fatal exits (see
 `receiver_config_invalid`, `receiver_prerequisites_invalid`,
 `receiver_bind_failed`, `moderation_disable_unknown`,
 `container_service_failed`, plus the twelve classes above.
+
+## Voice responder overload
+
+| Event | Callsite (stable anchor) | Level | Fields | Meaning |
+| --- | --- | --- | --- | --- |
+| `voice responder saturated; interaction dropped without acknowledgement (sampled)` | `crates/bot/src/voice_rooms.rs` (`ResponderAdmission::record_drop`) | WARN | `interaction_id`: the refused interaction's snowflake as a string; `dropped`: cumulative refusals for this responder instance | All 16 responder permits are occupied. The refused interaction sends no callback and runs no command; no detached busy-response task is started. |
+
+The counter increments on every refusal. The warning is sampled at most once
+per 60-second wall-clock window per responder, shared across guilds and
+interaction kinds; suppressed warnings do not extend the window. `dropped`
+is a log field, not a metrics series. No interaction token, command arguments,
+member name or response body is logged. This execution bound is distinct from
+the shared router's lane, which continues to own `/kick`.
 
 ## Voice structured fields (gateway sink, adjacent)
 
@@ -405,6 +445,31 @@ Empty-grace override warning (in `stored_empty_grace_with` in
 stored per-guild `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` row is malformed or
 outside 0 to 600 whole seconds, so the sweep keeps the boot fallback. The
 line carries the setting key and the `out_of_range` reason.
+
+Fatal boot-setting warning (in `invalid_boot_setting`, called by
+`build_production_runtime` in `crates/bot/src/voice_rooms.rs`):
+`temp-voice boot setting invalid; refusing voice runtime` (warn). Fields:
+`key`: `&'static str` (one fixed key below); `reason`: `&'static str`
+(always `invalid_value`). No configured values, parser errors, tokens,
+channel/member lists or synthetic identity input are logged. This precedes
+the unchanged `RoomHttpError::InvalidRequest` setup failure and the gateway's
+`voice HTTP setup failed` line. It refuses the voice runtime, not necessarily
+the process. Exactly one warning names the first invalid setting in existing
+validation order:
+
+1. Protected infrastructure channels: `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID`,
+   `TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID`, `TWO_TEMP_VOICE_CATEGORY_ID`, then
+   `TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS`. The exact refused sub-key is named.
+2. Generator channel: `TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID` (also checked by
+   protection above, so malformed input normally refuses there first).
+3. Empty-room grace: `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` (whole seconds,
+   0 to 600).
+4. Synthetic humans: `TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS` (up to four distinct
+   nonzero IDs).
+
+Absent, blank and valid settings remain silent. Nonfatal admission knobs
+retain their separate default-fallback warning below. For safe triage, see
+[voice boot-setting refusal](runbook-observability.md#voice-boot-setting-refusal).
 
 Configured-channel notice fallback warning (in
 `GuildRoomWorker::deliver_notice` in `crates/bot/src/voice_rooms.rs`, guild

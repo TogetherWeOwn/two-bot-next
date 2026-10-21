@@ -2,7 +2,7 @@
 
 use crate::{automation_admission::ActorCooldowns, ActionExecutor, DiscordError};
 use serde_json::{json, Value};
-use two_bot_core::commands::MAX_RESOURCE_ID_CHARS;
+use sha2::{Digest, Sha256};
 use two_bot_core::lfg::{self, LfgPost, LfgRole, LfgSelectAction, LfgSignup, LfgStatus};
 use two_bot_core::{lfg_store as store, rsvp::RsvpAudit, rsvp_store};
 
@@ -141,33 +141,26 @@ impl LfgInteractions {
         interaction_id: u64,
         bot_user_id: u64,
     ) -> Result<String, LfgError> {
-        // Apply only to signup/move, before queue admission, SQL, audit or
-        // channel refresh. Leave and close must remain usable for recovery.
-        let signup = matches!(&request, LfgRequest::Select(LfgSelectAction::Signup { .. }));
-        self.admit_signup(&request, guild_id, actor_id, interaction_id)
-            .await?;
-        let now = time::OffsetDateTime::now_utc();
-        let at = lfg::iso_millis_utc(now);
         let id = match &request {
             LfgRequest::Create { .. } => format!("lfg-{interaction_id}"),
-            LfgRequest::Close { post_id } => {
-                if post_id.is_empty()
-                    || post_id
-                        .encode_utf16()
-                        .take(MAX_RESOURCE_ID_CHARS + 1)
-                        .count()
-                        > MAX_RESOURCE_ID_CHARS
-                {
+            LfgRequest::Close { post_id }
+            | LfgRequest::Select(
+                LfgSelectAction::Signup { post_id, .. } | LfgSelectAction::Leave { post_id },
+            ) => {
+                if !lfg::valid_post_id(post_id) {
                     return Err(LfgError::Invalid(
                         "LFG id must be between 1 and 128 characters.".into(),
                     ));
                 }
                 post_id.clone()
             }
-            LfgRequest::Select(
-                LfgSelectAction::Signup { post_id, .. } | LfgSelectAction::Leave { post_id },
-            ) => post_id.clone(),
         };
+        // Apply only to signup/move, before queue admission, SQL, audit or
+        // channel refresh. Leave and close must remain usable for recovery.
+        self.admit_signup(&request, guild_id, actor_id, interaction_id)
+            .await?;
+        let now = time::OffsetDateTime::now_utc();
+        let at = lfg::iso_millis_utc(now);
         // Cap pool use before taking a connection: blocked lock waiters must not
         // starve the lock holder or the gateway checkpoint writer. The queue is
         // bounded too, so waiters cannot fill the shared interaction lane.
@@ -175,25 +168,47 @@ impl LfgInteractions {
         // Serialize store changes + refresh across runtime instances. This key is
         // distinct from the capacity/close lock taken by the domain store.
         let mut guard = self.pool.begin().await?;
+        let select_identity = match &request {
+            LfgRequest::Select(select) => Some(select_fingerprint(select, guild_id, actor_id)),
+            _ => None,
+        };
+        if select_identity.is_some() {
+            // Serialize the identity as well as the post: divergent deliveries
+            // can name different posts or guilds, including across processes.
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(format!("lfg-select:{interaction_id}"))
+                .execute(&mut *guard)
+                .await?;
+        }
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(format!("lfg-runtime:{guild_id}:{id}"))
             .execute(&mut *guard)
             .await?;
-        // An admitted redelivery may retry refresh, but must not append another
-        // signup audit or reapply a signup after the actor has left. The same
-        // per-post lock serializes this lookup with the original execution.
-        let replay_outcome: Option<String> = if signup {
-            sqlx::query_scalar(
-                "SELECT outcome FROM announcements_audit_log
-                 WHERE id = $1 AND guild_id = $2 AND actor_id = $3
-                   AND target_key = $4 AND action = 'lfg.signup'",
-            )
-            .bind(format!("lfg:signup:{interaction_id}"))
-            .bind(guild_id)
-            .bind(actor_id)
-            .bind(&id)
-            .fetch_optional(&self.pool)
-            .await?
+        // Find the interaction before filtering its request fields; otherwise
+        // divergence looks like a new request. Legacy rows without a binding
+        // cannot prove identical redelivery and are conservatively refused.
+        let replay_outcome: Option<String> = if let Some(identity) = &select_identity {
+            let audit_id = format!("lfg:signup:{interaction_id}");
+            let outcome: Option<String> =
+                sqlx::query_scalar("SELECT outcome FROM announcements_audit_log WHERE id = $1")
+                    .bind(&audit_id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+            if outcome.is_some() {
+                let bound: Option<String> = sqlx::query_scalar(
+                    "SELECT reason FROM announcements_audit_log WHERE id = $1 AND reason = $2",
+                )
+                .bind(&audit_id)
+                .bind(identity)
+                .fetch_optional(&self.pool)
+                .await?;
+                if bound.as_ref() != Some(identity) {
+                    return Err(LfgError::Invalid(
+                        "LFG interaction does not match its saved request.".into(),
+                    ));
+                }
+            }
+            outcome
         } else {
             None
         };
@@ -342,30 +357,65 @@ impl LfgInteractions {
                 ("lfg.signup", outcome, reply, true)
             }
             LfgRequest::Select(LfgSelectAction::Leave { .. }) => {
-                // leave_lfg is id-only: establish the guild fence before invoking it.
-                let exists = store::get_lfg(&self.pool, guild_id, &id).await?.is_some();
-                let removed = exists && store::leave_lfg(&self.pool, &id, actor_id).await?;
-                (
-                    "lfg.leave",
-                    if removed { "left" } else { "not_signed_up" }.into(),
-                    lfg::leave_reply(removed),
-                    true,
-                )
+                let outcome = match replay_outcome.as_ref() {
+                    Some(outcome) => outcome.clone(),
+                    None => {
+                        // leave_lfg is id-only: establish the guild fence first.
+                        let exists = store::get_lfg(&self.pool, guild_id, &id).await?.is_some();
+                        let removed = exists && store::leave_lfg(&self.pool, &id, actor_id).await?;
+                        if removed { "left" } else { "not_signed_up" }.into()
+                    }
+                };
+                let reply = lfg::leave_reply(outcome == "left");
+                ("lfg.leave", outcome, reply, true)
             }
         };
-        if replay_outcome.is_none() {
-            self.audit(
-                guild_id,
-                actor_id,
-                interaction_id,
-                &id,
-                action,
-                &outcome,
-                &at,
-            )
-            .await?;
-        }
-        let result = if refresh {
+        let audited = if replay_outcome.is_some() {
+            true
+        } else {
+            let audit = if let Some(identity) = select_identity {
+                // Keep the existing signup ID namespace, shared with leave so
+                // changing the action cannot evade the replay fence.
+                rsvp_store::write_audit(
+                    &self.pool,
+                    &RsvpAudit {
+                        id: format!("lfg:signup:{interaction_id}"),
+                        guild_id: guild_id.into(),
+                        actor_id: Some(actor_id.into()),
+                        action: action.into(),
+                        target_key: Some(id.clone()),
+                        outcome: outcome.clone(),
+                        reason: Some(identity),
+                        created_at: at.clone(),
+                    },
+                )
+                .await
+                .map(|_| ())
+                .map_err(LfgError::from)
+            } else {
+                self.audit(
+                    guild_id,
+                    actor_id,
+                    interaction_id,
+                    &id,
+                    action,
+                    &outcome,
+                    &at,
+                )
+                .await
+            };
+            match audit {
+                Ok(()) => true,
+                // Create/nonce recovery has its own failure contract.
+                Err(error) if action == "lfg.create" => return Err(error),
+                Err(_) => false,
+            }
+        };
+        let result = if !audited {
+            // Store calls committed independently of this lock-only transaction.
+            // Do not turn applied state into a bare failure or claim an audit.
+            format!("{reply} Audit could not be recorded; check the saved state before retrying.")
+        } else if refresh {
             match self.refresh(executor, guild_id, &id).await {
                 Ok(()) => reply,
                 Err(_) => format!("{reply} Message refresh failed; the saved state is unchanged."),
@@ -437,6 +487,23 @@ impl LfgInteractions {
         .await?;
         Ok(())
     }
+}
+
+/// Versioned, length-delimited request binding. Hashing keeps the audit reason
+/// bounded and avoids copying member-controlled role text into the audit trail.
+fn select_fingerprint(select: &LfgSelectAction, guild: &str, actor: &str) -> String {
+    let (post, action, role) = match select {
+        LfgSelectAction::Signup { post_id, role_key } => {
+            (post_id.as_str(), "signup", role_key.as_str())
+        }
+        LfgSelectAction::Leave { post_id } => (post_id.as_str(), "leave", ""),
+    };
+    let mut hash = Sha256::new();
+    for field in ["lfg-select:v1", guild, actor, post, action, role] {
+        hash.update((field.len() as u64).to_be_bytes());
+        hash.update(field.as_bytes());
+    }
+    format!("lfg-select:v1:{}", hex::encode(hash.finalize()))
 }
 
 /// Legacy message shape. Closed posts remove the select; user references never ping.
@@ -596,6 +663,48 @@ mod tests {
             service.admitted.load(Ordering::Acquire),
             0,
             "gateway shutdown cancels queued work without leaking places"
+        );
+    }
+
+    #[test]
+    fn select_fingerprint_is_versioned_bounded_and_stable() {
+        let signup = LfgSelectAction::Signup {
+            post_id: "post-a".into(),
+            role_key: "tank".into(),
+        };
+        assert_eq!(
+            select_fingerprint(&signup, "1", "2"),
+            "lfg-select:v1:60115d1e043296e19120f8c252c61372a98fbb8571534bdbf5453b49393e2e3c"
+        );
+        let hostile = LfgSelectAction::Signup {
+            post_id: "post-a".into(),
+            role_key: "@everyone".repeat(1000),
+        };
+        let fingerprint = select_fingerprint(&hostile, "1", "2");
+        assert_eq!(fingerprint.len(), 78);
+        assert!(!fingerprint.contains("@everyone"));
+        assert_ne!(fingerprint, select_fingerprint(&signup, "1", "2"));
+    }
+
+    #[test]
+    fn select_fingerprint_distinguishes_field_boundaries_and_leave() {
+        let signup = LfgSelectAction::Signup {
+            post_id: "post-a".into(),
+            role_key: String::new(),
+        };
+        assert_ne!(
+            select_fingerprint(&signup, "1", "23"),
+            select_fingerprint(&signup, "12", "3")
+        );
+        assert_ne!(
+            select_fingerprint(&signup, "1", "2"),
+            select_fingerprint(
+                &LfgSelectAction::Leave {
+                    post_id: "post-a".into()
+                },
+                "1",
+                "2"
+            )
         );
     }
 

@@ -18,7 +18,7 @@ available in DMs (`docs/commands.md`):
 | --- | --- | --- |
 | `/feed-add` | `kind` (required choice: `"rss"`, `"youtube"`, `"twitch"`), `source` (required string, max 2048 chars) | Posts into the invoking channel. At most 2,048 input bytes total. |
 | `/feed-list` | none | Ephemeral text; each source capped at 128 UTF-16 units, shrinking adaptively at capacity (scheme-stripped head…tail so same-host relays stay distinguishable) so every relay id stays discoverable within the 2,000-unit message cap (`crates/core/src/feeds.rs`). |
-| `/feed-remove` | `id` (required string, max 128 chars) | Replies `Feed relay removed.` or `No feed relay with that id.` (`crates/core/src/feeds.rs:354-360`). Guild-scoped delete. |
+| `/feed-remove` | `id` (required string, max 128 chars) | Replies `Feed relay removed.`, `No feed relay with that id.` (`crates/core/src/feeds.rs:354-360`) or, while a delivery is still pending recovery, `Feed relay kept: unresolved deliveries are still pending recovery.` (`crates/core/src/feeds.rs:362-366`). Guild-scoped delete. |
 
 Source rules (`crates/core/src/feeds.rs:168-184`, `docs/feeds-port.md`):
 
@@ -30,9 +30,11 @@ Source rules (`crates/core/src/feeds.rs:168-184`, `docs/feeds-port.md`):
   Twitch is **not** a Helix API integration and needs no Twitch credential.
 - Adding a relay does not fetch the source. At most 25 feed relays per
   guild (disabled relays count; `docs/runbook.md:1312`).
-- Removal cascades delivery history (`feed_deliveries` rows go with the
-  relay). Do not remove and re-add a relay to "fix" it unless resetting its
-  delivery history is intended.
+- Removal cascades settled delivery history (`feed_deliveries` rows go with
+  the relay). While any delivery is still pending recovery, removal is
+  refused and keeps the relay and its ledger; let recovery settle it, then
+  remove again (`docs/feeds-port.md`). Do not remove and re-add a relay to
+  "fix" it unless resetting its delivery history is intended.
 
 Gates (both must hold or the poller parks):
 
@@ -136,6 +138,73 @@ Check the configured feed source's availability and recent fetch status
 through authorized diagnostics; do not copy response bodies
 (`docs/runbook.md:241`).
 
+### Metric anchors (fetch counters)
+
+The table above reads logs and job state. Two counters in the same
+`/ops/metrics` scrape answer the aggregate direction — how many fetches
+ran and which failure class they hit — with no log window to page.
+Series contract: [metrics](metrics.md). This section installs no monitor,
+rule, or dashboard; its thresholds are triage guidance (when to act),
+not firing levels.
+
+Fetch one scrape (operator supplies the Worker URL and the
+already-provisioned scrape token; the token never goes in a PR or log):
+
+```bash
+curl --silent --show-error --max-time 10 \
+  -H "Authorization: Bearer ${METRICS_SCRAPE_TOKEN}" \
+  "${WORKER_URL}/ops/metrics" > /tmp/feed-start.txt
+```
+
+Repeat at the end of the window into a second file and diff the counters.
+A counter that reset to zero means the process restarted, not that the
+window was quiet — re-baseline both files after a reset.
+
+Copy-paste reads over the two scrapes (exact rendered names):
+
+```bash
+grep "^two_bot_feed_fetches_total{" /tmp/feed-start.txt /tmp/feed-end.txt
+grep "^two_bot_feed_fetch_errors_total{" /tmp/feed-start.txt /tmp/feed-end.txt
+```
+
+PromQL equivalents for a Prometheus-compatible reader over the scrapes:
+
+```promql
+sum by (outcome) (increase(two_bot_feed_fetches_total[1h]))
+sum(increase(two_bot_feed_fetch_errors_total[1h]))
+  / sum(increase(two_bot_feed_fetches_total[1h]))
+topk(5, sum by (error_class) (increase(two_bot_feed_fetch_errors_total[1h])))
+```
+
+Label vocabulary (fixed; no source URL, host, or feed id ever reaches a
+label, so a single bad relay is visible only as its class):
+
+- `two_bot_feed_fetches_total{outcome}`: `success` (2xx fetch),
+  `invalid_source` (source refused before dialling),
+  `refused_redirect` (redirect refused by policy), `failure` (every other
+  failure, including non-2xx HTTP). One sample per fetch.
+- `two_bot_feed_fetch_errors_total{error_class}`: `invalid_source`,
+  `non_public_address`, `redirect_refused`, `too_large`,
+  `invalid_encoding`, `unsupported_content_type`, `unsupported_encoding`,
+  `resolve`, `transport`, `deadline`, `http_error` (completed non-2xx
+  fetch), or `other`. One sample per failed fetch alongside
+  `fetches_total`; successes record nothing here.
+
+Investigate when, and what to do next:
+
+| Signal | Meaning | Next action |
+| --- | --- | --- |
+| Any `invalid_source` growth (outcome or class) | A stored source fails validation before dialling | Source config, not the poller: check the relay's source URL against the [Source configuration](#source-configuration) rules. Never edit stored sources in place; there is no reviewed in-place remediation path. |
+| Errors concentrated in one class across 2+ consecutive passes (`http_error`, `too_large`, `invalid_encoding`, `unsupported_content_type`, `redirect_refused`) | One source (or one feed host) failing the same way each pass | Check that source's availability and recent fetch status through authorized diagnostics; do not copy response bodies. A `refused_redirect` outcome means the 3-hop same-host HTTPS policy refused the redirect — change the source feed, not the bot. |
+| Errors spread across `resolve` / `transport` / `deadline` for many relays | Fetch-side platform trouble, not feed config | Treat as platform (DNS/network), not feed config; see the operations runbook. If the pass also carries `timeout` / `database` / `rest` job classes, triage those rows first. |
+| Error share above 50% over 1h | Most fetches failing, not one bad relay | Same platform triage as above; a single dead source out of many relays cannot reach this share. |
+| `failure` outcome growth with no matching error-class growth | Counters disagree across the two scrapes | Re-check for a process restart between scrapes (reset skips the window); otherwise escalate with both scrape files. |
+
+A zero error share with missing posts is not a fetch problem: match the
+`feed items skipped` log row (filtered by design) or the
+`recovery_required` path instead. Missing in a bounded 100-message search
+is not authoritative absence — never repost to "fix" it.
+
 ## Read-only guarantees
 
 - Inspect first. Poller state (cursor, pending claims) is the delivery
@@ -164,7 +233,7 @@ two-bot commands publish [--apply] [--guild-id ID] [--application-id ID] [--allo
     Fetch and compare the guild command list against the compiled, feature-gated
     builtins. Both commands are read-only unless publish receives --apply.
     Env: DISCORD_TOKEN, GUILD_ID, DISCORD_APPLICATION_ID; feature gates as on boot
-    (TWO_VOICE=1 adds the voice set; TWO_ASSISTANT_ENDPOINT also adds /templateassistant).
+    (TWO_VOICE=1 adds the voice set; /templateassistant stays unpublished until its slice lands).
     Live Discord targets additionally require TWO_DATABASE_URL (or DATABASE_URL
     when unset), the shared send-admission Postgres. No database is opened for
     loopback DISCORD_API_BASE fixtures, and no gateway is started.

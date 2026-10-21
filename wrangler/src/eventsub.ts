@@ -95,6 +95,26 @@ const SIGNATURE_MAX = 128;
 const HEADER_VALUE = /^[\x21-\x7e]+$/;
 const CONTENT_TYPES = ["application/json", "application/json; charset=utf-8"];
 
+/**
+ * No-restart rotation: the fenced DO attaches the Worker's current signing
+ * secret plus this HMAC to every delivery it forwards, so the running
+ * container learns a rotated secret without a restart. These headers are
+ * never caller-supplied: the edge allowlist below refuses any inbound value
+ * for them, and only the DO sets server-side values on the container-bound
+ * forward. Mirrors `crates/core/src/eventsub_refresh.rs` (header names,
+ * canonical string, HMAC shape); the two must stay identical.
+ */
+export const REFRESH_SECRET_HEADER = "x-two-eventsub-secret";
+export const REFRESH_TIMESTAMP_HEADER = "x-two-eventsub-timestamp";
+export const REFRESH_NONCE_HEADER = "x-two-eventsub-nonce";
+export const REFRESH_SIGNATURE_HEADER = "x-two-eventsub-signature";
+const REFRESH_HEADERS = [
+  REFRESH_SECRET_HEADER,
+  REFRESH_TIMESTAMP_HEADER,
+  REFRESH_NONCE_HEADER,
+  REFRESH_SIGNATURE_HEADER,
+] as const;
+
 // Per-isolate caps, the same best-effort shape as healthBuckets/clickBuckets.
 // Twitch delivers from many edge IPs and retries with backoff, so a per-IP
 // burst budget only blunts a single-source flood; signature verification in
@@ -166,11 +186,14 @@ export function isEventsubRequest(request: Request): boolean {
  * The allowlisted headers, or the refusal that explains the first bad one.
  * `authorization`, `cookie`, `cf-connecting-ip`, the retry/subscription
  * informational headers and any caller-supplied deployment header are never
- * copied. `x-request-id` is the one caller header that flows on: only its
- * validated generated shape (a non-secret 26-char token; anything else is
- * replaced with a fresh id), so the DO and container can join this delivery
- * in their own logs. The signature keeps its `sha256=` prefix verbatim: the
- * receiver strips and hex-decodes it during verification.
+ * copied. A caller-supplied `x-two-eventsub-*` refresh header is refused
+ * outright (it is a privileged DO-set field, never Twitch input), so no
+ * caller value can reach the container's refresh path. `x-request-id` is the
+ * one caller header that flows on: only its validated generated shape (a
+ * non-secret 26-char token; anything else is replaced with a fresh id), so
+ * the DO and container can join this delivery in their own logs. The
+ * signature keeps its `sha256=` prefix verbatim: the receiver strips and
+ * hex-decodes it during verification.
  */
 export function allowlistedHeaders(
   source: Headers,
@@ -183,6 +206,11 @@ export function allowlistedHeaders(
     source.has("content-encoding")
   ) {
     return { refusal: refuse(415, "unsupported_media_type", false, undefined, requestId, release) };
+  }
+  for (const name of REFRESH_HEADERS) {
+    if (source.has(name)) {
+      return { refusal: refuse(400, "malformed", false, undefined, requestId, release) };
+    }
   }
   const headers = new Headers({ "content-type": media });
   for (const [name, max, alphabet] of DELIVERY_HEADERS) {
@@ -265,6 +293,56 @@ export function forwardRequest(
   signal?: AbortSignal,
 ): Request {
   return new Request(url, { method: "POST", headers, body: bytes, ...(signal ? { signal } : {}) });
+}
+
+export interface RefreshSigningInput {
+  /** Dedicated refresh HMAC key (Worker secret, never logged). */
+  reloadKey: string;
+  /** The Worker's current signing secret (never logged). */
+  secret: string;
+  /** The flow's `x-request-id`, binding this refresh to its delivery. */
+  requestId: string;
+  /** Test seam: fixed unix seconds instead of `Date.now()`. */
+  timestamp?: string;
+  /** Test seam: fixed 32-hex nonce instead of a random one. */
+  nonce?: string;
+}
+
+function hexOf(bytes: Uint8Array): string {
+  return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * The DO's server-side refresh headers for one container-bound delivery.
+ * Signs `POST\n/hooks/twitch\n{timestamp}\n{nonce}\n{request_id}\n{sha256_hex(secret)}`
+ * with the reload key — the exact contract `eventsub_refresh::sign` verifies
+ * in `crates/core/src/eventsub_refresh.rs`. Returns null (caller fails closed
+ * to the fixed 503 envelope) when either secret is missing, so a
+ * half-provisioned enable never forwards an unsigned refresh. Throws only on
+ * platform crypto failure, which the DO maps to the same envelope. Never
+ * logs: both inputs are secret-bearing.
+ */
+export async function signEventsubRefresh(input: RefreshSigningInput): Promise<Headers | null> {
+  if (input.reloadKey === "" || input.secret === "") return null;
+  const enc = new TextEncoder();
+  const timestamp = input.timestamp ?? String(Math.floor(Date.now() / 1000));
+  const nonce = input.nonce ?? hexOf(crypto.getRandomValues(new Uint8Array(16)));
+  const secretHash = hexOf(new Uint8Array(await crypto.subtle.digest("SHA-256", enc.encode(input.secret))));
+  const canonical = `POST\n${EVENTSUB_PATH}\n${timestamp}\n${nonce}\n${input.requestId}\n${secretHash}`;
+  const key = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(input.reloadKey),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = hexOf(new Uint8Array(await crypto.subtle.sign("HMAC", key, enc.encode(canonical))));
+  const headers = new Headers();
+  headers.set(REFRESH_SECRET_HEADER, input.secret);
+  headers.set(REFRESH_TIMESTAMP_HEADER, timestamp);
+  headers.set(REFRESH_NONCE_HEADER, nonce);
+  headers.set(REFRESH_SIGNATURE_HEADER, `${SIGNATURE_PREFIX}${signature}`);
+  return headers;
 }
 
 /**

@@ -6,7 +6,7 @@
 use crate::ratelimit_guard::GuardError;
 use crate::{ActionExecutor, DiscordError};
 use serde_json::{json, Map, Value};
-use two_bot_core::channel_moderation::{self, ChannelOutcome, UnlockPlan};
+use two_bot_core::channel_moderation::{self, ChannelOutcome, PurgeStopReason, UnlockPlan};
 use two_bot_core::channel_moderation_store::{
     ChannelAuditRow, ChannelClaim, ChannelClaimTicket, ChannelModerationStore,
 };
@@ -133,6 +133,7 @@ pub struct InternalChannelExecutor {
 pub struct InternalChannelResult {
     pub outcome: String,
     pub affected: Option<u64>,
+    pub stop_reason: Option<PurgeStopReason>,
     pub replayed: bool,
 }
 
@@ -142,6 +143,9 @@ impl InternalChannelResult {
         let mut result = json!({"outcome": self.outcome});
         if let Some(affected) = self.affected {
             result["affected"] = json!(affected);
+        }
+        if let Some(reason) = self.stop_reason {
+            result["stop_reason"] = json!(reason.name());
         }
         let mut response = json!({"result": result, "outcome": self.outcome});
         if self.replayed {
@@ -248,6 +252,13 @@ impl InternalChannelExecutor {
                 return Ok(InternalChannelResult {
                     outcome,
                     affected: value.get("affected").and_then(Value::as_u64),
+                    stop_reason: value
+                        .get("stop_reason")
+                        .map(|reason| serde_json::from_value(reason.clone()))
+                        .transpose()
+                        .map_err(|_| {
+                            error(ErrorCode::Internal, "unreadable stored moderation result")
+                        })?,
                     replayed: true,
                 });
             }
@@ -348,7 +359,10 @@ impl InternalChannelExecutor {
                 self.discord
                     .purge_messages(&request.channel_id, &ids, &reason)
                     .await
-                    .map(|affected| ChannelOutcome::Purged { affected })
+                    .map(|report| ChannelOutcome::Purged {
+                        affected: report.affected,
+                        stop_reason: report.stop_reason,
+                    })
             }
             ModerationAction::Slowmode => self
                 .discord
@@ -503,16 +517,23 @@ impl InternalChannelExecutor {
                 return Err(discord_error(failure));
             }
         };
-        let affected = match outcome {
-            ChannelOutcome::Purged { affected } => Some(affected),
-            _ => None,
+        let (affected, stop_reason) = match outcome {
+            ChannelOutcome::Purged {
+                affected,
+                stop_reason,
+            } => (Some(affected), stop_reason),
+            _ => (None, None),
         };
         audit.outcome = outcome.name().to_owned();
-        audit.metadata_json =
-            json!({"duration_seconds": request.duration_seconds, "count": request.count,
-            "seconds": request.seconds, "affected": affected})
-            .to_string();
-        let stored = json!({"outcome": audit.outcome, "affected": affected}).to_string();
+        let mut metadata = json!({"duration_seconds": request.duration_seconds, "count": request.count,
+            "seconds": request.seconds, "affected": affected});
+        let mut stored = json!({"outcome": audit.outcome, "affected": affected});
+        if let Some(reason) = stop_reason {
+            metadata["stop_reason"] = json!(reason.name());
+            stored["stop_reason"] = json!(reason.name());
+        }
+        audit.metadata_json = metadata.to_string();
+        let stored = stored.to_string();
         if !self
             .store
             .finish_channel(&ticket, &audit, &stored, clear_on_success.as_deref())
@@ -524,6 +545,7 @@ impl InternalChannelExecutor {
         Ok(InternalChannelResult {
             outcome: audit.outcome,
             affected,
+            stop_reason,
             replayed: false,
         })
     }

@@ -67,6 +67,24 @@ permission → target present → self-target → owner/Owen/bot/staff protectio
 bot hierarchy → actor hierarchy. Audit `reason` is trimmed, non-empty, ≤512
 UTF-16 units on every moderation row.
 
+## Voice slice: vote-kick, setup/import (CI-proven handlers; staging round-trip UNPROVEN)
+
+The `TWO_VOICE` slice stays out of the live 29-row suite above. Its handlers
+are proven deterministically in CI with constructed interaction inputs and no
+guild, network, or database. The user-originated staging round-trip is
+UNPROVEN: a bot token cannot invoke slash commands or click components, so no
+unattended synthetic can drive it. These rows need a supervised human tester
+run on staging. Never record them as passed until a human has run them.
+
+| Command | CI proof (deterministic, no guild) | Staging expectation (human run) | Staging status |
+| --- | --- | --- | --- |
+| `/kick` (vote) | `vote_kick_open_vote_close_round_trip_through_interactions`: occupant opens via `/kick`, Yes ballots to strict majority close Passed with disabled buttons, replay stays terminal; room-scoped deny/disconnect enforcement pinned by `strict_majority_passes_and_enforces_on_that_room_only` | Occupant `/kick` opens a public ballot; majority Yes disconnects and Connect-denies the target on that room only; refusals stay ephemeral with no state change | UNPROVEN — human run required |
+| `/setup` | `setup_then_import_confirm_round_trip_through_interactions` reads the admin panel before and after the import | Admin sees status/health/creators; members see the generic panel only | UNPROVEN — human run required |
+| `/import` | Same test: upload previews the diff, Confirm applies the file exactly once (`Import applied: …`), stored config equals the upload, replayed Confirm expires with no second apply; Cancel-consumes-preview pinned by `import_cancel_writes_nothing_and_consumes_the_preview` | Manage Server upload shows the diff preview; Confirm applies it; Cancel writes nothing | UNPROVEN — human run required |
+
+Out of this slice: owner-command round-trips (`/limit`, `/private`, `/name`)
+ship separately and are untouched here.
+
 ## Out of scope
 
 - Voice `/create /setup /ping /invite /textchannels /access /reclaim
@@ -76,7 +94,7 @@ UTF-16 units on every moderation row.
   `kick` loses the merge to moderation first-wins — runtime dispatch decides).
   The published voice set is pinned separately by the `voice` section of
   `crates/core/tests/fixtures/staging_published_commands.json`.
-- `/templateassistant` (voice + assistant gates; same fixture section).
+- `/templateassistant` (unpublished until its slice lands; name still reserved, same fixture section).
 - DB-backed custom commands and `!` prefix triggers (dynamic surfaces).
 - Component/modal surfaces (pickers, tickets, self-roles, LFG signup).
 - Dropped `/rota-acknowledge` (parity row 13, never published).

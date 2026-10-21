@@ -5,6 +5,9 @@
 use super::*;
 use two_bot_core::voice_private::{ChannelId, JoinChannel, MemberId};
 
+#[path = "voice_overwrite_snapshot_tests.rs"]
+mod overwrite_snapshot;
+
 const ROOM: u64 = 500;
 const JOIN: u64 = 700;
 const BOT: u64 = 999;

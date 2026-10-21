@@ -598,6 +598,7 @@ async fn uncertain_role_intent_retains_resolved_role_after_configuration_remappi
                 resource_id: None,
                 affected: 1,
                 outcome: None,
+                stop_reason: None,
             },
             ReconciliationEvidence::DiscordConfirmedEffect,
         )

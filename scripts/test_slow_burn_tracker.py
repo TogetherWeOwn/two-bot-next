@@ -115,6 +115,28 @@ class TrackerUnitTests(unittest.TestCase):
         self.assertEqual(stored["verdict"], "unknown")
         self.assertEqual(stored["action"], "none")
 
+    def test_scrape_names_its_user_agent(self):
+        seen = {}
+
+        def fake_open(request, timeout=None):
+            seen["agent"] = request.get_header("User-agent")
+            seen["auth"] = request.get_header("Authorization")
+            response = mock.MagicMock()
+            response.status = 200
+            response.read.return_value = b"# expo\n"
+            response.__enter__.return_value = response
+            return response
+
+        opener = mock.Mock()
+        opener.open.side_effect = fake_open
+        with mock.patch.object(tracker.urllib.request, "build_opener",
+                               return_value=opener):
+            body = tracker.scrape_metrics("https://staging.example", "token")
+        self.assertEqual(body, "# expo\n")
+        self.assertEqual(seen["agent"], tracker.USER_AGENT)
+        self.assertNotIn("Python-urllib", seen["agent"])
+        self.assertEqual(seen["auth"], "Bearer token")
+
     def test_fire_creates_one_issue(self):
         fake = FakeGh()
         with mock.patch("subprocess.run", fake):
@@ -611,6 +633,23 @@ class TrackerUnitTests(unittest.TestCase):
 
 @unittest.skipUnless(NODE and DRIVER.exists(), "node driver integration needs node")
 class TrackerDriverTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Hand-built cadence fixtures need every companion series a Worker
+        # scrape requires; keep fixture_inputs itself under test unchanged.
+        fixture = (DRIVER.parent.parent / "test" / "fixtures" / "metrics.ts").as_uri()
+        import subprocess
+        completed = subprocess.run(
+            [NODE, "--input-type=module", "-e",
+             f"import {{ metricsLines }} from {json.dumps(fixture)};"
+             'process.stdout.write(metricsLines().filter(line => '
+             '!line.startsWith(\'two_bot_voice_joins_received_total \') && '
+             '!line.startsWith(\'two_bot_voice_join_refused_total{reason="duplicate"} \') && '
+             '!line.startsWith(\'two_bot_voice_join_to_move_seconds_bucket{le="5"} \')'
+             ').join("\\n") + "\\n");'],
+            capture_output=True, text=True, timeout=10, check=True)
+        cls.companion_exposition = completed.stdout
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -670,7 +709,7 @@ class TrackerDriverTests(unittest.TestCase):
                          "fastMoves": fast})
         received += 25
         fast += 24
-        exposition = (
+        exposition = self.companion_exposition + (
             f"two_bot_voice_joins_received_total {received}\n"
             f'two_bot_voice_join_refused_total{{reason="duplicate"}} 0\n'
             f'two_bot_voice_join_to_move_seconds_bucket{{le="5"}} {fast}\n'
@@ -702,7 +741,7 @@ class TrackerDriverTests(unittest.TestCase):
                          "fastMoves": fast})
         received += 25
         fast += 24
-        exposition = (
+        exposition = self.companion_exposition + (
             f"two_bot_voice_joins_received_total {received}\n"
             f'two_bot_voice_join_refused_total{{reason="duplicate"}} 0\n'
             f'two_bot_voice_join_to_move_seconds_bucket{{le="5"}} {fast}\n'
@@ -748,6 +787,46 @@ class TrackerDriverTests(unittest.TestCase):
         verdict = tracker.run_driver(NODE, str(DRIVER), expo, ring_path, now)
         self.assertFalse(verdict["slow"])
         self.assertFalse(verdict.get("slowCovered", True))
+
+
+class TrackerCacheDuplicateKeyTests(unittest.TestCase):
+    """Duplicate keys in the cached ring/sidecar rebuild, like other malformed cache data."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+
+    def test_duplicate_key_ring_entry_rebuilds(self):
+        now = 1_700_000_000
+        ring_path = self.dir / "ring.json"
+        ring_path.write_text(
+            '[{"t": 100, "t": 9999999999, "received": 25,'
+            ' "duplicate": 0, "fastMoves": 24}]', encoding="utf-8")
+        ring = tracker.load_ring(str(ring_path))
+        self.assertEqual(ring, [])
+        self.assertIsNone(tracker.ring_gap_seconds(ring, now))
+
+    def test_duplicate_key_sidecar_rebuilds(self):
+        sidecar = self.dir / "coverage.json"
+        sidecar.write_text('{"last_covered": 100, "last_covered": 9999999999}',
+                           encoding="utf-8")
+        self.assertEqual(tracker._load_sidecar_dict(str(sidecar)), {})
+        self.assertIsNone(tracker.load_covered_at(str(sidecar)))
+
+    def test_unique_cache_still_loads_byte_identical(self):
+        ring = [{"t": 1_699_999_700, "received": 25,
+                 "duplicate": 0, "fastMoves": 24}]
+        ring_path = self.dir / "ring.json"
+        ring_path.write_text(json.dumps(ring), encoding="utf-8")
+        self.assertEqual(tracker.load_ring(str(ring_path)), ring)
+        sidecar = self.dir / "coverage.json"
+        sidecar.write_text('{"last_covered": 1699999700}', encoding="utf-8")
+        self.assertEqual(tracker.load_covered_at(str(sidecar)), 1699999700)
+
+
+# Keep protected intake acceptance tests in the existing CI entrypoint.
+from test_slow_burn_tracker_intake_acceptance import TrackerIntakeAcceptanceTests
 
 
 if __name__ == "__main__":
