@@ -109,16 +109,33 @@ async fn upsert_rsvp_row(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     record: &RsvpRecord,
 ) -> Result<Option<(String, sqlx::types::time::OffsetDateTime)>, RsvpStoreError> {
-    // Coarser lock first, always in this order: the event lock serializes the
-    // admission count below across distinct members, and the identity lock
-    // then serializes the read-modify-write on this member's row. Arity
-    // differs (2 vs 3 elements), so the two keys never alias by construction.
+    // Coarser lock first, always in this order on every RSVP write path:
+    // event, then user budget, then identity. The event lock serializes the
+    // admission count below across distinct members. The user-budget lock
+    // serializes the per-user rate check plus its audit-consuming write
+    // across distinct events: the ledger below counts by (guild, user), so
+    // same-user writers on different events must meet here or a single
+    // remaining budget slot admits both. The identity lock then serializes
+    // the read-modify-write on this member's row. Independent users take
+    // distinct budget keys and never contend; per-event capacity still
+    // serializes on the event key. The budget key carries a literal tag so
+    // it can never alias the untagged 2- and 3-element keys (whose first
+    // element is always a numeric guild snowflake); a hash collision only
+    // causes extra contention, never an incorrect transition.
     sqlx::query(
         "SELECT pg_advisory_xact_lock(hashtextextended(
             jsonb_build_array($1::text, $2::text)::text, 0))",
     )
     .bind(&record.guild_id)
     .bind(&record.event_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended(
+            jsonb_build_array('rsvp-user-budget-v1', $1::text, $2::text)::text, 0))",
+    )
+    .bind(&record.guild_id)
+    .bind(&record.user_id)
     .execute(&mut **tx)
     .await?;
     // FOR UPDATE cannot lock an absent row. Serialize the complete identity
@@ -407,13 +424,24 @@ pub async fn record_checkin(
 /// A first response (`previous` is `None`) deletes the row this attempt
 /// wrote; a re-response restores the member's exact prior row (status plus
 /// timestamp) instead, so a refused rewrite never destroys the earlier
-/// response that was live before this attempt. Both paths are guarded by
-/// this attempt's `responded_at`: a newer concurrent rewrite of the same
-/// member's row survives (the newer attempt delivers its own reply), while
-/// this attempt's audit row — owned by its unique id — is always removed.
-/// Net effect on refusal when this call succeeds: the table looks as if this
-/// attempt never ran. A failed call can leave the attempt's rows; the caller
-/// reports that as a `compensation_failed` diagnostic.
+/// response that was live before this attempt.
+///
+/// The response cleanup is fenced to this attempt's write identity — its
+/// audit row's `(outcome, created_at)` plus commit order — never
+/// `responded_at` alone: a later same-millisecond rewrite (including an
+/// identical status rewrite) survives older compensation, while this
+/// attempt's audit row — owned by its unique id — is always removed. When
+/// the audit row is absent (idempotent retry or a write that never
+/// ledgered), the fence falls back to the `responded_at` guard so the
+/// exact-timestamp case still cleans up.
+///
+/// The response cleanup and the audit delete share one transaction under
+/// the same identity lock writers take, so a midway database failure
+/// rolls both back and a same-identity rewrite cannot land between the
+/// fence check and the cleanup. Net effect on refusal when this call
+/// succeeds: the table looks as if this attempt never ran. A failed call
+/// leaves both pre-cleanup rows intact; the caller reports that as a
+/// `compensation_failed` diagnostic.
 pub async fn compensate_rsvp_write(
     pool: &Pool<Postgres>,
     guild_id: &str,
@@ -423,38 +451,129 @@ pub async fn compensate_rsvp_write(
     audit_id: &str,
     previous: Option<(RsvpStatus, &str)>,
 ) -> Result<(), RsvpStoreError> {
-    if let Some((status, previous_responded_at)) = previous {
-        sqlx::query(
-            "UPDATE event_rsvps SET status = $4, responded_at = $5::timestamptz
-             WHERE guild_id = $1 AND event_id = $2 AND user_id = $3
-               AND responded_at = $6::timestamptz",
-        )
-        .bind(guild_id)
-        .bind(event_id)
-        .bind(user_id)
-        .bind(status.as_str())
-        .bind(previous_responded_at)
-        .bind(responded_at)
-        .execute(pool)
-        .await?;
-    } else {
-        sqlx::query(
-            "DELETE FROM event_rsvps
-             WHERE guild_id = $1 AND event_id = $2 AND user_id = $3
-               AND responded_at = $4::timestamptz",
-        )
-        .bind(guild_id)
-        .bind(event_id)
-        .bind(user_id)
-        .bind(responded_at)
-        .execute(pool)
-        .await?;
+    let mut tx = pool.begin().await?;
+    // Serialize with same-identity writers and compensations. Writers take
+    // event -> budget -> identity; taking only the identity key here cannot
+    // deadlock (this path never waits for event/budget while holding it)
+    // and still blocks a same-identity rewrite from landing mid-cleanup.
+    // Tuple encoding matches the writer identity key exactly.
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended(
+            jsonb_build_array($1::text, $2::text, $3::text)::text, 0))",
+    )
+    .bind(guild_id)
+    .bind(event_id)
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+    // This attempt's own audit row is the write-identity witness: its
+    // outcome/created_at names what the attempt wrote, and its commit
+    // order breaks same-millisecond ties no value comparison can.
+    let owned: Option<(String, sqlx::types::time::OffsetDateTime)> =
+        sqlx::query_as("SELECT outcome, created_at FROM announcements_audit_log WHERE id = $1")
+            .bind(audit_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let current: Option<(String, sqlx::types::time::OffsetDateTime)> = sqlx::query_as(
+        "SELECT status, responded_at FROM event_rsvps
+         WHERE guild_id = $1 AND event_id = $2 AND user_id = $3 FOR UPDATE",
+    )
+    .bind(guild_id)
+    .bind(event_id)
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let owned_response = match (&owned, &current) {
+        (Some((outcome, created)), Some((status, responded))) => {
+            // Values must still be this attempt's write, and no later
+            // same-identity attempt may exist — otherwise the row belongs
+            // to the newer attempt and survives this compensation.
+            status == outcome
+                && responded == created
+                && !has_newer_rsvp_audit(&mut tx, guild_id, user_id, event_id, audit_id).await?
+        }
+        // No audit row to witness ownership: keep the legacy
+        // responded_at-guarded cleanup so the exact-timestamp case still
+        // removes its row (the guard below no-ops on mismatch).
+        (None, Some(_)) => true,
+        // No response row: nothing to clean, only the audit delete below.
+        (_, None) => false,
+    };
+    if owned_response {
+        if let Some((status, previous_responded_at)) = previous {
+            sqlx::query(
+                "UPDATE event_rsvps SET status = $4, responded_at = $5::timestamptz
+                 WHERE guild_id = $1 AND event_id = $2 AND user_id = $3
+                   AND responded_at = $6::timestamptz",
+            )
+            .bind(guild_id)
+            .bind(event_id)
+            .bind(user_id)
+            .bind(status.as_str())
+            .bind(previous_responded_at)
+            .bind(responded_at)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            sqlx::query(
+                "DELETE FROM event_rsvps
+                 WHERE guild_id = $1 AND event_id = $2 AND user_id = $3
+                   AND responded_at = $4::timestamptz",
+            )
+            .bind(guild_id)
+            .bind(event_id)
+            .bind(user_id)
+            .bind(responded_at)
+            .execute(&mut *tx)
+            .await?;
+        }
     }
     sqlx::query("DELETE FROM announcements_audit_log WHERE id = $1")
         .bind(audit_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(())
+}
+
+/// True when a later same-identity RSVP attempt ledgered after `audit_id`:
+/// a greater `created_at` wins outright, and `xmin` (insertion commit
+/// order) breaks same-timestamp ties that values alone cannot. Same-user
+/// writers serialize on the budget lock and same-identity writers on the
+/// identity lock, so commit order matches write order here; the numeric
+/// `xmin` comparison only ever spans adjacent same-millisecond commits,
+/// far from transaction-id wraparound. Scoped to `event.rsvp` rows so
+/// other slices sharing the log table never fence an RSVP cleanup.
+async fn has_newer_rsvp_audit(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    guild_id: &str,
+    user_id: &str,
+    event_id: &str,
+    audit_id: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(
+           SELECT 1
+           FROM announcements_audit_log AS newer,
+                announcements_audit_log AS owned
+           WHERE owned.id = $5
+             AND newer.guild_id = $1
+             AND newer.actor_id = $2
+             AND newer.action = $3
+             AND newer.target_key = $4
+             AND newer.id <> owned.id
+             AND (newer.created_at > owned.created_at
+                  OR (newer.created_at = owned.created_at
+                      AND newer.xmin::text::bigint > owned.xmin::text::bigint))
+         )",
+    )
+    .bind(guild_id)
+    .bind(user_id)
+    .bind(RSVP_AUDIT_ACTION)
+    .bind(event_id)
+    .bind(audit_id)
+    .fetch_one(&mut **tx)
+    .await
 }
 
 /// RA-03 compensation (TOG-19773): remove the attendance fact one attempt
