@@ -8675,6 +8675,16 @@ async fn load_actor_worker<S: RoomPersistence, H: RoomWrites>(
     }
 }
 
+/// Fair-scheduling bound for the per-guild actor loop: at most this many
+/// consecutive inbox turns before a ready dispatch, timer or maintenance
+/// branch runs. The inbox branch is parked once the count is reached, so
+/// sustained benign churn cannot starve already-ready dispatch or due
+/// maintenance; the count resets on any timer, maintenance or
+/// queue-draining dispatch turn. Exposed as the
+/// `two_bot_voice_actor_inbox_turn_bound` gauge; the inbox/dispatch turn
+/// counters beside it tell inbox activity apart from dispatch progress.
+const VOICE_ACTOR_MAX_CONSECUTIVE_INBOX_TURNS: u8 = 32;
+
 #[cfg(test)]
 async fn run_actor<S: RoomPersistence, H: RoomWrites + 'static>(
     worker: &mut GuildRoomWorker<S, H>,
@@ -8972,6 +8982,7 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
     let mut dispatch_ready = false;
     let mut maintenance_ready = false;
     let mut dispatch_budget = 8u8;
+    let mut consecutive_inbox_turns = 0u8;
     let mut complete_join_pair = false;
     let mut last_progress = tokio::time::Instant::now();
     let mut last_halt_probe = tokio::time::Instant::now();
@@ -8995,6 +9006,8 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
         }),
     });
     stall.snapshot(worker, last_progress);
+    metrics::global()
+        .set_voice_actor_inbox_turn_bound(u64::from(VOICE_ACTOR_MAX_CONSECUTIVE_INBOX_TURNS));
     // Retires this incarnation's stall contribution on every exit path
     // (inbox close or panic unwind). Declared after `stall`, so it drops
     // while the strong ref is still alive and its retire fence can engage.
@@ -9036,6 +9049,7 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
             worker.revalidate_creator(ticket.creator_id).await;
         }
         let accepted = apply_command(worker, command, now_ms);
+        metrics::global().voice_actor_inbox_turn();
         if accepted {
             last_progress = tokio::time::Instant::now();
         }
@@ -9045,7 +9059,11 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
     loop {
         tokio::select! {
             biased;
-            command = inbox.recv() => {
+            // Fair scheduling: park the inbox once the consecutive-turn
+            // bound is reached so a ready dispatch, timer or maintenance
+            // branch runs instead. The count resets on any timer,
+            // maintenance or progressing dispatch turn (see below).
+            command = inbox.recv(), if consecutive_inbox_turns < VOICE_ACTOR_MAX_CONSECUTIVE_INBOX_TURNS => {
                 let Some(command) = command else { break };
                 let now_ms = start
                     .elapsed()
@@ -9058,6 +9076,8 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                     worker.revalidate_creator(ticket.creator_id).await;
                 }
                 let accepted = apply_command(worker, command, now_ms);
+                consecutive_inbox_turns = consecutive_inbox_turns.saturating_add(1);
+                metrics::global().voice_actor_inbox_turn();
                 if accepted {
                     last_progress = tokio::time::Instant::now();
                 }
@@ -9092,6 +9112,14 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                 dispatch_ready = progressed;
                 complete_join_pair = worker.moves.len() > pending_moves;
                 dispatch_budget = dispatch_budget.saturating_sub(1);
+                metrics::global().voice_actor_dispatch_turn();
+                // A progressing dispatch keeps the inbox parked so the drain
+                // finishes (a create runs with its priority move); a no-op
+                // turn yields back to the inbox unless maintenance is already
+                // due, in which case it runs next.
+                if !progressed && !maintenance_ready {
+                    consecutive_inbox_turns = 0;
+                }
             }
             _ = timer.tick() => {
                 let now_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
@@ -9162,6 +9190,7 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                 stall.snapshot(worker, last_progress);
                 dispatch_ready = true;
                 maintenance_ready = true;
+                consecutive_inbox_turns = 0;
             }
             // Never interpose maintenance SQL/notices between create and move.
             _ = std::future::ready(()), if maintenance_ready => {
@@ -9178,10 +9207,14 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                 worker.send_notices(now_ms).await;
                 worker.flush_kick_audit(now_ms).await;
                 dispatch_budget = 8;
+                consecutive_inbox_turns = 0;
             }
             // Yield after a bounded turn even when the next timer is not due.
             // A persisted creator move is allowed to finish the current pair.
             _ = tokio::task::yield_now(), if dispatch_ready => {
+                // Budget refill only, not a fairness turn: the inbox stays
+                // parked so the refilled dispatch runs next instead of
+                // starving behind new churn.
                 dispatch_budget = 8;
             }
         }
