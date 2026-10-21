@@ -5,7 +5,7 @@ use serde::Serialize;
 use std::{
     collections::HashMap,
     fmt::Write,
-    sync::{Mutex, OnceLock},
+    sync::{LockResult, Mutex, MutexGuard, OnceLock},
     time::Duration,
 };
 
@@ -361,6 +361,21 @@ pub const DISPATCH_LANES: &[&str] = &[
 /// single checkpoint failure stops the worker, so there is no
 /// benign-singleton case.
 pub const CHECKPOINT_FAILURE_STAGES: &[&str] = &["pre_commit", "commit"];
+/// Drop-guard names for `two_bot_drop_poison_total{guard}`: the four guards
+/// whose `Drop` bodies recover a poisoned lock instead of panicking (which
+/// would abort the process when the drop runs during unwinding).
+/// `command_dispatch_guard` stops the command task scope,
+/// `schedule_run` finishes a feed poll schedule, `user_slot` releases an
+/// interaction admission count, `in_flight_guard` releases a voice REST
+/// attempt slot. Exactly these four series exist; unknown guards collapse
+/// to the trailing `in_flight_guard` slot only when the allowlist grows.
+/// Panic payloads are never labels.
+pub const DROP_POISON_GUARDS: &[&str] = &[
+    "command_dispatch_guard",
+    "schedule_run",
+    "user_slot",
+    "in_flight_guard",
+];
 /// Presence-capture outcomes for `two_bot_presence_capture_total{outcome}`
 /// (event-store S3): `inserted` for a first delivery that stored a row,
 /// `duplicate` for a same-key retry absorbed by the shared dedup key, and
@@ -633,6 +648,7 @@ struct Values {
     prefix_trigger_refused: [u64; PREFIX_TRIGGER_REFUSED_REASONS.len()],
     dispatch_drops: [u64; DISPATCH_LANES.len()],
     checkpoint_failures: [u64; CHECKPOINT_FAILURE_STAGES.len()],
+    drop_poisons: [u64; DROP_POISON_GUARDS.len()],
     presence_capture: [u64; PRESENCE_CAPTURE_OUTCOMES.len()],
     feed_fetch: [u64; FEED_FETCH_OUTCOMES.len()],
     feed_fetch_errors: [u64; FEED_FETCH_ERROR_CLASSES.len()],
@@ -677,6 +693,24 @@ pub struct Metrics(Mutex<Values>);
 pub fn global() -> &'static Metrics {
     static METRICS: OnceLock<Metrics> = OnceLock::new();
     METRICS.get_or_init(Metrics::default)
+}
+
+/// Recover a drop-guard lock acquisition: on poison, count one
+/// `two_bot_drop_poison_total{guard}`, log one fixed-vocabulary warn, and
+/// hand back the recovered guard so the drop still releases its state.
+/// Panicking inside `drop` aborts the process when the drop runs during
+/// unwinding; this helper is the only poison path a `Drop` body needs.
+/// `guard` must be a [`DROP_POISON_GUARDS`] member. Never panics and never
+/// blocks on another lock: the metrics mutex is a leaf.
+pub fn recover_drop_poison<T>(
+    result: LockResult<MutexGuard<'_, T>>,
+    guard: &str,
+) -> MutexGuard<'_, T> {
+    result.unwrap_or_else(|poisoned| {
+        global().drop_poison(guard);
+        tracing::warn!(guard, "drop guard recovered a poisoned lock");
+        poisoned.into_inner()
+    })
 }
 
 /// The recorded contribution for `actor`, fenced by generation: an older
@@ -1302,6 +1336,21 @@ impl Metrics {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let counter =
             &mut values.checkpoint_failures[bounded_index(stage, CHECKPOINT_FAILURE_STAGES)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One poisoned lock recovered by a drop guard instead of panicking
+    /// inside `drop` (which aborts the process during unwinding). Call once
+    /// per poisoned drop, with a [`DROP_POISON_GUARDS`] member. Unknown
+    /// guards collapse to `in_flight_guard` only when the allowlist grows;
+    /// panic payloads are never labels. No IDs, tokens or bodies are
+    /// retained.
+    pub fn drop_poison(&self, guard: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.drop_poisons[bounded_index(guard, DROP_POISON_GUARDS)];
         *counter = counter.saturating_add(1);
     }
 
@@ -2000,6 +2049,19 @@ impl Metrics {
             writeln!(
                 out,
                 "two_bot_gateway_checkpoint_failures_total{{stage=\"{stage}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_drop_poison_total",
+            "counter",
+            "Poisoned locks recovered by drop guards instead of panicking inside drop (which aborts during unwinding); every recovery also logs one warn with the guard name.",
+        );
+        for (guard, count) in DROP_POISON_GUARDS.iter().zip(values.drop_poisons) {
+            writeln!(
+                out,
+                "two_bot_drop_poison_total{{guard=\"{guard}\"}} {count}"
             )
             .unwrap();
         }
@@ -2886,6 +2948,42 @@ mod tests {
         assert_eq!(text.lines().count(), before);
         assert!(!text.contains("secret"));
         assert!(text.contains("two_bot_gateway_checkpoint_failures_total{stage=\"commit\"} 100\n"));
+    }
+
+    #[test]
+    fn drop_poisons_stay_bounded_and_count_per_guard() {
+        let metrics = Metrics::default();
+        metrics.drop_poison("command_dispatch_guard");
+        metrics.drop_poison("schedule_run");
+        metrics.drop_poison("user_slot");
+        metrics.drop_poison("in_flight_guard");
+        metrics.drop_poison("user_slot");
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_drop_poison_total{guard=\"command_dispatch_guard\"} 1\n"));
+        assert!(text.contains("two_bot_drop_poison_total{guard=\"schedule_run\"} 1\n"));
+        assert!(text.contains("two_bot_drop_poison_total{guard=\"user_slot\"} 2\n"));
+        assert!(text.contains("two_bot_drop_poison_total{guard=\"in_flight_guard\"} 1\n"));
+        // Fixed cardinality: exactly the allowlisted series render.
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("two_bot_drop_poison_total{"))
+                .count(),
+            DROP_POISON_GUARDS.len()
+        );
+    }
+
+    #[test]
+    fn drop_poison_hostile_labels_collapse_without_new_series() {
+        let metrics = Metrics::default();
+        let before = metrics.render(None).lines().count();
+        for id in 0..100 {
+            let hostile = format!("{id}\"\\\nsecret=value");
+            metrics.drop_poison(&hostile);
+        }
+        let text = metrics.render(None);
+        assert_eq!(text.lines().count(), before);
+        assert!(!text.contains("secret"));
+        assert!(text.contains("two_bot_drop_poison_total{guard=\"in_flight_guard\"} 100\n"));
     }
 
     #[test]

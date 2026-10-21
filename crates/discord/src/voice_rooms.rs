@@ -353,9 +353,13 @@ impl InFlightRest {
 /// process-global gauge, which is last-writer-wins and flakes when another
 /// test's begin/drop lands between the publish and the read.
 fn oldest_age_secs(slots: &Arc<Mutex<InFlightRest>>) -> u64 {
+    // Silent recovery: the `InFlightGuard` drop body owns the poison
+    // counter emission, and this only observes a poisoned lock through
+    // that drop path (`begin` locks before publishing, so it never
+    // reaches here on a poisoned lock).
     slots
         .lock()
-        .expect("in-flight lock")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .live
         .values()
         .map(|started| started.elapsed().as_secs())
@@ -378,7 +382,9 @@ struct InFlightGuard {
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         if let Some(slots) = self.slots.take() {
-            slots.lock().expect("in-flight lock").live.remove(&self.id);
+            two_bot_core::metrics::recover_drop_poison(slots.lock(), "in_flight_guard")
+                .live
+                .remove(&self.id);
             publish_rest_age(&slots);
         }
     }
