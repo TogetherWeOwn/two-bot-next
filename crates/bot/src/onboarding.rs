@@ -482,11 +482,25 @@ impl OnboardingRuntime {
                 joined_at_ms,
                 member_id,
             } => {
-                if guild_id != config.guild_id
-                    || bot
-                    || config.gates.mode != OnboardingMode::Session
-                    || config.gates.dry_run
-                {
+                if guild_id != config.guild_id || bot {
+                    return Ok(());
+                }
+                // Release the prompt guard first, whatever the goodbye-post
+                // settings: a rejoin is welcomed again in every mode, since
+                // welcomes post in all of them. The DELETE is idempotent, so
+                // a failed clear retries before anything is public and a
+                // failed post below retries with nothing to undo. The next
+                // welcome re-runs the full suppression gate.
+                if let Some(member_id) = member_id {
+                    clear_onboarding_prompt(
+                        &self.pool,
+                        &guild_id.to_string(),
+                        &member_id.to_string(),
+                    )
+                    .await
+                    .map_err(|_| RuntimeError::Store)?;
+                }
+                if config.gates.mode != OnboardingMode::Session || config.gates.dry_run {
                     return Ok(());
                 }
                 let channel = self
@@ -507,21 +521,6 @@ impl OnboardingRuntime {
                         .post_channel_message(&channel_id, &content, &[], mentions)
                         .await
                         .map_err(|_| RuntimeError::Discord)?;
-                }
-                // The leave is processed (posted, or skipped for want of a
-                // channel): release the prompt guard so a rejoin is welcomed
-                // again. A failed post returns above, keeping the job
-                // retryable without clearing. Like the welcome's
-                // send-then-record path, a crash between the post and this
-                // clear is not exactly-once across the two systems.
-                if let Some(member_id) = member_id {
-                    clear_onboarding_prompt(
-                        &self.pool,
-                        &guild_id.to_string(),
-                        &member_id.to_string(),
-                    )
-                    .await
-                    .map_err(|_| RuntimeError::Store)?;
                 }
                 Ok(())
             }
@@ -716,6 +715,23 @@ impl OnboardingRuntime {
                 ?handler,
                 "onboarding picker failed; attempting deferred error reply"
             );
+            // The success rows commit before the reply, so a reply that never
+            // reached the member (or a timeout past the commit) must not leave
+            // them counted for a selection the member is told failed. Keys
+            // are per submission, so this is a no-op when nothing committed.
+            if let Err(retract) = retract_picker_rows(
+                &self.pool,
+                &config.guild_id.to_string(),
+                &user.id.get().to_string(),
+                at,
+            )
+            .await
+            {
+                tracing::warn!(
+                    ?retract,
+                    "could not retract picker rows after a failed reply"
+                );
+            }
             let content = if matches!(error, RuntimeError::Role) {
                 PICKER_ROLE_FAILURE_REPLY
             } else if handler == ComponentHandler::GamePicker {
@@ -779,7 +795,8 @@ impl OnboardingRuntime {
                 .map_err(|_| RuntimeError::Store)?;
                 // Commit before replying: the reply describes committed state,
                 // so a commit failure yields the failure path, never a false
-                // routed claim.
+                // routed claim. A reply that then fails is retracted in
+                // `interaction`.
                 transaction
                     .commit()
                     .await
@@ -908,6 +925,7 @@ impl OnboardingRuntime {
             .map_err(|_| RuntimeError::Store)?;
         // Commit before replying: the reply describes committed state, so a
         // commit failure yields the failure path, never a false saved claim.
+        // A reply that then fails is retracted in `interaction`.
         lock.commit().await.map_err(|_| RuntimeError::Store)?;
         self.reply(interaction, &reply).await?;
         Ok(())

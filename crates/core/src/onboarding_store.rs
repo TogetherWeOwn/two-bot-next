@@ -1,4 +1,6 @@
 //! Onboarding persistence over the legacy funnel `events` table.
+//! The prompt marker is a per-stay guard: [`clear_onboarding_prompt`] releases
+//! it when a member's goodbye is processed.
 //!
 //! Use [`begin_prompt`] before executing a welcome. The transaction-scoped
 //! member lock serializes join/gate-clear redeliveries, then checks the durable
@@ -11,7 +13,8 @@ use sqlx::{PgConnection, Pool, Postgres, Transaction};
 
 use super::onboarding::{
     channel_routed_row, funnel_idempotency_key, game_selected_row, prompted_row,
-    session_routed_row, FunnelRow, GameSelection, SessionPlan, EVENT_ONBOARDING_PROMPTED,
+    session_routed_row, FunnelRow, GameSelection, SessionPlan, EVENT_CHANNEL_ROUTED,
+    EVENT_GAME_ROLES_SELECTED, EVENT_ONBOARDING_PROMPTED,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -273,8 +276,8 @@ pub async fn record_channel_routed(
 /// Stage both game success rows in the caller's role-write transaction.
 /// The caller commits before replying, so the reply always describes committed
 /// state: an insert or commit failure yields the failure reply path with
-/// neither row, while a reply failure after commit leaves the committed rows
-/// and finishes the defer with the terminal error edit.
+/// neither row. A reply failure after commit retracts the rows through
+/// [`retract_picker_rows`] before the terminal error edit.
 /// An empty destination list records the granted games but no successful route.
 pub async fn record_game_selection_in_transaction(
     transaction: &mut Transaction<'_, Postgres>,
@@ -346,6 +349,40 @@ pub async fn record_game_partial_in_transaction(
     )
     .await?;
     Ok(())
+}
+
+/// Retract the picker success rows committed for one submission when its
+/// reply never reached the member, so the funnel does not count a selection
+/// or route the member was told had failed. Keys are the submission's own
+/// `guild/member/type/occurred_at` idempotency keys, so only that
+/// submission's rows can match; a submission that staged nothing (a
+/// suppressed pair, or a failure before commit) makes this a no-op. Returns
+/// the number of rows removed.
+pub async fn retract_picker_rows(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    member_id: &str,
+    occurred_at: &str,
+) -> Result<u64, OnboardingStoreError> {
+    let keys: Vec<String> = [EVENT_GAME_ROLES_SELECTED, EVENT_CHANNEL_ROUTED]
+        .into_iter()
+        .map(|event_type| {
+            funnel_idempotency_key(&FunnelRow {
+                guild_id: guild_id.to_owned(),
+                member_id: member_id.to_owned(),
+                event_type,
+                occurred_at: occurred_at.to_owned(),
+                source: String::new(),
+                metadata: None,
+            })
+        })
+        .collect();
+    let removed = sqlx::query("DELETE FROM events WHERE idempotency_key = ANY($1)")
+        .bind(&keys)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok(removed)
 }
 
 /// Stage roleless routing in the caller's transaction. The caller commits
