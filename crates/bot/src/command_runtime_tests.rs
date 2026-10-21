@@ -4210,10 +4210,10 @@ async fn failed_defer_leaves_set_and_remove_state_untouched() {
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
-async fn unconfirmed_replacement_preserves_previous_and_releases_claim() {
+async fn unusable_success_receipt_retains_uncertainty_fence() {
     let db = TestDb::new().await;
     db.seed(Some("8888"), 120_000, 5).await;
-    for body in [
+    for (index, body) in [
         "{}",
         "not JSON",
         r#"{"id":null}"#,
@@ -4223,7 +4223,10 @@ async fn unconfirmed_replacement_preserves_previous_and_releases_claim() {
         r#"{"id":"abc"}"#,
         r#"{"id":"+123"}"#,
         r#"{"id":"18446744073709551616"}"#,
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let (runtime, mock) = db_runtime_script(
             &db,
             vec![RestResponse {
@@ -4240,31 +4243,52 @@ async fn unconfirmed_replacement_preserves_previous_and_releases_claim() {
             ActivityOutcome::Held,
             "{body}"
         );
+        let (remembered, last_id, claim) = db.row().await.expect("row retained");
+        assert_eq!(remembered, "remember this", "{body}");
+        assert_eq!(last_id.as_deref(), Some("8888"), "{body}");
+        assert!(
+            claim.is_some(),
+            "uncertain delivery keeps the fence for {body}"
+        );
+        // Only the first attempt reaches the wire; the fence holds the rest.
         assert_eq!(
-            db.row().await,
-            Some(("remember this".into(), Some("8888".into()), None)),
+            mock.posts_to("/messages").await.len(),
+            usize::from(index == 0),
             "{body}"
         );
-        assert_eq!(mock.posts_to("/messages").await.len(), 1);
         assert!(mock.deletes().is_empty(), "no retirement for {body}");
         mock.shutdown().await;
     }
-    let audits = db.audits().await;
-    assert_eq!(audits.len(), 9);
-    assert!(audits
-        .iter()
-        .all(|(action, outcome)| action == "sticky.run" && outcome == "post_failed"));
+    assert_eq!(
+        db.audits().await,
+        vec![("sticky.run".to_owned(), "post_failed".to_owned())],
+        "only the first attempt audits; fenced holds stay silent"
+    );
+    // The fence outlives the 60s claim lease: a probe past expiry is held,
+    // and the next accepted message holds without posting a duplicate.
+    assert!(
+        store::claim_sticky_post(
+            &db.pool,
+            GUILD_S,
+            CHANNEL_S,
+            "lease-probe",
+            now_millis_for_test() + 120_000,
+        )
+        .await
+        .expect("lease probe")
+        .is_none(),
+        "uncertainty survives lease expiry"
+    );
     let (runtime, mock) = db_runtime(&db, vec![]).await;
     assert_eq!(
         runtime
             .on_message(&message(25, CHANNEL, false, Some(GUILD)))
             .await,
-        ActivityOutcome::Reposted
+        ActivityOutcome::Held
     );
-    assert_eq!(
-        mock.deletes().len(),
-        1,
-        "subsequent confirmed replacement retires previous"
+    assert!(
+        mock.posts_to("/messages").await.is_empty(),
+        "fenced channel sends no duplicate"
     );
     mock.shutdown().await;
     db.close().await;
@@ -4375,7 +4399,7 @@ async fn debounce_window_holds_the_repost() {
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
-async fn post_failure_releases_claim_and_audits_post_failed() {
+async fn post_transport_failure_retains_uncertainty_fence() {
     let db = TestDb::new().await;
     db.seed(Some("8000000000000000004"), 120_000, 5).await;
     // First request (the replacement post) fails 500; default 200 after.
@@ -4391,19 +4415,22 @@ async fn post_failure_releases_claim_and_audits_post_failed() {
     );
     let (_, last_id, claim) = db.row().await.expect("row exists");
     assert_eq!(last_id.as_deref(), Some("8000000000000000004"), "unchanged");
-    assert_eq!(claim, None, "claim released for the next activity");
+    assert!(claim.is_some(), "ambiguous 500 keeps the fence");
 
-    // The released claim lets the very next activity re-post successfully.
+    // The fence holds the next activity: no duplicate reaches the wire.
     let outcome = runtime
         .on_message(&message(23, CHANNEL, false, Some(GUILD)))
         .await;
-    assert_eq!(outcome, ActivityOutcome::Reposted);
-    // Failed attempt + the retry both hit the wire; only the retry lands.
-    assert_eq!(mock.posts_to("/messages").await.len(), 2);
-    let audits = db.audits().await;
+    assert_eq!(outcome, ActivityOutcome::Held);
     assert_eq!(
-        audits.last().map(|(a, o)| (a.as_str(), o.as_str())),
-        Some(("sticky.run", "ok"))
+        mock.posts_to("/messages").await.len(),
+        1,
+        "failed attempt only; no retry while fenced"
+    );
+    assert_eq!(
+        db.audits().await.len(),
+        1,
+        "fenced hold audits nothing more"
     );
     mock.shutdown().await;
     db.close().await;
@@ -9001,6 +9028,10 @@ async fn worker_trigger_gate_observes_sticky_http_and_state() {
     );
     assert!(after["claim_token"].is_null(), "record releases claim");
     assert!(after["claimed_at"].is_null(), "record clears claim time");
+    assert_eq!(
+        after["delivery_uncertain"], false,
+        "record disarms the delivery fence"
+    );
     assert_eq!(
         audits().await,
         vec![(

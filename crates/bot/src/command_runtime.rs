@@ -83,7 +83,7 @@ use two_bot_core::{
 };
 use two_bot_discord::{
     help_response, publish_commands, register_channel_handlers, response_for_slash,
-    route_interaction, ActionExecutor, ChannelModerationRuntime, LevelingRuntime,
+    route_interaction, ActionExecutor, ChannelModerationRuntime, DiscordError, LevelingRuntime,
     RoutedInteraction,
 };
 
@@ -100,6 +100,15 @@ use crate::interaction_admission::{
 const RETIRE_REASON: &str = "sticky re-post";
 /// Reason for deleting a replacement post whose claim moved on.
 const ORPHAN_REASON: &str = "sticky re-post rolled back";
+/// Bounded diagnostic code logged when a re-post attempt leaves delivery
+/// uncertainty behind (the store fence stays armed — no retry until an
+/// administrator reconfigures). Fixed vocabulary; the log line carries ids
+/// and cause tokens only, never the sticky body, tokens or member content.
+const UNCERTAIN_DELIVERY_CODE: &str = "sticky_delivery_uncertain";
+/// Recovery next action for [`UNCERTAIN_DELIVERY_CODE`]: inspect the channel
+/// and resolve any possible orphan before explicitly resetting the sticky.
+/// Never wait out the lease or blindly resend — the fence outlives both.
+const UNCERTAIN_DELIVERY_NEXT_ACTION: &str = "inspect_channel_before_sticky_reset";
 /// Reason for the `/sticky-remove` Discord cleanup delete.
 const REMOVE_REASON: &str = "sticky-remove";
 /// Safe reply when the store fails — never leak sqlx internals to Discord.
@@ -1571,7 +1580,7 @@ impl CommandRuntime {
                 }
             })
         else {
-            // Debounced, disabled, or another attempt holds the claim.
+            // Debounced, disabled, claimed, or fenced by an uncertain delivery.
             return ActivityOutcome::Held;
         };
 
@@ -1613,64 +1622,85 @@ impl CommandRuntime {
                     Ok(false) => {
                         // The claim moved on between post and record: the
                         // replacement we just posted is an orphan (legacy
-                        // deletes exactly this, then reports held).
-                        self.delete_quiet(&channel_id, &message_id, ORPHAN_REASON)
-                            .await;
-                        ActivityOutcome::Held
+                        // deletes exactly this, then reports held). Proven
+                        // absence keeps that shape; an unconfirmed cleanup
+                        // re-arms the fence instead of authorizing a
+                        // duplicate, and a removed row stays absent.
+                        match self.delete_orphan(&channel_id, &message_id).await {
+                            Ok(_) => ActivityOutcome::Held,
+                            Err(err) => {
+                                let cause = discord_class(&err);
+                                self.fence_uncertain(&guild_id, &channel_id).await;
+                                self.diagnose_uncertain(&guild_id, &channel_id, cause).await;
+                                ActivityOutcome::Held
+                            }
+                        }
                     }
                     Err(err) => {
-                        // Record failed — the post may be live but unrecorded,
-                        // so roll back what we can: release our claim and
-                        // delete the orphan, then audit post_failed.
+                        // Record failed — the post may be live but unrecorded.
+                        // Only proven orphan absence reopens the window;
+                        // anything else keeps the fence the claim armed.
                         warn!(
                             reason = db_class(&err),
-                            "sticky record failed; rolling back"
+                            "sticky record failed; confirming orphan absence"
                         );
-                        self.release(&guild_id, &channel_id, &claim_token).await;
-                        self.delete_quiet(&channel_id, &message_id, ORPHAN_REASON)
-                            .await;
-                        self.audit(
-                            &guild_id,
-                            None,
-                            StickyAuditAction::Run,
-                            Some(&channel_id),
-                            StickyAuditOutcome::PostFailed,
-                            Some("record failed"),
-                        )
-                        .await;
-                        ActivityOutcome::Held
+                        match self.delete_orphan(&channel_id, &message_id).await {
+                            Ok(_) => {
+                                self.release(&guild_id, &channel_id, &claim_token).await;
+                                self.audit(
+                                    &guild_id,
+                                    None,
+                                    StickyAuditAction::Run,
+                                    Some(&channel_id),
+                                    StickyAuditOutcome::PostFailed,
+                                    Some("record failed"),
+                                )
+                                .await;
+                                ActivityOutcome::Held
+                            }
+                            Err(cleanup_err) => {
+                                self.diagnose_uncertain(
+                                    &guild_id,
+                                    &channel_id,
+                                    discord_class(&cleanup_err),
+                                )
+                                .await;
+                                ActivityOutcome::Held
+                            }
+                        }
                     }
                 }
             }
             Ok(_) => {
-                // A 2xx without a usable id is not a confirmed replacement.
-                // Keep the previous message; the unknown post cannot safely
-                // be recorded or cleaned up by id.
-                self.release(&guild_id, &channel_id, &claim_token).await;
-                self.audit(
-                    &guild_id,
-                    None,
-                    StickyAuditAction::Run,
-                    Some(&channel_id),
-                    StickyAuditOutcome::PostFailed,
-                    Some("replacement message id missing or invalid"),
-                )
-                .await;
+                // A 2xx without a usable id is not a confirmed replacement
+                // (the executor normally rejects these before they arrive).
+                // Discord may have accepted the post, so the fence stays
+                // armed — the next message must hold, not resend.
+                self.diagnose_uncertain(&guild_id, &channel_id, "receipt_id_unusable")
+                    .await;
                 ActivityOutcome::Held
             }
             Err(err) => {
-                // Post did not land (or its id was lost): release the claim so
-                // the next message can retry.
-                self.release(&guild_id, &channel_id, &claim_token).await;
-                self.audit(
-                    &guild_id,
-                    None,
-                    StickyAuditAction::Run,
-                    Some(&channel_id),
-                    StickyAuditOutcome::PostFailed,
-                    Some(&err.to_string()),
-                )
-                .await;
+                // Only a proven no-send reopens the window (explicit
+                // rejection, rate limit, local guard, or a pre-wire
+                // admission refusal — none of them reached Discord as a
+                // mutation). Timeouts, transport losses and ambiguous
+                // statuses keep the fence: the post may be live.
+                if err.is_admission_blocked() || err.proves_no_effect() {
+                    self.release(&guild_id, &channel_id, &claim_token).await;
+                    self.audit(
+                        &guild_id,
+                        None,
+                        StickyAuditAction::Run,
+                        Some(&channel_id),
+                        StickyAuditOutcome::PostFailed,
+                        Some(&err.to_string()),
+                    )
+                    .await;
+                } else {
+                    self.diagnose_uncertain(&guild_id, &channel_id, discord_class(&err))
+                        .await;
+                }
                 ActivityOutcome::Held
             }
         }
@@ -2079,16 +2109,79 @@ impl CommandRuntime {
         }
     }
 
-    /// Release this attempt's claim; failure means expiry clears it in 60s.
+    /// Release this attempt's claim after a definitive outcome; failure
+    /// leaves the delivery fence armed for an administrator reset (the claim
+    /// itself still expires in 60s, but expiry no longer authorizes a post).
     async fn release(&self, guild_id: &str, channel_id: &str, claim_token: &str) {
         if let Err(err) =
             store::release_sticky_post(&self.pool, guild_id, channel_id, claim_token).await
         {
             warn!(
                 reason = db_class(&err),
-                "sticky claim release failed; expiry will clear it"
+                "sticky claim release failed; uncertainty fence retained"
             );
         }
+    }
+
+    /// Confirming orphan delete: `Ok(true)` deleted, `Ok(false)` already
+    /// absent (both proven — a retry is safe), `Err` the orphan may still be
+    /// live. An unconfirmed cleanup is never reported as success; the caller
+    /// keeps or re-arms the delivery fence.
+    async fn delete_orphan(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+    ) -> Result<bool, DiscordError> {
+        let outcome = self
+            .executor
+            .delete_message_confirmed(channel_id, message_id, ORPHAN_REASON)
+            .await;
+        if let Err(err) = &outcome {
+            warn!(
+                reason = discord_class(err),
+                "sticky orphan cleanup unconfirmed; fencing delivery"
+            );
+        }
+        outcome
+    }
+
+    /// Re-arm the delivery fence after an obsolete attempt's unconfirmed
+    /// cleanup; a no-op when the administrator removed the row. A failed
+    /// write is logged — without a claim no further post is possible until
+    /// the store recovers, and the next attempt re-fences if needed.
+    async fn fence_uncertain(&self, guild_id: &str, channel_id: &str) {
+        if let Err(err) =
+            store::mark_sticky_delivery_uncertain(&self.pool, guild_id, channel_id).await
+        {
+            warn!(
+                reason = db_class(&err),
+                "sticky uncertainty fence write failed; orphan may be live"
+            );
+        }
+    }
+
+    /// Log the bounded uncertainty diagnostic and audit the attempt as
+    /// failed — never as success. `cause` is a fixed cause token, never
+    /// payload or member content.
+    async fn diagnose_uncertain(&self, guild_id: &str, channel_id: &str, cause: &str) {
+        warn!(
+            code = UNCERTAIN_DELIVERY_CODE,
+            retryable = false,
+            next_action = UNCERTAIN_DELIVERY_NEXT_ACTION,
+            reason = cause,
+            guild_id = %guild_id,
+            channel_id = %channel_id,
+            "sticky re-post outcome uncertain; inspect the channel before resetting the sticky"
+        );
+        self.audit(
+            guild_id,
+            None,
+            StickyAuditAction::Run,
+            Some(channel_id),
+            StickyAuditOutcome::PostFailed,
+            Some(cause),
+        )
+        .await;
     }
 
     /// Append one `sticky.*` audit row; an audit write failure is logged but

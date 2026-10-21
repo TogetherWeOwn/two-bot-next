@@ -452,6 +452,10 @@
     "crates/store/migrations/0451_scheduled_events_claim.sql": {
       "sha256": "7a76512da8e7033e41a655955db9a7e243e55d92bf2a747312f2809399b927b2",
       "justification": "Store-chain copy of the scheduled_events_claim epoch gate (cutover 0450): one new table, IF NOT EXISTS, no writes to the existing mirror. Numbered 0451 because cutover owns 0450; global migration numbers remain unique across both chains."
+    },
+    "crates/cutover/migrations/0452_sticky_delivery_uncertainty.sql": {
+      "sha256": "d947d70327cbbb4f64519a23108b7c1f5a954e747c946b0077854d1571040c85",
+      "justification": "Uncertain-delivery fence for sticky re-posts: one NOT NULL DEFAULT FALSE column delivery_uncertain on sticky_messages, armed by the atomic claim and disarmed only by confirmed record, proven no-send, confirmed orphan absence, or administrator reconfigure. Additive, IF NOT EXISTS; numbered 0452 because the store chain owns 0451; global migration numbers remain unique across both chains; rollback drops the column."
     }
   }
 }

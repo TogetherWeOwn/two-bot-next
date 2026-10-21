@@ -515,6 +515,18 @@ Remove this channel's sticky message
 
 No options.
 
+### Uncertain delivery
+
+If a re-post attempt cannot prove its outcome (lost response, unreadable
+receipt, or a record failure with unconfirmed orphan cleanup), the channel's
+sticky is fenced: further activity holds instead of sending a possible
+duplicate, across restarts and lease expiry, and the bot logs
+`code="sticky_delivery_uncertain"` with
+`next_action="inspect_channel_before_sticky_reset"`. Recovery: inspect the
+channel, delete any duplicate or orphan sticky post, then run `/sticky` again
+to reset the fence (or `/sticky-remove` plus `/sticky` to start over). Never
+wait out the fence or resend blindly.
+
 ## `/tempban`
 
 Temporarily ban a member
