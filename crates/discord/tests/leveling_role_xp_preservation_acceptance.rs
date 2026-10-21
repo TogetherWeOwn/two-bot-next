@@ -141,7 +141,7 @@ impl TestDb {
 }
 
 fn award_count(pool: &PgPool) -> impl std::future::Future<Output = i64> + '_ {
-    async {
+    async move {
         sqlx::query_scalar("SELECT COUNT(*) FROM xp_awards")
             .fetch_one(pool)
             .await
