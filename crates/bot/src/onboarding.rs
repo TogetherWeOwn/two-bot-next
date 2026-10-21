@@ -1082,16 +1082,19 @@ mod tests {
     fn goodbye_payloads_from_before_member_identity_still_recover() {
         let payload =
             r#"{"Goodbye":{"guild_id":22,"username":"dave","bot":false,"joined_at_ms":123}}"#;
-        match OnboardingJob::recover(payload).expect("old payload parses") {
-            Some(OnboardingJob::Goodbye {
-                member_id,
-                username,
-                ..
-            }) => {
-                assert_eq!(member_id, None);
-                assert_eq!(username, "dave");
-            }
-            _ => panic!("an old goodbye payload must recover as a goodbye job"),
+        let recovered = OnboardingJob::recover(payload).expect("old payload parses");
+        assert!(
+            matches!(recovered, Some(OnboardingJob::Goodbye { .. })),
+            "an old goodbye payload must recover as a goodbye job"
+        );
+        if let Some(OnboardingJob::Goodbye {
+            member_id,
+            username,
+            ..
+        }) = recovered
+        {
+            assert_eq!(member_id, None);
+            assert_eq!(username, "dave");
         }
     }
 
