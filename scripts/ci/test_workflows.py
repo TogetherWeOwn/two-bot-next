@@ -2466,8 +2466,17 @@ def synthetic_user_flow_errors(workflow):
         notice_run = str(notice.get("run", ""))
         if expected_notice not in notice_run or "::error::" not in notice_run:
             errors.append(f"{name}:{job_id}: missing-binding skip must fail with an error naming the binding")
-        if "exit 1" not in notice_run:
-            errors.append(f"{name}:{job_id}: missing-binding skip must exit 1 so the run fails closed")
+        if "exit 1" not in shell_logical_lines(notice_run):
+            errors.append(f"{name}:{job_id}: missing-binding skip must exit 1 on its own line "
+                          "so the run fails closed")
+        expected_notice_if = (
+            f"steps.probe.outcome == 'skipped' && vars.{expected_target} == ''"
+            + (" && !inputs.force_fail" if job_id == "staging" else ""))
+        if notice.get("if") != expected_notice_if:
+            errors.append(f"{name}:{job_id}: missing-binding notice must keep its probe-skipped gate")
+        if "continue-on-error" in notice:
+            errors.append(f"{name}:{job_id}: missing-binding notice must not set "
+                          "continue-on-error (fail closed)")
         if upload.get("if") != "always()":
             errors.append(f"{name}:{job_id}: upload must run with if: always() so failures keep their artifact")
         if not str(upload.get("uses", "")).startswith("actions/upload-artifact@"):
@@ -2653,6 +2662,10 @@ def slow_burn_tracker_errors(workflow):
         if run_step.get("run") != command or "uses" in run_step:
             errors.append(f"{name}:{job_id}: run step must run exactly the reviewed tracker command, "
                           "with inputs passed via env only")
+        if "if" in run_step:
+            errors.append(f"{name}:{job_id}: run step must not set if (fail closed)")
+        if "continue-on-error" in run_step:
+            errors.append(f"{name}:{job_id}: run step must not set continue-on-error (fail closed)")
         if upload.get("if") != "always()":
             errors.append(f"{name}:{job_id}: upload must run with if: always() so failures keep their artifact")
         if not str(upload.get("uses", "")).startswith("actions/upload-artifact@"):
@@ -2725,8 +2738,10 @@ def scheduled_binding_audit_errors(workflows):
     hands both bindings to scripts/slow_burn_tracker.py, which exits 1
     with an ::error:: naming the unset binding (proved below against the
     reviewed script, and pinned per binding in
-    scripts/test_slow_burn_tracker.py); synthetic's missing-binding
-    notice fails the job with an ::error:: naming the unset target var.
+    scripts/test_slow_burn_tracker.py), and the handoff step itself
+    carries no if or continue-on-error; synthetic's missing-binding
+    notice keeps its probe-skipped gate and fails the job with an
+    ::error:: naming the unset target var, with no continue-on-error.
     """
     name = "scheduled-binding-audit"
     errors = []
@@ -2752,6 +2767,12 @@ def scheduled_binding_audit_errors(workflows):
         if "STAGING_WORKER_URL" not in handoff or "METRICS_SCRAPE_TOKEN" not in handoff:
             errors.append(f"{name}: slow-burn-tracker.yml: tracker step must hand both "
                           "bindings to the tracker script via env")
+        if "if" in runs[0]:
+            errors.append(f"{name}: slow-burn-tracker.yml: tracker step must not set "
+                          "if (fail closed)")
+        if "continue-on-error" in runs[0]:
+            errors.append(f"{name}: slow-burn-tracker.yml: tracker step must not set "
+                          "continue-on-error (fail closed)")
     with tempfile.TemporaryDirectory() as tmp:
         evidence = str(Path(tmp) / "evidence.json")
         expo = str(Path(tmp) / "expo.prom")
@@ -2782,9 +2803,18 @@ def scheduled_binding_audit_errors(workflows):
                           "missing-binding notice step")
             continue
         run = str(notices[0].get("run", ""))
-        if target not in run or "::error::" not in run or "exit 1" not in run:
+        if (target not in run or "::error::" not in run
+                or "exit 1" not in shell_logical_lines(run)):
             errors.append(f"{name}: synthetic-user-flow.yml:{job_id}: missing-binding "
-                          f"notice must fail with an ::error:: naming {target}")
+                          f"notice must fail with an ::error:: naming {target} "
+                          "and exit 1 on its own line")
+        notice_if = str(notices[0].get("if", ""))
+        if "steps.probe.outcome" not in notice_if or target not in notice_if:
+            errors.append(f"{name}: synthetic-user-flow.yml:{job_id}: missing-binding "
+                          f"notice must keep its probe-skipped gate on {target}")
+        if "continue-on-error" in notices[0]:
+            errors.append(f"{name}: synthetic-user-flow.yml:{job_id}: missing-binding "
+                          "notice must not set continue-on-error (fail closed)")
     return errors
 
 
@@ -5684,10 +5714,13 @@ class WorkflowTests(unittest.TestCase):
         workflows = self.workflows
         self.assertEqual(scheduled_binding_audit_errors(workflows), [])
 
-        def tracker_env(copy):
+        def tracker_run_step(copy):
             steps = copy["slow-burn-tracker.yml"]["jobs"]["tracker"]["steps"]
             return next(step for step in steps
-                        if "slow_burn_tracker.py" in step.get("run", ""))["env"]
+                        if "slow_burn_tracker.py" in step.get("run", ""))
+
+        def tracker_env(copy):
+            return tracker_run_step(copy)["env"]
 
         def notice_step(copy, job_id):
             steps = copy["synthetic-user-flow.yml"]["jobs"][job_id]["steps"]
@@ -5706,6 +5739,16 @@ class WorkflowTests(unittest.TestCase):
                 "METRICS_SCRAPE_TOKEN"),
             "tracker drops the url handoff": lambda w: tracker_env(w).pop(
                 "STAGING_WORKER_URL"),
+            "tracker run step gated": lambda w: tracker_run_step(w).__setitem__(
+                "if", "false"),
+            "tracker run tolerates failure": lambda w: tracker_run_step(w).__setitem__(
+                "continue-on-error", True),
+            "staging notice gated off": lambda w: notice_step(w, "staging").__setitem__(
+                "if", "false"),
+            "staging notice tolerates failure": lambda w: notice_step(w, "staging").__setitem__(
+                "continue-on-error", True),
+            "staging notice neutralizes its exit": lambda w: notice_run(
+                w, "staging", lambda run: run.replace("exit 1", "exit 1 || true")),
             "staging notice warns": lambda w: notice_run(
                 w, "staging", lambda run: run.replace("::error::", "::warning::")),
             "staging notice loses its exit": lambda w: notice_run(
@@ -5718,6 +5761,12 @@ class WorkflowTests(unittest.TestCase):
                 w, "prod-passive", lambda run: run.replace("::error::", "::warning::")),
             "prod notice loses its exit": lambda w: notice_run(
                 w, "prod-passive", lambda run: run.replace("exit 1", "exit 0")),
+            "prod notice gated off": lambda w: notice_step(w, "prod-passive").__setitem__(
+                "if", "false"),
+            "prod notice tolerates failure": lambda w: notice_step(w, "prod-passive").__setitem__(
+                "continue-on-error", True),
+            "prod notice neutralizes its exit": lambda w: notice_run(
+                w, "prod-passive", lambda run: run.replace("exit 1", "exit 1 || true")),
         }
         for label, change in mutations.items():
             with self.subTest(change=label):
