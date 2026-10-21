@@ -87,9 +87,9 @@ refusals included, as an ephemeral deferred reply completed by an edit
   (`crates/core/src/router.rs:401`).
 - Refusal serialization: `refusal_response`
   (`crates/discord/src/interactions.rs:183`).
-- Leveling runtime ownership of the immediate rank/leaderboard callback:
+- Leveling runtime ownership of the defer-then-edit rank/leaderboard replies:
   the `HandlerId::Rank | HandlerId::Leaderboard` branch
-  (`crates/bot/src/command_runtime.rs:1348`).
+  (`crates/bot/src/command_runtime.rs:1350`).
 - Discovery reply: `help_text` and `HELP_GROUPS`
   (`crates/core/src/help.rs`), served as one immediate ephemeral reply by
   `help_response` (`crates/discord/src/interactions.rs`) from the

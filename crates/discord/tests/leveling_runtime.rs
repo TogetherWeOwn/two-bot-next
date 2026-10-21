@@ -5,16 +5,17 @@ mod common;
 
 use common::{MockRest, ScriptedResponse};
 use serde_json::{json, Value};
-use sqlx::{PgPool, PgPoolOptions};
+use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
 use std::{sync::Arc, time::Duration};
 use twilight_model::{application::interaction::Interaction, gateway::event::Event};
 use two_bot_core::{
     leveling::{leaderboard_reply_for_season, rank_text, season_id_for_ms, LevelRoleReward},
     leveling_store as store, HandlerId, MemStore, OnboardingGates, OnboardingMode,
 };
+use two_bot_discord::leveling_runtime::LevelingRuntimeError;
 use two_bot_discord::{
-    pipeline::MessageEligibility, ActionExecutor, LevelingRuntime, LevelingRuntimeError,
-    OrderedLevelingPipeline,
+    pipeline::MessageEligibility, ActionExecutor, LevelingRuntime, OrderedLevelingPipeline,
 };
 use two_bot_testsupport::TestDatabase;
 
