@@ -23,10 +23,11 @@ guild fences, feature gates and handler checks still apply. See [parity](parity.
 The router publishes one complete set: first definition wins, built-in names\n\
 are reserved, and Discord's 100-command limit applies. Database-backed custom\n\
 commands and optional text triggers are dynamic and are not listed here.\n\n\
-The voice commands publish only while `TWO_VOICE=1`, and `/templateassistant`\n\
-also needs `TWO_ASSISTANT_ENDPOINT`; both are enabled here. The voice `kick`\n\
-loses first-wins to moderation `/kick`, so the `/kick` below is the moderation\n\
-command and the vote-kick shape is not listed.\n\n\
+The voice commands publish only while `TWO_VOICE=1`, which is enabled\n\
+here. `/templateassistant` stays unpublished until its slice lands with a\n\
+handler, so `TWO_ASSISTANT_ENDPOINT` currently publishes nothing. The voice\n\
+`kick` loses first-wins to moderation `/kick`, so the `/kick` below is the\n\
+moderation command and the vote-kick shape is not listed.\n\n\
 Bounds below are registry bounds; a dash means no bound is declared there,\n\
 not that handler validation is unlimited. Permissions are Discord default\n\
 member-permission bitfields, not a replacement for runtime authorization.\n\n";
