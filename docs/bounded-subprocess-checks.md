@@ -12,9 +12,11 @@ here instead of hanging until the external CI ceiling.
   each `subprocess.run` carries `timeout=30` (one value per tool).
 - Retention audit (`cargo_cache.py` `retention_audit`): each of the three
   provenance Git waits (`rev-parse`, `ls-files`, `check-ignore`) carries
-  `timeout=min(30, remaining receipt freshness)`; under one second of
-  remaining freshness the audit refuses instead of probing, and freshness
-  is rechecked after the waits.
+  `timeout=min(30, live remaining receipt freshness)`, recomputed before
+  each call as static age minus monotonic elapsed since audit entry; under
+  one second of live freshness the audit refuses instead of probing,
+  each candidate's first call rechecks freshness before probing, and
+  freshness is rechecked after the waits.
 - Every timeout, spawn/OS failure and nonzero child result maps into the
   tool's existing fail-closed vocabulary with the exit status and a `next:`
   action. No traceback, no echoed child stderr. Selector failures exit 2

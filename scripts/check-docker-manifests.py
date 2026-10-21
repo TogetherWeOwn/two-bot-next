@@ -174,7 +174,7 @@ def run_locked_fetch(dest):
         subprocess.run(
             ["cargo", "metadata", "--offline", "--locked", "--no-deps",
              "--format-version", "1", "--manifest-path", str(dest / "Cargo.toml")],
-            check=True, stdout=subprocess.DEVNULL,
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             timeout=SUBPROCESS_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as error:
@@ -217,7 +217,8 @@ def main():
         print(f"docker-manifests: {error}", file=sys.stderr)
         return 1
     print("Docker dependency-layer manifests: PASS (offline, locked)")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

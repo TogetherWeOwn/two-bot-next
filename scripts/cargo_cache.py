@@ -1136,20 +1136,25 @@ def retention_audit(worktrees, inventory, proc_root='/proc', now=None, max_age=6
         git_env = {key: value for key, value in os.environ.items()
                    if key not in {'GIT_INDEX_FILE', 'GIT_DIR', 'GIT_WORK_TREE',
                                   'GIT_COMMON_DIR', 'GIT_NAMESPACE'}}
-        # Bound every provenance wait by the remaining receipt freshness:
-        # a Git call that could outlive the receipt must not establish
-        # eligibility. Under one second of freshness no bounded call fits,
-        # so the audit refuses instead of probing.
-        remaining = max_age - (now - captured)
-        if remaining < 1:
-            raise Refusal('control-plane inventory is stale or from the '
-                          'future; capture a new inventory')
-        git_timeout = min(PROVENANCE_GIT_TIMEOUT_SECONDS, remaining)
+        # Bound every provenance wait by the live remaining receipt
+        # freshness: static age minus monotonic elapsed since audit
+        # entry. Each of the three calls recomputes the budget, so a
+        # stalled earlier call cannot lend its budget to a later one,
+        # and each candidate's first call rechecks freshness before
+        # probing. Under one second of live freshness no bounded call
+        # fits, so the audit refuses instead of probing.
+        def live_git_timeout():
+            remaining = (max_age - (now - captured)
+                         - (time.monotonic() - started))
+            if remaining < 1:
+                raise Refusal('control-plane inventory is stale or from '
+                              'the future; capture a new inventory')
+            return min(PROVENANCE_GIT_TIMEOUT_SECONDS, remaining)
         try:
             toplevel = subprocess.run(['git', '-C', str(workspace), 'rev-parse',
                                        '--show-toplevel'],
                                       capture_output=True, check=True, env=git_env,
-                                      text=True, timeout=git_timeout)
+                                      text=True, timeout=live_git_timeout())
         except subprocess.TimeoutExpired:
             result['reason'] = ('unverified workspace repository '
                                 '(git-timeout); next: capture a new '
@@ -1173,7 +1178,7 @@ def retention_audit(worktrees, inventory, proc_root='/proc', now=None, max_age=6
         try:
             tracked = subprocess.run(['git', '-C', str(workspace), 'ls-files', '-z', '--', 'target'],
                                      capture_output=True, check=True, env=git_env,
-                                     timeout=git_timeout)
+                                     timeout=live_git_timeout())
         except subprocess.TimeoutExpired:
             result['reason'] = ('cannot verify workspace index '
                                 '(git-timeout); next: capture a new '
@@ -1192,7 +1197,8 @@ def retention_audit(worktrees, inventory, proc_root='/proc', now=None, max_age=6
             continue
         try:
             ignored = subprocess.run(['git', '-C', str(workspace), 'check-ignore', '-q', 'target'],
-                                     env=git_env, timeout=git_timeout)
+                                     capture_output=True, env=git_env,
+                                     timeout=live_git_timeout())
         except subprocess.TimeoutExpired:
             result['reason'] = ('cannot verify ignore status (git-timeout); '
                                 'next: capture a new inventory and re-run '
