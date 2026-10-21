@@ -21,6 +21,13 @@ GIB = 1024 ** 3
 DEFAULT_POOL = Path('/paperclip/.cache/two-bot-next-bounded')
 TERMINAL = {'done', 'cancelled'}
 
+# Bounded-subprocess policy (docs/bounded-subprocess-checks.md): each
+# retention-audit provenance Git wait is finite and never longer than the
+# remaining receipt freshness allowance, so a stalled child fails closed
+# into candidate ineligibility instead of hanging past the receipt guard.
+# Local Git probes answer in well under a second; 30s bounds the stall.
+PROVENANCE_GIT_TIMEOUT_SECONDS = 30
+
 
 class Refusal(Exception):
     pass
@@ -1129,23 +1136,85 @@ def retention_audit(worktrees, inventory, proc_root='/proc', now=None, max_age=6
         git_env = {key: value for key, value in os.environ.items()
                    if key not in {'GIT_INDEX_FILE', 'GIT_DIR', 'GIT_WORK_TREE',
                                   'GIT_COMMON_DIR', 'GIT_NAMESPACE'}}
+        # Bound every provenance wait by the remaining receipt freshness:
+        # a Git call that could outlive the receipt must not establish
+        # eligibility. Under one second of freshness no bounded call fits,
+        # so the audit refuses instead of probing.
+        remaining = max_age - (now - captured)
+        if remaining < 1:
+            raise Refusal('control-plane inventory is stale or from the '
+                          'future; capture a new inventory')
+        git_timeout = min(PROVENANCE_GIT_TIMEOUT_SECONDS, remaining)
         try:
             toplevel = subprocess.run(['git', '-C', str(workspace), 'rev-parse',
                                        '--show-toplevel'],
                                       capture_output=True, check=True, env=git_env,
-                                      text=True)
+                                      text=True, timeout=git_timeout)
+        except subprocess.TimeoutExpired:
+            result['reason'] = ('unverified workspace repository '
+                                '(git-timeout); next: capture a new '
+                                'inventory and re-run the audit')
+            continue
+        except OSError:
+            result['reason'] = ('unverified workspace repository '
+                                '(git-spawn); next: capture a new '
+                                'inventory and re-run the audit on a host '
+                                'with git installed')
+            continue
         except subprocess.CalledProcessError:
-            result['reason'] = 'unverified workspace repository'
+            result['reason'] = ('unverified workspace repository '
+                                '(git-unverified); next: verify the '
+                                'workspace is a git checkout, capture a new '
+                                'inventory and re-run the audit')
             continue
         if Path(toplevel.stdout.strip()) != workspace:
             result['reason'] = 'unverified workspace repository'
             continue
-        tracked = subprocess.run(['git', '-C', str(workspace), 'ls-files', '-z', '--', 'target'],
-                                 capture_output=True, check=True, env=git_env)
-        ignored = subprocess.run(['git', '-C', str(workspace), 'check-ignore', '-q', 'target'],
-                                 env=git_env)
-        if tracked.stdout or ignored.returncode != 0:
+        try:
+            tracked = subprocess.run(['git', '-C', str(workspace), 'ls-files', '-z', '--', 'target'],
+                                     capture_output=True, check=True, env=git_env,
+                                     timeout=git_timeout)
+        except subprocess.TimeoutExpired:
+            result['reason'] = ('cannot verify workspace index '
+                                '(git-timeout); next: capture a new '
+                                'inventory and re-run the audit')
+            continue
+        except OSError:
+            result['reason'] = ('cannot verify workspace index (git-spawn); '
+                                'next: capture a new inventory and re-run '
+                                'the audit on a host with git installed')
+            continue
+        except subprocess.CalledProcessError as error:
+            result['reason'] = ('cannot verify workspace index (git-ls-files, '
+                                f'exit status {error.returncode}); next: '
+                                'verify the workspace index, capture a new '
+                                'inventory and re-run the audit')
+            continue
+        try:
+            ignored = subprocess.run(['git', '-C', str(workspace), 'check-ignore', '-q', 'target'],
+                                     env=git_env, timeout=git_timeout)
+        except subprocess.TimeoutExpired:
+            result['reason'] = ('cannot verify ignore status (git-timeout); '
+                                'next: capture a new inventory and re-run '
+                                'the audit')
+            continue
+        except OSError:
+            result['reason'] = ('cannot verify ignore status (git-spawn); '
+                                'next: capture a new inventory and re-run '
+                                'the audit on a host with git installed')
+            continue
+        # Freshness is rechecked after the waits: Git success that arrives
+        # past max_age must not establish eligibility.
+        if now - captured + time.monotonic() - started > max_age:
+            raise Refusal('audit took too long; capture a new inventory')
+        if tracked.stdout or ignored.returncode == 1:
             result['reason'] = 'tracked or not ignored'
+            continue
+        if ignored.returncode != 0:
+            result['reason'] = ('cannot verify ignore status (git-ignore, '
+                                f'exit status {ignored.returncode}); next: '
+                                'verify the workspace checkout, capture a '
+                                'new inventory and re-run the audit')
             continue
         # .gitignore proves nothing about provenance: an ignored target can
         # still hold preserved evidence/backups/sources. Only Cargo's own

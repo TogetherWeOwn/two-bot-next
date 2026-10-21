@@ -5,10 +5,21 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# Bounded-subprocess policy (docs/bounded-subprocess-checks.md): every child
+# wait is finite so a stalled child fails closed here instead of hanging
+# until the external CI ceiling. Local Git/metadata probes answer in well
+# under a second; 30s bounds the stall without touching valid runs.
+SUBPROCESS_TIMEOUT_SECONDS = 30
+
+
+class MetadataFetchError(ValueError):
+    """The locked cargo-metadata probe failed, timed out or never spawned."""
 
 # Pinned dependency-layer inputs, derived from the workspace members so the
 # pin can never drift from `Cargo.toml`: every COPY source before `COPY . .`
@@ -159,11 +170,27 @@ def validate_layer(dest):
 
 def run_locked_fetch(dest):
     """The real locked fetch; raises when the layer does not resolve."""
-    subprocess.run(
-        ["cargo", "metadata", "--offline", "--locked", "--no-deps",
-         "--format-version", "1", "--manifest-path", str(dest / "Cargo.toml")],
-        check=True, stdout=subprocess.DEVNULL,
-    )
+    try:
+        subprocess.run(
+            ["cargo", "metadata", "--offline", "--locked", "--no-deps",
+             "--format-version", "1", "--manifest-path", str(dest / "Cargo.toml")],
+            check=True, stdout=subprocess.DEVNULL,
+            timeout=SUBPROCESS_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise MetadataFetchError(
+            f"metadata fetch timeout after {SUBPROCESS_TIMEOUT_SECONDS}s; "
+            "next: re-run the check; if the stall repeats, inspect the "
+            "cargo metadata invocation and runner load") from error
+    except OSError as error:
+        raise MetadataFetchError(
+            f"metadata fetch spawn failed ({error}); "
+            "next: re-run the check on a runner with cargo installed") from error
+    except subprocess.CalledProcessError as error:
+        raise MetadataFetchError(
+            "metadata fetch failed with exit status "
+            f"{error.returncode}; next: re-run the check; if it repeats, "
+            "inspect the dependency-layer Cargo.toml files") from error
 
 
 def check_tree(docker_text, root, scratch_dir=None, fetch=run_locked_fetch):
@@ -184,7 +211,11 @@ def main():
     docker = (ROOT / "Dockerfile").read_text()
     scratch = os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR") \
         or os.environ["RUNNER_TEMP"]
-    check_tree(docker, ROOT, scratch_dir=scratch)
+    try:
+        check_tree(docker, ROOT, scratch_dir=scratch)
+    except MetadataFetchError as error:
+        print(f"docker-manifests: {error}", file=sys.stderr)
+        return 1
     print("Docker dependency-layer manifests: PASS (offline, locked)")
 
 
