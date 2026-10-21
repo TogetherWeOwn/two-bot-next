@@ -538,16 +538,29 @@ pub async fn compensate_rsvp_write(
     Ok(())
 }
 
+/// SQL predicate "`newer` committed after `owned`", comparing 32-bit
+/// transaction ids the way PostgreSQL itself does (`TransactionIdPrecedes`):
+/// the forward distance modulo 2^32 must fall in `[1, 2^31)`. A plain `>`
+/// on `xmin` inverts once the two ids straddle a transaction-id wraparound
+/// (an older pre-wrap audit then looks numerically greater than a new
+/// post-wrap attempt), so the fence must never compare `xmin` numerically.
+/// Operands interpolate as SQL fragments (column expressions in the fence,
+/// literals in the regression test) — never caller input.
+fn xid_committed_after(newer: &str, owned: &str) -> String {
+    format!("((({newer}) - ({owned}) + 4294967296) % 4294967296) BETWEEN 1 AND 2147483647")
+}
+
 /// True when a later same-identity RSVP attempt committed after `audit_id`,
 /// by insertion commit order (`xmin`) alone. Timestamps never order
 /// attempts: the handler mints `responded_at` before pool and lock
 /// acquisition, so concurrent attempts can mint in one order and commit in
 /// the other, and the store accepts decreasing timestamps. Same-user
 /// writers serialize on the budget lock and same-identity writers on the
-/// identity lock, so commit order matches write order here; the numeric
-/// `xmin` comparison only ever spans adjacent same-identity commits, far
-/// from transaction-id wraparound. Scoped to `event.rsvp` rows so other
-/// slices sharing the log table never fence an RSVP cleanup.
+/// identity lock, so commit order matches write order here; the `xmin`
+/// comparison is wraparound-aware (see [`xid_committed_after`]), so it
+/// stays correct when transaction ids straddle a wraparound. Scoped to
+/// `event.rsvp` rows so other slices sharing the log table never fence an
+/// RSVP cleanup.
 async fn has_newer_rsvp_audit(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     guild_id: &str,
@@ -555,7 +568,10 @@ async fn has_newer_rsvp_audit(
     event_id: &str,
     audit_id: &str,
 ) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(
+    // SAFETY: only the fixed predicate fragment interpolates; values bind.
+    let newer_after_owned =
+        xid_committed_after("newer.xmin::text::bigint", "owned.xmin::text::bigint");
+    let sql = format!(
         "SELECT EXISTS(
            SELECT 1
            FROM announcements_audit_log AS newer,
@@ -566,16 +582,17 @@ async fn has_newer_rsvp_audit(
              AND newer.action = $3
              AND newer.target_key = $4
              AND newer.id <> owned.id
-             AND newer.xmin::text::bigint > owned.xmin::text::bigint
+             AND {newer_after_owned}
          )",
-    )
-    .bind(guild_id)
-    .bind(user_id)
-    .bind(RSVP_AUDIT_ACTION)
-    .bind(event_id)
-    .bind(audit_id)
-    .fetch_one(&mut **tx)
-    .await
+    );
+    sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .bind(guild_id)
+        .bind(user_id)
+        .bind(RSVP_AUDIT_ACTION)
+        .bind(event_id)
+        .bind(audit_id)
+        .fetch_one(&mut **tx)
+        .await
 }
 
 /// RA-03 compensation (TOG-19773): remove the attendance fact one attempt
@@ -1579,6 +1596,56 @@ mod tests {
             .await
             .expect("audit ids");
         assert_eq!(audits, ["audit-inversion-first".to_owned()]);
+        drop_schema(&pool, &schema).await;
+    }
+
+    /// The fence's commit-order predicate stays correct across transaction-id
+    /// wraparound: a plain numeric `>` on `xmin` inverts once ids straddle
+    /// the 2^32 boundary. Real `xmin` wraparound is not fabricable in a
+    /// test, so this pins the exact shared predicate over boundary
+    /// literals — including the wrap-straddling pairs a numeric comparison
+    /// gets backwards.
+    #[tokio::test]
+    async fn fence_commit_order_survives_transaction_id_wraparound() {
+        let Some((pool, schema)) = test_pool("rsvp_fence_xid_wraparound")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping rsvp_store test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        // (newer xid, owned xid, newer committed after owned)
+        let cases = [
+            ("101", "100", true),
+            ("100", "100", false),
+            ("100", "101", false),
+            // Post-wrap attempt after a pre-wrap audit: numerically
+            // smaller, but committed later.
+            ("5", "4294967295", true),
+            // Pre-wrap audit against a post-wrap attempt: numerically
+            // greater, but committed earlier — this is the inversion a
+            // numeric `xmin` comparison gets wrong.
+            ("4294967295", "5", false),
+            // Frozen-era audit against a recent attempt.
+            ("500000000", "2", true),
+            // Modulo-2^32 boundary, matching TransactionIdPrecedes: a
+            // forward distance of 2^31 - 1 is after, 2^31 is not.
+            ("2147483648", "1", true),
+            ("2147483649", "1", false),
+        ];
+        for (newer, owned, expected) in cases {
+            // SAFETY: only numeric literals interpolate; the predicate is
+            // the exact fragment the fence query uses.
+            let sql = format!("SELECT {}", xid_committed_after(newer, owned));
+            let actual: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+                .fetch_one(&pool)
+                .await
+                .expect("predicate probe");
+            assert_eq!(
+                actual, expected,
+                "commit order of newer={newer} against owned={owned}"
+            );
+        }
         drop_schema(&pool, &schema).await;
     }
 }
