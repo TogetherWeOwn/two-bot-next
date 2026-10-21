@@ -3,6 +3,8 @@ use serde_json::json;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
 
+#[path = "voice_actor_inbox_backpressure_acceptance_tests.rs"]
+mod actor_inbox_backpressure_acceptance;
 #[path = "voice_admission_config_acceptance_tests.rs"]
 mod admission_config_acceptance;
 #[path = "voice_admission_spawn_tests.rs"]
@@ -2417,6 +2419,7 @@ async fn actor_creator_added_command_feeds_creator_channels() {
         &mut worker,
         ActorCommand::CreatorAdded(CreatorChannel::new(GUILD, COMMANDED)),
         0,
+        &ActorInboxBackpressure::default(),
     );
     let (_, sample) = worker
         .live
@@ -7220,6 +7223,7 @@ async fn access_changed_refreshes_a_loaded_worker() {
                 ..AccessControls::default()
             }),
             0,
+            &ActorInboxBackpressure::default(),
         );
         let ticket = worker
             .live
@@ -9152,7 +9156,12 @@ async fn creator_edit_applies_to_new_rooms_only() {
     let mut edited = text_creator();
     edited.text_channel_name = Some("lounge".to_owned());
     edited.text_viewer_role_id = Some(42);
-    apply_command(&mut worker, ActorCommand::CreatorAdded(edited), now);
+    apply_command(
+        &mut worker,
+        ActorCommand::CreatorAdded(edited),
+        now,
+        &ActorInboxBackpressure::default(),
+    );
     assert_eq!(
         worker.companions[&500].settings, before,
         "the existing companion keeps its creation-time snapshot"
@@ -12633,7 +12642,12 @@ async fn voice_name_settings_notification_invalidates_cached_renders() {
     settings
         .lists
         .insert("maps".to_owned(), vec!["new".to_owned()]);
-    apply_command(&mut worker, ActorCommand::NameSettingsChanged(settings), 1);
+    apply_command(
+        &mut worker,
+        ActorCommand::NameSettingsChanged(settings),
+        1,
+        &ActorInboxBackpressure::default(),
+    );
     worker.refresh_template_names(1);
     assert_eq!(worker.desired_names[&700], "new");
     assert!(
@@ -12671,6 +12685,7 @@ async fn voice_name_import_refreshes_creator_template_without_waiting_for_reload
         &mut worker,
         ActorCommand::NameSettingsChanged(settings),
         100_000,
+        &ActorInboxBackpressure::default(),
     );
     assert_eq!(
         worker.name_settings_read_ms, None,
@@ -12705,7 +12720,12 @@ async fn voice_name_creator_notification_invalidates_cached_renders() {
     dispatch(&mut worker, 0).await;
     let mut creator = worker.creators[&CREATOR].clone();
     creator.name_template = "new".to_owned();
-    apply_command(&mut worker, ActorCommand::CreatorAdded(creator), 1);
+    apply_command(
+        &mut worker,
+        ActorCommand::CreatorAdded(creator),
+        1,
+        &ActorInboxBackpressure::default(),
+    );
     worker.refresh_template_names(1);
     assert_eq!(worker.desired_names[&700], "new");
     assert!(!worker.dispatch_one(1).await);
@@ -12772,6 +12792,7 @@ async fn a_voice_display_update_reaches_the_owner_token() {
             display: "Sam".to_owned(),
         },
         0,
+        &ActorInboxBackpressure::default(),
     );
     worker.refresh_template_names(0);
     dispatch(&mut worker, 0).await;
@@ -12797,6 +12818,7 @@ async fn a_restarted_worker_waits_for_the_owner_name_instead_of_renaming_to_memb
             display: "Alex".to_owned(),
         },
         1,
+        &ActorInboxBackpressure::default(),
     );
     worker.refresh_template_names(1);
     dispatch(&mut worker, 1).await;
@@ -12813,6 +12835,7 @@ async fn written_settings_reach_automatic_names() {
         &mut worker,
         ActorCommand::NameSettingsChanged(NameSettings::from_config(&config)),
         5,
+        &ActorInboxBackpressure::default(),
     );
     assert_eq!(worker.name_settings.no_game_label, "Hangout");
     assert!(worker.name_settings_loaded);
@@ -14422,12 +14445,22 @@ async fn join_commands_count_received_on_accept_and_on_refusal() {
         .live
         .voice_update(MEMBER, Some(CREATOR), Some(false))
         .unwrap();
-    assert!(apply_command(&mut worker, join_command(ticket), 0));
+    assert!(apply_command(
+        &mut worker,
+        join_command(ticket),
+        0,
+        &ActorInboxBackpressure::default()
+    ));
     // Same ticket twice: the second delivery is refused as a duplicate, but
     // both deliveries count as received. Lower bounds, not exact diffs: these
     // counters are process-global and sink tests deliver joins through the
     // same Join arm concurrently, so concurrent runs can only add.
-    assert!(!apply_command(&mut worker, join_command(ticket), 1));
+    assert!(!apply_command(
+        &mut worker,
+        join_command(ticket),
+        1,
+        &ActorInboxBackpressure::default()
+    ));
     assert!(
         global_series("two_bot_voice_joins_received_total") >= received_before + 2,
         "both deliveries count as received"
@@ -14703,11 +14736,13 @@ async fn actor_join_revalidates_a_stale_creator_view() {
         .expect("ticket for a joined channel");
     let (tx, rx) = mpsc::unbounded_channel();
     let handle = tokio::spawn(async move {
+        let backpressure = ActorInboxBackpressure::default();
         run_actor_with_limits(
             &mut worker,
             rx,
             Duration::from_millis(100),
             ActorLimits::default(),
+            &backpressure,
         )
         .await;
         worker
@@ -14739,7 +14774,12 @@ async fn refresh_creators_command_flags_a_debounced_merge() {
     let (live, store, http, _) = fixture();
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     assert!(!worker.creators_refresh_due);
-    apply_command(&mut worker, ActorCommand::RefreshCreators, 0);
+    apply_command(
+        &mut worker,
+        ActorCommand::RefreshCreators,
+        0,
+        &ActorInboxBackpressure::default(),
+    );
     assert!(worker.creators_refresh_due);
 }
 
@@ -14756,11 +14796,13 @@ async fn maintenance_tick_runs_the_creator_refresh() {
     assert!(worker.creators_read_ms.is_none());
     let (tx, rx) = mpsc::unbounded_channel();
     let handle = tokio::spawn(async move {
+        let backpressure = ActorInboxBackpressure::default();
         run_actor_with_limits(
             &mut worker,
             rx,
             Duration::from_millis(100),
             ActorLimits::default(),
+            &backpressure,
         )
         .await;
         worker
@@ -15295,7 +15337,15 @@ async fn halt_reprobe_clears_the_credential_latch_without_a_restart() {
         ..ActorLimits::default()
     };
     let handle = tokio::spawn(async move {
-        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+        let backpressure = ActorInboxBackpressure::default();
+        run_actor_with_limits(
+            &mut worker,
+            rx,
+            Duration::from_millis(100),
+            limits,
+            &backpressure,
+        )
+        .await;
     });
     // Pump the actor once so its probe baseline starts at t=0 (a Status
     // round-trip also proves the halted actor is still alive to answer).
@@ -15345,7 +15395,15 @@ async fn halt_reprobe_keeps_a_discord_401_latch_set() {
         ..ActorLimits::default()
     };
     let handle = tokio::spawn(async move {
-        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+        let backpressure = ActorInboxBackpressure::default();
+        run_actor_with_limits(
+            &mut worker,
+            rx,
+            Duration::from_millis(100),
+            limits,
+            &backpressure,
+        )
+        .await;
     });
     // Pump the actor once so its probe baseline starts at t=0 (a Status
     // round-trip also proves the halted actor is still alive to answer).
@@ -15455,7 +15513,15 @@ async fn watchdog_fires_while_a_dispatch_is_hung_mid_write() {
         ..ActorLimits::default()
     };
     let handle = tokio::spawn(async move {
-        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+        let backpressure = ActorInboxBackpressure::default();
+        run_actor_with_limits(
+            &mut worker,
+            rx,
+            Duration::from_millis(100),
+            limits,
+            &backpressure,
+        )
+        .await;
     });
     // Drive the actor until the limit write is held mid-flight. The clock
     // only moves here, so the waiter must be registered before advancing.
@@ -15547,7 +15613,15 @@ async fn watchdog_sibling_exits_when_its_actor_dies() {
         ..ActorLimits::default()
     };
     let handle = tokio::spawn(async move {
-        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+        let backpressure = ActorInboxBackpressure::default();
+        run_actor_with_limits(
+            &mut worker,
+            rx,
+            Duration::from_millis(100),
+            limits,
+            &backpressure,
+        )
+        .await;
     });
     // Drive the actor until the panicking write kills it: the unwind drops
     // the inbox receiver, which closes the sender's side.
@@ -15608,7 +15682,15 @@ async fn actor_exit_on_inbox_close_retires_its_stall_contribution() {
         ..ActorLimits::default()
     };
     let handle = tokio::spawn(async move {
-        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+        let backpressure = ActorInboxBackpressure::default();
+        run_actor_with_limits(
+            &mut worker,
+            rx,
+            Duration::from_millis(100),
+            limits,
+            &backpressure,
+        )
+        .await;
     });
     // Drive ticks until the running actor's halted contribution lands.
     let mut contribution = None;
@@ -15667,7 +15749,15 @@ async fn actor_panic_unwind_retires_its_stall_contribution() {
         ..ActorLimits::default()
     };
     let handle = tokio::spawn(async move {
-        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+        let backpressure = ActorInboxBackpressure::default();
+        run_actor_with_limits(
+            &mut worker,
+            rx,
+            Duration::from_millis(100),
+            limits,
+            &backpressure,
+        )
+        .await;
     });
     let mut ticks = 0;
     while !tx.is_closed() {
@@ -15994,7 +16084,15 @@ async fn watchdog_fires_while_a_backed_off_queue_makes_no_progress() {
         ..ActorLimits::default()
     };
     let handle = tokio::spawn(async move {
-        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+        let backpressure = ActorInboxBackpressure::default();
+        run_actor_with_limits(
+            &mut worker,
+            rx,
+            Duration::from_millis(100),
+            limits,
+            &backpressure,
+        )
+        .await;
     });
     // Liveness first: the actor answers Status probes while stalled.
     let (reply, reply_rx) = oneshot::channel();
