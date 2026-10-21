@@ -139,8 +139,8 @@ async fn rsvp_burst_against_stalled_drain_refuses_and_counts() {
     })
     .await
     .expect("first interaction completes after the hold releases");
-    let edits: Vec<_> = rest
-        .requests()
+    let requests = rest.requests();
+    let edits: Vec<_> = requests
         .iter()
         .filter(|request| request.method == "PATCH" && request.path.contains("mock-rsvp-2"))
         .collect();
