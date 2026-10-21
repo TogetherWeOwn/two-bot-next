@@ -363,8 +363,11 @@ def validate_baseline(baseline):
             "invalid_baseline_receipt")
     # `prepare` writes `started=time.time()`, always finite and positive. A
     # hand-edited zero/negative value would accept pre-baseline rollouts as
-    # new; NaN/inf would fail later under a misleading stale token.
-    require(math.isfinite(started) and started > 0, "invalid_baseline_receipt")
+    # new; NaN/inf would fail later under a misleading stale token. Only
+    # floats take the finiteness check: math.isfinite() raises OverflowError
+    # on ints beyond the float range instead of returning False.
+    require(started > 0 and (isinstance(started, int) or math.isfinite(started)),
+            "invalid_baseline_receipt")
     for member in ("application_id", "namespace_id"):
         value = baseline.get(member)
         require(isinstance(value, str) and BASELINE_IDENTITY.fullmatch(value),

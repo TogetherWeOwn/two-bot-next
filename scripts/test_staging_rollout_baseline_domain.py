@@ -96,7 +96,8 @@ class OfflineTestCase(unittest.TestCase):
 
 class StartedDomainTests(OfflineTestCase):
     def test_out_of_domain_started_refuses(self):
-        for value in [-1, 0, 0.0, -0.5, math.nan, math.inf, -math.inf]:
+        for value in [-1, 0, 0.0, -0.5, math.nan, math.inf, -math.inf,
+                      -(10 ** 400)]:
             with self.subTest(value=value):
                 baseline = valid_baseline()
                 baseline["started"] = value
@@ -111,7 +112,7 @@ class StartedDomainTests(OfflineTestCase):
             output=str(root / "deploy.ndjson"),
             evidence=str(root / "evidence.json"),
         )
-        for value in [-1, 0, math.nan, math.inf]:
+        for value in [-1, 0, math.nan, math.inf, -(10 ** 400)]:
             with self.subTest(value=value):
                 baseline = valid_baseline()
                 baseline["started"] = value
@@ -127,6 +128,18 @@ class StartedDomainTests(OfflineTestCase):
         baseline["started"] = -1
         row = new_row(created_at="1970-01-01T00:00:01Z")
         self.assert_baseline_gate(rollout.select_rollout, [row], baseline, IMAGE)
+
+    def test_huge_positive_integer_started_does_not_crash(self):
+        # math.isfinite() raises OverflowError on ints beyond the float
+        # range, so only floats take the finiteness check: a huge positive
+        # int passes validation exactly as before, then loses the timestamp
+        # floor under the fixed stale token instead of a traceback.
+        baseline = valid_baseline()
+        baseline["started"] = 10 ** 400
+        self.assertIs(rollout.validate_baseline(baseline), baseline)
+        with self.assertRaises(rollout.GateError) as caught:
+            rollout.select_rollout([new_row()], baseline, IMAGE)
+        self.assertEqual(str(caught.exception), "stale_new_rollout")
 
     def test_finite_positive_started_still_selects(self):
         for value in [1, 0.001, STARTED, 1_800_000_000]:
