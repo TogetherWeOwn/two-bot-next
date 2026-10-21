@@ -220,7 +220,7 @@ transition may make that one job uncertain, but does not strand the remaining
 batch. No running claim is reclaimed by age. `claim_due_unbans` acquires member
 queues internally; do not wrap it in another `serialize_member` callback.
 
-A definite DELETE refusal still ends that tick without automatically retrying it.
+A definite DELETE refusal is recorded and the sweep continues without automatically retrying it until the next tick.
 Migration 0113 adds a nullable `retry_generation` queue ticket. Exact-token requeue
 allocates the next value from the existing ban-generation sequence, then clears
 only the safe dispatch claim. Due jobs sort by that ticket (or their original
