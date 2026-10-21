@@ -1114,3 +1114,7 @@ mod no_work_acceptance_tests;
 #[cfg(test)]
 #[path = "ticket_failure_class_tests.rs"]
 mod failure_class_tests;
+
+#[cfg(test)]
+#[path = "ticket_cursor_budget_acceptance_tests.rs"]
+mod cursor_budget_acceptance_tests;
