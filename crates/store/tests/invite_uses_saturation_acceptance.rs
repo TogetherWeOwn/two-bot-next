@@ -203,18 +203,6 @@ fn expected(code: &str, uses: u64) -> InviteState {
     invite(code, uses)
 }
 
-/// Run `store_all` without letting a baseline panic leak the owned schema:
-/// the caller drops the schema first, then rethrows the original panic so
-/// RED evidence names the production expect.
-fn store_all_guarded(snapshots: &PgInviteSnapshots, guild: u64, states: &[InviteState]) {
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        snapshots.store_all(guild, states);
-    }));
-    if let Err(payload) = outcome {
-        std::panic::resume_unwind(payload);
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn uses_one_above_i32_max_saturates_and_write_proceeds() {
     let Some(fixture) = Fixture::new("invite_saturation").await else {
@@ -308,9 +296,15 @@ async fn normal_uses_round_trip_byte_identical() {
         invite("normal-small", 7),
         invite("normal-max", SATURATED),
     ];
-    store_all_guarded(&snapshots, GUILD, &states);
-    let mut loaded = snapshots.load(GUILD);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        snapshots.store_all(GUILD, &states);
+        snapshots.load(GUILD)
+    }));
     fixture.finish().await;
+    let mut loaded = match outcome {
+        Ok(loaded) => loaded,
+        Err(payload) => std::panic::resume_unwind(payload),
+    };
     loaded.sort_by(|left, right| left.code.cmp(&right.code));
     assert_eq!(
         loaded,
@@ -331,8 +325,13 @@ async fn exact_i32_max_writes_without_saturation_warn() {
     };
     let capture = Capture::shared();
     let snapshots = fixture.snapshots();
-    store_all_guarded(&snapshots, GUILD, &[invite("exact-max-quiet", SATURATED)]);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        snapshots.store_all(GUILD, &[invite("exact-max-quiet", SATURATED)]);
+    }));
     fixture.finish().await;
+    if let Err(payload) = outcome {
+        std::panic::resume_unwind(payload);
+    }
     let lines = capture.lines();
     assert!(
         !lines
