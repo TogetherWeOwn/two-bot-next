@@ -9,10 +9,19 @@ Contract (offline, stdlib only, no Cargo, subprocesses or network):
 * Refuse Cargo ``--no-run`` and libtest ``--list`` as automated soak coverage.
   The validator uses an explicit bounded supported-option vocabulary and
   enforces value arity, including after ``--``.
-* Compute nonempty effective selected tests after positive filters, ``--exact``
-  and ``--skip``. A selected test that is entirely skipped cannot satisfy
-  coverage; a supported skip leaving real tests passes. Fail closed for
-  unsupported semantics (misplaced known options).
+* Enforce Cargo's single pre-separator filter: at most one positional
+  test-name filter may appear before ``--`` (pinned Cargo 1.98.1 rejects a
+  second with unexpected-argument and runs nothing); additional filters
+  belong after ``--`` where libtest accepts several. A second
+  pre-separator filter fails with ``UNSUPPORTED``.
+* Compute nonempty effective selected tests after positive filters, ``--exact``,
+  ``--skip`` and ignore-mode filtering. Default excludes ``#[ignore]`` tests,
+  ``--ignored`` selects only ignored tests, ``--include-ignored`` selects all
+  matched tests; the scanner preserves ignored identity across inline and
+  external modules. A selected test that is entirely skipped or excluded by
+  its ignore mode cannot satisfy coverage; a supported skip leaving real
+  executable tests passes. Fail closed for unsupported semantics (misplaced
+  known options, excess pre-separator filters).
 * Unknown flags and missing/invalid option values fail with stable row-scoped
   reason codes and a next action, without invoking Cargo, subprocesses or
   network.
@@ -26,7 +35,9 @@ Reason codes (stable, uppercase tokens in the message):
 * ``NOEXEC``: Cargo ``--no-run``, libtest ``--list`` and other non-executing
   modes used as automated coverage.
 * ``EMPTY_SELECTION``: no effective tests remain after positive filters,
-  ``--exact`` and ``--skip``.
+  ``--exact``, ``--skip`` and ignore-mode filtering (default excludes
+  ``#[ignore]``, ``--ignored`` selects only ignored, ``--include-ignored``
+  selects all matched).
 * ``UNKNOWN_OPTION``: a flag outside the bounded supported vocabulary.
 * ``MISSING_VALUE``: a value option with no value token (``--skip`` or
   ``--test-threads`` at the end, ``--test`` or ``-p`` without a value).
@@ -35,7 +46,8 @@ Reason codes (stable, uppercase tokens in the message):
   given ``=value`` such as ``--exact=foo``, ``--ignored=foo``, ``--lib=foo``).
 * ``UNSUPPORTED``: a known option in the wrong position (libtest ``--skip`` /
   ``--exact`` / ``--ignored`` before ``--``; Cargo ``-p`` / ``--test`` /
-  ``--features`` after ``--``).
+  ``--features`` after ``--``) or a second positional test-name filter
+  before ``--`` (Cargo accepts at most one; pass the rest after ``--``).
 
 Every new failure message is row-scoped (starts with ``"<entry_id>: "``),
 contains its reason code verbatim, and contains a next action (the message,
@@ -69,6 +81,14 @@ from check_soak_checklist import check_verification, render, validate
 ROOT = Path(__file__).resolve().parents[1]
 WRAPPED = "python3 scripts/cargo_cache.py run -- test "
 
+# Fixture libtest names: tests::alpha_test, tests::beta_test,
+# tests::gamma_other (nonignored inline); tests::quarantined_inline
+# (ignored inline); outer::quarantined_outer_test (ignored external via
+# `mod outer;`); smoke_case (nonignored integration);
+# quarantined_smoke (ignored integration). Ignored names avoid the
+# alpha/beta/gamma/smoke substrings used by the nonignored controls, and
+# the external ignored name keeps a "test" substring so the whole-target
+# `--skip test` control still skips every lib test.
 FIXTURE = {
     "Cargo.toml": """
         [workspace]
@@ -79,6 +99,7 @@ FIXTURE = {
         name = "demo"
     """,
     "crates/demo/src/lib.rs": """
+        mod outer;
         #[cfg(test)]
         mod tests {
             #[test]
@@ -87,10 +108,20 @@ FIXTURE = {
             fn beta_test() {}
             #[test]
             fn gamma_other() {}
+            #[ignore]
+            #[test]
+            fn quarantined_inline() {}
         }
+    """,
+    "crates/demo/src/outer.rs": """
+        #[ignore]
+        #[test]
+        fn quarantined_outer_test() {}
     """,
     "crates/demo/tests/smoke.rs": """
         #[test] fn smoke_case() {}
+        #[ignore]
+        #[test] fn quarantined_smoke() {}
     """,
 }
 
@@ -219,8 +250,9 @@ class EffectiveSelectionTests(NoexecAcceptanceBase):
             "EMPTY_SELECTION")
 
     def test_skip_covering_every_positive_match_fails(self):
-        # "test" matches all three lib tests (via "tests::" and the fn names);
-        # skipping "test" leaves nothing.
+        # "test" matches every lib test (via "tests::" for the inline module
+        # and the fn name for the external ignored test); skipping "test"
+        # leaves nothing executable behind.
         self.assert_stable("-p demo --lib test -- --skip test", "EMPTY_SELECTION")
 
     def test_skip_covering_every_test_without_positive_filters_fails(self):
@@ -235,9 +267,12 @@ class EffectiveSelectionTests(NoexecAcceptanceBase):
         self.assertTrue(message.startswith("s9-03: "))
 
     def test_supported_skip_leaving_real_tests_passes(self):
-        # "test" matches alpha/beta/gamma; skipping only alpha leaves two.
+        # "test" matches every lib test; default excludes the two ignored and
+        # skipping only alpha leaves beta/gamma executable.
         self.assert_accepts("-p demo --lib test -- --skip alpha_test")
-        self.assert_accepts("-p demo --lib alpha_test beta_test -- --skip alpha")
+        # Cargo accepts at most one filter before --; the two-filter selection
+        # with a skip belongs after the separator and still leaves beta.
+        self.assert_accepts("-p demo --lib -- alpha_test beta_test --skip alpha")
         # Exact skip that does not exactly match removes nothing.
         self.assert_accepts("-p demo --test smoke smoke_case -- --exact --skip smoke")
         # Skip with a valid thread count still resolves.
@@ -355,20 +390,160 @@ class UnsupportedSemanticsTests(NoexecAcceptanceBase):
         self.assertTrue(message.startswith("s9-07: "))
 
 
+class CargoFilterArityTests(NoexecAcceptanceBase):
+    """Cargo accepts at most one positional filter before `--`."""
+
+    def test_second_pre_separator_filter_is_unsupported(self):
+        # Pinned Cargo 1.98.1 rejects the second pre-separator filter with
+        # unexpected-argument and runs nothing; the validator must fail
+        # closed with UNSUPPORTED rather than union both filters.
+        for command in (
+            "-p demo --lib alpha_test beta_test",
+            "-p demo --lib beta_test gamma_other",
+            "-p demo --lib alpha_test beta_test -- --skip alpha",
+            "-p demo --lib alpha_test beta_test gamma_other",
+            "-p demo --test smoke smoke_case quarantined_smoke",
+            "-p demo --features db --lib alpha_test beta_test",
+        ):
+            with self.subTest(command=command):
+                self.assert_stable(command, "UNSUPPORTED")
+
+    def test_second_filter_unsupported_is_row_scoped_with_next_action(self):
+        message = self.assert_rejects(
+            "-p demo --lib alpha_test beta_test", "UNSUPPORTED",
+            entry_id="s9-08")
+        self.assertTrue(message.startswith("s9-08: "))
+        message = self.assert_rejects(
+            "-p demo --lib beta_test gamma_other -- --skip beta",
+            "UNSUPPORTED", entry_id="s9-09")
+        self.assertTrue(message.startswith("s9-09: "))
+
+    def test_valid_filter_arity_resolves(self):
+        # One filter before -- is valid Cargo; several filters after -- are
+        # valid libtest. Both shapes keep resolving.
+        self.assert_accepts("-p demo --lib alpha_test")
+        self.assert_accepts("-p demo --lib -- alpha_test beta_test")
+        self.assert_accepts("-p demo --lib -- beta_test gamma_other --skip beta")
+        self.assert_accepts("-p demo --lib -- alpha_test beta_test gamma_other")
+        self.assert_accepts(
+            "-p demo --test smoke -- smoke_case quarantined_smoke --include-ignored")
+
+
+class IgnoredSelectionTests(NoexecAcceptanceBase):
+    """Effective selection honors ignore mode; empty executable fails."""
+
+    def test_ignored_flag_selects_only_ignored(self):
+        # --ignored intersects matched with ignored: inline, external and
+        # integration ignored tests all resolve.
+        self.assert_accepts("-p demo --lib -- --ignored quarantined_inline")
+        self.assert_accepts("-p demo --lib -- --ignored quarantined_outer_test")
+        self.assert_accepts("-p demo --lib -- --ignored quarantined")
+        self.assert_accepts("-p demo --lib -- --ignored outer")
+        self.assert_accepts("-p demo --test smoke -- --ignored")
+        self.assert_accepts("-p demo --test smoke quarantined_smoke -- --ignored")
+
+    def test_ignored_flag_with_only_nonignored_matches_fails(self):
+        # --ignored with filters matching only nonignored tests executes
+        # nothing (pinned libtest runs zero tests); fail with EMPTY_SELECTION.
+        for command in (
+            "-p demo --lib -- --ignored alpha",
+            "-p demo --lib -- --ignored beta_test",
+            "-p demo --lib -- --ignored alpha_test beta_test",
+            "-p demo --test smoke smoke_case -- --ignored --test-threads=1",
+            "-p demo --test smoke -- --ignored smoke_case",
+        ):
+            with self.subTest(command=command):
+                self.assert_stable(command, "EMPTY_SELECTION")
+
+    def test_default_excludes_ignored(self):
+        # Without --ignored/--include-ignored, matched ignored tests are
+        # reported ignored, not passed; ignored-only matches leave no
+        # executable test behind.
+        for command in (
+            "-p demo --lib quarantined_inline",
+            "-p demo --lib -- quarantined_outer_test",
+            "-p demo --lib -- quarantined",
+            "-p demo --test smoke quarantined_smoke",
+            "-p demo --test smoke -- quarantined_smoke",
+        ):
+            with self.subTest(command=command):
+                self.assert_stable(command, "EMPTY_SELECTION")
+        # Mixed matches still resolve by excluding ignored.
+        self.assert_accepts("-p demo --lib -- quarantined_inline alpha_test")
+        self.assert_accepts("-p demo --lib -- quarantined alpha_test")
+
+    def test_include_ignored_selects_all_matched(self):
+        # --include-ignored runs both ignored and nonignored matches.
+        self.assert_accepts("-p demo --lib -- --include-ignored quarantined")
+        self.assert_accepts("-p demo --lib -- --include-ignored alpha")
+        self.assert_accepts(
+            "-p demo --lib -- --include-ignored quarantined_inline alpha_test")
+        self.assert_accepts("-p demo --test smoke -- --include-ignored")
+        self.assert_accepts(
+            "-p demo --test smoke quarantined_smoke -- --include-ignored")
+        self.assert_accepts(
+            "-p demo --test smoke smoke_case -- --include-ignored")
+
+    def test_exact_interactions_with_ignore_modes(self):
+        # --exact applies to both positive filters and ignore-mode selection.
+        self.assert_accepts(
+            "-p demo --lib -- --exact --ignored tests::quarantined_inline")
+        self.assert_accepts(
+            "-p demo --lib -- --exact --ignored outer::quarantined_outer_test")
+        self.assert_accepts(
+            "-p demo --lib -- --exact --include-ignored tests::quarantined_inline")
+        self.assert_accepts("-p demo --lib tests::alpha_test -- --exact")
+        for command in (
+            "-p demo --lib -- --exact --ignored tests::alpha_test",
+            "-p demo --lib tests::quarantined_inline -- --exact",
+            "-p demo --lib -- --exact tests::quarantined_inline",
+        ):
+            with self.subTest(command=command):
+                self.assert_stable(command, "EMPTY_SELECTION")
+
+    def test_skip_interactions_with_ignore_modes(self):
+        # --skip removes from the executable set after ignore-mode filtering.
+        self.assert_accepts(
+            "-p demo --lib -- --ignored quarantined --skip quarantined_inline")
+        self.assert_accepts(
+            "-p demo --lib -- quarantined alpha_test --skip quarantined")
+        for command in (
+            "-p demo --lib -- --ignored alpha_test quarantined_inline --skip quarantined_inline",
+            "-p demo --lib -- alpha_test quarantined_inline --skip alpha_test",
+            "-p demo --test smoke -- --ignored --skip quarantined",
+        ):
+            with self.subTest(command=command):
+                self.assert_stable(command, "EMPTY_SELECTION")
+
+    def test_empty_ignored_selection_is_row_scoped_with_next_action(self):
+        message = self.assert_rejects(
+            "-p demo --lib -- --ignored alpha", "EMPTY_SELECTION",
+            entry_id="s9-10")
+        self.assertTrue(message.startswith("s9-10: "))
+        message = self.assert_rejects(
+            "-p demo --lib quarantined_inline", "EMPTY_SELECTION",
+            entry_id="s9-11")
+        self.assertTrue(message.startswith("s9-11: "))
+
+
 class ValidControlsTests(NoexecAcceptanceBase):
     """Supported shapes keep resolving without subprocesses or network."""
 
     def test_fixture_filters_resolve_by_target(self):
+        # One filter before -- is valid Cargo; several filters belong after --.
         self.assert_accepts("-p demo --lib alpha_test")
-        self.assert_accepts("-p demo --lib beta_test gamma_other")
+        self.assert_accepts("-p demo --lib -- beta_test gamma_other")
         self.assert_accepts("-p demo --test smoke smoke_case -- --exact")
+        # Whole smoke target with --ignored selects the ignored smoke test.
         self.assert_accepts("-p demo --test smoke -- --ignored")
 
     def test_existing_libtest_flags_keep_resolving(self):
-        # --ignored and --include-ignored appear in live checklist rows.
-        self.assert_accepts("-p demo --lib -- --ignored alpha")
+        # --ignored and --include-ignored appear in live checklist rows; the
+        # --ignored controls match real ignored tests in this fixture.
+        self.assert_accepts("-p demo --lib -- --ignored quarantined")
         self.assert_accepts("-p demo --lib -- --include-ignored beta")
-        self.assert_accepts("-p demo --test smoke smoke_case -- --ignored --test-threads=1")
+        self.assert_accepts(
+            "-p demo --test smoke quarantined_smoke -- --ignored --test-threads=1")
         self.assert_accepts("-p demo --lib tests::alpha_test -- --exact")
 
     def test_every_automated_checklist_row_still_resolves(self):
