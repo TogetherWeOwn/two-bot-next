@@ -429,6 +429,115 @@ class CargoFilterArityTests(NoexecAcceptanceBase):
             "-p demo --test smoke -- smoke_case quarantined_smoke --include-ignored")
 
 
+class LibtestOptionArityTests(NoexecAcceptanceBase):
+    """Refuse options pinned libtest rejects before executing any tests."""
+
+    # Every filter resolves under either last-wins or union ignore semantics,
+    # so EMPTY_SELECTION cannot conceal an accepted invalid option combination.
+    CONFLICTING_IGNORE_MODES = (
+        "-p demo --lib -- --ignored --include-ignored quarantined_inline",
+        "-p demo --lib -- --include-ignored --ignored quarantined_inline",
+    )
+    REPEATED_EXACT = (
+        "-p demo --lib tests::alpha_test -- --exact --exact",
+        "-p demo --lib -- --exact tests::alpha_test --exact",
+    )
+    REPEATED_IGNORED = (
+        "-p demo --lib -- --ignored --ignored quarantined_inline",
+        "-p demo --lib -- --ignored outer::quarantined_outer_test --ignored",
+    )
+    REPEATED_INCLUDE_IGNORED = (
+        "-p demo --lib -- --include-ignored --include-ignored quarantined_inline",
+        "-p demo --lib -- --include-ignored alpha_test --include-ignored",
+    )
+    REPEATED_TEST_THREADS = (
+        "-p demo --lib alpha_test -- --test-threads 1 --test-threads 1",
+        "-p demo --lib alpha_test -- --test-threads 1 --test-threads 2",
+        "-p demo --lib -- --test-threads=1 alpha_test --test-threads=1",
+        "-p demo --lib -- --test-threads=1 alpha_test --test-threads=2",
+        "-p demo --test smoke smoke_case -- --test-threads 1 --test-threads=2",
+        "-p demo --test smoke -- --test-threads=2 smoke_case --test-threads 1",
+    )
+
+    def test_conflicting_ignore_modes_are_unsupported_in_either_order(self):
+        for command in self.CONFLICTING_IGNORE_MODES:
+            with self.subTest(command=command):
+                self.assert_stable(command, "UNSUPPORTED")
+
+    def test_repeated_exact_is_unsupported(self):
+        for command in self.REPEATED_EXACT:
+            with self.subTest(command=command):
+                self.assert_stable(command, "UNSUPPORTED")
+
+    def test_repeated_ignored_is_unsupported(self):
+        for command in self.REPEATED_IGNORED:
+            with self.subTest(command=command):
+                self.assert_stable(command, "UNSUPPORTED")
+
+    def test_repeated_include_ignored_is_unsupported(self):
+        for command in self.REPEATED_INCLUDE_IGNORED:
+            with self.subTest(command=command):
+                self.assert_stable(command, "UNSUPPORTED")
+
+    def test_repeated_test_threads_is_unsupported_for_all_value_spellings(self):
+        for command in self.REPEATED_TEST_THREADS:
+            with self.subTest(command=command):
+                self.assert_stable(command, "UNSUPPORTED")
+
+    def test_option_arity_refusals_are_row_scoped_stable_and_actionable(self):
+        commands = (
+            self.CONFLICTING_IGNORE_MODES + self.REPEATED_EXACT
+            + self.REPEATED_IGNORED + self.REPEATED_INCLUDE_IGNORED
+            + self.REPEATED_TEST_THREADS
+        )
+        for index, command in enumerate(commands, 1):
+            entry_id = f"s9-option-{index:02d}"
+            with self.subTest(entry=entry_id, command=command):
+                self.assert_stable(command, "UNSUPPORTED", entry_id=entry_id)
+
+    def test_single_use_options_once_keep_resolving(self):
+        for command in (
+            "-p demo --lib tests::alpha_test -- --exact",
+            "-p demo --lib -- --ignored quarantined_inline",
+            "-p demo --lib -- --ignored outer::quarantined_outer_test",
+            "-p demo --lib -- --include-ignored quarantined_inline",
+            "-p demo --lib -- --include-ignored alpha_test",
+            "-p demo --lib -- --include-ignored quarantined_inline alpha_test",
+            "-p demo --lib alpha_test -- --test-threads 2",
+            "-p demo --test smoke smoke_case -- --test-threads=1",
+            "-p demo --lib -- --exact --ignored --test-threads=2 tests::quarantined_inline",
+            "-p demo --lib -- --exact --include-ignored tests::alpha_test --test-threads 1",
+        ):
+            with self.subTest(command=command):
+                self.assert_accepts(command)
+
+    def test_repeated_skip_patterns_remain_supported(self):
+        # --skip is repeatable: skip alpha/beta but leave gamma executable.
+        # Include identical patterns and every separated/equals ordering.
+        for command in (
+            "-p demo --lib -- --skip alpha_test --skip beta_test",
+            "-p demo --lib -- --skip=alpha_test --skip=beta_test",
+            "-p demo --lib -- --skip alpha_test --skip=beta_test",
+            "-p demo --lib -- --skip=alpha_test --skip beta_test",
+            "-p demo --lib -- --skip=alpha_test --skip alpha_test",
+            "-p demo --lib -- --exact --skip tests::alpha_test --skip=tests::beta_test tests::gamma_other",
+        ):
+            with self.subTest(command=command):
+                self.assert_accepts(command)
+
+    def test_repeated_skips_still_remove_all_matching_tests(self):
+        # Accepting repeatable --skip must still apply every pattern, not
+        # silently keep only the first or last and claim nonempty coverage.
+        for command in (
+            "-p demo --lib -- alpha_test beta_test --skip alpha_test --skip beta_test",
+            "-p demo --lib -- alpha_test beta_test --skip=alpha_test --skip=beta_test",
+            "-p demo --lib -- alpha_test beta_test --skip alpha_test --skip=beta_test",
+            "-p demo --lib -- alpha_test beta_test --skip=alpha_test --skip beta_test",
+        ):
+            with self.subTest(command=command):
+                self.assert_stable(command, "EMPTY_SELECTION")
+
+
 class IgnoredSelectionTests(NoexecAcceptanceBase):
     """Effective selection honors ignore mode; empty executable fails."""
 
