@@ -316,6 +316,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cutover_freeze_drill.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cutover_freeze_drill_observation_acceptance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cutover_freeze_drill_duplicate_key_acceptance.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cutover_freeze_drill_dryrun_acceptance.py' -v
 
       - name: staging E2E run-record template (offline)
         run: |
@@ -324,6 +325,15 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_run_record_no_echo_acceptance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_run_record_condition_shapes.py' -v
 
+      # The bench suites below are also matched by pipeline-benchmark.yml's
+      # wildcard, but that job is evidence-only (not required) and path-gated;
+      # these lines gate the PR.
+      - name: CI tooling input-refusal acceptance (offline)
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_release_sbom_target_shape_refusal_acceptance.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_release_sbom_target_gh_channel_refusal.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_compare_pipeline_bench_argparse_refusal_acceptance.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_compare_pipeline_bench_negative_spellings.py' -v
       - name: SBOM intake refusal acceptance (offline)
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_validate_sbom_intake_refusal_acceptance.py' -v
@@ -2222,6 +2232,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_smoke.py' -v
       - name: Offline smoke cleanup-failure acceptance
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_smoke_cleanup_acceptance.py' -v
+      - name: Offline smoke inspect-shape acceptance
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_smoke_inspect_refusal_acceptance.py' -v
       - name: Offline smoke budget-refusal acceptance
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_smoke_budget_acceptance.py' -v
       - name: Offline smoke fail-paths acceptance
@@ -2672,10 +2684,14 @@ jobs:
       # pins this step with no `if:` (test_required_worker_ci_runs_this_offline_suite).
       - name: Verify staging rollout provenance (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollout.py -v
+      - name: Verify deploy ID format and Deployment record (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_deploy_id.py -v
       - name: Verify staging rollback drill (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollback_drill.py -v
       - name: Verify staging rollback drill duplicate-key refusal (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollback_drill_duplicate_key_acceptance.py -v
+      - name: Verify staging rollback drill dry-run plan (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollback_drill_dryrun_acceptance.py -v
       - name: Verify worker-container rollback (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_worker_container_rollback.py -v
       - name: Verify worker-container rollback duplicate-key refusal (offline fixtures)
@@ -2696,6 +2712,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollback_drill_envelope_duplicate_key_acceptance.py -v
       - name: Verify staging container drill envelope duplicate-key refusal (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_container_drill_envelope_duplicate_key_acceptance.py -v
+      - name: Verify staging container drill dry-run plan (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_container_drill_dryrun_acceptance.py -v
       - name: Verify staging ownership-takeover retry (offline fixtures)
         run: node --test scripts/test-ownership-control.mjs
       - name: Verify production ownership-status retry (offline fixtures)

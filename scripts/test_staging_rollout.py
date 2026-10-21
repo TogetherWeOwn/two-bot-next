@@ -20,6 +20,9 @@ from unittest.mock import MagicMock, Mock, patch
 from urllib.error import HTTPError, URLError
 
 
+# staging_rollout imports its sibling build_identity module; the spec import
+# below does not put the scripts directory on the path by itself.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 spec = importlib.util.spec_from_file_location(
     "staging_rollout", Path(__file__).with_name("staging_rollout.py")
 )
@@ -31,6 +34,7 @@ VERSION = "12345678-1234-4234-8234-123456789abc"
 OLD_VERSION = "87654321-4321-4321-8321-cba987654321"
 REVISION = "a" * 40
 BUILD_ID = "123456-2"
+DEPLOY_ID = "2026.10.21.1+aaaaaaa"
 ACCOUNT = "b" * 32
 NAMESPACE = "c" * 64  # DO namespaces are opaque hex, not Worker-version UUIDs.
 APPLICATION_ID = "app_opaque-123"
@@ -51,6 +55,7 @@ ENVIRONMENT = {
     "GITHUB_SHA": REVISION,
     "GITHUB_RUN_ID": "123456",
     "GITHUB_RUN_ATTEMPT": "2",
+    "DEPLOY_ID": DEPLOY_ID,
     "STAGING_URL": URL,
     "CLOUDFLARE_ACCOUNT_ID": ACCOUNT,
     "CLOUDFLARE_API_TOKEN": SENTINEL,
@@ -122,12 +127,13 @@ def baseline():
     return {
         "started": STARTED, "application_id": APPLICATION_ID,
         "namespace_id": NAMESPACE, "rollout_ids": [OLD_ROLLOUT],
-        "revision": REVISION, "build_id": BUILD_ID,
+        "revision": REVISION, "build_id": BUILD_ID, "deploy_id": DEPLOY_ID,
     }
 
 
 def image_details():
-    return {"revision": REVISION, "build_id": BUILD_ID, "digests": [IMAGE]}
+    return {"revision": REVISION, "build_id": BUILD_ID, "deploy_id": DEPLOY_ID,
+            "digests": [IMAGE]}
 
 
 def completed_row():
@@ -175,7 +181,7 @@ def deployment():
 
 
 def ready_response():
-    body = {"build_revision": REVISION, "build_id": BUILD_ID,
+    body = {"build_revision": REVISION, "build_id": BUILD_ID, "deploy_id": DEPLOY_ID,
             "components": [["database", "ready"], ["gateway", "ready"], ["http", "ready"]]}
     return 200, {"x-two-worker-version": VERSION}, json.dumps(body).encode()
 
@@ -392,16 +398,17 @@ class DeployReceiptTests(OfflineTestCase):
 class ImageReceiptTests(OfflineTestCase):
     def test_exact_repo_tag_digest_revision_and_nonce(self):
         tags = [TAG, "unrelated:latest", REPOSITORY + ":87654321"]
-        self.assertEqual(rollout.image_receipt(tags, image_details(), VERSION, REVISION, BUILD_ID), IMAGE)
+        self.assertEqual(rollout.image_receipt(tags, image_details(), VERSION, REVISION, BUILD_ID, DEPLOY_ID), IMAGE)
 
     def test_stale_image_revision_or_build_nonce(self):
         for key, value in [("revision", "f" * 40), ("build_id", "123456-1"),
-                           ("revision", None), ("build_id", None)]:
+                           ("deploy_id", "2026.10.20.9+aaaaaaa"),
+                           ("revision", None), ("build_id", None), ("deploy_id", None)]:
             with self.subTest(key=key, value=value):
                 details = image_details()
                 details[key] = value
                 self.assert_gate("image_build_mismatch", rollout.image_receipt,
-                                 [TAG], details, VERSION, REVISION, BUILD_ID)
+                                 [TAG], details, VERSION, REVISION, BUILD_ID, DEPLOY_ID)
 
     def test_wrong_repo_exact_tag_and_ambiguous_tags(self):
         for tags in [[], [REPOSITORY + ":87654321"], [TAG + "-extra"],
@@ -410,13 +417,13 @@ class ImageReceiptTests(OfflineTestCase):
                      [TAG, TAG], [TAG, TAG.replace(ACCOUNT, "f" * 32)]]:
             with self.subTest(tags=tags):
                 self.assert_gate("image_tag_missing_or_ambiguous", rollout.image_receipt,
-                                 tags, image_details(), VERSION, REVISION, BUILD_ID)
+                                 tags, image_details(), VERSION, REVISION, BUILD_ID, DEPLOY_ID)
 
     def test_digest_must_match_selected_exact_repository(self):
         details = image_details()
         details["digests"] = [IMAGE.replace(ACCOUNT, "f" * 32)]
         self.assert_gate("image_digest_missing_or_ambiguous", rollout.image_receipt,
-                         [TAG], details, VERSION, REVISION, BUILD_ID)
+                         [TAG], details, VERSION, REVISION, BUILD_ID, DEPLOY_ID)
 
     def test_missing_ambiguous_or_malformed_digest(self):
         for digests in [[], [IMAGE, OLD_IMAGE], [IMAGE, IMAGE], [IMAGE[:-1]],
@@ -426,7 +433,7 @@ class ImageReceiptTests(OfflineTestCase):
                 details = image_details()
                 details["digests"] = digests
                 self.assert_gate("image_digest_missing_or_ambiguous", rollout.image_receipt,
-                                 [TAG], details, VERSION, REVISION, BUILD_ID)
+                                 [TAG], details, VERSION, REVISION, BUILD_ID, DEPLOY_ID)
 
     def test_unknown_digest_schema(self):
         for value in [None, IMAGE, {"digest": IMAGE}]:
@@ -434,13 +441,13 @@ class ImageReceiptTests(OfflineTestCase):
                 details = image_details()
                 details["digests"] = value
                 self.assert_gate("invalid_api_schema", rollout.image_receipt,
-                                 [TAG], details, VERSION, REVISION, BUILD_ID)
+                                 [TAG], details, VERSION, REVISION, BUILD_ID, DEPLOY_ID)
 
     def test_docker_inspects_only_allowlisted_labels_and_digests(self):
         outputs = [subprocess.CompletedProcess([], 0, (TAG + "\n").encode()),
                    subprocess.CompletedProcess([], 0, json.dumps(image_details()).encode())]
         with patch.object(rollout.subprocess, "run", side_effect=outputs) as run:
-            self.assertEqual(rollout.docker_image(VERSION, REVISION, BUILD_ID), IMAGE)
+            self.assertEqual(rollout.docker_image(VERSION, REVISION, BUILD_ID, DEPLOY_ID), IMAGE)
         self.assertEqual(run.call_count, 2)
         inspect = run.call_args_list[1].args[0]
         self.assertEqual(inspect[:4], ["docker", "image", "inspect", TAG])
@@ -454,7 +461,7 @@ class ImageReceiptTests(OfflineTestCase):
     def test_docker_failure_does_not_expose_stderr(self):
         error = subprocess.CalledProcessError(1, ["docker"], output=SENTINEL, stderr=SENTINEL)
         with patch.object(rollout.subprocess, "run", side_effect=error):
-            self.assert_gate("image_inspection_failed", rollout.docker_image, VERSION, REVISION, BUILD_ID)
+            self.assert_gate("image_inspection_failed", rollout.docker_image, VERSION, REVISION, BUILD_ID, DEPLOY_ID)
 
 
 class RolloutSelectionTests(OfflineTestCase):
@@ -669,32 +676,33 @@ class ActiveLagTests(OfflineTestCase):
 
 class RuntimeTests(OfflineTestCase):
     def test_all_components_ready_for_exact_worker_sha_and_build(self):
-        self.assertTrue(rollout.runtime_ready(*ready_response(), VERSION, REVISION, BUILD_ID))
+        self.assertTrue(rollout.runtime_ready(*ready_response(), VERSION, REVISION, BUILD_ID, DEPLOY_ID))
 
     def test_503_and_500_never_pass_even_with_exact_ready_body(self):
         _, headers, body = ready_response()
         for status in [503, 500, 0, 204, 302]:
             with self.subTest(status=status):
-                self.assertFalse(rollout.runtime_ready(status, headers, body, VERSION, REVISION, BUILD_ID))
+                self.assertFalse(rollout.runtime_ready(status, headers, body, VERSION, REVISION, BUILD_ID, DEPLOY_ID))
                 self.assertFalse(rollout.runtime_ready(status, {}, SENTINEL.encode(),
-                                                       VERSION, REVISION, BUILD_ID))
+                                                       VERSION, REVISION, BUILD_ID, DEPLOY_ID))
 
     def test_old_or_missing_serving_worker_fails(self):
         status, _, body = ready_response()
         for headers in [{}, {"x-two-worker-version": OLD_VERSION}]:
             with self.subTest(headers=headers):
                 self.assert_gate("serving_worker_mismatch", rollout.runtime_ready,
-                                 status, headers, body, VERSION, REVISION, BUILD_ID)
+                                 status, headers, body, VERSION, REVISION, BUILD_ID, DEPLOY_ID)
 
     def test_old_sha_or_build_nonce_fails(self):
         status, headers, body = ready_response()
         for key, value in [("build_revision", "f" * 40), ("build_id", "123456-1"),
-                           ("build_revision", None), ("build_id", None)]:
+                           ("deploy_id", "2026.10.20.9+aaaaaaa"),
+                           ("build_revision", None), ("build_id", None), ("deploy_id", None)]:
             with self.subTest(key=key, value=value):
                 report = json.loads(body)
                 report[key] = value
                 self.assert_gate("serving_image_mismatch", rollout.runtime_ready,
-                                 status, headers, json.dumps(report).encode(), VERSION, REVISION, BUILD_ID)
+                                 status, headers, json.dumps(report).encode(), VERSION, REVISION, BUILD_ID, DEPLOY_ID)
 
     def test_empty_unready_or_malformed_components_never_pass(self):
         for components in [[], [["database", "ready"], ["gateway", "warming"]],
@@ -705,16 +713,16 @@ class RuntimeTests(OfflineTestCase):
                 report = json.loads(body)
                 report["components"] = components
                 self.assertFalse(rollout.runtime_ready(status, headers, json.dumps(report).encode(),
-                                                       VERSION, REVISION, BUILD_ID))
+                                                       VERSION, REVISION, BUILD_ID, DEPLOY_ID))
 
     def test_missing_components_and_invalid_json_fail_closed(self):
         status, headers, body = ready_response()
         report = json.loads(body)
         del report["components"]
         self.assert_gate("invalid_api_schema", rollout.runtime_ready,
-                         status, headers, json.dumps(report).encode(), VERSION, REVISION, BUILD_ID)
+                         status, headers, json.dumps(report).encode(), VERSION, REVISION, BUILD_ID, DEPLOY_ID)
         self.assert_gate("invalid_json", rollout.runtime_ready,
-                         status, headers, SENTINEL.encode(), VERSION, REVISION, BUILD_ID)
+                         status, headers, SENTINEL.encode(), VERSION, REVISION, BUILD_ID, DEPLOY_ID)
 
 
 class IdentityAndControlPlaneTests(OfflineTestCase):
@@ -1083,7 +1091,8 @@ class OrchestrationTests(OfflineTestCase):
                 self.assertEqual(container["image"], str(self.root / f"Dockerfile.{suffix}"))
                 self.assertEqual(container["image_build_context"], str(self.root))
         staging = containers[1]
-        self.assertEqual(staging["image_vars"], {"BOT_BUILD_REVISION": REVISION, "BOT_BUILD_ID": BUILD_ID})
+        self.assertEqual(staging["image_vars"], {"BOT_BUILD_REVISION": REVISION, "BOT_BUILD_ID": BUILD_ID,
+                                                     "BOT_DEPLOY_ID": DEPLOY_ID})
         self.assertEqual(staging["rollout_kind"], "full_auto")
         for container in [containers[0], containers[2]]:
             self.assertNotIn("image_vars", container)
@@ -1249,6 +1258,12 @@ class OrchestrationTests(OfflineTestCase):
     def test_prepare_invalid_build_identity_and_wrong_config(self):
         with patch.dict(os.environ, {"GITHUB_SHA": "bad-sha"}):
             self.assert_gate("invalid_build_identity", self.prepare_baseline)
+        for deploy_id in ("bad-id", "2026.10.21.1+fffffff", ""):
+            with self.subTest(deploy_id=deploy_id):
+                # A malformed ID, an ID naming another commit, and a missing
+                # ID all refuse before anything is snapshotted or rendered.
+                with patch.dict(os.environ, {"DEPLOY_ID": deploy_id}):
+                    self.assert_gate("invalid_build_identity", self.prepare_baseline)
         for config, code in [(CONFIG.replace('name = "two-bot-next"', 'name = "other"'),
                               "wrong_staging_config"),
                              (CONFIG.replace('binding = "CF_VERSION_METADATA"', 'binding = "OTHER"'),
@@ -1301,9 +1316,10 @@ class OrchestrationTests(OfflineTestCase):
         self.assertEqual(json.loads(Path(self.args.evidence).read_text()), {
             "worker_version": VERSION, "application_id": APPLICATION_ID,
             "rollout_id": NEW_ROLLOUT, "target_version": 8, "image": IMAGE,
-            "revision": REVISION, "build_id": BUILD_ID, "readyz": 200, "health": 200,
+            "revision": REVISION, "build_id": BUILD_ID, "deploy_id": DEPLOY_ID,
+            "readyz": 200, "health": 200,
         })
-        self.docker.assert_called_once_with(VERSION, REVISION, BUILD_ID)
+        self.docker.assert_called_once_with(VERSION, REVISION, BUILD_ID, DEPLOY_ID)
         self.assertEqual(client.calls, [
             ("api", NAMESPACE_PATH), ("api", APP_PATH), ("api", ROWS_PATH),
             ("api", DETAIL_PATH), ("api", DEPLOYMENTS_PATH), ("request", URL + "/readyz"),
@@ -1329,7 +1345,8 @@ class OrchestrationTests(OfflineTestCase):
         self.assertEqual(json.loads(Path(self.args.evidence).read_text()), {
             "worker_version": VERSION, "application_id": APPLICATION_ID,
             "rollout_id": NEW_ROLLOUT, "target_version": 8, "image": IMAGE,
-            "revision": REVISION, "build_id": BUILD_ID, "readyz": 200, "health": 200,
+            "revision": REVISION, "build_id": BUILD_ID, "deploy_id": DEPLOY_ID,
+            "readyz": 200, "health": 200,
             "active_lag": True,
         })
         self.assertEqual(self.clock.sleeps, [5])
@@ -1497,7 +1514,7 @@ class OrchestrationTests(OfflineTestCase):
         self.prepare_baseline()
         self.write_deploy_output()
         _, headers, _ = ready_response()
-        stuck = {"build_revision": REVISION, "build_id": BUILD_ID,
+        stuck = {"build_revision": REVISION, "build_id": BUILD_ID, "deploy_id": DEPLOY_ID,
                  "components": [["process", "ready"], ["gateway", "starting"],
                                 ["token_invalid", "ready"], ["Bad\nname", "ready"],
                                 ["gateway", SENTINEL], ["x"], "junk"]}
@@ -1540,7 +1557,7 @@ class OrchestrationTests(OfflineTestCase):
         self.assert_no_secret_saved_or_printed()
 
     def readyz_body(self, failure, **extra):
-        body = {"build_revision": REVISION, "build_id": BUILD_ID,
+        body = {"build_revision": REVISION, "build_id": BUILD_ID, "deploy_id": DEPLOY_ID,
                 "components": [["process", "ready"], ["gateway", "down"]], **extra}
         if failure is not None:
             body["gateway_failure"] = failure
@@ -1595,7 +1612,7 @@ class OrchestrationTests(OfflineTestCase):
                 503, {"x-two-worker-version": VERSION},
                 self.readyz_body({"phase": "durable_gateway", "class": "gateway_runtime_failed",
                                   "error": SENTINEL}),
-                VERSION, REVISION, BUILD_ID),
+                VERSION, REVISION, BUILD_ID, DEPLOY_ID),
             "readyz=503 components=process:ready,gateway:down identity=match "
             "gateway_failure=durable_gateway:gateway_runtime_failed")
 
@@ -1628,7 +1645,8 @@ class OrchestrationTests(OfflineTestCase):
         self.write_deploy_output()
         cases = [
             ((503, {"x-two-worker-version": OLD_VERSION},
-              json.dumps({"build_revision": REVISION, "build_id": BUILD_ID}).encode()),
+              json.dumps({"build_revision": REVISION, "build_id": BUILD_ID,
+                            "deploy_id": DEPLOY_ID}).encode()),
              "readyz=503 identity=mismatch"),
             ((503, {"content-type": "application/json"},
               b'{"error":"ownership_fenced","reason":"not_owner"}'),
@@ -1960,7 +1978,7 @@ class OrchestrationTests(OfflineTestCase):
         argv = ["staging_rollout.py", "verify", "--receipt", self.args.receipt,
                 "--output", self.args.output, "--evidence", self.args.evidence]
         _, headers, _ = ready_response()
-        body = json.dumps({"build_revision": REVISION, "build_id": BUILD_ID,
+        body = json.dumps({"build_revision": REVISION, "build_id": BUILD_ID, "deploy_id": DEPLOY_ID,
                            "components": [["process", "ready"], ["gateway", "down"]]}).encode()
         client = verify_client()
         client.request_routes[URL + "/readyz"] = [(503, headers, body)]
@@ -2750,9 +2768,9 @@ class DeepNestingTests(OfflineTestCase):
         for body in (self.deep_array(), self.deep_object()):
             with self.subTest(length=len(body)):
                 self.assert_gate("invalid_json", rollout.runtime_ready,
-                                 status, headers, body, VERSION, REVISION, BUILD_ID)
+                                 status, headers, body, VERSION, REVISION, BUILD_ID, DEPLOY_ID)
                 observed = rollout.runtime_observation(
-                    status, headers, body, VERSION, REVISION, BUILD_ID)
+                    status, headers, body, VERSION, REVISION, BUILD_ID, DEPLOY_ID)
                 self.assertIn("body=unreadable", observed)
                 self.assertNotIn("Traceback", observed)
                 self.assertNotIn("[[[[[", observed)
