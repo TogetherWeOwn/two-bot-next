@@ -96,6 +96,31 @@ class TrackerUnitTests(unittest.TestCase):
         stored = json.loads(Path(evidence).read_text())
         self.assertEqual(stored["verdict"], "unconfigured")
 
+    def test_scrape_sends_named_user_agent(self):
+        # The workers.dev edge 403s urllib's default Python-urllib/x.y UA
+        # (Cloudflare 1010) before the Worker gate runs, so the scrape must
+        # carry an explicit named User-Agent beside the bearer.
+        seen = {}
+        response = mock.MagicMock()
+        response.status = 200
+        response.read.return_value = b"# metrics\n"
+        response.__enter__.return_value = response
+        opener = mock.Mock()
+
+        def capture(request, timeout=None):
+            seen["user_agent"] = request.get_header("User-agent")
+            seen["auth"] = request.get_header("Authorization")
+            return response
+
+        opener.open.side_effect = capture
+        with mock.patch.object(tracker.urllib.request, "build_opener",
+                               return_value=opener):
+            body = tracker.scrape_metrics("https://staging.example", "token")
+        self.assertEqual(body, "# metrics\n")
+        self.assertEqual(seen["user_agent"],
+                         "two-bot-next-slow-burn-tracker/1.0")
+        self.assertEqual(seen["auth"], "Bearer token")
+
     def test_scrape_failure_never_reconciles(self):
         evidence = str(self.dir / "evidence.json")
         env = base_env({"STAGING_WORKER_URL": "https://staging.example",

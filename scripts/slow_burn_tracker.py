@@ -63,6 +63,10 @@ CADENCE_WARN_SECONDS = 600
 # go unfiled and open cards stay unclosed while coverage is gone.
 UNCOVERED_WARN_SECONDS = int(6.5 * 3600)
 MARKER_RE = re.compile(r"<!-- slow-burn-tracker:last-update=([0-9]{1,19}) -->")
+# The workers.dev edge answers urllib's default Python-urllib/x.y UA with
+# HTTP 403 / Cloudflare 1010 before the Worker gate runs, so the scrape
+# names itself (precedent: rollback_readiness_probe.USER_AGENT).
+USER_AGENT = "two-bot-next-slow-burn-tracker/1.0"
 TIMEOUT_SECONDS = 6
 MAX_BODY_BYTES = 64 * 1024
 # Plenty for a six-hour ring or 50 ordinary issue rows. Check UTF-8 bytes,
@@ -113,7 +117,8 @@ def scrape_metrics(origin, token):
         raise TrackError("metrics origin refused: https only")
     url = origin.rstrip("/") + "/ops/metrics"
     request = urllib.request.Request(
-        url, method="GET", headers={"Authorization": f"Bearer {token}"}
+        url, method="GET", headers={"Authorization": f"Bearer {token}",
+                                    "User-Agent": USER_AGENT}
     )
     opener = urllib.request.build_opener(_NoRedirectHandler())
     try:
