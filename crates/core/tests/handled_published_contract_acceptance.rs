@@ -66,10 +66,6 @@ fn every_published_non_voice_command_routes_to_a_handler() {
     let router = InteractionRouter::new(all_gates_on());
     let defs = router.publish_set(&[]).expect("full set assembles");
     let voice = voice_names();
-    assert!(
-        defs.iter().any(|d| d.name == "templateassistant"),
-        "precondition: /templateassistant is published on the pre-fix head"
-    );
     let mut unhandled = Vec::new();
     for def in &defs {
         if voice.contains(&def.name) {

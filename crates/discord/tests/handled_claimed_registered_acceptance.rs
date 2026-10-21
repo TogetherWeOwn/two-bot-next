@@ -5,9 +5,7 @@
 //! 1. Every `route_slash`-reachable [`HandlerId`] is registered on the
 //!    production router (RED: `Rsvp`/`RsvpAttendance`/`ScorecardAttendance`).
 //! 2. Every `Handled` outcome is claimed by exactly one surface (RED: the
-//!    three RSVP outcomes are claimed by zero surfaces while unregistered,
-//!    and `help` is claimed by two: the help arm and the dead owner-map
-//!    entry, which is unreachable because the help arm returns first).
+//!    three RSVP outcomes are claimed by zero surfaces while unregistered).
 //!
 //! Production wiring (`router_with_commands`, `CommandRuntime::build`) is
 //! binary-private, so this file compiles on the baseline through the
@@ -168,11 +166,10 @@ fn ctx(name: &str, custom_row: Option<bool>) -> SlashContext<'_> {
 }
 
 /// Exact mirror of the `on_interaction` owner map (`command_runtime.rs`),
-/// including the member-consumer guards — and the dead `"help"` entry, which
-/// never executes because the help arm returns first.
+/// including the member-consumer guards. No `"help"` entry: the help arm
+/// owns `/help` and returns first, so an owner-map entry could never execute.
 fn owner_map(name: &str, member_present: bool) -> Option<HandlerId> {
     match name {
-        "help" => Some(HandlerId::Help),
         "privacy" => Some(HandlerId::Privacy),
         "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list" => {
             Some(HandlerId::AutomationAdmin)
