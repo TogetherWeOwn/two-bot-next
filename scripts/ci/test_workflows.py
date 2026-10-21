@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import tomllib
 import unittest
+from unittest.mock import patch
 
 import yaml
 
@@ -148,6 +149,117 @@ def load_workflows():
 def runner_allowed(job_id, runs_on):
     # The routing expression must name this job, so one job's switch cannot move another.
     return runs_on == ROUTED_RUNNER.format(job=job_id)
+
+
+def shell_logical_lines(script):
+    """Join backslash continuations so each shell command is one line."""
+    lines, pending = [], ""
+    for raw_line in script.splitlines():
+        stripped = raw_line.strip()
+        pending = f"{pending} {stripped}".strip() if pending else stripped
+        if stripped.endswith("\\"):
+            pending = pending[:-1].strip()
+            continue
+        lines.append(pending)
+        pending = ""
+    if pending:
+        lines.append(pending)
+    return lines
+
+
+# An `#[ignore ...]` line, further attributes or trivia, then the fn it marks.
+# A single regex with a block-comment alternative inside `(?:...)*` backtracks
+# exponentially (CodeQL `py/polynomial-regular-expression-used-on-uncontrolled-data`);
+# scan forward with string ops instead so each byte is visited once.
+IGNORE_MARK = re.compile(r"^[ \t]*#\[ignore\b", re.MULTILINE)
+
+
+def _skip_trivia(text, pos):
+    """Skip whitespace, line/block comments and `#[...]` lines from `pos`."""
+    end = len(text)
+    while pos < end:
+        char = text[pos]
+        if char.isspace():
+            pos += 1
+            continue
+        if text.startswith("//", pos):
+            newline = text.find("\n", pos + 2)
+            if newline == -1:
+                return end
+            pos = newline + 1
+            continue
+        if text.startswith("/*", pos):
+            close = text.find("*/", pos + 2)
+            if close == -1:
+                return end
+            pos = close + 2
+            continue
+        if text.startswith("#[", pos):
+            newline = text.find("\n", pos)
+            if newline == -1:
+                return end
+            pos = newline + 1
+            continue
+        return pos
+    return pos
+
+
+def _match_fn_name(text, pos):
+    """The fn name at `pos`, allowing an `async` prefix on the same line."""
+    end = len(text)
+    if text.startswith("async", pos) and pos + 5 < end and text[pos + 5] in " \t":
+        pos += 5
+        while pos < end and text[pos] in " \t":
+            pos += 1
+    if not text.startswith("fn", pos):
+        return None
+    pos += 2
+    if pos >= end or text[pos] not in " \t":
+        return None
+    while pos < end and text[pos] in " \t":
+        pos += 1
+    if pos >= end or not (text[pos].isalpha() or text[pos] == "_"):
+        return None
+    start = pos
+    pos += 1
+    while pos < end and (text[pos].isalnum() or text[pos] == "_"):
+        pos += 1
+    return text[start:pos]
+
+
+def ignored_test_names(suite):
+    """Find ignored test fns, refusing any ignore mark the scanner cannot map."""
+    [path] = ROOT.glob(f"crates/*/tests/{suite}.rs")
+    text = path.read_text(encoding="utf-8")
+    marks = list(IGNORE_MARK.finditer(text))
+    names = []
+    for mark in marks:
+        line_end = text.find("\n", mark.end())
+        if line_end == -1:
+            continue
+        name = _match_fn_name(text, _skip_trivia(text, line_end + 1))
+        if name is not None:
+            names.append(name)
+    # This is a source-style scanner, not a Rust parser. Unsupported syntax
+    # must fail policy validation, never silently shrink the sweep's skip set.
+    if len(names) != len(marks):
+        raise ValueError(
+            f"{path.name}: discovered {len(names)} of {len(marks)} ignored test functions; "
+            "extend the scanner for the unsupported declaration",
+        )
+    return names
+
+
+def skip_blocks_test(skip, name):
+    """Whether a cargo `--skip` token blocks a bare test fn `name`.
+
+    Cargo matches `--skip` as a substring of the full test path (for
+    example `database::my_test`), but the sweep policy only knows the
+    bare fn name. A module-qualified token never occurs in the bare
+    name, so compare its last `::` segment instead. This over-blocks
+    when the module part would not match, which fails closed.
+    """
+    return skip.rsplit("::", 1)[-1] in name
 
 
 # Staging deploy push filter. Each deploy restarts the bot container and drops the
@@ -3312,18 +3424,7 @@ class WorkflowTests(unittest.TestCase):
         # occurrence mask a flag dropped from another invocation (e.g.
         # --ignore-run-fail removed from either sweep). Join line
         # continuations, then assert flags on each cov_run separately.
-        logical_lines = []
-        pending = ""
-        for raw_line in step["run"].splitlines():
-            stripped = raw_line.strip()
-            pending = f"{pending} {stripped}".strip() if pending else stripped
-            if stripped.endswith("\\"):
-                pending = pending[:-1].strip()
-                continue
-            logical_lines.append(pending)
-            pending = ""
-        if pending:
-            logical_lines.append(pending)
+        logical_lines = shell_logical_lines(step["run"])
         cov_runs = [line for line in logical_lines if line.startswith("cov_run ")]
         # cov_run's failure annotation must go to stderr: the stdout report
         # retry redirects cov_run's stdout into the lcov file.
@@ -3553,6 +3654,189 @@ class WorkflowTests(unittest.TestCase):
         )
         checkout = next(step for step in job["steps"] if step.get("uses", "").startswith("actions/checkout@"))
         self.assertEqual(checkout["with"]["fetch-depth"], "0")
+
+    def test_ignored_test_names_include_intervening_comments_and_blank_lines(self):
+        separators = (
+            "",
+            "\n \t\n",
+            "// first comment\n\n  // second comment\n",
+            "/* block comment\n   on two lines */\n",
+            "/* inline comment */ ",
+            "#[tokio::test]\n\n// between attribute and function\n",
+            "// before attribute\n#[tokio::test]\n/* after attribute */\n\n",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "crates/fixture/tests/discovery.rs"
+            source.parent.mkdir(parents=True)
+            for separator in separators:
+                for prefix in ("", "async "):
+                    with self.subTest(separator=separator, prefix=prefix):
+                        source.write_text(
+                            '#[test]\nfn ordinary_before() {}\n'
+                            '#[ignore = "requires disposable test database"]\n'
+                            + separator + prefix + 'fn selected() {}\n'
+                            '#[test]\nfn ordinary_after() {}\n'
+                            '#[ignore]\nfn other_ignored() {}\n'
+                            'struct NotAFunction;\nfn unrelated() {}\n',
+                            encoding="utf-8",
+                        )
+                        with patch(f"{__name__}.ROOT", root):
+                            self.assertEqual(
+                                ignored_test_names("discovery"), ["selected", "other_ignored"],
+                            )
+
+    def test_ignored_test_names_fail_closed_on_unsupported_forms(self):
+        unsupported = (
+            ("public function", '#[ignore]\npub async fn omitted() {}\n'),
+            ("multiline attribute", '#[ignore]\n#[cfg_attr(\n'
+             '    all(feature = "first", feature = "second"),\n'
+             '    tokio::test\n)]\nasync fn omitted() {}\n'),
+            ("nested block comment", '#[ignore]\n/* outer comment\n'
+             '   /* nested comment */\n*/\nasync fn omitted() {}\n'),
+            ("non-function item", '#[ignore]\nstruct NotAFunction;\nfn unrelated() {}\n'),
+            ("no following function", '#[ignore]\n'),
+            ("no final newline", '#[ignore]'),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "crates/fixture/tests/discovery.rs"
+            source.parent.mkdir(parents=True)
+            for label, declaration in unsupported:
+                with self.subTest(form=label):
+                    source.write_text(
+                        '#[ignore]\nfn discovered() {}\n' + declaration,
+                        encoding="utf-8",
+                    )
+                    with patch(f"{__name__}.ROOT", root):
+                        with self.assertRaisesRegex(
+                            ValueError, r"discovery\.rs: discovered 1 of 2 ignored test functions",
+                        ):
+                            ignored_test_names("discovery")
+
+    def test_patch_coverage_ignored_sweep_skips_tests_that_cannot_pass_there(self):
+        # The ignored sweep tolerates failures, but the flake ledger reads
+        # every FAILED line it prints as a flake. No ignored test in these
+        # suites can pass under its two_bot_test_ci URL, so the sweep skips
+        # each one. Names come from the sources: a new ignored test in one of
+        # these suites fails here until the sweep skips it too.
+        # Exact-URL suites: a fail-closed run elsewhere still executes them.
+        # The stream go-live ledger suite shares the strict agent_test
+        # guard; its dedicated replay below stays fail-closed.
+        refused_suites = (
+            "legacy_tls_fence", "legacy_verify_db", "raid_list_db",
+            "reengagement_list_db", "staging_migrate_db", "internal_events",
+            "mutation_429_proves_no_effect_channel", "stream_live_store",
+        )
+        # Red acceptance suites: the store lane skips every one of them too.
+        red_suites = (
+            "backfill_audit_log", "backfill_bans_invites_onboarding",
+            "backfill_event_users_reactions_pins",
+        )
+        jobs = self.workflows["check.yml"]["jobs"]
+        step = next(
+            step for step in jobs["rust-tests"]["steps"]
+            if step.get("name") == "Patch coverage (HARD, 80% of added lines)"
+        )
+        [sweep] = [
+            line for line in shell_logical_lines(step["run"])
+            if line.startswith("cov_run ") and "--workspace --lib --bins --tests" in line
+            and "-- --ignored" in line
+        ]
+        sweep_skips = re.findall(r"--skip (\S+)", sweep)
+        # Fail-closed command lines only: both tolerated sweeps drop out.
+        runs = [
+            line
+            for job in jobs.values() for candidate in job.get("steps", [])
+            for line in shell_logical_lines(str(candidate.get("run", "")))
+            if "--ignore-run-fail" not in line
+        ]
+        expected = set()
+        for suite in refused_suites:
+            names = ignored_test_names(suite)
+            self.assertTrue(names, suite)
+            expected.update(names)
+            target = re.compile(rf"--test {re.escape(suite)}(?:\s|$)")
+            gates = [
+                re.findall(r"--skip (\S+)", line) for line in runs
+                if target.search(line) and re.search(r"--(?:include-)?ignored\b", line)
+            ]
+            for name in names:
+                with self.subTest(suite=suite, test=name):
+                    self.assertTrue(
+                        any(
+                            not any(skip_blocks_test(skip, name) for skip in skips)
+                            for skips in gates
+                        ),
+                        f"no fail-closed --test {suite} run executes {name}",
+                    )
+        [store_lane] = [line for line in runs if "--test backfill_audit_log" in line]
+        store_skips = re.findall(r"--skip (\S+)", store_lane)
+        for suite in red_suites:
+            names = ignored_test_names(suite)
+            self.assertTrue(names, suite)
+            expected.update(names)
+            for name in names:
+                with self.subTest(suite=suite, test=name):
+                    self.assertIn(name, store_skips)
+        # The internal-events DB test is skipped by its module-qualified
+        # path: the bare function name would also match a same-named test
+        # in any other module swept here. The qualified pin in the
+        # coverage contract above keeps the narrower filter.
+        expected.discard("actions_persist_rows_and_preserve_other_events_and_guilds")
+        expected.add("database::actions_persist_rows_and_preserve_other_events_and_guilds")
+        self.assertEqual(len(sweep_skips), len(set(sweep_skips)))
+        self.assertEqual(set(sweep_skips) - {"regenerate_reference_docs"}, expected)
+
+    def test_fail_closed_gate_sees_qualified_skip_tokens(self):
+        # Cargo matches --skip against the full test path, so a qualified
+        # token on every fail-closed gate must read as blocking even though
+        # the bare fn name never contains the `::` qualifier.
+        name = "actions_persist_rows_and_preserve_other_events_and_guilds"
+        qualified = f"database::{name}"
+        self.assertIn(name, ignored_test_names("internal_events"))
+        self.assertTrue(skip_blocks_test(qualified, name))
+        self.assertTrue(skip_blocks_test(name, name))
+        self.assertFalse(skip_blocks_test("regenerate_reference_docs", name))
+        # The old `skip in name` check missed the qualified form entirely.
+        self.assertNotIn(qualified, name)
+        mutated = deepcopy(self.workflows)
+        jobs = mutated["check.yml"]["jobs"]
+        touched = 0
+        for job in jobs.values():
+            for candidate in job.get("steps", []):
+                run = str(candidate.get("run", ""))
+                if "--test internal_events" not in run:
+                    continue
+                rewritten = []
+                for line in shell_logical_lines(run):
+                    if ("--test internal_events" in line
+                            and "--ignore-run-fail" not in line
+                            and re.search(r"--(?:include-)?ignored\b", line)):
+                        line = f"{line} --skip {qualified}"
+                        touched += 1
+                    rewritten.append(line)
+                candidate["run"] = "\n".join(rewritten)
+        self.assertEqual(touched, 2)
+        runs = [
+            line
+            for job in jobs.values() for candidate in job.get("steps", [])
+            for line in shell_logical_lines(str(candidate.get("run", "")))
+            if "--ignore-run-fail" not in line
+        ]
+        target = re.compile(r"--test internal_events(?:\s|$)")
+        gates = [
+            re.findall(r"--skip (\S+)", line) for line in runs
+            if target.search(line) and re.search(r"--(?:include-)?ignored\b", line)
+        ]
+        self.assertEqual(len(gates), 2)
+        self.assertTrue(all(qualified in skips for skips in gates))
+        self.assertFalse(
+            any(
+                not any(skip_blocks_test(skip, name) for skip in skips)
+                for skips in gates
+            ),
+        )
 
     def test_coverage_replays_strict_agent_test_targets_and_fails_closed(self):
         job = self.workflows["check.yml"]["jobs"]["rust-tests"]

@@ -288,6 +288,9 @@ jobs:
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_staging_voice_synthetic_redirect_refusal.py' -v
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_token_redirect_gate.py' -v
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_slow_burn_tracker_intake_acceptance.py' -v
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_synthetic_alert_duplicate_key_acceptance.py' -v
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_synthetic_alert_history_duplicate_key_acceptance.py' -v
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_slow_burn_tracker_duplicate_key_acceptance.py' -v
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_docker_manifests_no_assert_acceptance.py' -v
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docker_deps_no_assert.py' -v
 
@@ -307,6 +310,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_rollback_readiness_input_limits_acceptance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cutover_freeze_drill.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cutover_freeze_drill_observation_acceptance.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cutover_freeze_drill_duplicate_key_acceptance.py' -v
 
       - name: staging E2E run-record template (offline)
         run: |
@@ -885,6 +889,11 @@ jobs:
           # instead of printing 32 FAILED lines that the flake ledger
           # misattributes as real flakes. The dedicated re-run below stays the
           # fail-closed gate.
+          # Skip every other ignored test that cannot pass in this sweep, for
+          # the same reason. Exact-URL suites refuse its two_bot_test_ci URL
+          # and keep a fail-closed agent_test run (a re-run below or their own
+          # lane). The red backfill acceptance tests are skipped by the store
+          # lane too. test_workflows.py derives both lists from the sources.
           export MEMBER_TESTDB=agent-testdb
           # These fixtures accept only the exact agent_test URL, not the
           # two_bot_test_ci URL on this step; they run in their dedicated sweep
@@ -921,7 +930,22 @@ jobs:
             --skip lockdown_429_preserves_prior_seed_while_releasing_the_lane \
             --skip slowmode_5xx_and_unexpected_statuses_stay_fenced \
             --skip slowmode_timeout_stays_fenced \
-            --skip cancelled_lockdown_stays_fenced_with_seed_retained
+            --skip cancelled_lockdown_stays_fenced_with_seed_retained \
+            --skip audit_log_pagination_limit_1_to_100_before_after_covers_45d_window \
+            --skip audit_log_requests_ride_rate_limit_client_never_direct_rest \
+            --skip audit_cursor_persists_per_window_and_resumes_mid_window \
+            --skip audit_rows_hold_ids_timestamps_enums_only \
+            --skip audit_429_retry_after_pauses_without_losing_place \
+            --skip bans_fetch_applies_blocklist_and_counts_everyone \
+            --skip invite_rows_hold_metadata_only \
+            --skip onboarding_rows_hold_ids_enums_metadata_only \
+            --skip bans_invites_onboarding_resume_continues_from_persisted_cursors \
+            --skip event_users_paginate_through_rate_limit_client_with_max_100 \
+            --skip reaction_users_paginate_through_rate_limit_client \
+            --skip pins_list_through_rate_limit_client_persists_metadata_only \
+            --skip blocklisted_users_skipped_for_per_user_rows_while_aggregates_keep_counting \
+            --skip persisted_rows_hold_ids_timestamps_enums_only \
+            --skip resume_continues_from_persisted_cursors_per_family
           # Guarded channel suites accept the exact agent_test URL and the
           # workspace bootstrap URL (they always connect to agent_test with
           # an isolated schema). The sweep above already runs them green, and
@@ -2171,6 +2195,10 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_smoke.py' -v
       - name: Offline smoke cleanup-failure acceptance
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_smoke_cleanup_acceptance.py' -v
+      - name: Offline smoke fail-paths acceptance
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_smoke_fail_paths_acceptance.py' -v
+      - name: Offline smoke inspect-fields regressions
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_smoke_inspect_fields_regression.py' -v
       - name: Offline JSON-log smoke parser regressions
         run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-logging-container.py --self-test
       # A skipped build still reports success: the offline tests above ran,
@@ -2612,6 +2640,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_worker_container_rollback_listing.py -v
       - name: Verify staging container backout/restore drill (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_container_drill.py -v
+      - name: Verify staging container drill duplicate-key refusal (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_container_drill_duplicate_key_acceptance.py -v
       - name: Verify staging ownership-takeover retry (offline fixtures)
         run: node --test scripts/test-ownership-control.mjs
       - name: Verify staging ownership status read (offline fixtures)
@@ -2630,14 +2660,21 @@ jobs:
       - name: Verify staging voice synthetic (offline fixtures)
         if: needs.job-inputs.outputs.voice != 'false'
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_voice_synthetic.py -v
+      - name: Verify staging voice synthetic gateway intake (offline fixtures)
+        if: needs.job-inputs.outputs.voice != 'false'
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_voice_synthetic_gateway_intake_acceptance.py -v
       - name: Verify staging health-contract probe (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_health_contract_probe.py -v
       - name: Verify staging health-contract build identity (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_health_contract_probe_build_identity_acceptance.py -v
+      - name: Verify staging health-contract duplicate-key refusal (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_health_contract_probe_duplicate_key_acceptance.py -v
       - name: Verify passive production probe (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_prod_passive_probe.py -v
       - name: Verify passive production probe build identity (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_prod_passive_probe_build_identity_acceptance.py -v
+      - name: Verify passive production probe duplicate-key refusal (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_prod_passive_probe_duplicate_key_acceptance.py -v
       - name: Verify synthetic alert delivery (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_synthetic_alert.py -v
       - name: Verify synthetic alert history rollover (offline fixtures)
@@ -2650,6 +2687,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_guild_e2e_prep.py -v
       - name: Verify staging smoke edge-case fixtures (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_edge_cases.py -v
+      - name: Verify staging smoke edge-case honesty (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_edge_cases_smoke_honesty_acceptance.py -v
       - name: Verify staging smoke run (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_smoke_run.py -v
       - name: Verify staging events read (offline fixtures, no database)
