@@ -2885,6 +2885,44 @@ class WorkflowTests(unittest.TestCase):
         # BaseLoader keeps scalars as strings; "60" is the 60-minute limit.
         self.assertEqual(job["timeout-minutes"], "60")
 
+    def test_rust_lane_cargo_cache_entries_are_pinned(self):
+        # The `check` entry is written by `rust-tests` and restored by the two
+        # ignored-db lanes, which rebuild the same non-instrumented graph. The
+        # `patch-coverage` lane builds a unique instrumented graph under
+        # `target/llvm-cov-target` that no other lane produces, so it owns a
+        # separate writable `coverage` entry: restore-only would cold-build the
+        # instrumented dependencies on every run after a cache rotation and
+        # erode the 60-minute ceiling the split exists to protect. Two writers
+        # must never share one entry (no concurrent save race on `check`).
+        jobs = self.workflows["check.yml"]["jobs"]
+        # (shared-key, save-if); BaseLoader keeps scalars as strings.
+        expected = {
+            "check": ("lint", "${{ github.event_name == 'push' }}"),
+            "rust-tests": ("check", "${{ github.event_name == 'push' }}"),
+            "patch-coverage": ("coverage", "${{ github.event_name == 'push' }}"),
+            "ignored-db-stores": ("check", "false"),
+            "ignored-db-runtime": ("check", "false"),
+        }
+        writers = []
+        for job_id, (shared_key, save_if) in expected.items():
+            cache = next(
+                (step for step in jobs[job_id]["steps"]
+                 if step.get("name") == "Restore cargo cache"),
+                None,
+            )
+            with self.subTest(job=job_id):
+                self.assertIsNotNone(cache, "Restore cargo cache step is missing")
+                self.assertEqual(cache["with"]["shared-key"], shared_key)
+                self.assertEqual(cache["with"]["save-if"], save_if)
+            if save_if != "false":
+                writers.append((job_id, shared_key))
+        seen = set()
+        for job_id, shared_key in writers:
+            self.assertNotIn(
+                shared_key, seen,
+                f"{job_id} races another writer on shared-key {shared_key}")
+            seen.add(shared_key)
+
     def test_rust_test_container_pins_disposable_database_service_address(self):
         job = self.workflows["check.yml"]["jobs"]["rust-tests"]
         prerequisites = next(

@@ -718,8 +718,10 @@ jobs:
           PY
 
       # Dependency build cache, saved on pushes to main only. `shared-key: check` keeps
-      # the pre-split entry key so the test-profile dependency cache stays warm; the
-      # three Rust test lanes share this one entry instead of each storing a copy.
+      # the pre-split entry key so the test-profile dependency cache stays warm; this
+      # lane writes it and the two ignored-db lanes restore it (same non-instrumented
+      # graph). `patch-coverage` owns a separate `coverage` entry: its llvm-cov graph
+      # never builds here, so sharing would cold-build every run after a rotation.
       - name: Restore cargo cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -1062,13 +1064,14 @@ jobs:
           print('cpu pressure:', pathlib.Path('/proc/pressure/cpu').read_text().strip())
           PY
 
-      # Restore-only: the entry is written by the `rust-tests` lane.
+      # Own entry: the instrumented llvm-cov graph never builds in `rust-tests`,
+      # so this lane saves its own dependency cache on push events.
       - name: Restore cargo cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: ${{ runner.os }}-cargo
-          shared-key: check
-          save-if: false
+          shared-key: coverage
+          save-if: ${{ github.event_name == 'push' }}
 
       - name: Prepare isolated test databases
         id: prepare_test_databases
