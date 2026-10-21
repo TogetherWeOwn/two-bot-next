@@ -407,7 +407,10 @@ def check_cargo_test(args, root, packages):
                             f"MISSING_VALUE: option {option!r} needs a value but none followed; "
                             f"next: add a value, e.g. `{option} <value>` or `{option}=<value>`")
                 if option == "--test-threads":
-                    if not value.isdigit() or int(value) <= 0:
+                    # ASCII only: str.isdigit is Unicode-aware, but libtest
+                    # parses an ASCII integer (and int() raises on some
+                    # digit-like codepoints instead of returning a count).
+                    if not value.isascii() or not value.isdigit() or int(value) <= 0:
                         raise ValueError(
                             f"INVALID_VALUE: option '--test-threads' needs a positive integer "
                             f"but got {value!r}; next: pass a positive integer like "

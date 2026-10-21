@@ -352,6 +352,17 @@ class AutomatedVerificationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, f"^row: no test matching '{ghost}'"):
                     check_verification("row", WRAPPED + "-p demo " + ghost, self.root)
 
+    def test_thread_counts_must_be_ascii_digits(self):
+        # str.isdigit is Unicode-aware, but libtest parses an ASCII
+        # integer; non-ASCII digits must fail with INVALID_VALUE, never
+        # pass or escape as a bare int() error.
+        for threads in ("٣", "²", "2²"):
+            with self.subTest(threads=threads):
+                with self.assertRaisesRegex(ValueError, "^row: INVALID_VALUE"):
+                    check_verification(
+                        "row", WRAPPED + "-p demo --lib -- --test-threads " + threads,
+                        self.root)
+
 
 class DeltaChecklistTests(unittest.TestCase):
     """Parity §12 additions and §13 non-dropped ledger rows (B4 gate)."""
