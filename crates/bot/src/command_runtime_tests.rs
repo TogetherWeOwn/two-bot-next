@@ -17,6 +17,10 @@
 
 #![cfg(test)]
 
+#[path = "leveling_ack_ordering_acceptance_tests.rs"]
+mod leveling_ack_ordering_acceptance_tests;
+#[path = "leveling_ack_visibility_acceptance_tests.rs"]
+mod leveling_ack_visibility_acceptance_tests;
 #[path = "member_dispatch_authority_acceptance.rs"]
 mod member_dispatch_authority_acceptance;
 
