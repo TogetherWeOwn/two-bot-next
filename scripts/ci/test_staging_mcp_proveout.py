@@ -173,7 +173,7 @@ class AuditContractTests(unittest.TestCase):
                 if tool == "get_audit":
                     envelope.update(audit_reply)
                 elif tool == "no_such_tool":
-                    envelope["error"] = {"code": -32601}
+                    envelope["error"] = {"code": -32601, "message": "unknown tool"}
                 else:
                     envelope["result"] = {"content": []}
             return 200, {}, json.dumps(envelope)
@@ -211,7 +211,7 @@ class AuditContractTests(unittest.TestCase):
             }}), (0, []))
 
     def test_other_audit_errors_still_fail(self):
-        code, failures = self.run_proveout({"error": {"code": -32603}})
+        code, failures = self.run_proveout({"error": {"code": -32603, "message": "x"}})
         self.assertEqual(code, 1)
         self.assertEqual(failures, ["tools/call get_audit: unexpected JSON-RPC error code -32603"])
 
@@ -332,7 +332,8 @@ class HostileBodyTests(unittest.TestCase):
             "content": [], "structuredContent": {
                 "available": True, "rows": [], "truncated": False}}}))
              for offset in range(len(proveout.EXPECTED_TOOLS))] + [
-            (200, {}, '{"jsonrpc":"2.0","id":8,"error":{"code":-32601}}'),
+            (200, {}, '{"jsonrpc":"2.0","id":8,'
+             '"error":{"code":-32601,"message":"unknown tool"}}'),
             (401, {"www-authenticate": "Bearer"}, "{}"),
             (401, {"www-authenticate": "Bearer"}, "{}"),
         ]
@@ -378,7 +379,8 @@ class HostileBodyTests(unittest.TestCase):
         # Corroborated fence: bound -32000 envelopes plus the explicit
         # dispatcher expectation still pass.
         overrides = {i: (200, {}, json.dumps(
-            {"jsonrpc": "2.0", "id": i + 1, "error": {"code": -32000}}))
+            {"jsonrpc": "2.0", "id": i + 1, "error": {
+                "code": -32000, "message": "container request failed"}}))
             for i in (2, 3, 4)}
         with mock.patch.dict(os.environ, {proveout.EXPECT_FENCE_ENV: "1"}):
             code, _, artifact, _ = self.run_main(overrides)
@@ -432,6 +434,77 @@ class HostileBodyTests(unittest.TestCase):
                     self.assert_shape_failure(index, json.dumps({
                         "jsonrpc": "2.0", "id": index + 1,
                         "error": {"code": code}}))
+
+    def test_non_200_authenticated_replies_name_the_http_status(self):
+        # One case per authenticated stage family: transport and credential
+        # failures must report the HTTP status, never an envelope code.
+        transports = [
+            (401, {}, "unauthorized"),
+            (503, {}, "<html>busy</html>"),
+            (None, {}, "network-error"),
+        ]
+        for index in (0, 1, 2, 7):
+            for status, headers, body in transports:
+                with self.subTest(stage=self.PROBES[index], status=status):
+                    code, _stdout, artifact, _raw = self.run_main({
+                        index: (status, headers, body)})
+                    self.assertEqual(code, 1)
+                    self.assertEqual(len(artifact["failures"]), 1)
+                    failure = artifact["failures"][0]
+                    self.assertTrue(
+                        failure.startswith(self.PROBES[index] + ":"))
+                    self.assertIn(f"HTTP {status}", failure)
+                    self.assertNotIn("ENVELOPE", failure)
+                    self.assertEqual(
+                        artifact["proof_disposition"], "failed")
+
+    def test_error_without_string_message_fails_framing(self):
+        errors = [
+            {"code": -32601},
+            {"code": -32601, "message": None},
+            {"code": -32601, "message": 123},
+            {"code": -32601, "message": True},
+            {"code": -32601, "message": ["x"]},
+        ]
+        for index in (0, 2, 7):
+            for error in errors:
+                with self.subTest(stage=self.PROBES[index], error=error):
+                    code, _stdout, artifact, _raw = self.run_main({
+                        index: (200, {}, json.dumps({
+                            "jsonrpc": "2.0", "id": index + 1,
+                            "error": error}))})
+                    self.assertEqual(code, 1)
+                    self.assertEqual(len(artifact["failures"]), 1)
+                    self.assertIn("[ENVELOPE_FRAMING]", artifact["failures"][0])
+
+    def test_message_less_32000_is_not_a_corroborated_fence(self):
+        body = json.dumps({"jsonrpc": "2.0", "id": 3, "error": {"code": -32000}})
+        with mock.patch.dict(os.environ, {proveout.EXPECT_FENCE_ENV: "1"}):
+            code, _stdout, artifact, _raw = self.run_main({2: (200, {}, body)})
+        self.assertEqual(code, 1)
+        self.assertEqual(len(artifact["failures"]), 1)
+        self.assertIn("[ENVELOPE_FRAMING]", artifact["failures"][0])
+
+    def test_non_boolean_is_error_fails_content(self):
+        for is_error in (1, "true", "false", 0):
+            with self.subTest(isError=is_error):
+                code, _stdout, artifact, _raw = self.run_main({
+                    2: (200, {}, json.dumps({
+                        "jsonrpc": "2.0", "id": 3, "result": {
+                            "content": [{"type": "text", "text": "ok"}],
+                            "isError": is_error}}))})
+                self.assertEqual(code, 1)
+                self.assertEqual(len(artifact["failures"]), 1)
+                self.assertIn("[CONTENT_INVALID]", artifact["failures"][0])
+
+    def test_explicit_is_error_false_still_passes(self):
+        code, _stdout, artifact, _raw = self.run_main({
+            2: (200, {}, json.dumps({
+                "jsonrpc": "2.0", "id": 3, "result": {
+                    "content": [{"type": "text", "text": "ok"}],
+                    "isError": False}}))})
+        self.assertEqual(code, 0)
+        self.assertEqual(artifact["failures"], [])
 
     def test_wrong_typed_audit_structured_content_is_shape_failure(self):
         for structured in (["x"], "x", True, 1):

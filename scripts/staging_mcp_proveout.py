@@ -286,7 +286,8 @@ def envelope_failure(stage, shape, parsed, rpc_id):
     Checks, in order: the reply is a JSON-RPC 2.0 object, its numeric id
     matches the request exactly, and it carries exactly one well-formed
     result or error (explicit null members count as absent, so error:null
-    alongside a valid result stays success). `shape` names the stage's
+    alongside a valid result stays success; a well-formed error is a dict
+    with an integer code and a string message). `shape` names the stage's
     expected payload so the failure stays actionable. Failures carry the
     stage id, a fixed reason code and a next action, and never echo remote
     bytes or the bearer.
@@ -309,7 +310,8 @@ def envelope_failure(stage, shape, parsed, rpc_id):
     error = parsed.get("error")
     if has_result == has_error or (
             has_error and (not isinstance(error, dict)
-                           or jsonrpc_code(error) is None)):
+                           or jsonrpc_code(error) is None
+                           or not isinstance(error.get("message"), str))):
         return (f"{stage}: expected exactly one well-formed result or "
                 f"error for {shape} [ENVELOPE_FRAMING] next: verify the "
                 f"reply carries exactly one well-formed result or error")
@@ -321,13 +323,17 @@ def tool_content_failure(stage, result):
 
     Content must be a list of blocks (empty allowed; each non-empty entry
     a dict with a string type), and an explicit isError:true always fails,
-    even with otherwise valid content.
+    even with otherwise valid content. isError is an optional boolean, so
+    a present non-boolean value (1, "true", ...) is malformed too; an
+    explicit null counts as absent, matching the envelope rule.
     """
     if not isinstance(result, dict):
         return (f"{stage}: expected result.content as a list of typed "
                 f"blocks [CONTENT_INVALID] next: verify the tool result "
                 f"carries a content block list without isError")
-    if result.get("isError") is True:
+    is_error = result.get("isError")
+    if is_error is True or (is_error is not None
+                            and not isinstance(is_error, bool)):
         return (f"{stage}: tool result reports isError [CONTENT_INVALID] "
                 f"next: verify the tool result carries a content block "
                 f"list without isError")
@@ -432,11 +438,14 @@ def main():
     status, headers, body = fetch("initialize", redacted_request_line("initialize", rpc_id, '"params":{...}'), payload, token)
     if body is not None:
         _valid_json, parsed = load_bounded_json(body)
-        failure = envelope_failure("initialize", "result.protocolVersion", parsed, rpc_id)
+        if status != 200:
+            failure = f"initialize: expected HTTP 200, got HTTP {status}"
+        else:
+            failure = envelope_failure("initialize", "result.protocolVersion", parsed, rpc_id)
         if failure is None:
             result = parsed.get("result")
-            if status != 200 or not isinstance(result, dict) or not result.get("protocolVersion"):
-                failure = "initialize: expected HTTP 200 with result.protocolVersion"
+            if not isinstance(result, dict) or not result.get("protocolVersion"):
+                failure = "initialize: expected result.protocolVersion"
         if failure is not None:
             failures.append(failure)
     rpc_id += 1
@@ -446,7 +455,10 @@ def main():
     status, headers, body = fetch("tools/list", redacted_request_line("tools/list", rpc_id), payload, token)
     if body is not None:
         _valid_json, parsed = load_bounded_json(body)
-        failure = envelope_failure("tools/list", "result.tools", parsed, rpc_id)
+        if status != 200:
+            failure = f"tools/list: expected HTTP 200, got HTTP {status}"
+        else:
+            failure = envelope_failure("tools/list", "result.tools", parsed, rpc_id)
         if failure is None:
             result = parsed.get("result")
             tools = result.get("tools") if isinstance(result, dict) else None
@@ -454,7 +466,7 @@ def main():
             if isinstance(tools, list) and all(
                     isinstance(t, dict) and isinstance(t.get("name"), str) for t in tools):
                 names = sorted(t["name"] for t in tools)
-            if status != 200 or names != sorted(EXPECTED_TOOLS):
+            if names != sorted(EXPECTED_TOOLS):
                 failure = (
                     "tools/list: expected exactly "
                     f"{','.join(sorted(EXPECTED_TOOLS))}, got unexpected tool names"
@@ -482,12 +494,14 @@ def main():
             continue
         _valid_json, parsed = load_bounded_json(body)
         stage = f"tools/call {tool}"
-        failure = envelope_failure(stage, "result.content", parsed, rpc_id)
+        if status != 200:
+            failure = f"{stage}: expected HTTP 200, got HTTP {status}"
+        else:
+            failure = envelope_failure(stage, "result.content", parsed, rpc_id)
         if failure is None:
-            if status != 200:
-                failure = f"{stage}: expected HTTP 200 JSON-RPC envelope"
-            elif "error" in parsed and parsed["error"] is not None:
-                # The envelope check above guarantees a dict with an int code.
+            if "error" in parsed and parsed["error"] is not None:
+                # The envelope check above guarantees a dict with an int
+                # code and a string message.
                 code = jsonrpc_code(parsed["error"])
                 if tool in CONTAINER_BACKED and code == -32000:
                     if expect_fence:
@@ -526,12 +540,15 @@ def main():
     )
     if body is not None:
         _valid_json, parsed = load_bounded_json(body)
-        failure = envelope_failure("tools/call unknown", "error -32601", parsed, rpc_id)
+        if status != 200:
+            failure = f"tools/call unknown: expected HTTP 200, got HTTP {status}"
+        else:
+            failure = envelope_failure("tools/call unknown", "error -32601", parsed, rpc_id)
         if failure is None:
             err = parsed.get("error")
             err = err if isinstance(err, dict) else {}
             code = jsonrpc_code(err)
-            if status != 200 or code != -32601:
+            if code != -32601:
                 failure = (
                     "tools/call unknown: expected JSON-RPC -32601, "
                     f"got HTTP {status}, JSON-RPC code {code}"
