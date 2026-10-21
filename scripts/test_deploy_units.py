@@ -110,6 +110,9 @@ def effective_onfailure(unit_lines):
     return effective
 
 
+ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
 def effective_environment(service_lines):
     """(values, invalid) honouring empty resets, quoting and last-wins (systemd.exec)."""
     values = {}
@@ -117,6 +120,9 @@ def effective_environment(service_lines):
         if rest == "":
             values.clear()
             continue
+        if "\\" in rest:
+            # systemd C-unescapes Environment= (\x53 is S); shlex cannot model that, so fail closed.
+            return values, True
         try:
             assignments = shlex.split(rest)
         except ValueError:
@@ -128,7 +134,7 @@ def effective_environment(service_lines):
             if "=" not in assignment:
                 return values, True
             var, val = assignment.split("=", 1)
-            if not var:
+            if not ENV_NAME.fullmatch(var):
                 return values, True
             values[var] = val
     return values, False
@@ -323,6 +329,17 @@ class UnitLintTests(unittest.TestCase):
         path.write_text(text.replace(
             anchor, anchor + 'Environment="TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S=999999999"\n', 1))
         self.assertTrue(any(f.startswith(DRILL + ":") for f in lint(tmp)), lint(tmp))
+
+    def test_escaped_environment_names_cannot_hide_an_override(self):
+        anchor = "Environment=TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S=172800\n"
+        name = "TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_"
+        for forged in [name + "\\x53", name + "\\123", name + "S ", "1" + name + "S"]:
+            tmp = self.copy_deploy()
+            path = tmp / DRILL
+            text = path.read_text()
+            path.write_text(text.replace(
+                anchor, anchor + 'Environment="' + forged + '=999999999"\n', 1))
+            self.assertTrue(any(f.startswith(DRILL + ":") for f in lint(tmp)), (forged, lint(tmp)))
 
     def test_misplaced_directive_is_refused(self):
         tmp = self.copy_deploy()
