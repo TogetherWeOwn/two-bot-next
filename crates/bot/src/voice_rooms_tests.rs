@@ -7,8 +7,12 @@ use std::sync::Mutex;
 mod admission_config_acceptance;
 #[path = "voice_admission_spawn_tests.rs"]
 mod admission_spawn;
+#[path = "voice_boot_settings_acceptance_tests.rs"]
+mod boot_settings_acceptance;
 #[path = "voice_cold_authority_tests.rs"]
 mod cold_authority;
+#[path = "voice_creation_receipt_acceptance_tests.rs"]
+mod creation_receipt_acceptance;
 #[path = "voice_delete_guard_tests.rs"]
 mod delete_guards;
 #[path = "voice_empty_grace_override_tests.rs"]
@@ -19,6 +23,8 @@ mod invite_override;
 mod invite_responder_wiring;
 #[path = "voice_join_requests_tests.rs"]
 mod join;
+#[path = "voice_join_grant_witness_acceptance_tests.rs"]
+mod join_grant_witness_acceptance;
 #[path = "voice_kick_tests.rs"]
 mod kick;
 #[path = "voice_rooms_limit_tests.rs"]
@@ -31,8 +37,12 @@ mod name_filter_acceptance;
 mod name_rerender;
 #[path = "voice_private_runtime_tests.rs"]
 mod private;
+#[path = "voice_responder_admission_acceptance_tests.rs"]
+mod responder_admission_acceptance;
 #[path = "voice_rooms_sink_tests.rs"]
 mod sink;
+#[path = "voice_snapshot_fence_acceptance_tests.rs"]
+mod snapshot_fence_acceptance;
 #[path = "../../core/tests/support/tracing_capture.rs"]
 mod tracing_capture;
 
@@ -168,6 +178,7 @@ struct Store {
     save_privacy_errors: Mutex<VecDeque<StoreError>>,
     /// Durable approved Connect grants, keyed by room then member.
     join_grants: Mutex<BTreeMap<u64, BTreeSet<u64>>>,
+    join_grants_errors: Mutex<VecDeque<StoreError>>,
     save_join_grant_errors: Mutex<VecDeque<StoreError>>,
     remove_join_grant_errors: Mutex<VecDeque<StoreError>>,
     add_creator_error: Mutex<Option<StoreError>>,
@@ -245,6 +256,7 @@ impl Store {
             privacy: Mutex::new(BTreeMap::new()),
             save_privacy_errors: Mutex::new(VecDeque::new()),
             join_grants: Mutex::new(BTreeMap::new()),
+            join_grants_errors: Mutex::new(VecDeque::new()),
             save_join_grant_errors: Mutex::new(VecDeque::new()),
             remove_join_grant_errors: Mutex::new(VecDeque::new()),
             add_creator_error: Mutex::new(None),
@@ -702,9 +714,17 @@ impl RoomPersistence for Store {
         Ok(true)
     }
     async fn join_grants(&self, _: u64) -> Result<BTreeMap<u64, BTreeSet<u64>>, StoreError> {
+        if let Some(error) = self.join_grants_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
         Ok(self.join_grants.lock().unwrap().clone())
     }
-    async fn save_join_grant(&self, _: u64, room: u64, member: u64) -> Result<bool, StoreError> {
+    async fn save_join_grant(
+        &self,
+        _: u64,
+        room: u64,
+        member: u64,
+    ) -> Result<JoinGrantIntent, StoreError> {
         self.trace
             .lock()
             .unwrap()
@@ -713,15 +733,20 @@ impl RoomPersistence for Store {
             return Err(error);
         }
         if !self.rooms.lock().unwrap().contains_key(&room) {
-            return Ok(false);
+            return Ok(JoinGrantIntent::RoomMissing);
         }
-        self.join_grants
+        let inserted = self
+            .join_grants
             .lock()
             .unwrap()
             .entry(room)
             .or_default()
             .insert(member);
-        Ok(true)
+        Ok(if inserted {
+            JoinGrantIntent::Fresh
+        } else {
+            JoinGrantIntent::Retained
+        })
     }
     async fn remove_join_grant(&self, _: u64, room: u64, member: u64) -> Result<(), StoreError> {
         self.trace
@@ -785,6 +810,8 @@ struct Http {
     written_overwrites: Mutex<Vec<(u64, PermissionOverwrite)>>,
     notices: Mutex<Vec<(NoticeTarget, String, Option<u64>)>>,
     refused_notices: Mutex<Vec<NoticeTarget>>,
+    /// Notice targets answering a per-route 429 instead of a refusal.
+    rate_limited_notices: Mutex<Vec<NoticeTarget>>,
     /// V3 join-request prompts posted in a room's chat, and the scripted
     /// errors (one per attempt) the next sends fail with.
     prompts: Mutex<Vec<SentPrompt>>,
@@ -849,6 +876,7 @@ impl Http {
             written_overwrites: Mutex::new(Vec::new()),
             notices: Mutex::new(Vec::new()),
             refused_notices: Mutex::new(Vec::new()),
+            rate_limited_notices: Mutex::new(Vec::new()),
             prompts: Mutex::new(Vec::new()),
             prompt_errors: Mutex::new(VecDeque::new()),
             next_message: Mutex::new(9_000),
@@ -1311,6 +1339,12 @@ impl RoomWrites for Http {
         content: &str,
         mention_role: Option<u64>,
     ) -> Result<(), RoomHttpError> {
+        if self.rate_limited_notices.lock().unwrap().contains(&target) {
+            return Err(RoomHttpError::RateLimited {
+                retry_after_ms: 1_000,
+                global: false,
+            });
+        }
         if self.refused_notices.lock().unwrap().contains(&target) {
             return Err(RoomHttpError::AccessDenied);
         }
@@ -10232,6 +10266,15 @@ fn applied(trace: &Trace) -> bool {
         .any(|entry| entry == "config_apply")
 }
 
+fn applied_count(trace: &Trace) -> usize {
+    trace
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry.as_str() == "config_apply")
+        .count()
+}
+
 #[test]
 fn parse_export_and_import_attachment_option() {
     let export = with_user(
@@ -10542,6 +10585,58 @@ async fn import_confirm_applies() {
     assert!(response_text(&response.expect("applied")).starts_with("Import applied:"));
     assert_eq!(*shared.lock().unwrap(), full_config());
     assert!(applied(&trace));
+}
+
+/// `/setup` then `/import` confirm round-trip through constructed interactions.
+///
+/// An admin reads the status panel, uploads a configuration file, previews
+/// the diff, and confirms: the stored configuration equals the upload and
+/// the apply lands exactly once, with the panel still answering after.
+/// Drives the real `handle_voice_interaction_with` arms with constructed
+/// slash and component inputs; no guild, network, or database.
+#[tokio::test]
+async fn setup_then_import_confirm_round_trip_through_interactions() {
+    let trace = Trace::default();
+    let bytes = serde_json::to_vec(&full_config()).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    // Baseline: /setup answers the admin panel before the import.
+    let setup = with_user(
+        voice_interaction(Some(command_data("setup", Vec::new())), manager(), true),
+        UPLOADER,
+    );
+    let (owned, panel) = handle_import_capture(&runtime, &setup, Some(&inventory)).await;
+    assert!(owned, "voice owns the /setup callback");
+    assert!(!response_text(&panel.expect("setup panel")).is_empty());
+
+    // Upload: /import previews the diff with confirm/cancel buttons.
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (owned, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    assert!(owned, "voice owns the /import callback");
+    let preview = preview.expect("preview");
+    assert!(!applied(&trace), "preview writes nothing");
+    let (confirm_id, _) = preview_buttons(&preview);
+
+    // Confirm: the component press applies the upload exactly once.
+    let confirm = component_interaction(&confirm_id, manager(), UPLOADER);
+    let (owned, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(owned, "voice owns the confirm callback");
+    assert!(response_text(&response.expect("applied")).starts_with("Import applied:"));
+    assert_eq!(*shared.lock().unwrap(), full_config());
+    assert_eq!(applied_count(&trace), 1, "one apply per confirm");
+
+    // Replay: pressing Confirm again expires instead of applying twice.
+    let (owned, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(owned, "voice owns the replayed confirm callback");
+    let replayed = response_text(&response.expect("expired replay"));
+    assert!(replayed.contains("expired"), "{replayed}");
+    assert_eq!(applied_count(&trace), 1, "no second apply");
+    assert_eq!(*shared.lock().unwrap(), full_config());
+
+    // The panel still answers with content after the import lands.
+    let (owned, panel) = handle_import_capture(&runtime, &setup, Some(&inventory)).await;
+    assert!(owned, "voice still owns /setup after the import");
+    assert!(!response_text(&panel.expect("post-import panel")).is_empty());
 }
 
 #[tokio::test]
@@ -11173,6 +11268,77 @@ async fn notices_fall_back_from_system_channel_to_owner_dm_to_creator_chat() {
 }
 
 #[tokio::test]
+async fn configured_channel_failure_warns_then_falls_back() {
+    let settings = LoggingSettings {
+        channel_id: Some(650),
+        mention_role_id: Some(NOTICE_ROLE),
+        ..LoggingSettings::default()
+    };
+    let mut worker = failed_worker(settings, Some(SYSTEM_CHANNEL)).await;
+
+    // A working configured channel stays silent: no fallback warn.
+    let global = tracing_capture::global();
+    let before = global.text().len();
+    assert!(worker.send_notices(0).await);
+    assert_eq!(sent(&worker)[0].0, NoticeTarget::Channel(650));
+    let quiet = global.text()[before..].to_owned();
+    assert!(
+        !quiet.contains("voice notice configured channel failed; trying fallback"),
+        "success stays silent: {quiet}"
+    );
+
+    // A rate limit is a retry, not a misconfiguration: the fallback still
+    // delivers and no warn fires. Kept in this test because the capture is
+    // process-wide and only this test emits the warn, so a sibling's line
+    // cannot land in these silent windows.
+    worker
+        .http
+        .rate_limited_notices
+        .lock()
+        .unwrap()
+        .push(NoticeTarget::Channel(650));
+    let before = global.text().len();
+    assert!(worker.send_notices(NOTICE_REPEAT_INTERVAL_MS).await);
+    let notices = sent(&worker);
+    assert_eq!(notices.len(), 2);
+    assert_eq!(notices[1].0, NoticeTarget::Channel(SYSTEM_CHANNEL));
+    let throttled = global.text()[before..].to_owned();
+    assert!(
+        !throttled.contains("voice notice configured channel failed; trying fallback"),
+        "a rate limit stays silent: {throttled}"
+    );
+
+    // A failing configured channel warns once, then the fallback delivers
+    // with the mention intact.
+    worker.http.rate_limited_notices.lock().unwrap().clear();
+    worker
+        .http
+        .refused_notices
+        .lock()
+        .unwrap()
+        .push(NoticeTarget::Channel(650));
+    let before = global.text().len();
+    assert!(worker.send_notices(2 * NOTICE_REPEAT_INTERVAL_MS).await);
+    let notices = sent(&worker);
+    assert_eq!(notices.len(), 3);
+    assert_eq!(notices[2].0, NoticeTarget::Channel(SYSTEM_CHANNEL));
+    assert_eq!(notices[2].2, Some(NOTICE_ROLE));
+    let logged = global.text()[before..].to_owned();
+    let line = logged
+        .lines()
+        .find(|line| line.contains("voice notice configured channel failed; trying fallback"))
+        .expect("a configured-channel failure warns before falling back");
+    assert!(line.starts_with("WARN "), "{line}");
+    assert!(line.contains(&format!("guild=\"{GUILD}\"")), "{line}");
+    assert!(line.contains("op=\"send_notice\""), "{line}");
+    assert!(line.contains("outcome=\"discord\""), "{line}");
+    assert!(
+        !line.contains("/setup"),
+        "the warn carries no notice text: {line}"
+    );
+}
+
+#[tokio::test]
 async fn no_system_channel_goes_straight_to_the_owner_dm() {
     let mut worker = failed_worker(LoggingSettings::default(), None).await;
     assert!(worker.send_notices(0).await);
@@ -11570,6 +11736,132 @@ async fn sink_never_answers_kick_without_the_router() {
         "no callback, got {calls:?}"
     );
     assert!(replies.completed.lock().unwrap().is_empty());
+}
+
+/// Every ballot button's custom ID plus its disabled state, in render order.
+fn ballot_button_states(response: &InteractionResponse) -> Vec<(String, bool)> {
+    let mut states = Vec::new();
+    let Some(data) = response.data.as_ref() else {
+        return states;
+    };
+    let Some(components) = data.components.as_ref() else {
+        return states;
+    };
+    for component in components {
+        let Component::ActionRow(row) = component else {
+            continue;
+        };
+        for inner in &row.components {
+            let Component::Button(button) = inner else {
+                continue;
+            };
+            states.push((
+                button.custom_id.clone().unwrap_or_default(),
+                button.disabled,
+            ));
+        }
+    }
+    states
+}
+
+/// Vote-kick open/vote/close round-trip through constructed interactions.
+///
+/// Drives the real `handle_voice_interaction` arms with a `/kick` slash
+/// command followed by Yes-ballot component presses: the open renders the
+/// public ballot, the second Yes reaches strict majority (2/3) and closes
+/// the vote Passed with disabled buttons, and a further ballot replays the
+/// terminal Passed instead of reopening. The queued room-scoped
+/// deny/disconnect enforcement is pinned at worker level by
+/// `strict_majority_passes_and_enforces_on_that_room_only`; no guild,
+/// network, or database here.
+#[tokio::test]
+async fn vote_kick_open_vote_close_round_trip_through_interactions() {
+    const VOTER_B: u64 = 302;
+    const VOTER_C: u64 = 304;
+    let trace = Trace::default();
+    let runtime = kick_room_runtime(
+        &trace,
+        true,
+        vec![
+            voice_member_in(KICK_VOTER, KICK_ROOM),
+            voice_member_in(VOTER_B, KICK_ROOM),
+            voice_member_in(KICK_TARGET, KICK_ROOM),
+            voice_member_in(VOTER_C, KICK_ROOM),
+        ],
+    );
+
+    // Open: /kick from an occupant renders the public ballot.
+    let open = kick_sink_interaction(KICK_TARGET, KICK_VOTER);
+    let vote_id = open.id.get();
+    let (owned, ballot) = handle_capture(&runtime, &open).await;
+    assert!(owned, "voice owns the /kick callback");
+    let ballot = ballot.expect("ballot reply");
+    assert_eq!(
+        ballot.kind,
+        InteractionResponseType::ChannelMessageWithSource
+    );
+    let content = response_text(&ballot);
+    assert!(content.contains("<@303>"), "{content}");
+    assert!(content.contains("too loud"), "{content}");
+    assert!(content.contains("2/3 needed"), "{content}");
+    assert_eq!(
+        ballot_button_states(&ballot),
+        vec![
+            (vote_button_id(vote_id, VoteBallot::Yes), false),
+            (vote_button_id(vote_id, VoteBallot::No), false),
+        ]
+    );
+
+    // First Yes: still active, buttons live.
+    let first = component_interaction(&vote_button_id(vote_id, VoteBallot::Yes), None, KICK_VOTER);
+    let (owned, response) = handle_capture(&runtime, &first).await;
+    assert!(owned, "voice owns the ballot callback");
+    let response = response.expect("first ballot update");
+    assert_eq!(response.kind, InteractionResponseType::UpdateMessage);
+    let content = response_text(&response);
+    assert!(content.contains("2/3 needed"), "{content}");
+    assert_eq!(
+        ballot_button_states(&response),
+        vec![
+            (vote_button_id(vote_id, VoteBallot::Yes), false),
+            (vote_button_id(vote_id, VoteBallot::No), false),
+        ],
+        "active ballot keeps both live buttons"
+    );
+
+    // Second Yes: strict majority closes the vote Passed, buttons disabled.
+    let second = component_interaction(&vote_button_id(vote_id, VoteBallot::Yes), None, VOTER_B);
+    let (owned, response) = handle_capture(&runtime, &second).await;
+    assert!(owned, "voice owns the closing ballot callback");
+    let response = response.expect("closing ballot update");
+    assert_eq!(response.kind, InteractionResponseType::UpdateMessage);
+    let content = response_text(&response);
+    assert!(content.contains("Vote passed"), "{content}");
+    assert_eq!(
+        ballot_button_states(&response),
+        vec![
+            (vote_button_id(vote_id, VoteBallot::Yes), true),
+            (vote_button_id(vote_id, VoteBallot::No), true),
+        ],
+        "closed ballot keeps both buttons, disabled"
+    );
+
+    // Replay: a further ballot stays terminal instead of reopening.
+    let replay = component_interaction(&vote_button_id(vote_id, VoteBallot::Yes), None, VOTER_C);
+    let (owned, response) = handle_capture(&runtime, &replay).await;
+    assert!(owned, "voice owns the replay ballot callback");
+    let response = response.expect("replay update");
+    assert_eq!(response.kind, InteractionResponseType::UpdateMessage);
+    let content = response_text(&response);
+    assert!(content.contains("Vote passed"), "{content}");
+    assert_eq!(
+        ballot_button_states(&response),
+        vec![
+            (vote_button_id(vote_id, VoteBallot::Yes), true),
+            (vote_button_id(vote_id, VoteBallot::No), true),
+        ],
+        "replay keeps the closed Passed shell"
+    );
 }
 
 // ---- lifecycle-outcome signals (offline cutover verification) ----

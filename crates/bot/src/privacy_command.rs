@@ -47,7 +47,7 @@ const GUILD_ONLY_REPLY: &str = "This command only works in a server.";
 
 const UNKNOWN_MEMBER_REPLY: &str = "Could not identify you for this server; try again.";
 
-const USAGE_REPLY: &str = "Use `/privacy opt-out`, `/privacy opt-in` or `/privacy status`.";
+const USAGE_REPLY: &str = "Use `/privacy opt-out`, `/privacy opt-in`, `/privacy status`, `/privacy delete`, `/privacy deletion-status`, or `/privacy deletion-receipt`.";
 
 /// Purge cooldown for member self-serve: a pair with a purge receipt younger
 /// than this window gets the cooldown reply instead of a fresh locking
@@ -82,13 +82,14 @@ pub(crate) enum PrivacyAction {
     OptOut,
     OptIn,
     Status,
+    DeletionRequest,
+    DeletionStatus,
+    DeletionReceipt,
     Invalid,
 }
 
-/// Decode the invoked subcommand: the first option names it
-/// (`opt-out` / `opt-in` / `status`). Anything else — missing options, a
-/// non-subcommand value, an unknown name — is `Invalid` and refuses before
-/// any database access.
+/// Decode the invoked subcommand. Anything missing or unknown refuses before
+/// database access.
 pub(crate) fn privacy_action(interaction: &Interaction) -> PrivacyAction {
     let Interaction {
         data:
@@ -108,8 +109,37 @@ pub(crate) fn privacy_action(interaction: &Interaction) -> PrivacyAction {
         "opt-out" => PrivacyAction::OptOut,
         "opt-in" => PrivacyAction::OptIn,
         "status" => PrivacyAction::Status,
+        "delete" => PrivacyAction::DeletionRequest,
+        "deletion-status" => PrivacyAction::DeletionStatus,
+        "deletion-receipt" => PrivacyAction::DeletionReceipt,
         _ => PrivacyAction::Invalid,
     }
+}
+
+/// Read the nested request id from a deletion-status or deletion-receipt interaction.
+pub(crate) fn deletion_request_id(interaction: &Interaction) -> Option<&str> {
+    let Interaction {
+        data:
+            Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)),
+        ..
+    } = interaction
+    else {
+        return None;
+    };
+    let first = data.options.first()?;
+    if !matches!(first.name.as_str(), "deletion-status" | "deletion-receipt") {
+        return None;
+    }
+    let CommandOptionValue::SubCommand(options) = &first.value else {
+        return None;
+    };
+    options
+        .iter()
+        .find(|option| option.name == "request-id")
+        .and_then(|option| match &option.value {
+            CommandOptionValue::String(value) => Some(value.as_str()),
+            _ => None,
+        })
 }
 
 /// Complete the original ephemeral defer with `content`.
@@ -221,6 +251,100 @@ pub(crate) async fn privacy_command(
                 }
                 (Err(err), _) | (_, Err(err)) => {
                     tracing::warn!(reason = db_class(&err), "privacy status failed");
+                    finish(executor, interaction, STORE_FAILURE_REPLY).await;
+                }
+            }
+        }
+        PrivacyAction::DeletionRequest => {
+            let interaction_id = interaction.id.get().to_string();
+            match two_bot_cutover::deletion_intake::request_member_deletion(
+                pool,
+                &guild_id,
+                &member,
+                &interaction_id,
+            )
+            .await
+            {
+                Ok(ack) => {
+                    let reply = match ack.status.as_str() {
+                        "pending" => format!(
+                            "Your deletion request was accepted and queued as pending. This is not a completion receipt; use `/privacy deletion-status` with request id `{}` to check progress.",
+                            ack.request_id
+                        ),
+                        "completed" => format!(
+                            "Your deletion request `{}` was already accepted. This is not a completion receipt; use `/privacy deletion-status` with this request id to check its current status.",
+                            ack.request_id
+                        ),
+                        _ => STORE_FAILURE_REPLY.to_owned(),
+                    };
+                    finish(executor, interaction, reply).await;
+                }
+                Err(err) => {
+                    tracing::warn!(reason = db_class(&err), "privacy deletion request failed");
+                    finish(executor, interaction, STORE_FAILURE_REPLY).await;
+                }
+            }
+        }
+        PrivacyAction::DeletionStatus => {
+            let Some(request_id) = deletion_request_id(interaction) else {
+                finish(executor, interaction, USAGE_REPLY).await;
+                return;
+            };
+            match two_bot_cutover::deletion_intake::deletion_status_for_requester(
+                pool, &guild_id, &member, request_id,
+            )
+            .await
+            {
+                Ok(status) => {
+                    finish(
+                        executor,
+                        interaction,
+                        format!(
+                            "Deletion request `{}` is {}. Requested at {} (Unix seconds).{}",
+                            status.request_id,
+                            status.status,
+                            status.requested_at_unix,
+                            if status.overdue {
+                                " It is past the 72-hour service objective."
+                            } else {
+                                ""
+                            }
+                        ),
+                    )
+                    .await;
+                }
+                Err(err) => {
+                    tracing::warn!(reason = db_class(&err), "privacy deletion status failed");
+                    finish(executor, interaction, STORE_FAILURE_REPLY).await;
+                }
+            }
+        }
+        PrivacyAction::DeletionReceipt => {
+            let Some(request_id) = deletion_request_id(interaction) else {
+                finish(executor, interaction, USAGE_REPLY).await;
+                return;
+            };
+            match two_bot_cutover::deletion_intake::deletion_receipt_for_requester(
+                pool, &guild_id, &member, request_id,
+            )
+            .await
+            {
+                Ok(receipt) => {
+                    finish(
+                        executor,
+                        interaction,
+                        format!(
+                            "Deletion receipt `{}` completed at {} (Unix seconds). Scope: {}. Retained limits: {}",
+                            receipt.receipt_id,
+                            receipt.completed_at_unix,
+                            receipt.scope,
+                            receipt.retained_limits
+                        ),
+                    )
+                    .await;
+                }
+                Err(err) => {
+                    tracing::warn!(reason = db_class(&err), "privacy deletion receipt failed");
                     finish(executor, interaction, STORE_FAILURE_REPLY).await;
                 }
             }

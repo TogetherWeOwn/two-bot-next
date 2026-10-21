@@ -66,9 +66,9 @@ use two_bot_core::{
     commands::PERM_MANAGE_GUILD,
     feeds::{
         feed_list_text, feed_removed_text, plan_command, FeedCommand, FeedCommandContext,
-        FeedCommandPlan, FeedError, FeedKind,
+        FeedCommandPlan, FeedError, FeedKind, FEED_REMOVAL_RECOVERY_REQUIRED_TEXT,
     },
-    feeds_store::{add_feed, list_feeds, remove_feed, write_audit, FeedAudit},
+    feeds_store::{add_feed, list_feeds, remove_feed, write_audit, FeedAudit, FeedRemoval},
     funnel::now_millis_for_test,
     moderation::ModerationAction,
     sticky::{
@@ -1370,8 +1370,9 @@ impl CommandRuntime {
             self.answer(interaction, response).await;
             return;
         }
+        // No `"help"` entry: the help arm above owns `/help` and returns
+        // first, so an owner-map entry could never execute.
         let owner = match name.as_str() {
-            "help" => Some(HandlerId::Help),
             "privacy" => Some(HandlerId::Privacy),
             "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list" => {
                 Some(HandlerId::AutomationAdmin)
@@ -1888,7 +1889,9 @@ impl CommandRuntime {
     }
 
     /// `/feed-remove`: decode `id` → plan → guild-scoped delete → `feed.remove`
-    /// audit (`removed`/`missing` outcome) → ephemeral confirmation. A store
+    /// audit (`removed`/`missing`/`recovery_required` outcome) → ephemeral
+    /// confirmation. A relay carrying unresolved pending delivery evidence is
+    /// retained with a fixed recovery reply, never claimed removed. A store
     /// failure audits one `feed.remove`/`rejected` refusal row, then replies
     /// safe.
     async fn feed_remove(&self, interaction: &Interaction) {
@@ -1903,16 +1906,17 @@ impl CommandRuntime {
         match plan_command(&context, command) {
             Ok(FeedCommandPlan::Remove { guild_id, id }) => {
                 match remove_feed(&self.pool, &guild_id, &id).await {
-                    Ok(removed) => {
-                        self.feed_audit(
-                            &inputs,
-                            "feed.remove",
-                            &id,
-                            if removed { "removed" } else { "missing" },
-                            None,
-                        )
-                        .await;
-                        self.finish(interaction, feed_removed_text(removed)).await;
+                    Ok(outcome) => {
+                        let (audit_outcome, reply) = match outcome {
+                            FeedRemoval::Removed => ("removed", feed_removed_text(true)),
+                            FeedRemoval::Missing => ("missing", feed_removed_text(false)),
+                            FeedRemoval::RecoveryRequired => {
+                                ("recovery_required", FEED_REMOVAL_RECOVERY_REQUIRED_TEXT)
+                            }
+                        };
+                        self.feed_audit(&inputs, "feed.remove", &id, audit_outcome, None)
+                            .await;
+                        self.finish(interaction, reply).await;
                     }
                     Err(err) => {
                         let class = feed_store_class(&err);
@@ -2233,9 +2237,16 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
             HandlerId::FeedAdd,
             HandlerId::FeedRemove,
             HandlerId::FeedList,
+            // The ordered RSVP surface executes these ids; registration
+            // documents the ownership the router outcome names.
+            HandlerId::Rsvp,
+            HandlerId::RsvpAttendance,
         ] {
             router.register(Box::new(SliceHandler(id)));
         }
+    }
+    if gates.scorecard {
+        router.register(Box::new(SliceHandler(HandlerId::ScorecardAttendance)));
     }
     // Leveling is not an activation-fenced capability: the core rank and
     // leaderboard commands stay available to every permitted identity.

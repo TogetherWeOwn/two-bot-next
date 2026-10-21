@@ -13,8 +13,9 @@
 //! scorecard + automation + announcement + moderation). Out of scope on
 //! purpose: voice commands (`voice_commands`, separate slice with its own
 //! `TWO_VOICE` gate and a `kick` name collision resolved first-wins in favour
-//! of moderation), `/templateassistant` (voice + assistant gates; both are
-//! pinned by the `voice` section of `staging_published_commands.json`), DB-backed
+//! of moderation), `/templateassistant` (unpublished until its slice lands;
+//! the name and intended gate stay pinned by the `voice` section of
+//! `staging_published_commands.json`), DB-backed
 //! custom commands and `!` prefix triggers (dynamic), component/modal
 //! surfaces, and the dropped `/rota-acknowledge` row. The human-readable
 //! rendering lives in `docs/staging-e2e-command-matrix.md`; the
@@ -164,8 +165,11 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             0,
             "Everyone",
             "Privacy",
-            "Deferred ephemeral reply; opt-out purges the invoker's guild rows plus suppression plus one audit receipt, opt-in clears suppression, status reports suppression plus guild analytics switches.",
-            &["Valid:subcommand:required,opt-out|opt-in|status"],
+            "Deferred ephemeral reply; analytics opt-out purges the invoker's guild rows plus suppression plus one audit receipt, opt-in clears suppression, status reports suppression plus guild analytics switches; delete queues a member-erasure request, and deletion status/receipt reads bind to the authenticated requester and guild.",
+            &[
+                "Valid:subcommand:required,opt-out|opt-in|status|delete|deletion-status|deletion-receipt",
+                "Valid:request-id:required,max128,deletion-status|deletion-receipt",
+            ],
         ),
         row(
             "attendance",
@@ -552,6 +556,34 @@ mod tests {
                 "duplicate parity row {}",
                 row.parity_row
             );
+        }
+    }
+
+    #[test]
+    fn privacy_matrix_pins_required_bounded_request_ids() {
+        let matrix = e2e_command_matrix();
+        let privacy = matrix
+            .iter()
+            .find(|row| row.command == "privacy")
+            .expect("privacy matrix row");
+        assert!(privacy
+            .denials
+            .contains(&"Valid:request-id:required,max128,deletion-status|deletion-receipt"));
+
+        let definition = crate::commands::core_commands()
+            .into_iter()
+            .find(|definition| definition.name == "privacy")
+            .expect("published privacy command");
+        for subcommand in ["deletion-status", "deletion-receipt"] {
+            let option = definition
+                .options
+                .iter()
+                .find(|option| option.name == subcommand)
+                .and_then(|option| option.options.first())
+                .expect("request-id option");
+            assert_eq!(option.name, "request-id");
+            assert_eq!(option.required, Some(true));
+            assert_eq!(option.max_length, Some(128));
         }
     }
 

@@ -15,8 +15,9 @@
  * request. No larger or independent timeout budget may appear.
  *
  * Preserved behavior: the fixed payload-safe refusal envelope (503,
- * `unavailable`, fixed message, honored `x-request-id`), body caps at
- * exactly the cap relayed byte for byte, exact EventSub challenge bytes,
+ * `unavailable`, fixed message, honored `x-request-id`), body admission at
+ * exactly the cap (EventSub JSON projects its supported envelope; internal
+ * actions retain bytes), exact valid EventSub challenge bytes,
  * permitted status/header vocabulary, ownership fence, cold-container
  * refusal, and exactly one container fetch per request — a signed action is
  * NEVER retried automatically, and nothing here asserts that a wrapper
@@ -67,7 +68,6 @@ import {
 import {
   EVENTSUB_PATH,
   EVENTSUB_RECEIVER_PORT,
-  MAX_CHALLENGE_BYTES,
   MAX_RESPONSE_BYTES as EVENTSUB_MAX_RESPONSE_BYTES,
   REQUEST_TIMEOUT_MS as EVENTSUB_REQUEST_TIMEOUT_MS,
   resetEventsubIngressLimits,
@@ -151,7 +151,7 @@ const ROUTES: Route[] = [
     timeoutMs: ACTIONS_REQUEST_TIMEOUT_MS,
     maxResponseBytes: ACTIONS_MAX_RESPONSE_BYTES,
     request: () => directRequest(ACTIONS_PATH, ACTIONS_HEADERS, ACTIONS_BODY),
-    validUpstream: () => Response.json({ ok: true, result: { message_id: "1" } }),
+    validUpstream: () => Response.json({ ok: true, request_id: SENT_ID, result: { message_id: "1" } }),
   },
   {
     label: "eventsub",
@@ -160,7 +160,7 @@ const ROUTES: Route[] = [
     timeoutMs: EVENTSUB_REQUEST_TIMEOUT_MS,
     maxResponseBytes: EVENTSUB_MAX_RESPONSE_BYTES,
     request: () => directRequest(EVENTSUB_PATH, EVENTSUB_HEADERS, EVENTSUB_BODY),
-    validUpstream: () => Response.json({ ok: true }),
+    validUpstream: () => Response.json({ ok: true, request_id: SENT_ID }),
   },
 ];
 
@@ -440,18 +440,33 @@ for (const route of ROUTES) {
     assert.equal(calls.length, 1);
   });
 
-  test(`${route.label} (preserved): exactly-at-cap response relays byte for byte`, async (t) => {
+  test(`${route.label} (preserved): valid exactly-at-cap response is admitted`, async (t) => {
     const h = await harness(t);
-    const payload = new Uint8Array(route.maxResponseBytes);
+    let payload = new Uint8Array(route.maxResponseBytes);
     for (let i = 0; i < payload.byteLength; i++) payload[i] = (i * 31 + 7) & 0xff;
+    if (route.label === "eventsub") {
+      // The actual receiver emits an acknowledgement with request_id, never
+      // arbitrary binary JSON. Whitespace fills the byte budget without
+      // introducing unsupported fields or requiring raw JSON reflection.
+      payload = new TextEncoder().encode(JSON.stringify({ ok: true, request_id: SENT_ID }).padEnd(route.maxResponseBytes, " "));
+    } else {
+      // The signed-action receiver emits a correlated envelope with its
+      // action-specific result, never arbitrary bytes. Whitespace fills the
+      // byte budget; the relay projects the envelope it parses.
+      payload = new TextEncoder().encode(JSON.stringify({ ok: true, request_id: SENT_ID, result: { message_id: "1" } }).padEnd(route.maxResponseBytes, " "));
+    }
+    assert.equal(payload.byteLength, route.maxResponseBytes, "fixture reaches the input byte cap");
     stubFetch(t, h.bot, async () => new Response(payload, {
       status: 200, headers: { "content-type": "application/json" },
     }));
     const response = await settleWithin(h.bot.fetch(route.request()), `${route.label} exact-cap`);
     assert.equal(response.status, 200);
     const body = new Uint8Array(await response.arrayBuffer());
-    assert.equal(body.byteLength, route.maxResponseBytes);
-    assert.equal(Buffer.compare(body, payload), 0, "cap-exact bytes unchanged");
+    if (route.label === "eventsub") {
+      assert.deepEqual(JSON.parse(new TextDecoder().decode(body)), { ok: true, request_id: SENT_ID });
+    } else {
+      assert.deepEqual(JSON.parse(new TextDecoder().decode(body)), { ok: true, request_id: SENT_ID, result: { message_id: "1" } });
+    }
   });
 
   test(`${route.label} (preserved): small valid response relays with status preserved`, async (t) => {
@@ -497,7 +512,7 @@ for (const route of ROUTES) {
 test("internal-actions (preserved): relayed 401 keeps idempotent-replay/retry-after and drops secret headers", async (t) => {
   const h = await harness(t);
   stubFetch(t, h.bot, async () => new Response(
-    JSON.stringify({ ok: false, request_id: "r1", error: { code: "unauthorized", message: "unauthorized", retryable: false } }),
+    JSON.stringify({ ok: false, request_id: SENT_ID, error: { code: "unauthorized", message: "unauthorized", retryable: false } }),
     {
       status: 401,
       headers: {
@@ -531,14 +546,14 @@ test("eventsub (preserved): challenge relays byte for byte, including exactly at
   assert.equal(await short.text(), CHALLENGE, "challenge bytes exact");
 
   const h2 = await harness(t);
-  const atCap = "c".repeat(MAX_CHALLENGE_BYTES);
+  const atCap = "c".repeat(256);
   stubFetch(t, h2.bot, async () => new Response(atCap, {
     status: 200, headers: { "content-type": "text/plain" },
   }));
   const capped = await settleWithin(h2.bot.fetch(route.request()), "eventsub challenge at cap");
   assert.equal(capped.status, 200);
   const body = await capped.text();
-  assert.equal(body.length, MAX_CHALLENGE_BYTES);
+  assert.equal(body.length, 256);
   assert.equal(body, atCap, "challenge bytes exact at the cap");
 });
 

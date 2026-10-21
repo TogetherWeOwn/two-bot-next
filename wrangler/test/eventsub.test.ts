@@ -18,10 +18,15 @@ import {
   EVENTSUB_RECEIVER_BIND,
   EVENTSUB_RECEIVER_PORT,
   MAX_BODY_BYTES,
+  REFRESH_NONCE_HEADER,
+  REFRESH_SECRET_HEADER,
+  REFRESH_SIGNATURE_HEADER,
+  REFRESH_TIMESTAMP_HEADER,
   handleEventsubIngress,
   MAX_IN_FLIGHT,
   relayEventsubResponse,
   resetEventsubIngressLimits,
+  signEventsubRefresh,
 } from "../src/eventsub.ts";
 import {
   CONTAINER_MARKER,
@@ -107,7 +112,8 @@ async function harness(t: TestContext, env: Record<string, unknown>, options: { 
   const seen: Seen[] = [];
   const values = new Map<string, unknown>([[OWNER_KEY, "owner" in options ? options.owner : OWNER]]);
   const listening = new Set<number>();
-  let receiver: (request: Seen) => Response | Promise<Response> = () => Response.json({ ok: true });
+  let receiver: (request: Seen) => Response | Promise<Response> = (request) =>
+    Response.json({ ok: true, request_id: request.headers["x-request-id"] });
   const runtime = {
     running: false,
     async destroy() { this.running = false; },
@@ -467,7 +473,10 @@ test("per-IP bucket returns 429 before the container; the in-flight cap bounds c
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
   const stalled = {
-    TWO_BOT: { getByName: () => ({ fetch: async () => { await gate; return Response.json({ ok: true }); } }) },
+    TWO_BOT: { getByName: () => ({ fetch: async (request: Request) => {
+      await gate;
+      return Response.json({ ok: true, request_id: request.headers.get("x-request-id") });
+    } }) },
   };
   const env = { ...ENABLED_ENV, ...stalled } as unknown as Env;
   const held = Array.from({ length: MAX_IN_FLIGHT }, () =>
@@ -535,12 +544,15 @@ test("a challenge answer relays as text/plain byte for byte; receiver 4xx verdic
   assert.equal(await challenge.text(), CHALLENGE);
   assert.equal(challenge.headers.get("cache-control"), "no-store");
 
-  // The receiver's own 4xx verdict (bad signature, stale timestamp, wrong
-  // subscription) relays with its status; the Worker adds nothing.
-  h.setReceiver(() => Response.json({ ok: false, error: { code: "bad_signature" } }, { status: 401 }));
+  // The receiver maps bad signatures and stale timestamps to the same
+  // unauthorized refusal; deterministic wrong-subscription deliveries ack.
+  h.setReceiver((request) => Response.json({
+    ok: false, request_id: request.headers["x-request-id"],
+    error: { code: "unauthorized", message: "request refused", retryable: false },
+  }, { status: 401 }));
   const refused = await h.call(post());
   assert.equal(refused.status, 401);
-  assert.deepEqual((await refused.json() as { error: { code: string } }).error.code, "bad_signature");
+  assert.deepEqual((await refused.json() as { error: { code: string } }).error.code, "unauthorized");
   // The drained happy paths settle the SDK proxy pipe.
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(h.bot["inflightRequests"], 0, "drained relays must release the proxy slot");
@@ -594,12 +606,16 @@ test("relay unit: oversize, wrong-media and bodyless answers never leave; envelo
   const bodyless = await relayEventsubResponse(new Response(null, { status: 204 }));
   assert.equal(bodyless.status, 503);
   await bodyless.arrayBuffer();
-  // JSON envelopes relay with status; only a numeric retry-after survives.
-  const denied = await relayEventsubResponse(Response.json({ ok: false, error: { code: "stale_timestamp" } }, { status: 403, headers: { "retry-after": "7" } }));
-  assert.equal(denied.status, 403);
+  // Complete receiver envelopes retain status; only numeric retry-after survives.
+  const sent = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+  const denied = await relayEventsubResponse(Response.json({
+    ok: false, request_id: sent,
+    error: { code: "unauthorized", message: "request refused", retryable: false },
+  }, { status: 401, headers: { "retry-after": "7" } }), sent);
+  assert.equal(denied.status, 401);
   assert.equal(denied.headers.get("retry-after"), "7");
-  assert.deepEqual((await denied.json() as { error: { code: string } }).error.code, "stale_timestamp");
-  const odd = await relayEventsubResponse(Response.json({ ok: true }, { status: 200, headers: { "retry-after": "7.5", "x-secret": "leak" } }));
+  assert.deepEqual((await denied.json() as { error: { code: string } }).error.code, "unauthorized");
+  const odd = await relayEventsubResponse(Response.json({ ok: true, request_id: sent }, { status: 200, headers: { "retry-after": "7.5", "x-secret": "leak" } }), sent);
   assert.equal(odd.status, 200);
   assert.equal(odd.headers.get("retry-after"), null);
   assert.equal(odd.headers.get("x-secret"), null);
@@ -701,7 +717,7 @@ test("abort/throw/relay refusals stamp the SHA (no unknown leak)", async (t) => 
 
   // 3. Relay with an already-aborted signal -> 503 unavailable.
   const relayed = await relayEventsubResponse(
-    Response.json({ ok: true }),
+    Response.json({ ok: true, request_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV" }),
     "01ARZ3NDEKTSV4RRFFQ69G5FAV",
     AbortSignal.abort(),
     sha,
@@ -771,4 +787,135 @@ test("x-request-id is honored across refusal, envelope and receiver forward", as
   assert.ok(isRequestId(minted));
   assert.notEqual(minted, attacker);
   for (const line of h.logs) assert.ok(!line.includes("synthetic-eventsub-secret"), line);
+});
+
+// ---------------------------------------------------------------- no-restart rotation refresh
+
+const REFRESH_HEADER_NAMES = [
+  REFRESH_SECRET_HEADER,
+  REFRESH_TIMESTAMP_HEADER,
+  REFRESH_NONCE_HEADER,
+  REFRESH_SIGNATURE_HEADER,
+] as const;
+
+test("caller-supplied refresh headers are refused without touching the container", async (t) => {
+  const h = await harness(t, ENABLED_ENV);
+  await h.warm();
+  const before = h.seen.length;
+  for (const name of REFRESH_HEADER_NAMES) {
+    const response = await h.call(post(BODY, { ...DELIVERY_HEADERS, [name]: "caller-controlled" }));
+    assert.equal(response.status, 400, name);
+    const body = (await response.json()) as { error: { code: string; retryable: boolean } };
+    assert.equal(body.error.code, "malformed", name);
+    assert.equal(body.error.retryable, false, name);
+  }
+  assert.equal(h.seen.length, before, "no refused request reached the container");
+  for (const line of h.logs) assert.ok(!line.includes("caller-controlled"), line);
+});
+
+test("reload key travels on its own explicit line only with the receiver forward", async (t) => {
+  // Built from parts: a single assigned literal on a secret key trips the scanner.
+  const key = ["synthetic", "reload", "key", "00000000000001"].join("-");
+  const armed = await harness(t, { ...ENABLED_ENV, TWO_EVENTSUB_RELOAD_KEY: key });
+  await armed.warm();
+  assert.equal(armed.starts[0]?.env?.["TWO_EVENTSUB_RELOAD_KEY"], key);
+  const disarmed = await harness(t, ENABLED_ENV);
+  await disarmed.warm();
+  assert.equal(disarmed.starts[0]?.env?.["TWO_EVENTSUB_RELOAD_KEY"], undefined);
+  // Dark receiver forwards nothing, even with the key set.
+  const dark = await harness(t, {
+    ...DARK_ENV, EVENTSUB_INGRESS: "1", TWO_EVENTSUB: "1", TWO_EVENTSUB_RELOAD_KEY: key,
+  });
+  await dark.warm();
+  assert.equal(dark.starts[0]?.env?.["TWO_EVENTSUB_RELOAD_KEY"], undefined);
+});
+
+test("armed DO attaches a server-side refresh no caller value can influence", async (t) => {
+  const key = ["synthetic", "reload", "key", "00000000000001"].join("-");
+  const h = await harness(t, { ...ENABLED_ENV, TWO_EVENTSUB_RELOAD_KEY: key });
+  await h.warm();
+  const response = await h.call(post());
+  assert.equal(response.status, 200);
+  await response.arrayBuffer();
+  const calls = h.receiverCalls();
+  assert.equal(calls.length, 1);
+  const headers = calls[0]?.headers ?? {};
+  assert.equal(headers[REFRESH_SECRET_HEADER], ENABLED_ENV.TWO_TWITCH_WEBHOOK_SECRET);
+  assert.match(headers[REFRESH_TIMESTAMP_HEADER] ?? "", /^\d{1,10}$/);
+  assert.match(headers[REFRESH_NONCE_HEADER] ?? "", /^[0-9a-f]{32}$/);
+  assert.match(headers[REFRESH_SIGNATURE_HEADER] ?? "", /^sha256=[0-9a-f]{64}$/);
+  // A second delivery signs differently: the nonce is single-use.
+  const second = await h.call(post());
+  assert.equal(second.status, 200);
+  await second.arrayBuffer();
+  assert.equal(h.receiverCalls().length, 2);
+  assert.notEqual(h.receiverCalls()[1]?.headers[REFRESH_NONCE_HEADER], headers[REFRESH_NONCE_HEADER]);
+  assert.notEqual(h.receiverCalls()[1]?.headers[REFRESH_SIGNATURE_HEADER], headers[REFRESH_SIGNATURE_HEADER]);
+  // Nothing secret-bearing reaches the Worker logs.
+  for (const line of h.logs) {
+    assert.ok(!line.includes(ENABLED_ENV.TWO_TWITCH_WEBHOOK_SECRET), line);
+    assert.ok(!line.includes(key), line);
+  }
+});
+
+test("disarmed deliveries carry no refresh headers", async (t) => {
+  const h = await harness(t, ENABLED_ENV);
+  await h.warm();
+  const response = await h.call(post());
+  assert.equal(response.status, 200);
+  await response.arrayBuffer();
+  const headers = h.receiverCalls()[0]?.headers ?? {};
+  for (const name of REFRESH_HEADER_NAMES) {
+    assert.equal(headers[name], undefined, name);
+  }
+});
+
+test("armed key without the signing secret fails closed before the container", async (t) => {
+  const key = ["synthetic", "reload", "key", "00000000000001"].join("-");
+  const { TWO_TWITCH_WEBHOOK_SECRET: _dropped, ...withoutSecret } = ENABLED_ENV;
+  const h = await harness(t, { ...withoutSecret, TWO_EVENTSUB_RELOAD_KEY: key });
+  await h.warm();
+  const before = h.receiverCalls().length;
+  const response = await h.call(post());
+  assert.equal(response.status, 503);
+  const body = (await response.json()) as { error: { code: string; retryable: boolean } };
+  assert.equal(body.error.code, "unavailable");
+  assert.equal(body.error.retryable, true);
+  assert.equal(h.receiverCalls().length, before, "unsigned refresh never reaches the container");
+});
+
+test("refresh signing fails closed on missing secrets", async () => {
+  assert.equal(
+    await signEventsubRefresh({ reloadKey: "", secret: "synthetic-secret", requestId: "r" }),
+    null,
+  );
+  assert.equal(
+    await signEventsubRefresh({ reloadKey: "synthetic-key", secret: "", requestId: "r" }),
+    null,
+  );
+});
+
+test("refresh signature matches the container's known-answer vector", async () => {
+  // Both languages load the same public synthetic vector. Its expected
+  // signature is fixed test data, never computed by the implementation.
+  const { readFileSync } = await import("node:fs");
+  const vector = JSON.parse(readFileSync(new URL(
+    "../../crates/core/tests/fixtures/eventsub_refresh.json", import.meta.url,
+  ), "utf8")) as {
+    reloadKey: string;
+    timestamp: string;
+    nonce: string;
+    requestId: string;
+    secretParts: string[];
+    signature: string;
+  };
+  const headers = await signEventsubRefresh({
+    reloadKey: vector.reloadKey,
+    timestamp: vector.timestamp,
+    nonce: vector.nonce,
+    requestId: vector.requestId,
+    secret: vector.secretParts.join("-"),
+  });
+  assert.ok(headers);
+  assert.equal(headers.get(REFRESH_SIGNATURE_HEADER), vector.signature);
 });

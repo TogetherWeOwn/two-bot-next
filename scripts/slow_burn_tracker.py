@@ -62,13 +62,61 @@ CADENCE_WARN_SECONDS = 600
 # once the slow windows have gone this long without coverage: genuine burns
 # go unfiled and open cards stay unclosed while coverage is gone.
 UNCOVERED_WARN_SECONDS = int(6.5 * 3600)
-MARKER_RE = re.compile(r"<!-- slow-burn-tracker:last-update=(\d+) -->")
+MARKER_RE = re.compile(r"<!-- slow-burn-tracker:last-update=([0-9]{1,19}) -->")
+# The staging edge answers the stdlib default agent with 403/error 1010, so
+# the scrape names itself (a missing bearer still reads as the Worker's own
+# 401, never a 403).
+USER_AGENT = "two-bot-next-slow-burn-tracker/1.0"
 TIMEOUT_SECONDS = 6
 MAX_BODY_BYTES = 64 * 1024
+# Plenty for a six-hour ring or 50 ordinary issue rows. Check UTF-8 bytes,
+# not characters, before decoding any cached or subprocess JSON.
+MAX_JSON_BYTES = 1024 * 1024
+
+
+def _load_cache_json(path):
+    """Read a bounded cache; missing, oversized or malformed data rebuilds."""
+    try:
+        with Path(path).open("rb") as stream:
+            raw = stream.read(MAX_JSON_BYTES + 1)
+        if len(raw) > MAX_JSON_BYTES:
+            return None
+        return json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+    except (OSError, ValueError, UnicodeError, RecursionError):
+        return None
+
+
+def _intake_json(raw, message):
+    """Decode a bounded subprocess answer without exposing remote error text."""
+    try:
+        if len(raw.encode("utf-8") if isinstance(raw, str) else raw) > MAX_JSON_BYTES:
+            raise TrackError(message)
+        return json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+    except (ValueError, UnicodeError, RecursionError):
+        raise TrackError(message) from None
 
 
 class TrackError(Exception):
     """A fixed-vocabulary tracker failure (never carries secrets)."""
+
+
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    raised message is fixed vocabulary: it names no key, value or path.
+    """
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -88,7 +136,9 @@ def scrape_metrics(origin, token):
         raise TrackError("metrics origin refused: https only")
     url = origin.rstrip("/") + "/ops/metrics"
     request = urllib.request.Request(
-        url, method="GET", headers={"Authorization": f"Bearer {token}"}
+        url,
+        method="GET",
+        headers={"Authorization": f"Bearer {token}", "User-Agent": USER_AGENT},
     )
     opener = urllib.request.build_opener(_NoRedirectHandler())
     try:
@@ -115,14 +165,7 @@ def scrape_metrics(origin, token):
 
 
 def load_ring(path):
-    try:
-        raw = Path(path).read_text(encoding="utf-8")
-    except OSError:
-        return []
-    try:
-        parsed = json.loads(raw)
-    except ValueError:
-        return []
+    parsed = _load_cache_json(path)
     return parsed if isinstance(parsed, list) else []
 
 
@@ -152,14 +195,7 @@ def _sidecar_tick(parsed, key):
 
 def _load_sidecar_dict(path):
     """Sidecar dict, or {} when missing/unreadable/malformed."""
-    try:
-        raw = Path(path).read_text(encoding="utf-8")
-    except OSError:
-        return {}
-    try:
-        parsed = json.loads(raw)
-    except ValueError:
-        return {}
+    parsed = _load_cache_json(path)
     if isinstance(parsed, dict):
         return parsed
     if isinstance(parsed, (int, float)) and not isinstance(parsed, bool) \
@@ -219,16 +255,14 @@ def run_driver(node, driver, exposition_path, ring_path, now):
         completed = subprocess.run(
             [node, str(driver), "--exposition", str(exposition_path),
              "--ring", str(ring_path), "--now", str(now)],
-            capture_output=True, text=True, timeout=120, check=False,
+            capture_output=True, timeout=120, check=False,
         )
     except (OSError, subprocess.SubprocessError):
         raise TrackError("burn evaluation failed: driver did not run")
     if completed.returncode != 0:
         raise TrackError("burn evaluation failed: driver refused its inputs")
-    try:
-        verdict = json.loads(completed.stdout)
-    except ValueError:
-        raise TrackError("burn evaluation failed: driver answer is not JSON")
+    verdict = _intake_json(
+        completed.stdout, "burn evaluation failed: driver answer is not bounded JSON")
     if (not isinstance(verdict, dict) or not isinstance(verdict.get("slow"), bool)
             or not isinstance(verdict.get("held"), bool)
             or not isinstance(verdict.get("slowCovered"), bool)
@@ -264,7 +298,14 @@ def fixture_inputs(kind, now):
                 "duplicate": 0,
                 "fastMoves": fast,
             })
-    exposition = (
+    # Checked-in complete companions keep proof mode under the same strict
+    # scrape contract as live mode. The driver never fills missing live series.
+    try:
+        companions = (REPO_ROOT / "scripts" / "fixtures" / "slow-burn-companion.prom").read_text(
+            encoding="utf-8")
+    except (OSError, UnicodeError):
+        raise TrackError("fixture refused: companion metrics are unreadable") from None
+    exposition = companions + (
         f"two_bot_voice_joins_received_total {received}\n"
         f'two_bot_voice_join_refused_total{{reason="duplicate"}} 0\n'
         f'two_bot_voice_join_to_move_seconds_bucket{{le="5"}} {fast}\n'
@@ -280,6 +321,8 @@ def gh(args, repo, token_env):
             capture_output=True, text=True, timeout=60, check=False,
             env={"GH_TOKEN": token_env, "PATH": "/usr/bin:/bin:/usr/local/bin"},
         )
+    except UnicodeDecodeError:
+        raise TrackError("issue reconcile failed: gh answer is not text")
     except (OSError, subprocess.SubprocessError):
         raise TrackError("issue reconcile failed: gh did not run")
     if completed.returncode != 0:
@@ -294,16 +337,17 @@ def open_tracking_issues(repo, token, label, prefix):
                  repo, token)
     except TrackError:
         raise TrackError("issue reconcile failed: open issues are unreadable")
-    try:
-        issues = json.loads(raw)
-    except ValueError:
+    issues = _intake_json(raw, "issue reconcile failed: open issues are unreadable")
+    if not isinstance(issues, list) or any(
+            not isinstance(issue, dict)
+            or not isinstance(issue.get("title"), str)
+            or type(issue.get("number")) is not int
+            or issue["number"] <= 0
+            or "body" not in issue
+            or (issue["body"] is not None and not isinstance(issue["body"], str))
+            for issue in issues):
         raise TrackError("issue reconcile failed: open issues are unreadable")
-    if not isinstance(issues, list):
-        raise TrackError("issue reconcile failed: open issues are unreadable")
-    return [issue for issue in issues
-            if isinstance(issue, dict)
-            and isinstance(issue.get("title"), str)
-            and issue["title"].startswith(prefix)]
+    return [issue for issue in issues if issue["title"].startswith(prefix)]
 
 
 def marker_time(body):
@@ -484,7 +528,13 @@ def main(argv=None, env=None):
                       f"the 5-minute schedule catches up")
     else:
         evidence["origin"] = f"fixture:{args.fixture}"
-        exposition, ring = fixture_inputs(args.fixture, now)
+        try:
+            exposition, ring = fixture_inputs(args.fixture, now)
+        except TrackError as error:
+            print(f"::error::{error}")
+            Path(args.evidence_out).write_text(json.dumps(evidence, indent=2) + "\n",
+                                               encoding="utf-8")
+            return 1
         Path(args.exposition_out).write_text(exposition, encoding="utf-8")
 
     gh_token = env.get("GH_TOKEN", "")

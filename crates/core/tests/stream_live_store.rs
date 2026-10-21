@@ -14,15 +14,25 @@ use two_bot_core::stream_live_store::*;
 /// Unix-socket override would divert setup/cleanup outside the disposable
 /// container, so sockets are rejected outright, and the documented empty
 /// test password is forced so an inherited `PGPASSWORD`/`.pgpass`
-/// credential can never leak into test connections.
+/// credential can never leak into test connections. The workspace bootstrap
+/// database is accepted but never used: the check.yml coverage sweep exports
+/// it, and connecting to `agent_test` with an isolated schema keeps the sweep
+/// green instead of emitting guard panics that flake detection misattributes
+/// as test flakes.
 fn test_options(url: &str) -> Result<PgConnectOptions, &'static str> {
+    if url.contains('?') || url.contains('#') {
+        return Err("invalid test URL");
+    }
     let options: PgConnectOptions = url.parse().map_err(|_| "invalid test URL")?;
     if options.get_host() != "agent-testdb" || options.get_socket().is_some() {
         return Err("refusing non-test host");
     }
     if options.get_port() != 5432
         || options.get_username() != "agent_test"
-        || options.get_database() != Some("agent_test")
+        || !matches!(
+            options.get_database(),
+            Some("agent_test" | "two_bot_test_ci")
+        )
         || options
             .to_url_lossy()
             .password()
@@ -30,18 +40,36 @@ fn test_options(url: &str) -> Result<PgConnectOptions, &'static str> {
     {
         return Err("refusing non-test database or credential");
     }
-    Ok(options.password(""))
+    // Never fall back to an inherited PGPASSWORD or .pgpass credential.
+    // The bootstrap database name is rewritten to agent_test so sweep data
+    // never lands in the bootstrap database.
+    Ok(options.password("").database("agent_test"))
 }
 
 #[test]
 fn live_test_options_require_the_approved_container() {
     assert!(test_options("postgres://agent_test:@agent-testdb:5432/agent_test").is_ok());
+    // The check.yml coverage sweep exports the workspace bootstrap database.
+    // Accept it so the sweep runs these tests instead of panicking in the
+    // guard. Data still lands in agent_test under an isolated schema.
+    assert!(test_options("postgres://agent_test:@agent-testdb:5432/two_bot_test_ci").is_ok());
+    assert_eq!(
+        test_options("postgres://agent_test:@agent-testdb:5432/two_bot_test_ci")
+            .unwrap()
+            .get_database(),
+        Some("agent_test")
+    );
+    assert!(test_options("postgres://agent_test@agent-testdb:5432/agent_test").is_ok());
     for url in [
         "postgres://agent_test@production.example/testdb",
         "postgres://agent_test:@agent-testdb.production.example/agent_test",
         "postgres://agent_test:@localhost/agent_test",
         "postgres://agent_test:@127.0.0.1/agent_test",
+        "postgres://agent_test:@agent-testdb:5433/agent_test",
         "postgres://agent_test:@agent-testdb/agent_test?host=/var/run/postgresql",
+        "postgres://agent_test:@agent-testdb/agent_test?port=5433",
+        "postgres://agent_test:@agent-testdb/agent_test?sslmode=disable",
+        "postgres://agent_test:@agent-testdb/agent_test#fragment",
         "postgres://other_user:@agent-testdb/agent_test",
         "postgres://agent_test:@agent-testdb/production",
         "postgres://agent_test:fixture-password@agent-testdb/agent_test",

@@ -19,20 +19,22 @@
  * Prints one JSON object to stdout:
  *   {"slow": bool, "fast": bool, "held": bool, "slowCovered": bool, "ring": JoinBurnSnapshot[]}
  * `slow` is the tracker's only filing signal; `fast` is reported for the
- * evidence receipt. `held` means the join series were unusable and the
- * previous firing state holds: the caller must treat the verdict as unknown,
+ * evidence receipt. `held` means the Worker refused the scrape or the join
+ * series were unusable. The caller must treat the verdict as unknown,
  * never as clear. `slowCovered` reports whether both slow windows have
  * baseline history; silence without it is unknown too, so only a covered
  * non-firing verdict may resolve the card. A malformed ring starts empty
  * (windows stay inactive until history covers them, never a false fire).
  */
 
-import { readFileSync } from "node:fs";
-import {
-  EMPTY_STATE,
-  evaluateMetrics,
-  parseExposition,
-} from "../src/alert-rules.ts";
+import { closeSync, openSync, readSync } from "node:fs";
+import { EMPTY_STATE, evaluateMetrics } from "../src/alert-rules.ts";
+import { parseAlertScrape } from "../src/metrics-scrape.ts";
+
+const MAX_CACHE_BYTES = 1024 * 1024;
+// Exposition cap mirrors the Worker scrape (MAX_METRICS_BODY_BYTES in
+// wrangler/src/index.ts): every sibling reader refuses bodies over 64 KiB.
+const MAX_EXPOSITION_BYTES = 64 * 1024;
 
 function usage() {
   console.error(
@@ -48,10 +50,22 @@ function argValue(args, name) {
 
 function loadRing(path) {
   let raw;
+  let fd;
   try {
-    raw = readFileSync(path, "utf8");
+    fd = openSync(path, "r");
+    const buffer = Buffer.alloc(MAX_CACHE_BYTES + 1);
+    let size = 0;
+    while (size < buffer.length) {
+      const count = readSync(fd, buffer, size, buffer.length - size, null);
+      if (count === 0) break;
+      size += count;
+    }
+    if (size > MAX_CACHE_BYTES) return [];
+    raw = buffer.subarray(0, size).toString("utf8");
   } catch {
     return [];
+  } finally {
+    if (fd !== undefined) closeSync(fd);
   }
   let parsed;
   try {
@@ -85,6 +99,30 @@ function loadRing(path) {
   return ring;
 }
 
+/**
+ * Bounded exposition read matching loadRing's capped pattern. Returns
+ * null when the file exceeds MAX_EXPOSITION_BYTES; the caller holds the
+ * verdict exactly like a Worker-refused scrape. IO errors propagate so a
+ * missing file still crashes instead of reading as a refusal.
+ */
+function loadExposition(path) {
+  let fd;
+  try {
+    fd = openSync(path, "r");
+    const buffer = Buffer.alloc(MAX_EXPOSITION_BYTES + 1);
+    let size = 0;
+    while (size < buffer.length) {
+      const count = readSync(fd, buffer, size, buffer.length - size, null);
+      if (count === 0) break;
+      size += count;
+    }
+    if (size > MAX_EXPOSITION_BYTES) return null;
+    return buffer.subarray(0, size).toString("utf8");
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
 const args = process.argv.slice(2);
 const expositionPath = argValue(args, "--exposition");
 const ringPath = argValue(args, "--ring");
@@ -95,16 +133,19 @@ if (!expositionPath || !ringPath || !Number.isFinite(now)) {
   process.exit(2);
 }
 
-const exposition = readFileSync(expositionPath, "utf8");
-const samples = parseExposition(exposition);
+const exposition = loadExposition(expositionPath);
+const samples = exposition === null ? null : parseAlertScrape(exposition);
 const ring = loadRing(ringPath);
 const previous = { ...EMPTY_STATE, joinBurn: ring };
-const { firing, state, joinHeld, joinSlowCovered } = evaluateMetrics(samples, previous, now);
-const verdict = {
-  slow: firing.includes("voice_join_slow_burn"),
-  fast: firing.includes("voice_join_fast_burn"),
-  held: joinHeld === true,
-  slowCovered: joinSlowCovered === true,
-  ring: state.joinBurn ?? [],
-};
+let verdict = { slow: false, fast: false, held: true, slowCovered: false, ring };
+if (samples !== null) {
+  const { firing, state, joinHeld, joinSlowCovered } = evaluateMetrics(samples, previous, now);
+  verdict = {
+    slow: firing.includes("voice_join_slow_burn"),
+    fast: firing.includes("voice_join_fast_burn"),
+    held: joinHeld === true,
+    slowCovered: joinSlowCovered === true,
+    ring: state.joinBurn ?? [],
+  };
+}
 process.stdout.write(`${JSON.stringify(verdict)}\n`);

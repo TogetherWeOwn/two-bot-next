@@ -52,6 +52,10 @@ mod scorecard_retry;
 #[path = "community_jobs_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "community_scorecard_bounds_tests.rs"]
+mod bounds_tests;
+
 #[derive(Clone, Copy)]
 pub(crate) enum Kind {
     PresenceProbe,
@@ -464,9 +468,9 @@ async fn scorecard_once(
     )
     .await
     .map_err(|error| match error {
-        CommunityStoreError::Build(_) | CommunityStoreError::UnknownFactType(_) => {
-            ErrorClass::Configuration
-        }
+        CommunityStoreError::Build(_)
+        | CommunityStoreError::UnknownFactType(_)
+        | CommunityStoreError::TooManyFacts { .. } => ErrorClass::Configuration,
         CommunityStoreError::Db(_) => ErrorClass::Database,
     })?;
     sqlx::query(

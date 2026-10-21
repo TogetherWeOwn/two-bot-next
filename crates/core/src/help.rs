@@ -148,10 +148,12 @@ const HELP_GROUPS: &[HelpGroup] = &[
         ],
         anchor: Some("textchannels"),
     },
+    // `/templateassistant` stays out until its slice lands with a handler;
+    // the slice restores the name and the "and assistant" title.
     HelpGroup {
-        title: "Voice room settings and assistant",
+        title: "Voice room settings",
         requires: Some("Manage Server"),
-        commands: &["export", "import", "templateassistant"],
+        commands: &["export", "import"],
         anchor: Some("textchannels"),
     },
 ];
@@ -268,10 +270,11 @@ mod tests {
             );
         }
         // 28 legacy builtins plus the Next-only help and privacy commands,
-        // plus the 21 gated voice commands and `/templateassistant` (voice
-        // `kick` loses first-wins to moderation `/kick`): matches the
-        // regenerated `docs/commands.md` total.
-        assert!(text.contains("**Server commands** (51 live)"));
+        // plus the 21 gated voice commands (voice `kick` loses first-wins
+        // to moderation `/kick`; `/templateassistant` stays unpublished
+        // until its slice lands): matches the regenerated `docs/commands.md`
+        // total.
+        assert!(text.contains("**Server commands** (50 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"
@@ -291,7 +294,7 @@ mod tests {
             ("Bans", "Ban Members"),
             ("Message cleanup", "Manage Messages"),
             ("Voice room admin", "Manage Channels"),
-            ("Voice room settings and assistant", "Manage Server"),
+            ("Voice room settings", "Manage Server"),
         ] {
             assert!(
                 text.contains(&format!("**{group}** — needs {perm}")),
@@ -301,7 +304,7 @@ mod tests {
         for line in [
             "**Voice rooms**\n/setup · /ping · /invite · /reclaim · /transfer · /name · /private · /public · /limit · /unlimit\n",
             "**Voice room admin** — needs Manage Channels\n/create · /textchannels · /access · /logging · /position · /group · /inheritpermissions · /defaultlimit · /alwaysprivate\n",
-            "**Voice room settings and assistant** — needs Manage Server\n/export · /import · /templateassistant\n",
+            "**Voice room settings** — needs Manage Server\n/export · /import\n",
         ] {
             assert!(text.contains(line), "{line}");
         }
@@ -393,8 +396,9 @@ mod tests {
             .collect();
         // 27 legacy builtins plus the Next-only help command and the
         // Next-only privacy command, then the 21 voice names (voice `kick`
-        // shares the Kick group) and `/templateassistant`.
-        assert_eq!(grouped.len(), 51);
+        // shares the Kick group). `/templateassistant` stays out until its
+        // slice lands.
+        assert_eq!(grouped.len(), 50);
         for name in [
             "rank",
             "leaderboard",
@@ -424,9 +428,7 @@ mod tests {
             crate::voice_rooms::voice_commands()
                 .iter()
                 .map(|def| def.name.as_str()),
-        )
-        .chain(["templateassistant"])
-        {
+        ) {
             assert!(grouped.contains(name), "{name} has a help group");
         }
     }

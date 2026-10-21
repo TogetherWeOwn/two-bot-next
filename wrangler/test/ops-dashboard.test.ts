@@ -194,10 +194,10 @@ test(`${OPS_DASHBOARD_PATH}: CSP authorizes only the unchanged page's inline blo
   assert.equal(directives.length, Object.keys(expected).length, "no duplicate or extra directives");
   assert.deepEqual(Object.fromEntries(directives.map(([name, ...sources]) => [name, sources])), expected);
   assert.doesNotMatch(html, /\s(?:on[\w:-]+|style)\s*=/i, "no inline event handlers or style attributes");
-  // Hashes leave the served body byte-for-byte identical to the pre-CSP page.
+  // CSP hashes are header-only, so they do not rewrite the body. Re-pin when the static page changes.
   assert.equal(
     createHash("sha256").update(html).digest("hex"),
-    "b31222e7fb8f15e1826a58f7a6c33c09f83e4b86c8ecb099cd184006291e5124",
+    "3436cd503436829a3ceb93ddbebc6174f156714ce997a8c2e302aeebc892f638",
   );
   const headers = new Headers(res.headers);
   headers.delete("content-security-policy");

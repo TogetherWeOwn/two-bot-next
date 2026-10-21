@@ -116,6 +116,19 @@ channel or substitute credentials.
    LIMIT 61;
    ```
 
+   Both `BETWEEN` bounds are inclusive. The collector strictly parses psql CSV
+   (including the identity probe) and requires real UTC calendar/clock instants,
+   not just timestamp-shaped strings. Every returned row, including the 61st
+   overflow witness, must fall inside those bounds. Malformed quoting, impossible
+   dates/times, out-of-window rows or unknown event types fail with a bounded
+   fixed-vocabulary read error (exit 1), without writing an artifact or summary
+   or echoing raw rows, member identifiers or database values. Valid quoted CSV
+   and zero rows remain valid. Before publication, `artifact_errors` independently
+   checks real, ordered window bounds (at most 15 minutes) and all kept rows
+   against the same inclusive window. Rows remain in SQL ID order; recorded times
+   need not be chronological. These offline checks establish the evidence
+   contract, not live coverage or soak acceptance.
+
    The extra row only detects overflow. The run uploads
    `staging-events-read-<run_id>.json` (14 days, `gh run download <run_id>`):
 

@@ -305,8 +305,14 @@ for (const ingress of INGRESS_CASES) {
     }
   });
 
-  test(`${ingress.name} relayed 200 keeps bytes and header filtering with hardening`, async (t) => {
-    for (const body of [new TextEncoder().encode('{ "ok": true, "text": "café" }\n'), null]) {
+  test(`${ingress.name} relayed JSON keeps supported content and header filtering with hardening`, async (t) => {
+    t.mock.method(console, "warn", () => {});
+    const requestId = newRequestId();
+    const ack = ingress.name === "actions"
+      ? { ok: true, request_id: requestId, result: { message_id: "1" } }
+      : { ok: true, request_id: requestId };
+    const json = JSON.stringify({ ...ack, text: "café" });
+    for (const body of [new TextEncoder().encode(json), null]) {
       for (const retry of ["7", "7.5"]) {
         await t.test(`${body === null ? "empty" : "streamed"} body, retry-after ${retry}`, async () => {
           const response = await ingress.relay(new Response(body, {
@@ -320,12 +326,17 @@ for (const ingress of INGRESS_CASES) {
               "x-content-type-options": "weakened",
               "set-cookie": "fixture=value",
             },
-          }));
-          assert.equal(response.status, 200);
-          assert.deepEqual(new Uint8Array(await response.arrayBuffer()), body ?? new Uint8Array());
-          assert.equal(response.headers.get("content-type"), ingress.media);
-          assert.equal(response.headers.get("retry-after"), retry === "7" ? "7" : null);
-          assert.equal(response.headers.get("idempotent-replay"), ingress.name === "actions" ? "true" : null);
+          }), requestId);
+          const refusedEmpty = body === null;
+          const projected = refusedEmpty
+            ? { ok: false, request_id: requestId, error: { code: "unavailable", message: "request refused", retryable: true } }
+            : ack;
+          const expectedBody = new TextEncoder().encode(JSON.stringify(projected));
+          assert.equal(response.status, refusedEmpty ? 503 : 200);
+          assert.deepEqual(new Uint8Array(await response.arrayBuffer()), expectedBody);
+          assert.equal(response.headers.get("content-type"), refusedEmpty ? "application/json" : ingress.media);
+          assert.equal(response.headers.get("retry-after"), !refusedEmpty && retry === "7" ? "7" : null);
+          assert.equal(response.headers.get("idempotent-replay"), ingress.name === "actions" && !refusedEmpty ? "true" : null);
           assert.equal(response.headers.get("cache-control"), "no-store");
           assert.equal(response.headers.get("set-cookie"), null);
           assertHardened(response.headers, `${ingress.name} relayed 200`);
@@ -336,7 +347,7 @@ for (const ingress of INGRESS_CASES) {
 }
 
 test("EventSub relayed challenge keeps bytes and gains hardening", async () => {
-  const challenge = new TextEncoder().encode("synthetic-challenge-headers\n");
+  const challenge = new TextEncoder().encode("synthetic-challenge-headers");
   const response = await relayEventsubResponse(new Response(challenge, {
     headers: { "content-type": "text/plain; charset=utf-8", "retry-after": "9" },
   }));
@@ -346,6 +357,25 @@ test("EventSub relayed challenge keeps bytes and gains hardening", async () => {
   assert.equal(response.headers.get("retry-after"), "9");
   assert.equal(response.headers.get("cache-control"), "no-store");
   assertHardened(response.headers, "EventSub challenge 200");
+});
+
+test("EventSub invalid challenge becomes a hardened refusal without upstream headers", async (t) => {
+  t.mock.method(console, "warn", () => {});
+  const requestId = newRequestId();
+  const response = await relayEventsubResponse(new Response("synthetic-challenge-headers\n", {
+    headers: { "content-type": "text/plain", "retry-after": "9", "set-cookie": "fixture=value" },
+  }), requestId);
+  assert.equal(response.status, 503);
+  assert.deepEqual(await response.json(), {
+    ok: false,
+    request_id: requestId,
+    error: { code: "unavailable", message: "request refused", retryable: true },
+  });
+  assert.equal(response.headers.get("content-type"), "application/json");
+  assert.equal(response.headers.get("retry-after"), null);
+  assert.equal(response.headers.get("set-cookie"), null);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assertHardened(response.headers, "EventSub invalid challenge 503");
 });
 
 for (const [reason, status] of [["epoch_conflict", 409], ["not_owner", 503]] as const) {

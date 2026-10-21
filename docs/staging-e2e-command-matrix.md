@@ -35,7 +35,7 @@ guild.`), all other builtins stay silent (`Ignore`); stale or unknown names
 | 1 | `/rank` | always | Everyone | Ephemeral text with XP, level, server rank | — |
 | 2 | `/leaderboard` | always | Everyone | Public mention-suppressed top ten | — |
 | 31 | `/help` | always | Everyone | Immediate ephemeral list of the live published commands, grouped by audience with permission hints (no defer, no store read) | — |
-| 32 | `/privacy` | always | Everyone | Deferred ephemeral reply; `opt-out` purges the invoker's guild rows plus suppression plus one audit receipt, `opt-in` clears suppression, `status` reports suppression plus guild switches | subcommand required (`opt-out`/`opt-in`/`status`); guild-only |
+| 32 | `/privacy` | always | Everyone | Deferred ephemeral reply; analytics `opt-out` purges the invoker's guild rows plus suppression plus one audit receipt, `opt-in` clears suppression, `status` reports suppression plus guild switches; `delete` queues the invoker's erasure request (fresh requests acknowledge as pending; same-interaction retries reuse the request and direct the member to status), and deletion status/receipt reads bind to the same invoker and guild | subcommand required (`opt-out`/`opt-in`/`status`/`delete`/`deletion-status`/`deletion-receipt`); request id required for `deletion-status` and `deletion-receipt`; guild-only |
 | 12 | `/attendance` | `TWO_COMMUNITY_SCORECARD` | ManageEvents | Ephemeral confirmation/refusal; records verified attendee | `ScorecardDisabled`, `ManageEventsRequired`, `event-occurrence` required ≤128, `member` required |
 | 14 | `/command` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral confirmation + audit row | `AutomationsDisabled`, `ManageServerRequired`, `name`/`template` required |
 | 15 | `/command-remove` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral confirmation + audit row | `AutomationsDisabled`, `ManageServerRequired`, `name` required |
@@ -67,6 +67,24 @@ permission → target present → self-target → owner/Owen/bot/staff protectio
 bot hierarchy → actor hierarchy. Audit `reason` is trimmed, non-empty, ≤512
 UTF-16 units on every moderation row.
 
+## Voice slice: vote-kick, setup/import (CI-proven handlers; staging round-trip UNPROVEN)
+
+The `TWO_VOICE` slice stays out of the live 29-row suite above. Its handlers
+are proven deterministically in CI with constructed interaction inputs and no
+guild, network, or database. The user-originated staging round-trip is
+UNPROVEN: a bot token cannot invoke slash commands or click components, so no
+unattended synthetic can drive it. These rows need a supervised human tester
+run on staging. Never record them as passed until a human has run them.
+
+| Command | CI proof (deterministic, no guild) | Staging expectation (human run) | Staging status |
+| --- | --- | --- | --- |
+| `/kick` (vote) | `vote_kick_open_vote_close_round_trip_through_interactions`: occupant opens via `/kick`, Yes ballots to strict majority close Passed with disabled buttons, replay stays terminal; room-scoped deny/disconnect enforcement pinned by `strict_majority_passes_and_enforces_on_that_room_only` | Occupant `/kick` opens a public ballot; majority Yes disconnects and Connect-denies the target on that room only; refusals stay ephemeral with no state change | UNPROVEN — human run required |
+| `/setup` | `setup_then_import_confirm_round_trip_through_interactions` reads the admin panel before and after the import | Admin sees status/health/creators; members see the generic panel only | UNPROVEN — human run required |
+| `/import` | Same test: upload previews the diff, Confirm applies the file exactly once (`Import applied: …`), stored config equals the upload, replayed Confirm expires with no second apply; Cancel-consumes-preview pinned by `import_cancel_writes_nothing_and_consumes_the_preview` | Manage Server upload shows the diff preview; Confirm applies it; Cancel writes nothing | UNPROVEN — human run required |
+
+Out of this slice: owner-command round-trips (`/limit`, `/private`, `/name`)
+ship separately and are untouched here.
+
 ## Out of scope
 
 - Voice `/create /setup /ping /invite /textchannels /access /reclaim
@@ -76,7 +94,7 @@ UTF-16 units on every moderation row.
   `kick` loses the merge to moderation first-wins — runtime dispatch decides).
   The published voice set is pinned separately by the `voice` section of
   `crates/core/tests/fixtures/staging_published_commands.json`.
-- `/templateassistant` (voice + assistant gates; same fixture section).
+- `/templateassistant` (unpublished until its slice lands; name still reserved, same fixture section).
 - DB-backed custom commands and `!` prefix triggers (dynamic surfaces).
 - Component/modal surfaces (pickers, tickets, self-roles, LFG signup).
 - Dropped `/rota-acknowledge` (parity row 13, never published).

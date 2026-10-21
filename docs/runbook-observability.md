@@ -34,6 +34,30 @@ No Gatus or third-party monitor is used.
   revision. The Worker version ID is distinct from the Git SHA. Production
   release tags are created by the successful promotion flow, not by hand.
 
+## Log retention for postmortems
+
+Postmortems query Workers Logs directly; no separate log export exists.
+Both named environments keep unsampled Worker, Durable Object, and container
+logs for seven days on the Workers Paid plan (20 million events per month
+included; the Free plan keeps three days). Seven days is the Cloudflare-side
+maximum, so an incident's log window must be captured — queries plus the
+quoted lines — in the incident record within that week; it cannot be
+re-queried later. Sources: the Workers Logs
+[limits](https://developers.cloudflare.com/workers/observability/logs/workers-logs/#limits)
+and [pricing](https://developers.cloudflare.com/workers/observability/logs/workers-logs/#pricing)
+tables, and the [dataset retention table](https://developers.cloudflare.com/observability/logs/datasets/)
+(workers and containers: 7 days). From December 1, 2026 Workers Logs moves to
+[Observability pricing](https://developers.cloudflare.com/observability/pricing/),
+which keeps a default seven-day retention for the shared allowance.
+
+No Logpush job or Tail Worker export is planned: the
+[October production postmortem](production-incident-2026-10-15-postmortem.md)
+was written from same-day log queries plus deploy run receipts, and every
+signal in this runbook (alert to log window to build SHA to change) resolves
+within days of the incident. Revisit only on a concrete trigger: a postmortem
+that misses its log window, a compliance rule that needs longer retention, or
+a Cloudflare pricing change that moves the seven-day default.
+
 ## From an alert to the responsible change
 
 1. Record the alert's environment, rule/class, timestamp, and runbook link. Do
@@ -96,6 +120,33 @@ existing firing state and does not count as recovery. See the detailed rule
 definitions and their alert-response sections in
 [the operations runbook](runbook.md#metrics-alerts) and
 [metrics reference](metrics.md#off-container-scrape-and-alert-rules).
+
+## Voice boot-setting refusal
+
+If the gateway logs `voice HTTP setup failed`, look earlier in the same
+Container boot window for `temp-voice boot setting invalid; refusing voice
+runtime` at WARN. Match the JSON `message` field, not `msg`. Its `key` names
+the exact fixed environment key to inspect; `reason` is always
+`invalid_value`. The log intentionally contains no configured value, raw
+parser error, token, channel/member list or synthetic identity input.
+
+The first invalid setting wins: protected channels (lobby, generator,
+category, protected list), generator, empty-room grace, then synthetic humans.
+The generator key is already checked during protection. Later invalid keys
+are not reported until the earlier refusal is corrected. See the
+[event catalog](observability-event-catalog.md#voice-structured-fields-gateway-sink-adjacent)
+for the complete key list and field shape.
+
+Record the build revision, boot timestamp, fixed key and reason only. Have
+the authorized configuration executor inspect that one setting privately
+against its existing contract; use the normal configuration/restart gates
+for any correction. Do not dump environment values or paste lists into an
+incident. This runbook does not authorize a live setting change or restart.
+The runtime still refuses setup with `InvalidRequest`; process health alone
+is not evidence that voice initialized. Absent, blank and valid settings do
+not emit this diagnostic. Do not confuse it with `temp-voice admission
+setting invalid; using default`: admission knobs remain nonfatal and fall
+back per knob without refusing voice setup.
 
 ## Request-id correlation
 
@@ -194,8 +245,9 @@ claim them as shipped acceptance:
   the `production` job against live production `/ops/metrics` (evidence
   `production-error-rate-gate.json`), failing the stage into the same
   auto-rollback; live enforcement needs the `PRODUCTION_METRICS_SCRAPE_TOKEN`
-  secret, else a recorded skip, and the `inject_error_rate_spike` dispatch
-  input proves the chain with a rehearsal firing.
+  secret, else a recorded skip. Production has no rehearsal path: its guard
+  refuses `inject_error_rate_spike` (failure injection runs on staging only,
+  after the 10-20 20:54Z forced production drill).
 - The shared central gradual-promotion action promotes 5-50-100% with
   per-stage health gates and automatic rollback to the recorded pre-promote
   version. The caller contract is implemented (`bin/smoke.mjs`, contract-tested

@@ -11,6 +11,7 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -692,7 +693,11 @@ class WebSocketFrameTest(unittest.TestCase):
         ours, theirs = socket.socketpair()
         ws = synth.WebSocket.__new__(synth.WebSocket)
         ws.sock, ws.lock = ours, threading.Lock()
-        message = json.dumps({"op": 0, "t": "GUILD_CREATE", "d": {"x": "y" * 70000}}).encode()
+        # Half the gateway message cap: fragmentation and ping coverage
+        # stay, while the cap boundary itself is pinned by the
+        # gateway-intake acceptance file.
+        message = json.dumps({"op": 0, "t": "GUILD_CREATE",
+                              "d": {"x": "y" * (synth.MAX_BODY_BYTES // 2)}}).encode()
         theirs.sendall(self.frame(0x9, b"hi") + self.frame(0x1, message[:100], fin=False)
                        + self.frame(0x0, message[100:]))
         got = ws.recv()
@@ -718,6 +723,273 @@ class WebSocketFrameTest(unittest.TestCase):
         self.assertEqual(json.loads(body), {"op": 1, "d": None})
         ours.close()
         theirs.close()
+
+    def recvall(self, sock, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                self.fail("the pong ended early")
+            buf += chunk
+        return buf
+
+    def test_ping_at_125_bytes_is_ponged_verbatim(self):
+        ours, theirs = socket.socketpair()
+        try:
+            ws = synth.WebSocket.__new__(synth.WebSocket)
+            ws.sock, ws.lock = ours, threading.Lock()
+            payload = b"p" * 125
+            theirs.sendall(self.frame(0x9, payload) + self.frame(0x8, b""))
+            self.assertIsNone(ws.recv())
+            pong = self.recvall(theirs, 2 + 4 + 125)
+            self.assertEqual(pong[0], 0x8A)
+            self.assertEqual(pong[1], 0x80 | 125)
+            mask = pong[2:6]
+            body = bytes(b ^ mask[i % 4] for i, b in enumerate(pong[6:]))
+            self.assertEqual(body, payload)
+        finally:
+            ours.close()
+            theirs.close()
+
+    def test_ping_over_125_bytes_refuses_with_fixed_message(self):
+        for size in (126, 1000):
+            with self.subTest(size=size):
+                ours, theirs = socket.socketpair()
+                # Fail fast if the bound is ever removed: without the
+                # refusal the reader would block past the pong instead.
+                ours.settimeout(5)
+                try:
+                    ws = synth.WebSocket.__new__(synth.WebSocket)
+                    ws.sock, ws.lock = ours, threading.Lock()
+                    theirs.sendall(self.frame(0x9, b"q" * size))
+                    with self.assertRaises(synth.GatewayShapeError) as ctx:
+                        ws.recv()
+                    self.assertEqual(str(ctx.exception), "gateway frame was malformed")
+                finally:
+                    ours.close()
+                    theirs.close()
+
+    def test_close_over_125_bytes_refuses_with_fixed_message(self):
+        ours, theirs = socket.socketpair()
+        try:
+            ws = synth.WebSocket.__new__(synth.WebSocket)
+            ws.sock, ws.lock = ours, threading.Lock()
+            theirs.sendall(self.frame(0x8, b"c" * 126))
+            with self.assertRaises(synth.GatewayShapeError) as ctx:
+                ws.recv()
+            self.assertEqual(str(ctx.exception), "gateway frame was malformed")
+        finally:
+            ours.close()
+            theirs.close()
+
+    def test_continuation_over_cap_refuses_before_payload_read(self):
+        cap = synth.MAX_BODY_BYTES
+        first = b"j" * (cap - 100)
+        # Over-cap continuation header declaring 200 bytes, payload never sent:
+        # the pre-read check must refuse without requesting those bytes.
+        data = (self.frame(0x1, first, fin=False)
+                + bytes([0x80, 126]) + struct.pack(">H", 200))
+        ws = synth.WebSocket.__new__(synth.WebSocket)
+        sock = _RecordingSocket(data)
+        ws.sock, ws.lock = sock, threading.Lock()
+        with self.assertRaises(synth.BodyTooLarge) as ctx:
+            ws.recv()
+        self.assertEqual(str(ctx.exception),
+                         "gateway message answered over the byte cap")
+        self.assertEqual(sock.requested, [2, 2, cap - 100, 2, 2])
+
+    def test_continuation_exact_cap_passes(self):
+        cap = synth.MAX_BODY_BYTES
+        payload = json.dumps({"op": 0, "t": "READY",
+                              "d": {"user": {"id": "900"}}}).encode()
+        payload += b" " * (cap - len(payload))
+        self.assertEqual(len(payload), cap)
+        first, rest = payload[:-100], payload[-100:]
+        data = self.frame(0x1, first, fin=False) + self.frame(0x0, rest)
+        ws = synth.WebSocket.__new__(synth.WebSocket)
+        sock = _RecordingSocket(data)
+        ws.sock, ws.lock = sock, threading.Lock()
+        self.assertEqual(ws.recv(), json.loads(payload))
+
+
+class _HandshakeScript:
+    """Scripted socket for the websocket handshake: bytes, then EOF."""
+
+    def __init__(self, data):
+        self._buf = bytearray(data)
+        self.sent = []
+
+    def recv(self, n):
+        chunk = bytes(self._buf[:n])
+        del self._buf[:n]
+        return chunk
+
+    def sendall(self, data):
+        self.sent.append(bytes(data))
+
+    def close(self):
+        pass
+
+
+class _RecordingSocket:
+    """Scripted socket logging every requested read size; EOF when exhausted."""
+
+    def __init__(self, data):
+        self._buf = bytearray(data)
+        self.requested = []
+        self.sent = []
+
+    def recv(self, n):
+        self.requested.append(n)
+        chunk = bytes(self._buf[:n])
+        del self._buf[:n]
+        return chunk
+
+    def sendall(self, data):
+        self.sent.append(bytes(data))
+
+    def close(self):
+        pass
+
+
+class WebSocketHandshakeTest(unittest.TestCase):
+    HANDSHAKE_MSG = "gateway handshake answered over the byte cap"
+
+    def connect(self, data):
+        script = _HandshakeScript(data)
+        context = mock.Mock()
+        context.wrap_socket.return_value = script
+        with mock.patch.object(synth.socket, "create_connection",
+                               return_value=object()), \
+                mock.patch.object(synth.ssl, "create_default_context",
+                                  return_value=context):
+            return synth.WebSocket("gateway.example", "/?v=10&encoding=json")
+
+    def test_valid_handshake_passes(self):
+        ws = self.connect(b"HTTP/1.1 101 Switching Protocols\r\n"
+                          b"Upgrade: websocket\r\n\r\n")
+        self.assertTrue(ws.sock.sent[0].startswith(
+            b"GET /?v=10&encoding=json HTTP/1.1\r\n"))
+        ws.close()
+
+    def test_handshake_over_cap_refuses_with_fixed_message(self):
+        sentinel = "SENTINEL_HANDSHAKE_must_not_echo"
+        head = (sentinel + "\r\n").encode() + b"X" * synth.MAX_BODY_BYTES
+        self.assertNotIn(b"\r\n\r\n", head)
+        with self.assertRaises(synth.BodyTooLarge) as ctx:
+            self.connect(head)
+        self.assertEqual(str(ctx.exception), self.HANDSHAKE_MSG)
+        self.assertNotIn(sentinel, str(ctx.exception))
+
+    def test_handshake_exact_cap_passes(self):
+        cap = synth.MAX_BODY_BYTES
+        status = b"HTTP/1.1 101 Switching Protocols\r\n"
+        head = status + b"X" * (cap - len(status) - 4) + b"\r\n\r\n"
+        self.assertEqual(len(head), cap)
+        self.assertNotIn(b"\r\n\r\n", head[:-4])
+        ws = self.connect(head)
+        self.assertTrue(ws.sock.sent[0].startswith(
+            b"GET /?v=10&encoding=json HTTP/1.1\r\n"))
+        ws.close()
+
+    def test_handshake_cap_plus_one_refuses_with_fixed_message(self):
+        cap = synth.MAX_BODY_BYTES
+        status = b"HTTP/1.1 101 Switching Protocols\r\n"
+        head = status + b"X" * (cap + 1 - len(status) - 4) + b"\r\n\r\n"
+        self.assertEqual(len(head), cap + 1)
+        self.assertNotIn(b"\r\n\r\n", head[:-4])
+        with self.assertRaises(synth.BodyTooLarge) as ctx:
+            self.connect(head)
+        self.assertEqual(str(ctx.exception), self.HANDSHAKE_MSG)
+
+    def test_handshake_eof_refuses_without_hanging(self):
+        with self.assertRaises(ConnectionError) as ctx:
+            self.connect(b"HTTP/1.1 101 Switching Protoco")
+        self.assertEqual(str(ctx.exception), "gateway closed during handshake")
+
+
+class _ScriptSock:
+    """Socket stand-in: pump only sets timeouts on it."""
+
+    def settimeout(self, timeout):
+        pass
+
+
+class _ScriptGateway:
+    """Scripted ``WebSocket`` stand-in returning parsed messages."""
+
+    def __init__(self, script):
+        self._script = list(script)
+        self.sent = []
+        self.sock = _ScriptSock()
+
+    def recv(self):
+        assert self._script, "test bug: gateway script exhausted"
+        return self._script.pop(0)
+
+    def send(self, payload):
+        self.sent.append(payload)
+
+
+class GatewayDispatchShapeTest(unittest.TestCase):
+    DISPATCH_MSG = "gateway dispatch was malformed"
+
+    def pump_session(self, script):
+        session = synth.Session.__new__(synth.Session)
+        session.ws = _ScriptGateway(script)
+        session.seq, session.events, session.me = None, [], None
+        return session
+
+    def dispatch_fails(self, message):
+        session = self.pump_session([message])
+        with self.assertRaises(synth.GatewayShapeError) as ctx:
+            session.pump(lambda event: False, time.monotonic() + 5)
+        self.assertEqual(str(ctx.exception), self.DISPATCH_MSG)
+
+    def test_non_dict_message_refuses(self):
+        self.dispatch_fails([])
+
+    def test_non_string_t_or_non_dict_d_refuses(self):
+        for bad in ({"op": 0, "t": 5, "d": {}},
+                    {"op": 0, "t": None, "d": {}},
+                    {"op": 0, "t": "READY", "d": ["user"]}):
+            with self.subTest(message=bad):
+                self.dispatch_fails(bad)
+
+    def test_ready_with_non_string_user_id_refuses(self):
+        for bad_id in (None, 900, {"snow": "flake"}, ["900"]):
+            with self.subTest(id=bad_id):
+                self.dispatch_fails({"op": 0, "s": 1, "t": "READY",
+                                     "d": {"user": {"id": bad_id}}})
+        self.dispatch_fails({"op": 0, "s": 1, "t": "READY", "d": {"user": None}})
+
+    def test_ready_with_string_user_id_passes(self):
+        session = self.pump_session([{"op": 0, "s": 1, "t": "READY",
+                                      "d": {"user": {"id": "900"}}}])
+        event = session.pump(lambda e: True, time.monotonic() + 5)
+        self.assertEqual(event, {"t": "READY", "d": {"user": {"id": "900"}}})
+        self.assertEqual(session.me, "900")
+
+    def test_guild_create_or_channel_delete_without_string_id_refuses(self):
+        for t in ("GUILD_CREATE", "CHANNEL_DELETE"):
+            for d in ({}, {"id": None}, {"id": 5001}):
+                with self.subTest(t=t, d=d):
+                    self.dispatch_fails({"op": 0, "s": 3, "t": t, "d": d})
+
+    def test_guild_create_and_channel_delete_with_string_id_pass(self):
+        create = {"op": 0, "s": 3, "t": "GUILD_CREATE", "d": {"id": "111"}}
+        delete = {"op": 0, "s": 4, "t": "CHANNEL_DELETE", "d": {"id": "5001"}}
+        session = self.pump_session([create, delete])
+        # The run_live consumers index e["d"]["id"] directly; the pump
+        # validation above is what keeps that indexing safe.
+        event = session.pump(
+            lambda e: e["t"] == "GUILD_CREATE" and e["d"]["id"] == "111",
+            time.monotonic() + 5)
+        self.assertEqual(event, {"t": "GUILD_CREATE", "d": {"id": "111"}})
+        event = session.pump(
+            lambda e: e["t"] == "CHANNEL_DELETE" and e["d"]["id"] == "5001",
+            time.monotonic() + 5)
+        self.assertEqual(event, {"t": "CHANNEL_DELETE", "d": {"id": "5001"}})
 
 
 class BodyCapTest(unittest.TestCase):
@@ -889,6 +1161,54 @@ class BodyCapTest(unittest.TestCase):
         self.assertEqual(len(requests), 3)
         for req in requests:
             self.assertEqual(req.get_header("User-agent"), self.EXPECTED_UA)
+
+
+class HelloIntervalTest(unittest.TestCase):
+    HELLO_MSG = "gateway hello was malformed"
+
+    def session_with_interval(self, interval):
+        hello = {"op": 10, "d": {"heartbeat_interval": interval}}
+
+        class _Gateway:
+            def __init__(self, *args):
+                self.sent = []
+
+            def recv(self):
+                return hello
+
+            def send(self, payload):
+                self.sent.append(payload)
+
+            def close(self):
+                pass
+
+        with mock.patch.object(synth, "WebSocket", _Gateway):
+            return synth.Session("TOK")
+
+    def test_valid_interval_becomes_seconds(self):
+        session = self.session_with_interval(41250)
+        try:
+            self.assertEqual(session.interval, 41.25)
+        finally:
+            session.close()
+
+    def test_invalid_intervals_fail_with_fixed_message(self):
+        for bad in (0, -41250, True, float("nan"), float("inf"),
+                    10 ** 1000, 1e300):
+            with self.subTest(interval=bad), \
+                    self.assertRaises(synth.GatewayShapeError) as ctx:
+                self.session_with_interval(bad)
+            self.assertEqual(str(ctx.exception), self.HELLO_MSG)
+
+    def test_timing_cap_boundary_milliseconds(self):
+        session = self.session_with_interval(600000)
+        try:
+            self.assertEqual(session.interval, 600.0)
+        finally:
+            session.close()
+        with self.assertRaises(synth.GatewayShapeError) as ctx:
+            self.session_with_interval(600001)
+        self.assertEqual(str(ctx.exception), self.HELLO_MSG)
 
 
 if __name__ == "__main__":

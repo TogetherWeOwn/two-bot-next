@@ -138,7 +138,8 @@ each non-bot join to a registered `JoinObserver` after the funnel rows are
 written (`Pipeline::set_join_observer`), so an alert problem can never cost the
 join record. A single worker owns the volatile `RaidWatch`, re-reads
 `TWO_RAID_JOIN_THRESHOLD` / `TWO_RAID_WINDOW_SECONDS` through the settings store
-at most every 15 s (hot-wired keys; a failed read keeps the last good values),
+at most every 15 s (hot-wired keys; a failed read keeps the last outcome,
+including refusal),
 logs `raid_alert` first, and posts the staff message through the shared
 `ActionExecutor` to the live `DISCORD_STAFF_ALERT_CHANNEL_ID` (stored rows win
 over the boot value; a delete hands the key back) when the
@@ -193,15 +194,19 @@ permission, channel, tuning or runtime changes.
 
 - Boot value versus stored override. The Container boots from the forwarded
   `DISCORD_STAFF_ALERT_CHANNEL_ID` deployment value; the settings store then
-  wins per observation for the hot keys (`crates/bot/src/raid_runtime.rs:159-200`,
-  `SETTING_KEYS`). A stored row moves the next observation, and deleting the
-  row hands the key back to the boot value. Tuning behaves the same way: a
-  failed refresh keeps the last good values. The first join the worker
-  observes after each start logs `raid_watch_enabled` with the target in force
-  at that moment (`crates/bot/src/raid_runtime.rs:190-198`, reached only via
-  `handle` at `:322-339`; `start`/`start_from_env` log nothing) — a quiet
-  guild logs nothing from the raid worker until a join arrives, and
-  `raid_watch_enabled` is not logged again when the channel changes. A hot
+  wins per observation for the hot keys (`StoreSettings::apply_refresh` in
+  `crates/bot/src/raid_runtime.rs`, `SETTING_KEYS`). A stored row moves the next
+  observation after refresh, and deleting the row hands the key back to the
+  boot value. A failed refresh keeps the last outcome, including refusal.
+  Present malformed numbers or staff channels refuse the observation before
+  updating the watch or proposing an alert. `raid_tuning_refused` logs only the
+  key at error level on entry or a changed refused key, not once per join;
+  recovery requires a valid read. Missing/empty/whitespace keys retain defaults
+  and an absent channel remains log-only. The first valid read after start or
+  refusal logs `raid_watch_enabled` with the target in force (reached via
+  `RaidWorker::handle`; `start`/`start_from_env` log nothing) — a quiet guild
+  logs nothing from the raid worker until a join arrives. A channel-only change
+  between valid settings does not log `raid_watch_enabled` again. A hot
   change to the channel (set, change or delete) is logged separately by the
   settings poll job within one 15 s poll: `settings_applied` (key names only)
   plus `setting_changed` with `key=DISCORD_STAFF_ALERT_CHANNEL_ID`,
@@ -210,25 +215,25 @@ permission, channel, tuning or runtime changes.
   back to the settings-store row for the live value only if the log line is
   unavailable.
 - Delivery requirements. Every post needs all three: a usable channel value
-  (unusable falls back to log-only, `RaidSettings::from_vars`), a guild text
+  (`RaidSettings::try_from_vars` refuses malformed nonempty channels), a guild text
   channel the bot can View and Send in (`MemberAccess::load` plus
   `permits(channel, true)`), and `MentionPolicy::None` with empty allowed
   mentions — a proposal asking for anything else is refused
-  (`raid_alert_refused`) rather than widened (`crates/bot/src/raid_runtime.rs:230-297`).
+  (`raid_alert_refused`) rather than widened (`RaidDelivery::announce`).
   No identifier or credential is ever needed to check these: read the log
   lines, not the values.
 - Evidence map (raid alerts; join risk shares the staff channel and the
   `Delivery` enum under `join_risk_*` strings). Search logs for these exact
   strings: `raid_alert` is the log-first proposal (always emitted, even when
   nothing is posted — an unset staff channel logs only this line and no
-  delivery-status line, `crates/bot/src/raid_runtime.rs:244-246`);
+  delivery-status line, `RaidDelivery::announce`);
   `raid_alert_posted` means `Delivery::Posted`; `raid_alert_undeliverable`
   means the channel is missing, not text, or View/Send was refused
   (`Delivery::Undeliverable`); `raid_alert_post_failed` means delivery failed
   (`Delivery::Failed`: failed bot-identity lookup, failed member/permission
   read — so an unproven permission reports as post_failed, not
   undeliverable — the 12 s delivery timeout, or a failed send,
-  `crates/bot/src/raid_runtime.rs:267-297`). Join-risk equivalents are
+  `RaidDelivery::post_staff_message` and `post`). Join-risk equivalents are
   `join_risk_posted`, `join_risk_undeliverable`, `join_risk_post_failed` and
   `join_risk_refused` (`crates/bot/src/join_risk_runtime.rs:372-389`). The
   proposal consumes the cooldown, so a missing channel, a refusal and a

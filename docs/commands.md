@@ -10,16 +10,17 @@ The router publishes one complete set: first definition wins, built-in names
 are reserved, and Discord's 100-command limit applies. Database-backed custom
 commands and optional text triggers are dynamic and are not listed here.
 
-The voice commands publish only while `TWO_VOICE=1`, and `/templateassistant`
-also needs `TWO_ASSISTANT_ENDPOINT`; both are enabled here. The voice `kick`
-loses first-wins to moderation `/kick`, so the `/kick` below is the moderation
-command and the vote-kick shape is not listed.
+The voice commands publish only while `TWO_VOICE=1`, which is enabled
+here. `/templateassistant` stays unpublished until its slice lands with a
+handler, so `TWO_ASSISTANT_ENDPOINT` currently publishes nothing. The voice
+`kick` loses first-wins to moderation `/kick`, so the `/kick` below is the
+moderation command and the vote-kick shape is not listed.
 
 Bounds below are registry bounds; a dash means no bound is declared there,
 not that handler validation is unlimited. Permissions are Discord default
 member-permission bitfields, not a replacement for runtime authorization.
 
-Built-in commands: 51.
+Built-in commands: 50.
 
 ## `/access`
 
@@ -348,7 +349,7 @@ Set where new rooms appear and the first room number
 
 ## `/privacy`
 
-Manage your analytics privacy for this server.
+Manage your analytics privacy and deletion requests for this server.
 
 - Default permissions: Everyone (no default permission gate)
 - Available in DMs: false
@@ -358,6 +359,11 @@ Manage your analytics privacy for this server.
 | `opt-out` | subcommand | false | — | — | — | — | Delete your stored activity for this server and stop future analytics persistence. |
 | `opt-in` | subcommand | false | — | — | — | — | Resume analytics persistence for this server (already-deleted rows are not restored). |
 | `status` | subcommand | false | — | — | — | — | Show whether you are opted out and this server's analytics switches. |
+| `delete` | subcommand | false | — | — | — | — | Request deletion of your stored data for this server. |
+| `deletion-status` | subcommand | false | — | — | — | — | Show the status of your deletion request. |
+| `deletion-status request-id` | string | true | — | — | 128 | — | The request id returned when you requested deletion. |
+| `deletion-receipt` | subcommand | false | — | — | — | — | Show the completed receipt for your deletion request. |
+| `deletion-receipt request-id` | string | true | — | — | 128 | — | The request id returned when you requested deletion. |
 
 ## `/private`
 
@@ -521,17 +527,6 @@ Temporarily ban a member
 | `target` | user | true | — | — | — | — | Member to moderate |
 | `duration_seconds` | integer | true | 60 | 31536000 | — | — | Duration in seconds |
 | `reason` | string | true | — | — | 512 | — | Mandatory audit reason |
-
-## `/templateassistant`
-
-Describe the voice-room naming you want; the bot drafts a name template
-
-- Default permissions: ManageGuild (`32`)
-- Available in DMs: false
-
-| Option | Type | Required | Min | Max | Max length | Choices | Description |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| `request` | string | true | — | — | 2000 | — | Plain-language description of the naming you want, in any language |
 
 ## `/textchannels`
 

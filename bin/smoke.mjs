@@ -39,7 +39,7 @@
 // gradual deployments) or a separate non-DO fixture Worker.
 // Production wiring is passive (see docs/gradual-promote-caller.md); never
 // claim unwired stages as proof.
-import { pathToFileURL } from "node:url";
+import { isDirectInvocation } from "../wrangler/scripts/is-direct-invocation.mjs";
 
 export const OVERRIDE_HEADER = "Cloudflare-Workers-Version-Overrides";
 export const VERSION_HEADER = "x-two-worker-version";
@@ -273,7 +273,7 @@ export async function smoke(
   return state.failures === 0;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isDirectInvocation(process.argv[1], import.meta.url)) {
   let args;
   try {
     args = parseArgs(process.argv.slice(2));

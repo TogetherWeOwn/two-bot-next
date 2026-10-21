@@ -271,6 +271,7 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID: "go-live delivery destination channel; reaches the Container only through an explicit containerEnvVars line while the EventSub receiver is forwarded and the delivery gate is exactly \"1\", never this flag allowlist",
   TWO_EVENTSUB_DELIVERY: "go-live delivery gate; reaches the Container only as exactly \"1\" on an explicit containerEnvVars line while the EventSub receiver is forwarded, never this flag allowlist",
   TWO_EVENTSUB_INVITE_URL: "go-live delivery invite URL; reaches the Container only through an explicit containerEnvVars line while the EventSub receiver is forwarded and the delivery gate is exactly \"1\", never this flag allowlist",
+  TWO_EVENTSUB_RELOAD_KEY: "EventSub no-restart rotation HMAC key; reaches the Container only through an explicit containerEnvVars line while the EventSub receiver is forwarded, never this flag allowlist",
   TWO_DATABASE_URL: "cutover/operator CLI secret; the Container reads DATABASE_URL",
   TWO_STAGING_DATABASE_URL: SECRET,
   TWO_BOT_STAGING_MIGRATOR_DATABASE_URL: SECRET,
@@ -362,6 +363,7 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_TOTALLY_MADE_UP: TEST,
   TWO_TYPO_KEYS: TEST,
   TWO_UNKNOWN: TEST,
+  TWO_TUNING_LOG_TEST_CHILD: TEST,
   // Store-only guild setting: the invite responder resolves it from the live
   // settings snapshot, never from the process environment, so there is
   // nothing to forward.

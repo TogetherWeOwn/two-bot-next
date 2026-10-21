@@ -44,7 +44,7 @@ Production has no ingress, route, variable or secret for this receiver.
 | Body | Forwarded byte for byte; the signature covers the raw bytes. Never re-serialized. |
 | Fence | Forwarded only inside the Durable Object's ownership gate. A stale, fenced or missing deployment answers 503 `unavailable` and never reaches the container. |
 | Startup | Public ingress never starts the container; probes and the keepalive do. While the container is not running the answer is 503 `unavailable`. |
-| Answers | The receiver's own JSON envelope is relayed with `Content-Type`, `Idempotent-Replay` and `Retry-After` only, `Cache-Control: no-store`. Any non-JSON, oversize or transport-failure answer (including SDK startup text that embeds error messages) becomes the fixed `unavailable` envelope. Worker refusals use the same envelope with a fixed message. |
+| Answers | The receiver's JSON envelope is validated against the [relayed answer contract](#relayed-answer-contract) and projected: successes keep their action-specific result verbatim beside the correlated id (plus the optional top-level settings version), refusals keep their table status/code/retryability with the fixed message. Headers relayed are `Content-Type`, `Idempotent-Replay` and `Retry-After` only, `Cache-Control: no-store`. Any non-JSON, oversize, transport-failure, malformed, contradictory or unknown-code answer (including SDK startup text that embeds error messages) becomes the fixed `unavailable` envelope. Worker refusals use the same envelope with a fixed message. |
 | Logs | Scalar `internal_actions_ingress` events: `status` and `error_class` only. Never header values, nonce, signature, body or query. |
 
 Authentication is unchanged: legacy v1 HMAC and a durable nonce burn at the
@@ -102,6 +102,13 @@ event receipts read back. Roll back in this order: disable the receiver (step 5)
 and deploy the previous binary, then drop the column. Dropping it while this
 binary runs fails every finish and every success replay, not only event receipts.
 
+Migration `0448` adds nullable `stop_reason` columns to `internal_idempotency`
+and `internal_action_log`, so a purge receipt and its terminal audit keep an
+early stop's reason for outer replays. Every finish writes the column and every
+replay reads it, so apply it before this binary and roll back in the same order
+as `0424`: disable the receiver and deploy the previous binary, then drop both
+columns.
+
 TOG-16851 proved a loopback-only receiver never becomes healthy: the Containers
 port check and `containerFetch` cannot reach it, so the container waited on 8091
 forever. The fix binds the wildcard behind the Worker-set container marker (the
@@ -136,6 +143,50 @@ is not an implemented verifier. No unsigned caller/audience header is trusted.
 Stable caller mapping, idempotency claim, action validation, outbound admission,
 execution and durable finalization remain receiver responsibilities; this
 capability does not itself permit a Discord effect.
+
+## Automation import contract
+
+`automations.import` accepts the version-1 command document produced by
+`automations.export`; the existing MEE6 translation path is unchanged. Parsing
+preserves command document order and duplicate names. Malformed wire entries
+contribute to `skipped`; parsed definitions still undergo normal name,
+description, template and trigger validation.
+
+Planning simulates current content and case-insensitive trigger ownership in
+document order. Each accepted occurrence sees the results of earlier accepted
+occurrences, including those with the same name. Changed content requires
+`overwrite: true`, even for a name first created earlier in this import;
+identical content converges without overwrite. An accepted update releases its
+previous trigger, including when it becomes slash-only. The next accepted
+claimant owns a released trigger. Refused occurrences never change simulated
+content or acquire/release triggers. Validation refusals are reported first,
+followed by overwrite/trigger refusals in document order.
+
+The transactional service applies only the exact parsed-entry indices accepted
+by that plan, in document order, while holding the guild capacity lock. The
+capacity precheck still counts the union of existing names and validated
+candidate names and refuses the whole import before command writes if it is
+over budget. Accepted same-content occurrences are rewritten and count as
+`imported`; each rejected occurrence and malformed wire entry counts as
+`skipped`. `conflicts` retains translation collisions followed by refused
+overwrite/trigger names. Fresh rows are enabled; rewrites preserve the current
+enabled flag and original creator/timestamp.
+
+Each accepted occurrence has one audit ID
+`<import-audit-id>#cmd:<name>#<ordinal>`, with a zero-based per-name ordinal among
+all parsed occurrences, including rejected ones. The command writes, occurrence
+audits and `<import-audit-id>#summary` commit together. The receiver replays the
+committed summary's original counts and conflict names without replanning or
+rewriting commands after later admin edits.
+
+Authentication, durable nonce burn, action claims and feature gates are
+unchanged. Overwrite still requires the separately configured
+`TWO_INTERNAL_ALLOW_AUTOMATIONS_OVERWRITE` capability in addition to the base
+automations flag. These import semantics do not enable ingress, publish
+commands, grant capabilities or authorize a rollout. Parser/planner coverage
+lives in `automation_import_occurrence_planner_acceptance`; the corresponding
+`automation_import_occurrence_service_acceptance` suite checks transactional
+rows, provenance, audit facts and replay readback on disposable databases only.
 
 ## Configuration contract
 
@@ -264,6 +315,63 @@ re-derived), `result.outcome` (membership: `assigned`/`already_held`,
 adds
 `Idempotent-Replay: true`; inbound bucket refusal carries `Retry-After`.
 Messages are fixed/redacted and all envelopes use `Cache-Control: no-store`.
+
+## Relayed answer contract
+
+The Worker relays only envelopes the receiver's constructors emit
+(`crates/core/src/internal_actions.rs`, `crates/bot/src/internal_action_http.rs`).
+Every relayed body carries the forwarded `request_id` (generated shape, echoed
+by the receiver); a missing, misshapen or mismatched id fails closed. Extra
+fields and the receiver's message text never leave: callers see the shapes
+below and nothing else.
+
+Success (`200` only, `result` always an object, no `error` key):
+
+| Family | `result` | Notes |
+| --- | --- | --- |
+| announcement.post | `{message_id}` | |
+| event.upsert/cancel | `{outcome, event_id}` | `outcome` replayed from the stored receipt |
+| event.read | full observed event | behind its allowlist flag |
+| settings.get/set | `{key, ...}` plus top-level integer `version` | `version` beside `result`, never inside |
+| automations.export/import | command document / `{imported, skipped, conflicts}` | |
+| role.assign / guild.add_member | `{outcome}` | `assigned`/`already_held`, `added`/`already_member` |
+| moderation.\* | `{outcome[, affected]}` | |
+
+Refusals keep their code, status and retry policy with the fixed message
+`request refused`:
+
+| Code | Status | Retryable |
+| --- | --- | --- |
+| malformed | 400 | no |
+| unauthorized | 401 | no |
+| stale_request | 401 | no |
+| action_not_allowed | 403 | no |
+| not_found | 404 | no |
+| method_not_allowed | 405 | no |
+| request_timeout | 408 | yes |
+| replayed | 409 | no |
+| version_conflict | 409 | no |
+| in_progress | 409 | yes |
+| needs_reconciliation | 409 | no |
+| discord_rejected | 422 | no |
+| rate_limited | 429 | yes |
+| internal | 500 | yes |
+| discord_unavailable | 502 | yes |
+| no_effect | 502 | no |
+| busy | 503 | yes |
+| upstream_timeout | 504 | yes |
+
+Compact next-action map (the `retryable` flag is the machine rule; the map is
+the human gloss):
+
+| Situation | Next action |
+| --- | --- |
+| `retryable: true` (408, 409 `in_progress`, 429, 500, 502 `discord_unavailable`, 503 `busy`, 504) | Retry the same `Idempotency-Key`; never mint a new key for an unknown outcome. Honor `Retry-After` when present. |
+| `needs_reconciliation` (409) | Reconcile by hand first (see the event rules above); never re-submit under a new key. |
+| `replayed` / `version_conflict` (409) | Same key already decided or superseded: read the stored outcome, use a new key only for a new intent. |
+| 401 / 403 | Fix the caller: signing key, timestamp/nonce freshness, action allowlist. Do not retry the bytes. |
+| `malformed` (400), `not_found` (404), `method_not_allowed` (405), `discord_rejected` (422), `no_effect` (502) | Fix the request: shape, route, verb, payload or target state. |
+| `unavailable` (503, Worker-only) | Staging/Operator state: dark route, cold container, fenced deployment, oversize or an unusable receiver answer. Not a receiver verdict. |
 
 ## Tests
 

@@ -168,11 +168,33 @@ async fn release_lane_or_warn(store: &SelfRoleStore, lane: &PanelClaim, event_id
 /// Renewal is concurrent with REST/pacing/pool waits. Failure latches a shared
 /// stop flag; it does not cancel an in-flight remote mutation or invent success.
 /// Drop aborts the task, including on cancellation of the surrounding operation.
-struct LeaseKeeper(tokio::task::JoinHandle<()>);
+struct LeaseKeeper(RenewalTask);
+
+// Preserve explicit aborts by settlement/repair owners, including inert keepers.
+struct RenewalTask(Option<tokio::task::JoinHandle<()>>);
+
+impl RenewalTask {
+    fn abort(&self) {
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct KeeperClaimError;
+
+impl std::fmt::Display for KeeperClaimError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a renewal keeper requires exactly one claim")
+    }
+}
+
+impl std::error::Error for KeeperClaimError {}
 
 impl LeaseKeeper {
     fn terminal(store: SelfRoleStore, claim: SupersededClaim, lost: Arc<AtomicBool>) -> Self {
-        Self(tokio::spawn(async move {
+        Self(RenewalTask(Some(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(claim.renew_after_ms())).await;
                 if !matches!(
@@ -183,7 +205,7 @@ impl LeaseKeeper {
                     return;
                 }
             }
-        }))
+        }))))
     }
 
     fn start(
@@ -192,25 +214,51 @@ impl LeaseKeeper {
         panel: Option<PanelClaim>,
         lost: Arc<AtomicBool>,
     ) -> Self {
-        let renew_after_ms = event
-            .as_ref()
-            .map(|claim| claim.renew_after_ms)
-            .or_else(|| panel.as_ref().map(|claim| claim.renew_after_ms))
-            .expect("a renewal keeper has a claim");
-        Self(tokio::spawn(async move {
+        match Self::try_start(store, event, panel, lost.clone()) {
+            Ok(keeper) => keeper,
+            Err(_) => {
+                // Legacy callers cannot return a construction error. Fail closed
+                // synchronously, without spawning an unobserved renewal task.
+                lost.store(true, Ordering::SeqCst);
+                Self(RenewalTask(None))
+            }
+        }
+    }
+
+    pub(crate) fn try_start(
+        store: SelfRoleStore,
+        event: Option<EventClaim>,
+        panel: Option<PanelClaim>,
+        lost: Arc<AtomicBool>,
+    ) -> Result<Self, KeeperClaimError> {
+        enum Claim {
+            Event(EventClaim),
+            Panel(PanelClaim),
+        }
+        let (claim, renew_after_ms) = match (event, panel) {
+            (Some(event), None) => {
+                let interval = event.renew_after_ms;
+                (Claim::Event(event), interval)
+            }
+            (None, Some(panel)) => {
+                let interval = panel.renew_after_ms;
+                (Claim::Panel(panel), interval)
+            }
+            _ => return Err(KeeperClaimError),
+        };
+        Ok(Self(RenewalTask(Some(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(renew_after_ms)).await;
-                let result = match (&event, &panel) {
-                    (Some(event), None) => store_io(store.renew_claim(event)).await,
-                    (None, Some(panel)) => store_io(store.renew_panel_claim(panel)).await,
-                    _ => unreachable!("one keeper per claim"),
+                let result = match &claim {
+                    Claim::Event(event) => store_io(store.renew_claim(event)).await,
+                    Claim::Panel(panel) => store_io(store.renew_panel_claim(panel)).await,
                 };
                 if !matches!(result, Ok(true)) {
                     lost.store(true, Ordering::SeqCst);
                     return;
                 }
             }
-        }))
+        })))))
     }
 }
 
@@ -377,8 +425,8 @@ impl SelfRoleRuntime {
             if target.iter().any(|id| !offered.contains(id)) {
                 return Err(RuntimeError::InvalidSnapshot);
             }
-            let remaining = plan_select_delta(panel, &snapshot.member_role_ids, target)
-                .map_err(|_| RuntimeError::InvalidSnapshot)?;
+            let remaining =
+                convergence_plan(panel, &prepared.audit, &snapshot.member_role_ids, target)?;
             prepared.remaining = remaining;
             prepared.snapshot = snapshot;
             let next = prepared
@@ -646,10 +694,12 @@ impl SelfRoleRuntime {
         } else {
             &prepared.event.desired_role_ids
         };
-        if snapshot.member_is_bot
-            || snapshot.validate(&self.guild_id, panel, &offered).is_some()
-            || panel_roles(panel, &snapshot.member_role_ids) != *target
-        {
+        if snapshot.member_is_bot || snapshot.validate(&self.guild_id, panel, &offered).is_some() {
+            return Err(RuntimeError::InvalidSnapshot);
+        }
+        let remaining =
+            convergence_plan(panel, &prepared.audit, &snapshot.member_role_ids, target)?;
+        if !remaining.add_role_ids.is_empty() || !remaining.remove_role_ids.is_empty() {
             return Err(RuntimeError::InvalidSnapshot);
         }
         let option = if panel.exclusive {
@@ -1424,11 +1474,10 @@ impl SelfRoleRuntime {
         } else {
             &event.desired_role_ids
         };
-        let remaining = plan_select_delta(panel, &snapshot.member_role_ids, recovery_target)
-            .map_err(|_| RuntimeError::InvalidSnapshot)?;
         audit.option_key = plan.option_key.clone();
         audit.role_id = plan.role_id.clone();
         audit.operation = plan.operation;
+        let remaining = convergence_plan(panel, audit, &snapshot.member_role_ids, recovery_target)?;
         audit.effects = event.effects.clone();
         audit.desired_role_ids = event.desired_role_ids.clone();
         audit.pre_mutation_role_ids = event.pre_mutation_role_ids.clone();
@@ -1667,6 +1716,35 @@ fn committed_target(
     }
 }
 
+/// Immutable intent records the whole panel, but independent button/reaction
+/// events own only their audited option. Use the same scope for forward work,
+/// rollback, replay and settlement without rewriting the admitted snapshots.
+fn convergence_plan(
+    panel: &SelfRolePanel,
+    audit: &SelfRoleAudit,
+    held: &HashSet<String>,
+    target: &[String],
+) -> Result<SelfRolePlan, RuntimeError> {
+    let mut plan =
+        plan_select_delta(panel, held, target).map_err(|_| RuntimeError::InvalidSnapshot)?;
+    if !panel.exclusive && matches!(audit.source, PanelMode::Button | PanelMode::Reaction) {
+        let role = audit
+            .role_id
+            .as_ref()
+            .ok_or(RuntimeError::InvalidSnapshot)?;
+        if !panel
+            .options
+            .iter()
+            .any(|option| &option.role_id == role && audit.option_key.as_ref() == Some(&option.key))
+        {
+            return Err(RuntimeError::InvalidSnapshot);
+        }
+        plan.add_role_ids.retain(|id| id == role);
+        plan.remove_role_ids.retain(|id| id == role);
+    }
+    Ok(plan)
+}
+
 fn panel_roles(panel: &SelfRolePanel, roles: &HashSet<String>) -> Vec<String> {
     panel
         .options
@@ -1679,3 +1757,11 @@ fn panel_roles(panel: &SelfRolePanel, roles: &HashSet<String>) -> Vec<String> {
 #[cfg(test)]
 #[path = "self_role_runtime_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "self_role_nonexclusive_acceptance_tests.rs"]
+mod nonexclusive_acceptance_tests;
+
+#[cfg(test)]
+#[path = "self_role_keeper_claim_acceptance_tests.rs"]
+mod keeper_claim_acceptance_tests;
