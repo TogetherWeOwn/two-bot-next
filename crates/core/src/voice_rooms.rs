@@ -1414,20 +1414,30 @@ impl ActionQueue {
         (len(&inner.urgent), len(&inner.deferred))
     }
 
-    /// Age of the oldest still-queued (not in-flight) action for the guild,
-    /// measured from first enqueue across retries. `None` when nothing is
-    /// queued. Feeds the queue-age gauge and the stuck-worker watchdog.
+    /// First-enqueue stamp of the oldest still-queued (not in-flight)
+    /// action for the guild, across retries. `None` when nothing is queued.
+    /// Stall snapshots keep the stamp (not the age) so the watchdog sibling
+    /// can recompute a climbing queue age on its own clock while a dispatch
+    /// is hung.
     #[must_use]
-    pub fn oldest_pending_age(&self, guild_id: Snowflake) -> Option<std::time::Duration> {
+    pub fn oldest_pending_at(&self, guild_id: Snowflake) -> Option<std::time::Instant> {
         let inner = self.inner.lock().expect("queue lock");
-        let now = std::time::Instant::now();
         [&inner.urgent, &inner.deferred]
             .iter()
             .filter_map(|lanes| lanes.get(&guild_id))
             .flat_map(|queue| queue.iter())
             .filter_map(|queued| inner.enqueued_at.get(&queued.id))
-            .map(|at| now.saturating_duration_since(*at))
-            .max()
+            .min()
+            .copied()
+    }
+
+    /// Age of the oldest still-queued (not in-flight) action for the guild,
+    /// measured from first enqueue across retries. `None` when nothing is
+    /// queued. Feeds the queue-age gauge and the stuck-worker watchdog.
+    #[must_use]
+    pub fn oldest_pending_age(&self, guild_id: Snowflake) -> Option<std::time::Duration> {
+        self.oldest_pending_at(guild_id)
+            .map(|at| std::time::Instant::now().saturating_duration_since(at))
     }
 
     /// Dead-lettered writes for `/setup` recent failures (V10): the newest
@@ -3217,5 +3227,55 @@ mod tests {
         assert!(queue.mark_succeeded(&action));
         assert_eq!(queue.oldest_pending_age(GUILD), None);
         assert_eq!(queue.pending_counts(GUILD), (0, 0));
+    }
+
+    #[test]
+    fn oldest_pending_at_is_the_minimum_first_enqueue_stamp() {
+        // The stall snapshot keeps this stamp so the watchdog sibling can
+        // recompute a climbing queue age while a dispatch is hung: it must
+        // be the earliest first-enqueue across both lanes, stable across
+        // the retry path, and `None` exactly when the queue-age gauge
+        // would read empty.
+        let queue = ActionQueue::new();
+        assert_eq!(queue.oldest_pending_at(GUILD), None);
+        queue.enqueue(GUILD, RoomAction::DeleteRoom { channel_id: 501 });
+        let first = queue
+            .oldest_pending_at(GUILD)
+            .expect("queued action has a stamp");
+        queue.enqueue(
+            GUILD,
+            RoomAction::RenameRoom {
+                channel_id: 502,
+                name: "later".to_owned(),
+            },
+        );
+        assert_eq!(
+            queue.oldest_pending_at(GUILD),
+            Some(first),
+            "a newer deferred enqueue must not move the oldest stamp"
+        );
+        assert!(
+            queue
+                .oldest_pending_age(GUILD)
+                .is_some_and(|age| age < std::time::Duration::from_secs(60)),
+            "the age still derives from the same stamp"
+        );
+        let action = queue.pop_due(GUILD, 0).expect("action is due");
+        assert!(queue.mark_rate_limited(GUILD, 1_000, 0, action));
+        assert_eq!(
+            queue.oldest_pending_at(GUILD),
+            Some(first),
+            "the retry path must not reset the first-enqueue stamp"
+        );
+        let action = queue
+            .pop_due(GUILD, 1_001)
+            .expect("action is due after the backoff");
+        assert!(queue.mark_succeeded(&action));
+        let rename = queue
+            .pop_due(GUILD, 1_001)
+            .expect("the deferred rename is due after the delete completes");
+        assert!(queue.mark_succeeded(&rename));
+        assert_eq!(queue.oldest_pending_at(GUILD), None);
+        assert_eq!(queue.oldest_pending_age(GUILD), None);
     }
 }

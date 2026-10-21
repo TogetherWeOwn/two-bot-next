@@ -54,8 +54,8 @@ and the Worker (`packetFilename` in `wrangler/src/alert-rules.ts`).
 | `prefix_trigger_verdict_refusals` | **ticket**: automod-verdict refusal of prefix commands rises in 3 consecutive samples (first sample is baseline, flat/reset clears; `other` never counts) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-prefix-trigger-verdict-refusals) |
 | `voice_worker_halted` | **page**: halt latch reads 1 (any guild actor halted); a valid 0 clears at once, missing/invalid holds | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-worker-halted) |
 | `voice_live_self_heal` | **ticket**: self-heal repairs rise between valid samples (first sample is baseline-only, restarts re-baseline, missing family is no window) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-live-self-heal) |
-| `voice_live_not_ready` | **page**: live view not ready past 120 s on a connected gateway (promotes the host-watchdog bound; hung dispatch freezes the published age); at or below clears, missing/invalid holds | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-live-not-ready) |
-| `voice_queue_stall` | **ticket**: oldest queued action waiting past 120 s (matches the stuck horizon; hung dispatch freezes publication below the bound); at or below clears, missing/invalid holds | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-queue-stall) |
+| `voice_live_not_ready` | **page**: live view not ready past 120 s on a connected gateway (promotes the host-watchdog bound; the sibling keeps the age climbing through a hang); at or below clears, missing/invalid holds | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-live-not-ready) |
+| `voice_queue_stall` | **ticket**: oldest queued action waiting past 120 s (matches the stuck horizon; the sibling keeps the age climbing through a hang); at or below clears, missing/invalid holds | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-queue-stall) |
 
 Out of scope for paging (log-only findings, still recorded on the watch log):
 gateway session starts, handler-latency quantiles, unban-queue depth via

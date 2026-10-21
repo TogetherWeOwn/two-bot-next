@@ -1953,10 +1953,7 @@ impl LiveGuild {
     #[must_use]
     pub fn not_ready_secs(&self, now: tokio::time::Instant) -> u64 {
         let live = self.read_state();
-        match live.not_ready_since {
-            Some(since) if !live.ready => now.saturating_duration_since(since).as_secs(),
-            _ => 0,
-        }
+        snapshot_not_ready_age_secs(live.not_ready_since, live.ready, now)
     }
 
     /// V10 health check: the bot's missing Manage Channels, Move Members,
@@ -8745,6 +8742,33 @@ fn creator_map_age_secs(creators_merged_ms: Option<u64>, now_ms: u64) -> u64 {
     creators_merged_ms.map_or(0, |last| now_ms.saturating_sub(last) / 1000)
 }
 
+/// Queue age on the sibling's own clock: seconds since the snapshot's
+/// oldest first-enqueue stamp; 0 when the snapshot queue was empty. Pure,
+/// unit-tested: a frozen snapshot (hung dispatch) still yields a climbing
+/// age instead of the snapshot-time value.
+fn snapshot_queue_age_secs(
+    oldest_enqueued_at: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> u64 {
+    oldest_enqueued_at.map_or(0, |at| now.saturating_duration_since(at).as_secs())
+}
+
+/// Live-not-ready age on the sibling's own clock: seconds since the
+/// snapshot's not-ready-since stamp; 0 when the snapshot view was ready or
+/// the transport was down. Pure, unit-tested: a frozen snapshot (hung
+/// dispatch) still yields a climbing age. [`LiveGuild::not_ready_secs`]
+/// delegates here so the sibling can never drift from main-task semantics.
+fn snapshot_not_ready_age_secs(
+    not_ready_since: Option<tokio::time::Instant>,
+    ready: bool,
+    now: tokio::time::Instant,
+) -> u64 {
+    match not_ready_since {
+        Some(since) if !ready => now.saturating_duration_since(since).as_secs(),
+        _ => 0,
+    }
+}
+
 /// Process-wide guild-actor incarnation counter for the per-actor stall
 /// gauges. Each actor loop start takes the next generation, so a
 /// replacement actor's first publish retires the old incarnation's
@@ -8853,7 +8877,17 @@ struct StallState {
     last_progress: tokio::time::Instant,
     urgent: usize,
     deferred: usize,
-    oldest_age_secs: u64,
+    /// First-enqueue stamp (std clock, as the queue records it) of the
+    /// oldest action still queued at snapshot time; `None` when the queue
+    /// was empty. The sibling recomputes the age on its own clock, so a
+    /// frozen snapshot still yields a climbing age.
+    oldest_enqueued_at: Option<std::time::Instant>,
+    /// Live-view readiness plus the not-ready-since stamp (tokio clock, as
+    /// the live view records it) at snapshot time. The sibling republishes
+    /// the not-ready age from these, so a hung dispatch no longer freezes
+    /// it at the snapshot-time value.
+    live_ready: bool,
+    not_ready_since: Option<tokio::time::Instant>,
     halted: bool,
     creators_generation: u64,
     creators_merged_ms: Option<u64>,
@@ -8867,15 +8901,18 @@ impl<H: RoomWrites> StallShared<H> {
     ) {
         let guild = worker.live.guild_id;
         let (urgent, deferred) = worker.queue.pending_counts(guild);
-        let oldest_age_secs = worker
-            .queue
-            .oldest_pending_age(guild)
-            .map_or(0, |age| age.as_secs());
+        let oldest_enqueued_at = worker.queue.oldest_pending_at(guild);
+        let (live_ready, not_ready_since) = {
+            let live = worker.live.read_state();
+            (live.ready, live.not_ready_since)
+        };
         *self.state.lock().expect("stall snapshot lock") = StallState {
             last_progress,
             urgent,
             deferred,
-            oldest_age_secs,
+            oldest_enqueued_at,
+            live_ready,
+            not_ready_since,
             halted: worker.halted(),
             creators_generation: worker.creators_generation,
             creators_merged_ms: worker.creators_merged_ms,
@@ -8892,6 +8929,11 @@ impl<H: RoomWrites> StallShared<H> {
     /// Watchdog + gauge publish from the shared snapshot. Reads only: safe
     /// to run on the sibling task while the main task is hung in dispatch.
     fn observe(&self, stuck_after: Duration, last_fire: &mut Option<tokio::time::Instant>) {
+        // Both ages derive from the snapshot's stamps on this task's own
+        // clocks, so a frozen snapshot (hung dispatch) still yields
+        // climbing ages and the hung case reaches the pipeline rules.
+        let now = tokio::time::Instant::now();
+        let queue_now = std::time::Instant::now();
         // Publish under the snapshot lock: the metric guard sets `retired`
         // under the same lock before removing this actor's contribution,
         // so a publish either lands before that removal or not at all.
@@ -8912,7 +8954,12 @@ impl<H: RoomWrites> StallShared<H> {
                 self.generation,
                 u64::try_from(snap.urgent).unwrap_or(u64::MAX),
                 u64::try_from(snap.deferred).unwrap_or(u64::MAX),
-                snap.oldest_age_secs,
+                snapshot_queue_age_secs(snap.oldest_enqueued_at, queue_now),
+            );
+            gauges.set_voice_actor_live_not_ready(
+                self.guild,
+                self.generation,
+                snapshot_not_ready_age_secs(snap.not_ready_since, snap.live_ready, now),
             );
             gauges.set_voice_creator_map(
                 snap.creators_generation,
@@ -8923,7 +8970,6 @@ impl<H: RoomWrites> StallShared<H> {
         // Stuck-worker watchdog: queued work with no completed turn for the
         // full window. Log + metric only; the queue keeps its retries so a
         // transient outage still drains on recovery.
-        let now = tokio::time::Instant::now();
         let fire_cooled =
             last_fire.is_none_or(|fired| now.saturating_duration_since(fired) >= stuck_after);
         if fire_cooled
@@ -8940,7 +8986,8 @@ impl<H: RoomWrites> StallShared<H> {
                 guild = self.guild.to_string(),
                 urgent = snap.urgent,
                 deferred = snap.deferred,
-                oldest_pending_age_secs = snap.oldest_age_secs,
+                oldest_pending_age_secs =
+                    snapshot_queue_age_secs(snap.oldest_enqueued_at, queue_now),
                 halted = snap.halted,
                 "voice worker stuck: queued actions with no progress"
             );
@@ -8988,7 +9035,9 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
             last_progress,
             urgent: 0,
             deferred: 0,
-            oldest_age_secs: 0,
+            oldest_enqueued_at: None,
+            live_ready: true,
+            not_ready_since: None,
             halted: false,
             creators_generation: 0,
             creators_merged_ms: None,
