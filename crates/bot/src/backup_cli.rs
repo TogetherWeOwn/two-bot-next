@@ -51,12 +51,17 @@ fn tls_policy_from_env() -> Result<two_bot_core::database_tls::TlsPolicy, &'stat
 }
 
 /// Backup/restore pool shape: max 5 (legacy `TWO_DB_POOL_MAX` parity) with a
-/// 10 s acquire timeout and a 15 s statement timeout. The CLI runs sequential
+/// 10 s acquire timeout and a 60 s statement timeout. The CLI runs sequential
 /// backup steps, so one small pool suffices; a hung database refuses with the
 /// fixed `cannot connect` constant instead of hanging the operator command.
+/// The statement leg is bulk-sized (matching the `legacy_copy` 60 s bulk
+/// precedent): dump/restore run whole-table ordered scans, per-table
+/// `COUNT(*)` and `LOCK TABLE` that can legitimately exceed the 15 s
+/// application bound, so the application value would cancel healthy backups
+/// with Postgres 57014.
 const BACKUP_POOL_MAX: u32 = 5;
 const BACKUP_ACQUIRE_TIMEOUT_SECS: u64 = 10;
-const BACKUP_STATEMENT_TIMEOUT_MS: u64 = 15_000;
+const BACKUP_STATEMENT_TIMEOUT_MS: u64 = 60_000;
 
 /// Open a Postgres pool through the shared redacting parse path
 /// (`two_bot_core::database_url`): unsupported query keys are refused before
@@ -85,13 +90,8 @@ async fn open_pool_with_tls(
         two_bot_core::database_url::connect_options(url).map_err(|_| "invalid database URL")?,
         tls,
     );
-    let options = options.options([(
-        "statement_timeout",
-        format!("{}ms", BACKUP_STATEMENT_TIMEOUT_MS),
-    )]);
-    sqlx::postgres::PgPoolOptions::new()
-        .max_connections(BACKUP_POOL_MAX)
-        .acquire_timeout(std::time::Duration::from_secs(BACKUP_ACQUIRE_TIMEOUT_SECS))
+    let options = options.options([backup_statement_timeout_option()]);
+    backup_pool_options()
         .connect_with(options)
         .await
         .map_err(|_| "cannot connect; database details redacted")
@@ -107,6 +107,26 @@ pub(crate) async fn open_restore_pool(url: Option<&str>) -> Result<sqlx::PgPool,
         return Err("missing restore database URL");
     };
     open_pool(url).await
+}
+
+/// Backup pool builder: max 5 with a 10 s acquire bound (the pool half of
+/// the documented backup triple, applied by [`open_pool_with_tls`]; the
+/// statement leg rides the connection options). Split out so tests pin the
+/// built values exactly instead of grepping the source.
+fn backup_pool_options() -> sqlx::postgres::PgPoolOptions {
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(BACKUP_POOL_MAX)
+        .acquire_timeout(std::time::Duration::from_secs(BACKUP_ACQUIRE_TIMEOUT_SECS))
+}
+
+/// Backup statement-timeout server setting, applied to the connection
+/// options by [`open_pool_with_tls`]. Split out so tests pin the exact
+/// `60000ms` bulk bound the pool applies.
+fn backup_statement_timeout_option() -> (String, String) {
+    (
+        "statement_timeout".to_owned(),
+        format!("{}ms", BACKUP_STATEMENT_TIMEOUT_MS),
+    )
 }
 
 /// Only an absent credential permits the deliberate environment fallback.
@@ -954,6 +974,27 @@ fn atomic_json(path: &Path, value: &serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Guild-config admission pool builder: the shared admission triple's pool
+/// half (max 2 + 10 s acquire), reusing the `website_jobs` constants so the
+/// second pool in this file cannot drift from the other admission pools.
+fn guild_config_admission_pool_options() -> sqlx::postgres::PgPoolOptions {
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(crate::website_jobs::ADMISSION_POOL_MAX)
+        .acquire_timeout(std::time::Duration::from_secs(
+            crate::website_jobs::ADMISSION_ACQUIRE_TIMEOUT_SECS,
+        ))
+}
+
+/// Guild-config admission statement-timeout server setting (the 15 s
+/// admission bound, `website_jobs` parity), applied to the connection
+/// options by `governed_guild_config_api`.
+fn guild_config_statement_timeout_option() -> (String, String) {
+    (
+        "statement_timeout".to_owned(),
+        format!("{}ms", crate::website_jobs::ADMISSION_STATEMENT_TIMEOUT_MS),
+    )
+}
+
 async fn governed_guild_config_api(
     token: String,
     guild_id: String,
@@ -991,8 +1032,11 @@ async fn governed_guild_config_api(
             .map_err(|_| "Discord admission authority unavailable")?,
         tls,
     );
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
+    // The admission pool carries the shared admission triple (max 2 + 10 s
+    // acquire + 15 s statement, `website_jobs` parity): a hung database
+    // refuses instead of hanging the guild-config command.
+    let options = options.options([guild_config_statement_timeout_option()]);
+    let pool = guild_config_admission_pool_options()
         .connect_with(options)
         .await
         .map_err(|_| "Discord admission authority unavailable")?;
@@ -2073,3 +2117,7 @@ mod tests {
 #[cfg(test)]
 #[path = "backup_pool_timeout_acceptance_tests.rs"]
 mod pool_timeout_acceptance_tests;
+
+#[cfg(test)]
+#[path = "backup_pool_triple_pin_tests.rs"]
+mod pool_triple_pin_tests;

@@ -361,11 +361,14 @@ impl Failure {
 
 type Result<T> = std::result::Result<T, Failure>;
 
-/// Maximum history pages fetched per capture (100 messages each): fetching
-/// stops at the cap even when the channel runs deeper, so a huge channel
-/// cannot page Discord without bound. The capture still validates every
-/// fetched page and completes with the shared truncation marker; histories
-/// under the cap are byte-identical.
+/// Maximum history data pages fetched per capture (100 messages each):
+/// fetching stops at the cap even when the channel runs deeper, so a huge
+/// channel cannot page Discord without bound. A full 10th page is followed
+/// by one boundary probe (11 fetches at most): an empty probe proves the
+/// history is exactly 1000 and completes without the marker, anything else
+/// proves depth and completes with the shared truncation marker. The
+/// capture still validates every stored page; histories under the cap are
+/// byte-identical, and `message_count` covers stored messages only.
 const MAX_HISTORY_PAGES: usize = 10;
 
 impl TicketRuntime {
@@ -803,7 +806,22 @@ impl TicketRuntime {
                 break;
             }
             if pages >= MAX_HISTORY_PAGES {
-                capture.mark_page_capped();
+                // A full 10th page cannot prove the end (see
+                // exact_full_page_requires_a_final_empty_page): fetch one
+                // boundary probe past its floor. Empty proves exactly 1000
+                // (complete, no marker); anything else proves depth, so cap
+                // with the marker without storing the probe page.
+                let probe_before = floor.ok_or(Failure::InvalidEvidence)?.to_string();
+                let probe = self
+                    .executor
+                    .fetch_channel_messages(channel, Some(probe_before.as_str()), 100)
+                    .await?;
+                if probe.len() > 100 {
+                    return Err(Failure::InvalidEvidence);
+                }
+                if !probe.is_empty() {
+                    capture.mark_page_capped();
+                }
                 break;
             }
             before = Some(floor.ok_or(Failure::InvalidEvidence)?.to_string());
@@ -1172,3 +1190,7 @@ mod cursor_budget_interaction_tests;
 #[cfg(test)]
 #[path = "ticket_capture_cap_acceptance_tests.rs"]
 mod capture_cap_acceptance_tests;
+
+#[cfg(test)]
+#[path = "ticket_capture_cap_boundary_tests.rs"]
+mod capture_cap_boundary_tests;
