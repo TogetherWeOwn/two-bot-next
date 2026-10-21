@@ -2603,6 +2603,8 @@ def slow_burn_tracker_errors(workflow):
     """
     name = "slow-burn-tracker.yml"
     errors = []
+    if "defaults" in workflow:
+        errors.append(f"{name}: workflow-level defaults must stay absent (fail-closed shell)")
     if "env" in workflow:
         errors.append(f"{name}: workflow-level env must stay absent")
     on = workflow.get("on") or {}
@@ -2647,7 +2649,7 @@ def slow_burn_tracker_errors(workflow):
             errors.append(f"{name}:{job_id}: timeout must stay 10 minutes")
         if not runner_allowed(job_id, job.get("runs-on")):
             errors.append(f"{name}:{job_id}: must use the routed runner expression for job '{job_id}'")
-        for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
+        for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy", "defaults"):
             if key in job:
                 errors.append(f"{name}:{job_id}: must not set {key}")
         text = str(job).lower().replace(" ", "")
@@ -2672,6 +2674,8 @@ def slow_burn_tracker_errors(workflow):
                           "with inputs passed via env only")
         if "if" in run_step:
             errors.append(f"{name}:{job_id}: run step must not set if (fail closed)")
+        if "shell" in run_step:
+            errors.append(f"{name}:{job_id}: run step must not override shell (fail closed)")
         if "continue-on-error" in run_step:
             errors.append(f"{name}:{job_id}: run step must not set continue-on-error (fail closed)")
         if upload.get("if") != "always()":
@@ -2763,8 +2767,14 @@ def scheduled_binding_audit_errors(workflows):
             f"{', '.join(sorted(FIVE_MINUTE_SCHEDULERS))} (a new five-minute "
             "watcher needs its fail-closed audit entry)")
         return errors
-    tracker = ((workflows.get("slow-burn-tracker.yml") or {}).get("jobs")
-               or {}).get("tracker") or {}
+    slow_burn_workflow = workflows.get("slow-burn-tracker.yml") or {}
+    if "defaults" in slow_burn_workflow:
+        errors.append(f"{name}: slow-burn-tracker.yml: workflow-level defaults must "
+                      "stay absent (fail-closed shell)")
+    tracker = (slow_burn_workflow.get("jobs") or {}).get("tracker") or {}
+    if "defaults" in tracker:
+        errors.append(f"{name}: slow-burn-tracker.yml:tracker: job-level defaults "
+                      "must stay absent (fail-closed shell)")
     runs = [step for step in tracker.get("steps") or []
             if "scripts/slow_burn_tracker.py" in str(step.get("run", ""))]
     if len(runs) != 1:
@@ -2778,6 +2788,9 @@ def scheduled_binding_audit_errors(workflows):
         if "if" in runs[0]:
             errors.append(f"{name}: slow-burn-tracker.yml: tracker step must not set "
                           "if (fail closed)")
+        if "shell" in runs[0]:
+            errors.append(f"{name}: slow-burn-tracker.yml: tracker step must not "
+                          "override shell")
         if "continue-on-error" in runs[0]:
             errors.append(f"{name}: slow-burn-tracker.yml: tracker step must not set "
                           "continue-on-error (fail closed)")
@@ -5629,6 +5642,16 @@ class WorkflowTests(unittest.TestCase):
             "pull_request_target trigger": lambda w: w["on"].update({"pull_request_target": None}),
             "workflow_run trigger": lambda w: w["on"].update({"workflow_run": {"workflows": ["check"]}}),
             "workflow-level secret": lambda w: w.update({"env": {"T": bearer}}),
+            "workflow-level shell default": lambda w: w.update(
+                {"defaults": {"run": {"shell": "echo {0}"}}}),
+            "live job shell default": lambda w: live_job(w).update(
+                {"defaults": {"run": {"shell": "echo {0}"}}}),
+            "fixture job shell default": lambda w: fixture_job(w).update(
+                {"defaults": {"run": {"shell": "echo {0}"}}}),
+            "live run step shell override": lambda w: live_job(w)["steps"][3].update(
+                {"shell": "echo {0}"}),
+            "fixture run step shell override": lambda w: fixture_job(w)["steps"][2].update(
+                {"shell": "echo {0}"}),
             "third job": lambda w: w["jobs"].update({"again": deepcopy(live_job(w))}),
             "fixture job dropped": lambda w: w["jobs"].pop("fixture"),
             # Live job: exactly the existing staging bearer, from main only.
@@ -5803,6 +5826,12 @@ class WorkflowTests(unittest.TestCase):
                 "if", "false"),
             "tracker run tolerates failure": lambda w: tracker_run_step(w).__setitem__(
                 "continue-on-error", True),
+            "tracker run step shell override": lambda w: tracker_run_step(w).__setitem__(
+                "shell", "echo {0}"),
+            "tracker job shell default": lambda w: w["slow-burn-tracker.yml"]["jobs"][
+                "tracker"].__setitem__("defaults", {"run": {"shell": "echo {0}"}}),
+            "slow-burn workflow shell default": lambda w: w["slow-burn-tracker.yml"].__setitem__(
+                "defaults", {"run": {"shell": "echo {0}"}}),
             "staging notice gated off": lambda w: notice_step(w, "staging").__setitem__(
                 "if", "false"),
             "staging notice tolerates failure": lambda w: notice_step(w, "staging").__setitem__(
