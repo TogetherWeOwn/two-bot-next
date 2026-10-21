@@ -25,6 +25,8 @@ mod invite_responder_wiring;
 mod join;
 #[path = "voice_join_grant_witness_acceptance_tests.rs"]
 mod join_grant_witness_acceptance;
+#[path = "voice_join_still_waiting_acceptance_tests.rs"]
+mod join_still_waiting_acceptance;
 #[path = "voice_kick_tests.rs"]
 mod kick;
 #[path = "voice_rooms_limit_tests.rs"]
