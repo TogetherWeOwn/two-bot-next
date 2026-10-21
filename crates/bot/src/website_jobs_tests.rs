@@ -622,21 +622,158 @@ fn heal_roles(bot_role: &str, bot_position: i64) -> Value {
     Value::Array(roles)
 }
 
-/// Route-aware heal fixture: bot identity `999`, bot member roles
-/// `bot_roles`, every role PUT answered with `put_status`.
+/// Discord path without the API prefix or query string.
+fn discord_route(path: &str) -> &str {
+    let path = path.strip_prefix("/api/v10").unwrap_or(path);
+    match path.split_once('?') {
+        Some((route, _)) => route,
+        None => path,
+    }
+}
+
+/// `PUT /guilds/2222/members/{id}/roles/{role}` as `(member, role)`.
+fn member_role_target(route: &str) -> Option<(&str, &str)> {
+    let rest = route.strip_prefix("/guilds/2222/members/")?;
+    let (id, role) = rest.split_once("/roles/")?;
+    if id.is_empty() || role.is_empty() || id.contains('/') || role.contains('/') {
+        return None;
+    }
+    Some((id, role))
+}
+
+fn point_member(id: &str, roles: &[String]) -> Value {
+    json!({"user": {"id": id, "bot": false}, "roles": roles})
+}
+
+/// Route-aware heal fixture. Bot identity is `999`. Member `1001` currently
+/// holds Soldier (`13`), not Member, so a Member grant stays eligible after a
+/// point read. A 204 PUT sticks that role; any other PUT status leaves member
+/// truth unchanged. Unknown routes panic.
 async fn start_heal_mock(put_status: u16, bot_roles: Vec<String>) -> MockRest {
+    let members = Arc::new(std::sync::Mutex::new(HashMap::from([(
+        "1001".to_owned(),
+        vec!["13".to_owned()],
+    )])));
     MockRest::with_responder(move |request: &RestRequest| {
-        if request.path.ends_with("/users/@me") {
-            ScriptedResponse::json(200, json!({"id": "999", "bot": true}))
-        } else if request.method == "GET" && request.path.contains("/members/999") {
-            ScriptedResponse::json(200, json!({"roles": bot_roles}))
-        } else if request.method == "PUT" {
-            ScriptedResponse::status(put_status)
-        } else {
-            ScriptedResponse::status(500)
+        let route = discord_route(&request.path);
+        if request.method == "GET" && route == "/users/@me" {
+            return ScriptedResponse::json(200, json!({"id": "999", "bot": true}));
         }
+        if request.method == "GET" && route == "/guilds/2222/members/999" {
+            return ScriptedResponse::json(200, json!({"roles": bot_roles.clone()}));
+        }
+        if request.method == "GET" && route == "/guilds/2222/members/1001" {
+            let roles = members
+                .lock()
+                .expect("member truth")
+                .get("1001")
+                .cloned()
+                .expect("member 1001");
+            return ScriptedResponse::json(200, point_member("1001", &roles));
+        }
+        if request.method == "PUT" {
+            if put_status == 204 {
+                if let Some((id, role)) = member_role_target(route) {
+                    let mut members = members.lock().expect("member truth");
+                    let held = members.entry(id.to_owned()).or_default();
+                    if !held.iter().any(|have| have == role) {
+                        held.push(role.to_owned());
+                    }
+                    held.sort();
+                }
+            }
+            return ScriptedResponse::status(put_status);
+        }
+        panic!("unexpected mock Discord route: {} {route}", request.method);
     })
     .await
+}
+
+/// Point-read ledger for one rank publication tick. `point_reads` records
+/// `(grants already stuck, roles returned)` for every non-bot member GET.
+struct RankMemberTruth {
+    roles: HashMap<String, Vec<String>>,
+    point_reads: Vec<(usize, Vec<String>)>,
+    grants_stuck: usize,
+}
+
+/// Route-aware publication fixture. The list roster stays the frozen capture.
+/// Point reads serve current member truth, and a 204 role PUT sticks that role
+/// before any later read. Unknown routes and unknown members panic.
+async fn start_rank_publication_mock(
+    roster: Value,
+    roles_doc: Value,
+) -> (MockRest, Arc<std::sync::Mutex<RankMemberTruth>>) {
+    let mut roles = HashMap::new();
+    for member in roster.as_array().expect("roster array") {
+        let id = member["user"]["id"]
+            .as_str()
+            .expect("roster member id")
+            .to_owned();
+        let held = member["roles"]
+            .as_array()
+            .expect("roster roles")
+            .iter()
+            .map(|role| role.as_str().expect("role id").to_owned())
+            .collect();
+        roles.insert(id, held);
+    }
+    let truth = Arc::new(std::sync::Mutex::new(RankMemberTruth {
+        roles,
+        point_reads: Vec::new(),
+        grants_stuck: 0,
+    }));
+    let shared = Arc::clone(&truth);
+    let mock = MockRest::with_responder(move |request: &RestRequest| {
+        let route = discord_route(&request.path);
+        let mut state = shared.lock().expect("member truth");
+        if request.method == "GET" && route == "/guilds/2222" {
+            return ScriptedResponse::json(200, roles_doc.clone());
+        }
+        if request.method == "GET" && route == "/guilds/2222/members" {
+            return ScriptedResponse::json(200, roster.clone());
+        }
+        if request.method == "GET" && route == "/users/@me" {
+            return ScriptedResponse::json(200, json!({"id": "999", "bot": true}));
+        }
+        if request.method == "GET" && route == "/guilds/2222/members/999" {
+            return ScriptedResponse::json(200, json!({"roles": ["10"]}));
+        }
+        if request.method == "GET" {
+            if let Some(id) = route.strip_prefix("/guilds/2222/members/") {
+                if id.is_empty() || id.contains('/') {
+                    panic!("unexpected mock Discord route: GET {route}");
+                }
+                let held = state
+                    .roles
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("unexpected mock Discord member: {id}"));
+                let stuck = state.grants_stuck;
+                state.point_reads.push((stuck, held.clone()));
+                return ScriptedResponse::json(200, point_member(id, &held));
+            }
+        }
+        if request.method == "PUT" {
+            let (id, role) = member_role_target(route)
+                .unwrap_or_else(|| panic!("unexpected mock Discord route: PUT {route}"));
+            {
+                let held = state
+                    .roles
+                    .get_mut(id)
+                    .unwrap_or_else(|| panic!("unexpected mock Discord member: {id}"));
+                if !held.iter().any(|have| have == role) {
+                    held.push(role.to_owned());
+                }
+                held.sort();
+            }
+            state.grants_stuck += 1;
+            return ScriptedResponse::status(204);
+        }
+        panic!("unexpected mock Discord route: {} {route}", request.method);
+    })
+    .await;
+    (mock, truth)
 }
 
 fn open_shutdown() -> (watch::Sender<bool>, watch::Receiver<bool>) {
@@ -657,11 +794,22 @@ async fn rank_heal_grants_missing_rungs_with_audit_reason() {
     .await;
     assert_eq!(healed, Ok(true));
     let requests = mock.requests();
-    assert_eq!(requests.len(), 3, "{requests:?}");
-    let put = requests
+    assert_eq!(
+        requests.len(),
+        4,
+        "member revalidation must precede the grant: {requests:?}"
+    );
+    let put_at = requests
         .iter()
-        .find(|request| request.method == "PUT")
+        .position(|request| request.method == "PUT")
         .expect("role grant");
+    assert!(
+        put_at > 0
+            && requests[put_at - 1].method == "GET"
+            && requests[put_at - 1].path == "/api/v10/guilds/2222/members/1001",
+        "member revalidation must precede the grant: {requests:?}"
+    );
+    let put = &requests[put_at];
     assert_eq!(put.path, "/api/v10/guilds/2222/members/1001/roles/12");
     let reason = put
         .header("x-audit-log-reason")
@@ -804,8 +952,9 @@ async fn rank_heal_stops_before_wire_on_shutdown() {
 /// Rank-tick self-heal end to end (needs the guarded test database, like
 /// `three_website_ticks_publish_rows_and_fail_closed`): member 1001 holds
 /// Member without Prospect, so the tick grants Prospect with an audit reason
-/// and publishes instead of failing as `Configuration`. A genuinely invalid
-/// ladder (Legend missing) still fails closed with no mutation.
+/// and publishes instead of failing as `Configuration`. That grant is preceded
+/// by a point read of member 1001, and a later point read shows both rungs.
+/// A genuinely invalid ladder (Legend missing) still fails closed with no mutation.
 #[test]
 fn rank_tick_self_heals_non_cumulative_ladder_and_publishes() {
     let capture = tracing_capture::Capture::default();
@@ -850,54 +999,10 @@ fn rank_tick_self_heals_non_cumulative_ladder_and_publishes() {
                 {"id":"14","name":"Veteran","position":4},
                 {"id":"15","name":"Legend","position":5},
             ]});
-            let mock = MockRest::start(
-                vec![
-                    ScriptedResponse::json(200, roster.clone()),
-                    ScriptedResponse::json(200, roles),
-                    ScriptedResponse::json(200, json!({"id": "999", "bot": true})),
-                    ScriptedResponse::json(200, json!({"roles": ["10"]})),
-                    ScriptedResponse::status(204),
-                ],
-                ScriptedResponse::status(500),
-            )
-            .await;
             let observation = Arc::new(Mutex::new(()));
-            tick(Kind::Rank, &pool, &executor(&mock), guild, &observation)
-                .await
-                .expect("non-cumulative ladder heals and publishes");
-            let requests = mock.requests();
-            assert_eq!(requests.len(), 5, "{requests:?}");
-            let put = requests
-                .iter()
-                .find(|request| request.method == "PUT")
-                .expect("role grant");
-            // Member 1001 holds Member ("12") without Prospect ("11"), so the
-            // heal grants exactly the missing lower rung.
-            assert_eq!(put.path, "/api/v10/guilds/2222/members/1001/roles/11");
-            assert!(
-                put.header("x-audit-log-reason")
-                    .and_then(decode_reason)
-                    .is_some_and(|reason| reason == RANK_SELF_HEAL_AUDIT_REASON),
-                "heal grant carries the exact audit reason"
-            );
-            let rank: Option<String> =
-                sqlx::query_scalar("SELECT rank_key FROM member_ranks WHERE guild_id=$1 AND member_id='1001'")
-                    .bind(guild)
-                    .fetch_optional(&pool)
-                    .await
-                    .unwrap();
-            assert_eq!(rank.as_deref(), Some("member"));
-            let holders: i32 =
-                sqlx::query_scalar("SELECT holders_count FROM rank_snapshots WHERE guild_id=$1 AND rank_key='prospect'")
-                    .bind(guild)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap();
-            assert_eq!(holders, 2, "healed Prospect rung counts both holders");
-            mock.shutdown().await;
-
             // A genuinely invalid ladder still fails closed: Legend missing,
-            // nothing granted, nothing published.
+            // nothing granted, nothing published. This control stays on the
+            // scripted queue and runs before the freshness assertions.
             let bad_roles = json!({"roles": [
                 {"id":"11","name":"Prospect","position":1},
                 {"id":"12","name":"Member","position":2},
@@ -906,7 +1011,7 @@ fn rank_tick_self_heals_non_cumulative_ladder_and_publishes() {
             ]});
             let mock = MockRest::start(
                 vec![
-                    ScriptedResponse::json(200, roster),
+                    ScriptedResponse::json(200, roster.clone()),
                     ScriptedResponse::json(200, bad_roles),
                 ],
                 ScriptedResponse::status(500),
@@ -921,6 +1026,92 @@ fn rank_tick_self_heals_non_cumulative_ladder_and_publishes() {
                 mock.requests().iter().all(|request| request.method != "PUT"),
                 "invalid ladder must not mutate"
             );
+            mock.shutdown().await;
+
+            let (mock, truth) = start_rank_publication_mock(roster, roles).await;
+            tick(Kind::Rank, &pool, &executor(&mock), guild, &observation)
+                .await
+                .expect("non-cumulative ladder heals and publishes");
+            let requests = mock.requests();
+            let puts: Vec<_> = requests
+                .iter()
+                .enumerate()
+                .filter(|(_, request)| request.method == "PUT")
+                .collect();
+            assert_eq!(puts.len(), 1, "exactly one original grant: {requests:?}");
+            let (put_at, put) = puts[0];
+            // Member 1001 holds Member ("12") without Prospect ("11"), so the
+            // heal grants exactly the missing lower rung.
+            assert_eq!(put.path, "/api/v10/guilds/2222/members/1001/roles/11");
+            assert!(
+                put.header("x-audit-log-reason")
+                    .and_then(decode_reason)
+                    .is_some_and(|reason| reason == RANK_SELF_HEAL_AUDIT_REASON),
+                "heal grant carries the exact audit reason"
+            );
+            let prior = if put_at == 0 {
+                None
+            } else {
+                requests.get(put_at - 1)
+            };
+            let prior_desc = prior
+                .map(|request| format!("{} {}", request.method, request.path))
+                .unwrap_or_else(|| "none".to_owned());
+            assert!(
+                prior.is_some_and(|request| {
+                    request.method == "GET"
+                        && request.path == "/api/v10/guilds/2222/members/1001"
+                }),
+                "fresh point read must sit immediately before the original grant: prior {prior_desc}"
+            );
+            assert!(
+                requests.iter().skip(put_at + 1).any(|request| {
+                    request.method == "GET"
+                        && request.path == "/api/v10/guilds/2222/members/1001"
+                }),
+                "post-repair member read must observe the granted rung: {requests:?}"
+            );
+            assert!(
+                requests.iter().any(|request| {
+                    request.method == "GET"
+                        && discord_route(&request.path) == "/guilds/2222/members"
+                }),
+                "frozen roster list still required: {requests:?}"
+            );
+            {
+                let truth = truth.lock().expect("member truth");
+                assert!(
+                    truth
+                        .point_reads
+                        .iter()
+                        .any(|(stuck, roles)| *stuck == 0 && roles.as_slice() == ["12".to_owned()]),
+                    "initial point read must show Member only: {:?}",
+                    truth.point_reads
+                );
+                assert!(
+                    truth.point_reads.iter().any(|(stuck, roles)| {
+                        *stuck >= 1
+                            && roles.iter().any(|role| role == "11")
+                            && roles.iter().any(|role| role == "12")
+                    }),
+                    "post-repair point read must show Prospect and Member: {:?}",
+                    truth.point_reads
+                );
+            }
+            let rank: Option<String> =
+                sqlx::query_scalar("SELECT rank_key FROM member_ranks WHERE guild_id=$1 AND member_id='1001'")
+                    .bind(guild)
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(rank.as_deref(), Some("member"));
+            let holders: i32 =
+                sqlx::query_scalar("SELECT holders_count FROM rank_snapshots WHERE guild_id=$1 AND rank_key='prospect'")
+                    .bind(guild)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(holders, 2, "healed Prospect rung counts both holders");
             mock.shutdown().await;
             fixture
                 .close()
@@ -1200,6 +1391,137 @@ async fn rank_tick_missing_rung_names_the_rung_and_writes_nothing() {
     for leaked in [probe_id, probe_name] {
         assert!(!logs.contains(leaked), "logs leaked {leaked:?}");
     }
+}
+
+/// Builder pin for the identity-binding guard behind C1/D8: a point-member
+/// read bound to a different user id is unproven evidence, even when its
+/// roles look nested. Deleting the user-id check in `rank_repair_member`
+/// turns this red. Offline: no database.
+#[tokio::test]
+async fn rank_repair_member_rejects_misbound_user_id() {
+    // Wrong identity carrying nested Prospect-only roles.
+    let mock = MockRest::start(
+        vec![ScriptedResponse::json(
+            200,
+            json!({"user": {"id": "1002", "bot": false}, "roles": ["11"]}),
+        )],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    assert_eq!(
+        rank_repair_member(&executor(&mock), "2222", "1001").await,
+        Err(ErrorClass::Rest)
+    );
+    mock.shutdown().await;
+
+    // Sanity: correctly bound nested evidence verifies.
+    let mock = MockRest::start(
+        vec![ScriptedResponse::json(
+            200,
+            json!({"user": {"id": "1001", "bot": false}, "roles": ["11"]}),
+        )],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let observed = rank_repair_member(&executor(&mock), "2222", "1001")
+        .await
+        .expect("correctly bound member verifies");
+    assert_eq!(
+        observed.map(|member| member.user_id),
+        Some("1001".to_owned())
+    );
+    mock.shutdown().await;
+}
+
+/// Builder pin for the wrong-identity publication hazard: the point read for
+/// 1001 returns a record bound to 1002 carrying nested Prospect-only roles.
+/// Without the user-id check the tick would publish Ok with the wrong member;
+/// with it the tick fails closed with no PUT and no publication. Lives here
+/// (not in the frozen acceptance file) per its builder contract.
+#[tokio::test]
+async fn rank_tick_wrong_identity_with_nested_roles_fails_closed() {
+    let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
+        assert!(
+            std::env::var("GITHUB_ACTIONS").is_err(),
+            "CI must supply the guarded test database"
+        );
+        eprintln!("SKIP wrong-identity nested integration: TWO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let fixture = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+        .await
+        .expect("create migrated agent-testdb fixture");
+    let pool = fixture.pool().clone();
+    apply_web_contract(&pool).await.unwrap();
+    let guild = "2222";
+    for (index, anomaly) in two_bot_core::RAID_ANOMALIES.iter().enumerate() {
+        let (start, _) = two_bot_core::window_bounds(anomaly.start, anomaly.end).unwrap();
+        sqlx::query("INSERT INTO members (guild_id, member_id, joined_at, is_bot) VALUES ($1,$2,$3::timestamptz,FALSE)")
+            .bind(guild).bind((9000 + index).to_string()).bind(start).execute(&pool).await.unwrap();
+    }
+    let roster = json!([
+        member(1000, false, &["11"]),
+        member(1001, false, &["12"]),
+        member(9000, false, &[]),
+        member(9001, false, &[]),
+        member(9002, false, &[]),
+    ]);
+    let roles_doc = json!({"roles": [
+        {"id":"10","name":"Bot","position":99},
+        {"id":"11","name":"Prospect","position":1},
+        {"id":"12","name":"Member","position":2},
+        {"id":"13","name":"Soldier","position":3},
+        {"id":"14","name":"Veteran","position":4},
+        {"id":"15","name":"Legend","position":5},
+    ]});
+    let mock = MockRest::with_responder(move |request: &RestRequest| {
+        let route = discord_route(&request.path);
+        if request.method == "GET" && route == "/guilds/2222" {
+            return ScriptedResponse::json(200, roles_doc.clone());
+        }
+        if request.method == "GET" && route == "/guilds/2222/members" {
+            return ScriptedResponse::json(200, roster.clone());
+        }
+        if request.method == "GET" && route == "/users/@me" {
+            return ScriptedResponse::json(200, json!({"id": "999", "bot": true}));
+        }
+        if request.method == "GET" && route == "/guilds/2222/members/999" {
+            return ScriptedResponse::json(200, json!({"roles": ["10"]}));
+        }
+        if request.method == "GET" && route == "/guilds/2222/members/1001" {
+            // Misbound evidence with nested roles: without the user-id check
+            // the post-repair refresh would publish this as 1001.
+            return ScriptedResponse::json(
+                200,
+                json!({"user": {"id": "1002", "bot": false}, "roles": ["11"]}),
+            );
+        }
+        if request.method == "PUT" {
+            return ScriptedResponse::status(204);
+        }
+        panic!("unexpected mock Discord route: {} {route}", request.method);
+    })
+    .await;
+    let observation = Arc::new(Mutex::new(()));
+    let outcome = tick(Kind::Rank, &pool, &executor(&mock), guild, &observation).await;
+    assert!(outcome.is_err(), "misbound nested evidence fails closed");
+    let requests = mock.requests();
+    assert!(
+        requests.iter().all(|request| request.method != "PUT"),
+        "misbound evidence must not grant: {requests:?}"
+    );
+    let published: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM rank_snapshots WHERE guild_id=$1")
+            .bind(guild)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(published, 0, "misbound evidence publishes nothing");
+    mock.shutdown().await;
+    fixture
+        .close()
+        .await
+        .expect("drop disposable test database");
 }
 
 /// A lazy pool that never connects: reaching storage surfaces `Database`, so
