@@ -735,6 +735,66 @@ impl TicketRuntime {
         Ok(())
     }
 
+    fn verify_creation_channel(
+        &self,
+        doc: &Value,
+        ticket: &Ticket,
+        channel: &str,
+        config: &TicketConfig,
+    ) -> Result<()> {
+        if ticket.guild_id != config.guild_id
+            || ticket.channel_id.as_deref().is_some_and(|id| id != channel)
+        {
+            return Err(Failure::InvalidEvidence);
+        }
+        self.validate_channel(doc, channel, 0)?;
+        TicketChannelRequest {
+            guild_id: &config.guild_id,
+            category_id: &config.category_id,
+            staff_role_id: &config.staff_role_id,
+            bot_id: &self.bot_id()?,
+            opener_id: &ticket.opener_id,
+            username: "", // Verification never constructs a channel name.
+            reservation_id: &ticket.id,
+        }
+        .verify_receipt(doc)?;
+        Ok(())
+    }
+
+    /// A listing or recorded id only selects a candidate. Fetch and prove it
+    /// before recording it or advancing rollback state; never launder listing
+    /// evidence into authority to delete a different/private-unproven channel.
+    async fn rollback_creating(
+        &self,
+        ticket: &Ticket,
+        channel: &str,
+        config: &TicketConfig,
+    ) -> Result<()> {
+        let present = match self.executor.fetch_ticket_channel(channel).await? {
+            ChannelPresence::Present(doc) => {
+                self.verify_creation_channel(&doc, ticket, channel, config)?;
+                true
+            }
+            ChannelPresence::Absent => false,
+        };
+        if !present && ticket.channel_id.is_none() {
+            self.store.abandon_creating(&ticket.id).await?;
+            return Ok(());
+        }
+        self.store.record_channel(&ticket.id, channel).await?;
+        self.store
+            .queue_open_rollback(&ticket.id, now_millis_for_test())
+            .await?;
+        if present {
+            // Reuse the just-verified fetch: one listing + one fetch + one DELETE.
+            self.executor.delete_ticket_channel(channel).await?;
+        }
+        self.store
+            .finish_cleanup(&ticket.id, now_millis_for_test())
+            .await?;
+        Ok(())
+    }
+
     fn require_history_access(&self, doc: &Value) -> Result<()> {
         let (allow, deny) = member_overwrite(doc, &self.bot_id()?)?;
         let required = (Permissions::VIEW_CHANNEL | Permissions::READ_MESSAGE_HISTORY).bits();
@@ -799,9 +859,21 @@ impl TicketRuntime {
     }
 
     async fn cleanup(&self, id: &str, channel: &str) -> Result<()> {
+        let ticket = self.store.get(id).await?.ok_or(Failure::InvalidEvidence)?;
+        if ticket.status != TicketStatus::CleanupPending
+            || ticket.channel_id.as_deref() != Some(channel)
+        {
+            return Err(Failure::InvalidEvidence);
+        }
         match self.executor.fetch_ticket_channel(channel).await? {
             ChannelPresence::Present(doc) => {
                 self.validate_channel(&doc, channel, 0)?;
+                // Open rollback has no close token. Re-prove creation on every
+                // retry, but preserve captured-close cleanup (opener writes are
+                // frozen there, and retention may already have purged the body).
+                if ticket.closing_started_at.is_none() {
+                    self.verify_creation_channel(&doc, &ticket, channel, &self.live_config())?;
+                }
                 self.executor.delete_ticket_channel(channel).await?;
             }
             ChannelPresence::Absent => {}
@@ -886,21 +958,12 @@ impl TicketRuntime {
                     [] => {
                         self.store.abandon_creating(&ticket.id).await?;
                     }
-                    [channel] => {
-                        self.store.record_channel(&ticket.id, channel).await?;
-                        self.store
-                            .queue_open_rollback(&ticket.id, now_millis_for_test())
-                            .await?;
-                        self.cleanup(&ticket.id, channel).await?;
-                    }
+                    [channel] => self.rollback_creating(ticket, channel, &config).await?,
                     _ => return Err(Failure::InvalidEvidence),
                 }
             }
             RecoveryAction::DeleteInterruptedCreate { channel_id } => {
-                self.store
-                    .queue_open_rollback(&ticket.id, now_millis_for_test())
-                    .await?;
-                self.cleanup(&ticket.id, &channel_id).await?;
+                self.rollback_creating(ticket, &channel_id, &config).await?;
             }
             RecoveryAction::RetryCleanup { channel_id } => {
                 self.cleanup(&ticket.id, &channel_id).await?
