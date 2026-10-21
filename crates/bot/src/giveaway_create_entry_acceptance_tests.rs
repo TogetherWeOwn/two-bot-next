@@ -422,7 +422,7 @@ fn giveaway_router_refuses_without_manage_guild_and_handles_with_it() {
             custom_row: None,
         })
     };
-    for permissions in [None, Some(0), Some(1), Some(u64::MAX & !PERM_MANAGE_GUILD)] {
+    for permissions in [None, Some(0), Some(1), Some(!PERM_MANAGE_GUILD)] {
         assert!(
             matches!(outcome(permissions), SlashOutcome::Refuse { .. }),
             "without ManageGuild the shared router refuses: {permissions:?}"
