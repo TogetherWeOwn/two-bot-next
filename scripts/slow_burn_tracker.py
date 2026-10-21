@@ -63,6 +63,10 @@ CADENCE_WARN_SECONDS = 600
 # go unfiled and open cards stay unclosed while coverage is gone.
 UNCOVERED_WARN_SECONDS = int(6.5 * 3600)
 MARKER_RE = re.compile(r"<!-- slow-burn-tracker:last-update=([0-9]{1,19}) -->")
+# The staging edge answers the stdlib default agent with 403/error 1010, so
+# the scrape names itself (a missing bearer still reads as the Worker's own
+# 401, never a 403).
+USER_AGENT = "two-bot-next-slow-burn-tracker/1.0"
 TIMEOUT_SECONDS = 6
 MAX_BODY_BYTES = 64 * 1024
 # Plenty for a six-hour ring or 50 ordinary issue rows. Check UTF-8 bytes,
@@ -113,7 +117,9 @@ def scrape_metrics(origin, token):
         raise TrackError("metrics origin refused: https only")
     url = origin.rstrip("/") + "/ops/metrics"
     request = urllib.request.Request(
-        url, method="GET", headers={"Authorization": f"Bearer {token}"}
+        url,
+        method="GET",
+        headers={"Authorization": f"Bearer {token}", "User-Agent": USER_AGENT},
     )
     opener = urllib.request.build_opener(_NoRedirectHandler())
     try:
