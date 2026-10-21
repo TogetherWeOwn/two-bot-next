@@ -5,16 +5,121 @@
 //! dry run. Offline only: a mock Discord double and a closed database pool.
 
 use super::*;
-use crate::discord_test_common::{MockRest, RestRequest, ScriptedResponse};
-use crate::gateway::ensure_crypto_provider;
 use crate::tuning_test_support as support;
+use axum::body::to_bytes;
+use axum::extract::Request;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::Router;
 use serde_json::json;
+use std::sync::Mutex;
+use tokio::net::TcpListener;
 
 const ROLES: &str = "GET /guilds/22/roles";
 const EXECUTOR_READ: &str = "GET /guilds/22/members/5001";
 const BOT_READ: &str = "GET /guilds/22/members/999";
 const FIRST_REMOVAL: &str = "DELETE /guilds/22/members/5001/roles/77";
 const SECOND_REMOVAL: &str = "DELETE /guilds/22/members/5001/roles/79";
+
+/// Install the process-wide rustls crypto provider (ring) unless one is set.
+/// Same body as the binary's `gateway::ensure_crypto_provider`, inlined
+/// because this lib-compiled test module cannot import binary-only modules.
+fn ensure_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+}
+
+// Loopback-only REST double, trimmed from `tests/support/containment_rest.rs`
+// (same axum shape and scripted API, without request-body recording): this
+// lib-compiled test module cannot import the binary-only `discord_test_common`
+// shim, and the latch pins only assert method-plus-path trails.
+#[derive(Clone)]
+struct RestRequest {
+    method: String,
+    path: String,
+}
+
+struct ScriptedResponse(Response);
+
+impl ScriptedResponse {
+    fn status(status: u16) -> Self {
+        Self(
+            StatusCode::from_u16(status)
+                .expect("valid mock status")
+                .into_response(),
+        )
+    }
+
+    fn json(status: u16, body: serde_json::Value) -> Self {
+        Self(
+            (
+                StatusCode::from_u16(status).expect("valid mock status"),
+                axum::Json(body),
+            )
+                .into_response(),
+        )
+    }
+}
+
+struct MockRest {
+    origin: String,
+    recorded: Arc<Mutex<Vec<RestRequest>>>,
+    handle: JoinHandle<()>,
+}
+
+impl MockRest {
+    async fn with_responder(
+        responder: impl Fn(&RestRequest) -> ScriptedResponse + Send + Sync + 'static,
+    ) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind rest");
+        let origin = format!("http://{}", listener.local_addr().expect("rest addr"));
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let requests = Arc::clone(&recorded);
+        let responder = Arc::new(responder);
+        let app = Router::new().fallback(move |request: Request| {
+            let requests = Arc::clone(&requests);
+            let responder = Arc::clone(&responder);
+            async move {
+                let (parts, body) = request.into_parts();
+                let request = RestRequest {
+                    method: parts.method.to_string(),
+                    path: parts.uri.path().to_owned(),
+                };
+                let _ = to_bytes(body, 1024 * 1024).await.expect("drain mock body");
+                requests.lock().expect("recorded").push(request.clone());
+                responder(&request).0
+            }
+        });
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve mock rest");
+        });
+        Self {
+            origin,
+            recorded,
+            handle,
+        }
+    }
+
+    fn origin(&self) -> String {
+        self.origin.clone()
+    }
+
+    fn requests(&self) -> Vec<RestRequest> {
+        self.recorded.lock().expect("recorded").clone()
+    }
+
+    async fn shutdown(mut self) {
+        self.handle.abort();
+        let _ = (&mut self.handle).await;
+    }
+}
+
+impl Drop for MockRest {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
 
 struct Fixed;
 
