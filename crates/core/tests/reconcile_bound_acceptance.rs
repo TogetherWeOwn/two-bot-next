@@ -148,17 +148,9 @@ type PostResult = Result<String, MirrorError>;
 type DocResult = Result<MirrorChannel, MirrorError>;
 type PageResult = Result<Vec<MirrorMessage>, MirrorError>;
 
-#[allow(dead_code)]
-#[derive(Debug)]
-struct Post {
-    channel_id: String,
-    content: String,
-    nonce: String,
-}
-
 #[derive(Clone, Default)]
 struct ScriptMirror {
-    posts: Arc<Mutex<Vec<Post>>>,
+    posts: Arc<AtomicU64>,
     post_script: Arc<Mutex<VecDeque<PostResult>>>,
     documents: Arc<Mutex<VecDeque<DocResult>>>,
     history: Arc<Mutex<VecDeque<PageResult>>>,
@@ -167,7 +159,7 @@ struct ScriptMirror {
 
 impl ScriptMirror {
     fn post_count(&self) -> usize {
-        self.posts.lock().unwrap().len()
+        self.posts.load(Ordering::Relaxed) as usize
     }
 
     fn reads(&self) -> u64 {
@@ -219,11 +211,8 @@ impl AuditMirror for ScriptMirror {
         E: Send,
     {
         authorize.await?;
-        self.posts.lock().unwrap().push(Post {
-            channel_id: channel_id.to_owned(),
-            content: content.to_owned(),
-            nonce: nonce.to_owned(),
-        });
+        let _ = (channel_id, content, nonce);
+        self.posts.fetch_add(1, Ordering::Relaxed);
         Ok(self
             .post_script
             .lock()
@@ -372,11 +361,11 @@ async fn deep_scan_stops_at_cap_with_fixed_marker_and_recovers() -> TestResult {
     // within the bound without a second POST.
     db.expire("deep-scan").await?;
     let ev = event("deep-scan");
-    mirror
-        .history
-        .lock()
-        .unwrap()
-        .push_back(Ok(vec![marked("640", &ev)]));
+    {
+        let mut history = mirror.history.lock().unwrap();
+        history.clear();
+        history.push_back(Ok(vec![marked("640", &ev)]));
+    }
     assert_eq!(
         service.deliver_entry("deep-scan").await?,
         DeliverOutcome::Reconciled {
