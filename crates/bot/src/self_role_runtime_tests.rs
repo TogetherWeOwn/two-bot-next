@@ -427,6 +427,7 @@ async fn exercise(pool: &PgPool) -> TestResult {
     exclusive_lane_before_reads(pool).await?;
     lost_panel_lane_release_is_logged(pool).await?;
     zero_row_receipt_completion_is_unmatched_receipt(pool).await?;
+    settlement_timeout_note_and_ambiguous_class(pool).await?;
     Ok(())
 }
 
@@ -4217,4 +4218,89 @@ async fn legacy_start_latches_loss_for_unusable_claim_shapes() {
             "dropping the refused keeper ({label}) is a silent no-op"
         );
     }
+}
+
+/// Settlement wiring through the live send path: a journaled send with no
+/// received response records `timeout_no_response` without completing the
+/// ticket, and a received ambiguous status persists `response_ambiguous`
+/// through completion. Runs last: it applies migration 0449 to the shared
+/// exercise schema, which earlier scenarios must not observe.
+async fn settlement_timeout_note_and_ambiguous_class(pool: &PgPool) -> TestResult {
+    sqlx::raw_sql(include_str!(
+        "../../cutover/migrations/0449_self_role_ticket_acknowledgement.sql"
+    ))
+    .execute(pool)
+    .await?;
+    // Timeout: the mutation overruns the 5 s moderation timeout, so no
+    // response is received and the ticket stays pending with its timeout.
+    let clock = Arc::new(AtomicI64::new(NOW));
+    let mut panel = panel(PanelMode::Select);
+    panel.id = "settlement-timeout-note".into();
+    let mut script = snapshot(&[OLD_ROLE, OTHER]);
+    script.push(ScriptedResponse::status(204).delayed(Duration::from_secs(6)));
+    let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+    let feature = runtime_with_timeout(pool, &clock, &mock, Duration::from_secs(5));
+    let request = request(
+        &panel.id,
+        Selection::Select {
+            option_keys: vec!["new".into()],
+        },
+    );
+    let mut prepared = ready(feature.prepare(&request, &panel).await.unwrap());
+    feature.checkpoint(&mut prepared).await.unwrap();
+    feature
+        .execute_step(&mut prepared, NEW_ROLE, true)
+        .await
+        .unwrap();
+    let timeout_row: (String, Option<String>, bool) = sqlx::query_as(
+        "SELECT disposition, outcome_class, completed_at IS NULL \
+         FROM self_role_exchanges WHERE event_id = $1",
+    )
+    .bind(&request.event_id)
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(timeout_row.0, "pending", "a timeout is not a receipt");
+    assert_eq!(
+        timeout_row.1.as_deref(),
+        Some("timeout_no_response"),
+        "a timed-out send must record its outcome"
+    );
+    assert!(timeout_row.2, "a timeout must not fabricate completion");
+    mock.shutdown().await;
+    // Ambiguous: a received 500 completes with its outcome class.
+    let clock = Arc::new(AtomicI64::new(NOW));
+    let mut panel = panel(PanelMode::Select);
+    panel.id = "settlement-ambiguous-class".into();
+    let mut script = snapshot(&[OLD_ROLE, OTHER]);
+    script.push(ScriptedResponse::status(500));
+    let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+    let feature = runtime(pool, &clock, &mock);
+    let request = request(
+        &panel.id,
+        Selection::Select {
+            option_keys: vec!["new".into()],
+        },
+    );
+    let mut prepared = ready(feature.prepare(&request, &panel).await.unwrap());
+    feature.checkpoint(&mut prepared).await.unwrap();
+    feature
+        .execute_step(&mut prepared, NEW_ROLE, true)
+        .await
+        .unwrap();
+    let class_row: (String, Option<i16>, Option<String>) = sqlx::query_as(
+        "SELECT disposition, response_status, outcome_class \
+         FROM self_role_exchanges WHERE event_id = $1",
+    )
+    .bind(&request.event_id)
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(class_row.0, "response");
+    assert_eq!(class_row.1, Some(500));
+    assert_eq!(
+        class_row.2.as_deref(),
+        Some("response_ambiguous"),
+        "an ambiguous receipt must persist its class"
+    );
+    mock.shutdown().await;
+    Ok(())
 }

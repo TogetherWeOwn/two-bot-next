@@ -2089,6 +2089,8 @@ jobs:
         run: cargo test -p two-bot-cutover --test self_role_store --locked -- --ignored
       - name: self-role ticket acknowledgement columns and caps
         run: cargo test -p two-bot-cutover --test self_role_ack_acceptance --locked -- --ignored
+      - name: self-role settlement through acknowledgement columns
+        run: cargo test -p two-bot-cutover --test self_role_settlement_acceptance --locked -- --ignored
       - name: self-role runtime admission and immutable snapshots (mock REST and isolated schema)
         run: >-
           cargo test -p two-bot --locked self_role_runtime:: -- --include-ignored --test-threads=1

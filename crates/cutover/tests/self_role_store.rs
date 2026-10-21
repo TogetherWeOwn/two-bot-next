@@ -2735,3 +2735,198 @@ async fn exercise_atomic_finish_wait(pool: &PgPool) -> TestResult {
     );
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires agent-testdb; run explicitly with --ignored"]
+async fn settlement_writers_degrade_ahead_of_acknowledgement_migration() -> TestResult {
+    with_isolated_schema(|pool| async move { exercise_settlement_legacy_fallback(&pool).await })
+        .await
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb; run explicitly with --ignored"]
+async fn settlement_link_guards_refuse_self_and_cross_event_links() -> TestResult {
+    with_isolated_schema(|pool| async move { exercise_settlement_link_guards(&pool).await }).await
+}
+
+/// Ahead of migration 0449 the build must behave exactly as before: receipts
+/// still land and retirement still works, while settlement writes degrade to
+/// "wrote nothing" instead of failing. Bad input still fails closed even
+/// without the columns.
+async fn exercise_settlement_legacy_fallback(pool: &PgPool) -> TestResult {
+    for migration in [
+        include_str!("../migrations/0200_self_roles.sql"),
+        include_str!("../migrations/0201_self_role_intent_initialization.sql"),
+        include_str!("../migrations/0202_self_role_compensation_phase.sql"),
+        include_str!("../migrations/0203_self_role_pending_exchange.sql"),
+        include_str!("../migrations/0204_self_role_terminal_repair.sql"),
+        include_str!("../migrations/0205_self_role_exchange_receipts.sql"),
+        include_str!("../migrations/0206_self_role_exchange_baselines.sql"),
+    ] {
+        sqlx::raw_sql(migration).execute(pool).await?;
+    }
+    let store = SelfRoleStore::new(pool.clone());
+    let audit = row("legacy-fallback", "legacy-fallback");
+    let claim = store
+        .claim_audit(&audit)
+        .await?
+        .expect("fresh audit must claim");
+    let intent = ExchangeIntent {
+        role_id: "role-a".into(),
+        adding: true,
+        compensating: false,
+    };
+    let ticket = store
+        .journal_role_exchange(&claim, None, &intent)
+        .await?
+        .expect("journal must succeed");
+    // The ambiguous receipt lands through the legacy statement.
+    assert!(
+        store
+            .complete_role_exchange(&ticket, ExchangeReceipt::Response { status: 500 })
+            .await?,
+        "ambiguous completion must still apply ahead of the migration"
+    );
+    let (disposition, status): (String, Option<i16>) = sqlx::query_as(
+        "SELECT disposition, response_status FROM self_role_exchanges \
+         WHERE event_id = 'legacy-fallback'",
+    )
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(disposition, "response");
+    assert_eq!(status, Some(500));
+    // Settlement writes degrade to "wrote nothing".
+    assert!(
+        !store.note_wire_retry(&ticket).await?,
+        "retry bump must degrade ahead of the migration"
+    );
+    assert!(
+        !store
+            .note_ambiguous_outcome(&ticket, "timeout_no_response")
+            .await?,
+        "timeout note must degrade ahead of the migration"
+    );
+    assert!(
+        store
+            .note_ambiguous_outcome(&ticket, "bogus")
+            .await
+            .is_err(),
+        "unknown classes fail closed even without the columns"
+    );
+    let replacement = store
+        .journal_role_exchange(&claim, None, &intent)
+        .await?
+        .expect("replacement must journal");
+    assert!(
+        !store.supersede_role_exchange(&ticket, &replacement).await?,
+        "supersede must degrade ahead of the migration"
+    );
+    assert_eq!(
+        store
+            .expire_stale_exchanges(time::Duration::hours(1))
+            .await?,
+        0,
+        "expiry settles nothing ahead of the migration"
+    );
+    let (pending_id,): (String,) = sqlx::query_as(
+        "SELECT exchange_id FROM self_role_exchanges WHERE event_id = 'legacy-fallback' \
+         AND disposition = 'pending'",
+    )
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(
+        SelfRoleStore::pending_retry_candidates(pool, "legacy-fallback").await?,
+        vec![pending_id],
+        "unfiltered pending fallback must keep listing the pending ticket"
+    );
+    // Retirement keeps working through the legacy statement.
+    store
+        .retire_role_receipts(&claim, None)
+        .await?
+        .expect("live owner must retire");
+    let (retired,): (bool,) = sqlx::query_as(
+        "SELECT retired_at IS NOT NULL FROM self_role_exchanges \
+         WHERE event_id = 'legacy-fallback' AND disposition = 'response'",
+    )
+    .fetch_one(pool)
+    .await?;
+    assert!(retired, "completed ticket must retire");
+    Ok(())
+}
+
+/// The explicit supersede link refuses nonsense (self-links, cross-event
+/// links) and settlement notes refuse completed rows, without over-refusing
+/// a genuine same-event replacement.
+async fn exercise_settlement_link_guards(pool: &PgPool) -> TestResult {
+    for migration in [
+        include_str!("../migrations/0200_self_roles.sql"),
+        include_str!("../migrations/0201_self_role_intent_initialization.sql"),
+        include_str!("../migrations/0202_self_role_compensation_phase.sql"),
+        include_str!("../migrations/0203_self_role_pending_exchange.sql"),
+        include_str!("../migrations/0204_self_role_terminal_repair.sql"),
+        include_str!("../migrations/0205_self_role_exchange_receipts.sql"),
+        include_str!("../migrations/0206_self_role_exchange_baselines.sql"),
+        include_str!("../migrations/0449_self_role_ticket_acknowledgement.sql"),
+    ] {
+        sqlx::raw_sql(migration).execute(pool).await?;
+    }
+    let store = SelfRoleStore::new(pool.clone());
+    let intent = ExchangeIntent {
+        role_id: "role-a".into(),
+        adding: true,
+        compensating: false,
+    };
+    let claim = store
+        .claim_audit(&row("link-guards", "link-guards"))
+        .await?
+        .expect("fresh audit must claim");
+    let first = store
+        .journal_role_exchange(&claim, None, &intent)
+        .await?
+        .expect("first ticket must journal");
+    let second = store
+        .journal_role_exchange(&claim, None, &intent)
+        .await?
+        .expect("second ticket must journal");
+    assert!(
+        !store.supersede_role_exchange(&first, &first).await?,
+        "a ticket must not supersede itself"
+    );
+    let other_claim = store
+        .claim_audit(&row("link-guards-other", "link-guards-other"))
+        .await?
+        .expect("other audit must claim");
+    let other = store
+        .journal_role_exchange(&other_claim, None, &intent)
+        .await?
+        .expect("other ticket must journal");
+    assert!(
+        !store.supersede_role_exchange(&first, &other).await?,
+        "a replacement must belong to the same event"
+    );
+    assert!(
+        store
+            .complete_role_exchange(&first, ExchangeReceipt::NoSend)
+            .await?,
+        "definite completion must still apply"
+    );
+    assert!(
+        !store.note_wire_retry(&first).await?,
+        "completed rows never bump"
+    );
+    assert!(
+        !store
+            .note_ambiguous_outcome(&first, "timeout_no_response")
+            .await?,
+        "completed rows never take timeout notes"
+    );
+    let third = store
+        .journal_role_exchange(&claim, None, &intent)
+        .await?
+        .expect("third ticket must journal");
+    assert!(
+        store.supersede_role_exchange(&second, &third).await?,
+        "a genuine same-event replacement must link"
+    );
+    Ok(())
+}
