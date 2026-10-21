@@ -490,7 +490,7 @@ async fn snapshot_store_all_hostile_uses_saturates_i32() {
         return;
     };
     let store = PgInviteSnapshots::new(pool.clone());
-    let hostile = u64::from(i32::MAX) + 1;
+    let hostile = u64::from(i32::MAX as u32) + 1;
     store.store_all(
         GUILD,
         &[InviteState {
