@@ -250,9 +250,18 @@ struct LiveInteraction {
 
 type LiveInteractions = Arc<std::sync::Mutex<HashMap<i64, LiveInteraction>>>;
 
-async fn generation_changed(generation: &AtomicU64, expected: u64) {
-    while generation.load(Ordering::Acquire) == expected {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+async fn generation_changed(generation: &AtomicU64, wake: &tokio::sync::Notify, expected: u64) {
+    loop {
+        // Arm the wait BEFORE reading the counter: `enable` registers this
+        // waiter up front, so a bump that lands between the read and the park
+        // still wakes it. No generation change is missed without polling.
+        let notified = wake.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if generation.load(Ordering::Acquire) != expected {
+            return;
+        }
+        notified.await;
     }
 }
 
@@ -464,7 +473,11 @@ async fn await_interaction_completion(
     completion.await.map_err(|_| interaction_drain_failure())
 }
 
-async fn transport_disconnected(state: &RwLock<GatewayState>, generation: &AtomicU64) {
+async fn transport_disconnected(
+    state: &RwLock<GatewayState>,
+    generation: &AtomicU64,
+    wake: &tokio::sync::Notify,
+) {
     // Share the lock with checkpoint restoration and READY publication so a
     // disconnect cannot land between their generation check and state write.
     // The counter below is the 48h-watch disconnect series: every transport
@@ -474,6 +487,9 @@ async fn transport_disconnected(state: &RwLock<GatewayState>, generation: &Atomi
     two_bot_core::metrics::global().gateway_disconnect();
     let mut state = state.write().await;
     generation.fetch_add(1, Ordering::AcqRel);
+    // Wake every `generation_changed` waiter paired with this bump: the wait
+    // resolves off this notification instead of a 10 ms poll.
+    wake.notify_waiters();
     if *state != GatewayState::Draining {
         *state = GatewayState::Armed;
     }
@@ -1201,6 +1217,9 @@ pub async fn run_shard<I: InviteSource + 'static>(
     let _dispatch_guard = runtime.as_ref().map(|runtime| runtime.dispatch_guard());
     let _voice_connection = VoiceConnectionGuard(voice.clone());
     let generation = Arc::new(AtomicU64::new(0));
+    // Wakes `generation_changed` waiters on every bump; paired 1:1 with the
+    // counter above, so the wait resolves immediately instead of polling.
+    let generation_wake = Arc::new(tokio::sync::Notify::new());
     // Counts current-generation checkpoint failures so an overlapping success
     // cannot restore readiness after a failure (see `checkpoint_io`).
     let checkpoint_failures = Arc::new(AtomicU64::new(0));
@@ -1328,7 +1347,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         if committed.await.is_err() {
                             return Ok(None);
                         }
-                        transport_disconnected(&state, &generation).await;
+                        transport_disconnected(&state, &generation, &generation_wake).await;
                         voice_disconnected(voice.as_ref());
                         // Twilight consumes the boot session from config on
                         // construction; the config clone starts a fresh IDENTIFY.
@@ -1344,7 +1363,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         let message = match item {
                             Ok(message) => message,
                             Err(error) if matches!(error.kind(), twilight_gateway::error::ReceiveMessageErrorType::Reconnect) => {
-                                transport_disconnected(&state, &generation).await;
+                                transport_disconnected(&state, &generation, &generation_wake).await;
                                 voice_disconnected(voice.as_ref());
                                 warn!(
                                     msg = "gateway_reconnect_failed",
@@ -1357,7 +1376,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         observer.observe(&message, &shard);
                         let Message::Text(text) = message else {
                             crate::logging::shard_closed(&message);
-                            transport_disconnected(&state, &generation).await;
+                            transport_disconnected(&state, &generation, &generation_wake).await;
                             voice_disconnected(voice.as_ref());
                             let rejected = matches!(message, Message::Close(Some(ref frame)) if matches!(frame.code, 4007 | 4009));
                             let clear = rejected || shard.session().is_none();
@@ -1375,7 +1394,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         if header.op == 9 {
                             let packet: serde_json::Value = serde_json::from_str(&text).map_err(|_| sqlx::Error::InvalidArgument("invalid gateway session packet".into()))?;
                             let resumable = packet["d"].as_bool().ok_or_else(|| sqlx::Error::InvalidArgument("invalid gateway session flag".into()))?;
-                            transport_disconnected(&state, &generation).await;
+                            transport_disconnected(&state, &generation, &generation_wake).await;
                             voice_disconnected(voice.as_ref());
                             if invalidates_session(resumable) { received = None; return Ok(Some(ReceivedWork::Clear(deadline))); }
                         }
@@ -1549,6 +1568,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
             Arc::clone(&live_interactions),
             OnboardingQueueSignals {
                 signal: Arc::clone(&queue_signal),
+                generation_wake: Arc::clone(&generation_wake),
                 writer_drained: Arc::clone(&writer_drained),
                 opening_confirmed: opening_rx,
             },
@@ -1717,11 +1737,14 @@ pub async fn run_shard<I: InviteSource + 'static>(
 /// (cooperative shutdown drain).
 ///
 /// Coordination signals for the queue worker: wakeups for newly committed
-/// jobs, the writer-drained shutdown flag, and the gateway opening-frame gate
+/// jobs, the writer-drained shutdown flag, the generation-bump wake signal
+/// (paired 1:1 with the generation counter, so invalidation waits resolve
+/// immediately instead of polling), and the gateway opening-frame gate
 /// (claims wait for the first validated authenticated dispatch, so a fast
 /// member-read error cannot drop the socket before the opening write).
 struct OnboardingQueueSignals {
     signal: Arc<tokio::sync::Notify>,
+    generation_wake: Arc<tokio::sync::Notify>,
     writer_drained: Arc<std::sync::atomic::AtomicBool>,
     opening_confirmed: tokio::sync::watch::Receiver<bool>,
 }
@@ -1821,6 +1844,7 @@ async fn onboarding_queue(
                 if let Some(job) = job {
                     let runtime = Arc::clone(&runtime);
                     let generation = Arc::clone(&generation);
+                    let generation_wake = Arc::clone(&signals.generation_wake);
                     feature_jobs.spawn(async move {
                         let interrupted =
                             tokio::time::timeout(std::time::Duration::from_secs(90), async {
@@ -1829,7 +1853,7 @@ async fn onboarding_queue(
                                     // staged SQL rolls back and credentials are not replayed.
                                     tokio::select! {
                                         biased;
-                                        _ = generation_changed(&generation, live.generation) => return Ok(true),
+                                        _ = generation_changed(&generation, &generation_wake, live.generation) => return Ok(true),
                                         result = async {
                                             if live.ticket.await.unwrap_or(false) {
                                                 runtime.handle_acknowledged(&live.interaction, saved.occurred_at_ms).await
@@ -2468,7 +2492,8 @@ mod tests {
                 entering.await.unwrap();
                 // A disconnect bumps the generation and a fresh READY publishes
                 // Connected before this stale checkpoint fails.
-                transport_disconnected(&state, &generation).await;
+                let wake = tokio::sync::Notify::new();
+                transport_disconnected(&state, &generation, &wake).await;
                 *state.write().await = GatewayState::Connected;
                 fail.send(()).unwrap();
             };
@@ -2535,7 +2560,8 @@ mod tests {
         let failures = AtomicU64::new(0);
         checkpoint_io(&state, &generation, &failures, CHECKPOINT_IO_MAX, async {
             assert_eq!(*state.read().await, GatewayState::Armed);
-            transport_disconnected(&state, &generation).await;
+            let wake = tokio::sync::Notify::new();
+            transport_disconnected(&state, &generation, &wake).await;
             Ok(())
         })
         .await
@@ -2549,8 +2575,32 @@ mod tests {
     #[tokio::test]
     async fn transport_disconnect_cannot_clear_draining() {
         let state = RwLock::new(GatewayState::Draining);
-        transport_disconnected(&state, &AtomicU64::new(0)).await;
+        let wake = tokio::sync::Notify::new();
+        transport_disconnected(&state, &AtomicU64::new(0), &wake).await;
         assert_eq!(*state.read().await, GatewayState::Draining);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn generation_wait_resolves_on_notification_without_polling() {
+        // The production wait resolves off its wake signal with no sleep
+        // loop: a bump 5 ms after wait-start resolves in 5 ms, beating the
+        // old 10 ms poll. Mirrors the acceptance notify-latency bound.
+        let generation = Arc::new(AtomicU64::new(7));
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let flipped = Arc::clone(&generation);
+        let waker = Arc::clone(&wake);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            flipped.store(8, Ordering::Release);
+            waker.notify_waiters();
+        });
+        let start = tokio::time::Instant::now();
+        generation_changed(&generation, &wake, 7).await;
+        assert_eq!(
+            start.elapsed(),
+            std::time::Duration::from_millis(5),
+            "notification wake resolves exactly when the bump lands"
+        );
     }
 
     #[tokio::test]
@@ -3156,7 +3206,8 @@ mod tests {
         let sink = Arc::new(Recorder(std::sync::Mutex::new(Vec::new())));
         let voice: Arc<dyn VoiceEventSink> = sink.clone();
         // Transport loss at reception: generation bump, then voice disconnect.
-        transport_disconnected(&state, &generation).await;
+        let wake = tokio::sync::Notify::new();
+        transport_disconnected(&state, &generation, &wake).await;
         voice_disconnected(Some(&voice));
         let run = |observed: u64| {
             let checkpoint = GatewaySession {
@@ -3198,7 +3249,7 @@ mod tests {
         assert_eq!(*sink.0.lock().unwrap(), ["disconnect", "resumed"]);
         // A further loss after reception revokes the publish it just made.
         let observed = generation.load(Ordering::Acquire);
-        transport_disconnected(&state, &generation).await;
+        transport_disconnected(&state, &generation, &wake).await;
         run(observed);
         assert_eq!(
             *sink.0.lock().unwrap(),

@@ -198,6 +198,7 @@ async fn refused_worker_does_not_claim_alert_or_remove_roles() {
                     bot_user_id: "999".into(),
                     armed,
                     entries,
+                    shutdown: Arc::new(crate::raid_runtime::WorkerShutdown::default()),
                 };
                 let entry = AuditLogObservation {
                     guild_id: GUILD,
@@ -280,7 +281,14 @@ async fn malformed_cold_lists_refuse_boot_before_identity_or_effects() {
                 AntiNukeFences::from_vars(&input, guild).armed,
                 "positive arming control"
             );
-            assert!(start_from_vars(closed_pool().await, executor, guild, &input).is_none());
+            assert!(start_from_vars(
+                closed_pool().await,
+                executor,
+                guild,
+                &input,
+                tokio::sync::watch::channel(false).1
+            )
+            .is_none());
             support::assert_no_discord(&trap);
         }
         // Disabled fences stay disabled; malformed lists grant no activation.
@@ -289,7 +297,8 @@ async fn malformed_cold_lists_refuse_boot_before_identity_or_effects() {
             closed_pool().await,
             executor,
             guild,
-            &vars(&[(TRUSTED_KEY, SENTINEL)])
+            &vars(&[(TRUSTED_KEY, SENTINEL)]),
+            tokio::sync::watch::channel(false).1
         )
         .is_none());
         support::assert_no_discord(&trap);

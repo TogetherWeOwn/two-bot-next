@@ -134,6 +134,10 @@ mod tuning_test_support;
 mod website_jobs;
 #[cfg(test)]
 mod website_roster_cap_acceptance_tests;
+#[cfg(test)]
+mod worker_supervision_acceptance_tests;
+#[cfg(test)]
+mod worker_supervision_builder_tests;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -523,6 +527,9 @@ async fn run(cli_args: &[String]) {
         let self_roles = self_roles.clone();
         let member = member.clone();
         let linger_stop = stopping.clone();
+        // Cloned before the move: each supervised worker (raid, join-risk,
+        // containment) subscribes its own drain receiver below.
+        let worker_shutdown = shutdown.clone();
         let gateway_span = logging::gateway_span(guild_id);
         let task = async move {
             // A panic is caught only to name it on /readyz; the task still ends
@@ -689,8 +696,12 @@ async fn run(cli_args: &[String]) {
                             )
                         })?,
                     };
-                    let raid =
-                        raid_runtime::start_from_env(pool.clone(), raid_executor.clone(), guild_id);
+                    let raid = raid_runtime::start_from_env(
+                        pool.clone(),
+                        raid_executor.clone(),
+                        guild_id,
+                        worker_shutdown.subscribe(),
+                    );
                     // Join-risk delivery (R2) shares the raid observer slot:
                     // the pipeline takes one observer, so risk chains behind
                     // the raid watch and both stay behind the funnel's join
@@ -701,15 +712,19 @@ async fn run(cli_args: &[String]) {
                         raid_executor.clone(),
                         guild_id,
                         raid,
+                        worker_shutdown.subscribe(),
                     ));
                     // Containment (R3) watches the audit-log entry slot, a
                     // separate observer from the join slot above. Without
                     // exact TWO_ANTI_NUKE=1 on the staging guild there is no
                     // observer at all; dry-run is the default and only an
                     // armed worker executes removals.
-                    if let Some(containment) =
-                        containment_runtime::start_from_env(pool.clone(), raid_executor, guild_id)
-                    {
+                    if let Some(containment) = containment_runtime::start_from_env(
+                        pool.clone(),
+                        raid_executor,
+                        guild_id,
+                        worker_shutdown.subscribe(),
+                    ) {
                         pipeline.set_audit_entry_observer(containment);
                     }
                     // Automod shares the command runtime's REST executor; it never

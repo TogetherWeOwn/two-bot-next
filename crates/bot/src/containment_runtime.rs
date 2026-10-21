@@ -396,6 +396,7 @@ struct ContainmentWorker<S> {
     bot_user_id: String,
     armed: bool,
     entries: mpsc::Receiver<AuditLogObservation>,
+    shutdown: Arc<crate::raid_runtime::WorkerShutdown>,
 }
 
 impl<S: CheckedSettingsSource> ContainmentWorker<S> {
@@ -430,14 +431,31 @@ impl<S: CheckedSettingsSource> ContainmentWorker<S> {
             return;
         }
         self.bot_user_id = bot;
-        while let Some(entry) = self.entries.recv().await {
-            // An internal failure must never end containment: log and carry on.
-            if AssertUnwindSafe(self.handle(entry))
-                .catch_unwind()
-                .await
-                .is_err()
-            {
-                error!("containment_failed: observation panicked");
+        loop {
+            tokio::select! {
+                biased;
+                () = self.shutdown.notified() => {
+                    let dropped = crate::raid_runtime::drain_queued(&mut self.entries);
+                    self.shutdown.note_dropped(dropped);
+                    crate::raid_runtime::worker_shutdown_drain(self.shutdown.finished(), dropped);
+                    return;
+                }
+                msg = self.entries.recv() => {
+                    let Some(entry) = msg else {
+                        // Unlatched sender-drop: every buffered entry already
+                        // yielded above, so the legacy full drain exits here.
+                        return;
+                    };
+                    // An internal failure must never end containment: log and carry on.
+                    if AssertUnwindSafe(self.handle(entry))
+                        .catch_unwind()
+                        .await
+                        .is_err()
+                    {
+                        error!("containment_failed: observation panicked");
+                    }
+                    self.shutdown.note_finished();
+                }
             }
         }
     }
@@ -832,6 +850,26 @@ fn log_disposition(disposition: &ContainmentDisposition) {
 /// The pipeline-facing half: queue only, never block.
 pub struct ContainmentRuntime {
     entries: mpsc::Sender<AuditLogObservation>,
+    shutdown: Arc<crate::raid_runtime::WorkerShutdown>,
+}
+
+impl ContainmentRuntime {
+    /// Latch the bounded shutdown drain: the worker finishes its in-flight
+    /// entry, drops the queued inbox with a count, logs
+    /// `worker_shutdown_drain`, and exits so its handle joins.
+    pub fn shutdown(&self) {
+        self.shutdown.latch();
+    }
+
+    /// Dequeued entries handled to completion, caught panics included.
+    pub fn finished(&self) -> u64 {
+        self.shutdown.finished()
+    }
+
+    /// Queued entries dropped without starting after a latched shutdown.
+    pub fn dropped_shutdown(&self) -> u64 {
+        self.shutdown.dropped()
+    }
 }
 
 impl AuditEntryObserver for ContainmentRuntime {
@@ -847,8 +885,11 @@ impl AuditEntryObserver for ContainmentRuntime {
     }
 }
 
-/// Spawn the worker. It ends when the last [`ContainmentRuntime`] reference
-/// drops. Identity is verified inside `run`, before any entry is claimed.
+/// Spawn the worker. [`ContainmentRuntime::shutdown`] latches the bounded
+/// drain (finish the in-flight entry, drop the queue with a count); an
+/// unlatched worker ends when the last [`ContainmentRuntime`] reference
+/// drops, draining fully as before. Identity is verified inside `run`,
+/// before any entry is claimed.
 pub fn start<S: CheckedSettingsSource>(
     guild_id: u64,
     settings: S,
@@ -859,6 +900,7 @@ pub fn start<S: CheckedSettingsSource>(
     armed: bool,
 ) -> (Arc<ContainmentRuntime>, JoinHandle<()>) {
     let (sender, receiver) = mpsc::channel(QUEUE_CAPACITY);
+    let shutdown = Arc::new(crate::raid_runtime::WorkerShutdown::default());
     let worker = ContainmentWorker {
         guild_id,
         settings,
@@ -870,9 +912,13 @@ pub fn start<S: CheckedSettingsSource>(
         bot_user_id: String::new(),
         armed,
         entries: receiver,
+        shutdown: Arc::clone(&shutdown),
     };
     (
-        Arc::new(ContainmentRuntime { entries: sender }),
+        Arc::new(ContainmentRuntime {
+            entries: sender,
+            shutdown,
+        }),
         tokio::spawn(worker.run()),
     )
 }
@@ -882,13 +928,22 @@ pub fn start<S: CheckedSettingsSource>(
 /// `TWO_ANTI_NUKE_DRY_RUN`, `TWO_ONBOARDING_MODE`, trusted/protected lists)
 /// come from the deployment environment; Hot tuning comes from the settings
 /// store. `armed` is false unless dry-run is explicitly `0` outside session
-/// mode, and only an armed worker executes removals.
+/// mode, and only an armed worker executes removals. The service shutdown
+/// receiver latches the worker drain through a bounded supervisor that holds
+/// the worker handle and joins-or-aborts it.
 pub fn start_from_env(
     pool: PgPool,
     executor: ActionExecutor,
     guild_id: u64,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Option<Arc<dyn AuditEntryObserver>> {
-    start_from_vars(pool, executor, guild_id, &std::env::vars().collect())
+    start_from_vars(
+        pool,
+        executor,
+        guild_id,
+        &std::env::vars().collect(),
+        shutdown,
+    )
 }
 
 fn start_from_vars(
@@ -896,6 +951,7 @@ fn start_from_vars(
     executor: ActionExecutor,
     guild_id: u64,
     vars: &HashMap<String, String>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Option<Arc<dyn AuditEntryObserver>> {
     let fences = AntiNukeFences::from_vars(vars, guild_id);
     if !fences.enabled {
@@ -925,7 +981,7 @@ fn start_from_vars(
                 .map(|value| ((*key).to_owned(), value.clone()))
         })
         .collect();
-    let (runtime, _worker) = start(
+    let (runtime, worker) = start(
         guild_id,
         StoreSettings::new(pool.clone(), guild_id, deployment),
         ContainmentStore::from_pool(pool),
@@ -933,6 +989,15 @@ fn start_from_vars(
         trusted,
         protected,
         fences.armed,
+    );
+    crate::raid_runtime::join_on_shutdown(
+        worker,
+        shutdown,
+        crate::raid_runtime::WORKER_JOIN_BUDGET,
+        {
+            let runtime = Arc::clone(&runtime);
+            move || runtime.shutdown()
+        },
     );
     Some(runtime)
 }
