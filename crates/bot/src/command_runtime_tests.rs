@@ -20,6 +20,9 @@
 #[path = "member_dispatch_authority_acceptance.rs"]
 mod member_dispatch_authority_acceptance;
 
+#[path = "giveaway_create_entry_acceptance_tests.rs"]
+mod giveaway_create_entry_acceptance_tests;
+
 use std::collections::VecDeque;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
