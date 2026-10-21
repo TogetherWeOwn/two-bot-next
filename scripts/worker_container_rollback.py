@@ -592,6 +592,28 @@ def check_url(variant, url):
     return url
 
 
+def print_dry_run_plan(*, client, worker, restore_version, restore_image,
+                     receipt_sha, log=print):
+    """Print the ordered restore plan; reads only, never a POST or mutation.
+
+    The five lines name the fence, worker, image, takeover and gate steps in
+    the order the live path runs them, carrying the validated receipt members
+    (version UUID, image digest URL, SHA). Only allowlisted IDs reach the log.
+    """
+    current = serving_version(client, worker)
+    log(f"dry-run plan: fence the singleton before restoring version {restore_version}")
+    if current != restore_version:
+        log(f"dry-run plan: worker POST deployments restoring version {restore_version}")
+    else:
+        log(f"dry-run plan: worker already serves {restore_version}; image leg only")
+    log(f"dry-run plan: image POST container rollout restoring image {restore_image}")
+    log(f"dry-run plan: takeover ownership to version {restore_version}")
+    if receipt_sha is not None:
+        log(f"dry-run plan: gate stable readyz for version {restore_version} sha {receipt_sha}")
+    else:
+        log(f"dry-run plan: gate stable readyz for version {restore_version} pre-stamp no-sha")
+
+
 def main(argv=None, *, environ=None, client_factory=RollbackClient):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -612,6 +634,9 @@ def main(argv=None, *, environ=None, client_factory=RollbackClient):
     roll.add_argument("--target-image", default=None)
     roll.add_argument("--actor", required=True)
     roll.add_argument("--evidence", required=True)
+    roll.add_argument("--dry-run", action="store_true",
+                      help="validate the receipt and print the ordered restore plan "
+                           "without any POST or ownership mutation")
     args = parser.parse_args(argv)
     env = os.environ if environ is None else environ
     rollback = None
@@ -690,6 +715,15 @@ def main(argv=None, *, environ=None, client_factory=RollbackClient):
             receipt = ProvenanceReceipt(worker, application, restore_version,
                                         expected_sha, restore_image)
             validate_receipt_against_live(client, receipt)
+        if args.dry_run:
+            # The receipt is validated identically to the live path above; the
+            # plan below reads the serving version only and never POSTs, never
+            # touches ownership control, and writes no evidence file.
+            print_dry_run_plan(client=client, worker=worker,
+                               restore_version=restore_version,
+                               restore_image=restore_image,
+                               receipt_sha=receipt.sha if receipt is not None else expected_sha)
+            return 0
         token = env.get("OWNERSHIP_CONTROL_TOKEN", "")
         require(len(token) >= 32, "missing_ownership_token")
         require(ACTOR.fullmatch(args.actor), "invalid_actor")
