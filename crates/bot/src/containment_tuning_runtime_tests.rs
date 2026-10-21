@@ -323,3 +323,59 @@ async fn malformed_cold_lists_refuse_boot_before_identity_or_effects() {
         .all(|record| record.fields["message"].contains("containment_tuning_refused")));
     assert!(!format!("{records:?}").contains(SENTINEL));
 }
+
+#[tokio::test]
+async fn production_vars_constructor_defaults_to_dry_run_and_joins_with_live_observer() {
+    if support::isolated_log_test() {
+        return;
+    }
+    let logs = Capture::default();
+    async {
+        let guild = two_bot_cutover::STAGING_GUILD_ID
+            .parse()
+            .expect("staging fence ID");
+        let (executor, mock) = support::containment_identity().await;
+        let (shutdown, stopping) = tokio::sync::watch::channel(false);
+        // No explicit dry-run override: the production default must install
+        // observation without arming role removals. Only startup identity
+        // GETs can run; no events are queued for DB-dependent processing.
+        let (observer, mut supervisor) = start_from_vars(
+            closed_pool().await,
+            executor,
+            guild,
+            &vars(&[("TWO_ANTI_NUKE", "1")]),
+            stopping,
+        )
+        .expect("enabled default dry-run installs a supervised observer");
+        assert!(futures_util::poll!(&mut supervisor).is_pending());
+        shutdown.send(true).expect("service shutdown");
+        tokio::time::timeout(Duration::from_secs(5), supervisor)
+            .await
+            .expect("constructor must propagate shutdown without sender-drop")
+            .expect("constructor supervisor joins cleanly");
+        let weak = Arc::downgrade(&observer);
+        drop(observer);
+        assert!(
+            weak.upgrade().is_none(),
+            "joined supervisor releases observer"
+        );
+        support::assert_only_containment_identity(mock).await;
+    }
+    .with_subscriber(logs.subscriber())
+    .await;
+    let fences: Vec<_> = logs
+        .records()
+        .into_iter()
+        .filter(|record| {
+            record
+                .fields
+                .get("message")
+                .is_some_and(|message| message.contains("containment_fences"))
+        })
+        .collect();
+    assert_eq!(fences.len(), 1, "constructor reports its actual boot fence");
+    assert_eq!(
+        fences[0].fields["armed"], "false",
+        "default is safe dry-run"
+    );
+}
