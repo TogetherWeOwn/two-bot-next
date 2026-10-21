@@ -4256,9 +4256,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         self.ownership_commit_deadline = Some(deadline);
         loop {
             if let Ok(outcome) = staged.waiter.try_recv() {
-                let StagedOwnershipReply {
-                    reply, success, ..
-                } = staged;
+                let StagedOwnershipReply { reply, success, .. } = staged;
                 let _ = reply.send(match outcome {
                     OwnershipCommit::Committed => success,
                     OwnershipCommit::Pending => OWNERSHIP_FINALIZING.to_owned(),
