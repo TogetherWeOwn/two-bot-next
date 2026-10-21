@@ -1075,7 +1075,8 @@ fn acceptance_malformed_blank_and_fallback_controls_hold() {
 // ----------------------------------------------- drain-report outcomes --
 
 /// `ScanBoundReached` and `Unclaimed` deliveries report through the outcome
-/// counter without quarantine: executes the bounded-scan arm of `log_report`.
+/// counter without quarantine: executes the bounded-scan arm of `log_report`
+/// and asserts the counter mapping.
 #[test]
 fn log_report_counts_scan_bound_reached_and_unclaimed() {
     let report = DrainReport {
@@ -1088,5 +1089,14 @@ fn log_report_counts_scan_bound_reached_and_unclaimed() {
         ],
         failed: vec![],
     };
+    let capture = sweep_log_capture();
+    let start = capture.text().len();
     log_report(&report);
+    let logs = capture.text().split_off(start);
+    assert!(logs.contains("rows=2"), "report counts both rows");
+    assert!(
+        logs.contains("scan_bound_reached=1"),
+        "report counts the bound hit"
+    );
+    assert!(logs.contains("unclaimed=1"), "report counts the refusal");
 }

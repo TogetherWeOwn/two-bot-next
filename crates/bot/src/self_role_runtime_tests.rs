@@ -4218,3 +4218,63 @@ async fn legacy_start_latches_loss_for_unusable_claim_shapes() {
         );
     }
 }
+
+// --------------------------------------- contention-seed freshness pins --
+
+/// Call-site source for the freshness pins below: the production half of this
+/// file, above the test-module marker (the tests below also mention panel
+/// claims and must never satisfy these pins).
+const RUNTIME_SRC: &str = include_str!("self_role_runtime.rs");
+
+fn production_src() -> &'static str {
+    RUNTIME_SRC
+        .split_once("#[path = \"self_role_runtime_tests.rs\"]")
+        .expect("test-module marker moved; update these pins on the card")
+        .0
+}
+
+/// Both Busy arms must draw a fresh `contention_seed` per sleep: a fixed seed
+/// replays one delay and the lockstep this slice breaks returns. The adoption
+/// guard pins the jittered call; this pins the seed freshness it cannot see.
+#[test]
+fn both_busy_arms_seed_jitter_from_fresh_contention() {
+    let prod = production_src();
+    let mut arms = 0;
+    let mut rest = prod;
+    while let Some(at) = rest.find("PanelClaimResult::Busy if") {
+        let window: Vec<&str> = rest[at..].lines().take(14).collect();
+        assert!(
+            window.iter().any(|line| line.contains("contention_seed(")),
+            "Busy arm sleeps a fixed seed: pass contention_seed(&key, contention) \
+             so simultaneous contenders spread"
+        );
+        arms += 1;
+        rest = &rest[at + "PanelClaimResult::Busy if".len()..];
+    }
+    assert_eq!(arms, 2, "expected exactly the two Busy arms");
+}
+
+/// The seed helper itself spreads: identical inputs on consecutive calls draw
+/// different seeds (process-wide sequence), so one claimant's retries and
+/// simultaneous contenders never share a delay stream.
+#[test]
+fn contention_seeds_differ_across_consecutive_sleeps() {
+    let key = PanelKey {
+        guild_id: GUILD.to_owned(),
+        member_id: USER.to_owned(),
+        panel_id: "games".to_owned(),
+    };
+    let first = super::contention_seed(&key, 0);
+    let second = super::contention_seed(&key, 0);
+    assert_ne!(first, second, "consecutive sleeps must not share a seed");
+    let other = PanelKey {
+        guild_id: GUILD.to_owned(),
+        member_id: OTHER.to_owned(),
+        panel_id: "games".to_owned(),
+    };
+    assert_ne!(
+        super::contention_seed(&other, 0),
+        super::contention_seed(&key, 0),
+        "simultaneous contenders must not share a seed"
+    );
+}

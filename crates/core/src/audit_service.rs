@@ -44,11 +44,11 @@ use crate::audit_store::{
 };
 
 /// Maximum `channel_history` pages one Reconcile pass reads while proving the
-/// marker. A deep channel once paged past any bound; at the cap the pass stops
-/// with [`DeliverOutcome::ScanBoundReached`] and the row stays
-/// reconcile-eligible for the next owner — never quarantined for merely being
-/// unscanned. Marker identity, floor and empty-history outcomes within the
-/// bound are unchanged.
+/// marker. A deep channel once paged past any bound; at the cap the pass
+/// yields (`UncertainAcceptance`, boundary preserved) and stops with
+/// [`DeliverOutcome::ScanBoundReached`] while the row stays reconcile-eligible
+/// for the next owner — never quarantined for merely being unscanned. Marker
+/// identity, floor and empty-history outcomes within the bound are unchanged.
 pub const RECONCILE_MAX_PAGES: usize = 16;
 
 /// Wall-clock budget for one Reconcile boundary scan, checked per page beside
@@ -113,8 +113,11 @@ pub enum DeliverOutcome {
     /// Terminal hold with the bounded reason stored.
     Quarantined(QuarantineReason),
     /// The boundary scan hit [`RECONCILE_MAX_PAGES`] or [`RECONCILE_SCAN_TIMEOUT`]
-    /// with the marker neither proven nor disproven: nothing was written and
-    /// the row stays reconcile-eligible for the next owner.
+    /// with the marker neither proven nor disproven: the pass yields with an
+    /// `UncertainAcceptance` (boundary preserved) so the row rotates behind
+    /// older rows instead of burning a drain slot every cycle, and stays
+    /// reconcile-eligible for the next owner — which rescans from the head,
+    /// since scan progress is not persisted.
     ScanBoundReached,
     /// A store transition refused (stale/lost claim): nothing was sent and
     /// nothing was written by this pass.
@@ -153,6 +156,12 @@ pub struct AuditMirrorService<M: AuditMirror> {
     /// mandatory pre-POST halt re-check, so fault-injection tests can land a
     /// halt deterministically in that window.
     pre_send_gate: Option<Box<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>>,
+    /// Fixed Reconcile scan deadline (tests only): `None` (production)
+    /// derives it from [`RECONCILE_SCAN_TIMEOUT`] on every pass, while `Some`
+    /// pins it — a past deadline stops the scan with `ScanBoundReached`
+    /// before any read, pinning the timeout half of the bound without
+    /// sleeping 30 s. See [`AuditMirrorService::with_reconcile_scan_deadline`].
+    reconcile_scan_deadline: Option<Instant>,
 }
 
 impl<M: AuditMirror> AuditMirrorService<M> {
@@ -164,6 +173,7 @@ impl<M: AuditMirror> AuditMirrorService<M> {
             observed: Mutex::new(None),
             transitions: Mutex::new(Vec::new()),
             pre_send_gate: None,
+            reconcile_scan_deadline: None,
         }
     }
 
@@ -174,6 +184,13 @@ impl<M: AuditMirror> AuditMirrorService<M> {
         F: Fn() -> BoxFuture<'static, ()> + Send + Sync + 'static,
     {
         self.pre_send_gate = Some(Box::new(gate));
+        self
+    }
+
+    /// Fix the Reconcile scan deadline (tests only; see field docs).
+    #[must_use]
+    pub fn with_reconcile_scan_deadline(mut self, deadline: Instant) -> Self {
+        self.reconcile_scan_deadline = Some(deadline);
         self
     }
 
@@ -535,12 +552,27 @@ impl<M: AuditMirror> AuditMirrorService<M> {
         // downward until the marker is proven, the floor drops below the
         // boundary, history runs out, or the page/time budget is spent — a
         // merely-unscanned row is never quarantined.
-        let scan_deadline = Instant::now() + RECONCILE_SCAN_TIMEOUT;
+        let scan_deadline = self
+            .reconcile_scan_deadline
+            .unwrap_or_else(|| Instant::now() + RECONCILE_SCAN_TIMEOUT);
         let mut pages: usize = 0;
         let mut before: Option<String> = None;
         loop {
             if pages >= RECONCILE_MAX_PAGES || Instant::now() >= scan_deadline {
-                return Ok(DeliverOutcome::ScanBoundReached);
+                // Yield the queue slot: without this a bound-hit row keeps
+                // its `COALESCE(delivery_yielded_at, created_at)` sort key and
+                // burns a drain batch slot plus a full scan every lease cycle.
+                // `UncertainAcceptance` preserves the boundary, so the row
+                // stays reconcile-only for the next owner.
+                let yielded = self
+                    .store
+                    .fail_attempt(claim, DeliveryFailure::UncertainAcceptance)
+                    .await?;
+                return Ok(if yielded {
+                    DeliverOutcome::ScanBoundReached
+                } else {
+                    DeliverOutcome::Unclaimed
+                });
             }
             let page = match self
                 .mirror
@@ -621,5 +653,249 @@ impl<M: AuditMirror> AuditMirrorService<M> {
         } else {
             DeliverOutcome::Unclaimed
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+    use sqlx::PgPool;
+
+    use super::*;
+    use crate::audit::AuditKind;
+    use crate::audit_mirror::{MirrorChannel, MirrorMessage};
+    use crate::audit_store::{AuditStore, DeliveryState};
+
+    const MIGRATION_0340: &str =
+        include_str!("../../cutover/migrations/0340_operational_audit.sql");
+
+    const GUILD: &str = "18446744073709551615";
+    const AUDIT_CH: &str = "1111";
+    const VOICE_CH: &str = "2222";
+    const MOD_CH: &str = "3333";
+    const BOT: &str = "9999";
+
+    /// Only an absent URL skips the test. Configured setup failures are errors.
+    async fn test_pool(prefix: &str) -> Result<Option<(PgPool, String)>, sqlx::Error> {
+        let url = match std::env::var("TWO_TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(std::env::VarError::NotPresent) => return Ok(None),
+            Err(_) => panic!("TWO_TEST_DATABASE_URL must be Unicode"),
+        };
+        let options: PgConnectOptions = url.parse()?;
+        // No DATABASE_URL or inherited credentials: tests accept only the
+        // approved agent container or the ephemeral Postgres service in
+        // GitHub Actions (see the `community-db` CI job).
+        let host = options.get_host();
+        assert!(
+            host == "agent-testdb"
+                || (host == "localhost"
+                    && std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")),
+            "test-container-only URL"
+        );
+        assert_eq!(
+            options.get_username(),
+            "agent_test",
+            "test-container-only user"
+        );
+        // No shared fixed-name fixtures: each invocation owns its schema,
+        // including concurrent invocations of the same test in other processes.
+        static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let schema = format!(
+            "{prefix}_{}_{nonce}_{}",
+            std::process::id(),
+            NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed)
+        );
+        assert!(is_test_schema_name(&schema), "safe unique test schema");
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.clone())
+            .await?;
+        // SAFETY: only the guarded identifier interpolates; values bind.
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&admin)
+            .await?;
+        admin.close().await;
+        let pool = PgPoolOptions::new()
+            .max_connections(3)
+            .connect_with(options.options([("search_path", schema.as_str())]))
+            .await?;
+        sqlx::raw_sql(MIGRATION_0340).execute(&pool).await?;
+        Ok(Some((pool, schema)))
+    }
+
+    /// Test-only schema names: lowercase identifier characters, so DDL
+    /// interpolation cannot break out of the identifier position.
+    fn is_test_schema_name(schema: &str) -> bool {
+        !schema.is_empty()
+            && schema.len() <= 63
+            && schema
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    }
+
+    async fn drop_schema(pool: &PgPool, schema: &str) {
+        assert!(is_test_schema_name(schema));
+        // SAFETY: guarded by `is_test_schema_name` (see `test_pool`).
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(pool)
+            .await
+            .expect("clean up owned test schema");
+        pool.close().await;
+    }
+
+    /// Scripted mirror double: the POST script drives the Send pass to
+    /// `Ambiguous`, history always reads empty, and every history read counts.
+    #[derive(Clone, Default)]
+    struct ScriptMirror {
+        post_script: Arc<Mutex<VecDeque<Result<String, MirrorError>>>>,
+        history_reads: Arc<AtomicU64>,
+    }
+
+    impl ScriptMirror {
+        fn reads(&self) -> u64 {
+            self.history_reads.load(Ordering::Relaxed)
+        }
+    }
+
+    impl AuditMirror for ScriptMirror {
+        async fn post_mirror_checked<Fut, E>(
+            &self,
+            channel_id: &str,
+            content: &str,
+            nonce: &str,
+            authorize: Fut,
+        ) -> Result<Result<String, MirrorError>, E>
+        where
+            Fut: std::future::Future<Output = Result<(), E>> + Send,
+            E: Send,
+        {
+            authorize.await?;
+            let _ = (channel_id, content, nonce);
+            Ok(self
+                .post_script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Ok("900000".to_owned())))
+        }
+
+        async fn channel_document(&self, channel_id: &str) -> Result<MirrorChannel, MirrorError> {
+            let _ = channel_id;
+            Ok(MirrorChannel {
+                guild_id: GUILD.to_owned(),
+                everyone: Some(crate::audit_mirror::MirrorOverwrite {
+                    allow: "0".to_owned(),
+                    deny: "1024".to_owned(),
+                }),
+            })
+        }
+
+        async fn channel_history(
+            &self,
+            channel_id: &str,
+            _before: Option<&str>,
+            _limit: u8,
+        ) -> Result<Vec<MirrorMessage>, MirrorError> {
+            let _ = channel_id;
+            self.history_reads.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![])
+        }
+    }
+
+    fn event(entry: &str) -> AuditEvent {
+        let mut event = AuditEvent::new(
+            entry.to_owned(),
+            AuditKind::MemberUpdate,
+            GUILD.to_owned(),
+            "2026-09-30T00:01:02.003Z".to_owned(),
+        );
+        event.actor_id = Some("18446744073709551614".to_owned());
+        event.target_id = Some("18446744073709551613".to_owned());
+        event.metadata_json = r#"{"nicknameChanged":true}"#.to_owned();
+        event
+    }
+
+    fn config() -> MirrorConfig {
+        MirrorConfig {
+            channels: AuditChannelIds {
+                audit: Some(AUDIT_CH.to_owned()),
+                voice: Some(VOICE_CH.to_owned()),
+                moderation: Some(MOD_CH.to_owned()),
+            },
+            configured: vec![AUDIT_CH.to_owned(), VOICE_CH.to_owned(), MOD_CH.to_owned()],
+            mirror_guild_id: Some(GUILD.to_owned()),
+            bot_user_id: BOT.to_owned(),
+        }
+    }
+
+    /// A past scan deadline stops the Reconcile pass with `ScanBoundReached`
+    /// before any history read: pins the timeout half of the bound (the page
+    /// cap alone would read on and quarantine this empty history as
+    /// `MarkerMissing`). The yield is pinned too: the row is pending with its
+    /// boundary intact, not left claimed.
+    #[tokio::test]
+    async fn past_scan_deadline_stops_before_any_read_and_yields() {
+        let Some((pool, schema)) = test_pool("audit_scan_deadline")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping audit_service test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        let store = AuditStore::new(&pool);
+        let mirror = ScriptMirror::default();
+        let service = AuditMirrorService::new(AuditStore::new(&pool), mirror.clone(), config());
+        // Drive the row to reconcile-eligible through the Send path: empty
+        // dedup seeds a boundary, then the POST times out ambiguously.
+        service
+            .record(&event("scan-deadline"))
+            .await
+            .expect("record");
+        mirror
+            .post_script
+            .lock()
+            .unwrap()
+            .push_back(Err(MirrorError::Uncertain(
+                "accepted but timed out".to_owned(),
+            )));
+        assert_eq!(
+            service
+                .deliver_entry("scan-deadline")
+                .await
+                .expect("send pass"),
+            DeliverOutcome::Ambiguous
+        );
+        let timed = AuditMirrorService::new(AuditStore::new(&pool), mirror.clone(), config())
+            .with_reconcile_scan_deadline(Instant::now() - Duration::from_secs(1));
+        let reads_before = mirror.reads();
+        assert_eq!(
+            timed
+                .deliver_entry("scan-deadline")
+                .await
+                .expect("reconcile pass"),
+            DeliverOutcome::ScanBoundReached
+        );
+        assert_eq!(
+            mirror.reads() - reads_before,
+            0,
+            "timeout stops before any read"
+        );
+        let row = store
+            .get("scan-deadline")
+            .await
+            .expect("row")
+            .expect("row exists");
+        assert_eq!(row.state, DeliveryState::Pending);
+        assert!(row.search_before.is_some(), "yield preserves the boundary");
+        drop_schema(&pool, &schema).await;
     }
 }

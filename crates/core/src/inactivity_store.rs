@@ -31,6 +31,8 @@ pub enum InactivityStoreError {
     Db(#[from] sqlx::Error),
     #[error("invalid inactivity sweep timestamp: {0:?}")]
     InvalidTimestamp(String),
+    #[error("invalid inactivity sweep budget: {0:?}")]
+    InvalidBudget(String),
 }
 
 /// Quiet-member rows per select: the sweep re-runs the bounded select until
@@ -43,9 +45,11 @@ const SWEEP_PAGE_ROWS: usize = 4_096;
 /// [`SweepCursor`] back as `resume`.
 #[derive(Debug, Clone, Copy)]
 pub struct SweepBudget {
-    /// Maximum keyset selects this pass reads. Clamped to at least one: a
-    /// zero budget still reads a single page, so a resume loop always makes
-    /// progress instead of reporting more work with an unchanged cursor.
+    /// Maximum keyset selects this pass reads. Zero is rejected with
+    /// [`InactivityStoreError::InvalidBudget`] before any select: a zero
+    /// budget that returned "more work" with an unchanged cursor would spin
+    /// a resume loop forever, and silently reading a page anyway would write
+    /// events after the budget was exhausted.
     pub max_pages: usize,
     /// Wall-clock budget for this pass, checked before every select.
     pub deadline: std::time::Instant,
@@ -53,11 +57,19 @@ pub struct SweepBudget {
 
 /// Opaque resume position for a budgeted sweep: moved by value from one
 /// [`run_sweep_budgeted`] pass to the next. Callers never inspect it — the
-/// keyset cursor inside keeps pages disjoint across passes, so the union
-/// across passes is byte-identical to one complete sweep.
+/// keyset cursor inside keeps pages disjoint across passes, and the pinned
+/// sweep time keeps the cutoff and outcome stamps fixed, so the union across
+/// passes is byte-identical to one complete sweep at the originating time no
+/// matter what `now`/`days` later passes are called with.
 #[derive(Debug, Clone)]
 pub struct SweepCursor {
     cursor: Option<(String, String)>,
+    /// Sweep time pinned by the originating pass: resume passes reuse it
+    /// instead of their own `now`/`days`, so a member that goes quiet between
+    /// passes is never silently skipped behind the cursor.
+    now_ms: i64,
+    /// Day threshold pinned beside `now_ms`.
+    days: u64,
 }
 
 /// One hourly sweep (legacy `flagInactive`): select members still present,
@@ -77,12 +89,15 @@ pub async fn run_sweep(
 
 /// One budgeted sweep pass over the same quiet-member set as [`run_sweep`]:
 /// at most `budget.max_pages` selects, stopping when `budget.deadline`
-/// passes. Returns the pass outcome plus `Some(cursor)` iff more work may
-/// remain — an empty or short page means done and returns `None`, while an
-/// expired deadline before any page returns `Some` with an empty outcome.
-/// Resume passes continue strictly past the cursor: every member event is
-/// written exactly once and nothing is silently skipped within or across
-/// passes. The paged SELECT keeps its SQL text.
+/// passes. A zero `max_pages` is rejected with
+/// [`InactivityStoreError::InvalidBudget`] before any select. Returns the
+/// pass outcome plus `Some(cursor)` iff more work may remain — an empty or
+/// short page means done and returns `None`, while an expired deadline
+/// before any page returns `Some` with an empty outcome. Resume passes
+/// continue strictly past the cursor and reuse the originating pass's sweep
+/// time: every member event is written exactly once and nothing is silently
+/// skipped within or across passes, even when later passes are called with a
+/// newer `now`. The paged SELECT keeps its SQL text.
 pub async fn run_sweep_budgeted(
     pool: &Pool<Postgres>,
     now: &str,
@@ -90,6 +105,11 @@ pub async fn run_sweep_budgeted(
     budget: SweepBudget,
     resume: Option<SweepCursor>,
 ) -> Result<(InactivityOutcome, Option<SweepCursor>), InactivityStoreError> {
+    if budget.max_pages == 0 {
+        return Err(InactivityStoreError::InvalidBudget(
+            "max_pages must be at least 1".to_owned(),
+        ));
+    }
     run_sweep_inner(
         pool,
         now,
@@ -113,6 +133,17 @@ async fn run_sweep_inner(
     // never silently flag nobody and report success.
     let now_ms =
         parse(now).ok_or_else(|| InactivityStoreError::InvalidTimestamp(now.to_owned()))?;
+    let mut cursor: Option<(String, String)> = None;
+    let mut resume_time: Option<(i64, u64)> = None;
+    if let Some(resume) = resume {
+        cursor = resume.cursor;
+        resume_time = Some((resume.now_ms, resume.days));
+    }
+    // Resume passes reuse the originating sweep time: re-deriving the cutoff
+    // from a newer `now` would silently skip members that went quiet between
+    // passes (they sit behind the cursor) and stamp the tail with a different
+    // `occurred_at`, so the union would equal no complete sweep.
+    let (now_ms, days) = resume_time.unwrap_or((now_ms, days));
     // The cutoff is computed in Rust (legacy `Date.now() - days * 86_400_000`)
     // and binds as one ISO timestamp: no interval arithmetic in SQL, and the
     // same millisecond feeds both the query and the outcome stamp.
@@ -140,17 +171,16 @@ async fn run_sweep_inner(
     // tail behind them: the cursor has already moved past their keys. A page
     // therefore ends the sweep only when it comes back empty or short, never
     // because its rows were seen before.
-    let mut cursor: Option<(String, String)> = resume.and_then(|resume| resume.cursor);
     let mut written: Vec<(String, String)> = Vec::with_capacity(SWEEP_PAGE_ROWS);
     let mut outcome = InactivityOutcome { flagged: vec![] };
     let cutoff_ms = super::inactivity::inactivity_cutoff_ms(now_ms, days);
     let mut pages: usize = 0;
     let finished = loop {
         if let Some((max_pages, deadline)) = budget {
-            // A zero page budget still reads one page: stopping before the
-            // first select would report more work with an unchanged cursor,
-            // and a resume loop would spin on it forever.
-            if pages >= max_pages.max(1) || std::time::Instant::now() >= deadline {
+            // Zero budgets never reach here: `run_sweep_budgeted` rejects
+            // them before the first select, so this check keeps the exact
+            // at-most-max_pages contract.
+            if pages >= max_pages || std::time::Instant::now() >= deadline {
                 break false;
             }
         }
@@ -331,7 +361,11 @@ async fn run_sweep_inner(
     let resume = if finished {
         None
     } else {
-        Some(SweepCursor { cursor })
+        Some(SweepCursor {
+            cursor,
+            now_ms,
+            days,
+        })
     };
     Ok((outcome, resume))
 }
@@ -714,6 +748,162 @@ mod tests {
                 .await
                 .expect("untouched projection count");
         assert_eq!(untouched.0, 4096);
+        drop_schema(&pool, &schema).await;
+    }
+
+    /// A zero page budget is rejected before any select: the pass reads
+    /// nothing and writes nothing, so "at most max_pages selects" holds
+    /// exactly. Offline (closed pool): any attempted I/O would surface as a
+    /// `Db` error instead of `InvalidBudget`.
+    #[tokio::test]
+    async fn budgeted_pass_with_zero_max_pages_is_rejected_without_selects() {
+        let pool = closed_lazy_pool().await;
+        let budget = SweepBudget {
+            max_pages: 0,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
+        };
+        assert!(matches!(
+            run_sweep_budgeted(&pool, "2026-09-07T00:00:00.000Z", 14, budget, None).await,
+            Err(InactivityStoreError::InvalidBudget(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn budgeted_resume_reuses_the_originating_sweep_time() {
+        let Some((pool, schema)) = test_pool("inactivity_resume_time")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping inactivity_store test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        let Some((fresh, fresh_schema)) = test_pool("inactivity_resume_full")
+            .await
+            .expect("test database setup")
+        else {
+            drop_schema(&pool, &schema).await;
+            eprintln!("skipping inactivity_store test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        // 5,000 quiet members in both schemas: the budgeted sweep completes
+        // across two passes while its resume call passes a *later* now. The
+        // cursor pins the originating sweep time, so the union is
+        // byte-identical to one complete sweep at that time — a resume that
+        // re-derived its cutoff and stamps from the later now would drift.
+        for target in [&pool, &fresh] {
+            sqlx::query(
+                "INSERT INTO members (guild_id, member_id, joined_at)
+                 SELECT 'guild-a', 'member-' || g, '2026-07-01T00:00:00.000Z'::timestamptz
+                 FROM generate_series(1, 5000) g",
+            )
+            .execute(*target)
+            .await
+            .expect("seed members");
+        }
+        let one_page = SweepBudget {
+            max_pages: 1,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(300),
+        };
+        let (first, cursor) =
+            run_sweep_budgeted(&pool, "2026-09-07T00:00:00.000Z", 14, one_page, None)
+                .await
+                .expect("first budgeted pass");
+        assert_eq!(first.flagged.len(), 4_096);
+        let (rest, done) = run_sweep_budgeted(
+            &pool,
+            "2026-09-08T00:00:00.000Z",
+            14,
+            SweepBudget {
+                max_pages: 10_000,
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(300),
+            },
+            Some(cursor.expect("more work remains after page one")),
+        )
+        .await
+        .expect("resume pass under a later now");
+        assert!(done.is_none());
+        let mut union = first.flagged;
+        union.extend(rest.flagged);
+        let full = run_sweep(&fresh, "2026-09-07T00:00:00.000Z", 14)
+            .await
+            .expect("complete sweep at the originating time");
+        assert_eq!(union, full.flagged);
+        assert_eq!(union.len(), 5_000);
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM events")
+            .fetch_one(&pool)
+            .await
+            .expect("event count");
+        assert_eq!(count.0, 5_000);
+        drop_schema(&pool, &schema).await;
+        drop_schema(&fresh, &fresh_schema).await;
+    }
+
+    #[tokio::test]
+    async fn budgeted_resume_pages_past_a_lagging_prefix_to_the_tail() {
+        let Some((pool, schema)) = test_pool("inactivity_budget_lagging")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping inactivity_store test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        // Same shape as the complete-sweep lagging-prefix regression: a full
+        // page whose events already exist but whose projections lag, ahead of
+        // a 100-member writable tail. The prefix rows stay eligible forever,
+        // so only the threaded resume cursor moves the window forward — a
+        // pass that restarted from the head would reselect the prefix and
+        // never reach the tail.
+        sqlx::query(
+            "INSERT INTO members (guild_id, member_id, joined_at)
+             SELECT 'guild-a', 'member-' || g, '2026-07-01T00:00:00.000Z'::timestamptz
+             FROM generate_series(1, 4196) g",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed members");
+        sqlx::query(
+            "INSERT INTO events (event_type, member_id, guild_id, occurred_at, source, metadata, idempotency_key)
+             SELECT 'member_inactive', 'member-' || g, 'guild-a',
+                    '2026-09-07T00:00:00.000Z'::timestamptz, 'job:inactivity',
+                    '{\"thresholdDays\":14}',
+                    'guild-a:member-' || g || ':member_inactive:2026-09-07T00:00:00.000Z'
+             FROM generate_series(1, 4096) g",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed existing events");
+        let budget = SweepBudget {
+            max_pages: 1,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(300),
+        };
+        let mut union = Vec::new();
+        let mut resume = None;
+        let mut passes = 0;
+        loop {
+            passes += 1;
+            assert!(passes <= 4, "budgeted resume did not reach the tail");
+            let (out, next) =
+                run_sweep_budgeted(&pool, "2026-09-07T00:00:00.000Z", 14, budget, resume)
+                    .await
+                    .expect("budgeted pass");
+            union.extend(out.flagged);
+            match next {
+                Some(cursor) => resume = Some(cursor),
+                None => break,
+            }
+        }
+        assert_eq!(passes, 2, "one page per pass over prefix plus tail");
+        assert_eq!(union.len(), 4_196);
+        assert!(
+            union.iter().any(|f| f.member_id == "member-4196"),
+            "resume reached the writable tail"
+        );
+        // Prefix rows are reported without new writes; only the tail inserts.
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM events")
+            .fetch_one(&pool)
+            .await
+            .expect("event count");
+        assert_eq!(count.0, 4_196);
         drop_schema(&pool, &schema).await;
     }
 }
