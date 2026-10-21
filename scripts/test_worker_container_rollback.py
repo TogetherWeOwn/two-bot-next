@@ -915,5 +915,41 @@ class ControlFenceHintTests(unittest.TestCase):
                                 "fence": "false", "status": "false"})
 
 
+class ControlDeepStdoutTests(unittest.TestCase):
+    # Depth-10000 nested objects exhaust the decoder recursion limit (the
+    # probe suite's nested_object_body precedent). The hooked status parse
+    # must map that to the fixed malformed-stdout refusal, not a traceback.
+    DEEP_STATUS = '{"a":' * 10000 + "1" + "}" * 10000
+
+    def control(self, stdout):
+        control = rollback.control_client(
+            "staging", "t" * 32, "https://w.example", "https://s.example", "actor")
+        done = rollback.subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=stdout, stderr="")
+        patcher = mock.patch.object(rollback.subprocess, "run", return_value=done)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return control
+
+    def test_deeply_nested_status_refuses_as_invalid_response(self):
+        with self.assertRaises(base.GateError) as caught:
+            self.control(self.DEEP_STATUS)("status")
+        self.assertEqual(str(caught.exception), "ownership_control_invalid_response")
+        self.assertIsNone(caught.exception.detail)
+
+    def test_deeply_nested_status_refuses_before_any_restore_post(self):
+        # BAD serves and GOOD is the restore target, so a parseable status
+        # would fence first and then POST; the deep stdout refuses instead.
+        routes = {("GET", f"/workers/scripts/{WORKER}/deployments"):
+                  lambda: {"success": True, "result": {"deployments": [
+                      {"versions": [{"version_id": BAD_VERSION,
+                                     "percentage": 100}]}]}}}
+        rb, client, _ = make_rollback(routes, control=self.control(self.DEEP_STATUS))
+        with self.assertRaises(base.GateError) as caught:
+            rb.run(GOOD_VERSION, good_image())
+        self.assertEqual(str(caught.exception), "ownership_control_invalid_response")
+        self.assertEqual([call for call in client.calls if call[0] == "POST"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
