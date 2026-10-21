@@ -44,8 +44,14 @@ export const ALERT_INPUT_LABELS: Record<string, Record<string, readonly string[]
  * still scrape, with the failed-pass ticket held rather than every rule
  * silenced. The EventSub delivery-kind counters are optional for the same
  * reason: an older container without them must still scrape, with the
- * tampered-signature page held rather than every rule silenced. The evaluator
- * already tolerates their absence.
+ * tampered-signature page held rather than every rule silenced. The safety
+ * family below (retention purge-skip counter, voice dispatch-timeout,
+ * watchdog-stuck and halt-recovery counters, breaker opens and global-pause
+ * counters) is optional for the same reason: an older container without it
+ * must still scrape, with the safety-series tickets held rather than every
+ * rule silenced. Breaker closes (`two_bot_rest_guard_breaker_closes_total`)
+ * stays unvalidated: no rule consumes it (see the catalog deferral). The
+ * evaluator already tolerates their absence.
  */
 export const ALERT_OPTIONAL_INPUT_LABELS: Record<string, Record<string, readonly string[]>> = {
   two_bot_gateway_prefix_trigger_refused_total: { reason: ["verdict", "other"] },
@@ -61,6 +67,13 @@ export const ALERT_OPTIONAL_INPUT_LABELS: Record<string, Record<string, readonly
   two_bot_voice_vote_kick_total: { outcome: ["started", "evidence_unavailable", "not_a_room", "initiator_not_occupant", "target_not_occupant", "self_target", "protected_target", "privileged_target", "authority_unavailable", "active_vote_exists", "cooldown", "initiator_limited", "reused_vote_id", "unknown_vote", "wrong_vote_boundary", "ineligible_voter", "repeated_vote", "invalid_time", "connect_denied_and_disconnected", "connect_denied_target_absent", "skipped_room_gone", "skipped_target_protected", "permission_missing", "discord_error", "gave_up", "other"] },
   two_bot_eventsub_classified_total: { kind: ["challenge", "notification", "revocation", "tampered", "ignored", "other"] },
   two_bot_event_store_consumer_lag_seconds: {},
+  // Safety/liveness family; old containers may omit the whole family.
+  two_bot_retention_replay_needed_total: {},
+  two_bot_voice_dispatch_timeouts_total: {},
+  two_bot_voice_watchdog_stucks_total: {},
+  two_bot_voice_halt_recoveries_total: {},
+  two_bot_rest_guard_breaker_opens_total: {},
+  two_bot_rest_guard_global_pauses_total: {},
   // Same-scrape lifecycle evidence; old containers may omit the whole family.
   two_bot_process_incarnation: { part: ["0", "1", "2", "3"] },
 };
