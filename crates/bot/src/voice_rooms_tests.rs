@@ -3,6 +3,8 @@ use serde_json::json;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
 
+#[path = "voice_actor_inbox_backpressure_acceptance_tests.rs"]
+mod actor_inbox_backpressure_acceptance;
 #[path = "voice_admission_config_acceptance_tests.rs"]
 mod admission_config_acceptance;
 #[path = "voice_admission_spawn_tests.rs"]
