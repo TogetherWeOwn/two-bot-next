@@ -183,6 +183,8 @@ def get_json(fetch_fn, url, name):
         raise ProbeError(f"{name} probe answered over the body cap")
     try:
         value = json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+    except DuplicateKeyError:
+        raise ProbeError(f"{name} probe carries duplicate JSON object keys") from None
     except (ValueError, UnicodeDecodeError, RecursionError):
         # Deeply nested in-cap JSON exhausts the decoder recursion limit;
         # refuse it as malformed, same as any other unparseable body.

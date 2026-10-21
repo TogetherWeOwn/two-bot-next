@@ -1,23 +1,20 @@
-"""Duplicate-key refusal acceptance for scripts/staging_health_contract_probe.py.
+"""Protected acceptance: drill/probe JSON must refuse duplicate object keys.
 
-The probe parses both staging bodies with a hookless ``json.loads``
-(``get_json``), so a repeated object key currently keeps the last value and
-the probe grades it: a repeated ``status`` can forge the liveness shape, and
-a repeated ``build_revision`` can mask a stale container as this run's
-build — or echo the hostile value into a verdict and the evidence receipt.
+Offline only (stdlib, fake fetches, no network). No implementation source
+or diff is used to derive expectations. The combined fix must retain this
+file byte-identically; the builder must make these tests pass without
+editing it.
 
-Contract pinned here: any duplicate object key in either body — conflicting
-in both orders, identical values, nested, or hidden behind an escaped
-spelling — refuses as malformed, exactly like a garbage body: the same
-fixed-vocabulary reasons, the same nonzero exit, and no echo of the hostile
-keys, values or bodies in verdicts or the receipt. Duplicate-free bodies
-grade byte-identically to today.
-
-Stdlib only: the probe only gets fake fetches here, and any real HTTP is a
-test failure.
-
-This file is the contract: satisfy it by changing the probe, not by
-editing these tests.
+Contract for staging_health_contract_probe (baseline 8978f1249):
+- Bare json.loads last-wins lets a repeated key grade from the surviving
+  value. Fixed code must refuse any duplicate object key at any depth via
+  object_pairs_hook=_reject_duplicate_keys (precedent:
+  rollback_readiness_probe.decode_strict, qa_cutover_probes).
+- Refusal is fixed vocabulary containing the shape token "duplicate" and
+  naming no raw key, value, body bytes or header bytes.
+- A refused /health body fails only the health check; a refused /readyz
+  body fails readyz and build (no report to grade, no identity retained).
+  Valid bodies keep byte-identical verdicts.
 """
 
 import io
@@ -35,68 +32,36 @@ import staging_health_contract_probe as probe
 
 STAGING = "https://two-bot-next-staging.example-sub.workers.dev"
 SHA = "0123456789abcdef0123456789abcdef01234567"
-OTHER_SHA = "f" * 40
-BUILD_ID = "1-1"
-GARBAGE = b"{not json"
-
-# Hostile markers are assembled at run time so the file stays scanner-clean.
-HOSTILE_STATUS = "hos" + "tile" + "-status-9"
-HOSTILE_REVISION = "hos" + "tile" + "-revision-9"
-
-READY = {
-    "components": [["process", "ready"], ["gateway", "ready"],
-                   ["database", "ready"], ["token_invalid", "ready"]],
-    "jobs": {},
-    "build_revision": SHA,
-    "build_id": BUILD_ID,
-}
-HEALTH_OK = {"status": "ok"}
-HEALTH_UNREADABLE = "health 200 without the exact status shape"
-READYZ_UNREADABLE = ("readyz 200 without the bot's component breakdown "
-                     "(ownership refusal or broken deploy)")
-NO_BUILD_BODY = "no readyz body to read build identity from"
+OTHER_SHA = "fedcba9876543210fedcba9876543210fedcba98"
+BUILD_ID = "37512552064-1"
+SENTINEL = "SENTINEL_DUP_HEALTH_9f3b1c7e"
+HEADER_SENTINEL = "SENTINEL_DUP_HEADER_4a2d8f1c"
 
 
-def components_json():
-    return json.dumps(READY["components"])
+def components(*pairs):
+    return [[name, status] for name, status in pairs]
 
 
-# Duplicate-key /health bodies. Pre-fix the last value wins and is graded.
-HEALTH_IDENTICAL = b'{"status": "ok", "status": "ok"}'
-HEALTH_HOSTILE_FIRST = ('{"status": "%s", "status": "ok"}' % HOSTILE_STATUS).encode()
-HEALTH_OK_FIRST = ('{"status": "ok", "status": "%s"}' % HOSTILE_STATUS).encode()
-HEALTH_ESCAPED = b'{"status": "ok", "\\u0073tatus": "ok"}'
-
-# Duplicate-key /readyz bodies. Pre-fix the last value wins and is graded.
-READYZ_CONFLICT_OTHER_WINS = (
-    '{"components": %s, "jobs": {}, "build_revision": "%s", "build_id": "%s", '
-    '"build_revision": "%s"}' % (components_json(), SHA, BUILD_ID, OTHER_SHA)
-).encode()
-READYZ_CONFLICT_SHA_WINS = (
-    '{"build_revision": "%s", "components": %s, "jobs": {}, '
-    '"build_revision": "%s", "build_id": "%s"}' % (OTHER_SHA, components_json(), SHA, BUILD_ID)
-).encode()
-READYZ_IDENTICAL = (
-    '{"components": %s, "jobs": {}, "build_revision": "%s", "build_id": "%s", '
-    '"build_revision": "%s"}' % (components_json(), SHA, BUILD_ID, SHA)
-).encode()
-READYZ_NESTED_JOBS = (
-    '{"components": %s, "jobs": {"counter": 1, "counter": 2}, '
-    '"build_revision": "%s", "build_id": "%s"}' % (components_json(), SHA, BUILD_ID)
-).encode()
-READYZ_ESCAPED = (
-    '{"components": %s, "jobs": {}, "build_revision": "%s", "build_id": "%s", '
-    '"build_\\u0072evision": "%s"}' % (components_json(), SHA, BUILD_ID, OTHER_SHA)
-).encode()
-READYZ_HOSTILE_REVISION = (
-    '{"components": %s, "jobs": {}, "build_revision": "%s", "build_id": "%s", '
-    '"build_revision": "%s"}' % (components_json(), SHA, BUILD_ID, HOSTILE_REVISION)
-).encode()
+def ready_report(revision=SHA, build_id=BUILD_ID):
+    return {
+        "components": components(("process", "ready"), ("gateway", "ready"),
+                                 ("database", "ready"), ("token_invalid", "ready")),
+        "jobs": {},
+        "build_revision": revision,
+        "build_id": build_id,
+    }
 
 
-class DuplicateKeyProbeTests(unittest.TestCase):
+def body(value, status=200, headers=None):
+    return status, dict(headers or {}), json.dumps(value).encode()
+
+
+def raw_body(raw: bytes, status=200, headers=None):
+    return status, dict(headers or {}), raw
+
+
+class DuplicateKeyAcceptanceTests(unittest.TestCase):
     def setUp(self):
-        # Any real HTTP is a test failure: the probe only gets fake fetches here.
         guard = mock.patch.object(probe.urllib.request.OpenerDirector, "open",
                                   side_effect=AssertionError("network access in a unit test"))
         guard.start()
@@ -117,9 +82,11 @@ class DuplicateKeyProbeTests(unittest.TestCase):
             return response
         return fake
 
-    def drive(self, routes, *extra):
+    def drive(self, health_route, readyz_route):
+        routes = {STAGING + "/health": health_route,
+                  STAGING + "/readyz": readyz_route}
         out = io.StringIO()
-        argv = ["--staging-url", STAGING, "--evidence", self.evidence, *extra]
+        argv = ["--staging-url", STAGING, "--evidence", self.evidence]
         with mock.patch.dict(os.environ, {}, clear=True), redirect_stdout(out):
             code = probe.main(argv, fetch_fn=self.fetch(routes))
         lines = out.getvalue().splitlines()
@@ -127,144 +94,209 @@ class DuplicateKeyProbeTests(unittest.TestCase):
         for line in lines[:-1]:
             head, _, _ = line.partition(":")
             named[head] = line
-        return code, named, lines[-1], lines
+        receipt = None
+        receipt_text = None
+        if Path(self.evidence).exists():
+            receipt_text = Path(self.evidence).read_text()
+            receipt = json.loads(receipt_text)
+        return code, named, lines[-1], out.getvalue(), receipt_text, receipt
 
-    def receipt(self):
-        return json.loads(Path(self.evidence).read_text())
+    def assert_no_raw_echo(self, *texts):
+        for text in texts:
+            if text is None:
+                continue
+            self.assertNotIn(SENTINEL, text)
+            self.assertNotIn(HEADER_SENTINEL, text)
+            self.assertNotIn("SENTINEL_DUP", text)
 
-    def assert_health_refused_as_malformed(self, body):
-        routes = {STAGING + "/health": (200, {}, body),
-                  STAGING + "/readyz": (200, {}, json.dumps(READY).encode())}
-        code, results, _, _ = self.drive(routes, "--expected-sha", SHA)
-        self.assertEqual(code, 1)
-        self.assertEqual(set(results), {"FAIL health", "PASS readyz", "PASS build"})
-        self.assertIn(HEALTH_UNREADABLE, results["FAIL health"])
+    # -- controls: valid bodies keep byte-identical verdicts -----------------
 
-    def assert_readyz_refused_as_malformed(self, body):
-        routes = {STAGING + "/health": (200, {}, json.dumps(HEALTH_OK).encode()),
-                  STAGING + "/readyz": (200, {}, body)}
-        code, results, _, _ = self.drive(routes, "--expected-sha", SHA)
-        self.assertEqual(code, 1)
-        self.assertEqual(set(results), {"PASS health", "FAIL readyz", "FAIL build"})
-        self.assertIn(READYZ_UNREADABLE, results["FAIL readyz"])
-        self.assertIn(NO_BUILD_BODY, results["FAIL build"])
-
-    def test_health_identical_values_refuse_as_malformed(self):
-        self.assert_health_refused_as_malformed(HEALTH_IDENTICAL)
-
-    def test_health_conflicting_orders_refuse_as_malformed(self):
-        # Hostile-first currently passes (last-wins "ok"); ok-first already
-        # fails with the same reason and pins it plus the no-echo rule.
-        self.assert_health_refused_as_malformed(HEALTH_HOSTILE_FIRST)
-        self.assert_health_refused_as_malformed(HEALTH_OK_FIRST)
-
-    def test_health_escaped_spelling_refuses(self):
-        # The decoder resolves escapes before the hook runs, so this is a
-        # repeat of "status", not a new key. A text scan would miss it.
-        self.assert_health_refused_as_malformed(HEALTH_ESCAPED)
-
-    def test_health_duplicate_matches_garbage_body_verdicts(self):
-        # Duplicates are malformed: byte-identical verdicts, reasons and exit
-        # code to a garbage body on the same route.
-        readyz = (200, {}, json.dumps(READY).encode())
-
-        def run(body):
-            return self.drive({STAGING + "/health": (200, {}, body),
-                               STAGING + "/readyz": readyz}, "--expected-sha", SHA)
-
-        duplicate = run(HEALTH_IDENTICAL)
-        garbage = run(GARBAGE)
-        self.assertEqual((duplicate[0], duplicate[3]), (garbage[0], garbage[3]))
-
-    def test_readyz_conflicting_revisions_refuse_before_grading(self):
-        # Other-wins currently echoes the hostile revision into the build
-        # verdict and receipt; sha-wins currently passes outright.
-        self.assert_readyz_refused_as_malformed(READYZ_CONFLICT_OTHER_WINS)
-        self.assert_readyz_refused_as_malformed(READYZ_CONFLICT_SHA_WINS)
-
-    def test_readyz_identical_values_refuse(self):
-        self.assert_readyz_refused_as_malformed(READYZ_IDENTICAL)
-
-    def test_readyz_nested_duplicate_refuses(self):
-        self.assert_readyz_refused_as_malformed(READYZ_NESTED_JOBS)
-
-    def test_readyz_escaped_spelling_refuses(self):
-        self.assert_readyz_refused_as_malformed(READYZ_ESCAPED)
-
-    def test_readyz_duplicate_matches_garbage_body_verdicts(self):
-        health = (200, {}, json.dumps(HEALTH_OK).encode())
-
-        def run(body):
-            return self.drive({STAGING + "/health": health,
-                               STAGING + "/readyz": (200, {}, body)},
-                              "--expected-sha", SHA)
-
-        duplicate = run(READYZ_IDENTICAL)
-        garbage = run(GARBAGE)
-        self.assertEqual((duplicate[0], duplicate[3]), (garbage[0], garbage[3]))
-
-    def test_hostile_values_never_echo_in_verdicts_or_receipt(self):
-        bodies = {"health": HEALTH_OK_FIRST, "readyz_revision": READYZ_HOSTILE_REVISION,
-                  "readyz_sha": READYZ_CONFLICT_OTHER_WINS}
-        for name, body in bodies.items():
-            with self.subTest(name):
-                if name == "health":
-                    routes = {STAGING + "/health": (200, {}, body),
-                              STAGING + "/readyz": (200, {}, json.dumps(READY).encode())}
-                else:
-                    routes = {STAGING + "/health": (200, {}, json.dumps(HEALTH_OK).encode()),
-                              STAGING + "/readyz": (200, {}, body)}
-                code, _, _, lines = self.drive(routes, "--expected-sha", SHA)
-                text = "\n".join(lines)
-                dumped = json.dumps(self.receipt())
-                self.assertEqual(code, 1, text)
-                self.assertNotIn(HOSTILE_STATUS, text)
-                self.assertNotIn(HOSTILE_REVISION, text)
-                self.assertNotIn(HOSTILE_STATUS, dumped)
-                self.assertNotIn(HOSTILE_REVISION, dumped)
-                self.assertNotIn(OTHER_SHA, text)
-                self.assertNotIn(OTHER_SHA, dumped)
-
-    def test_readyz_duplicate_leaves_no_build_identity_in_receipt(self):
-        routes = {STAGING + "/health": (200, {}, json.dumps(HEALTH_OK).encode()),
-                  STAGING + "/readyz": (200, {}, READYZ_CONFLICT_SHA_WINS)}
-        code, _, _, _ = self.drive(routes, "--expected-sha", SHA)
-        self.assertEqual(code, 1)
-        receipt = self.receipt()
-        self.assertIsNone(receipt["build_revision"])
-        self.assertIsNone(receipt["build_id"])
-        self.assertIsNone(receipt["gateway_failure_class"])
-
-    def test_unique_bodies_grade_unchanged(self):
-        # Control: duplicate-free bodies pass exactly as today, pre- and post-fix.
-        routes = {STAGING + "/health": (200, {}, json.dumps(HEALTH_OK).encode()),
-                  STAGING + "/readyz": (200, {}, json.dumps(READY).encode())}
-        code, results, summary, _ = self.drive(routes, "--expected-sha", SHA)
+    def test_valid_bodies_pass_byte_identical(self):
+        first = self.drive(body({"status": "ok"}), body(ready_report()))
+        code, results, summary, out, receipt_text, receipt = first
         self.assertEqual(code, 0)
         self.assertEqual(set(results), {"PASS health", "PASS readyz", "PASS build"})
         self.assertIn("3/3 checks passed", summary)
-        receipt = self.receipt()
         self.assertEqual(receipt["build_revision"], SHA)
         self.assertEqual(receipt["build_id"], BUILD_ID)
+        # A second run with the same valid bytes must be byte-identical.
+        Path(self.evidence).unlink()
+        self.requested = []
+        second = self.drive(body({"status": "ok"}), body(ready_report()))
+        self.assertEqual(second[0], 0)
+        self.assertEqual(second[3], out)
+        self.assertEqual(second[4], receipt_text)
 
-    def test_get_json_unique_parses_exactly(self):
-        # Control: the parse itself is byte-identical on unique objects.
-        body = json.dumps(READY).encode()
+    def test_valid_parked_readyz_still_truthful(self):
+        parked = ready_report()
+        parked["components"] = components(("process", "ready"), ("gateway", "starting"),
+                                          ("database", "ready"), ("token_invalid", "ready"))
+        code, results, _, _, _, receipt = self.drive(body({"status": "ok"}),
+                                                     body(parked, status=503))
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL readyz", set(results))
+        self.assertIn("PASS build", set(results))
+        self.assertEqual(receipt["build_revision"], SHA)
 
-        def fake(url):
-            return 200, {}, body
+    # -- /health duplicates: zero grading from the refused body --------------
 
-        status, _, value = probe.get_json(fake, STAGING + "/readyz", "readyz")
+    def assert_health_refused(self, health_raw: bytes):
+        headers = {"X-Dup-Sentinel": HEADER_SENTINEL}
+        code, results, _, out, receipt_text, receipt = self.drive(
+            raw_body(health_raw, headers=headers), body(ready_report()))
+        self.assertEqual(code, 1, f"duplicate /health must not pass: {results}")
+        self.assertEqual(set(results), {"FAIL health", "PASS readyz", "PASS build"})
+        self.assertIn("duplicate", results["FAIL health"].lower())
+        self.assert_no_raw_echo(out, receipt_text, results["FAIL health"])
+        self.assertIsNotNone(receipt)
+        self.assertEqual(receipt["result"], "fail")
+        # The readyz leg still grades from its own valid body.
+        self.assertEqual(receipt["build_revision"], SHA)
+        self.assertEqual(self.requested, [STAGING + "/health", STAGING + "/readyz"])
+
+    def test_health_conflicting_ok_then_degraded_refused(self):
+        # Last-wins today grades "degraded" (FAIL for the wrong reason).
+        self.assert_health_refused(b'{"status": "ok", "status": "degraded"}')
+
+    def test_health_conflicting_degraded_then_ok_refused(self):
+        # Last-wins today grades "ok" (PASS from a refused body).
+        self.assert_health_refused(b'{"status": "degraded", "status": "ok"}')
+
+    def test_health_overwritten_sentinel_value_refused_without_echo(self):
+        # The first value is overwritten today; it must never surface.
+        raw = json.dumps({"status": SENTINEL})[:-1].encode() + b', "status": "ok"}'
+        # raw is {"status": "SENTINEL...", "status": "ok"} with a duplicate key.
+        self.assertIn(SENTINEL, raw.decode())
+        self.assert_health_refused(raw)
+
+    def test_health_identical_values_refused(self):
+        self.assert_health_refused(b'{"status": "ok", "status": "ok"}')
+
+    def test_health_nested_duplicate_refused(self):
+        raw = (b'{"status": "ok", "extra": {"a": 1, "a": 2}, '
+               b'"note": "' + SENTINEL.encode() + b'"}')
+        self.assert_health_refused(raw)
+
+    def test_health_escaped_key_duplicate_refused(self):
+        # "s..." decodes to "status": a repeat after escape decoding.
+        raw = b'{"status": "ok", "\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073": "ok"}'
+        self.assertEqual(json.loads(raw), {"status": "ok"})
+        self.assert_health_refused(raw)
+
+    # -- /readyz duplicates: no breakdown, no identity from refused bytes ----
+
+    def assert_readyz_refused(self, readyz_raw: bytes, status=200):
+        headers = {"X-Dup-Sentinel": HEADER_SENTINEL}
+        code, results, _, out, receipt_text, receipt = self.drive(
+            body({"status": "ok"}), raw_body(readyz_raw, status=status, headers=headers))
+        self.assertEqual(code, 1, f"duplicate /readyz must not pass: {results}")
+        self.assertEqual(set(results), {"PASS health", "FAIL readyz", "FAIL build"})
+        self.assertIn("duplicate", results["FAIL readyz"].lower())
+        self.assertIn("no readyz body", results["FAIL build"])
+        self.assert_no_raw_echo(out, receipt_text,
+                                results["FAIL readyz"], results["FAIL build"])
+        self.assertIsNotNone(receipt)
+        self.assertEqual(receipt["result"], "fail")
+        self.assertIsNone(receipt.get("build_revision"))
+        self.assertIsNone(receipt.get("build_id"))
+        self.assertIsNone(receipt.get("gateway_failure_class"))
+        self.assertIsNone(receipt.get("gateway_failure_root_cause"))
+
+    def readyz_with(self, fragment: bytes) -> bytes:
+        # Splice a duplicate fragment into an otherwise valid readyz body.
+        base = ready_report()
+        prefix = json.dumps({k: base[k] for k in ("components", "jobs")})[:-1].encode()
+        suffix = b', "build_revision": "%s", "build_id": "%s"}' % (
+            base["build_revision"].encode(), base["build_id"].encode())
+        # Caller supplies the duplicate pair; we keep the valid tail.
+        return prefix + b", " + fragment + suffix
+
+    def test_readyz_build_revision_conflicting_both_orders_refused(self):
+        for first, second in ((SHA, OTHER_SHA), (OTHER_SHA, SHA)):
+            with self.subTest(first=first[:8], second=second[:8]):
+                Path(self.evidence).unlink(missing_ok=True)
+                self.requested = []
+                frag = ('"build_revision": "%s", "build_revision": "%s"'
+                        % (first, second)).encode()
+                # Build the full body manually: components/jobs + dup + build_id.
+                base = ready_report()
+                raw = (json.dumps({"components": base["components"],
+                                            "jobs": base["jobs"]})[:-1].encode()
+                       + b", " + frag
+                       + (' , "build_id": "%s"}' % BUILD_ID).encode())
+                self.assert_readyz_refused(raw)
+
+    def test_readyz_build_revision_overwritten_sentinel_refused(self):
+        base = ready_report()
+        raw = (json.dumps({"components": base["components"],
+                                    "jobs": base["jobs"]})[:-1].encode()
+               + (' , "build_revision": "%s", "build_revision": "%s", "build_id": "%s"}'
+                  % (SENTINEL, SHA, BUILD_ID)).encode())
+        # Sanity: today this last-wins to the valid SHA and passes build.
+        self.assertEqual(json.loads(raw)["build_revision"], SHA)
+        self.assert_readyz_refused(raw)
+
+    def test_readyz_identical_build_revision_refused(self):
+        base = ready_report()
+        raw = (json.dumps({"components": base["components"],
+                                    "jobs": base["jobs"]})[:-1].encode()
+               + (' , "build_revision": "%s", "build_revision": "%s", "build_id": "%s"}'
+                  % (SHA, SHA, BUILD_ID)).encode())
+        self.assert_readyz_refused(raw)
+
+    def test_readyz_nested_gateway_failure_duplicate_refused(self):
+        base = ready_report()
+        base["gateway_failure"] = {"phase": "durable_gateway",
+                                   "class": "checkpoint_load_failed"}
+        # Duplicate "class" inside the nested object, both valid values.
+        nested = ('"gateway_failure": {"phase": "durable_gateway", '
+                  '"class": "checkpoint_load_failed", '
+                  '"class": "gateway_runtime_failed", '
+                  '"note": "%s"}' % SENTINEL).encode()
+        raw = (json.dumps({"components": base["components"], "jobs": base["jobs"],
+                                    "build_revision": SHA, "build_id": BUILD_ID})[:-1].encode()
+               + b", " + nested + b"}")
+        self.assertEqual(json.loads(raw)["gateway_failure"]["class"],
+                         "gateway_runtime_failed")
+        self.assert_readyz_refused(raw, status=503)
+
+    def test_readyz_nested_jobs_duplicate_refused(self):
+        base = ready_report()
+        nested = ('"jobs": {"a": 1, "a": 2, "note": "%s"}' % SENTINEL).encode()
+        raw = (json.dumps({"components": base["components"],
+                                    "build_revision": SHA, "build_id": BUILD_ID})[:-1].encode()
+               + b", " + nested + b"}")
+        self.assert_readyz_refused(raw)
+
+    def test_readyz_top_level_components_duplicate_refused(self):
+        # Two valid components arrays: last-wins passes today.
+        comps = json.dumps(ready_report()["components"]).encode()
+        raw = (b'{"components": ' + comps + b', "components": ' + comps
+               + b', "jobs": {}, "build_revision": "%s", "build_id": "%s"}'
+               % (SHA.encode(), BUILD_ID.encode()))
+        self.assert_readyz_refused(raw)
+
+    # -- seam: the JSON decode itself must refuse -----------------------------
+
+    def test_get_json_refuses_duplicate_health_bytes(self):
+        routes = {STAGING + "/x": raw_body(b'{"status": "ok", "status": "ok"}')}
+        with self.assertRaises(probe.ProbeError) as ctx:
+            probe.get_json(self.fetch(routes), STAGING + "/x", "x")
+        self.assertIn("duplicate", str(ctx.exception).lower())
+        self.assertNotIn(SENTINEL, str(ctx.exception))
+
+    def test_get_json_refuses_nested_duplicate_bytes(self):
+        raw = b'{"a": {"b": 1, "b": 2}}'
+        routes = {STAGING + "/x": raw_body(raw)}
+        with self.assertRaises(probe.ProbeError) as ctx:
+            probe.get_json(self.fetch(routes), STAGING + "/x", "x")
+        self.assertIn("duplicate", str(ctx.exception).lower())
+
+    def test_get_json_still_parses_valid_bytes(self):
+        routes = {STAGING + "/x": body({"status": "ok"})}
+        status, _, parsed = probe.get_json(self.fetch(routes), STAGING + "/x", "x")
         self.assertEqual(status, 200)
-        self.assertEqual(value, json.loads(body))
-
-    def test_get_json_duplicate_is_unparseable(self):
-        def fake(url):
-            return 200, {}, READYZ_IDENTICAL
-
-        status, _, value = probe.get_json(fake, STAGING + "/readyz", "readyz")
-        self.assertEqual(status, 200)
-        self.assertIsNone(value)
+        self.assertEqual(parsed, {"status": "ok"})
 
 
 if __name__ == "__main__":

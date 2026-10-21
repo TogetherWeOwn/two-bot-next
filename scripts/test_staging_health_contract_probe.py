@@ -388,9 +388,7 @@ class HealthContractProbeTests(unittest.TestCase):
                 report = dict(READY, **{field: nested})
 
                 def parse(raw, *args, report=report, **kwargs):
-                    if raw == b"READYZ":
-                        return report
-                    return real_loads(raw, *args, **kwargs)
+                    return report if raw == b"READYZ" else real_loads(raw, *args, **kwargs)
 
                 routes = {STAGING + "/health": body({"status": "ok"}),
                           STAGING + "/readyz": (200, {}, b"READYZ")}
