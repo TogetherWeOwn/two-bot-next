@@ -2655,6 +2655,28 @@ mod tests {
 
     const NOW: &str = "2023-11-14T22:13:20.000Z";
 
+    /// Pin a failure/incomplete audit row: bound to the actor, guild, target,
+    /// action and idempotency key, under the `:<outcome>` suffixed request id
+    /// that keeps it from masking the accepted row of a later retry.
+    fn assert_bound_failure_audit(
+        row: &AuditRow,
+        exec: &MemberExecution,
+        outcome: &str,
+        stage: &str,
+    ) {
+        assert_eq!(row.request_id, format!("{}:{outcome}", exec.request_id));
+        assert_eq!(row.outcome, outcome);
+        assert_eq!(row.action, exec.action.action_name());
+        assert_eq!(row.guild_id, GUILD);
+        assert_eq!(row.actor_id, ACTOR_ID);
+        assert_eq!(row.target_id.as_deref(), Some(TARGET_ID));
+        assert_eq!(row.idempotency_key, exec.idempotency_key);
+        let metadata: serde_json::Value =
+            serde_json::from_str(&row.metadata_json).expect("metadata is JSON");
+        assert_eq!(metadata["stage"], stage);
+        assert_eq!(metadata["request_id"], exec.request_id);
+    }
+
     // Imported ownership may contain an older uncertain PUT plus a later
     // accepted one, a state ordinary staging deliberately cannot create.
     async fn historical_fixture(
@@ -3382,8 +3404,12 @@ mod tests {
             err,
             MemberError::Discord(DiscordError::Rejected(_))
         ));
-        // No audit row for a mutation that provably never happened.
-        assert!(svc.store.audits().is_empty());
+        // The rejected attempt is audited as a bound `failed` row under a
+        // suffixed request id, so it can never mask the accepted retry's row.
+        let exec = execution(ModerationAction::Kick);
+        let audits = svc.store.audits();
+        assert_eq!(audits.len(), 1);
+        assert_bound_failure_audit(&audits[0], &exec, "failed", "discord");
 
         // Retry is a real second attempt, not a cached error.
         svc.discord.clear_failure("kick");
@@ -3393,7 +3419,111 @@ mod tests {
             .expect("retry");
         assert!(!res.replayed);
         assert_eq!(svc.discord.call_count("kick"), 2);
-        assert_eq!(svc.store.audits().len(), 1);
+        // The failed row survives the retry untouched and the accepted retry
+        // adds its own plain-request-id success row.
+        let audits = svc.store.audits();
+        assert_eq!(audits.len(), 2);
+        assert_bound_failure_audit(&audits[0], &exec, "failed", "discord");
+        assert_eq!(audits[1].request_id, exec.request_id);
+        assert_eq!(audits[1].outcome, "kicked");
+        assert_eq!(audits[1].action, "moderation.kick");
+        assert_eq!(audits[1].guild_id, GUILD);
+        assert_eq!(audits[1].actor_id, ACTOR_ID);
+        assert_eq!(audits[1].target_id.as_deref(), Some(TARGET_ID));
+        assert_eq!(audits[1].idempotency_key, exec.idempotency_key);
+        assert_eq!(audits[1].reason, exec.reason);
+    }
+
+    /// A definitive Discord rejection that leaves the key unreleasable is an
+    /// uncertain claim, not a retryable failure: it audits as `in_progress`.
+    #[tokio::test]
+    async fn rejected_discord_call_with_failed_release_audits_in_progress() {
+        let discord = MockMemberDiscord::new();
+        let store = FaultyStore::wrap(MemMemberStore::new());
+        let svc = MemberModerationService::new(discord.clone(), store.clone(), policy(), || {
+            1_700_000_000_000
+        });
+
+        discord.fail_with("kick", DiscordError::Rejected("unknown member".to_owned()));
+        store.arm_release();
+        let exec = execution(ModerationAction::Kick);
+        let err = svc.execute(&exec).await.expect_err("must fail");
+        assert!(matches!(
+            err,
+            MemberError::Discord(DiscordError::Rejected(_))
+        ));
+        let audits = store.inner.audits();
+        assert_eq!(audits.len(), 1);
+        assert_bound_failure_audit(&audits[0], &exec, "in_progress", "discord");
+
+        // The claim stayed in flight: no second Discord call, no new row.
+        discord.clear_failure("kick");
+        assert_eq!(svc.execute(&exec).await, Err(MemberError::InFlight));
+        assert_eq!(discord.call_count("kick"), 1);
+        assert_eq!(store.inner.audits(), audits);
+    }
+
+    /// A failed-audit write must never change the original error, and must
+    /// still release the key so the retry is a real attempt.
+    #[tokio::test]
+    async fn failure_audit_write_loss_keeps_error_and_release() {
+        let discord = MockMemberDiscord::new();
+        let store = FaultyStore::wrap(MemMemberStore::new());
+        let svc = MemberModerationService::new(discord.clone(), store.clone(), policy(), || {
+            1_700_000_000_000
+        });
+
+        discord.fail_with("kick", DiscordError::Rejected("unknown member".to_owned()));
+        store.arm_audit();
+        let exec = execution(ModerationAction::Kick);
+        let err = svc.execute(&exec).await.expect_err("must fail");
+        assert!(matches!(
+            err,
+            MemberError::Discord(DiscordError::Rejected(_))
+        ));
+        assert!(store.inner.audits().is_empty(), "the audit write was lost");
+
+        discord.clear_failure("kick");
+        let res = svc.execute(&exec).await.expect("retry");
+        assert!(!res.replayed);
+        assert_eq!(discord.call_count("kick"), 2);
+        let audits = store.inner.audits();
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].request_id, exec.request_id);
+        assert_eq!(audits[0].outcome, "kicked");
+    }
+
+    /// An in-flight refusal is audited under the suffixed id, makes no
+    /// Discord call and adds nothing on redelivery.
+    #[tokio::test]
+    async fn in_flight_refusal_is_audited_once_without_effect() {
+        let svc = service(MockMemberDiscord::new(), MemMemberStore::new());
+        let exec = execution(ModerationAction::Ban);
+        let hash = request_hash(
+            exec.action,
+            &exec.guild_id,
+            Some(TARGET_ID),
+            "spam in #general",
+            None,
+        );
+        svc.store
+            .claim(
+                &exec.guild_id,
+                &exec.idempotency_key,
+                "moderation.ban",
+                &hash,
+                "x",
+            )
+            .await
+            .expect("claim");
+
+        for _ in 0..2 {
+            assert_eq!(svc.execute(&exec).await, Err(MemberError::InFlight));
+        }
+        assert_eq!(svc.discord.call_count("ban"), 0);
+        let audits = svc.store.audits();
+        assert_eq!(audits.len(), 1, "redelivery deduplicates the row");
+        assert_bound_failure_audit(&audits[0], &exec, "in_progress", "claim");
     }
 
     #[tokio::test]
@@ -3631,7 +3761,10 @@ mod tests {
             svc.store.unban_state("req-tempban"),
             Some("cancelled".to_owned())
         );
-        assert!(svc.store.audits().is_empty());
+        let exec = execution(ModerationAction::TempBan);
+        let audits = svc.store.audits();
+        assert_eq!(audits.len(), 1);
+        assert_bound_failure_audit(&audits[0], &exec, "failed", "discord");
         svc.discord.clear_failure("ban");
         let res = svc
             .execute(&execution(ModerationAction::TempBan))
@@ -3642,6 +3775,13 @@ mod tests {
             svc.store.unban_state("req-tempban"),
             Some("pending".to_owned())
         );
+        // The failed row is kept; the accepted retry adds a plain success row.
+        let audits = svc.store.audits();
+        assert_eq!(audits.len(), 2);
+        assert_bound_failure_audit(&audits[0], &exec, "failed", "discord");
+        assert_eq!(audits[1].request_id, exec.request_id);
+        assert_eq!(audits[1].outcome, "temporarily_banned");
+        assert_eq!(audits[1].action, "moderation.tempban");
     }
 
     #[tokio::test]
