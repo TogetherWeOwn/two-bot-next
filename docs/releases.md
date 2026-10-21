@@ -21,9 +21,10 @@ compares it to the last digest tag's target:
   its own run, so the digest run never waits for the SBOM chain.
 - Today's tag already exists: repair a missing Release, else skip; tomorrow's
   digest covers any later production move. Never a second tag for one day.
-- Production moved but no digest tag was made: the `alert` job posts one
-  Discord ops-channel alert reusing the synthetic-alert line. A red digest
-  job is already visible and never alerts.
+
+A red digest job is already visible, and every other outcome either cut a tag
+or skipped by policy, so the workflow carries no missing-digest alert: there
+is no silent skip left to alert on.
 
 `sbom-target`, `release-sbom` and `attach-sbom` build, scan and attach the
 SBOM assets to the digest release (`docs/supply-chain.md`).
@@ -58,7 +59,7 @@ CI and review on `main`.
 ```sh
 # Re-cut today's digest (idempotent; repairs a missing Release, else skips).
 gh workflow run daily-digest.yml --ref main
-# Preview the digest notes without tagging, publishing or alerting.
+# Preview the digest notes without tagging or publishing.
 gh workflow run daily-digest.yml --ref main -f dry_run=true
 # Repair SBOM assets on a digest release (or a pre-digest vX.Y.Z release).
 gh workflow run release.yml --ref main -f release_tag=vYYYY.MM.DD
@@ -79,10 +80,8 @@ already-cut today skip, semver continuity, the off-main refusal and invalid
 inputs. Its ENOBUFS regression builds a 200-commit range above 1 MiB and proves
 the digest completes. Its one non-dry-run case runs a fresh cut against a
 mocked `gh` and pins the single `release create` call's target and its
-`--latest` flag. `scripts/test_digest_alert.py` (worker CI) pins the
-missing-digest alert content and its refusals. `scripts/ci/test_workflows.py`
-pins the workflow shapes, the digest schedule, the alert gate and the
-`contents: write` grant on the tagging job.
+`--latest` flag. `scripts/ci/test_workflows.py` pins the workflow shapes,
+the digest schedule and the `contents: write` grant on the tagging job.
 
 The root `src/lib.rs` release-metadata library was added for release-please's
 Rust strategy, which needed a root `[package]` version. It stays as is; nothing

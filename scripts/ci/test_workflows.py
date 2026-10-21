@@ -46,9 +46,9 @@ JOB_INVENTORY = {
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
     "release.yml": {"sbom-target", "release-sbom", "attach-sbom", "verdict"},
-    # Daily digest release (docs/releases.md): one vYYYY.MM.DD tag per day,
-    # plus the missing-digest alert; pinned shape below.
-    "daily-digest.yml": {"digest", "alert"},
+    # Daily digest release (docs/releases.md): one vYYYY.MM.DD tag per day;
+    # pinned shape below.
+    "daily-digest.yml": {"digest"},
     "staging-migrate.yml": {"plan", "claim", "apply"},
     "production-migrate.yml": {"plan", "claim", "apply"},
     # TOG-14008: manual staging-only Worker rollback drill; pinned shape below.
@@ -2104,16 +2104,15 @@ def release_errors(workflow):
 
 
 def daily_digest_errors(workflow):
-    """daily-digest cuts one vYYYY.MM.DD tag per day and alerts when production moved but no tag was made.
+    """daily-digest cuts one vYYYY.MM.DD tag per day.
 
     Schedule-only plus manual dispatch: one daily cron at an off-minute (never
     :00 or :30, never bunched with the deploy-production backstop) and a
     dry_run-only dispatch. The digest job resolves the live production SHA
     (/readyz, falling back to the newest successful production Deployment),
     cuts the tag via daily-digest.cjs, and dispatches the SBOM chain for the
-    fresh tag only. The alert job runs only on the silent-failure mode (digest
-    succeeded, production changed, nothing released) through the
-    synthetic-alerts environment, reusing the existing Discord line.
+    fresh tag only. There is no alert job: every non-red outcome either cut a
+    tag or skipped by policy, so there is no silent skip to alert on.
     """
     name = "daily-digest.yml"
     errors = []
@@ -2144,8 +2143,8 @@ def daily_digest_errors(workflow):
     if workflow.get("concurrency") != {"group": "daily-digest", "cancel-in-progress": "false"}:
         errors.append(f"{name}: must serialize digests at the top level without cancelling")
     jobs = workflow.get("jobs") or {}
-    if set(jobs) != {"digest", "alert"}:
-        errors.append(f"{name}: jobs must be exactly digest and alert")
+    if set(jobs) != {"digest"}:
+        errors.append(f"{name}: jobs must be exactly digest")
         return errors
     digest = jobs["digest"]
     if digest.get("if") != "github.ref == 'refs/heads/main'":
@@ -2162,30 +2161,9 @@ def daily_digest_errors(workflow):
     if "release-on-promote" in digest_text or "vX.Y.Z" in digest_text:
         errors.append(f"{name}:digest: must not reference the retired per-promote tagging")
     outputs = digest.get("outputs") or {}
-    for output in ("released", "tag_name", "prod_changed", "live_sha", "prev_tag"):
+    for output in ("released", "tag_name"):
         if output not in outputs:
-            errors.append(f"{name}:digest: must publish the {output} output for the alert gate")
-    alert = jobs["alert"]
-    if alert.get("needs") != "digest":
-        errors.append(f"{name}:alert: must wait for the digest job")
-    expected_alert_if = ("${{ !cancelled() && needs.digest.result == 'success' && "
-                         "needs.digest.outputs.prod_changed == 'true' && "
-                         "needs.digest.outputs.released != 'true' && "
-                         "inputs.dry_run != true }}")
-    if alert.get("if") != expected_alert_if:
-        errors.append(f"{name}:alert: must fire only when the digest succeeded yet production "
-                      "changed with nothing released, never on a dry run")
-    if alert.get("permissions") != {"contents": "read"}:
-        errors.append(f"{name}:alert: must keep contents:read only")
-    if alert.get("environment") != "synthetic-alerts":
-        errors.append(f"{name}:alert: must reuse the synthetic-alerts environment webhook")
-    if not runner_allowed("alert", alert.get("runs-on")):
-        errors.append(f"{name}:alert: must use the routed runner expression for job 'alert'")
-    alert_text = str(alert)
-    for required in ("SYNTHETIC_ALERT_WEBHOOK_URL", "scripts/digest_alert.py",
-                     "needs.digest.outputs.live_sha", "needs.digest.outputs.prev_tag"):
-        if required not in alert_text:
-            errors.append(f"{name}:alert: missing pin {required}")
+            errors.append(f"{name}:digest: must publish the {output} output")
     return errors
 
 

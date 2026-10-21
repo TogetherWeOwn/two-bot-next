@@ -4,10 +4,9 @@ name: daily-digest
 # covering the live production commit with notes from the Conventional Commit
 # subjects since the previous digest. Quiet days (production already matches
 # the last digest) skip green with no tag. Rollbacks serve an older commit and
-# are never tagged. When production changed but no digest tag was made — the
-# silent-failure mode that lost tags when the per-promote release job skipped
-# with no alert — the `alert` job posts one Discord ops-channel alert reusing
-# the existing synthetic-alert line.
+# are never tagged. A red digest job is already visible, and every other
+# outcome either cut a tag or skipped by policy, so there is no silent skip
+# left to alert on.
 #
 # Production change detection reads the live production /readyz build revision
 # through PRODUCTION_WORKER_URL (the single source for deploy and passive
@@ -20,7 +19,7 @@ name: daily-digest
 #
 # When it runs: daily at an off-minute on main, plus manual dispatch. The
 # dispatch `dry_run` input prints the notes without tagging, publishing,
-# dispatching SBOM or alerting.
+# or dispatching SBOM.
 
 on:
   schedule:
@@ -28,7 +27,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: Print the digest notes without tagging, publishing or alerting
+        description: Print the digest notes without tagging or publishing
         type: boolean
         default: false
 
@@ -52,9 +51,6 @@ jobs:
     outputs:
       released: ${{ steps.digest.outputs.released }}
       tag_name: ${{ steps.digest.outputs.tag_name }}
-      prod_changed: ${{ steps.digest.outputs.prod_changed }}
-      live_sha: ${{ steps.resolve.outputs.live_sha }}
-      prev_tag: ${{ steps.digest.outputs.prev_tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -165,32 +161,3 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ steps.digest.outputs.tag_name }}
         run: gh workflow run release.yml --ref main -f release_tag="$TAG"
-
-  alert:
-    name: alert on a missing digest
-    needs: digest
-    # The silent-failure mode only: the digest job succeeded (not red) yet
-    # production changed and no digest tag was made. A red digest job is
-    # already visible; a quiet day, a rollback, an already-cut today, or a
-    # dry run never alerts.
-    if: ${{ !cancelled() && needs.digest.result == 'success' && needs.digest.outputs.prod_changed == 'true' && needs.digest.outputs.released != 'true' && inputs.dry_run != true }}
-    permissions:
-      contents: read
-    environment: synthetic-alerts
-    # Runner routing: see the note on `check` in check.yml.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'alert') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          fetch-depth: 1
-      - name: Alert the ops channel about the missing digest
-        env:
-          SYNTHETIC_ALERT_WEBHOOK_URL: ${{ secrets.SYNTHETIC_ALERT_WEBHOOK_URL }}
-          RUN_ID: ${{ github.run_id }}
-          LIVE_SHA: ${{ needs.digest.outputs.live_sha }}
-          PREV_TAG: ${{ needs.digest.outputs.prev_tag }}
-        run: |
-          set -euo pipefail
-          python3 scripts/digest_alert.py --live-sha "$LIVE_SHA" --prev-tag "$PREV_TAG"

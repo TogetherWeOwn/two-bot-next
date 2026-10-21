@@ -103,21 +103,21 @@ let r = run(featSha);
 assert.equal(r.status, 0, r.stderr);
 assert.match(r.stdout, /## \[v2026\.10\.21\]/);
 assert.match(r.stdout, /### Added\n\n\* \*\*voice:\*\* name pools/);
-assert.match(r.stdout, /prod_changed=true/);
-assert.match(r.out, /prod_changed=true/);
+assert.match(r.stdout, /released=false/);
+assert.match(r.out, /^tag_name=$/m);
 assert.match(r.out, /released=false/);
 // Quiet day: production already matches the last digest.
 g('tag', 'v2026.10.21', featSha);
 r = run(featSha);
 assert.equal(r.status, 0, r.stderr);
 assert.match(r.stdout, /already exists|quiet day/, 'today cut or quiet skips');
-assert.match(r.out, /prod_changed=false/);
+assert.match(r.out, /released=false/);
 g('tag', '-d', 'v2026.10.21');
 // Rollback: production serves an older commit than the last digest.
 r = run(first);
 assert.equal(r.status, 0, r.stderr);
 assert.match(r.stdout, /rollback serving, no new tag/);
-assert.match(r.out, /prod_changed=false/);
+assert.match(r.out, /released=false/);
 // Off-main and invalid SHAs refuse.
 r = run(offMain);
 assert.notEqual(r.status, 0);
@@ -170,7 +170,7 @@ const bigRes = spawnSync('node', [SCRIPT], {
 });
 assert.equal(bigRes.status, 0, bigRes.stderr);
 assert.match(bigRes.stdout, /## \[v2026\.10\.21\]/);
-assert.match(fs.readFileSync(bigOut, 'utf8'), /prod_changed=true/);
+assert.match(fs.readFileSync(bigOut, 'utf8'), /released=false/);
 
 // Non-dry-run fresh cut against a mocked gh: pins the single release create
 // call's target and its --latest flag.
