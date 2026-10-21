@@ -456,6 +456,9 @@ async fn control_fifo_and_latest_state_preserved_under_churn() {
         expected.insert(member, format!("churn {member}"));
     }
     expected.insert(DIRECTORY_TARGET, "second".to_owned());
+    // Accepted joins also record the join display in the directory.
+    expected.insert(MEMBER, "first room".to_owned());
+    expected.insert(MEMBER + 1, "second room".to_owned());
     assert_eq!(
         worker.name_directory, expected,
         "the later Display for one member still wins"
