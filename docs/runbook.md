@@ -2008,8 +2008,11 @@ Pooler hosts/ports and production-like or empty pins refuse with fixed,
 secret-free messages. When the three variables are unset the gate fails
 closed, so set and verify them in the environment before relying on deploys.
 
-Outcomes: `pending_before` and `pending_store_before` both empty prints
-`schema gate clean` and the deploy proceeds; either non-empty exits 1 with
+The gate first binds the returned read-only report to the requested SHA and
+verified identity (the [evidence contract](#schema-gate-evidence-and-terminal-results)
+below applies to both targets). Only then do `pending_before` and
+`pending_store_before` both empty print `schema gate clean` and allow the
+deploy; either non-empty exits 1 with
 `schema drift: staging database is behind source <sha>: pending versions [...]`
 — fix it with the manual `staging-migrate` apply dispatch for that source
 (reviewed plan, exact `expected_pending` plus `expected_store_pending` when
@@ -2027,6 +2030,52 @@ never fails — when usage is strictly above 80% of the non-superuser ceiling
 `superuser_reserved_connections`, else raw `max_connections` for older
 manifests, labelled as such). A saturated staging database (logins refused)
 therefore shows in the gate log before the deploy hits it.
+
+#### Schema-gate evidence and terminal results
+
+Both schema gates require a canonical lowercase 40-hex `--source-sha` before
+running a plan or writing evidence. The existing report must have strict integer
+`runner_version=1`, `mode=plan`, the exact `migration_target` (`staging` or
+`production`), the exact requested `source_sha`, `role=two_bot_migrator_ro`,
+and strict integer zero `applied_count` and `applied_store_count`. No new
+schema-version field is used. `target` must contain string `host`, `database`
+and `branch_id` fields matching the independently verified, trimmed environment
+pins: host and branch case-insensitively, database exactly. The manifest cannot
+choose replacement pins. Missing/minimal/contradictory reports refuse.
+
+Both pending arrays are required, strictly increasing, unique positive i64
+integers (no booleans, floats or strings). Duplicate JSON fields, non-JSON,
+nonfinite numbers and malformed shapes refuse **before** publishing any plan.
+Validated clean and drift reports are saved atomically in `--manifest-out`;
+refused/error runs publish no new manifest. An output failure leaves prior
+evidence untouched; do not consume a pre-existing file as evidence of this run.
+The production script's existing guard-validated rollback/live-SHA exemptions
+still record `waived` evidence without reading the database; these are not clean
+plan attestations or new waiver authority. Valid connection-usage warnings stay
+advisory and do not change the verdict.
+
+The **last nonempty stdout line** is a single-line JSON object with `verdict`,
+`code` and `next_action`. Earlier human-readable drift/warning lines remain;
+parse the terminal object, not those lines. Codes/actions are fixed tokens:
+
+| Code | Verdict / exit | `next_action` | Meaning |
+| --- | --- | --- | --- |
+| `schema_clean` | `clean` / 0 | `proceed_with_deploy` | Bound read-only report; both chains clean. |
+| `schema_drift` | `drift` / 1 | `run_reviewed_migration_then_retry` | Follow the target's reviewed manual migration and role-restore procedure above. |
+| `recovery_waived` | `waived` / 0 | `continue_guard_validated_recovery` | Existing production recovery exemption only. |
+| `arguments_invalid` | `refused` / 2 | `correct_gate_arguments` | Repair the CLI invocation. |
+| `source_sha_invalid` | `refused` / 2 | `supply_canonical_source_sha` | Supply the resolved lowercase full commit SHA. |
+| `binding_refused` | `refused` / 2 | `repair_plan_binding_and_pins` | Operator verifies the existing direct read-only binding and independent pins. |
+| `manifest_invalid` | `refused` / 2 | `rebuild_reviewed_plan_runner_and_retry` | Runner output is malformed, unsupported or not this read-only request. |
+| `plan_process_failed` | `error` / 3 | `inspect_plan_runner_failure_and_retry` | Plan subprocess exited nonzero. |
+| `plan_execution_failed` | `error` / 3 | `repair_plan_runner_execution_and_retry` | Plan subprocess could not execute. |
+| `plan_timeout` | `error` / 3 | `investigate_plan_timeout_and_retry` | Plan exceeded its 600-second limit. |
+| `manifest_write_failed` | `error` / 3 | `repair_evidence_output_and_retry` | Evidence serialization/output publication failed. |
+| `gate_internal_error` | `error` / 3 | `inspect_gate_implementation_before_retry` | Unexpected gate fault; no deploy authorization. |
+
+Failures never relay raw child stdout/stderr, rejected values, filesystem paths,
+exception text or tracebacks. Investigate within the existing authorized runner
+and credential boundaries; do not bypass the gate or retry with another binding.
 
 ### Production migration runner
 
