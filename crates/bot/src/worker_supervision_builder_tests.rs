@@ -93,3 +93,30 @@ async fn supervisor_reaps_a_panicked_worker() {
     shutdown_tx.send(true).expect("latch the service shutdown");
     await_supervisor(supervisor, "supervisor reaps the panicked worker").await;
 }
+
+#[tokio::test]
+async fn drain_queued_closes_the_inbox_so_late_sends_fail_closed() {
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+    sender.send(1u32).await.expect("queue one item");
+    let dropped = crate::raid_runtime::drain_queued(&mut receiver);
+    assert_eq!(dropped, 1, "queued items are counted");
+    assert!(
+        matches!(
+            sender.try_send(2),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+        ),
+        "sends racing the drain fail at the observer boundary instead of landing in a dead channel uncounted"
+    );
+}
+
+#[test]
+fn join_budget_covers_the_slowest_healthy_in_flight_path() {
+    // Slowest healthy path: the 1.5 s settings read plus one 12 s bounded
+    // staff-post delivery (raid_runtime SETTINGS_READ_MAX/DELIVERY_MAX), with
+    // headroom for the containment snapshot/removal sequence under a slow
+    // Discord. A lower budget aborts healthy work as wedged.
+    assert!(
+        crate::raid_runtime::WORKER_JOIN_BUDGET >= Duration::from_secs(20),
+        "WORKER_JOIN_BUDGET must stay above the slowest healthy in-flight path"
+    );
+}

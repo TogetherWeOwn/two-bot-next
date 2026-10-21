@@ -930,13 +930,14 @@ pub fn start<S: CheckedSettingsSource>(
 /// store. `armed` is false unless dry-run is explicitly `0` outside session
 /// mode, and only an armed worker executes removals. The service shutdown
 /// receiver latches the worker drain through a bounded supervisor that holds
-/// the worker handle and joins-or-aborts it.
+/// the worker handle and joins-or-aborts it; the supervisor handle is
+/// returned for the `main` shutdown join and must not be detached.
 pub fn start_from_env(
     pool: PgPool,
     executor: ActionExecutor,
     guild_id: u64,
     shutdown: tokio::sync::watch::Receiver<bool>,
-) -> Option<Arc<dyn AuditEntryObserver>> {
+) -> Option<(Arc<dyn AuditEntryObserver>, JoinHandle<()>)> {
     start_from_vars(
         pool,
         executor,
@@ -952,7 +953,7 @@ fn start_from_vars(
     guild_id: u64,
     vars: &HashMap<String, String>,
     shutdown: tokio::sync::watch::Receiver<bool>,
-) -> Option<Arc<dyn AuditEntryObserver>> {
+) -> Option<(Arc<dyn AuditEntryObserver>, JoinHandle<()>)> {
     let fences = AntiNukeFences::from_vars(vars, guild_id);
     if !fences.enabled {
         info!("containment_disabled: no audit-entry observer without the fences");
@@ -990,7 +991,7 @@ fn start_from_vars(
         protected,
         fences.armed,
     );
-    crate::raid_runtime::join_on_shutdown(
+    let supervisor = crate::raid_runtime::join_on_shutdown(
         worker,
         shutdown,
         crate::raid_runtime::WORKER_JOIN_BUDGET,
@@ -999,7 +1000,8 @@ fn start_from_vars(
             move || runtime.shutdown()
         },
     );
-    Some(runtime)
+    let observer: Arc<dyn AuditEntryObserver> = runtime;
+    Some((observer, supervisor))
 }
 
 #[cfg(test)]

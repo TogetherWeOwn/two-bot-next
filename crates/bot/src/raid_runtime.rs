@@ -425,8 +425,11 @@ impl WorkerShutdown {
     }
 }
 
-/// Fixed-vocabulary shutdown-drain event. Every supervised worker logs exactly
-/// one per latched shutdown with the finished/dropped counts.
+/// Fixed-vocabulary shutdown-drain event. Every supervised worker that drains
+/// normally logs exactly one per latched shutdown with the finished/dropped
+/// counts. A worker aborted as wedged never reaches its drain, so the abort
+/// path intentionally reports nothing here; the supervisor logs the abort
+/// itself with the budget it outlived.
 pub(crate) fn worker_shutdown_drain(finished: u64, dropped: u64) {
     info!(
         event = "worker_shutdown_drain",
@@ -436,9 +439,13 @@ pub(crate) fn worker_shutdown_drain(finished: u64, dropped: u64) {
     );
 }
 
-/// Drop the queued inbox without starting any item. The caller reports the
-/// count via `WorkerShutdown::note_dropped` and `worker_shutdown_drain`.
+/// Drop the queued inbox without starting any item. The inbox is closed first
+/// so sends racing the drain fail closed at the observer boundary (the same
+/// `Closed` arm as a dropped receiver) instead of landing in a dead channel
+/// uncounted. The caller reports the count via `WorkerShutdown::note_dropped`
+/// and `worker_shutdown_drain`.
 pub(crate) fn drain_queued<T>(receiver: &mut mpsc::Receiver<T>) -> u64 {
+    receiver.close();
     let mut dropped = 0;
     while receiver.try_recv().is_ok() {
         dropped += 1;
@@ -447,16 +454,19 @@ pub(crate) fn drain_queued<T>(receiver: &mut mpsc::Receiver<T>) -> u64 {
 }
 
 /// Bound for one latched worker drain (finish the in-flight item, drop the
-/// queue) before the supervisor aborts it. Drains normally finish in
-/// milliseconds; the bound only backstops a wedged in-flight item.
-pub(crate) const WORKER_JOIN_BUDGET: Duration = Duration::from_secs(10);
+/// queue) before the supervisor aborts it. Derived from the slowest healthy
+/// in-flight path — the raid settings read (1.5 s) plus one bounded staff-post
+/// delivery (12 s) — with headroom for the containment snapshot/removal
+/// sequence under a slow Discord. A worker still running past this bound is
+/// treated as wedged and aborted; the drain normally finishes in milliseconds.
+pub(crate) const WORKER_JOIN_BUDGET: Duration = Duration::from_secs(20);
 
 /// Hold a production worker handle and join-or-abort it on service shutdown,
 /// after `eventsub_reconcile::join`: latch the worker drain first so the join
 /// normally succeeds, and abort only a worker that outlives `budget`. The
-/// supervisor task is bounded (latch wait, one join, at most one abort), so
-/// production constructors detach it and keep their observer return types.
-/// Returns the supervisor handle so tests can await the drain deterministically.
+/// returned supervisor handle must itself be retained and joined (production
+/// constructors return it to `main` for the shutdown join); a detached
+/// supervisor is aborted with the runtime and its drain guarantee is lost.
 pub(crate) fn join_on_shutdown(
     mut worker: JoinHandle<()>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -477,7 +487,7 @@ pub(crate) fn join_on_shutdown(
             Err(_) => {
                 error!(
                     budget_ms = budget.as_millis() as u64,
-                    "worker did not finish within the shutdown drain; aborting it, so a wedged in-flight item is dropped and the queued count is final"
+                    "worker did not finish within the shutdown drain; aborting it, so a wedged in-flight item is dropped and its queued inbox is discarded uncounted"
                 );
                 worker.abort();
                 let _ = worker.await;
@@ -619,13 +629,14 @@ pub fn start<S: CheckedSettingsSource>(
 /// Production wiring: deployment values from the environment, hot rows from the
 /// settings store. Always on, as legacy raid watch was (TWO-56). The service
 /// shutdown receiver latches the worker drain through a bounded supervisor
-/// that holds the worker handle and joins-or-aborts it.
+/// that holds the worker handle and joins-or-aborts it; the supervisor handle
+/// is returned for the `main` shutdown join and must not be detached.
 pub fn start_from_env(
     pool: PgPool,
     executor: ActionExecutor,
     guild_id: u64,
     shutdown: tokio::sync::watch::Receiver<bool>,
-) -> Arc<RaidRuntime> {
+) -> (Arc<RaidRuntime>, JoinHandle<()>) {
     let deployment = SETTING_KEYS
         .iter()
         .filter_map(|key| {
@@ -639,11 +650,11 @@ pub fn start_from_env(
         StoreSettings::new(pool, guild_id, deployment),
         executor,
     );
-    join_on_shutdown(worker, shutdown, WORKER_JOIN_BUDGET, {
+    let supervisor = join_on_shutdown(worker, shutdown, WORKER_JOIN_BUDGET, {
         let runtime = Arc::clone(&runtime);
         move || runtime.shutdown()
     });
-    runtime
+    (runtime, supervisor)
 }
 
 #[cfg(test)]

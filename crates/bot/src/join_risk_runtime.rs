@@ -577,14 +577,16 @@ pub fn start<S: SettingsSource>(
 /// `TWO_ANTI_NUKE_DRY_RUN`, `TWO_ONBOARDING_MODE`) come from the deployment
 /// environment; Hot tuning comes from the settings store. The service
 /// shutdown receiver latches the risk worker drain through a bounded
-/// supervisor that holds the worker handle and joins-or-aborts it.
+/// supervisor that holds the worker handle and joins-or-aborts it; the
+/// supervisor handle is returned for the `main` shutdown join (`None` when
+/// the fences refuse and no risk worker spawns) and must not be detached.
 pub fn chain_from_env(
     pool: PgPool,
     executor: ActionExecutor,
     guild_id: u64,
     raid: Arc<RaidRuntime>,
     shutdown: tokio::sync::watch::Receiver<bool>,
-) -> Arc<dyn JoinObserver> {
+) -> (Arc<dyn JoinObserver>, Option<JoinHandle<()>>) {
     let vars: HashMap<String, String> = std::env::vars().collect();
     let fences = AntiNukeFences::from_vars(&vars, guild_id);
     if !fences.enabled {
@@ -593,7 +595,8 @@ pub fn chain_from_env(
             staging_guild = guild_id.to_string() == STAGING_GUILD_ID,
             "join_risk_disabled: chain is the raid watch alone"
         );
-        return raid;
+        let observer: Arc<dyn JoinObserver> = raid;
+        return (observer, None);
     }
     info!(
         armed = fences.armed,
@@ -615,7 +618,7 @@ pub fn chain_from_env(
         JoinRiskStore::from_pool(pool),
         executor,
     );
-    crate::raid_runtime::join_on_shutdown(
+    let supervisor = crate::raid_runtime::join_on_shutdown(
         worker,
         shutdown,
         crate::raid_runtime::WORKER_JOIN_BUDGET,
@@ -624,10 +627,11 @@ pub fn chain_from_env(
             move || risk.shutdown()
         },
     );
-    Arc::new(Fanout {
+    let observer: Arc<dyn JoinObserver> = Arc::new(Fanout {
         first: raid,
         second: risk,
-    })
+    });
+    (observer, Some(supervisor))
 }
 
 #[cfg(test)]
