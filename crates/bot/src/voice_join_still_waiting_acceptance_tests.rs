@@ -200,6 +200,12 @@ fn is_rejoin_copy(text_lower: &str) -> bool {
             || text_lower.contains("join again"))
 }
 
+/// Any rejoin recovery wording: the owner copy needs only the rejoin part
+/// ("ask them to rejoin"), not the requester's "leave" half.
+fn has_rejoin(text_lower: &str) -> bool {
+    contains_any(text_lower, &["rejoin", "re-join", "join again"])
+}
+
 /// The false movement claim the owner must never see for a gone member.
 fn claims_movement(text_lower: &str) -> bool {
     text_lower.contains("being let in and moved") || text_lower.contains("moved to")
@@ -241,7 +247,7 @@ async fn approve_after_leave_corrects_the_owner_without_claiming_movement() {
         "owner must learn what happened, got: {text}"
     );
     assert!(
-        is_rejoin_copy(&text) || text.contains("rejoin"),
+        has_rejoin(&text),
         "owner must get the rejoin recovery, got: {text}"
     );
 }
@@ -295,7 +301,7 @@ async fn a_refused_move_is_reported_instead_of_a_silent_moved_claim() {
             "owner must learn the move failed after a moved claim, got press: {press_text} visible: {visible}"
         );
         assert!(
-            is_rejoin_copy(&visible) || visible.contains("rejoin"),
+            has_rejoin(&visible),
             "owner must get the rejoin recovery, got: {visible}"
         );
     }
@@ -334,7 +340,7 @@ async fn approve_then_leave_before_dispatch_corrects_the_owner() {
             "owner must learn the member left after a moved claim, got press: {press_text} visible: {visible}"
         );
         assert!(
-            is_rejoin_copy(&visible) || visible.contains("rejoin"),
+            has_rejoin(&visible),
             "owner must get the rejoin recovery, got: {visible}"
         );
     }
