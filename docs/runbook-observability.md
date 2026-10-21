@@ -121,6 +121,30 @@ definitions and their alert-response sections in
 [the operations runbook](runbook.md#metrics-alerts) and
 [metrics reference](metrics.md#off-container-scrape-and-alert-rules).
 
+## Raid and join-risk queue drops
+
+`two_bot_raid_dropped_joins_total{reason}` and
+`two_bot_join_risk_dropped_joins_total{reason}` count each join the respective
+observer could not enqueue. The only reasons are `queue_full` and
+`queue_closed`; all four series render zero before the first drop and reset
+on process restart. Queue saturation still drops without waiting and logs a
+warning. A closed queue additionally logs ERROR with `error_class` equal to
+`raid_queue_closed` or `join_risk_queue_closed`. It means the receiver is gone,
+not merely busy; correlate the same build's worker lifecycle and
+`raid_watch_failed` / `join_risk_failed` logs before considering a repair.
+
+The gateway has already recorded the join before calling these observers: a
+drop means missing raid observation or risk scoring, not lost gateway
+persistence. Compare counters across scrapes of the same process and inspect
+the corresponding Container log window. Existing raid and join-risk ERROR
+sites carry a fixed `error_class` matching their message stem, including
+`raid_alert` and `join_risk_evidence` (log-first evidence, not proof a post
+failed). Tuning refusals still log ERROR only on state changes. Record bounded
+classes, timestamps and build revision, not member IDs or raw error details.
+No new alert rule, retry, tuning or delivery change is introduced. Do not
+replay joins to repair a missed alert; configuration and restart actions keep
+their existing gates. See [raid delivery boundaries](raid-port.md).
+
 ## Voice boot-setting refusal
 
 If the gateway logs `voice HTTP setup failed`, look earlier in the same
