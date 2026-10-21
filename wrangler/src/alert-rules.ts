@@ -220,9 +220,10 @@ export const VOICE_LIVE_NOT_READY_THRESHOLD_SECONDS = 120;
  * `crates/bot/src/voice_rooms.rs`), which fires when queued actions see no
  * completed dispatch turn for this long. An oldest-wait past it means a
  * guild's queue is draining unacceptably slowly. A hung dispatch freezes
- * publication below the bound (the watchdog sibling republishes the last
- * snapshot's age verbatim), so the hung case stays with the in-process
- * stuck verdict (error log plus `voice_watchdog_stucks_total`).
+ * publication (the watchdog sibling republishes the last snapshot's age
+ * verbatim), so a hang that starts below the bound never tickets — that hung
+ * case stays with the in-process stuck verdict (error log plus
+ * `two_bot_voice_watchdog_stucks_total`).
  */
 export const VOICE_QUEUE_STALL_THRESHOLD_SECONDS = 120;
 /** Error-budget ratio of the 48h watch: 99.9% SLO leaves 0.1% spendable. */
@@ -1369,8 +1370,9 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   // bound clears at once. The gauge is an optional scrape input, so older
   // containers hold the previous firing state instead of resolving it. A hung
   // dispatch freezes the published age (the watchdog sibling never
-  // republishes this gauge), so a not-ready view that predates a hang stays
-  // with the in-process signals; the runbook names that backstop.
+  // republishes this gauge), so a hang that starts below the bound never
+  // pages — that case stays with the in-process signals; the runbook names
+  // that backstop.
   const NOT_READY_RULE = "voice_live_not_ready";
   const notReady = exactSeries(gauge("two_bot_voice_live_not_ready_seconds"), {});
   if (notReady !== undefined) {
@@ -1387,10 +1389,11 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   // member-visible join degradation already pages through the join-budget
   // burn rules. A valid reading at or below the bound clears at once; the
   // gauge is an optional scrape input, so older containers hold the previous
-  // firing state. A hung dispatch freezes publication below the bound (the
-  // watchdog sibling republishes the last snapshot's age verbatim), so the
-  // hung case stays with the in-process stuck verdict (error log plus
-  // `voice_watchdog_stucks_total`); the runbook names that backstop.
+  // firing state. A hung dispatch freezes publication (the watchdog sibling
+  // republishes the last snapshot's age verbatim), so a hang that starts
+  // below the bound never tickets — that hung case stays with the in-process
+  // stuck verdict (error log plus `two_bot_voice_watchdog_stucks_total`);
+  // the runbook names that backstop.
   // Queue depth (`two_bot_voice_queue_pending{lane}`) is deliberately
   // unconsumed: depth without age is not a failure signal (see the catalog).
   const QUEUE_STALL_RULE = "voice_queue_stall";

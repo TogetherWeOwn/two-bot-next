@@ -652,8 +652,8 @@ watchdog's >120 s bound into the standard pipeline. Pages on a single valid
 reading past the bound — the age itself proves continuous not-ready — and a
 valid reading at or below 120 s clears at once. Older containers without the
 gauge hold the previous state. Known blind spot: a hung dispatch freezes the
-published age (the watchdog sibling never republishes this gauge), so a
-not-ready view that predates a hang never pages.
+published age (the watchdog sibling never republishes this gauge), so a hang
+that starts before the age reaches 120 s never pages.
 
 First response: confirm via the authorized `/ops/metrics` scrape that the
 age keeps climbing while the gateway is connected; check
