@@ -631,7 +631,12 @@ fn rollback_import_refuses_an_overlong_single_line() {
         line.len() < INTAKE_CAP_BYTES,
         "line must stay under the file cap"
     );
-    let err = parse_import(&line).expect_err("a 2 MiB single line must be refused");
+    // Map the Ok payload to () FIRST: on RED the parser accepts the 2 MiB
+    // row and expect_err would Debug-print all 2 MiB into one log line,
+    // which wedges the CI log runner until the job times out.
+    let err = parse_import(&line)
+        .map(|_| ())
+        .expect_err("a 2 MiB single line must be refused");
     let message = err.to_string();
     assert!(
         is_bound_refusal(&message),
