@@ -945,7 +945,7 @@ fn snapshot_upload_argv(upload_raw: Option<&str>, path: &Path) -> Option<(String
 // guild-config-snapshot
 // ---------------------------------------------------------------------------
 
-/// Removes the pid temp unless a successful rename disarms it. Every
+/// Removes our temp file unless a successful rename disarms it. Every
 /// post-create failure path (write, permissions, fsync, rename) drops through
 /// here, so no `.tmp` partial survives a failed write. Only our own temp is
 /// removed; siblings are never touched. The guard arms only after the temp is
@@ -968,11 +968,18 @@ fn atomic_json(path: &Path, value: &serde_json::Value) -> Result<(), String> {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     }
-    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    // Unique temp per call (pid + nanos): exclusive creation can never
+    // collide with a stale temp from a crashed run, and `create_new` refuses
+    // a planted symlink or file at the temp path instead of following or
+    // truncating it (CWE-59). A collision fails closed with the existing
+    // "cannot write" error.
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = path.with_extension(format!("{}.{unique}.tmp", std::process::id()));
     // Stays unarmed until the temp exists: a creation failure returns the
-    // existing error without removing a pre-existing path. Truncating
-    // `create` (not `create_new`) is kept so a stale temp from a crashed
-    // same-pid run is recovered, not a fatal error.
+    // existing error without removing a pre-existing path.
     let mut guard = TmpGuard {
         tmp: &tmp,
         armed: false,
@@ -980,7 +987,10 @@ fn atomic_json(path: &Path, value: &serde_json::Value) -> Result<(), String> {
     let text = serde_json::to_string_pretty(value).map_err(|e| format!("cannot serialise: {e}"))?;
     {
         use std::io::Write;
-        let mut file = std::fs::File::create(&tmp)
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
             .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
         guard.armed = true;
         #[cfg(unix)]
@@ -1275,11 +1285,29 @@ async fn cmd_guild_config_restore(args: &[String]) -> i32 {
         return 2;
     }
 
-    // Open once: a missing file keeps the existing read error, a non-regular
-    // file (device/FIFO) is refused before any read, and an over-cap file is
-    // refused before buffering. The bounded `take` read mirrors the restore
-    // drill, so a file that grows past the cap mid-read is still refused
-    // before parsing.
+    // Gate before open: a FIFO opened for reading blocks until a writer
+    // connects, so non-regular and over-cap snapshots are refused via
+    // metadata first and `File::open` only sees likely-regular files. A
+    // missing file falls through to the existing read error below.
+    if let Ok(meta) = std::fs::metadata(&snapshot_arg) {
+        if !meta.is_file() {
+            eprintln!(
+                "guild-config-restore: cannot read snapshot {snapshot_arg}: not a regular file"
+            );
+            return 2;
+        }
+        if meta.len() > MAX_SNAPSHOT_BYTES {
+            eprintln!(
+                "guild-config-restore: snapshot {snapshot_arg} is {} bytes, exceeding the {MAX_SNAPSHOT_BYTES}-byte snapshot cap; refusing rather than buffering it",
+                meta.len()
+            );
+            return 2;
+        }
+    }
+    // Open once. The descriptor is re-checked after open for a path swapped
+    // between the gate and the open; the bounded `take` read mirrors the
+    // restore drill, so a file that grows past the cap mid-read is still
+    // refused before parsing.
     let snapshot_file = match std::fs::File::open(&snapshot_arg) {
         Ok(file) => file,
         Err(err) => {
@@ -1287,6 +1315,8 @@ async fn cmd_guild_config_restore(args: &[String]) -> i32 {
             return 2;
         }
     };
+    // Descriptor-level recheck: refuse a path swapped for a non-regular or
+    // over-cap file between the pre-open gate and the open.
     if let Ok(meta) = snapshot_file.metadata() {
         if !meta.is_file() {
             eprintln!(

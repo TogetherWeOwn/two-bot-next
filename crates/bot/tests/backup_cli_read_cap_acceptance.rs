@@ -461,6 +461,36 @@ async fn oversized_snapshot_refuses_before_discord_read() {
 }
 
 #[tokio::test]
+async fn fifo_snapshot_refuses_without_blocking() {
+    // A writer-less FIFO opened for reading blocks forever, so the restore
+    // path must refuse it via metadata before `File::open`. Fixed: exit 2
+    // naming the non-regular cause with zero Discord calls. The bounded
+    // `output` wait turns a regression into a test failure (killing the
+    // blocked child via `kill_on_drop`) instead of a hung job.
+    let scratch = Scratch::new("snapshot-fifo");
+    scratch.write_token();
+    let fifo = scratch.0.join("snapshot.fifo");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo must exist on test hosts");
+    assert!(status.success(), "mkfifo must create the FIFO");
+    assert!(!std::fs::metadata(&fifo).unwrap().is_file());
+    let fake = FakeDiscord::start(fixture()).await;
+    let (out, text) = output(&mut restore_cmd(&scratch, &fake, &fifo), 30).await;
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        text.contains("not a regular file"),
+        "FIFO refusal must name the non-regular cause: {text}"
+    );
+    assert_eq!(
+        fake.calls(),
+        0,
+        "FIFO snapshot must refuse before any Discord read: {text}"
+    );
+}
+
+#[tokio::test]
 async fn small_dump_uploads_byte_identical() {
     // GREEN control: a small dump still uploads, and the PUT body is the file.
     let scratch = Scratch::new("dump-small");
