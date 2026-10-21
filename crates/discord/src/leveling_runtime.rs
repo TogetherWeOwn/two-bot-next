@@ -950,6 +950,248 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{body::Body, http::Method, http::Response, http::Uri, Router};
+    use serde_json::{json, Value};
+    use std::collections::VecDeque;
+
+    struct RoleRest {
+        executor: Arc<ActionExecutor>,
+        requests: Arc<Mutex<Vec<(Method, String)>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for RoleRest {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    impl RoleRest {
+        async fn start(script: Vec<(u16, Value)>) -> Self {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let script = Arc::new(Mutex::new(VecDeque::from(script)));
+            let recorded = Arc::clone(&requests);
+            let app = Router::new().fallback(move |method: Method, uri: Uri| {
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push((method, uri.path().to_owned()));
+                let (status, body) = script
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or((500, Value::Null));
+                async move {
+                    Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(if status == 204 {
+                            Body::empty()
+                        } else {
+                            Body::from(body.to_string())
+                        })
+                        .unwrap()
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let executor = Arc::new(
+                ActionExecutor::with_proxy("mock-only-token".into(), Some(origin)).unwrap(),
+            );
+            Self {
+                executor,
+                requests,
+                task,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_role_refusal_preserves_prior_committed_awards_in_order() {
+        let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
+            eprintln!("SKIP drain award preservation: TWO_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let db = two_bot_testsupport::TestDatabase::create(
+            &url,
+            &sqlx::migrate!("../cutover/migrations"),
+        )
+        .await
+        .expect("create disposable test database");
+        for (member, xp) in [(200_u64, 99_i64), (201, 250)] {
+            sqlx::query("INSERT INTO member_levels (guild_id,member_id,xp,imported_xp,updated_at) VALUES ('100',$1,$2,$2,NOW())")
+                .bind(member.to_string())
+                .bind(xp)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        leveling_store::replace_role_rewards(
+            db.pool(),
+            "100",
+            &[two_bot_core::leveling::LevelRoleReward {
+                level: 1,
+                role_id: "5555".into(),
+            }],
+        )
+        .await
+        .unwrap();
+        let rest = RoleRest::start(vec![
+            (200, json!({"roles": []})),
+            (204, Value::Null),
+            (200, json!({"roles": []})),
+            (
+                403,
+                json!({"code": 50013, "message": "Missing Permissions"}),
+            ),
+        ])
+        .await;
+        let runtime = LevelingRuntime::new(
+            db.pool().clone(),
+            Arc::clone(&rest.executor),
+            100,
+            two_bot_core::OnboardingGates {
+                mode: two_bot_core::OnboardingMode::Legacy,
+                dry_run: false,
+            },
+        );
+        let pipeline = OrderedLevelingPipeline::new(two_bot_core::MemStore::new(), Some(runtime));
+        let requests = [200, 201]
+            .into_iter()
+            .map(|member_id| AwardRequest {
+                guild_id: 100,
+                member_id,
+                channel_id: 300,
+                at: "2026-08-15T00:00:00.000Z".into(),
+                duration: None,
+                content_length: Some(30),
+                has_embed_or_attachment: false,
+            })
+            .collect();
+        let result = pipeline.drain(requests).await;
+        let persisted: Vec<(String, i64)> =
+            sqlx::query_as("SELECT member_id,xp FROM member_levels ORDER BY member_id")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        db.close().await.expect("drop disposable test database");
+
+        let error = result.expect_err("second member's role write must be refused");
+        assert_eq!(
+            error.committed_awards(),
+            &[
+                XpAward {
+                    awarded: 15,
+                    total_xp: 114,
+                    level: 1,
+                    previous_level: 0,
+                    leveled_up: true
+                },
+                XpAward {
+                    awarded: 15,
+                    total_xp: 265,
+                    level: 2,
+                    previous_level: 1,
+                    leveled_up: true
+                },
+            ]
+        );
+        assert!(matches!(error, LevelingRuntimeError::RoleApplication {
+            cause: RoleApplicationError::Refused { role_id, reason, applied, skipped }, ..
+        } if role_id == "5555" && reason.contains("403") && applied.is_empty() && skipped.is_empty()));
+        assert_eq!(persisted, vec![("200".into(), 114), ("201".into(), 265)]);
+        assert_eq!(
+            *rest.requests.lock().unwrap(),
+            vec![
+                (Method::GET, "/api/v10/guilds/100/members/200".into()),
+                (
+                    Method::PUT,
+                    "/api/v10/guilds/100/members/200/roles/5555".into()
+                ),
+                (Method::GET, "/api/v10/guilds/100/members/201".into()),
+                (
+                    Method::PUT,
+                    "/api/v10/guilds/100/members/201/roles/5555".into()
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_revoke_refusal_reports_exact_roles_after_successful_grants() {
+        use crate::executor::StagingRevokeFence;
+        use two_bot_core::leveling::RewardRolePlan;
+
+        const GUILD: u64 = 1545644954272137297;
+        const PRODUCTION: u64 = 326474832151838730;
+        let rest = RoleRest::start(vec![
+            (200, json!({"id": "4444"})),
+            (200, json!({"roles": ["8888"]})),
+            (
+                200,
+                json!([
+                    {"id": GUILD.to_string(), "permissions": "0", "position": 0, "managed": false},
+                    {"id": "8888", "permissions": "268435456", "position": 10, "managed": false},
+                    {"id": "6666", "permissions": "0", "position": 1, "managed": false},
+                    {"id": "7777", "permissions": "0", "position": 2, "managed": false},
+                ]),
+            ),
+            (204, Value::Null),
+            (204, Value::Null),
+            (
+                403,
+                json!({"code": 50013, "message": "Missing Permissions"}),
+            ),
+        ])
+        .await;
+        let plan = RewardRolePlan {
+            grant: vec!["5555".into(), "5556".into()],
+            revoke: vec!["6666".into(), "7777".into()],
+            grant_reason: "TWO leveling: reached level 1".into(),
+            revoke_reason: Some("TWO leveling: below level thresholds at level 1".into()),
+        };
+        let (applied, failed, skipped) = rest
+            .executor
+            .execute_reward_roles(
+                GUILD,
+                3333,
+                &plan,
+                Some(StagingRevokeFence::new(GUILD, PRODUCTION).unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(applied, vec!["5555", "5556"]);
+        assert_eq!(
+            failed,
+            Some((
+                "6666".into(),
+                "discord refused the request: Discord refused the request with 403".into()
+            ))
+        );
+        assert_eq!(skipped, vec!["7777"]);
+        assert_eq!(
+            *rest.requests.lock().unwrap(),
+            vec![
+                (Method::GET, "/api/v10/users/@me".into()),
+                (Method::GET, format!("/api/v10/guilds/{GUILD}/members/4444")),
+                (Method::GET, format!("/api/v10/guilds/{GUILD}/roles")),
+                (
+                    Method::PUT,
+                    format!("/api/v10/guilds/{GUILD}/members/3333/roles/5555")
+                ),
+                (
+                    Method::PUT,
+                    format!("/api/v10/guilds/{GUILD}/members/3333/roles/5556")
+                ),
+                (
+                    Method::DELETE,
+                    format!("/api/v10/guilds/{GUILD}/members/3333/roles/6666")
+                ),
+            ]
+        );
+    }
 
     fn gate<'a>(
         member_id: Snowflake,
