@@ -702,10 +702,10 @@ pub fn global() -> &'static Metrics {
 /// unwinding; this helper is the only poison path a `Drop` body needs.
 /// `guard` must be a [`DROP_POISON_GUARDS`] member. Never panics and never
 /// blocks on another lock: the metrics mutex is a leaf.
-pub fn recover_drop_poison<T>(
-    result: LockResult<MutexGuard<'_, T>>,
+pub fn recover_drop_poison<'a, T>(
+    result: LockResult<MutexGuard<'a, T>>,
     guard: &str,
-) -> MutexGuard<'_, T> {
+) -> MutexGuard<'a, T> {
     result.unwrap_or_else(|poisoned| {
         global().drop_poison(guard);
         tracing::warn!(guard, "drop guard recovered a poisoned lock");

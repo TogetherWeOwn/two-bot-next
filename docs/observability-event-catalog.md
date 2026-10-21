@@ -246,6 +246,21 @@ rule. Full semantics live in `docs/metrics.md`.
 | --- | --- |
 | `two_bot_retention_replay_needed_total` | Skipped retention purges needing Operator replay: one per real guild removal whose purge-queue write hit the schema gap; successful queue writes and rejoin-cancel skips never increment it |
 
+## Drop-guard poison recovery series
+
+Labelled counter recorded by `recover_drop_poison` in
+`crates/core/src/metrics.rs` and rendered by `render` in the same file. Each
+poisoned drop counts once under its guard and logs one `drop guard recovered
+a poisoned lock` warn carrying the guard name; the drop still releases its
+state from the recovered guard. Unknown guards collapse to the trailing
+`in_flight_guard` slot, and no panic payload, ID, token or body content ever
+becomes a label. Manual check, not an alert input: consumed by no alert rule.
+Full semantics live in `docs/metrics.md`.
+
+| Series | Meaning |
+| --- | --- |
+| `two_bot_drop_poison_total{guard}` | Poisoned locks recovered by drop guards instead of panicking inside `drop`; `guard` is `command_dispatch_guard`, `schedule_run`, `user_slot` or `in_flight_guard`. Any increase is a fault worth a look in the container logs |
+
 ## Scheduled job labels
 
 Each label owns independent `two_bot_job_runs_total{job,outcome}`,
