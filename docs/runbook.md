@@ -67,7 +67,11 @@ green without the flag. Each probe line cites the code path it checks. The five
 probes cover liveness, the readyz breakdown shape, gateway truthfulness, the
 jobs map (freshness-graded when ready or with --expect-ready, otherwise
 informational), and that the body is the container's breakdown rather
-than an ownership-fence refusal.
+than an ownership-fence refusal. Pass `--json` for one machine-readable
+verdict object with stable per-check ids, codes and next actions.
+Malformed origins and remote fields fail as bounded fixed-vocabulary
+verdicts that echo nothing; failures never write `--evidence`, which stays
+a success-only attestation.
 
 The container listens on `LISTEN_ADDR` (default `0.0.0.0:8080`). The Worker
 sets it from `BOT_PORT` (default 8080). Both routes use this listener; there is
