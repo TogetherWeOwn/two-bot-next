@@ -26,6 +26,7 @@ pub(crate) const USAGE: &str = "\
       List unknown event.upsert/event.cancel intents oldest first.
       Read-only. Shows 25 rows by default, at most 100; a capped listing
       ends with `showing <shown> of <total> rows (truncated; rerun with --limit <total>)`.
+      Past 100 rows no rerun converges: resolve shown rows and re-list.
       Env: TWO_DATABASE_URL (required). Staging guild only.
 
   two-bot reconcile-event --guild <id> --intent <n> --created --event-key <k> --event-id <id> [--execute]
@@ -294,6 +295,25 @@ fn expected_action<'a>(mode: &ResolveMode, unknown_action: Option<&'a str>) -> O
     }
 }
 
+/// The truncation receipt for a capped page, if capped. A total within the
+/// ceiling names the rerun that shows it all; past the ceiling no `--limit`
+/// rerun converges (values clamp), so the receipt names the ceiling and the
+/// way to advance instead of prescribing a looping rerun.
+fn truncation_receipt(shown: i64, total: i64) -> Option<String> {
+    if total <= shown {
+        return None;
+    }
+    if total <= OPERATOR_LIST_MAX_LIMIT {
+        return Some(format!(
+            "showing {shown} of {total} rows (truncated; rerun with --limit {total})"
+        ));
+    }
+    Some(format!(
+        "showing {shown} of {total} rows (truncated to the {}-row ceiling; resolve shown rows and re-list to advance)",
+        OPERATOR_LIST_MAX_LIMIT
+    ))
+}
+
 async fn run(store: &InternalActionStore, guild: &str, command: &Command, execute: bool) -> i32 {
     match command {
         Command::List { limit } => match store
@@ -316,13 +336,11 @@ async fn run(store: &InternalActionStore, guild: &str, command: &Command, execut
                     // tool purpose.
                     println!("{}\t{}\t{}", row.intent_id, row.action, row.created_at_utc);
                 }
-                // The store counts before deciding, so a listing that ends
+                // The store pages before counting, so a listing that ends
                 // exactly at the cap prints no receipt; only a capped one
-                // names its total and the rerun that shows it all.
-                if total > shown {
-                    println!(
-                        "showing {shown} of {total} rows (truncated; rerun with --limit {total})"
-                    );
+                // names its total and the way to see the rest.
+                if let Some(receipt) = truncation_receipt(shown, total) {
+                    println!("{receipt}");
                 }
                 0
             }
@@ -456,6 +474,29 @@ mod tests {
             "--limit"
         ]))
         .is_err());
+    }
+
+    #[test]
+    fn truncation_receipt_names_rerun_within_ceiling_and_ceiling_past_it() {
+        assert_eq!(truncation_receipt(0, 0), None);
+        assert_eq!(truncation_receipt(25, 25), None);
+        assert_eq!(truncation_receipt(30, 30), None);
+        assert_eq!(
+            truncation_receipt(5, 30).as_deref(),
+            Some("showing 5 of 30 rows (truncated; rerun with --limit 30)")
+        );
+        assert_eq!(
+            truncation_receipt(25, 150).as_deref(),
+            Some(
+                "showing 25 of 150 rows (truncated to the 100-row ceiling; resolve shown rows and re-list to advance)"
+            )
+        );
+        assert_eq!(
+            truncation_receipt(100, 150).as_deref(),
+            Some(
+                "showing 100 of 150 rows (truncated to the 100-row ceiling; resolve shown rows and re-list to advance)"
+            )
+        );
     }
 
     #[test]

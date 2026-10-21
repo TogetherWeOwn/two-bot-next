@@ -178,23 +178,11 @@ impl PgMemberModerationStore {
         limit: i64,
     ) -> Result<(Vec<UncertainRow>, i64), StoreError> {
         self.ensure_guild(guild_id)?;
-        // The count and the page read the same UNION ALL: a row counted here
-        // is a row the page can show, so the receipt total never disagrees
-        // with the listing.
-        let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM (
-               SELECT request_id FROM moderation_member_bans
-               WHERE guild_id = $1 AND state = 'prepared'
-               UNION ALL
-               SELECT request_id FROM moderation_scheduled_unbans
-               WHERE guild_id = $1
-                 AND (state = 'running' OR dispatch_uncertain OR state = 'quarantined')
-             ) AS fenced",
-        )
-        .bind(&self.guild_id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(db_error)?;
+        // Page before counting, against the same UNION ALL: a row arriving
+        // between the two reads then prints a (converging) receipt instead of
+        // hiding behind a stale count, while a row resolved between them only
+        // stales already-shown rows — and every resolution re-checks its
+        // exact row under lock before writing.
         let rows = sqlx::query(
             "SELECT request_id, user_id, generation, NULL::text AS execute_at,
                'prepared_ban' AS kind
@@ -211,6 +199,20 @@ impl PgMemberModerationStore {
         .bind(&self.guild_id)
         .bind(limit.clamp(0, OPERATOR_LIST_MAX_LIMIT))
         .fetch_all(&self.pool)
+        .await
+        .map_err(db_error)?;
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM (
+               SELECT request_id FROM moderation_member_bans
+               WHERE guild_id = $1 AND state = 'prepared'
+               UNION ALL
+               SELECT request_id FROM moderation_scheduled_unbans
+               WHERE guild_id = $1
+                 AND (state = 'running' OR dispatch_uncertain OR state = 'quarantined')
+             ) AS fenced",
+        )
+        .bind(&self.guild_id)
+        .fetch_one(&self.pool)
         .await
         .map_err(db_error)?;
         let mut uncertain = Vec::with_capacity(rows.len());

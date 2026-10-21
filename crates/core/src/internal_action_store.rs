@@ -765,9 +765,25 @@ impl InternalActionStore {
         if !is_snowflake(guild_id) {
             return Err(InternalStoreError::InvalidInput);
         }
-        // The count and the page read the same WHERE clause: a row counted
-        // here is a row the page can show, so the receipt total never
-        // disagrees with the listing.
+        // Page before counting, against the same WHERE clause: a row arriving
+        // between the two reads then prints a (converging) receipt instead of
+        // hiding behind a stale count, while a row resolved between them only
+        // stales already-shown rows — and the resolution re-checks its exact
+        // row under lock before writing.
+        let rows: Vec<UnknownEventIntent> = sqlx::query(
+            "SELECT intent_id, action, \
+             to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at_utc \
+             FROM internal_idempotency \
+             WHERE state = 'unknown' AND action IN ('event.upsert', 'event.cancel') \
+             AND guild_id = $1 ORDER BY intent_id LIMIT $2",
+        )
+        .bind(guild_id)
+        .bind(limit.clamp(0, OPERATOR_LIST_MAX_LIMIT))
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| Self::unknown_event_intent(&row))
+        .collect();
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM internal_idempotency \
              WHERE state = 'unknown' AND action IN ('event.upsert', 'event.cancel') \
@@ -776,23 +792,7 @@ impl InternalActionStore {
         .bind(guild_id)
         .fetch_one(&self.pool)
         .await?;
-        Ok((
-            sqlx::query(
-                "SELECT intent_id, action, \
-                 to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at_utc \
-                 FROM internal_idempotency \
-                 WHERE state = 'unknown' AND action IN ('event.upsert', 'event.cancel') \
-                 AND guild_id = $1 ORDER BY intent_id LIMIT $2",
-            )
-            .bind(guild_id)
-            .bind(limit.clamp(0, OPERATOR_LIST_MAX_LIMIT))
-            .fetch_all(&self.pool)
-            .await?
-            .into_iter()
-            .map(|row| Self::unknown_event_intent(&row))
-            .collect(),
-            total,
-        ))
+        Ok((rows, total))
     }
 
     /// Operator resolution of one exact unknown event intent, in a single

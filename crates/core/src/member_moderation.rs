@@ -2152,6 +2152,10 @@ impl MemberModerationStore for MemMemberStore {
                 })
                 .collect()
         };
+        // The double activates every staged row newest-first: it models the
+        // claim contract (bounded claims completing across calls), not the
+        // Postgres page schedule (bounded oldest-first activation). Tests for
+        // the single-pass bound run against Postgres, not this double.
         staged.sort_by(|a, b| b.cmp(a));
         for (_, id, guild_id, user_id) in staged {
             self.serialize_member(&guild_id, &user_id, || async {
