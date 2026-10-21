@@ -81,8 +81,8 @@ mod flush_adapter {
     }
 
     fn episode(collector: &GameActivityCollector, start: i64) {
-        let guild = Snowflake::new(111).expect("fixture guild");
-        let member = Snowflake::new(222).expect("fixture member");
+        let guild: Snowflake = 111;
+        let member: Snowflake = 222;
         collector.observe_join(guild, member, start);
         collector.observe_presence(
             guild,
@@ -120,20 +120,25 @@ mod flush_adapter {
         }
     }
 
-    async fn finish(mut task: tokio::task::JoinHandle<()>) -> bool {
-        match tokio::time::timeout(Duration::from_secs(1), &mut task).await {
-            Ok(result) => {
-                result.expect("flush task did not panic");
-                true
-            }
-            Err(_) => {
-                task.abort();
-                assert!(task
-                    .await
-                    .expect_err("aborted baseline loop")
-                    .is_cancelled());
-                false
-            }
+    async fn finish(task: tokio::task::JoinHandle<()>) -> bool {
+        // Paused-time join: a wall-clock timeout never fires without an
+        // explicit advance, so yield the loop onto the latch, advance past
+        // the join budget, then read is_finished. The 1s advance stays
+        // inside the 300s poll interval, so it cannot trigger a periodic
+        // flush and skew the totals assertions.
+        settle().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        settle().await;
+        if task.is_finished() {
+            task.await.expect("flush task did not panic");
+            true
+        } else {
+            task.abort();
+            assert!(task
+                .await
+                .expect_err("aborted baseline loop")
+                .is_cancelled());
+            false
         }
     }
 
@@ -324,12 +329,22 @@ mod cache_adapter {
     }
 
     fn interaction(id: u64) -> Box<Interaction> {
+        // Same proven shape as the gateway slash() packet: only the token
+        // differs, so the durable-marker assertion can detect leakage.
         Box::new(
             serde_json::from_value(serde_json::json!({
-                "id": id.to_string(), "application_id": "444444444444444444", "type": 2,
-                "data": {"id": "555555555555555555", "type": 1, "name": "fixture"},
+                "id": id.to_string(), "application_id": "1111", "type": 2,
                 "token": "synthetic-interaction-token", "version": 1,
-                "authorizing_integration_owners": {}, "entitlements": []
+                "guild_id": "22",
+                "channel": {"id": "4444", "type": 0, "name": "commands"},
+                "authorizing_integration_owners": {"0": "22"}, "entitlements": [],
+                "member": {
+                    "permissions": "0", "roles": [], "joined_at": null,
+                    "deaf": false, "mute": false, "flags": 0,
+                    "user": {"id": "3333", "username": "tester",
+                             "discriminator": "0000", "avatar": null}
+                },
+                "data": {"id": "5555", "name": "fixture", "type": 1, "options": []}
             }))
             .expect("synthetic interaction"),
         )
