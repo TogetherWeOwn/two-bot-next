@@ -85,8 +85,8 @@ claim. Staging deploys from `main`; production deploys through the manual
 ### Stream delivery (Twitch EventSub)
 
 Twitch `stream.online` deliveries arrive at the staging-only public Worker
-route (`POST /hooks/twitch`, `wrangler/src/eventsub.ts:30`), which forwards
-them inward (`wrangler/src/eventsub.ts:223`) to the private container
+route (`POST /hooks/twitch`, `wrangler/src/eventsub.ts:37`), which forwards
+them inward (`wrangler/src/eventsub.ts:289`) to the private container
 receiver (`crates/bot/src/eventsub_http.rs:1`). The Worker route answers only
 when the staging-only Worker var `EVENTSUB_INGRESS` and the Operator-set Worker
 secret `TWO_EVENTSUB` are both exactly `1`. A missing `TWO_TWITCH_WEBHOOK_SECRET`
@@ -105,12 +105,12 @@ Every delivery body is capped at 64 KiB and verified
 version 1 is accepted for classification. With delivery dark the runtime
 receiver only acknowledges verified notifications and revocations; with
 delivery enabled a verified `stream.online` runs the durable claim → send →
-settle flow (`deliver_go_live`, `crates/bot/src/eventsub_http.rs:262`;
-production deps built at `crates/bot/src/main.rs:422`). Planning rules live in the
+settle flow (`deliver_go_live`, `crates/bot/src/eventsub_http.rs:282`;
+production deps built at `crates/bot/src/main.rs:437`). Planning rules live in the
 [stream funnel](docs/stream-funnel.md); the operator runbook is the
 [EventSub runbook](docs/eventsub-runbook.md). The keys (`TWO_EVENTSUB`,
 `TWO_EVENTSUB_BIND`, `TWO_TWITCH_WEBHOOK_SECRET`) are catalogued in
-[Configuration](docs/configuration.md) (`docs/configuration.md:194`).
+[Configuration](docs/configuration.md) (`docs/configuration.md:200`).
 
 ### Regenerate the references
 
