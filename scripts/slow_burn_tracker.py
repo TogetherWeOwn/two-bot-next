@@ -77,7 +77,7 @@ def _load_cache_json(path):
             raw = stream.read(MAX_JSON_BYTES + 1)
         if len(raw) > MAX_JSON_BYTES:
             return None
-        return json.loads(raw)
+        return json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
     except (OSError, ValueError, UnicodeError, RecursionError):
         return None
 
@@ -87,13 +87,32 @@ def _intake_json(raw, message):
     try:
         if len(raw.encode("utf-8") if isinstance(raw, str) else raw) > MAX_JSON_BYTES:
             raise TrackError(message)
-        return json.loads(raw)
+        return json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
     except (ValueError, UnicodeError, RecursionError):
         raise TrackError(message) from None
 
 
 class TrackError(Exception):
     """A fixed-vocabulary tracker failure (never carries secrets)."""
+
+
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    raised message is fixed vocabulary: it names no key, value or path.
+    """
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):

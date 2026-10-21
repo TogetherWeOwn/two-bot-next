@@ -767,6 +767,42 @@ class TrackerDriverTests(unittest.TestCase):
         self.assertFalse(verdict.get("slowCovered", True))
 
 
+class TrackerCacheDuplicateKeyTests(unittest.TestCase):
+    """Duplicate keys in the cached ring/sidecar rebuild, like other malformed cache data."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+
+    def test_duplicate_key_ring_entry_rebuilds(self):
+        now = 1_700_000_000
+        ring_path = self.dir / "ring.json"
+        ring_path.write_text(
+            '[{"t": 100, "t": 9999999999, "received": 25,'
+            ' "duplicate": 0, "fastMoves": 24}]', encoding="utf-8")
+        ring = tracker.load_ring(str(ring_path))
+        self.assertEqual(ring, [])
+        self.assertIsNone(tracker.ring_gap_seconds(ring, now))
+
+    def test_duplicate_key_sidecar_rebuilds(self):
+        sidecar = self.dir / "coverage.json"
+        sidecar.write_text('{"last_covered": 100, "last_covered": 9999999999}',
+                           encoding="utf-8")
+        self.assertEqual(tracker._load_sidecar_dict(str(sidecar)), {})
+        self.assertIsNone(tracker.load_covered_at(str(sidecar)))
+
+    def test_unique_cache_still_loads_byte_identical(self):
+        ring = [{"t": 1_699_999_700, "received": 25,
+                 "duplicate": 0, "fastMoves": 24}]
+        ring_path = self.dir / "ring.json"
+        ring_path.write_text(json.dumps(ring), encoding="utf-8")
+        self.assertEqual(tracker.load_ring(str(ring_path)), ring)
+        sidecar = self.dir / "coverage.json"
+        sidecar.write_text('{"last_covered": 1699999700}', encoding="utf-8")
+        self.assertEqual(tracker.load_covered_at(str(sidecar)), 1699999700)
+
+
 # Keep protected intake acceptance tests in the existing CI entrypoint.
 from test_slow_burn_tracker_intake_acceptance import TrackerIntakeAcceptanceTests
 
