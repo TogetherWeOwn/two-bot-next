@@ -1155,3 +1155,7 @@ mod cursor_budget_acceptance_tests;
 #[cfg(test)]
 #[path = "ticket_cursor_budget_interaction_tests.rs"]
 mod cursor_budget_interaction_tests;
+
+#[cfg(test)]
+#[path = "ticket_creation_receipt_acceptance_tests.rs"]
+mod creation_receipt_acceptance_tests;
