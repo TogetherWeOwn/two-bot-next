@@ -28,7 +28,27 @@ fn channel() -> TicketChannelRequest<'static> {
 
 #[tokio::test]
 async fn ticket_create_has_exact_metadata_and_least_privilege_overwrites() {
-    let mock = MockRest::start(vec![], ScriptedResponse::json(201, json!({"id":"600"}))).await;
+    let mock = MockRest::with_responder(|request| {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        let common = (Permissions::VIEW_CHANNEL
+            | Permissions::SEND_MESSAGES
+            | Permissions::READ_MESSAGE_HISTORY)
+            .bits();
+        ScriptedResponse::json(
+            201,
+            json!({
+                "id":"600", "guild_id":"100", "type":0, "parent_id":"200",
+                "topic":body["topic"],
+                "permission_overwrites":[
+                    {"id":"100","type":0,"allow":"0","deny":Permissions::VIEW_CHANNEL.bits().to_string()},
+                    {"id":"400","type":1,"allow":(common | Permissions::MANAGE_CHANNELS.bits()).to_string(),"deny":"0"},
+                    {"id":"500","type":1,"allow":common.to_string(),"deny":"0"},
+                    {"id":"300","type":0,"allow":common.to_string(),"deny":"0"},
+                ]
+            }),
+        )
+    })
+    .await;
     assert_eq!(
         executor(&mock)
             .create_ticket_channel(&channel())
