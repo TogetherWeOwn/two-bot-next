@@ -110,13 +110,14 @@ class QueryPinTests(unittest.TestCase):
     SCRIPTS = (census.IDENTITY_SQL, census.MIGRATIONS_SQL, census.INDEXES_SQL,
                census.COUNTS_SQL, census.cohort_sql(ANCHOR),
                census.cohort_nodigest_sql(ANCHOR), census.PROBE_SQL,
-               census.ANCHOR_SQL, census.FIXTURE_SCOPE_SQL,
-               census.FIXTURE_GUILDS_SQL, census.FIXTURE_GUILDS_NODIGEST_SQL)
+               census.ANCHOR_SQL, census.fixture_census_sql(True),
+               census.fixture_census_sql(False))
 
     def test_every_statement_is_read_only_with_timeouts(self):
         for script in self.SCRIPTS:
             with self.subTest(script=script[:40]):
-                self.assertIn("BEGIN READ ONLY", script)
+                self.assertRegex(script,
+                                 r"BEGIN (?:ISOLATION LEVEL REPEATABLE READ, )?READ ONLY;")
                 self.assertIn("statement_timeout", script)
                 self.assertIn("lock_timeout", script)
                 self.assertTrue(script.rstrip().endswith("COMMIT;"))
@@ -263,6 +264,43 @@ class QueryPinTests(unittest.TestCase):
                           .replace("NULL::bigint,NULL::bigint,NULL::bigint",
                                    "NULL::bigint, NULL::bigint, NULL::bigint"))
             self.assertNotIn("LIKE", branch[0])
+
+    def test_fixture_marker_columns_match_sql_and_docs(self):
+        expected = {
+            "events": "idempotency_key",
+            "members": "join_source",
+            "invite_snapshots": None,
+            "community_facts": "idempotency_key",
+            "event_store": "dedup_key",
+            "retention_deletion_requests": "request_id",
+            "retention_guild_purge_queue": None,
+        }
+        branches = census.FIXTURE_SCOPE_SQL.split("UNION ALL")
+        self.assertEqual(len(branches), len(expected))
+        docs = (ROOT / "docs/staging-fixture-census.md").read_text(
+            encoding="utf-8")
+        for table, column in expected.items():
+            with self.subTest(table=table):
+                branch = [part for part in branches if f"SELECT '{table}'" in part]
+                self.assertEqual(len(branch), 1)
+                self.assertRegex(branch[0], rf"\bFROM {table}\b")
+                columns = re.findall(
+                    r"count\(\*\) FILTER \(WHERE ([a-z_]+) LIKE 'fixture-run:%'\)",
+                    branch[0])
+                self.assertEqual(columns, [column] if column else [])
+                marker = f"`{column}`" if column else "none (totals only)"
+                rows = [line.split("|")[2].strip() for line in docs.splitlines()
+                        if line.startswith(f"| `{table}` |")]
+                self.assertEqual(rows, [marker])
+
+    def test_fixture_cleanup_procedure_does_not_use_totals_as_an_oracle(self):
+        docs = (ROOT / "docs/staging-fixture-census.md").read_text(
+            encoding="utf-8")
+        prose = " ".join(docs.split())
+        self.assertIn("zero marked rows is the completion condition", prose)
+        self.assertIn("does not prove that cleanup touched nothing else", prose)
+        self.assertIn("explain total, unmarked-total and guild-digest deltas", prose)
+        self.assertNotIn("its totals must agree with the pre-seed", prose)
 
     def test_fixture_auxiliaries_are_pinned(self):
         # community_facts stages on the bot-assigned classification; deletion
@@ -785,11 +823,12 @@ class CensusRunTests(unittest.TestCase):
 
 
 class FixtureCensusRunTests(unittest.TestCase):
-    def run_with(self, pgcrypto=True):
+    def run_with(self, pgcrypto=True, capture_output=None):
         guilds = GUILDS_OUT if pgcrypto else GUILDS_NODIGEST_OUT
+        if capture_output is None:
+            capture_output = SCOPE_OUT + guilds
         outputs = [("current_user", IDENTITY_OUT),
-                   ("LIKE 'fixture-run", SCOPE_OUT),
-                   ("guild_count", guilds)]
+                   ("LIKE 'fixture-run", capture_output)]
         fake = canned_run(outputs, pgcrypto)
         clock_value = datetime(2026, 10, 21, 14, 0, 0, tzinfo=timezone.utc)
         stdout = io.StringIO()
@@ -798,6 +837,29 @@ class FixtureCensusRunTests(unittest.TestCase):
                 report = census.run_fixture_census(
                     good_env(), "psql", lambda: clock_value)
         return report, stdout.getvalue(), fake.calls
+
+    def test_both_groups_share_one_repeatable_read_session(self):
+        for pgcrypto in (True, False):
+            with self.subTest(pgcrypto=pgcrypto):
+                _, _, calls = self.run_with(pgcrypto=pgcrypto)
+                self.assertEqual(len(calls), 3)  # identity, capability, E+F
+                capture = calls[-1][0]
+                self.assertTrue(capture.startswith(census.SET_ROLE))
+                self.assertEqual(capture.count("SET ROLE"), 1)
+                self.assertIn("BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY;",
+                              capture)
+                self.assertEqual(capture.count("BEGIN"), 1)
+                self.assertEqual(capture.count("COMMIT;"), 1)
+                self.assertTrue(capture.rstrip().endswith("COMMIT;"))
+                self.assertIn("SET LOCAL statement_timeout = '15s';", capture)
+                self.assertIn("SET LOCAL lock_timeout = '5s';", capture)
+                self.assertIn("AS total", capture)
+                self.assertIn("AS guild_count", capture)
+                self.assertLess(capture.index("AS total"),
+                                capture.index("AS guild_count"))
+                self.assertNotIn("COMMIT;", capture[:capture.index("AS guild_count")])
+                if not pgcrypto:
+                    self.assertNotIn("digest(", capture)
 
     def test_success_reports_scope_and_guilds_once(self):
         report, printed, calls = self.run_with()
@@ -822,11 +884,10 @@ class FixtureCensusRunTests(unittest.TestCase):
         self.assertNotIn(HOST, report)
         self.assertNotIn(GOOD_URL, report)
         self.assertNotIn("PASS", report)
-        # Exactly the shared fences plus E and F, in order.
+        # Exactly the shared fences plus one E/F snapshot, in order.
         scripts = [script for script, _ in calls]
         self.assertEqual(scripts, [census.IDENTITY_SQL, census.PROBE_SQL,
-                                   census.FIXTURE_SCOPE_SQL,
-                                   census.FIXTURE_GUILDS_SQL])
+                                   census.fixture_census_sql(True)])
 
     def test_missing_pgcrypto_falls_back_without_digests(self):
         report, _, calls = self.run_with(pgcrypto=False)
@@ -836,8 +897,25 @@ class FixtureCensusRunTests(unittest.TestCase):
                       report)
         scripts = [script for script, _ in calls]
         self.assertEqual(scripts, [census.IDENTITY_SQL, census.PROBE_SQL,
-                                   census.FIXTURE_SCOPE_SQL,
-                                   census.FIXTURE_GUILDS_NODIGEST_SQL])
+                                   census.fixture_census_sql(False)])
+
+    def test_malformed_combined_capture_is_not_reported(self):
+        for pgcrypto in (True, False):
+            guilds = GUILDS_OUT if pgcrypto else GUILDS_NODIGEST_OUT
+            scope_lines = SCOPE_OUT.splitlines(keepends=True)
+            guild_lines = guilds.splitlines(keepends=True)
+            cases = ("", SCOPE_OUT, guilds, guilds + SCOPE_OUT,
+                     "".join(scope_lines[:-1]) + guilds,
+                     SCOPE_OUT + "".join(guild_lines[:-1]),
+                     SCOPE_OUT + scope_lines[0] + guilds,
+                     SCOPE_OUT + guilds + guild_lines[0],
+                     SCOPE_OUT + guilds.replace("events,", "members,", 1))
+            for output in cases:
+                with self.subTest(pgcrypto=pgcrypto, output=output[:30]):
+                    with mock.patch.object(census, "format_fixture_report") as report:
+                        with self.assertRaises(census.ReadFailed):
+                            self.run_with(pgcrypto=pgcrypto, capture_output=output)
+                    report.assert_not_called()
 
     def test_identity_gate_runs_inside_run_fixture_census(self):
         fake = canned_run([("current_user", "two_bot,two_bot,f\n")])

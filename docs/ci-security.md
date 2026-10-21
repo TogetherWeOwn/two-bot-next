@@ -215,8 +215,11 @@ environment, the routed runner for job `fixture-census`,
 `contents: read`, exactly two unconditional steps, log only with no
 artifact, and no `set -x`, wrangler, apply, seed or purge route. The
 only deliberate differences are its own non-cancelling concurrency
-group, a 10-minute timeout (no in-job sleep: one observation instant),
-and the exact `fixture-scope` command. The identity, role, timeout and
+group, a 10-minute timeout (no in-job sleep), and the exact `fixture-scope`
+command. Both fixture query groups share one psql session and one
+`REPEATABLE READ, READ ONLY` transaction, so the evidence has a single
+database snapshot despite concurrent staging writes. The report timestamp
+records runner-clock capture completion. The identity, role, timeout and
 output fences are the shared ones above; the marker prefix is fixed in
 the queries, so no per-run value ever crosses the dispatch boundary.
 Do not dispatch until the security review for the fixture queries is

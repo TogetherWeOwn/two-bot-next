@@ -37,7 +37,8 @@ fixture tables the read-only role can SELECT (`events`, `members`,
 `invite_snapshots`, `community_facts`, `event_store`,
 `retention_deletion_requests`, `retention_guild_purge_queue`; the role-matrix
 kinds are pinned by the offline suite). Same fences, same counts/digests
-only, no sleep, one observation instant:
+only, no sleep, one REPEATABLE READ, READ ONLY snapshot for E/F (the
+report timestamp is runner-clock capture completion):
   E. per-table totals plus fixture-marker counts. Seeded rows carry the
      fixed `fixture-run:` prefix in one opaque per-table column
      (`events.idempotency_key`, `members.join_source`,
@@ -50,9 +51,9 @@ only, no sleep, one observation instant:
      auxiliaries ride the same rows: the bot-assigned staging/test
      classification count on `community_facts`, and the pending/completed
      split on `retention_deletion_requests` (CHECK-bound, so they sum to the
-     total). Unmarked rows are the non-fixture baseline: pre-seed and
-     post-cleanup runs must show zero marked rows, and the totals at those
-     two instants must agree for cleanup to be complete;
+     total). Pre-seed and post-cleanup runs must show zero marked rows.
+     Total and digest deltas need explanation: staging writers keep running,
+     so equality neither proves cleanup completeness nor preserves real rows;
   F. anonymous guild inventory per table: the distinct-guild count plus the
      sha256 of the sorted guild set and of the sorted per-guild row-count
      distribution. Existence and stability without naming: guild and member
@@ -306,8 +307,7 @@ def cohort_nodigest_sql(anchor_epoch):
 # auxiliaries (community_facts staging/test scope, deletion-request
 # pending/completed split) and NULL elsewhere.
 FIXTURE_SCOPE_SQL = (
-    READ_ONLY_15S
-    + "SELECT 'events' AS tbl, count(*) AS total,\n"
+    "SELECT 'events' AS tbl, count(*) AS total,\n"
     + "       count(*) FILTER (WHERE idempotency_key LIKE 'fixture-run:%') AS marked,\n"
     + "       NULL::bigint AS aux_a, NULL::bigint AS aux_b\n"
     + "  FROM events\n"
@@ -340,7 +340,6 @@ FIXTURE_SCOPE_SQL = (
     + "SELECT 'retention_guild_purge_queue', count(*), NULL::bigint, NULL::bigint,\n"
     + "       NULL::bigint\n"
     + "  FROM retention_guild_purge_queue;\n"
-    + "COMMIT;\n"
 )
 
 
@@ -374,15 +373,22 @@ def _fixture_guild_nodigest_branch(table):
 # on every supported PostgreSQL; an empty table yields count 0 with NULL
 # digests. pgcrypto-absent fallback reports counts without digests.
 FIXTURE_GUILDS_SQL = (
-    READ_ONLY_15S + "UNION ALL\n".join(
-        _fixture_guild_branch(table) for table in FIXTURE_TABLES)
-    + ";\nCOMMIT;\n"
+    "UNION ALL\n".join(_fixture_guild_branch(table) for table in FIXTURE_TABLES)
+    + ";\n"
 )
 FIXTURE_GUILDS_NODIGEST_SQL = (
-    READ_ONLY_15S + "UNION ALL\n".join(
-        _fixture_guild_nodigest_branch(table) for table in FIXTURE_TABLES)
-    + ";\nCOMMIT;\n"
+    "UNION ALL\n".join(_fixture_guild_nodigest_branch(table) for table in FIXTURE_TABLES)
+    + ";\n"
 )
+
+
+def fixture_census_sql(with_digest):
+    """E/F share one snapshot even while staging ingestion keeps writing."""
+    guilds = FIXTURE_GUILDS_SQL if with_digest else FIXTURE_GUILDS_NODIGEST_SQL
+    return (SET_ROLE + "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY;\n"
+            + "SET LOCAL statement_timeout = '15s';\n"
+            + "SET LOCAL lock_timeout = '5s';\n"
+            + FIXTURE_SCOPE_SQL + guilds + "COMMIT;\n")
 
 
 class Refused(Exception):
@@ -664,6 +670,10 @@ def _parse_maybe_count(value, allowed):
 
 
 def parse_fixture_scope(output):
+    return _parse_fixture_scope_rows(csv_rows(output))
+
+
+def _parse_fixture_scope_rows(rows):
     """Per-table (total, marked_or_None, aux_a_or_None, aux_b_or_None).
 
     Every UNION ALL branch returns exactly one row, so all seven labels must
@@ -673,7 +683,7 @@ def parse_fixture_scope(output):
     CHECK binds status to those two values).
     """
     found = {}
-    for raw in csv_rows(output):
+    for raw in rows:
         if len(raw) != 5 or raw[0] not in FIXTURE_TABLES or raw[0] in found:
             raise ReadFailed("a row had an unexpected shape; nothing was reported")
         table = raw[0]
@@ -702,6 +712,10 @@ def _parse_maybe_digest(value):
 
 
 def parse_fixture_guilds(output, with_digest):
+    return _parse_fixture_guild_rows(csv_rows(output), with_digest)
+
+
+def _parse_fixture_guild_rows(rows, with_digest):
     """Per-table (guild_count, set_digest_or_None, dist_digest_or_None).
 
     An empty table reports count 0 with NULL digests; a non-empty table must
@@ -710,7 +724,7 @@ def parse_fixture_guilds(output, with_digest):
     labels are required.
     """
     found = {}
-    for raw in csv_rows(output):
+    for raw in rows:
         if with_digest and len(raw) != 4 or not with_digest and len(raw) != 2:
             raise ReadFailed("a row had an unexpected shape; nothing was reported")
         if raw[0] not in FIXTURE_TABLES or raw[0] in found:
@@ -839,20 +853,17 @@ def run_census(env, psql, clock, sleep_fn):
 
 
 def run_fixture_census(env, psql, clock):
-    """Every fence, then E/F once at dispatch time. Returns the report.
+    """Every fence, then E/F in one repeatable-read, read-only snapshot.
 
-    Point-in-time by design: both groups run back-to-back with one
-    observation instant and no sleep, so a dispatch is one census-at-time
-    capture for the run record it is filed under.
+    Each result set has exactly seven labeled aggregate rows. Parse the
+    combined CSV once, then validate both sets before reporting anything.
+    The runner-clock timestamp records capture completion, not the server
+    snapshot acquisition time.
     """
     pg_env, pgcrypto = connect_read_only(env, psql)
-    scope = parse_fixture_scope(run_psql(psql, pg_env, FIXTURE_SCOPE_SQL))
-    if pgcrypto:
-        guilds = parse_fixture_guilds(
-            run_psql(psql, pg_env, FIXTURE_GUILDS_SQL), True)
-    else:
-        guilds = parse_fixture_guilds(
-            run_psql(psql, pg_env, FIXTURE_GUILDS_NODIGEST_SQL), False)
+    rows = csv_rows(run_psql(psql, pg_env, fixture_census_sql(pgcrypto)))
+    scope = _parse_fixture_scope_rows(rows[:len(FIXTURE_TABLES)])
+    guilds = _parse_fixture_guild_rows(rows[len(FIXTURE_TABLES):], pgcrypto)
     return format_fixture_report(format_instant(clock()), scope, guilds,
                                  pgcrypto)
 
