@@ -525,11 +525,15 @@ impl SelfRoleRuntime {
                 return Err(RuntimeError::Store(StoreErrorKind::UnmatchedReceipt));
             }
         } else if exchange.is_ok() {
-            store_io(
+            if let Err(error) = store_io(
                 self.store
                     .note_ambiguous_outcome(ticket, "timeout_no_response"),
             )
-            .await?;
+            .await
+            {
+                // The journaled ticket already records pending uncertainty.
+                warn!(?error, "self-role timeout outcome note failed");
+            }
         }
         Ok(())
     }

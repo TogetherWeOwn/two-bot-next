@@ -428,6 +428,7 @@ async fn exercise(pool: &PgPool) -> TestResult {
     lost_panel_lane_release_is_logged(pool).await?;
     zero_row_receipt_completion_is_unmatched_receipt(pool).await?;
     settlement_timeout_note_and_ambiguous_class(pool).await?;
+    timeout_note_store_failure_stays_non_fatal(pool).await?;
     Ok(())
 }
 
@@ -4301,6 +4302,65 @@ async fn settlement_timeout_note_and_ambiguous_class(pool: &PgPool) -> TestResul
         Some("response_ambiguous"),
         "an ambiguous receipt must persist its class"
     );
+    mock.shutdown().await;
+    Ok(())
+}
+
+/// A failing timeout note must not abort the step. The ticket is already
+/// durably pending, so `complete_step_receipt` logs the store error and
+/// continues instead of returning it and skipping the checkpoint.
+async fn timeout_note_store_failure_stays_non_fatal(pool: &PgPool) -> TestResult {
+    let clock = Arc::new(AtomicI64::new(NOW));
+    let mock = MockRest::start(snapshot(&[OLD_ROLE, OTHER]), ScriptedResponse::status(500)).await;
+    let feature = runtime(pool, &clock, &mock);
+    let mut panel = panel(PanelMode::Select);
+    panel.id = "timeout-note-failure".into();
+    let request = request(
+        "timeout-note-failure-event",
+        Selection::Select {
+            option_keys: vec!["new".into()],
+        },
+    );
+    let mut prepared = ready(feature.prepare(&request, &panel).await.unwrap());
+    let ticket = feature
+        .store
+        .journal_role_exchange(
+            &prepared.event,
+            prepared.panel.as_ref(),
+            &ExchangeIntent {
+                role_id: NEW_ROLE.into(),
+                adding: true,
+                compensating: false,
+            },
+        )
+        .await?
+        .unwrap();
+    // Every store call fails fast: the disposable test service refuses the
+    // unknown database on first use. The receipt only needs the ticket data.
+    let failing = PgPoolOptions::new().max_connections(1).connect_lazy_with(
+        PgConnectOptions::new()
+            .host("agent-testdb")
+            .port(5432)
+            .username("agent_test")
+            .database("self_role_note_failure_probe"),
+    );
+    let failing_feature = runtime(&failing, &clock, &mock);
+    let timeout = Ok(RoleExchange {
+        result: Err(SelfRoleRestError::Ambiguous),
+        owned_after: false,
+        response_received: false,
+        response_status: None,
+    });
+    assert!(
+        failing_feature
+            .complete_step_receipt(&ticket, &timeout)
+            .await
+            .is_ok(),
+        "a failed timeout note must not abort the receipt"
+    );
+    failing.close().await;
+    feature.park(&mut prepared).await;
+    drop(prepared);
     mock.shutdown().await;
     Ok(())
 }
