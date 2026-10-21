@@ -3,7 +3,7 @@
 
 use std::future::Future;
 use std::sync::{
-    atomic::{AtomicI64, Ordering},
+    atomic::{AtomicI64, AtomicU64, Ordering},
     Arc,
 };
 use std::time::Duration;
@@ -79,6 +79,51 @@ async fn acknowledgement_oversized_row_refused_at_journal() -> TestResult {
         .await
 }
 
+static SCHEMA_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn schema_name_at(pid: u32, timestamp: Duration) -> String {
+    let nonce = timestamp.as_nanos();
+    let sequence = SCHEMA_SEQ.fetch_add(1, Ordering::Relaxed);
+    // At most 61 bytes: prefix 11 + PID 8 + separators 2 + nanos 24 + sequence 16.
+    // Keep the sequence inside PostgreSQL's 63-byte identifier limit.
+    format!("self_roles_{pid:x}_{nonce:x}_{sequence:016x}")
+}
+
+#[test]
+fn schema_names_are_distinct_and_bounded_when_the_clock_repeats() {
+    let barrier = std::sync::Barrier::new(8);
+    let names = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    (0..32)
+                        .map(|_| schema_name_at(u32::MAX, Duration::MAX))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().expect("schema allocation worker"))
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(names.len(), 256);
+    assert_eq!(
+        names.iter().collect::<std::collections::HashSet<_>>().len(),
+        names.len(),
+        "concurrent fixtures must not share a schema when PID and timestamp repeat"
+    );
+    for name in names {
+        assert!(name.len() <= 63, "Postgres must not truncate {name}");
+        assert!(name.starts_with("self_roles_"));
+        assert!(name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'));
+    }
+}
+
 /// One generated schema per scenario, dropped after the scenario runs.
 async fn with_isolated_schema<F, Fut>(scenario: F) -> TestResult
 where
@@ -95,13 +140,11 @@ where
         .max_connections(1)
         .connect_with(options.clone())
         .await?;
-    // Generated identifier contains digits/underscore only. Each run gets its
-    // own namespace, and cleanup never touches another test's tables.
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_nanos();
-    let schema = format!("self_roles_{}_{}", std::process::id(), nonce);
-    // Audited: identifier is a fixed prefix plus numeric PID and timestamp.
+    // Generated identifier contains lowercase ASCII/digits/underscores only.
+    // Each scenario owns its namespace; cleanup uses that exact same identifier.
+    let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    let schema = schema_name_at(std::process::id(), timestamp);
+    // Audited: bounded identifier is a fixed prefix plus hex PID, time and sequence.
     // https://docs.rs/sqlx/0.9.0/sqlx/struct.AssertSqlSafe.html
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
         .execute(&admin)
