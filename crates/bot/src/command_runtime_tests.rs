@@ -19,6 +19,8 @@
 
 #[path = "member_dispatch_authority_acceptance.rs"]
 mod member_dispatch_authority_acceptance;
+#[path = "sticky_uncertain_acceptance_tests.rs"]
+mod sticky_uncertain_acceptance_tests;
 
 use std::collections::VecDeque;
 use std::str::FromStr;
