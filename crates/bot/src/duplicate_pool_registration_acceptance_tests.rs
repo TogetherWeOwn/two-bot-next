@@ -30,12 +30,18 @@
 //!
 //! Isolation: the counter and the global pool slot are process-global. Each
 //! behavioral assertion runs in a fresh child process (the test binary
-//! re-executed with `--exact <child> --ignored`) so counts are deterministic
+//! re-executed with `<probe> --exact --nocapture`, following the repo's
+//! `backup_cli::tests::tls_admission_guard_child` /
+//! `admission_test_support::run_probe` recipe) so counts are deterministic
 //! (`0` with no registrations, `1` with one reject) and no parent-process
 //! global is mutated. Parent tests only spawn children and parse receipt
-//! lines; they never call `register_pool` themselves. This is offline-only:
-//! lazy pools (`connect_lazy`, no I/O), in-process `oneshot` router calls, no
-//! network, no database, no `TWO_TEST_DATABASE_URL`, no Discord.
+//! lines; they never call `register_pool` themselves. The probes are plain
+//! tests gated on `DUPLICATE_POOL_CHILD_PROBE`: in normal suite runs the env
+//! var is unset and they return immediately without touching any global (no
+//! `#[ignore]`: the floor guard bans new skips, and an ignored probe cannot
+//! be re-selected reliably). This is offline-only: lazy pools
+//! (`connect_lazy`, no I/O), in-process `oneshot` router calls, no network,
+//! no database, no `TWO_TEST_DATABASE_URL`, no Discord.
 //!
 //! RED now (behavioral, not compile): the increment control passes, the two
 //! surfacing tests fail with assertion panics naming the absent gauge. GREEN
@@ -62,6 +68,9 @@ use crate::server::SharedState;
 const OPS_FIELD: &str = "duplicate_pool_registrations";
 /// Stable scrape metric name (label-free gauge in the pool family).
 const SCRAPE_METRIC: &str = "two_bot_db_pool_duplicate_registrations";
+/// Gates the child probes: only a parent-spawned child sets this. Normal
+/// suite runs leave it unset, so the probes return without touching globals.
+const PROBE_ENV: &str = "DUPLICATE_POOL_CHILD_PROBE";
 
 fn lazy_pool(max: u32) -> sqlx::PgPool {
     sqlx::postgres::PgPoolOptions::new()
@@ -116,8 +125,7 @@ async fn fetch_scrape_text(app: &Router) -> String {
 }
 
 fn print_receipt(key: &str, value: &str) {
-    // Leading newline separates the receipt from libtest's prefix (precedent:
-    // `metrics_process_incarnation_acceptance::process_incarnation_child_probe`).
+    // Leading newline separates the receipt from libtest's prefix.
     writeln!(std::io::stdout().lock(), "\n{key}={value}").expect("write child receipt");
 }
 
@@ -140,11 +148,13 @@ fn scrape_duplicate_type(scrape: &str) -> String {
 }
 
 /// Fresh-process probe: one install plus one reject, then the count and both
-/// surfaces. Runs only via `--exact` from a parent test (ignored in normal
-/// runs so it never mutates the shared test process).
+/// surfaces. Runs only as a parent-spawned child (`PROBE_ENV` set); in normal
+/// suite runs it returns immediately so it never mutates the shared process.
 #[tokio::test]
-#[ignore]
 async fn duplicate_pool_child_probe_with_reject() {
+    if std::env::var_os(PROBE_ENV).is_none() {
+        return;
+    }
     let first = lazy_pool(3);
     let second = lazy_pool(7);
     assert!(
@@ -172,10 +182,13 @@ async fn duplicate_pool_child_probe_with_reject() {
 }
 
 /// Fresh-process probe: no registrations at all (count zero, pool `None`).
-/// Runs only via `--exact` from the zero-state parent test.
+/// Runs only as a parent-spawned child (`PROBE_ENV` set); in normal suite
+/// runs it returns immediately so it never mutates the shared process.
 #[tokio::test]
-#[ignore]
 async fn duplicate_pool_child_probe_zero() {
+    if std::env::var_os(PROBE_ENV).is_none() {
+        return;
+    }
     let count = crate::metrics_http::duplicate_registration_count();
     assert_eq!(count, 0, "fresh child with no registrations must count 0");
     print_receipt("DUPLICATE_COUNT", &count.to_string());
@@ -195,17 +208,16 @@ async fn duplicate_pool_child_probe_zero() {
 fn run_child_probe(child_fn: &str) -> (String, String, bool) {
     let test_path = format!("{}::{child_fn}", module_path!());
     let output = Command::new(std::env::current_exe().expect("test executable"))
-        .args([
-            "--exact",
-            &test_path,
-            "--nocapture",
-            "--ignored",
-            "--test-threads=1",
-        ])
+        .args([&test_path, "--exact", "--nocapture"])
+        .env(PROBE_ENV, "1")
         .output()
         .expect("spawn isolated child probe (infra: failed to spawn test binary)");
     let stdout = String::from_utf8(output.stdout).expect("child stdout is UTF-8");
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        stdout.contains("running 1 test"),
+        "child probe filter must select exactly the probe (infra: filter missed); stderr:\n{stderr}\nstdout:\n{stdout}"
+    );
     (stdout, stderr, output.status.success())
 }
 
