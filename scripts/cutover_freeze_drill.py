@@ -685,7 +685,13 @@ def main(argv=None, call=None):
     if args.dry_run:
         # Guards above already validated guild, reason, transport mode and
         # (for live) confirm, channel and token exactly like the live path.
-        # The plan prints the validated values without touching Discord.
+        # Run the read-only baseline step so a wrong-guild or already-locked
+        # channel refuses exactly like live step 1, then print the plan.
+        try:
+            _read_baseline(call, channel)
+        except DrillError as error:
+            print(f"FAIL baseline-read: {error}")
+            return 1
         print(dry_run_plan_text(args.guild_id, channel,
                                 check_reason(args.reason), transport))
         return 0

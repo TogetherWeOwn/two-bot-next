@@ -691,5 +691,48 @@ class OwnershipControlTimeoutTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["timeout"], drill.OWNERSHIP_CONTROL_TIMEOUT_SECONDS)
 
 
+class DryRunPlanPinTests(unittest.TestCase):
+    """Builder pins: --dry-run binds each version to its label and leg."""
+
+    def environ(self):
+        return {"STAGING_WORKER_URL": URL, "OWNERSHIP_CONTROL_TOKEN": SENTINEL,
+                "GITHUB_RUN_ID": "123456", "CLOUDFLARE_ACCOUNT_ID": ACCOUNT,
+                "CLOUDFLARE_API_TOKEN": "t" * 40}
+
+    def dry_run(self):
+        world = World()
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory) / "evidence.json"
+            output = io.StringIO()
+            with patch("builtins.print",
+                       lambda *a, **k: output.write(" ".join(map(str, a)) + "\n")), \
+                    patch.object(drill, "POLL_SECONDS", 0):
+                code = drill.main(
+                    ["--target-version", TARGET, "--dry-run",
+                     "--evidence", str(evidence)],
+                    environ=self.environ(),
+                    make_control=lambda token, url, actor: make_control(world),
+                    client_factory=lambda account, token: FakeClient(world))
+        return code, output.getvalue(), world
+
+    def test_plan_pins_labeled_versions_and_numbered_leg_order(self):
+        code, out, world = self.dry_run()
+        self.assertEqual(code, 0)
+        lines = out.splitlines()
+        self.assertIn(f"target_version: {TARGET}", lines)
+        self.assertIn(f"pre_version: {PRE}", lines)
+        drill_lines = [line for line in lines if line.startswith("1. drill")]
+        restore_lines = [line for line in lines if line.startswith("2. restore")]
+        self.assertEqual(len(drill_lines), 1)
+        self.assertEqual(len(restore_lines), 1)
+        self.assertIn(TARGET, drill_lines[0])
+        self.assertIn(PRE, restore_lines[0])
+        self.assertLess(out.index("1. drill"), out.index("2. restore"))
+        self.assertEqual(world.posts, [])
+        mutating = [call for call in world.calls
+                    if call[0] in ("fence", "deployment-takeover")]
+        self.assertEqual(mutating, [])
+
+
 if __name__ == "__main__":
     unittest.main()
