@@ -87,7 +87,10 @@ Placement and secrecy rules:
 - `MusicGates`: exact-`"1"` `TWO_MUSIC` gate (mirrors `VoiceGates`).
 - `VoicePairing`: per-guild pairing cache. Server and state halves arrive on
   separate dispatches in either order; a bot-leave (`None` channel) drops
-  the guild entry; a server refresh replaces the endpoint.
+  the guild entry; a server refresh replaces the endpoint. A post-completion
+  server half is kept for a following new session (server-first rejoin), so
+  a region move followed by an external move transiently re-pairs the region
+  half until the new session's own server half lands and heals it.
 - `PlayerVoiceUpdate::player_path` / `voice_body`: the exact v4 PATCH path
   and JSON body, snowflakes as strings.
 - `is_staging_guild`: the never-forward-outside-staging fence.

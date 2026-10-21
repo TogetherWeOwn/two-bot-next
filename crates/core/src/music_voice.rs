@@ -58,6 +58,14 @@ struct PartialVoice {
     /// confirmed it yet. Disambiguates a region move (same session, no
     /// state follows) from a rejoin arriving server-first (new state
     /// follows and must keep, not drop, this half).
+    ///
+    /// Kept halves are ambiguous by construction: a region move followed
+    /// later by an externally-initiated new session looks identical to a
+    /// server-first rejoin, so the new session transiently pairs with the
+    /// previous server half until its own server half lands and replaces
+    /// it (one extra PATCH, then healed). Dropping instead would stall a
+    /// genuine server-first rejoin whose server half already arrived — a
+    /// permanent silence versus a self-healing transient — so keep wins.
     server_after_complete: bool,
 }
 
@@ -99,8 +107,11 @@ impl VoicePairing {
     /// A new session id starts a new handshake generation: the server half
     /// paired with the previous session is stale and is dropped, so the new
     /// session can never reuse the prior token or endpoint — unless a server
-    /// half arrived after the pair completed, which is the new generation
-    /// arriving server-first and is kept. A pending server half with no
+    /// half arrived after the pair completed, which is assumed to be the new
+    /// generation arriving server-first and is kept (a region move followed
+    /// by an external move therefore transiently re-pairs the region half
+    /// until the new session's own server half heals it; see the field
+    /// docs). A pending server half with no
     /// session yet is kept as the matching half (initial join server-first),
     /// and a repeated same-session state keeps the pair (mute/deafen frames
     /// carry the same session).
@@ -406,11 +417,64 @@ mod tests {
         assert_eq!(update.session_id, "session");
         assert_eq!(update.token.expose(), "new-token");
         assert_eq!(update.endpoint, "new-endpoint");
-        // A redundant same-session state afterwards confirms the pair and
-        // clears the flag without dropping anything.
+        // No state follows: that is the region-move premise. The
+        // confirming-state path is pinned by
+        // `same_session_state_disarms_post_completion_flag` instead.
+    }
+
+    #[test]
+    fn region_then_external_move_heals_on_next_server_half() {
+        let mut pairing = VoicePairing::new();
+        pairing.observe_server(10, "old-token", "old-endpoint");
+        pairing.observe_state(10, "session", Some(30));
+        // Region move: no state follows, the new half PATCHes at once.
+        pairing.observe_server(10, "region-token", "region-endpoint");
+        let update = pairing.complete(10).expect("region move stays complete");
+        assert_eq!(update.token.expose(), "region-token");
+        // A moderator moves the bot: new session, new channel, arriving
+        // state-first. Indistinguishable from a server-first rejoin, so the
+        // region half transiently pairs with the new session (documented
+        // tradeoff) instead of stalling for a server half that, in the
+        // rejoin case, already arrived.
+        pairing.observe_state(10, "moved-session", Some(31));
+        let transient = pairing
+            .complete(10)
+            .expect("transient re-pair, not a stall");
+        assert_eq!(transient.session_id, "moved-session");
+        assert_eq!(transient.token.expose(), "region-token");
+        // The move's own server half lands and heals the pair.
+        pairing.observe_server(10, "moved-token", "moved-endpoint");
+        let update = pairing.complete(10).expect("move heals on its server half");
+        assert_eq!(update.session_id, "moved-session");
+        assert_eq!(update.token.expose(), "moved-token");
+        assert_eq!(update.endpoint, "moved-endpoint");
+        assert_eq!(update.channel_id, 31);
+    }
+
+    #[test]
+    fn same_session_state_disarms_post_completion_flag() {
+        let mut pairing = VoicePairing::new();
+        pairing.observe_server(10, "old-token", "old-endpoint");
+        pairing.observe_state(10, "session", Some(30));
+        pairing.observe_server(10, "region-token", "region-endpoint");
+        // A redundant same-session state confirms the region half and
+        // disarms the flag without dropping anything.
         pairing.observe_state(10, "session", Some(30));
         let update = pairing.complete(10).expect("confirmed pair stays");
-        assert_eq!(update.endpoint, "new-endpoint");
+        assert_eq!(update.endpoint, "region-endpoint");
+        // A later new session now drops the confirmed half: the flag is
+        // gone, so this is a fresh generation, not a server-first rejoin.
+        // Deleting the disarm makes this pair instead of returning `None`.
+        pairing.observe_state(10, "new-session", Some(30));
+        assert_eq!(
+            pairing.complete(10),
+            None,
+            "confirmed half is stale once the session turns over"
+        );
+        pairing.observe_server(10, "new-token", "new-endpoint");
+        let update = pairing.complete(10).expect("fresh halves pair");
+        assert_eq!(update.session_id, "new-session");
+        assert_eq!(update.token.expose(), "new-token");
     }
 
     #[test]
