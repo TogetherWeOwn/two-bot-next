@@ -60,6 +60,14 @@ IMAGE_MAX_BYTES = 112 * MIB
 # revisit if the binary approaches it.
 # The voice actor-init retry measured 16,782,904 bytes (+6,808, no new dependencies).
 BINARY_MAX_BYTES = 17 * MIB
+# CLI refusal bounds (not budget policy): --image-max-bytes/--binary-max-bytes
+# outside 1..cap are unusable — a non-positive budget can never pass and a
+# gigantic one silently disables the budget — so main() refuses them with a
+# fixed message before any Docker call. The caps sit far above any sane
+# override (defaults are 112 MiB/17 MiB) and far below budget-disabling
+# magnitudes; sane values pass through byte-identically.
+IMAGE_BUDGET_CAP_BYTES = 1024 * MIB
+BINARY_BUDGET_CAP_BYTES = 256 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
 # docker cp archives from a never-started container instead of exec helpers.
 BINARY = "/home/nonroot/two-bot"
@@ -85,6 +93,17 @@ class BodyTooLarge(RuntimeError):
 def require(condition, message):
     if not condition:
         raise RuntimeError(message)
+
+
+def check_budget(value, flag, cap, cap_label):
+    """Refuse an unusable CLI size budget before any Docker call.
+
+    Raises RuntimeError with a fixed message naming the flag; main()
+    reports it through the FAIL container smoke contract. The supplied
+    value is never echoed.
+    """
+    if not 1 <= value <= cap:
+        raise RuntimeError(f"refusing: {flag} must be a positive size within {cap_label}")
 
 
 def docker(*args, timeout=30, check=True, text=True):
@@ -224,6 +243,16 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
     # present-but-non-string Id must FAIL here, not as a TypeError.
     require(isinstance(metadata.get("Id"), str), "docker image inspect entry has no Id")
     require("Size" in metadata, "docker image inspect entry has no Size")
+    # An empty Id would reach docker as a vacuous argument; reject it with
+    # the field named, like every other malformed image field here.
+    require(metadata["Id"], "docker image inspect Id must be a nonempty string")
+    # Config and Healthcheck shapes are validated here, with the rest of
+    # the image probe, so a malformed entry fails before the history call
+    # and before any container exists.
+    require(isinstance(metadata.get("Config"), dict),
+            "docker image inspect entry has no Config")
+    require(isinstance(metadata["Config"].get("Healthcheck", {}), dict),
+            "docker image inspect Config Healthcheck must be an object")
     # Resolve the tag once; measurement and every image probe use this ID.
     image = metadata["Id"]
     report(f"Docker storage-driver Size (diagnostic only): {metadata['Size']} bytes")
@@ -251,16 +280,12 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
         report(f"{label}: {size} bytes ({size / MIB:.2f} MiB); budget {limit} bytes ({limit / MIB:.2f} MiB)")
     require(measured_image_bytes <= image_max_bytes, "image exceeds size budget")
     require(binary_bytes <= binary_max_bytes, "release binary exceeds size budget")
-    # A missing or non-object Config, or a present-but-non-object
-    # Healthcheck, is a malformed-probe FAIL naming the field -- never a
-    # KeyError/AttributeError traceback. An absent Healthcheck keeps the
-    # {} default and fails on the Test assertion below.
-    config = metadata.get("Config")
-    require(isinstance(config, dict), "docker image inspect entry has no Config")
+    # Config and Healthcheck shapes were validated with the image probe
+    # above, before the history call, so both are objects here. An absent
+    # Healthcheck keeps the {} default and fails on the Test assertion below.
+    config = metadata["Config"]
     require(config.get("User") not in (None, "", "root", "0", "0:0"), "image must specify a non-root user")
     healthcheck = config.get("Healthcheck", {})
-    require(isinstance(healthcheck, dict),
-            "docker image inspect Config Healthcheck must be an object")
     require(healthcheck.get("Test") == ["CMD", BINARY, "--healthcheck"],
             "image HEALTHCHECK must invoke the runtime's --healthcheck")
     # Any account (including the configured non-root user) must be able to
@@ -387,6 +412,8 @@ def main():
     parser.add_argument("--binary-max-bytes", type=int, default=BINARY_MAX_BYTES)
     args = parser.parse_args()
     try:
+        check_budget(args.image_max_bytes, "--image-max-bytes", IMAGE_BUDGET_CAP_BYTES, "1 GiB")
+        check_budget(args.binary_max_bytes, "--binary-max-bytes", BINARY_BUDGET_CAP_BYTES, "256 MiB")
         smoke(args.image, args.image_max_bytes, args.binary_max_bytes)
     except (RuntimeError, subprocess.SubprocessError, ValueError, KeyError) as error:
         raise SystemExit(f"FAIL container smoke: {error}") from error

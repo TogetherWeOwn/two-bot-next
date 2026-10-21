@@ -308,10 +308,10 @@ for (const ingress of INGRESS_CASES) {
   test(`${ingress.name} relayed JSON keeps supported content and header filtering with hardening`, async (t) => {
     t.mock.method(console, "warn", () => {});
     const requestId = newRequestId();
-    const ack = { ok: true, request_id: requestId };
-    const json = ingress.name === "actions"
-      ? '{ "ok": true, "text": "café" }\n'
-      : JSON.stringify({ ...ack, text: "café" });
+    const ack = ingress.name === "actions"
+      ? { ok: true, request_id: requestId, result: { message_id: "1" } }
+      : { ok: true, request_id: requestId };
+    const json = JSON.stringify({ ...ack, text: "café" });
     for (const body of [new TextEncoder().encode(json), null]) {
       for (const retry of ["7", "7.5"]) {
         await t.test(`${body === null ? "empty" : "streamed"} body, retry-after ${retry}`, async () => {
@@ -327,18 +327,16 @@ for (const ingress of INGRESS_CASES) {
               "set-cookie": "fixture=value",
             },
           }), requestId);
-          const refusedEmpty = ingress.name === "EventSub" && body === null;
+          const refusedEmpty = body === null;
           const projected = refusedEmpty
             ? { ok: false, request_id: requestId, error: { code: "unavailable", message: "request refused", retryable: true } }
             : ack;
-          const expectedBody = ingress.name === "actions"
-            ? body ?? new Uint8Array()
-            : new TextEncoder().encode(JSON.stringify(projected));
+          const expectedBody = new TextEncoder().encode(JSON.stringify(projected));
           assert.equal(response.status, refusedEmpty ? 503 : 200);
           assert.deepEqual(new Uint8Array(await response.arrayBuffer()), expectedBody);
-          assert.equal(response.headers.get("content-type"), ingress.media);
+          assert.equal(response.headers.get("content-type"), refusedEmpty ? "application/json" : ingress.media);
           assert.equal(response.headers.get("retry-after"), !refusedEmpty && retry === "7" ? "7" : null);
-          assert.equal(response.headers.get("idempotent-replay"), ingress.name === "actions" ? "true" : null);
+          assert.equal(response.headers.get("idempotent-replay"), ingress.name === "actions" && !refusedEmpty ? "true" : null);
           assert.equal(response.headers.get("cache-control"), "no-store");
           assert.equal(response.headers.get("set-cookie"), null);
           assertHardened(response.headers, `${ingress.name} relayed 200`);
