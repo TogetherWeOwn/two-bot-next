@@ -334,7 +334,13 @@ async fn two_commands_before_first_ready_tick_keep_the_expiry_initiator() {
         .expect("expiry row for the reaped vote");
     assert_eq!(result.initiator_id, VOTER_A);
     assert_eq!(result.target_id, TARGET);
-    // The fence releases once the tick settles the vote: no leak.
+    // The fence releases once the tick settles the vote and the terminal
+    // ballot edit drains: no leak.
+    assert!(
+        worker.dispatch_one(past_horizon + 4).await,
+        "drain the terminal ballot edit"
+    );
+    worker.kick_refresh(past_horizon + 5);
     assert!(!worker.vote_initiators.contains_key(&VOTE));
 }
 
