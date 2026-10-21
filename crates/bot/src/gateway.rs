@@ -2115,6 +2115,10 @@ pub async fn build_voice_runtime(
 }
 
 #[cfg(test)]
+#[path = "gateway_drop_poison_acceptance_tests.rs"]
+mod drop_poison_acceptance_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

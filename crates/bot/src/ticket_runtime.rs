@@ -457,7 +457,14 @@ impl TicketRuntime {
     }
 
     fn stop_tasks(&self) {
-        let mut tasks = self.tasks.lock().expect("ticket task scope");
+        // Drop-reachable (`TicketSupervisor::drop`) and shared with async
+        // shutdown: recover silently so a poisoned scope still aborts its
+        // tasks instead of panicking during unwinding. No counter: non-drop
+        // callers must never be miscounted as drop poison.
+        let mut tasks = self
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.stopping.store(true, Ordering::Release);
         tasks.abort_all();
     }
@@ -1154,6 +1161,10 @@ fn panels(messages: Vec<Value>) -> Result<Vec<PanelMessage>> {
 #[cfg(test)]
 #[path = "ticket_runtime_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "ticket_drop_poison_acceptance_tests.rs"]
+mod drop_poison_acceptance_tests;
 
 #[cfg(test)]
 #[path = "ticket_timer_tests.rs"]

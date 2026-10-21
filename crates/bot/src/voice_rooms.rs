@@ -8325,7 +8325,17 @@ where
         // Clear before invalidating the views so a concurrent dispatch
         // cannot heal a view this transport loss is about to invalidate.
         self.gateway_connected.store(false, Ordering::Release);
-        for actor in self.actors.lock().expect("voice runtime lock").values() {
+        // Drop-reachable (`VoiceConnectionGuard::drop` via `VoiceEventSink`)
+        // and shared with live disconnects: recover silently so a poisoned
+        // registry still invalidates its views instead of panicking during
+        // unwinding. No counter: non-drop callers must never be miscounted
+        // as drop poison.
+        for actor in self
+            .actors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+        {
             actor.live.transport_lost();
         }
         // Game-activity wiring: transport loss invalidates live voice state,
