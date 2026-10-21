@@ -3,17 +3,21 @@
 
 Supported automated verification runs Cargo through the controller cache
 wrapper only: `python3 scripts/cargo_cache.py run -- test -p <package>
-[--lib | --test <target> | --tests] [filters] [-- <libtest>]`. The supported
+[--lib | --test <target> | --tests] [filter] [-- <libtest>]`. The supported
 option vocabulary is bounded: Cargo side `-p`/`--package`, `--test`,
 `--lib`, `--tests`, `--all-targets`, `--features`; libtest side (after `--`)
 `--exact`, `--ignored`, `--include-ignored`, `--skip <pattern>`
 (repeatable), `--test-threads <n>`. Cargo `--no-run` and libtest `--list`
 never execute tests and are refused as automated coverage, as are unknown
 flags, missing or invalid option values, and known options in the wrong
-position. Effective selection is the union of positive filters (exact when
-`--exact`, else substring) minus `--skip` patterns, read offline from
-source and never run; it must be nonempty. Static executable selection is
-not an execution verdict: attach actual run evidence separately.
+position. Cargo accepts at most one positional filter before `--`; pass
+additional filters after `--` where libtest accepts several. Effective
+selection is the union of positive filters (exact when `--exact`, else
+substring) under ignore-mode filtering (default excludes `#[ignore]`,
+`--ignored` selects only ignored, `--include-ignored` selects all matched)
+minus `--skip` patterns, read offline from source and never run; it must be
+nonempty. Static executable selection is not an execution verdict: attach
+actual run evidence separately.
 
 Offline regression: `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py`
 plus `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p
@@ -260,19 +264,26 @@ def is_test_attribute(tokens):
             and tokens[end + 1:end + 2] in ([], [("punct", "(")]))
 
 
-def libtest_names(path, mod_rs=True, prefix=(), seen=None):
-    """Libtest names (`module::fn`) of test fns reachable from a target root.
+def is_ignore_attribute(tokens):
+    """`#[ignore]` and `#[ignore = "..."]` attributes."""
+    return bool(tokens) and tokens[0] == ("ident", "ignore")
+
+
+def _libtest_entries(path, mod_rs=True, prefix=(), seen=None):
+    """`(name, ignored)` pairs of test fns reachable from a target root.
 
     Follows `mod name;` (including `#[path]`) and inline `mod name { }` like
     rustc, ignoring cfg: a renamed or removed test leaves no name behind.
     Frames hold a module name, "" for a macro body or None for other blocks.
+    Ignored identity comes from `#[ignore]` on the test fn; inline, external
+    file and integration targets all preserve it.
     """
     seen = set() if seen is None else seen
     if path.resolve() in seen:
         return []
     seen.add(path.resolve())
     tokens = rust_tokens(path.read_text())
-    names = []
+    entries = []
     frames = []
     attributes = []
     i = 0
@@ -322,20 +333,37 @@ def libtest_names(path, mod_rs=True, prefix=(), seen=None):
                     candidates = ((base / f"{name}.rs", False), (base / name / "mod.rs", True))
                 for child, child_mod_rs in candidates:
                     if child.is_file():
-                        names += libtest_names(child, child_mod_rs,
-                                               (*prefix, *inline, name), seen)
+                        entries += _libtest_entries(child, child_mod_rs,
+                                                    (*prefix, *inline, name), seen)
                         break
         elif (token == ("ident", "fn") and following and following[0][0] == "ident"
               and None not in frames and any(map(is_test_attribute, attributes))):
-            names.append("::".join((*prefix, *inline, following[0][1])))
+            name = "::".join((*prefix, *inline, following[0][1]))
+            entries.append((name, any(map(is_ignore_attribute, attributes))))
         i += 1
-    return names
+    return entries
+
+
+def libtest_names(path, mod_rs=True, prefix=(), seen=None):
+    """Libtest names (`module::fn`) of test fns reachable from a target root.
+
+    Follows `mod name;` (including `#[path]`) and inline `mod name { }` like
+    rustc, ignoring cfg: a renamed or removed test leaves no name behind.
+    Frames hold a module name, "" for a macro body or None for other blocks.
+    """
+    return [name for name, _ in _libtest_entries(path, mod_rs, prefix, seen)]
 
 
 @cache
 def target_tests(root):
     """Test names of one target root; sources are fixed for a process."""
     return frozenset(libtest_names(root))
+
+
+@cache
+def target_ignored_tests(root):
+    """Ignored test names of one target root; sources are fixed for a process."""
+    return frozenset(name for name, ignored in _libtest_entries(root) if ignored)
 
 
 def workspace_packages(root):
@@ -385,7 +413,9 @@ def check_cargo_test(args, root, packages):
     """Fail unless `cargo test` args name a real package, target and tests."""
     if args[:1] != ["test"]:
         raise ValueError(f"automated verification must be `cargo test`: {' '.join(args)}")
-    names, selectors, filters, skips, exact, libtest = [], [], [], [], False, False
+    names, selectors, filters, skips = [], [], [], []
+    exact, ignored_only, include_ignored, libtest = False, False, False, False
+    pre_filters = 0
     words = iter(args[1:])
     for word in words:
         option, has_value, value = word.partition("=")
@@ -424,6 +454,10 @@ def check_cargo_test(args, root, packages):
                         f"next: drop `={value}` and pass {option} alone")
                 if option == "--exact":
                     exact = True
+                elif option == "--ignored":
+                    ignored_only = True
+                elif option == "--include-ignored":
+                    include_ignored = True
             elif option in CARGO_KNOWN:
                 raise ValueError(
                     f"UNSUPPORTED: known Cargo option {option!r} after `--`; "
@@ -474,7 +508,16 @@ def check_cargo_test(args, root, packages):
                     f"next: drop `={value}` and pass {option} alone")
             selectors.append((option, None))
         elif not word.startswith("-"):
+            # Pinned Cargo 1.98.1 takes a single [TESTNAME] before `--` and
+            # rejects a second positional with unexpected-argument, running
+            # nothing. Libtest after `--` accepts several filters.
+            if pre_filters >= 1:
+                raise ValueError(
+                    f"UNSUPPORTED: Cargo accepts at most one positional filter before "
+                    f"`--` but got second filter {word!r}; next: move extra filters "
+                    f"after `--` where libtest accepts several")
             filters.append(word)
+            pre_filters += 1
         else:
             raise ValueError(
                 f"UNKNOWN_OPTION: unsupported flag {word!r} before `--`; "
@@ -502,6 +545,7 @@ def check_cargo_test(args, root, packages):
     tests = frozenset().union(*map(target_tests, roots))
     if not tests:
         raise ValueError(f"no tests in the selected targets of {names[0]}")
+    ignored = frozenset().union(*map(target_ignored_tests, roots)) & tests
     for pattern in filters:
         if not (pattern in tests if exact else any(pattern in name for name in tests)):
             raise ValueError(
@@ -512,15 +556,26 @@ def check_cargo_test(args, root, packages):
                           for pattern in filters)}
     else:
         matched = set(tests)
+    # Libtest ignore semantics: default runs matched minus ignored,
+    # --ignored runs matched intersect ignored, --include-ignored runs all
+    # matched. An ignored-only default match or a nonignored-only --ignored
+    # match executes zero tests and cannot satisfy coverage.
+    if include_ignored:
+        executable = set(matched)
+    elif ignored_only:
+        executable = set(matched) & set(ignored)
+    else:
+        executable = set(matched) - set(ignored)
     if skips:
-        matched -= {candidate for candidate in matched
-                    if any(candidate == skip if exact else skip in candidate
-                           for skip in skips)}
-    if not matched:
+        executable -= {candidate for candidate in executable
+                       if any(candidate == skip if exact else skip in candidate
+                              for skip in skips)}
+    if not executable:
         raise ValueError(
             f"EMPTY_SELECTION: no effective tests remain after filters {filters!r} with "
-            f"--exact={exact} and --skip {skips!r}; next: narrow --skip or add a positive "
-            f"filter that selects a real test")
+            f"--exact={exact}, --ignored={ignored_only}, --include-ignored={include_ignored} "
+            f"and --skip {skips!r}; next: narrow --skip, adjust ignore mode, or add a "
+            f"positive filter that selects a real executable test")
 
 
 def check_verification(entry_id, verification, root=ROOT):
