@@ -415,7 +415,7 @@ def control_client(variant, token, worker_url, staging_url, actor, root=None):
             raise GateError("ownership_control_failed", detail)
         try:
             return base.mapping(json.loads(result.stdout, object_pairs_hook=_reject_duplicate_keys))
-        except ValueError:
+        except (ValueError, RecursionError):
             raise GateError("ownership_control_invalid_response") from None
 
     return control

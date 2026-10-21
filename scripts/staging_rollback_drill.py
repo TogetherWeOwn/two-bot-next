@@ -350,7 +350,7 @@ def ownership_control(token, url, actor, root=None, expected_deployment=None):
             raise GateError("ownership_control_failed", match.group(0) if match else None)
         try:
             state = json.loads(result.stdout, object_pairs_hook=_reject_duplicate_keys)
-        except ValueError:
+        except (ValueError, RecursionError):
             raise GateError("ownership_control_invalid_response") from None
         return rollout.mapping(state)
 

@@ -531,6 +531,37 @@ class ClientAndControlTests(unittest.TestCase):
         self.assertEqual(env["OWNERSHIP_EXPECTED_DEPLOYMENT"], TARGET)
         self.assertNotIn(TARGET, " ".join(run.call_args.args[0]))
 
+    def test_deeply_nested_status_stdout_refuses_as_invalid_response(self):
+        # Depth-10000 nested objects exhaust the decoder recursion limit (the
+        # probe suite's nested_object_body precedent). The hooked status parse
+        # must map that to the fixed malformed-stdout refusal, not
+        # drill:unexpected_error and not a traceback.
+        deep = '{"a":' * 10000 + "1" + "}" * 10000
+        done = subprocess.CompletedProcess([], 0, stdout=deep, stderr="")
+        control = drill.ownership_control(SENTINEL, URL, "github-actions:1:rollback-drill",
+                                          root="/repo")
+        with patch.object(drill.subprocess, "run", return_value=done):
+            with self.assertRaises(GateError) as caught:
+                control("status")
+        self.assertEqual(str(caught.exception), "ownership_control_invalid_response")
+        self.assertIsNone(caught.exception.detail)
+
+    def test_deeply_nested_status_stdout_fails_the_drill_with_the_exact_code(self):
+        world = World()
+        deep = '{"a":' * 10000 + "1" + "}" * 10000
+        done = subprocess.CompletedProcess([], 0, stdout=deep, stderr="")
+        control = drill.ownership_control(SENTINEL, URL, "github-actions:1:rollback-drill",
+                                          root="/repo")
+        logs = []
+        with patch.object(drill.subprocess, "run", return_value=done):
+            instance = drill.Drill(FakeClient(world), control, URL, "123456",
+                                   now=lambda: world.t, sleep=world.tick,
+                                   log=logs.append)
+            failures = instance.run(TARGET)
+        self.assertEqual(failures, ["drill:ownership_control_invalid_response"])
+        self.assertEqual(world.posts, [])
+        self.assertNotIn("Traceback", "\n".join(logs))
+
     def test_takeover_legs_pin_the_target_and_restore_versions(self):
         world = World()
         instance, failures, logs = run_drill(world)
