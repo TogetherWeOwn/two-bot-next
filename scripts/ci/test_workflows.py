@@ -2950,13 +2950,13 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(step["env"][head_key], expected_head)
 
     def test_rust_tests_timeout_leaves_headroom_for_coverage_measurement(self):
-        # The HARD patch-coverage step re-runs the suite under llvm-cov
-        # (measured 30 min of a 42m16s job; four earlier runs of this design
-        # took 36-42 min), so every event keeps 60 minutes: a slow runner
-        # reports a coverage verdict, not a job timeout.
+        # The HARD patch-coverage step re-runs the suite under llvm-cov, and
+        # the suite has grown past the old 60-minute ceiling (five recent
+        # main runs took 49-60 min), so every event keeps 75 minutes: a slow
+        # runner reports a coverage verdict, not a job timeout.
         job = self.workflows["check.yml"]["jobs"]["rust-tests"]
-        # BaseLoader keeps scalars as strings; "60" is the 60-minute limit.
-        self.assertEqual(job["timeout-minutes"], "60")
+        # BaseLoader keeps scalars as strings; "75" is the 75-minute limit.
+        self.assertEqual(job["timeout-minutes"], "75")
 
     def test_rust_test_container_pins_disposable_database_service_address(self):
         job = self.workflows["check.yml"]["jobs"]["rust-tests"]
