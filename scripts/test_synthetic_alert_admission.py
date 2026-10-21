@@ -42,6 +42,70 @@ class AdmissionBoundaryTests(unittest.TestCase):
                      "GITHUB_RUN_ID": "999"}, "staging")
         self.assertLessEqual(len(calls), 4)
 
+    def test_page_budget_with_healthy_samples_stays_unknown_below_scan_bound(self):
+        # The settle-closed branch requires scanned >= MAX_HISTORY_RUNS: a
+        # page budget hit with fewer scanned runs is unknown history even
+        # when every collected sample is healthy with a skipped post.
+        jobs_calls = []
+
+        def healthy_skipped_jobs():
+            return {"jobs": [{
+                "name": history.JOB_NAMES["staging"], "steps": [
+                    {"name": history.PROBE_STEPS["staging"], "conclusion": "success"},
+                    {"name": history.ALERT_STEPS["staging"], "conclusion": "skipped"},
+                ]}]}
+
+        def get(path, _token):
+            if "/jobs?" in path:
+                jobs_calls.append(path)
+                return healthy_skipped_jobs()
+            page = int(parse_qs(urlparse(path).query)["page"][0])
+            base = 100 - (page - 1) * 2
+            return {"total_count": 100, "workflow_runs": [
+                {"id": base, "run_number": base, "event": "workflow_dispatch"},
+                {"id": base - 1, "run_number": base - 1, "event": "schedule"},
+            ]}
+
+        with mock.patch.object(history, "MAX_HISTORY_RUNS", 5), \
+                mock.patch.object(history, "RUNS_PAGE_SIZE", 2), \
+                mock.patch.object(history, "_get", side_effect=get):
+            with self.assertRaises(history.HistoryError):
+                history.previous_probe_outcomes(
+                    {"GITHUB_TOKEN": "fixture", "GITHUB_REPOSITORY": "owner/repo",
+                     "GITHUB_RUN_ID": "999"}, "staging")
+        # One schedule sample per page over the 4-page budget: 4 scanned
+        # samples below the bound of 5, so the settle branch must not fire.
+        self.assertEqual(len(jobs_calls), 4)
+
+    def test_cross_page_run_number_overlap_refuses_before_page_two_jobs(self):
+        # Later pages must contain older run numbers: page 2 reuses no id or
+        # number, but one number is newer than the page-1 minimum, so the
+        # ordering clause (not the duplicate checks) must refuse admission
+        # before any page-2 jobs fetch.
+        jobs_runs = []
+
+        def row(run_id, number):
+            return {"id": run_id, "run_number": number, "event": "schedule",
+                    "status": "completed", "conclusion": "success"}
+
+        pages = {1: [row(1000, 100), row(900, 90)],
+                 2: [row(950, 95), row(800, 80)]}
+
+        def get(path, _token):
+            if "/jobs?" in path:
+                jobs_runs.append(int(path.split("/runs/")[1].split("/")[0]))
+                return {"jobs": []}
+            page = int(parse_qs(urlparse(path).query)["page"][0])
+            return {"total_count": 4, "workflow_runs": pages[page]}
+
+        with mock.patch.object(history, "RUNS_PAGE_SIZE", 2), \
+                mock.patch.object(history, "_get", side_effect=get):
+            with self.assertRaises(history.HistoryError):
+                history.previous_probe_outcomes(
+                    {"GITHUB_TOKEN": "fixture", "GITHUB_REPOSITORY": "owner/repo",
+                     "GITHUB_RUN_ID": "999"}, "staging")
+        self.assertEqual(sorted(jobs_runs), [900, 1000])
+
     def test_optional_fields_are_validated_when_present(self):
         run = {"id": 100, "run_number": 1, "event": "schedule"}
         job = {"name": history.JOB_NAMES["staging"], "steps": [
@@ -73,6 +137,10 @@ class AdmissionBoundaryTests(unittest.TestCase):
             self.assertEqual(receipt["run_id"], "123" if run_id == "123" else "unknown")
             self.assertEqual(receipt["code"], "no_probe_sample")
             self.assertIsNone(receipt["event"])
+            # No sample reads no history: the receipt must not claim it did,
+            # while next_action stays none (nothing to inspect).
+            self.assertIs(receipt["history_known"], False)
+            self.assertEqual(receipt["next_action"], "none")
             self.assertEqual(len(out.getvalue().splitlines()), 1)
             self.assertLess(len(out.getvalue()), 512)
             self.assertIn("event=\n", err.getvalue())

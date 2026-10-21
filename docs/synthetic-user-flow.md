@@ -153,7 +153,8 @@ Optional `--decide-only --json` prints one bounded JSON object to stdout:
 string `run_id` (decimal current ID or `unknown`), nullable `event`, boolean
 `history_known`, `code` and `next_action`. Known decisions use
 `decision_ready` / `none`; unknown history uses the values above; an absent
-probe uses `no_probe_sample` / `none`. This receipt is a decision, not proof
+probe uses `no_probe_sample` / `none` with `history_known` false, since no
+history was read. This receipt is a decision, not proof
 of delivery or exactly-once posting. `GITHUB_OUTPUT` still receives precisely
 `event=alert`, `event=recovery` or `event=`. Without that file, JSON mode moves
 the event line to stderr to keep stdout valid JSON. Without `--json`, text

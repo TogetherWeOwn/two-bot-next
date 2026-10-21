@@ -153,7 +153,9 @@ def _decide(env, environment):
     """(event, history_known) for the decide step; see decide_event."""
     current = env.get("PROBE_OUTCOME")
     if current not in ("success", "failure"):
-        return None, True
+        # No sample means no history read: report unknown so the JSON
+        # receipt never claims incident history was verified.
+        return None, False
     try:
         previous = previous_probe_outcomes(env, environment)
     except HistoryError as error:
@@ -182,15 +184,19 @@ def write_decision(environment, event, history_known, no_sample):
     run_id = os.environ.get("GITHUB_RUN_ID") or os.environ.get("RUN_ID", "")
     if not re.fullmatch(r"[1-9][0-9]{0,18}", run_id):
         run_id = "unknown"
+    # A missing probe sample reads no history, so it is unknown even if a
+    # caller passes history_known true; its next_action stays none because
+    # there is no incident history to inspect, only a missing sample.
+    known = history_known and not no_sample
     print(json.dumps({
         "schema_version": 1,
         "check_id": f"synthetic-user-flow:{environment}",
         "run_id": run_id,
         "event": event,
-        "history_known": history_known,
+        "history_known": known,
         "code": ("no_probe_sample" if no_sample else
-                 "decision_ready" if history_known else HistoryError.code),
-        "next_action": "none" if history_known else HistoryError.next_action,
+                 "decision_ready" if known else HistoryError.code),
+        "next_action": "none" if (known or no_sample) else HistoryError.next_action,
     }, separators=(",", ":")))
 
 
