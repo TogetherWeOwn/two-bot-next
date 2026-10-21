@@ -21,7 +21,10 @@ recovers service, it never certifies the failed build. Without a successful
 deploy and snapshot there is nothing to restore, so no rollback is attempted.
 The gate does not
 accept a health response from an old singleton. This is a **staging-only** gate,
-not production authorization or a migration tool.
+not production authorization or a migration tool. Operators can preview the
+ordered restore plan for a receipt without any mutation via
+`scripts/worker_container_rollback.py rollback ... --dry-run`, which validates
+the receipt identically to the live path and exits 0.
 
 ## Step order and why
 
@@ -66,16 +69,25 @@ not production authorization or a migration tool.
    `two-bot-next-twobotcontainer-staging`, its Durable Object namespace, and rollout
    IDs. An absent/ambiguous application or an in-flight prior rollout fails closed.
 2. Generate a temporary JSON Wrangler config from the checked-in TOML. Keep the
-   staging Container/DO wiring, use absolute source/build paths, and pass two
+   staging Container/DO wiring, use absolute source/build paths, and pass three
    non-secret Docker build arguments as `image_vars`: `BOT_BUILD_REVISION` (the
-   exact `GITHUB_SHA`) and `BOT_BUILD_ID` (the unique
-   `GITHUB_RUN_ID-GITHUB_RUN_ATTEMPT`). The Rust `/readyz` response compiles these
-   values into the binary as `build_revision`/`build_id`; runtime environment
-   overrides cannot substitute them. The `org.opencontainers.image.revision` and
-   `com.togetherweown.build-id` OCI labels repeat them for narrowly scoped image
-   inspection. A redeploy of the same SHA therefore still produces a new image
-   identity. Prepare also requires the `CF_VERSION_METADATA` version-metadata
-   binding in the staging config and sets `rollout_kind: full_auto`.
+   exact `GITHUB_SHA`), `BOT_BUILD_ID` (the unique
+   `GITHUB_RUN_ID-GITHUB_RUN_ATTEMPT`), and `BOT_DEPLOY_ID` (the
+   `YYYY.MM.DD.N+sha7` deploy ID derived in-lane by the compute step). The Rust
+   `/readyz` response compiles these values into the binary as
+   `build_revision`/`build_id`/`deploy_id`; runtime environment
+   overrides cannot substitute them. The `org.opencontainers.image.revision`,
+   `com.togetherweown.build-id` and `com.togetherweown.deploy-id` OCI labels
+   repeat them for narrowly scoped image inspection. A redeploy of the same SHA
+   therefore still produces a new image identity. Prepare also requires the
+   `CF_VERSION_METADATA` version-metadata binding in the staging config and sets
+   `rollout_kind: full_auto`. After the gates judge, the record step stores the
+   deploy as a GitHub Deployment with `environment` set to `staging` carrying
+   the deploy ID — never a tag or Release — after the auto-rollback, so its
+   failure fails the run red with the service already restored. Both ID steps
+   run reviewed tooling from the workflow's own
+   commit, so a pinned drill deploys a commit whose checkout may predate the
+   script while the gate scripts stay on the deployed checkout.
 3. Read the **fresh** `WRANGLER_OUTPUT_FILE_PATH` NDJSON only after Wrangler exits
    successfully. Every Wrangler invocation appends its own `wrangler-session`
    record, and `wrangler-action` runs `wrangler --version` before deploying, so
@@ -270,7 +282,10 @@ performed by `scripts/staging_rollout.py` itself; rollback is a workflow step th
 invokes `scripts/worker_container_rollback.py`. The local baseline receipt is
 type- and shape-validated before `select_rollout`, `receipt` or `verify` acts
 on it; any malformed member refuses with the single fixed token
-`invalid_baseline_receipt`. `started` must be a finite positive timestamp
+`invalid_baseline_receipt`. Required members are `started`, `application_id`,
+`namespace_id`, `revision`, `build_id`, `deploy_id` and `rollout_ids`. `deploy_id`
+must be canonical `YYYY.MM.DD.N+sha7` (a real date, positive sequence without
+leading zeros, lowercase seven-hex revision). `started` must be a finite positive timestamp
 (the producer writes `time.time()`), and a decodable-but-non-object receipt
 file (a JSON list, null, or string) refuses with the same token.
 

@@ -1,6 +1,7 @@
 //! Explicit opt-in, isolated-schema integration test. No inherited DATABASE_URL
 //! or credentials: only the agent-testdb container is allowed here.
 
+use std::future::Future;
 use std::sync::{
     atomic::{AtomicI64, Ordering},
     Arc,
@@ -68,6 +69,22 @@ fn panel_key(audit: &SelfRoleAudit) -> PanelKey {
 #[tokio::test]
 #[ignore = "requires agent-testdb; run explicitly with --ignored"]
 async fn leases_recovery_ordering_and_atomic_settlement() -> TestResult {
+    with_isolated_schema(|pool| async move { exercise(&pool).await }).await
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb; run explicitly with --ignored"]
+async fn acknowledgement_oversized_row_refused_at_journal() -> TestResult {
+    with_isolated_schema(|pool| async move { exercise_acknowledgement_row_bound(&pool).await })
+        .await
+}
+
+/// One generated schema per scenario, dropped after the scenario runs.
+async fn with_isolated_schema<F, Fut>(scenario: F) -> TestResult
+where
+    F: FnOnce(PgPool) -> Fut,
+    Fut: Future<Output = TestResult>,
+{
     let options = PgConnectOptions::new()
         .host("agent-testdb")
         .port(5432)
@@ -104,13 +121,83 @@ async fn leases_recovery_ordering_and_atomic_settlement() -> TestResult {
         })
         .connect_with(options)
         .await?;
-    let result = exercise(&pool).await;
+    let result = scenario(pool.clone()).await;
     pool.close().await;
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&admin)
         .await?;
     admin.close().await;
     result
+}
+
+/// Journal-level pin for the 512 B acknowledgement row bound. The pure helper
+/// is pinned by offline tests, but only this test journals an oversized row
+/// through `journal_role_exchange`, so the estimate fed into the cap check
+/// cannot regress (for example to zero) without a red suite.
+async fn exercise_acknowledgement_row_bound(pool: &PgPool) -> TestResult {
+    sqlx::raw_sql(include_str!("../migrations/0200_self_roles.sql"))
+        .execute(pool)
+        .await?;
+    sqlx::raw_sql(include_str!(
+        "../migrations/0201_self_role_intent_initialization.sql"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../migrations/0202_self_role_compensation_phase.sql"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../migrations/0203_self_role_pending_exchange.sql"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../migrations/0204_self_role_terminal_repair.sql"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../migrations/0205_self_role_exchange_receipts.sql"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../migrations/0206_self_role_exchange_baselines.sql"
+    ))
+    .execute(pool)
+    .await?;
+    let store = SelfRoleStore::new(pool.clone());
+    // 160 B fixed + 400 B event id + 3 B role id = 563 B, over the bound.
+    let event_id = "e".repeat(400);
+    let audit = row(&event_id, &event_id);
+    let claim = store
+        .claim_audit(&audit)
+        .await?
+        .expect("fresh audit must claim");
+    let intent = ExchangeIntent {
+        role_id: "101".into(),
+        adding: true,
+        compensating: false,
+    };
+    let result = store.journal_role_exchange(&claim, None, &intent).await;
+    assert!(
+        result.is_err(),
+        "oversized row must be refused, got {result:?}"
+    );
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("row") && msg.contains("512"),
+        "refusal must name the row bound: {msg}"
+    );
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM self_role_exchanges WHERE event_id=$1")
+            .bind(&event_id)
+            .fetch_one(pool)
+            .await?;
+    assert_eq!(count, 0, "a refused attempt must never partially write");
+    Ok(())
 }
 
 async fn exchange_owner_state(pool: &PgPool, event: &str) -> TestResult<(String, Option<String>)> {

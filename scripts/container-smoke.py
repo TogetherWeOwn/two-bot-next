@@ -60,6 +60,14 @@ IMAGE_MAX_BYTES = 112 * MIB
 # revisit if the binary approaches it.
 # The voice actor-init retry measured 16,782,904 bytes (+6,808, no new dependencies).
 BINARY_MAX_BYTES = 17 * MIB
+# CLI refusal bounds (not budget policy): --image-max-bytes/--binary-max-bytes
+# outside 1..cap are unusable — a non-positive budget can never pass and a
+# gigantic one silently disables the budget — so main() refuses them with a
+# fixed message before any Docker call. The caps sit far above any sane
+# override (defaults are 112 MiB/17 MiB) and far below budget-disabling
+# magnitudes; sane values pass through byte-identically.
+IMAGE_BUDGET_CAP_BYTES = 1024 * MIB
+BINARY_BUDGET_CAP_BYTES = 256 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
 # docker cp archives from a never-started container instead of exec helpers.
 BINARY = "/home/nonroot/two-bot"
@@ -87,6 +95,17 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
+def check_budget(value, flag, cap, cap_label):
+    """Refuse an unusable CLI size budget before any Docker call.
+
+    Raises RuntimeError with a fixed message naming the flag; main()
+    reports it through the FAIL container smoke contract. The supplied
+    value is never echoed.
+    """
+    if not 1 <= value <= cap:
+        raise RuntimeError(f"refusing: {flag} must be a positive size within {cap_label}")
+
+
 def docker(*args, timeout=30, check=True, text=True):
     return subprocess.run(
         ["docker", *args], capture_output=True, text=text, timeout=timeout, check=check
@@ -96,12 +115,15 @@ def docker(*args, timeout=30, check=True, text=True):
 def inspect_state(name):
     """The State object of `docker inspect NAME`, or a clean FAIL.
 
-    An empty inspect array or a missing/non-object entry/State is a
-    malformed-probe FAIL naming the inspect check -- never an
-    IndexError/KeyError/TypeError traceback, and Docker output is never
-    echoed into the failure.
+    A non-JSON reply, an empty inspect array or a missing/non-object
+    entry/State is a malformed-probe FAIL naming the inspect check --
+    never an IndexError/KeyError/TypeError traceback, and Docker output
+    is never echoed into the failure.
     """
-    entries = json.loads(docker("inspect", name).stdout)
+    try:
+        entries = json.loads(docker("inspect", name).stdout)
+    except ValueError:
+        raise RuntimeError("docker inspect output is not valid JSON") from None
     require(isinstance(entries, list) and entries, "docker inspect returned no entries")
     require(isinstance(entries[0], dict), "docker inspect entry must be a JSON object")
     state = entries[0].get("State")
@@ -221,6 +243,16 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
     # present-but-non-string Id must FAIL here, not as a TypeError.
     require(isinstance(metadata.get("Id"), str), "docker image inspect entry has no Id")
     require("Size" in metadata, "docker image inspect entry has no Size")
+    # An empty Id would reach docker as a vacuous argument; reject it with
+    # the field named, like every other malformed image field here.
+    require(metadata["Id"], "docker image inspect Id must be a nonempty string")
+    # Config and Healthcheck shapes are validated here, with the rest of
+    # the image probe, so a malformed entry fails before the history call
+    # and before any container exists.
+    require(isinstance(metadata.get("Config"), dict),
+            "docker image inspect entry has no Config")
+    require(isinstance(metadata["Config"].get("Healthcheck", {}), dict),
+            "docker image inspect Config Healthcheck must be an object")
     # Resolve the tag once; measurement and every image probe use this ID.
     image = metadata["Id"]
     report(f"Docker storage-driver Size (diagnostic only): {metadata['Size']} bytes")
@@ -248,16 +280,12 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
         report(f"{label}: {size} bytes ({size / MIB:.2f} MiB); budget {limit} bytes ({limit / MIB:.2f} MiB)")
     require(measured_image_bytes <= image_max_bytes, "image exceeds size budget")
     require(binary_bytes <= binary_max_bytes, "release binary exceeds size budget")
-    # A missing or non-object Config, or a present-but-non-object
-    # Healthcheck, is a malformed-probe FAIL naming the field -- never a
-    # KeyError/AttributeError traceback. An absent Healthcheck keeps the
-    # {} default and fails on the Test assertion below.
-    config = metadata.get("Config")
-    require(isinstance(config, dict), "docker image inspect entry has no Config")
+    # Config and Healthcheck shapes were validated with the image probe
+    # above, before the history call, so both are objects here. An absent
+    # Healthcheck keeps the {} default and fails on the Test assertion below.
+    config = metadata["Config"]
     require(config.get("User") not in (None, "", "root", "0", "0:0"), "image must specify a non-root user")
     healthcheck = config.get("Healthcheck", {})
-    require(isinstance(healthcheck, dict),
-            "docker image inspect Config Healthcheck must be an object")
     require(healthcheck.get("Test") == ["CMD", BINARY, "--healthcheck"],
             "image HEALTHCHECK must invoke the runtime's --healthcheck")
     # Any account (including the configured non-root user) must be able to
@@ -377,13 +405,42 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
             raise
 
 
+def dry_run_plan(image):
+    """Print the container-mutation plan without touching Docker or the network.
+
+    Static text plus the image under test: no container names, ports or
+    timestamps are generated, so the plan is byte-identical across runs.
+    Size budgets are never enforced here because nothing is measured.
+    """
+    print("\n".join((
+        "dry-run plan for container smoke (no mutations performed)",
+        f"image: {image}",
+        "1. measure: docker create a measurement container (--memory 256m, "
+        "--network none), read the binary and CA bundle, then remove it",
+        "2. main run: docker run --detach --memory 256m "
+        "--publish 127.0.0.1::8080, then probe /health until 200 and assert "
+        "/readyz 503 parked over loopback HTTP",
+        "3. health-probe: docker run --network none --memory 256m <image> "
+        "--healthcheck (expects exit 1), then remove the probe container",
+        "4. shutdown: docker kill --signal TERM, docker wait (10s budget), "
+        "then remove every owned container",
+    )))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image")
     parser.add_argument("--image-max-bytes", type=int, default=IMAGE_MAX_BYTES)
     parser.add_argument("--binary-max-bytes", type=int, default=BINARY_MAX_BYTES)
+    parser.add_argument("--dry-run", action="store_true",
+                        help="print the container-mutation plan without running anything")
     args = parser.parse_args()
+    if args.dry_run:
+        dry_run_plan(args.image)
+        return
     try:
+        check_budget(args.image_max_bytes, "--image-max-bytes", IMAGE_BUDGET_CAP_BYTES, "1 GiB")
+        check_budget(args.binary_max_bytes, "--binary-max-bytes", BINARY_BUDGET_CAP_BYTES, "256 MiB")
         smoke(args.image, args.image_max_bytes, args.binary_max_bytes)
     except (RuntimeError, subprocess.SubprocessError, ValueError, KeyError) as error:
         raise SystemExit(f"FAIL container smoke: {error}") from error

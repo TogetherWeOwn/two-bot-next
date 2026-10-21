@@ -22,6 +22,7 @@ pub mod backfill_history;
 pub mod journal;
 pub mod migrations;
 pub mod pool;
+pub mod retry;
 pub mod snapshots;
 pub mod store;
 pub mod web;

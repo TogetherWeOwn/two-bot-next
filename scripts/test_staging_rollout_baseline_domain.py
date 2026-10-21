@@ -47,6 +47,7 @@ def valid_baseline():
         "rollout_ids": [OLD_ROLLOUT],
         "revision": REVISION,
         "build_id": BUILD_ID,
+        "deploy_id": "2026.10.21.1+aaaaaaa",
     }
 
 

@@ -79,6 +79,7 @@ def valid_baseline():
         "rollout_ids": [OLD_ROLLOUT],
         "revision": REVISION,
         "build_id": BUILD_ID,
+        "deploy_id": "2026.10.21.1+aaaaaaa",
     }
 
 
@@ -366,6 +367,132 @@ class ValidBaselineControls(OfflineTestCase):
                 with self.assertRaises(rollback.GateError) as caught:
                     rollback.ProvenanceReceipt(**mutated)
                 self.assertEqual(str(caught.exception), code)
+
+
+# Removing deploy-ID validation, accepting non-string/malformed deploy IDs,
+# checking only populated rollout lists, or checking after Docker/API access
+# must fail these tests. Expected values are independent literal fixtures.
+MISTYPED_DEPLOY_IDS = (
+    None, True, False, 20261021, 1.5,
+    ["2026.10.21.1+aaaaaaa"], {"id": "2026.10.21.1+aaaaaaa"},
+)
+MALFORMED_DEPLOY_IDS = (
+    "", " ", "unknown", "123456-2", "2026.10.21.1", "2026.10.21+aaaaaaa",
+    "2026-10-21.1+aaaaaaa", "2026.10.21.x+aaaaaaa",
+    "2026.10.21.0+aaaaaaa", "2026.10.21.01+aaaaaaa",
+    "2026.13.01.1+aaaaaaa", "2026.02.30.1+aaaaaaa",
+    "2026.10.21.1+aaaaaa", "2026.10.21.1+aaaaaaaa",
+    "2026.10.21.1+ggggggg", "2026.10.21.1+AAAAAAA",
+    " 2026.10.21.1+aaaaaaa", "2026.10.21.1+aaaaaaa ",
+    "2026.10.21.1+aaaaaaa\n", SENTINEL,
+)
+
+
+def missing_deploy_id():
+    baseline = valid_baseline()
+    del baseline["deploy_id"]
+    return baseline
+
+
+def with_deploy_id(value):
+    baseline = valid_baseline()
+    baseline["deploy_id"] = value
+    return baseline
+
+
+class DeployIdBaselineAcceptanceTests(OfflineTestCase):
+    """Require a canonical deploy ID before selection, receipt, or verification."""
+
+    def assert_selection_refuses(self, baseline):
+        for rows in ([], [new_row()]):
+            with self.subTest(rows=len(rows)):
+                self.assert_baseline_gate(
+                    rollout.select_rollout, rows, baseline, IMAGE
+                )
+
+    def assert_file_mode_refuses(self, mode, baseline):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        args = argparse.Namespace(
+            receipt=str(root / "baseline.json"),
+            output=str(root / "deploy.ndjson"),
+            evidence=str(root / "evidence.json"),
+        )
+        baseline_bytes = json.dumps(baseline).encode()
+        output_bytes = ("\n".join(
+            json.dumps(row) for row in deploy_records()
+        ) + "\n").encode()
+        Path(args.receipt).write_bytes(baseline_bytes)
+        Path(args.output).write_bytes(output_bytes)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        client = Mock(deadline=110.0)
+        client.api.side_effect = AssertionError("API before baseline refusal")
+        client.request.side_effect = AssertionError("HTTP before baseline refusal")
+        environment = {
+            "GITHUB_SHA": REVISION,
+            "GITHUB_RUN_ID": "123456",
+            "GITHUB_RUN_ATTEMPT": "2",
+            "STAGING_URL": "https://two-bot-next-staging.offline-fixture.workers.dev",
+            "CLOUDFLARE_ACCOUNT_ID": ACCOUNT,
+            "CLOUDFLARE_API_TOKEN": SENTINEL,
+        }
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr), \
+                patch.dict(os.environ, environment, clear=True), \
+                patch.object(rollout, "docker_image", side_effect=AssertionError(
+                    "Docker before baseline refusal")) as docker, \
+                patch.object(rollout.time, "sleep", side_effect=AssertionError(
+                    "wait before baseline refusal")):
+            if mode == "verify":
+                self.assert_baseline_gate(rollout.verify, args, client)
+            else:
+                self.assert_baseline_gate(rollout.receipt, args)
+        docker.assert_not_called()
+        client.api.assert_not_called()
+        client.request.assert_not_called()
+        self.assertFalse(Path(args.evidence).exists())
+        self.assertEqual(Path(args.receipt).read_bytes(), baseline_bytes)
+        self.assertEqual(Path(args.output).read_bytes(), output_bytes)
+        self.assertNotIn(SENTINEL, stdout.getvalue())
+        self.assertNotIn(SENTINEL, stderr.getvalue())
+
+    def test_select_missing_deploy_id_refuses_even_without_rows(self):
+        self.assert_selection_refuses(missing_deploy_id())
+
+    def test_select_mistyped_deploy_id_refuses_even_without_rows(self):
+        for value in MISTYPED_DEPLOY_IDS:
+            with self.subTest(value=value):
+                self.assert_selection_refuses(with_deploy_id(value))
+
+    def test_select_malformed_deploy_id_refuses_even_without_rows(self):
+        for value in MALFORMED_DEPLOY_IDS:
+            with self.subTest(value=value):
+                self.assert_selection_refuses(with_deploy_id(value))
+
+    def test_receipt_missing_deploy_id_refuses_without_evidence(self):
+        self.assert_file_mode_refuses("receipt", missing_deploy_id())
+
+    def test_receipt_mistyped_deploy_id_refuses_without_evidence(self):
+        for value in MISTYPED_DEPLOY_IDS:
+            with self.subTest(value=value):
+                self.assert_file_mode_refuses("receipt", with_deploy_id(value))
+
+    def test_receipt_malformed_deploy_id_refuses_without_evidence(self):
+        for value in MALFORMED_DEPLOY_IDS:
+            with self.subTest(value=value):
+                self.assert_file_mode_refuses("receipt", with_deploy_id(value))
+
+    def test_verify_missing_deploy_id_refuses_before_docker_or_api(self):
+        self.assert_file_mode_refuses("verify", missing_deploy_id())
+
+    def test_verify_mistyped_deploy_id_refuses_before_docker_or_api(self):
+        for value in MISTYPED_DEPLOY_IDS:
+            with self.subTest(value=value):
+                self.assert_file_mode_refuses("verify", with_deploy_id(value))
+
+    def test_verify_malformed_deploy_id_refuses_before_docker_or_api(self):
+        for value in MALFORMED_DEPLOY_IDS:
+            with self.subTest(value=value):
+                self.assert_file_mode_refuses("verify", with_deploy_id(value))
 
 
 if __name__ == "__main__":
