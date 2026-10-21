@@ -288,13 +288,23 @@ function main() {
 			],
 			{ stdio: "inherit" },
 		);
-		output({ tag_name: digestTag, released: "true" });
+		output({
+			tag_name: digestTag,
+			released: "true",
+			prod_changed: "true",
+			prev_tag: lastDigest || "",
+		});
 		return;
 	}
 
 	if (lastTarget === sha) {
 		console.log(`${sha} already matches ${lastDigest}; quiet day, no new tag`);
-		output({ tag_name: "", released: "false" });
+		output({
+			tag_name: "",
+			released: "false",
+			prod_changed: "false",
+			prev_tag: lastDigest,
+		});
 		return;
 	}
 	if (lastTarget && isAncestor(sha, lastTarget)) {
@@ -304,7 +314,12 @@ function main() {
 		console.log(
 			`${sha} is older than ${lastDigest}; rollback serving, no new tag`,
 		);
-		output({ tag_name: "", released: "false" });
+		output({
+			tag_name: "",
+			released: "false",
+			prod_changed: "false",
+			prev_tag: lastDigest,
+		});
 		return;
 	}
 	if (existing) {
@@ -312,7 +327,12 @@ function main() {
 		// preview of either). Tomorrow's digest covers any production move
 		// since. Never a second tag for the same day.
 		console.log(`${digestTag} already exists; no new tag today`);
-		output({ tag_name: "", released: "false" });
+		output({
+			tag_name: "",
+			released: "false",
+			prod_changed: "false",
+			prev_tag: lastDigest || "",
+		});
 		return;
 	}
 
@@ -337,7 +357,12 @@ function main() {
 	});
 	console.log(notes);
 	if (dryRun) {
-		output({ tag_name: "", released: "false" });
+		output({
+			tag_name: "",
+			released: "false",
+			prod_changed: "true",
+			prev_tag: lastDigest || "",
+		});
 		return;
 	}
 	if (!releaseExists(digestTag)) {
@@ -362,7 +387,12 @@ function main() {
 			{ stdio: "inherit" },
 		);
 	}
-	output({ tag_name: digestTag, released: "true" });
+	output({
+		tag_name: digestTag,
+		released: "true",
+		prod_changed: "true",
+		prev_tag: lastDigest || "",
+	});
 }
 
 module.exports = {
