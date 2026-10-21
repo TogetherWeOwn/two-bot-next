@@ -121,7 +121,8 @@ class RequiredChecksReportTests(unittest.TestCase):
         self.assertEqual(len(build), 1)
         self.assertEqual(build[0].get("working-directory"), "fuzz")
         self.assertEqual(build[0].get("run"), "cargo +nightly-2026-10-01 fuzz build")
-        targets = ("eventsub_delivery", "helix_token", "custom_command_template", "fb_page_events")
+        targets = ("eventsub_delivery", "helix_token", "custom_command_template", "fb_page_events",
+                   "database_url", "feeds_http", "self_role_custom_id", "helix_subscription_listing")
         fuzz_runs = [step for step in job.get("steps", [])
                      if "fuzz run" in step.get("run", "")]
         self.assertEqual(len(fuzz_runs), len(targets))
@@ -150,6 +151,43 @@ class RequiredChecksReportTests(unittest.TestCase):
         agg = workflow["jobs"]["ci-ok"]
         self.assertIn("fuzz-compile", agg["needs"])
         self.assertIn("FUZZ_COMPILE_RESULT", "\n".join(step.get("run", "") for step in agg["steps"]))
+
+    def test_ignored_db_runtime_routes_claimed_ignored_tests(self):
+        # These two filters are the only required-lane coverage for eleven
+        # ignored tests. Cargo exits 0 when a filter matches nothing, so pin
+        # step presence, the exact run lines (a one-character typo would
+        # silently unroute the tests) and the frontier's guarded URL.
+        job = self.workflows["check.yml"]["jobs"]["ignored-db-runtime"]
+        evidence = [step for step in job.get("steps", [])
+                    if step.get("name") == "containment evidence acceptance (mock Discord and CI service only)"]
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(
+            evidence[0].get("run"),
+            "cargo test -p two-bot --locked --lib --bins containment_runtime_evidence_ -- --include-ignored",
+        )
+        frontier = [step for step in job.get("steps", [])
+                    if step.get("name") == "ops backfill frontier acceptance (CI service only)"]
+        self.assertEqual(len(frontier), 1)
+        self.assertEqual(
+            frontier[0].get("env", {}).get("TWO_TEST_DATABASE_URL"),
+            "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
+        )
+        self.assertEqual(
+            frontier[0].get("run"),
+            "cargo test -p two-bot --locked --lib --bins configured_database_reports_seeded_family_frontier -- --include-ignored",
+        )
+
+        # Each filter substring must still match its ignored test fns in the
+        # source tree: a renamed test would otherwise keep every gate green
+        # while the required lane runs an empty filter.
+        sources = [path.read_text(encoding="utf-8", errors="replace")
+                   for path in (ROOT / "crates").rglob("*.rs")]
+        evidence_fns = [name for body in sources
+                        for name in re.findall(r"fn (containment_runtime_evidence_\w+)", body)]
+        self.assertEqual(len(evidence_fns), 10, sorted(set(evidence_fns)))
+        frontier_fns = [name for body in sources
+                        for name in re.findall(r"fn (configured_database_reports_seeded_family_frontier)\b", body)]
+        self.assertEqual(frontier_fns, ["configured_database_reports_seeded_family_frontier"])
 
     def test_nextest_is_required_and_rust_gated(self):
         job = self.workflows["check.yml"]["jobs"]["nextest"]

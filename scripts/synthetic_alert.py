@@ -291,11 +291,16 @@ def main(argv=None):
         return dry_run_plan(args.env, args.evidence)
     if args.decide_only:
         # Decide step: compute the transition, never post, never need webhook.
-        # A missing/skipped probe is not a sample and writes an empty event.
+        # A missing/skipped probe is not a sample: write the empty event that
+        # keeps the post step skipped, then fail the step so a zero-sample
+        # run never reads as a healthy pass.
         event, history_known = _decide(os.environ, args.env)
-        if event is None and os.environ.get("PROBE_OUTCOME") not in ("success", "failure"):
-            print("synthetic_alert: no probe sample; no alert transition", file=sys.stderr)
+        no_sample = os.environ.get("PROBE_OUTCOME") not in ("success", "failure")
+        if event is None and no_sample:
+            print("synthetic_alert: no probe sample; failing closed", file=sys.stderr)
         write_event(event)
+        if no_sample:
+            return 1
         if not history_known and os.environ.get("PROBE_OUTCOME") == "success":
             # Record "history unknown" explicitly in this run's step
             # conclusions: a failed decide step keeps later reconstruction
@@ -315,10 +320,11 @@ def main(argv=None):
         return post_event(os.environ, args.env, args.evidence, event)
     current = os.environ.get("PROBE_OUTCOME")
     # A missing/skipped probe (for example, an unset optional target binding)
-    # is not a sample and must not create an alert or recovery transition.
+    # is not a sample and must not create an alert or recovery transition;
+    # fail closed so a zero-sample run never reads as a healthy pass.
     if current not in ("success", "failure"):
-        print("synthetic_alert: no probe sample; no alert transition", file=sys.stderr)
-        return 0
+        print("synthetic_alert: no probe sample; failing closed", file=sys.stderr)
+        return 1
     event = decide_event(os.environ, args.env)
     if event is None:
         print("synthetic_alert: no alert transition", file=sys.stderr)

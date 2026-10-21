@@ -653,15 +653,17 @@ without an accept or refusal line
 watchdog's >120 s bound into the standard pipeline. Pages on a single valid
 reading past the bound — the age itself proves continuous not-ready — and a
 valid reading at or below 120 s clears at once. Older containers without the
-gauge hold the previous state. Known blind spot: a hung dispatch freezes the
-published age (the watchdog sibling never republishes this gauge), so a hang
-that starts before the age reaches 120 s never pages.
+gauge hold the previous state. A hung dispatch does not freeze the published
+age: the watchdog sibling reads the shared live view directly, so a hang
+still pages once the age passes 120 s.
 
 First response: confirm via the authorized `/ops/metrics` scrape that the
 age keeps climbing while the gateway is connected; check
 `two_bot_voice_live_self_heal_total` — repairs without recovery mean every
 dispatch retries the cached snapshot and the view will not stay ready. If
-the age is frozen while joins drop, read the container logs for
+the age is frozen while joins drop, check the container build first —
+current builds keep the age climbing through a hang; on an older build,
+read the container logs for
 `voice worker stuck: queued actions with no progress` (error): a hang
 predating the not-ready view explains the frozen age. Then restart for a
 fresh IDENTIFY + GUILD_CREATE and file a bug report with the logs around
@@ -678,11 +680,11 @@ to the on-call engineer, not another redeploy.
 in-flight) voice action has waited over two minutes — a guild's queue is
 draining unacceptably slowly. The bound matches the in-process stuck horizon
 (`watchdog_stuck_after`: queued actions with no completed dispatch turn for
-120 s bump `two_bot_voice_watchdog_stucks_total`). Known blind spot: a hung
-dispatch freezes publication below the bound (the watchdog sibling
-republishes the last snapshot's age verbatim), so a hang that starts before
-the age reaches 120 s never tickets — the hung case stays with the
-in-process stuck verdict below. Ticket, not page: a slow-but-healthy
+120 s bump `two_bot_voice_watchdog_stucks_total`). A hung dispatch does not
+freeze publication: the watchdog sibling recomputes the queue age from the
+snapshot's first-enqueue stamp on its own clock, so a hang that starts
+below the bound still tickets once the age passes 120 s. Ticket, not page:
+a slow-but-healthy
 drain can legitimately age past the bound under burst load, and
 member-visible join degradation already pages through the join-budget burn
 rules. A valid reading at or below 120 s clears at once; older containers
@@ -698,9 +700,11 @@ climbing age at once (follow [voice worker halted](#alert-voice-worker-halted),
 not this ticket). Then read the container logs for
 `voice worker stuck: queued actions with no progress` (error, the in-process
 verdict) and `voice dispatch turn exceeded observe bound` (warn, a slow turn
-that still completed). When this ticket is absent but joins stall with a
-frozen age below the bound, that stuck line is the hung case this ticket
-cannot see: treat it as the verdict and escalate on it.
+that still completed). When this ticket is absent but joins stall, that
+stuck line is still the fastest verdict: on current builds the ticket
+follows once the climbing age passes the bound, while on an older container
+a frozen age below the bound means the stuck line is the only signal —
+treat it as the verdict and escalate on it.
 
 Escalate when the age climbs while the latch reads 0 and no stuck line
 appears, or when burn alerts join the ticket — the fix belongs to the
@@ -1339,6 +1343,193 @@ or rotation is identified, when it coincides with 429, DB-error, or
 reconcile-failure alerts, or when `notification` traffic for the same window
 collapses while tampered rises — the receiver may be refusing legitimate work
 and the fix belongs to the on-call engineer, not another redeploy.
+
+#### Alert: retention replay needed
+
+`two_bot_retention_replay_needed_total` increased between two keepalive
+samples. A real guild removal's purge-queue write hit the schema gap (an
+unapplied migration or grant), so the removed guild's rows linger until the
+Operator replays the insert. Successful queue writes and rejoin-cancel skips
+never increment this counter, and the counter resets on process restart, so a
+nonzero value means at least one skip since the last restart — the ticket
+names the window, not the guild. The first sample after monitoring arms only
+stores the baseline and never fires, and a counter reset (process restart)
+skips the window rather than firing. This is a **ticket**, not a page: no
+member impact and no data loss, but every skip is bounded operator work.
+
+First response: read the error log line `retention purge skipped; schema gap,
+operator replay required` over the whole schema-gap window — it carries the
+guild id and SQLSTATE (`42P01` missing table, `42501` missing grant) and stays
+the source of truth for which guilds to replay. Confirm the migration or ACL
+plan is now applied, then replay per the
+[retention procedure](privacy.md#retention-and-explicit-exceptions): run the
+same `retention_guild_purge_queue` insert the live path runs, but only when no
+`GUILD_CREATE` for that guild was acked after the error line — a later
+`retention lifecycle skipped; schema gap, nothing to cancel` warn means the
+guild rejoined, so skip the insert while the guild is live. Run the default
+dry run first and confirm the guild is still gone before executing. Do not
+restart the container to "clear" the counter; a replacement resets the
+baseline without replaying the purge.
+
+Escalate when skips repeat across windows after the migration lands (the gap
+is not the schema), when the error lines name `42501` on rejoins (the ACL
+plan is still unapplied and the cursor stays held), or when a skip coincides
+with DB-error or pool-saturation alerts suggesting a wider database incident.
+
+#### Alert: voice dispatch timeouts
+
+`two_bot_voice_dispatch_timeouts_total` increased between two keepalive
+samples. One actor dispatch turn ran past the 60 s observe bound. The turn ran
+to completion and the queue keeps its retries, so a single overrun is
+slowness, not loss — but an over-budget turn proves only that the total turn
+exceeded 60 s, which bounded awaits, lock contention, scheduling delay, or
+downstream latency can also produce, and repeats mean the actor is not
+keeping up. The first sample after
+monitoring arms only stores the baseline and never fires, and a counter reset
+(process restart) skips the window rather than firing. This is a **ticket**,
+not a page: one slow turn never pages, while member-visible join degradation
+already pages through the join-budget burn rules.
+
+First response: read the warn log line `voice dispatch turn exceeded observe
+bound` for the guild and elapsed seconds, plus the queue-side posture from the
+authorized `/ops/metrics` scrape (`two_bot_voice_queue_oldest_age_seconds`,
+`two_bot_voice_live_not_ready_seconds`). A lone overrun next to a healthy
+queue is one slow turn — note it and watch the next windows. Do
+not restart the container to "clear" the counter; a replacement resets the
+baseline without addressing the slowness.
+
+Escalate when overruns repeat across windows, when they coincide with
+watchdog-stuck or queue-stall tickets (the actor is not keeping up), or when
+they coincide with sustained join-budget burn — the slowness is then
+member-visible and the fix belongs to the on-call engineer, not another
+redeploy.
+
+#### Alert: voice watchdog stucks
+
+`two_bot_voice_watchdog_stucks_total` increased between two keepalive samples.
+Queued actions saw no completed dispatch turn for the full 120 s stuck window:
+the actor had work and made no progress on it. One stuck window can self-clear
+on the next window, so this is a **ticket**, not a page — but a stuck window
+is never healthy idleness (an empty queue never fires the watchdog), and
+member-visible join degradation already pages through the join-budget burn
+rules. The first sample after monitoring arms only stores the baseline and
+never fires, and a counter reset (process restart) skips the window rather
+than firing.
+
+First response: read the error log line `voice worker stuck: queued actions
+with no progress` (at most one per stuck window), then check the sibling
+posture from the authorized `/ops/metrics` scrape: the halt latch
+(`two_bot_voice_worker_halted`), the live-not-ready age, the queue oldest age
+and the join-budget burn rules. A stuck window next to a halted latch suggests
+the halt rather than the queue — but both signals aggregate across all guild
+actors with no guild labels, so co-occurrence alone does not prove the halt
+caused this stuck window; confirm attribution in the guild-scoped log lines,
+then follow the halted-worker section. A stuck window with a
+hung dispatch is the in-process verdict; anything else points at a slow drain.
+Do not restart the container to "clear" the counter; a replacement resets the
+baseline without draining the queue.
+
+Escalate when stuck windows repeat across windows, when they coincide with
+dispatch-timeout tickets (turns overrun and no progress lands), or when they
+coincide with sustained join-budget burn — queued members are then waiting
+past the stuck horizon and the fix belongs to the on-call engineer, not
+another redeploy.
+
+#### Alert: voice halt recoveries
+
+`two_bot_voice_halt_recoveries_total` increased between two keepalive samples.
+A store-CredentialRefused halt cleared via the 60 s credential re-probe: the
+halted worker read the store under timeout and the latch cleared, so the next
+join flows. Discord-401 halts never reach the probe — only a token fix and a
+restart clear those — so this counter never counts a token recovery; every
+increase is a store fault the automation covered. This is a **ticket**, not a
+page: the fault already passed, but the halt refused member joins while
+latched, and the store refusal is worth a look — including brief halt/recover
+cycles the sampled halt latch never shows. The first sample after monitoring
+arms only stores the baseline and never fires, and a counter reset (process
+restart) skips the window rather than firing.
+
+First response: read the info log line `voice worker halt cleared: store
+credentials healthy` for the guild, plus any `voice halt re-probe: store
+still refusing` or `timed out` lines around it from the container logs. A lone
+recovery after one refusing probe is a transient store blip — note it and
+watch the next windows. Confirm the halt latch reads 0 on the authorized
+`/ops/metrics` scrape; a latched 1 next to a recovery means some guild actor is
+still halted — possibly the same guild re-halted, possibly another (the latch
+aggregates all current guild actors with no guild labels); use the
+guild-scoped log lines for attribution. Do not restart
+the container to "clear" the counter; a replacement resets the baseline
+without explaining the refusal.
+
+Escalate when recoveries repeat across windows (the store credentials flap),
+when a recovery coincides with DB-error alerts (the refusal is a wider
+database incident), or when the latch stays 1 with no further recovery (the
+probe keeps failing and the halt needs operator action, not another redeploy).
+
+#### Alert: REST breaker opens
+
+`two_bot_rest_guard_breaker_opens_total` increased between two keepalive
+samples. The 600 s invalid-request window reached threshold (default 5000
+observations of 401, 403 or 429 response headers) and the guard started
+refusing non-essential REST sends locally. Essential interaction
+acknowledgements may bypass this breaker, but never a global pause or fatal
+token state. This is a **ticket**, like its sustained-open sibling: a trip on
+a bad deploy is routine, and the breaker closes on its own when the window
+cools below threshold — closes are the resolution evidence for this ticket,
+not a rule of their own. The first sample after monitoring arms only stores
+the baseline and never fires, and a counter reset (process restart) skips the
+window rather than firing.
+
+First response: read the guard's `discord_breaker_open` log line for the
+invalid-request count and threshold, plus `two_bot_rest_guard_invalid_requests_in_window`
+and `two_bot_rest_guard_rejected_requests_total` from the authorized
+`/ops/metrics` scrape; confirm whether a deploy is in progress (a fresh
+deploy shipping a bad token or a hot invalid route fills the window fast).
+There is no manual breaker reset: do not restart the container to "clear" it —
+a restart only resets the counters and destroys the evidence. As with the
+sustained-open ticket, check `two_bot_rest_guard_token_invalid` separately:
+ticket resolution on a cooled window is not REST recovery while the fatal
+token latch stays set — follow the
+[fatal-token procedure](rest-guard.md#fatal-bot-token-and-readiness).
+
+Escalate when trips repeat across windows after the rolling window should have
+cleared, when invalid requests keep arriving with no suspect deploy (a caller
+may be minting bad requests in a loop), or when the ticket coincides with
+missed gateway events or 5xx alerts suggesting a wider Discord or network
+incident.
+
+#### Alert: REST global pauses
+
+`two_bot_rest_guard_global_pauses_total` increased between two keepalive
+samples. A new Discord global REST pause began: all guarded REST admission
+holds until the learned deadline passes. Extensions and overlapping pending
+responses never increment this counter, so every increase is a genuinely new
+episode. This is a **ticket**, never a page: the pause self-clears at its
+deadline and no operator action shortens Discord-side backpressure. Every 429
+response, including global 429s, also counts toward the 600 s invalid-request
+window and can contribute to opening the breaker — a pause episode next to a
+breaker trip is the expected shape of a global-limit storm, not two
+independent incidents. The first sample after monitoring arms only stores the
+baseline and never fires, and a counter reset (process restart) skips the
+window rather than firing.
+
+First response: read the guard's `discord_global_pause` log line for the
+wait, plus `two_bot_rest_guard_global_paused`,
+`two_bot_rest_guard_global_pause_remaining_seconds` and
+`two_bot_rest_guard_pending_global_responses` from the authorized
+`/ops/metrics` scrape; confirm whether a deploy is in progress (a fresh
+deploy shipping a request storm trips the global limit fast). There is no
+manual pause release: do not restart the container to "clear" it — a restart
+resets the counters, drops pending response state, and loses the in-memory
+deadline; the new process does not retain the pause unless it observes another
+global 429. Read the remaining duration together with
+`global_paused` and pending responses, not as a standalone readiness signal.
+
+Escalate when new episodes arrive back-to-back across windows with no
+Discord-side incident (our own request pattern may be tripping the global
+limit), when episodes coincide with breaker trips and sustained 429 rates, or
+when a pause never clears past its learned deadline — the hold is then
+unexplained and the fix belongs to the on-call engineer, not another redeploy.
 
 #### Auto-remediation: guarded stall and crash-loop response
 
@@ -2110,8 +2301,11 @@ activation. Current activation admits these capabilities only for the staging
 guild/application pair; live flags alone cannot enable them. Registry entries
 do not prove every builtin has a handler. Internal-action HTTP is the
 dark-by-default private announcement receiver (see the Internal actions row).
-There is no binary audit-halt command or settings hot-reload/admin endpoint to
-recommend. See the [incident playbooks](#incident-playbooks) for persistent
+There is no settings hot-reload/admin endpoint to recommend; the audit halt
+handle for disposable agent-testdb fixtures is the `audit_switch` operator
+binary ([usage](audit-store.md#operator-handle)). No halt command for a
+deployed staging/production store is provided. See the
+[incident playbooks](#incident-playbooks) for persistent
 ownership containment, actual degradation and stop boundaries.
 
 For unexpected writes: first identify the actual writer (legacy bot, next image,
@@ -2122,7 +2316,7 @@ tokens, or redeploy with an unreviewed wiring change during this docs procedure.
 
 | Control | Ported contract | Current operational boundary |
 |---|---|---|
-| Audit kill switch | Durable `audit_kill_switch`, singleton `id=1`; `engage_halt(actor_id)` / `disengage_halt()` library methods. Halt blocks queue discovery/claim/preparation, not fact recording or an already prepared/in-flight send. | Store and delivery sweep exist (`crates/bot/src/website_jobs.rs:289` registers `audit_runtime`; `crates/bot/src/audit_runtime.rs:141-159` installs the `audit_retry` sweep). Operator endpoint not wired: no supported command in this binary. Durable DB errors propagate; legacy pure-model read-fail-open is **not** send authorization. See [audit store](audit-store.md). |
+| Audit kill switch | Durable `audit_kill_switch`, singleton `id=1`; `engage_halt(actor_id)` / `disengage_halt()` library methods. Halt blocks queue discovery/claim/preparation, not fact recording or an already prepared/in-flight send. | Store and delivery sweep exist (`crates/bot/src/website_jobs.rs:294` registers `audit_runtime`; `crates/bot/src/audit_runtime.rs:141-159` installs the `audit_retry` sweep). Operator handle for disposable agent-testdb fixtures is the `audit_switch` binary ([usage](audit-store.md#operator-handle)); no command in the bot binary itself, and no halt command for a deployed staging/production store. Durable DB errors propagate; legacy pure-model read-fail-open is **not** send authorization. See [audit store](audit-store.md). |
 | Automod | Exact `TWO_AUTOMOD=1` enables config. Dry-run by default; exact `TWO_AUTOMOD_ENFORCE=1` selects enforce. | Forwarded and composed into the gateway when activation/configuration permit. Requires valid Owen/protected-role configuration; enforcement can sanction. `TWO_AUTOMOD=1` requests MESSAGE_CONTENT intent. Flags alone do not override identity/permission gates or stop the bot. Filter/effect semantics, repeat expiry, corpus care and triage: [automod operator guide](automod-operator-guide.md). |
 | Moderation | Exact `TWO_MODERATION=1`; enabled config requires `TWO_OWEN_USER_ID`; protected-role policy applies. | Forwarded; channel handlers `/purge`, `/slowmode`, `/lockdown`, `/unlock` are registered and subject to activation and permission checks. Do not infer every member-moderation builtin executes. No config toggle demonstrated as an emergency stop. |
 | Automations/announcements/text | `TWO_AUTOMATIONS=1`, `TWO_ANNOUNCEMENTS=1`; text needs automations **and** `TWO_TEXT_COMMANDS=1`. | Per-feature gates, not operational containment. Verify the affected deployed handler; registry publishing or a periodic job alone does not prove a specific action is active. |
@@ -2709,7 +2903,7 @@ into this Rust binary without an implemented dispatch path.
 | Redeploy/rollback/Coolify deployment | Replaced by explicit Wrangler environment/version/image procedure. Current production cutover remains separate; no Coolify action is prescribed here. |
 | Backup/restore, off-box storage, timers | Ported CLI/unit templates; [backup.md](backup.md). Only test-container rehearsals authorized here; no assertion timers are installed. |
 | Guild-config snapshot/restore/seal/drift | Ported staging-guarded CLI; not permission to run a real restore or use a live token. |
-| Operational audit kill switch/MAC reasons | Core/store port exists; delivery sweep wired (`crates/bot/src/website_jobs.rs:289`, `crates/bot/src/audit_runtime.rs:141-159`), operator control not wired. No fake SQL/CLI replacement. |
+| Operational audit kill switch/MAC reasons | Core/store port exists; delivery sweep wired (`crates/bot/src/website_jobs.rs:294`, `crates/bot/src/audit_runtime.rs:141-159`); operator handle for disposable agent-testdb fixtures is the `audit_switch` binary ([usage](audit-store.md#operator-handle)); no halt command for a deployed staging/production store. No fake SQL replacement. |
 | Automod, moderation, feature toggles | Forwarded gates, channel-command handlers and gateway automod are implemented and identity/permission gated. This is not blanket builtin coverage or cutover approval; use the current containment table and verify the deployed writer. |
 | Health/REST rate limits/429 breaker | Liveness/readiness, durable token admission, executor-local pacing and process-wide guard are implemented. They differ from the legacy control topology; no manual reset endpoint. The private announcement receiver has a separate governor; a legacy writer uses its own runbook. |
 | Attribution/scorecard/plan/onboarding/automation reports | Legacy read-only reporting CLIs intentionally dropped by parity decision; core calculations/store presence does not add operator commands. |

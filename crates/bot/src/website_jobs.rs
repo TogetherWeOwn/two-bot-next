@@ -11,9 +11,9 @@ use two_bot_core::{
     build_community_snapshot, build_counter_reading,
     database_tls::{self, TlsPolicy},
     diagnose_rank_roles, match_rank_roles, normalize_events, now_iso, plan_rank_heal,
-    read_raid_windows, replace_events, write_counter, write_rank_snapshot, Config, RankHeal,
-    RankRungProblem, RawScheduledEvent, RosterMember, WebsiteStoreError, LIVE_COUNTER_INTERVAL_MS,
-    RANK_SNAPSHOT_INTERVAL_MS, SCHEDULED_EVENTS_INTERVAL_MS,
+    read_raid_windows, replace_events, write_counter, write_rank_snapshot, Config, JobGate,
+    RankHeal, RankRungProblem, RawScheduledEvent, RosterMember, WebsiteStoreError,
+    LIVE_COUNTER_INTERVAL_MS, RANK_SNAPSHOT_INTERVAL_MS, SCHEDULED_EVENTS_INTERVAL_MS,
 };
 use two_bot_discord::executor::{ActionExecutor, DiscordError};
 use two_bot_discord::internal_events::canonical_snowflake;
@@ -50,11 +50,50 @@ mod snapshot_tests;
 #[path = "website_event_identity_acceptance_tests.rs"]
 mod event_identity_acceptance_tests;
 
+#[cfg(test)]
+#[path = "website_jobgate_acceptance_tests.rs"]
+mod jobgate_acceptance_tests;
+
+#[cfg(test)]
+#[path = "website_events_dispatch_tests.rs"]
+mod events_dispatch_tests;
+
 #[derive(Clone, Copy)]
 pub enum Kind {
     Counter,
     Rank,
     Events,
+}
+
+impl Kind {
+    /// Whole-tick Events entry point with [`JobGate`] single-flight: a tick
+    /// that cannot acquire the gate skips at once (`Ok`, no fetch, no
+    /// publish, no queue, no error); otherwise the guard is held across the
+    /// delegated tick, so overlapping ticks cannot both run. Counter and rank
+    /// ticks never take this path.
+    pub async fn run_events_tick(
+        pool: &PgPool,
+        rest: &ActionExecutor,
+        guild: &str,
+        observation: &Mutex<()>,
+        shutdown: &watch::Receiver<bool>,
+        rank_heal: bool,
+        gate: &JobGate,
+    ) -> Result<(), ErrorClass> {
+        let Some(_guard) = gate.try_acquire() else {
+            return Ok(());
+        };
+        snapshot_once(
+            Kind::Events,
+            pool,
+            rest,
+            guild,
+            observation,
+            shutdown,
+            rank_heal,
+        )
+        .await
+    }
 }
 
 /// Cadence overrides are compiled only into tests, never the deployed binary.
@@ -89,6 +128,7 @@ pub(crate) struct Context {
     pub(crate) rest: ActionExecutor,
     pub(crate) guild: String,
     observation: Mutex<()>,
+    events_gate: JobGate,
 }
 
 impl Context {
@@ -105,6 +145,42 @@ impl Context {
                 Ok(db.pool().clone())
             })
             .await
+    }
+
+    /// One supervised website tick: Events ticks run through the shared
+    /// [`JobGate`] single-flight entry point, so overlapping Events ticks
+    /// cannot both run; every other kind runs direct via [`run_once`] and
+    /// never touches the gate. The scheduler closure calls this instead of
+    /// branching itself, so the routing stays unit-testable next to the tick
+    /// it guards.
+    async fn run_tick(
+        &self,
+        kind: Kind,
+        shutdown: &watch::Receiver<bool>,
+        rank_heal: bool,
+    ) -> Result<(), ErrorClass> {
+        if matches!(kind, Kind::Events) {
+            return Kind::run_events_tick(
+                self.pool().await?,
+                &self.rest,
+                &self.guild,
+                &self.observation,
+                shutdown,
+                rank_heal,
+                &self.events_gate,
+            )
+            .await;
+        }
+        run_once(
+            kind,
+            self.pool().await?,
+            &self.rest,
+            &self.guild,
+            &self.observation,
+            shutdown,
+            rank_heal,
+        )
+        .await
     }
 }
 
@@ -218,6 +294,7 @@ pub async fn serve(
                     rest,
                     guild: guild.to_string(),
                     observation: Mutex::new(()),
+                    events_gate: JobGate::default(),
                 });
                 // The rank tick is the only website job with a Discord write
                 // path: the ladder self-heal grants roles under the bot
@@ -252,15 +329,7 @@ pub async fn serve(
                                     biased;
                                     _ = server::shutdown_requested(shutdown.clone()) => Ok(()),
                                     result = async {
-                                        run_once(
-                                            kind,
-                                            context.pool().await?,
-                                            &context.rest,
-                                            &context.guild,
-                                            &context.observation,
-                                            &shutdown,
-                                            rank_heal,
-                                        ).await
+                                        context.run_tick(kind, &shutdown, rank_heal).await
                                     } => result,
                                 }
                             })
@@ -496,6 +565,19 @@ async fn drain_http(
 
 pub(crate) async fn get(rest: &ActionExecutor, path: &str) -> Result<Value, ErrorClass> {
     rest.get_json(path)
+        .await
+        .map_err(|_| ErrorClass::Rest)?
+        .ok_or(ErrorClass::Rest)
+}
+
+/// [`get`] plus the raw wire-body length, for callers enforcing a wire-body
+/// cap. The length is measured over the collected response bytes, never over
+/// a re-serialization of the parsed value.
+async fn get_with_body_len(
+    rest: &ActionExecutor,
+    path: &str,
+) -> Result<(Value, usize), ErrorClass> {
+    rest.get_json_with_body_len(path)
         .await
         .map_err(|_| ErrorClass::Rest)?
         .ok_or(ErrorClass::Rest)
@@ -782,6 +864,75 @@ fn publication_stopped(shutdown: &watch::Receiver<bool>) -> bool {
     *shutdown.borrow() || shutdown.has_changed().is_err()
 }
 
+/// Raw scheduled-events response-body cap, 1 MiB (bounded-claim decision §4).
+/// Bodies over this refuse as [`ErrorClass::Rest`] before any row reaches
+/// storage; the last good snapshot is kept by construction.
+pub(crate) const MAX_SCHEDULED_EVENTS_BODY_BYTES: usize = 1_048_576;
+
+/// One Events snapshot attempt with the observation stamp injected.
+/// Production stamps `observed_at` from the real clock in [`snapshot_once`]
+/// immediately before the GET (TOG-20273); age-bound tests inject a fixed
+/// stamp here instead of racing the clock.
+///
+/// Whole-response gates, in order: the raw wire-body cap (measured over the
+/// collected response bytes — unknown fields and JSON-insignificant bytes
+/// included, never over known fields alone or a re-serialization), then the
+/// existing shape/normalize/store path unchanged (including the epoch-claim
+/// StaleSnapshot gate: an older-than-committed fetch still rolls back and is
+/// logged here). The 5-minute age skip (decision §4) is NOT enforced here
+/// yet: the follow-up age slice pins it through this seam first, then wires
+/// the check.
+pub(crate) async fn snapshot_events_once(
+    pool: &PgPool,
+    rest: &ActionExecutor,
+    guild: &str,
+    shutdown: &watch::Receiver<bool>,
+    observed_at: &str,
+) -> Result<(), ErrorClass> {
+    let (response, body_len) = get_with_body_len(
+        rest,
+        &format!("/guilds/{guild}/scheduled-events?with_user_count=true"),
+    )
+    .await?;
+    // Measure the wire bytes, not the parsed value: an unknown-field pad must
+    // count toward the cap exactly like a long description does, and
+    // JSON-insignificant bytes (whitespace, duplicate keys, \uXXXX escapes)
+    // count as Discord sent them. A re-serialized measure would compact those
+    // away and admit an over-cap body.
+    if body_len > MAX_SCHEDULED_EVENTS_BODY_BYTES {
+        return Err(ErrorClass::Rest);
+    }
+    let raw = response
+        .as_array()
+        .ok_or(ErrorClass::Rest)?
+        .iter()
+        .map(|value| raw_event(value, guild))
+        .collect::<Result<Vec<_>, _>>()?;
+    let events = normalize_events(&raw).ok_or(ErrorClass::Rest)?;
+    if publication_stopped(shutdown) {
+        return Ok(());
+    }
+    // Epoch-claim gate (main #1472): a strictly older fetch rolls the whole
+    // swap back and reports StaleSnapshot; the tick logs the skip and keeps
+    // the newer snapshot.
+    match replace_events(pool, guild, observed_at, &events).await {
+        Ok(None) => Ok(()),
+        Ok(Some(skip)) => {
+            // Warn, not info: the runner never overlaps ticks
+            // (`jobs.rs` skips while one is active), so a lost claim
+            // means wall-clock skew froze the whole events mirror until
+            // real time passes the stored epoch.
+            tracing::warn!(
+                job = "events",
+                skip = ?skip,
+                "stale snapshot lost the epoch claim; publication skipped"
+            );
+            Ok(())
+        }
+        Err(_) => Err(ErrorClass::Database),
+    }
+}
+
 async fn snapshot_once(
     kind: Kind,
     pool: &PgPool,
@@ -797,37 +948,7 @@ async fn snapshot_once(
         // began, so a mutation that lands while the GET is in flight keeps
         // its newer row instead of being overwritten by this older fetch.
         let fetched_at = now_iso();
-        let response = get(
-            rest,
-            &format!("/guilds/{guild}/scheduled-events?with_user_count=true"),
-        )
-        .await?;
-        let raw = response
-            .as_array()
-            .ok_or(ErrorClass::Rest)?
-            .iter()
-            .map(|value| raw_event(value, guild))
-            .collect::<Result<Vec<_>, _>>()?;
-        let events = normalize_events(&raw).ok_or(ErrorClass::Rest)?;
-        if publication_stopped(shutdown) {
-            return Ok(());
-        }
-        return match replace_events(pool, guild, &fetched_at, &events).await {
-            Ok(None) => Ok(()),
-            Ok(Some(skip)) => {
-                // Warn, not info: the runner never overlaps ticks
-                // (`jobs.rs` skips while one is active), so a lost claim
-                // means wall-clock skew froze the whole events mirror until
-                // real time passes the stored epoch.
-                tracing::warn!(
-                    job = "events",
-                    skip = ?skip,
-                    "stale snapshot lost the epoch claim; publication skipped"
-                );
-                Ok(())
-            }
-            Err(_) => Err(ErrorClass::Database),
-        };
+        return snapshot_events_once(pool, rest, guild, shutdown, &fetched_at).await;
     }
     // Both kinds publish the denominator. Hold one shared lane from the first
     // observation through commit so a slow rank tick cannot overwrite a newer

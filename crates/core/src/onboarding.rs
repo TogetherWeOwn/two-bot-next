@@ -142,7 +142,7 @@ pub enum PromptDecision {
 }
 
 /// Skip reasons, in legacy check order: bots, then the rules gate, then the
-/// once-per-member guard (legacy `decidePrompt`).
+/// per-stay guard (legacy `decidePrompt`; a processed goodbye clears it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptSkip {
     Bot,
@@ -152,7 +152,7 @@ pub enum PromptSkip {
 
 /// Pure prompt gate: a member becomes promptable the moment they can see and
 /// click things. `already_prompted` is the store's `onboarding_prompted`
-/// answer; the store enforces once-per-member again at write time.
+/// answer; the store enforces the per-stay guard again at write time.
 #[must_use]
 pub fn decide_prompt(is_bot: bool, pending: bool, already_prompted: bool) -> PromptDecision {
     if is_bot {
@@ -1323,7 +1323,8 @@ pub struct FunnelRow {
 }
 
 /// Stable idempotency key, byte-identical to legacy `idempotencyKey()` for
-/// these types: `onboarding_prompted` is once-per-member; the other two
+/// these types: `onboarding_prompted` is once per stay (a processed goodbye
+/// deletes it, see `clear_onboarding_prompt`); the other two
 /// repeat by design (re-picks) and key on member + time.
 #[must_use]
 pub fn funnel_idempotency_key(row: &FunnelRow) -> String {
