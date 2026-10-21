@@ -7,6 +7,9 @@
 
 pub mod action_outcomes;
 pub mod activation;
+#[cfg(all(test, feature = "db"))]
+#[path = "admin_api_audit_acceptance_tests.rs"]
+mod admin_api_audit_acceptance_tests;
 pub mod analytics_family;
 pub mod anchor_event;
 pub mod assistant_transport;
