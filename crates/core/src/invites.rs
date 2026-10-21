@@ -29,6 +29,19 @@ pub struct InviteState {
     pub temporary: bool,
 }
 
+/// Largest invite `uses` the `invite_snapshots.uses` INTEGER column can persist.
+///
+/// Discord counters are `u64`; every writer clamps to this bound instead of
+/// failing, and every diff compares in this clamped domain so a saturated
+/// baseline never reports growth forever.
+pub const MAX_INVITE_USES: u64 = i32::MAX as u64;
+
+/// Clamp a Discord-fed invite counter to [`MAX_INVITE_USES`].
+#[must_use]
+pub fn saturate_invite_uses(uses: u64) -> u64 {
+    uses.min(MAX_INVITE_USES)
+}
+
 /// How much each invite code was used between two counter readings.
 ///
 /// A code absent from `prev` was created inside the window, so ALL its uses
@@ -392,8 +405,14 @@ impl<S: InviteSnapshotStore> InviteTracker<S> {
         let mut grew = Vec::new();
         if !stale {
             for inv in current {
+                // Compare in the clamped domain the column can persist: `load`
+                // returns at most `MAX_INVITE_USES`, so comparing raw live
+                // counters would credit a saturated code on every diff,
+                // forever. The store below persists (and warns on) the same
+                // clamp, so the comparison and the stored baseline agree.
+                let uses = saturate_invite_uses(inv.uses);
                 if let Some(before) = prev.get(&inv.code) {
-                    if inv.uses > *before {
+                    if uses > *before {
                         grew.push(inv.code.clone());
                     }
                 }
@@ -575,6 +594,62 @@ mod tests {
         assert!(grew.is_empty());
         let grew = t.diff_and_store(1, &[state("a", 6), state("new", 9)]);
         assert!(grew.is_empty());
+    }
+
+    #[test]
+    fn saturate_invite_uses_clamps_at_i32_max() {
+        assert_eq!(saturate_invite_uses(0), 0);
+        assert_eq!(saturate_invite_uses(MAX_INVITE_USES), MAX_INVITE_USES);
+        assert_eq!(saturate_invite_uses(MAX_INVITE_USES + 1), MAX_INVITE_USES);
+        assert_eq!(saturate_invite_uses(u64::MAX), MAX_INVITE_USES);
+    }
+
+    /// A store that persists the column's clamp, like `PgInviteSnapshots`:
+    /// `load` returns at most `MAX_INVITE_USES` while live counters stay raw.
+    struct ClampingSnapshots {
+        inner: MemSnapshots,
+    }
+
+    impl InviteSnapshotStore for ClampingSnapshots {
+        fn load(&self, guild_id: Snowflake) -> Vec<InviteState> {
+            self.inner.load(guild_id)
+        }
+
+        fn store_all(&self, guild_id: Snowflake, states: &[InviteState]) {
+            let clamped: Vec<InviteState> = states
+                .iter()
+                .map(|state| InviteState {
+                    uses: saturate_invite_uses(state.uses),
+                    ..state.clone()
+                })
+                .collect();
+            self.inner.store_all(guild_id, &clamped);
+        }
+
+        fn delete_missing(&self, guild_id: Snowflake, live_codes: &HashSet<String>) {
+            self.inner.delete_missing(guild_id, live_codes);
+        }
+    }
+
+    #[test]
+    fn saturated_counter_reports_growth_once_then_goes_quiet() {
+        let t = InviteTracker::new(ClampingSnapshots {
+            inner: MemSnapshots::new(),
+        });
+        assert!(t
+            .diff_and_store(1, &[state("a", MAX_INVITE_USES)])
+            .is_empty());
+        // Genuine growth across the clamp reads once...
+        assert_eq!(
+            t.diff_and_store(1, &[state("a", MAX_INVITE_USES + 1)]),
+            vec!["a".to_owned()]
+        );
+        // ...then the saturated baseline stays quiet: the live counter is
+        // still above the clamp, but nothing moved since the last diff.
+        assert!(t
+            .diff_and_store(1, &[state("a", MAX_INVITE_USES + 1)])
+            .is_empty());
+        assert!(t.diff_and_store(1, &[state("a", u64::MAX)]).is_empty());
     }
 
     #[test]

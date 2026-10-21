@@ -122,17 +122,16 @@ impl InviteSnapshotStore for PgInviteSnapshots {
                 // out-of-range counters instead of panicking: the snapshot
                 // write proceeds with the clamped value. The warn names only
                 // the guild and code identifiers, never the raw counter.
-                let uses = if s.uses > i32::MAX as u64 {
+                let saturated = two_bot_core::saturate_invite_uses(s.uses);
+                if saturated != s.uses {
                     tracing::warn!(
                         guild_id = %guild_id,
                         code = %s.code,
                         "invite uses saturated at i32::MAX",
                     );
-                    i32::MAX
-                } else {
-                    // `s.uses <= i32::MAX`, so the cast cannot truncate.
-                    s.uses as i32
-                };
+                }
+                // `saturated <= i32::MAX`, so the cast cannot truncate.
+                let uses = saturated as i32;
                 sqlx::query(
                     "INSERT INTO invite_snapshots (guild_id, code, uses, inviter_id, channel_id, updated_at)
                      VALUES ($1, $2, $3, $4, $5, $6::timestamptz)
