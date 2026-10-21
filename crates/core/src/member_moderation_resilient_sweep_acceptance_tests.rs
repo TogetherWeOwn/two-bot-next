@@ -47,6 +47,12 @@
 //! database (`MEMBER_TESTDB=agent-testdb` or `ci` in GitHub Actions); it
 //! never touches staging or production.
 //!
+//! Lane placement: this file is a `#[cfg(test)]` module of the core crate
+//! (wired at the end of `member_moderation.rs`), not an integration target
+//! under `tests/`. The lib/bins lanes (nextest, rust tests) execute it on
+//! every head; the integration step never runs on a red head because the
+//! lib/bins step fails first, so a `tests/` target could never show RED.
+//!
 //! Expected results on the baseline: `sweep_continues_past_rejected_job_
 //! and_reports_counts`, `sweep_continues_past_rate_limited_job_and_requeues_
 //! it`, `sweep_fences_uncertain_timeout_and_completes_the_rest` and
@@ -60,11 +66,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use two_bot_core::member_moderation::{
+use crate::member_moderation::{
     DiscordCall, DiscordError, MemMemberStore, MemberDiscord, MemberError, MemberModerationService,
     MemberModerationStore,
 };
-use two_bot_core::ModerationPolicy;
+use crate::ModerationPolicy;
 
 const GUILD: &str = "100000000000000001";
 const NOW: &str = "2023-11-14T22:13:20.000Z";
@@ -240,10 +246,7 @@ async fn stage_three_pending(store: &MemMemberStore) {
     }
 }
 
-fn failure_audit_for(
-    audits: &[two_bot_core::member_moderation::AuditRow],
-    req: &str,
-) -> Option<usize> {
+fn failure_audit_for(audits: &[crate::member_moderation::AuditRow], req: &str) -> Option<usize> {
     audits
         .iter()
         .position(|row| row.request_id == format!("{req}:unban-failed"))
@@ -252,7 +255,7 @@ fn failure_audit_for(
 /// The recorded-failure shape from contract item 3: exact ids, bounded cause,
 /// never the raw Discord detail.
 fn assert_failure_recorded(
-    audits: &[two_bot_core::member_moderation::AuditRow],
+    audits: &[crate::member_moderation::AuditRow],
     req: &str,
     user: &str,
     raw_detail: &str,
@@ -429,13 +432,13 @@ async fn empty_sweep_reports_zero_zero_control() {
 // --- Disposable-DB sweep proof (self-skips without MEMBER_TESTDB) -------------
 
 #[cfg(feature = "db")]
+use crate::member_moderation_store::PgMemberModerationStore;
+#[cfg(feature = "db")]
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 #[cfg(feature = "db")]
 use sqlx::{PgPool, Postgres, QueryBuilder};
 #[cfg(feature = "db")]
 use std::time::Duration;
-#[cfg(feature = "db")]
-use two_bot_core::member_moderation_store::PgMemberModerationStore;
 
 #[cfg(feature = "db")]
 async fn db_pool() -> Option<(PgPool, PgPool, String)> {

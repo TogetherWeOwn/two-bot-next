@@ -4787,3 +4787,7 @@ mod tests {
         assert_eq!(discord.call_count("ban"), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "member_moderation_resilient_sweep_acceptance_tests.rs"]
+mod resilient_sweep_acceptance_tests;
