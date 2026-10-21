@@ -3870,12 +3870,14 @@ class WorkflowTests(unittest.TestCase):
                     )
         [store_lane] = [line for line in runs if "--test backfill_audit_log" in line]
         store_skips = re.findall(r"--skip (\S+)", store_lane)
+        quarantined = set()
         for suite in red_suites:
-            names = backfill_quarantine_members(ignored_test_reasons(suite))
-            expected.update(names)
-            for name in names:
-                with self.subTest(suite=suite, test=name):
-                    self.assertIn(name, store_skips)
+            quarantined.update(backfill_quarantine_members(ignored_test_reasons(suite)))
+        expected.update(quarantined)
+        self.assertEqual(
+            set(store_skips), quarantined,
+            "store skip set must match quarantine; un-skip graduated tests in the fail-closed lane",
+        )
         # The internal-events DB test is skipped by its module-qualified
         # path: the bare function name would also match a same-named test
         # in any other module swept here. The qualified pin in the
@@ -3915,42 +3917,64 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(backfill_quarantine_errors({}, {"alpha": reason}), [])
 
     def test_fixed_backfill_family_can_leave_coverage_and_store_skip_sets(self):
-        suite = "backfill_bans_invites_onboarding"
-        fixed = set(ignored_test_names(suite))
         reasons = ignored_test_reasons
-        current = {}
-        for candidate in BACKFILL_QUARANTINE_SUITES:
-            current.update(reasons(candidate))
-        for name in fixed:
-            current[name] = '#[ignore = "requires authorized TEST_DATABASE_URL"]'
-        pinned = {name: ref for name, ref in BACKFILL_QUARANTINE.items() if name not in fixed}
-        mutated = deepcopy(self.workflows)
-        for job in mutated["check.yml"]["jobs"].values():
-            for step in job.get("steps", []):
-                if "run" in step:
-                    for name in fixed:
-                        step["run"] = step["run"].replace(f"--skip {name}", "")
-        with patch.object(self, "workflows", mutated), patch(
-            f"{__name__}.ignored_test_reasons",
-            side_effect=lambda candidate: (
-                {name: current[name] for name in fixed}
-                if candidate == suite else reasons(candidate)
-            ),
-        ):
-            # Exercise the neighboring exact sweep pin, not just the helper.
-            self.test_patch_coverage_ignored_sweep_skips_tests_that_cannot_pass_there()
-        self.assertEqual(backfill_quarantine_errors(pinned, current), [])
-
-    def test_backfill_quarantine_is_tracked_counted_and_shrink_only(self):
-        # TOG-34944: the 15 nowhere-run red backfill tests are quarantined,
-        # never silent. Tracked: each ignore reason carries its build card.
-        # Counted: the pin asserts 15. Shrink-only: growth fails, and a fix
-        # ratchets the pin down in the same PR.
-        self.assertEqual(len(BACKFILL_QUARANTINE), 15)
-        current = {}
         for suite in BACKFILL_QUARANTINE_SUITES:
-            current.update(ignored_test_reasons(suite))
-        self.assertEqual(backfill_quarantine_errors(BACKFILL_QUARANTINE, current), [])
+            fixed = set(ignored_test_names(suite))
+            current = {}
+            for candidate in BACKFILL_QUARANTINE_SUITES:
+                current.update(reasons(candidate))
+            for name in fixed:
+                current[name] = '#[ignore = "requires authorized TEST_DATABASE_URL"]'
+            pinned = {name: ref for name, ref in BACKFILL_QUARANTINE.items() if name not in fixed}
+            mutated = deepcopy(self.workflows)
+            for workflow in ("check.yml", "nightly.yml"):
+                for job in mutated[workflow]["jobs"].values():
+                    for step in job.get("steps", []):
+                        if "run" in step:
+                            for name in fixed:
+                                step["run"] = step["run"].replace(f"--skip {name}", "")
+            store = next(
+                step for job in mutated["check.yml"]["jobs"].values()
+                for step in job.get("steps", [])
+                if "--test backfill_audit_log" in step.get("run", "")
+            )
+            nightly = next(
+                step for step in mutated["nightly.yml"]["jobs"]["sweep"]["steps"]
+                if step.get("name") == "Full workspace sweep including ignored tests"
+            )
+            with patch.object(self, "workflows", mutated), patch(
+                f"{__name__}.ignored_test_reasons",
+                side_effect=lambda candidate: (
+                    {name: current[name] for name in fixed}
+                    if candidate == suite else reasons(candidate)
+                ),
+            ), patch(f"{__name__}.BACKFILL_QUARANTINE", pinned):
+                # Proper graduation keeps the DB opt-in and un-skips all three sites.
+                with self.subTest(suite=suite, graduation="complete"):
+                    self.test_patch_coverage_ignored_sweep_skips_tests_that_cannot_pass_there()
+                    self._assert_backfill_quarantine_skip_sites(current)
+                    self.assertEqual(backfill_quarantine_errors(pinned, current), [])
+                name = sorted(fixed)[0]
+                for site, step in (("store", store), ("nightly", nightly)):
+                    original = step["run"]
+                    # Cargo also accepts substring and module-qualified skips.
+                    for token in (name, name[:-1], f"database::{name}"):
+                        with self.subTest(suite=suite, site=site, stale_skip=token):
+                            step["run"] = original.rstrip() + f" --skip {token}"
+                            try:
+                                message = (
+                                    "store skip set must match quarantine" if site == "store"
+                                    else "un-skip graduated backfill tests in the nightly sweep"
+                                )
+                                with self.assertRaisesRegex(AssertionError, message):
+                                    self._assert_backfill_quarantine_skip_sites(current)
+                                if site == "store":
+                                    with self.assertRaisesRegex(AssertionError, message):
+                                        self.test_patch_coverage_ignored_sweep_skips_tests_that_cannot_pass_there()
+                            finally:
+                                step["run"] = original
+
+    def _assert_backfill_quarantine_skip_sites(self, current):
         # All three skip sites pin every quarantined test: the coverage sweep
         # and the store lane (check.yml) plus the nightly sweep (nightly.yml).
         check_jobs = self.workflows["check.yml"]["jobs"]
@@ -3978,11 +4002,39 @@ class WorkflowTests(unittest.TestCase):
             for line in shell_logical_lines(str(candidate.get("run", "")))
         ]
         nightly_skips = set(re.findall(r"--skip (\S+)", nightly_sweep))
+        self.assertEqual(
+            store_skips, set(BACKFILL_QUARANTINE),
+            "store skip set must match quarantine; un-skip graduated tests in the fail-closed lane",
+        )
+        graduated = set(current) - set(backfill_quarantine_members(current))
+        blocked = {}
+        for name in sorted(graduated):
+            # These backfill fns are top-level: unrelated module-only filters
+            # such as channel_moderation_store:: cannot block their bare paths.
+            matches = sorted(
+                skip for skip in nightly_skips
+                if skip.rsplit("::", 1)[-1] and skip_blocks_test(skip, name)
+            )
+            if matches:
+                blocked[name] = matches
+        self.assertEqual(blocked, {}, "un-skip graduated backfill tests in the nightly sweep")
         for name in sorted(BACKFILL_QUARANTINE):
             with self.subTest(quarantined=name):
                 self.assertIn(name, coverage_skips)
                 self.assertIn(name, store_skips)
                 self.assertIn(name, nightly_skips)
+
+    def test_backfill_quarantine_is_tracked_counted_and_shrink_only(self):
+        # TOG-34944: the 15 nowhere-run red backfill tests are quarantined,
+        # never silent. Tracked: each ignore reason carries its build card.
+        # Counted: the pin asserts 15. Shrink-only: growth fails, and a fix
+        # ratchets the pin down in the same PR.
+        self.assertEqual(len(BACKFILL_QUARANTINE), 15)
+        current = {}
+        for suite in BACKFILL_QUARANTINE_SUITES:
+            current.update(ignored_test_reasons(suite))
+        self.assertEqual(backfill_quarantine_errors(BACKFILL_QUARANTINE, current), [])
+        self._assert_backfill_quarantine_skip_sites(current)
         # Both workflow comments restate the quarantine at test granularity
         # with tracking refs: every name and every ref appears in a `#`
         # comment line, so the prose cannot drift from the pin.
