@@ -105,10 +105,11 @@ Placement and secrecy rules:
 Gateway capture (dry-run, staging only) wraps the voice sink
 (`crates/bot/src/music_capture.rs`): `VoiceServerUpdate` plus self
 `VoiceStateUpdate` (resolved from the cache identity) feed `VoicePairing`
-behind `TWO_MUSIC=1` and the staging fence. A completed handshake logs
-one structured line (guild, channel, `has_token` — never token/endpoint
-values) and is dropped; a self leave logs the clear. No HTTP, no PATCH,
-no gateway send in the capture slice.
+behind `TWO_MUSIC=1` and the staging fence. Each distinct completed
+handshake logs one structured line (guild, channel, `has_token` — never
+token/endpoint values) and is dropped; a self leave logs the clear.
+Redelivered identical halves (mute toggles, region refreshes) do not
+re-log. No HTTP, no PATCH, no gateway send in the capture slice.
 
 Still to come (follow-up cards): the REST/WS client, the
 `UpdateVoiceState` send path (the bot never issues gateway voice commands

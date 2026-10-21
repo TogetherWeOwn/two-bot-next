@@ -36,6 +36,7 @@ pub struct MusicVoiceTap {
     inner: Option<Arc<dyn VoiceEventSink>>,
     staging_guild: Option<Snowflake>,
     pairing: Mutex<VoicePairing>,
+    last_logged: Mutex<HashMap<Snowflake, PlayerVoiceUpdate>>,
     dry_runs: AtomicU64,
     clears: AtomicU64,
 }
@@ -72,6 +73,7 @@ impl MusicVoiceTap {
             inner,
             staging_guild,
             pairing: Mutex::new(VoicePairing::new()),
+            last_logged: Mutex::new(HashMap::new()),
             dry_runs: AtomicU64::new(0),
             clears: AtomicU64::new(0),
         }
@@ -105,8 +107,10 @@ impl MusicVoiceTap {
     ///
     /// Anything else — unset staging guild, another guild, another member,
     /// unknown bot identity, a server half without endpoint — is ignored
-    /// silently. A completed handshake logs one structured line (guild,
-    /// channel, `has_token`) and is dropped: dry-run only.
+    /// silently. Each distinct completed handshake logs one structured line
+    /// (guild, channel, `has_token`) and is dropped: dry-run only.
+    /// Redelivered identical halves (mute toggles, region refreshes) do not
+    /// re-log; a changed half or a rejoin after leave logs again.
     fn observe(&self, event: &Event, bot_id: Option<Snowflake>) {
         match event {
             Event::VoiceServerUpdate(update) => {
@@ -117,11 +121,13 @@ impl MusicVoiceTap {
                 let Some(endpoint) = update.endpoint.as_deref() else {
                     return;
                 };
-                let mut pairing = self.pairing.lock().expect("music pairing lock");
-                pairing.observe_server(guild_id, &update.token, endpoint);
-                if let Some(complete) = pairing.complete(guild_id) {
-                    self.dry_runs.fetch_add(1, Ordering::Relaxed);
-                    log_dry_run(guild_id, complete.channel_id);
+                let completed = {
+                    let mut pairing = self.pairing.lock().expect("music pairing lock");
+                    pairing.observe_server(guild_id, &update.token, endpoint);
+                    pairing.complete(guild_id)
+                };
+                if let Some(update) = completed {
+                    self.note_completed(&update);
                 }
             }
             Event::VoiceStateUpdate(update) => {
@@ -136,16 +142,26 @@ impl MusicVoiceTap {
                     return;
                 }
                 let channel = update.channel_id.map(|id| id.get());
-                let mut pairing = self.pairing.lock().expect("music pairing lock");
-                pairing.observe_state(guild_id, &update.session_id, channel);
                 match channel {
                     Some(_) => {
-                        if let Some(complete) = pairing.complete(guild_id) {
-                            self.dry_runs.fetch_add(1, Ordering::Relaxed);
-                            log_dry_run(guild_id, complete.channel_id);
+                        let completed = {
+                            let mut pairing = self.pairing.lock().expect("music pairing lock");
+                            pairing.observe_state(guild_id, &update.session_id, channel);
+                            pairing.complete(guild_id)
+                        };
+                        if let Some(update) = completed {
+                            self.note_completed(&update);
                         }
                     }
                     None => {
+                        {
+                            let mut pairing = self.pairing.lock().expect("music pairing lock");
+                            pairing.observe_state(guild_id, &update.session_id, None);
+                        }
+                        self.last_logged
+                            .lock()
+                            .expect("music pairing lock")
+                            .remove(&guild_id);
                         self.clears.fetch_add(1, Ordering::Relaxed);
                         tracing::info!(
                             msg = "music_voice_pairing_cleared",
@@ -158,6 +174,22 @@ impl MusicVoiceTap {
             }
             _ => {}
         }
+    }
+
+    /// Log a completed handshake unless it repeats the last logged one.
+    ///
+    /// Discord re-emits self voice state on every mute/deafen/video toggle
+    /// with the same session and channel, and repeats server halves on
+    /// region moves: without this, one handshake logs a line per dispatch
+    /// instead of one line per handshake.
+    fn note_completed(&self, update: &PlayerVoiceUpdate) {
+        let mut last_logged = self.last_logged.lock().expect("music pairing lock");
+        if last_logged.get(&update.guild_id) == Some(update) {
+            return;
+        }
+        last_logged.insert(update.guild_id, update.clone());
+        self.dry_runs.fetch_add(1, Ordering::Relaxed);
+        log_dry_run(update.guild_id, update.channel_id);
     }
 }
 
@@ -513,6 +545,61 @@ mod tests {
             "a server half without endpoint cannot complete"
         );
         assert_eq!(tap.complete(STAGING), None);
+    }
+
+    #[test]
+    fn repeat_halves_do_not_relog() {
+        let tap = tap(Some(STAGING));
+        tap.observe(&server_event(STAGING, "token", Some("endpoint")), Some(BOT));
+        tap.observe(
+            &state_event(STAGING, BOT, "session", Some(CHANNEL)),
+            Some(BOT),
+        );
+        assert_eq!(tap.dry_runs(), 1);
+        // Mute toggles and region refreshes redeliver identical halves.
+        tap.observe(&server_event(STAGING, "token", Some("endpoint")), Some(BOT));
+        tap.observe(
+            &state_event(STAGING, BOT, "session", Some(CHANNEL)),
+            Some(BOT),
+        );
+        assert_eq!(tap.dry_runs(), 1, "an unchanged handshake logs once");
+    }
+
+    #[test]
+    fn changed_half_relogs() {
+        let tap = tap(Some(STAGING));
+        tap.observe(
+            &server_event(STAGING, "token", Some("old-endpoint")),
+            Some(BOT),
+        );
+        tap.observe(
+            &state_event(STAGING, BOT, "session", Some(CHANNEL)),
+            Some(BOT),
+        );
+        assert_eq!(tap.dry_runs(), 1);
+        tap.observe(
+            &server_event(STAGING, "token", Some("new-endpoint")),
+            Some(BOT),
+        );
+        assert_eq!(tap.dry_runs(), 2, "a refreshed endpoint is a new handshake");
+    }
+
+    #[test]
+    fn rejoin_after_leave_relogs() {
+        let tap = tap(Some(STAGING));
+        tap.observe(&server_event(STAGING, "token", Some("endpoint")), Some(BOT));
+        tap.observe(
+            &state_event(STAGING, BOT, "session", Some(CHANNEL)),
+            Some(BOT),
+        );
+        assert_eq!(tap.dry_runs(), 1);
+        tap.observe(&state_event(STAGING, BOT, "session", None), Some(BOT));
+        tap.observe(&server_event(STAGING, "token", Some("endpoint")), Some(BOT));
+        tap.observe(
+            &state_event(STAGING, BOT, "session", Some(CHANNEL)),
+            Some(BOT),
+        );
+        assert_eq!(tap.dry_runs(), 2, "leave clears the dedup memory");
     }
 
     #[test]
