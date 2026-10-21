@@ -16,8 +16,11 @@ refuses with fixed vocabulary, and the marker sits outside the projection
 hash. The host denylists are intentionally mirror-image rather than
 identical: the staging gate refuses prod-like hosts and databases, while the
 production gate refuses staging-like hosts (staging label, Neon, test
-database, pooler). Each gate therefore refuses the other's canonical host;
-the explicit-target acceptance tests pin both directions.
+database, pooler). Each gate therefore refuses the other's label-bearing
+canonical test host; label-free targets such as identical PlanetScale hosts
+are distinguished by the explicit marker, workflow identity and pin match,
+not the denylist. The explicit-target acceptance tests pin both
+directions.
 
 ## Available before environment approval
 

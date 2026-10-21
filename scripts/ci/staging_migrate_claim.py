@@ -153,7 +153,9 @@ def build_claim(manifest, env):
     # Mirror-image denylist, intentionally different from the production
     # gate: staging refuses prod-like hosts and databases, while production
     # refuses staging-like hosts (staging label, Neon, test database,
-    # pooler). Each gate refuses the other's canonical host. Pinned by the
+    # pooler). Each gate refuses the other's label-bearing canonical test
+    # host; label-free targets are distinguished by the explicit marker,
+    # workflow identity and pin match, not this list. Pinned by the
     # explicit-target acceptance tests; see docs/staging-migrate-claim.md.
     require(isinstance(target.get("host"), str)
             and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}", target["host"])
