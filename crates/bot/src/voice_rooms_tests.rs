@@ -15,6 +15,8 @@ mod cold_authority;
 mod creation_receipt_acceptance;
 #[path = "voice_delete_guard_tests.rs"]
 mod delete_guards;
+#[path = "voice_disconnect_poison_acceptance_tests.rs"]
+mod drop_poison_acceptance_tests;
 #[path = "voice_empty_grace_override_tests.rs"]
 mod empty_grace_override;
 #[path = "voice_invite_override_tests.rs"]

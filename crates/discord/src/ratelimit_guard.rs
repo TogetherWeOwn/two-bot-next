@@ -1071,6 +1071,10 @@ impl Drop for ResponseAccounting<'_> {
 }
 
 #[cfg(test)]
+#[path = "ratelimit_drop_poison_acceptance_tests.rs"]
+mod drop_poison_acceptance_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

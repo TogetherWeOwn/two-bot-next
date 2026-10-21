@@ -2326,6 +2326,10 @@ fn scalar(out: &mut String, name: &str, kind: &str, value: u64) {
 }
 
 #[cfg(test)]
+#[path = "metrics_drop_poison_acceptance_tests.rs"]
+mod drop_poison_acceptance_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
