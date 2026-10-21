@@ -4278,11 +4278,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             // deadline. Always yield past a miss so a queue that keeps
             // reporting progress cannot spin the reply budget away
             // without advancing the clock.
-            let pump = self.dispatch_one(now_ms);
-            tokio::pin!(pump);
+            let mut pump = Box::pin(self.dispatch_one(now_ms));
             let expired = tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => true,
-                _ = &mut pump => false,
+                _ = pump.as_mut() => false,
             };
             if expired {
                 let StagedOwnershipReply { reply, .. } = staged;
@@ -4290,7 +4289,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 // The reply is out; the attempt still owns its queued
                 // action, so run it to completion instead of cancelling.
                 // The store leg sees the dropped waiter and finishes
-                // unbounded (see the commit deadline below).
+                // unbounded (see the commit deadline below). Awaiting
+                // consumes the heap-pinned pump, ending its borrow of
+                // `self` before the deadline is cleared.
                 pump.await;
                 self.ownership_commit_deadline = None;
                 return;
