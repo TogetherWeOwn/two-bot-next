@@ -222,6 +222,12 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
     metadata = image_entries[0]
     require("Id" in metadata, "docker image inspect entry has no Id")
     require("Size" in metadata, "docker image inspect entry has no Size")
+    require(isinstance(metadata["Id"], str) and metadata["Id"],
+            "docker image inspect Id must be a nonempty string")
+    require(isinstance(metadata.get("Config"), dict),
+            "docker image inspect Config must be an object")
+    require(isinstance(metadata["Config"].get("Healthcheck", {}), dict),
+            "docker image inspect Healthcheck must be an object")
     # Resolve the tag once; measurement and every image probe use this ID.
     image = metadata["Id"]
     report(f"Docker storage-driver Size (diagnostic only): {metadata['Size']} bytes")

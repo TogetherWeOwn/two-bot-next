@@ -308,7 +308,10 @@ def collect(image, directory):
                 and isinstance(os_name, str)
                 and isinstance(configured_user, (str, type(None)))
                 and isinstance(entrypoint, (list, type(None)))
-                and isinstance(cmd, (list, type(None)))):
+                and isinstance(cmd, (list, type(None)))
+                and (entrypoint is None
+                     or all(isinstance(item, str) for item in entrypoint))
+                and (cmd is None or all(isinstance(item, str) for item in cmd))):
             raise TypeError("unexpected inspection field type")
     except (ValueError, KeyError, IndexError, TypeError, AttributeError, RecursionError):
         # Malformed inspection fails closed through the collection_error path

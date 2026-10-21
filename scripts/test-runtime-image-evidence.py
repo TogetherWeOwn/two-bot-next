@@ -454,6 +454,12 @@ class InspectShapeRegressionTests(unittest.TestCase):
             "user-number": entry(Config={"User": 123}),
             "entrypoint-string": entry(Config={"Entrypoint": "/home/nonroot/two-bot"}),
             "cmd-string": entry(Config={"Cmd": "run"}),
+            # A non-string element is malformed too: the fields are string
+            # arrays per the image spec, so [123] must not land in a
+            # complete report.
+            "entrypoint-number-element": entry(
+                Config={"Entrypoint": ["/home/nonroot/two-bot", 123]}),
+            "cmd-number-element": entry(Config={"Cmd": [123]}),
         }
         for label, stdout in cases.items():
             with self.subTest(label=label):

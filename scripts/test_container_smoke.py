@@ -1001,6 +1001,24 @@ class MalformedInspectRegressionTests(unittest.TestCase):
             ("not json", "non-json"),
             (json.dumps([{"Size": 1}]), "missing-id"),
             (json.dumps([{"Id": "sha256:" + "a" * 64}]), "missing-size"),
+            # A wrong-typed Id must not reach subprocess argv (TypeError
+            # traceback): it fails at validation before any history call.
+            (json.dumps([{"Id": 123, "Size": 1}]), "numeric-id"),
+            (json.dumps([{"Id": None, "Size": 1}]), "null-id"),
+            (json.dumps([{"Id": ["sha256:" + "b" * 64], "Size": 1}]), "list-id"),
+            (json.dumps([{"Id": "", "Size": 1}]), "empty-id"),
+            # A missing or wrong-typed Config (or Healthcheck) must fail at
+            # validation too, not as AttributeError at config.get below.
+            (json.dumps([{"Id": "sha256:" + "a" * 64, "Size": 1}]),
+             "missing-config"),
+            (json.dumps([{"Id": "sha256:" + "a" * 64, "Size": 1,
+                          "Config": None}]), "null-config"),
+            (json.dumps([{"Id": "sha256:" + "a" * 64, "Size": 1,
+                          "Config": "x"}]), "string-config"),
+            (json.dumps([{"Id": "sha256:" + "a" * 64, "Size": 1,
+                          "Config": {"User": "65532:65532",
+                                     "Healthcheck": "x"}}]),
+             "string-healthcheck"),
         ):
             with self.subTest(label=label):
                 error, out, err, calls = self.run_cli(stdout)
