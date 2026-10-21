@@ -206,7 +206,9 @@ def dry_run_plan(environment, evidence_path):
     history read is included, fail-open as live) so the planned event
     matches what a live run would deliver, then reports the webhook shape
     before any send. A missing webhook or a missing probe sample is a plan
-    line, never a failure: a preview is not a delivery.
+    line, never a failure: a preview is not a delivery. Refused evidence
+    (for example duplicate JSON keys) fails closed with the same clean
+    refusal as the live post path, never a traceback.
     """
     env = os.environ
     current = env.get("PROBE_OUTCOME")
@@ -214,7 +216,11 @@ def dry_run_plan(environment, evidence_path):
         event = None
     else:
         event = decide_event(env, environment)
-    evidence = load_evidence(evidence_path)
+    try:
+        evidence = load_evidence(evidence_path)
+    except AlertError as error:
+        print(f"synthetic_alert: {error}", file=sys.stderr)
+        return 1
     if event == "alert":
         summary = summarize(evidence)
     elif event == "recovery":

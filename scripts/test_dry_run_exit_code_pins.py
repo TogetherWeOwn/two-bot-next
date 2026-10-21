@@ -15,6 +15,8 @@ Contract pinned here:
 
 * ``synthetic_alert --dry-run`` raw return ``is 0`` with a valid webhook,
   a missing webhook, and a missing probe sample.
+* ``synthetic_alert --dry-run`` on refused evidence returns ``is 1`` with
+  the live-path fixed-vocabulary refusal and no traceback.
 * ``staging_voice_synthetic --dry-run`` raw return ``is 0`` with no token.
 * Every network/Discord entry point refuses during the run.
 
@@ -172,6 +174,31 @@ class AlertExitCodePins(unittest.TestCase):
             code, out, err = raw_alert(self.argv(), env)
         self.assertExactZero(code, err, "no-sample --dry-run")
         self.assertIn("dry-run plan", out, "must print the plan to stdout")
+
+
+class AlertDryRunRefusedEvidence(unittest.TestCase):
+    """--dry-run fails closed on refused evidence, like the live post path.
+
+    The duplicate-key refusal lives on main (load_evidence raises
+    AlertError); on this base the loader never raises, so the refusal is
+    injected to prove the handler. The test stays green across the merge
+    either way: it pins the handler, not the loader.
+    """
+
+    def test_dry_run_refused_evidence_exits_one_without_traceback(self):
+        argv = ["--env", "staging", "--evidence", "dup.json", "--dry-run"]
+        with (
+            no_network(history=[("failure", "success")]),
+            patch.object(alert, "load_evidence", side_effect=alert.AlertError(
+                "evidence refused: duplicate JSON object key")),
+        ):
+            code, out, err = raw_alert(argv, base_env())
+        self.assertIs(code, 1,
+                      f"refused evidence must exit exactly int 1; got {code!r}: {err[-300:]!r}")
+        self.assertIn("synthetic_alert: evidence refused: duplicate JSON object key", err,
+                      "refusal must use the live-path fixed vocabulary")
+        self.assertNotIn("Traceback", out + err, "refusal must never print a traceback")
+        self.assertEqual(out, "", "refusal must print no plan to stdout")
 
 
 class SynthExitCodePins(unittest.TestCase):
