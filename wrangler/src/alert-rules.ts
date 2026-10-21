@@ -2003,7 +2003,10 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   // never manufactures a page, matching every sibling rule, and a missing
   // required series in a real scrape fails the whole scrape anyway (the
   // metrics_scrape_lost path). The first valid sample only stores the
-  // baseline and never fires.
+  // baseline and never fires. A validated incarnation change (process
+  // restart, `unpaired.restarted` from the #1409 fence) re-baselines like
+  // the first sample and holds a firing page: the new process has no
+  // same-process history to judge.
   const GATEWAY_LATENCY_DEAD_RULE = "gateway_latency_dead";
   const latencyWasFiring = prev.firing.includes(GATEWAY_LATENCY_DEAD_RULE);
   const latencyRows = gauge("two_bot_gateway_latency_seconds");
@@ -2025,9 +2028,10 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   let gatewayLatencySeen = prevLatencySeen;
   if (latencyReading === "invalid") {
     if (latencyWasFiring) firing.push(GATEWAY_LATENCY_DEAD_RULE);
-  } else if (!prevLatencySeen) {
-    // The first valid sample (including after a gap) is only a baseline. A
-    // new baseline is not a quiet window, so a held page stays held.
+  } else if (!prevLatencySeen || unpaired.restarted) {
+    // The first valid sample (including after a gap or a validated process
+    // restart) is only a baseline. A new baseline is not a quiet window,
+    // so a held page stays held.
     gatewayLatencySeen = true;
     if (latencyReading === "unknown") {
       gatewayLatencyDeadStreak = 1;
@@ -2055,7 +2059,10 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   // gateway bound); a flat window resolves, a backwards counter (process
   // restart) rebaselines, the first valid sample only stores the baseline,
   // and missing/invalid samples hold a firing page without manufacturing
-  // evidence. Any sequence gap the flapping causes still pages immediately
+  // evidence. A validated incarnation change (`unpaired.restarted`) also
+  // re-baselines like the first sample and holds: a new process whose first
+  // counter already overtook the old baseline is not a same-process rise.
+  // Any sequence gap the flapping causes still pages immediately
   // via gateway_missed_events.
   const GATEWAY_RECONNECT_FLAP_RULE = "gateway_reconnect_flapping";
   const flapValue = exactSeries(gauge("two_bot_gateway_reconnects_total"), {});
@@ -2068,9 +2075,10 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   let gatewayReconnectStreak = prevFlapStreak;
   if (flapValue === undefined) {
     if (wasFlapFiring) firing.push(GATEWAY_RECONNECT_FLAP_RULE);
-  } else if (!flapSeen) {
-    // The first valid sample (including after a gap) is only a baseline. A
-    // new baseline is not a quiet window, so a held page stays held.
+  } else if (!flapSeen || unpaired.restarted) {
+    // The first valid sample (including after a gap or a validated process
+    // restart) is only a baseline. A new baseline is not a quiet window,
+    // so a held page stays held.
     gatewayReconnects = flapValue;
     gatewayReconnectsSeen = true;
     gatewayReconnectStreak = 0;
@@ -2102,8 +2110,11 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   // windows ticket; any judged-quiet window or counter reset (process
   // restart) clears at once. The first valid sample only stores the
   // baseline; missing/invalid samples drop the baseline and hold a firing
-  // ticket without manufacturing evidence. Routine quantile movement stays
-  // log-only in the query pack; this rule is the saturation backstop.
+  // ticket without manufacturing evidence. A validated incarnation change
+  // (`unpaired.restarted`) re-baselines like the first sample and holds:
+  // bucket deltas against a dead process baseline are not a same-process
+  // window. Routine quantile movement stays log-only in the query pack;
+  // this rule is the saturation backstop.
   const HANDLER_SATURATED_RULE = "handler_duration_saturated";
   const handlerSamples = gauge("two_bot_handler_duration_seconds_bucket");
   const handlerCounts: Record<string, number> = {};
@@ -2131,9 +2142,10 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
         const count = prevHandler[le];
         return typeof count === "number" && Number.isSafeInteger(count) && count >= 0;
       });
-    if (!hasHandlerBaseline) {
-      // The first valid sample (including after a gap or from legacy state)
-      // is only a baseline; it never resolves an active ticket on its own.
+    if (!hasHandlerBaseline || unpaired.restarted) {
+      // The first valid sample (including after a gap, from legacy state,
+      // or a validated process restart) is only a baseline; it never
+      // resolves an active ticket on its own.
       handlerBuckets = { ...handlerCounts };
       if (wasHandlerFiring) firing.push(HANDLER_SATURATED_RULE);
     } else {
@@ -2172,8 +2184,11 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   // `eventsub_post_failed_share`). Only a judged window (floor met) at or
   // below the line resolves; flat or sub-floor windows hold an active
   // ticket, missing/invalid samples preserve firing and baseline, and any
-  // backwards counter (restart) rebaselines. The first valid sample only
-  // stores the baseline and never fires. Unknown job labels are ignored,
+  // backwards counter (restart) rebaselines. A validated incarnation
+  // change (`unpaired.restarted`) also re-baselines like the first sample
+  // and holds: run deltas against a dead process baseline are not a
+  // same-process window. The first valid sample only stores the baseline
+  // and never fires. Unknown job labels are ignored,
   // never subjects; a Rust job addition fails loud via the catalog job-label
   // gate until the fixed list names it. A job dead enough to page
   // `job_consecutive_failures` tickets here too: co-firing means continuous
@@ -2204,6 +2219,15 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   } else if (!prevJobShareSeen || prevJobShareBase === undefined) {
     for (const [job, counts] of Object.entries(jobRunsNow)) jobShareBase[job] = { ...counts };
     jobShareSeen = true;
+  } else if (unpaired.restarted) {
+    // A validated process restart re-baselines like the first sample and
+    // holds any firing ticket: run deltas against a dead process baseline
+    // are never judged, resolved, or fired from this sample.
+    for (const [job, counts] of Object.entries(jobRunsNow)) jobShareBase[job] = { ...counts };
+    jobShareSeen = true;
+    for (const key of prev.firing) {
+      if (key === JOB_SHARE_RULE || key.startsWith(`${JOB_SHARE_RULE}:`)) firing.push(key);
+    }
   } else {
     jobShareSeen = true;
     for (const job of JOB_RUNS_JOBS) {

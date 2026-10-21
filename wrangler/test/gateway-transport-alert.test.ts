@@ -65,6 +65,21 @@ const jobLines = (runs: Record<string, { s: number; f: number }>, latency: strin
   ]),
 ];
 
+// Process-incarnation fence rows (wire contract from
+// gateway-process-incarnation-acceptance.test.ts): two distinct validated
+// identities plus stable pairing counters that never fire
+// gateway_unpaired_disconnect on their own.
+const INCARNATION_SERIES = "two_bot_process_incarnation";
+const WORDS_A = [19088743, 2309737967, 2147483648, 4294967295];
+const WORDS_B = [0, 1, 0, 0];
+const identityLines = (words: number[]): string[] =>
+  words.map((value, part) => `${INCARNATION_SERIES}{part="${part}"} ${value}`);
+const pairingLines = (): string[] => [
+  `two_bot_gateway_disconnects_total 0`,
+  `two_bot_gateway_resumes_total 1`,
+  `two_bot_gateway_events_total{event="READY"} 1`,
+];
+
 function headingAnchors(text: string): Set<string> {
   return new Set([...text.matchAll(/^#+ (.+)$/gm)].map((m) =>
     m[1]!.toLowerCase().replace(/[^a-z0-9 _-]/g, "").replace(/ /g, "-")));
@@ -503,4 +518,103 @@ test("job failure share co-fires with consecutive failures on a continuous outag
     `two_bot_job_consecutive_failures{job="counter"} 3`,
   ], clean);
   assert.deepEqual(firing.firing.sort(), ["job_consecutive_failures:counter", `${SHARE}:counter`].sort());
+});
+
+test("gateway latency dead re-baselines on incarnation restart instead of paging", () => {
+  const a = [...pairingLines(), ...identityLines(WORDS_A)];
+  const b = [...pairingLines(), ...identityLines(WORDS_B)];
+  let s = ev([...latencyLines("0.011"), ...a]);
+  s = ev([...latencyLines("0.011"), ...a], s.state);
+  s = ev([...latencyLines("0.011"), ...a], s.state);
+  assert.equal(s.state.gatewayLatencyDeadStreak, 2);
+  assert.deepEqual(s.firing, []);
+  // Restart: the new process first ACK measures microsecond-identical RTT.
+  // Without the fence this third evidenceless sample would page; with it,
+  // the restart re-baselines and holds.
+  const restart = ev([...latencyLines("0.011"), ...b], s.state);
+  assert.deepEqual(restart.firing, []);
+  assert.equal(restart.state.gatewayLatencyDeadStreak, 0);
+  assert.equal(restart.state.gatewayLatencyLast, 0.011);
+  // Same-process recount after the restart: two more identical samples stay
+  // silent, the third pages.
+  let again = ev([...latencyLines("0.011"), ...b], restart.state);
+  again = ev([...latencyLines("0.011"), ...b], again.state);
+  assert.deepEqual(again.firing, []);
+  assert.deepEqual(ev([...latencyLines("0.011"), ...b], again.state).firing, [DEAD]);
+  // A firing page holds across the boundary instead of resolving: fresh
+  // evidence on the restart sample is a new baseline, not a quiet window.
+  const firing = ev([...latencyLines("0.011"), ...b], again.state);
+  assert.deepEqual(firing.firing, [DEAD]);
+  const held = ev([...latencyLines("0.012"), ...a], firing.state);
+  assert.deepEqual(held.firing, [DEAD]);
+  assert.equal(held.state.gatewayLatencyDeadStreak, 0);
+});
+
+test("reconnect flapping re-baselines on incarnation restart instead of paging", () => {
+  const a = [...pairingLines(), ...identityLines(WORDS_A)];
+  const b = [...pairingLines(), ...identityLines(WORDS_B)];
+  let s = ev([...flapLines(1, "0.011"), ...a]);
+  s = ev([...flapLines(2, "0.012"), ...a], s.state);
+  s = ev([...flapLines(3, "0.013"), ...a], s.state);
+  assert.equal(s.state.gatewayReconnectStreak, 2);
+  assert.deepEqual(s.firing, []);
+  // Restart: the new process reconnected 4 times in its first flaky minute,
+  // overtaking the old baseline 3 in one sample. Without the fence this
+  // reads as a third consecutive rise and pages; with it, re-baseline.
+  const restart = ev([...flapLines(4, "0.014"), ...b], s.state);
+  assert.deepEqual(restart.firing, []);
+  assert.equal(restart.state.gatewayReconnectStreak, 0);
+  assert.equal(restart.state.gatewayReconnects, 4);
+  // Same-process recount after the restart pages on the third rise.
+  let again = ev([...flapLines(5, "0.015"), ...b], restart.state);
+  again = ev([...flapLines(6, "0.016"), ...b], again.state);
+  assert.deepEqual(again.firing, []);
+  assert.deepEqual(ev([...flapLines(7, "0.017"), ...b], again.state).firing, [FLAP]);
+  // A firing page holds across the boundary instead of resolving.
+  const firing = ev([...flapLines(7, "0.017"), ...b], again.state);
+  assert.deepEqual(firing.firing, [FLAP]);
+  assert.deepEqual(ev([...flapLines(8, "0.018"), ...a], firing.state).firing, [FLAP]);
+});
+
+test("handler saturation re-baselines on incarnation restart instead of ticketing", () => {
+  const a = [...pairingLines(), ...identityLines(WORDS_A)];
+  const b = [...pairingLines(), ...identityLines(WORDS_B)];
+  let s = ev([...handlerLines(100, 100, "0.011"), ...a]);
+  s = ev([...handlerLines(110, 120, "0.012"), ...a], s.state);
+  s = ev([...handlerLines(120, 140, "0.013"), ...a], s.state);
+  assert.equal(s.state.handlerStreak, 2);
+  assert.deepEqual(s.firing, []);
+  // Restart: the new process buckets overtake the dead baseline in one
+  // sample (20 completions, 10 slow). Without the fence the delta judges
+  // a third saturated window; with it, re-baseline and hold quiet.
+  const restart = ev([...handlerLines(130, 160, "0.014"), ...b], s.state);
+  assert.deepEqual(restart.firing, []);
+  assert.equal(restart.state.handlerStreak, 0);
+  // Same-process recount after the restart tickets on the third window.
+  let again = ev([...handlerLines(140, 180, "0.015"), ...b], restart.state);
+  again = ev([...handlerLines(150, 200, "0.016"), ...b], again.state);
+  assert.deepEqual(again.firing, []);
+  assert.deepEqual(ev([...handlerLines(160, 220, "0.017"), ...b], again.state).firing, [SATURATED]);
+  // A firing ticket holds across the boundary instead of resolving.
+  const firing = ev([...handlerLines(160, 220, "0.017"), ...b], again.state);
+  assert.deepEqual(firing.firing, [SATURATED]);
+  assert.deepEqual(ev([...handlerLines(170, 240, "0.018"), ...a], firing.state).firing, [SATURATED]);
+});
+
+test("job failure share re-baselines on incarnation restart instead of ticketing", () => {
+  const a = [...pairingLines(), ...identityLines(WORDS_A)];
+  const b = [...pairingLines(), ...identityLines(WORDS_B)];
+  const clean = ev([...jobLines({ counter: { s: 8, f: 0 } }, "0.011"), ...a]).state;
+  // Restart: the new process runs overtake the dead baseline in one sample
+  // (12 runs, 2 failures = 16%). Without the fence the delta judges a
+  // failing window; with it, re-baseline and hold quiet.
+  const restart = ev([...jobLines({ counter: { s: 18, f: 2 } }, "0.012"), ...b], clean);
+  assert.deepEqual(restart.firing, []);
+  assert.deepEqual(restart.state.jobShareBase?.["counter"], { failure: 2, total: 20 });
+  // Same-process accumulation after the restart tickets on a judged window.
+  const fire = ev([...jobLines({ counter: { s: 26, f: 4 } }, "0.013"), ...b], restart.state);
+  assert.deepEqual(fire.firing, [`${SHARE}:counter`]);
+  // A firing ticket holds across the boundary instead of resolving.
+  const held = ev([...jobLines({ counter: { s: 30, f: 5 } }, "0.014"), ...a], fire.state);
+  assert.deepEqual(held.firing, [`${SHARE}:counter`]);
 });
