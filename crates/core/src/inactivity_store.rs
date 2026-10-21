@@ -37,6 +37,27 @@ pub enum InactivityStoreError {
 /// it comes back empty, so no single read materializes an unbounded row set.
 const SWEEP_PAGE_ROWS: usize = 4_096;
 
+/// Page/time budget for one [`run_sweep_budgeted`] pass: at most `max_pages`
+/// keyset selects, stopping early when `deadline` passes (checked per page).
+/// Large memberships complete across passes by feeding the returned
+/// [`SweepCursor`] back as `resume`.
+#[derive(Debug, Clone, Copy)]
+pub struct SweepBudget {
+    /// Maximum keyset selects this pass reads.
+    pub max_pages: usize,
+    /// Wall-clock budget for this pass, checked before every select.
+    pub deadline: std::time::Instant,
+}
+
+/// Opaque resume position for a budgeted sweep: moved by value from one
+/// [`run_sweep_budgeted`] pass to the next. Callers never inspect it — the
+/// keyset cursor inside keeps pages disjoint across passes, so the union
+/// across passes is byte-identical to one complete sweep.
+#[derive(Debug, Clone)]
+pub struct SweepCursor {
+    cursor: Option<(String, String)>,
+}
+
 /// One hourly sweep (legacy `flagInactive`): select members still present,
 /// not bots, quiet since before the cutoff, and either never flagged or last
 /// flagged before the cutoff; record one `member_inactive` event each and
@@ -48,6 +69,42 @@ pub async fn run_sweep(
     now: &str,
     days: u64,
 ) -> Result<InactivityOutcome, InactivityStoreError> {
+    let (outcome, _) = run_sweep_inner(pool, now, days, None, None).await?;
+    Ok(outcome)
+}
+
+/// One budgeted sweep pass over the same quiet-member set as [`run_sweep`]:
+/// at most `budget.max_pages` selects, stopping when `budget.deadline`
+/// passes. Returns the pass outcome plus `Some(cursor)` iff more work may
+/// remain — an empty or short page means done and returns `None`, while an
+/// expired deadline before any page returns `Some` with an empty outcome.
+/// Resume passes continue strictly past the cursor: every member event is
+/// written exactly once and nothing is silently skipped within or across
+/// passes. The paged SELECT keeps its SQL text.
+pub async fn run_sweep_budgeted(
+    pool: &Pool<Postgres>,
+    now: &str,
+    days: u64,
+    budget: SweepBudget,
+    resume: Option<SweepCursor>,
+) -> Result<(InactivityOutcome, Option<SweepCursor>), InactivityStoreError> {
+    run_sweep_inner(
+        pool,
+        now,
+        days,
+        Some((budget.max_pages, budget.deadline)),
+        resume,
+    )
+    .await
+}
+
+async fn run_sweep_inner(
+    pool: &Pool<Postgres>,
+    now: &str,
+    days: u64,
+    budget: Option<(usize, std::time::Instant)>,
+    resume: Option<SweepCursor>,
+) -> Result<(InactivityOutcome, Option<SweepCursor>), InactivityStoreError> {
     let parse = super::funnel::parse_iso_millis;
     let format = super::funnel::format_iso_millis;
     // Fail closed before any query or write: an unparseable sweep time must
@@ -81,11 +138,17 @@ pub async fn run_sweep(
     // tail behind them: the cursor has already moved past their keys. A page
     // therefore ends the sweep only when it comes back empty or short, never
     // because its rows were seen before.
-    let mut cursor: Option<(String, String)> = None;
+    let mut cursor: Option<(String, String)> = resume.and_then(|resume| resume.cursor);
     let mut written: Vec<(String, String)> = Vec::with_capacity(SWEEP_PAGE_ROWS);
     let mut outcome = InactivityOutcome { flagged: vec![] };
     let cutoff_ms = super::inactivity::inactivity_cutoff_ms(now_ms, days);
-    loop {
+    let mut pages: usize = 0;
+    let finished = loop {
+        if let Some((max_pages, deadline)) = budget {
+            if pages >= max_pages || std::time::Instant::now() >= deadline {
+                break false;
+            }
+        }
         // Keyset paging re-runs the bounded select with the previous page's
         // final key instead of using OFFSET (an offset would skip members the
         // earlier pages just flagged). `$3` is false on the first page, when
@@ -125,8 +188,9 @@ pub async fn run_sweep(
         .bind(cursor_member)
         .fetch_all(pool)
         .await?;
+        pages += 1;
         if rows.is_empty() {
-            break;
+            break true;
         }
         let page_len = rows.len();
         if let Some((guild_id, member_id, _, _, _)) = rows.last() {
@@ -247,9 +311,9 @@ pub async fn run_sweep(
         }
         outcome.flagged.extend(page.flagged);
         if page_len < SWEEP_PAGE_ROWS {
-            break;
+            break true;
         }
-    }
+    };
     // Linear membership: one set build, one O(1) probe per outcome, and the
     // probes borrow, so the filter clones nothing per item.
     let written_set: HashSet<(&str, &str)> = written
@@ -259,7 +323,12 @@ pub async fn run_sweep(
     outcome
         .flagged
         .retain(|f| written_set.contains(&(f.guild_id.as_str(), f.member_id.as_str())));
-    Ok(outcome)
+    let resume = if finished {
+        None
+    } else {
+        Some(SweepCursor { cursor })
+    };
+    Ok((outcome, resume))
 }
 
 #[cfg(test)]

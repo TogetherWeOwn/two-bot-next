@@ -25,6 +25,7 @@
 //! of its own — that lives in the [`AuditMirror`] implementation.
 
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use futures_util::future::BoxFuture;
 
@@ -41,6 +42,19 @@ use crate::audit_store::{
     AuditClaim, AuditStore, AuditStoreError, DeliveryFailure, DeliveryIntent, PrepareSend,
     QuarantineReason,
 };
+
+/// Maximum `channel_history` pages one Reconcile pass reads while proving the
+/// marker. A deep channel once paged past any bound; at the cap the pass stops
+/// with [`DeliverOutcome::ScanBoundReached`] and the row stays
+/// reconcile-eligible for the next owner — never quarantined for merely being
+/// unscanned. Marker identity, floor and empty-history outcomes within the
+/// bound are unchanged.
+pub const RECONCILE_MAX_PAGES: usize = 16;
+
+/// Wall-clock budget for one Reconcile boundary scan, checked per page beside
+/// [`RECONCILE_MAX_PAGES`]. Whichever bound hits first stops the pass with
+/// [`DeliverOutcome::ScanBoundReached`].
+pub const RECONCILE_SCAN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Static destination wiring for the service.
 #[derive(Debug, Clone)]
@@ -98,6 +112,10 @@ pub enum DeliverOutcome {
     Ambiguous,
     /// Terminal hold with the bounded reason stored.
     Quarantined(QuarantineReason),
+    /// The boundary scan hit [`RECONCILE_MAX_PAGES`] or [`RECONCILE_SCAN_TIMEOUT`]
+    /// with the marker neither proven nor disproven: nothing was written and
+    /// the row stays reconcile-eligible for the next owner.
+    ScanBoundReached,
     /// A store transition refused (stale/lost claim): nothing was sent and
     /// nothing was written by this pass.
     Unclaimed,
@@ -513,11 +531,17 @@ impl<M: AuditMirror> AuditMirrorService<M> {
             return Ok(DeliverOutcome::Held);
         }
 
-        // Unbounded boundary scan (legacy `findMirror` with a cursor): page
+        // Bounded boundary scan (legacy `findMirror` with a cursor): page
         // downward until the marker is proven, the floor drops below the
-        // boundary, or history runs out.
+        // boundary, history runs out, or the page/time budget is spent — a
+        // merely-unscanned row is never quarantined.
+        let scan_deadline = Instant::now() + RECONCILE_SCAN_TIMEOUT;
+        let mut pages: usize = 0;
         let mut before: Option<String> = None;
         loop {
+            if pages >= RECONCILE_MAX_PAGES || Instant::now() >= scan_deadline {
+                return Ok(DeliverOutcome::ScanBoundReached);
+            }
             let page = match self
                 .mirror
                 .channel_history(&destination, before.as_deref(), HISTORY_PAGE_LIMIT)
@@ -544,6 +568,7 @@ impl<M: AuditMirror> AuditMirrorService<M> {
                     return Ok(DeliverOutcome::Ambiguous);
                 }
             };
+            pages += 1;
             if let Some(message_id) =
                 find_mirror_in_page(&page, &entry_id, &self.config.bot_user_id, Some(&boundary))
             {
@@ -572,7 +597,7 @@ impl<M: AuditMirror> AuditMirrorService<M> {
                     .quarantine(claim, QuarantineReason::MarkerMissing)
                     .await;
             }
-            // Keep the lease alive across an unbounded scan.
+            // Keep the lease alive across the scan.
             self.store.renew(claim).await?;
             before = Some(floor);
         }
