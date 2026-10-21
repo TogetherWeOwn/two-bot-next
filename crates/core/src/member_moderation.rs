@@ -1171,15 +1171,11 @@ where
     /// The same continuing sweep as [`Self::run_due_unbans`], reporting both
     /// counts: jobs whose DELETE landed, and jobs that failed (requeued for
     /// the next sweep or fenced for reconciliation). The bot tick logs both.
-    #[expect(
-        clippy::manual_async_fn,
-        reason = "explicit Send preserves spawnability through the generic queue callback"
-    )]
     pub fn run_due_unbans_summary<'a>(
         &'a self,
         guild_id: &'a str,
     ) -> impl Future<Output = Result<(usize, usize), MemberError>> + Send + 'a {
-        async move { self.run_due_unbans_inner(guild_id).await }
+        self.run_due_unbans_inner(guild_id)
     }
 
     async fn run_due_unbans_inner(&self, guild_id: &str) -> Result<(usize, usize), MemberError> {
@@ -4862,8 +4858,4 @@ mod tests {
 
 #[cfg(test)]
 #[path = "member_moderation_resilient_sweep_acceptance_tests.rs"]
-// The protected acceptance module keeps baseline fallback traits that the
-// inherent items shadow once the builder lands; they are intentionally dead
-// on a GREEN head, and the builder must not edit that file.
-#[allow(dead_code)]
 mod resilient_sweep_acceptance_tests;
