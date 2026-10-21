@@ -454,14 +454,16 @@ Verified deliveries that need no operator action answer `200`:
   re-subscription after a revocation is automatic, not manual and not
   immediate — and not bounded by one hour (see above).
 - Unknown message types, and known deterministic classification errors on
-  non-verification messages (`WrongSubscription`, `InvalidBody`):
-  acknowledged with 2xx so Twitch does not retry what will never succeed.
+  non-verification messages (`WrongSubscription`, `InvalidBody`,
+  `DuplicateKeys`): acknowledged with 2xx so Twitch does not retry what
+  will never succeed.
   Unknown/future `classify()` errors are not included: they return retryable
   503 `unavailable` and count as metric `kind="other"` so an unrecognized
   failure is not silently discarded or conflated with known ignored deliveries.
   This carve-out excludes `webhook_callback_verification`: `classify()`
-  returns `WrongSubscription` / `InvalidBody` for a challenge with the wrong
-  type or version, or an unparsable signed body, and the handler still acks
+  returns `WrongSubscription` / `InvalidBody` / `DuplicateKeys` for a challenge
+  with the wrong type or version, an unparsable signed body, or a signed body
+  that repeats a key, and the handler still acks
   `200 {"ok": true, "request_id"}` with only an info `delivery ignored` line without
   echoing the challenge — so the subscription is never enabled. A `200
   delivery ignored` immediately after a subscription creation means the

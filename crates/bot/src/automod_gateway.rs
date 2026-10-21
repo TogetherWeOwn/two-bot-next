@@ -254,6 +254,9 @@ pub(crate) fn partial_edit(text: &str, receipt_ms: u64) -> Option<MessageDeliver
         return None;
     }
     let packet: serde_json::Value = serde_json::from_str(text).ok()?;
+    // Bytes already parsed: a repeated key refuses the edit before any ID
+    // routes the verdict pipeline.
+    two_bot_core::duplicate_keys::reject_duplicate_keys(text.as_bytes()).ok()?;
     if packet.get("t")?.as_str()? != "MESSAGE_UPDATE" {
         return None;
     }
@@ -346,3 +349,9 @@ pub(crate) fn expiry_job(slot: Slot) -> Job {
 #[cfg(test)]
 #[path = "automod_gateway_tests.rs"]
 mod tests;
+
+// Duplicate-key refusal acceptance (paired Test Author file; test-only,
+// production unchanged). The builder must preserve this wiring.
+#[cfg(test)]
+#[path = "automod_gateway_duplicate_key_acceptance_tests.rs"]
+mod duplicate_key_acceptance_tests;
