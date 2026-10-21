@@ -200,12 +200,13 @@ def webhook_validity(webhook_url):
 
 
 def dry_run_plan(environment, evidence_path):
-    """Print the delivery plan without posting or opening any connection.
+    """Print the delivery plan without posting or contacting Discord.
 
-    Runs the same decide step as the live path (history read included) so
-    the planned event matches what a live run would deliver, then reports
-    the webhook shape before any send. A missing webhook or a missing probe
-    sample is a plan line, never a failure: a preview is not a delivery.
+    Runs the same decide step as the live path (the read-only GitHub
+    history read is included, fail-open as live) so the planned event
+    matches what a live run would deliver, then reports the webhook shape
+    before any send. A missing webhook or a missing probe sample is a plan
+    line, never a failure: a preview is not a delivery.
     """
     env = os.environ
     current = env.get("PROBE_OUTCOME")
