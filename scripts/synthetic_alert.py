@@ -68,7 +68,7 @@ def load_evidence(path):
             value = json.load(handle, object_pairs_hook=_reject_duplicate_keys)
     except DuplicateKeyError:
         raise AlertError("evidence refused: duplicate JSON object key") from None
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return None
     return value if isinstance(value, dict) else None
 

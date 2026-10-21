@@ -229,7 +229,7 @@ def _get(path, token):
                            "(response exceeds the size cap)")
     try:
         return json.loads(body, object_pairs_hook=_reject_duplicate_keys)
-    except ValueError as error:
+    except (ValueError, RecursionError) as error:
         raise HistoryError("could not read recent synthetic workflow history ("
                            + error.__class__.__name__ + ")") from None
 

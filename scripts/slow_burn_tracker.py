@@ -77,7 +77,7 @@ def _load_cache_json(path):
             raw = stream.read(MAX_JSON_BYTES + 1)
         if len(raw) > MAX_JSON_BYTES:
             return None
-        return json.loads(raw)
+        return json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
     except (OSError, ValueError, UnicodeError, RecursionError):
         return None
 
