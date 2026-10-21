@@ -1726,3 +1726,7 @@ mod tests {
         publish_rest_age(&slots);
     }
 }
+
+#[cfg(test)]
+#[path = "voice_rooms_poison_acceptance.rs"]
+mod in_flight_poison_acceptance;

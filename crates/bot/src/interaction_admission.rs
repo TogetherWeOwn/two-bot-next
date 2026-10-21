@@ -318,3 +318,7 @@ mod tests {
         assert_eq!(slots.tracked_users(), 0, "counts never grow unbounded");
     }
 }
+
+#[cfg(test)]
+#[path = "interaction_admission_poison_acceptance.rs"]
+mod slot_poison_acceptance;
