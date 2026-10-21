@@ -23,8 +23,8 @@ use two_bot_core::{
         voice_ended_fact, voice_started_fact, CommunityStoreError, FactWrite, MessageFactInput,
     },
     leveling::{
-        leaderboard_reply_for_season, plan_reward_roles, rank_reply, season_id_for_ms, XpAward,
-        LEADERBOARD_DEFAULT_LIMIT,
+        leaderboard_reply_for_season, plan_reward_roles, rank_reply, season_id_for_ms,
+        RewardPlanError, XpAward, LEADERBOARD_DEFAULT_LIMIT,
     },
     leveling_store::{self, LevelingStoreError},
     ClassifierConfig, ClassifyInput, FactsSink, FunnelHandlers, FunnelStore, HandlerId,
@@ -49,6 +49,62 @@ pub enum LevelingRuntimeError {
     Discord(#[from] DiscordError),
     #[error("invalid leveling interaction")]
     InvalidInteraction,
+    /// The award committed but applying its level-up roles failed. The XP and
+    /// the computed level-up are durable; `awards` carries them so the caller
+    /// never reports the level-up as failed.
+    #[error("leveling role application failed after the XP award committed: {cause}")]
+    RoleApplication {
+        cause: RoleApplicationError,
+        awards: Vec<XpAward>,
+    },
+}
+
+impl LevelingRuntimeError {
+    /// Awards committed before the error. Only a role-application failure
+    /// carries any; every other error returns an empty slice.
+    #[must_use]
+    pub fn committed_awards(&self) -> &[XpAward] {
+        match self {
+            Self::RoleApplication { awards, .. } => awards,
+            _ => &[],
+        }
+    }
+
+    /// Put awards committed earlier in the same drain ahead of the ones this
+    /// error already carries; non-role errors are unchanged.
+    fn with_prior_awards(mut self, mut prior: Vec<XpAward>) -> Self {
+        if let Self::RoleApplication { awards, .. } = &mut self {
+            prior.append(awards);
+            *awards = prior;
+        }
+        self
+    }
+}
+
+/// Why a committed level-up's role application failed. Display carries role
+/// ids and fixed refusal evidence only: no SQL, tokens or response bodies.
+#[derive(Debug, thiserror::Error)]
+pub enum RoleApplicationError {
+    #[error("role rewards could not be read")]
+    Store(#[from] LevelingStoreError),
+    /// A read or a pre-mutation refusal: no role was written.
+    #[error("role application Discord operation failed")]
+    Discord(#[from] DiscordError),
+    /// The plan hit the per-list role-write cap: no role was written.
+    #[error(transparent)]
+    Plan(#[from] RewardPlanError),
+    /// The first refused write aborted the rest. Earlier roles stay applied.
+    #[error(
+        "role {role_id} refused: {reason} ({} applied, {} skipped)",
+        applied.len(),
+        skipped.len()
+    )]
+    Refused {
+        role_id: String,
+        reason: String,
+        applied: Vec<String>,
+        skipped: Vec<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -552,19 +608,45 @@ impl LevelingRuntime {
             && !self.onboarding.dry_run
             && two_bot_core::onboarding::level_role_writes_allowed(self.onboarding.mode)
         {
-            let rewards = leveling_store::role_rewards(&self.pool, &guild).await?;
-            if !rewards.is_empty() {
-                let held = self
-                    .executor
-                    .member_role_ids(request.guild_id, request.member_id)
-                    .await?;
-                let plan = plan_reward_roles(result.level, &rewards, &held, true, false);
-                self.executor
-                    .execute_reward_roles(request.guild_id, request.member_id, &plan, None)
-                    .await?;
-            }
+            self.apply_level_roles(&request, &guild, result.level)
+                .await
+                .map_err(|cause| LevelingRuntimeError::RoleApplication {
+                    cause,
+                    awards: vec![result],
+                })?;
         }
         Ok(Some(result))
+    }
+
+    /// Plan and apply the level-up roles after the award committed.
+    async fn apply_level_roles(
+        &self,
+        request: &AwardRequest,
+        guild: &str,
+        level: u64,
+    ) -> Result<(), RoleApplicationError> {
+        let rewards = leveling_store::role_rewards(&self.pool, guild).await?;
+        if rewards.is_empty() {
+            return Ok(());
+        }
+        let held = self
+            .executor
+            .member_role_ids(request.guild_id, request.member_id)
+            .await?;
+        let plan = plan_reward_roles(level, &rewards, &held, true, false)?;
+        let (applied, failed, skipped) = self
+            .executor
+            .execute_reward_roles(request.guild_id, request.member_id, &plan, None)
+            .await?;
+        match failed {
+            None => Ok(()),
+            Some((role_id, reason)) => Err(RoleApplicationError::Refused {
+                role_id,
+                reason,
+                applied,
+                skipped,
+            }),
+        }
     }
 
     /// Execute only the shared router's accepted leveling handler. The guild
@@ -806,8 +888,10 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
         let mut results = Vec::with_capacity(requests.len());
         if let Some(runtime) = &self.runtime {
             for request in requests {
-                if let Some(award) = runtime.award(request).await? {
-                    results.push(award);
+                match runtime.award(request).await {
+                    Ok(Some(award)) => results.push(award),
+                    Ok(None) => {}
+                    Err(error) => return Err(error.with_prior_awards(results)),
                 }
             }
         }

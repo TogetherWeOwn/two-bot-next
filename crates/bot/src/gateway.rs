@@ -989,6 +989,7 @@ fn apply_dispatch<I: InviteSource>(
                         // log its SQL/HTTP source.
                         tracing::warn!(
                             error = %error,
+                            committed_awards = error.committed_awards().len(),
                             "gateway leveling dispatch failed"
                         );
                         leveling_dispatch_failure()
