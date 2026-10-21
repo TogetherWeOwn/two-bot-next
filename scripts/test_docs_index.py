@@ -42,6 +42,13 @@ class DocsIndexTests(unittest.TestCase):
                     anchor = re.sub(r"\s", "-", re.sub(r"[^\w\s-]", "", heading.lower()))
                     self.assertIn(f"](#{anchor})", toc, heading)
 
+    def test_alert_navigation_does_not_shadow_section_readers(self):
+        text = (ROOT / "docs/runbook.md").read_text()
+        toc = text.split("<!-- start-here -->")[1].split("<!-- /start-here -->")[0]
+        # Existing alert conformance readers locate bodies by their title text.
+        # Short labels under "Alert anchors" must not become the first match.
+        self.assertNotIn("Alert:", toc)
+
 
 class IndexFixtureTests(unittest.TestCase):
     def setUp(self):
