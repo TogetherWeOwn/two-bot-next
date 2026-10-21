@@ -15,6 +15,7 @@ use two_bot_testsupport::TestDatabase;
 mod adapter;
 mod automations;
 mod drain_shutdown;
+mod moderate_slice_acceptance;
 mod receipt_lifecycle;
 mod settings;
 
