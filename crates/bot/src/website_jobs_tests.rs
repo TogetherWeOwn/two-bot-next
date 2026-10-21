@@ -10,6 +10,9 @@ use crate::{
 
 use crate::tracing_capture;
 
+#[path = "website_event_age_acceptance_tests.rs"]
+mod website_event_age_acceptance_tests;
+
 #[test]
 fn admission_lazy_pool_rejects_query_secrets_before_sqlx_logging() {
     let capture = tracing_capture::Capture::default();
