@@ -1,3 +1,6 @@
+#[path = "scheduled_uncertainty_acceptance_tests.rs"]
+mod uncertainty_acceptance;
+
 use serde_json::{json, Value};
 use tokio::sync::watch;
 use two_bot_core::{advance_next_run_iso, get_scheduled, put_scheduled, ScheduledWrite};
