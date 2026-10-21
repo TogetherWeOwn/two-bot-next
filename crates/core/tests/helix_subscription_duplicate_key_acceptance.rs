@@ -172,7 +172,10 @@ async fn listing_duplicate_data_is_refused_in_both_orders() {
         ScriptTransport::ok_raw(one_first.into_bytes()),
     ]);
     let a = match client.list_subscriptions().await {
-        Ok(list) => panic!("sub-1-first duplicate must be refused, got: {list:?}"),
+        Ok(list) => panic!(
+            "sub-1-first duplicate must be refused, got {} subscriptions",
+            list.len()
+        ),
         Err(error) => assert_refused(&error, "data duplicate, sub-1 first"),
     };
     let (mut client, _) = client_for(vec![
@@ -180,7 +183,10 @@ async fn listing_duplicate_data_is_refused_in_both_orders() {
         ScriptTransport::ok_raw(two_first.into_bytes()),
     ]);
     let b = match client.list_subscriptions().await {
-        Ok(list) => panic!("sub-2-first duplicate must be refused, got: {list:?}"),
+        Ok(list) => panic!(
+            "sub-2-first duplicate must be refused, got {} subscriptions",
+            list.len()
+        ),
         Err(error) => assert_refused(&error, "data duplicate, sub-2 first"),
     };
     assert_eq!(a, b, "both orders share one fixed refusal");
@@ -198,7 +204,10 @@ async fn listing_identical_duplicate_is_refused() {
         ScriptTransport::ok_raw(body.into_bytes()),
     ]);
     match client.list_subscriptions().await {
-        Ok(list) => panic!("identical duplicate must be refused, got: {list:?}"),
+        Ok(list) => panic!(
+            "identical duplicate must be refused, got {} subscriptions",
+            list.len()
+        ),
         Err(error) => {
             assert_refused(&error, "data repeated with the identical value");
         }
@@ -216,7 +225,10 @@ async fn listing_nested_entry_duplicate_is_refused() {
         ScriptTransport::ok_raw(body.into_bytes()),
     ]);
     match client.list_subscriptions().await {
-        Ok(list) => panic!("nested duplicate must be refused, got: {list:?}"),
+        Ok(list) => panic!(
+            "nested duplicate must be refused, got {} subscriptions",
+            list.len()
+        ),
         Err(error) => {
             assert_refused(&error, "nested duplicate entry id");
         }
@@ -236,7 +248,10 @@ async fn listing_escaped_key_spelling_counts_as_duplicate() {
         ScriptTransport::ok_raw(body.into_bytes()),
     ]);
     match client.list_subscriptions().await {
-        Ok(list) => panic!("escaped duplicate must be refused, got: {list:?}"),
+        Ok(list) => panic!(
+            "escaped duplicate must be refused, got {} subscriptions",
+            list.len()
+        ),
         Err(error) => {
             assert_refused(&error, "escaped spelling of data");
         }
@@ -254,7 +269,10 @@ async fn listing_unknown_duplicate_key_is_refused_without_echo() {
         ScriptTransport::ok_raw(body.into_bytes()),
     ]);
     match client.list_subscriptions().await {
-        Ok(list) => panic!("unknown duplicate must be refused, got: {list:?}"),
+        Ok(list) => panic!(
+            "unknown duplicate must be refused, got {} subscriptions",
+            list.len()
+        ),
         Err(error) => {
             assert_refused(&error, "unknown key repeated");
         }
@@ -280,7 +298,10 @@ async fn duplicate_on_second_page_refuses_without_partial_success() {
         ScriptTransport::ok_raw(page_two.into_bytes()),
     ]);
     match client.list_subscriptions().await {
-        Ok(list) => panic!("page-two duplicate must be refused, got: {list:?}"),
+        Ok(list) => panic!(
+            "page-two duplicate must be refused, got {} subscriptions",
+            list.len()
+        ),
         Err(error) => {
             assert_refused(&error, "duplicate on the second page");
         }
@@ -331,7 +352,10 @@ async fn every_duplicate_shape_shares_one_fixed_error() {
     for (shape, body) in shapes {
         let (mut client, _) = client_for(vec![token_answer(), ScriptTransport::ok_raw(body)]);
         let error = match client.list_subscriptions().await {
-            Ok(list) => panic!("{shape} duplicate must be refused, got: {list:?}"),
+            Ok(list) => panic!(
+                "{shape} duplicate must be refused, got {} subscriptions",
+                list.len()
+            ),
             Err(error) => error,
         };
         let display = assert_refused(&error, shape);
@@ -380,7 +404,10 @@ async fn valid_listings_behave_byte_identically() {
         ScriptTransport::ok_raw(br#"{"data":{"leak":1}}"#.to_vec()),
     ]);
     match client.list_subscriptions().await {
-        Ok(list) => panic!("malformed envelope must fail, got: {list:?}"),
+        Ok(list) => panic!(
+            "malformed envelope must fail, got {} subscriptions",
+            list.len()
+        ),
         Err(error @ HelixError::BadResponse(_)) => {
             assert!(
                 !format!("{error}").contains(DUP_TOKEN),
