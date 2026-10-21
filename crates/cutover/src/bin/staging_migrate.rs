@@ -29,7 +29,9 @@
 //! manifest's store projection, and the downloaded manifest at --plan-manifest-path
 //! (fetched by the workflow from the --plan-run-id run) carries both hashes,
 //! proving the bound hashes came from the named producing run; --plan prints that
-//! manifest (including both hashes) and ignores the plan-binding flags.
+//! manifest (including both hashes) and ignores the plan-binding flags. Intake
+//! cap: a downloaded manifest over 8 MiB is refused (exit 2) before parsing,
+//! so an oversized artifact never reaches the provenance comparison.
 //!
 //! `--staging-branch-id` (staging target) and `--production-branch-id`
 //! (production target) pin the PlanetScale branch id (non-secret): the pin is
