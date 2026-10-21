@@ -362,7 +362,7 @@ bounded-helper contract from the nightly backup above: a hung helper is
 terminated and reaped (direct child only), the run fails, and both files
 stay on disk. The snapshot + drift report land in
 `TWO_GUILD_CONFIG_BACKUP_DIR` (default `./guild-config-backups`;
-`crates/bot/src/backup_cli.rs:1044`, usage at `:200`).
+`crates/bot/src/backup_cli.rs:1067`, usage at `:200`).
 
 Both guild-config commands first read `CREDENTIALS_DIRECTORY/discord_staging_token`
 (the service's `LoadCredential` contract). Only an absent credential/no configured
