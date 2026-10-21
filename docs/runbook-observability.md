@@ -236,6 +236,33 @@ claim them as shipped acceptance:
   production has no gradual caller. Do not treat the existing gated readiness
   check plus manual rollback as proof of a gradual traffic rollout here.
 
+## Promotion gate failure codes
+
+The promotion error-rate gate (`wrangler/scripts/promotion-error-gate.mjs`)
+fences its scrape destination to the configured staging/production Worker
+origins and fails closed with a stable code, a fixed next action and a JSON
+error receipt (`verdict: "error"`) when it cannot judge. The closed code
+vocabulary:
+
+- `usage_error` — bad flags; check the gate flags with `--help` and retry. Exit 2.
+- `invalid_metrics_origin` — `--metrics-url` is not a bare `https://` Worker
+  origin from the configured identities; fix the origin and retry. Exit 2.
+- `invalid_timeout` — `--scrape-timeout-seconds` is not finite and positive;
+  fix the value and retry. Exit 2.
+- `redirect_refused` — the scrape refused a redirect; the bearer is never
+  followed across redirects. Verify direct `/ops/metrics` and retry. Exit 1.
+- `transport_failed` — the scrape transport failed after 3 attempts; verify
+  the Worker is reachable and retry. Exit 1.
+- `decode_failed` — the exposition could not be decoded; verify valid output
+  at `/ops/metrics` and retry. Exit 1.
+
+Receipts and console text never carry remote bodies, URL credentials, the
+bearer or exception messages. Offline rehearsal (no network, no token):
+
+```sh
+node wrangler/scripts/promotion-error-gate.mjs --metrics-url https://two-bot-next-staging.5150.workers.dev --evidence /tmp/gate-evidence.json --rehearsal-firing '[]'
+```
+
 For the full health, metrics, and rollback procedures, see the
 [operations runbook](runbook.md), [metrics reference](metrics.md), and
 [production deployment guide](production-deploy.md).
