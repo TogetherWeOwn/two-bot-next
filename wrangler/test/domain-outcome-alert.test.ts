@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
-  EMPTY_STATE, RULES, evaluateMetrics, evaluatePromotionGate, packetFilename,
+  EMPTY_STATE, RULES, evaluateMetrics, evaluatePromotionGate, interruptDispatchDrops, packetFilename,
   parseExposition, ruleFor, runbookUrl, transitionMessages,
   EVENTSUB_RECEIVE_GAP_SAMPLES, VOICE_REST_STUCK_SECONDS, VOICE_REST_STUCK_SAMPLES,
   FEED_FETCH_ERROR_CLASSES, EVENTSUB_CLASSIFIED_KINDS, MODERATION_VERBS,
@@ -414,6 +414,32 @@ test("receive gap: partial families and negative gaps are no window", () => {
   const held = ev([`${RECEIVED_SERIES} 60`], fired.state);
   assert.deepEqual(held.firing, [GAP]);
   assert.deepEqual(ev(full(60, 60), held.state).firing, [], "the return sample can still resolve");
+});
+
+test("a failed scrape breaks the gap and stuck streaks without firing", () => {
+  const gap = (received: number, classified: number) =>
+    [`${RECEIVED_SERIES} ${received}`, ...classifiedLines({ notification: classified })];
+  // Two gapped samples, a failed scrape, then two more: the streak restarts,
+  // so the fourth gapped sample stays quiet and only the third consecutive
+  // post-scrape sample tickets.
+  let state = ev(gap(100, 100)).state;
+  state = ev(gap(101, 100), state).state;
+  state = ev(gap(102, 100), state).state;
+  assert.deepEqual(state.firing, []);
+  const interrupted = interruptDispatchDrops(state);
+  assert.equal(interrupted.eventsubReceiveGapStreak, 0);
+  assert.equal(interrupted.voiceRestStuckStreak, 0);
+  let resumed = ev(gap(103, 100), interrupted).state;
+  resumed = ev(gap(104, 100), resumed).state;
+  assert.deepEqual(resumed.firing, [], "two post-scrape gaps stay quiet");
+  assert.deepEqual(ev(gap(105, 100), resumed).firing, [GAP]);
+  // Same for the stuck gauge: two stuck samples, a failed scrape, one more.
+  const age = (n: number) => [`${STUCK_SERIES} ${n}`];
+  let stuck = ev(age(61), ev(age(61)).state).state;
+  stuck = ev(age(61), interruptDispatchDrops(stuck)).state;
+  assert.deepEqual(stuck.firing, [], "the failed scrape broke the stuck streak");
+  stuck = ev(age(61), stuck).state;
+  assert.deepEqual(ev(age(61), stuck).firing, [STUCK]);
 });
 
 test("a stuck voice REST attempt tickets on the third consecutive sample", () => {

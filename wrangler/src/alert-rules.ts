@@ -676,9 +676,9 @@ function errorBudgetBurnEvaluation(
 
 export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, breakerOpenStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, voiceVoteKickFailures: 0, voiceVoteKickFailuresSeen: false, voiceVoteKickFiring: false, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, gatewayNotReadySeen: false, gatewayNotReadyStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {}, communityFactsDrainFailures: {}, communityFactsDrainStreak: 0, eventsubPosts: {}, eventsubPostsSeen: false, eventStoreLagStreak: 0, eventsubTampered: 0, eventsubTamperedSeen: false, eventsubTamperedStreak: 0, reconcileHealthy: 0, reconcilePending: 0, reconcileFailed: 0, reconcileSeen: false, feedFetchErrors: 0, feedFetchErrorsSeen: false, eventsubReceiveGapStreak: 0, reconcilePriorFailed: 0, reconcilePriorFailedPassFailed: 0, reconcilePriorFailedSeen: false, automodSanctionRefused: 0, automodSanctionRefusedSeen: false, moderationEnforcementFailures: 0, moderationEnforcementFailuresSeen: false, voiceRestStuckStreak: 0, voiceBackoffCapped: 0, voiceBackoffCappedSeen: false };
 
-/** An unsuccessful scrape breaks the dispatch, breaker, and lag streaks, never an existing alert. */
+/** An unsuccessful scrape breaks the dispatch, breaker, lag, receive-gap, and REST-stuck streaks, never an existing alert. */
 export function interruptDispatchDrops(state: MetricsAlertState): MetricsAlertState {
-  return { ...state, dispatchDrops: {}, dispatchDropStreaks: {}, breakerOpenStreak: 0, eventStoreLagStreak: 0 };
+  return { ...state, dispatchDrops: {}, dispatchDropStreaks: {}, breakerOpenStreak: 0, eventStoreLagStreak: 0, eventsubReceiveGapStreak: 0, voiceRestStuckStreak: 0 };
 }
 
 /** A failed scrape breaks the engaged run, but cannot prove a halt cleared. */
@@ -1763,7 +1763,8 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   // classification was received first), so a corrupt sample is no window.
   // Missing or malformed families (older containers without either row, or a
   // kind row short) break the streak but preserve a firing ticket, and never
-  // let label values reach state or keys.
+  // let label values reach state or keys. Failed scrapes reset the streak
+  // through interruptDispatchDrops.
   const RECEIVE_GAP_RULE = "eventsub_receive_gap";
   const wasGapFiring = prev.firing.includes(RECEIVE_GAP_RULE);
   const receivedNow = exactSeries(gauge("two_bot_eventsub_received_total"), {});
