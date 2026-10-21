@@ -1290,7 +1290,7 @@ mod tests {
         let rows = vec![stored("faq"), off];
         assert_eq!(
             format_command_list(&rows),
-            "/faq — on\n/rules (or !rules) — off"
+            "/faq — on\n/rules (or !rules) — off\n\nPage 1 of 1"
         );
     }
 
