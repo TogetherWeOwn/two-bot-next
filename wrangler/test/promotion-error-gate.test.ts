@@ -406,6 +406,39 @@ test("unparseable exposition still fails once as decode_failed", async () => {
   assert.equal(calls, 1, "a decodable fetch with garbage content is not transient");
 });
 
+test("an over-cap exposition is refused at once as decode_failed", async () => {
+  // Merge pin with the 64 KiB intake cap: a body the bounded reader
+  // refuses is deterministic, so it fails on the first attempt (no bearer
+  // re-send) with the fixed decode_failed code, never remote bytes.
+  const base = `${restBody(100, 0)}\n`;
+  const pad = 64 * 1024 + 1 - Buffer.byteLength(base, "utf8") - 2;
+  const over = `${base}#${"x".repeat(pad)}\n`;
+  assert.equal(Buffer.byteLength(over, "utf8"), 64 * 1024 + 1);
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls += 1;
+    return new Response(over, { status: 200 });
+  };
+  await assert.rejects(
+    runLiveGate({
+      metricsUrl: REVIEW_STAGING,
+      token: REVIEW_TOKEN,
+      allowedMetricsOrigins: [REVIEW_STAGING],
+      fetchImpl,
+      sleep: async () => {},
+      nowSeconds: () => 1_000_000,
+      retrySleepSeconds: 0,
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal((error as { code?: unknown }).code, "decode_failed");
+      assert.equal((error as Error).message, "metrics scrape failed: exposition could not be decoded");
+      return true;
+    },
+  );
+  assert.equal(calls, 1, "an over-cap body will not shrink on retry");
+});
+
 test("the allowlist honors the workflow-spelled origin env names", async () => {
   // The deploy workflows expose only STAGING_URL / PRODUCTION_URL on the
   // gate step: deleting either spelling must break this test, not production.
