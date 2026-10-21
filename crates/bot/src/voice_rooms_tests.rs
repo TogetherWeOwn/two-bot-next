@@ -7531,10 +7531,13 @@ async fn handle_textchannels_refuses_without_manage_channels() {
 async fn handle_textchannels_preserves_stored_toggle_on_rename_only() {
     let trace = Trace::default();
     let runtime = VoiceRuntime::new(
-        move || {
-            let store = Store::new(trace.clone());
-            store.creators.lock().unwrap()[0].text_channels = true;
-            (store, Http::new(trace.clone()))
+        {
+            let trace = trace.clone();
+            move || {
+                let store = Store::new(trace.clone());
+                store.creators.lock().unwrap()[0].text_channels = true;
+                (store, Http::new(trace.clone()))
+            }
         },
         Duration::from_millis(10),
         true,
