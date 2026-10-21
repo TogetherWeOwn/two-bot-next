@@ -54,6 +54,10 @@ mod event_identity_acceptance_tests;
 #[path = "website_jobgate_acceptance_tests.rs"]
 mod jobgate_acceptance_tests;
 
+#[cfg(test)]
+#[path = "website_events_dispatch_tests.rs"]
+mod events_dispatch_tests;
+
 #[derive(Clone, Copy)]
 pub enum Kind {
     Counter,
@@ -141,6 +145,42 @@ impl Context {
                 Ok(db.pool().clone())
             })
             .await
+    }
+
+    /// One supervised website tick: Events ticks run through the shared
+    /// [`JobGate`] single-flight entry point, so overlapping Events ticks
+    /// cannot both run; every other kind runs direct via [`run_once`] and
+    /// never touches the gate. The scheduler closure calls this instead of
+    /// branching itself, so the routing stays unit-testable next to the tick
+    /// it guards.
+    async fn run_tick(
+        &self,
+        kind: Kind,
+        shutdown: &watch::Receiver<bool>,
+        rank_heal: bool,
+    ) -> Result<(), ErrorClass> {
+        if matches!(kind, Kind::Events) {
+            return Kind::run_events_tick(
+                self.pool().await?,
+                &self.rest,
+                &self.guild,
+                &self.observation,
+                shutdown,
+                rank_heal,
+                &self.events_gate,
+            )
+            .await;
+        }
+        run_once(
+            kind,
+            self.pool().await?,
+            &self.rest,
+            &self.guild,
+            &self.observation,
+            shutdown,
+            rank_heal,
+        )
+        .await
     }
 }
 
@@ -289,27 +329,7 @@ pub async fn serve(
                                     biased;
                                     _ = server::shutdown_requested(shutdown.clone()) => Ok(()),
                                     result = async {
-                                        if matches!(kind, Kind::Events) {
-                                            return Kind::run_events_tick(
-                                                context.pool().await?,
-                                                &context.rest,
-                                                &context.guild,
-                                                &context.observation,
-                                                &shutdown,
-                                                rank_heal,
-                                                &context.events_gate,
-                                            )
-                                            .await;
-                                        }
-                                        run_once(
-                                            kind,
-                                            context.pool().await?,
-                                            &context.rest,
-                                            &context.guild,
-                                            &context.observation,
-                                            &shutdown,
-                                            rank_heal,
-                                        ).await
+                                        context.run_tick(kind, &shutdown, rank_heal).await
                                     } => result,
                                 }
                             })
