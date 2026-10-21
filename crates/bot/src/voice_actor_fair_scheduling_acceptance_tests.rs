@@ -282,7 +282,10 @@ async fn fair_notice_maintenance_within_bounded_inbox_turns() {
     assert_eq!(worker.failures().len(), 1);
     worker.store.creator_for_delay = Some(Duration::from_secs(30));
     let http_probe = Arc::clone(&worker.http);
-    let ticket = creator_ticket(&worker, MEMBER);
+    // MEMBER already joined during the failed-worker setup, so a second
+    // ticket for MEMBER would be a same-channel update (None). The blocking
+    // join only needs a valid ticket shape with an unknown creator id.
+    let ticket = creator_ticket(&worker, MEMBER + 1);
     let (tx, rx) = mpsc::unbounded_channel();
     send_churn(&tx, CHURN_BASE, MAX_INBOX_TURNS_BEFORE_CHAINED_PROGRESS);
     let (s1_tx, s1_rx) = oneshot::channel();
@@ -316,13 +319,28 @@ async fn scheduling_bound_and_diagnosis_exposed() {
     // data. Counters use lower bounds so parallel suites cannot flake them.
     let inbox_before = global_series("two_bot_voice_actor_inbox_turns_total");
     let dispatch_before = global_series("two_bot_voice_actor_dispatch_turns_total");
-    let (live, store, http, _) = fixture();
+    let (live, store, http, trace) = fixture();
     let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     let ticket = creator_ticket(&worker, MEMBER);
     let (tx, rx) = mpsc::unbounded_channel();
     send_join(&tx, ticket, "new room", 7);
     send_churn(&tx, CHURN_BASE, 50);
     let handle = spawn_actor(worker, rx);
+    // The inbox stays open while the create dispatches: closing it first
+    // would break the actor loop before any dispatch turn runs.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if trace.lock().unwrap().iter().any(|call| call == "create") {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!(
+                "the create must dispatch without continuous churn: {:?}",
+                trace.lock().unwrap()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     drop(tx);
     let worker = tokio::time::timeout(Duration::from_secs(10), handle)
         .await
@@ -376,7 +394,7 @@ async fn control_fifo_and_latest_state_preserved_under_churn() {
     // Fair scheduling must not reorder the inbox: two joins separated by
     // churn still create in arrival order, and the later Display for one
     // member still wins.
-    let (live, store, http, _) = fixture();
+    let (live, store, http, trace) = fixture();
     let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     let first_ticket = creator_ticket(&worker, MEMBER);
     let second_ticket = creator_ticket(&worker, MEMBER + 1);
@@ -396,6 +414,27 @@ async fn control_fifo_and_latest_state_preserved_under_churn() {
     .unwrap();
 
     let handle = spawn_actor(worker, rx);
+    // The inbox stays open while dispatch drains: closing it first would
+    // break the actor loop before any dispatch turn runs.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let creates = trace
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.as_str() == "create")
+            .count();
+        if creates >= 2 {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!(
+                "both joins must dispatch without continuous churn: {:?}",
+                trace.lock().unwrap()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     drop(tx);
     let worker = tokio::time::timeout(Duration::from_secs(10), handle)
         .await
@@ -480,11 +519,22 @@ async fn control_create_move_adjacency_no_maintenance_between() {
         *probe_slot.lock().unwrap() = Some(probe_reads.load(Ordering::Relaxed));
     }));
 
-    let (_tx, rx) = mpsc::unbounded_channel::<ActorCommand>();
-    // The sender is dropped at once: the actor runs its immediately-ready
-    // timer, both dispatch turns, then maintenance, then exits on the closed
-    // inbox.
+    let (tx, rx) = mpsc::unbounded_channel::<ActorCommand>();
+    // The inbox stays open but empty, so the immediately-ready timer, both
+    // dispatch turns and then maintenance all run. The sender drops only
+    // after maintenance is observed, letting the actor exit on close.
     let handle = spawn_actor(worker, rx);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if config_reads.load(Ordering::Relaxed) > reads_before {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("maintenance must still run after the pair");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    drop(tx);
     let worker = tokio::time::timeout(Duration::from_secs(10), handle)
         .await
         .expect("actor must exit after inbox close")
