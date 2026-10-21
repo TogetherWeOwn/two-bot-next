@@ -72,6 +72,10 @@ jobs:
         shell: python3 {0}
         run: |
           import json, os, re, subprocess, sys, urllib.error, urllib.parse, urllib.request
+          # The resolve step runs at the repo root after checkout; the deploy-ID
+          # predicate lives in scripts/ (see scripts/deploy_id.py).
+          sys.path.insert(0, os.path.join(os.environ.get("GITHUB_WORKSPACE", os.getcwd()), "scripts"))
+          from build_identity import is_deploy_id_shape
 
           repo = os.environ["GITHUB_REPOSITORY"]
           sha = ""
@@ -105,7 +109,7 @@ jobs:
               return revision if isinstance(revision, str) and re.fullmatch(r"[0-9a-f]{40}", revision) else ""
 
           def newest_success_deployment():
-              """The newest successful production Deployment SHA, or "" when unreadable."""
+              """The newest recorded successful production Deployment SHA, or "" when unreadable."""
               try:
                   batch = json.loads(subprocess.check_output(
                       ["gh", "api", "--method", "GET", f"repos/{repo}/deployments",
@@ -123,6 +127,11 @@ jobs:
                   if type(dep_id) is not int or not isinstance(dep_sha, str):
                       continue
                   if not re.fullmatch(r"[0-9a-f]{40}", dep_sha):
+                      continue
+                  # Only recorded deploy rows count: Actions' automatic
+                  # `environment:` rows carry no deploy ID, and their SHA is
+                  # the workflow revision rather than the deployed commit.
+                  if not is_deploy_id_shape(row.get("description")):
                       continue
                   try:
                       statuses = json.loads(subprocess.check_output(

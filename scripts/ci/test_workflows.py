@@ -2109,7 +2109,8 @@ def daily_digest_errors(workflow):
     Schedule-only plus manual dispatch: one daily cron at an off-minute (never
     :00 or :30, never bunched with the deploy-production backstop) and a
     dry_run-only dispatch. The digest job resolves the live production SHA
-    (/readyz, falling back to the newest successful production Deployment),
+    (/readyz, falling back to the newest recorded successful production
+    Deployment: rows whose description is a deploy ID),
     cuts the tag via daily-digest.cjs, and dispatches the SBOM chain for the
     fresh tag only. The alert job runs only on the silent-failure mode (digest
     succeeded, production changed, nothing released) through the
@@ -2156,6 +2157,7 @@ def daily_digest_errors(workflow):
         errors.append(f"{name}:digest: must use the routed runner expression for job 'digest'")
     digest_text = str(digest)
     for required in ("PRODUCTION_WORKER_URL", "/readyz", "environment=production",
+                     "is_deploy_id_shape",
                      "daily-digest.cjs", "gh workflow run release.yml --ref main -f release_tag="):
         if required not in digest_text:
             errors.append(f"{name}:digest: missing pin {required}")

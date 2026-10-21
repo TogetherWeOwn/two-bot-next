@@ -8,8 +8,10 @@ retired: no deploy creates a version tag.
 
 A release is cut once a day by the `daily-digest` workflow, not by the
 promote itself. It resolves the live production SHA (the `/readyz` build
-revision, falling back to the newest successful production Deployment) and
-compares it to the last digest tag's target:
+revision, falling back to the newest recorded successful production
+Deployment: only rows whose description is a deploy ID count, since Actions'
+automatic `environment:` rows carry the workflow revision rather than the
+deployed commit) and compares it to the last digest tag's target:
 
 - Production already matches the last digest: quiet day, no tag, green run.
 - Production serves an older commit (a rollback): never tagged; the next
