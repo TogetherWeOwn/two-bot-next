@@ -1,7 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { relative } from "node:path";
+import { join, relative } from "node:path";
 import {
   decideLiveVerdict,
   decideMode,
@@ -9,6 +11,7 @@ import {
   judgeFiring,
   parseArgs,
   parseRehearsalFiring,
+  runCli,
   runLiveGate,
 } from "../scripts/promotion-error-gate.mjs";
 import { metricsLines } from "./fixtures/metrics.ts";
@@ -159,6 +162,285 @@ test("live gate passes busy quiet windows, flags too-quiet ones", async () => {
     decideLiveVerdict({ firing: tinyVerdict.firing, restDelta: tinyVerdict.restDelta }),
     { fail: false, verdict: "insufficient_data", reasons: [] },
   );
+});
+
+// Review-round pins: timer-range timeouts, 4xx handling with an auth code,
+// body-read retry, workflow-spelled allowlist env, redirect-throw
+// classification, and flag-position --help. Offline fixtures only.
+const REVIEW_STAGING = "https://two-bot-next-staging.5150.workers.dev";
+const REVIEW_PRODUCTION = "https://two-bot-next-production.fixture.workers.dev";
+const REVIEW_TOKEN = "sentinel-scrape-bearer-222222222222222222";
+const REVIEW_HOSTILE = "HOSTILE-REVIEW-4e8a-must-not-echo";
+
+function reviewEnv(vars: Record<string, string | undefined>): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(vars)) {
+    if (value !== undefined) env[key] = value;
+  }
+  return env;
+}
+
+function reviewDeps(fetchImpl: unknown) {
+  return { fetchImpl, sleep: async () => {}, nowSeconds: () => 1_000_000, retrySleepSeconds: 0 };
+}
+
+function silenceReviewConsole<T>(fn: () => Promise<T>): Promise<{ result: T; output: string }> {
+  const lines: string[] = [];
+  const origLog = console.log;
+  console.log = (...args: unknown[]) => void lines.push(args.map(String).join(" "));
+  return fn().then(
+    (result) => {
+      console.log = origLog;
+      return { result, output: lines.join("\n") };
+    },
+    (error: unknown) => {
+      console.log = origLog;
+      throw error;
+    },
+  );
+}
+
+function reviewEvidencePath(): string {
+  return join(mkdtempSync(join(tmpdir(), "gate-review-")), "evidence.json");
+}
+
+test("timeouts outside the supported timer range are refused before any fetch", async () => {
+  for (const value of ["3000000", "99999999999"]) {
+    let error: unknown;
+    try {
+      parseArgs(["--metrics-url", REVIEW_STAGING, "--evidence", "/tmp/e.json", "--scrape-timeout-seconds", value]);
+    } catch (thrown: unknown) {
+      error = thrown;
+    }
+    assert.ok(error instanceof Error, `expected a timeout refusal for ${value}`);
+    assert.equal((error as { code?: unknown }).code, "invalid_timeout", `stable code for ${value}`);
+  }
+  // Fractional seconds stay valid: the gate rounds to a whole-millisecond delay.
+  assert.equal(
+    parseArgs(["--metrics-url", REVIEW_STAGING, "--evidence", "/tmp/e.json", "--scrape-timeout-seconds", "1.1"])
+      .timeoutSeconds,
+    1.1,
+  );
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls += 1;
+    return { ok: true, status: 200, text: async () => restBody(100, 0) };
+  };
+  await assert.rejects(
+    runLiveGate({
+      metricsUrl: REVIEW_STAGING,
+      token: REVIEW_TOKEN,
+      timeoutSeconds: 1e12,
+      allowedMetricsOrigins: [REVIEW_STAGING],
+      fetchImpl,
+      sleep: async () => {},
+      nowSeconds: () => 1_000_000,
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal((error as { code?: unknown }).code, "invalid_timeout");
+      return true;
+    },
+  );
+  assert.equal(calls, 0, "an out-of-range timeout must cause zero fetches");
+});
+
+test("client errors fail at once with an auth code for 401/403, 5xx keeps retrying", async () => {
+  const failing = async (status: number) => {
+    let calls = 0;
+    const fetchImpl = async () => {
+      calls += 1;
+      return { ok: false, status, text: async () => REVIEW_HOSTILE };
+    };
+    let error: unknown;
+    try {
+      await runLiveGate({
+        metricsUrl: REVIEW_STAGING,
+        token: REVIEW_TOKEN,
+        allowedMetricsOrigins: [REVIEW_STAGING],
+        fetchImpl,
+        sleep: async () => {},
+        nowSeconds: () => 1_000_000,
+        retrySleepSeconds: 0,
+      });
+    } catch (thrown: unknown) {
+      error = thrown;
+    }
+    assert.ok(error instanceof Error, `expected a failure for ${status}`);
+    return { error: error as Error & { code?: unknown }, calls };
+  };
+  for (const status of [401, 403]) {
+    const { error, calls } = await failing(status);
+    assert.equal(error.code, "auth_failed", `auth code for ${status}`);
+    assert.equal(calls, 1, `no retry for ${status}: the bearer must not ride a refused request`);
+    assert.ok(!error.message.includes(REVIEW_HOSTILE), "auth text is fixed");
+  }
+  const badRequest = await failing(400);
+  assert.equal(badRequest.error.code, "transport_failed");
+  assert.equal(badRequest.calls, 1, "a retry cannot fix a client error");
+  const serverError = await failing(500);
+  assert.equal(serverError.error.code, "transport_failed");
+  assert.equal(serverError.calls, 3, "5xx keeps the bounded retry");
+});
+
+test("an auth failure is a fail-closed receipt with exit 1", async () => {
+  const fetchImpl = async () => ({ ok: false, status: 401, text: async () => REVIEW_HOSTILE });
+  const evidencePath = reviewEvidencePath();
+  const { result: code, output } = await silenceReviewConsole(() =>
+    runCli(
+      ["--metrics-url", REVIEW_STAGING, "--evidence", evidencePath, "--sha", "test-sha"],
+      reviewEnv({ METRICS_SCRAPE_TOKEN: REVIEW_TOKEN, STAGING_WORKER_URL: REVIEW_STAGING }),
+      reviewDeps(fetchImpl),
+    ),
+  );
+  assert.equal(code, 1);
+  const evidence = JSON.parse(readFileSync(evidencePath, "utf8")) as Record<string, unknown>;
+  assert.equal(evidence.verdict, "error");
+  assert.equal(evidence.code, "auth_failed");
+  assert.ok(output.includes("auth_failed"), "the console names the stable code");
+  assert.ok(!JSON.stringify(evidence).includes(REVIEW_TOKEN), "the receipt never carries the bearer");
+});
+
+test("body-read failures retry like connect failures and never echo", async () => {
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls += 1;
+    return {
+      ok: true,
+      status: 200,
+      text: async () => {
+        throw new Error(REVIEW_HOSTILE);
+      },
+    };
+  };
+  let error: unknown;
+  try {
+    await runLiveGate({
+      metricsUrl: REVIEW_STAGING,
+      token: REVIEW_TOKEN,
+      allowedMetricsOrigins: [REVIEW_STAGING],
+      fetchImpl,
+      sleep: async () => {},
+      nowSeconds: () => 1_000_000,
+      retrySleepSeconds: 0,
+    });
+  } catch (thrown: unknown) {
+    error = thrown;
+  }
+  assert.ok(error instanceof Error, "expected a transport failure");
+  assert.equal((error as { code?: unknown }).code, "transport_failed");
+  assert.equal(calls, 3, "body-phase transients keep the 3-attempt bound");
+  assert.ok(!(error as Error).message.includes(REVIEW_HOSTILE), "body-read text is fixed");
+});
+
+test("unparseable exposition still fails once as decode_failed", async () => {
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls += 1;
+    return { ok: true, status: 200, text: async () => REVIEW_HOSTILE };
+  };
+  await assert.rejects(
+    runLiveGate({
+      metricsUrl: REVIEW_STAGING,
+      token: REVIEW_TOKEN,
+      allowedMetricsOrigins: [REVIEW_STAGING],
+      fetchImpl,
+      sleep: async () => {},
+      nowSeconds: () => 1_000_000,
+      retrySleepSeconds: 0,
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal((error as { code?: unknown }).code, "decode_failed");
+      return true;
+    },
+  );
+  assert.equal(calls, 1, "a decodable fetch with garbage content is not transient");
+});
+
+test("the allowlist honors the workflow-spelled origin env names", async () => {
+  // The deploy workflows expose only STAGING_URL / PRODUCTION_URL on the
+  // gate step: deleting either spelling must break this test, not production.
+  for (const [origin, vars] of [
+    [REVIEW_STAGING, { STAGING_URL: REVIEW_STAGING }],
+    [REVIEW_PRODUCTION, { PRODUCTION_URL: REVIEW_PRODUCTION }],
+  ] as const) {
+    const { fetchImpl, calls } = stubFetch([restBody(100, 0), restBody(180, 0)]);
+    const evidencePath = reviewEvidencePath();
+    const { result: code } = await silenceReviewConsole(() =>
+      runCli(
+        ["--metrics-url", origin, "--evidence", evidencePath, "--sha", "test-sha"],
+        reviewEnv({ METRICS_SCRAPE_TOKEN: REVIEW_TOKEN, ...vars }),
+        reviewDeps(fetchImpl),
+      ),
+    );
+    assert.equal(code, 0, `workflow-spelled env authorizes ${origin}`);
+    assert.ok(calls() > 0, "an allowlisted origin must be scraped");
+    const evidence = JSON.parse(readFileSync(evidencePath, "utf8")) as Record<string, unknown>;
+    assert.equal(evidence.verdict, "pass");
+  }
+});
+
+test("a redirect-shaped throw is one fixed refusal with a single attempt", async () => {
+  let calls = 0;
+  // Real fetch with redirect: "error" never returns a 3xx response; it throws.
+  const fetchImpl = async () => {
+    calls += 1;
+    throw new TypeError("fetch failed", { cause: new Error("unexpected redirect") });
+  };
+  await assert.rejects(
+    runLiveGate({
+      metricsUrl: REVIEW_STAGING,
+      token: REVIEW_TOKEN,
+      allowedMetricsOrigins: [REVIEW_STAGING],
+      fetchImpl,
+      sleep: async () => {},
+      nowSeconds: () => 1_000_000,
+      retrySleepSeconds: 0,
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal((error as { code?: unknown }).code, "redirect_refused");
+      return true;
+    },
+  );
+  assert.equal(calls, 1, "a redirect is refused once, never retried");
+});
+
+test("a help token in a value slot is data, flag-position --help still prints", async () => {
+  // --user-agent --help from a templated variable: the scrape proceeds with
+  // the token as data instead of exiting 0 with no evidence.
+  const { fetchImpl, calls } = stubFetch([restBody(100, 0), restBody(180, 0)]);
+  const livePath = reviewEvidencePath();
+  const live = await silenceReviewConsole(() =>
+    runCli(
+      ["--metrics-url", REVIEW_STAGING, "--evidence", livePath, "--sha", "test-sha", "--user-agent", "--help"],
+      reviewEnv({ METRICS_SCRAPE_TOKEN: REVIEW_TOKEN, STAGING_WORKER_URL: REVIEW_STAGING }),
+      reviewDeps(fetchImpl),
+    ),
+  );
+  assert.equal(live.result, 0);
+  assert.ok(calls() > 0, "a value-position --help must not suppress the scrape");
+  assert.ok(!live.output.includes("Failure codes"), "no help text for a value token");
+  const liveEvidence = JSON.parse(readFileSync(livePath, "utf8")) as Record<string, unknown>;
+  assert.equal(liveEvidence.mode, "live");
+  // --sha -h with no token: a recorded skip carrying the value, not bare help.
+  const skipPath = reviewEvidencePath();
+  const skip = await silenceReviewConsole(() =>
+    runCli(
+      ["--metrics-url", REVIEW_STAGING, "--evidence", skipPath, "--sha", "-h"],
+      reviewEnv({}),
+      reviewDeps(fetchImpl),
+    ),
+  );
+  assert.equal(skip.result, 0);
+  const skipEvidence = JSON.parse(readFileSync(skipPath, "utf8")) as Record<string, unknown>;
+  assert.equal(skipEvidence.mode, "skip");
+  assert.equal(skipEvidence.sha, "-h");
+  // Flag position keeps working.
+  const help = await silenceReviewConsole(() => runCli(["--help"], reviewEnv({}), reviewDeps(fetchImpl)));
+  assert.equal(help.result, 0);
+  assert.ok(help.output.includes("Failure codes"), "flag-position --help prints the code map");
 });
 
 test("live gate fails closed when metrics are unreadable", async () => {

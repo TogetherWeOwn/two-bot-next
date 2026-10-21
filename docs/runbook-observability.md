@@ -247,10 +247,12 @@ vocabulary:
 - `usage_error` — bad flags; check the gate flags with `--help` and retry. Exit 2.
 - `invalid_metrics_origin` — `--metrics-url` is not a bare `https://` Worker
   origin from the configured identities; fix the origin and retry. Exit 2.
-- `invalid_timeout` — `--scrape-timeout-seconds` is not finite and positive;
-  fix the value and retry. Exit 2.
+- `invalid_timeout` — `--scrape-timeout-seconds` is not a finite positive
+  value within the supported timer range; fix the value and retry. Exit 2.
 - `redirect_refused` — the scrape refused a redirect; the bearer is never
   followed across redirects. Verify direct `/ops/metrics` and retry. Exit 1.
+- `auth_failed` — the Worker refused the scrape credentials (401/403);
+  verify the token is current and retry. Exit 1.
 - `transport_failed` — the scrape transport failed after 3 attempts; verify
   the Worker is reachable and retry. Exit 1.
 - `decode_failed` — the exposition could not be decoded; verify valid output

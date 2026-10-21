@@ -55,25 +55,28 @@ const FAILURE_CODES = [
   "invalid_metrics_origin",
   "invalid_timeout",
   "redirect_refused",
+  "auth_failed",
   "transport_failed",
   "decode_failed",
 ];
 const NEXT_ACTIONS = {
   usage_error: "Check the gate flags with --help and retry.",
   invalid_metrics_origin: "Set --metrics-url to the configured staging or production Worker origin and retry.",
-  invalid_timeout: "Set --scrape-timeout-seconds to a finite positive number and retry.",
+  invalid_timeout: "Set --scrape-timeout-seconds to a finite positive value within the supported range and retry.",
   redirect_refused: "Verify the Worker serves /ops/metrics directly without redirects and retry.",
+  auth_failed: "Verify METRICS_SCRAPE_TOKEN is current and retry.",
   transport_failed: "Verify the Worker is reachable and retry.",
   decode_failed: "Verify the Worker serves valid exposition at /ops/metrics and retry.",
 };
 const INPUT_REFUSAL_CODES = new Set(["usage_error", "invalid_metrics_origin", "invalid_timeout"]);
 const REDIRECT_REFUSED_MESSAGE =
   "metrics scrape failed: redirect refused; the scrape bearer is never followed across redirects";
+const AUTH_FAILED_MESSAGE = "metrics scrape failed: the Worker refused the scrape credentials";
 const TRANSPORT_FAILED_MESSAGE = `metrics scrape failed after ${SCRAPE_ATTEMPTS} attempts: transport error`;
 const DECODE_FAILED_MESSAGE = "metrics scrape failed: exposition could not be decoded";
 const ORIGIN_REFUSED_MESSAGE =
   "metrics origin refused: expected a bare https:// Worker origin from the configured staging/production identities";
-const TIMEOUT_REFUSED_MESSAGE = "scrape timeout refused: expected a finite positive number of seconds";
+const TIMEOUT_REFUSED_MESSAGE = "scrape timeout refused: expected a finite positive timeout within the supported range";
 
 class UsageError extends Error {
   constructor(message, code = "usage_error") {
@@ -122,8 +125,21 @@ function originOf(value) {
   }
 }
 
+// Largest delay the timer behind AbortSignal.timeout honors: above 2^31 - 1
+// ms Node clamps the timer, so the scrape would abort almost at once instead
+// of waiting out the configured timeout. The gate refuses such values as
+// invalid_timeout before any signal or network work.
+const MAX_TIMER_MS = 2_147_483_647;
+
+/** Whole-millisecond delay for a timeout in seconds; ceiling so sub-ms values still wait. */
+function timeoutMs(seconds) {
+  return Math.ceil(seconds * 1000);
+}
+
 function isSupportedTimeout(value) {
-  return Number.isFinite(value) && value > 0;
+  if (!Number.isFinite(value) || value <= 0) return false;
+  const ms = timeoutMs(value);
+  return ms >= 1 && ms <= MAX_TIMER_MS;
 }
 
 /**
@@ -193,7 +209,8 @@ Options:
   --rehearsal-firing <json>       Offline drill input: judge a JSON array of rule names
                                   with no network and no token.
   --sample-interval-seconds <n>   Seconds between live scrapes (default: 75).
-  --scrape-timeout-seconds <n>    Per-scrape timeout, finite and positive (default: 15).
+  --scrape-timeout-seconds <n>    Per-scrape timeout in seconds: finite, positive, and
+                                  within the supported timer range (default: 15).
   --user-agent <name>             Scrape user agent (default: ${USER_AGENT}).
   --help                          Print this text and exit 0. No token, no network.
 
@@ -202,6 +219,7 @@ Failure codes (receipt verdict "error", never a pass):
   invalid_metrics_origin  Destination refused. ${NEXT_ACTIONS.invalid_metrics_origin}
   invalid_timeout         Timeout refused. ${NEXT_ACTIONS.invalid_timeout}
   redirect_refused        Redirect refused. ${NEXT_ACTIONS.redirect_refused} Exit 1.
+  auth_failed             Credentials refused (401/403). ${NEXT_ACTIONS.auth_failed} Exit 1.
   transport_failed        Scrape transport failed after ${SCRAPE_ATTEMPTS} attempts. ${NEXT_ACTIONS.transport_failed} Exit 1.
   decode_failed           Exposition not decodable. ${NEXT_ACTIONS.decode_failed} Exit 1.
 
@@ -243,12 +261,13 @@ export function decideMode({ rehearsalFiring, token }) {
 
 async function fetchExposition({ metricsUrl, token, timeoutSeconds, fetchImpl, retrySleepSeconds = SCRAPE_RETRY_SECONDS, userAgent = USER_AGENT }) {
   const url = `${metricsUrl.replace(/\/$/, "")}/ops/metrics`;
+  const delayMs = timeoutMs(timeoutSeconds);
   for (let attempt = 1; attempt <= SCRAPE_ATTEMPTS; attempt += 1) {
     let response;
     try {
       response = await fetchImpl(url, {
         headers: { authorization: `Bearer ${token}`, "user-agent": userAgent },
-        signal: AbortSignal.timeout(timeoutSeconds * 1000),
+        signal: AbortSignal.timeout(delayMs),
         redirect: "error",
       });
     } catch (error) {
@@ -262,14 +281,30 @@ async function fetchExposition({ metricsUrl, token, timeoutSeconds, fetchImpl, r
     if (response.status >= 300 && response.status < 400) {
       throw new ScrapeError(REDIRECT_REFUSED_MESSAGE, "redirect_refused");
     }
+    if (response.status === 401 || response.status === 403) {
+      throw new ScrapeError(AUTH_FAILED_MESSAGE, "auth_failed");
+    }
     if (!response.ok) {
+      // Only 5xx is transient: a retry cannot fix a client error, and must
+      // not re-send the bearer against a request the Worker already refused.
+      if (response.status >= 500 && attempt < SCRAPE_ATTEMPTS) {
+        await new Promise((resolve) => setTimeout(resolve, retrySleepSeconds * 1000));
+        continue;
+      }
+      throw new ScrapeError(TRANSPORT_FAILED_MESSAGE, "transport_failed");
+    }
+    let text;
+    try {
+      text = await response.text();
+    } catch {
+      // Body-phase transients (stalls, resets, the timeout firing mid-read)
+      // keep the same bounded retry as connect-phase ones.
       if (attempt < SCRAPE_ATTEMPTS) {
         await new Promise((resolve) => setTimeout(resolve, retrySleepSeconds * 1000));
         continue;
       }
       throw new ScrapeError(TRANSPORT_FAILED_MESSAGE, "transport_failed");
     }
-    const text = await response.text();
     const samples = parseAlertScrape(text);
     if (samples === null) throw new ScrapeError(DECODE_FAILED_MESSAGE, "decode_failed");
     return { text, samples };
@@ -400,13 +435,26 @@ function reportFailure(code) {
 }
 
 /**
+ * True when --help/-h appears in flag position. Every gate flag takes a
+ * value, so flags sit at even indices; a help token in a value slot (for
+ * example `--user-agent --help` from a templated variable) is data, not a
+ * help request, and must never exit 0 with no evidence.
+ */
+function wantsHelp(argv) {
+  for (let i = 0; i < argv.length; i += 2) {
+    if (argv[i] === "--help" || argv[i] === "-h") return true;
+  }
+  return false;
+}
+
+/**
  * CLI entry with injectable deps for offline tests. Returns the process
  * exit code: 0 pass/skip, 1 gate or scrape failure, 2 usage/input refusal.
  * Failures write a deterministic fail-closed error receipt when the
  * evidence path is usable; the console always carries the stable code.
  */
 export async function runCli(argv, env, deps = {}) {
-  if (argv.includes("--help") || argv.includes("-h")) {
+  if (wantsHelp(argv)) {
     console.log(helpText());
     return 0;
   }
