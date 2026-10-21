@@ -19,11 +19,9 @@ from datetime import datetime, timezone
 import json
 import os
 import subprocess
-import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from build_identity import (  # noqa: E402
+from build_identity import (
     count_deployments_for_date,
     deployment_utc_date,
     format_deploy_id,
