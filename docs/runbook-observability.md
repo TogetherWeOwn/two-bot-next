@@ -110,7 +110,9 @@ deployment/schema/ACL issue for the authorized Operator,
 not something to repair with a production query or restart.
 
 Every alert message and alert log line carries the container build revision and
-a log-query link; a crash-loop or unhandled exception surfaces as a sustained
+a log-query link (`Build: <sha>` + `Logs: <url>` via `alertContextSuffix`,
+`wrangler/src/alert-rules.ts:311-320`; `unknown` when the `/readyz` probe
+failed); a crash-loop or unhandled exception surfaces as a sustained
 `/readyz` red, which alerts after the readiness threshold below.
 
 If `/readyz` remains red, the Worker/DO readiness transition alerts after its
@@ -221,9 +223,6 @@ ids: they join to themselves, not to an inbound request.
 These are deliberate, visible limits of the current implementation; do not
 claim them as shipped acceptance:
 
-- Worker/DO alert log lines and Discord messages do not yet consistently carry
-  the Container Git SHA and a direct log-query URL. Use the build/deploy
-  correlation procedure above.
 - Worker/DO request-span and dispatch lines (`internal_actions_ingress`,
   `eventsub_ingress`) carry `release` (the container Git SHA, deploy-stamped
   on the Worker edge and probe-read on the DO relay, `"unknown"` when neither
@@ -284,6 +283,35 @@ claim them as shipped acceptance:
   before any Cloudflare call until its isolated synthetic fixture lands, and
   production has no gradual caller. Do not treat the existing gated readiness
   check plus manual rollback as proof of a gradual traffic rollout here.
+
+## Promotion gate failure codes
+
+The promotion error-rate gate (`wrangler/scripts/promotion-error-gate.mjs`)
+fences its scrape destination to the configured staging/production Worker
+origins and fails closed with a stable code, a fixed next action and a JSON
+error receipt (`verdict: "error"`) when it cannot judge. The closed code
+vocabulary:
+
+- `usage_error` — bad flags; check the gate flags with `--help` and retry. Exit 2.
+- `invalid_metrics_origin` — `--metrics-url` is not a bare `https://` Worker
+  origin from the configured identities; fix the origin and retry. Exit 2.
+- `invalid_timeout` — `--scrape-timeout-seconds` is not a finite positive
+  value within the supported timer range; fix the value and retry. Exit 2.
+- `redirect_refused` — the scrape refused a redirect; the bearer is never
+  followed across redirects. Verify direct `/ops/metrics` and retry. Exit 1.
+- `auth_failed` — the Worker refused the scrape credentials (401/403);
+  verify the token is current and retry. Exit 1.
+- `transport_failed` — the scrape transport failed after 3 attempts; verify
+  the Worker is reachable and retry. Exit 1.
+- `decode_failed` — the exposition could not be decoded; verify valid output
+  at `/ops/metrics` and retry. Exit 1.
+
+Receipts and console text never carry remote bodies, URL credentials, the
+bearer or exception messages. Offline rehearsal (no network, no token):
+
+```sh
+node wrangler/scripts/promotion-error-gate.mjs --metrics-url https://two-bot-next-staging.5150.workers.dev --evidence /tmp/gate-evidence.json --rehearsal-firing '[]'
+```
 
 For the full health, metrics, and rollback procedures, see the
 [operations runbook](runbook.md), [metrics reference](metrics.md), and

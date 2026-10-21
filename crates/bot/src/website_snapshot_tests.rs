@@ -723,6 +723,183 @@ async fn stop_during_fetch_discards_snapshot_results_without_post_shutdown_publi
     db.close().await.unwrap();
 }
 
+// ── Scheduled-event snapshot bounds (bounded-claim decision, caps item) ──
+// Tick-level pins for the caps the pure `normalize_events` suite cannot see:
+// the raw-body 1 MiB cap (body bytes never reach `normalize_*`), plus
+// tick wiring for the row and name bounds (refuse, never truncate-then-
+// accept). Every refusal below must surface as `Err(ErrorClass::Rest)`
+// with the poison pool untouched, which proves zero writes: no partial
+// application, and the last good snapshot kept by construction. Controls
+// assert `Err(ErrorClass::Database)`: with a poison pool that error is the
+// observable proof an in-bounds snapshot still attempted publication.
+// The channel-id length bound is pinned only in the pure core suite: the
+// tick's pre-existing canonical-snowflake check rejects non-snowflake
+// channels before normalization, so over-length channels are unreachable
+// here by a stricter, older property.
+
+/// Raw response-body cap: 1 MiB.
+const SNAPSHOT_BODY_CAP: usize = 1_048_576;
+
+/// Cap the decision pins on rows per snapshot.
+const SNAPSHOT_ROW_CAP: usize = 100;
+
+/// Two valid events with an unknown-field pad sized so the served body is
+/// exactly `target_len` bytes. Known fields stay in bounds and rows stay far
+/// under the row cap, so only the body bound can refuse. Padding hides in an
+/// unknown field on purpose: the bound measures RAW body bytes, so a
+/// stripped-known-fields measure (which would see ~200 bytes here) must not
+/// satisfy it.
+fn padded_snapshot_body(target_len: usize) -> Value {
+    let mut first = event("3000");
+    first["pad"] = json!("");
+    let mut body = json!([first, event("3001")]);
+    let base_len = body.to_string().len();
+    assert!(
+        target_len > base_len,
+        "target {target_len} must exceed the unpadded body {base_len}"
+    );
+    body[0]["pad"] = json!("x".repeat(target_len - base_len));
+    let wire = body.to_string();
+    assert_eq!(
+        wire.len(),
+        target_len,
+        "served body must be exactly the target length"
+    );
+    body
+}
+
+/// 101 valid small events: rows over cap, every field in bounds.
+fn over_cap_row_snapshot() -> Value {
+    Value::Array(
+        (0..SNAPSHOT_ROW_CAP + 1)
+            .map(|i| event(&format!("3{:03}", 100 + i)))
+            .collect(),
+    )
+}
+
+/// 100 events with at-cap names and descriptions: fully in bounds.
+fn at_cap_snapshot() -> Value {
+    Value::Array(
+        (0..SNAPSHOT_ROW_CAP)
+            .map(|i| {
+                let mut row = event(&format!("3{:03}", 100 + i));
+                row["name"] = json!("n".repeat(100));
+                row["description"] = json!("d".repeat(1000));
+                row
+            })
+            .collect(),
+    )
+}
+
+/// Run one Events tick against a single scripted body and a poison pool.
+/// Returns the tick outcome plus the mock-side request count.
+async fn run_events_tick(body: Value) -> (Result<(), ErrorClass>, usize) {
+    let mock = MockRest::start(
+        vec![ScriptedResponse::json(200, body)],
+        ScriptedResponse::status(403),
+    )
+    .await;
+    let pool = poison_pool();
+    let (_stop, shutdown) = watch::channel(false);
+    let outcome = run_once(
+        Kind::Events,
+        &pool,
+        &executor(&mock),
+        "2222",
+        &Mutex::new(()),
+        &shutdown,
+        false,
+    )
+    .await;
+    let requests = mock.requests().len();
+    mock.shutdown().await;
+    pool.close().await;
+    (outcome, requests)
+}
+
+#[tokio::test]
+async fn over_cap_body_is_read_failure_and_never_reaches_storage() {
+    let body = padded_snapshot_body(SNAPSHOT_BODY_CAP + 1);
+    let (outcome, requests) = run_events_tick(body).await;
+    assert_eq!(requests, 1, "the tick must fetch before it can refuse");
+    assert_eq!(
+        outcome,
+        Err(ErrorClass::Rest),
+        "a 1 MiB + 1 byte body must refuse before storage; reaching the \
+         poison pool would surface a database error instead"
+    );
+}
+
+#[tokio::test]
+async fn exact_cap_body_still_reaches_storage() {
+    let (outcome, requests) = run_events_tick(padded_snapshot_body(SNAPSHOT_BODY_CAP)).await;
+    assert_eq!(requests, 1);
+    assert_eq!(
+        outcome,
+        Err(ErrorClass::Database),
+        "an exactly-1 MiB body is in bounds and must still attempt publication"
+    );
+}
+
+#[tokio::test]
+async fn just_under_cap_body_still_reaches_storage() {
+    let (outcome, requests) = run_events_tick(padded_snapshot_body(SNAPSHOT_BODY_CAP - 1)).await;
+    assert_eq!(requests, 1);
+    assert_eq!(
+        outcome,
+        Err(ErrorClass::Database),
+        "a 1 MiB - 1 byte body is in bounds and must still attempt publication"
+    );
+}
+
+#[tokio::test]
+async fn over_100_rows_never_reaches_storage() {
+    let body = over_cap_row_snapshot();
+    assert!(
+        body.to_string().len() < SNAPSHOT_BODY_CAP,
+        "row fixture must stay under the body cap to isolate the row bound"
+    );
+    let (outcome, requests) = run_events_tick(body).await;
+    assert_eq!(requests, 1);
+    assert_eq!(
+        outcome,
+        Err(ErrorClass::Rest),
+        "101 rows must refuse the whole snapshot; applying any prefix would \
+         reach the poison pool and surface a database error instead"
+    );
+}
+
+#[tokio::test]
+async fn over_length_name_is_refused_not_truncated() {
+    let mut row = event("3000");
+    row["name"] = json!("n".repeat(101));
+    let (outcome, requests) = run_events_tick(json!([row])).await;
+    assert_eq!(requests, 1);
+    assert_eq!(
+        outcome,
+        Err(ErrorClass::Rest),
+        "a 101-char name must refuse; truncating to 100 and accepting would \
+         reach the poison pool and surface a database error instead"
+    );
+}
+
+#[tokio::test]
+async fn at_cap_rows_and_fields_reach_storage() {
+    let body = at_cap_snapshot();
+    assert_eq!(body.as_array().expect("array snapshot").len(), 100);
+    assert!(
+        body.to_string().len() < SNAPSHOT_BODY_CAP,
+        "at-cap fixture must stay under the body cap to isolate the row/field bounds"
+    );
+    let (outcome, requests) = run_events_tick(body).await;
+    assert_eq!(requests, 1);
+    assert_eq!(
+        outcome,
+        Err(ErrorClass::Database),
+        "100 rows with at-cap fields are in bounds and must still attempt publication"
+    );
+}
+
 #[tokio::test]
 async fn stale_tick_returns_ok_and_writes_nothing() {
     let Some(db) = fixture().await else {
