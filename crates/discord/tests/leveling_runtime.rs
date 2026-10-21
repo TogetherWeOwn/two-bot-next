@@ -114,7 +114,21 @@ impl TestDb {
 #[ignore = "requires approved agent-testdb or credential-free CI service"]
 async fn routed_rank_optional_member_and_fixed_public_top_ten_match_legacy() {
     let db = TestDb::new().await;
-    let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+    let edit = || ScriptedResponse::json(200, json!({"id": "99"}));
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            edit(),
+            ScriptedResponse::status(204),
+            edit(),
+            ScriptedResponse::status(204),
+            edit(),
+            ScriptedResponse::status(204),
+            edit(),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
     let runtime = runtime(db.pool.clone(), &mock, OnboardingMode::Legacy);
     runtime
         .handle_interaction(&interaction("rank", false), HandlerId::Rank)
@@ -156,34 +170,60 @@ async fn routed_rank_optional_member_and_fixed_public_top_ten_match_legacy() {
         .await
         .unwrap());
     let requests = mock.requests();
-    assert_eq!(requests.len(), 4);
-    let body: Vec<Value> = requests
+    assert_eq!(
+        requests.len(),
+        8,
+        "one defer plus one completion edit per routed command"
+    );
+    let callbacks: Vec<_> = requests
+        .iter()
+        .filter(|r| r.method == "POST" && r.path.ends_with("/callback"))
+        .collect();
+    let edits: Vec<_> = requests
+        .iter()
+        .filter(|r| r.method == "PATCH" && r.path.ends_with("/messages/@original"))
+        .collect();
+    assert_eq!(callbacks.len(), 4, "one acknowledgement per command");
+    assert_eq!(edits.len(), 4, "one completion edit per command");
+    let defers: Vec<Value> = callbacks
         .iter()
         .map(|r| serde_json::from_slice(&r.body).unwrap())
         .collect();
-    assert_eq!(
-        body[0]["data"]["content"],
-        rank_text("Global name", 0, None, 0, 0)
+    for defer in &defers {
+        assert_eq!(defer["type"], 5, "leveling acknowledges with a defer");
+    }
+    assert_eq!(defers[0]["data"]["flags"], 64, "rank defers ephemerally");
+    assert_eq!(defers[1]["data"]["flags"], 64, "rank defers ephemerally");
+    assert_ne!(
+        defers[2]["data"]["flags"], 64,
+        "leaderboard defers publicly"
     );
-    assert_eq!(
-        body[1]["data"]["content"],
-        rank_text("username", 0, None, 0, 0)
+    assert_ne!(
+        defers[3]["data"]["flags"], 64,
+        "leaderboard defers publicly"
     );
-    assert_eq!(body[0]["data"]["flags"], 64);
+    let body: Vec<Value> = edits
+        .iter()
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    assert_eq!(body[0]["content"], rank_text("Global name", 0, None, 0, 0));
+    assert_eq!(body[1]["content"], rank_text("username", 0, None, 0, 0));
     assert_eq!(
-        body[2]["data"]["content"],
+        body[2]["content"],
         leaderboard_reply_for_season(&[], &season).content
     );
-    assert_eq!(body[3]["data"]["allowed_mentions"]["parse"], json!([]));
+    assert_eq!(body[3]["allowed_mentions"]["parse"], json!([]));
     assert_eq!(
-        body[3]["data"]["content"].as_str().unwrap().lines().count(),
-        11
+        body[3]["content"].as_str().unwrap().lines().count(),
+        11,
+        "no invented paging on the completed board"
     );
-    assert!(body[3]["data"]["flags"].is_null());
-    assert!(body[3]["data"]["components"].is_null());
-    assert!(requests
+    assert!(callbacks
         .iter()
         .all(|r| r.path.starts_with("/api/v10/interactions/7/")));
+    assert!(edits
+        .iter()
+        .all(|r| r.path == "/api/v10/webhooks/8/mock-callback/messages/@original"));
     mock.shutdown().await;
     db.close().await;
 }
@@ -654,7 +694,17 @@ fn foreign_voice(channel: Option<u64>) -> Event {
 #[ignore = "requires approved agent-testdb or credential-free CI service"]
 async fn foreign_guild_rank_and_leaderboard_leave_zero_rows_and_no_reply() {
     let db = TestDb::new().await;
-    let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+    let edit = || ScriptedResponse::json(200, json!({"id": "99"}));
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            edit(),
+            ScriptedResponse::status(204),
+            edit(),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
     let runtime = runtime(db.pool.clone(), &mock, OnboardingMode::Legacy);
 
     // Foreign-guild /rank (self and targeted) and /leaderboard, plus a
@@ -702,7 +752,11 @@ async fn foreign_guild_rank_and_leaderboard_leave_zero_rows_and_no_reply() {
         .handle_interaction(&interaction("leaderboard", false), HandlerId::Leaderboard)
         .await
         .unwrap());
-    assert_eq!(mock.requests().len(), 2);
+    assert_eq!(
+        mock.requests().len(),
+        4,
+        "one defer plus one completion edit per own-guild command"
+    );
     assert_eq!(leveling_row_counts(&db.pool, GUILD).await, (0, 0));
     assert_eq!(total_leveling_rows(&db.pool).await, (0, 0));
     mock.shutdown().await;
