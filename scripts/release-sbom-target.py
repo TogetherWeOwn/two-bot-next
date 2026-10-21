@@ -16,15 +16,19 @@ LOOKUP_REASON = "Release tag lookup failed"
 def github_object(path):
     """Fetch one git ref object; refuse transport and shape failures with fixed vocabulary.
 
-    Returns the full ``gh api`` response dict; the ``object`` member is
-    guaranteed present and a dict. Callers index ``["object"]`` as before,
-    so the pre-existing mock contract (outer shape) is preserved.
+    gh stderr is discarded so service diagnostics never precede the fixed
+    refusal, and undecodable stdout refuses as invalid shape. Returns the
+    full ``gh api`` response dict; the ``object`` member is guaranteed
+    present and a dict. Callers index ``["object"]`` as before, so the
+    pre-existing mock contract (outer shape) is preserved.
     """
     try:
         raw = subprocess.check_output(
             ["gh", "api", f"repos/{os.environ['GH_REPO']}/git/{path}"],
-            text=True, timeout=30,
+            text=True, timeout=30, stderr=subprocess.DEVNULL,
         )
+    except UnicodeDecodeError:
+        raise ValueError(SHAPE_REASON) from None
     except (subprocess.SubprocessError, OSError):
         raise ValueError(LOOKUP_REASON) from None
     try:

@@ -109,9 +109,12 @@ class BenchParser(argparse.ArgumentParser):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Digit runs allow single underscores between digits, matching the
+        # float() literal rules, so `-1_0` reaches its type check instead of
+        # dying as "expected one argument".
         self._negative_number_matcher = re.compile(
-            r"^-\d+$|^-\d*\.\d+$|^-\d+\.$"
-            r"|^-\d+(\.\d*)?[eE][+-]?\d+$|^-(\.\d+)[eE][+-]?\d+$"
+            r"^-\d(?:_?\d)*$|^-(?:\d(?:_?\d)*)?\.\d(?:_?\d)*$|^-\d(?:_?\d)*\.$"
+            r"|^-\d(?:_?\d)*(\.(?:\d(?:_?\d)*)?)?[eE][+-]?\d(?:_?\d)*$|^-(\.\d(?:_?\d)*)[eE][+-]?\d(?:_?\d)*$"
             r"|^-inf(inity)?$|^-nan$",
             re.IGNORECASE,
         )

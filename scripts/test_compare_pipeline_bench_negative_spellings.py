@@ -6,8 +6,11 @@ These spellings are all valid ``float()`` input the stdlib match misses:
 
 * ``-1.`` (trailing dot) and ``-.5e3`` (leading-dot scientific) refuse with
   the fixed bound vocabulary before any file read;
-* ``-0.`` (negative zero, which ``compare()`` accepts) passes argparse and
-  proceeds to the file reads;
+* underscore spellings ``-1_0``, ``-1_000.5`` and ``-1e1_0`` (all valid
+  ``float()`` input) refuse with the fixed bound vocabulary before any
+  file read;
+* ``-0.`` and ``-0_0`` (negative zero, which ``compare()`` accepts) pass
+  argparse and proceed to the file reads;
 * strings that are not numbers (``-x``) still parse as flags, never as values.
 
 Offline only: reports are temp files; no network, no credentials. Routed to
@@ -85,7 +88,11 @@ class NegativeSpellingTests(unittest.TestCase):
             for flag, value, message in (
                     ("--tolerance", "-1.", TOLERANCE_MESSAGE),
                     ("--tolerance", "-.5e3", TOLERANCE_MESSAGE),
-                    ("--max-rss-mib", "-1.", RSS_MESSAGE)):
+                    ("--tolerance", "-1_0", TOLERANCE_MESSAGE),
+                    ("--tolerance", "-1_000.5", TOLERANCE_MESSAGE),
+                    ("--tolerance", "-1e1_0", TOLERANCE_MESSAGE),
+                    ("--max-rss-mib", "-1.", RSS_MESSAGE),
+                    ("--max-rss-mib", "-1_0", RSS_MESSAGE)):
                 with self.subTest(flag=flag, value=value):
                     code, out, err, reads = self.run_main(
                         ["compare_pipeline_bench.py", str(actual),
@@ -99,12 +106,14 @@ class NegativeSpellingTests(unittest.TestCase):
     def test_negative_zero_passes_argparse(self):
         with tempfile.TemporaryDirectory(dir=scratch_dir()) as directory:
             baseline, actual = self.write_reports(directory)
-            code, out, err, reads = self.run_main(
-                ["compare_pipeline_bench.py", str(actual),
-                 "--baseline", str(baseline), "--tolerance", "-0."])
-            self.assertEqual(code, 0, err)
-            self.assertTrue(out.startswith("PASS"), out)
-            self.assertNotEqual(reads, [])
+            for value in ("-0.", "-0_0"):
+                with self.subTest(value=value):
+                    code, out, err, reads = self.run_main(
+                        ["compare_pipeline_bench.py", str(actual),
+                         "--baseline", str(baseline), "--tolerance", value])
+                    self.assertEqual(code, 0, err)
+                    self.assertTrue(out.startswith("PASS"), out)
+                    self.assertNotEqual(reads, [])
 
     def test_non_numeric_dash_value_still_parses_as_flag(self):
         with tempfile.TemporaryDirectory(dir=scratch_dir()) as directory:
