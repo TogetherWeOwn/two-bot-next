@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use std::time::{Duration, Instant};
@@ -41,7 +41,7 @@ use two_bot_discord::{ActionExecutor, JoinObservation, JoinObserver};
 /// dispatch writer must never wait on this runtime.
 pub(crate) const QUEUE_CAPACITY: usize = 2048;
 /// Bound on one alert's bot lookup, permission reads and post.
-const DELIVERY_MAX: Duration = Duration::from_secs(12);
+pub(crate) const DELIVERY_MAX: Duration = Duration::from_secs(12);
 /// The live settings are re-checked at most this often (legacy 15 s poll).
 const SETTINGS_MAX_AGE: Duration = Duration::from_secs(15);
 const SETTINGS_READ_MAX: Duration = Duration::from_millis(1500);
@@ -390,6 +390,7 @@ impl RaidDelivery {
 #[derive(Default)]
 pub(crate) struct WorkerShutdown {
     wake: Notify,
+    latched: AtomicBool,
     finished: AtomicU64,
     dropped: AtomicU64,
 }
@@ -399,7 +400,15 @@ impl WorkerShutdown {
     /// `notify_one` stores its permit when nobody is parked, so a latch that
     /// lands mid-item still wakes the worker's next `select!`.
     pub(crate) fn latch(&self) {
+        self.latched.store(true, Ordering::SeqCst);
         self.wake.notify_one();
+    }
+
+    /// Poll side of the latch: a worker mid-item checks this between sequential
+    /// steps and stops starting new work, so the post-latch drain stays one
+    /// in-flight step plus the outcome persist instead of the whole plan.
+    pub(crate) fn is_latched(&self) -> bool {
+        self.latched.load(Ordering::SeqCst)
     }
 
     /// Wait side of the latch: the worker selects this against inbox receives.
@@ -456,12 +465,31 @@ pub(crate) fn drain_queued<T>(receiver: &mut mpsc::Receiver<T>) -> u64 {
 }
 
 /// Bound for one latched worker drain (finish the in-flight item, drop the
-/// queue) before the supervisor aborts it. Derived from the slowest healthy
-/// in-flight path — the raid settings read (1.5 s) plus one bounded staff-post
-/// delivery (12 s) — with headroom for the containment snapshot/removal
-/// sequence under a slow Discord. A worker still running past this bound is
-/// treated as wedged and aborted; the drain normally finishes in milliseconds.
+/// queue) before the supervisor aborts it. The floor is the slowest latched
+/// drain: a containment worker starts no new step once latched, so at most one
+/// in-flight Discord call (`MODERATION_TIMEOUT_MS`, 5 s) plus the settings tail
+/// (`SETTINGS_READ_MAX`, 1.5 s) and one bounded staff post (`DELIVERY_MAX`,
+/// 12 s) remain — 18.5 s, with the rest as headroom for pacing and the outcome
+/// persist. The raid and join-risk items fit the same floor with a single
+/// trailing post. A worker still running past this bound is parked in a wait
+/// no in-deadline budget can cover (a 429-clamped retry sleep, a hung store)
+/// and is treated as wedged and aborted; the drain normally finishes in
+/// milliseconds.
 pub(crate) const WORKER_JOIN_BUDGET: Duration = Duration::from_secs(20);
+
+/// Abort the owned worker when the supervisor future is dropped. Aborting (or
+/// dropping) a supervisor `JoinHandle` detaches its task in Tokio; without
+/// this guard the nested worker would keep running — Discord writes, store
+/// writes, staff posts — after the service join logged its drain as cut
+/// short. Aborting an already-finished worker is a harmless no-op, so the
+/// guard needs no disarm on the healthy paths.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 /// Hold a production worker handle and join-or-abort it on service shutdown,
 /// after `eventsub_reconcile::join`: latch the worker drain first so the join
@@ -476,6 +504,8 @@ pub(crate) fn join_on_shutdown(
     on_shutdown: impl FnOnce() + Send + 'static,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // An aborted supervisor must not leave a detached worker behind.
+        let _worker_guard = AbortOnDrop(worker.abort_handle());
         let _ = shutdown.wait_for(|latched| *latched).await;
         on_shutdown();
         match tokio::time::timeout(budget, &mut worker).await {

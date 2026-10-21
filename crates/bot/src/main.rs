@@ -138,6 +138,8 @@ mod website_roster_cap_acceptance_tests;
 mod worker_supervision_acceptance_tests;
 #[cfg(test)]
 mod worker_supervision_builder_tests;
+#[cfg(test)]
+mod worker_supervision_review_tests;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

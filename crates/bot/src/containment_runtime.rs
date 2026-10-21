@@ -56,7 +56,7 @@ use crate::raid_runtime::{Delivery, RaidDelivery, QUEUE_CAPACITY};
 
 /// Re-checked at most this often (legacy 15 s poll).
 const SETTINGS_MAX_AGE: Duration = Duration::from_secs(15);
-const SETTINGS_READ_MAX: Duration = Duration::from_millis(1500);
+pub(crate) const SETTINGS_READ_MAX: Duration = Duration::from_millis(1500);
 
 const WINDOW_KEY: &str = "TWO_ANTI_NUKE_WINDOW_SECONDS";
 const MAX_AGE_KEY: &str = "TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS";
@@ -561,7 +561,11 @@ impl<S: CheckedSettingsSource> ContainmentWorker<S> {
     /// follows the `docs/containment.md` decision contract via
     /// [`quarantine_outcome`]: partial success then failure is uncertain, an
     /// empty successful plan is contained, a first-removal timeout/429/5xx is
-    /// uncertain, and definitive rejection with nothing removed is refused.
+    /// uncertain, and definitive rejection with nothing removed is refused. A
+    /// latched shutdown between steps interrupts the plan the same way a
+    /// timeout does: the confirmed removals persist and the incident is
+    /// uncertain (held, never released at cooldown expiry) rather than left
+    /// stranded in `Containing` by a supervisor abort.
     async fn contain(
         &self,
         settings: &ContainmentSettings,
@@ -635,6 +639,16 @@ impl<S: CheckedSettingsSource> ContainmentWorker<S> {
                 return PlanOutcome::Failed;
             }
         };
+        // A latched shutdown starts no new Discord step: the incident is
+        // uncertain with nothing removed yet, and `finish` still persists it.
+        // Without this (and the per-removal check below) a slow-but-healthy
+        // plan outlives the drain budget and the abort strands the incident.
+        if self.shutdown.is_latched() {
+            return PlanOutcome::Removed {
+                removed: Vec::new(),
+                failure: Some(QuarantineFailure::Shutdown),
+            };
+        }
         let executor_roles = match self.executor.member_role_ids(guild, executor).await {
             Ok(roles) => roles,
             Err(_) => {
@@ -692,6 +706,13 @@ impl<S: CheckedSettingsSource> ContainmentWorker<S> {
                 let mut removed = Vec::new();
                 let mut failure: Option<QuarantineFailure> = None;
                 for role_id in role_ids {
+                    // Stop between removals once latched: the confirmed
+                    // removals persist and the incident is uncertain, instead
+                    // of timing out mid-loop and stranding it in `Containing`.
+                    if self.shutdown.is_latched() {
+                        failure = Some(QuarantineFailure::Shutdown);
+                        break;
+                    }
                     match self
                         .executor
                         .set_member_role(

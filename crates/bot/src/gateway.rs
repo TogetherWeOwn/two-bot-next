@@ -2605,6 +2605,33 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn generation_wait_resolves_through_transport_disconnect() {
+        // The production wake path end to end: `transport_disconnected` bumps
+        // the generation AND wakes the waiters paired with it. Every other
+        // generation test notifies on its own `Notify`, so deleting the
+        // production `notify_waiters` keeps them green — this is the test that
+        // goes red, because the waiter only resolves off the real seam.
+        let state = RwLock::new(GatewayState::Armed);
+        let generation = AtomicU64::new(3);
+        let wake = tokio::sync::Notify::new();
+        let waiter = generation_changed(&generation, &wake, 3);
+        tokio::pin!(waiter);
+        assert!(
+            futures_util::poll!(&mut waiter).is_pending(),
+            "waiter stays parked until the disconnect lands"
+        );
+        transport_disconnected(&state, &generation, &wake).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("disconnect wakes the waiter promptly");
+        assert_eq!(
+            generation.load(Ordering::Acquire),
+            4,
+            "disconnect bumps the generation exactly once"
+        );
+    }
+
     #[tokio::test]
     async fn checkpoint_completion_cannot_restore_readiness_after_reception_stops() {
         let state = RwLock::new(GatewayState::Connected);
