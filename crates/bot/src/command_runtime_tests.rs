@@ -17,6 +17,8 @@
 
 #![cfg(test)]
 
+#[path = "member_authority_cause_acceptance.rs"]
+mod member_authority_cause_acceptance;
 #[path = "member_dispatch_authority_acceptance.rs"]
 mod member_dispatch_authority_acceptance;
 
