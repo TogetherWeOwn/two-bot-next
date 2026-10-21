@@ -2056,4 +2056,312 @@ mod tests {
             "timed-out upload child {pid} must be terminated and reaped"
         );
     }
+
+    // Stable-error patch coverage: the acceptance suite pins tokens via source
+    // text, which llvm-cov does not count as execution. These runtime tests
+    // execute each changed failure line so the patch gate measures them.
+    // Env-mutating tests share one lock; no other unit test reads these vars.
+    static STABLE_CODE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn clear_stable_code_env() {
+        for name in [
+            "TWO_DATABASE_URL",
+            "TWO_BACKUP_KEEP",
+            "TWO_BACKUP_DIR",
+            "TWO_BACKUP_S3_ENDPOINT",
+            "TWO_BACKUP_S3_BUCKET",
+            "TWO_BACKUP_S3_ACCESS_KEY_ID",
+            "TWO_BACKUP_S3_SECRET_ACCESS_KEY",
+            "CREDENTIALS_DIRECTORY",
+            "DISCORD_STAGING_BOT_TOKEN",
+            "DISCORD_STAGING_GUILD_ID",
+            "TWO_GUILD_CONFIG_OFFLINE_TEST",
+            "GUILD_CONFIG_API_BASE",
+            "GUILD_CONFIG_CDN_BASE",
+            "TWO_GUILD_CONFIG_BACKUP_DIR",
+            "TWO_GUILD_CONFIG_UPLOAD_CMD",
+            "TWO_BACKUP_UPLOAD_CMD",
+        ] {
+            std::env::remove_var(name);
+        }
+    }
+
+    #[test]
+    fn stable_codes_cover_upload_wait_failed() {
+        let message = super::upload_failure_message(
+            "backup",
+            "upload-wait.sh",
+            &super::UploadOutcome::WaitFailed("interrupted".to_owned()),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        assert!(message.contains("upload wait failed"));
+    }
+
+    #[tokio::test]
+    async fn stable_codes_cover_backup_missing_database_url() {
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        let exit = super::cmd_backup().await;
+        assert_eq!(exit, 1);
+        clear_stable_code_env();
+    }
+
+    #[tokio::test]
+    async fn stable_codes_cover_backup_retention_refused() {
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        std::env::set_var("TWO_DATABASE_URL", "postgres://127.0.0.1:1/db");
+        std::env::set_var("TWO_BACKUP_KEEP", "0");
+        let exit = super::cmd_backup().await;
+        assert_eq!(exit, 1);
+        clear_stable_code_env();
+    }
+
+    #[tokio::test]
+    async fn stable_codes_cover_backup_dest_create_failed() {
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        std::env::set_var("TWO_DATABASE_URL", "postgres://127.0.0.1:1/db");
+        let dir = Credentials::new();
+        let blocker = dir.0.join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let bad_dest = blocker.join("subdir");
+        std::env::set_var("TWO_BACKUP_DIR", bad_dest.to_str().unwrap());
+        let exit = super::cmd_backup().await;
+        assert_eq!(exit, 1);
+        clear_stable_code_env();
+    }
+
+    #[tokio::test]
+    async fn stable_codes_cover_backup_pool_open_failed() {
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        std::env::set_var("TWO_DATABASE_URL", "postgres://127.0.0.1:1/db");
+        let dir = Credentials::new();
+        std::env::set_var("TWO_BACKUP_DIR", dir.0.to_str().unwrap());
+        let exit = super::cmd_backup().await;
+        assert_eq!(exit, 1);
+        clear_stable_code_env();
+    }
+
+    #[tokio::test]
+    async fn stable_codes_cover_upload_s3_target() {
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        let dir = Credentials::new();
+        let path = dir.0.join("dump.ndjson.gz");
+        std::fs::write(&path, b"fake-dump").unwrap();
+        let args = vec![path.to_string_lossy().into_owned()];
+        let exit = super::cmd_backup_upload(&args).await;
+        assert_eq!(exit, 1);
+        clear_stable_code_env();
+    }
+
+    #[tokio::test]
+    async fn stable_codes_cover_upload_put_failed() {
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        std::env::set_var("TWO_BACKUP_S3_ENDPOINT", "http://127.0.0.1:1");
+        std::env::set_var("TWO_BACKUP_S3_BUCKET", "test-bucket");
+        std::env::set_var("TWO_BACKUP_S3_ACCESS_KEY_ID", "test-key");
+        std::env::set_var("TWO_BACKUP_S3_SECRET_ACCESS_KEY", "test-secret");
+        let dir = Credentials::new();
+        let path = dir.0.join("dump.ndjson.gz");
+        std::fs::write(&path, b"fake-dump").unwrap();
+        let args = vec![path.to_string_lossy().into_owned()];
+        let exit = super::cmd_backup_upload(&args).await;
+        assert_eq!(exit, 1);
+        clear_stable_code_env();
+    }
+
+    #[tokio::test]
+    async fn stable_codes_cover_snapshot_token_load_failed() {
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        let exit = super::cmd_guild_config_snapshot().await;
+        assert_eq!(exit, 1);
+        clear_stable_code_env();
+    }
+
+    #[tokio::test]
+    async fn stable_codes_cover_snapshot_token_check_refused() {
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        std::env::set_var("DISCORD_STAGING_BOT_TOKEN", "invalid-token");
+        let exit = super::cmd_guild_config_snapshot().await;
+        assert_eq!(exit, 2);
+        clear_stable_code_env();
+    }
+
+    #[tokio::test]
+    async fn stable_codes_cover_snapshot_guild_id_failed() {
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        std::env::set_var("DISCORD_STAGING_BOT_TOKEN", TOKEN);
+        let exit = super::cmd_guild_config_snapshot().await;
+        assert_eq!(exit, 2);
+        clear_stable_code_env();
+    }
+
+    #[tokio::test]
+    async fn stable_codes_cover_snapshot_governed_api_failed() {
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        std::env::set_var("DISCORD_STAGING_BOT_TOKEN", TOKEN);
+        std::env::set_var(
+            "DISCORD_STAGING_GUILD_ID",
+            two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID,
+        );
+        let exit = super::cmd_guild_config_snapshot().await;
+        assert_eq!(exit, 2);
+        clear_stable_code_env();
+    }
+
+    #[tokio::test]
+    async fn stable_codes_cover_snapshot_identity_failed() {
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        std::env::set_var("DISCORD_STAGING_BOT_TOKEN", TOKEN);
+        std::env::set_var(
+            "DISCORD_STAGING_GUILD_ID",
+            two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID,
+        );
+        std::env::set_var("TWO_GUILD_CONFIG_OFFLINE_TEST", "1");
+        std::env::set_var("GUILD_CONFIG_API_BASE", "http://127.0.0.1:1");
+        std::env::set_var("GUILD_CONFIG_CDN_BASE", "http://127.0.0.1:1");
+        let exit = super::cmd_guild_config_snapshot().await;
+        assert_eq!(exit, 1);
+        clear_stable_code_env();
+    }
+
+    struct StableCodeFake {
+        base: String,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    async fn stable_code_fake_handler(
+        axum::extract::State(fail_guild): axum::extract::State<
+            std::sync::Arc<std::sync::atomic::AtomicBool>,
+        >,
+        request: axum::extract::Request,
+    ) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+        let path = request.uri().path().to_owned();
+        let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
+        let app_id = two_bot_core::backup::guild_config::STAGING_BOT_APPLICATION_ID;
+        let guild_path = format!("/guilds/{guild_id}");
+        let roles_path = format!("{guild_path}/roles");
+        let channels_path = format!("{guild_path}/channels");
+        if path == "/users/@me" {
+            let body = serde_json::json!({"id": app_id});
+            return (axum::http::StatusCode::OK, axum::Json(body));
+        }
+        if path == "/users/@me/guilds" {
+            let body = serde_json::json!([{"id": guild_id}]);
+            return (axum::http::StatusCode::OK, axum::Json(body));
+        }
+        if path == guild_path {
+            if fail_guild.load(std::sync::atomic::Ordering::Relaxed) {
+                let body = serde_json::json!({"message": "fixture failure"});
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(body),
+                );
+            }
+            let body = serde_json::json!({"id": guild_id, "name": "Loopback guild"});
+            return (axum::http::StatusCode::OK, axum::Json(body));
+        }
+        if path == roles_path {
+            let body = serde_json::json!([]);
+            return (axum::http::StatusCode::OK, axum::Json(body));
+        }
+        if path == channels_path {
+            let body = serde_json::json!([]);
+            return (axum::http::StatusCode::OK, axum::Json(body));
+        }
+        let body = serde_json::json!([]);
+        (axum::http::StatusCode::OK, axum::Json(body))
+    }
+
+    impl StableCodeFake {
+        async fn start(fail_guild: bool) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(fail_guild));
+            let app = axum::Router::new()
+                .fallback(stable_code_fake_handler)
+                .with_state(flag);
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            Self { base, task }
+        }
+    }
+
+    impl Drop for StableCodeFake {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn stable_codes_cover_snapshot_capture_failed() {
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        let fake = StableCodeFake::start(true).await;
+        let dir = Credentials::new();
+        std::env::set_var("DISCORD_STAGING_BOT_TOKEN", TOKEN);
+        std::env::set_var(
+            "DISCORD_STAGING_GUILD_ID",
+            two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID,
+        );
+        std::env::set_var("TWO_GUILD_CONFIG_OFFLINE_TEST", "1");
+        std::env::set_var("GUILD_CONFIG_API_BASE", &fake.base);
+        std::env::set_var("GUILD_CONFIG_CDN_BASE", &fake.base);
+        std::env::set_var("TWO_GUILD_CONFIG_BACKUP_DIR", dir.0.to_str().unwrap());
+        let exit = super::cmd_guild_config_snapshot().await;
+        assert_eq!(exit, 1);
+        clear_stable_code_env();
+    }
+
+    #[tokio::test]
+    async fn stable_codes_cover_snapshot_atomic_write_failed() {
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        let fake = StableCodeFake::start(false).await;
+        let dir = Credentials::new();
+        let blocker = dir.0.join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let bad_dir = blocker.join("captured");
+        std::env::set_var("DISCORD_STAGING_BOT_TOKEN", TOKEN);
+        std::env::set_var(
+            "DISCORD_STAGING_GUILD_ID",
+            two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID,
+        );
+        std::env::set_var("TWO_GUILD_CONFIG_OFFLINE_TEST", "1");
+        std::env::set_var("GUILD_CONFIG_API_BASE", &fake.base);
+        std::env::set_var("GUILD_CONFIG_CDN_BASE", &fake.base);
+        std::env::set_var("TWO_GUILD_CONFIG_BACKUP_DIR", bad_dir.to_str().unwrap());
+        let exit = super::cmd_guild_config_snapshot().await;
+        assert_eq!(exit, 1);
+        clear_stable_code_env();
+    }
+
+    #[tokio::test]
+    async fn stable_codes_cover_snapshot_local_only_refused() {
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        let fake = StableCodeFake::start(false).await;
+        let dir = Credentials::new();
+        std::env::set_var("DISCORD_STAGING_BOT_TOKEN", TOKEN);
+        std::env::set_var(
+            "DISCORD_STAGING_GUILD_ID",
+            two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID,
+        );
+        std::env::set_var("TWO_GUILD_CONFIG_OFFLINE_TEST", "1");
+        std::env::set_var("GUILD_CONFIG_API_BASE", &fake.base);
+        std::env::set_var("GUILD_CONFIG_CDN_BASE", &fake.base);
+        std::env::set_var("TWO_GUILD_CONFIG_BACKUP_DIR", dir.0.to_str().unwrap());
+        let exit = super::cmd_guild_config_snapshot().await;
+        assert_eq!(exit, 2);
+        clear_stable_code_env();
+    }
 }
