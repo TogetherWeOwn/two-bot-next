@@ -273,6 +273,7 @@ jobs:
     needs: [schema-gate, roles-gate]
     permissions:
       contents: read # checkout only; the deploy authenticates with `staging` environment secrets
+      deployments: write # derive the deploy ID from today's staging Deployments, then record this one
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'deploy') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     # TOG-11143: STAGING_OWNERSHIP_CONTROL_TOKEN is a `staging` environment
@@ -323,6 +324,16 @@ jobs:
           rollout_dir="$RUNNER_TEMP/two-bot-staging-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           echo "ROLLOUT_DIR=$rollout_dir" >> "$GITHUB_ENV"
           echo "WRANGLER_OUTPUT_FILE_PATH=$rollout_dir/wrangler-output.ndjson" >> "$GITHUB_ENV"
+      # The deploy ID (`YYYY.MM.DD.N+sha7`, scripts/deploy_id.py) is derived
+      # here, inside the serialized staging lane: N is one plus the count of
+      # today's staging Deployments, so a queued lane entry cannot mint a
+      # duplicate. The prepare step stamps it into the image below.
+      - name: Compute the deploy ID for this staging deploy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: | # zizmor: ignore[github-env] the script prints only DEPLOY_ID=<canonical id> (shape-enforced, no newlines); the SHA is the validated DEPLOY_SHA
+          set -euo pipefail
+          python3 ../scripts/deploy_id.py next --environment staging --sha "$DEPLOY_SHA" >> "$GITHUB_ENV"
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
@@ -459,6 +470,7 @@ jobs:
             exit 1
           fi
       - name: Verify exact new rollout and serving Worker/container readiness
+        id: verify
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -505,6 +517,27 @@ jobs:
           # Evidence carries the mode, firing list and verdict only.
           # No tokens, no raw exposition bodies.
           python3 -c 'import json, os; print(json.dumps(json.load(open(os.environ["ROLLOUT_DIR"] + "/error-rate-gate.json")), sort_keys=True))'
+      # Record the deploy as a GitHub Deployment carrying the deploy ID (never
+      # a tag or Release): success only when the rollout verify and the
+      # error-rate gate both passed, failure when the deploy went out but a
+      # gate refused it. Without a deploy there is nothing to record.
+      - name: Record the staging deployment
+        if: always() && steps.deploy.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          GATE_OUTCOME: ${{ steps.error_rate_gate.outcome }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+        run: |
+          set -euo pipefail
+          status=failure
+          if [ "$VERIFY_OUTCOME" = "success" ] && [ "$GATE_OUTCOME" = "success" ]; then
+            status=success
+          fi
+          python3 ../scripts/deploy_id.py record --environment staging --sha "$DEPLOY_SHA" \
+            --deploy-id "$DEPLOY_ID" --state "$status" --run-url "$RUN_URL" \
+            --environment-url "$WORKER_URL"
       # A failed verify or error-rate gate after a deploy rolls back
       # automatically to the pre-deploy snapshot (Worker version AND container
       # image, with takeover). The run still fails red: the rollback restores

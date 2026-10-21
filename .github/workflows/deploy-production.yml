@@ -1102,6 +1102,7 @@ jobs:
     environment: production
     permissions:
       contents: read
+      deployments: write # derive the deploy ID from today's production Deployments, then record this one
     env:
       SHA: ${{ needs.guard.outputs.sha }}
       MODE: ${{ needs.guard.outputs.mode }}
@@ -1147,6 +1148,17 @@ jobs:
             echo "::error::PRODUCTION_WORKER_URL equals STAGING_WORKER_URL; refusing to gate production on staging"
             exit 1
           fi
+      # The deploy ID (`YYYY.MM.DD.N+sha7`, scripts/deploy_id.py) is derived
+      # here, inside the deploy-production lane: N is one plus the count of
+      # today's production Deployments, so a queued lane entry cannot mint a
+      # duplicate. Rollbacks mint one too: the record names the deploy event,
+      # while the restored build keeps reporting its original stamped ID.
+      - name: Compute the deploy ID for this production deploy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: | # zizmor: ignore[github-env] the script prints only DEPLOY_ID=<canonical id> (shape-enforced, no newlines); the SHA is the guarded SHA
+          set -euo pipefail
+          python3 ../tooling/scripts/deploy_id.py next --environment production --sha "$SHA" >> "$GITHUB_ENV"
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
@@ -1204,8 +1216,9 @@ jobs:
           retention-days: 14
           compression-level: 0
       # Build identity, as deploy-staging stamps it: the image gets
-      # BOT_BUILD_REVISION (the guarded SHA) and BOT_BUILD_ID (run id and
-      # attempt) through `image_vars`, which /readyz then reports. The SHA is
+      # BOT_BUILD_REVISION (the guarded SHA), BOT_BUILD_ID (run id and
+      # attempt) and BOT_DEPLOY_ID (the compute step's `YYYY.MM.DD.N+sha7`)
+      # through `image_vars`, which /readyz then reports. The SHA is
       # the guard's, not GITHUB_SHA: a dispatch runs on main's head, which may
       # be newer than the commit being deployed.
       - name: Render the production deploy config with build identity
@@ -1215,7 +1228,8 @@ jobs:
           config="$RUNNER_TEMP/production-deploy.json"
           python3 ../tooling/scripts/production_deploy.py render \
             --config wrangler.toml --out "$config" \
-            --sha "$SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
+            --sha "$SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --deploy-id "$DEPLOY_ID"
           echo "PRODUCTION_DEPLOY_CONFIG=$config" >> "$GITHUB_ENV"
       - name: Deploy to production
         id: deploy
@@ -1382,7 +1396,8 @@ jobs:
       # Same contract as staging, plus the build identity and stability:
       # /health must be 200, which proves the Container/DO bindings are wired.
       # /readyz must answer 200 with gateway=ready and this run's build
-      # identity: the guarded SHA and this run's `<run id>-<attempt>`. A
+      # identity: the guarded SHA, this run's `<run id>-<attempt>` and this
+      # run's `YYYY.MM.DD.N+sha7` deploy ID. A
       # truthful 503 while the gateway reconnects is NEVER a pass: the gate
       # keeps polling, and anything short of 200-with-gateway-ready fails the
       # run and rolls back below. The build ID matters because a replaced
@@ -1416,7 +1431,7 @@ jobs:
             code=$(curl -s --max-time 10 --max-filesize 65536 -H "User-Agent: $agent" -o "$readyz" -w '%{http_code}' "$url/readyz") || code=000
             # The verdict follows the script's exit code; `state` carries its
             # fixed-vocabulary reason either way.
-            if state=$(python3 ../tooling/scripts/production_deploy.py readyz --status "$code" --body "$readyz" --sha "$SHA" --mode "$MODE" --build-id "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" 2>&1); then
+            if state=$(python3 ../tooling/scripts/production_deploy.py readyz --status "$code" --body "$readyz" --sha "$SHA" --mode "$MODE" --build-id "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --deploy-id "$DEPLOY_ID" 2>&1); then
               return 0
             else
               return 1
@@ -1504,6 +1519,34 @@ jobs:
           # Evidence carries the mode, firing list and verdict only.
           # No tokens, no raw exposition bodies.
           python3 -c 'import json, os; print(json.dumps(json.load(open(os.environ["RUNNER_TEMP"] + "/production-error-rate-gate.json")), sort_keys=True))'
+      # Record the deploy as a GitHub Deployment carrying the deploy ID (never
+      # a tag or Release): success only when the readyz gate passed and the
+      # error-rate gate did not fail (it skips in rollback mode). A rollback
+      # record names itself, since its event ID differs from the restored
+      # build's stamped ID. Without a deploy or rollback there is nothing to
+      # record.
+      - name: Record the production deployment
+        if: always() && (steps.deploy.outcome == 'success' || steps.rollback.outcome == 'success')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GATE_OUTCOME: ${{ steps.gate.outcome }}
+          ERROR_GATE_OUTCOME: ${{ steps.error_rate_gate.outcome }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
+        run: |
+          set -euo pipefail
+          status=failure
+          if [ "$GATE_OUTCOME" = "success" ] && [ "$ERROR_GATE_OUTCOME" != "failure" ] \
+              && [ "$ERROR_GATE_OUTCOME" != "cancelled" ]; then
+            status=success
+          fi
+          rollback=()
+          if [ "$MODE" = "rollback" ]; then
+            rollback=(--rollback)
+          fi
+          python3 ../tooling/scripts/deploy_id.py record --environment production --sha "$SHA" \
+            --deploy-id "$DEPLOY_ID" --state "$status" "${rollback[@]}" --run-url "$RUN_URL" \
+            --environment-url "$WORKER_URL"
       # A failed gate after a takeover rolls back automatically to the
       # pre-deploy snapshot (Worker version AND container image, with
       # takeover). The run still fails red: the rollback restores service,

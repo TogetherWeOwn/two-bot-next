@@ -66,16 +66,21 @@ not production authorization or a migration tool.
    `two-bot-next-twobotcontainer-staging`, its Durable Object namespace, and rollout
    IDs. An absent/ambiguous application or an in-flight prior rollout fails closed.
 2. Generate a temporary JSON Wrangler config from the checked-in TOML. Keep the
-   staging Container/DO wiring, use absolute source/build paths, and pass two
+   staging Container/DO wiring, use absolute source/build paths, and pass three
    non-secret Docker build arguments as `image_vars`: `BOT_BUILD_REVISION` (the
-   exact `GITHUB_SHA`) and `BOT_BUILD_ID` (the unique
-   `GITHUB_RUN_ID-GITHUB_RUN_ATTEMPT`). The Rust `/readyz` response compiles these
-   values into the binary as `build_revision`/`build_id`; runtime environment
-   overrides cannot substitute them. The `org.opencontainers.image.revision` and
-   `com.togetherweown.build-id` OCI labels repeat them for narrowly scoped image
-   inspection. A redeploy of the same SHA therefore still produces a new image
-   identity. Prepare also requires the `CF_VERSION_METADATA` version-metadata
-   binding in the staging config and sets `rollout_kind: full_auto`.
+   exact `GITHUB_SHA`), `BOT_BUILD_ID` (the unique
+   `GITHUB_RUN_ID-GITHUB_RUN_ATTEMPT`), and `BOT_DEPLOY_ID` (the
+   `YYYY.MM.DD.N+sha7` deploy ID derived in-lane by the compute step). The Rust
+   `/readyz` response compiles these values into the binary as
+   `build_revision`/`build_id`/`deploy_id`; runtime environment
+   overrides cannot substitute them. The `org.opencontainers.image.revision`,
+   `com.togetherweown.build-id` and `com.togetherweown.deploy-id` OCI labels
+   repeat them for narrowly scoped image inspection. A redeploy of the same SHA
+   therefore still produces a new image identity. Prepare also requires the
+   `CF_VERSION_METADATA` version-metadata binding in the staging config and sets
+   `rollout_kind: full_auto`. After the gates judge, the record step stores the
+   deploy as a GitHub Deployment with `environment` set to `staging` carrying
+   the deploy ID — never a tag or Release.
 3. Read the **fresh** `WRANGLER_OUTPUT_FILE_PATH` NDJSON only after Wrangler exits
    successfully. Every Wrangler invocation appends its own `wrangler-session`
    record, and `wrangler-action` runs `wrangler --version` before deploying, so

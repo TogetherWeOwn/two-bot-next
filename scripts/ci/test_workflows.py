@@ -746,6 +746,79 @@ def staging_deploy_identity_errors(workflow, name="deploy-staging.yml"):
     return errors
 
 
+def staging_deploy_id_errors(workflow, name="deploy-staging.yml"):
+    """The staging deploy ID is derived in-lane and recorded as a Deployment.
+
+    The compute step derives `YYYY.MM.DD.N+sha7` from the validated deploy
+    SHA inside the serialized staging lane (N counts today's staging
+    Deployments, so a queued entry cannot mint a duplicate) and exports it
+    before the prepare step stamps it. The record step stores the deploy as
+    a GitHub Deployment carrying the ID — never a tag or Release — with
+    success only when the rollout verify and the error-rate gate both
+    passed. No other step may call deploy_id.py.
+    """
+    errors = []
+    jobs = workflow.get("jobs") or {}
+    deploy = jobs.get("deploy") or {}
+    steps = deploy.get("steps") or []
+
+    def find(label, predicate):
+        found = [step for step in steps if predicate(step)]
+        if len(found) != 1:
+            errors.append(f"{name}:deploy: must carry exactly one {label}")
+            return None, -1
+        return found[0], steps.index(found[0])
+
+    compute, compute_at = find(
+        "deploy-ID compute step",
+        lambda step: step.get("name") == "Compute the deploy ID for this staging deploy")
+    if compute is not None:
+        if (compute.get("env") or {}).get("GH_TOKEN") != "${{ github.token }}":
+            errors.append(f"{name}:deploy: compute step must list Deployments with github.token")
+        run = str(compute.get("run") or "")
+        if ("deploy_id.py next --environment staging --sha \"$DEPLOY_SHA\"" not in run
+                or '>> "$GITHUB_ENV"' not in run):
+            errors.append(f"{name}:deploy: compute step must derive the staging ID "
+                          "from the validated deploy SHA")
+    prepare, prepare_at = find(
+        "staging identity snapshot step",
+        lambda step: step.get("name") == "Snapshot staging identity and generate per-deploy image provenance")
+    if compute_at >= 0 and prepare_at >= 0 and compute_at > prepare_at:
+        errors.append(f"{name}:deploy: compute step must run before the prepare step stamps the ID")
+    verify, _ = find(
+        "rollout verify step",
+        lambda step: step.get("name") == "Verify exact new rollout and serving Worker/container readiness")
+    if verify is not None and verify.get("id") != "verify":
+        errors.append(f"{name}:deploy: verify step must carry id verify for the record step")
+    gate, gate_at = find("promotion error-rate gate step",
+                         lambda step: step.get("id") == "error_rate_gate")
+    record, record_at = find(
+        "deployment record step",
+        lambda step: step.get("name") == "Record the staging deployment")
+    if record is not None:
+        if record.get("if") != "always() && steps.deploy.outcome == 'success'":
+            errors.append(f"{name}:deploy: record step must run whenever a deploy went out")
+        env = record.get("env") or {}
+        if env.get("GH_TOKEN") != "${{ github.token }}":
+            errors.append(f"{name}:deploy: record step must create the Deployment with github.token")
+        if env.get("VERIFY_OUTCOME") != "${{ steps.verify.outcome }}":
+            errors.append(f"{name}:deploy: record step must judge the rollout verify outcome")
+        if env.get("GATE_OUTCOME") != "${{ steps.error_rate_gate.outcome }}":
+            errors.append(f"{name}:deploy: record step must judge the error-rate gate outcome")
+        run = str(record.get("run") or "")
+        if ("deploy_id.py record --environment staging --sha \"$DEPLOY_SHA\"" not in run
+                or '--deploy-id "$DEPLOY_ID"' not in run):
+            errors.append(f"{name}:deploy: record step must record the staging ID "
+                          "for the validated deploy SHA")
+        if "--rollback" in run:
+            errors.append(f"{name}:deploy: staging has no rollback mode to record")
+    if gate_at >= 0 and record_at >= 0 and record_at < gate_at:
+        errors.append(f"{name}:deploy: record step must run after the error-rate gate judges")
+    if str(deploy).count("deploy_id.py") != 2:
+        errors.append(f"{name}:deploy: only the compute and record steps may call deploy_id.py")
+    return errors
+
+
 def staging_claim_errors(claim, name="staging-migrate.yml",
                            job_name="staging-migrate (claim)",
                            manifest="staging-migrate-manifest",
@@ -1846,6 +1919,86 @@ def production_errors(workflow):
     return errors
 
 
+def production_deploy_id_errors(workflow, name="deploy-production.yml"):
+    """The production deploy ID is derived in-lane, stamped, gated and recorded.
+
+    The compute step derives `YYYY.MM.DD.N+sha7` from the guarded SHA inside
+    the deploy-production lane (N counts today's production Deployments, so a
+    queued entry cannot mint a duplicate) before the render step stamps it;
+    the readyz gate judges it; the record step stores the deploy as a GitHub
+    Deployment with environment=production carrying the ID — never a tag or
+    Release — with success only when the readyz gate passed and the
+    error-rate gate did not fail. Rollbacks mint a fresh event ID and name
+    themselves, since the restored build keeps its original stamped ID. No
+    other step may call deploy_id.py.
+    """
+    errors = []
+    jobs = workflow.get("jobs") or {}
+    production = jobs.get("production") or {}
+    steps = production.get("steps") or []
+
+    def find(label, predicate):
+        found = [step for step in steps if predicate(step)]
+        if len(found) != 1:
+            errors.append(f"{name}:production: must carry exactly one {label}")
+            return None, -1
+        return found[0], steps.index(found[0])
+
+    compute, compute_at = find(
+        "deploy-ID compute step",
+        lambda step: step.get("name") == "Compute the deploy ID for this production deploy")
+    if compute is not None:
+        if (compute.get("env") or {}).get("GH_TOKEN") != "${{ github.token }}":
+            errors.append(f"{name}:production: compute step must list Deployments with github.token")
+        run = str(compute.get("run") or "")
+        if ("tooling/scripts/deploy_id.py next --environment production --sha \"$SHA\"" not in run
+                or '>> "$GITHUB_ENV"' not in run):
+            errors.append(f"{name}:production: compute step must derive the production ID "
+                          "from the guarded SHA")
+    render, render_at = find(
+        "deploy config render step",
+        lambda step: step.get("name") == "Render the production deploy config with build identity")
+    if render is not None and '--deploy-id "$DEPLOY_ID"' not in str(render.get("run") or ""):
+        errors.append(f"{name}:production: render step must stamp the computed deploy ID")
+    if compute_at >= 0 and render_at >= 0 and compute_at > render_at:
+        errors.append(f"{name}:production: compute step must run before the render step stamps the ID")
+    gate, _ = find(
+        "readyz gate step",
+        lambda step: step.get("name") == "Gate on stable /health + /readyz gateway-ready")
+    if gate is not None and '--deploy-id "$DEPLOY_ID"' not in str(gate.get("run") or ""):
+        errors.append(f"{name}:production: readyz gate must judge the computed deploy ID")
+    error_gate, error_gate_at = find("promotion error-rate gate step",
+                                     lambda step: step.get("id") == "error_rate_gate")
+    record, record_at = find(
+        "deployment record step",
+        lambda step: step.get("name") == "Record the production deployment")
+    if record is not None:
+        condition = str(record.get("if") or "")
+        if ("steps.deploy.outcome == 'success'" not in condition
+                or "steps.rollback.outcome == 'success'" not in condition):
+            errors.append(f"{name}:production: record step must run whenever a deploy "
+                          "or rollback went out")
+        env = record.get("env") or {}
+        if env.get("GH_TOKEN") != "${{ github.token }}":
+            errors.append(f"{name}:production: record step must create the Deployment with github.token")
+        if env.get("GATE_OUTCOME") != "${{ steps.gate.outcome }}":
+            errors.append(f"{name}:production: record step must judge the readyz gate outcome")
+        if env.get("ERROR_GATE_OUTCOME") != "${{ steps.error_rate_gate.outcome }}":
+            errors.append(f"{name}:production: record step must judge the error-rate gate outcome")
+        run = str(record.get("run") or "")
+        if ("tooling/scripts/deploy_id.py record --environment production --sha \"$SHA\"" not in run
+                or '--deploy-id "$DEPLOY_ID"' not in run):
+            errors.append(f"{name}:production: record step must record environment=production "
+                          "for the guarded SHA")
+        if '"$MODE" = "rollback"' not in run or "--rollback" not in run:
+            errors.append(f"{name}:production: record step must name rollback records")
+    if error_gate_at >= 0 and record_at >= 0 and record_at < error_gate_at:
+        errors.append(f"{name}:production: record step must run after the error-rate gate judges")
+    if str(production).count("deploy_id.py") != 2:
+        errors.append(f"{name}:production: only the compute and record steps may call deploy_id.py")
+    return errors
+
+
 def staging_active_errors(workflow):
     """The deploy job is live (TOG-12856): no static suspension guard.
 
@@ -2609,12 +2762,14 @@ def workflow_policy_errors(workflows):
             errors.extend(production_schema_gate_errors(workflow))
             errors.extend(production_roles_gate_errors(workflow))
             errors.extend(production_error_rate_gate_errors(workflow))
+            errors.extend(production_deploy_id_errors(workflow))
             continue
         if name == "deploy-staging.yml":
             errors.extend(staging_dispatch_errors(workflow))
             errors.extend(staging_active_errors(workflow))
             errors.extend(staging_pinned_sha_errors(workflows))
             errors.extend(staging_deploy_identity_errors(workflow))
+            errors.extend(staging_deploy_id_errors(workflow))
             errors.extend(soak_hold_errors(workflow))
             errors.extend(pinned_history_guard_errors(workflow))
             errors.extend(schema_gate_errors(workflow))
@@ -6040,6 +6195,14 @@ class WorkflowTests(unittest.TestCase):
                         # Read-only fetch of the producing plan
                         # run's manifest artifact for the provenance gate.
                         expected = {"contents": "read", "actions": "read"}
+                    elif (name, job_id) == ("deploy-staging.yml", "deploy"):
+                        # Derives the deploy ID from today's staging
+                        # Deployments, then records this one.
+                        expected = {"contents": "read", "deployments": "write"}
+                    elif (name, job_id) == ("deploy-production.yml", "production"):
+                        # Derives the deploy ID from today's production
+                        # Deployments, then records this one.
+                        expected = {"contents": "read", "deployments": "write"}
                     elif (name, job_id) == ("deploy-production.yml", "guard"):
                         expected = {"contents": "read", "actions": "read", "checks": "read"}
                     elif (name, job_id) == ("deploy-production.yml", "recheck"):
