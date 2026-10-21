@@ -1,15 +1,20 @@
 """Pin the gh output channels behind release-sbom-target's fixed refusals.
 
-Two channels escape the shape/lookup vocabulary when ``gh`` misbehaves:
+Three channels escape the shape/lookup vocabulary when ``gh`` misbehaves:
 
 * ``gh`` failing (nonzero exit) writes HTTP diagnostics to stderr, which
   ``subprocess.check_output`` inherits unless redirected, so service text
   lands in the log ahead of the fixed lookup refusal;
 * ``gh`` succeeding with non-UTF-8 stdout raises ``UnicodeDecodeError``
   inside ``check_output(text=True)``, before ``json.loads`` ever runs, so
-  the raw codec message escapes instead of the fixed shape refusal.
+  the raw codec message escapes instead of the fixed shape refusal;
+* ``gh`` succeeding with an over-limit integer token (past CPython's
+  4300-digit conversion cap, still far under the 1 MiB byte cap) raises a
+  plain ``ValueError`` inside ``json.loads``, not ``JSONDecodeError``, so
+  the raw interpreter limit text escapes instead of the fixed shape
+  refusal.
 
-Both refuse with the existing fixed reasons and never echo gh output.
+All refuse with the existing fixed reasons and never echo gh output.
 Offline only: ``gh`` is faked on ``PATH``; no network, no credentials.
 
 Run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_release_sbom_target_gh_channel_refusal.py' -v
@@ -36,6 +41,9 @@ SHAPE_REASON = "Release tag response has invalid shape"
 LOOKUP_REASON = "Release tag lookup failed"
 CANARY = "SBOM-CANARY-NEVER-ECHO-9X2W"
 OTHER_SHA = "c" * 40
+# Past CPython's 4300-digit int conversion cap, far under the 1 MiB byte cap.
+GIANT_INT = "9" * 5000
+VALID_SHA = "a" * 40
 
 FAKE_GH = """#!/usr/bin/env python3
 import os
@@ -101,6 +109,44 @@ class GhChannelRefusalTests(unittest.TestCase):
             with self.assertRaises(ValueError) as caught:
                 target.resolve_tag("v1.2.3")
         self.assertEqual(str(caught.exception), SHAPE_REASON)
+
+    def test_giant_int_sha_refuses_as_invalid_shape(self):
+        raw = '{"object": {"sha": ' + GIANT_INT + ', "type": "commit"}}'
+        with patch.object(target.subprocess, "check_output", return_value=raw), \
+                patch.dict(os.environ, {"GH_REPO": "o/r"}):
+            with self.assertRaises(ValueError) as caught:
+                target.resolve_tag("v1.2.3")
+        self.assertEqual(str(caught.exception), SHAPE_REASON)
+
+    def test_giant_int_extra_field_refuses_as_invalid_shape(self):
+        raw = ('{"object": {"sha": "' + VALID_SHA + '", "type": "commit", '
+               '"extra": ' + GIANT_INT + '}}')
+        with patch.object(target.subprocess, "check_output", return_value=raw), \
+                patch.dict(os.environ, {"GH_REPO": "o/r"}):
+            with self.assertRaises(ValueError) as caught:
+                target.resolve_tag("v1.2.3")
+        self.assertEqual(str(caught.exception), SHAPE_REASON)
+
+    def test_cli_giant_int_sha_refuses_as_invalid_shape(self):
+        result = self.run_cli(
+            {"FAKE_GH_REF": '{"object": {"sha": ' + GIANT_INT + ', "type": "commit"}}'})
+        combined = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(SHAPE_REASON, combined)
+        self.assertNotIn("Traceback", combined)
+        self.assertNotIn("Exceeds the limit", combined)
+        self.assertNotIn(GIANT_INT, combined)
+
+    def test_cli_giant_int_extra_field_refuses_as_invalid_shape(self):
+        result = self.run_cli(
+            {"FAKE_GH_REF": '{"object": {"sha": "' + VALID_SHA + '", "type": "commit", '
+                            '"extra": ' + GIANT_INT + '}}'})
+        combined = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(SHAPE_REASON, combined)
+        self.assertNotIn("Traceback", combined)
+        self.assertNotIn("Exceeds the limit", combined)
+        self.assertNotIn(GIANT_INT, combined)
 
 
 if __name__ == "__main__":

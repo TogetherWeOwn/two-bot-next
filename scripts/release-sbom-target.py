@@ -69,7 +69,9 @@ def github_object(path):
     gh stderr is discarded so service diagnostics never precede the fixed
     refusal, and undecodable stdout refuses as invalid shape. The reply is
     parsed with the intake guard (byte cap, duplicate keys, non-finite
-    numbers, nesting depth); unparseable JSON refuses as invalid shape.
+    numbers, nesting depth), whose refusals propagate; any other parse
+    failure (malformed JSON, over-limit integer tokens) refuses as
+    invalid shape, never raw parser text.
     Returns the full ``gh api`` response dict; the ``object`` member is
     guaranteed present and a dict. Callers index ``["object"]`` as before,
     so the pre-existing mock contract (outer shape) is preserved.
@@ -88,7 +90,9 @@ def github_object(path):
         raise ValueError(LOOKUP_REASON) from None
     try:
         response = parse_response(raw)
-    except json.JSONDecodeError:
+    except ValueError as error:
+        if str(error) in (OVER_CAP, DUP_KEYS, BAD_CONST, TOO_DEEP):
+            raise
         raise ValueError(SHAPE_REASON) from None
     if not isinstance(response, dict) or not isinstance(response.get("object"), dict):
         raise ValueError(SHAPE_REASON)
