@@ -120,7 +120,8 @@ class RequiredChecksReportTests(unittest.TestCase):
         self.assertEqual(len(build), 1)
         self.assertEqual(build[0].get("working-directory"), "fuzz")
         self.assertEqual(build[0].get("run"), "cargo +nightly-2026-10-01 fuzz build")
-        targets = ("eventsub_delivery", "helix_token", "custom_command_template", "fb_page_events")
+        targets = ("eventsub_delivery", "helix_token", "custom_command_template", "fb_page_events",
+                   "database_url", "feeds_http", "self_role_custom_id", "helix_subscription_listing")
         fuzz_runs = [step for step in job.get("steps", [])
                      if "fuzz run" in step.get("run", "")]
         self.assertEqual(len(fuzz_runs), len(targets))
