@@ -2647,6 +2647,12 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_container_drill.py -v
       - name: Verify staging container drill duplicate-key refusal (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_container_drill_duplicate_key_acceptance.py -v
+      - name: Verify staging rollout duplicate-key refusal (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollout_duplicate_key_acceptance.py -v
+      - name: Verify staging rollback drill duplicate-key refusal (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollback_drill_envelope_duplicate_key_acceptance.py -v
+      - name: Verify staging container drill envelope duplicate-key refusal (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_container_drill_envelope_duplicate_key_acceptance.py -v
       - name: Verify staging ownership-takeover retry (offline fixtures)
         run: node --test scripts/test-ownership-control.mjs
       - name: Verify staging ownership status read (offline fixtures)
