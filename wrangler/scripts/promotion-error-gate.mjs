@@ -285,9 +285,14 @@ async function fetchExposition({ metricsUrl, token, timeoutSeconds, fetchImpl, r
       throw new ScrapeError(AUTH_FAILED_MESSAGE, "auth_failed");
     }
     if (!response.ok) {
-      // Only 5xx is transient: a retry cannot fix a client error, and must
-      // not re-send the bearer against a request the Worker already refused.
-      if (response.status >= 500 && attempt < SCRAPE_ATTEMPTS) {
+      // Only 5xx and 429 are transient. 429 is the endpoint's own designed
+      // refusal: /ops/metrics sheds a momentarily exhausted per-caller scrape
+      // bucket with `slow down` plus retry-after, expecting a correct bearer
+      // to wait it out (wrangler/src/index.ts). The fixed retry sleep already
+      // exceeds the refill, so the bounded retry recovers it. Every other 4xx
+      // is refused at once: a retry cannot fix a client error, and must not
+      // re-send the bearer against a request the Worker already refused.
+      if ((response.status === 429 || response.status >= 500) && attempt < SCRAPE_ATTEMPTS) {
         await new Promise((resolve) => setTimeout(resolve, retrySleepSeconds * 1000));
         continue;
       }

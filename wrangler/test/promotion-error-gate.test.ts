@@ -283,6 +283,54 @@ test("client errors fail at once with an auth code for 401/403, 5xx keeps retryi
   assert.equal(serverError.calls, 3, "5xx keeps the bounded retry");
 });
 
+test("a transient 429 is retried and recovers, a stuck 429 fails bounded", async () => {
+  // /ops/metrics sheds an exhausted per-caller scrape bucket with 429 plus
+  // retry-after; the gate's bounded retry must recover a transient throttle
+  // instead of failing the deploy stage after a single attempt.
+  let recoveredCalls = 0;
+  const transient = async () => {
+    recoveredCalls += 1;
+    if (recoveredCalls === 1) return { ok: false, status: 429, text: async () => REVIEW_HOSTILE };
+    return { ok: true, status: 200, text: async () => restBody(100, 0) };
+  };
+  const recovered = await runLiveGate({
+    metricsUrl: REVIEW_STAGING,
+    token: REVIEW_TOKEN,
+    allowedMetricsOrigins: [REVIEW_STAGING],
+    fetchImpl: transient,
+    sleep: async () => {},
+    nowSeconds: () => 1_000_000,
+    retrySleepSeconds: 0,
+  });
+  // First scrape retries the 429 once and recovers; the second scrape is clean.
+  assert.equal(recoveredCalls, 3, "a transient 429 is retried, not fatal");
+  assert.deepEqual(recovered.firing, []);
+  // An endpoint stuck at 429 still fails closed after the 3-attempt bound.
+  let stuckCalls = 0;
+  const stuck = async () => {
+    stuckCalls += 1;
+    return { ok: false, status: 429, text: async () => REVIEW_HOSTILE };
+  };
+  await assert.rejects(
+    runLiveGate({
+      metricsUrl: REVIEW_STAGING,
+      token: REVIEW_TOKEN,
+      allowedMetricsOrigins: [REVIEW_STAGING],
+      fetchImpl: stuck,
+      sleep: async () => {},
+      nowSeconds: () => 1_000_000,
+      retrySleepSeconds: 0,
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal((error as { code?: unknown }).code, "transport_failed");
+      assert.ok(!error.message.includes(REVIEW_HOSTILE), "refusal text is fixed");
+      return true;
+    },
+  );
+  assert.equal(stuckCalls, 3, "a stuck 429 keeps the 3-attempt bound");
+});
+
 test("an auth failure is a fail-closed receipt with exit 1", async () => {
   const fetchImpl = async () => ({ ok: false, status: 401, text: async () => REVIEW_HOSTILE });
   const evidencePath = reviewEvidencePath();
