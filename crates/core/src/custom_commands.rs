@@ -939,8 +939,14 @@ mod tests {
         let reserved = reserved_command_names();
         let definitions = router.publish_set(&[]).unwrap();
         let published: HashSet<_> = definitions.iter().map(|def| def.name.clone()).collect();
-        assert_eq!(reserved, published);
+        // `templateassistant` is unpublished until its slice lands, but the name
+        // stays squatted: reservations cover the publish set plus exactly that
+        // one held name (which keeps holding its guild slot in the capacity
+        // math below, so the slot count does not churn when it republishes).
+        assert!(published.is_subset(&reserved));
+        assert_eq!(reserved.len(), published.len() + 1);
         assert!(reserved.contains("templateassistant"));
+        assert!(!published.contains("templateassistant"));
         assert_eq!(
             validate_put_input(&put_input("templateassistant"), &reserved),
             Err(CommandError::ReservedName("templateassistant".to_owned()))
@@ -955,7 +961,7 @@ mod tests {
             .collect();
         assert_eq!(
             router.publish_set(&custom).unwrap().len(),
-            GUILD_COMMAND_LIMIT
+            published.len() + capacity
         );
         assert_eq!(
             check_capacity(capacity, true, reserved.len()),

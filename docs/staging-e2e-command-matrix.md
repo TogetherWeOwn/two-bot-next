@@ -94,7 +94,7 @@ ship separately and are untouched here.
   `kick` loses the merge to moderation first-wins — runtime dispatch decides).
   The published voice set is pinned separately by the `voice` section of
   `crates/core/tests/fixtures/staging_published_commands.json`.
-- `/templateassistant` (voice + assistant gates; same fixture section).
+- `/templateassistant` (unpublished until its slice lands; name still reserved, same fixture section).
 - DB-backed custom commands and `!` prefix triggers (dynamic surfaces).
 - Component/modal surfaces (pickers, tickets, self-roles, LFG signup).
 - Dropped `/rota-acknowledge` (parity row 13, never published).

@@ -119,9 +119,9 @@ read as delivered.
 - Repository variables `STAGING_WORKER_URL` and `PRODUCTION_WORKER_URL`:
   the staging and production Worker origins. `PRODUCTION_WORKER_URL` is the
   single source for deploy and passive synthetic checks; remove any production
-  Environment override of the same name. A missing variable fails that
-  target's job with an error naming the variable, so a perpetually
-  unconfigured schedule reads red instead of green.
+  Environment override of the same name. A missing variable fails that job
+  with an error naming the unset variable, so a run with zero probe samples
+  never reads green; the decide step also fails closed on any skipped probe.
 - Environment `synthetic-alerts`, secret `SYNTHETIC_ALERT_WEBHOOK_URL`: the
   Discord webhook. Never paste it into a command, log, or report.
 

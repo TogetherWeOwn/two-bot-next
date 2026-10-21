@@ -1,9 +1,10 @@
 """Production deploy build identity and the /readyz revision check.
 
 `render` writes the Wrangler config for `wrangler deploy --config`: the checked-in
-TOML with absolute paths and the two non-secret build arguments (`image_vars`)
-that /readyz reports as `build_revision` and `build_id`. `readyz` decides whether
-one /readyz answer proves the revision the workflow deployed or rolled back to.
+TOML with absolute paths and the three non-secret build arguments (`image_vars`)
+that /readyz reports as `build_revision`, `build_id` and `deploy_id`. `readyz`
+decides whether one /readyz answer proves the revision the workflow deployed or
+rolled back to.
 
 `readyz` refuses bodies over 64 KiB before decoding or parsing. It refuses
 ambiguous or unsafe evidence before grading: duplicate JSON object keys,
@@ -24,6 +25,8 @@ from build_identity import (
     UNSTAMPED,
     is_build_id_shape,
     is_build_revision_shape,
+    is_deploy_id_shape,
+    parse_deploy_id,
 )
 
 EXCERPT_BYTES = 2048
@@ -72,8 +75,13 @@ def _too_deeply_nested(record, limit=MAX_READYZ_DEPTH):
 
 
 def render(args):
-    if not (is_build_revision_shape(args.sha) and DIGITS.fullmatch(args.run_id) and DIGITS.fullmatch(args.attempt)):
-        sys.exit("render: needs a 40-hex SHA and numeric run id and attempt")
+    if not (is_build_revision_shape(args.sha) and DIGITS.fullmatch(args.run_id) and DIGITS.fullmatch(args.attempt)
+            and is_deploy_id_shape(args.deploy_id)):
+        sys.exit("render: needs a 40-hex SHA, numeric run id and attempt, and a canonical deploy ID")
+    # The stamped ID must name this SHA: an ID computed for another commit
+    # refuses here, not after the deploy it cannot match.
+    if parse_deploy_id(args.deploy_id)[2] != args.sha[:7]:
+        sys.exit("render: the deploy ID names a different commit")
     source = Path(args.config).resolve()
     config = tomllib.loads(source.read_text())
     if config.get("name") != "two-bot-next":
@@ -89,7 +97,9 @@ def render(args):
     for container in declared:
         container["image"] = str((source.parent / container["image"]).resolve())
         container["image_build_context"] = str(source.parent.parent)
-    containers[0]["image_vars"] = {"BOT_BUILD_REVISION": args.sha, "BOT_BUILD_ID": f"{args.run_id}-{args.attempt}"}
+    containers[0]["image_vars"] = {"BOT_BUILD_REVISION": args.sha,
+                                      "BOT_BUILD_ID": f"{args.run_id}-{args.attempt}",
+                                      "BOT_DEPLOY_ID": args.deploy_id}
     # Worker-edge span lines log this SHA as `release` (same commit as the
     # container image). Generated-only: a committed value would go stale, so
     # the committed TOML must never carry it.
@@ -124,6 +134,20 @@ def _gateway_ready(report):
 def readyz(args):
     if args.status not in ("200", "503"):
         return reject(f"/readyz answered {args.status}")
+    # The expected deploy ID is optional during the stamping transition:
+    # callers that predate it judge the legacy revision/build-ID shape
+    # exactly as before (the protected body-cap suite pins those verdicts
+    # byte-for-byte). Present callers always pass it — the workflow pins the
+    # flag — and then it must be canonical and name the guarded SHA in both
+    # modes. getattr: direct callers may predate the attribute itself.
+    expected = getattr(args, "deploy_id", None)
+    if expected is not None:
+        try:
+            _date, _n, expected_sha7 = parse_deploy_id(expected)
+        except ValueError:
+            return reject("readyz needs a canonical deploy ID to judge")
+        if expected_sha7 != args.sha[:7]:
+            return reject("the expected deploy ID names a different commit")
     try:
         with open(args.body, "rb") as handle:
             raw = handle.read(MAX_READYZ_BYTES + 1)
@@ -160,10 +184,26 @@ def readyz(args):
         return reject("/readyz build_revision has an unexpected shape")
     if build_id != UNSTAMPED and not is_build_id_shape(build_id):
         return reject("/readyz build_id has an unexpected shape")
+    deploy_id = report.get("deploy_id")
+    if args.mode == "deploy" and expected is not None:
+        # A fresh build always reports its stamped ID; a missing key is a
+        # previous container still serving, never a pass. Rollback mode —
+        # and legacy callers without an expectation — ignore the reported
+        # value entirely: the restored build predates stamping or carries
+        # its original stamped ID (like build_id).
+        if not isinstance(deploy_id, str):
+            return reject("/readyz has no deploy_id")
+        if deploy_id != UNSTAMPED and not is_deploy_id_shape(deploy_id):
+            return reject("/readyz deploy_id has an unexpected shape")
     if revision == args.sha:
         if args.mode == "deploy" and build_id != args.build_id:
             return reject(
                 f"build_id {build_id} is not this run's build ({args.build_id}): "
+                "a previous container still serves this SHA"
+            )
+        if args.mode == "deploy" and expected is not None and deploy_id != expected:
+            return reject(
+                f"deploy_id {deploy_id} is not this run's deploy ({expected}): "
                 "a previous container still serves this SHA"
             )
         # A parked gateway is never a pass: the release gate requires
@@ -210,6 +250,7 @@ def main(argv=None):
     render_cmd.add_argument("--sha", required=True)
     render_cmd.add_argument("--run-id", required=True)
     render_cmd.add_argument("--attempt", required=True)
+    render_cmd.add_argument("--deploy-id", required=True)
 
     readyz_cmd = commands.add_parser("readyz", help="judge one /readyz answer against the revision")
     readyz_cmd.add_argument("--status", required=True)
@@ -220,6 +261,12 @@ def main(argv=None):
     # serving version was built by an older run). Deploy mode requires it so a
     # same-SHA redeploy cannot pass on the previous container's answer.
     readyz_cmd.add_argument("--build-id", required=True)
+    # This run's `YYYY.MM.DD.N+sha7` deploy ID. Deploy mode requires the
+    # report to carry it; rollback mode ignores the reported value (the
+    # restored build carries its original stamped ID) but still requires a
+    # canonical expectation naming the guarded SHA. Absent, the legacy
+    # revision/build-ID verdicts apply unchanged (stamping transition).
+    readyz_cmd.add_argument("--deploy-id", required=False, default=None)
 
     excerpt_cmd = commands.add_parser("excerpt", help="print a remote body as one bounded escaped line")
     excerpt_cmd.add_argument("--body", required=True)

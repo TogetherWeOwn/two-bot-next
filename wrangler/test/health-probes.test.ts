@@ -1,6 +1,6 @@
 /**
- * TOG-12245 (threat-model F7): public /health and /readyz are bounded
- * GET/HEAD probes at the Worker. Synthetic bindings only — the stub DO
+ * TOG-12245 (threat-model F7): public /health, /readyz and /version are
+ * bounded GET/HEAD probes at the Worker. Synthetic bindings only — the stub DO
  * records what the Worker forwards; no endpoint, database or secret is
  * contacted. The Container's own alarm probe bypasses the Worker entirely,
  * so it is covered by the keepalive tests in container.test.ts (full suite).
@@ -49,7 +49,7 @@ function harness() {
 const probe = (path: string, init?: RequestInit) =>
   new Request(`https://probe.invalid${path}`, init);
 
-for (const path of ["/health", "/readyz"]) {
+for (const path of ["/health", "/readyz", "/version"]) {
   test(`${path}: POST/PUT/DELETE/PATCH/OPTIONS return 405 and never touch the container`, async () => {
     const h = harness();
     for (const method of ["POST", "PUT", "DELETE", "PATCH", "OPTIONS"]) {

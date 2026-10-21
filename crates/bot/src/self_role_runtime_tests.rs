@@ -8,6 +8,7 @@ use sqlx::PgPool;
 use std::sync::atomic::AtomicI64;
 use tracing::instrument::WithSubscriber;
 use two_bot_core::self_roles::{event_order_for_event_id, SelfRoleOption};
+use two_bot_core::Secret;
 
 const GUILD: &str = "100000000000000001";
 const USER: &str = "100000000000000002";
@@ -4165,4 +4166,55 @@ async fn lost_panel_lane_release_is_logged(pool: &PgPool) -> TestResult {
     assert!(logs.contains("lost-lane-release-closed-store"), "{logs}");
     mock.shutdown().await;
     Ok(())
+}
+
+#[tokio::test]
+async fn legacy_start_latches_loss_for_unusable_claim_shapes() {
+    // Offline: the lazy pool is closed before any use, so no socket opens and
+    // no database is touched. Unusable shapes must fail closed synchronously:
+    // no panic, loss latched, no renewal task spawned, drop a silent no-op.
+    let options = PgConnectOptions::new()
+        .host("127.0.0.1")
+        .port(1)
+        .username("offline_unused")
+        .database("offline_unused");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_lazy_with(options);
+    pool.close().await;
+    let store = SelfRoleStore::new(pool);
+
+    let both = (
+        Some(EventClaim {
+            event_id: "keeper-offline-event".to_owned(),
+            token: Secret::new("keeper-offline-event-sentinel".to_owned()),
+            generation: 1,
+            recovered: false,
+            intent_initialized: true,
+            compensating: false,
+            exchange_pending: false,
+            effects: AuditEffects::default(),
+            desired_role_ids: Vec::new(),
+            pre_mutation_role_ids: Vec::new(),
+            renew_after_ms: 3_600_000,
+        }),
+        Some(PanelClaim::offline_fixture(3_600_000)),
+    );
+    for (label, event, panel) in [("neither", None, None), ("both", both.0, both.1)].into_iter() {
+        let lost = Arc::new(AtomicBool::new(false));
+        let keeper = LeaseKeeper::start(store.clone(), event, panel, Arc::clone(&lost));
+        assert!(
+            lost.load(Ordering::SeqCst),
+            "legacy start ({label}) must latch loss synchronously"
+        );
+        assert!(
+            keeper.0 .0.is_none(),
+            "a refused keeper ({label}) spawns no renewal task"
+        );
+        drop(keeper);
+        assert!(
+            lost.load(Ordering::SeqCst),
+            "dropping the refused keeper ({label}) is a silent no-op"
+        );
+    }
 }

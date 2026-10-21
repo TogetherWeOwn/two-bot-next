@@ -44,8 +44,18 @@ export const ALERT_INPUT_LABELS: Record<string, Record<string, readonly string[]
  * still scrape, with the failed-pass ticket held rather than every rule
  * silenced. The EventSub delivery-kind counters are optional for the same
  * reason: an older container without them must still scrape, with the
- * tampered-signature page held rather than every rule silenced. The evaluator
- * already tolerates their absence.
+ * tampered-signature page held rather than every rule silenced. The voice
+ * stall family below (halt latch, live not-ready age, self-heal counter,
+ * queue oldest age) is optional for the same reason: an older container
+ * without it must still scrape, with the stall rules held rather than every
+ * rule silenced. Queue depth (`two_bot_voice_queue_pending{lane}`) stays
+ * unvalidated: no rule consumes it (see the catalog deferral). The safety
+ * family below (retention purge-skip counter, voice dispatch-timeout,
+ * watchdog-stuck and halt-recovery counters, breaker opens and global-pause
+ * counters) is optional for the same reason, with the safety-series tickets
+ * held. Breaker closes (`two_bot_rest_guard_breaker_closes_total`) stays
+ * unvalidated: no rule consumes it (see the catalog deferral). The
+ * evaluator already tolerates their absence.
  */
 export const ALERT_OPTIONAL_INPUT_LABELS: Record<string, Record<string, readonly string[]>> = {
   two_bot_gateway_prefix_trigger_refused_total: { reason: ["verdict", "other"] },
@@ -61,6 +71,18 @@ export const ALERT_OPTIONAL_INPUT_LABELS: Record<string, Record<string, readonly
   two_bot_voice_vote_kick_total: { outcome: ["started", "evidence_unavailable", "not_a_room", "initiator_not_occupant", "target_not_occupant", "self_target", "protected_target", "privileged_target", "authority_unavailable", "active_vote_exists", "cooldown", "initiator_limited", "reused_vote_id", "unknown_vote", "wrong_vote_boundary", "ineligible_voter", "repeated_vote", "invalid_time", "connect_denied_and_disconnected", "connect_denied_target_absent", "skipped_room_gone", "skipped_target_protected", "permission_missing", "discord_error", "gave_up", "other"] },
   two_bot_eventsub_classified_total: { kind: ["challenge", "notification", "revocation", "tampered", "ignored", "other"] },
   two_bot_event_store_consumer_lag_seconds: {},
+  // Voice stall family; old containers may omit the whole family.
+  two_bot_voice_worker_halted: {},
+  two_bot_voice_live_self_heal_total: {},
+  two_bot_voice_live_not_ready_seconds: {},
+  two_bot_voice_queue_oldest_age_seconds: {},
+  // Safety/liveness family; old containers may omit the whole family.
+  two_bot_retention_replay_needed_total: {},
+  two_bot_voice_dispatch_timeouts_total: {},
+  two_bot_voice_watchdog_stucks_total: {},
+  two_bot_voice_halt_recoveries_total: {},
+  two_bot_rest_guard_breaker_opens_total: {},
+  two_bot_rest_guard_global_pauses_total: {},
   // Same-scrape lifecycle evidence; old containers may omit the whole family.
   two_bot_process_incarnation: { part: ["0", "1", "2", "3"] },
 };
@@ -124,7 +146,7 @@ export function parseAlertScrape(text: string): Sample[] | null {
       } else if (Object.keys(labels).length !== Object.keys(axes).length
         || Object.keys(axes).some((axis) => !labels[axis])
         || !Number.isFinite(value) || !Number.isInteger(value) || value < 0 || value > 18446744073709551615
-        || ((name === "two_bot_db_pool_configured" || name === "two_bot_audit_delivery_halt" || name === "two_bot_rest_guard_breaker_open") && value !== 0 && value !== 1)) return null;
+        || ((name === "two_bot_db_pool_configured" || name === "two_bot_audit_delivery_halt" || name === "two_bot_rest_guard_breaker_open" || name === "two_bot_voice_worker_halted") && value !== 0 && value !== 1)) return null;
       // Per-family state uses plain objects in the evaluator. Future families
       // are welcome, but never allow inherited object properties as subjects.
       if (name === "two_bot_internal_actions_total" && labels["family"]! in Object.prototype) return null;
