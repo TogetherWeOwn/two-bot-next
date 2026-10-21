@@ -71,7 +71,8 @@ than an ownership-fence refusal. Pass `--json` for one machine-readable
 verdict object with stable per-check ids, codes and next actions.
 Malformed origins and remote fields fail as bounded fixed-vocabulary
 verdicts that echo nothing; failures never write `--evidence`, which stays
-a success-only attestation.
+a success-only attestation. If the checks pass but the receipt write itself
+fails, `--json` reports FAIL with an `evidence` row instead of PASS.
 
 The container listens on `LISTEN_ADDR` (default `0.0.0.0:8080`). The Worker
 sets it from `BOT_PORT` (default 8080). Both routes use this listener; there is

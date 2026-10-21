@@ -573,6 +573,41 @@ class EvidenceTest(unittest.TestCase):
         self.assertEqual(code, 1)
         handle.assert_not_called()
 
+    def test_json_evidence_failure_is_fail_verdict_with_empty_stderr(self):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("builtins.open",
+                        side_effect=IsADirectoryError(21, "Is a directory")), \
+                redirect_stdout(out), redirect_stderr(err):
+            code = probe.main(["--base-url", "http://h/", "--json",
+                               "--evidence", "receipt.json"],
+                              fetch_fn=double({"/health": HEALTH,
+                                               "/readyz": READY}))
+        self.assertEqual(code, 1)
+        self.assertEqual(err.getvalue(), "")
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["verdict"], "FAIL")
+        rows = {row["id"]: row for row in report["checks"]}
+        self.assertEqual(rows["evidence"]["verdict"], "FAIL")
+        self.assertEqual(rows["evidence"]["code"], "evidence_not_written")
+        self.assertIn("IsADirectoryError", rows["evidence"]["detail"])
+        self.assertTrue(all(row["verdict"] == "PASS"
+                            for row in report["checks"]
+                            if row["id"] != "evidence"))
+
+    def test_text_evidence_failure_keeps_notice_on_stdout(self):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("builtins.open",
+                        side_effect=PermissionError(13, "denied")), \
+                redirect_stdout(out), redirect_stderr(err):
+            code = probe.main(["--base-url", "http://h/",
+                               "--evidence", "receipt.json"],
+                              fetch_fn=double({"/health": HEALTH,
+                                               "/readyz": READY}))
+        self.assertEqual(code, 1)
+        self.assertIn("evidence not written (PermissionError)",
+                      out.getvalue())
+        self.assertEqual(err.getvalue(), "")
+
 
 class UserAgentTests(unittest.TestCase):
     def test_fetch_sends_an_explicit_user_agent(self):
@@ -984,6 +1019,85 @@ class NonfiniteJobFieldTest(unittest.TestCase):
                 with self.assertRaisesRegex(probe.ProbeError,
                                             "nonfinite consecutive_failures"):
                     probe.consecutive_failures({"consecutive_failures": value})
+
+
+class HugeMagnitudeTest(unittest.TestCase):
+    """Absurd finite magnitudes are display-capped, never expanded digit
+    for digit: an in-cap body must stay within the 16 KiB machine bound."""
+
+    HUGE = 10 ** 4200
+
+    def test_helpers_cap_absurd_magnitudes_without_changing_grading(self):
+        now_ms = int(time.time() * 1000)
+        self.assertEqual(
+            probe._field_age_seconds({"last_success": -self.HUGE},
+                                     "last_success", now_ms),
+            probe.MAX_DISPLAY_AGE_SECONDS)
+        self.assertEqual(
+            probe.consecutive_failures(
+                {"consecutive_failures": self.HUGE}),
+            probe.MAX_DISPLAY_FAILURES)
+        # Realistic values flow through untouched.
+        self.assertEqual(
+            probe._field_age_seconds({"last_success": now_ms - 5000},
+                                     "last_success", now_ms), 5)
+        self.assertEqual(
+            probe.consecutive_failures({"consecutive_failures": 4}), 4)
+
+    def test_huge_remote_magnitudes_stay_within_output_bound(self):
+        jobs = {}
+        for index, name in enumerate(probe.JOB_CADENCE_SECONDS):
+            if index % 3 == 0:
+                jobs[name] = {"parked": False, "running": True,
+                              "last_success": -self.HUGE}
+            elif index % 3 == 1:
+                jobs[name] = {"parked": False, "running": True,
+                              "consecutive_failures": self.HUGE}
+            else:
+                jobs[name] = {"parked": False, "running": True,
+                              "last_start": -self.HUGE}
+        body = (200, json.dumps({
+            "components": [["process", "ready"], ["gateway", "ready"]],
+            "jobs": jobs,
+            "build_revision": "0123456789abcdef0123456789abcdef01234567",
+            "build_id": "700-1",
+        }).encode())
+        self.assertLessEqual(len(body[1]), probe.BODY_CAP)
+        for flags in (["--json"], []):
+            with self.subTest(flags=flags):
+                out, err = io.StringIO(), io.StringIO()
+                with redirect_stdout(out), redirect_stderr(err):
+                    code = probe.main(["--base-url", "http://h/", *flags],
+                                      fetch_fn=double({"/health": HEALTH,
+                                                       "/readyz": body}))
+                self.assertEqual(code, 1)
+                combined = out.getvalue() + err.getvalue()
+                self.assertLessEqual(len(combined.encode()), 16_384)
+                self.assertNotIn("Traceback", combined)
+
+
+class DecoderRecursionTest(unittest.TestCase):
+    """A decoder RecursionError becomes None (an ordinary failed check),
+    never a traceback escaping the verdict path."""
+
+    def test_decode_returns_none_when_decoder_recurses(self):
+        with mock.patch.object(probe, "decode_strict",
+                               side_effect=RecursionError("max depth")):
+            self.assertIsNone(probe.decode(b"[0]"))
+
+    def test_recursing_body_fails_a_check_without_traceback(self):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(probe, "decode_strict",
+                               side_effect=RecursionError("max depth")), \
+                redirect_stdout(out), redirect_stderr(err):
+            code = probe.main(["--base-url", "http://h/", "--json"],
+                              fetch_fn=double({"/health": HEALTH,
+                                               "/readyz": READY}))
+        self.assertEqual(code, 1)
+        self.assertEqual(err.getvalue(), "")
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["verdict"], "FAIL")
+        self.assertNotIn("Traceback", out.getvalue())
 
 class FixedCadenceJobGradingTest(unittest.TestCase):
     """self_role_recovery (30 s cadence, 25 s timeout) and automod_expiry

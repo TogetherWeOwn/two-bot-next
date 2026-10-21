@@ -39,6 +39,11 @@ Probes and the code path each one checks:
                    NaN/Infinity, including an overflowing exponent decoded
                    to Infinity) fails and is named with bounded diagnostics,
                    never a traceback and never a verified-fresh count.
+                   Absurd finite magnitudes are display-capped (ages at
+                   9,999,999,999 s, failure counts at 999,999,999), far above
+                   every fail line, so an in-cap body cannot expand
+                   digit-for-digit past the machine output bound; grading is
+                   unchanged, since anything past a cap was already stale.
                    While degraded without --expect-ready the jobs map stays
                    informational so a truthful parked 503 stays green. feeds
                    is ungraded (its cadence is env-configured), as is any
@@ -110,6 +115,10 @@ Machine verdict contract: --json prints exactly one JSON object on stdout
 code, next_action and detail) with empty stderr. A failed verdict never
 claims result=pass and, like text failures, never creates or overwrites
 --evidence; the success-only evidence receipt keeps its existing schema.
+When the checks pass but the receipt itself cannot be written, the verdict
+is FAIL with an additional evidence row (code evidence_not_written): stdout
+still holds exactly one JSON object, stderr stays empty, and the exit code
+is 1, so a verdict consumer never proceeds as if attested.
 """
 
 import argparse
@@ -208,6 +217,14 @@ MAX_LAST_SUCCESS_AGE_SECONDS = {
     name: 2 * JOB_CADENCE_SECONDS[name] + JOB_TIMEOUT_SECONDS[name]
     for name in JOB_CADENCE_SECONDS
 }
+# Display caps for remote-derived magnitudes. The largest graded fail line is
+# 7320 s (inactivity/presence_probe) and failure counts are small ints, so
+# capping here never changes a grading decision: anything past a cap was
+# already stale or failing. Without the caps a single in-cap body carrying
+# e.g. last_success=-(10**4200) would expand digit-for-digit into diagnostics
+# past the 16 KiB machine output bound.
+MAX_DISPLAY_AGE_SECONDS = 9_999_999_999
+MAX_DISPLAY_FAILURES = 999_999_999
 # Only these last_error_class values may reach diagnostics; anything else is
 # reported as unrecognized, never echoed. Source: JobErrorClass,
 # crates/core/src/metrics.rs (serde snake_case); null means no failure yet.
@@ -585,7 +602,7 @@ def _field_age_seconds(entry, field, now_ms):
                          code="jobs_nonfinite_field",
                          next_action="inspect why the job timestamp is not "
                                      "finite and re-run the probe")
-    return max(0, int(now_ms - last) // 1000)
+    return min(MAX_DISPLAY_AGE_SECONDS, max(0, int(now_ms - last) // 1000))
 
 
 def job_age_seconds(entry, now_ms):
@@ -614,7 +631,7 @@ def consecutive_failures(entry):
                          code="jobs_nonfinite_field",
                          next_action="inspect why the failure count is not "
                                      "finite and re-run the probe")
-    return max(0, int(failures))
+    return min(MAX_DISPLAY_FAILURES, max(0, int(failures)))
 
 
 def check_jobs(report, now_ms=None, enforce_freshness=True):
@@ -861,23 +878,9 @@ def main(argv=None, fetch_fn=None):
               "greater than 0 and at most 60", file=sys.stderr)
         return 2
     report, results = run(args, fetch_fn)
-    if args.json:
-        verdict = "PASS" if all(r.ok for r in results) else "FAIL"
-        print(json.dumps({
-            "verdict": verdict,
-            "next_action": JSON_PASS_ACTION if verdict == "PASS" else JSON_FAIL_ACTION,
-            "checks": [r.verdict_row() for r in results],
-        }, indent=2))
-    else:
-        for result in results:
-            print(result.line())
-        failed = sum(not r.ok for r in results)
-        print(f"cutover acceptance probes: {len(results) - failed}/{len(results)} checks passed")
-    if report is None or not all(r.ok for r in results):
-        # Refusals and failures leave no receipt to attest: --evidence is
-        # neither created nor overwritten here.
-        return 1
-    if args.evidence:
+    passed = report is not None and all(r.ok for r in results)
+    evidence_error = None
+    if passed and args.evidence:
         receipt = {"utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                    "result": "pass",
                    "expect_ready": args.expect_ready,
@@ -888,10 +891,41 @@ def main(argv=None, fetch_fn=None):
                 json.dump(receipt, handle, indent=2)
                 handle.write("\n")
         except OSError as error:
+            evidence_error = error.__class__.__name__
+    if args.json:
+        rows = [r.verdict_row() for r in results]
+        if evidence_error is not None:
+            rows.append({
+                "id": "evidence",
+                "verdict": "FAIL",
+                "code": "evidence_not_written",
+                "next_action": ("check the --evidence path is writable "
+                                "and re-run the probe"),
+                "detail": (f"evidence receipt not written "
+                           f"({evidence_error})"),
+            })
+        verdict = "PASS" if passed and evidence_error is None else "FAIL"
+        print(json.dumps({
+            "verdict": verdict,
+            "next_action": JSON_PASS_ACTION if verdict == "PASS" else JSON_FAIL_ACTION,
+            "checks": rows,
+        }, indent=2))
+    else:
+        for result in results:
+            print(result.line())
+        failed = sum(not r.ok for r in results)
+        print(f"cutover acceptance probes: {len(results) - failed}/{len(results)} checks passed")
+    if evidence_error is not None:
+        # The verdict above already carries the failure in --json mode, so
+        # stderr stays empty there; text mode keeps the one-line notice.
+        if not args.json:
             print(f"cutover acceptance probes failed: evidence not written "
-                  f"({error.__class__.__name__})",
-                  file=sys.stderr if args.json else sys.stdout)
-            return 1
+                  f"({evidence_error})")
+        return 1
+    if not passed:
+        # Refusals and failures leave no receipt to attest: --evidence is
+        # neither created nor overwritten here.
+        return 1
     return 0
 
 
