@@ -184,8 +184,8 @@ fn panic_message(error: Box<dyn std::any::Any + Send>) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn has_event_db_blip_degrades_false_with_retry_and_metric() {
-    let _blip = blip_guard();
     let server = BlipServer::drop_all().await;
+    let _blip = blip_guard();
     let store = PgFunnelStore::new(blip_pool(server.port));
     let before = db_error_total();
     let outcome = store.has_event(GUILD, MEMBER, EventType::MemberJoin);
@@ -206,8 +206,8 @@ async fn has_event_db_blip_degrades_false_with_retry_and_metric() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn next_message_rung_db_blip_degrades_none_with_retry_and_metric() {
-    let _blip = blip_guard();
     let server = BlipServer::drop_all().await;
+    let _blip = blip_guard();
     let store = PgFunnelStore::new(blip_pool(server.port));
     let before = db_error_total();
     let outcome = store.next_message_rung(GUILD, MEMBER, "2026-10-21T00:00:00.000Z");
@@ -228,8 +228,8 @@ async fn next_message_rung_db_blip_degrades_none_with_retry_and_metric() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn membership_db_blip_degrades_none_with_retry_and_metric() {
-    let _blip = blip_guard();
     let server = BlipServer::drop_all().await;
+    let _blip = blip_guard();
     let store = PgFunnelStore::new(blip_pool(server.port));
     let before = db_error_total();
     let outcome = store.membership(GUILD, MEMBER);
@@ -250,8 +250,8 @@ async fn membership_db_blip_degrades_none_with_retry_and_metric() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn membership_rows_db_blip_degrades_empty_with_retry_and_metric() {
-    let _blip = blip_guard();
     let server = BlipServer::drop_all().await;
+    let _blip = blip_guard();
     let store = PgFunnelStore::new(blip_pool(server.port));
     let before = db_error_total();
     let outcome = store.membership_rows(GUILD, MEMBER);
@@ -272,8 +272,8 @@ async fn membership_rows_db_blip_degrades_empty_with_retry_and_metric() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn snapshot_load_db_blip_degrades_empty_with_retry_and_metric() {
-    let _blip = blip_guard();
     let server = BlipServer::drop_all().await;
+    let _blip = blip_guard();
     let store = PgInviteSnapshots::new(blip_pool(server.port));
     let before = db_error_total();
     let outcome = store.load(GUILD);
@@ -296,8 +296,8 @@ async fn snapshot_load_db_blip_degrades_empty_with_retry_and_metric() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mark_bot_db_blip_retries_then_panics() {
-    let _blip = blip_guard();
     let server = BlipServer::drop_all().await;
+    let _blip = blip_guard();
     let store = PgFunnelStore::new(blip_pool(server.port));
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         store.mark_bot(GUILD, MEMBER);
@@ -315,8 +315,8 @@ async fn mark_bot_db_blip_retries_then_panics() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn record_db_blip_retries_then_panics() {
-    let _blip = blip_guard();
     let server = BlipServer::drop_all().await;
+    let _blip = blip_guard();
     let store = PgFunnelStore::new(blip_pool(server.port));
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         store.record(join_event(MEMBER, "2026-10-21T00:00:00.000Z"));
@@ -331,8 +331,8 @@ async fn record_db_blip_retries_then_panics() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn touch_activity_db_blip_retries_then_panics() {
-    let _blip = blip_guard();
     let server = BlipServer::drop_all().await;
+    let _blip = blip_guard();
     let store = PgFunnelStore::new(blip_pool(server.port));
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         store.touch_activity(
@@ -355,8 +355,8 @@ async fn touch_activity_db_blip_retries_then_panics() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn record_observed_db_blip_retries_then_panics() {
-    let _blip = blip_guard();
     let server = BlipServer::drop_all().await;
+    let _blip = blip_guard();
     let store = PgFunnelStore::new(blip_pool(server.port));
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         store.record_observed(
@@ -377,8 +377,8 @@ async fn record_observed_db_blip_retries_then_panics() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn snapshot_store_all_db_blip_retries_then_panics_fixed_vocabulary() {
-    let _blip = blip_guard();
     let server = BlipServer::drop_all().await;
+    let _blip = blip_guard();
     let store = PgInviteSnapshots::new(blip_pool(server.port));
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         store.store_all(
@@ -409,8 +409,8 @@ async fn snapshot_store_all_db_blip_retries_then_panics_fixed_vocabulary() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn snapshot_delete_missing_db_blip_retries_then_panics_fixed_vocabulary() {
-    let _blip = blip_guard();
     let server = BlipServer::drop_all().await;
+    let _blip = blip_guard();
     let store = PgInviteSnapshots::new(blip_pool(server.port));
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         store.delete_missing(GUILD, &HashSet::new());
