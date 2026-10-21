@@ -234,7 +234,19 @@ async fn closed_worker_delivery_is_not_reported_as_warming_up() {
     ] {
         let (runtime, rx) = stalled_runtime();
         drop(rx);
-        let (owned, response) = bounded(handle_capture(&runtime, &case.interaction())).await;
+        // Keep the closed inbox: handle_capture would publish a snapshot and respawn it.
+        let seen = Arc::new(Mutex::new(None::<InteractionResponse>));
+        let writer = seen.clone();
+        let owned = bounded(handle_voice_interaction(
+            &runtime,
+            &case.interaction(),
+            |response| {
+                *writer.lock().unwrap() = Some(response);
+                async {}
+            },
+        ))
+        .await;
+        let response = seen.lock().unwrap().clone();
         assert!(owned);
         assert_honest_worker_failure(&response.expect("closed worker reply"));
     }

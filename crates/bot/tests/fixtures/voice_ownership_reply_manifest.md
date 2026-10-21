@@ -14,7 +14,9 @@ Protected files (SHA-256):
 | File | SHA-256 |
 | --- | --- |
 | `crates/bot/src/voice_ownership_receipt_acceptance_tests.rs` | `c1ce2668ed26d520d598f838725d071efdcf70fc4861d8023e664840228fc5bc` |
-| `crates/bot/src/voice_worker_reply_acceptance_tests.rs` | `df5d698a26bcabc657da83bd6125c0b524f43fcd27d30d843955dd169621925c` |
+| `crates/bot/src/voice_worker_reply_acceptance_tests.rs` | `66282c127eaf2ba1356c49d8684845ebeb63e7a10a5563f1bf27cf069e93d372` |
+
+Test-author correction: closed-worker delivery calls the handler directly so snapshot publication cannot respawn the deliberately closed inbox.
 
 Do not edit, skip, or weaken these files. Return a mistaken assertion or a
 needed trait-adapter correction to the test author. Preserve the hashes before
