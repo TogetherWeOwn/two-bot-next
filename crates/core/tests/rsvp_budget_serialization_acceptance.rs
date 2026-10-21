@@ -152,7 +152,8 @@ async fn one_remaining_budget_slot_raced_across_two_events_admits_exactly_one() 
 
     let wins = u8::from(first.is_ok()) + u8::from(second.is_ok());
     assert_eq!(
-        wins, 1,
+        wins,
+        1,
         "exactly one racer wins the final slot: [{}, {}]",
         first.is_ok(),
         second.is_ok()
