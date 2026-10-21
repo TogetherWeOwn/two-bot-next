@@ -451,6 +451,7 @@ async fn absent_and_disabled_commands_stay_silent() {
 
 #[tokio::test]
 #[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+#[allow(clippy::type_complexity)]
 async fn completion_audit_rows_carry_no_template_or_rendered_content() {
     let pool = test_pool().await;
     seed_faq(&pool, "audit marker xyzzy {user}").await;
