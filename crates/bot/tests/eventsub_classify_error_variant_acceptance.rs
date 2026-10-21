@@ -262,6 +262,11 @@ fn unknown_and_display_labels_still_collapse_to_other() {
     }
     let exposition = metrics.render(None);
     for &label in &hostile {
+        if label.is_empty() {
+            // `contains("")` is vacuous, so the empty id is covered by the
+            // collapse-to-other count below instead of this loop.
+            continue;
+        }
         assert!(
             !exposition.contains(label),
             "hostile label must never reach exposition: {label:?}"
