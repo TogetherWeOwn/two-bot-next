@@ -2431,7 +2431,10 @@ jobs:
       - name: self-role claim, renewal, recovery and fencing tests
         run: cargo test -p two-bot-cutover --test self_role_store --locked -- --ignored
       - name: self-role ticket acknowledgement columns and caps
-        run: cargo test -p two-bot-cutover --test self_role_ack_acceptance --locked -- --ignored
+        # Serial: each test mints its schema as pid + clock nanos, so parallel
+        # setup collides on pg_namespace (duplicate-schema failure). The suite
+        # still runs in well under a second serially.
+        run: cargo test -p two-bot-cutover --test self_role_ack_acceptance --locked -- --ignored --test-threads=1
       - name: self-role runtime admission and immutable snapshots (mock REST and isolated schema)
         run: >-
           cargo test -p two-bot --locked self_role_runtime:: -- --include-ignored --test-threads=1
