@@ -30,6 +30,17 @@ export const ALERT_INPUT_LABELS: Record<string, Record<string, readonly string[]
     family: ["announcement", "event", "settings", "moderation", "membership", "other"],
     outcome: ["executed", "auth_failure", "unknown_key", "clock_skew", "nonce_replay", "rate_limit", "unknown_action", "action_disabled", "malformed_body", "conflict", "upstream", "internal"],
   },
+  // Gateway transport and job-run family. Always emitted on the same render
+  // path as the gateway/job inputs above (metrics.rs, since #82/#123), so a
+  // container that emits the required set cannot lack these: absence fails
+  // the scrape instead of silently holding the transport rules off. The
+  // handler `_sum`/`_count` rows stay unvalidated passthrough (only the
+  // `_bucket` family is an alert input); the rule reads the window count
+  // from the `+Inf` bucket delta.
+  two_bot_gateway_latency_seconds: {},
+  two_bot_gateway_reconnects_total: {},
+  two_bot_handler_duration_seconds_bucket: { le: ["0.001", "0.005", "0.01", "0.05", "0.1", "0.5", "1", "5", "+Inf"] },
+  two_bot_job_runs_total: { job: ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "other"], outcome: ["success", "failure"] },
 };
 
 /**
@@ -121,6 +132,13 @@ export function parseAlertScrape(text: string): Sample[] | null {
       if (name === "two_bot_event_store_consumer_lag_seconds") {
         if (Object.keys(labels).length !== 0
           || !Number.isFinite(value) || value < 0 || value > 18446744073709551615) return null;
+      } else if (name === "two_bot_gateway_latency_seconds") {
+        // Last-ACK latency: NaN until the first heartbeat ACK lands on the
+        // current connection (metrics.rs resets to None on every reconnect),
+        // otherwise a finite nonnegative second count. Fractional values are
+        // valid samples; only the unknown marker is non-finite.
+        if (Object.keys(labels).length !== 0
+          || !(Number.isNaN(value) || (Number.isFinite(value) && value >= 0 && value <= 18446744073709551615))) return null;
       } else if (Object.keys(labels).length !== Object.keys(axes).length
         || Object.keys(axes).some((axis) => !labels[axis])
         || !Number.isFinite(value) || !Number.isInteger(value) || value < 0 || value > 18446744073709551615

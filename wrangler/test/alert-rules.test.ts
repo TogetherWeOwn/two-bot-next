@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import worker, { type Env } from "../src/index.ts";
 import {
-  EMPTY_STATE, JOB_ERROR_CLASSES, PROMOTION_ERROR_GATE_RULES, RULES, RUNBOOK_BASE_URL, evaluateMetrics, evaluatePromotionGate, packetFilename, parseExposition, ruleFor, runbookUrl, transitionMessages,
+  EMPTY_STATE, JOB_ERROR_CLASSES, JOB_RUNS_JOBS, PROMOTION_ERROR_GATE_RULES, RULES, RUNBOOK_BASE_URL, evaluateMetrics, evaluatePromotionGate, packetFilename, parseExposition, ruleFor, runbookUrl, transitionMessages,
   type MetricsAlertState,
 } from "../src/alert-rules.ts";
 
@@ -973,6 +973,10 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "eventsub_reconcile_failed",
     "event_store_consumer_lag",
     "prefix_trigger_verdict_refusals",
+    "gateway_latency_dead",
+    "gateway_reconnect_flapping",
+    "handler_duration_saturated",
+    "job_failure_share",
   ]);
   assert.equal(packetFilename("job_stale:rank", window), `evidence-job_stale-${window}.json`);
   assert.equal(packetFilename("job_consecutive_failures:counter", window), `evidence-job_consecutive_failures-${window}.json`);
@@ -1003,6 +1007,10 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("eventsub_tampered", window), `evidence-eventsub_tampered-${window}.json`);
   assert.equal(packetFilename("eventsub_reconcile_failed", window), `evidence-eventsub_reconcile_failed-${window}.json`);
   assert.equal(packetFilename("prefix_trigger_verdict_refusals", window), `evidence-prefix_trigger_verdict_refusals-${window}.json`);
+  assert.equal(packetFilename("gateway_latency_dead", window), `evidence-gateway_latency_dead-${window}.json`);
+  assert.equal(packetFilename("gateway_reconnect_flapping", window), `evidence-gateway_reconnect_flapping-${window}.json`);
+  assert.equal(packetFilename("handler_duration_saturated", window), `evidence-handler_duration_saturated-${window}.json`);
+  assert.equal(packetFilename("job_failure_share:counter", window), `evidence-job_failure_share-${window}.json`);
   // Unknown keys get no filename rather than a misleading one; hostile
   // window stamps stay filename-safe.
   assert.equal(packetFilename("no_such_rule", window), undefined);
@@ -1222,6 +1230,37 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
     prefix = ev([`two_bot_gateway_prefix_trigger_refused_total{reason="verdict"} ${n}`], prefix.state);
   }
   firing.push(...prefix.firing);
+  // Gateway transport rules carry fresh latency in every multi-sample chain
+  // except the dead-gateway battery itself, whose NaN streak is the signal.
+  let dead = ev(["two_bot_gateway_latency_seconds NaN"]);
+  dead = ev(["two_bot_gateway_latency_seconds NaN"], dead.state);
+  dead = ev(["two_bot_gateway_latency_seconds NaN"], dead.state);
+  firing.push(...dead.firing);
+  let flap = ev(["two_bot_gateway_latency_seconds 0.011", "two_bot_gateway_reconnects_total 0"]);
+  for (const [n, latency] of [[1, "0.012"], [2, "0.013"], [3, "0.014"]] as const) {
+    flap = ev([`two_bot_gateway_latency_seconds ${latency}`, `two_bot_gateway_reconnects_total ${n}`], flap.state);
+  }
+  firing.push(...flap.firing);
+  const handlerLines = (fast: number, total: number, latency: string) => [
+    `two_bot_gateway_latency_seconds ${latency}`,
+    ...["0.001", "0.005", "0.01", "0.05", "0.1", "0.5", "1"].map((le) =>
+      `two_bot_handler_duration_seconds_bucket{le="${le}"} ${fast}`),
+    `two_bot_handler_duration_seconds_bucket{le="5"} ${total}`,
+    `two_bot_handler_duration_seconds_bucket{le="+Inf"} ${total}`,
+  ];
+  let saturated = ev(handlerLines(100, 100, "0.011"));
+  saturated = ev(handlerLines(110, 120, "0.012"), saturated.state);
+  saturated = ev(handlerLines(120, 140, "0.013"), saturated.state);
+  saturated = ev(handlerLines(130, 160, "0.014"), saturated.state);
+  firing.push(...saturated.firing);
+  const jobLines = (counterSuccess: number, counterFailure: number, latency: string) => [
+    `two_bot_gateway_latency_seconds ${latency}`,
+    ...JOB_RUNS_JOBS.flatMap((job) => [
+      `two_bot_job_runs_total{job="${job}",outcome="success"} ${job === "counter" ? counterSuccess : 0}`,
+      `two_bot_job_runs_total{job="${job}",outcome="failure"} ${job === "counter" ? counterFailure : 0}`,
+    ]),
+  ];
+  firing.push(...ev(jobLines(8, 2, "0.012"), ev(jobLines(0, 0, "0.011")).state).firing);
   assert.equal(firing.length, RULES.length, `expected one firing key per rule, got: ${firing.join(", ")}`);
   const packets = transitionMessages([], firing);
   assert.equal(packets.length, RULES.length);
