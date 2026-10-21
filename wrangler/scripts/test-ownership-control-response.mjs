@@ -65,14 +65,14 @@ for (const script of ['ownership-control.mjs', 'production-ownership-control.mjs
     return runFile(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(preload)}`, scriptPath, ...args], { env });
   };
 
-  test(`${script}: real CLI status prints only allowlisted fields`, async () => {
+  test(`${script}: real CLI status prints only allowlisted fields`, { timeout: 30_000 }, async () => {
     const result = await invoke(JSON.stringify(state({ owner: { ...owner, debug: LEAK }, debug: LEAK })));
     assert.deepEqual(JSON.parse(result.stdout), state());
     assert.equal(result.stderr, '');
     assert.equal(result.stdout.includes(LEAK), false);
   });
 
-  test(`${script}: real CLI rejects invalid envelopes without output or remote details`, async () => {
+  test(`${script}: real CLI rejects invalid envelopes without output or remote details`, { timeout: 30_000 }, async () => {
     await assert.rejects(invoke(JSON.stringify(state({ owner: [LEAK] }))), (error) => {
       assert.equal(error.code, 1);
       assert.equal(error.stdout, '');
@@ -81,8 +81,13 @@ for (const script of ['ownership-control.mjs', 'production-ownership-control.mjs
     });
   });
 
-  test(`${script}: malformed JSON never prints parser details`, async () => {
-    await assert.rejects(invoke(`{"debug":"${LEAK}"`), (error) => {
+  test(`${script}: malformed JSON never prints parser details`, { timeout: 30_000 }, async () => {
+    // Production `status` retries an unparseable answer through its ~330 s
+    // propagation budget by design, which would stall CI here. Probe the same
+    // real-CLI print path via `takeover` instead: its 5xx-only retry refuses a
+    // failed GET at once, so the fixed-vocabulary refusal is asserted fast.
+    const args = script === 'production-ownership-control.mjs' ? ['takeover'] : ['status'];
+    await assert.rejects(invoke(`{"debug":"${LEAK}"`, args), (error) => {
       assert.equal(error.code, 1);
       assert.equal(error.stdout, '');
       assert.equal(error.stderr.includes(LEAK), false);
