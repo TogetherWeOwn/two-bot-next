@@ -17,8 +17,8 @@ available in DMs (`docs/commands.md`):
 | Command | Options | Notes |
 | --- | --- | --- |
 | `/feed-add` | `kind` (required choice: `"rss"`, `"youtube"`, `"twitch"`), `source` (required string, max 2048 chars) | Posts into the invoking channel. At most 2,048 input bytes total. |
-| `/feed-list` | none | Ephemeral text; each source capped at 128 UTF-16 units, shrinking adaptively at capacity (scheme-stripped head…tail so same-host relays stay distinguishable) so every relay id stays discoverable within the 2,000-unit message cap (`crates/core/src/feeds.rs`). |
-| `/feed-remove` | `id` (required string, max 128 chars) | Replies `Feed relay removed.`, `No feed relay with that id.` (`crates/core/src/feeds.rs:354-360`) or, while a delivery is still pending recovery, `Feed relay kept: unresolved deliveries are still pending recovery.` (`crates/core/src/feeds.rs:362-366`). Guild-scoped delete. |
+| `/feed-list` | `page` (optional integer, min 1, default 1) | Ephemeral text; whole relay rows packed into bounded pages within the 2,000-unit message cap so every relay id stays discoverable, multi-page replies carrying a `Page N of M` footer with `/feed-list page:<n>` navigation; short lists keep the exact legacy single reply (`crates/core/src/feeds.rs`). |
+| `/feed-remove` | `id` (required string, max 128 chars) | Replies `Feed relay removed.`, `No feed relay with that id.` (`crates/core/src/feeds.rs:503-509`) or, while a delivery is still pending recovery, `Feed relay kept: unresolved deliveries are still pending recovery.` (`crates/core/src/feeds.rs:511-515`). Guild-scoped delete. |
 
 Source rules (`crates/core/src/feeds.rs:168-184`, `docs/feeds-port.md`):
 
@@ -39,7 +39,7 @@ Source rules (`crates/core/src/feeds.rs:168-184`, `docs/feeds-port.md`):
 Gates (both must hold or the poller parks):
 
 - `TWO_ANNOUNCEMENTS=1` — exact `1` enables; anything else is off.
-  Default off (`crates/core/src/feature_commands.rs:346-383`).
+  Default off (`crates/core/src/feature_commands.rs:352-389`).
 - Boot identity must permit the `announcements` capability
   (`feed_jobs::register_fenced`, the live-identity fence). A mismatched or
   unparseable identity parks the job with
@@ -50,7 +50,7 @@ Gates (both must hold or the poller parks):
   `feed poller parked: invalid feature configuration`
   (`crates/bot/src/feed_jobs.rs:274-284`); the gate error text is
   `TWO_FEED_POLL_SECONDS must be an integer between 60 and 86400`
-  (`crates/core/src/feature_commands.rs:354-357`).
+  (`crates/core/src/feature_commands.rs:360-363`).
 
 Per-feed fetch contract (what a "source is down" means): exact User-Agent
 `Owen/1.0 (+https://two.gg)`, 15-second total deadline across
@@ -70,7 +70,7 @@ As coded (`crates/bot/src/feed_jobs.rs:33-41,227-267`):
   (`crates/bot/src/feed_jobs.rs:235-265`, `crates/bot/src/jobs.rs:193-252`).
   The per-tick `FeedPollSchedule` gate re-reads the same stored interval
   before every tick (`crates/bot/src/feed_jobs.rs:274-280`,
-  `crates/core/src/feeds.rs:1320-1333`). A stored change reschedules the
+  `crates/core/src/feeds.rs:1469-1482`). A stored change reschedules the
   pending run to last-run + new interval in both directions: a decrease
   below the boot cadence fires at last-run + new interval without waiting
   for the pending boot-cadence slot, and an increase pushes the pending
@@ -348,4 +348,4 @@ constants (the exact strings each `--help` path prints). The `two-bot`
 binary was not built in this docs run, so no binary `--help` transcript
 is claimed. Slash-command options are pasted from `docs/commands.md`
 (rendered from the compiled registry) and the option decoders at
-`crates/bot/src/command_runtime.rs:2124-2160`.
+`crates/bot/src/command_runtime.rs:2141-2177`.

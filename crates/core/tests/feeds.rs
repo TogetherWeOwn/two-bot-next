@@ -1455,7 +1455,7 @@ fn feed_list_page_capacity_replies_fit_with_navigation_and_exact_once_ids() {
             reply.contains("/feed-list") && reply.contains("page"),
             "reply {page} gives usable navigation: {reply}"
         );
-        seen.extend(page_ids(&reply).into_iter().map(str::to_owned()));
+        seen.extend(page_ids(&reply).into_iter().map(str::to_owned));
     }
     let expected: Vec<String> = feeds.iter().map(|feed| feed.id.clone()).collect();
     assert_eq!(seen, expected, "every id appears once, in stable order");
