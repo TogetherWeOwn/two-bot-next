@@ -2379,7 +2379,9 @@ retry, or infer absence from missing/unreadable/bounded channel history. This
 slice performs no automatic history scan, even for a positive receipt.
 
 Migration 0142 is additive and conservatively fences existing nonce/claim rows;
-NULL fences fail closed. Rollout must stop old blind-replay writers first. Do
+NULL fences fail closed. Restoring a pre-0142 archive re-fences its pending
+nonce/claim rows the same way; current archives restore the recorded fence
+faithfully. Rollout must stop old blind-replay writers first. Do
 not downgrade to a binary that ignores the fence; retain it when reverting code.
 This is source behavior, not evidence of a migration or live release.
 

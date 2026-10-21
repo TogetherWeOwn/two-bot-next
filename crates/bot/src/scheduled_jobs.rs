@@ -49,6 +49,10 @@ mod acceptance_tests;
 #[path = "scheduled_store_failure_audit_acceptance_tests.rs"]
 mod store_failure_acceptance_tests;
 
+#[cfg(test)]
+#[path = "scheduled_confirmed_cleanup_tests.rs"]
+mod confirmed_cleanup_tests;
+
 /// The supervised ticker for the configured guild, or `None` while
 /// `TWO_AUTOMATIONS` is off (legacy only started the scheduler when automations
 /// were enabled, and a disabled scheduler fired zero jobs) or the boot
@@ -256,6 +260,8 @@ impl Occurrence<'_> {
 
     fn warn_uncertain(&self) {
         tracing::warn!(
+            guild = %self.row.guild_id,
+            schedule = %self.row.id,
             code = "scheduled_delivery_uncertain",
             next_action = "inspect_channel_before_cancel_or_replace",
             "scheduled occurrence held; no automatic resend or advancement"
