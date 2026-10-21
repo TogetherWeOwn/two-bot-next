@@ -86,10 +86,9 @@ def _reject_duplicate_keys(pairs):
 def _read_report(path):
     """Read one report bounded; refuse over-cap or unreadable input first.
 
-    A bounded binary pre-read witnesses EOF and enforces the byte, line and
-    record budgets before any decode. The content load still goes through
-    Path.read_text (pinned observation hook of the argparse-refusal suite);
-    its bytes are re-checked in case the file grew between the two reads.
+    One bounded binary read witnesses EOF and enforces the byte, line and
+    record budgets before any decode. Parse only that checked snapshot, even
+    if a producer replaces or grows the report after the read.
     """
     if not path.is_file():
         raise IntakeRefused("unreadable_input")
@@ -106,14 +105,9 @@ def _read_report(path):
     if any(len(line) > MAX_LINE_BYTES for line in raw_lines):
         raise IntakeRefused("line_too_long")
     try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        raise IntakeRefused("unreadable_input") from None
+        return data.decode("utf-8")
     except UnicodeDecodeError:
         raise IntakeRefused("invalid_json") from None
-    if len(text.encode("utf-8")) > MAX_INPUT_BYTES:
-        raise IntakeRefused("input_too_large")
-    return text
 
 
 def _invalid(code, detail=None):
@@ -250,6 +244,8 @@ def main():
     try:
         advisories = []
         failures = compare(baseline, actual, args.tolerance, args.max_rss_mib, advisories)
+    except OverflowError:
+        return _invalid("invalid_benchmark", "benchmark metric exceeds numeric range")
     except (ValueError, KeyError, TypeError) as error:
         return _invalid("invalid_benchmark", str(error))
     for line in advisories:

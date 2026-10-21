@@ -73,7 +73,9 @@ class Gate5IntakeAcceptanceTests(unittest.TestCase):
 
     def test_oversize_log_refuses_before_parsing(self):
         with tempfile.TemporaryDirectory(dir=scratch_dir()) as directory:
-            path = write_tmp(directory, "big.jsonl", b"x" * (cli.MAX_INPUT_BYTES + 1))
+            line = b"x" * cli.MAX_LINE_BYTES + b"\n"
+            raw = line * (cli.MAX_INPUT_BYTES // len(line) + 1)
+            path = write_tmp(directory, "big.jsonl", raw)
             with mock.patch.object(cli, "summarize",
                                    side_effect=AssertionError("over-cap log must not be parsed")):
                 self.assert_invalid(path, "input_too_large")
@@ -107,6 +109,36 @@ class Gate5IntakeAcceptanceTests(unittest.TestCase):
             with mock.patch.object(cli, "summarize",
                                    side_effect=AssertionError("over-long line must not be parsed")):
                 self.assert_invalid(path, "line_too_long")
+
+    def test_giant_line_read_is_bounded_before_refusal(self):
+        sizes = []
+
+        class BoundedReader(io.BytesIO):
+            def __iter__(self):
+                raise AssertionError("unbounded line iteration")
+
+            def readline(self, size=-1):
+                sizes.append(size)
+                return super().readline(size)
+
+        handle = BoundedReader(b"x" * (cli.MAX_LINE_BYTES * 4))
+        with mock.patch.object(cli, "open", return_value=handle), \
+                mock.patch.object(cli.os.path, "isfile", return_value=True):
+            self.assert_invalid("giant.jsonl", "line_too_long")
+        self.assertEqual(sizes, [cli.MAX_LINE_BYTES + 2])
+
+    def test_line_cap_excludes_lf_crlf_and_eof_terminators(self):
+        with tempfile.TemporaryDirectory(dir=scratch_dir()) as directory:
+            for ending in (b"\n", b"\r\n", b""):
+                for extra in (0, 1):
+                    with self.subTest(ending=ending, extra=extra):
+                        raw = b"x" * (cli.MAX_LINE_BYTES + extra) + ending
+                        path = write_tmp(directory, "boundary.jsonl", raw)
+                        if extra:
+                            self.assert_invalid(path, "line_too_long")
+                        else:
+                            self.assertEqual(cli._read_log_lines(path),
+                                             ["x" * cli.MAX_LINE_BYTES])
 
     def test_record_flood_refuses(self):
         with tempfile.TemporaryDirectory(dir=scratch_dir()) as directory:

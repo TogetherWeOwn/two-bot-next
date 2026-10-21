@@ -74,7 +74,9 @@ class SoakIntakeAcceptanceTests(unittest.TestCase):
 
     def test_oversize_log_refuses_before_json_decode(self):
         with tempfile.TemporaryDirectory(dir=scratch_dir()) as directory:
-            path = write_tmp(directory, "big.jsonl", b"x" * (cli.MAX_INPUT_BYTES + 1))
+            line = b"x" * cli.MAX_LINE_BYTES + b"\n"
+            raw = line * (cli.MAX_INPUT_BYTES // len(line) + 1)
+            path = write_tmp(directory, "big.jsonl", raw)
             with mock.patch.object(cli, "summarize",
                                    side_effect=AssertionError("over-cap log must not be parsed")):
                 self.assert_invalid([path], "input_too_large")
@@ -112,6 +114,36 @@ class SoakIntakeAcceptanceTests(unittest.TestCase):
             with mock.patch.object(cli, "summarize",
                                    side_effect=AssertionError("over-long line must not be parsed")):
                 self.assert_invalid([path], "line_too_long")
+
+    def test_giant_line_read_is_bounded_before_refusal(self):
+        sizes = []
+
+        class BoundedReader(io.BytesIO):
+            def __iter__(self):
+                raise AssertionError("unbounded line iteration")
+
+            def readline(self, size=-1):
+                sizes.append(size)
+                return super().readline(size)
+
+        handle = BoundedReader(b"x" * (cli.MAX_LINE_BYTES * 4))
+        with mock.patch.object(cli, "open", return_value=handle), \
+                mock.patch.object(cli.os.path, "isfile", return_value=True):
+            self.assert_invalid(["giant.jsonl"], "line_too_long")
+        self.assertEqual(sizes, [cli.MAX_LINE_BYTES + 2])
+
+    def test_line_cap_excludes_lf_crlf_and_eof_terminators(self):
+        with tempfile.TemporaryDirectory(dir=scratch_dir()) as directory:
+            for ending in (b"\n", b"\r\n", b""):
+                for extra in (0, 1):
+                    with self.subTest(ending=ending, extra=extra):
+                        raw = b"x" * (cli.MAX_LINE_BYTES + extra) + ending
+                        path = write_tmp(directory, "boundary.jsonl", raw)
+                        if extra:
+                            self.assert_invalid([path], "line_too_long")
+                        else:
+                            self.assertEqual(cli._read_log_lines(path),
+                                             ["x" * cli.MAX_LINE_BYTES])
 
     def test_exact_line_cap_passes(self):
         line = '{"ts": "2026-09-20T00:00:01Z", "event": "connect", "session": "a%s"}\n'
@@ -201,21 +233,24 @@ class SoakIntakeAcceptanceTests(unittest.TestCase):
         # Alternate disconnect/connect: every pair closes one gap.
         lines.append(json.dumps({"ts": stamp.isoformat(), "event": "connect", "session": "a"}))
         stamp += timedelta(seconds=1)
-        for _ in range(cli.MAX_REDEPLOY_GAPS + 25):
+        for index in range(cli.MAX_REDEPLOY_GAPS + 25):
             lines.append(json.dumps({"ts": stamp.isoformat(), "event": "disconnect"}))
-            stamp += timedelta(seconds=2)
+            # Only a dropped gap breaches the budget; max-over-stored would
+            # wrongly report 2 seconds and PASS.
+            stamp += timedelta(seconds=120 if index == cli.MAX_REDEPLOY_GAPS + 24 else 2)
             lines.append(json.dumps({"ts": stamp.isoformat(), "event": "connect", "session": "a"}))
             stamp += timedelta(seconds=1)
         lines.append(json.dumps({"ts": stamp.isoformat(), "event": "dispatch",
                                  "session": "a", "seq": 1}))
         summary = cli.summarize(io.StringIO("\n".join(lines) + "\n"))
-        # Every gap is within budget and nothing is unknown, so the verdict
-        # still passes; only the stored list is truncated.
-        self.assertEqual(summary["verdict"], "PASS")
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
         self.assertEqual(len(summary["redeploy_gaps_s"]), cli.MAX_REDEPLOY_GAPS)
         self.assertTrue(summary["truncated"])
-        # The max still sees every gap, including dropped ones.
-        self.assertEqual(summary["max_redeploy_gap_s"], 2.0)
+        self.assertEqual(max(summary["redeploy_gaps_s"]), 2.0)
+        self.assertEqual(summary["unknown_intervals"], [])
+        self.assertEqual(summary["dispatches"], 1)
+        # Only the dropped gap can cause this breach.
+        self.assertEqual(summary["max_redeploy_gap_s"], 120.0)
 
     def test_invalid_utf8_line_is_unknown_not_a_crash(self):
         with tempfile.TemporaryDirectory(dir=scratch_dir()) as directory:

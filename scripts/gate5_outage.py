@@ -131,7 +131,9 @@ def _read_log_lines(path):
     lines = []
     total = 0
     with handle:
-        for raw in handle:
+        # Two terminator bytes allow an exact-cap CRLF line. Never let a
+        # missing newline turn the line cap into an unbounded allocation.
+        while raw := handle.readline(MAX_LINE_BYTES + 2):
             total += len(raw)
             if total > MAX_INPUT_BYTES:
                 raise IntakeRefused("input_too_large")

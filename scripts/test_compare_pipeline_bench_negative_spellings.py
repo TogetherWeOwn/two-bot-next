@@ -60,14 +60,14 @@ class NegativeSpellingTests(unittest.TestCase):
     def run_main(self, argv):
         out, err = io.StringIO(), io.StringIO()
         reads = []
-        real_read_text = Path.read_text
+        real_open = Path.open
 
-        def counting_read_text(self, *args, **kwargs):
+        def counting_open(self, *args, **kwargs):
             reads.append(str(self))
-            return real_read_text(self, *args, **kwargs)
+            return real_open(self, *args, **kwargs)
 
         with patch.object(sys, "argv", argv), \
-                patch.object(Path, "read_text", counting_read_text), \
+                patch.object(Path, "open", counting_open), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             try:
                 code = bench.main()

@@ -284,6 +284,56 @@ class CompareIntakeAcceptanceTests(unittest.TestCase):
             actual.write_text("{" + MARKER + " not json")
             self.assert_invalid(run_cli(actual, baseline), "invalid_json")
 
+    def test_checked_bytes_are_parsed_without_a_second_read(self):
+        with tempfile.TemporaryDirectory(dir=scratch_dir()) as directory:
+            baseline, actual = self.write_reports(directory)
+            checked = actual.read_bytes()
+            real_open = Path.open
+            opens = []
+
+            @contextlib.contextmanager
+            def swapping_open(path, *args, **kwargs):
+                opens.append(str(path))
+                with real_open(path, *args, **kwargs) as handle:
+                    yield handle
+                # Simulate a producer replacing the report after its first
+                # bounded read. Parsing must use only the checked snapshot.
+                with real_open(path, "wb") as handle:
+                    handle.write(b"x" * (bench.MAX_INPUT_BYTES + 1))
+
+            with mock.patch.object(Path, "open", swapping_open):
+                text = bench._read_report(actual)
+            self.assertEqual(text, checked.decode("utf-8"))
+            self.assertEqual(opens, [str(actual)])
+
+    def test_bad_flags_never_open_reports(self):
+        with tempfile.TemporaryDirectory(dir=scratch_dir()) as directory:
+            baseline, actual = self.write_reports(directory)
+            for flag, value in (("--tolerance", "nan"), ("--max-rss-mib", "257")):
+                with self.subTest(flag=flag), mock.patch.object(
+                        Path, "open", side_effect=AssertionError("flag refusal must precede I/O")):
+                    code, out, err = run_main_inprocess([
+                        "compare_pipeline_bench.py", str(actual),
+                        "--baseline", str(baseline), flag, value])
+                    self.assertEqual(code, 2)
+                    self.assertIn(flag, err)
+                    self.assertNotIn("Traceback", out + err)
+
+    def test_huge_integer_metrics_refuse_without_traceback(self):
+        with tempfile.TemporaryDirectory(dir=scratch_dir()) as directory:
+            for report_side in ("baseline", "actual"):
+                for metric in bench.METRICS:
+                    with self.subTest(report_side=report_side, metric=metric):
+                        report = valid_report()
+                        container = report["metrics"]
+                        for key in metric[:-1]:
+                            container = container[key]
+                        container[metric[-1]] = 10 ** 400
+                        baseline, actual = self.write_reports(directory)
+                        path = baseline if report_side == "baseline" else actual
+                        path.write_text(json.dumps(report))
+                        self.assert_invalid(run_cli(actual, baseline), "invalid_benchmark")
+
     def test_validation_error_keeps_its_message(self):
         with tempfile.TemporaryDirectory(dir=scratch_dir()) as directory:
             regressed = valid_report()
