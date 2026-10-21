@@ -8,13 +8,17 @@
 #![allow(clippy::print_stdout)]
 
 use two_bot_cutover::cli::{now_iso, open_db, require_guild, require_guild_read, Args};
-use two_bot_cutover::{run_mee6_import, ImportError};
+use two_bot_cutover::{
+    over_cap_message, read_bytes_capped, run_mee6_import, ImportError, IntakeReadError,
+};
 
 fn usage() -> ! {
     eprintln!(
         "Usage: levels-import-mee6 [import] --guild <snowflake> --file <export.json>\n                                  [--apply] [--allow-lower] [--manifest <path>] [--allow-live-guild]\n       levels-import-mee6 inventory --guild <snowflake>\n\
          \nAccepted JSON: an array of players, or {{players:[...]}}; each player needs id/user_id and xp.\n\
-         Without --apply nothing is written and the full manifest is still produced."
+         Without --apply nothing is written and the full manifest is still produced.\n\
+         Intake caps: the export must not exceed 8 MiB (exit 1, before any database touch)\n\
+         and must carry at most 50,000 players; problems truncate after 100 with a count receipt."
     );
     std::process::exit(2);
 }
@@ -48,9 +52,13 @@ async fn main() {
     let Some(file_path) = args.values.get("file") else {
         usage();
     };
-    let file_bytes = match std::fs::read(file_path) {
+    let file_bytes = match read_bytes_capped(file_path) {
         Ok(b) => b,
-        Err(e) => {
+        Err(IntakeReadError::OverCap) => {
+            eprintln!("{}", over_cap_message("MEE6 export"));
+            std::process::exit(1);
+        }
+        Err(IntakeReadError::Unreadable(e)) => {
             eprintln!("cannot read {file_path}: {e}");
             std::process::exit(2);
         }

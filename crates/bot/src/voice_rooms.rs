@@ -1953,10 +1953,7 @@ impl LiveGuild {
     #[must_use]
     pub fn not_ready_secs(&self, now: tokio::time::Instant) -> u64 {
         let live = self.read_state();
-        match live.not_ready_since {
-            Some(since) if !live.ready => now.saturating_duration_since(since).as_secs(),
-            _ => 0,
-        }
+        snapshot_not_ready_age_secs(live.not_ready_since, live.ready, now)
     }
 
     /// V10 health check: the bot's missing Manage Channels, Move Members,
@@ -8685,6 +8682,18 @@ async fn load_actor_worker<S: RoomPersistence, H: RoomWrites>(
     }
 }
 
+/// Fair-scheduling bound for the per-guild actor loop: at most this many
+/// consecutive inbox turns before a ready dispatch, timer or maintenance
+/// branch runs. The inbox branch is parked once the count is reached, so
+/// sustained benign churn cannot starve already-ready dispatch or due
+/// maintenance; the count resets on any timer or maintenance turn, or on
+/// a dispatch turn that neither progresses nor leaves maintenance due,
+/// while a progressing dispatch keeps the inbox parked so a create runs
+/// with its priority move. Exposed as the
+/// `two_bot_voice_actor_inbox_turn_bound` gauge; the inbox/dispatch turn
+/// counters beside it tell inbox activity apart from dispatch progress.
+const VOICE_ACTOR_MAX_CONSECUTIVE_INBOX_TURNS: u8 = 32;
+
 #[cfg(test)]
 async fn run_actor<S: RoomPersistence, H: RoomWrites + 'static>(
     worker: &mut GuildRoomWorker<S, H>,
@@ -8753,6 +8762,35 @@ fn watchdog_due(
 /// keep climbing between merges instead of freezing at the merge-time zero.
 fn creator_map_age_secs(creators_merged_ms: Option<u64>, now_ms: u64) -> u64 {
     creators_merged_ms.map_or(0, |last| now_ms.saturating_sub(last) / 1000)
+}
+
+/// Queue age on the sibling's own clock: seconds since the snapshot's
+/// oldest first-enqueue stamp; 0 when the snapshot queue was empty. Pure,
+/// unit-tested: a frozen snapshot (hung dispatch) still yields a climbing
+/// age instead of the snapshot-time value.
+fn snapshot_queue_age_secs(
+    oldest_enqueued_at: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> u64 {
+    oldest_enqueued_at.map_or(0, |at| now.saturating_duration_since(at).as_secs())
+}
+
+/// Live-not-ready age on the sibling's own clock: seconds since the
+/// live view's not-ready-since stamp; 0 when the view is ready or the
+/// transport was down. Pure, unit-tested: the watchdog sibling reads the
+/// shared live view directly (the gateway mutates it off the actor task),
+/// so a hung dispatch still yields a climbing age.
+/// [`LiveGuild::not_ready_secs`] delegates here so the sibling can never
+/// drift from main-task semantics.
+fn snapshot_not_ready_age_secs(
+    not_ready_since: Option<tokio::time::Instant>,
+    ready: bool,
+    now: tokio::time::Instant,
+) -> u64 {
+    match not_ready_since {
+        Some(since) if !ready => now.saturating_duration_since(since).as_secs(),
+        _ => 0,
+    }
 }
 
 /// Process-wide guild-actor incarnation counter for the per-actor stall
@@ -8836,8 +8874,9 @@ fn publish_voice_gauges<S: RoomPersistence, H: RoomWrites>(
 
 /// Stall posture shared between the guild actor loop and its watchdog
 /// sibling. The main task owns `&mut worker` and refreshes the snapshot; the
-/// sibling only reads it, so the watchdog and the gauge publish keep running
-/// while a dispatch is hung inside an unbounded await. A hung dispatch still
+/// sibling only reads it (plus the shared live view), so the watchdog and
+/// the gauge publish keep running while a dispatch is hung inside an
+/// unbounded await. A hung dispatch still
 /// cannot answer inbox commands (the inbox consumer is the hung task) and
 /// still cannot recover the halt latch mid-hang: the sibling detects, the
 /// main task recovers once the write returns.
@@ -8851,6 +8890,13 @@ struct StallShared<H> {
     /// so no sibling publish can follow the contribution's removal.
     retired: AtomicBool,
     http: Arc<H>,
+    /// The actor's shared live view. The sibling reads readiness from this
+    /// directly instead of a snapshot copy, because the gateway mutates it
+    /// off the actor task (`publish` on GUILD_CREATE, `gateway_connected`
+    /// on READY/RESUMED) while a dispatch is hung: a copy would go stale
+    /// in both directions (false page after a republish, missed page after
+    /// a reconnect stamps a new not-ready clock).
+    live: LiveGuild,
     /// Actor start instant: the sibling computes the creator-map age from
     /// the stored merge stamp on this clock, so the age keeps climbing
     /// while the main task (and its snapshots) are hung in a dispatch.
@@ -8863,7 +8909,11 @@ struct StallState {
     last_progress: tokio::time::Instant,
     urgent: usize,
     deferred: usize,
-    oldest_age_secs: u64,
+    /// First-enqueue stamp (std clock, as the queue records it) of the
+    /// oldest action still queued at snapshot time; `None` when the queue
+    /// was empty. The sibling recomputes the age on its own clock, so a
+    /// frozen snapshot still yields a climbing age.
+    oldest_enqueued_at: Option<std::time::Instant>,
     halted: bool,
     creators_generation: u64,
     creators_merged_ms: Option<u64>,
@@ -8877,15 +8927,12 @@ impl<H: RoomWrites> StallShared<H> {
     ) {
         let guild = worker.live.guild_id;
         let (urgent, deferred) = worker.queue.pending_counts(guild);
-        let oldest_age_secs = worker
-            .queue
-            .oldest_pending_age(guild)
-            .map_or(0, |age| age.as_secs());
+        let oldest_enqueued_at = worker.queue.oldest_pending_at(guild);
         *self.state.lock().expect("stall snapshot lock") = StallState {
             last_progress,
             urgent,
             deferred,
-            oldest_age_secs,
+            oldest_enqueued_at,
             halted: worker.halted(),
             creators_generation: worker.creators_generation,
             creators_merged_ms: worker.creators_merged_ms,
@@ -8899,9 +8946,23 @@ impl<H: RoomWrites> StallShared<H> {
         creator_map_age_secs(snap.creators_merged_ms, now_ms)
     }
 
-    /// Watchdog + gauge publish from the shared snapshot. Reads only: safe
-    /// to run on the sibling task while the main task is hung in dispatch.
+    /// Watchdog + gauge publish from the shared snapshot and live view.
+    /// Reads only: safe to run on the sibling task while the main task is
+    /// hung in dispatch.
     fn observe(&self, stuck_after: Duration, last_fire: &mut Option<tokio::time::Instant>) {
+        // The queue age derives from the snapshot's first-enqueue stamp on
+        // this task's own clock, so a frozen snapshot (hung dispatch) still
+        // yields a climbing age. Readiness comes from the live view instead:
+        // the gateway mutates it off the actor task, so a snapshot copy
+        // would go stale in both directions (false page after a republish,
+        // missed page after a reconnect stamps a new not-ready clock). Read
+        // the live view before the snapshot lock.
+        let now = tokio::time::Instant::now();
+        let queue_now = std::time::Instant::now();
+        let (live_ready, not_ready_since) = {
+            let live = self.live.read_state();
+            (live.ready, live.not_ready_since)
+        };
         // Publish under the snapshot lock: the metric guard sets `retired`
         // under the same lock before removing this actor's contribution,
         // so a publish either lands before that removal or not at all.
@@ -8922,7 +8983,12 @@ impl<H: RoomWrites> StallShared<H> {
                 self.generation,
                 u64::try_from(snap.urgent).unwrap_or(u64::MAX),
                 u64::try_from(snap.deferred).unwrap_or(u64::MAX),
-                snap.oldest_age_secs,
+                snapshot_queue_age_secs(snap.oldest_enqueued_at, queue_now),
+            );
+            gauges.set_voice_actor_live_not_ready(
+                self.guild,
+                self.generation,
+                snapshot_not_ready_age_secs(not_ready_since, live_ready, now),
             );
             gauges.set_voice_creator_map(
                 snap.creators_generation,
@@ -8933,7 +8999,6 @@ impl<H: RoomWrites> StallShared<H> {
         // Stuck-worker watchdog: queued work with no completed turn for the
         // full window. Log + metric only; the queue keeps its retries so a
         // transient outage still drains on recovery.
-        let now = tokio::time::Instant::now();
         let fire_cooled =
             last_fire.is_none_or(|fired| now.saturating_duration_since(fired) >= stuck_after);
         if fire_cooled
@@ -8950,7 +9015,8 @@ impl<H: RoomWrites> StallShared<H> {
                 guild = self.guild.to_string(),
                 urgent = snap.urgent,
                 deferred = snap.deferred,
-                oldest_pending_age_secs = snap.oldest_age_secs,
+                oldest_pending_age_secs =
+                    snapshot_queue_age_secs(snap.oldest_enqueued_at, queue_now),
                 halted = snap.halted,
                 "voice worker stuck: queued actions with no progress"
             );
@@ -8982,6 +9048,7 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
     let mut dispatch_ready = false;
     let mut maintenance_ready = false;
     let mut dispatch_budget = 8u8;
+    let mut consecutive_inbox_turns = 0u8;
     let mut complete_join_pair = false;
     let mut last_progress = tokio::time::Instant::now();
     let mut last_halt_probe = tokio::time::Instant::now();
@@ -8993,18 +9060,21 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
         generation,
         retired: AtomicBool::new(false),
         http: Arc::clone(&worker.http),
+        live: worker.live.clone(),
         start,
         state: Mutex::new(StallState {
             last_progress,
             urgent: 0,
             deferred: 0,
-            oldest_age_secs: 0,
+            oldest_enqueued_at: None,
             halted: false,
             creators_generation: 0,
             creators_merged_ms: None,
         }),
     });
     stall.snapshot(worker, last_progress);
+    metrics::global()
+        .set_voice_actor_inbox_turn_bound(u64::from(VOICE_ACTOR_MAX_CONSECUTIVE_INBOX_TURNS));
     // Retires this incarnation's stall contribution on every exit path
     // (inbox close or panic unwind). Declared after `stall`, so it drops
     // while the strong ref is still alive and its retire fence can engage.
@@ -9046,6 +9116,7 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
             worker.revalidate_creator(ticket.creator_id).await;
         }
         let accepted = apply_command(worker, command, now_ms);
+        metrics::global().voice_actor_inbox_turn();
         if accepted {
             last_progress = tokio::time::Instant::now();
         }
@@ -9055,7 +9126,12 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
     loop {
         tokio::select! {
             biased;
-            command = inbox.recv() => {
+            // Fair scheduling: park the inbox once the consecutive-turn
+            // bound is reached so a ready dispatch, timer or maintenance
+            // branch runs instead. The count resets on any timer or
+            // maintenance turn, or on a no-op dispatch with none due; a
+            // progressing dispatch keeps the park (see below).
+            command = inbox.recv(), if consecutive_inbox_turns < VOICE_ACTOR_MAX_CONSECUTIVE_INBOX_TURNS => {
                 let Some(command) = command else { break };
                 let now_ms = start
                     .elapsed()
@@ -9068,6 +9144,8 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                     worker.revalidate_creator(ticket.creator_id).await;
                 }
                 let accepted = apply_command(worker, command, now_ms);
+                consecutive_inbox_turns = consecutive_inbox_turns.saturating_add(1);
+                metrics::global().voice_actor_inbox_turn();
                 if accepted {
                     last_progress = tokio::time::Instant::now();
                 }
@@ -9102,6 +9180,14 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                 dispatch_ready = progressed;
                 complete_join_pair = worker.moves.len() > pending_moves;
                 dispatch_budget = dispatch_budget.saturating_sub(1);
+                metrics::global().voice_actor_dispatch_turn();
+                // A progressing dispatch keeps the inbox parked so the drain
+                // finishes (a create runs with its priority move); a no-op
+                // turn yields back to the inbox unless maintenance is already
+                // due, in which case it runs next.
+                if !progressed && !maintenance_ready {
+                    consecutive_inbox_turns = 0;
+                }
             }
             _ = timer.tick() => {
                 let now_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
@@ -9172,6 +9258,7 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                 stall.snapshot(worker, last_progress);
                 dispatch_ready = true;
                 maintenance_ready = true;
+                consecutive_inbox_turns = 0;
             }
             // Never interpose maintenance SQL/notices between create and move.
             _ = std::future::ready(()), if maintenance_ready => {
@@ -9188,10 +9275,14 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                 worker.send_notices(now_ms).await;
                 worker.flush_kick_audit(now_ms).await;
                 dispatch_budget = 8;
+                consecutive_inbox_turns = 0;
             }
             // Yield after a bounded turn even when the next timer is not due.
             // A persisted creator move is allowed to finish the current pair.
             _ = tokio::task::yield_now(), if dispatch_ready => {
+                // Budget refill only, not a fairness turn: the inbox stays
+                // parked so the refilled dispatch runs next instead of
+                // starving behind new churn.
                 dispatch_budget = 8;
             }
         }

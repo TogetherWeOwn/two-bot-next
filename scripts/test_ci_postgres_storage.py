@@ -19,9 +19,9 @@ NEXTEST_WORKFLOW = (
     Path(__file__).resolve().parents[1] / ".github/workflows/reusable-rust-nextest.yml"
 )
 NEXTEST_WORKFLOW_TEXT = NEXTEST_WORKFLOW.read_text()
-# The three Rust test lanes (rust-tests, ignored-db-stores, ignored-db-runtime)
-# each run their own copy of this service; the first one in the file is the
-# reference and the others must match it exactly.
+# The four Rust test lanes (rust-tests, patch-coverage, ignored-db-stores,
+# ignored-db-runtime) each run their own copy of this service; the first one
+# in the file is the reference and the others must match it exactly.
 SERVICES = [part.split("    steps:\n", 1)[0] for part in WORKFLOW_TEXT.split("      agent-testdb:\n")[1:]]
 SERVICE = SERVICES[0]
 TOKENS = shlex.split(SERVICE.split("        options: >-\n", 1)[1])
@@ -37,11 +37,12 @@ NEXTEST_VERIFY_TAILS = NEXTEST_WORKFLOW_TEXT.split("      - name: Verify disposa
 NEXTEST_SCRIPT = textwrap.dedent(
     NEXTEST_VERIFY_TAILS[0].split("python3 - <<'PY'\n", 1)[1].split("\n          PY", 1)[0]
 )
-POSTGRES_LANES = ("rust-tests", "ignored-db-stores", "ignored-db-runtime")
+POSTGRES_LANES = ("rust-tests", "patch-coverage", "ignored-db-stores", "ignored-db-runtime")
 # Coverage replay needs earlier checkpoints on the same 1 GiB tmpfs. Only
-# its WAL targets differ; all four probes must enforce the same safety checks.
+# its WAL targets differ; all five probes must enforce the same safety checks.
 WAL_BUDGETS = {
     "rust-tests": ("128MB", "32MB"),
+    "patch-coverage": ("128MB", "32MB"),
     "ignored-db-stores": ("512MB", "64MB"),
     "ignored-db-runtime": ("512MB", "64MB"),
     "nextest": ("512MB", "64MB"),
@@ -84,10 +85,10 @@ class PostgresStorageTests(unittest.TestCase):
         self.assertEqual(OPTIONS["--memory-swap"], OPTIONS["--memory"])
         # One bounded service per lane, byte-identical: the lanes must keep
         # sharing the config the single `check` job had.
-        self.assertEqual(WORKFLOW_TEXT.count("--tmpfs /var/lib/postgresql:"), 3)
-        self.assertEqual(WORKFLOW_TEXT.count("image: postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722"), 3)
+        self.assertEqual(WORKFLOW_TEXT.count("--tmpfs /var/lib/postgresql:"), 4)
+        self.assertEqual(WORKFLOW_TEXT.count("image: postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722"), 4)
         bounded = [service for service in SERVICES if "--tmpfs" in service]
-        self.assertEqual(len(bounded), 3)
+        self.assertEqual(len(bounded), 4)
         self.assertEqual(len(set(bounded)), 1, "the lanes' Postgres services drifted apart")
         self.assertNotIn("/var/lib/postgresql/data", SERVICE)
         self.assertNotIn("PGDATA:", SERVICE)
@@ -110,15 +111,15 @@ class PostgresStorageTests(unittest.TestCase):
                 result = subprocess.run(["sh", "-c", stubs + command], check=False)
                 self.assertEqual(result.returncode, expected)
 
-    def test_all_three_lanes_bound_wal_and_verify_it(self):
+    def test_all_four_lanes_bound_wal_and_verify_it(self):
         # Run 39209332791: only rust-tests bounded WAL while the ignored lanes
         # ran the PG18 default (max_wal_size 1GB) on the same 1 GiB tmpfs, and
         # the stores lane PANICed with ENOSPC mid-suite. Every lane that mounts
         # the bounded service must carry the budget and verify it. Scope the
         # checks per job: a global count lets one lane's two prepares satisfy
         # another lane's missing one.
-        self.assertEqual(len(PREPARE_TAILS), 3)
-        self.assertEqual(len(VERIFY_TAILS), 3)
+        self.assertEqual(len(PREPARE_TAILS), 4)
+        self.assertEqual(len(VERIFY_TAILS), 4)
         scripts = []
         for lane in POSTGRES_LANES:
             with self.subTest(lane=lane):
