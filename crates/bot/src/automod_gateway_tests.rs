@@ -12,6 +12,12 @@ use two_bot_core::automod_runtime::{
 use two_bot_core::AutomodFilter;
 use two_bot_discord::automod_activation::{FetchedMessage, RetainReason};
 
+// Protected fail-open acceptance lives in its own file: unparseable
+// delivery timestamps must refuse instead of anchoring at epoch 0. The
+// implementation change must not edit the protected file.
+#[path = "fail_open_automod_acceptance_tests.rs"]
+mod fail_open_automod_acceptance;
+
 const OWEN: &str = "123456789012345678";
 const ROLE: &str = "234567890123456789";
 const GUILD: u64 = 1_545_644_954_272_137_297;
