@@ -191,9 +191,23 @@ class Client:
             return data["result"]
 
 
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins, at any depth."""
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
+
+
 def decode(body):
     try:
-        return json.loads(body)
+        return json.loads(body, object_pairs_hook=_reject_duplicate_keys)
     except (ValueError, UnicodeError, RecursionError):
         # Excessively nested input exhausts the decoder's recursion budget
         # below MAX_BODY; classify it as invalid_json like any malformed body.

@@ -108,6 +108,7 @@ import {
   interruptCommunityFactsDrain,
   interruptDispatchDrops,
   interruptAuditHalt,
+  interruptPrefixVerdictRefusals,
   sanitizeScrapeLossState,
   scrapeLossFiringMessage,
   scrapeLossResolvedMessage,
@@ -1641,7 +1642,7 @@ export class TwoBotContainer extends Container<Env> {
         // if the webhook fails or an alarm is retried.
         await this.ctx.storage.put(
           METRICS_ALERT_KEY,
-          interruptAuditHalt(interruptCommunityFactsDrain(interruptDispatchDrops(previous))),
+          interruptPrefixVerdictRefusals(interruptAuditHalt(interruptCommunityFactsDrain(interruptDispatchDrops(previous)))),
         );
         await this.ctx.storage.put(SCRAPE_LOSS_KEY, { streak, firing });
         if (justFired) {

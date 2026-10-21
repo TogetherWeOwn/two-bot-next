@@ -1,7 +1,7 @@
 # Backups, restore drills, and sealed guild-config snapshots (TOG-9881)
 
 Rust port of the legacy `two-bot` cutover-data surface (frozen source
-`two-bot` `main @ d5d11793`): v9 dump format with v3/v4/v5/v6/v7/v8 read compatibility,
+`two-bot` `main @ d5d11793`): v10 dump format with v3/v4/v5/v6/v7/v8/v9 read compatibility,
 SigV4 off-box upload, retention
 math, sealed guild-config snapshot + restore planner, and the three timer
 equivalents. Code: `crates/core/src/backup/`, CLI: `two-bot backup |
@@ -17,14 +17,15 @@ require `--force`. This confirmation is not authorization to target production.
 ## The format
 
 Gzipped NDJSON, one object per line: `manifest` / `row` / `end`. New dumps
-write **v9** (including durable voice-create reservations, the retention
+write **v10** (including durable voice-create reservations, the retention
 queues, the seasonal XP projection, the event store: voice capture plus
 presence capture plus member-capture deltas plus message/reaction capture
 plus thread lifecycle plus stage/interaction-observe/audit-log capture plus
 invite/scheduled-event capture, the stream go-live ledger, guild game-activity
-aggregates and the assistant monthly-cap ledger); the reader also accepts
+aggregates, the assistant monthly-cap ledger and the scheduled-event
+epoch-claim guard); the reader also accepts
 frozen **v3**, pre-reservation **v4**, pre-v6-tables **v5**, pre-seasonal **v6**,
-pre-stream-ledger **v7** and pre-guild-counters **v8**.
+pre-stream-ledger **v7**, pre-guild-counters **v8** and pre-epoch-claim **v9**.
 Other versions refuse.
 The manifest carries per-table `{name, columns, column_types, count}` taken
 inside one `REPEATABLE READ` transaction, the `events` high-water mark, the
@@ -57,10 +58,10 @@ unsupported. A failed write or validation leaves existing published recovery
 points untouched; a crash may leave a temporary file, but retention and drill
 selectors ignore it.
 
-### Coverage and recovery semantics (v4, v5, v6, v7, v8 and v9)
+### Coverage and recovery semantics (v4, v5, v6, v7, v8, v9 and v10)
 
 `DUMP_TABLES` in `crates/core/src/backup/dump_file.rs` is the single ordered
-inventory for both dump and restore. It includes **96 durable tables from the
+inventory for both dump and restore. It includes **97 durable tables from the
 current cutover migrations**, including the bot-owned website-contract backing
 tables, the member-moderation ledger, the self-role send receipts
 (`self_role_exchanges`) plus their uncertainty baselines
@@ -79,33 +80,38 @@ invite/scheduled-event capture)
 message/reaction capture, 0431 stage/interaction-observe/audit-log capture
 plus 0432 member-capture deltas plus 0439 invite/scheduled-event capture)
 the stream go-live ledger (`stream_live_claims`: 0440/0443), guild game-activity
-aggregates (`game_activity_guild_aggregates`: 0441/0442) and the assistant
-monthly-cap ledger (`assistant_monthly_builds`: 0446/0447).
+aggregates (`game_activity_guild_aggregates`: 0441/0442), the assistant
+monthly-cap ledger (`assistant_monthly_builds`: 0446/0447) and the
+scheduled-event epoch-claim guard (`scheduled_events_claim`: 0450/0451).
 `OPTIONAL_LEGACY_TABLES` is empty: the coverage
 test fails if a covered table is not migrated. A dump from a fresh Rust schema
-has 96 table entries. A missing current table refuses a dump/restore: migrate
+has 97 table entries. A missing current table refuses a dump/restore: migrate
 the target first.
 Each readable version requires its historical inventory and waives only
 versioned additions introduced later:
 
 | Version | Tables it may omit |
 | --- | --- |
-| v4 | `V5_ADDED_TABLES` (reservations and privacy controls), `V6_ADDED_TABLES` (event store), `V7_ADDED_TABLES` (seasonal XP and retention queues), `V8_ADDED_TABLES` (stream ledger), `V9_ADDED_TABLES` (guild counters) |
-| v5 | `V6_ADDED_TABLES`, `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES` |
-| v6 | `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES` |
-| v7 | `V8_ADDED_TABLES`, `V9_ADDED_TABLES` |
-| v8 | `V9_ADDED_TABLES`: `game_activity_guild_aggregates`, `assistant_monthly_builds` |
-| v9 | None: the full current inventory is required |
+| v4 | `V5_ADDED_TABLES` (reservations and privacy controls), `V6_ADDED_TABLES` (event store), `V7_ADDED_TABLES` (seasonal XP and retention queues), `V8_ADDED_TABLES` (stream ledger), `V9_ADDED_TABLES` (guild counters), `V10_ADDED_TABLES` (epoch-claim guard) |
+| v5 | `V6_ADDED_TABLES`, `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES` |
+| v6 | `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES` |
+| v7 | `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES` |
+| v8 | `V9_ADDED_TABLES`, `V10_ADDED_TABLES` |
+| v9 | `V10_ADDED_TABLES`: `scheduled_events_claim` |
+| v10 | None: the full current inventory is required |
 
 These are narrow waivers, not permission to omit arbitrary tables. An
 incomplete new archive refuses at inspection. The frozen 85-table v4 fixture
-is unchanged from before these additions; older v4–v8 archives need not
-invent entries for the v9 guild counters. Restoring an older archive clears
+is unchanged from before these additions; older v4–v9 archives need not
+invent entries for the v9 guild counters or the v10 epoch-claim guard.
+Restoring an older archive clears
 destination rows for every omitted later table instead of retaining unrelated
 target state. In particular, restoring v8 without guild counters clears both
 counters; it cannot recover assistant usage that predates its persistence.
-Use a v9 recovery point to preserve the monthly cap. Current v9 archives must
-include the ledger, so routine restores retain its archived usage.
+Restoring v9 without the claim guard clears the guard; the mirror re-fences
+on the next winning fetch. Use a v10 recovery point to preserve the monthly
+cap and the mirror fence. Current v10 archives must
+include both tables, so routine restores retain their archived state.
 An optional legacy table may be absent only when there are no archived rows for
 it. Nonempty legacy data without a matching target table refuses **before any
 truncate**, rather than silently discarding it.

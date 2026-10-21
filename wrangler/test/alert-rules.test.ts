@@ -972,6 +972,11 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "eventsub_tampered",
     "eventsub_reconcile_failed",
     "event_store_consumer_lag",
+    "prefix_trigger_verdict_refusals",
+    "voice_worker_halted",
+    "voice_live_self_heal",
+    "voice_live_not_ready",
+    "voice_queue_stall",
   ]);
   assert.equal(packetFilename("job_stale:rank", window), `evidence-job_stale-${window}.json`);
   assert.equal(packetFilename("job_consecutive_failures:counter", window), `evidence-job_consecutive_failures-${window}.json`);
@@ -1001,6 +1006,11 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("audit_delivery_halt", window), `evidence-audit_delivery_halt-${window}.json`);
   assert.equal(packetFilename("eventsub_tampered", window), `evidence-eventsub_tampered-${window}.json`);
   assert.equal(packetFilename("eventsub_reconcile_failed", window), `evidence-eventsub_reconcile_failed-${window}.json`);
+  assert.equal(packetFilename("prefix_trigger_verdict_refusals", window), `evidence-prefix_trigger_verdict_refusals-${window}.json`);
+  assert.equal(packetFilename("voice_worker_halted", window), `evidence-voice_worker_halted-${window}.json`);
+  assert.equal(packetFilename("voice_live_self_heal", window), `evidence-voice_live_self_heal-${window}.json`);
+  assert.equal(packetFilename("voice_live_not_ready", window), `evidence-voice_live_not_ready-${window}.json`);
+  assert.equal(packetFilename("voice_queue_stall", window), `evidence-voice_queue_stall-${window}.json`);
   // Unknown keys get no filename rather than a misleading one; hostile
   // window stamps stay filename-safe.
   assert.equal(packetFilename("no_such_rule", window), undefined);
@@ -1215,6 +1225,20 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
     `two_bot_eventsub_reconcile_passes_total{outcome="failed"} ${failed}`,
   ];
   firing.push(...ev(reconcilePasses(3, 1, 1), ev(reconcilePasses(3, 1, 0)).state).firing);
+  let prefix = ev([`two_bot_gateway_prefix_trigger_refused_total{reason="verdict"} 0`]);
+  for (const n of [1, 2, 3]) {
+    prefix = ev([`two_bot_gateway_prefix_trigger_refused_total{reason="verdict"} ${n}`], prefix.state);
+  }
+  firing.push(...prefix.firing);
+  firing.push(...ev(["two_bot_voice_worker_halted 1"]).firing);
+  firing.push(
+    ...ev(
+      [`two_bot_voice_live_self_heal_total 6`],
+      ev([`two_bot_voice_live_self_heal_total 5`]).state,
+    ).firing,
+  );
+  firing.push(...ev(["two_bot_voice_live_not_ready_seconds 121"]).firing);
+  firing.push(...ev(["two_bot_voice_queue_oldest_age_seconds 121"]).firing);
   assert.equal(firing.length, RULES.length, `expected one firing key per rule, got: ${firing.join(", ")}`);
   const packets = transitionMessages([], firing);
   assert.equal(packets.length, RULES.length);

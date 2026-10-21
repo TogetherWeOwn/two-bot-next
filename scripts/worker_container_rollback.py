@@ -29,9 +29,12 @@ version to SHA; the snapshot records that SHA beside the serving version
 and image. Before any restore POST, the receipt is validated against live
 Cloudflare state: the version's annotated SHA must equal the receipt SHA,
 the version must appear in the 100%-serving deployment history, and the
-image must appear in a completed rollout for the application. A missing or
-mismatched member refuses the rollback: a merely CI-green SHA paired with
-some other version is never admitted.
+image must appear in a completed rollout for the application, or a
+replaced one with convergence evidence (every step completed, every
+instance updated: a rollout can be replaced before it finishes). A missing or
+mismatched member refuses the
+rollback: a merely CI-green SHA paired with some other version is never
+admitted.
 
 Fail-closed rules, each pinned by scripts/test_worker_container_rollback.py:
 - Only allowlisted IDs, integers, statuses and fixed-vocabulary tokens reach
@@ -68,6 +71,26 @@ import staging_rollout as base
 GateError = base.GateError
 require = base.require
 
+
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    raised message is fixed vocabulary: it names no key, value or path.
+    """
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
+
+
 VERSION_ID = re.compile(base.UUID)
 SHA = re.compile(r"[0-9a-f]{40}")
 # Consecutive fully-passing gate polls required: ~10 s per poll, so 18 is the
@@ -84,6 +107,8 @@ AUTH_STATUSES = ("401", "403")
 ACTOR = re.compile(r"[a-zA-Z0-9_.:@/-]{1,128}")
 SAFE_CONTROL_LINE = re.compile(
     r"(Ownership control failed \(HTTP [0-9]{3}\)|"
+    r"Ownership control request (timeout|failed)|"
+    r"Ownership control invalid response|"
     r"Singleton is intentionally fenced or uninitialized|"
     r"Ownership transition not confirmed|"
     r"OWNERSHIP_CONTROL_TOKEN is missing or invalid|"
@@ -313,13 +338,43 @@ def version_sha(client, worker, version):
     return message if isinstance(message, str) and SHA.fullmatch(message) else None
 
 
+def replaced_converged(row):
+    """Convergence evidence for a `replaced` provenance row.
+
+    A rollout can be `replaced` before it finishes (superseded in flight),
+    so status alone never proves the image rolled out. Accept only rows
+    whose record shows every step completed and every instance updated.
+    Any malformed shape reads as unconverged: fail closed. Mirrors the
+    staging drill's replaced_converged (scripts/staging_container_drill.py).
+    """
+    try:
+        record = base.mapping(row)
+        steps = base.sequence(record.get("steps"))
+        progress = base.mapping(record.get("progress"))
+        total_steps = base.number(progress.get("total_steps"))
+        total = base.number(progress.get("total_instances"))
+        updated = base.number(progress.get("updated_instances"))
+        steps_done = all(base.mapping(step).get("status") == "completed"
+                         for step in steps)
+    except GateError:
+        return False
+    if not steps or total_steps <= 0 or len(steps) != total_steps:
+        return False
+    if not steps_done:
+        return False
+    return total > 0 and total == updated
+
+
 def validate_receipt_against_live(client, receipt):
     """Bind a receipt to live Cloudflare state with reads only, before any
     restore POST: the version must have been deployed from the receipt
     SHA and must have served 100% before, and the image must come from a
-    completed rollout of this application. Rollout images carry no
-    version link, so served-before membership is the strongest image
-    binding the API offers; version and SHA bind exactly."""
+    rollout of this application that completed (status completed, or
+    replaced with convergence evidence: Cloudflare flips every superseded
+    rollout to replaced, so after any deploy the previous image lives only
+    there, but a rollout can also be replaced before it finishes). Rollout
+    images carry no version link, so served-before membership is the
+    strongest image binding the API offers; version and SHA bind exactly."""
     require(version_sha(client, receipt.worker, receipt.version) == receipt.sha,
             "provenance_mismatch", "member=sha")
     require(receipt.version in deployments(client, receipt.worker),
@@ -329,7 +384,10 @@ def validate_receipt_against_live(client, receipt):
     for row in app_rollouts(client, app["id"]):
         row = base.mapping(row)
         image = base.mapping(row.get("target_configuration")).get("image")
-        if (row.get("status") == "completed" and isinstance(image, str)
+        status = row.get("status")
+        proven = (status == "completed"
+                  or (status == "replaced" and replaced_converged(row)))
+        if (proven and isinstance(image, str)
                 and re.fullmatch(image_pattern(receipt.application), image)):
             served.add(image)
     require(receipt.image in served, "provenance_image_never_served")
@@ -394,8 +452,8 @@ def control_client(variant, token, worker_url, staging_url, actor, root=None):
             # step, which runs with release_fence=false by default.
             raise GateError("ownership_control_failed", detail)
         try:
-            return base.mapping(json.loads(result.stdout))
-        except ValueError:
+            return base.mapping(json.loads(result.stdout, object_pairs_hook=_reject_duplicate_keys))
+        except (ValueError, RecursionError):
             raise GateError("ownership_control_invalid_response") from None
 
     return control
@@ -592,6 +650,33 @@ def check_url(variant, url):
     return url
 
 
+def print_dry_run_plan(*, client, worker, restore_version, restore_image,
+                     receipt_sha, log=print):
+    """Print the ordered restore plan; reads only, never a POST or mutation.
+
+    The five lines name the fence, worker, image, takeover and gate steps,
+    carrying the validated receipt members (version UUID, image digest URL,
+    SHA). Only allowlisted IDs reach the log. The fence line mirrors the live
+    path: a pre-restore fence when the worker leg runs, otherwise deferred to
+    takeover, since the live path only fences inside takeover after the image
+    rollout when the worker already serves the restore version.
+    """
+    current = serving_version(client, worker)
+    if current != restore_version:
+        log(f"dry-run plan: fence the singleton before restoring version {restore_version}")
+        log(f"dry-run plan: worker POST deployments restoring version {restore_version}")
+    else:
+        log("dry-run plan: fence deferred to takeover; no pre-restore fence "
+            "(worker leg skipped)")
+        log(f"dry-run plan: worker already serves {restore_version}; image leg only")
+    log(f"dry-run plan: image POST container rollout restoring image {restore_image}")
+    log(f"dry-run plan: takeover ownership to version {restore_version}")
+    if receipt_sha is not None:
+        log(f"dry-run plan: gate stable readyz for version {restore_version} sha {receipt_sha}")
+    else:
+        log(f"dry-run plan: gate stable readyz for version {restore_version} pre-stamp no-sha")
+
+
 def main(argv=None, *, environ=None, client_factory=RollbackClient):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -612,6 +697,9 @@ def main(argv=None, *, environ=None, client_factory=RollbackClient):
     roll.add_argument("--target-image", default=None)
     roll.add_argument("--actor", required=True)
     roll.add_argument("--evidence", required=True)
+    roll.add_argument("--dry-run", action="store_true",
+                      help="validate the receipt and print the ordered restore plan "
+                           "without any POST or ownership mutation")
     args = parser.parse_args(argv)
     env = os.environ if environ is None else environ
     rollback = None
@@ -690,6 +778,15 @@ def main(argv=None, *, environ=None, client_factory=RollbackClient):
             receipt = ProvenanceReceipt(worker, application, restore_version,
                                         expected_sha, restore_image)
             validate_receipt_against_live(client, receipt)
+        if args.dry_run:
+            # The receipt is validated identically to the live path above; the
+            # plan below reads the serving version only and never POSTs, never
+            # touches ownership control, and writes no evidence file.
+            print_dry_run_plan(client=client, worker=worker,
+                               restore_version=restore_version,
+                               restore_image=restore_image,
+                               receipt_sha=receipt.sha if receipt is not None else expected_sha)
+            return 0
         token = env.get("OWNERSHIP_CONTROL_TOKEN", "")
         require(len(token) >= 32, "missing_ownership_token")
         require(ACTOR.fullmatch(args.actor), "invalid_actor")

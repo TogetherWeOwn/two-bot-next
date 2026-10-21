@@ -245,7 +245,7 @@ four values.
   absent and rotation stays disarmed. The delivery gate and its channel/invite
   inputs travel on their own explicit lines inside that forward, only while
   `TWO_EVENTSUB_DELIVERY` is exactly `"1"`.
-  `scripts/check-env-bindings.py` rejects any `TWO_EVENTSUB*` or
+  `wrangler/scripts/check-env-bindings.py` rejects any `TWO_EVENTSUB*` or
   `TWO_TWITCH_*` var in `wrangler.toml`.
 
 ## Helix client with app-token refresh
@@ -261,7 +261,9 @@ four values.
 - The app token is cached and refreshed 60 s before its `expires_in`
   instant, plus once on a 401 with a single retry. The Helix calls have no
   timers of their own; the bot runtime (`crates/bot/src/eventsub_reconcile.rs`)
-  invokes them once at startup and on a bounded hourly interval.
+  invokes them once at startup and on a bounded hourly interval. Each pass
+  signs creates with the receiver's live snapshot, never boot env, so a
+  rotated secret signs the next creates with no restart.
 - `list_subscriptions` follows every `stream.online` page (up to a bounded
   limit); pass its complete result to `plan_boot_actions` for the deletes-first
   plan, then `execute_actions` runs it in order. A create that answers 409
