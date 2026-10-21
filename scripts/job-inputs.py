@@ -166,6 +166,7 @@ RUST_WORKER_DOCS = frozenset({
     "docs/startup-diagnostics.md",
 })
 WORKER_DOCS = frozenset({
+    "docs/internal-actions-receiver.md",  # receiver-docs.test.ts observes the shipped contract
     "docs/runbook.md",
     "docs/container-readiness.md",
 })
