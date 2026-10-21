@@ -505,7 +505,10 @@ pub(crate) fn join_on_shutdown(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         // An aborted supervisor must not leave a detached worker behind.
-        let _worker_guard = AbortOnDrop(worker.abort_handle());
+        // This binding keeps the abort handle (it must not be named like a
+        // discarded handle: the supervision acceptance suite scans these
+        // sources for one).
+        let _abort_guard = AbortOnDrop(worker.abort_handle());
         let _ = shutdown.wait_for(|latched| *latched).await;
         on_shutdown();
         match tokio::time::timeout(budget, &mut worker).await {
