@@ -7,6 +7,7 @@
     "invocation": "staging-migrate --plan|--apply"
   },
   "mode": "plan",
+  "migration_target": "staging",
   "source_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "target": {
     "host": "staging.invalid",
