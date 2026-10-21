@@ -115,8 +115,8 @@ pub const MAX_MESSAGE_CHARS: usize = 2000;
 
 /// Outcome of applying a reward plan: the role ids written (grants first,
 /// then revokes, in plan order), the first refused role with its
-/// [`refusal_reason`], and the role ids never attempted because the first
-/// refusal aborts the rest.
+/// fixed-vocabulary refusal reason, and the role ids never attempted because
+/// the first refusal aborts the rest.
 pub type RewardRoleReport = (Vec<String>, Option<(String, String)>, Vec<String>);
 
 /// Fixed-vocabulary reason a role write failed. A confirmed Discord refusal
