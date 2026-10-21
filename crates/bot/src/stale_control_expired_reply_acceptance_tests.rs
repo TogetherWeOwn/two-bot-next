@@ -240,7 +240,7 @@ fn unknown_modal(custom_id: &str) -> Interaction {
     interaction
 }
 
-async fn mock() -> MockRest {
+async fn new_mock() -> MockRest {
     MockRest::start(Vec::new(), ScriptedResponse::json(200, json!({"id": "99"}))).await
 }
 
@@ -273,7 +273,7 @@ fn assert_expired_reply(requests: &[RestRequest]) {
 
 #[tokio::test]
 async fn unknown_button_gets_one_expired_reply() {
-    let mock = mock().await;
+    let mock = new_mock().await;
     let runtime = runtime(base_gates(), mock.origin());
     let interaction = unknown_component(
         "two:stale-widget:deadbeef",
@@ -287,7 +287,7 @@ async fn unknown_button_gets_one_expired_reply() {
 
 #[tokio::test]
 async fn unknown_menu_gets_one_expired_reply() {
-    let mock = mock().await;
+    let mock = new_mock().await;
     let runtime = runtime(base_gates(), mock.origin());
     let interaction = unknown_component(
         "two:old-menu:xyz",
@@ -301,7 +301,7 @@ async fn unknown_menu_gets_one_expired_reply() {
 
 #[tokio::test]
 async fn unknown_modal_gets_one_expired_reply() {
-    let mock = mock().await;
+    let mock = new_mock().await;
     let runtime = runtime(base_gates(), mock.origin());
     runtime
         .on_interaction(&unknown_modal("two:old-modal:xyz"))
@@ -317,7 +317,7 @@ async fn removed_panel_gets_expired_reply_without_mutation() {
         parse_self_role_custom_id(custom_id).is_some(),
         "well-formed stale reference"
     );
-    let mock = mock().await;
+    let mock = new_mock().await;
     let runtime = roles_runtime(sr_gates(), mock.origin());
     let interaction = sr_button(SR_EVENT, custom_id, ComponentType::Button, Vec::new());
     runtime.on_interaction(&interaction).await;
@@ -328,7 +328,7 @@ async fn removed_panel_gets_expired_reply_without_mutation() {
 #[tokio::test]
 async fn replaced_source_message_gets_expired_reply_without_mutation() {
     let custom_id = self_role_custom_id("games", Some("new"));
-    let mock = mock().await;
+    let mock = new_mock().await;
     let runtime = roles_runtime(sr_gates(), mock.origin());
     let mut interaction = sr_button(SR_EVENT + 1, &custom_id, ComponentType::Button, Vec::new());
     interaction.message.as_mut().expect("source message").id = Id::new(SR_MESSAGE + 1);
@@ -344,7 +344,7 @@ async fn removed_button_option_gets_expired_reply_without_mutation() {
         parse_self_role_custom_id(custom_id).is_some(),
         "well-formed stale reference"
     );
-    let mock = mock().await;
+    let mock = new_mock().await;
     let runtime = roles_runtime(sr_gates(), mock.origin());
     let interaction = sr_button(SR_EVENT + 2, custom_id, ComponentType::Button, Vec::new());
     runtime.on_interaction(&interaction).await;
@@ -359,7 +359,7 @@ async fn removed_select_values_get_expired_reply_without_mutation() {
         parse_self_role_custom_id(&custom_id).is_some(),
         "well-formed stale reference"
     );
-    let mock = mock().await;
+    let mock = new_mock().await;
     let runtime = roles_runtime(sr_gates(), mock.origin());
     let interaction = sr_button(
         SR_EVENT + 3,
@@ -379,7 +379,7 @@ async fn voice_prefix_alone_does_not_claim_ownership() {
         parse_voice_custom_id(custom_id).is_none(),
         "prefix without a voice action is unowned"
     );
-    let mock = mock().await;
+    let mock = new_mock().await;
     let runtime = runtime(base_gates(), mock.origin());
     let interaction = unknown_component(custom_id, ComponentType::Button, Vec::new());
     runtime.on_interaction(&interaction).await;
@@ -389,7 +389,7 @@ async fn voice_prefix_alone_does_not_claim_ownership() {
 
 #[tokio::test]
 async fn armed_matching_application_gets_expired_reply() {
-    let mock = mock().await;
+    let mock = new_mock().await;
     let runtime = runtime(base_gates(), mock.origin());
     runtime.set_identity(APP_ID, APP_ID);
     let interaction = unknown_component(
@@ -413,7 +413,7 @@ async fn armed_matching_application_gets_expired_reply() {
 
 #[tokio::test]
 async fn foreign_application_stays_silent() {
-    let mock = mock().await;
+    let mock = new_mock().await;
     let runtime = runtime(base_gates(), mock.origin());
     runtime.set_identity(APP_ID, APP_ID);
     let mut button = unknown_component(
@@ -432,7 +432,7 @@ async fn foreign_application_stays_silent() {
     );
     mock.shutdown().await;
 
-    let mock_two = mock().await;
+    let mock_two = new_mock().await;
     let runtime = roles_runtime(sr_gates(), mock_two.origin());
     runtime.set_identity(APP_ID, APP_ID);
     let mut stale = sr_button(
@@ -452,7 +452,7 @@ async fn foreign_application_stays_silent() {
 
 #[tokio::test]
 async fn foreign_and_missing_guild_stay_silent() {
-    let mock = mock().await;
+    let mock = new_mock().await;
     let runtime = runtime(base_gates(), mock.origin());
     for guild in [Some(Id::new(9999)), None] {
         let mut button = unknown_component(
@@ -472,7 +472,7 @@ async fn foreign_and_missing_guild_stay_silent() {
     );
     mock.shutdown().await;
 
-    let mock_two = mock().await;
+    let mock_two = new_mock().await;
     let runtime = roles_runtime(sr_gates(), mock_two.origin());
     for (index, guild) in [Some(Id::new(9999)), None].into_iter().enumerate() {
         let mut stale = sr_button(
@@ -518,7 +518,7 @@ async fn malformed_self_role_reference_stays_silent() {
             "malformed id parses to nothing: {custom_id}"
         );
     }
-    let mock = mock().await;
+    let mock = new_mock().await;
     let runtime = roles_runtime(sr_gates(), mock.origin());
     for (index, (custom_id, component_type, values)) in cases.into_iter().enumerate() {
         let interaction = sr_button(
@@ -538,7 +538,7 @@ async fn malformed_self_role_reference_stays_silent() {
 
 #[tokio::test]
 async fn bot_member_stays_silent() {
-    let mock = mock().await;
+    let mock = new_mock().await;
     let runtime = runtime(base_gates(), mock.origin());
     let mut button = unknown_component(
         "two:stale-widget:deadbeef",
@@ -561,7 +561,7 @@ async fn bot_member_stays_silent() {
     );
     mock.shutdown().await;
 
-    let mock_two = mock().await;
+    let mock_two = new_mock().await;
     let runtime = roles_runtime(sr_gates(), mock_two.origin());
     let mut stale = sr_button(
         SR_EVENT + 5,
@@ -592,7 +592,7 @@ async fn disabled_self_role_surface_stays_silent() {
         ..sr_gates()
     };
     let custom_id = self_role_custom_id("games", Some("new"));
-    let mock = mock().await;
+    let mock = new_mock().await;
     let origin = mock.origin();
     let service = service(origin.clone());
     let runtime = CommandRuntime::new_with_self_roles(
@@ -630,7 +630,7 @@ async fn voice_owned_controls_stay_silent() {
         parse_voice_custom_id(&modal_id).is_some(),
         "voice modal fixture parses as voice-owned"
     );
-    let mock = mock().await;
+    let mock = new_mock().await;
     let runtime = runtime(base_gates(), mock.origin());
     let button = unknown_component(&button_id, ComponentType::Button, Vec::new());
     runtime.on_interaction(&button).await;
@@ -649,7 +649,7 @@ async fn onboarding_picker_controls_stay_silent() {
         session_picker: true,
         ..base_gates()
     };
-    let mock = mock().await;
+    let mock = new_mock().await;
     let runtime = runtime(gates, mock.origin());
     let game = unknown_component(GAME_SELECT_ID, ComponentType::Button, Vec::new());
     runtime.on_interaction(&game).await;
@@ -672,7 +672,7 @@ async fn ticket_controls_without_service_stay_silent() {
         tickets: true,
         ..base_gates()
     };
-    let mock = mock().await;
+    let mock = new_mock().await;
     let runtime = runtime(gates, mock.origin());
     let ticket = unknown_component(TICKET_OPEN_ID, ComponentType::Button, Vec::new());
     runtime.on_interaction(&ticket).await;
@@ -698,7 +698,7 @@ async fn disabled_surfaces_stay_silent() {
         onboarding_picker: false,
         session_picker: false,
     };
-    let mock = mock().await;
+    let mock = new_mock().await;
     let runtime = runtime(gates, mock.origin());
     let game = unknown_component(GAME_SELECT_ID, ComponentType::Button, Vec::new());
     runtime.on_interaction(&game).await;
@@ -723,7 +723,7 @@ async fn disabled_surfaces_stay_silent() {
 
 #[tokio::test]
 async fn invalid_component_payload_stays_silent() {
-    let mock = mock().await;
+    let mock = new_mock().await;
     let runtime = runtime(base_gates(), mock.origin());
     let mut dataless = slash("unused", Some(3333), Vec::new());
     dataless.kind = InteractionType::MessageComponent;
@@ -742,7 +742,7 @@ async fn invalid_component_payload_stays_silent() {
 
 #[tokio::test]
 async fn unknown_slash_keeps_unknown_command_copy() {
-    let mock = mock().await;
+    let mock = new_mock().await;
     let runtime = runtime(base_gates(), mock.origin());
     runtime
         .on_interaction(&slash("not-a-command", Some(3333), Vec::new()))
@@ -753,7 +753,7 @@ async fn unknown_slash_keeps_unknown_command_copy() {
 
 #[tokio::test]
 async fn help_stays_functional() {
-    let mock = mock().await;
+    let mock = new_mock().await;
     let runtime = runtime(base_gates(), mock.origin());
     runtime
         .on_interaction(&slash("help", Some(3333), Vec::new()))
