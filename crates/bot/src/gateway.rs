@@ -1459,18 +1459,42 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         if missed > 0 {
                             two_bot_core::metrics::global().gateway_missed_events(missed);
                         }
+                        // A duplicate key in a MESSAGE_UPDATE refuses the
+                        // automod edit below; the same bytes must neither
+                        // route through last-wins Twilight parsing (the event
+                        // path would still produce a verdict input) nor fail
+                        // the runner (the checkpoint would never advance past
+                        // a deterministic refusal). Skip the parse and dispatch
+                        // nothing: the worker still commits the checkpoint, so
+                        // a resume replays nothing.
+                        let duplicate_refused = automod_enabled
+                            && text.contains("MESSAGE_UPDATE")
+                            && two_bot_core::duplicate_keys::reject_duplicate_keys(
+                                text.as_bytes(),
+                            )
+                            .is_err();
+                        if duplicate_refused {
+                            tracing::debug!(
+                                sequence,
+                                "gateway dispatch refused: duplicate JSON key"
+                            );
+                        }
                         // A partial MESSAGE_UPDATE omits fields a full Twilight
                         // Message needs: decode its raw IDs before parsing.
-                        let edit = if automod_enabled {
+                        let edit = if automod_enabled && !duplicate_refused {
                             crate::automod_gateway::partial_edit(&text, crate::automod_gateway::receipt_ms(&observed_at))
                                 .map(|delivery| Box::new((delivery, observed_at.clone())))
                         } else {
                             None
                         };
-                        let parsed = match twilight_gateway::parse(text, EventTypeFlags::all()) {
-                            Ok(parsed) => parsed,
-                            Err(_) if edit.is_some() => None,
-                            Err(_) => return Err(sqlx::Error::InvalidArgument("gateway dispatch parse failed".into())),
+                        let parsed = if duplicate_refused {
+                            None
+                        } else {
+                            match twilight_gateway::parse(text, EventTypeFlags::all()) {
+                                Ok(parsed) => parsed,
+                                Err(_) if edit.is_some() => None,
+                                Err(_) => return Err(sqlx::Error::InvalidArgument("gateway dispatch parse failed".into())),
+                            }
                         };
                         received = Some(checkpoint.clone());
                         let mut dispatch = parsed.map(|parsed| Box::new(ReceivedDispatch { event: Event::from(parsed), observed_at, received: received_at, completion: None }));
