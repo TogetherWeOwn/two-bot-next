@@ -248,10 +248,21 @@ class NoRelabelTests(unittest.TestCase):
                                   f"(exited {exit_.code})")
                 row = out.getvalue().strip()
                 self.assertEqual(code, 1, row)
-                self.assertTrue(row.endswith("| EXTEND |"), row)
-                self.assertIn("staging_refused", row)
-                self.assertNotIn(STAGING[0], row)
                 self.assertEqual(requested, [])
+                self.assertNotIn(STAGING[0], row)
+                if extra == ["--format", "json"]:
+                    self.assertNotIn("\n", row)
+                    try:
+                        receipt = json.loads(row)
+                    except ValueError:
+                        self.fail(f"stdout must be one JSON object, got: {row[:200]!r}")
+                    self.assertEqual(receipt.get("verdict"), "EXTEND")
+                    self.assertEqual(receipt.get("reason"), "staging_refused")
+                    self.assertIsNone(receipt.get("origin"))
+                    self.assertIsNone(receipt.get("observed"))
+                else:
+                    self.assertTrue(row.endswith("| EXTEND |"), row)
+                    self.assertIn("staging_refused", row)
 
     def test_cli_offers_exactly_the_documented_flags(self):
         """No origin-override escape hatch may exist beside the five flags."""
