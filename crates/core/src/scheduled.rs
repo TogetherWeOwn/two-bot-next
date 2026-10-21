@@ -1336,6 +1336,10 @@ mod tests {
             "retry_scheduled"
         );
         assert_eq!(
+            OccurrenceOutcome::DeliveryUncertain.audit_outcome(),
+            "delivery_uncertain"
+        );
+        assert_eq!(
             OccurrenceOutcome::FailedPermanent.audit_outcome(),
             "post_failed"
         );
@@ -1349,7 +1353,7 @@ mod tests {
         );
         assert_eq!(
             OccurrenceOutcome::PostedUnrecorded { cleaned: false }.audit_outcome(),
-            "persistence_failed_retry_idempotent"
+            "persistence_failed_uncertain"
         );
     }
 }

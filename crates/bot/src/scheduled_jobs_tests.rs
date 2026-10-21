@@ -327,18 +327,14 @@ fn parse_iso(iso: &str) -> u64 {
 }
 
 #[tokio::test]
-async fn retryable_failures_requeue_with_the_clamped_delay_and_keep_the_nonce() {
+async fn ambiguous_503_arms_durable_uncertainty_and_never_reposts() {
     let Some(fixture) = fixture().await else {
         return;
     };
     let pool = fixture.pool();
     seed(pool, "flaky", T0 - 1_000, None).await;
     let mock = MockRest::start(
-        vec![
-            ScriptedResponse::status(503),
-            ScriptedResponse::status(429),
-            posted(),
-        ],
+        vec![ScriptedResponse::status(503)],
         ScriptedResponse::status(500),
     )
     .await;
@@ -347,39 +343,176 @@ async fn retryable_failures_requeue_with_the_clamped_delay_and_keep_the_nonce() 
     assert_eq!(delay, two_bot_core::RETRY_DEFAULT_MS);
 
     tick(pool, &rest, GUILD, || T0).await.expect("tick");
-    let requeued = row(pool, "flaky").await;
-    assert!(requeued.enabled);
-    assert_eq!(requeued.next_run_at, format_iso_ms(T0 + delay));
-    assert_eq!(requeued.claim_token, None);
-    let nonce = requeued.occurrence_nonce.clone().expect("nonce kept");
+    let fenced = row(pool, "flaky").await;
+    assert!(fenced.enabled, "uncertainty never completes the occurrence");
+    assert_eq!(fenced.next_run_at, format_iso_ms(T0 + delay));
+    assert_eq!(fenced.claim_token, None);
+    let nonce = fenced.occurrence_nonce.clone().expect("nonce kept");
+    assert!(
+        fenced.delivery_uncertain,
+        "the pre-wire fence survives the ambiguous 503"
+    );
+    assert_eq!(fenced.last_run_at, None);
+    assert_eq!(fenced.last_message_id, None);
+    assert_eq!(
+        audits(pool, "flaky").await,
+        [audit("delivery_uncertain", Some("discord_unavailable"))],
+    );
 
     // Not due until the clamped delay passes.
     tick(pool, &rest, GUILD, || T0 + delay - 1)
         .await
         .expect("tick");
     assert_eq!(posts(&mock).len(), 1);
+    assert_eq!(audits(pool, "flaky").await.len(), 1);
 
+    // At the retry horizon the fenced occurrence is held, never re-posted.
     tick(pool, &rest, GUILD, || T0 + delay).await.expect("tick");
-    assert_eq!(
-        row(pool, "flaky").await.next_run_at,
-        format_iso_ms(T0 + 2 * delay)
-    );
-    tick(pool, &rest, GUILD, || T0 + 2 * delay)
-        .await
-        .expect("tick");
-
-    let sent = posts(&mock);
-    assert_eq!(sent.len(), 3);
-    assert!(
-        sent.iter().all(|body| body["nonce"] == nonce.as_str()),
-        "every retry of one occurrence carries its nonce"
-    );
-    assert!(!row(pool, "flaky").await.enabled);
+    assert_eq!(posts(&mock).len(), 1, "a fenced row never POSTs again");
+    let held = row(pool, "flaky").await;
+    assert!(held.enabled);
+    assert!(held.claim_token.is_some(), "the held claim stays parked");
+    assert_eq!(held.occurrence_nonce.as_deref(), Some(nonce.as_str()));
+    assert!(held.delivery_uncertain);
     assert_eq!(
         audits(pool, "flaky").await,
         [
-            audit("retry_scheduled", Some("discord_unavailable")),
+            audit("delivery_uncertain", Some("discord_unavailable")),
+            audit("delivery_uncertain", Some("scheduled_delivery_uncertain")),
+        ]
+    );
+
+    // Past the lease the reclaim still holds without posting.
+    let lease = lease_until_ms(T0 + delay);
+    tick(pool, &rest, GUILD, || lease).await.expect("tick");
+    assert_eq!(posts(&mock).len(), 1);
+    assert!(row(pool, "flaky").await.delivery_uncertain);
+    assert_eq!(
+        audits(pool, "flaky").await.len(),
+        3,
+        "each reclaim audits the hold"
+    );
+    mock.shutdown().await;
+    fixture.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn proven_429_retries_without_a_fence_and_completes() {
+    let Some(fixture) = fixture().await else {
+        return;
+    };
+    let pool = fixture.pool();
+    seed(pool, "limited", T0 - 1_000, None).await;
+    let mock = MockRest::start(
+        vec![ScriptedResponse::status(429), posted()],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let rest = executor(&mock);
+    let delay = clamp_retry_delay_ms(None);
+
+    tick(pool, &rest, GUILD, || T0).await.expect("tick");
+    let requeued = row(pool, "limited").await;
+    assert!(requeued.enabled);
+    assert_eq!(requeued.next_run_at, format_iso_ms(T0 + delay));
+    assert_eq!(requeued.claim_token, None);
+    assert_eq!(
+        requeued.occurrence_nonce, None,
+        "a proven no-effect clears the nonce for a fresh identity"
+    );
+    assert!(
+        !requeued.delivery_uncertain,
+        "a 429 never arms durable uncertainty"
+    );
+    assert_eq!(
+        audits(pool, "limited").await,
+        [audit("retry_scheduled", Some("discord_rate_limited"))],
+    );
+    assert_eq!(posts(&mock).len(), 1);
+    let first_nonce = posts(&mock)[0]["nonce"].clone();
+
+    tick(pool, &rest, GUILD, || T0 + delay - 1)
+        .await
+        .expect("tick");
+    assert_eq!(posts(&mock).len(), 1);
+
+    tick(pool, &rest, GUILD, || T0 + delay).await.expect("tick");
+    let sent = posts(&mock);
+    assert_eq!(sent.len(), 2);
+    assert_ne!(
+        sent[1]["nonce"], first_nonce,
+        "the safe retry uses a fresh nonce"
+    );
+    let done = row(pool, "limited").await;
+    assert!(!done.enabled);
+    assert_eq!(done.last_message_id.as_deref(), Some("9001"));
+    assert!(!done.delivery_uncertain);
+    assert_eq!(
+        audits(pool, "limited").await,
+        [
             audit("retry_scheduled", Some("discord_rate_limited")),
+            audit("ok", None),
+        ]
+    );
+    mock.shutdown().await;
+    fixture.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn guard_refusal_retries_without_a_fence_and_completes() {
+    let Some(fixture) = fixture().await else {
+        return;
+    };
+    let pool = fixture.pool();
+    seed(pool, "guarded", T0 - 1_000, None).await;
+    let mock = MockRest::start(vec![posted()], ScriptedResponse::status(500)).await;
+    crate::gateway::ensure_crypto_provider();
+    let guard = std::sync::Arc::new(
+        two_bot_discord::ratelimit_guard::RateLimitGuard::new(Default::default()).unwrap(),
+    );
+    guard.observe_status(401, true);
+    let refused = two_bot_discord::executor::ActionExecutor::with_proxy_and_guard(
+        "synthetic-job-test-token".to_owned(),
+        Some(mock.origin()),
+        guard,
+    )
+    .unwrap();
+    let delay = clamp_retry_delay_ms(None);
+
+    tick(pool, &refused, GUILD, || T0).await.expect("tick");
+    assert!(
+        posts(&mock).is_empty(),
+        "a guard refusal never reaches the wire"
+    );
+    let requeued = row(pool, "guarded").await;
+    assert!(requeued.enabled);
+    assert_eq!(requeued.next_run_at, format_iso_ms(T0 + delay));
+    assert_eq!(requeued.claim_token, None);
+    assert_eq!(requeued.occurrence_nonce, None);
+    assert!(!requeued.delivery_uncertain);
+    assert_eq!(
+        audits(pool, "guarded").await,
+        [audit("retry_scheduled", Some("discord_guard_refused"))],
+    );
+
+    let fresh_guard = std::sync::Arc::new(
+        two_bot_discord::ratelimit_guard::RateLimitGuard::new(Default::default()).unwrap(),
+    );
+    let rest = two_bot_discord::executor::ActionExecutor::with_proxy_and_guard(
+        "synthetic-job-test-token".to_owned(),
+        Some(mock.origin()),
+        fresh_guard,
+    )
+    .unwrap();
+    tick(pool, &rest, GUILD, || T0 + delay).await.expect("tick");
+    assert_eq!(posts(&mock).len(), 1);
+    let done = row(pool, "guarded").await;
+    assert!(!done.enabled);
+    assert!(!done.delivery_uncertain);
+    assert_eq!(
+        audits(pool, "guarded").await,
+        [
+            audit("retry_scheduled", Some("discord_guard_refused")),
             audit("ok", None),
         ]
     );
