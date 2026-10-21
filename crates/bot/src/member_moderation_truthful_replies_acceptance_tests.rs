@@ -1,4 +1,5 @@
 #![cfg(test)]
+#![forbid(dead_code)]
 //! Protected acceptance: moderation replies tell the truth without leaking
 //! internals, and name who they acted on.
 //!
@@ -152,6 +153,57 @@ const VERB_BASES: [(MemberOutcome, &str); 6] = [
     (MemberOutcome::Warned, "Warned"),
     (MemberOutcome::Unbanned, "Unbanned"),
 ];
+
+// Explicit trait calls keep the baseline adapters exercised after inherent
+// items shadow them; behavioral acceptance tests below keep associated syntax.
+#[test]
+fn legacy_error_fallback_preserves_non_rejection_copy_control() {
+    for (error, expected) in [
+        (
+            MemberError::Discord(MemberDiscordError::RateLimited),
+            "Discord rate-limited the request; nothing was applied. Try again shortly.",
+        ),
+        (
+            MemberError::Discord(MemberDiscordError::Timeout),
+            "Discord did not confirm the action. It may still land; ask an operator to reconcile before retrying.",
+        ),
+    ] {
+        assert_eq!(
+            <MemberRuntime as ErrorTextWithLogFallback>::error_text_with_log(
+                error,
+                123456789,
+                "req-fallback-control",
+            ),
+            expected
+        );
+    }
+}
+
+#[test]
+fn legacy_outcome_fallback_preserves_raw_target_and_replay_order_control() {
+    let result = MemberResult {
+        outcome: MemberOutcome::Kicked,
+        replayed: false,
+    };
+    assert_eq!(
+        <MemberRuntime as OutcomeTextWithTargetFallback>::outcome_text_with_target(
+            &result,
+            "@everyone\nx",
+        ),
+        "Kicked. @everyone\nx"
+    );
+    let replay = MemberResult {
+        replayed: true,
+        ..result
+    };
+    assert_eq!(
+        <MemberRuntime as OutcomeTextWithTargetFallback>::outcome_text_with_target(
+            &replay,
+            "@everyone\nx",
+        ),
+        "Kicked. Already applied. @everyone\nx"
+    );
+}
 
 #[test]
 fn rejected_details_render_one_fixed_copy_without_raw_leak() {
