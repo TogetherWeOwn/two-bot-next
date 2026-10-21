@@ -217,7 +217,9 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
     require(isinstance(image_entries[0], dict),
             "docker image inspect entry must be a JSON object")
     metadata = image_entries[0]
-    require("Id" in metadata, "docker image inspect entry has no Id")
+    # The Id is passed to docker() as a subprocess argument, so a
+    # present-but-non-string Id must FAIL here, not as a TypeError.
+    require(isinstance(metadata.get("Id"), str), "docker image inspect entry has no Id")
     require("Size" in metadata, "docker image inspect entry has no Size")
     # Resolve the tag once; measurement and every image probe use this ID.
     image = metadata["Id"]
@@ -246,9 +248,17 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
         report(f"{label}: {size} bytes ({size / MIB:.2f} MiB); budget {limit} bytes ({limit / MIB:.2f} MiB)")
     require(measured_image_bytes <= image_max_bytes, "image exceeds size budget")
     require(binary_bytes <= binary_max_bytes, "release binary exceeds size budget")
-    config = metadata["Config"]
+    # A missing or non-object Config, or a present-but-non-object
+    # Healthcheck, is a malformed-probe FAIL naming the field -- never a
+    # KeyError/AttributeError traceback. An absent Healthcheck keeps the
+    # {} default and fails on the Test assertion below.
+    config = metadata.get("Config")
+    require(isinstance(config, dict), "docker image inspect entry has no Config")
     require(config.get("User") not in (None, "", "root", "0", "0:0"), "image must specify a non-root user")
-    require(config.get("Healthcheck", {}).get("Test") == ["CMD", BINARY, "--healthcheck"],
+    healthcheck = config.get("Healthcheck", {})
+    require(isinstance(healthcheck, dict),
+            "docker image inspect Config Healthcheck must be an object")
+    require(healthcheck.get("Test") == ["CMD", BINARY, "--healthcheck"],
             "image HEALTHCHECK must invoke the runtime's --healthcheck")
     # Any account (including the configured non-root user) must be able to
     # read the trust bundle; no network or OpenSSL helper is needed to verify

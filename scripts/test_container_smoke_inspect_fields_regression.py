@@ -10,10 +10,16 @@ Contract under test (``scripts/container-smoke.py``):
   inspect entry missing ``Id``/``Size``, becomes a ``RuntimeError``
   naming the check via ``smoke()``. Never a raw ``KeyError``
   traceback, never echoed Docker bodies.
+* Image metadata types are validated, not just presence: a missing
+  or non-object ``Config``, a present-but-non-object
+  ``Healthcheck``, and a non-string ``Id`` each become a
+  ``RuntimeError`` naming the field. Never ``KeyError``/
+  ``AttributeError``/``TypeError`` tracebacks.
 * Every new inspect guard is pinned by a fixture that turns red when
   the guard is reverted: a non-object entry (``[123]``), non-list
   inspect output, non-list/non-object image output, a ``State``
-  without ``Pid``, and a ``Health`` without ``Status``.
+  without ``Pid``, a ``Health`` without ``Status``, and a shutdown
+  ``State`` that keeps ``OOMKilled`` but omits ``Running``.
 
 Docker and HTTP are fully mocked through the ``DockerFixture`` in
 ``scripts/test_container_smoke.py``: no daemon, no containers, no
@@ -77,6 +83,17 @@ def image_entry_without(*keys):
     for key in keys:
         entry.pop(key)
     return json.dumps([entry])
+
+
+def image_entry_with_config(config):
+    return json.dumps([{"Id": "sha256:" + "a" * 64, "Size": 140 * smoke.MIB,
+                        "Config": config}])
+
+
+def image_entry_with_id(image_id):
+    return json.dumps([{"Id": image_id, "Size": 140 * smoke.MIB,
+                        "Config": {"User": "65532:65532",
+                                   "Healthcheck": {"Test": ["CMD", smoke.BINARY, "--healthcheck"]}}}])
 
 
 class InspectFixture(DockerFixture):
@@ -193,6 +210,16 @@ class InspectFieldsRegressionTests(unittest.TestCase):
         error, out, err = self.run_smoke(fixture)
         self.assert_clean_fail(error, out, err, ["OOMKilled"], "no-oomkilled")
 
+    def test_shutdown_state_missing_running_fails_cleanly(self):
+        # The shutdown read keeps OOMKilled but omits Running, so the
+        # shutdown-site Running require is the failing guard (and its
+        # deletion turns this test red).
+        shutdown = json.dumps([{"State": {"OOMKilled": False, "Pid": 0}}])
+        fixture = InspectFixture(
+            inspect_script=[healthy_state(), healthy_state(), shutdown])
+        error, out, err = self.run_smoke(fixture)
+        self.assert_clean_fail(error, out, err, ["Running"], "shutdown-no-running")
+
     # --- missing image fields --------------------------------------------
 
     def test_image_entry_missing_id_fails_cleanly(self):
@@ -206,6 +233,42 @@ class InspectFieldsRegressionTests(unittest.TestCase):
         fixture = InspectFixture(image_inspect=image_entry_without("Size"))
         error, out, err = self.run_smoke(fixture)
         self.assert_clean_fail(error, out, err, ["Size"], "no-size")
+
+    def test_image_entry_missing_config_fails_cleanly(self):
+        fixture = InspectFixture(image_inspect=image_entry_without("Config"))
+        error, out, err = self.run_smoke(fixture)
+        self.assert_clean_fail(error, out, err, ["Config"], "no-config")
+
+    def test_image_entry_null_config_fails_cleanly(self):
+        fixture = InspectFixture(image_inspect=image_entry_with_config(None))
+        error, out, err = self.run_smoke(fixture)
+        self.assert_clean_fail(error, out, err, ["Config"], "null-config")
+
+    def test_image_entry_string_config_fails_cleanly(self):
+        fixture = InspectFixture(image_inspect=image_entry_with_config("x"))
+        error, out, err = self.run_smoke(fixture)
+        self.assert_clean_fail(error, out, err, ["Config"], "string-config")
+
+    def test_image_entry_null_healthcheck_fails_cleanly(self):
+        config = {"User": "65532:65532", "Healthcheck": None}
+        fixture = InspectFixture(image_inspect=image_entry_with_config(config))
+        error, out, err = self.run_smoke(fixture)
+        self.assert_clean_fail(error, out, err, ["Healthcheck"], "null-healthcheck")
+
+    def test_image_entry_string_healthcheck_fails_cleanly(self):
+        config = {"User": "65532:65532", "Healthcheck": "x"}
+        fixture = InspectFixture(image_inspect=image_entry_with_config(config))
+        error, out, err = self.run_smoke(fixture)
+        self.assert_clean_fail(error, out, err, ["Healthcheck"], "string-healthcheck")
+
+    def test_image_entry_non_string_id_fails_cleanly(self):
+        # A non-string Id passes a presence-only check, then crashes the
+        # real docker() with TypeError (subprocess arg must be str).
+        for bad_id in (123, None, ["sha256:x"]):
+            with self.subTest(id=bad_id):
+                fixture = InspectFixture(image_inspect=image_entry_with_id(bad_id))
+                error, out, err = self.run_smoke(fixture)
+                self.assert_clean_fail(error, out, err, ["Id"], f"bad-id-{bad_id!r}")
 
     # --- guard pins: shapes the guards already handle ---------------------
 
