@@ -122,14 +122,15 @@ pub async fn containment_identity() -> (
                 .expect("HTTP request line")
                 .to_owned();
             let body = match route.as_str() {
-                "GET /api/v10/applications/@me HTTP/1.1" => serde_json::json!({
+                "GET /api/v10/applications/@me HTTP/1.1" => Some(serde_json::json!({
                     "id": two_bot_core::backup::guild_config::STAGING_BOT_APPLICATION_ID,
-                }),
-                "GET /api/v10/users/@me HTTP/1.1" => serde_json::json!({
+                })),
+                "GET /api/v10/users/@me HTTP/1.1" => Some(serde_json::json!({
                     "id": "999", "bot": true, "username": "offline-bot",
-                }),
-                _ => panic!("containment constructor must perform identity GETs only"),
+                })),
+                _ => None,
             }
+            .expect("containment constructor must perform identity GETs only")
             .to_string();
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
