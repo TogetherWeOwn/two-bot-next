@@ -37,6 +37,8 @@ mod name;
 mod name_filter_acceptance;
 #[path = "voice_name_rerender_tests.rs"]
 mod name_rerender;
+#[path = "voice_ownership_receipt_acceptance_tests.rs"]
+mod ownership_receipt_acceptance;
 #[path = "voice_private_runtime_tests.rs"]
 mod private;
 #[path = "voice_responder_admission_acceptance_tests.rs"]
@@ -47,6 +49,8 @@ mod sink;
 mod snapshot_fence_acceptance;
 #[path = "../../core/tests/support/tracing_capture.rs"]
 mod tracing_capture;
+#[path = "voice_worker_reply_acceptance_tests.rs"]
+mod worker_reply_acceptance;
 
 const GUILD: u64 = 100;
 const CREATOR: u64 = 200;
