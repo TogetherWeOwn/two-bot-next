@@ -1,7 +1,7 @@
 use super::*;
 use serde_json::json;
 use two_bot_core::{activation::LiveCapability, apply_web_contract, RankKey};
-use two_bot_testsupport::TestDatabase;
+use two_bot_testsupport::{guard_database_url, TestDatabase};
 
 use crate::{
     activation::fixtures,
@@ -1200,4 +1200,255 @@ async fn rank_tick_missing_rung_names_the_rung_and_writes_nothing() {
     for leaked in [probe_id, probe_name] {
         assert!(!logs.contains(leaked), "logs leaked {leaked:?}");
     }
+}
+
+/// A lazy pool that never connects: reaching storage surfaces `Database`, so
+/// a `Rest` outcome proves the refusal happened before any write. Mirrors the
+/// snapshot suite's poison pool (sibling test modules cannot share it).
+fn unconnected_pool() -> PgPool {
+    guard_database_url("postgres://agent_test:@agent-testdb:5432/two_bot_test_poison")
+        .expect("seam pool must reject ambient PostgreSQL connection settings");
+    PgPoolOptions::new()
+        .acquire_timeout(Duration::from_millis(20))
+        .connect_lazy_with(
+            PgConnectOptions::new_without_pgpass()
+                .host("agent-testdb")
+                .port(5432)
+                .username("agent_test")
+                .password("")
+                .database("two_bot_test_poison"),
+        )
+}
+
+/// The injected-stamp seam behaves exactly like the production `run_once`
+/// path (which stamps `now_iso()` before delegating): an in-bounds snapshot
+/// still attempts publication. The age bound itself is NOT asserted here —
+/// the follow-up age slice pins 5-minute staleness through this seam.
+#[tokio::test]
+async fn events_seam_with_injected_stamp_reaches_storage() {
+    let mock = MockRest::start(
+        vec![ScriptedResponse::json(200, json!([event()]))],
+        ScriptedResponse::status(403),
+    )
+    .await;
+    let pool = unconnected_pool();
+    let (_stop, shutdown) = watch::channel(false);
+    let outcome = snapshot_events_once(
+        &pool,
+        &executor(&mock),
+        "2222",
+        &shutdown,
+        "2026-10-01T18:00:00.000Z",
+    )
+    .await;
+    assert_eq!(
+        mock.requests().len(),
+        1,
+        "the seam must fetch before it can publish"
+    );
+    assert_eq!(
+        outcome,
+        Err(ErrorClass::Database),
+        "an in-bounds snapshot through the seam must still attempt publication"
+    );
+    mock.shutdown().await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn events_seam_refuses_malformed_before_storage() {
+    let mock = MockRest::start(
+        vec![ScriptedResponse::json(200, json!([event(), json!(null)]))],
+        ScriptedResponse::status(403),
+    )
+    .await;
+    let pool = unconnected_pool();
+    let (_stop, shutdown) = watch::channel(false);
+    let outcome = snapshot_events_once(
+        &pool,
+        &executor(&mock),
+        "2222",
+        &shutdown,
+        "2026-10-01T18:00:00.000Z",
+    )
+    .await;
+    assert_eq!(mock.requests().len(), 1);
+    assert_eq!(
+        outcome,
+        Err(ErrorClass::Rest),
+        "one malformed row through the seam must refuse before storage"
+    );
+    mock.shutdown().await;
+    pool.close().await;
+}
+
+/// One Events tick against raw wire bytes (not a re-serialized `Value`) and a
+/// poison pool. Returns the tick outcome plus the mock-side request count.
+async fn run_events_tick_raw(wire: Vec<u8>) -> (Result<(), ErrorClass>, usize) {
+    let mock = MockRest::start(
+        vec![ScriptedResponse {
+            body: wire,
+            ..ScriptedResponse::status(200)
+        }],
+        ScriptedResponse::status(403),
+    )
+    .await;
+    let pool = unconnected_pool();
+    let (_stop, shutdown) = watch::channel(false);
+    let outcome = run_once(
+        Kind::Events,
+        &pool,
+        &executor(&mock),
+        "2222",
+        &Mutex::new(()),
+        &shutdown,
+        false,
+    )
+    .await;
+    let requests = mock.requests().len();
+    mock.shutdown().await;
+    pool.close().await;
+    (outcome, requests)
+}
+
+/// One valid event wrapped in JSON-insignificant whitespace so the wire body is
+/// exactly `target_len` bytes while its re-serialization stays tiny. A cap
+/// measured over the re-serialized value would admit every leg below.
+fn whitespace_padded_wire(target_len: usize) -> Vec<u8> {
+    let compact = event().to_string();
+    let mut wire = Vec::with_capacity(target_len);
+    wire.push(b'[');
+    wire.extend(std::iter::repeat_n(
+        b' ',
+        target_len - compact.len() - 2, // '[' + event + ']'
+    ));
+    wire.extend_from_slice(compact.as_bytes());
+    wire.push(b']');
+    assert_eq!(wire.len(), target_len);
+    let reserialized: Value = serde_json::from_slice(&wire).unwrap();
+    assert!(
+        reserialized.to_string().len() < 1024,
+        "the re-serialization must stay far under the cap, or this leg \
+         cannot distinguish a wire measure from a re-serialized one"
+    );
+    wire
+}
+
+#[tokio::test]
+async fn events_tick_refuses_whitespace_padded_wire_body_over_cap() {
+    let (outcome, requests) =
+        run_events_tick_raw(whitespace_padded_wire(MAX_SCHEDULED_EVENTS_BODY_BYTES + 1)).await;
+    assert_eq!(requests, 1, "the tick must fetch before it can refuse");
+    assert_eq!(
+        outcome,
+        Err(ErrorClass::Rest),
+        "a wire body 1 byte over cap must refuse even when its re-serialization \
+         is tiny; reaching the poison pool would surface a database error instead"
+    );
+}
+
+#[tokio::test]
+async fn events_tick_accepts_whitespace_padded_wire_body_at_cap() {
+    let (outcome, requests) =
+        run_events_tick_raw(whitespace_padded_wire(MAX_SCHEDULED_EVENTS_BODY_BYTES)).await;
+    assert_eq!(requests, 1);
+    assert_eq!(
+        outcome,
+        Err(ErrorClass::Database),
+        "an exactly-at-cap wire body is in bounds and must still attempt publication"
+    );
+}
+
+/// The seam's injected stamp — not store time — is what the mirror stores and
+/// orders by. A fresh row must carry the injected stamp exactly, and a seeded
+/// newer row must survive a snapshot taken with an older injected stamp
+/// (TOG-20273 last-observed-wins through the seam; the epoch-claim gate rolls
+/// the older snapshot back, so the newer row survives with its stamp
+/// untouched). Stamping at store time instead of using the injected value
+/// fails both assertions: the fresh row would carry now(), and the older
+/// snapshot would win the epoch claim and clobber the seeded row.
+#[tokio::test]
+async fn events_seam_stores_the_injected_stamp_and_keeps_newer_rows() {
+    let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
+        assert!(
+            std::env::var("GITHUB_ACTIONS").is_err(),
+            "CI must supply the guarded test database"
+        );
+        eprintln!("SKIP seam stamp integration: TWO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let db = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+        .await
+        .expect("create migrated agent-testdb fixture");
+    let pool = db.pool();
+    apply_web_contract(pool).await.unwrap();
+    // Guild 3333: seed event 3000 with a stamp newer than the snapshot's
+    // injected stamp but older than any store-time stamp, so a store-time
+    // regression wins the epoch claim and clobbers it while the injected
+    // stamp loses the claim and preserves it. Guild 2222 stays empty so the
+    // fresh row below witnesses a genesis claim through the seam.
+    let mut seeded = event();
+    seeded["guild_id"] = json!("3333");
+    let seed = normalize_events(&[raw_event(&seeded, "3333").unwrap()]).unwrap();
+    replace_events(pool, "3333", "2026-10-15T12:00:00.000Z", &seed)
+        .await
+        .unwrap();
+    let mut fresh = event();
+    fresh["id"] = json!("3001");
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(200, json!([fresh])),
+            ScriptedResponse::json(200, json!([seeded])),
+        ],
+        ScriptedResponse::status(403),
+    )
+    .await;
+    let (_stop, shutdown) = watch::channel(false);
+    snapshot_events_once(
+        pool,
+        &executor(&mock),
+        "2222",
+        &shutdown,
+        "2026-10-01T18:00:00.000Z",
+    )
+    .await
+    .unwrap();
+    // Older than guild 3333's committed epoch: the whole swap rolls back and
+    // the seam reports Ok (stale skip), writing nothing.
+    snapshot_events_once(
+        pool,
+        &executor(&mock),
+        "3333",
+        &shutdown,
+        "2026-10-01T18:00:00.000Z",
+    )
+    .await
+    .unwrap();
+    assert_eq!(mock.requests().len(), 2);
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT guild_id, event_id, updated_at FROM scheduled_events \
+         WHERE guild_id IN ('2222', '3333') ORDER BY guild_id, event_id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        [
+            (
+                "2222".to_owned(),
+                "3001".to_owned(),
+                "2026-10-01T18:00:00.000Z".to_owned(),
+            ),
+            (
+                "3333".to_owned(),
+                "3000".to_owned(),
+                "2026-10-15T12:00:00.000Z".to_owned(),
+            ),
+        ],
+        "the fresh row must carry the injected stamp exactly (not store time), \
+         and the seeded newer row must survive the older snapshot"
+    );
+    mock.shutdown().await;
+    db.close().await.unwrap();
 }
