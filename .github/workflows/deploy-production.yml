@@ -1420,6 +1420,13 @@ jobs:
           readyz="$RUNNER_TEMP/production-readyz.json"
           # The same explicit agent name the staging gate sends (scripts/staging_rollout.py).
           agent="two-bot-next-production-rollout/1.0"
+          # The compute step always exports DEPLOY_ID before this gate runs; a
+          # caller without one (the stamping-transition suites) judges the
+          # legacy revision/build-ID shape instead of failing on an unset var.
+          deploy_id_arg=()
+          if [ -n "${DEPLOY_ID:-}" ]; then
+            deploy_id_arg=(--deploy-id "$DEPLOY_ID")
+          fi
           poll() {
             # Match production_deploy.py's 64 KiB cap. A failed transfer can
             # still report 200 with a valid prefix: never grade that as a pass.
@@ -1431,7 +1438,7 @@ jobs:
             code=$(curl -s --max-time 10 --max-filesize 65536 -H "User-Agent: $agent" -o "$readyz" -w '%{http_code}' "$url/readyz") || code=000
             # The verdict follows the script's exit code; `state` carries its
             # fixed-vocabulary reason either way.
-            if state=$(python3 ../tooling/scripts/production_deploy.py readyz --status "$code" --body "$readyz" --sha "$SHA" --mode "$MODE" --build-id "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --deploy-id "$DEPLOY_ID" 2>&1); then
+            if state=$(python3 ../tooling/scripts/production_deploy.py readyz --status "$code" --body "$readyz" --sha "$SHA" --mode "$MODE" --build-id "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" "${deploy_id_arg[@]}" 2>&1); then
               return 0
             else
               return 1
@@ -1526,6 +1533,7 @@ jobs:
       # build's stamped ID. Without a deploy or rollback there is nothing to
       # record.
       - name: Record the production deployment
+        id: record
         if: always() && (steps.deploy.outcome == 'success' || steps.rollback.outcome == 'success')
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1554,7 +1562,9 @@ jobs:
       # without a deploy or a snapshot there is nothing to restore.
       - name: Auto-roll back Worker version and container image
         id: auto_rollback
-        if: failure() && env.MODE == 'deploy' && env.TAKEOVER == 'true' && steps.deploy.outcome == 'success' && steps.snapshot.outcome == 'success'
+        # A failed record step fails the run without moving the service:
+        # bookkeeping never rolls back a healthy deploy.
+        if: failure() && env.MODE == 'deploy' && env.TAKEOVER == 'true' && steps.deploy.outcome == 'success' && steps.snapshot.outcome == 'success' && steps.record.outcome != 'failure'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

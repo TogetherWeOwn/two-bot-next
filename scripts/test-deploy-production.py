@@ -417,10 +417,12 @@ class StaticGuardTests(unittest.TestCase):
         }
         # Auto-rollback only after a takeover deploy actually replaced
         # something: the run still fails red, but service is restored first.
+        # A failed record step fails the run without moving the service.
         self.assertEqual(
             conditions[f"      - name: {AUTO_ROLLBACK_STEP}"],
             ["if: failure() && env.MODE == 'deploy' && env.TAKEOVER == 'true' "
-             "&& steps.deploy.outcome == 'success' && steps.snapshot.outcome == 'success'"],
+             "&& steps.deploy.outcome == 'success' && steps.snapshot.outcome == 'success' "
+             "&& steps.record.outcome != 'failure'"],
         )
         production = "\n".join(JOBS["production"])
         self.assertIn("production-rollback-snapshot.json", production)
@@ -458,8 +460,13 @@ class StaticGuardTests(unittest.TestCase):
     def test_readyz_gate_judges_the_guarded_sha_and_mode_without_secrets(self):
         self.assertIn('production_deploy.py readyz --status "$code" --body "$readyz" --sha "$SHA" '
                       '--mode "$MODE" --build-id "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" '
-                      '--deploy-id "$DEPLOY_ID" 2>&1',
+                      '"${deploy_id_arg[@]}" 2>&1',
                       GATE)
+        # The flag is conditional: real runs always export DEPLOY_ID from the
+        # compute step, while callers without one judge the legacy shape.
+        self.assertIn("deploy_id_arg=()", GATE)
+        self.assertIn('if [ -n "${DEPLOY_ID:-}" ]; then', GATE)
+        self.assertIn('deploy_id_arg=(--deploy-id "$DEPLOY_ID")', GATE)
         for text in (RENDER, GATE):
             self.assertNotIn("secrets.", text)
             self.assertNotIn("token", text.lower())
@@ -1895,10 +1902,14 @@ class ShellStepTests(unittest.TestCase):
 
     def gate(self, routes, mode="deploy", sha=SHA, run_id="700", attempt="1",
                deploy_id=DEPLOY_ID):
+        # deploy_id=None leaves the variable unset, like a caller from before
+        # the compute step existed; the gate then judges the legacy shape.
+        extra = {} if deploy_id is None else {"DEPLOY_ID": deploy_id}
         with ScriptedWorker(routes) as worker:
             code, summary, _ = self.bash(GATE, cwd=WRANGLER_DIR, PRODUCTION_URL=worker.url,
-                                         MODE=mode, SHA=sha, DEPLOY_ID=deploy_id,
-                                         GITHUB_RUN_ID=run_id, GITHUB_RUN_ATTEMPT=attempt)
+                                         MODE=mode, SHA=sha,
+                                         GITHUB_RUN_ID=run_id, GITHUB_RUN_ATTEMPT=attempt,
+                                         **extra)
         return code, summary, worker
 
     def test_matching_revision_passes_only_when_gateway_ready_and_stable(self):
@@ -2014,6 +2025,15 @@ class ShellStepTests(unittest.TestCase):
                     mode="rollback")
                 self.assertEqual(code, 0, summary)
                 self.assertIn("gateway ready", summary)
+
+    def test_gate_without_an_exported_id_judges_the_legacy_shape(self):
+        # Stamping-transition compat: without DEPLOY_ID the gate omits the
+        # flag and passes a report with no deploy_id key, exactly as before.
+        code, summary, _ = self.gate(
+            {"/health": [(200, "{}")], "/readyz": [(200, report(deploy_id=None))]},
+            deploy_id=None)
+        self.assertEqual(code, 0, summary)
+        self.assertIn("stable 18/18 polls", summary)
 
     def test_readyz_that_moves_to_this_revision_passes(self):
         code, summary, worker = self.gate({
@@ -2165,11 +2185,11 @@ class ReadyzVerdictTests(unittest.TestCase):
             path = Path(tmp) / "readyz.json"
             if body is not None:
                 path.write_text(body)
-            result = subprocess.run(
-                [sys.executable, str(SCRIPT), "readyz", "--status", status, "--body", str(path),
-                 "--sha", sha, "--mode", mode, "--build-id", build_id, "--deploy-id", deploy_id],
-                capture_output=True, text=True, timeout=60,
-            )
+            command = [sys.executable, str(SCRIPT), "readyz", "--status", status, "--body", str(path),
+                       "--sha", sha, "--mode", mode, "--build-id", build_id]
+            if deploy_id is not None:
+                command += ["--deploy-id", deploy_id]
+            result = subprocess.run(command, capture_output=True, text=True, timeout=60)
             return result.returncode, result.stdout.strip()
 
     def test_matching_revision_passes_only_when_gateway_ready(self):
@@ -2224,6 +2244,16 @@ class ReadyzVerdictTests(unittest.TestCase):
                 code, message = self.judge("200", report(), deploy_id=deploy_id)
                 self.assertEqual(code, 1)
                 self.assertIn(reason, message)
+
+    def test_absent_deploy_id_judges_the_legacy_shape(self):
+        # Stamping-transition compat: callers without an expectation (the
+        # protected body-cap suite) see the pre-stamp verdicts, including a
+        # pass on a report with no deploy_id key at all.
+        code, message = self.judge("200", report(deploy_id=None), deploy_id=None)
+        self.assertEqual(code, 0)
+        self.assertIn("gateway ready", message)
+        code, _ = self.judge("200", report(revision="f" * 40), deploy_id=None)
+        self.assertEqual(code, 1)
 
     def test_every_other_observation_fails_with_its_reason(self):
         cases = (

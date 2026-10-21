@@ -101,6 +101,27 @@ def deploy_id_sort_key(value):
     return (date_text, n, sha7)
 
 
+def deployment_utc_date(row):
+    """A deployment row's `created_at` as a UTC date; ValueError unless parseable.
+
+    A row without a parseable zoned timestamp fails closed: silently
+    skipping it could mint a duplicate N (in the count) or stop the listing
+    early (in the fetch).
+    """
+    if not isinstance(row, dict):
+        raise ValueError("deployment row is not an object")
+    raw = row.get("created_at")
+    if not isinstance(raw, str) or not raw:
+        raise ValueError("deployment row has no created_at timestamp")
+    try:
+        moment = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError("deployment created_at is not ISO-8601") from None
+    if moment.tzinfo is None:
+        raise ValueError("deployment created_at carries no time zone")
+    return moment.astimezone(timezone.utc).date()
+
+
 def count_deployments_for_date(deployments, date_text):
     """How many deployment rows were created on a UTC `YYYY.MM.DD` date.
 
@@ -112,19 +133,4 @@ def count_deployments_for_date(deployments, date_text):
         want = datetime.strptime(date_text, "%Y.%m.%d").date()
     except (ValueError, TypeError):
         raise ValueError("date must be a real YYYY.MM.DD calendar date") from None
-    count = 0
-    for row in deployments:
-        if not isinstance(row, dict):
-            raise ValueError("deployment row is not an object")
-        raw = row.get("created_at")
-        if not isinstance(raw, str) or not raw:
-            raise ValueError("deployment row has no created_at timestamp")
-        try:
-            moment = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        except ValueError:
-            raise ValueError("deployment created_at is not ISO-8601") from None
-        if moment.tzinfo is None:
-            raise ValueError("deployment created_at carries no time zone")
-        if moment.astimezone(timezone.utc).date() == want:
-            count += 1
-    return count
+    return sum(1 for row in deployments if deployment_utc_date(row) == want)

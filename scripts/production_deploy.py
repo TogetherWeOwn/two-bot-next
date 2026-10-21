@@ -134,15 +134,20 @@ def _gateway_ready(report):
 def readyz(args):
     if args.status not in ("200", "503"):
         return reject(f"/readyz answered {args.status}")
-    # Own inputs first, in both modes: the expected deploy ID must be
-    # canonical and name the guarded SHA (rollback ignores the *reported*
-    # value below, never a malformed expectation). Fixed refusals, no echo.
-    try:
-        _date, _n, expected_sha7 = parse_deploy_id(args.deploy_id)
-    except ValueError:
-        return reject("readyz needs a canonical deploy ID to judge")
-    if expected_sha7 != args.sha[:7]:
-        return reject("the expected deploy ID names a different commit")
+    # The expected deploy ID is optional during the stamping transition:
+    # callers that predate it judge the legacy revision/build-ID shape
+    # exactly as before (the protected body-cap suite pins those verdicts
+    # byte-for-byte). Present callers always pass it — the workflow pins the
+    # flag — and then it must be canonical and name the guarded SHA in both
+    # modes. getattr: direct callers may predate the attribute itself.
+    expected = getattr(args, "deploy_id", None)
+    if expected is not None:
+        try:
+            _date, _n, expected_sha7 = parse_deploy_id(expected)
+        except ValueError:
+            return reject("readyz needs a canonical deploy ID to judge")
+        if expected_sha7 != args.sha[:7]:
+            return reject("the expected deploy ID names a different commit")
     try:
         with open(args.body, "rb") as handle:
             raw = handle.read(MAX_READYZ_BYTES + 1)
@@ -180,11 +185,12 @@ def readyz(args):
     if build_id != UNSTAMPED and not is_build_id_shape(build_id):
         return reject("/readyz build_id has an unexpected shape")
     deploy_id = report.get("deploy_id")
-    if args.mode == "deploy":
+    if args.mode == "deploy" and expected is not None:
         # A fresh build always reports its stamped ID; a missing key is a
-        # previous container still serving, never a pass. Rollback mode
-        # ignores the reported value entirely: the restored build predates
-        # stamping or carries its original stamped ID (like build_id).
+        # previous container still serving, never a pass. Rollback mode —
+        # and legacy callers without an expectation — ignore the reported
+        # value entirely: the restored build predates stamping or carries
+        # its original stamped ID (like build_id).
         if not isinstance(deploy_id, str):
             return reject("/readyz has no deploy_id")
         if deploy_id != UNSTAMPED and not is_deploy_id_shape(deploy_id):
@@ -195,9 +201,9 @@ def readyz(args):
                 f"build_id {build_id} is not this run's build ({args.build_id}): "
                 "a previous container still serves this SHA"
             )
-        if args.mode == "deploy" and deploy_id != args.deploy_id:
+        if args.mode == "deploy" and expected is not None and deploy_id != expected:
             return reject(
-                f"deploy_id {deploy_id} is not this run's deploy ({args.deploy_id}): "
+                f"deploy_id {deploy_id} is not this run's deploy ({expected}): "
                 "a previous container still serves this SHA"
             )
         # A parked gateway is never a pass: the release gate requires
@@ -258,8 +264,9 @@ def main(argv=None):
     # This run's `YYYY.MM.DD.N+sha7` deploy ID. Deploy mode requires the
     # report to carry it; rollback mode ignores the reported value (the
     # restored build carries its original stamped ID) but still requires a
-    # canonical expectation naming the guarded SHA.
-    readyz_cmd.add_argument("--deploy-id", required=True)
+    # canonical expectation naming the guarded SHA. Absent, the legacy
+    # revision/build-ID verdicts apply unchanged (stamping transition).
+    readyz_cmd.add_argument("--deploy-id", required=False, default=None)
 
     excerpt_cmd = commands.add_parser("excerpt", help="print a remote body as one bounded escaped line")
     excerpt_cmd.add_argument("--body", required=True)

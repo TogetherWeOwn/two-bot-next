@@ -299,6 +299,17 @@ jobs:
           persist-credentials: false
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}
           fetch-depth: 0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Reviewed tooling runs from the workflow's own commit: a pinned
+          # drill deploys an older SHA whose checkout predates deploy_id.py,
+          # so the compute and record steps below run from here, never from
+          # the deployed commit. The prepare/verify gate scripts stay on the
+          # deployed checkout: they judge that commit's own identity.
+          ref: ${{ github.sha }}
+          path: tooling
+          persist-credentials: false
+          fetch-depth: 1
       - name: Deploy SHA must be exact and reachable from main
         env:
           SOURCE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}
@@ -333,7 +344,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: | # zizmor: ignore[github-env] the script prints only DEPLOY_ID=<canonical id> (shape-enforced, no newlines); the SHA is the validated DEPLOY_SHA
           set -euo pipefail
-          python3 ../scripts/deploy_id.py next --environment staging --sha "$DEPLOY_SHA" >> "$GITHUB_ENV"
+          python3 ../tooling/scripts/deploy_id.py next --environment staging --sha "$DEPLOY_SHA" >> "$GITHUB_ENV"
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
@@ -522,6 +533,7 @@ jobs:
       # error-rate gate both passed, failure when the deploy went out but a
       # gate refused it. Without a deploy there is nothing to record.
       - name: Record the staging deployment
+        id: record
         if: always() && steps.deploy.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -535,7 +547,7 @@ jobs:
           if [ "$VERIFY_OUTCOME" = "success" ] && [ "$GATE_OUTCOME" = "success" ]; then
             status=success
           fi
-          python3 ../scripts/deploy_id.py record --environment staging --sha "$DEPLOY_SHA" \
+          python3 ../tooling/scripts/deploy_id.py record --environment staging --sha "$DEPLOY_SHA" \
             --deploy-id "$DEPLOY_ID" --state "$status" --run-url "$RUN_URL" \
             --environment-url "$WORKER_URL"
       # A failed verify or error-rate gate after a deploy rolls back
@@ -545,7 +557,9 @@ jobs:
       # there is nothing to restore.
       - name: Auto-roll back Worker version and container image
         id: auto_rollback
-        if: failure() && steps.deploy.outcome == 'success' && steps.snapshot.outcome == 'success'
+        # A failed record step fails the run without moving the service:
+        # bookkeeping never rolls back a healthy deploy.
+        if: failure() && steps.deploy.outcome == 'success' && steps.snapshot.outcome == 'success' && steps.record.outcome != 'failure'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

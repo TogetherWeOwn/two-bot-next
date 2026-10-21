@@ -393,8 +393,9 @@ ID as its description and `{"deploy_id"}` as its payload — never a tag or
 Release — and posts its `success`/`failure` status with links to the run and
 the Worker. A rollback mints a fresh event ID and names itself in the
 payload, since its event ID differs from the restored build's stamped ID.
-`scripts/ci/test_workflows.py` pins the compute/record step shapes and their
-order against the stamp and gate steps.
+A record-step failure fails the run without rolling back: bookkeeping never
+moves the service. `scripts/ci/test_workflows.py` pins the compute/record
+step shapes and their order against the stamp and gate steps.
 
 ## Production ownership takeover (P2–P4)
 

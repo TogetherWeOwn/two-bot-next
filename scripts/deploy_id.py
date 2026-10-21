@@ -4,7 +4,8 @@
 `next` derives N deterministically: one plus the count of that environment's
 GitHub Deployments created on today's UTC date. The deploy lanes serialize
 deploys (the deploy-staging workflow concurrency, the deploy-production lane),
-so the count cannot race; a date with more deployments than the page cap
+so the count cannot race; the listing stops at the first row older than the
+date (the API returns newest first), and a same-day flood past the page cap
 refuses instead of minting a duplicate N.
 
 `record` stores the deploy as a GitHub Deployment carrying the ID — never a
@@ -24,6 +25,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from build_identity import (  # noqa: E402
     count_deployments_for_date,
+    deployment_utc_date,
     format_deploy_id,
     is_build_revision_shape,
     is_deploy_id_shape,
@@ -32,9 +34,10 @@ from build_identity import (  # noqa: E402
 
 ENVIRONMENTS = ("staging", "production")
 DEPLOYMENTS_PER_PAGE = 100
-# Six pages (600 rows) bound the daily count: each deploy takes minutes, so a
-# fuller day is a miscount, not a deploy rate, and refuses instead of minting
-# a duplicate N.
+# Six pages (600 rows) bound one day's count: each deploy takes minutes, so
+# a fuller day is a miscount, not a deploy rate, and refuses instead of
+# minting a duplicate N. Total history is unbounded: the listing stops at
+# the first row older than the date (the API returns newest first).
 DEPLOYMENTS_MAX_PAGES = 6
 
 
@@ -62,11 +65,19 @@ def _gh_api(args, body=None):
         raise DeployIdError("github api returned invalid JSON") from None
 
 
-def list_deployments(repo, environment):
-    """Every deployment row for an environment, newest pages first.
+def list_deployments(repo, environment, date_text):
+    """Deployment rows for an environment down to a UTC `YYYY.MM.DD` date.
 
-    Refuses past the page cap instead of undercounting a day it cannot see.
+    The API returns newest first, so the listing stops at the first row
+    older than the date: total history never matters, only the day. Rows
+    newer than the date (clock skew) are kept but never counted. Past the
+    page cap without reaching an older row, the day itself is too full to
+    count and refuses instead of minting a duplicate N.
     """
+    try:
+        want = datetime.strptime(date_text, "%Y.%m.%d").date()
+    except ValueError:
+        raise DeployIdError("date must be a real YYYY.MM.DD calendar date") from None
     rows = []
     for page in range(1, DEPLOYMENTS_MAX_PAGES + 1):
         batch = _gh_api([
@@ -77,7 +88,14 @@ def list_deployments(repo, environment):
         ])
         if not isinstance(batch, list):
             raise DeployIdError("unexpected deployments page")
-        rows.extend(batch)
+        for row in batch:
+            try:
+                day = deployment_utc_date(row)
+            except ValueError as error:
+                raise DeployIdError(str(error)) from None
+            if day < want:
+                return rows
+            rows.append(row)
         if len(batch) < DEPLOYMENTS_PER_PAGE:
             return rows
     raise DeployIdError("too many deployments to count this date")
@@ -180,7 +198,7 @@ def cmd_next(args):
         if not isinstance(deployments, list):
             raise DeployIdError("deployments fixture is not a list")
     else:
-        deployments = list_deployments(_repo(), args.environment)
+        deployments = list_deployments(_repo(), args.environment, date_text)
     deploy_id = next_deploy_id(deployments, date_text, args.sha)
     # The single stdout line is a GITHUB_ENV assignment; the workflow appends
     # it, humans read it directly.

@@ -529,6 +529,26 @@ def staging_pinned_sha_errors(workflows):
         steps = job.get("steps") or []
         checkouts = [step for step in steps
                      if str(step.get("uses", "")).startswith("actions/checkout@")]
+        if job_id == "deploy":
+            # The deploy job carries one extra checkout: reviewed tooling
+            # from the workflow head, so the deploy-ID steps run even when
+            # the deployed pin predates the script. It must be exactly that
+            # shape — the workflow head at shallow depth, never the
+            # deployed ref — and credentialless like every checkout.
+            tooling = [step for step in checkouts
+                       if (step.get("with") or {}).get("path") == "tooling"]
+            if len(tooling) != 1:
+                errors.append("deploy-staging.yml:deploy: must carry exactly one "
+                              "workflow-head tooling checkout")
+            else:
+                tooling_with = tooling[0].get("with") or {}
+                if tooling_with.get("ref") != "${{ github.sha }}":
+                    errors.append("deploy-staging.yml:deploy: tooling checkout must pin "
+                                  "the workflow head, never the deployed ref")
+                if tooling_with.get("fetch-depth") != "1":
+                    errors.append("deploy-staging.yml:deploy: tooling checkout must stay shallow")
+            checkouts = [step for step in checkouts
+                         if (step.get("with") or {}).get("path") != "tooling"]
         if len(checkouts) != 1:
             errors.append(f"deploy-staging.yml:{job_id}: must check out exactly once")
             continue
@@ -701,7 +721,9 @@ def staging_deploy_identity_errors(workflow, name="deploy-staging.yml"):
     SHA-from-build_revision step and poison the next rollback snapshot's
     serving_sha (recorded from the workers/message annotation). No other
     github.sha may appear in the deploy job outside the two pinned
-    dispatch-or-head expressions (checkout ref, SHA-step env).
+    dispatch-or-head expressions (checkout ref, SHA-step env) and the
+    workflow-head tooling checkout ref (which runs deploy_id.py for pins
+    whose commits predate it).
     """
     errors = []
     jobs = workflow.get("jobs") or {}
@@ -740,9 +762,9 @@ def staging_deploy_identity_errors(workflow, name="deploy-staging.yml"):
             "github-actions:${{ github.run_id }}:${{ env.DEPLOY_SHA }}":
         errors.append(f"{name}:deploy: rollback actor must name the validated deploy SHA")
     text = str(deploy)
-    if text.count("github.sha") != text.count(DEPLOY_SHA_EXPRESSION) or text.count("github.sha") != 2:
-        errors.append(f"{name}:deploy: github.sha may only appear in the checkout ref and "
-                      "SHA-step dispatch-or-head expressions")
+    if text.count("github.sha") != text.count(DEPLOY_SHA_EXPRESSION) + 1 or text.count("github.sha") != 3:
+        errors.append(f"{name}:deploy: github.sha may only appear in the checkout ref, "
+                      "the SHA-step dispatch-or-head expressions and the tooling checkout ref")
     return errors
 
 
@@ -752,10 +774,13 @@ def staging_deploy_id_errors(workflow, name="deploy-staging.yml"):
     The compute step derives `YYYY.MM.DD.N+sha7` from the validated deploy
     SHA inside the serialized staging lane (N counts today's staging
     Deployments, so a queued entry cannot mint a duplicate) and exports it
-    before the prepare step stamps it. The record step stores the deploy as
-    a GitHub Deployment carrying the ID — never a tag or Release — with
+    before the prepare step stamps it. Both ID steps run reviewed tooling
+    from the workflow's own commit, since a pinned drill deploys a commit
+    whose checkout may predate the script. The record step stores the deploy
+    as a GitHub Deployment carrying the ID — never a tag or Release — with
     success only when the rollout verify and the error-rate gate both
-    passed. No other step may call deploy_id.py.
+    passed; its failure fails the run without rolling back. No other step
+    may call deploy_id.py.
     """
     errors = []
     jobs = workflow.get("jobs") or {}
@@ -776,10 +801,10 @@ def staging_deploy_id_errors(workflow, name="deploy-staging.yml"):
         if (compute.get("env") or {}).get("GH_TOKEN") != "${{ github.token }}":
             errors.append(f"{name}:deploy: compute step must list Deployments with github.token")
         run = str(compute.get("run") or "")
-        if ("deploy_id.py next --environment staging --sha \"$DEPLOY_SHA\"" not in run
-                or '>> "$GITHUB_ENV"' not in run):
+        if ("tooling/scripts/deploy_id.py next --environment staging --sha \"$DEPLOY_SHA\""
+                not in run or '>> "$GITHUB_ENV"' not in run):
             errors.append(f"{name}:deploy: compute step must derive the staging ID "
-                          "from the validated deploy SHA")
+                          "from the validated deploy SHA via reviewed tooling")
     prepare, prepare_at = find(
         "staging identity snapshot step",
         lambda step: step.get("name") == "Snapshot staging identity and generate per-deploy image provenance")
@@ -796,6 +821,8 @@ def staging_deploy_id_errors(workflow, name="deploy-staging.yml"):
         "deployment record step",
         lambda step: step.get("name") == "Record the staging deployment")
     if record is not None:
+        if record.get("id") != "record":
+            errors.append(f"{name}:deploy: record step must carry id record for the rollback guard")
         if record.get("if") != "always() && steps.deploy.outcome == 'success'":
             errors.append(f"{name}:deploy: record step must run whenever a deploy went out")
         env = record.get("env") or {}
@@ -806,14 +833,17 @@ def staging_deploy_id_errors(workflow, name="deploy-staging.yml"):
         if env.get("GATE_OUTCOME") != "${{ steps.error_rate_gate.outcome }}":
             errors.append(f"{name}:deploy: record step must judge the error-rate gate outcome")
         run = str(record.get("run") or "")
-        if ("deploy_id.py record --environment staging --sha \"$DEPLOY_SHA\"" not in run
-                or '--deploy-id "$DEPLOY_ID"' not in run):
+        if ("tooling/scripts/deploy_id.py record --environment staging --sha \"$DEPLOY_SHA\""
+                not in run or '--deploy-id "$DEPLOY_ID"' not in run):
             errors.append(f"{name}:deploy: record step must record the staging ID "
-                          "for the validated deploy SHA")
+                          "for the validated deploy SHA via reviewed tooling")
         if "--rollback" in run:
             errors.append(f"{name}:deploy: staging has no rollback mode to record")
     if gate_at >= 0 and record_at >= 0 and record_at < gate_at:
         errors.append(f"{name}:deploy: record step must run after the error-rate gate judges")
+    rollback = [step for step in steps if step.get("id") == "auto_rollback"]
+    if len(rollback) == 1 and "steps.record.outcome != 'failure'" not in str(rollback[0].get("if") or ""):
+        errors.append(f"{name}:deploy: auto-rollback must stand down on a record-step failure")
     if str(deploy).count("deploy_id.py") != 2:
         errors.append(f"{name}:deploy: only the compute and record steps may call deploy_id.py")
     return errors
@@ -1928,7 +1958,8 @@ def production_deploy_id_errors(workflow, name="deploy-production.yml"):
     the readyz gate judges it; the record step stores the deploy as a GitHub
     Deployment with environment=production carrying the ID — never a tag or
     Release — with success only when the readyz gate passed and the
-    error-rate gate did not fail. Rollbacks mint a fresh event ID and name
+    error-rate gate did not fail; a record-step failure fails the run
+    without rolling back. Rollbacks mint a fresh event ID and name
     themselves, since the restored build keeps its original stamped ID. No
     other step may call deploy_id.py.
     """
@@ -1965,14 +1996,25 @@ def production_deploy_id_errors(workflow, name="deploy-production.yml"):
     gate, _ = find(
         "readyz gate step",
         lambda step: step.get("name") == "Gate on stable /health + /readyz gateway-ready")
-    if gate is not None and '--deploy-id "$DEPLOY_ID"' not in str(gate.get("run") or ""):
-        errors.append(f"{name}:production: readyz gate must judge the computed deploy ID")
+    if gate is not None:
+        run = str(gate.get("run") or "")
+        # The flag is conditional: real runs judge the computed ID, while a
+        # caller without an exported ID judges the legacy shape (the
+        # stamping-transition suites run the gate without one).
+        for required in ('deploy_id_arg=(--deploy-id "$DEPLOY_ID")',
+                         '"${deploy_id_arg[@]}"'):
+            if required not in run:
+                errors.append(f"{name}:production: readyz gate must judge the computed "
+                              "deploy ID when one is exported")
     error_gate, error_gate_at = find("promotion error-rate gate step",
                                      lambda step: step.get("id") == "error_rate_gate")
     record, record_at = find(
         "deployment record step",
         lambda step: step.get("name") == "Record the production deployment")
     if record is not None:
+        if record.get("id") != "record":
+            errors.append(f"{name}:production: record step must carry id record "
+                          "for the rollback guard")
         condition = str(record.get("if") or "")
         if ("steps.deploy.outcome == 'success'" not in condition
                 or "steps.rollback.outcome == 'success'" not in condition):
@@ -1994,6 +2036,9 @@ def production_deploy_id_errors(workflow, name="deploy-production.yml"):
             errors.append(f"{name}:production: record step must name rollback records")
     if error_gate_at >= 0 and record_at >= 0 and record_at < error_gate_at:
         errors.append(f"{name}:production: record step must run after the error-rate gate judges")
+    rollback = [step for step in steps if step.get("id") == "auto_rollback"]
+    if len(rollback) == 1 and "steps.record.outcome != 'failure'" not in str(rollback[0].get("if") or ""):
+        errors.append(f"{name}:production: auto-rollback must stand down on a record-step failure")
     if str(production).count("deploy_id.py") != 2:
         errors.append(f"{name}:production: only the compute and record steps may call deploy_id.py")
     return errors
@@ -4113,13 +4158,16 @@ class WorkflowTests(unittest.TestCase):
                         if "staging_schema_gate.py" in str(step.get("run", "")))
         self.assertEqual(gate_run["env"]["SOURCE_SHA"], DEPLOY_SHA_EXPRESSION)
 
+        # Deploy step indices: the workflow-head tooling checkout sits at [1],
+        # so the SHA step is [2] there (schema-gate and roles-gate are
+        # unchanged at [1]).
         def swap_shape_after_equality(workflow):
-            run = workflow["jobs"]["deploy"]["steps"][1]["run"]
+            run = workflow["jobs"]["deploy"]["steps"][2]["run"]
             lines = run.splitlines()
             case_i = next(i for i, line in enumerate(lines) if line.strip().startswith("case "))
             test_i = next(i for i, line in enumerate(lines) if "git rev-parse HEAD" in line)
             lines[case_i], lines[test_i] = lines[test_i], lines[case_i]
-            workflow["jobs"]["deploy"]["steps"][1]["run"] = "\n".join(lines)
+            workflow["jobs"]["deploy"]["steps"][2]["run"] = "\n".join(lines)
 
         mutations = {
             # A push (or an empty dispatch) must deploy the workflow head, never a constant.
@@ -4130,29 +4178,29 @@ class WorkflowTests(unittest.TestCase):
             "checkout ref removed": lambda w: w["jobs"]["deploy"]["steps"][0]["with"].pop("ref"),
             "deploy checkout shallow": lambda w: w["jobs"]["deploy"]["steps"][0]["with"]
                 .__setitem__("fetch-depth", "1"),
-            "SHA env constant": lambda w: w["jobs"]["deploy"]["steps"][1]["env"]
+            "SHA env constant": lambda w: w["jobs"]["deploy"]["steps"][2]["env"]
                 .__setitem__("SOURCE_SHA", "abc"),
-            "ancestry check dropped": lambda w: w["jobs"]["deploy"]["steps"][1]
+            "ancestry check dropped": lambda w: w["jobs"]["deploy"]["steps"][2]
                 .__setitem__("run", "\n".join(line for line in
-                                             w["jobs"]["deploy"]["steps"][1]["run"].splitlines()
+                                             w["jobs"]["deploy"]["steps"][2]["run"].splitlines()
                                              if "merge-base" not in line)),
-            "ancestry rejection goes green": lambda w: w["jobs"]["deploy"]["steps"][1]
-                .__setitem__("run", w["jobs"]["deploy"]["steps"][1]["run"]
+            "ancestry rejection goes green": lambda w: w["jobs"]["deploy"]["steps"][2]
+                .__setitem__("run", w["jobs"]["deploy"]["steps"][2]["run"]
                              .replace("exit 1", "exit 0")),
             "ancestry-only rejection goes green": lambda w: [
-                job["steps"][1].__setitem__(
-                    "run", job["steps"][1]["run"].replace(
+                job["steps"][2 if job is w["jobs"]["deploy"] else 1].__setitem__(
+                    "run", job["steps"][2 if job is w["jobs"]["deploy"] else 1]["run"].replace(
                         'git merge-base --is-ancestor "$SOURCE_SHA" origin/main || '
                         '{ echo "::error::$SOURCE_SHA is not an ancestor of origin/main" >&2; exit 1; }',
                         'git merge-base --is-ancestor "$SOURCE_SHA" origin/main || '
                         '{ echo "::error::$SOURCE_SHA is not an ancestor of origin/main" >&2; exit 0; }'))
                 for job in (w["jobs"]["schema-gate"], w["jobs"]["roles-gate"], w["jobs"]["deploy"])],
-            "hex enforcement dropped": lambda w: w["jobs"]["deploy"]["steps"][1]
+            "hex enforcement dropped": lambda w: w["jobs"]["deploy"]["steps"][2]
                 .__setitem__("run", "\n".join(line for line in
-                                             w["jobs"]["deploy"]["steps"][1]["run"].splitlines()
+                                             w["jobs"]["deploy"]["steps"][2]["run"].splitlines()
                                              if "${#SOURCE_SHA}" not in line)),
             "shape check after equality": swap_shape_after_equality,
-            "second sha reader": lambda w: w["jobs"]["deploy"]["steps"][2]
+            "second sha reader": lambda w: w["jobs"]["deploy"]["steps"][3]
                 .setdefault("env", {}).__setitem__("EXTRA_SHA", DEPLOY_SHA_EXPRESSION),
             "sha input removed": lambda w: w["on"]["workflow_dispatch"]["inputs"].pop("sha"),
             "sha input boolean": lambda w: w["on"]["workflow_dispatch"]["inputs"]["sha"]

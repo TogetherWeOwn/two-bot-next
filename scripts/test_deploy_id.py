@@ -220,13 +220,45 @@ class GhTests(unittest.TestCase):
         with patch.dict("os.environ", {"GITHUB_REPOSITORY": "owner/repo"}, clear=False):
             code, out, calls = self.run_cli(
                 ["next", "--environment", "staging", "--sha", SHA, "--date", DATE],
-                outputs=(page, []),
+                outputs=(page,),
             )
         # A short first page ends the listing: one API call, N = 2.
         self.assertEqual(code, 0)
         self.assertEqual(out, f"DEPLOY_ID={DATE}.2+{SHA7}\n")
         self.assertEqual(len(calls), 1)
         self.assertIn("environment=staging", str(calls[0][0]))
+
+    def test_next_stops_at_the_first_row_older_than_the_date(self):
+        full = [row("2026-10-21T08:00:00Z")] * 100
+        older = [row("2026-10-20T08:00:00Z")]
+        with patch.dict("os.environ", {"GITHUB_REPOSITORY": "owner/repo"}, clear=False):
+            code, out, calls = self.run_cli(
+                ["next", "--environment", "staging", "--sha", SHA, "--date", DATE],
+                outputs=(full, older),
+            )
+        # Total history never matters: two pages, N counts today only.
+        self.assertEqual(code, 0)
+        self.assertEqual(out, f"DEPLOY_ID={DATE}.101+{SHA7}\n")
+        self.assertEqual(len(calls), 2)
+
+    def test_next_ignores_future_rows_without_counting_them(self):
+        rows = [row("2026-10-22T08:00:00Z"), row("2026-10-21T08:00:00Z")]
+        with patch.dict("os.environ", {"GITHUB_REPOSITORY": "owner/repo"}, clear=False):
+            code, out, _ = self.run_cli(
+                ["next", "--environment", "staging", "--sha", SHA, "--date", DATE],
+                outputs=(rows,),
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, f"DEPLOY_ID={DATE}.2+{SHA7}\n")
+
+    def test_next_refuses_a_malformed_listing_row(self):
+        with patch.dict("os.environ", {"GITHUB_REPOSITORY": "owner/repo"}, clear=False):
+            code, out, _ = self.run_cli(
+                ["next", "--environment", "staging", "--sha", SHA, "--date", DATE],
+                outputs=([{"environment": "staging"}],),
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("created_at", out)
 
     def test_next_refuses_past_the_page_cap(self):
         full = [row("2026-10-21T08:00:00Z")] * 100
