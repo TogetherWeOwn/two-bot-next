@@ -4245,35 +4245,63 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// Answer a staged `Ownership` reply. Pumps the guild queue until the
     /// handoff's first commit attempt settles the waiter or
     /// `OWNERSHIP_COMMIT_WAIT` passes, then sends the success text only when
-    /// the commit confirmed. A dispatch already in flight always runs to
-    /// completion — abandoning one would lose its action and wedge the
-    /// guild's in-flight slot — so the deadline only gates starting new work.
+    /// the commit confirmed. The deadline bounds the reply, not the attempt:
+    /// a dispatch already in flight when the budget expires still runs to
+    /// completion — abandoning one would lose its action and a cancelled
+    /// Discord write may already have landed — but the reply goes out as
+    /// finalizing first, and the resumed attempt finishes unbounded while
+    /// its late commit stays silent.
     async fn drive_staged_ownership(&mut self, now_ms: u64) {
-        let Some(staged) = self.staged_ownership_reply.take() else {
+        let Some(mut staged) = self.staged_ownership_reply.take() else {
             return;
         };
         let deadline = tokio::time::Instant::now() + OWNERSHIP_COMMIT_WAIT;
         self.ownership_commit_deadline = Some(deadline);
-        let mut waiter = staged.waiter;
-        let outcome = loop {
-            if let Ok(outcome) = waiter.try_recv() {
-                break outcome;
+        loop {
+            if let Ok(outcome) = staged.waiter.try_recv() {
+                let StagedOwnershipReply {
+                    reply, success, ..
+                } = staged;
+                let _ = reply.send(match outcome {
+                    OwnershipCommit::Committed => success,
+                    OwnershipCommit::Pending => OWNERSHIP_FINALIZING.to_owned(),
+                });
+                self.ownership_commit_deadline = None;
+                return;
             }
             if tokio::time::Instant::now() >= deadline {
-                break OwnershipCommit::Pending;
+                let StagedOwnershipReply { reply, .. } = staged;
+                let _ = reply.send(OWNERSHIP_FINALIZING.to_owned());
+                // Dropping the waiter keeps the attempt's late commit
+                // silent; the handoff itself stays queued for retry.
+                self.ownership_commit_deadline = None;
+                return;
             }
             // Pumping executes whatever is due in queue order — the handoff
-            // when its turn comes. Always yield past a miss so a queue that
-            // keeps reporting progress cannot spin the reply budget away
+            // when its turn comes. Race one pump against the reply budget:
+            // a held Discord grant must not hold the reply past the
+            // deadline. Always yield past a miss so a queue that keeps
+            // reporting progress cannot spin the reply budget away
             // without advancing the clock.
-            self.dispatch_one(now_ms).await;
+            let pump = self.dispatch_one(now_ms);
+            tokio::pin!(pump);
+            let expired = tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => true,
+                _ = &mut pump => false,
+            };
+            if expired {
+                let StagedOwnershipReply { reply, .. } = staged;
+                let _ = reply.send(OWNERSHIP_FINALIZING.to_owned());
+                // The reply is out; the attempt still owns its queued
+                // action, so run it to completion instead of cancelling.
+                // The store leg sees the dropped waiter and finishes
+                // unbounded (see the commit deadline below).
+                pump.await;
+                self.ownership_commit_deadline = None;
+                return;
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
-        };
-        self.ownership_commit_deadline = None;
-        let _ = staged.reply.send(match outcome {
-            OwnershipCommit::Committed => staged.success,
-            OwnershipCommit::Pending => OWNERSHIP_FINALIZING.to_owned(),
-        });
+        }
     }
 
     /// Replay durable cleanup independently of caretaker succession. A present
@@ -6398,10 +6426,15 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 }
                 // A staged Ownership reply bounds its own commit: an attempt
                 // past the reply budget stays queued and keeps retrying, but
-                // the reply must already have gone out as finalizing.
-                let commit_deadline = self
-                    .ownership_commit_deadline
-                    .filter(|_| self.ownership_commit_waiters.contains_key(&channel_id));
+                // the reply must already have gone out as finalizing. Once
+                // that reply is out its waiter is gone, so a resumed attempt
+                // finishes unbounded instead of cancelling a write nobody
+                // is waiting on.
+                let commit_deadline = self.ownership_commit_deadline.filter(|_| {
+                    self.ownership_commit_waiters
+                        .get(&channel_id)
+                        .is_some_and(|waiters| waiters.iter().any(|tx| !tx.is_closed()))
+                });
                 let committed = if let Some(deadline) = commit_deadline {
                     tokio::time::timeout_at(
                         deadline,
