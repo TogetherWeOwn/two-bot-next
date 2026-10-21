@@ -34,6 +34,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("feed-add", "docs/parity.md §1 #28 caps"),
     ("feed-remove", "docs/parity.md §1 #29 caps"),
     ("schedule-list", "docs/parity.md §1 #19 page"),
+    ("feed-list", "docs/parity.md §1 #30 page"),
     ("privacy", "docs/parity.md §1 privacy"),
 ];
 
@@ -376,6 +377,37 @@ pub fn expected_registry() -> Value {
             CommandOption::new(
                 "page",
                 "Page of the schedule list (1-based)",
+                two_bot_core::commands::CommandOptionType::Integer,
+            )
+            .min_value(1),
+        )
+        .expect("page option serializes");
+        command["options"] = json!([page]);
+    }
+    // Feed-list pagination: the Next-only additive `page` option keeps every
+    // stored relay id discoverable as whole rows within Discord's 2,000-unit
+    // cap. Legacy publishes no options on `feed-list`; permissions and the
+    // command name stay legacy-identical.
+    {
+        let _ = INTENTIONAL_DIFFERENCES
+            .iter()
+            .find(|(command, _)| *command == "feed-list")
+            .expect("page has a documented command exception");
+        let command = commands
+            .iter_mut()
+            .find(|command| command["name"] == "feed-list")
+            .expect("docs/parity.md §1 #30 page");
+        assert!(
+            command["options"]
+                .as_array()
+                .expect("command options array")
+                .is_empty(),
+            "legacy feed-list has no options"
+        );
+        let page = serde_json::to_value(
+            CommandOption::new(
+                "page",
+                "Page of the feed relay list (1-based)",
                 two_bot_core::commands::CommandOptionType::Integer,
             )
             .min_value(1),
