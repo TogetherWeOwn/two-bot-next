@@ -152,12 +152,84 @@ impl PgMemberModerationStore {
         }
         Ok(())
     }
+
+    fn uncertain_row(row: &sqlx::postgres::PgRow) -> Result<UncertainRow, StoreError> {
+        let kind = match row.try_get::<String, _>("kind").map_err(db_error)?.as_str() {
+            "prepared_ban" => UncertainKind::PreparedBan,
+            "quarantined_unban" => UncertainKind::QuarantinedUnban,
+            _ => UncertainKind::RunningUnban,
+        };
+        Ok(UncertainRow {
+            request_id: row.try_get("request_id").map_err(db_error)?,
+            user_id: row.try_get("user_id").map_err(db_error)?,
+            kind,
+            generation: row.try_get("generation").map_err(db_error)?,
+            execute_at: row.try_get("execute_at").map_err(db_error)?,
+        })
+    }
+
+    /// Bounded operator page over the same fenced rows `surface_uncertain`
+    /// reports, oldest request first: at most `limit` rows plus the total
+    /// fenced count so `--list` can print its truncation receipt. The limit
+    /// clamps to `OPERATOR_LIST_MAX_LIMIT`. Identifiers only, tokens never.
+    pub async fn surface_uncertain_limited(
+        &self,
+        guild_id: &str,
+        limit: i64,
+    ) -> Result<(Vec<UncertainRow>, i64), StoreError> {
+        self.ensure_guild(guild_id)?;
+        // The count and the page read the same UNION ALL: a row counted here
+        // is a row the page can show, so the receipt total never disagrees
+        // with the listing.
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM (
+               SELECT request_id FROM moderation_member_bans
+               WHERE guild_id = $1 AND state = 'prepared'
+               UNION ALL
+               SELECT request_id FROM moderation_scheduled_unbans
+               WHERE guild_id = $1
+                 AND (state = 'running' OR dispatch_uncertain OR state = 'quarantined')
+             ) AS fenced",
+        )
+        .bind(&self.guild_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_error)?;
+        let rows = sqlx::query(
+            "SELECT request_id, user_id, generation, NULL::text AS execute_at,
+               'prepared_ban' AS kind
+             FROM moderation_member_bans WHERE guild_id = $1 AND state = 'prepared'
+             UNION ALL
+             SELECT request_id, user_id, retry_generation AS generation,
+               execute_at::text AS execute_at,
+               CASE WHEN state = 'quarantined' THEN 'quarantined_unban'
+                 ELSE 'running_unban' END AS kind
+             FROM moderation_scheduled_unbans WHERE guild_id = $1
+               AND (state = 'running' OR dispatch_uncertain OR state = 'quarantined')
+             ORDER BY 1 LIMIT $2",
+        )
+        .bind(&self.guild_id)
+        .bind(limit.clamp(0, OPERATOR_LIST_MAX_LIMIT))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_error)?;
+        let mut uncertain = Vec::with_capacity(rows.len());
+        for row in &rows {
+            uncertain.push(Self::uncertain_row(row)?);
+        }
+        Ok((uncertain, total))
+    }
 }
 
 // The request id is already owned by a durable non-rejected intent: the
 // request itself is fenced, never safe to retry under the same key.
 const REQUEST_ID_IN_USE: &str = "ban request id is already in use";
 const UNBAN_REQUEST_ID_IN_USE: &str = "unban request id is already in use";
+
+// Operator `--list` page: the default rows per listing and the ceiling an
+// explicit `--limit` clamps to. The reconcile-member CLI documents both.
+pub const OPERATOR_LIST_DEFAULT_LIMIT: i64 = 25;
+pub const OPERATOR_LIST_MAX_LIMIT: i64 = 100;
 
 // Never log SQL parameter values or database DETAIL (which can contain a
 // moderator's reason). The SQLSTATE is enough to diagnose a ledger failure.
@@ -645,6 +717,12 @@ impl MemberModerationStore for PgMemberModerationStore {
         limit: i64,
     ) -> Result<Vec<UnbanJob>, StoreError> {
         self.ensure_guild(guild)?;
+        // Both phases honor the same bound: staged activation takes the oldest
+        // rows first so the sweep — which claims one job per iteration and
+        // stops on empty — always progresses from the same end of the queue
+        // the candidates query dispatches from. Newest-first under a bound
+        // would stall behind one future-dated row and starve old rows under
+        // churn; oldest-first completes every due unban across passes.
         let staged = sqlx::query(
             "SELECT job.request_id, job.user_id FROM moderation_scheduled_unbans AS job
              JOIN moderation_member_bans AS intent ON intent.request_id = job.request_id
@@ -662,9 +740,10 @@ impl MemberModerationStore for PgMemberModerationStore {
                    AND ((newer.state = 'prepared' AND newer.request_id <> intent.request_id)
                      OR (newer.generation > intent.generation AND newer.state <> 'rejected'))
                )
-             ORDER BY intent.generation DESC",
+             ORDER BY intent.generation ASC, job.request_id ASC LIMIT $2",
         )
         .bind(&self.guild_id)
+        .bind(limit.clamp(0, 25))
         .fetch_all(&self.pool)
         .await
         .map_err(db_error)?;
@@ -814,19 +893,8 @@ impl MemberModerationStore for PgMemberModerationStore {
         .await
         .map_err(db_error)?;
         let mut uncertain = Vec::with_capacity(rows.len());
-        for row in rows {
-            let kind = match row.try_get::<String, _>("kind").map_err(db_error)?.as_str() {
-                "prepared_ban" => UncertainKind::PreparedBan,
-                "quarantined_unban" => UncertainKind::QuarantinedUnban,
-                _ => UncertainKind::RunningUnban,
-            };
-            uncertain.push(UncertainRow {
-                request_id: row.try_get("request_id").map_err(db_error)?,
-                user_id: row.try_get("user_id").map_err(db_error)?,
-                kind,
-                generation: row.try_get("generation").map_err(db_error)?,
-                execute_at: row.try_get("execute_at").map_err(db_error)?,
-            });
+        for row in &rows {
+            uncertain.push(Self::uncertain_row(row)?);
         }
         Ok(uncertain)
     }

@@ -675,6 +675,8 @@ pub trait MemberModerationStore: Send + Sync {
     /// Dispatchers request one job at a time so a cancelled first request
     /// cannot strand a batch of never-dispatched expiries. Running rows are
     /// never reclaimed by age; prepared bans require reconciliation.
+    /// Each call claims at most `limit.clamp(0, 25)` jobs; repeated calls
+    /// complete every due unban.
     fn claim_due_unbans(
         &self,
         guild_id: &str,

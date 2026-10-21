@@ -17,14 +17,16 @@
 
 use two_bot_core::internal_action_store::{
     DiscordId, EventOutcome, InternalActionStore, ReconciliationEvidence, TerminalFailure,
-    TerminalResponse,
+    TerminalResponse, OPERATOR_LIST_DEFAULT_LIMIT, OPERATOR_LIST_MAX_LIMIT,
 };
 use two_bot_core::internal_actions::{is_snowflake, valid_event_key};
 
 pub(crate) const USAGE: &str = "\
-  two-bot reconcile-event --guild <id> --list
+  two-bot reconcile-event --guild <id> --list [--limit <n>]
       List unknown event.upsert/event.cancel intents oldest first.
-      Read-only. Env: TWO_DATABASE_URL (required). Staging guild only.
+      Read-only. Shows 25 rows by default, at most 100; a capped listing
+      ends with `showing <shown> of <total> rows (truncated; rerun with --limit <total>)`.
+      Env: TWO_DATABASE_URL (required). Staging guild only.
 
   two-bot reconcile-event --guild <id> --intent <n> --created --event-key <k> --event-id <id> [--execute]
       The create landed in Discord: register the key mapping and record a
@@ -55,7 +57,7 @@ enum ResolveMode {
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
-    List,
+    List { limit: i64 },
     Resolve { intent: i64, mode: ResolveMode },
 }
 
@@ -71,6 +73,7 @@ fn parse(args: &[String]) -> Result<Args, ()> {
     let mut event_key = None;
     let mut event_id = None;
     let mut mode: Option<&str> = None;
+    let mut limit = None;
     let mut execute = false;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -102,13 +105,29 @@ fn parse(args: &[String]) -> Result<Args, ()> {
             {
                 mode = Some(arg.as_str());
             }
+            "--limit" if limit.is_none() => {
+                let value: i64 = args.next().ok_or(())?.parse().map_err(|_| ())?;
+                if value <= 0 {
+                    return Err(());
+                }
+                limit = Some(value);
+            }
             "--execute" if !execute => execute = true,
             _ => return Err(()),
         }
     }
     let guild = guild.filter(|id| is_snowflake(id)).ok_or(())?;
+    // The row cap belongs to listings only: silently ignoring it on a
+    // resolution would mislead the operator about what ran.
+    if !matches!(mode, Some("--list")) && limit.is_some() {
+        return Err(());
+    }
     let command = match mode.ok_or(())? {
-        "--list" => Command::List,
+        "--list" => Command::List {
+            limit: limit
+                .unwrap_or(OPERATOR_LIST_DEFAULT_LIMIT)
+                .min(OPERATOR_LIST_MAX_LIMIT),
+        },
         "--created" => Command::Resolve {
             intent: intent.ok_or(())?,
             mode: ResolveMode::Created {
@@ -277,11 +296,15 @@ fn expected_action<'a>(mode: &ResolveMode, unknown_action: Option<&'a str>) -> O
 
 async fn run(store: &InternalActionStore, guild: &str, command: &Command, execute: bool) -> i32 {
     match command {
-        Command::List => match store.list_unknown_event_intents(guild).await {
-            Ok(rows) => {
+        Command::List { limit } => match store
+            .list_unknown_event_intents_limited(guild, *limit)
+            .await
+        {
+            Ok((rows, total)) => {
                 if rows.is_empty() {
                     println!("no unknown event intents");
                 }
+                let shown = rows.len() as i64;
                 for row in rows {
                     // Event keys stay hashed in the database, so the listing
                     // names only the exact intent id the operator resolves.
@@ -292,6 +315,14 @@ async fn run(store: &InternalActionStore, guild: &str, command: &Command, execut
                     // staging-guild fenced; listing fenced intents is the
                     // tool purpose.
                     println!("{}\t{}\t{}", row.intent_id, row.action, row.created_at_utc);
+                }
+                // The store counts before deciding, so a listing that ends
+                // exactly at the cap prints no receipt; only a capped one
+                // names its total and the rerun that shows it all.
+                if total > shown {
+                    println!(
+                        "showing {shown} of {total} rows (truncated; rerun with --limit {total})"
+                    );
                 }
                 0
             }
@@ -371,8 +402,74 @@ mod tests {
     fn list_parses() {
         let parsed = parse(&args(&["--guild", "222222222222222222", "--list"])).expect("list");
         assert_eq!(parsed.guild, "222222222222222222");
-        assert!(matches!(parsed.command, Command::List));
+        assert!(matches!(
+            parsed.command,
+            Command::List { limit } if limit == OPERATOR_LIST_DEFAULT_LIMIT
+        ));
         assert!(!parsed.execute);
+    }
+
+    #[test]
+    fn list_limit_override_parses_and_clamps() {
+        let parsed = parse(&args(&[
+            "--guild",
+            "222222222222222222",
+            "--list",
+            "--limit",
+            "5",
+        ]))
+        .expect("override");
+        assert!(matches!(parsed.command, Command::List { limit: 5 }));
+        let parsed = parse(&args(&[
+            "--guild",
+            "222222222222222222",
+            "--list",
+            "--limit",
+            "500",
+        ]))
+        .expect("clamped");
+        assert!(matches!(
+            parsed.command,
+            Command::List { limit } if limit == OPERATOR_LIST_MAX_LIMIT
+        ));
+    }
+
+    #[test]
+    fn list_limit_rejects_non_positive_non_numeric_and_missing() {
+        for value in ["0", "-5", "abc"] {
+            assert!(
+                parse(&args(&[
+                    "--guild",
+                    "222222222222222222",
+                    "--list",
+                    "--limit",
+                    value
+                ]))
+                .is_err(),
+                "--limit {value} is invalid"
+            );
+        }
+        assert!(parse(&args(&[
+            "--guild",
+            "222222222222222222",
+            "--list",
+            "--limit"
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn limit_is_refused_without_list() {
+        assert!(parse(&args(&[
+            "--guild",
+            "222222222222222222",
+            "--intent",
+            "7",
+            "--no-effect",
+            "--limit",
+            "5",
+        ]))
+        .is_err());
     }
 
     #[test]

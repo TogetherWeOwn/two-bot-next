@@ -17,13 +17,17 @@ use two_bot_core::{
     member_moderation::{
         BanAttempt, HistoricalBanAcceptance, MemberModerationStore, UnbanResolution, UncertainKind,
     },
-    member_moderation_store::PgMemberModerationStore,
+    member_moderation_store::{
+        PgMemberModerationStore, OPERATOR_LIST_DEFAULT_LIMIT, OPERATOR_LIST_MAX_LIMIT,
+    },
 };
 
 pub(crate) const USAGE: &str = "\
-  two-bot reconcile-member --guild <id> --list
+  two-bot reconcile-member --guild <id> --list [--limit <n>]
       List fenced rows: prepared ban intents, running dispatches and
       quarantined imports. Read-only; claim tokens never print.
+      Shows 25 rows by default, at most 100; a capped listing ends with
+      `showing <shown> of <total> rows (truncated; rerun with --limit <total>)`.
       Env: TWO_DATABASE_URL (required). Staging guild only.
 
   two-bot reconcile-member --guild <id> (--confirm-ban | --reject-ban) --request <req> --user <id> --generation <n> [--execute]
@@ -44,7 +48,9 @@ pub(crate) const USAGE: &str = "\
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
-    List,
+    List {
+        limit: i64,
+    },
     ConfirmBan {
         request: String,
         user: String,
@@ -106,6 +112,7 @@ fn parse(args: &[String]) -> Result<Args, ()> {
     let mut actor = None;
     let mut mode: Option<&str> = None;
     let mut completed = None;
+    let mut limit = None;
     let mut execute = false;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -141,13 +148,29 @@ fn parse(args: &[String]) -> Result<Args, ()> {
             }
             "--completed" if completed.is_none() => completed = Some(true),
             "--void" if completed.is_none() => completed = Some(false),
+            "--limit" if limit.is_none() => {
+                let value: i64 = args.next().ok_or(())?.parse().map_err(|_| ())?;
+                if value <= 0 {
+                    return Err(());
+                }
+                limit = Some(value);
+            }
             "--execute" if !execute => execute = true,
             _ => return Err(()),
         }
     }
     let guild = guild.filter(|id| snowflake(id)).ok_or(())?;
+    // The row cap belongs to listings only: silently ignoring it on a
+    // resolution would mislead the operator about what ran.
+    if !matches!(mode, Some("--list")) && limit.is_some() {
+        return Err(());
+    }
     let command = match mode.ok_or(())? {
-        "--list" => Command::List,
+        "--list" => Command::List {
+            limit: limit
+                .unwrap_or(OPERATOR_LIST_DEFAULT_LIMIT)
+                .min(OPERATOR_LIST_MAX_LIMIT),
+        },
         "--confirm-ban" | "--reject-ban" => {
             let request = request.filter(|id| reference(id)).ok_or(())?;
             let user = user.filter(|id| snowflake(id)).ok_or(())?;
@@ -239,11 +262,12 @@ async fn run(
     execute: bool,
 ) -> i32 {
     match command {
-        Command::List => match store.surface_uncertain(guild).await {
-            Ok(rows) => {
+        Command::List { limit } => match store.surface_uncertain_limited(guild, *limit).await {
+            Ok((rows, total)) => {
                 if rows.is_empty() {
                     println!("no fenced member rows");
                 }
+                let shown = rows.len() as i64;
                 for row in rows {
                     let detail = match row.kind {
                         UncertainKind::PreparedBan => format!(
@@ -260,6 +284,14 @@ async fn run(
                         row.kind.as_str(),
                         row.request_id,
                         row.user_id
+                    );
+                }
+                // The store counts before deciding, so a listing that ends
+                // exactly at the cap prints no receipt; only a capped one
+                // names its total and the rerun that shows it all.
+                if total > shown {
+                    println!(
+                        "showing {shown} of {total} rows (truncated; rerun with --limit {total})"
                     );
                 }
                 0
@@ -435,8 +467,78 @@ mod tests {
     fn list_parses() {
         let parsed = parse(&args(&["--guild", "222222222222222222", "--list"])).expect("list");
         assert_eq!(parsed.guild, "222222222222222222");
-        assert!(matches!(parsed.command, Command::List));
+        assert!(matches!(
+            parsed.command,
+            Command::List { limit } if limit == OPERATOR_LIST_DEFAULT_LIMIT
+        ));
         assert!(!parsed.execute);
+    }
+
+    #[test]
+    fn list_limit_override_parses_and_clamps() {
+        let parsed = parse(&args(&[
+            "--guild",
+            "222222222222222222",
+            "--list",
+            "--limit",
+            "5",
+        ]))
+        .expect("override");
+        assert!(matches!(parsed.command, Command::List { limit: 5 }));
+        let parsed = parse(&args(&[
+            "--guild",
+            "222222222222222222",
+            "--list",
+            "--limit",
+            "500",
+        ]))
+        .expect("clamped");
+        assert!(matches!(
+            parsed.command,
+            Command::List { limit } if limit == OPERATOR_LIST_MAX_LIMIT
+        ));
+    }
+
+    #[test]
+    fn list_limit_rejects_non_positive_non_numeric_and_missing() {
+        for value in ["0", "-5", "abc"] {
+            assert!(
+                parse(&args(&[
+                    "--guild",
+                    "222222222222222222",
+                    "--list",
+                    "--limit",
+                    value
+                ]))
+                .is_err(),
+                "--limit {value} is invalid"
+            );
+        }
+        assert!(parse(&args(&[
+            "--guild",
+            "222222222222222222",
+            "--list",
+            "--limit"
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn limit_is_refused_without_list() {
+        assert!(parse(&args(&[
+            "--guild",
+            "222222222222222222",
+            "--confirm-ban",
+            "--request",
+            "r",
+            "--user",
+            "333333333333333333",
+            "--generation",
+            "7",
+            "--limit",
+            "5",
+        ]))
+        .is_err());
     }
 
     #[test]
