@@ -237,8 +237,11 @@ fn validate_input_shape(input: &Map<String, Value>, label: &str) -> Result<(), R
     // landed, so refuse it here. Absent fields stay valid; only present values
     // must match the documented Discord-bound shape.
     if let Some(value) = guild.get("name") {
-        if !value.is_string() {
-            return Err(shape_error(&format!("{label}.guild.name"), "a string"));
+        if !nonempty_string(Some(value)) {
+            return Err(shape_error(
+                &format!("{label}.guild.name"),
+                "a nonempty string",
+            ));
         }
     }
     if let Some(value) = guild.get("description") {
@@ -257,16 +260,19 @@ fn validate_input_shape(input: &Map<String, Value>, label: &str) -> Result<(), R
         "system_channel_flags",
     ] {
         if let Some(value) = guild.get(field) {
-            if value.as_i64().is_none() {
-                return Err(shape_error(&format!("{label}.guild.{field}"), "an integer"));
+            if value.as_i64().is_none_or(|value| value < 0) {
+                return Err(shape_error(
+                    &format!("{label}.guild.{field}"),
+                    "a nonnegative integer",
+                ));
             }
         }
     }
     if let Some(value) = guild.get("preferred_locale") {
-        if !value.is_string() {
+        if !nonempty_string(Some(value)) {
             return Err(shape_error(
                 &format!("{label}.guild.preferred_locale"),
-                "a string",
+                "a nonempty string",
             ));
         }
     }
@@ -336,8 +342,11 @@ fn validate_input_shape(input: &Map<String, Value>, label: &str) -> Result<(), R
                     }
                 }
                 if let Some(value) = row.get("color") {
-                    if value.as_i64().is_none() {
-                        return Err(shape_error(&format!("{path}.color"), "an integer"));
+                    if value.as_i64().is_none_or(|value| value < 0) {
+                        return Err(shape_error(
+                            &format!("{path}.color"),
+                            "a nonnegative integer",
+                        ));
                     }
                 }
             }
@@ -365,8 +374,11 @@ fn validate_input_shape(input: &Map<String, Value>, label: &str) -> Result<(), R
                 // valid; null stays valid only for the nullable topic.
                 for field in ["bitrate", "user_limit", "rate_limit_per_user"] {
                     if let Some(value) = row.get(field) {
-                        if value.as_i64().is_none() {
-                            return Err(shape_error(&format!("{path}.{field}"), "an integer"));
+                        if value.as_i64().is_none_or(|value| value < 0) {
+                            return Err(shape_error(
+                                &format!("{path}.{field}"),
+                                "a nonnegative integer",
+                            ));
                         }
                     }
                 }
