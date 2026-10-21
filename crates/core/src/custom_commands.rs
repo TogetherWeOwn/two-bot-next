@@ -604,6 +604,32 @@ pub fn format_command_list_page(
             Err(INVALID_COMMAND_LIST_PAGE)
         };
     }
+    let lines: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            let trigger = row
+                .text_trigger
+                .as_deref()
+                .map(|trigger| format!(" (or {trigger})"))
+                .unwrap_or_default();
+            format!(
+                "/{}{} — {}",
+                row.name,
+                trigger,
+                if row.enabled { "on" } else { "off" }
+            )
+        })
+        .collect();
+    // A single page needs no next hint. Do not reject a complete snapshot
+    // that fits exactly with its shorter footer.
+    let single_page = format!("{}\n\nPage 1 of 1", lines.join("\n"));
+    if single_page.encode_utf16().count() <= MAX_RENDERED_CHARS {
+        return if page == 1 {
+            Ok(single_page)
+        } else {
+            Err(INVALID_COMMAND_LIST_PAGE)
+        };
+    }
     let reserved = format!(
         "\n\nPage {0} of {0}\nNext: /command-list page:{0}",
         rows.len()
@@ -614,22 +640,11 @@ pub fn format_command_list_page(
     let mut pages = Vec::new();
     let mut body = String::new();
     let mut units = 0;
-    for row in rows {
-        let trigger = row
-            .text_trigger
-            .as_deref()
-            .map(|trigger| format!(" (or {trigger})"))
-            .unwrap_or_default();
-        let line = format!(
-            "/{}{} — {}",
-            row.name,
-            trigger,
-            if row.enabled { "on" } else { "off" }
-        );
+    for line in lines {
         let line_units = line.encode_utf16().count();
         if line_units > body_limit {
             return Err(
-                "A custom-command row is too long to list. Ask a server admin to repair it.",
+                "A custom-command row is too long to list. Ask a server admin to repair it, then run /command-list page:1.",
             );
         }
         if units + usize::from(!body.is_empty()) + line_units > body_limit {
