@@ -478,7 +478,12 @@ pub(crate) async fn serve_jobs(
     // Fail fast before spawning the supervisor task or draining HTTP: its
     // completion is joined with `let _`, so a registration error returned from
     // inside the task would read as a silent idle instead of a boot failure.
-    jobs::check_registered(&registered, &status.read().await).map_err(std::io::Error::other)?;
+    // The guard is scoped: the read lock must be released before the
+    // supervisor spawns, or the jobs' first status write would block on it.
+    {
+        let statuses = status.read().await;
+        jobs::check_registered(&registered, &statuses).map_err(std::io::Error::other)?;
+    }
     let shutdown = Shutdown(shutdown);
     let supervisor = tokio::spawn(jobs::supervise(registered, status, shutdown.0.subscribe()));
     let result = drain_http(http, shutdown.0.subscribe()).await;

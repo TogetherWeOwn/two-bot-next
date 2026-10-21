@@ -116,7 +116,12 @@ pub async fn supervise(
 ) -> Result<(), UnregisteredJob> {
     // Fail fast before any task spawns: a name mismatch is a registration bug,
     // not a runtime outcome, and must never surface as a supervisor-task panic.
-    check_registered(&jobs, &status.read().await)?;
+    // The guard is scoped: the read lock must be released before tasks spawn,
+    // or their first status write would block on it forever.
+    {
+        let statuses = status.read().await;
+        check_registered(&jobs, &statuses)?;
+    }
     let mut tasks = JoinSet::new();
     for job in jobs {
         assert!(!job.cadence.is_zero(), "job cadence must be nonzero");
