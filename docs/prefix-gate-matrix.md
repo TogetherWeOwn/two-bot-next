@@ -31,5 +31,8 @@ parser rules.
   a folded trigger colliding with a builtin name is rejected.
 - Stored triggers always match the legacy shape (`TRIGGER_PATTERN =
   /^![a-z0-9_-]{1,32}$/`), so a parse miss is a store miss. Gateway wiring
-  and custom-command storage are out of scope (follow-ups under TOG-10080);
+  and custom-command storage are covered outside this matrix (store:
+  `crates/core/src/custom_command_store.rs`, service:
+  `crates/core/src/custom_command_service.rs`, gateway composition:
+  `crates/bot/src/gateway_tests/custom_composition.rs`);
   the caller resolves the returned name against its store.
