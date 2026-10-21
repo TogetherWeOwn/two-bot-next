@@ -623,7 +623,10 @@ fn rollback_import_refuses_an_overlong_single_line() {
         "{{\"table\":\"events\",\"row\":{{\"pad\":\"{}\"}}}}",
         "x".repeat(2 * 1024 * 1024)
     );
-    assert!(line.len() > 1024 * 1024, "line must clear any sane line bound");
+    assert!(
+        line.len() > 1024 * 1024,
+        "line must clear any sane line bound"
+    );
     assert!(
         line.len() < INTAKE_CAP_BYTES,
         "line must stay under the file cap"
