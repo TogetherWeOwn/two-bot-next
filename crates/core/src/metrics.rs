@@ -2996,7 +2996,7 @@ mod tests {
 
         let holder = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _held = lock.lock().expect("uncontended");
-            panic!("poison the lock");
+            std::panic::panic_any("poison the lock");
         }));
         assert!(holder.is_err());
         assert!(lock.is_poisoned());
