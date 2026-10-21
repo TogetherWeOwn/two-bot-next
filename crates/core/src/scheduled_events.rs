@@ -125,9 +125,10 @@ pub trait ScheduledEventMirror: Send + Sync {
 pub enum ScheduledEventsSkip {
     DiscordReadFailed,
     InvalidResponse,
-    /// The fetch's `observed_at` predates the guild's committed epoch: a newer
-    /// tick already swapped, so this tick's whole transaction rolled back and
-    /// wrote nothing. The mirror keeps the newer snapshot.
+    /// The observation exceeds the tick's five-minute age bound, or its
+    /// `observed_at` predates the guild's committed epoch. The tick skips before
+    /// storage in the first case; the store rolls back the whole transaction
+    /// in the second. Neither path changes the last good snapshot.
     StaleSnapshot,
 }
 
