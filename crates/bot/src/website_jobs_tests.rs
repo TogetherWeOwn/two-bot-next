@@ -210,6 +210,59 @@ async fn registered_statuses_fails_fast_on_an_unknown_job_name() {
     assert_eq!(error.to_string(), "unregistered job: ghost");
 }
 
+#[tokio::test]
+async fn prepare_job_statuses_cancels_boot_siblings_before_returning_an_error() {
+    let ghost = Job {
+        name: "ghost",
+        cadence: Duration::from_secs(30),
+        cadence_source: None,
+        startup_jitter: Duration::ZERO,
+        timeout: Duration::from_secs(25),
+        action: Arc::new(|| Box::pin(async { Ok(()) })),
+    };
+    let (shutdown, stopping) = watch::channel(false);
+    let error = prepare_job_statuses(&[ghost], &[], &shutdown)
+        .await
+        .expect_err("boot must reject an unknown job before serving HTTP");
+    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    assert_eq!(error.to_string(), "unregistered job: ghost");
+    assert!(
+        error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<jobs::UnregisteredJob>()
+            .is_some(),
+        "keep the typed registration error inside the I/O error"
+    );
+    assert!(*stopping.borrow(), "cancel boot siblings before returning");
+    assert!(
+        *shutdown.subscribe().borrow(),
+        "late boot subscribers must also observe cancellation"
+    );
+}
+
+#[tokio::test]
+async fn prepare_job_statuses_preserves_valid_registration_without_shutdown() {
+    let recovery = Job {
+        name: RECOVERY_JOB_NAME,
+        cadence: Duration::from_secs(30),
+        cadence_source: None,
+        startup_jitter: Duration::ZERO,
+        timeout: Duration::from_secs(25),
+        action: Arc::new(|| Box::pin(async { Ok(()) })),
+    };
+    let (shutdown, stopping) = watch::channel(false);
+    let status = prepare_job_statuses(&[recovery], &[crate::retention_jobs::NAME], &shutdown)
+        .await
+        .unwrap();
+    let entries = status.read().await;
+    assert!(!entries[RECOVERY_JOB_NAME].parked);
+    assert!(entries[crate::retention_jobs::NAME].parked);
+    assert!(entries.values().all(|entry| !entry.running));
+    assert!(!*stopping.borrow(), "valid registration must not stop boot");
+    assert!(!stopping.has_changed().unwrap());
+}
+
 /// TOG-15758: a job the identity fence refuses is absent from the supervised
 /// set, so `/readyz` lists it parked and never running, while the staging pair
 /// with the same environment unparks both posting jobs.

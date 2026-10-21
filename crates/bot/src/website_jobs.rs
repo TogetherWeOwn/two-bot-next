@@ -314,14 +314,7 @@ pub async fn serve(
     if let Some(service) = self_roles {
         registered.push(service.recovery_job());
     }
-    let status = registered_statuses(&registered, &parked)
-        .await
-        .map_err(|error| {
-            // The boot owner joins reconcile after serve returns, even when
-            // registration fails before serve_jobs installs its shutdown guard.
-            shutdown.send_replace(true);
-            std::io::Error::other(error)
-        })?;
+    let status = prepare_job_statuses(&registered, &parked, &shutdown).await?;
     let public = server::serve(listener, gateway, status.clone(), shutdown.clone());
     let http = async {
         match (receiver, eventsub_receiver) {
@@ -398,6 +391,22 @@ fn retention_registration(config: &Config) -> RetentionRegistration {
             RetentionRegistration::Parked
         }
     }
+}
+
+/// Prepare boot status, cancelling boot-owned siblings on registration failure.
+async fn prepare_job_statuses(
+    registered: &[Job],
+    parked: &[&str],
+    shutdown: &watch::Sender<bool>,
+) -> std::io::Result<jobs::SharedStatus> {
+    registered_statuses(registered, parked)
+        .await
+        .map_err(|error| {
+            // The boot owner joins reconcile after serve returns, even when
+            // registration fails before serve_jobs installs its shutdown guard.
+            shutdown.send_replace(true);
+            std::io::Error::other(error)
+        })
 }
 
 async fn registered_statuses(
