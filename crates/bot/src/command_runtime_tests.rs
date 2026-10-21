@@ -60,7 +60,7 @@ use crate::command_runtime::{
     sticky_options, CommandRuntime, RegistrySyncError,
 };
 use crate::internal_action_http::MODERATION_METRICS_LOCK;
-use crate::member_runtime::MemberRuntime;
+use crate::member_runtime::{sweep_job, MemberRuntime};
 use crate::privacy_command::{deletion_request_id, privacy_action, PrivacyAction};
 use crate::schedule_runtime::{schedule_options, schedule_remove_option};
 
@@ -1755,6 +1755,160 @@ async fn member_ban_refuses_without_ban_permission() {
     );
     assert_eq!(mock.requests().len(), 1, "no other REST effects");
     mock.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable agent-testdb for refusal audits"]
+async fn rejected_ban_through_command_path_logs_detail_with_ids_and_replies_fixed_copy() {
+    // The command path must wire execute() to error_text_with_log: the
+    // moderator gets exactly the fixed copy while the server log keeps the
+    // full detail with the interaction and request ids. Reverting execute()
+    // to error_text keeps the reply byte-identical but drops the log line,
+    // so this test reads the process-wide capture (fresh text only) with a
+    // unique interaction id.
+    let _metrics = MODERATION_METRICS_LOCK.lock().await;
+    let db = member_refusal_database().await;
+    let capture = crate::tracing_capture::global();
+    let log_start = capture.text().len();
+    let mut script = vec![RestResponse::status(200)];
+    script.extend(authority_reads(true));
+    script.push(scripted_json(serde_json::json!(
+        {"user": {"id": "3333", "bot": false}, "roles": []}
+    )));
+    script.push(scripted_json(
+        serde_json::json!({"user": {"id": "4444", "bot": true}, "roles": ["103"]}),
+    ));
+    script.push(RestResponse::status(403));
+    script.push(RestResponse::status(200));
+    let (mock, origin) = MockRest::start_script(script).await;
+    let runtime = runtime_with_member(member_gates(), origin, db.pool().clone());
+    let mut interaction = member_slash("ban");
+    interaction.id = Id::new(9007001);
+    runtime.on_interaction(&interaction).await;
+    let reply = mock.deferred_reply();
+    assert_eq!(
+        reply["content"],
+        "Discord refused the request; nothing was applied. Check the bot's permissions or ask an operator."
+    );
+    assert!(
+        !reply["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("403"),
+        "rejection copy carries no status detail: {reply}"
+    );
+    let bans: Vec<_> = mock
+        .requests()
+        .iter()
+        .filter(|r| r.method == "PUT" && r.path.contains("/bans/"))
+        .collect();
+    assert_eq!(bans.len(), 1, "one refused ban dispatch");
+    let logged = capture.text().split_off(log_start);
+    let line = logged
+        .lines()
+        .find(|line| {
+            line.contains("member moderation discord failure")
+                && line.contains("9007001")
+                && line.contains("Discord refused the request with 403")
+        })
+        .unwrap_or_else(|| panic!("rejection must log detail with ids; fresh log: {logged:?}"));
+    assert!(
+        line.contains("request_id"),
+        "log carries the request id: {line:?}"
+    );
+    mock.shutdown().await;
+    db.close().await.expect("dispose fixture");
+}
+
+#[tokio::test]
+#[ignore = "requires disposable agent-testdb for refusal audits"]
+async fn sweep_tick_reports_a_failed_unban_as_a_rest_job_failure() {
+    // The sweep continues past per-job failures, but the tick must report
+    // them: Ok would reset the member_unban_sweep consecutive-failure
+    // streak and silence its failure-only alert while expired tempbans
+    // never lift.
+    let _metrics = MODERATION_METRICS_LOCK.lock().await;
+    let db = member_refusal_database().await;
+    let mut script = vec![RestResponse::status(200)];
+    script.extend(authority_reads(true));
+    script.push(scripted_json(serde_json::json!(
+        {"user": {"id": "3333", "bot": false}, "roles": []}
+    )));
+    script.push(scripted_json(
+        serde_json::json!({"user": {"id": "4444", "bot": true}, "roles": ["103"]}),
+    ));
+    script.push(RestResponse::status(204));
+    script.push(RestResponse::status(200));
+    let (mock, origin) = MockRest::start_script(script).await;
+    let runtime = runtime_with_member(member_gates(), origin, db.pool().clone());
+    let mut interaction = member_slash("tempban");
+    let Some(InteractionData::ApplicationCommand(data)) = interaction.data.as_mut() else {
+        panic!("command fixture");
+    };
+    data.options.push(option(
+        "duration_seconds",
+        CommandOptionValue::Integer(3600),
+    ));
+    runtime.on_interaction(&interaction).await;
+    assert_eq!(mock.deferred_reply()["content"], "Temporarily banned 3333.");
+    let staged: (String,) =
+        sqlx::query_as("SELECT state FROM moderation_scheduled_unbans WHERE guild_id = $1")
+            .bind(GUILD_S)
+            .fetch_one(db.pool())
+            .await
+            .expect("tempban stages its unban");
+    assert_eq!(staged.0, "staged");
+    sqlx::query(
+        "UPDATE moderation_scheduled_unbans SET execute_at = '2020-01-01T00:00:00+00:00' WHERE guild_id = $1",
+    )
+    .bind(GUILD_S)
+    .execute(db.pool())
+    .await
+    .expect("backdate the staged job");
+    mock.shutdown().await;
+
+    // The DELETE is refused: the job requeues, the failure is audited, and
+    // the tick reports Rest so the job streak records the failure.
+    let (sweep_mock, sweep_origin) = MockRest::start_script(vec![
+        scripted_json(serde_json::to_value(user(4444, true)).unwrap()),
+        RestResponse::status(403),
+    ])
+    .await;
+    let sweep_rest = ActionExecutor::with_proxy("test-token".to_owned(), Some(sweep_origin))
+        .expect("mock executor");
+    let member = MemberRuntime::for_test(db.pool().clone(), GUILD_S);
+    let result = (sweep_job(member, sweep_rest).action)().await;
+    assert!(
+        matches!(result, Err(crate::jobs::ErrorClass::Rest)),
+        "a failed sweep reports Rest, got {result:?}"
+    );
+    let failures: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM moderation_audit WHERE guild_id = $1 AND outcome = 'unban_failed'",
+    )
+    .bind(GUILD_S)
+    .fetch_one(db.pool())
+    .await
+    .expect("failure audit");
+    assert_eq!(failures.0, 1);
+    assert_eq!(sweep_mock.deletes().len(), 1, "one refused DELETE");
+    sweep_mock.shutdown().await;
+
+    // Nothing due anywhere else stays a clean Ok: the failure signal fires
+    // only when a job actually failed.
+    let (idle_mock, idle_origin) = MockRest::start_script(vec![scripted_json(
+        serde_json::to_value(user(4444, true)).unwrap(),
+    )])
+    .await;
+    let idle_rest = ActionExecutor::with_proxy("test-token".to_owned(), Some(idle_origin))
+        .expect("mock executor");
+    let idle = MemberRuntime::for_test(db.pool().clone(), "9999");
+    let idle_result = (sweep_job(idle, idle_rest).action)().await;
+    assert!(
+        matches!(idle_result, Ok(())),
+        "an empty sweep succeeds, got {idle_result:?}"
+    );
+    idle_mock.shutdown().await;
+    db.close().await.expect("dispose fixture");
 }
 
 #[tokio::test]

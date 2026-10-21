@@ -3613,6 +3613,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sweep_failure_audits_carry_the_exact_cause_per_variant() {
+        // One staged job per Discord failure class. The cause is the only
+        // field that tells a safe-to-retry refusal from an uncertain
+        // dispatch, so each variant pins its exact string; a swapped mapping
+        // must turn this red. The Unavailable arm had no sweep coverage.
+        let cases = [
+            (
+                "req-cause-rejected",
+                DiscordError::Rejected("missing permissions".to_owned()),
+                "rejected",
+                "pending",
+            ),
+            (
+                "req-cause-429",
+                DiscordError::RateLimited,
+                "rate_limited",
+                "pending",
+            ),
+            (
+                "req-cause-timeout",
+                DiscordError::Timeout,
+                "timeout",
+                "running",
+            ),
+            (
+                "req-cause-unavailable",
+                DiscordError::Unavailable("bad gateway".to_owned()),
+                "unavailable",
+                "running",
+            ),
+        ];
+        for (request, error, cause, state) in cases {
+            let discord = MockMemberDiscord::new();
+            let store = MemMemberStore::new();
+            let svc = service(discord, store);
+            let mut exec = execution(ModerationAction::TempBan);
+            exec.request_id = request.to_owned();
+            exec.idempotency_key = format!("key-{request}");
+            svc.execute(&exec).await.expect("tempban");
+            {
+                let mut inner = svc.store.inner.lock().expect("lock");
+                let row = inner.unbans.get_mut(request).expect("staged");
+                row.execute_at = "2023-11-14T22:00:00.000Z".to_owned();
+            }
+            svc.discord.fail_with("unban", error);
+            assert_eq!(svc.run_due_unbans(GUILD).await.expect("continues"), 0);
+            let failure = svc
+                .store
+                .audits()
+                .iter()
+                .find(|row| row.request_id == format!("{request}:unban-failed"))
+                .expect("failed job is recorded")
+                .clone();
+            assert_eq!(failure.outcome, "unban_failed");
+            let metadata: serde_json::Value =
+                serde_json::from_str(&failure.metadata_json).expect("failure metadata is JSON");
+            assert_eq!(
+                metadata.get("cause").and_then(serde_json::Value::as_str),
+                Some(cause),
+                "cause must name the injected failure class"
+            );
+            assert_eq!(
+                svc.store.unban_state(request),
+                Some(state.to_owned()),
+                "post-failure queue state"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn tempban_ban_rejection_cancels_the_staged_row() {
         let discord = MockMemberDiscord::new();
         let store = MemMemberStore::new();

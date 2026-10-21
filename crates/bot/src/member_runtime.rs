@@ -680,7 +680,16 @@ async fn tick(member: &MemberRuntime, rest: &ActionExecutor) -> Result<(), Error
             if completed > 0 || failed > 0 {
                 tracing::info!(completed, failed, guild = %member.guild_id, "member unban sweep completed jobs");
             }
-            Ok(())
+            // A failed job is a failed sweep: Ok here would reset the
+            // `member_unban_sweep` consecutive-failure streak (and its
+            // failure-only alert) while expired tempbans never lift.
+            // Per-job requeue and fencing already happened inside the
+            // summary; this only reports the tick outcome.
+            if failed > 0 {
+                Err(ErrorClass::Rest)
+            } else {
+                Ok(())
+            }
         }
         Err(MemberError::Store(_)) => Err(ErrorClass::Database),
         Err(MemberError::Discord(_)) => Err(ErrorClass::Rest),
