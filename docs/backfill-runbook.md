@@ -70,7 +70,7 @@ client below.
   request; it is not the bootstrap error (`crates/core/src/send_admission/postgres.rs:110-139`).
 - 5xx backs off at 500 × 2^attempt ms and gives up as retry-exhausted
   (`rest.rs:270`, `rest.rs:306`, `rest.rs:478`;
-  `backoff_duration` at `rest.rs:701-703`, base `BACKOFF_BASE_MS` in
+  `backoff_duration` at `rest.rs:707-709`, base `BACKOFF_BASE_MS` in
   `action_outcomes.rs:184`). Total budget is 5 tries per call
   (`MAX_HTTP_TRIES` in `action_outcomes.rs:188`).
 - 403/404 on a page read as `Unreadable`, not an abort (`rest.rs:266`):
