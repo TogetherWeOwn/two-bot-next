@@ -23,6 +23,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import staging_retention_census as census
 
+MATRIX_SCHEMA = "public"
+
 
 HOST = "staging-direct.neon.example"
 DATABASE = "two_bot"
@@ -55,6 +57,19 @@ ANCHOR_OUT = f"{ANCHOR}\n"
 COHORT_OUT = (f"3,{DIGEST},2026-10-20 20:00:00+00,2026-10-20 20:10:00+00\n")
 COHORT_NODIGEST_OUT = "3,2026-10-20 20:00:00+00,2026-10-20 20:10:00+00\n"
 EMPTY_COHORT_OUT = "0,,,\n"
+SET_DIGEST = "aa" * 32
+DIST_DIGEST = "bb" * 32
+SCOPE_OUT = ("events,100,10,,\n"
+             "members,20,4,,\n"
+             "invite_snapshots,6,,,\n"
+             "community_facts,50,5,12,\n"
+             "event_store,200,0,,\n"
+             "retention_deletion_requests,3,1,2,1\n"
+             "retention_guild_purge_queue,1,,,\n")
+GUILDS_OUT = "".join(f"{table},2,{SET_DIGEST},{DIST_DIGEST}\n"
+                     for table in census.FIXTURE_TABLES)
+GUILDS_NODIGEST_OUT = "".join(f"{table},2\n"
+                              for table in census.FIXTURE_TABLES)
 
 
 def canned_run(outputs, pgcrypto=True):
@@ -95,7 +110,8 @@ class QueryPinTests(unittest.TestCase):
     SCRIPTS = (census.IDENTITY_SQL, census.MIGRATIONS_SQL, census.INDEXES_SQL,
                census.COUNTS_SQL, census.cohort_sql(ANCHOR),
                census.cohort_nodigest_sql(ANCHOR), census.PROBE_SQL,
-               census.ANCHOR_SQL)
+               census.ANCHOR_SQL, census.FIXTURE_SCOPE_SQL,
+               census.FIXTURE_GUILDS_SQL, census.FIXTURE_GUILDS_NODIGEST_SQL)
 
     def test_every_statement_is_read_only_with_timeouts(self):
         for script in self.SCRIPTS:
@@ -182,6 +198,124 @@ class QueryPinTests(unittest.TestCase):
         self.assertIn("make_interval(days => 30)", census.COUNTS_SQL)
         self.assertIn("make_interval(days => 45)", census.COUNTS_SQL)
         self.assertEqual(census.SLEEP_SECONDS, 900)
+
+    def test_fixture_tables_match_the_read_only_role_matrix(self):
+        # member_erasure_audit is role-matrix kind 'migrator' (migrator-only,
+        # no read-only SELECT), so it is excluded; the other seven fixture
+        # tables are kind 'table' and are all queried.
+        matrix = (ROOT / "sql" / "database_role_matrix.sql").read_text(
+            encoding="utf-8")
+        expected = {"events", "members", "invite_snapshots",
+                    "community_facts", "event_store",
+                    "retention_deletion_requests",
+                    "retention_guild_purge_queue"}
+        self.assertEqual(set(census.FIXTURE_TABLES), expected)
+        self.assertEqual(len(census.FIXTURE_TABLES), 7)
+        for table in expected:
+            with self.subTest(table=table):
+                self.assertIn(f"('{MATRIX_SCHEMA}', '{table}', 'table')",
+                              matrix)
+        self.assertIn(f"('{MATRIX_SCHEMA}', 'member_erasure_audit', "
+                      "'migrator')",
+                      matrix)
+        self.assertNotIn("member_erasure_audit",
+                         census.FIXTURE_SCOPE_SQL + census.FIXTURE_GUILDS_SQL
+                         + census.FIXTURE_GUILDS_NODIGEST_SQL)
+
+    def test_fixture_scope_queries_every_table_exactly_once(self):
+        # One UNION ALL branch per fixture table over FROM <table>; no branch
+        # may drift onto another table, repeat a table, or query anything else.
+        for script in (census.FIXTURE_SCOPE_SQL, census.FIXTURE_GUILDS_SQL,
+                       census.FIXTURE_GUILDS_NODIGEST_SQL):
+            branches = script.count("UNION ALL")
+            self.assertEqual(branches, len(census.FIXTURE_TABLES) - 1,
+                             script[:80])
+            froms = re.findall(r"\bFROM ([a-z_]+)\b", script)
+            self.assertEqual(sorted(set(froms)), sorted(census.FIXTURE_TABLES))
+            for table in census.FIXTURE_TABLES:
+                self.assertEqual(script.count(f"SELECT '{table}'"), 1, table)
+        # The guild branches are generated per pinned table name, never from
+        # caller input: an unknown name is a read failure, not SQL.
+        for builder in (census._fixture_guild_branch,
+                        census._fixture_guild_nodigest_branch):
+            with self.assertRaises(census.ReadFailed):
+                builder("events; SELECT 1 --")
+
+    def test_fixture_marker_prefix_is_a_fixed_like_literal(self):
+        # No %, _, backslash or quote: the LIKE pattern is a plain prefix
+        # match, and the prefix appears in the scope query only for the five
+        # tables with a marker column.
+        prefix = census.FIXTURE_MARKER_PREFIX
+        self.assertEqual(prefix, "fixture-run:")
+        for char in ("%", "_", "\\", "'", '"'):
+            self.assertNotIn(char, prefix)
+        self.assertEqual(census.FIXTURE_SCOPE_SQL.count(
+            f"LIKE '{prefix}%'"), len(census.FIXTURE_MARKED_TABLES))
+        self.assertEqual(set(census.FIXTURE_MARKED_TABLES),
+                         set(census.FIXTURE_TABLES)
+                         - {"invite_snapshots", "retention_guild_purge_queue"})
+        for table in ("invite_snapshots", "retention_guild_purge_queue"):
+            parts = census.FIXTURE_SCOPE_SQL.split("UNION ALL")
+            branch = [part for part in parts if f"'{table}'" in part]
+            self.assertEqual(len(branch), 1)
+            self.assertIn("NULL::bigint, NULL::bigint, NULL::bigint",
+                          branch[0].replace(" ", "").replace("\n", "")
+                          .replace("NULL::bigint,NULL::bigint,NULL::bigint",
+                                   "NULL::bigint, NULL::bigint, NULL::bigint"))
+            self.assertNotIn("LIKE", branch[0])
+
+    def test_fixture_auxiliaries_are_pinned(self):
+        # community_facts stages on the bot-assigned classification; deletion
+        # requests split on the CHECK-bound statuses; nothing else carries
+        # auxiliaries.
+        scope = census.FIXTURE_SCOPE_SQL
+        self.assertIn("classification IN ('staging', 'test')", scope)
+        self.assertIn("WHERE status = 'pending'", scope)
+        self.assertIn("WHERE status = 'completed'", scope)
+        counted = re.findall(r"FILTER \(WHERE classification", scope)
+        self.assertEqual(len(counted), 1)
+        pending = re.findall(r"FILTER \(WHERE status = 'pending'\)", scope)
+        completed = re.findall(r"FILTER \(WHERE status = 'completed'\)", scope)
+        self.assertEqual((len(pending), len(completed)), (1, 1))
+
+    def test_fixture_guild_inventory_names_no_identity(self):
+        # The inventory is counts plus digests: member-identity columns never
+        # appear, and guild_id appears only inside count(DISTINCT ...),
+        # GROUP BY, or the digest subqueries -- never as a bare output.
+        for script in (census.FIXTURE_GUILDS_SQL,
+                       census.FIXTURE_GUILDS_NODIGEST_SQL):
+            for column in ("member_id", "user_id", "actor_id", "target_id",
+                           "inviter_id", "request_id"):
+                self.assertNotIn(column, script)
+            self.assertEqual(script.count("count(DISTINCT guild_id)"),
+                             len(census.FIXTURE_TABLES))
+            scrubbed = script.replace("count(DISTINCT guild_id)", "")
+            if script is census.FIXTURE_GUILDS_SQL:
+                for context in ("GROUP BY guild_id",
+                                "SELECT DISTINCT guild_id AS g",
+                                "SELECT guild_id AS g, count(*) AS c"):
+                    self.assertEqual(scrubbed.count(context),
+                                     len(census.FIXTURE_TABLES), context)
+                    scrubbed = scrubbed.replace(context, "")
+            self.assertNotIn("guild_id", scrubbed)
+        # Digest shape: set over DISTINCT guilds, distribution over per-guild
+        # counts, ordered before aggregation so the digest is deterministic.
+        digest_script = census.FIXTURE_GUILDS_SQL
+        self.assertEqual(digest_script.count("string_agg(g, ',' ORDER BY g)"),
+                         len(census.FIXTURE_TABLES))
+        self.assertEqual(digest_script.count(
+            "string_agg(g || ':' || c::text, ',' ORDER BY g)"),
+                         len(census.FIXTURE_TABLES))
+        nodigest = census.FIXTURE_GUILDS_NODIGEST_SQL
+        self.assertNotIn("digest", nodigest)
+        self.assertNotIn("string_agg", nodigest)
+        # Every guild-DISTINCT sits in a subquery, never beside an aggregate
+        # ORDER BY in one SELECT (PostgreSQL 15 rejects that mix).
+        for match in re.finditer(r"SELECT ([^;]+?)(?=SELECT|COMMIT|$)",
+                                 digest_script, re.DOTALL):
+            body = match.group(1)
+            if "count(DISTINCT" in body:
+                self.assertNotIn("ORDER BY g", body, body[:160])
 
     def test_migration_ledger_and_index_scope(self):
         # Hardcoded, not derived from the constant: 444/445 are the two
@@ -395,6 +529,80 @@ class ParseTests(unittest.TestCase):
                 with self.assertRaises(census.ReadFailed):
                     census.parse_cohort(output, with_digest)
 
+    def test_fixture_scope_parses_totals_marked_and_auxiliaries(self):
+        parsed = census.parse_fixture_scope(SCOPE_OUT)
+        self.assertEqual(set(parsed), set(census.FIXTURE_TABLES))
+        self.assertEqual(parsed["events"], (100, 10, None, None))
+        self.assertEqual(parsed["members"], (20, 4, None, None))
+        self.assertEqual(parsed["invite_snapshots"], (6, None, None, None))
+        self.assertEqual(parsed["community_facts"], (50, 5, 12, None))
+        self.assertEqual(parsed["event_store"], (200, 0, None, None))
+        self.assertEqual(parsed["retention_deletion_requests"], (3, 1, 2, 1))
+        self.assertEqual(parsed["retention_guild_purge_queue"],
+                         (1, None, None, None))
+
+    def test_malformed_fixture_scope_fails(self):
+        lines = SCOPE_OUT.splitlines(keepends=True)
+        purge = [line for line in lines
+                 if line.startswith("retention_guild_purge_queue")][0]
+        rest = "".join(line for line in lines if line != purge)
+        cases = [
+            rest,  # a missing UNION ALL branch is a shape error, not a zero
+            SCOPE_OUT + "events,1,0,,\n",  # duplicate label
+            SCOPE_OUT.replace("events,100,10,,",
+                              "events,100,101,,", 1),  # marked > total
+            SCOPE_OUT.replace("community_facts,50,5,12,",
+                              "community_facts,50,5,51,", 1),  # aux > total
+            SCOPE_OUT.replace("retention_deletion_requests,3,1,2,1",
+                              "retention_deletion_requests,3,1,2,2", 1),
+            SCOPE_OUT.replace("invite_snapshots,6,,,",
+                              "invite_snapshots,6,0,,", 1),  # no column
+            SCOPE_OUT.replace("members,20,4,,",
+                              "members,20,4,1,", 1),  # aux on plain table
+            SCOPE_OUT.replace("events,100,10,,",
+                              "member_erasure_audit,1,0,,", 1),  # out of scope
+            SCOPE_OUT.replace("events,100,10,,", "events,100,10,", 1),
+        ]
+        for output in cases:
+            with self.subTest(output=output[:60]):
+                with self.assertRaises(census.ReadFailed):
+                    census.parse_fixture_scope(output)
+
+    def test_fixture_guilds_parse_counts_and_digests(self):
+        parsed = census.parse_fixture_guilds(GUILDS_OUT, True)
+        self.assertEqual(set(parsed), set(census.FIXTURE_TABLES))
+        for table in census.FIXTURE_TABLES:
+            self.assertEqual(parsed[table], (2, SET_DIGEST, DIST_DIGEST))
+        nodigest = census.parse_fixture_guilds(GUILDS_NODIGEST_OUT, False)
+        for table in census.FIXTURE_TABLES:
+            self.assertEqual(nodigest[table], (2, None, None))
+
+    def test_empty_guild_table_parses_to_count_zero_without_digests(self):
+        empty = "".join(f"{table},0,,\n" for table in census.FIXTURE_TABLES)
+        parsed = census.parse_fixture_guilds(empty, True)
+        for table in census.FIXTURE_TABLES:
+            self.assertEqual(parsed[table], (0, None, None))
+
+    def test_malformed_fixture_guilds_fail(self):
+        lines = GUILDS_OUT.splitlines(keepends=True)
+        rest = "".join(line for line in lines[1:])
+        cases = [
+            (rest, True),  # a missing branch is a shape error, not a zero
+            (GUILDS_OUT + lines[0], True),  # duplicate label
+            (GUILDS_OUT.replace(SET_DIGEST, "short", 1), True),
+            (GUILDS_OUT.replace(f",2,{SET_DIGEST},{DIST_DIGEST}",
+                                f",2,,{DIST_DIGEST}", 1),
+             True),  # half digests
+            ("".join(f"{table},0,{SET_DIGEST},{DIST_DIGEST}\n"
+                     for table in census.FIXTURE_TABLES), True),
+            (GUILDS_OUT, False),  # wrong arity
+            (GUILDS_NODIGEST_OUT, True),
+        ]
+        for output, with_digest in cases:
+            with self.subTest(output=output[:60]):
+                with self.assertRaises(census.ReadFailed):
+                    census.parse_fixture_guilds(output, with_digest)
+
 
 class CensusRunTests(unittest.TestCase):
     def run_with(self, outputs, pgcrypto=True, cohorts=(COHORT_OUT, COHORT_OUT)):
@@ -576,7 +784,104 @@ class CensusRunTests(unittest.TestCase):
         self.assertEqual(calls, [census.IDENTITY_SQL])
 
 
+class FixtureCensusRunTests(unittest.TestCase):
+    def run_with(self, pgcrypto=True):
+        guilds = GUILDS_OUT if pgcrypto else GUILDS_NODIGEST_OUT
+        outputs = [("current_user", IDENTITY_OUT),
+                   ("LIKE 'fixture-run", SCOPE_OUT),
+                   ("guild_count", guilds)]
+        fake = canned_run(outputs, pgcrypto)
+        clock_value = datetime(2026, 10, 21, 14, 0, 0, tzinfo=timezone.utc)
+        stdout = io.StringIO()
+        with mock.patch("subprocess.run", fake):
+            with redirect_stdout(stdout):
+                report = census.run_fixture_census(
+                    good_env(), "psql", lambda: clock_value)
+        return report, stdout.getvalue(), fake.calls
+
+    def test_success_reports_scope_and_guilds_once(self):
+        report, printed, calls = self.run_with()
+        # One observation instant, no sleep: the point-in-time capture.
+        self.assertIn("observed: 2026-10-21T14:00:00.000Z", report)
+        self.assertNotIn("sleeping", printed)
+        self.assertIn("## staging fixture census", report)
+        self.assertIn("events: total=100 marked=10 unmarked=90", report)
+        self.assertIn("members: total=20 marked=4 unmarked=16", report)
+        self.assertIn("invite_snapshots: total=6 "
+                      "marked=n/a (no marker column)", report)
+        self.assertIn("community_facts: total=50 marked=5 unmarked=45 "
+                      "staging_scope=12", report)
+        self.assertIn("retention_deletion_requests: total=3 marked=1 "
+                      "unmarked=2 pending=2 completed=1", report)
+        self.assertIn(f"guilds events: count=2 set_digest={SET_DIGEST} "
+                      f"dist_digest={DIST_DIGEST}", report)
+        self.assertIn("excluded: member_erasure_audit is not readable",
+                      report)
+        # Secrets and identities never print.
+        self.assertNotIn(PASSWORD, report)
+        self.assertNotIn(HOST, report)
+        self.assertNotIn(GOOD_URL, report)
+        self.assertNotIn("PASS", report)
+        # Exactly the shared fences plus E and F, in order.
+        scripts = [script for script, _ in calls]
+        self.assertEqual(scripts, [census.IDENTITY_SQL, census.PROBE_SQL,
+                                   census.FIXTURE_SCOPE_SQL,
+                                   census.FIXTURE_GUILDS_SQL])
+
+    def test_missing_pgcrypto_falls_back_without_digests(self):
+        report, _, calls = self.run_with(pgcrypto=False)
+        self.assertIn("limitation: pgcrypto absent; guild digests unavailable",
+                      report)
+        self.assertIn("guilds events: count=2 set_digest=- dist_digest=-",
+                      report)
+        scripts = [script for script, _ in calls]
+        self.assertEqual(scripts, [census.IDENTITY_SQL, census.PROBE_SQL,
+                                   census.FIXTURE_SCOPE_SQL,
+                                   census.FIXTURE_GUILDS_NODIGEST_SQL])
+
+    def test_identity_gate_runs_inside_run_fixture_census(self):
+        fake = canned_run([("current_user", "two_bot,two_bot,f\n")])
+        with mock.patch("subprocess.run", fake):
+            with self.assertRaises(census.Refused):
+                census.run_fixture_census(
+                    good_env(), "psql", lambda: datetime.now(timezone.utc))
+        self.assertEqual([script for script, _ in fake.calls],
+                         [census.IDENTITY_SQL])
+
+
 class MainTests(unittest.TestCase):
+    def test_mode_routing(self):
+        cases = ([], "run_census"), (["retention"], "run_census"), \
+            (["fixture-scope"], "run_fixture_census")
+        for argv, expected in cases:
+            with self.subTest(argv=argv):
+                patched = mock.patch.object
+                with patched(census, "run_census",
+                              return_value="retention\n") as retention, \
+                     patched(census, "run_fixture_census",
+                             return_value="fixture\n") as fixture:
+                    stdout = io.StringIO()
+                    with redirect_stdout(stdout):
+                        status = census.main(
+                            list(argv), env=good_env(),
+                            clock=lambda: datetime.now(timezone.utc),
+                            psql="psql", sleep_fn=lambda seconds: None)
+                self.assertEqual(status, 0)
+                if expected == "run_census":
+                    retention.assert_called_once()
+                    fixture.assert_not_called()
+                    self.assertIn("retention", stdout.getvalue())
+                else:
+                    fixture.assert_called_once()
+                    retention.assert_not_called()
+                    self.assertIn("fixture", stdout.getvalue())
+
+    def test_unknown_mode_is_rejected(self):
+        with self.assertRaises(SystemExit):
+            census.main(["execute"], env=good_env(),
+                        clock=lambda: datetime.now(timezone.utc),
+                        psql="psql", sleep_fn=lambda seconds: None)
+
     def test_success_writes_summary_and_prints_ok(self):
         fake = canned_run(standard_outputs())
         clock_values = iter((datetime(2026, 10, 20, 21, 0, 0, tzinfo=timezone.utc),
