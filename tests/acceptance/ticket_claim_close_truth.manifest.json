@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Protected test-only claim/close truthfulness handoff; the builder owns the combined implementation PR.",
+  "baseCommit": "fffae20366719cbfdb79a4ed934d88416847c8df",
+  "branch": "test/ticket-claim-close-truth",
+  "protectedFiles": [
+    {
+      "path": "crates/bot/src/ticket_claim_close_truth_acceptance_tests.rs",
+      "sha256": "82e8607ce982b5c14a70620e407655d65d305e9624a1c168a0ff2ed3901f4763",
+      "tests": 7
+    },
+    {
+      "path": "crates/core/tests/ticket_claim_close_truth_controls.rs",
+      "sha256": "e54e3bd4d43ef0a9b557ebedc04732a5944b8f61c0d4807a7ed5e5c54b52aaf2",
+      "tests": 4
+    }
+  ],
+  "registration": {
+    "path": "crates/bot/src/ticket_runtime.rs",
+    "module": "claim_close_truth_acceptance_tests",
+    "productionBehaviorChanged": false
+  },
+  "commands": {
+    "runtime": "python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot ticket_runtime::claim_close_truth_acceptance_tests:: -- --nocapture --test-threads=1",
+    "controls": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test ticket_claim_close_truth_controls -- --nocapture"
+  },
+  "database": {
+    "environment": "TWO_TEST_DATABASE_URL",
+    "guard": "two_bot_testsupport::TestDatabase",
+    "missingEnvironment": "Six runtime cases explicitly print SKIP and return; that is not behavioral evidence.",
+    "ciRoute": "check.yml rust-tests workspace lib/bins step supplies the guarded disposable database; the integration step discovers the core target.",
+    "fixtures": "Disposable test database and loopback Discord only; never live Discord or staging/production databases."
+  },
+  "contract": {
+    "marker": "Visible claimant mention after the claim commits, with allowed_mentions.parse empty; event replay adds no post.",
+    "markerFailure": "A 403 produces exactly one post attempt, leaves the claim committed and successful, and emits one structured ticket claim marker failed event with failed=1. Replay adds no post or failure event. Do not echo remote bodies.",
+    "refusals": "A competing staff member learns the stored claimant from the shared router's mention-suppressed reply; closing refuses for lifecycle state, not ownership.",
+    "close": "Disclose actual transcript truncation, state the up-to-90-day ceiling, and do not promise an unavailable transcript read path. Complete capture does not claim truncation.",
+    "controls": "No permission, cooldown, claimant, stale-close, cleanup/recovery, retention or close-replay semantic changes."
+  },
+  "handoff": "Do not edit protected files. Return test corrections to their author. Do not merge a deliberately red test-only PR."
+}
