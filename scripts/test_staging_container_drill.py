@@ -1042,5 +1042,72 @@ class MainTests(unittest.TestCase):
                 self.assertIn("refused before any change", output)
 
 
+class DryRunPlanPinTests(unittest.TestCase):
+    """Builder pins: --dry-run binds the restore leg to the live baseline."""
+
+    def environ(self):
+        return {"STAGING_WORKER_URL": URL, "OWNERSHIP_CONTROL_TOKEN": SENTINEL,
+                "GITHUB_RUN_ID": "123456", "CLOUDFLARE_ACCOUNT_ID": ACCOUNT,
+                "CLOUDFLARE_API_TOKEN": "t" * 40}
+
+    def args(self, directory):
+        base = {"backout_source_sha": BACKOUT_SHA, "backout_build_id": BACKOUT_BUILD,
+                "backout_image": BACKOUT_IMAGE,
+                "backout_worker_version": BACKOUT_WORKER,
+                "backout_rollout_id": "r-backout",
+                "backout_review_ref": "PR-612:ci-ok",
+                "backout_staging_run_id": "37243860909",
+                "compatibility_note": "schema-0417+DO-unchanged",
+                "session_attestation": COVERING_ATTESTATION,
+                "evidence": str(Path(directory) / "evidence.json"),
+                "deploy_config": str(Path(directory) / "deploy.json")}
+        argv = []
+        for key, value in base.items():
+            argv += [f"--{key.replace('_', '-')}", value]
+        return [*argv, "--dry-run"]
+
+    def dry_run(self):
+        world = World()
+        with tempfile.TemporaryDirectory() as directory:
+            wrangler_dir = Path(directory) / "wrangler"
+            wrangler_dir.mkdir()
+            (wrangler_dir / "wrangler.toml").write_text(WRANGLER_TOML)
+
+            def deploy_factory(wrangler_bin, directory, environ):
+                def deploy(config_path, message_sha):
+                    world.deploys.append((config_path, message_sha))
+                    return 0
+                return deploy
+
+            output = io.StringIO()
+            with patch("builtins.print",
+                       lambda *a, **k: output.write(" ".join(map(str, a)) + "\n")):
+                code = container_drill.main(
+                    self.args(directory), environ=self.environ(),
+                    make_control=lambda token, url, actor: make_control(world),
+                    client_factory=lambda account, token: FakeClient(world),
+                    deploy_factory=deploy_factory)
+        return code, output.getvalue(), world
+
+    def test_plan_pins_baseline_and_numbered_leg_order(self):
+        code, out, world = self.dry_run()
+        self.assertEqual(code, 0)
+        self.assertIn(f"baseline image: {PRE_IMAGE}", out)
+        self.assertIn(f"baseline worker_version: {PRE}", out)
+        lines = out.splitlines()
+        drill_lines = [line for line in lines if line.startswith("1. drill")]
+        restore_lines = [line for line in lines if line.startswith("2. restore")]
+        self.assertEqual(len(drill_lines), 1)
+        self.assertEqual(len(restore_lines), 1)
+        self.assertIn(BACKOUT_IMAGE, drill_lines[0])
+        self.assertIn(PRE_IMAGE, restore_lines[0])
+        self.assertIn(PRE, restore_lines[0])
+        self.assertLess(out.index("1. drill"), out.index("2. restore"))
+        self.assertEqual(world.deploys, [])
+        mutating = [call for call in world.calls
+                    if call[0] in ("fence", "deployment-takeover")]
+        self.assertEqual(mutating, [])
+
+
 if __name__ == "__main__":
     unittest.main()

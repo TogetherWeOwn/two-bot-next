@@ -316,6 +316,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cutover_freeze_drill.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cutover_freeze_drill_observation_acceptance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cutover_freeze_drill_duplicate_key_acceptance.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cutover_freeze_drill_dryrun_acceptance.py' -v
 
       - name: staging E2E run-record template (offline)
         run: |
@@ -1823,6 +1824,21 @@ jobs:
       - name: containment worker-path soak (mock Discord and CI service only)
         run: cargo test -p two-bot --locked --test containment_worker_soak -- --include-ignored
 
+      # The evidence filter is its own step on purpose: `containment_worker_`
+      # does not substring-match `containment_runtime_evidence_*`, so these
+      # ten ignored tests ran only in the non-required nightly sweep and the
+      # fail-open coverage sweep until this lane routed them.
+      - name: containment evidence acceptance (mock Discord and CI service only)
+        run: cargo test -p two-bot --locked --lib --bins containment_runtime_evidence_ -- --include-ignored
+
+      # The seeded-frontier test needs the guarded bootstrap URL: its fixture
+      # creates a disposable database off two_bot_test_ci (prepared above) and
+      # refuses any other host, principal or database name.
+      - name: ops backfill frontier acceptance (CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot --locked --lib --bins configured_database_reports_seeded_family_frontier -- --include-ignored
+
       - name: Raid cohort query (CI service container only)
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
@@ -2585,7 +2601,8 @@ jobs:
         run: cargo +nightly-2026-10-01 fetch --locked
       # Builds all twenty-five libFuzzer targets. No campaign or generated corpus
       # output; the per-PR seed replay below covers the bounded eventsub_delivery,
-      # helix_token, custom_command_template, and fb_page_events seeds.
+      # helix_token, custom_command_template, fb_page_events, database_url,
+      # feeds_http, self_role_custom_id, and helix_subscription_listing seeds.
       # Bounded vote_kick and helix_token smokes are manual (README).
       # The `+nightly-2026-10-01` selector is load-bearing: rustup resolves the
       # toolchain from the repo-root rust-toolchain.toml (stable 1.98.1) even
@@ -2595,16 +2612,23 @@ jobs:
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fuzz build
       # Bounded seed replay, eventsub_delivery, helix_token,
-      # custom_command_template, and fb_page_events: `-runs=0`
+      # custom_command_template, fb_page_events, database_url, feeds_http,
+      # self_role_custom_id, and helix_subscription_listing: `-runs=0`
       # executes each committed corpus seed exactly once (plus the target's
       # fixed matrix) and exits without fuzzing. A signing-key drift between
       # the harness and production, a token-contract drift between the
       # helix_token oracle and the parser, a template-contract drift between
       # the custom_command_template oracle and the renderer, a
       # challenge/envelope-contract drift between the fb_page_events oracles
-      # and the front door, or seed misrouting panics an assertion here
-      # instead of passing a compile-only gate. Compile stays the only gate
-      # for the other twenty-one targets.
+      # and the front door, a database-URL-contract drift between the
+      # database_url oracle and the guard, an SSRF/redirect/content-type
+      # drift between the feeds_http oracle and the validators, a
+      # custom-id-namespace drift between the self_role_custom_id oracle and
+      # the parser, a subscription-listing drift between the
+      # helix_subscription_listing oracle and the envelope validator, or seed
+      # misrouting panics an assertion here instead of passing a
+      # compile-only gate. Compile stays the only gate for the other
+      # seventeen targets.
       - name: Seed replay for eventsub_delivery (bounded, no campaign)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fuzz run eventsub_delivery -- -runs=0 -timeout=10 -rss_limit_mb=2048
@@ -2617,6 +2641,18 @@ jobs:
       - name: Seed replay for fb_page_events (bounded, no campaign)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fuzz run fb_page_events -- -runs=0 -timeout=10 -rss_limit_mb=2048
+      - name: Seed replay for database_url (bounded, no campaign)
+        working-directory: fuzz
+        run: cargo +nightly-2026-10-01 fuzz run database_url -- -runs=0 -timeout=10 -rss_limit_mb=2048
+      - name: Seed replay for feeds_http (bounded, no campaign)
+        working-directory: fuzz
+        run: cargo +nightly-2026-10-01 fuzz run feeds_http -- -runs=0 -timeout=10 -rss_limit_mb=2048
+      - name: Seed replay for self_role_custom_id (bounded, no campaign)
+        working-directory: fuzz
+        run: cargo +nightly-2026-10-01 fuzz run self_role_custom_id -- -runs=0 -timeout=10 -rss_limit_mb=2048
+      - name: Seed replay for helix_subscription_listing (bounded, no campaign)
+        working-directory: fuzz
+        run: cargo +nightly-2026-10-01 fuzz run helix_subscription_listing -- -runs=0 -timeout=10 -rss_limit_mb=2048
 
   worker:
     name: worker check
@@ -2689,6 +2725,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollback_drill.py -v
       - name: Verify staging rollback drill duplicate-key refusal (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollback_drill_duplicate_key_acceptance.py -v
+      - name: Verify staging rollback drill dry-run plan (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollback_drill_dryrun_acceptance.py -v
       - name: Verify worker-container rollback (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_worker_container_rollback.py -v
       - name: Verify worker-container rollback duplicate-key refusal (offline fixtures)
@@ -2709,6 +2747,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollback_drill_envelope_duplicate_key_acceptance.py -v
       - name: Verify staging container drill envelope duplicate-key refusal (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_container_drill_envelope_duplicate_key_acceptance.py -v
+      - name: Verify staging container drill dry-run plan (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_container_drill_dryrun_acceptance.py -v
       - name: Verify staging ownership-takeover retry (offline fixtures)
         run: node --test scripts/test-ownership-control.mjs
       - name: Verify production ownership-status retry (offline fixtures)
