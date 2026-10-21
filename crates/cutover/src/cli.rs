@@ -237,7 +237,7 @@ pub fn now_iso() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::Args;
+    use super::{read_text_capped, Args};
 
     fn parse(argv: &[&str]) -> Result<Args, String> {
         Args::try_parse(&argv.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>())
