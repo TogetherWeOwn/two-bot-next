@@ -1153,6 +1153,23 @@ impl Metrics {
         })
     }
 
+    /// One actor's recorded live-not-ready age in seconds, or `None` when
+    /// the actor has no recorded contribution. Test/diagnostic seam only:
+    /// the actor key is process-local and this lookup is never rendered,
+    /// labelled or persisted. Pins the watchdog sibling's not-ready
+    /// republication per actor, where the public maximum cannot.
+    #[doc(hidden)]
+    pub fn voice_actor_live_not_ready_secs(&self, actor: u64) -> Option<u64> {
+        let values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values
+            .voice_actors
+            .get(&actor)
+            .map(|entry| entry.live_not_ready_secs)
+    }
+
     /// Age of the oldest in-flight voice REST attempt in seconds; 0 idles it.
     /// Last writer wins.
     pub fn set_voice_rest_in_flight_age_secs(&self, age_secs: u64) {
@@ -3197,6 +3214,9 @@ mod tests {
         assert!(text.contains("two_bot_voice_live_self_heal_total 0\n"));
         metrics.set_voice_actor_live_not_ready(1, 1, 0);
         metrics.set_voice_actor_live_not_ready(2, 1, 95);
+        assert_eq!(metrics.voice_actor_live_not_ready_secs(1), Some(0));
+        assert_eq!(metrics.voice_actor_live_not_ready_secs(2), Some(95));
+        assert_eq!(metrics.voice_actor_live_not_ready_secs(3), None);
         let text = metrics.render(None);
         assert!(text.contains("two_bot_voice_live_not_ready_seconds 95\n"));
         assert!(!text.contains("two_bot_voice_live_not_ready_seconds{"));

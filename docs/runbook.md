@@ -653,15 +653,17 @@ without an accept or refusal line
 watchdog's >120 s bound into the standard pipeline. Pages on a single valid
 reading past the bound — the age itself proves continuous not-ready — and a
 valid reading at or below 120 s clears at once. Older containers without the
-gauge hold the previous state. Known blind spot: a hung dispatch freezes the
-published age (the watchdog sibling never republishes this gauge), so a hang
-that starts before the age reaches 120 s never pages.
+gauge hold the previous state. A hung dispatch does not freeze the published
+age: the watchdog sibling reads the shared live view directly, so a hang
+still pages once the age passes 120 s.
 
 First response: confirm via the authorized `/ops/metrics` scrape that the
 age keeps climbing while the gateway is connected; check
 `two_bot_voice_live_self_heal_total` — repairs without recovery mean every
 dispatch retries the cached snapshot and the view will not stay ready. If
-the age is frozen while joins drop, read the container logs for
+the age is frozen while joins drop, check the container build first —
+current builds keep the age climbing through a hang; on an older build,
+read the container logs for
 `voice worker stuck: queued actions with no progress` (error): a hang
 predating the not-ready view explains the frozen age. Then restart for a
 fresh IDENTIFY + GUILD_CREATE and file a bug report with the logs around
@@ -678,11 +680,11 @@ to the on-call engineer, not another redeploy.
 in-flight) voice action has waited over two minutes — a guild's queue is
 draining unacceptably slowly. The bound matches the in-process stuck horizon
 (`watchdog_stuck_after`: queued actions with no completed dispatch turn for
-120 s bump `two_bot_voice_watchdog_stucks_total`). Known blind spot: a hung
-dispatch freezes publication below the bound (the watchdog sibling
-republishes the last snapshot's age verbatim), so a hang that starts before
-the age reaches 120 s never tickets — the hung case stays with the
-in-process stuck verdict below. Ticket, not page: a slow-but-healthy
+120 s bump `two_bot_voice_watchdog_stucks_total`). A hung dispatch does not
+freeze publication: the watchdog sibling recomputes the queue age from the
+snapshot's first-enqueue stamp on its own clock, so a hang that starts
+below the bound still tickets once the age passes 120 s. Ticket, not page:
+a slow-but-healthy
 drain can legitimately age past the bound under burst load, and
 member-visible join degradation already pages through the join-budget burn
 rules. A valid reading at or below 120 s clears at once; older containers
@@ -698,9 +700,11 @@ climbing age at once (follow [voice worker halted](#alert-voice-worker-halted),
 not this ticket). Then read the container logs for
 `voice worker stuck: queued actions with no progress` (error, the in-process
 verdict) and `voice dispatch turn exceeded observe bound` (warn, a slow turn
-that still completed). When this ticket is absent but joins stall with a
-frozen age below the bound, that stuck line is the hung case this ticket
-cannot see: treat it as the verdict and escalate on it.
+that still completed). When this ticket is absent but joins stall, that
+stuck line is still the fastest verdict: on current builds the ticket
+follows once the climbing age passes the bound, while on an older container
+a frozen age below the bound means the stuck line is the only signal —
+treat it as the verdict and escalate on it.
 
 Escalate when the age climbs while the latch reads 0 and no stuck line
 appears, or when burn alerts join the ticket — the fix belongs to the
