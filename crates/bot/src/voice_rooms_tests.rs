@@ -7528,9 +7528,17 @@ async fn handle_textchannels_refuses_without_manage_channels() {
 }
 
 #[tokio::test]
-async fn handle_textchannels_saves_settings_for_a_creator_channel() {
+async fn handle_textchannels_preserves_stored_toggle_on_rename_only() {
     let trace = Trace::default();
-    let runtime = test_runtime(trace.clone());
+    let runtime = VoiceRuntime::new(
+        move || {
+            let store = Store::new(trace.clone());
+            store.creators.lock().unwrap()[0].text_channels = true;
+            (store, Http::new(trace.clone()))
+        },
+        Duration::from_millis(10),
+        true,
+    );
     let interaction = textchannels_interaction(
         vec![
             typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
@@ -8214,7 +8222,7 @@ async fn handle_defaultlimit_saves_the_limit() {
 }
 
 #[tokio::test]
-async fn handle_alwaysprivate_saves_the_default() {
+async fn handle_alwaysprivate_refuses_without_enabled() {
     let trace = Trace::default();
     let runtime = test_runtime(trace.clone());
     let interaction = v8_interaction(
@@ -8227,13 +8235,18 @@ async fn handle_alwaysprivate_saves_the_default() {
     let (owned, response) = handle_capture(&runtime, &interaction).await;
     assert!(owned);
     assert!(
-        response_text(response.as_ref().expect("reply")).contains("private"),
-        "alwaysprivate defaults on and reports it"
+        response_text(response.as_ref().expect("reply"))
+            .contains("Choose whether new rooms start private, then try again."),
+        "alwaysprivate refuses an absent toggle instead of defaulting on"
     );
-    assert!(trace
-        .lock()
-        .unwrap()
-        .contains(&format!("add_creator:{CREATOR}")));
+    assert!(
+        !trace
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.starts_with("add_creator")),
+        "a refused toggle writes nothing"
+    );
 }
 
 #[test]
