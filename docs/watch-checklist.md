@@ -61,9 +61,11 @@ and the Worker (`packetFilename` in `wrangler/src/alert-rules.ts`).
 | `voice_watchdog_stucks` | **ticket**: watchdog stuck windows rise between samples (first sample is baseline-only, restarts re-baseline, missing family is no window) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-watchdog-stucks) |
 | `voice_halt_recoveries` | **ticket**: halt-latch recoveries rise between samples (first sample is baseline-only, restarts re-baseline, missing family is no window) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-halt-recoveries) |
 | `rest_breaker_opens` | **ticket**: invalid-request breaker opens rise between samples (first sample is baseline-only, restarts re-baseline, missing family is no window) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-rest-breaker-opens) |
-| `rest_global_pauses` | **ticket**: Discord global-pause episodes rise between samples (first sample is baseline-only, restarts re-baseline, missing family is no window) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-rest-global-pauses) || `rest_token_invalid` | **page**: bot-token latch reads 1 on any valid sample (credential death; first sample may fire, only a corrected restart clears) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-rest-token-invalid) |
+| `rest_global_pauses` | **ticket**: Discord global-pause episodes rise between samples (first sample is baseline-only, restarts re-baseline, missing family is no window) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-rest-global-pauses) |
+| `rest_token_invalid` | **page**: bot-token latch reads 1 on any valid sample (credential death; first sample may fire, only a corrected restart clears) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-rest-token-invalid) |
 | `rest_refusal_surge` | **page**: guard invalid + refused requests grow 10+ between samples (first sample is baseline-only, a backwards counter re-baselines only that family, quiet windows resolve) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-rest-refusal-surge) |
 | `rest_global_responses_stuck` | **page**: global-pause response bodies unresolved for 3 consecutive valid samples (a valid zero resolves; paused/remaining gauges stay rule-free by design) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-rest-global-responses-stuck) |
+
 Out of scope for paging (log-only findings, still recorded on the watch log):
 gateway session starts, handler-latency quantiles, unban-queue depth via
 `moderation_scheduled_unbans` counts (test-container copy or backup artifact
