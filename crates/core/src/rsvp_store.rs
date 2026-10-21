@@ -427,9 +427,10 @@ pub async fn record_checkin(
 /// response that was live before this attempt.
 ///
 /// The response cleanup is fenced to this attempt's write identity — its
-/// audit row's `(outcome, created_at)` plus commit order — never
-/// `responded_at` alone: a later same-millisecond rewrite (including an
-/// identical status rewrite) survives older compensation, while this
+/// audit row's `(outcome, created_at)` plus insertion commit order — never
+/// `responded_at` alone and never timestamp order: a later-committed rewrite
+/// (including an identical same-millisecond status rewrite, or an earlier
+/// timestamp committed second) survives older compensation, while this
 /// attempt's audit row — owned by its unique id — is always removed. When
 /// the audit row is absent (idempotent retry or a write that never
 /// ledgered), the fence falls back to the `responded_at` guard so the
@@ -467,8 +468,9 @@ pub async fn compensate_rsvp_write(
     .execute(&mut *tx)
     .await?;
     // This attempt's own audit row is the write-identity witness: its
-    // outcome/created_at names what the attempt wrote, and its commit
-    // order breaks same-millisecond ties no value comparison can.
+    // outcome/created_at names what the attempt wrote, and its insertion
+    // commit order decides which attempt is newer — timestamps never order
+    // attempts because mint order can differ from commit order.
     let owned: Option<(String, sqlx::types::time::OffsetDateTime)> =
         sqlx::query_as("SELECT outcome, created_at FROM announcements_audit_log WHERE id = $1")
             .bind(audit_id)
@@ -536,14 +538,16 @@ pub async fn compensate_rsvp_write(
     Ok(())
 }
 
-/// True when a later same-identity RSVP attempt ledgered after `audit_id`:
-/// a greater `created_at` wins outright, and `xmin` (insertion commit
-/// order) breaks same-timestamp ties that values alone cannot. Same-user
+/// True when a later same-identity RSVP attempt committed after `audit_id`,
+/// by insertion commit order (`xmin`) alone. Timestamps never order
+/// attempts: the handler mints `responded_at` before pool and lock
+/// acquisition, so concurrent attempts can mint in one order and commit in
+/// the other, and the store accepts decreasing timestamps. Same-user
 /// writers serialize on the budget lock and same-identity writers on the
 /// identity lock, so commit order matches write order here; the numeric
-/// `xmin` comparison only ever spans adjacent same-millisecond commits,
-/// far from transaction-id wraparound. Scoped to `event.rsvp` rows so
-/// other slices sharing the log table never fence an RSVP cleanup.
+/// `xmin` comparison only ever spans adjacent same-identity commits, far
+/// from transaction-id wraparound. Scoped to `event.rsvp` rows so other
+/// slices sharing the log table never fence an RSVP cleanup.
 async fn has_newer_rsvp_audit(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     guild_id: &str,
@@ -562,9 +566,7 @@ async fn has_newer_rsvp_audit(
              AND newer.action = $3
              AND newer.target_key = $4
              AND newer.id <> owned.id
-             AND (newer.created_at > owned.created_at
-                  OR (newer.created_at = owned.created_at
-                      AND newer.xmin::text::bigint > owned.xmin::text::bigint))
+             AND newer.xmin::text::bigint > owned.xmin::text::bigint
          )",
     )
     .bind(guild_id)
@@ -1519,6 +1521,64 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, RsvpStatus::Declined);
         assert_eq!(rows[0].responded_at, "2026-09-10T10:02:00.000Z");
+        drop_schema(&pool, &schema).await;
+    }
+
+    /// Commit order, not timestamp order, decides which attempt is newer: the
+    /// handler mints `responded_at` before lock acquisition, so a later
+    /// timestamp can commit first and an earlier timestamp second. Compensating
+    /// the last-committed attempt must restore its predecessor even though the
+    /// predecessor's timestamp is greater.
+    #[tokio::test]
+    async fn compensation_restores_predecessor_when_commit_order_inverts_timestamps() {
+        let Some((pool, schema)) = test_pool("rsvp_fence_order_inversion")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping rsvp_store test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        // Later timestamp commits first ...
+        let first = rsvp(RsvpStatus::Interested, "u1", "2026-09-10T10:00:00.500Z");
+        put_rsvp(&pool, &first).await.expect("first");
+        write_audit(&pool, &RsvpAudit::for_rsvp("audit-inversion-first", &first))
+            .await
+            .expect("audit");
+        // ... then the earlier timestamp commits second and owns the row.
+        let second = rsvp(RsvpStatus::Going, "u1", "2026-09-10T10:00:00.000Z");
+        let transition = put_rsvp(&pool, &second).await.expect("second");
+        write_audit(
+            &pool,
+            &RsvpAudit::for_rsvp("audit-inversion-second", &second),
+        )
+        .await
+        .expect("audit");
+        assert_eq!(
+            transition.previous_response(),
+            Some((RsvpStatus::Interested, "2026-09-10T10:00:00.500Z"))
+        );
+        compensate_rsvp_write(
+            &pool,
+            "1545644954272137297",
+            "1546451670500642999",
+            "u1",
+            "2026-09-10T10:00:00.000Z",
+            "audit-inversion-second",
+            transition.previous_response(),
+        )
+        .await
+        .expect("compensate inverted");
+        let rows = list_rsvps(&pool, "1545644954272137297", "1546451670500642999")
+            .await
+            .expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, RsvpStatus::Interested);
+        assert_eq!(rows[0].responded_at, "2026-09-10T10:00:00.500Z");
+        let audits: Vec<String> = sqlx::query_scalar("SELECT id FROM announcements_audit_log")
+            .fetch_all(&pool)
+            .await
+            .expect("audit ids");
+        assert_eq!(audits, ["audit-inversion-first".to_owned()]);
         drop_schema(&pool, &schema).await;
     }
 }
