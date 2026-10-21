@@ -644,6 +644,26 @@ def staging_pinned_sha_errors(workflows):
         steps = job.get("steps") or []
         checkouts = [step for step in steps
                      if str(step.get("uses", "")).startswith("actions/checkout@")]
+        if job_id == "deploy":
+            # The deploy job carries one extra checkout: reviewed tooling
+            # from the workflow head, so the deploy-ID steps run even when
+            # the deployed pin predates the script. It must be exactly that
+            # shape — the workflow head at shallow depth, never the
+            # deployed ref — and credentialless like every checkout.
+            tooling = [step for step in checkouts
+                       if (step.get("with") or {}).get("path") == "tooling"]
+            if len(tooling) != 1:
+                errors.append("deploy-staging.yml:deploy: must carry exactly one "
+                              "workflow-head tooling checkout")
+            else:
+                tooling_with = tooling[0].get("with") or {}
+                if tooling_with.get("ref") != "${{ github.sha }}":
+                    errors.append("deploy-staging.yml:deploy: tooling checkout must pin "
+                                  "the workflow head, never the deployed ref")
+                if tooling_with.get("fetch-depth") != "1":
+                    errors.append("deploy-staging.yml:deploy: tooling checkout must stay shallow")
+            checkouts = [step for step in checkouts
+                         if (step.get("with") or {}).get("path") != "tooling"]
         if len(checkouts) != 1:
             errors.append(f"deploy-staging.yml:{job_id}: must check out exactly once")
             continue
@@ -816,7 +836,9 @@ def staging_deploy_identity_errors(workflow, name="deploy-staging.yml"):
     SHA-from-build_revision step and poison the next rollback snapshot's
     serving_sha (recorded from the workers/message annotation). No other
     github.sha may appear in the deploy job outside the two pinned
-    dispatch-or-head expressions (checkout ref, SHA-step env).
+    dispatch-or-head expressions (checkout ref, SHA-step env) and the
+    workflow-head tooling checkout ref (which runs deploy_id.py for pins
+    whose commits predate it).
     """
     errors = []
     jobs = workflow.get("jobs") or {}
@@ -855,9 +877,90 @@ def staging_deploy_identity_errors(workflow, name="deploy-staging.yml"):
             "github-actions:${{ github.run_id }}:${{ env.DEPLOY_SHA }}":
         errors.append(f"{name}:deploy: rollback actor must name the validated deploy SHA")
     text = str(deploy)
-    if text.count("github.sha") != text.count(DEPLOY_SHA_EXPRESSION) or text.count("github.sha") != 2:
-        errors.append(f"{name}:deploy: github.sha may only appear in the checkout ref and "
-                      "SHA-step dispatch-or-head expressions")
+    if text.count("github.sha") != text.count(DEPLOY_SHA_EXPRESSION) + 1 or text.count("github.sha") != 3:
+        errors.append(f"{name}:deploy: github.sha may only appear in the checkout ref, "
+                      "the SHA-step dispatch-or-head expressions and the tooling checkout ref")
+    return errors
+
+
+def staging_deploy_id_errors(workflow, name="deploy-staging.yml"):
+    """The staging deploy ID is derived in-lane and recorded as a Deployment.
+
+    The compute step derives `YYYY.MM.DD.N+sha7` from the validated deploy
+    SHA inside the serialized staging lane (N counts today's recorded staging
+    deploy IDs, so a queued entry cannot mint a duplicate) and exports it
+    before the prepare step stamps it. Both ID steps run reviewed tooling
+    from the workflow's own commit, since a pinned drill deploys a commit
+    whose checkout may predate the script. The record step stores the deploy
+    as a GitHub Deployment carrying the ID — never a tag or Release — with
+    success only when the rollout verify and the error-rate gate both
+    passed; it runs after the auto-rollback so bookkeeping can never gate
+    recovery. No other step may call deploy_id.py.
+    """
+    errors = []
+    jobs = workflow.get("jobs") or {}
+    deploy = jobs.get("deploy") or {}
+    steps = deploy.get("steps") or []
+
+    def find(label, predicate):
+        found = [step for step in steps if predicate(step)]
+        if len(found) != 1:
+            errors.append(f"{name}:deploy: must carry exactly one {label}")
+            return None, -1
+        return found[0], steps.index(found[0])
+
+    compute, compute_at = find(
+        "deploy-ID compute step",
+        lambda step: step.get("name") == "Compute the deploy ID for this staging deploy")
+    if compute is not None:
+        if (compute.get("env") or {}).get("GH_TOKEN") != "${{ github.token }}":
+            errors.append(f"{name}:deploy: compute step must list Deployments with github.token")
+        run = str(compute.get("run") or "")
+        if ("tooling/scripts/deploy_id.py next --environment staging --sha \"$DEPLOY_SHA\""
+                not in run or '>> "$GITHUB_ENV"' not in run):
+            errors.append(f"{name}:deploy: compute step must derive the staging ID "
+                          "from the validated deploy SHA via reviewed tooling")
+    prepare, prepare_at = find(
+        "staging identity snapshot step",
+        lambda step: step.get("name") == "Snapshot staging identity and generate per-deploy image provenance")
+    if compute_at >= 0 and prepare_at >= 0 and compute_at > prepare_at:
+        errors.append(f"{name}:deploy: compute step must run before the prepare step stamps the ID")
+    verify, _ = find(
+        "rollout verify step",
+        lambda step: step.get("name") == "Verify exact new rollout and serving Worker/container readiness")
+    if verify is not None and verify.get("id") != "verify":
+        errors.append(f"{name}:deploy: verify step must carry id verify for the record step")
+    gate, gate_at = find("promotion error-rate gate step",
+                         lambda step: step.get("id") == "error_rate_gate")
+    record, record_at = find(
+        "deployment record step",
+        lambda step: step.get("name") == "Record the staging deployment")
+    if record is not None:
+        if record.get("if") != "always() && steps.deploy.outcome == 'success'":
+            errors.append(f"{name}:deploy: record step must run whenever a deploy went out")
+        env = record.get("env") or {}
+        if env.get("GH_TOKEN") != "${{ github.token }}":
+            errors.append(f"{name}:deploy: record step must create the Deployment with github.token")
+        if env.get("VERIFY_OUTCOME") != "${{ steps.verify.outcome }}":
+            errors.append(f"{name}:deploy: record step must judge the rollout verify outcome")
+        if env.get("GATE_OUTCOME") != "${{ steps.error_rate_gate.outcome }}":
+            errors.append(f"{name}:deploy: record step must judge the error-rate gate outcome")
+        run = str(record.get("run") or "")
+        if ("tooling/scripts/deploy_id.py record --environment staging --sha \"$DEPLOY_SHA\""
+                not in run or '--deploy-id "$DEPLOY_ID"' not in run):
+            errors.append(f"{name}:deploy: record step must record the staging ID "
+                          "for the validated deploy SHA via reviewed tooling")
+        if "--rollback" in run:
+            errors.append(f"{name}:deploy: staging has no rollback mode to record")
+    if gate_at >= 0 and record_at >= 0 and record_at < gate_at:
+        errors.append(f"{name}:deploy: record step must run after the error-rate gate judges")
+    rollback_at = next((index for index, step in enumerate(steps)
+                        if step.get("id") == "auto_rollback"), -1)
+    if rollback_at >= 0 and record_at >= 0 and record_at < rollback_at:
+        errors.append(f"{name}:deploy: record step must run after the auto-rollback "
+                      "so bookkeeping can never gate recovery")
+    if str(deploy).count("deploy_id.py") != 2:
+        errors.append(f"{name}:deploy: only the compute and record steps may call deploy_id.py")
     return errors
 
 
@@ -2069,6 +2172,101 @@ def production_errors(workflow):
     return errors
 
 
+def production_deploy_id_errors(workflow, name="deploy-production.yml"):
+    """The production deploy ID is derived in-lane, stamped, gated and recorded.
+
+    The compute step derives `YYYY.MM.DD.N+sha7` from the guarded SHA inside
+    the deploy-production lane (N counts today's recorded production deploy
+    IDs, so a queued entry cannot mint a duplicate) before the render step stamps it;
+    the readyz gate judges it; the record step stores the deploy as a GitHub
+    Deployment with environment=production carrying the ID — never a tag or
+    Release — with success only when the readyz gate passed and the
+    error-rate gate did not fail. It runs after the auto-rollback so
+    bookkeeping can never gate recovery. Rollbacks mint a fresh event ID
+    and name themselves, since the restored build keeps its original
+    stamped ID. No other step may call deploy_id.py.
+    """
+    errors = []
+    jobs = workflow.get("jobs") or {}
+    production = jobs.get("production") or {}
+    steps = production.get("steps") or []
+
+    def find(label, predicate):
+        found = [step for step in steps if predicate(step)]
+        if len(found) != 1:
+            errors.append(f"{name}:production: must carry exactly one {label}")
+            return None, -1
+        return found[0], steps.index(found[0])
+
+    compute, compute_at = find(
+        "deploy-ID compute step",
+        lambda step: step.get("name") == "Compute the deploy ID for this production deploy")
+    if compute is not None:
+        if (compute.get("env") or {}).get("GH_TOKEN") != "${{ github.token }}":
+            errors.append(f"{name}:production: compute step must list Deployments with github.token")
+        run = str(compute.get("run") or "")
+        if ("tooling/scripts/deploy_id.py next --environment production --sha \"$SHA\"" not in run
+                or '>> "$GITHUB_ENV"' not in run):
+            errors.append(f"{name}:production: compute step must derive the production ID "
+                          "from the guarded SHA")
+    render, render_at = find(
+        "deploy config render step",
+        lambda step: step.get("name") == "Render the production deploy config with build identity")
+    if render is not None and '--deploy-id "$DEPLOY_ID"' not in str(render.get("run") or ""):
+        errors.append(f"{name}:production: render step must stamp the computed deploy ID")
+    if compute_at >= 0 and render_at >= 0 and compute_at > render_at:
+        errors.append(f"{name}:production: compute step must run before the render step stamps the ID")
+    gate, _ = find(
+        "readyz gate step",
+        lambda step: step.get("name") == "Gate on stable /health + /readyz gateway-ready")
+    if gate is not None:
+        run = str(gate.get("run") or "")
+        # The flag is conditional: real runs judge the computed ID only when
+        # the deployed Dockerfile can stamp it, while a caller without an
+        # exported ID (the stamping-transition suites run the gate without
+        # one) or a pre-stamping guarded SHA judges the legacy shape.
+        for required in ('deploy_id_arg=(--deploy-id "$DEPLOY_ID")',
+                         '"${deploy_id_arg[@]}"'):
+            if required not in run:
+                errors.append(f"{name}:production: readyz gate must judge the computed "
+                              "deploy ID when one is exported")
+    error_gate, error_gate_at = find("promotion error-rate gate step",
+                                     lambda step: step.get("id") == "error_rate_gate")
+    record, record_at = find(
+        "deployment record step",
+        lambda step: step.get("name") == "Record the production deployment")
+    if record is not None:
+        condition = str(record.get("if") or "")
+        if ("steps.deploy.outcome == 'success'" not in condition
+                or "steps.rollback.outcome == 'success'" not in condition):
+            errors.append(f"{name}:production: record step must run whenever a deploy "
+                          "or rollback went out")
+        env = record.get("env") or {}
+        if env.get("GH_TOKEN") != "${{ github.token }}":
+            errors.append(f"{name}:production: record step must create the Deployment with github.token")
+        if env.get("GATE_OUTCOME") != "${{ steps.gate.outcome }}":
+            errors.append(f"{name}:production: record step must judge the readyz gate outcome")
+        if env.get("ERROR_GATE_OUTCOME") != "${{ steps.error_rate_gate.outcome }}":
+            errors.append(f"{name}:production: record step must judge the error-rate gate outcome")
+        run = str(record.get("run") or "")
+        if ("tooling/scripts/deploy_id.py record --environment production --sha \"$SHA\"" not in run
+                or '--deploy-id "$DEPLOY_ID"' not in run):
+            errors.append(f"{name}:production: record step must record environment=production "
+                          "for the guarded SHA")
+        if '"$MODE" = "rollback"' not in run or "--rollback" not in run:
+            errors.append(f"{name}:production: record step must name rollback records")
+    if error_gate_at >= 0 and record_at >= 0 and record_at < error_gate_at:
+        errors.append(f"{name}:production: record step must run after the error-rate gate judges")
+    rollback_at = next((index for index, step in enumerate(steps)
+                        if step.get("id") == "auto_rollback"), -1)
+    if rollback_at >= 0 and record_at >= 0 and record_at < rollback_at:
+        errors.append(f"{name}:production: record step must run after the auto-rollback "
+                      "so bookkeeping can never gate recovery")
+    if str(production).count("deploy_id.py") != 2:
+        errors.append(f"{name}:production: only the compute and record steps may call deploy_id.py")
+    return errors
+
+
 def staging_active_errors(workflow):
     """The deploy job is live (TOG-12856): no static suspension guard.
 
@@ -2832,12 +3030,14 @@ def workflow_policy_errors(workflows):
             errors.extend(production_schema_gate_errors(workflow))
             errors.extend(production_roles_gate_errors(workflow))
             errors.extend(production_error_rate_gate_errors(workflow))
+            errors.extend(production_deploy_id_errors(workflow))
             continue
         if name == "deploy-staging.yml":
             errors.extend(staging_dispatch_errors(workflow))
             errors.extend(staging_active_errors(workflow))
             errors.extend(staging_pinned_sha_errors(workflows))
             errors.extend(staging_deploy_identity_errors(workflow))
+            errors.extend(staging_deploy_id_errors(workflow))
             errors.extend(soak_hold_errors(workflow))
             errors.extend(pinned_history_guard_errors(workflow))
             errors.extend(schema_gate_errors(workflow))
@@ -4396,13 +4596,16 @@ class WorkflowTests(unittest.TestCase):
                         if "staging_schema_gate.py" in str(step.get("run", "")))
         self.assertEqual(gate_run["env"]["SOURCE_SHA"], DEPLOY_SHA_EXPRESSION)
 
+        # Deploy step indices: the workflow-head tooling checkout sits at [1],
+        # so the SHA step is [2] there (schema-gate and roles-gate are
+        # unchanged at [1]).
         def swap_shape_after_equality(workflow):
-            run = workflow["jobs"]["deploy"]["steps"][1]["run"]
+            run = workflow["jobs"]["deploy"]["steps"][2]["run"]
             lines = run.splitlines()
             case_i = next(i for i, line in enumerate(lines) if line.strip().startswith("case "))
             test_i = next(i for i, line in enumerate(lines) if "git rev-parse HEAD" in line)
             lines[case_i], lines[test_i] = lines[test_i], lines[case_i]
-            workflow["jobs"]["deploy"]["steps"][1]["run"] = "\n".join(lines)
+            workflow["jobs"]["deploy"]["steps"][2]["run"] = "\n".join(lines)
 
         mutations = {
             # A push (or an empty dispatch) must deploy the workflow head, never a constant.
@@ -4413,29 +4616,29 @@ class WorkflowTests(unittest.TestCase):
             "checkout ref removed": lambda w: w["jobs"]["deploy"]["steps"][0]["with"].pop("ref"),
             "deploy checkout shallow": lambda w: w["jobs"]["deploy"]["steps"][0]["with"]
                 .__setitem__("fetch-depth", "1"),
-            "SHA env constant": lambda w: w["jobs"]["deploy"]["steps"][1]["env"]
+            "SHA env constant": lambda w: w["jobs"]["deploy"]["steps"][2]["env"]
                 .__setitem__("SOURCE_SHA", "abc"),
-            "ancestry check dropped": lambda w: w["jobs"]["deploy"]["steps"][1]
+            "ancestry check dropped": lambda w: w["jobs"]["deploy"]["steps"][2]
                 .__setitem__("run", "\n".join(line for line in
-                                             w["jobs"]["deploy"]["steps"][1]["run"].splitlines()
+                                             w["jobs"]["deploy"]["steps"][2]["run"].splitlines()
                                              if "merge-base" not in line)),
-            "ancestry rejection goes green": lambda w: w["jobs"]["deploy"]["steps"][1]
-                .__setitem__("run", w["jobs"]["deploy"]["steps"][1]["run"]
+            "ancestry rejection goes green": lambda w: w["jobs"]["deploy"]["steps"][2]
+                .__setitem__("run", w["jobs"]["deploy"]["steps"][2]["run"]
                              .replace("exit 1", "exit 0")),
             "ancestry-only rejection goes green": lambda w: [
-                job["steps"][1].__setitem__(
-                    "run", job["steps"][1]["run"].replace(
+                job["steps"][2 if job is w["jobs"]["deploy"] else 1].__setitem__(
+                    "run", job["steps"][2 if job is w["jobs"]["deploy"] else 1]["run"].replace(
                         'git merge-base --is-ancestor "$SOURCE_SHA" origin/main || '
                         '{ echo "::error::$SOURCE_SHA is not an ancestor of origin/main" >&2; exit 1; }',
                         'git merge-base --is-ancestor "$SOURCE_SHA" origin/main || '
                         '{ echo "::error::$SOURCE_SHA is not an ancestor of origin/main" >&2; exit 0; }'))
                 for job in (w["jobs"]["schema-gate"], w["jobs"]["roles-gate"], w["jobs"]["deploy"])],
-            "hex enforcement dropped": lambda w: w["jobs"]["deploy"]["steps"][1]
+            "hex enforcement dropped": lambda w: w["jobs"]["deploy"]["steps"][2]
                 .__setitem__("run", "\n".join(line for line in
-                                             w["jobs"]["deploy"]["steps"][1]["run"].splitlines()
+                                             w["jobs"]["deploy"]["steps"][2]["run"].splitlines()
                                              if "${#SOURCE_SHA}" not in line)),
             "shape check after equality": swap_shape_after_equality,
-            "second sha reader": lambda w: w["jobs"]["deploy"]["steps"][2]
+            "second sha reader": lambda w: w["jobs"]["deploy"]["steps"][3]
                 .setdefault("env", {}).__setitem__("EXTRA_SHA", DEPLOY_SHA_EXPRESSION),
             "sha input removed": lambda w: w["on"]["workflow_dispatch"]["inputs"].pop("sha"),
             "sha input boolean": lambda w: w["on"]["workflow_dispatch"]["inputs"]["sha"]
@@ -6592,6 +6795,14 @@ class WorkflowTests(unittest.TestCase):
                         # Read-only fetch of the producing plan
                         # run's manifest artifact for the provenance gate.
                         expected = {"contents": "read", "actions": "read"}
+                    elif (name, job_id) == ("deploy-staging.yml", "deploy"):
+                        # Derives the deploy ID from today's staging
+                        # Deployments, then records this one.
+                        expected = {"contents": "read", "deployments": "write"}
+                    elif (name, job_id) == ("deploy-production.yml", "production"):
+                        # Derives the deploy ID from today's production
+                        # Deployments, then records this one.
+                        expected = {"contents": "read", "deployments": "write"}
                     elif (name, job_id) == ("deploy-production.yml", "guard"):
                         expected = {"contents": "read", "actions": "read", "checks": "read"}
                     elif (name, job_id) == ("deploy-production.yml", "recheck"):

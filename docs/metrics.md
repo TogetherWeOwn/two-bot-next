@@ -414,7 +414,7 @@ as dynamic labels.
   ID leaves the process in any label or field.
 - Worker log fields (Workers Logs only, never a metric):
   `event="container_gateway_failure"` with `phase`/`class`/`failed_step`/
-  `error_code`/`build_revision`/`release`/`worker_version`/`log_url`, emitted
+  `error_code`/`build_revision`/`deploy_id`/`release`/`worker_version`/`log_url`, emitted
   by the Container DO keepalive in `wrangler/src/index.ts` once per tick while
   the gateway task is failing. `phase` is `durable_gateway`; `class` is one of
   `store_unavailable`, `gateway_pool_connect_failed`, `checkpoint_load_failed`,
