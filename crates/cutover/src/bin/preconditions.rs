@@ -337,3 +337,196 @@ fn check(root: &Path) -> (Vec<Outcome>, Vec<String>) {
 
     (outcomes, missing)
 }
+
+#[cfg(test)]
+mod tests {
+    //! In-process coverage for the 8 MiB read cap. The protected
+    //! `preconditions_read_cap_acceptance` suite pins the same contract by
+    //! spawning this binary with a cleared environment, which drops the
+    //! coverage profile; these unit tests execute the same paths in-process
+    //! so the changed-lines gate can measure them.
+    use super::*;
+    use std::fs;
+
+    /// Pinned cap, kept as a literal so the contract does not move with the
+    /// implementation.
+    const CAP: usize = 8 * 1024 * 1024;
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let root = std::env::var_os("PAPERCLIP_RUN_SCRATCH_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = root.join(format!("preconditions-unit-{name}-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write(dir: &Path, rel: &str, content: &str) {
+        let path = dir.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+
+    /// Pad `head` with filler to exactly `total` bytes.
+    fn sized(head: &str, total: usize) -> String {
+        let mut out = String::with_capacity(total);
+        out.push_str(head);
+        out.push_str(&"x".repeat(total - head.len()));
+        out
+    }
+
+    /// A repo-root tree every check accepts.
+    fn valid_tree(name: &str) -> PathBuf {
+        let dir = scratch_dir(name);
+        for &doc in REQUIRED_DOCS {
+            write(&dir, doc, "present\n");
+        }
+        write(&dir, PARITY_DOC, &format!("{PARITY_MARKER}\n"));
+        write(&dir, CUTOVER_DOC, &REQUIRED_SECTIONS.join("\n"));
+        for &unit in REQUIRED_TIMERS {
+            write(&dir, unit, "[Timer]\nOnCalendar=daily\n");
+        }
+        write(&dir, REGISTRY_FIXTURE, r#"{"commands": [{"id": "cmd"}]}"#);
+        dir
+    }
+
+    fn assert_refused(missing: &[String], role: &str) {
+        let entry = format!("{role} exceeds 8 MiB");
+        assert!(
+            missing.contains(&entry),
+            "missing must refuse {role} naming the cap, got: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn read_input_accepts_small_and_at_cap_files() {
+        let dir = scratch_dir("read-ok");
+        let small = dir.join("small.txt");
+        fs::write(&small, "hello\n").unwrap();
+        assert_eq!(read_input(&small).unwrap(), "hello\n");
+        let at_cap = dir.join("at-cap.txt");
+        fs::write(&at_cap, sized("hello\n", CAP)).unwrap();
+        assert_eq!(read_input(&at_cap).unwrap().len(), CAP);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn read_input_refuses_over_cap() {
+        let dir = scratch_dir("read-over");
+        let path = dir.join("over.txt");
+        fs::write(&path, sized("hello\n", CAP + 1)).unwrap();
+        assert!(matches!(read_input(&path), Err(InputError::OverCap)));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn read_input_maps_a_missing_file_to_unreadable() {
+        let dir = scratch_dir("read-missing");
+        assert!(matches!(
+            read_input(&dir.join("absent.txt")),
+            Err(InputError::Unreadable)
+        ));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_input_maps_a_directory_to_unreadable() {
+        // Directories open but never read: the open succeeds and the bounded
+        // read fails, so the input stays opaque like the old path.
+        let dir = scratch_dir("read-dir");
+        assert!(matches!(read_input(&dir), Err(InputError::Unreadable)));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn check_accepts_a_valid_tree() {
+        let dir = valid_tree("check-valid");
+        let (outcomes, missing) = check(&dir);
+        assert!(missing.is_empty(), "unexpected missing: {missing:?}");
+        assert!(outcomes.iter().all(|o| o.ok));
+        assert_eq!(outcomes.len(), 5);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn check_refuses_an_over_cap_parity_doc() {
+        let dir = valid_tree("check-parity-over");
+        write(
+            &dir,
+            PARITY_DOC,
+            &sized(&format!("{PARITY_MARKER}\n"), CAP + 1),
+        );
+        let (outcomes, missing) = check(&dir);
+        assert_refused(&missing, PARITY_DOC);
+        assert!(outcomes
+            .iter()
+            .any(|o| o.name == "parity-zero-unmapped" && !o.ok));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn check_refuses_an_over_cap_cutover_doc() {
+        let dir = valid_tree("check-cutover-over");
+        write(
+            &dir,
+            CUTOVER_DOC,
+            &sized(&REQUIRED_SECTIONS.join("\n"), CAP + 1),
+        );
+        let (outcomes, missing) = check(&dir);
+        assert_refused(&missing, CUTOVER_DOC);
+        assert!(outcomes
+            .iter()
+            .any(|o| o.name == "runbook-sections" && !o.ok));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn check_refuses_an_over_cap_timer_unit() {
+        let dir = valid_tree("check-timer-over");
+        write(
+            &dir,
+            REQUIRED_TIMERS[0],
+            &sized("[Timer]\nOnCalendar=daily\n", CAP + 1),
+        );
+        let (_, missing) = check(&dir);
+        assert_refused(&missing, REQUIRED_TIMERS[0]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn check_refuses_an_over_cap_registry_fixture() {
+        let dir = valid_tree("check-registry-over");
+        // Valid JSON, so only the cap can refuse it (and the refusal must
+        // name the cap, not JSON).
+        let prefix = r#"{"commands": [{"id": "cmd", "pad": ""#;
+        let suffix = r#""}]}"#;
+        let content = format!(
+            "{prefix}{}{suffix}",
+            "x".repeat(CAP + 1 - prefix.len() - suffix.len())
+        );
+        assert_eq!(content.len(), CAP + 1);
+        serde_json::from_str::<serde_json::Value>(&content).unwrap();
+        write(&dir, REGISTRY_FIXTURE, &content);
+        let (outcomes, missing) = check(&dir);
+        assert_refused(&missing, REGISTRY_FIXTURE);
+        assert!(outcomes
+            .iter()
+            .any(|o| o.name == "registry-fixture" && !o.ok));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn check_maps_absent_inputs_to_unreadable() {
+        let dir = scratch_dir("check-absent");
+        let (outcomes, missing) = check(&dir);
+        assert!(missing.iter().any(|m| m == PARITY_DOC));
+        assert!(missing.iter().any(|m| m == CUTOVER_DOC));
+        for &unit in REQUIRED_TIMERS {
+            assert!(missing.iter().any(|m| m == unit));
+        }
+        assert!(missing.iter().any(|m| m == REGISTRY_FIXTURE));
+        assert_eq!(outcomes.len(), 5);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+}
