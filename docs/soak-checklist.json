@@ -2067,8 +2067,8 @@
       "parity": {
         "section": 12,
         "row": [
-          "Durable join-risk event claim store over the existing flags table (unwired, no new migration)",
-          "`JoinRiskStore` record with legacy lock-key derivation and exactly-once claim tests plus audit-DB step (#362)"
+          "Durable join-risk event claim store over the existing flags table (no new migration), wired via the join-risk runtime",
+          "`JoinRiskStore::record` (`crates/core/src/join_risk_store.rs:79`) claimed from `crates/bot/src/join_risk_runtime.rs:418` and production-wired in `chain_from_env` (`:566`), plus exactly-once claim tests and audit-DB step (#362)"
         ]
       },
       "owner": [
