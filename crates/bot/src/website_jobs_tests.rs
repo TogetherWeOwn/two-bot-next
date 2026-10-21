@@ -1392,3 +1392,134 @@ async fn rank_tick_missing_rung_names_the_rung_and_writes_nothing() {
         assert!(!logs.contains(leaked), "logs leaked {leaked:?}");
     }
 }
+
+/// Builder pin for the identity-binding guard behind C1/D8: a point-member
+/// read bound to a different user id is unproven evidence, even when its
+/// roles look nested. Deleting the user-id check in `rank_repair_member`
+/// turns this red. Offline: no database.
+#[tokio::test]
+async fn rank_repair_member_rejects_misbound_user_id() {
+    // Wrong identity carrying nested Prospect-only roles.
+    let mock = MockRest::start(
+        vec![ScriptedResponse::json(
+            200,
+            json!({"user": {"id": "1002", "bot": false}, "roles": ["11"]}),
+        )],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    assert_eq!(
+        rank_repair_member(&executor(&mock), "2222", "1001").await,
+        Err(ErrorClass::Rest)
+    );
+    mock.shutdown().await;
+
+    // Sanity: correctly bound nested evidence verifies.
+    let mock = MockRest::start(
+        vec![ScriptedResponse::json(
+            200,
+            json!({"user": {"id": "1001", "bot": false}, "roles": ["11"]}),
+        )],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let observed = rank_repair_member(&executor(&mock), "2222", "1001")
+        .await
+        .expect("correctly bound member verifies");
+    assert_eq!(
+        observed.map(|member| member.user_id),
+        Some("1001".to_owned())
+    );
+    mock.shutdown().await;
+}
+
+/// Builder pin for the wrong-identity publication hazard: the point read for
+/// 1001 returns a record bound to 1002 carrying nested Prospect-only roles.
+/// Without the user-id check the tick would publish Ok with the wrong member;
+/// with it the tick fails closed with no PUT and no publication. Lives here
+/// (not in the frozen acceptance file) per its builder contract.
+#[tokio::test]
+async fn rank_tick_wrong_identity_with_nested_roles_fails_closed() {
+    let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
+        assert!(
+            std::env::var("GITHUB_ACTIONS").is_err(),
+            "CI must supply the guarded test database"
+        );
+        eprintln!("SKIP wrong-identity nested integration: TWO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let fixture = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+        .await
+        .expect("create migrated agent-testdb fixture");
+    let pool = fixture.pool().clone();
+    apply_web_contract(&pool).await.unwrap();
+    let guild = "2222";
+    for (index, anomaly) in two_bot_core::RAID_ANOMALIES.iter().enumerate() {
+        let (start, _) = two_bot_core::window_bounds(anomaly.start, anomaly.end).unwrap();
+        sqlx::query("INSERT INTO members (guild_id, member_id, joined_at, is_bot) VALUES ($1,$2,$3::timestamptz,FALSE)")
+            .bind(guild).bind((9000 + index).to_string()).bind(start).execute(&pool).await.unwrap();
+    }
+    let roster = json!([
+        member(1000, false, &["11"]),
+        member(1001, false, &["12"]),
+        member(9000, false, &[]),
+        member(9001, false, &[]),
+        member(9002, false, &[]),
+    ]);
+    let roles_doc = json!({"roles": [
+        {"id":"10","name":"Bot","position":99},
+        {"id":"11","name":"Prospect","position":1},
+        {"id":"12","name":"Member","position":2},
+        {"id":"13","name":"Soldier","position":3},
+        {"id":"14","name":"Veteran","position":4},
+        {"id":"15","name":"Legend","position":5},
+    ]});
+    let mock = MockRest::with_responder(move |request: &RestRequest| {
+        let route = discord_route(&request.path);
+        if request.method == "GET" && route == "/guilds/2222" {
+            return ScriptedResponse::json(200, roles_doc.clone());
+        }
+        if request.method == "GET" && route == "/guilds/2222/members" {
+            return ScriptedResponse::json(200, roster.clone());
+        }
+        if request.method == "GET" && route == "/users/@me" {
+            return ScriptedResponse::json(200, json!({"id": "999", "bot": true}));
+        }
+        if request.method == "GET" && route == "/guilds/2222/members/999" {
+            return ScriptedResponse::json(200, json!({"roles": ["10"]}));
+        }
+        if request.method == "GET" && route == "/guilds/2222/members/1001" {
+            // Misbound evidence with nested roles: without the user-id check
+            // the post-repair refresh would publish this as 1001.
+            return ScriptedResponse::json(
+                200,
+                json!({"user": {"id": "1002", "bot": false}, "roles": ["11"]}),
+            );
+        }
+        if request.method == "PUT" {
+            return ScriptedResponse::status(204);
+        }
+        panic!("unexpected mock Discord route: {} {route}", request.method);
+    })
+    .await;
+    let observation = Arc::new(Mutex::new(()));
+    let outcome = tick(Kind::Rank, &pool, &executor(&mock), guild, &observation).await;
+    assert!(outcome.is_err(), "misbound nested evidence fails closed");
+    let requests = mock.requests();
+    assert!(
+        requests.iter().all(|request| request.method != "PUT"),
+        "misbound evidence must not grant: {requests:?}"
+    );
+    let published: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM rank_snapshots WHERE guild_id=$1")
+            .bind(guild)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(published, 0, "misbound evidence publishes nothing");
+    mock.shutdown().await;
+    fixture
+        .close()
+        .await
+        .expect("drop disposable test database");
+}
