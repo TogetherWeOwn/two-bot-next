@@ -244,6 +244,50 @@ names, never error text or payloads. Take the first action for the reported clas
 The streak clears on the next successful completion. For feed delivery
 specifically, follow the [feed supervisor operator guide](feed-supervisor.md).
 
+#### Alert: job failure share
+
+One job's `two_bot_job_runs_total` failures exceeded 10% of its recent runs:
+at least 10 completed runs with at least 2 failures in the judged window.
+This is the intermittent-sickness ticket. [`job_consecutive_failures`](#alert-job-failures)
+pages when a job fails three times in a row, but a job failing every other
+run never trips it; this rule accumulates runs across consecutive valid
+samples until the 10-run floor is met and then judges the share, so the
+flapping poller, sweeper or snapshotter tickets here. Sub-floor windows hold
+the baseline and accumulate instead of judging, so slow-cadence jobs (an
+hourly probe needs ~10 hours to judge) ticket late but never on thin
+evidence. Only a judged window at or below the line resolves; flat and
+sub-floor windows hold an active ticket, and a counter reset (process
+restart) rebaselines and resolves. The first valid sample only stores the
+baseline and never fires; missing or malformed samples preserve the firing
+state and the baseline. Unknown job labels are ignored, never subjects. This
+is a **ticket**, not a page: the consecutive-failures page owns the
+continuous outage. The firing key carries the job subject
+(`job_failure_share:<job>`).
+
+A job dead enough to page also tickets here: co-firing with the
+consecutive-failures page for the same job means continuous outage — follow
+the page first. This ticket alone means intermittent failure: successes land
+between the failures, so the cause is flakiness (a forking dependency, a
+racy tick, a poisoned-then-recovered lock) rather than a hard wedge. A job
+that stops completing anything holds this ticket while the staleness rules
+(`job_stale`, `ticker_stale`, `job_unknown_stale`) fire on its aging success
+timestamp; treat that pair as a wedge, not flakiness.
+
+First response: scrape `/ops/metrics` as described above and read the job's
+`success`/`failure` run counts, its `consecutive_failures` streak and its
+one-hot `last_error_class` row — the class names the failure family the
+share alone cannot. Then read the Worker/container logs for `periodic job
+failed` lines for that job over the judged window and correlate with deploy
+and dependency health. Do not restart the container to "clear" the share; a
+replacement resets the baseline without healing the flake, and the next
+judged window re-tickets.
+
+Escalate when the ticket co-fires with the consecutive-failures page (the
+outage turned continuous), when several jobs ticket at once (the cause is a
+shared dependency, usually the database or the Discord REST path), or when
+the ticket survives the suspect deploy's rollback — the fix then belongs to
+the on-call engineer, not another redeploy.
+
 #### Alert: REST 429
 
 More than 10% of Discord REST requests between two keepalive samples (minimum
@@ -919,6 +963,97 @@ path. Do not restart the container to clear the alert. A restart re-baselines
 the streak without showing that the gateway came back, so confirm `gateway
 ready` in the new process's logs first.
 
+#### Alert: gateway latency dead
+
+`two_bot_gateway_latency_seconds` carried no heartbeat-ACK evidence for 3
+consecutive valid samples. The gauge reports the last heartbeat round-trip
+from Twilight's completed ACK sample, or NaN until the first ACK lands on
+the current connection (every reconnect resets it to unknown, so a stale ACK
+never looks like latency on the new connection). Either unknown (NaN) or an
+unchanged finite value across samples means no fresh ACK arrived: healthy
+connections ACK every heartbeat interval (~41 s), well inside the ~60 s
+scrape cadence, so three evidenceless samples (~2-3 min, the sibling gateway
+bound) mean the gateway is dead — no heartbeats answered, no events flowing.
+Any fresh evidence (a finite change, or a finite value after unknown) clears
+at once. A clean boot (Connected within ~1 min, first ACK within another
+interval) never reaches the third sample. The first valid sample only stores
+the baseline and never fires; malformed rows (duplicated, labeled, negative,
+infinite) and missing rows hold the previous state, and a failed scrape
+re-baselines the streak while holding a firing page. This is page severity
+(SEV-1 in the [watch escalation path](watch-escalation-path.md)). The firing
+key is the constant `gateway_latency_dead`.
+
+Read this page beside [`gateway_not_ready`](#alert-gateway-not-ready): both
+firing together mean the gateway never connected (follow the not-ready
+runbook first), while this page alone with readyz still Connected means a
+half-dead connection — the shard looks up but answers nothing, the case no
+other gateway rule can see. A parked gateway (Unconfigured, for example a
+missing `DISCORD_TOKEN`) pages here too on its permanent NaN, exactly as it
+already trips the generic unready page: confirm the expected token
+configuration before touching the bot.
+
+First response: scrape `/ops/metrics` as described above and read the
+latency row plus the disconnect, reconnect, resume and READY counters. NaN
+with flat counters means the gateway never connected; an unchanged finite
+value with flat counters means ACKs stopped mid-connection; NaN beside
+climbing disconnects means the transport is churning (see the flapping
+runbook below). Then read `/readyz` for the component breakdown and the
+container logs for `gateway ready; checkpoint committed` (a recovery) and
+`gateway reconnect failed; Twilight will retry` (still retrying). Do not
+restart the container to clear the page. A restart re-baselines the streak
+without showing that ACKs flow again, so confirm fresh latency movement in
+the new process's scrapes first.
+
+Escalate when the page survives a confirmed reconnect (fresh HELLO with no
+ACK after it points at the Discord-side session, not our transport), when it
+coincides with missed-events or unpaired-disconnect pages (the outage is
+losing traffic, not just heartbeats), or when the gateway flaps between
+Connected and down without ever holding — the fix then belongs to the
+on-call engineer, not another redeploy.
+
+#### Alert: gateway reconnect flapping
+
+`two_bot_gateway_reconnects_total` rose in 3 consecutive keepalive samples.
+The counter counts successful transport reconnections (new HELLOs after the
+first HELLO in the running loop — not failed dial attempts), so one blip is
+a clean recovery and only a sustained rise means the session cannot stay up:
+the transport drops and re-establishes faster than the session can settle.
+Single reconnects stay log-only per the watch checklist; this page needs
+three consecutive rising windows (~2-3 min, the sibling gateway bound). A
+flat window resolves at once, a backwards counter (process restart)
+re-baselines, the first valid sample only stores the baseline and never
+fires, and missing or malformed samples hold a firing page without
+manufacturing evidence. This is page severity (SEV-1 in the [watch
+escalation path](watch-escalation-path.md)). The firing key is the constant
+`gateway_reconnect_flapping`.
+
+A flapping transport usually pairs with climbing disconnects; what it does
+not by itself prove is traffic loss — a session can bounce between clean
+resumes without dropping a dispatch. Any sequence gap the flapping causes
+pages immediately and separately via
+[`gateway_missed_events`](#alert-gateway-missed-events), so read the two
+together: flapping alone is transport instability, flapping plus missed
+events is an outage losing traffic.
+
+First response: scrape `/ops/metrics` as described above and read the
+reconnect, disconnect, resume and missed-events counters over the last few
+windows. Reconnects climbing with matching resumes means Discord keeps
+asking for fresh sessions (check Discord status before touching the bot);
+reconnects climbing with flat resumes and climbing disconnects means our
+dial or resume path is failing (read the container logs for `gateway
+reconnect failed; Twilight will retry` and any TLS/DNS/connector errors).
+Confirm no deploy is in progress: a rollout restarts the process and resets
+the baseline, but a crash loop looks like flapping with a side of restarts —
+correlate container restart counts before concluding the transport is at
+fault. Do not restart the container to "clear" the counter; a replacement
+resets the baseline without steadying the session.
+
+Escalate when flapping persists past one full heartbeat interval of stable
+deploys, when it coincides with missed-events, unpaired-disconnect or
+latency-dead pages, or when resumes flatline while reconnects climb (the
+session re-establishes but never resumes — the fix belongs to the on-call
+engineer, not another redeploy).
+
 #### Alert: ticker stale
 
 A 15 s ticker (`scheduled_messages` or `settings`) recorded no successful
@@ -1053,6 +1188,51 @@ integration nor paging escalation: it labels the existing transition delivery
 as `(ticket)` and supplies this runbook. Persist sanitized incident evidence and
 route a continuing dispatch problem to the on-call engineer through the normal
 triage path. No new webhook, production activation or live load test is authorized.
+
+#### Alert: handler duration saturated
+
+The `two_bot_handler_duration_seconds` dispatch tail crossed into seconds:
+p99 past 1 s in 3 consecutive keepalive samples. The histogram covers
+nonduplicate dispatch parse, pipeline and durable commit; the rule reads p99
+exactly from the bucket deltas (the share of completed dispatches the 1 s
+bucket did not absorb exceeds 1%) and additionally requires at least 10
+completions (quiet windows stay silent) and at least 2 slow ones (one slow
+dispatch stays silent). The 1 s line is the first seconds-scale bucket — a
+healthy p99 sits in the millisecond buckets — so a sustained crossing means
+second-scale tail work (slow commits, lock contention, a dependency with a
+long tail), not ordinary jitter. Any judged-quiet window or counter reset
+(process restart) clears at once; the first valid sample only stores the
+baseline and never fires; missing or malformed samples drop the baseline and
+hold a firing ticket without manufacturing evidence. This is a **ticket**,
+not a page: the pipeline still works, only slowly. The firing key is the
+constant `handler_duration_saturated`.
+
+This ticket is the saturation backstop, not an SLO: routine quantile
+movement stays log-only in the [watch signal queries](watch-signal-queries.md)
+compare-across-windows pack, which the ticket points at for diagnosis.
+Frozen buckets (zero completions between samples) resolve this ticket — a
+dispatcher completing nothing is a different failure from a slow one, so a
+resolve beside flat `_count` growth means look at [dispatch
+drops](#alert-dispatch-drops), [gateway missed
+events](#alert-gateway-missed-events) and consumer lag instead of closing
+the incident.
+
+First response: scrape `/ops/metrics` as described above and read the
+handler bucket deltas for the firing windows — which `le` buckets absorbed
+the growth locates the slowdown (growth only above 1 s is tail-only; growth
+shifting down through the millisecond buckets is the whole pipeline
+slowing). Then run the action-latency quantile queries for the same window
+and compare against the prior 24 h, and read the container logs for slow
+commit, lock-wait and REST-timeout lines. Do not restart the container to
+"clear" the tail; a replacement resets the baseline without draining the
+slow dependency, and the next three saturated windows re-ticket.
+
+Escalate when the tail keeps climbing across tickets (the dependency is
+degrading, not flapping), when saturation coincides with dispatch drops,
+pool saturation or DB errors (the slowdown found its cause — follow that
+signal), or when p99 crosses 5 s (the top finite bucket: dispatches now take
+longer than a keepalive tick, and the fix belongs to the on-call engineer,
+not another redeploy).
 
 #### Alert: prefix trigger verdict refusals
 

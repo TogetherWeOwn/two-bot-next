@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import worker, { type Env } from "../src/index.ts";
 import {
-  EMPTY_STATE, JOB_ERROR_CLASSES, PROMOTION_ERROR_GATE_RULES, REST_PENDING_STUCK_SAMPLES, REST_REFUSAL_SURGE_MIN, RULES, RUNBOOK_BASE_URL, evaluateMetrics, evaluatePromotionGate, interruptDispatchDrops, packetFilename, parseExposition, ruleFor, runbookUrl, transitionMessages,
+  EMPTY_STATE, JOB_ERROR_CLASSES, JOB_RUNS_JOBS, PROMOTION_ERROR_GATE_RULES, REST_PENDING_STUCK_SAMPLES, REST_REFUSAL_SURGE_MIN, RULES, RUNBOOK_BASE_URL, evaluateMetrics, evaluatePromotionGate, interruptDispatchDrops, packetFilename, parseExposition, ruleFor, runbookUrl, transitionMessages,
   type MetricsAlertState,
 } from "../src/alert-rules.ts";
 import { ALERT_INPUT_LABELS, ALERT_OPTIONAL_INPUT_LABELS, parseAlertScrape } from "../src/metrics-scrape.ts";
@@ -978,6 +978,10 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "rest_token_invalid",
     "rest_refusal_surge",
     "rest_global_responses_stuck",
+    "gateway_latency_dead",
+    "gateway_reconnect_flapping",
+    "handler_duration_saturated",
+    "job_failure_share",
   ]);
   assert.equal(packetFilename("job_stale:rank", window), `evidence-job_stale-${window}.json`);
   assert.equal(packetFilename("job_consecutive_failures:counter", window), `evidence-job_consecutive_failures-${window}.json`);
@@ -1011,6 +1015,10 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("rest_token_invalid", window), `evidence-rest_token_invalid-${window}.json`);
   assert.equal(packetFilename("rest_refusal_surge", window), `evidence-rest_refusal_surge-${window}.json`);
   assert.equal(packetFilename("rest_global_responses_stuck", window), `evidence-rest_global_responses_stuck-${window}.json`);
+  assert.equal(packetFilename("gateway_latency_dead", window), `evidence-gateway_latency_dead-${window}.json`);
+  assert.equal(packetFilename("gateway_reconnect_flapping", window), `evidence-gateway_reconnect_flapping-${window}.json`);
+  assert.equal(packetFilename("handler_duration_saturated", window), `evidence-handler_duration_saturated-${window}.json`);
+  assert.equal(packetFilename("job_failure_share:counter", window), `evidence-job_failure_share-${window}.json`);
   // Unknown keys get no filename rather than a misleading one; hostile
   // window stamps stay filename-safe.
   assert.equal(packetFilename("no_such_rule", window), undefined);
@@ -1247,6 +1255,37 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
   stuck = ev(["two_bot_rest_guard_pending_global_responses 2"], stuck.state);
   stuck = ev(["two_bot_rest_guard_pending_global_responses 1"], stuck.state);
   firing.push(...stuck.firing);
+  // Gateway transport rules carry fresh latency in every multi-sample chain
+  // except the dead-gateway battery itself, whose NaN streak is the signal.
+  let dead = ev(["two_bot_gateway_latency_seconds NaN"]);
+  dead = ev(["two_bot_gateway_latency_seconds NaN"], dead.state);
+  dead = ev(["two_bot_gateway_latency_seconds NaN"], dead.state);
+  firing.push(...dead.firing);
+  let flap = ev(["two_bot_gateway_latency_seconds 0.011", "two_bot_gateway_reconnects_total 0"]);
+  for (const [n, latency] of [[1, "0.012"], [2, "0.013"], [3, "0.014"]] as const) {
+    flap = ev([`two_bot_gateway_latency_seconds ${latency}`, `two_bot_gateway_reconnects_total ${n}`], flap.state);
+  }
+  firing.push(...flap.firing);
+  const handlerLines = (fast: number, total: number, latency: string) => [
+    `two_bot_gateway_latency_seconds ${latency}`,
+    ...["0.001", "0.005", "0.01", "0.05", "0.1", "0.5", "1"].map((le) =>
+      `two_bot_handler_duration_seconds_bucket{le="${le}"} ${fast}`),
+    `two_bot_handler_duration_seconds_bucket{le="5"} ${total}`,
+    `two_bot_handler_duration_seconds_bucket{le="+Inf"} ${total}`,
+  ];
+  let saturated = ev(handlerLines(100, 100, "0.011"));
+  saturated = ev(handlerLines(110, 120, "0.012"), saturated.state);
+  saturated = ev(handlerLines(120, 140, "0.013"), saturated.state);
+  saturated = ev(handlerLines(130, 160, "0.014"), saturated.state);
+  firing.push(...saturated.firing);
+  const jobLines = (counterSuccess: number, counterFailure: number, latency: string) => [
+    `two_bot_gateway_latency_seconds ${latency}`,
+    ...JOB_RUNS_JOBS.flatMap((job) => [
+      `two_bot_job_runs_total{job="${job}",outcome="success"} ${job === "counter" ? counterSuccess : 0}`,
+      `two_bot_job_runs_total{job="${job}",outcome="failure"} ${job === "counter" ? counterFailure : 0}`,
+    ]),
+  ];
+  firing.push(...ev(jobLines(8, 2, "0.012"), ev(jobLines(0, 0, "0.011")).state).firing);
   assert.equal(firing.length, RULES.length, `expected one firing key per rule, got: ${firing.join(", ")}`);
   const packets = transitionMessages([], firing);
   assert.equal(packets.length, RULES.length);
@@ -1629,7 +1668,7 @@ test("runbook and metrics docs explain the guard-health pages and the paused def
   const stuck = section("#### Alert: REST global responses stuck");
   assert.match(stuck, /First response/);
   assert.match(stuck, /pending/i);
-  assert.match(stuck, /healthy backpressure/i, "the stuck section records why paused/remaining stay out");
+  assert.match(stuck, /healthy Discord backpressure/i, "the stuck section records why paused/remaining stay out");
   const metrics = readFileSync(new URL("../../docs/metrics.md", import.meta.url), "utf8");
   for (const rule of [TOKEN_RULE, SURGE_RULE, STUCK_RULE]) {
     assert.match(metrics, new RegExp(`\\| \`${rule}\`[^\\n]*\\|`, "i"),

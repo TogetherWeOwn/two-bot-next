@@ -52,14 +52,21 @@ and the Worker (`packetFilename` in `wrangler/src/alert-rules.ts`).
 | `error_budget_slow_burn` | **ticket**: same budget burns faster than 3x in both the 2 h and 15 min windows (same floors; needs full 2 h history, holds on gaps, covered quiet 15 min resolves) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-error-budget-slow-burn) |
 | `eventsub_reconcile_failed` | **ticket**: failed EventSub reconcile passes rise between samples (first sample is baseline-only; a restart sample fires when the new process already counted a failed pass, else holds) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-eventsub-reconcile-failed) |
 | `prefix_trigger_verdict_refusals` | **ticket**: automod-verdict refusal of prefix commands rises in 3 consecutive samples (first sample is baseline, flat/reset clears; `other` never counts) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-prefix-trigger-verdict-refusals) |
+| `gateway_latency_dead` | no heartbeat-ACK evidence (NaN or unchanged latency) for 3 consecutive valid samples (first sample is baseline, fresh readings clear at once; co-firing with `gateway_not_ready` means never-connected) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-gateway-latency-dead) |
+| `gateway_reconnect_flapping` | successful transport reconnections rise in 3 consecutive samples (single blips stay log-only; first sample is baseline, flat/reset clears) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-gateway-reconnect-flapping) |
+| `handler_duration_saturated` | **ticket**: handler p99 past 1 s (tail above 1% with >= 10 completions, >= 2 slow) in 3 consecutive windows | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-handler-duration-saturated) |
+| `job_failure_share:<job>` | **ticket**: per-job failures above 10% of recent runs (>= 10 runs, >= 2 failures; sub-floor windows accumulate) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-job-failure-share) |
 | `rest_token_invalid` | **page**: bot-token latch reads 1 on any valid sample (credential death; first sample may fire, only a corrected restart clears) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-rest-token-invalid) |
 | `rest_refusal_surge` | **page**: guard invalid + refused requests grow 10+ between samples (first sample is baseline-only, restarts re-baseline, quiet windows resolve) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-rest-refusal-surge) |
 | `rest_global_responses_stuck` | **page**: global-pause response bodies unresolved for 3 consecutive valid samples (a valid zero resolves; paused/remaining gauges stay rule-free by design) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-rest-global-responses-stuck) |
 
 Out of scope for paging (log-only findings, still recorded on the watch log):
-gateway session starts, handler-latency quantiles, unban-queue depth via
-`moderation_scheduled_unbans` counts (test-container copy or backup artifact
-only, never staging/production), and restart counts. See the query pack.
+single gateway session starts (sustained reconnect flapping pages via
+`gateway_reconnect_flapping`), routine handler-latency quantile movement
+(sustained p99 saturation tickets via `handler_duration_saturated`),
+unban-queue depth via `moderation_scheduled_unbans` counts (test-container
+copy or backup artifact only, never staging/production), and restart counts.
+See the query pack.
 
 ## 2. Dashboards and read paths
 
