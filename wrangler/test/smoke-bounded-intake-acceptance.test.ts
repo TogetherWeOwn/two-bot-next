@@ -51,7 +51,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import { fileURLToPath } from "node:url";
@@ -741,6 +741,35 @@ test("JSON preserves exit behavior and stays GET-only", async () => {
   assertGetOnlyManual(calls, "json unhealthy");
 });
 
+// Async CLI runner: spawnSync would block the event loop and starve the
+// in-process stub server while the child waits for a response. Spawn errors
+// reject instead of surfacing as a result field.
+function runSmoker(
+  args: string[],
+  timeoutMs = 15_000,
+): Promise<{ status: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, args, {});
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", reject);
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error(`smoker timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    child.on("close", (status) => {
+      clearTimeout(timer);
+      resolve({ status, stdout, stderr });
+    });
+  });
+}
+
 test("CLI --json against a stub exits 0/1 with JSON and 2 on usage", async (t) => {
   const smoker = fileURLToPath(new URL("../../bin/smoke.mjs", import.meta.url));
   async function stubServer(readyzStatus: number) {
@@ -762,11 +791,7 @@ test("CLI --json against a stub exits 0/1 with JSON and 2 on usage", async (t) =
   }
 
   const healthy = await stubServer(200);
-  const pass = spawnSync(process.execPath, [smoker, healthy, "--json"], {
-    encoding: "utf8",
-    timeout: 15_000,
-  });
-  assert.equal(pass.error, undefined);
+  const pass = await runSmoker([smoker, healthy, "--json"]);
   assert.equal(pass.status, 0, `healthy --json exits 0, got ${pass.status}\n${pass.stderr}`);
   const passDoc = JSON.parse(pass.stdout) as Record<string, unknown>;
   assert.equal(passDoc["verdict"], "pass");
@@ -776,17 +801,11 @@ test("CLI --json against a stub exits 0/1 with JSON and 2 on usage", async (t) =
   );
 
   const sick = await stubServer(503);
-  const fail = spawnSync(process.execPath, [smoker, sick, "--json"], {
-    encoding: "utf8",
-    timeout: 15_000,
-  });
+  const fail = await runSmoker([smoker, sick, "--json"]);
   assert.equal(fail.status, 1, `unhealthy --json exits 1, got ${fail.status}\n${fail.stderr}`);
   assert.equal((JSON.parse(fail.stdout) as Record<string, unknown>)["verdict"], "fail");
 
-  const usage = spawnSync(process.execPath, [smoker, "not-a-url", "--json"], {
-    encoding: "utf8",
-    timeout: 15_000,
-  });
+  const usage = await runSmoker([smoker, "not-a-url", "--json"]);
   assert.equal(usage.status, 2, "--json with an invalid URL stays a usage error");
 });
 
