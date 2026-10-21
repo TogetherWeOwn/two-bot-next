@@ -91,6 +91,7 @@ mod member_runtime;
 mod metrics_http;
 mod moderation_cli;
 mod moderation_release_cli;
+mod music_capture;
 #[cfg(test)]
 mod observability_event_conformance_tests;
 mod onboarding;
@@ -822,6 +823,11 @@ async fn run(cli_args: &[String]) {
                             Box::pin(async move { voice.kick_vote(interaction).await })
                         }));
                     }
+                    // Staging-only music voice-update capture (dry-run): wraps
+                    // the voice sink so VoiceServerUpdate/self VoiceStateUpdate
+                    // feed the Lavalink pairing without touching rooms. Inert
+                    // unless TWO_MUSIC=1; the tap refuses non-staging guilds.
+                    let voice = music_capture::MusicVoiceTap::wrap(voice, Some(guild_id));
 
                     let intents = intents_from_env(&activation);
                     // Voice-room game names need GUILD_PRESENCES; record
