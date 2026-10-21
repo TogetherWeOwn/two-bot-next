@@ -27,8 +27,9 @@ name: synthetic-user-flow
 # is the single source for deploy and passive synthetic checks; remove any
 # production Environment override. The `synthetic-alerts` environment secret
 # SYNTHETIC_ALERT_WEBHOOK_URL carries the Discord webhook.
-# Missing target vars skip that probe with a notice; an event that needs a
-# notification fails if the webhook is missing or delivery fails.
+# Missing target vars fail the job with an error naming the var, so a
+# perpetually unconfigured schedule reads red, never green; an event that
+# needs a notification fails if the webhook is missing or delivery fails.
 on:
   schedule:
     - cron: '*/5 * * * *'
@@ -72,7 +73,9 @@ jobs:
           python3 scripts/staging_health_contract_probe.py --evidence "synthetic-staging-$RUN_ID.json"
       - name: Notice missing staging target binding
         if: steps.probe.outcome == 'skipped' && vars.STAGING_WORKER_URL == '' && !inputs.force_fail
-        run: echo "::warning::Skipping staging synthetic because STAGING_WORKER_URL is unset"
+        run: |
+          echo "::error::staging synthetic misconfigured: STAGING_WORKER_URL is unset"
+          exit 1
       - name: Upload the staging evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -128,7 +131,9 @@ jobs:
           python3 scripts/prod_passive_probe.py --evidence "synthetic-prod-$RUN_ID.json"
       - name: Notice missing production target binding
         if: steps.probe.outcome == 'skipped' && vars.PRODUCTION_WORKER_URL == ''
-        run: echo "::warning::Skipping production synthetic because PRODUCTION_WORKER_URL is unset"
+        run: |
+          echo "::error::production synthetic misconfigured: PRODUCTION_WORKER_URL is unset"
+          exit 1
       - name: Upload the prod evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

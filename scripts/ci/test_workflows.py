@@ -18,6 +18,10 @@ _HISTORY_SPEC = importlib.util.spec_from_file_location(
     "synthetic_alert_history", ROOT / "scripts/synthetic_alert_history.py")
 _HISTORY_MODULE = importlib.util.module_from_spec(_HISTORY_SPEC)
 _HISTORY_SPEC.loader.exec_module(_HISTORY_MODULE)
+_TRACKER_SPEC = importlib.util.spec_from_file_location(
+    "slow_burn_tracker", ROOT / "scripts/slow_burn_tracker.py")
+_TRACKER_MODULE = importlib.util.module_from_spec(_TRACKER_SPEC)
+_TRACKER_SPEC.loader.exec_module(_TRACKER_MODULE)
 ALERT_STEPS = _HISTORY_MODULE.ALERT_STEPS
 DECIDE_STEPS = _HISTORY_MODULE.DECIDE_STEPS
 JOB_NAMES = _HISTORY_MODULE.JOB_NAMES
@@ -2392,8 +2396,9 @@ def synthetic_user_flow_errors(workflow):
     the `synthetic-alerts` environment. Two jobs: `staging` runs the reviewed
     staging health-contract probe, `prod-passive` runs the reviewed passive
     production probe (observe and alert only, never a deploy gate). Each job
-    has an optional target probe, a notice when its binding is absent, an
-    always() evidence upload, an always() decide step, and a gated post step.
+    has an optional target probe, a fail-closed error when its binding is
+    absent, an always() evidence upload, an always() decide step, and a
+    gated post step.
     The decide step reads recent run history with actions:read, alerts after
     two failures, and writes the event to GITHUB_OUTPUT; the post step runs
     only when an event is due so a no-op is skipped (never success), and only
@@ -2458,8 +2463,11 @@ def synthetic_user_flow_errors(workflow):
         if probe_step.get("id") != "probe" or expected_target not in str(probe_step.get("if", "")):
             errors.append(f"{name}:{job_id}: probe must be skipped when {expected_target} is unset")
         expected_notice = expected_target + " is unset"
-        if expected_notice not in str(notice.get("run", "")) or "::warning::" not in str(notice.get("run", "")):
-            errors.append(f"{name}:{job_id}: missing-binding skip must emit a notice")
+        notice_run = str(notice.get("run", ""))
+        if expected_notice not in notice_run or "::error::" not in notice_run:
+            errors.append(f"{name}:{job_id}: missing-binding skip must fail with an error naming the binding")
+        if "exit 1" not in notice_run:
+            errors.append(f"{name}:{job_id}: missing-binding skip must exit 1 so the run fails closed")
         if upload.get("if") != "always()":
             errors.append(f"{name}:{job_id}: upload must run with if: always() so failures keep their artifact")
         if not str(upload.get("uses", "")).startswith("actions/upload-artifact@"):
@@ -2703,11 +2711,89 @@ def slow_burn_tracker_errors(workflow):
     return errors
 
 
+FIVE_MINUTE_SCHEDULERS = ("slow-burn-tracker.yml", "synthetic-user-flow.yml")
+
+
+def scheduled_binding_audit_errors(workflows):
+    """Five-minute watchers must fail closed on missing bindings.
+
+    Both `*/5` schedules exist to watch production health every five
+    minutes; an unconfigured watcher that warns and exits green reads as a
+    clean bill of health forever. The audit pins the `*/5` inventory (a new
+    five-minute watcher needs its fail-closed entry here) and each
+    watcher's fail-closed unconfigured path: slow-burn's tracker step
+    hands both bindings to scripts/slow_burn_tracker.py, which exits 1
+    with an ::error:: naming the unset binding (proved below against the
+    reviewed script, and pinned per binding in
+    scripts/test_slow_burn_tracker.py); synthetic's missing-binding
+    notice fails the job with an ::error:: naming the unset target var.
+    """
+    name = "scheduled-binding-audit"
+    errors = []
+    five_min = sorted(
+        path for path, workflow in workflows.items()
+        for slot in ((workflow.get("on") or {}).get("schedule") or [])
+        if isinstance(slot, dict) and slot.get("cron") == "*/5 * * * *")
+    if five_min != sorted(FIVE_MINUTE_SCHEDULERS):
+        errors.append(
+            f"{name}: */5 schedules must stay exactly "
+            f"{', '.join(sorted(FIVE_MINUTE_SCHEDULERS))} (a new five-minute "
+            "watcher needs its fail-closed audit entry)")
+        return errors
+    tracker = ((workflows.get("slow-burn-tracker.yml") or {}).get("jobs")
+               or {}).get("tracker") or {}
+    runs = [step for step in tracker.get("steps") or []
+            if "scripts/slow_burn_tracker.py" in str(step.get("run", ""))]
+    if len(runs) != 1:
+        errors.append(f"{name}: slow-burn-tracker.yml: tracker job must invoke "
+                      "scripts/slow_burn_tracker.py exactly once")
+    else:
+        handoff = runs[0].get("env") or {}
+        if "STAGING_WORKER_URL" not in handoff or "METRICS_SCRAPE_TOKEN" not in handoff:
+            errors.append(f"{name}: slow-burn-tracker.yml: tracker step must hand both "
+                          "bindings to the tracker script via env")
+    with tempfile.TemporaryDirectory() as tmp:
+        evidence = str(Path(tmp) / "evidence.json")
+        expo = str(Path(tmp) / "expo.prom")
+        with patch("sys.stdout") as stdout:
+            code = _TRACKER_MODULE.main(
+                ["--evidence-out", evidence, "--exposition-out", expo],
+                {"GITHUB_REPOSITORY": "TogetherWeOwn/two-bot-next",
+                 "GITHUB_RUN_ID": "0",
+                 "GITHUB_SERVER_URL": "https://github.com",
+                 "GH_TOKEN": "audit-token",
+                 "STAGING_WORKER_URL": "", "METRICS_SCRAPE_TOKEN": ""})
+        writes = stdout.write.call_args_list
+        out = writes[0].args[0] if writes else ""
+        if (code == 0 or "::error::" not in out
+                or "STAGING_WORKER_URL" not in out
+                or "METRICS_SCRAPE_TOKEN" not in out):
+            errors.append(f"{name}: slow-burn-tracker.yml: an unconfigured tracker run "
+                          "must exit non-zero with an ::error:: naming the unset bindings")
+    synthetic = ((workflows.get("synthetic-user-flow.yml") or {}).get("jobs") or {})
+    targets = (("staging", "STAGING_WORKER_URL"),
+               ("prod-passive", "PRODUCTION_WORKER_URL"))
+    for job_id, target in targets:
+        steps = (synthetic.get(job_id) or {}).get("steps") or []
+        notices = [step for step in steps
+                   if str(step.get("name", "")).startswith("Notice missing ")]
+        if len(notices) != 1:
+            errors.append(f"{name}: synthetic-user-flow.yml:{job_id}: must keep its "
+                          "missing-binding notice step")
+            continue
+        run = str(notices[0].get("run", ""))
+        if target not in run or "::error::" not in run or "exit 1" not in run:
+            errors.append(f"{name}: synthetic-user-flow.yml:{job_id}: missing-binding "
+                          f"notice must fail with an ::error:: naming {target}")
+    return errors
+
+
 def workflow_policy_errors(workflows):
     errors = []
     errors.extend(staging_gateway_injection_errors(workflows))
     errors.extend(staging_error_rate_gate_errors(workflows))
     errors.extend(staging_fault_injection_errors(workflows))
+    errors.extend(scheduled_binding_audit_errors(workflows))
     # Fail closed on new workflows/jobs, including reusable-workflow alternatives.
     # An intentional addition needs an explicit policy change and independent review.
     if set(workflows) != set(JOB_INVENTORY):
@@ -5593,6 +5679,52 @@ class WorkflowTests(unittest.TestCase):
         del missing["slow-burn-tracker.yml"]
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
+
+    def test_five_minute_schedulers_fail_closed_on_missing_bindings(self):
+        workflows = self.workflows
+        self.assertEqual(scheduled_binding_audit_errors(workflows), [])
+
+        def tracker_env(copy):
+            steps = copy["slow-burn-tracker.yml"]["jobs"]["tracker"]["steps"]
+            return next(step for step in steps
+                        if "slow_burn_tracker.py" in step.get("run", ""))["env"]
+
+        def notice_step(copy, job_id):
+            steps = copy["synthetic-user-flow.yml"]["jobs"][job_id]["steps"]
+            return next(step for step in steps
+                        if str(step.get("name", "")).startswith("Notice missing "))
+
+        def notice_run(copy, job_id, transform):
+            notice_step(copy, job_id)["run"] = transform(notice_step(copy, job_id)["run"])
+
+        mutations = {
+            "slow-burn schedule coarsened": lambda w: w["slow-burn-tracker.yml"]["on"][
+                "schedule"].__setitem__(0, {"cron": "*/6 * * * *"}),
+            "nightly gains a five-minute schedule": lambda w: w["nightly.yml"]["on"][
+                "schedule"].__setitem__(0, {"cron": "*/5 * * * *"}),
+            "tracker drops the bearer handoff": lambda w: tracker_env(w).pop(
+                "METRICS_SCRAPE_TOKEN"),
+            "tracker drops the url handoff": lambda w: tracker_env(w).pop(
+                "STAGING_WORKER_URL"),
+            "staging notice warns": lambda w: notice_run(
+                w, "staging", lambda run: run.replace("::error::", "::warning::")),
+            "staging notice loses its exit": lambda w: notice_run(
+                w, "staging", lambda run: run.replace("exit 1", "exit 0")),
+            "staging notice drops the binding name": lambda w: notice_run(
+                w, "staging", lambda run: run.replace("STAGING_WORKER_URL", "the target var")),
+            "staging notice renamed": lambda w: notice_step(w, "staging").update(
+                {"name": "Note"}),
+            "prod notice warns": lambda w: notice_run(
+                w, "prod-passive", lambda run: run.replace("::error::", "::warning::")),
+            "prod notice loses its exit": lambda w: notice_run(
+                w, "prod-passive", lambda run: run.replace("exit 1", "exit 0")),
+        }
+        for label, change in mutations.items():
+            with self.subTest(change=label):
+                changed = deepcopy(workflows)
+                change(changed)
+                self.assertTrue(scheduled_binding_audit_errors(changed), label)
+                self.assertTrue(workflow_policy_errors(changed), label)
 
     def test_gradual_promote_proof_shape_is_pinned(self):
         workflows = self.workflows
