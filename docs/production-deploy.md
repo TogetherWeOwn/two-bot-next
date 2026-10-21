@@ -461,11 +461,14 @@ exact value `true` changes the guard. With it set, the guard:
 - accepts a `production` Environment with no required reviewers, provided the
   latest `deploy-staging` run on the SHA is a completed success. With no
   reviewers and the variable unset, the guard refuses;
-- never applies to a rollback or a live-SHA takeover redeploy
-  (`allow_unstaged`): those waive the staging history the automated approval
-  vouches through, so they still need the human Environment reviewers.
-  Until a required reviewer is added, those two dispatches are refused;
-- records `Approval: automated (PRODUCTION_AUTO_APPROVE)` in the run summary.
+- accepts a rollback with no reviewers only when its `rollback`, `image` and
+  `sha` match a verified rollback snapshot (see **Roll back**); any other
+  rollback target still needs a human reviewer;
+- never applies to a live-SHA takeover redeploy (`allow_unstaged`): it waives
+  the staging history the automated approval vouches through, so it still
+  needs the human Environment reviewers and is refused until one is added;
+- records `Approval: automated (PRODUCTION_AUTO_APPROVE)` (or, for a
+  snapshot-backed rollback, `Approval: automated rollback`) in the run summary.
 
 It does not remove reviewers. If the Environment has required reviewers,
 GitHub still pauses the `production` job until one of them approves, and the

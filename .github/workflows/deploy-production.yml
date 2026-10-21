@@ -543,7 +543,6 @@ jobs:
           SNAPSHOT_ARTIFACT = "production-rollback-snapshot"
           SNAPSHOT_FILE = SNAPSHOT_ARTIFACT + ".json"
           SNAPSHOT_MAX_AGE_SECONDS = 14 * 86400  # the artifact's retention-days
-          SNAPSHOT_CANDIDATES = 30
           SNAPSHOT_MAX_BYTES = 65536
           PRODUCTION_WORKFLOW = ".github/workflows/deploy-production.yml"
 
@@ -560,14 +559,16 @@ jobs:
               this image digest and this SHA. The rollback step still
               validates that receipt against live Cloudflare state before any
               restore, and the SHA still passed every ancestry/CI check above.
-              Anything unreadable or unmatched returns None: the human
-              reviewer refusal below then applies, as before.
+              An unlistable artifact history refuses outright; anything
+              unreadable or unmatched returns None, and the human reviewer
+              refusal below then applies, as before.
               """
-              listed = api(f"repos/{repo}/actions/artifacts", "the production rollback snapshots",
-                           name=SNAPSHOT_ARTIFACT, per_page="100")
-              artifacts = listed.get("artifacts") if isinstance(listed, dict) else None
-              if not isinstance(artifacts, list):
-                  return None
+              # Enumerate every page and inspect every fresh snapshot: a match
+              # may sit behind a busy artifact history, and only an exact
+              # target match may approve. Newest first, as listed.
+              artifacts = collection(f"repos/{repo}/actions/artifacts",
+                                     "the production rollback snapshots",
+                                     "artifacts", name=SNAPSHOT_ARTIFACT)
               now = time.time()
               fresh = []
               for artifact in artifacts:
@@ -589,7 +590,7 @@ jobs:
                       continue
                   fresh.append((created.timestamp(), artifact))
               fresh.sort(key=lambda item: item[0], reverse=True)
-              for _, artifact in fresh[:SNAPSHOT_CANDIDATES]:
+              for _, artifact in fresh:
                   try:
                       blob = subprocess.check_output(
                           ["gh", "api", "--method", "GET", f"repos/{repo}/actions/artifacts/{artifact['id']}/zip"])

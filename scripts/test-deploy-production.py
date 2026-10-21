@@ -772,7 +772,10 @@ class GuardBehaviourTests(unittest.TestCase):
             elif path == f"repos/{REPO}/environments/production/deployment-branch-policies":
                 key = "branches"
             elif path == f"repos/{REPO}/actions/artifacts":
-                self.assertEqual(query, {"name": "production-rollback-snapshot", "per_page": "100"})
+                # Paginated like every other collection: the name filter is
+                # pinned, the page cursor passes through to the fixture.
+                self.assertEqual(query["name"], "production-rollback-snapshot")
+                self.assertEqual(query["per_page"], "100")
                 key = "artifacts"
             elif re.fullmatch(rf"repos/{REPO}/actions/artifacts/[0-9]+/zip", path):
                 key = "artifact-zip-" + path.split("/")[-2]
@@ -1417,7 +1420,6 @@ class GuardBehaviourTests(unittest.TestCase):
             "not a zip": {**snapshot_responses(), f"artifact-zip-{SNAPSHOT_ARTIFACT_ID}": b"not a zip"},
             "wrong file": {**snapshot_responses(),
                            f"artifact-zip-{SNAPSHOT_ARTIFACT_ID}": snapshot_zip(snapshot_receipt(), name="x.json")},
-            "unlistable": {"artifacts": {"message": "nope"}},
         }
         for label, responses in cases.items():
             with self.subTest(label):
@@ -1445,6 +1447,53 @@ class GuardBehaviourTests(unittest.TestCase):
                                             takeover="true", **responses)
         self.assertEqual(code, 0)
         self.assertIn(f"deploy-production run `{SNAPSHOT_RUN_ID}`", summary)
+
+    def test_reviewerless_rollback_finds_a_match_past_the_first_page(self):
+        # A busy artifact history must not hide the snapshot: page 1 holds
+        # only newer non-matching snapshots, the match sits on page 2.
+        environment = {**green()["environment"], "protection_rules": []}
+        decoys = [snapshot_artifact(artifact_id=7800 + i, run_id=9200 + i, age_days=0)
+                  for i in range(3)]
+        pages = {"1": {"total_count": 4, "artifacts": decoys},
+                 "2": {"total_count": 4, "artifacts": [snapshot_artifact()]}}
+        responses = {**snapshot_responses(),
+                     "artifacts": lambda path, query: pages[query["page"]]}
+        for decoy in decoys:
+            responses[f"artifact-zip-{decoy['id']}"] = snapshot_zip(
+                snapshot_receipt(version=OLD_VERSION))
+        code, _, summary, calls, _ = self.guard(
+            auto="true", environment=environment, rollback=VERSION,
+            takeover="true", **responses)
+        self.assertEqual(code, 0)
+        self.assertIn(f"deploy-production run `{SNAPSHOT_RUN_ID}`", summary)
+        artifact_pages = [query["page"] for path, query in calls
+                          if path == f"repos/{REPO}/actions/artifacts"]
+        self.assertEqual(artifact_pages, ["1", "2"])
+
+    def test_reviewerless_rollback_checks_every_fresh_snapshot(self):
+        # No newest-N cap: 35 newer non-matching snapshots must not hide an
+        # older match in the same 14-day window.
+        environment = {**green()["environment"], "protection_rules": []}
+        decoys = [snapshot_artifact(artifact_id=7800 + i, run_id=9200 + i, age_days=0)
+                  for i in range(35)]
+        responses = {**snapshot_responses(),
+                     "artifacts": {"total_count": 36, "artifacts": [*decoys, snapshot_artifact()]}}
+        for decoy in decoys:
+            responses[f"artifact-zip-{decoy['id']}"] = snapshot_zip(
+                snapshot_receipt(version=OLD_VERSION))
+        code, _, summary, _, _ = self.guard(
+            auto="true", environment=environment, rollback=VERSION,
+            takeover="true", **responses)
+        self.assertEqual(code, 0)
+        self.assertIn(f"deploy-production run `{SNAPSHOT_RUN_ID}`", summary)
+
+    def test_reviewerless_rollback_refuses_an_unlistable_snapshot_history(self):
+        # Failing closed stays a refusal, but the summary distinguishes an
+        # unreadable history from an unmatched target.
+        environment = {**green()["environment"], "protection_rules": []}
+        result = self.guard(auto="true", environment=environment, rollback=VERSION,
+                            takeover="true", artifacts={"message": "nope"})
+        self.assertRefused(result, "could not enumerate the production rollback snapshots")
 
     def test_reviewers_present_never_read_snapshots(self):
         code, _, _, calls, _ = self.guard(rollback=VERSION, takeover="true")

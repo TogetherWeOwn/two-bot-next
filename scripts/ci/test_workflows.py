@@ -1858,6 +1858,7 @@ def production_errors(workflow):
     # Recovery never waits for a human: a reviewer-less rollback runs only
     # on a verified production rollback snapshot of its exact target.
     for required in ('snapshot_run = verified_rollback_snapshot() if not reviewers and mode == "rollback" else None',
+                     'collection(f"repos/{repo}/actions/artifacts"',
                      "target != (version, image, sha)",
                      'receipt.get("provenance_complete") is not True',
                      'PRODUCTION_WORKFLOW = ".github/workflows/deploy-production.yml"',
@@ -4454,6 +4455,8 @@ class WorkflowTests(unittest.TestCase):
                 without('refuse("failure injection never runs against production'),
             "snapshot path dropped":
                 without('snapshot_run = verified_rollback_snapshot() if not reviewers and mode == "rollback" else None'),
+            "snapshot pagination dropped":
+                without('collection(f"repos/{repo}/actions/artifacts"'),
             "snapshot target binding dropped": without("target != (version, image, sha)"),
             "snapshot provenance dropped": without('receipt.get("provenance_complete") is not True'),
             "snapshot fork filter dropped":
