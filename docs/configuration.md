@@ -17,7 +17,7 @@ The Container registers a `guild_settings` poll job
 (`crates/bot/src/website_jobs.rs:152`) publishing through
 `settings_jobs::live` (`crates/bot/src/settings_jobs.rs:53`). Message-path
 automod refreshes its lists, thresholds and enforce flag from that snapshot
-on every delivery (`automod_gateway.rs:211-222`, `:292`); the feed poller
+on every delivery (`automod_gateway.rs:211-222`, `:316`); the feed poller
 re-reads its interval from the snapshot before every tick
 (`feed_jobs.rs:235-287`). Other stored reads happen through per-runtime
 store refreshes (`raid_runtime.rs:136`,
@@ -44,7 +44,7 @@ instead of “stored unwired”: containment applies `TWO_ANTI_NUKE_WINDOW_SECON
 `CONFIG_KEYS` from the snapshot on each relevant
 event (`crates/bot/src/onboarding.rs:21-30`, `:175-182`); message-path automod
 applies its ten live lists, thresholds and the enforce flag from the snapshot
-on every delivery (`crates/bot/src/automod_gateway.rs:211-222`, `:292`);
+on every delivery (`crates/bot/src/automod_gateway.rs:211-222`, `:316`);
 the feed poller applies `TWO_FEED_POLL_SECONDS` from the snapshot to the
 supervisor cadence and its per-tick schedule gate, so a changed interval
 reschedules the next run to last-run + new interval without a restart

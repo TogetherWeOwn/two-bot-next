@@ -315,14 +315,14 @@ mod tests {
 
     #[test]
     fn vanity_presence_distinguishes_absence_from_refusal() {
-        assert_eq!(
-            vanity_presence(Ok(Some("two".to_owned()))),
-            Ok(true),
+        // `RestError` is not `PartialEq` (it wraps transport errors), so the
+        // readable cases assert on the unwrapped bool, not the `Result`.
+        assert!(
+            vanity_presence(Ok(Some("two".to_owned()))).expect("present code must read"),
             "a vanity code reads present"
         );
-        assert_eq!(
-            vanity_presence(Ok(None)),
-            Ok(false),
+        assert!(
+            !vanity_presence(Ok(None)).expect("genuine absence must read"),
             "genuine absence reads absent"
         );
         assert!(
