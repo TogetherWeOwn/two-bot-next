@@ -140,13 +140,29 @@ impl TestDb {
     }
 }
 
-fn award_count(pool: &PgPool) -> impl std::future::Future<Output = i64> + '_ {
-    async move {
-        sqlx::query_scalar("SELECT COUNT(*) FROM xp_awards")
-            .fetch_one(pool)
-            .await
-            .unwrap()
+async fn award_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM xp_awards")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+// The client percent-encodes the audit-log reason on the wire, so decode
+// before asserting on its text (same helper as the moderation suites).
+fn decode_reason(header: &str) -> String {
+    let mut bytes = Vec::new();
+    let input = header.as_bytes();
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == b'%' {
+            bytes.push(u8::from_str_radix(&header[i + 1..i + 3], 16).unwrap());
+            i += 3;
+        } else {
+            bytes.push(input[i]);
+            i += 1;
+        }
     }
+    String::from_utf8(bytes).unwrap()
 }
 
 #[tokio::test]
@@ -231,7 +247,7 @@ async fn grant_refusal_preserves_committed_xp_and_level_up() {
     assert_eq!(requests[2].method, "PUT");
     assert!(requests[2].path.ends_with("/roles/400000000000000002"));
     for request in &requests[1..] {
-        let reason = request.header("x-audit-log-reason").unwrap_or_default();
+        let reason = decode_reason(request.header("x-audit-log-reason").unwrap_or_default());
         assert!(
             reason.contains("reached level 3"),
             "attempted writes keep the grant audit reason: {reason}"
@@ -350,7 +366,7 @@ async fn successful_grants_apply_and_report_the_level_up() {
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[1].method, "PUT");
     assert!(requests[1].path.ends_with("/roles/400000000000000001"));
-    let reason = requests[1].header("x-audit-log-reason").unwrap_or_default();
+    let reason = decode_reason(requests[1].header("x-audit-log-reason").unwrap_or_default());
     assert!(
         reason.contains("reached level 1"),
         "the applied write keeps the grant audit reason: {reason}"

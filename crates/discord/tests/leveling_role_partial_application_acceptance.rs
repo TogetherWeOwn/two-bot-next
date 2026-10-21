@@ -137,8 +137,26 @@ fn fence() -> StagingRevokeFence {
     StagingRevokeFence::new(GUILD, PRODUCTION).unwrap()
 }
 
-fn audit_reason(request: &common::RestRequest) -> &str {
-    request.header("x-audit-log-reason").unwrap_or_default()
+fn audit_reason(request: &common::RestRequest) -> String {
+    decode_reason(request.header("x-audit-log-reason").unwrap_or_default())
+}
+
+// The client percent-encodes the audit-log reason on the wire, so decode
+// before asserting on its text (same helper as the moderation suites).
+fn decode_reason(header: &str) -> String {
+    let mut bytes = Vec::new();
+    let input = header.as_bytes();
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == b'%' {
+            bytes.push(u8::from_str_radix(&header[i + 1..i + 3], 16).unwrap());
+            i += 3;
+        } else {
+            bytes.push(input[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(bytes).unwrap()
 }
 
 #[tokio::test]
