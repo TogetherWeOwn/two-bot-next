@@ -245,7 +245,7 @@ four values.
   absent and rotation stays disarmed. The delivery gate and its channel/invite
   inputs travel on their own explicit lines inside that forward, only while
   `TWO_EVENTSUB_DELIVERY` is exactly `"1"`.
-  `scripts/check-env-bindings.py` rejects any `TWO_EVENTSUB*` or
+  `wrangler/scripts/check-env-bindings.py` rejects any `TWO_EVENTSUB*` or
   `TWO_TWITCH_*` var in `wrangler.toml`.
 
 ## Helix client with app-token refresh

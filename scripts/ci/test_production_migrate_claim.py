@@ -72,10 +72,17 @@ class ProductionClaimTests(unittest.TestCase):
         with self.assertRaises(Refused):
             build_claim(staging, {**self.env,
                                   "PLAN_MANIFEST_SHA256": staging["plan_manifest_sha256"]})
-        # A manifest with no target marker at all is not a production plan.
+        # A manifest with no target marker at all is not a production plan,
+        # even when its target is production-like and the pins match, so the
+        # refusal can only come from the marker check.
         unmarked = json.loads(PLAN.read_text())
-        with self.assertRaises(Refused):
+        unmarked.pop("migration_target", None)
+        unmarked["target"] = {"host": ENV["PRODUCTION_HOST"],
+                              "database": ENV["PRODUCTION_DATABASE"],
+                              "branch_id": ""}
+        with self.assertRaises(Refused) as refused:
             build_claim(unmarked, self.env)
+        self.assertEqual(str(refused.exception), "manifest is not a production plan")
 
     def test_refuses_staging_hosts(self):
         for host in ("ep-staging-example.us-east-2.aws.neon.tech",

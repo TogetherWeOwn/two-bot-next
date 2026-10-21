@@ -590,6 +590,58 @@ class SyntheticAlertTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("status 500", err.getvalue())
 
+    def test_deeply_nested_history_body_is_unknown_history_not_a_crash(self):
+        # A response far under the size cap can still nest past the JSON
+        # recursion limit: it must map to the fixed HistoryError vocabulary
+        # (fail-open on a failed probe), never escape as a traceback.
+        body = '{"a":' * 10000 + '1' + '}' * 10000
+        self.assertLess(len(body.encode("utf-8")), history.MAX_RESPONSE_BYTES)
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, _n):
+                return body.encode("utf-8")
+
+        opener = mock.Mock()
+        opener.open.return_value = FakeResponse()
+        env = {**self.base_env(), "GITHUB_REPOSITORY": "owner/repo",
+               "GITHUB_RUN_ID": "999"}
+        with mock.patch.object(history.urllib.request, "build_opener",
+                               return_value=opener):
+            with self.assertRaises(history.HistoryError) as raised:
+                history._get("/repos/owner/repo/actions/runs", "test-token")
+            self.assertEqual(
+                str(raised.exception),
+                "could not read recent synthetic workflow history (RecursionError)")
+            err = io.StringIO()
+            with redirect_stderr(err):
+                event = alert.decide_event({**env, "PROBE_OUTCOME": "failure",
+                                            "FORCE_FAIL": "false"}, "staging")
+        self.assertEqual(event, "alert")
+        self.assertNotIn("Traceback", err.getvalue())
+
+    def test_deeply_nested_evidence_reads_as_unknown_build(self):
+        # An unparseably deep receipt follows the existing malformed-evidence
+        # channel (unknown build, still posts), never a traceback.
+        deep = '{"a":' * 10000 + '1' + '}' * 10000
+        path = str(self.dir / "deep-evidence.json")
+        Path(path).write_text(deep, encoding="utf-8")
+        self.assertIsNone(alert.load_evidence(path))
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err), \
+                mock.patch.dict(os.environ, self.base_env(), clear=True), \
+                mock.patch.object(alert, "post") as post:
+            code = alert.post_event(self.base_env(), "staging", path, "alert")
+        self.assertEqual(code, 0)
+        post.assert_called_once()
+        self.assertIn("unknown", post.call_args.args[1])
+        self.assertNotIn("Traceback", out.getvalue() + err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

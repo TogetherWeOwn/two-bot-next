@@ -47,6 +47,10 @@ const SCRAPE_ATTEMPTS = 3;
 const SCRAPE_RETRY_SECONDS = 10;
 const EXIT_USAGE = 2;
 const EXIT_GATE = 1;
+// Intake cap mirrors the Worker scrape (MAX_METRICS_BODY_BYTES in
+// wrangler/src/index.ts) and the MCP container reads: every sibling
+// reader refuses expositions over 64 KiB.
+const MAX_EXPOSITION_BYTES = 64 * 1024;
 // Closed failure vocabulary. Every refusal carries one of these codes plus
 // its fixed next action; receipts and console text never carry remote
 // bodies, URL credentials, the bearer or exception messages.
@@ -229,6 +233,55 @@ Offline rehearsal (no network, no token):
 }
 
 /**
+ * Bounded exposition read: content-length precheck plus an incremental
+ * streaming cap, so an over-cap body never buffers fully. Returns null
+ * when the body exceeds `limit`. Minimal fetch stubs without a body
+ * stream fall back to text() with a post-read byte check.
+ */
+async function readBoundedExposition(response, limit) {
+  const declared = response.headers?.get?.("content-length");
+  if (declared !== undefined && declared !== null) {
+    const parsed = Number(declared);
+    if (Number.isFinite(parsed) && parsed > limit) return null;
+  }
+  const reader = response.body?.getReader?.();
+  if (!reader) {
+    const text = await response.text();
+    return Buffer.byteLength(text, "utf8") > limit ? null : text;
+  }
+  const chunks = [];
+  let size = 0;
+  let complete = false;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        complete = true;
+        break;
+      }
+      size += value.byteLength;
+      if (size > limit) return null;
+      chunks.push(value);
+    }
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return new TextDecoder().decode(bytes);
+  } finally {
+    // A hostile cancel hook can itself stall or reject. Do not await it.
+    if (!complete) void reader.cancel().catch(() => {});
+    try {
+      reader.releaseLock();
+    } catch {
+      // Some runtimes cannot release a lock while a read is pending.
+    }
+  }
+}
+
+/**
  * Firing verdict over an evaluateMetrics firing list. `fail` true means the
  * promotion stage must fail so auto-rollback runs. Thin wrapper so the
  * workflow judges through the same helper the unit tests pin.
@@ -300,7 +353,7 @@ async function fetchExposition({ metricsUrl, token, timeoutSeconds, fetchImpl, r
     }
     let text;
     try {
-      text = await response.text();
+      text = await readBoundedExposition(response, MAX_EXPOSITION_BYTES);
     } catch {
       // Body-phase transients (stalls, resets, the timeout firing mid-read)
       // keep the same bounded retry as connect-phase ones.
@@ -310,6 +363,11 @@ async function fetchExposition({ metricsUrl, token, timeoutSeconds, fetchImpl, r
       }
       throw new ScrapeError(TRANSPORT_FAILED_MESSAGE, "transport_failed");
     }
+    // Over-cap is refused at once, like any other deterministic refusal: a
+    // retry re-sends the bearer against a body that will not shrink, so it
+    // must not loop. The code stays decode_failed with fixed text: the
+    // exposition could not be admitted for decoding.
+    if (text === null) throw new ScrapeError(DECODE_FAILED_MESSAGE, "decode_failed");
     const samples = parseAlertScrape(text);
     if (samples === null) throw new ScrapeError(DECODE_FAILED_MESSAGE, "decode_failed");
     return { text, samples };
