@@ -1,5 +1,23 @@
 # Parity soak checklist
 
+<!-- start-here -->
+**Start here — section map**
+
+- [Safety and execution contract](#safety-and-execution-contract)
+- [Maintaining coverage](#maintaining-coverage)
+- [Existing fixture entry points](#existing-fixture-entry-points)
+- [1. Slash / prefix commands](#1-slash--prefix-commands)
+- [2. Non-command interactions](#2-non-command-interactions)
+- [3. Gateway event handlers](#3-gateway-event-handlers)
+- [4. Scheduled jobs & timers](#4-scheduled-jobs--timers)
+- [5. DB tables & queries](#5-db-tables--queries)
+- [6. External integrations](#6-external-integrations)
+- [7. Config / env](#7-config--env)
+- [8. Observable behaviours](#8-observable-behaviours)
+- [12. Baseline additions and corrections](#12-baseline-additions-and-corrections)
+- [13. Post-freeze ledger obligations (non-dropped rows)](#13-post-freeze-ledger-obligations-non-dropped-rows)
+<!-- /start-here -->
+
 <!-- Generated from soak-checklist.json by scripts/check_soak_checklist.py --render. -->
 
 This is the **unexecuted** B4 coverage plan for [TOG-9699](/TOG/issues/TOG-9699), authored under [TOG-10885](/TOG/issues/TOG-10885). Running the soak is out of scope. `manual`/`automated`/`waived` describe the verification method, not PASS. No row has been executed by writing this checklist.

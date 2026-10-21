@@ -49,6 +49,8 @@ claim. Staging deploys from `main`; production deploys through the manual
 
 ## Operator references
 
+Browse the [documentation map](docs/README.md) for every guide, contract and evidence form.
+
 - [Commands](docs/commands.md): built-ins, options, registry bounds and default
   Discord permissions, rendered from the compiled all-enabled registry.
 - [Configuration](docs/configuration.md): all catalog keys/classes, known parsed

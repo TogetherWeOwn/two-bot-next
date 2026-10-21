@@ -1,5 +1,65 @@
 # two-bot-next operations runbook
 
+<!-- start-here -->
+**Start here — section map**
+
+- [Start here](#start-here)
+- [Is it alive?](#is-it-alive)
+- [Persisted ownership control](#persisted-ownership-control)
+- [Redeploy and rollback](#redeploy-and-rollback)
+- [Restart semantics: durable RESUME, not full state recovery](#restart-semantics-durable-resume-not-full-state-recovery)
+- [Containment, kill switches and feature flags](#containment-kill-switches-and-feature-flags)
+- [Backup, restore and drill commands](#backup-restore-and-drill-commands)
+- [Common failures](#common-failures)
+- [Incident playbooks](#incident-playbooks)
+- [Secret inventory: names only](#secret-inventory-names-only)
+- [Legacy review and deliberately unported operations](#legacy-review-and-deliberately-unported-operations)
+- [Keep the runbook honest](#keep-the-runbook-honest)
+
+**Alert anchors**
+
+- [Alert: job stale](#alert-job-stale)
+- [Alert: job unknown stale](#alert-job-unknown-stale)
+- [Alert: job failures](#alert-job-failures)
+- [Alert: REST 429](#alert-rest-429)
+- [Alert: REST 5xx](#alert-rest-5xx)
+- [Alert: REST admission breaker open](#alert-rest-admission-breaker-open)
+- [Alert: DB pool](#alert-db-pool)
+- [Alert: DB errors](#alert-db-errors)
+- [Alert: send admission blocked](#alert-send-admission-blocked)
+- [Alert: voice failures](#alert-voice-failures)
+- [Alert: voice join fast burn](#alert-voice-join-fast-burn)
+- [Alert: voice join slow burn](#alert-voice-join-slow-burn)
+- [Alert: voice creator-map stale](#alert-voice-creator-map-stale)
+- [Alert: voice worker halted](#alert-voice-worker-halted)
+- [Alert: voice live self-heal](#alert-voice-live-self-heal)
+- [Alert: voice live not ready](#alert-voice-live-not-ready)
+- [Alert: voice queue stall](#alert-voice-queue-stall)
+- [Alert: error budget fast burn](#alert-error-budget-fast-burn)
+- [Alert: error budget slow burn](#alert-error-budget-slow-burn)
+- [Alert: gateway missed events](#alert-gateway-missed-events)
+- [Alert: gateway unpaired disconnect](#alert-gateway-unpaired-disconnect)
+- [Alert: gateway not ready](#alert-gateway-not-ready)
+- [Alert: ticker stale](#alert-ticker-stale)
+- [Alert: receiver refusals](#alert-receiver-refusals)
+- [Alert: checkpoint failures](#alert-checkpoint-failures)
+- [Alert: dispatch drops](#alert-dispatch-drops)
+- [Alert: prefix trigger verdict refusals](#alert-prefix-trigger-verdict-refusals)
+- [Alert: community facts drain failures](#alert-community-facts-drain-failures)
+- [Alert: EventSub post failed share](#alert-eventsub-post-failed-share)
+- [Alert: event-store consumer lag](#alert-event-store-consumer-lag)
+- [Alert: metrics scrape lost](#alert-metrics-scrape-lost)
+- [Alert: audit delivery halt](#alert-audit-delivery-halt)
+- [Alert: eventsub reconcile failed](#alert-eventsub-reconcile-failed)
+- [Alert: EventSub tampered](#alert-eventsub-tampered)
+- [Alert: retention replay needed](#alert-retention-replay-needed)
+- [Alert: voice dispatch timeouts](#alert-voice-dispatch-timeouts)
+- [Alert: voice watchdog stucks](#alert-voice-watchdog-stucks)
+- [Alert: voice halt recoveries](#alert-voice-halt-recoveries)
+- [Alert: REST breaker opens](#alert-rest-breaker-opens)
+- [Alert: REST global pauses](#alert-rest-global-pauses)
+<!-- /start-here -->
+
 For the on-call operator of the Rust bot and its Cloudflare Worker/Container.
 The bot is live in production on one Cloudflare Container; this describes the
 shipped source, not proof that a soak passed or that any specific recovery is
