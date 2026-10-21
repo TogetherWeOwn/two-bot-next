@@ -54,6 +54,20 @@ struct PartialVoice {
     endpoint: Option<String>,
     session_id: Option<String>,
     channel_id: Option<Snowflake>,
+    /// A server half arrived after the pair completed and no state has
+    /// confirmed it yet. Disambiguates a region move (same session, no
+    /// state follows) from a rejoin arriving server-first (new state
+    /// follows and must keep, not drop, this half).
+    server_after_complete: bool,
+}
+
+impl PartialVoice {
+    fn is_complete(&self) -> bool {
+        self.token.is_some()
+            && self.endpoint.is_some()
+            && self.session_id.is_some()
+            && self.channel_id.is_some()
+    }
 }
 
 impl VoicePairing {
@@ -65,8 +79,15 @@ impl VoicePairing {
 
     /// Record a `VoiceServerUpdate` half. A repeat replaces the previous
     /// server half (Discord rotates the endpoint on region moves).
+    ///
+    /// Replacement is immediate on purpose: a region move sends no state
+    /// afterwards, so holding the new half pending would pin the player to
+    /// a dead endpoint. When the pair was already complete the half is also
+    /// flagged, so a following new-session state keeps it (rejoin arriving
+    /// server-first) instead of dropping it and stalling.
     pub fn observe_server(&mut self, guild_id: Snowflake, token: &str, endpoint: &str) {
         let entry = self.by_guild.entry(guild_id).or_default();
+        entry.server_after_complete = entry.is_complete();
         entry.token = Some(Secret::new(token.to_owned()));
         entry.endpoint = Some(endpoint.to_owned());
     }
@@ -77,10 +98,12 @@ impl VoicePairing {
     ///
     /// A new session id starts a new handshake generation: the server half
     /// paired with the previous session is stale and is dropped, so the new
-    /// session can never reuse the prior token or endpoint. A pending server
-    /// half with no session yet is kept as the matching half (initial join
-    /// server-first), and a repeated same-session state keeps the pair
-    /// (mute/deafen frames carry the same session).
+    /// session can never reuse the prior token or endpoint — unless a server
+    /// half arrived after the pair completed, which is the new generation
+    /// arriving server-first and is kept. A pending server half with no
+    /// session yet is kept as the matching half (initial join server-first),
+    /// and a repeated same-session state keeps the pair (mute/deafen frames
+    /// carry the same session).
     pub fn observe_state(
         &mut self,
         guild_id: Snowflake,
@@ -94,10 +117,11 @@ impl VoicePairing {
                     .session_id
                     .as_deref()
                     .is_some_and(|previous| previous != session_id);
-                if fresh_session {
+                if fresh_session && !entry.server_after_complete {
                     entry.token = None;
                     entry.endpoint = None;
                 }
+                entry.server_after_complete = false;
                 entry.session_id = Some(session_id.to_owned());
                 entry.channel_id = Some(channel);
             }
@@ -111,8 +135,10 @@ impl VoicePairing {
     /// this before sending `UpdateVoiceState` (join/move): our own join
     /// always brings fresh halves, so resetting first means a rejoin can
     /// never emit a stale mix whichever half arrives first. A rejoin whose
-    /// server half arrives first without a reset would pair a fresh server
-    /// half with the previous session, so the reset call is load-bearing.
+    /// server half arrives first without a reset still pairs transiently
+    /// with the previous session (indistinguishable from a region move),
+    /// then self-heals when its state lands instead of stalling, so the
+    /// reset call keeps our own joins exact.
     pub fn reset(&mut self, guild_id: Snowflake) {
         self.by_guild.remove(&guild_id);
     }
@@ -306,19 +332,25 @@ mod tests {
         let mut pairing = VoicePairing::new();
         pairing.observe_server(10, "secret-voice-token", "endpoint");
         pairing.observe_state(10, "session", Some(30));
-        for output in [
+        // The failure messages name the output index, never the output: the
+        // token must not flow into any panic message (CodeQL cleartext
+        // logging), even in a test that asserts its absence.
+        for (idx, output) in [
             format!("{pairing:?}"),
             format!("{pairing:#?}"),
             format!("{:?}", pairing.complete(10).expect("complete pair")),
             format!("{:#?}", pairing.complete(10).expect("complete pair")),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             assert!(
                 !output.contains("secret-voice-token"),
-                "Debug must never print the voice token: {output}"
+                "Debug output {idx} must never print the voice token"
             );
             assert!(
                 output.contains("[REDACTED]"),
-                "Debug marks the redacted token: {output}"
+                "Debug output {idx} marks the redacted token"
             );
         }
     }
@@ -329,8 +361,9 @@ mod tests {
         pairing.observe_server(10, "old-token", "old-endpoint");
         pairing.observe_state(10, "old-session", Some(30));
         assert!(pairing.complete(10).is_some());
-        // A rejoin brings a new session: the prior server half is stale and
-        // must not combine with it, in either arrival order.
+        // State-first rejoin: no server half arrived after the old pair
+        // completed, so the stored one is stale and must not combine with
+        // the new session.
         pairing.observe_state(10, "new-session", Some(30));
         assert_eq!(
             pairing.complete(10),
@@ -341,6 +374,42 @@ mod tests {
         let update = pairing.complete(10).expect("fresh halves pair");
         assert_eq!(update.session_id, "new-session");
         assert_eq!(update.token.expose(), "new-token");
+        assert_eq!(update.endpoint, "new-endpoint");
+    }
+
+    #[test]
+    fn rejoin_server_first_keeps_new_server_half() {
+        let mut pairing = VoicePairing::new();
+        pairing.observe_server(10, "old-token", "old-endpoint");
+        pairing.observe_state(10, "old-session", Some(30));
+        assert!(pairing.complete(10).is_some());
+        // Server-first rejoin without a reset: the flagged half is the new
+        // generation's, so the new state keeps it instead of stalling for
+        // a server update that never comes.
+        pairing.observe_server(10, "new-token", "new-endpoint");
+        pairing.observe_state(10, "new-session", Some(30));
+        let update = pairing.complete(10).expect("server-first rejoin pairs");
+        assert_eq!(update.session_id, "new-session");
+        assert_eq!(update.token.expose(), "new-token");
+        assert_eq!(update.endpoint, "new-endpoint");
+    }
+
+    #[test]
+    fn region_move_promotes_endpoint_immediately() {
+        let mut pairing = VoicePairing::new();
+        pairing.observe_server(10, "old-token", "old-endpoint");
+        pairing.observe_state(10, "session", Some(30));
+        // Region moves send no state afterwards: the new half must PATCH
+        // at once, paired with the unchanged session.
+        pairing.observe_server(10, "new-token", "new-endpoint");
+        let update = pairing.complete(10).expect("region move stays complete");
+        assert_eq!(update.session_id, "session");
+        assert_eq!(update.token.expose(), "new-token");
+        assert_eq!(update.endpoint, "new-endpoint");
+        // A redundant same-session state afterwards confirms the pair and
+        // clears the flag without dropping anything.
+        pairing.observe_state(10, "session", Some(30));
+        let update = pairing.complete(10).expect("confirmed pair stays");
         assert_eq!(update.endpoint, "new-endpoint");
     }
 
