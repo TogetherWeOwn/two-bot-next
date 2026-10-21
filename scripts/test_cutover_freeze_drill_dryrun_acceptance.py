@@ -49,7 +49,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import cutover_freeze_drill as drill  # noqa: E402
+import cutover_freeze_drill as drill
 
 STAGING_GUILD = "1545644954272137297"
 LIVE_GUILD = "326474832151838730"
