@@ -5,7 +5,7 @@ mod common;
 
 use common::{MockRest, ScriptedResponse};
 use serde_json::{json, Value};
-use sqlx::PgPool;
+use sqlx::{PgPool, PgPoolOptions};
 use std::{sync::Arc, time::Duration};
 use twilight_model::{application::interaction::Interaction, gateway::event::Event};
 use two_bot_core::{
@@ -13,7 +13,8 @@ use two_bot_core::{
     leveling_store as store, HandlerId, MemStore, OnboardingGates, OnboardingMode,
 };
 use two_bot_discord::{
-    pipeline::MessageEligibility, ActionExecutor, LevelingRuntime, OrderedLevelingPipeline,
+    pipeline::MessageEligibility, ActionExecutor, LevelingRuntime, LevelingRuntimeError,
+    OrderedLevelingPipeline,
 };
 use two_bot_testsupport::TestDatabase;
 
@@ -1149,4 +1150,37 @@ async fn unavailable_content_keeps_unavailable_not_known_short_behavior() {
     );
     mock.shutdown().await;
     db.close().await;
+}
+
+// Hermetic double-failure precedence (no database: the refused loopback pool
+// fails the read at once, like the bot crate's immediate-error acceptance).
+// The acknowledged store error is the root cause the caller must log, so it
+// propagates even when the best-effort completion edit fails alongside it.
+#[tokio::test]
+async fn acknowledged_store_failure_reports_the_store_error_when_the_completion_edit_fails() {
+    let pool = PgPoolOptions::new()
+        .min_connections(0)
+        .max_connections(1)
+        .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+        .expect("lazy pool");
+    let mock = MockRest::start(
+        vec![ScriptedResponse::status(204), ScriptedResponse::status(500)],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(pool, &mock, OnboardingMode::Legacy);
+    let error = runtime
+        .handle_interaction(&interaction("rank", false), HandlerId::Rank)
+        .await
+        .expect_err("the double failure still reports");
+    assert!(
+        matches!(error, LevelingRuntimeError::Store(_)),
+        "the store error wins over the failed completion edit, got {error:?}"
+    );
+    assert_eq!(
+        mock.requests().len(),
+        2,
+        "one defer plus one completion-edit attempt"
+    );
+    mock.shutdown().await;
 }

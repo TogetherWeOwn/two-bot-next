@@ -706,13 +706,19 @@ impl LevelingRuntime {
                 } else {
                     LEADERBOARD_UNAVAILABLE_REPLY
                 };
-                self.executor
+                // Best-effort completion: attempt the edit, then report the
+                // store failure regardless. The store error is the root cause
+                // the caller must log; a simultaneous edit failure must not
+                // hide it (same precedence as the channel slice's
+                // Persistence-over-Edit return).
+                let _edit = self
+                    .executor
                     .edit_interaction_response_with_blocked_retry(
                         application_id,
                         &interaction.token,
                         unavailable,
                     )
-                    .await?;
+                    .await;
                 Err(LevelingRuntimeError::Store(store))
             }
         }
