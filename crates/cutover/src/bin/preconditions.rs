@@ -63,6 +63,7 @@ const REGISTRY_FIXTURE: &str = "crates/core/tests/fixtures/legacy_registry.json"
 /// the whole file past the cap; the boundary is strict `>`.
 const MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
 
+#[derive(Debug)]
 enum InputError {
     OverCap,
     Unreadable,
