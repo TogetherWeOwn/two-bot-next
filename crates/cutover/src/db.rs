@@ -1066,3 +1066,7 @@ mod reward_tests {
         result
     }
 }
+
+#[cfg(test)]
+#[path = "db_pool_timeout_acceptance_tests.rs"]
+mod pool_timeout_acceptance_tests;

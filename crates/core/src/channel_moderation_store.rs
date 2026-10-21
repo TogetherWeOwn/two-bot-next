@@ -1715,3 +1715,7 @@ mod tests {
         store.cleanup().await;
     }
 }
+
+#[cfg(test)]
+#[path = "channel_moderation_pool_timeout_acceptance_tests.rs"]
+mod pool_timeout_acceptance_tests;
