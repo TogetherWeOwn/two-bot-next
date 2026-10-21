@@ -197,7 +197,7 @@ test(`${OPS_DASHBOARD_PATH}: CSP authorizes only the unchanged page's inline blo
   // CSP hashes are header-only, so they do not rewrite the body. Re-pin when the static page changes.
   assert.equal(
     createHash("sha256").update(html).digest("hex"),
-    "6957ffd2d7885487f2a4948d6584d169a4ffd5fee05d730eddfef972a3f4a77c",
+    "3436cd503436829a3ceb93ddbebc6174f156714ce997a8c2e302aeebc892f638",
   );
   const headers = new Headers(res.headers);
   headers.delete("content-security-policy");

@@ -1461,10 +1461,10 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v9-source.ndjson.gz");
+    let current_path = directory.path("v10-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 9);
+    assert_eq!(old.manifest.version, 10);
     for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -1494,6 +1494,59 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
         .unwrap();
         assert_eq!(count, 0, "v8 restore clears newer {name} target rows");
     }
+    let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(members > 0, "older covered data is restored, not discarded");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v9_archive_restores_and_clears_newer_epoch_claim() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    seed(pool).await;
+    let directory = ArchiveDirectory::new();
+    let current_path = directory.path("v10-source.ndjson.gz");
+    dump(pool, &current_path).await.unwrap();
+    let mut old = inspect(&current_path).unwrap();
+    assert_eq!(old.manifest.version, 10);
+    let rows = old.buffers.remove("scheduled_events_claim").unwrap();
+    assert!(
+        !rows.is_empty(),
+        "fixture must populate newer scheduled_events_claim"
+    );
+    old.manifest
+        .tables
+        .retain(|table| table.name != "scheduled_events_claim");
+    old.manifest.version = 9;
+    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
+    let old_path = directory.path("pre-epoch-claim-v9.ndjson.gz");
+    write_archive(&old_path, &old);
+    let inspected = inspect(&old_path).expect("pre-change v9 archive remains readable");
+    assert_eq!(inspected.manifest.version, 9);
+    assert_eq!(
+        inspected.manifest.missing_tables(),
+        ["scheduled_events_claim"]
+    );
+    // This test deliberately replaces a reused isolated rehearsal target.
+    forget_moderation_history(pool).await;
+    let report = restore(pool, &old_path).await.unwrap();
+    assert!(report.ok);
+    let count: i64 = sqlx::query_scalar(audited(format!(
+        "SELECT COUNT(*) FROM {}",
+        identifier("scheduled_events_claim")
+    )))
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        count, 0,
+        "v9 restore clears newer scheduled_events_claim target rows"
+    );
     let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
         .fetch_one(pool)
         .await
