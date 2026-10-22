@@ -83,7 +83,7 @@ configure the container (see [runbook.md](runbook.md#logs-and-keepalive)).
 ## Prompt decisions
 
 `decide_prompt` (`crates/core/src/onboarding.rs:157`) runs in legacy check
-order: bots first, then the rules gate, then the once-per-member guard.
+order: bots first, then the rules gate, then the guard that lasts one stay (a processed goodbye clears it, so a rejoin is welcomed again).
 
 | Inputs | Decision |
 |---|---|
@@ -222,7 +222,7 @@ member data into evidence.
 | `gateway onboarding job invalid` (warn) | Worker-built job failed to serialize. | Record the revision; do not restart to clear it. Escalate with the log line if it repeats. |
 | Silent skip: bot / still-pending / already-prompted; gated join with no later gate-clear | `decide_prompt` / `welcome_trigger` working as designed. | No action. Gated members prompt when `pending` flips true → false. |
 | Silent skip: welcome/goodbye simply absent, nothing logged | No postable destination (none configured or bot lacks View/Send/Embed), or dry run (legacy/anchor welcome, any goodbye). `welcome()`/`goodbye` return `Ok(())` with no log line (`crates/bot/src/onboarding.rs:490,506,425`); the `no_landing_channel` / `no_goodbye_channel` / `dry_run` reason strings live only in core `adjudicate_*` effects, never in logs — do not grep for them. | Check the mode's channel config and the bot's effective channel access via preflight. Dry run needs no action; session welcomes still post. |
-| `command runtime parked; onboarding runtime disabled` (warn, `crates/bot/src/main.rs:535`) | The command runtime failed to build, so onboarding is off. Causes include invalid feature gates, invalid moderation gates, invalid send admission, REST executor build failure, or ticket runtime init failure (`crates/bot/src/command_runtime.rs:410,422,456,463,481`). | Read the `... command runtime disabled` warn logged just before — it carries the reason — and fix that cause; onboarding resumes with the runtime. |
+| `command runtime parked; onboarding runtime disabled` (warn, `crates/bot/src/main.rs:535`) | The command runtime failed to build, so onboarding is off. Causes include invalid feature gates, invalid moderation gates, invalid send admission, REST executor build failure, or ticket runtime init failure (`crates/bot/src/command_runtime.rs:413,425,459,466,484`). | Read the `... command runtime disabled` warn logged just before — it carries the reason — and fix that cause; onboarding resumes with the runtime. |
 | Picker reply `No channel is available to you right now.` with saved roles | All picks unavailable (hub also dark). | Check channel visibility/overwrites; roles are correctly kept. |
 | Rising `degraded` in `channel_routed` rows | Primaries dark, members routed to the hub fallback. | Open or re-expose the real rooms; the count is the signal. |
 

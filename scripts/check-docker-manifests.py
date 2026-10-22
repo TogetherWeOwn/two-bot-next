@@ -5,10 +5,42 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
+
+class Refusal(Exception):
+    """Fixed-vocabulary refusal for Docker dependency-layer validation.
+
+    Every validation path raises this (never ``assert``/``AssertionError``)
+    so the gate fails closed under ``python -O``, where asserts are stripped.
+    The message keeps its diagnostic vocabulary so any refusal maps to its
+    next action: fix the named Dockerfile line, restore the named pinned
+    input, or set the named scratch env var.
+    """
+
+
+def require(condition, message):
+    """Raise :class:`Refusal` when condition is false, else return None.
+
+    A function call survives ``python -O``; a bare ``assert`` does not.
+    """
+    if not condition:
+        raise Refusal(message)
+    return None
+
+
+# Bounded-subprocess policy (docs/bounded-subprocess-checks.md): every child
+# wait is finite so a stalled child fails closed here instead of hanging
+# until the external CI ceiling. Local Git/metadata probes answer in well
+# under a second; 30s bounds the stall without touching valid runs.
+SUBPROCESS_TIMEOUT_SECONDS = 30
+
+
+class MetadataFetchError(ValueError):
+    """The locked cargo-metadata probe failed, timed out or never spawned."""
 
 # Pinned dependency-layer inputs, derived from the workspace members so the
 # pin can never drift from `Cargo.toml`: every COPY source before `COPY . .`
@@ -50,36 +82,36 @@ def _layer_instructions(docker_text):
             break
         upper = stripped.split()[0].upper()
         if upper == "COPY":
-            assert stripped.startswith("COPY "), \
-                f"dependency layer must use uppercase COPY: {stripped}"
-            assert from_seen and workdir_seen, \
-                f"dependency-layer COPY before the builder preamble: {stripped}"
+            require(stripped.startswith("COPY "),
+                    f"dependency layer must use uppercase COPY: {stripped}")
+            require(from_seen and workdir_seen,
+                    f"dependency-layer COPY before the builder preamble: {stripped}")
             layer_started = True
             instructions.append(("copy", stripped))
         elif upper == "RUN":
-            assert stripped.startswith("RUN "), \
-                f"dependency layer must use uppercase RUN: {stripped}"
-            assert from_seen and workdir_seen, \
-                f"dependency-layer RUN before the builder preamble: {stripped}"
+            require(stripped.startswith("RUN "),
+                    f"dependency layer must use uppercase RUN: {stripped}")
+            require(from_seen and workdir_seen,
+                    f"dependency-layer RUN before the builder preamble: {stripped}")
             layer_started = True
             instructions.append(("run", stripped))
         elif upper == "FROM":
-            assert stripped.startswith("FROM "), \
-                f"dependency layer must use uppercase FROM: {stripped}"
-            assert not from_seen and not layer_started, \
-                f"unexpected dependency-layer preamble: {stripped}"
+            require(stripped.startswith("FROM "),
+                    f"dependency layer must use uppercase FROM: {stripped}")
+            require(not from_seen and not layer_started,
+                    f"unexpected dependency-layer preamble: {stripped}")
             from_seen = True
             instructions.append(("preamble", stripped))
         elif upper == "WORKDIR":
-            assert stripped == "WORKDIR /app", \
-                "dependency-layer WORKDIR must be the pinned builder " \
-                f"directory: {stripped}"
-            assert from_seen and not workdir_seen and not layer_started, \
-                f"unexpected dependency-layer preamble: {stripped}"
+            require(stripped == "WORKDIR /app",
+                    "dependency-layer WORKDIR must be the pinned builder "
+                    f"directory: {stripped}")
+            require(from_seen and not workdir_seen and not layer_started,
+                    f"unexpected dependency-layer preamble: {stripped}")
             workdir_seen = True
             instructions.append(("preamble", stripped))
         else:
-            raise AssertionError(
+            raise Refusal(
                 f"unsupported dependency-layer instruction: {stripped}")
     return instructions
 
@@ -104,8 +136,10 @@ def check_sources(sources, root=ROOT):
     expected = _expected_sources(root)
     missing = expected - set(sources)
     extra = set(sources) - expected
-    assert not missing, f"dependency layer lost pinned inputs: {sorted(missing)}"
-    assert not extra, f"dependency layer gained unpinned inputs: {sorted(extra)}"
+    require(not missing,
+            f"dependency layer lost pinned inputs: {sorted(missing)}")
+    require(not extra,
+            f"dependency layer gained unpinned inputs: {sorted(extra)}")
 
 
 def reconstruct(docker_text, root, dest):
@@ -136,7 +170,7 @@ def reconstruct(docker_text, root, dest):
                 elif words == ["cargo", "fetch", "--locked"]:
                     fetch_seen = True
                 else:
-                    raise AssertionError(
+                    raise Refusal(
                         f"unsupported dependency-layer command: {words[0]}")
     return fetch_seen
 
@@ -144,49 +178,75 @@ def reconstruct(docker_text, root, dest):
 def validate_layer(dest):
     """Every workspace member must resolve from the replayed layer."""
     manifest = tomllib.loads((dest / "Cargo.toml").read_text())
-    assert (dest / "Cargo.lock").is_file(), \
-        "Cargo.lock missing from dependency layer"
+    require((dest / "Cargo.lock").is_file(),
+            "Cargo.lock missing from dependency layer")
     members = [".", *manifest["workspace"]["members"]]
     for member in members:
         package = dest / member
-        assert (package / "Cargo.toml").is_file(), \
-            f"Missing dependency-layer manifest: {member}"
-        assert (package / "src/lib.rs").is_file() \
-            or (package / "src/main.rs").is_file(), \
-            f"Missing dependency-layer target: {member}"
+        require((package / "Cargo.toml").is_file(),
+                f"Missing dependency-layer manifest: {member}")
+        require((package / "src/lib.rs").is_file()
+                or (package / "src/main.rs").is_file(),
+                f"Missing dependency-layer target: {member}")
     return len(members)
 
 
 def run_locked_fetch(dest):
     """The real locked fetch; raises when the layer does not resolve."""
-    subprocess.run(
-        ["cargo", "metadata", "--offline", "--locked", "--no-deps",
-         "--format-version", "1", "--manifest-path", str(dest / "Cargo.toml")],
-        check=True, stdout=subprocess.DEVNULL,
-    )
+    try:
+        subprocess.run(
+            ["cargo", "metadata", "--offline", "--locked", "--no-deps",
+             "--format-version", "1", "--manifest-path", str(dest / "Cargo.toml")],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=SUBPROCESS_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise MetadataFetchError(
+            f"metadata fetch timeout after {SUBPROCESS_TIMEOUT_SECONDS}s; "
+            "next: re-run the check; if the stall repeats, inspect the "
+            "cargo metadata invocation and runner load") from error
+    except OSError as error:
+        raise MetadataFetchError(
+            f"metadata fetch spawn failed ({error}); "
+            "next: re-run the check on a runner with cargo installed") from error
+    except subprocess.CalledProcessError as error:
+        raise MetadataFetchError(
+            "metadata fetch failed with exit status "
+            f"{error.returncode}; next: re-run the check; if it repeats, "
+            "inspect the dependency-layer Cargo.toml files") from error
 
 
 def check_tree(docker_text, root, scratch_dir=None, fetch=run_locked_fetch):
     """Full offline validation of one Dockerfile text against one root."""
     sources = dependency_sources(docker_text)
-    assert sources, "no dependency-layer COPY sources found"
-    check_sources(sources)
+    require(sources, "no dependency-layer COPY sources found")
+    check_sources(sources, root)
     with tempfile.TemporaryDirectory(
             prefix="docker-manifests-", dir=scratch_dir) as directory:
         layer = Path(directory)
-        assert reconstruct(docker_text, root, layer), \
-            "dependency fetch layer was not checked"
+        # Called unconditionally: only the boolean goes through require(),
+        # so `python -O` still runs the replay instead of stripping it.
+        fetch_checked = reconstruct(docker_text, root, layer)
+        require(fetch_checked, "dependency fetch layer was not checked")
         validate_layer(layer)
         fetch(layer)
 
 
 def main():
-    docker = (ROOT / "Dockerfile").read_text()
     scratch = os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR") \
-        or os.environ["RUNNER_TEMP"]
-    check_tree(docker, ROOT, scratch_dir=scratch)
+        or os.environ.get("RUNNER_TEMP")
+    require(scratch,
+            "missing scratch directory: set PAPERCLIP_RUN_SCRATCH_DIR "
+            "or RUNNER_TEMP to a writable temp directory")
+    docker = (ROOT / "Dockerfile").read_text()
+    try:
+        check_tree(docker, ROOT, scratch_dir=scratch)
+    except MetadataFetchError as error:
+        print(f"docker-manifests: {error}", file=sys.stderr)
+        return 1
     print("Docker dependency-layer manifests: PASS (offline, locked)")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

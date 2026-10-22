@@ -97,23 +97,56 @@ where
         .sort_unstable_by(|a, b| (a.created_at, a.id.as_str()).cmp(&(b.created_at, b.id.as_str())));
     let after = cursor.lock().expect("ticket recovery cursor").clone();
     if let Some((created_at, id)) = after {
-        let start = tickets
+        // Steady state is a skip, not a replay: behind-cursor Open rows are
+        // settled and never attempted again. Any other status is an in-flight
+        // workflow whose immutable created_at key can sit behind the cursor
+        // while the row is still unfinished — a Creating row turns actionable
+        // only after the 15-minute stale cutoff, an Open row can move to
+        // Closing/CleanupPending after a pass attempted it, and a failed or
+        // cancelled attempt leaves the row behind the cursor — so those rows
+        // are always re-attempted, keeping the cursor monotonic.
+        let behind = tickets
             .iter()
             .position(|ticket| (ticket.created_at, ticket.id.as_str()) > (created_at, id.as_str()))
-            .unwrap_or(0);
-        tickets.rotate_left(start);
+            .unwrap_or(tickets.len());
+        let skipped = tickets[..behind]
+            .iter()
+            .filter(|ticket| ticket.status == TicketStatus::Open)
+            .count();
+        if skipped > 0 {
+            tracing::info!(skipped, "ticket recovery skipped behind-cursor rows");
+        }
+        if behind > 0 {
+            let mut kept = Vec::with_capacity(tickets.len() - skipped);
+            for (index, ticket) in tickets.into_iter().enumerate() {
+                if index >= behind || ticket.status != TicketStatus::Open {
+                    kept.push(ticket);
+                }
+            }
+            tickets = kept;
+        }
     }
     let deadline = Instant::now() + RECOVERY_ROWS_BUDGET;
     let mut failed = None;
-    for ticket in tickets {
+    let total = tickets.len();
+    for (index, ticket) in tickets.into_iter().enumerate() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
+            let dropped = total - index;
+            tracing::warn!(dropped, "ticket recovery budget exhausted");
             break;
         }
-        // Advance before await: even whole-scope cancellation rotates past
+        // Advance before await: even whole-scope cancellation skips past
         // this row next time. The durable row, not this cursor, remains truth.
-        *cursor.lock().expect("ticket recovery cursor") =
-            Some((ticket.created_at, ticket.id.clone()));
+        // Never move backwards: a re-attempted behind-cursor row must not
+        // rewind past newer rows the cursor already passed.
+        {
+            let mut guard = cursor.lock().expect("ticket recovery cursor");
+            let key = (ticket.created_at, ticket.id.clone());
+            if guard.as_ref().is_none_or(|current| key > *current) {
+                *guard = Some(key);
+            }
+        }
         if let Err(error) = bounded(remaining.min(RECOVERY_ITEM_TIMEOUT), action(ticket)).await {
             failed = Some(error.class());
             tracing::warn!(error_class = ?error.class(), "ticket recovery deferred");
@@ -328,6 +361,16 @@ impl Failure {
 
 type Result<T> = std::result::Result<T, Failure>;
 
+/// Maximum history data pages fetched per capture (100 messages each):
+/// fetching stops at the cap even when the channel runs deeper, so a huge
+/// channel cannot page Discord without bound. A full 10th page is followed
+/// by one boundary probe (11 fetches at most): an empty probe proves the
+/// history is exactly 1000 and completes without the marker, anything else
+/// proves depth and completes with the shared truncation marker. The
+/// capture still validates every stored page; histories under the cap are
+/// byte-identical, and `message_count` covers stored messages only.
+const MAX_HISTORY_PAGES: usize = 10;
+
 impl TicketRuntime {
     pub fn new(
         pool: PgPool,
@@ -414,7 +457,14 @@ impl TicketRuntime {
     }
 
     fn stop_tasks(&self) {
-        let mut tasks = self.tasks.lock().expect("ticket task scope");
+        // Drop-reachable (`TicketSupervisor::drop`) and shared with async
+        // shutdown: recover silently so a poisoned scope still aborts its
+        // tasks instead of panicking during unwinding. No counter: non-drop
+        // callers must never be miscounted as drop poison.
+        let mut tasks = self
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.stopping.store(true, Ordering::Release);
         tasks.abort_all();
     }
@@ -728,11 +778,13 @@ impl TicketRuntime {
     pub(crate) async fn capture_history(&self, channel: &str) -> Result<TranscriptSnapshot> {
         let mut before: Option<String> = None;
         let mut capture = history::HistoryCapture::default();
+        let mut pages = 0;
         loop {
             let page = self
                 .executor
                 .fetch_channel_messages(channel, before.as_deref(), 100)
                 .await?;
+            pages += 1;
             if page.len() > 100 {
                 return Err(Failure::InvalidEvidence);
             }
@@ -758,6 +810,25 @@ impl TicketRuntime {
                     .map_err(|_| Failure::InvalidEvidence)?;
             }
             if count < 100 {
+                break;
+            }
+            if pages >= MAX_HISTORY_PAGES {
+                // A full 10th page cannot prove the end (see
+                // exact_full_page_requires_a_final_empty_page): fetch one
+                // boundary probe past its floor. Empty proves exactly 1000
+                // (complete, no marker); anything else proves depth, so cap
+                // with the marker without storing the probe page.
+                let probe_before = floor.ok_or(Failure::InvalidEvidence)?.to_string();
+                let probe = self
+                    .executor
+                    .fetch_channel_messages(channel, Some(probe_before.as_str()), 100)
+                    .await?;
+                if probe.len() > 100 {
+                    return Err(Failure::InvalidEvidence);
+                }
+                if !probe.is_empty() {
+                    capture.mark_page_capped();
+                }
                 break;
             }
             before = Some(floor.ok_or(Failure::InvalidEvidence)?.to_string());
@@ -1092,6 +1163,10 @@ fn panels(messages: Vec<Value>) -> Result<Vec<PanelMessage>> {
 mod tests;
 
 #[cfg(test)]
+#[path = "ticket_drop_poison_acceptance_tests.rs"]
+mod drop_poison_acceptance_tests;
+
+#[cfg(test)]
 #[path = "ticket_timer_tests.rs"]
 mod timer_tests;
 
@@ -1114,3 +1189,19 @@ mod no_work_acceptance_tests;
 #[cfg(test)]
 #[path = "ticket_failure_class_tests.rs"]
 mod failure_class_tests;
+
+#[cfg(test)]
+#[path = "ticket_cursor_budget_acceptance_tests.rs"]
+mod cursor_budget_acceptance_tests;
+
+#[cfg(test)]
+#[path = "ticket_cursor_budget_interaction_tests.rs"]
+mod cursor_budget_interaction_tests;
+
+#[cfg(test)]
+#[path = "ticket_capture_cap_acceptance_tests.rs"]
+mod capture_cap_acceptance_tests;
+
+#[cfg(test)]
+#[path = "ticket_capture_cap_boundary_tests.rs"]
+mod capture_cap_boundary_tests;

@@ -96,6 +96,11 @@ export const FORWARDED_FLAGS = [
   // Staging-only synthetic voice test identities (docs/voice-synthetic.md).
   "TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS",
   "TWO_TEMP_VOICE_SWEEP_SECONDS",
+  // Staging-only music voice-node spike (docs/music-voice-node-spike.md):
+  // attaches the Lavalink voice-update forwarder. Staging vars only, same
+  // treatment as TWO_VOICE; the node password travels as its own Container
+  // secret, never through this flag allowlist.
+  "TWO_MUSIC",
   // Template assistant (V12): non-secret endpoint URL + model name; the
   // endpoint credential (if any) travels as its own Container secret, never
   // through this flag allowlist.
@@ -304,6 +309,7 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_GUILD_CONFIG_UPLOAD_CMD: BACKUP,
   TWO_RESTORE_DRILL_BOOTSTRAP_URL: BACKUP,
   TWO_RESTORE_DRILL_EVIDENCE_DIR: BACKUP,
+  TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S: BACKUP,
   TWO_ANTI_NUKE_SNAPSHOT_PATH: "filesystem write path; Container disk is ephemeral",
   TWO_HEALTH_BIND_HOST: BIND,
   TWO_HEALTH_PORT: BIND,

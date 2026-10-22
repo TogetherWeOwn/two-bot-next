@@ -219,7 +219,10 @@ pub(crate) struct CommandDispatchGuard(Arc<CommandRuntime>);
 
 impl Drop for CommandDispatchGuard {
     fn drop(&mut self) {
-        let mut tasks = self.0.tasks.lock().expect("command task scope");
+        let mut tasks = two_bot_core::metrics::recover_drop_poison(
+            self.0.tasks.lock(),
+            "command_dispatch_guard",
+        );
         tasks.stopped = true;
         for lane in &mut tasks.lanes {
             for handle in lane.drain(..) {
@@ -1377,8 +1380,9 @@ impl CommandRuntime {
             self.answer(interaction, response).await;
             return;
         }
+        // No `"help"` entry: the help arm above owns `/help` and returns
+        // first, so an owner-map entry could never execute.
         let owner = match name.as_str() {
-            "help" => Some(HandlerId::Help),
             "privacy" => Some(HandlerId::Privacy),
             "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list" => {
                 Some(HandlerId::AutomationAdmin)
@@ -2243,9 +2247,16 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
             HandlerId::FeedAdd,
             HandlerId::FeedRemove,
             HandlerId::FeedList,
+            // The ordered RSVP surface executes these ids; registration
+            // documents the ownership the router outcome names.
+            HandlerId::Rsvp,
+            HandlerId::RsvpAttendance,
         ] {
             router.register(Box::new(SliceHandler(id)));
         }
+    }
+    if gates.scorecard {
+        router.register(Box::new(SliceHandler(HandlerId::ScorecardAttendance)));
     }
     // Leveling is not an activation-fenced capability: the core rank and
     // leaderboard commands stay available to every permitted identity.
@@ -2329,3 +2340,7 @@ pub(crate) fn publication_definitions(
         .map(Some)
         .map_err(|_| RegistrySyncError::Invalid)
 }
+
+#[cfg(test)]
+#[path = "command_runtime_poison_acceptance.rs"]
+mod dispatch_guard_poison_acceptance;

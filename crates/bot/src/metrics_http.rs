@@ -65,9 +65,9 @@ pub(crate) fn replace_pool(pool: PgPool) {
     install_replace(pool_slot(), pool);
 }
 
-/// In-memory rejection count for introspection. No production reader yet;
-/// kept alongside the counter so the diagnostic stays queryable.
-#[allow(dead_code)]
+/// In-memory rejection count for introspection, surfaced as the
+/// top-level `duplicate_pool_registrations` field on `/ops/summary`.
+/// Always present (zero on unconfigured boots), never null or absent.
 pub(crate) fn duplicate_registration_count() -> u64 {
     DUPLICATE_REGISTRATIONS.load(Ordering::Relaxed)
 }
@@ -343,6 +343,10 @@ mod tests {
             "two_bot_voice_vote_kick_total{outcome=\"other\"} ",
             "two_bot_gateway_checkpoint_failures_total{stage=\"pre_commit\"} ",
             "two_bot_gateway_checkpoint_failures_total{stage=\"commit\"} ",
+            "two_bot_drop_poison_total{guard=\"command_dispatch_guard\"} ",
+            "two_bot_drop_poison_total{guard=\"schedule_run\"} ",
+            "two_bot_drop_poison_total{guard=\"user_slot\"} ",
+            "two_bot_drop_poison_total{guard=\"in_flight_guard\"} ",
             "two_bot_eventsub_reconcile_passes_total{outcome=\"healthy\"} ",
             "two_bot_eventsub_reconcile_actions_total{action=\"create\"} ",
             "two_bot_eventsub_reconcile_errors_total{error_class=\"reconcile_unhealthy\"} ",

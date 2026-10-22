@@ -424,7 +424,7 @@ async fn supervised_poll_applies_real_guild_settings_writes() {
     assert!(!log.contains("772"), "updated cold value leaked: {log}");
 
     stop.send(true).unwrap();
-    task.await.unwrap();
+    task.await.unwrap().unwrap();
     fixture
         .close()
         .await
