@@ -121,6 +121,7 @@ pub enum HandlerId {
     Leaderboard,
     Help,
     Privacy,
+    Remind,
     ScorecardAttendance,
     AutomationAdmin,
     AutomationCustom,
@@ -395,6 +396,7 @@ impl InteractionRouter {
             // Sticky/admin plus custom rows (`CustomCommandRuntime::register`).
             register(HandlerId::AutomationAdmin);
             register(HandlerId::AutomationCustom);
+            register(HandlerId::Remind);
         }
         if gates.announcements {
             for id in [
@@ -639,6 +641,11 @@ impl InteractionRouter {
             // definition (`feature_commands.rs`) and at dispatch (`rsvp.rs`
             // `require_manage_events`): Discord picker hiding is not
             // authorization, so the router enforces it server-side too.
+            "remind" => Row {
+                handler: HandlerId::Remind,
+                gate: RowGate::Automations,
+                permission_refusal: None,
+            },
             "attendance" => Row {
                 handler: HandlerId::ScorecardAttendance,
                 gate: RowGate::Scorecard,
@@ -769,6 +776,7 @@ impl InteractionRouter {
             .iter()
             .chain(std::iter::once(&scorecard_attendance_command()))
             .chain(automation_commands().iter())
+            .chain(std::iter::once(&crate::remind::command()))
             .chain(announcement_commands().iter())
             .chain(super::moderation::moderation_commands().iter())
             .map(|def| def.name.clone())
@@ -817,6 +825,7 @@ impl InteractionRouter {
         }
         if self.gates.automations {
             extra.push(automation_commands());
+            extra.push(vec![crate::remind::command()]);
         }
         if self.gates.announcements {
             extra.push(announcement_commands());

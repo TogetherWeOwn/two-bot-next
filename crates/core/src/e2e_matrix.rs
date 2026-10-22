@@ -172,6 +172,21 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             ],
         ),
         row(
+            "remind",
+            33,
+            E2eGate::Automations,
+            0,
+            "Everyone",
+            "Remind",
+            "Deferred ephemeral create/list/cancel reply scoped to the invoker; one-shot attributed channel delivery with closed mentions, restart-safe durable fencing and five pending reminders per member.",
+            &[
+                "Gate:AutomationsDisabled",
+                "Valid:in:1..525600,integer,required",
+                "Valid:text:1..240,UTF16,required",
+                "Valid:target:unique-own-id-prefix-or-full-text,required",
+            ],
+        ),
+        row(
             "attendance",
             12,
             E2eGate::Scorecard,
