@@ -1167,6 +1167,10 @@ mod tests;
 mod drop_poison_acceptance_tests;
 
 #[cfg(test)]
+#[path = "ticket_drop_poison_counter_acceptance_tests.rs"]
+mod drop_poison_counter_acceptance_tests;
+
+#[cfg(test)]
 #[path = "ticket_timer_tests.rs"]
 mod timer_tests;
 
