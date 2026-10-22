@@ -18,10 +18,10 @@
 //!   module-registration probes, and the five disposable-database contract
 //!   tests. The database tests fail with `table public.giveaways is missing`
 //!   style assertions, never transport errors.
-//! - Controls (pass on the baseline and after): the three `reference_*`
-//!   executable-spec tests. They pin the byte-exact replay contract the
-//!   builder's domain code must reproduce; the builder's own unit tests assert
-//!   the same vectors and the reviewer checks them.
+//! - Controls (pass on the baseline and after): the two `reference_*` replay
+//!   vectors plus `giveaway_domain_vocabulary_contract`. The `reference_*`
+//!   tests pin the byte-exact replay contract the builder's domain code must
+//!   reproduce; the builder's own unit tests assert the same vectors.
 //!
 //! Replay contract (byte-exact; anything else is a design change, not a fix
 //! shape): `seed = sha256("{draw_nonce_hex}:{draw_no}")` over ASCII,
