@@ -352,3 +352,29 @@ async fn history_requires_explicit_bot_view_and_read_overwrite() {
     assert!(mock.requests().is_empty());
     mock.shutdown().await;
 }
+
+#[tokio::test]
+async fn component_admission_ignores_generic_ticket_tasks() {
+    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let tickets = runtime(&mock);
+    // A generic ticket task sharing the scope (e.g. RESUMED readiness) must
+    // not consume component budget: all 16 components still admit with one
+    // generic task in flight, and only the 17th component refuses.
+    tickets.spawn(std::future::pending());
+    for member in 0..(MAX_TICKET_COMPONENT_IN_FLIGHT as u64) {
+        assert!(
+            tickets.try_spawn_component(Some(member), |permit| async move {
+                let _permit = permit;
+                std::future::pending::<()>().await;
+            }),
+            "component {member} refused while budget remained"
+        );
+    }
+    assert!(
+        !tickets.try_spawn_component(Some(u64::MAX), |permit| async move {
+            let _permit = permit;
+        })
+    );
+    assert!(mock.requests().is_empty());
+    mock.shutdown().await;
+}

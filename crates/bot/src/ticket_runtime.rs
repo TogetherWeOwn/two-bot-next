@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     future::Future,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex as TaskMutex,
     },
     time::Duration,
@@ -333,6 +333,12 @@ pub(crate) struct TicketRuntime {
     /// until it settles, so the slot releases on success, failure,
     /// cancellation and shutdown.
     component_slots: UserSlots,
+    /// Admitted ticket component executions currently in flight: the global
+    /// half of admission, counted separately from `tasks` so generic ticket
+    /// work sharing the scope (e.g. RESUMED readiness) never consumes
+    /// component budget. Each permit holds a clone and releases on drop, so
+    /// the count is exact without waiting for the next prune.
+    component_in_flight: Arc<AtomicUsize>,
     /// Last sampled saturation `warn!`; the drops counter increments
     /// un-sampled on every refusal.
     last_component_drop_log: TaskMutex<Option<std::time::Instant>>,
@@ -392,11 +398,18 @@ impl Failure {
 
 type Result<T> = std::result::Result<T, Failure>;
 
-/// An admitted ticket component execution. The member slot releases on drop —
+/// An admitted ticket component execution. Both slots release on drop —
 /// including when the handler is aborted — so admission is held exactly until
 /// the handler settles.
 pub(crate) struct TicketComponentPermit {
     _member: Option<UserSlot>,
+    _components: Arc<AtomicUsize>,
+}
+
+impl Drop for TicketComponentPermit {
+    fn drop(&mut self) {
+        self._components.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Reap finished tasks; an abnormal end keeps its durable state for recovery.
@@ -430,6 +443,7 @@ impl TicketRuntime {
             stopping: AtomicBool::new(false),
             tasks: TaskMutex::new(JoinSet::new()),
             component_slots: UserSlots::default(),
+            component_in_flight: Arc::new(AtomicUsize::new(0)),
             last_component_drop_log: TaskMutex::new(None),
         })
     }
@@ -498,8 +512,9 @@ impl TicketRuntime {
     /// are atomic under the task scope, so concurrent dispatches cannot
     /// over-admit; refused work queues no waiter. The permit moves into the
     /// spawned handler and releases when it settles — on success, failure,
-    /// cancellation and shutdown — while the global slot is the task itself,
-    /// reaped by the next admission's prune.
+    /// cancellation and shutdown — while the global slot rides the permit's
+    /// counter, so generic ticket tasks sharing the scope never consume
+    /// component budget.
     pub fn try_spawn_component<Fut>(
         &self,
         user: Option<u64>,
@@ -513,7 +528,7 @@ impl TicketRuntime {
             return false;
         }
         prune_finished(&mut tasks);
-        if tasks.len() >= MAX_TICKET_COMPONENT_IN_FLIGHT {
+        if self.component_in_flight.load(Ordering::Acquire) >= MAX_TICKET_COMPONENT_IN_FLIGHT {
             return false;
         }
         let member = match user {
@@ -523,7 +538,12 @@ impl TicketRuntime {
             },
             None => None,
         };
-        tasks.spawn(spawn(TicketComponentPermit { _member: member }));
+        self.component_in_flight.fetch_add(1, Ordering::AcqRel);
+        let permit = TicketComponentPermit {
+            _member: member,
+            _components: Arc::clone(&self.component_in_flight),
+        };
+        tasks.spawn(spawn(permit));
         true
     }
 
