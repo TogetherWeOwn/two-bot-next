@@ -3,8 +3,6 @@
   "packages": {
     ".": {
       "release-type": "rust",
-      "bump-minor-pre-major": true,
-      "bump-patch-for-minor-pre-major": false,
       "include-component-in-tag": false,
       "extra-files": [
         "fuzz/Cargo.toml",
@@ -71,8 +69,7 @@
           "section": "Style",
           "hidden": true
         }
-      ],
-      "release-as": "1.0.0"
+      ]
     }
   }
 }
