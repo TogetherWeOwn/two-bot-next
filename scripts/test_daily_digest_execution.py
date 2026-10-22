@@ -50,7 +50,9 @@ class DigestExecutionTest(unittest.TestCase):
             "#!" + shutil.which("python3") + "\n"
             "import json, os, sys\n"
             "with open(os.environ['GH_CALLS'], 'a') as f: f.write(json.dumps(sys.argv[1:]) + '\\n')\n"
-            "if sys.argv[1:3] == ['release', 'view']: sys.exit(0 if os.environ.get('RELEASE_EXISTS') == 'true' else 1)\n"
+            "if sys.argv[1:3] == ['release', 'view']:\n"
+            "    print(os.environ.get('RELEASE_VIEW_JSON', '{}'))\n"
+            "    sys.exit(0 if os.environ.get('RELEASE_EXISTS') == 'true' else 1)\n"
             "sys.exit(1 if os.environ.get('FAIL_CREATE') == 'true' else 0)\n"
         )
         gh.chmod(0o755)
@@ -155,6 +157,52 @@ class DigestExecutionTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(outputs["released"], "false")
         self.assertEqual(calls, [])
+
+    def test_next_day_quiet_and_rollback_redispatch_sbom_when_assets_missing(self):
+        full = json.dumps({"assets": [{"name": name} for name in (
+            "rust-workspace.cdx.json", "container-image.cdx.json", "SHA256SUMS",
+            "source-sha.txt", "image-id.txt")]})
+        partial = json.dumps({"assets": [{"name": "rust-workspace.cdx.json"}]})
+        step = WORKFLOW["jobs"]["digest"]["steps"][-1]
+        # Next morning: production still serves the v2026.10.20 target while
+        # the date rolled to 2026-10-21, so the quiet branch runs for a tag
+        # that is not today's. Missing assets redispatch the SBOM chain for
+        # the last digest without cutting a tag or alerting.
+        result, outputs, calls = self.run_digest(
+            PROD_SHA=self.first, RELEASE_EXISTS="true", RELEASE_VIEW_JSON=partial)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs.get("tag_name"), "v2026.10.20")
+        self.assertEqual(outputs.get("released"), "true")
+        self.assertEqual(outputs.get("prod_changed"), "false")
+        self.assertTrue(gate(step["if"], {"steps.digest.outputs.released": outputs.get("released", "")}))
+        self.assertFalse(self.alerts(result, outputs))
+        self.assertIn(["release", "view", "v2026.10.20", "--json", "assets"], calls)
+        self.assertFalse(any(call[:2] == ["release", "create"] for call in calls))
+        # Complete assets still skip green without dispatching.
+        result, outputs, _ = self.run_digest(
+            PROD_SHA=self.first, RELEASE_EXISTS="true", RELEASE_VIEW_JSON=full)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs.get("tag_name"), "")
+        self.assertEqual(outputs.get("released"), "false")
+        # A failed lookup skips green too: never red, never a dispatch.
+        result, outputs, _ = self.run_digest(PROD_SHA=self.first)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs.get("released"), "false")
+        # A dry-run quiet day makes no gh calls at all.
+        result, outputs, calls = self.run_digest(PROD_SHA=self.first, DRY_RUN="true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs.get("released"), "false")
+        self.assertEqual(calls, [])
+        # Rollback serving likewise reconciles the last digest's assets.
+        self.git("tag", "-f", "v2026.10.20", self.sha)
+        result, outputs, calls = self.run_digest(
+            PROD_SHA=self.first, RELEASE_EXISTS="true", RELEASE_VIEW_JSON=partial)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs.get("tag_name"), "v2026.10.20")
+        self.assertEqual(outputs.get("released"), "true")
+        self.assertEqual(outputs.get("prod_changed"), "false")
+        self.assertFalse(self.alerts(result, outputs))
+        self.assertFalse(any(call[:2] == ["release", "create"] for call in calls))
 
     def test_older_repair_and_backdated_fresh_cut_preserve_latest(self):
         self.git("tag", "v2026.10.22", self.sha)

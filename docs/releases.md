@@ -14,8 +14,13 @@ automatic `environment:` rows carry the workflow revision rather than the
 deployed commit) and compares it to the last digest tag's target:
 
 - Production already matches the last digest: quiet day, no tag, green run.
+  When the last digest's release lacks SBOM assets (a lost dispatch), the run
+  redispatches the idempotent SBOM chain for that tag instead of skipping, so
+  a green rerun the next morning restores the inventories no later run would
+  backfill.
 - Production serves an older commit (a rollback): never tagged; the next
-  forward deploy digests.
+  forward deploy digests. A rollback run likewise redispatches SBOM when the
+  last digest's release lacks its assets.
 - Production moved forward and today's tag is missing: cut one tag
   `vYYYY.MM.DD` on the live commit plus its GitHub Release, whose notes come
   from the Conventional Commit subjects (squash-merged PR titles) since the
@@ -94,8 +99,9 @@ mocked `gh` and pins the single `release create` call's target and its
 `--latest` flag. `scripts/test_daily_digest_execution.py` drives a failed
 publication through the workflow alert expression and a stubbed Discord
 poster, verifies quiet/dry-run/cancel suppression, executes SBOM redispatch
-for an existing release, and checks older repairs, backdated cuts and invalid
-calendar inputs. `scripts/test_digest_resolve.py` executes the extracted
+for an existing release and for next-day quiet/rollback runs whose last
+digest lacks its assets (complete assets and lookup failures still skip),
+and checks older repairs, backdated cuts and invalid calendar inputs. `scripts/test_digest_resolve.py` executes the extracted
 `scripts/digest_resolve.py` with offline readyz/Deployment fixtures, including
 automatic rows before recorded rows, failure statuses, malformed bodies, HTTPS
 refusal, 503 revisions and fail-closed behavior. Both run in worker CI.

@@ -200,6 +200,41 @@ function releaseExists(tag) {
 	}
 }
 
+// Release assets release.yml attaches to every digest (release.yml uploads
+// sbom/*.cdx.json, SHA256SUMS, source-sha.txt and image-id.txt; sbom.yml
+// names the two CycloneDX inventories). True when the release exists but
+// lacks any of them. False when the assets are complete, when the release
+// itself is missing (a DIGEST_DATE manual repair owns that), or when the
+// lookup fails: a quiet day must never turn red or spam dispatches on a
+// lookup error.
+const SBOM_ASSETS = new Set([
+	"rust-workspace.cdx.json",
+	"container-image.cdx.json",
+	"SHA256SUMS",
+	"source-sha.txt",
+	"image-id.txt",
+]);
+
+function sbomAssetsMissing(tag) {
+	let raw;
+	try {
+		raw = execFileSync("gh", ["release", "view", tag, "--json", "assets"], {
+			encoding: "utf8",
+		});
+	} catch {
+		return false;
+	}
+	let assets;
+	try {
+		assets = JSON.parse(raw).assets || [];
+	} catch {
+		return false;
+	}
+	const names = new Set(assets.map((a) => a && a.name).filter(Boolean));
+	for (const asset of SBOM_ASSETS) if (!names.has(asset)) return true;
+	return false;
+}
+
 function output(values) {
 	const text = Object.entries(values)
 		.map(([k, v]) => `${k}=${v}\n`)
@@ -239,6 +274,20 @@ function main() {
 		tag_name: "", released: "false", prod_changed: "true",
 		prev_tag: lastDigest || "",
 	});
+	// Quiet and rollback days owe no tag, but may still owe SBOM assets: a
+	// red run after yesterday's cut leaves the release without inventories,
+	// and no later scheduled run backfills it. Redispatch the idempotent
+	// chain for the last digest when its assets are incomplete; dry runs
+	// and lookup failures skip green without dispatching.
+	const reconcileSbom = () => {
+		if (dryRun || !lastDigest || !sbomAssetsMissing(lastDigest)) return false;
+		console.log(`${lastDigest} lacks SBOM assets; redispatching the SBOM chain`);
+		output({
+			tag_name: lastDigest, released: "true", prod_changed: "false",
+			prev_tag: lastDigest,
+		});
+		return true;
+	};
 	const lastTarget = lastDigest ? tagTarget(lastDigest) : null;
 	const prevTag = lastDigest || latestSemverReachable(sha);
 
@@ -319,6 +368,7 @@ function main() {
 	}
 
 	if (lastTarget === sha) {
+		if (reconcileSbom()) return;
 		console.log(`${sha} already matches ${lastDigest}; quiet day, no new tag`);
 		output({
 			tag_name: "",
@@ -332,6 +382,7 @@ function main() {
 		// Production serves an older commit than the last digest (a rollback
 		// or redeploy of a prior build). It is never tagged, mirroring the
 		// retired per-promote rollback guard; the next forward deploy digests.
+		if (reconcileSbom()) return;
 		console.log(
 			`${sha} is older than ${lastDigest}; rollback serving, no new tag`,
 		);
