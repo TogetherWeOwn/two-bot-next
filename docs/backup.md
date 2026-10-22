@@ -282,7 +282,10 @@ journalctl -u two-bot-next-backup -n 30       # what it did
 Every `deploy/*.service` is bounded and loud. These are templates; shipping the
 directives installs nothing and starts no timer (host installation stays with the
 Operator). `scripts/test_deploy_units.py` lints every unit, so a new or edited
-unit that drops a directive fails CI naming the file.
+unit that drops a directive fails CI naming the file. The lint also pins
+`Type=oneshot` (the start bound only applies to oneshot units) and refuses
+`TimeoutSec=` and `SuccessExitStatus=`/`RestartForceExitStatus=` overrides,
+which would silently drop the bound or the failure hook.
 
 | Unit | `TimeoutStartSec` | Why this long |
 |---|---|---|

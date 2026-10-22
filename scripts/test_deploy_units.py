@@ -84,7 +84,7 @@ def timeout_start_s(lines):
     value = values[-1]
     if value == "infinity":
         return 0
-    match = re.fullmatch(r"(\d+)\s*(s|sec|min|m|h)?", value)
+    match = re.fullmatch(r"([0-9]+)\s*(s|sec|min|m|h)?", value)
     if not match:
         return 0
     return int(match[1]) * UNIT_SECONDS[match[2] or "s"]
@@ -154,6 +154,14 @@ def lint(deploy_dir):
         seconds = timeout_start_s(service_lines)
         if not seconds or seconds > MAX_START_S:
             findings.append(f"{unit.name}: TimeoutStartSec must be finite and <= {MAX_START_S}s in [Service]")
+        types = values_for(service_lines, "Type")
+        if not types or types[-1] != "oneshot":
+            findings.append(f"{unit.name}: Type=oneshot is required in [Service] for the start bound to apply")
+        if values_for(service_lines, "TimeoutSec"):
+            findings.append(f"{unit.name}: TimeoutSec= overrides TimeoutStartSec; set the start bound explicitly")
+        for key in ("SuccessExitStatus", "RestartForceExitStatus"):
+            if values_for(service_lines, key):
+                findings.append(f"{unit.name}: {key}= must stay unset so failures reach OnFailure=")
         if unit.name != HANDLER and ON_FAILURE_TARGET not in effective_onfailure(unit_lines):
             findings.append(f"{unit.name}: missing {ON_FAILURE} in [Unit]")
         if unit.name == HANDLER:
@@ -176,6 +184,11 @@ def lint(deploy_dir):
             findings.append(f"{DRILL}: missing the documented max archive age in [Service]")
         else:
             try:
+                # Same grammar the drill's case pattern enforces: ASCII digits,
+                # no leading zero, at most 9 digits (int() alone accepts 007,
+                # +5, 1_000 and Unicode digits, which the drill refuses).
+                if not re.fullmatch(r"[1-9][0-9]{0,8}", age_text):
+                    raise ValueError(age_text)
                 age_value = int(age_text)
             except ValueError:
                 findings.append(f"{DRILL}: max archive age must be a positive whole number of seconds")
@@ -270,7 +283,7 @@ class UnitLintTests(unittest.TestCase):
                 self.assertTrue(findings and all(f.startswith(unit + ":") for f in findings), findings)
 
     def test_infinite_or_huge_timeout_is_refused(self):
-        for value in ["infinity", "0", "7h", "banana"]:
+        for value in ["infinity", "0", "7h", "banana", "٢h"]:
             with self.subTest(value=value):
                 tmp = self.copy_deploy()
                 path = tmp / "two-bot-next-backup.service"
@@ -358,12 +371,37 @@ class UnitLintTests(unittest.TestCase):
         self.assertTrue(
             any(f.startswith("two-bot-next-backup.service:") for f in lint(tmp)), lint(tmp))
 
+    def test_type_oneshot_is_required(self):
+        for replacement in ["", "Type=simple\n"]:
+            with self.subTest(replacement=replacement or "deleted"):
+                tmp = self.copy_deploy()
+                path = tmp / "two-bot-next-backup.service"
+                text = path.read_text()
+                self.assertIn("Type=oneshot\n", text)
+                path.write_text(text.replace("Type=oneshot\n", replacement, 1))
+                self.assertTrue(
+                    any(f.startswith("two-bot-next-backup.service:") for f in lint(tmp)), lint(tmp))
+
+    def test_timeout_shorthand_and_success_masks_are_refused(self):
+        for unit, line in [
+            ("two-bot-next-backup.service", "TimeoutSec=infinity"),
+            (DRILL, "TimeoutSec=infinity"),
+            (DRILL, "SuccessExitStatus=1"),
+            ("two-bot-next-backup.service", "RestartForceExitStatus=1"),
+        ]:
+            with self.subTest(unit=unit, line=line):
+                tmp = self.copy_deploy()
+                path = tmp / unit
+                path.write_text(path.read_text() + line + "\n")
+                self.assertTrue(any(f.startswith(unit + ":") for f in lint(tmp)),
+                                (unit, line, lint(tmp)))
+
     def test_shipped_max_archive_age_is_pinned_and_capped(self):
         unit = (DEPLOY / DRILL).read_text()
         shipped = int(re.search(
             r"^Environment=TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S=(\d+)$", unit, re.M)[1])
         self.assertEqual(shipped, SHIPPED_MAX_ARCHIVE_AGE_S)
-        for value in ["0", "999999999"]:
+        for value in ["0", "999999999", "007", "0172800", "+5", "1_000", "١٧٢٨٠٠"]:
             with self.subTest(value=value):
                 tmp = self.copy_deploy()
                 path = tmp / DRILL
