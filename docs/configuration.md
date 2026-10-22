@@ -158,7 +158,7 @@ gates (`feature_commands.rs`), moderation (`moderation.rs`), onboarding
 (`onboarding.rs`), automod (`automod.rs`), scorecard and classifier
 (`community.rs`). An empty ID list never contains a live ID.
 
-Catalog entries: 134.
+Catalog entries: 135.
 
 | Key | Class | Parsed default | Application | Description |
 | --- | --- | --- | --- | --- |
@@ -192,6 +192,7 @@ Catalog entries: 134.
 | `TWO_ANTI_NUKE_SNAPSHOT_PATH` | env_only | Not specified in Next | environment only | Filesystem snapshot destination; never dashboard-selectable. |
 | `TWO_ANTI_NUKE_TRUSTED_USER_IDS` | env_only | Not specified in Next | environment only | Trusted accounts ignored by anti-nuke; environment-only reach boundary. |
 | `TWO_ANTI_NUKE_WINDOW_SECONDS` | hot | Not specified in Next | stored, applied live by runtime refresh | Aggregation window for anti-nuke heat. |
+| `TWO_ASSISTANT_API_KEY` | env_only | Not rendered (secret) | environment only | Template-assistant bearer credential; required by the config gate, environment-only and never forwarded as a flag. |
 | `TWO_ASSISTANT_ENDPOINT` | env_only | Not specified in Next | environment only | Template-assistant OpenAI-compatible endpoint; environment-only destination boundary. |
 | `TWO_ASSISTANT_MODEL` | env_only | Not specified in Next | environment only | Template-assistant model name; environment-only so a web form cannot redirect it. |
 | `TWO_AUTOMATIONS` | cold | `false` | env at boot; stored unwired | Enable automation administration and custom command publication/routing. |
