@@ -21,6 +21,30 @@ from staging_schema_gate import (
 )
 
 
+STAGING_HOST = "ep-staging-123.us-east-2.aws.neon.tech"
+
+
+def plan_report(**fields):
+    manifest = {
+        "runner_version": 1, "mode": "plan", "migration_target": "staging",
+        "source_sha": "a" * 40, "role": "two_bot_migrator_ro",
+        "target": {"host": STAGING_HOST, "database": "two_bot", "branch_id": ""},
+        "applied_count": 0, "applied_store_count": 0,
+        "pending_before": [], "pending_store_before": [],
+    }
+    manifest.update(fields)
+    return manifest
+
+
+def plan_env():
+    return {
+        staging_schema_gate.PLAN_URL_ENV: f"postgresql://two_bot_migrator_ro:pw@{STAGING_HOST}/two_bot",
+        staging_schema_gate.EXPECTED_HOST_ENV: STAGING_HOST,
+        staging_schema_gate.EXPECTED_DATABASE_ENV: "two_bot",
+        staging_schema_gate.EXPECTED_BRANCH_ENV: "",
+    }
+
+
 class MainTests(unittest.TestCase):
     def test_store_pending_fails_and_clean_manifest_passes(self):
         source_sha = "a" * 40
@@ -28,23 +52,23 @@ class MainTests(unittest.TestCase):
             manifest_out = f"{directory}/manifest.json"
 
             def run_with_store_pending(*_args):
-                return {"pending_before": [], "pending_store_before": [400]}
+                return plan_report(pending_store_before=[400])
 
             result = main(
                 ["--binary", "staging-migrate", "--source-sha", source_sha,
                  "--manifest-out", manifest_out],
-                env={},
+                env=plan_env(),
                 run=run_with_store_pending,
             )
             self.assertEqual(result, 1)
 
             def run_clean(*_args):
-                return {"pending_before": [], "pending_store_before": []}
+                return plan_report()
 
             result = main(
                 ["--binary", "staging-migrate", "--source-sha", source_sha,
                  "--manifest-out", manifest_out],
-                env={},
+                env=plan_env(),
                 run=run_clean,
             )
             self.assertEqual(result, 0)

@@ -4,6 +4,8 @@
 mod creation_receipt_acceptance;
 #[path = "voice_creation_receipt_edge_tests.rs"]
 mod creation_receipt_edges;
+#[path = "voice_global_jitter_adoption_tests.rs"]
+mod global_jitter_adoption;
 
 use super::*;
 use axum::{

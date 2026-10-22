@@ -117,7 +117,13 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
             .required()
             .max_length(MAX_COMMAND_NAME_CHARS as u32)]),
         CommandDefinition::new("command-list", "List this server's custom commands")
-            .permissions(PERM_MANAGE_GUILD),
+            .permissions(PERM_MANAGE_GUILD)
+            .options(vec![CommandOption::new(
+                "page",
+                "Page of the custom-command list (1-based)",
+                CommandOptionType::Integer,
+            )
+            .min_value(1)]),
         CommandDefinition::new("schedule", "Schedule a message, once or recurring")
             .permissions(PERM_MANAGE_GUILD)
             .options(vec![

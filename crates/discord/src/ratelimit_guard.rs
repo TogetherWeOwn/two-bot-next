@@ -568,7 +568,14 @@ impl RateLimitGuard {
         let until = observed_at
             .checked_add(wait)
             .unwrap_or(observed_at + self.config.window);
-        let mut state = self.state.lock().expect("Discord guard state");
+        // Drop-reachable (`ResponseAccounting::drop`) and shared with live
+        // admission: recover silently so a poisoned guard still records the
+        // retry instead of panicking during unwinding. No counter: non-drop
+        // callers must never be miscounted as drop poison.
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Preserve a learned bucket mapping: replacing it with the raw route
         // would discard an existing longer deadline on the named bucket.
         let bucket = state
@@ -745,7 +752,14 @@ impl RateLimitGuard {
 
     fn finish_global(&self, id: u64, timing: Option<f64>, observed_at: Instant) {
         let until = self.global_until(timing, observed_at);
-        let mut state = self.state.lock().expect("Discord guard state");
+        // Drop-reachable (`ResponseAccounting::drop`) and shared with live
+        // settlement: recover silently so a poisoned guard still retires the
+        // entry instead of panicking during unwinding. No counter: non-drop
+        // callers must never be miscounted as drop poison.
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         state
             .pending_global
             .retain(|(pending_id, _)| *pending_id != id);
@@ -1069,6 +1083,10 @@ impl Drop for ResponseAccounting<'_> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "ratelimit_drop_poison_acceptance_tests.rs"]
+mod drop_poison_acceptance_tests;
 
 #[cfg(test)]
 mod tests {

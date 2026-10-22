@@ -113,6 +113,7 @@ async fn refused_worker_does_not_score_post_or_consume_cooldown() {
                 delivery: RaidDelivery::new(executor, GUILD),
                 watch: RaidWatch::default(),
                 joins,
+                shutdown: Arc::new(WorkerShutdown::default()),
             };
             for n in 0..6 {
                 tokio::time::timeout(

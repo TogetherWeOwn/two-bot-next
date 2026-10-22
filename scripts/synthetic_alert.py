@@ -153,7 +153,9 @@ def _decide(env, environment):
     """(event, history_known) for the decide step; see decide_event."""
     current = env.get("PROBE_OUTCOME")
     if current not in ("success", "failure"):
-        return None, True
+        # No sample means no history read: report unknown so the JSON
+        # receipt never claims incident history was verified.
+        return None, False
     try:
         previous = previous_probe_outcomes(env, environment)
     except HistoryError as error:
@@ -177,7 +179,28 @@ def decide_event(env, environment):
     return _decide(env, environment)[0]
 
 
-def write_event(event):
+def write_decision(environment, event, history_known, no_sample):
+    """Bounded machine-readable decision, never a delivery receipt."""
+    run_id = os.environ.get("GITHUB_RUN_ID") or os.environ.get("RUN_ID", "")
+    if not re.fullmatch(r"[1-9][0-9]{0,18}", run_id):
+        run_id = "unknown"
+    # A missing probe sample reads no history, so it is unknown even if a
+    # caller passes history_known true; its next_action stays none because
+    # there is no incident history to inspect, only a missing sample.
+    known = history_known and not no_sample
+    print(json.dumps({
+        "schema_version": 1,
+        "check_id": f"synthetic-user-flow:{environment}",
+        "run_id": run_id,
+        "event": event,
+        "history_known": known,
+        "code": ("no_probe_sample" if no_sample else
+                 "decision_ready" if known else HistoryError.code),
+        "next_action": "none" if (known or no_sample) else HistoryError.next_action,
+    }, separators=(",", ":")))
+
+
+def write_event(event, json_mode=False):
     """Record the decide-step event for the post-step gate."""
     value = event or ""
     path = os.environ.get("GITHUB_OUTPUT")
@@ -186,7 +209,7 @@ def write_event(event):
         with open(path, "a", encoding="utf-8") as handle:
             handle.write(line)
     else:
-        print(line, end="")
+        print(line, end="", file=sys.stderr if json_mode else sys.stdout)
     print(f"synthetic_alert: decided event={value or 'none'}", file=sys.stderr)
 
 
@@ -279,6 +302,8 @@ def parse_args(argv):
                         help="only post ALERT_EVENT without reading workflow history")
     parser.add_argument("--dry-run", action="store_true",
                         help="print the delivery plan without posting anything")
+    parser.add_argument("--json", action="store_true",
+                        help="emit a bounded JSON decision (requires --decide-only)")
     return parser.parse_args(argv)
 
 
@@ -287,15 +312,25 @@ def main(argv=None):
     if args.decide_only and args.post_only:
         print("synthetic_alert: --decide-only and --post-only are exclusive", file=sys.stderr)
         return 2
+    if args.json and (not args.decide_only or args.dry_run):
+        print("synthetic_alert: --json requires --decide-only without --dry-run", file=sys.stderr)
+        return 2
     if args.dry_run:
         return dry_run_plan(args.env, args.evidence)
     if args.decide_only:
         # Decide step: compute the transition, never post, never need webhook.
-        # A missing/skipped probe is not a sample and writes an empty event.
+        # A missing/skipped probe is not a sample: write the empty event that
+        # keeps the post step skipped, then fail the step so a zero-sample
+        # run never reads as a healthy pass.
         event, history_known = _decide(os.environ, args.env)
-        if event is None and os.environ.get("PROBE_OUTCOME") not in ("success", "failure"):
-            print("synthetic_alert: no probe sample; no alert transition", file=sys.stderr)
-        write_event(event)
+        no_sample = os.environ.get("PROBE_OUTCOME") not in ("success", "failure")
+        if event is None and no_sample:
+            print("synthetic_alert: no probe sample; failing closed", file=sys.stderr)
+        write_event(event, json_mode=args.json)
+        if args.json:
+            write_decision(args.env, event, history_known, no_sample)
+        if no_sample:
+            return 1
         if not history_known and os.environ.get("PROBE_OUTCOME") == "success":
             # Record "history unknown" explicitly in this run's step
             # conclusions: a failed decide step keeps later reconstruction
@@ -315,10 +350,11 @@ def main(argv=None):
         return post_event(os.environ, args.env, args.evidence, event)
     current = os.environ.get("PROBE_OUTCOME")
     # A missing/skipped probe (for example, an unset optional target binding)
-    # is not a sample and must not create an alert or recovery transition.
+    # is not a sample and must not create an alert or recovery transition;
+    # fail closed so a zero-sample run never reads as a healthy pass.
     if current not in ("success", "failure"):
-        print("synthetic_alert: no probe sample; no alert transition", file=sys.stderr)
-        return 0
+        print("synthetic_alert: no probe sample; failing closed", file=sys.stderr)
+        return 1
     event = decide_event(os.environ, args.env)
     if event is None:
         print("synthetic_alert: no alert transition", file=sys.stderr)

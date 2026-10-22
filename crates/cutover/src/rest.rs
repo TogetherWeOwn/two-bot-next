@@ -698,8 +698,37 @@ impl<T> ListPage<T> {
     }
 }
 
+/// Deterministic 5xx backoff base in millis: `500 * 2^attempt`, saturating
+/// the shift at 10 (512 s cap).
+fn backoff_base_ms(attempt: u32) -> u64 {
+    500u64.saturating_mul(1u64 << attempt.min(10))
+}
+
 fn backoff_duration(attempt: u32) -> Duration {
-    Duration::from_millis(500u64.saturating_mul(1 << attempt.min(10)))
+    Duration::from_millis(backoff_base_ms(attempt))
+}
+
+/// Deterministic 64-bit mixer (splitmix64) for seeded jitter without a
+/// global RNG: the same `(seed, attempt)` pair always yields the same draw,
+/// on every platform, with no clock and no `rand` dependency.
+fn jitter_draw(seed: u64, attempt: u32) -> u64 {
+    let mixed = seed.wrapping_add(u64::from(attempt).wrapping_mul(0x9E3779B97F4A7C15));
+    let mut z = mixed.wrapping_add(0x9E3779B97F4A7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+/// 5xx backoff for `attempt` (0-based) with full jitter: a deterministic
+/// draw in `[1 ms, backoff_base_ms(attempt)]`, so concurrent scans retrying
+/// the same outage spread instead of re-hammering in lockstep. The
+/// deterministic base stays as the bound (the 512 s saturation cap and the
+/// four-retry budgets hold by construction); the same `seed` replays the
+/// same sample, so tests pin ranges without a clock or RNG.
+#[must_use]
+pub fn backoff_duration_jittered(attempt: u32, seed: u64) -> Duration {
+    let base_ms = backoff_base_ms(attempt);
+    Duration::from_millis(1 + (jitter_draw(seed, attempt) % base_ms))
 }
 
 /// ISO-8601 → epoch millis for scan bounds.
@@ -1522,5 +1551,50 @@ mod tests {
             "unexpected error: {err:?}"
         );
         mock.shutdown();
+    }
+
+    #[test]
+    fn jittered_backoff_stays_within_base_and_replays_per_seed() {
+        for attempt in 0..5u32 {
+            let base = backoff_duration(attempt);
+            for seed in 0..8u64 {
+                let sample = backoff_duration_jittered(attempt, seed);
+                assert!(
+                    sample >= Duration::from_millis(1) && sample <= base,
+                    "attempt {attempt} seed {seed}: {sample:?} outside [1 ms, {base:?}]"
+                );
+            }
+        }
+        assert_eq!(
+            backoff_duration_jittered(3, 42),
+            backoff_duration_jittered(3, 42)
+        );
+    }
+
+    #[test]
+    fn jittered_backoff_spreads_across_seeds() {
+        use std::collections::HashSet;
+        // Attempt 3 has a 4 s base: concurrent scans must not retry in phase.
+        let distinct: HashSet<Duration> = (0..32u64)
+            .map(|seed| backoff_duration_jittered(3, seed))
+            .collect();
+        assert!(
+            distinct.len() >= 8,
+            "only {} distinct delays across 32 seeds",
+            distinct.len()
+        );
+    }
+
+    #[test]
+    fn jittered_backoff_never_exceeds_the_saturated_cap() {
+        let cap = Duration::from_secs(512);
+        assert_eq!(backoff_duration(u32::MAX), cap);
+        for seed in [0u64, 1, 42] {
+            let sample = backoff_duration_jittered(u32::MAX, seed);
+            assert!(
+                sample >= Duration::from_millis(1) && sample <= cap,
+                "seed {seed}: {sample:?} outside [1 ms, {cap:?}]"
+            );
+        }
     }
 }

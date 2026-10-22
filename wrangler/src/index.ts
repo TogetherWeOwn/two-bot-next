@@ -541,6 +541,10 @@ function isBotProbeResponse(response: Response): boolean {
 const FAILURE_TOKEN = /^[a-z0-9_]{1,32}$/;
 const SQLSTATE_TOKEN = /^(none|[0-9A-Z]{5})$/;
 const BUILD_TOKEN = /^[A-Za-z0-9._-]{1,64}$/;
+// Deploy IDs are `YYYY.MM.DD.N+sha7` (scripts/deploy_id.py): the `+` needs
+// its own token, since BUILD_TOKEN excludes it. Shape-only here; the deploy
+// gates own canonical validation, this only gates log echo.
+const DEPLOY_ID_TOKEN = /^\d{4}\.\d{2}\.\d{2}\.\d{1,6}\+[0-9a-f]{7}$/;
 const MAX_PROBE_BODY_BYTES = 64 * 1024;
 
 /** Bound awaits even when the SDK/response stream does not observe abort. */
@@ -607,6 +611,7 @@ export interface ProbeDetail {
   failure: { phase: string; class: string; failedStep?: string; errorCode?: string } | null;
   buildRevision?: string;
   buildId?: string;
+  deployId?: string;
   /**
    * The /readyz gateway component: true is `ready` (Connected), false is
    * `starting` (Armed) or `down` (Unconfigured/Draining). Absent unless the
@@ -647,6 +652,7 @@ function probeDetail(body: string): ProbeDetail {
       gateway_failure?: unknown;
       build_revision?: unknown;
       build_id?: unknown;
+      deploy_id?: unknown;
     } | null;
     let failure: ProbeDetail["failure"] = null;
     const field = report?.gateway_failure;
@@ -671,6 +677,9 @@ function probeDetail(body: string): ProbeDetail {
     }
     if (typeof report?.build_id === "string" && BUILD_TOKEN.test(report.build_id)) {
       detail.buildId = report.build_id;
+    }
+    if (typeof report?.deploy_id === "string" && DEPLOY_ID_TOKEN.test(report.deploy_id)) {
+      detail.deployId = report.deploy_id;
     }
     return detail;
   } catch {
@@ -880,8 +889,8 @@ export class TwoBotContainer extends Container<Env> {
       || (url.pathname === OPS_AUDIT_PATH && !mcpAuditRead)) {
       return this.opsControl(request);
     }
-    if (!mcpAuditRead && url.pathname !== "/health" && url.pathname !== "/readyz" && url.pathname !== OPS_METRICS_PATH
-      && !OPS_JSON_PATHS.includes(url.pathname)) {
+    if (!mcpAuditRead && url.pathname !== "/health" && url.pathname !== "/readyz" && url.pathname !== "/version"
+      && url.pathname !== OPS_METRICS_PATH && !OPS_JSON_PATHS.includes(url.pathname)) {
       return new Response("not found", { status: 404, headers: withSecurityHeaders() });
     }
     try {
@@ -1336,14 +1345,15 @@ export class TwoBotContainer extends Container<Env> {
             headers: withSecurityHeaders({ "cache-control": "no-store" }),
           });
         }
-        const rows = await ops.listAudit();
-        return Response.json({ deploymentId: id, rows }, {
+        const history = await ops.readAudit(id);
+        return Response.json(history, {
           headers: withSecurityHeaders({ "cache-control": "no-store" }),
         });
       });
     } catch (error) {
       if (error instanceof OwnershipRefused) return refused(error);
-      return opsRefused(error);
+      // GETs are reads; PUT/POST are mutations with reconcile-then-retry refusals.
+      return opsRefused(error, request.method === "GET");
     }
   }
 
@@ -1483,6 +1493,7 @@ export class TwoBotContainer extends Container<Env> {
                   failed_step: failure.failedStep ?? "unknown",
                   error_code: failure.errorCode ?? "none",
                   build_revision: probe.buildRevision ?? "unknown",
+                  deploy_id: probe.deployId ?? "unknown",
                   release: releaseTag(this.lastRelease),
                   worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
                   log_url: LOG_QUERY_URL,
@@ -1965,7 +1976,7 @@ export default {
       } catch (error) { return refused(error); }
     }
 
-    if (url.pathname === "/health" || url.pathname === "/readyz") {
+    if (url.pathname === "/health" || url.pathname === "/readyz" || url.pathname === "/version") {
       // Public probes carry no credentials, so only GET/HEAD are meaningful.
       // Anything else cannot be a scraper or load-balancer check: refuse it
       // before the Container is touched.

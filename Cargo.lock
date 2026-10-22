@@ -2357,6 +2357,7 @@ dependencies = [
  "twilight-model",
  "two-bot-core",
  "two-bot-cutover",
+ "two-bot-store",
  "two-bot-testsupport",
 ]
 

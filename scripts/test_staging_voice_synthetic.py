@@ -19,6 +19,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import staging_voice_synthetic as synth  # noqa: E402
+import test_staging_voice_synthetic_owned_room_acceptance as owned
 
 ME, CREATOR, ROOM, OTHER, CAT = "900", synth.STAGING_CREATOR_ID, "5001", "5002", "4000"
 OWNER_ALLOW = str(synth.OWNER_BITS | (1 << 21))
@@ -1209,6 +1210,80 @@ class HelloIntervalTest(unittest.TestCase):
         with self.assertRaises(synth.GatewayShapeError) as ctx:
             self.session_with_interval(600001)
         self.assertEqual(str(ctx.exception), self.HELLO_MSG)
+
+
+class OwnedRoomRegressionTest(unittest.TestCase):
+    """Additional regressions; the paired protected acceptance stays immutable."""
+
+    def run_case(self, batches, *, creator_name=owned.ORIGINAL_NAME,
+                 patch_plan=None):
+        rooms = {owned.OWN: owned.room_state(owned.OWN),
+                 owned.REJOIN: owned.room_state(owned.REJOIN, position=18)}
+        before = [owned.creator_state(owned.TEMP_NAME)]
+        fake = owned.make_fake(
+            rooms=rooms, before=before, after=before + list(rooms.values()),
+            creator_name=creator_name, patch_plan=patch_plan)
+        session = owned.FakeSession(batches)
+        result = owned.run_with_fakes([], session, fake)
+        self.assertTrue(session.closed)
+        return result, fake
+
+    def test_cleanup_2xx_with_unchanged_limit_requires_manual_restore(self):
+        batches = [
+            [owned.GUILD_CREATE],
+            [owned.channel_create(owned.OWN), owned.voice_update(owned.OWN)],
+            [], [], [],
+        ]
+        (code, _, _, evidence), fake = self.run_case(
+            batches, creator_name=owned.RESIDUE_NAME, patch_plan=[
+                ("apply_then_raise", ConnectionError("lost probe response")),
+                ("status", 204),
+            ])
+        self.assertEqual(code, 1)
+        self.assertEqual(evidence["room_id"], owned.OWN)
+        self.assertEqual(owned.verdicts(evidence)["limit"], "FAIL")
+        text = owned.detail(evidence, "limit")
+        for snippet in (owned.LIMIT_UNCERTAIN, owned.OWN,
+                        str(owned.INITIAL_LIMIT), "restore", "manually"):
+            self.assertIn(snippet, text)
+        self.assertNotIn("re-run", text)
+        self.assertEqual(fake.patches, owned.room_round_trip())
+        self.assertEqual(fake.rooms[owned.OWN]["user_limit"], owned.PROBED_LIMIT)
+        self.assertLessEqual(fake.gets_to(owned.OWN), 8)
+
+    def test_rejoin_create_after_move_is_collected_during_delete_wait(self):
+        batches = [
+            [owned.GUILD_CREATE],
+            [owned.channel_create(owned.OWN), owned.voice_update(owned.OWN)],
+            [owned.status_update(owned.OWN)],
+            [owned.voice_update(owned.REJOIN)],
+            [owned.channel_create(owned.REJOIN), owned.channel_delete(owned.OWN),
+             owned.channel_delete(owned.REJOIN)],
+        ]
+        (code, _, _, evidence), fake = self.run_case(batches)
+        self.assertEqual(code, 0)
+        self.assertEqual(evidence["room_id"], owned.OWN)
+        # The JSON evidence exposes the correlated subject in the detail.
+        self.assertIn(owned.REJOIN, owned.detail(evidence, "rejoin"))
+        self.assertEqual(owned.verdicts(evidence)["rejoin"], "PASS")
+        self.assertEqual(owned.verdicts(evidence)["delete"], "PASS")
+        self.assertEqual(fake.patches, [owned.rename_cycle()[0]]
+                         + owned.room_round_trip() + [owned.rename_cycle()[1]])
+
+    def test_wrong_category_create_refuses_before_any_patch(self):
+        batches = [
+            [owned.GUILD_CREATE],
+            [owned.channel_create(owned.OWN, parent_id="other"),
+             owned.voice_update(owned.OWN)],
+            [], [], [],
+        ]
+        (code, _, _, evidence), fake = self.run_case(
+            batches, creator_name=owned.RESIDUE_NAME)
+        self.assertEqual(code, 1)
+        self.assertIsNone(evidence["room_id"])
+        self.assertEqual(owned.verdicts(evidence)["create"], "FAIL")
+        self.assertEqual(fake.patches, [])
+        self.assertEqual(fake.gets_to(owned.OWN), 0)
 
 
 if __name__ == "__main__":

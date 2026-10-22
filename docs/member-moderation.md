@@ -131,9 +131,12 @@ the idempotency key, so redelivery of that same interaction still reaches durabl
 replay instead of consuming a new cooldown or moderating twice.
 
 Operator reconciliation ships as `two-bot reconcile-member`
-(`crates/bot/src/member_cli.rs`): `--list` surfaces prepared ban intents,
-running dispatches and quarantined imports via the read-only
-`surface_uncertain` store seam; `--confirm-ban`, `--reject-ban`,
+(`crates/bot/src/member_cli.rs`): `--list [--limit <n>]` surfaces prepared
+ban intents, running dispatches and quarantined imports via the read-only
+bounded `surface_uncertain_limited` store seam (25 rows by default, at most
+100; a capped listing ends with a `showing <shown> of <total> rows`
+truncation receipt, naming the ceiling past 100 rows since no `--limit`
+rerun converges there); `--confirm-ban`, `--reject-ban`,
 `--resolve-unban` and `--accept-historical` resolve one exact attempt with
 authoritative exact-intent evidence. Mutations are dry-run by default
 (`--execute` writes), staging-guild only, and claim tokens never print.
