@@ -765,9 +765,10 @@ fn assert_sqlstate(error: &sqlx::Error, code: &str) {
 
 /// Insert the full spec §3 `giveaways` row. Every spec column is bound except
 /// the lease/announce trio, which are nullable by design (`announced_at` NULL
-/// means announce is still owed). Timestamps ride as plain ISO strings so the
-/// insert is robust to timestamptz-or-TEXT storage; `ends_at` itself is pinned
-/// to timestamptz by the columns test.
+/// means announce is still owed). Timestamps bind as ISO strings with explicit
+/// `::timestamptz` casts (sqlx `&str` binds are typed TEXT, which Postgres
+/// will not implicitly cast); `ends_at` itself is pinned to timestamptz by the
+/// columns test.
 async fn insert_giveaway(pool: &sqlx::PgPool, guild_id: &str, giveaway_id: &str) {
     if is_json_column(pool, "giveaways", "requirements_json").await {
         sqlx::query(
@@ -776,7 +777,7 @@ async fn insert_giveaway(pool: &sqlx::PgPool, guild_id: &str, giveaway_id: &str)
                 ends_at, status, requirements_json, max_entries, draw_nonce,
                 created_at, updated_at)
              VALUES ($1, $2, 'Two game keys', $3, $4, $5, 2,
-                     $6, 'open', $7::jsonb, 500, $8, $9, $9)",
+                     $6::timestamptz, 'open', $7::jsonb, 500, $8, $9::timestamptz, $9::timestamptz)",
         )
         .bind(guild_id)
         .bind(giveaway_id)
@@ -797,7 +798,7 @@ async fn insert_giveaway(pool: &sqlx::PgPool, guild_id: &str, giveaway_id: &str)
                 ends_at, status, requirements_json, max_entries, draw_nonce,
                 created_at, updated_at)
              VALUES ($1, $2, 'Two game keys', $3, $4, $5, 2,
-                     $6, 'open', $7, 500, $8, $9, $9)",
+                     $6::timestamptz, 'open', $7, 500, $8, $9::timestamptz, $9::timestamptz)",
         )
         .bind(guild_id)
         .bind(giveaway_id)
@@ -817,7 +818,7 @@ async fn insert_giveaway(pool: &sqlx::PgPool, guild_id: &str, giveaway_id: &str)
 async fn insert_entry(pool: &sqlx::PgPool, guild_id: &str, giveaway_id: &str, user_id: &str) {
     sqlx::query(
         "INSERT INTO giveaway_entries (guild_id, giveaway_id, user_id, weight, entered_at)
-         VALUES ($1, $2, $3, 1, $4)",
+         VALUES ($1, $2, $3, 1, $4::timestamptz)",
     )
     .bind(guild_id)
     .bind(giveaway_id)
@@ -844,7 +845,7 @@ async fn insert_draw(
             "INSERT INTO giveaway_draws
                (guild_id, giveaway_id, draw_no, drawn_at, eligible_count,
                 eligible_hash, seed, winner_ids, reroll_kind)
-             VALUES ($1, $2, $3, $4, 10, $5, $6, $7::jsonb, $8)",
+             VALUES ($1, $2, $3, $4::timestamptz, 10, $5, $6, $7::jsonb, $8)",
         )
         .bind(guild_id)
         .bind(giveaway_id)
@@ -862,7 +863,7 @@ async fn insert_draw(
             "INSERT INTO giveaway_draws
                (guild_id, giveaway_id, draw_no, drawn_at, eligible_count,
                 eligible_hash, seed, winner_ids, reroll_kind)
-             VALUES ($1, $2, $3, $4, 10, $5, $6, $7, $8)",
+             VALUES ($1, $2, $3, $4::timestamptz, 10, $5, $6, $7, $8)",
         )
         .bind(guild_id)
         .bind(giveaway_id)
@@ -951,7 +952,7 @@ async fn giveaway_entry_pk_collapses_double_entry() -> Result<(), sqlx::Error> {
     // the PK refuses it, so the store's upsert has exactly one row to find.
     let duplicate = sqlx::query(
         "INSERT INTO giveaway_entries (guild_id, giveaway_id, user_id, weight, entered_at)
-         VALUES ($1, $2, $3, 1, $4)",
+         VALUES ($1, $2, $3, 1, $4::timestamptz)",
     )
     .bind(GUILD)
     .bind(GIVEAWAY)
@@ -1017,7 +1018,7 @@ async fn giveaway_draw_pk_forbids_double_draw_of_same_round() -> Result<(), sqlx
         "INSERT INTO giveaway_draws
            (guild_id, giveaway_id, draw_no, drawn_at, eligible_count,
             eligible_hash, seed, winner_ids, reroll_kind)
-         VALUES ($1, $2, 0, $3, 10, $4, $5, {winners_cast}, NULL)"
+         VALUES ($1, $2, 0, $3::timestamptz, 10, $4, $5, {winners_cast}, NULL)"
     )))
     .bind(GUILD)
     .bind(GIVEAWAY)
@@ -1117,7 +1118,7 @@ async fn giveaway_claim_lease_columns_support_draw_ticker_claim() -> Result<(), 
     );
     // Claim, then release: the lease round-trips through the two columns.
     sqlx::query(
-        "UPDATE giveaways SET claim_token = $3, claimed_at = $4 WHERE guild_id = $1 AND id = $2",
+        "UPDATE giveaways SET claim_token = $3, claimed_at = $4::timestamptz WHERE guild_id = $1 AND id = $2",
     )
     .bind(GUILD)
     .bind(GIVEAWAY)
