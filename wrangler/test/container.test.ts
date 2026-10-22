@@ -2580,7 +2580,7 @@ const PRIOR_METRICS: MetricsAlertState = {
   receiverRefusals: { membership: 8 }, receiverRefusalsSeen: true,
   receiverRefusalStreaks: { membership: 2 },
   dispatchDrops: { reactions: 5 }, dispatchDropStreaks: { reactions: 2 },
-  auditHaltStreak: 2,
+  auditHaltStreak: 2, restPendingStuckStreak: 2,
 };
 
 async function backgroundMetricsHarness(t: TestContext) {
@@ -2597,13 +2597,14 @@ async function backgroundMetricsHarness(t: TestContext) {
     ...h, previous, puts,
     setMetricsResponse: (next: typeof response) => { response = next; },
     assertInterrupted: () => {
-      // A failed scrape resets dispatch-drop, breaker and audit-halt evidence,
-      // preserving firing keys and unrelated baselines without a recovery.
+      // A failed scrape resets dispatch-drop, breaker, pending-global and
+      // audit-halt evidence, preserving firing keys and unrelated baselines
+      // without a recovery.
       const writes = puts.mock.calls.filter((call) => call.arguments[0] === METRICS_KEY);
       assert.equal(writes.length, 1, "one scrape-interrupt write");
-      assert.deepEqual(writes[0]!.arguments[1], { ...previous, dispatchDrops: {}, dispatchDropStreaks: {}, breakerOpenStreak: 0, auditHaltStreak: 0 });
+      assert.deepEqual(writes[0]!.arguments[1], { ...previous, dispatchDrops: {}, dispatchDropStreaks: {}, breakerOpenStreak: 0, restPendingStuckStreak: 0, auditHaltStreak: 0 });
       assert.deepEqual(previous, PRIOR_METRICS, "no in-place baseline/streak/firing mutation");
-      assert.deepEqual(h.values.get(METRICS_KEY), { ...PRIOR_METRICS, dispatchDrops: {}, dispatchDropStreaks: {}, breakerOpenStreak: 0, auditHaltStreak: 0 });
+      assert.deepEqual(h.values.get(METRICS_KEY), { ...PRIOR_METRICS, dispatchDrops: {}, dispatchDropStreaks: {}, breakerOpenStreak: 0, restPendingStuckStreak: 0, auditHaltStreak: 0 });
       assert.equal(h.posts.length, 0, "no false RESOLVED notification");
       assert.equal(h.events().length, 0, "no false transition logs");
       assert.deepEqual(h.logs.filter((line) => line !== "two-bot container started"), [SCRAPE_FAILURE]);

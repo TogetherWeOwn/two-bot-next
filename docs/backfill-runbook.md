@@ -70,7 +70,7 @@ client below.
   request; it is not the bootstrap error (`crates/core/src/send_admission/postgres.rs:110-139`).
 - 5xx backs off at 500 × 2^attempt ms and gives up as retry-exhausted
   (`rest.rs:270`, `rest.rs:306`, `rest.rs:478`;
-  `backoff_duration` at `rest.rs:701-703`, base `BACKOFF_BASE_MS` in
+  `backoff_duration` at `rest.rs:707-709`, base `BACKOFF_BASE_MS` in
   `action_outcomes.rs:184`). Total budget is 5 tries per call
   (`MAX_HTTP_TRIES` in `action_outcomes.rs:188`).
 - 403/404 on a page read as `Unreadable`, not an abort (`rest.rs:266`):
@@ -268,7 +268,7 @@ reporting are unchanged.
 
 A re-run report ends with a `scan completion` line plus one `INCOMPLETE`
 line per interrupted channel (`ScanReport::render`, `cli.rs:38-55`).
-The vocabulary is fixed (`ScanCompletion`, `rest.rs:722-752`):
+The vocabulary is fixed (`ScanCompletion`, `rest.rs:751-783`):
 
 | Token | Meaning | Complete? |
 |---|---|---|
@@ -303,7 +303,7 @@ Burst triage:
   concluding the intent is off. This is not proof of an empty guild or a
   complete roster.
 - Archived-thread discovery has its own budget
-  (`DEFAULT_ARCHIVED_THREAD_PAGES = 10`, `rest.rs:769`); early stops are
+  (`DEFAULT_ARCHIVED_THREAD_PAGES = 10`, `rest.rs:798`); early stops are
   reported per forum (`backfill_messages.rs:319-325`), not silently
   complete.
 - Route-level anchors: progress-route 503 means the database is

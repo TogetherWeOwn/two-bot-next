@@ -1,4 +1,4 @@
-//! The v11 backup envelope (also reads v3 through v10): manifest / rows / end marker, gzipped NDJSON.
+//! The v11 backup envelope (also reads v3/v4/v5/v6/v7/v8/v9/v10): manifest / rows / end marker, gzipped NDJSON.
 //!
 //! Port of the file half of legacy `src/store/dump.ts`. The writer side lives
 //! in [`super::dump`]; everything here touches no database, so every refusal
@@ -116,6 +116,12 @@ pub const DUMP_TABLES: &[&str] = &[
     // restore and let a stale in-flight fetch resurrect rows); see
     // [`V10_ADDED_TABLES`]. No foreign keys, so order beside the mirror is free.
     "scheduled_events_claim",
+    // Scheduled-event mirror delete tombstones (0452/0453, v11): one row per
+    // removed id, suppressing equal-stamp stale replays. Archived so a
+    // restore stays fail-closed (an excluded tombstone set would let a stale
+    // in-flight fetch resurrect rows); see [`V11_ADDED_TABLES`]. No foreign
+    // keys, so order beside the mirror is free.
+    "scheduled_events_tombstone",
     "counter_snapshots",
     "member_exclusions",
     "presence_probe",
@@ -186,7 +192,7 @@ pub const DUMP_TABLES: &[&str] = &[
     "retention_guild_purge_queue",
     "retention_deletion_requests",
     "event_store",
-    // V11 starboard history and configuration (0452/0453), no foreign keys.
+    // V11 starboard history and configuration (0454/0455), no foreign keys.
     "starboard_config",
     "starboard_starrers",
     "starboard_posts",
@@ -250,10 +256,22 @@ pub const V9_ADDED_TABLES: &[&str] =
 /// contain the guard so a restored mirror keeps its stale-fetch fence.
 pub const V10_ADDED_TABLES: &[&str] = &["scheduled_events_claim"];
 
-/// Starboard foundation, first covered by v11. Earlier archives predate the
-/// feature and may omit its three tables; restore clears destination rows.
-pub const V11_ADDED_TABLES: &[&str] =
-    &["starboard_config", "starboard_starrers", "starboard_posts"];
+/// Tables first covered by v11: the scheduled-event mirror delete tombstones
+/// (migrations 0452/0453) and the starboard foundation (migrations
+/// 0454/0455). Older archives may omit the tombstones and the three starboard
+/// tables; restore clears the destination rows, as for every versioned
+/// addition. New archives must contain the tombstones so a restored mirror
+/// keeps its equal-stamp resurrection fence, and the starboard tables so
+/// routine restores retain board state. v10 is a readable legacy shape:
+/// claim-only archives written by the merged v10 writer stay readable and
+/// clear the tombstones and the starboard tables, which no v10 writer
+/// produced.
+pub const V11_ADDED_TABLES: &[&str] = &[
+    "scheduled_events_tombstone",
+    "starboard_config",
+    "starboard_starrers",
+    "starboard_posts",
+];
 
 /// Covered tables not created by the current cutover migration set, if any.
 /// Keep legacy data when such tables exist, but do not require nonexistent
@@ -279,10 +297,10 @@ pub const EXCLUDED_TABLES: &[&str] = &[
     "gateway_onboarding_jobs",
     // Durable cutover rollback journal and per-table watermarks (store chain
     // 0406). The journal is append-only cutover evidence: the PgFunnelStore
-    // funnel append (not yet the production gateway batch writer, which needs
-    // its own slice) journals each events insert inside the primary
-    // transaction under a savepoint best-effort via journal::record_in, and
-    // rows stay re-capturable during the watch window.
+    // funnel append and the production gateway batch writer journal each
+    // events insert inside the primary transaction under a savepoint
+    // best-effort via journal::record_in, and rows stay re-capturable
+    // during the watch window.
     // Never replay pre-restore cutover cursors into a recovered process: a
     // restored watermark could mark post-backup writes as already journaled
     // and silently break rollback coverage.
@@ -330,7 +348,7 @@ pub fn is_destination_owned(table: &str, column: &str) -> bool {
         .any(|(owned_table, owned_column)| *owned_table == table && *owned_column == column)
 }
 
-/// Write complete v11 coverage; also read frozen v3 through v10 inventories.
+/// Write complete v11 coverage; the reader also accepts frozen v3/v4/v5/v6/v7/v8/v9/v10 coverage.
 pub const DUMP_VERSION: u32 = 11;
 
 /// A table name in the dump, validated against [`DUMP_TABLES`].
@@ -553,6 +571,24 @@ pub enum DumpError {
 #[must_use]
 pub fn is_dump_table(name: &str) -> bool {
     DUMP_TABLES.contains(&name)
+}
+
+/// Tombstone high-water marks compare as TEXT, so restore must preserve the
+/// exact fixed-width millisecond UTC form, not merely a parseable instant.
+#[must_use]
+pub fn is_canonical_tombstone_timestamp(value: Option<&Value>) -> bool {
+    let Some(text) = value
+        .and_then(Value::as_str)
+        .filter(|text| text.len() == 24)
+    else {
+        return false;
+    };
+    let Ok(instant) =
+        time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
+    else {
+        return false;
+    };
+    crate::funnel::format_iso_millis((instant.unix_timestamp_nanos() / 1_000_000) as i64) == text
 }
 
 fn refuse(message: impl Into<String>) -> DumpError {
@@ -952,6 +988,13 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                         "{table} row on line {line_no} is missing a manifest column"
                     )));
                 }
+                if table == "scheduled_events_tombstone"
+                    && !is_canonical_tombstone_timestamp(data.get("deleted_at"))
+                {
+                    return Err(refuse(
+                        "scheduled_events_tombstone row requires canonical millisecond UTC deleted_at",
+                    ));
+                }
                 // Frozen v3 has native driver-decoded cells and no type metadata.
                 // This port's text-output encoding must remain strings/nulls.
                 if !info.column_types.is_empty() {
@@ -1145,8 +1188,11 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
             .ok_or_else(|| refuse(format!("manifest table {name} has an invalid row count")))?;
         let _ = count;
     }
-    // Each historical version waives only tables introduced later. Keep the
-    // frozen v3 prefix's original indices when filtering the v11 additions.
+    // Historical inventories are pinned by fixtures. Each old version waives
+    // only tables first covered by a later version. New v11 archives require
+    // the full inventory, including both guild counters (0441/0442/0446/0447),
+    // the epoch-claim guard (0450/0451), the delete tombstones (0452/0453)
+    // and the starboard tables (0454/0455).
     let version = obj.get("version").and_then(Value::as_u64);
     let missing: Vec<&str> = DUMP_TABLES
         .iter()
@@ -1162,6 +1208,7 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
                     && !V8_ADDED_TABLES.contains(name)
                     && !V9_ADDED_TABLES.contains(name)
                     && !V10_ADDED_TABLES.contains(name)
+                    && !V11_ADDED_TABLES.contains(name)
                     && !OPTIONAL_LEGACY_TABLES.contains(name)
             }
             Some(5) => {
@@ -1170,6 +1217,7 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
                     && !V8_ADDED_TABLES.contains(name)
                     && !V9_ADDED_TABLES.contains(name)
                     && !V10_ADDED_TABLES.contains(name)
+                    && !V11_ADDED_TABLES.contains(name)
                     && !OPTIONAL_LEGACY_TABLES.contains(name)
             }
             Some(6) => {
@@ -1177,20 +1225,28 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
                     && !V8_ADDED_TABLES.contains(name)
                     && !V9_ADDED_TABLES.contains(name)
                     && !V10_ADDED_TABLES.contains(name)
+                    && !V11_ADDED_TABLES.contains(name)
                     && !OPTIONAL_LEGACY_TABLES.contains(name)
             }
             Some(7) => {
                 !V8_ADDED_TABLES.contains(name)
                     && !V9_ADDED_TABLES.contains(name)
                     && !V10_ADDED_TABLES.contains(name)
+                    && !V11_ADDED_TABLES.contains(name)
                     && !OPTIONAL_LEGACY_TABLES.contains(name)
             }
             Some(8) => {
                 !V9_ADDED_TABLES.contains(name)
                     && !V10_ADDED_TABLES.contains(name)
+                    && !V11_ADDED_TABLES.contains(name)
                     && !OPTIONAL_LEGACY_TABLES.contains(name)
             }
-            Some(9) => !V10_ADDED_TABLES.contains(name) && !OPTIONAL_LEGACY_TABLES.contains(name),
+            Some(9) => {
+                !V10_ADDED_TABLES.contains(name)
+                    && !V11_ADDED_TABLES.contains(name)
+                    && !OPTIONAL_LEGACY_TABLES.contains(name)
+            }
+            Some(10) => !V11_ADDED_TABLES.contains(name) && !OPTIONAL_LEGACY_TABLES.contains(name),
             _ => !OPTIONAL_LEGACY_TABLES.contains(name),
         })
         .map(|(_, name)| name)
@@ -1940,9 +1996,10 @@ mod tests {
             .iter()
             .map(|t| t.name.as_str())
             .collect();
-        // Literal starboard names, not V11_ADDED_TABLES: the frozen v4 archive
-        // predates the v11 tables, and this reproduces the pre-change inventory
-        // even if the version waiver is accidentally removed.
+        // The frozen v4 archive predates every v5+ table: each versioned
+        // addition filters through its const, and the literal
+        // `missing_tables` assert below pins the pre-change inventory even if
+        // a version waiver is accidentally removed.
         let expected: Vec<&str> = DUMP_TABLES
             .iter()
             .copied()
@@ -1953,9 +2010,7 @@ mod tests {
                     && !V8_ADDED_TABLES.contains(name)
                     && !V9_ADDED_TABLES.contains(name)
                     && !V10_ADDED_TABLES.contains(name)
-                    && *name != "starboard_config"
-                    && *name != "starboard_starrers"
-                    && *name != "starboard_posts"
+                    && !V11_ADDED_TABLES.contains(name)
             })
             .collect();
         assert_eq!(names, expected);
@@ -1971,6 +2026,7 @@ mod tests {
                 "assistant_monthly_builds",
                 "member_season_xp",
                 "scheduled_events_claim",
+                "scheduled_events_tombstone",
                 "stream_live_claims",
                 "voice_create_reservations",
                 "retention_guild_purge_queue",
@@ -2128,7 +2184,7 @@ mod tests {
         // A v6 recovery point written before the seasonal XP projection (0100)
         // declares every covered table except member_season_xp and stays
         // readable; promoting it to v7 without the table is refused. This is
-        // the frozen-manifest guard for the v7 bump (now pinned at v10):
+        // the frozen-manifest guard for the v7 bump (now pinned at v11):
         // building the old manifest from today's inventory (as the v5 tests
         // do) would silently include the new table and miss the refusal.
         let mut v6 = manifest(without(
@@ -2398,15 +2454,18 @@ mod tests {
     }
 
     #[test]
-    fn v10_archives_read_without_starboard_but_v11_requires_it() {
+    fn v10_archives_read_without_v11_tables_but_v11_requires_them() {
         // Literal names, not V11_ADDED_TABLES: this reproduces the pre-change
-        // inventory even if the version waiver is accidentally removed. The
-        // v11 tables are starboard_config, starboard_starrers and
-        // starboard_posts, appended after event_store in that order.
+        // inventory even if the version waiver is accidentally removed. This
+        // is the frozen claim-only v10 shape written by the merged v10 writer:
+        // the epoch-claim guard is present; the delete tombstones and the
+        // three starboard tables (appended after event_store in that order)
+        // are absent.
         let tables = complete_tables(&BTreeMap::new())
             .into_iter()
             .filter(|table| {
-                table["name"] != "starboard_config"
+                table["name"] != "scheduled_events_tombstone"
+                    && table["name"] != "starboard_config"
                     && table["name"] != "starboard_starrers"
                     && table["name"] != "starboard_posts"
             })
@@ -2418,11 +2477,16 @@ mod tests {
                 old.clone(),
                 serde_json::json!({"kind":"end","rows":0}),
             ]))
-            .expect("old archives without the v11 starboard tables stay readable");
+            .expect("old archives without the v11 tables stay readable");
             assert_eq!(contents.manifest.version, version);
             assert_eq!(
                 contents.manifest.missing_tables(),
-                ["starboard_config", "starboard_starrers", "starboard_posts"]
+                [
+                    "scheduled_events_tombstone",
+                    "starboard_config",
+                    "starboard_starrers",
+                    "starboard_posts"
+                ]
             );
             let mut gap = old.clone();
             gap["tables"]
@@ -2434,14 +2498,19 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 11, "new dumps require the starboard tables");
+        assert_eq!(DUMP_VERSION, 11, "new dumps require the v11 tables");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
         .expect("complete v11 archive inspects");
-        for name in ["starboard_config", "starboard_starrers", "starboard_posts"] {
+        for name in [
+            "scheduled_events_tombstone",
+            "starboard_config",
+            "starboard_starrers",
+            "starboard_posts",
+        ] {
             let mut gap = current.clone();
             gap["tables"]
                 .as_array_mut()

@@ -218,6 +218,11 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     // winning fetch rewrites epoch inside the swap transaction, so its
     // maximum is the row's last write.
     TableSpec { table: "scheduled_events_claim", measure: TableMeasure::Columns(&["epoch"]) },
+    // Delete tombstones for the scheduled-event mirror (0452/0453): every
+    // delete writes deleted_at and every re-delete refreshes it forward, so
+    // its maximum is the row's last write (purges and cap trims only remove
+    // rows, like any other deletion).
+    TableSpec { table: "scheduled_events_tombstone", measure: TableMeasure::Columns(&["deleted_at"]) },
     TableSpec { table: "scheduled_messages", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "self_role_audit", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec {

@@ -1,11 +1,11 @@
 {
   "version": 1,
   "migrations": {
-    "crates/store/migrations/0452_starboard.sql": {
+    "crates/store/migrations/0454_starboard.sql": {
       "sha256": "ef1013d4b13d1fbdcbfbfc5eeee9dda23bde54e58d6f0472c2d8f32272e0f7fc",
       "justification": "Add inert starboard configuration, distinct starrers and unique post records to the store chain."
     },
-    "crates/cutover/migrations/0453_starboard.sql": {
+    "crates/cutover/migrations/0455_starboard.sql": {
       "sha256": "ef1013d4b13d1fbdcbfbfc5eeee9dda23bde54e58d6f0472c2d8f32272e0f7fc",
       "justification": "Mirror the starboard foundation in the deployed cutover migration chain."
     },
@@ -460,6 +460,14 @@
     "crates/store/migrations/0451_scheduled_events_claim.sql": {
       "sha256": "7a76512da8e7033e41a655955db9a7e243e55d92bf2a747312f2809399b927b2",
       "justification": "Store-chain copy of the scheduled_events_claim epoch gate (cutover 0450): one new table, IF NOT EXISTS, no writes to the existing mirror. Numbered 0451 because cutover owns 0450; global migration numbers remain unique across both chains."
+    },
+    "crates/cutover/migrations/0452_scheduled_events_tombstone.sql": {
+      "sha256": "2be34c33d7a002668ed9f51e41172f208ac59b2b9d713763bba9aa3ba8e06adb",
+      "justification": "Delete tombstones for the scheduled-event mirror: new table scheduled_events_tombstone(guild_id, event_id, deleted_at TEXT; PK(guild_id, event_id)); the swap records one row per DELETE-removed id so equal-stamp replays cannot resurrect removed rows. Additive, IF NOT EXISTS, no covering index (guild PK prefix serves the bounded per-guild scans); numbered 0452 as the next free global migration; rollback drops the table."
+    },
+    "crates/store/migrations/0453_scheduled_events_tombstone.sql": {
+      "sha256": "21775bde6ded22b7b0c8e025365b70ecab9bb1961a98b7d34eb26ab713dd6a1e",
+      "justification": "Store-chain copy of the scheduled_events_tombstone delete layer (cutover 0452): one new table, IF NOT EXISTS, no writes to the existing mirror. Numbered 0453 because cutover owns 0452; global migration numbers remain unique across both chains."
     }
   }
 }
