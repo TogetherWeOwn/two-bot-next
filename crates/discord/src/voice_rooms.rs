@@ -433,9 +433,13 @@ impl InFlightRest {
 /// process-global gauge, which is last-writer-wins and flakes when another
 /// test's begin/drop lands between the publish and the read.
 fn oldest_age_secs(slots: &Arc<Mutex<InFlightRest>>) -> u64 {
+    // Silent recovery: the `InFlightGuard` drop body owns the poison
+    // counter emission, and this only observes a poisoned lock through
+    // that drop path (`begin` locks before publishing, so it never
+    // reaches here on a poisoned lock).
     slots
         .lock()
-        .expect("in-flight lock")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .live
         .values()
         .map(|started| started.elapsed().as_secs())
@@ -458,7 +462,9 @@ struct InFlightGuard {
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         if let Some(slots) = self.slots.take() {
-            slots.lock().expect("in-flight lock").live.remove(&self.id);
+            two_bot_core::metrics::recover_drop_poison(slots.lock(), "in_flight_guard")
+                .live
+                .remove(&self.id);
             publish_rest_age(&slots);
         }
     }
@@ -698,6 +704,31 @@ impl RoomHttp {
         .await
         .map_err(|_| RoomHttpError::UnknownOutcome)??;
         Ok(())
+    }
+
+    /// Read the original callback message without retaining the interaction
+    /// token. One bounded GET, no bot authentication or callback retry.
+    pub async fn interaction_message(
+        &self,
+        application: Id<ApplicationMarker>,
+        token: &str,
+    ) -> Result<MessageRef, RoomHttpError> {
+        let request = self
+            .http
+            .interaction(application)
+            .response(token)
+            .try_into_request()
+            .map_err(classify_http_error)?;
+        let body = self.send_request(request, || true, false).await?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|_| RoomHttpError::InvalidRequest)?;
+        let channel_id = value
+            .get("channel_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|id| id.parse::<u64>().ok())
+            .filter(|id| *id != 0)
+            .ok_or(RoomHttpError::InvalidRequest)?;
+        parse_posted_message(channel_id, &body)
     }
 
     /// Complete the deferred response, never a second initial response.
@@ -1809,3 +1840,7 @@ mod tests {
         publish_rest_age(&slots);
     }
 }
+
+#[cfg(test)]
+#[path = "voice_rooms_poison_acceptance.rs"]
+mod in_flight_poison_acceptance;

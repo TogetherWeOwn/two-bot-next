@@ -14,8 +14,9 @@ a required value or an implemented consumer. Secret defaults are never rendered.
 - `env_only`: never dashboard-stored. Unknown names and `TWO_INTERNAL_*` fail closed.
 - `cold` / `hot`: legacy-catalog storage classes, not application promises.
 The Container registers a `guild_settings` poll job
-(`crates/bot/src/website_jobs.rs:207`) publishing a `SettingsCache`
-snapshot every 15 s through `settings_jobs::live`
+(`crates/bot/src/website_jobs.rs:207`) that polls every 15 s and publishes a
+`SettingsCache` snapshot only when the revision or row count changes
+(`crates/bot/src/settings_jobs.rs:146-160`), exposed through `settings_jobs::live`
 (`crates/bot/src/settings_jobs.rs:53`). Every consumer reads store-first:
 a stored row wins and an absent row falls back to the boot value, except
 the invite responder, which falls back to the live vanity code; a malformed
@@ -30,7 +31,8 @@ legacy `HOT_WIRED` are labeled “reload-report hot” (the `RefreshReport::hot`
 partition in `settings.rs`); every other storable key reports cold.
 
 Live snapshot consumers at `1643438` (canonical table; eight `live()` call
-sites across five runtimes, plus voice through the gateway closure):
+sites total: seven across the five non-voice rows below, plus the voice
+gateway closure):
 
 | Runtime | Call sites | Reads | When |
 | --- | --- | --- | --- |

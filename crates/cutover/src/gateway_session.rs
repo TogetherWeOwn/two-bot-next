@@ -400,15 +400,55 @@ impl GatewaySessionStore {
             {
                 continue;
             }
-            let inserted = sqlx::query(
+            let inserted: Option<(i64,)> = sqlx::query_as(
                 "INSERT INTO events (event_type, member_id, guild_id, occurred_at, source, metadata, idempotency_key)
                  VALUES ($1, $2, $3, $4::timestamptz, $5, $6, $7)
-                 ON CONFLICT (idempotency_key) DO NOTHING",
+                 ON CONFLICT (idempotency_key) DO NOTHING RETURNING id",
             ).bind(&write.event_type).bind(&write.member_id).bind(&write.guild_id)
                 .bind(&write.occurred_at).bind(&write.source).bind(&write.metadata)
-                .bind(idempotency_key(&event)).execute(&mut *tx).await?;
-            if inserted.rows_affected() == 1 {
+                .bind(idempotency_key(&event)).fetch_optional(&mut *tx).await?;
+            // Conflict losers inserted no row, so they journal nothing.
+            if let Some((event_row_id,)) = inserted {
                 project_event(&mut tx, &write).await?;
+                // Rollback-journal writer: each committed batch row leaves one
+                // `events` insert entry naming the inserted row, journaled
+                // inside the primary dispatch transaction under a savepoint so
+                // the row and its evidence commit atomically — no crash window
+                // between a primary commit and a second journal transaction
+                // can leave a committed row unjournaled. Evidence-only and
+                // best-effort: only journal statement errors are isolated by
+                // rolling back the savepoint; they never fail or alter the
+                // primary write.
+                let entry = two_bot_store::journal::JournalEntry {
+                    table_name: "events".to_owned(),
+                    row_identity: event_row_id.to_string(),
+                    op: two_bot_store::journal::JournalOp::Insert,
+                    pre_image: None,
+                };
+                sqlx::query("SAVEPOINT gateway_journal")
+                    .execute(&mut *tx)
+                    .await?;
+                match two_bot_store::journal::record_in(&mut tx, &entry).await {
+                    Ok(_) => {
+                        sqlx::query("RELEASE SAVEPOINT gateway_journal")
+                            .execute(&mut *tx)
+                            .await?;
+                    }
+                    Err(journal_error) => {
+                        sqlx::query("ROLLBACK TO SAVEPOINT gateway_journal")
+                            .execute(&mut *tx)
+                            .await?;
+                        sqlx::query("RELEASE SAVEPOINT gateway_journal")
+                            .execute(&mut *tx)
+                            .await?;
+                        tracing::warn!(
+                            table = "events",
+                            row_identity = %entry.row_identity,
+                            error = %journal_error,
+                            "rollback_journal record failed; primary gateway batch write kept",
+                        );
+                    }
+                }
             }
         }
         for touch in batch.activity {

@@ -306,6 +306,14 @@ impl RawResponse {
     /// Call only for a definite effect/no-effect, after validating any required
     /// mutation receipt. A storage fault must not authorize effect replay.
     pub(crate) async fn complete(&mut self) {
+        if let Err(error) = self.complete_confirmed().await {
+            tracing::warn!(%error, "Discord send admission completion failed; lane held");
+        }
+    }
+
+    /// A durable delivery caller must observe completion failure, not turn an
+    /// accepted-but-unconfirmed exchange into clean success or permission to retry.
+    async fn complete_confirmed(&mut self) -> Result<(), DiscordError> {
         if let Some(permit) = self.completion.take() {
             let cooldown = (self.status == 429).then(|| {
                 two_bot_core::send_admission::cooldown_from_delays(
@@ -315,10 +323,11 @@ impl RawResponse {
                     self.body_retry_after_secs(),
                 )
             });
-            if let Err(error) = permit.complete(cooldown).await {
-                tracing::warn!(%error, "Discord send admission completion failed; lane held");
-            }
+            permit.complete(cooldown).await.map_err(|_| {
+                DiscordError::Unavailable("send admission completion unconfirmed".into())
+            })?;
         }
+        Ok(())
     }
 
     /// Body `retry_after` (seconds) when present and finite — wins over the
@@ -2664,6 +2673,33 @@ impl ActionExecutor {
         message_id: &str,
         reason: &str,
     ) -> Result<(), DiscordError> {
+        let mut response = self
+            .delete_message_raw(channel_id, message_id, reason)
+            .await?;
+        response.complete().await;
+        Ok(())
+    }
+
+    /// Cleanup may authorize another delivery only when both the DELETE and
+    /// its admission completion are confirmed. Missing ids/refusals are errors.
+    pub async fn delete_message_confirmed(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        reason: &str,
+    ) -> Result<(), DiscordError> {
+        let mut response = self
+            .delete_message_raw(channel_id, message_id, reason)
+            .await?;
+        response.complete_confirmed().await
+    }
+
+    async fn delete_message_raw(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        reason: &str,
+    ) -> Result<RawResponse, DiscordError> {
         let channel: Id<ChannelMarker> = snowflake(channel_id)?;
         let message: Id<MessageMarker> = snowflake(message_id)?;
         let reason = audit_reason(reason)?;
@@ -2674,8 +2710,7 @@ impl ActionExecutor {
                 .reason(&reason),
         )?;
         // request_of maps pre-send build failures to Rejected (finding 7).
-        self.call_once(req, &[200, 204]).await?;
-        Ok(())
+        self.call_once_raw(req, &[200, 204]).await
     }
 
     /// Post a message with mention suppression (legacy
@@ -2733,6 +2768,19 @@ impl ActionExecutor {
         .await
     }
 
+    /// Single-attempt durable delivery: a validated message id AND confirmed
+    /// admission completion are required. Any lost completion is uncertain.
+    /// Keep the occurrence nonce a string, including all-decimal/leading zeros.
+    pub async fn post_message_confirmed(
+        &self,
+        channel_id: &str,
+        content: &str,
+        nonce: &str,
+    ) -> Result<String, DiscordError> {
+        self.send_message_components(channel_id, content, Some(nonce.into()), None, false, true)
+            .await
+    }
+
     /// Post a rendered feature message through the shared request factory.
     pub async fn post_message_with_components(
         &self,
@@ -2746,6 +2794,7 @@ impl ActionExecutor {
             content,
             Some(nonce.into()),
             Some(components),
+            false,
             false,
         )
         .await
@@ -2900,7 +2949,7 @@ impl ActionExecutor {
         nonce: Option<serde_json::Value>,
         after_authorization: bool,
     ) -> Result<String, DiscordError> {
-        self.send_message_components(channel_id, content, nonce, None, after_authorization)
+        self.send_message_components(channel_id, content, nonce, None, after_authorization, false)
             .await
     }
 
@@ -2911,6 +2960,7 @@ impl ActionExecutor {
         nonce: Option<serde_json::Value>,
         components: Option<&[serde_json::Value]>,
         after_authorization: bool,
+        confirm_completion: bool,
     ) -> Result<String, DiscordError> {
         // Legacy ceiling is UTF-16 units (two-bot counts JS string length),
         // not scalar values: 1001 astral chars are 2002 units and must be
@@ -2965,7 +3015,11 @@ impl ActionExecutor {
             // before the durable lane reopens; an unreadable receipt is
             // uncertain, never an empty successful id.
             let id = mutation_receipt_id(&res.body)?;
-            res.complete().await;
+            if confirm_completion {
+                res.complete_confirmed().await?;
+            } else {
+                res.complete().await;
+            }
             id
         } else {
             // Feature posts with selects take the paced lane; the plain
@@ -2976,7 +3030,11 @@ impl ActionExecutor {
                 self.call_once_raw(req, &[200, 201]).await?
             };
             let id = mutation_receipt_id(&res.body)?;
-            res.complete().await;
+            if confirm_completion {
+                res.complete_confirmed().await?;
+            } else {
+                res.complete().await;
+            }
             id
         };
         Ok(message_id)

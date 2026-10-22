@@ -15,6 +15,8 @@ mod cold_authority;
 mod creation_receipt_acceptance;
 #[path = "voice_delete_guard_tests.rs"]
 mod delete_guards;
+#[path = "voice_disconnect_poison_acceptance_tests.rs"]
+mod drop_poison_acceptance_tests;
 #[path = "voice_empty_grace_override_tests.rs"]
 mod empty_grace_override;
 #[path = "event_voice_category_acceptance_tests.rs"]
@@ -33,6 +35,8 @@ mod join_grant_witness_acceptance;
 mod join_still_waiting_acceptance;
 #[path = "voice_kick_tests.rs"]
 mod kick;
+#[path = "voice_kick_ballot_delivery_tests.rs"]
+mod kick_ballot_delivery;
 #[path = "voice_rooms_limit_tests.rs"]
 mod limit_command;
 #[path = "voice_name_tests.rs"]
@@ -51,6 +55,8 @@ mod sink;
 mod snapshot_fence_acceptance;
 #[path = "../../core/tests/support/tracing_capture.rs"]
 mod tracing_capture;
+#[path = "voice_votekick_ballot_truth_acceptance_tests.rs"]
+mod votekick_ballot_truth_acceptance;
 
 const GUILD: u64 = 100;
 const CREATOR: u64 = 200;
@@ -822,6 +828,8 @@ struct Http {
     /// errors (one per attempt) the next sends fail with.
     prompts: Mutex<Vec<SentPrompt>>,
     prompt_errors: Mutex<VecDeque<RoomHttpError>>,
+    component_edits: Mutex<Vec<SentPrompt>>,
+    component_edit_errors: Mutex<VecDeque<RoomHttpError>>,
     next_message: Mutex<u64>,
     created_attributes: Mutex<Vec<RoomChannelAttributes>>,
     created_names: Mutex<Vec<String>>,
@@ -885,6 +893,8 @@ impl Http {
             rate_limited_notices: Mutex::new(Vec::new()),
             prompts: Mutex::new(Vec::new()),
             prompt_errors: Mutex::new(VecDeque::new()),
+            component_edits: Mutex::new(Vec::new()),
+            component_edit_errors: Mutex::new(VecDeque::new()),
             next_message: Mutex::new(9_000),
             created_attributes: Mutex::new(Vec::new()),
             created_names: Mutex::new(Vec::new()),
@@ -1337,7 +1347,18 @@ impl RoomWrites for Http {
             content,
             components.len()
         ));
-        Ok(())
+        self.component_edits.lock().unwrap().push(SentPrompt {
+            channel: message.channel_id,
+            content: content.to_owned(),
+            mention: None,
+            components: components.to_vec(),
+            message,
+        });
+        self.component_edit_errors
+            .lock()
+            .unwrap()
+            .pop_front()
+            .map_or(Ok(()), Err)
     }
     async fn send_notice(
         &self,

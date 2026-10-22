@@ -14,10 +14,11 @@
 //! - RED: Discord accepted the post, recording the run fails, the orphan
 //!   cleanup runs, and then the retry update also fails — the unrecorded
 //!   outcome (`persistence_failed_cleaned` for a cleaned orphan,
-//!   `persistence_failed_retry_idempotent` for a surviving one, reason
+//!   `persistence_failed_uncertain` for a surviving one, reason
 //!   `database`) is still audited exactly once.
-//! - RED: a retryable Discord failure whose retry update fails audits the
-//!   branch outcome (`retry_scheduled`) with the bounded Discord reason.
+//! - RED: an ambiguous Discord failure (503) whose retry update fails audits
+//!   `delivery_uncertain` with `discord_unavailable`. Proven no-effect
+//!   retries (429, guard) keep `retry_scheduled` with their bounded reason.
 //! - RED: a permanent Discord refusal whose completion update fails
 //!   audits the branch outcome (`post_failed`) with `discord_rejected`.
 //! - RED: when the audit write itself also fails, the attempted audit is
@@ -164,6 +165,10 @@ fn assert_still_claimed_unrecorded(unrecorded: &ScheduledMessageRow, post: &Valu
         post["nonce"].as_str(),
         "the occurrence nonce is unchanged"
     );
+    assert!(
+        unrecorded.delivery_uncertain,
+        "the pre-wire fence is retained when the recording write fails"
+    );
     assert_eq!(unrecorded.last_run_at, None, "no run was recorded");
     assert_eq!(unrecorded.last_message_id, None);
 }
@@ -293,21 +298,18 @@ async fn unrecorded_post_surviving_orphan_and_failed_retry_audits_persistence_fa
     );
     assert_eq!(
         audits(pool, "unrecorded-surviving-retry-fails").await,
-        [audit(
-            "persistence_failed_retry_idempotent",
-            Some("database")
-        )],
+        [audit("persistence_failed_uncertain", Some("database"))],
         "the surviving unrecorded post is audited even when the retry update fails"
     );
     mock.shutdown().await;
     fixture.close().await.unwrap();
 }
 
-// RED on current main: a retryable Discord failure whose retry update
-// fails returns the database error before the retry outcome can be
+// RED on current main: an ambiguous Discord failure (503) whose retry update
+// fails returns the database error before the uncertain outcome can be
 // audited, losing the bounded Discord reason with it.
 #[tokio::test]
-async fn retryable_failure_and_failed_retry_audits_retry_outcome_with_discord_reason() {
+async fn uncertain_503_and_failed_retry_audits_delivery_uncertain_with_discord_reason() {
     let Some(fixture) = fixture().await else {
         return;
     };
@@ -332,8 +334,8 @@ async fn retryable_failure_and_failed_retry_audits_retry_outcome_with_discord_re
     assert_still_claimed_unrecorded(&row(pool, "retryable-retry-fails").await, &sent[0]);
     assert_eq!(
         audits(pool, "retryable-retry-fails").await,
-        [audit("retry_scheduled", Some("discord_unavailable"))],
-        "the retryable failure is audited with its discord reason even when the retry update fails"
+        [audit("delivery_uncertain", Some("discord_unavailable"))],
+        "the ambiguous failure is audited uncertain with its discord reason even when the retry update fails"
     );
     mock.shutdown().await;
     fixture.close().await.unwrap();

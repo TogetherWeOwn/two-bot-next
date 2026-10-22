@@ -100,6 +100,11 @@ export const FORWARDED_FLAGS = [
   // category id. Non-secret runtime flag; the bot fails closed (inactive,
   // TBD `no_category`) until a usable category exists.
   "TWO_EVENT_VOICE_CATEGORY_ID",
+  // Staging-only music voice-node spike (docs/music-voice-node-spike.md):
+  // attaches the Lavalink voice-update forwarder. Staging vars only, same
+  // treatment as TWO_VOICE; the node password travels as its own Container
+  // secret, never through this flag allowlist.
+  "TWO_MUSIC",
   // Template assistant (V12): non-secret endpoint URL + model name; the
   // endpoint credential (if any) travels as its own Container secret, never
   // through this flag allowlist.

@@ -60,11 +60,7 @@ _ALERT_INPUT_REASON = (
 # Every emitted family absent from the catalog, with why it stays out.
 # A name here that gains a catalog row fails until its exemption is removed.
 EXEMPT_SERIES = {
-    "two_bot_rest_guard_invalid_requests_total": _GUARD_REASON,
-    "two_bot_rest_guard_rejected_requests_total": _GUARD_REASON,
     "two_bot_rest_guard_invalid_requests_in_window": _GUARD_REASON,
-    "two_bot_rest_guard_token_invalid": _GUARD_REASON,
-    "two_bot_rest_guard_pending_global_responses": _GUARD_REASON,
     "two_bot_rest_guard_global_paused": _GUARD_REASON,
     "two_bot_rest_guard_global_pause_remaining_seconds": _GUARD_REASON,
     "two_bot_db_pool_configured": _POOL_REASON,
