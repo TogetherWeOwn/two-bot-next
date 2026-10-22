@@ -44,12 +44,15 @@ JOB_INVENTORY = {
                   # like the Rust lanes.
                   "nextest"},
     "deploy-production.yml": {"guard", "schema-gate", "roles-gate", "soak", "recheck",
-                              "production", "release"},
+                              "production"},
     "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "soak-hold", "voice-synthetic",
                            "pinned-history-guard"},
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
-    "release.yml": {"tag", "sbom-target", "release-sbom", "attach-sbom", "verdict"},
+    "release.yml": {"sbom-target", "release-sbom", "attach-sbom", "verdict"},
+    # Daily digest release (docs/releases.md): one vYYYY.MM.DD tag per day,
+    # plus the missing-digest alert; pinned shape below.
+    "daily-digest.yml": {"digest", "alert"},
     "staging-migrate.yml": {"plan", "claim", "apply"},
     "production-migrate.yml": {"plan", "claim", "apply"},
     # TOG-14008: manual staging-only Worker rollback drill; pinned shape below.
@@ -725,13 +728,12 @@ def staging_pinned_sha_errors(workflows):
     a different commit. Build identity and provenance then follow the
     validated SHA through the deploy job's DEPLOY_SHA export, pinned by
     staging_deploy_identity_errors. Every other workflow must not mention the
-    switch at all, except deploy-production and release, which carry their
-    own reviewed sha inputs (the production guard's verified SHA, the
-    published release tag) pinned by their own checks.
+    switch at all, except deploy-production, which carries its own reviewed
+    sha input (the production guard's verified SHA) pinned by its own checks.
     """
     errors = []
     for name, workflow in workflows.items():
-        if name in ("deploy-staging.yml", "deploy-production.yml", "release.yml"):
+        if name in ("deploy-staging.yml", "deploy-production.yml"):
             continue
         if "inputs.sha" in str(workflow):
             errors.append(f"{name}: pinned-sha marker inputs.sha outside the deploy workflows")
@@ -2121,17 +2123,17 @@ def gradual_promote_proof_errors(workflow):
 def release_errors(workflow):
     """The release chain fails closed on an empty dispatch, never as a quiet green.
 
-    release.yml is dispatch-only with the sha, dry_run and release_tag
-    inputs, and every job but the verdict is input-guarded: an all-default
-    dispatch skips tag, sbom-target, release-sbom and attach-sbom and would
-    read green with nothing published. One verdict job runs after all four
-    (no input guard, always() so failures still judge): it fails the run
-    with an error naming the skipped jobs and why when every input sits at
-    its default, fails on any failed or cancelled dependency, and passes
-    otherwise, so the sha, dry_run and release_tag dispatches behave exactly
-    as before (their designed skips stay green). Every real job carries an
-    explicit timeout: tag 10 minutes, the SBOM plumbing (sbom-target,
-    attach-sbom) and the verdict 5.
+    release.yml is dispatch-only with the dry_run and release_tag inputs
+    (per-promote sha tagging is retired), and every job but the verdict is
+    input-guarded: an all-default dispatch skips sbom-target, release-sbom
+    and attach-sbom and would read green with nothing published. One verdict
+    job runs after all three (no input guard, always() so failures still
+    judge): it fails the run with an error naming the skipped jobs and why
+    when every input sits at its default, fails on any failed or cancelled
+    dependency, and passes otherwise, so the dry_run and release_tag
+    dispatches behave exactly as before (their designed skips stay green).
+    Every real job carries an explicit timeout: the SBOM plumbing
+    (sbom-target, attach-sbom) and the verdict 5 minutes.
     """
     name = "release.yml"
     errors = []
@@ -2143,14 +2145,11 @@ def release_errors(workflow):
     else:
         dispatch = on.get("workflow_dispatch") or {}
         inputs = (dispatch.get("inputs") or {}) if isinstance(dispatch, dict) else {}
-        if set(dispatch) != {"inputs"} or set(inputs) != {"sha", "dry_run", "release_tag"}:
-            errors.append(f"{name}: workflow_dispatch must carry exactly sha, dry_run and release_tag")
+        if set(dispatch) != {"inputs"} or set(inputs) != {"dry_run", "release_tag"}:
+            errors.append(f"{name}: workflow_dispatch must carry exactly dry_run and release_tag")
         else:
-            sha = inputs.get("sha") or {}
             dry_run = inputs.get("dry_run") or {}
             release_tag = inputs.get("release_tag") or {}
-            if sha.get("type") != "string" or sha.get("default") != "":
-                errors.append(f"{name}: sha must be a string defaulting to empty")
             if dry_run.get("type") != "boolean" or dry_run.get("default") not in (False, "false"):
                 errors.append(f"{name}: dry_run must be an opt-in boolean defaulting to false")
             if release_tag.get("type") != "string" or release_tag.get("default") != "":
@@ -2158,17 +2157,17 @@ def release_errors(workflow):
     if workflow.get("permissions") != {}:
         errors.append(f"{name}: top-level permissions must stay empty")
     jobs = workflow.get("jobs") or {}
-    if set(jobs) != {"tag", "sbom-target", "release-sbom", "attach-sbom", "verdict"}:
-        errors.append(f"{name}: jobs must be exactly tag, sbom-target, release-sbom, attach-sbom and verdict")
+    if set(jobs) != {"sbom-target", "release-sbom", "attach-sbom", "verdict"}:
+        errors.append(f"{name}: jobs must be exactly sbom-target, release-sbom, attach-sbom and verdict")
         return errors
-    for job_id, expected_timeout in (("tag", "10"), ("sbom-target", "5"), ("attach-sbom", "5")):
+    for job_id, expected_timeout in (("sbom-target", "5"), ("attach-sbom", "5")):
         if jobs[job_id].get("timeout-minutes") != expected_timeout:
             errors.append(f"{name}:{job_id}: timeout must stay {expected_timeout} minutes")
     verdict = jobs["verdict"]
     if verdict.get("name") != "release verdict (fail closed on empty dispatch)":
         errors.append(f"{name}:verdict: consumer job identity changed")
-    if verdict.get("needs") != ["tag", "sbom-target", "release-sbom", "attach-sbom"]:
-        errors.append(f"{name}:verdict: must run after tag, sbom-target, release-sbom and attach-sbom")
+    if verdict.get("needs") != ["sbom-target", "release-sbom", "attach-sbom"]:
+        errors.append(f"{name}:verdict: must run after sbom-target, release-sbom and attach-sbom")
     if verdict.get("if") != "${{ always() }}":
         errors.append(f"{name}:verdict: must run with if: always() so failures still judge")
     if verdict.get("permissions") != {"contents": "read"}:
@@ -2188,17 +2187,15 @@ def release_errors(workflow):
         errors.append(f"{name}:verdict: must run exactly one unconditional verdict step")
         return errors
     step = steps[0]
-    if step.get("env") != {"DISPATCH_SHA": "${{ inputs.sha }}",
-                           "DRY_RUN": "${{ inputs.dry_run }}",
+    if step.get("env") != {"DRY_RUN": "${{ inputs.dry_run }}",
                            "RELEASE_TAG": "${{ inputs.release_tag }}",
-                           "TAG_RESULT": "${{ needs.tag.result }}",
                            "SBOM_TARGET_RESULT": "${{ needs.sbom-target.result }}",
                            "RELEASE_SBOM_RESULT": "${{ needs.release-sbom.result }}",
                            "ATTACH_SBOM_RESULT": "${{ needs.attach-sbom.result }}"}:
         errors.append(f"{name}:verdict: step must bind exactly the dispatch inputs and job results "
                       "via the environment")
     run = str(step.get("run") or "")
-    for needle in ("DISPATCH_SHA", "DRY_RUN", "RELEASE_TAG", "skipped",
+    for needle in ("DRY_RUN", "RELEASE_TAG", "skipped",
                    "failure", "cancelled", "::error::"):
         if needle not in run:
             errors.append(f"{name}:verdict: missing pin {needle}")
@@ -2206,6 +2203,93 @@ def release_errors(workflow):
         errors.append(f"{name}:verdict: must fail exactly once, on an empty dispatch or a failed dependency")
     if "uses" in step or "${{" in run:
         errors.append(f"{name}:verdict: step must use the environment only, never an inline expression")
+    return errors
+
+
+def daily_digest_errors(workflow):
+    """daily-digest cuts one vYYYY.MM.DD tag per day and alerts when production moved but no tag was made.
+
+    Schedule-only plus manual dispatch: one daily cron at an off-minute (never
+    :00 or :30, never bunched with the deploy-production backstop) and a
+    dry_run-only dispatch. The digest job resolves the live production SHA
+    (/readyz, falling back to the newest recorded successful production
+    Deployment: rows whose description is a deploy ID),
+    cuts the tag via daily-digest.cjs, and dispatches the SBOM chain for the
+    fresh or existing release. The alert job consumes owed-digest outputs even
+    on a failed publication through the synthetic-alerts environment, reusing
+    the existing Discord line.
+    """
+    name = "daily-digest.yml"
+    errors = []
+    on = workflow.get("on") or {}
+    if set(on) != {"schedule", "workflow_dispatch"}:
+        errors.append(f"{name}: must run on a daily schedule or manual dispatch only")
+    else:
+        schedules = on.get("schedule") or []
+        if len(schedules) != 1 or not isinstance(schedules[0], dict):
+            errors.append(f"{name}: must carry exactly one daily schedule")
+        else:
+            cron = schedules[0].get("cron", "")
+            parts = str(cron).split()
+            if len(parts) != 5 or parts[1] == "*" or parts[2] != "*" or parts[3] != "*":
+                errors.append(f"{name}: schedule must be daily, not {cron!r}")
+            elif parts[0] in ("0", "30", "*/5", "*"):
+                errors.append(f"{name}: schedule must use an off-minute, not {parts[0]!r}")
+            if cron == "42 7 * * *":
+                errors.append(f"{name}: schedule must not bunch with the deploy-production backstop")
+        dispatch = on.get("workflow_dispatch") or {}
+        inputs = (dispatch.get("inputs") or {}) if isinstance(dispatch, dict) else {}
+        if set(dispatch) != {"inputs"} or set(inputs) != {"dry_run"}:
+            errors.append(f"{name}: workflow_dispatch must carry exactly dry_run")
+        elif inputs["dry_run"].get("type") != "boolean":
+            errors.append(f"{name}: dry_run must be an opt-in boolean defaulting to false")
+    if workflow.get("permissions") != {}:
+        errors.append(f"{name}: top-level permissions must stay empty")
+    if workflow.get("concurrency") != {"group": "daily-digest", "cancel-in-progress": "false"}:
+        errors.append(f"{name}: must serialize digests at the top level without cancelling")
+    jobs = workflow.get("jobs") or {}
+    if set(jobs) != {"digest", "alert"}:
+        errors.append(f"{name}: jobs must be exactly digest and alert")
+        return errors
+    digest = jobs["digest"]
+    if digest.get("if") != "github.ref == 'refs/heads/main'":
+        errors.append(f"{name}:digest: must run on main only")
+    if digest.get("permissions") != {"contents": "write", "deployments": "read", "actions": "write"}:
+        errors.append(f"{name}:digest: must tag the release, read Deployments and dispatch SBOM only")
+    if not runner_allowed("digest", digest.get("runs-on")):
+        errors.append(f"{name}:digest: must use the routed runner expression for job 'digest'")
+    digest_text = str(digest)
+    for required in ("PRODUCTION_WORKER_URL", "python3 scripts/digest_resolve.py",
+                     "daily-digest.cjs", "gh workflow run release.yml --ref main -f release_tag="):
+        if required not in digest_text:
+            errors.append(f"{name}:digest: missing pin {required}")
+    if "release-on-promote" in digest_text or "vX.Y.Z" in digest_text:
+        errors.append(f"{name}:digest: must not reference the retired per-promote tagging")
+    outputs = digest.get("outputs") or {}
+    for output in ("released", "tag_name", "prod_changed", "live_sha", "prev_tag"):
+        if output not in outputs:
+            errors.append(f"{name}:digest: must publish the {output} output for the alert gate")
+    alert = jobs["alert"]
+    if alert.get("needs") != "digest":
+        errors.append(f"{name}:alert: must wait for the digest job")
+    expected_alert_if = ("${{ !cancelled() && "
+                         "needs.digest.outputs.prod_changed == 'true' && "
+                         "needs.digest.outputs.released != 'true' && "
+                         "inputs.dry_run != true }}")
+    if alert.get("if") != expected_alert_if:
+        errors.append(f"{name}:alert: must consume owed-digest outputs even on failure, "
+                      "never on a dry run")
+    if alert.get("permissions") != {"contents": "read"}:
+        errors.append(f"{name}:alert: must keep contents:read only")
+    if alert.get("environment") != "synthetic-alerts":
+        errors.append(f"{name}:alert: must reuse the synthetic-alerts environment webhook")
+    if not runner_allowed("alert", alert.get("runs-on")):
+        errors.append(f"{name}:alert: must use the routed runner expression for job 'alert'")
+    alert_text = str(alert)
+    for required in ("SYNTHETIC_ALERT_WEBHOOK_URL", "scripts/digest_alert.py",
+                     "needs.digest.outputs.live_sha", "needs.digest.outputs.prev_tag"):
+        if required not in alert_text:
+            errors.append(f"{name}:alert: missing pin {required}")
     return errors
 
 
@@ -2244,17 +2328,16 @@ def production_errors(workflow):
     if production.get("if") != expected_production_if:
         errors.append(f"{name}:production: rollback may bypass skipped gates; deploy requires both gates, "
                       "a completed soak, a fresh recheck and no skip; cancelled runs never deploy")
-    # Only production and release hold the deploy-production lane: the guard,
-    # gates, soak and recheck run outside it, so a sleeping automatic promotion
-    # can never delay an operator rollback. The lane keeps the default single
+    # Only production holds the deploy-production lane: the guard, gates,
+    # soak and recheck run outside it, so a sleeping automatic promotion can
+    # never delay an operator rollback. The lane keeps the default single
     # pending slot, so the recheck must skip an automatic run while an operator
     # dispatch is active instead of entering the lane behind it.
     if "concurrency" in workflow:
         errors.append(f"{name}: must not hold the deploy lane at workflow level")
-    for job_id in ("production", "release"):
-        if jobs.get(job_id, {}).get("concurrency") != {"group": "deploy-production",
-                                                      "cancel-in-progress": "false"}:
-            errors.append(f"{name}:{job_id}: must hold the deploy-production lane without cancelling")
+    if jobs.get("production", {}).get("concurrency") != {"group": "deploy-production",
+                                                         "cancel-in-progress": "false"}:
+        errors.append(f"{name}:production: must hold the deploy-production lane without cancelling")
     for job_id in ("guard", "schema-gate", "roles-gate", "soak", "recheck"):
         if "concurrency" in jobs.get(job_id, {}):
             errors.append(f"{name}:{job_id}: must not hold the deploy lane")
@@ -3385,6 +3468,12 @@ def workflow_policy_errors(workflows):
             errors.extend(roles_gate_errors(workflow))
         if name == "release.yml":
             errors.extend(release_errors(workflow))
+        if name == "daily-digest.yml":
+            # Pinned shape above; the generic environment/marker scan below
+            # would flag its synthetic-alerts binding, production probe URL
+            # and Deployment fallback reads.
+            errors.extend(daily_digest_errors(workflow))
+            continue
         if name == "voice-synthetic.yml":
             # Pinned shape above; the generic environment scan below would
             # flag its voice-synthetic Environment binding.
@@ -7520,12 +7609,12 @@ class WorkflowTests(unittest.TestCase):
                         # Reads workflow runs to skip while an operator
                         # dispatch is active; the compare read needs contents.
                         expected = {"contents": "read", "actions": "read"}
-                    elif (name, job_id) == ("release.yml", "tag"):
-                        # Tags the promoted commit and publishes its release.
-                        expected = {"contents": "write"}
-                    elif (name, job_id) == ("deploy-production.yml", "release"):
-                        # Only dispatches release.yml for the deployed SHA.
-                        expected = {"actions": "write"}
+                    elif (name, job_id) == ("daily-digest.yml", "digest"):
+                        # Cuts the vYYYY.MM.DD tag and its release, reads the
+                        # production Deployments fallback, and dispatches the
+                        # SBOM chain for the fresh digest tag.
+                        expected = {"contents": "write", "deployments": "read",
+                                    "actions": "write"}
                     elif (name, job_id) == ("release.yml", "attach-sbom"):
                         # TOG-10893: uploads verified SBOMs to the published tag.
                         expected = {"contents": "write"}
@@ -7582,12 +7671,9 @@ class WorkflowTests(unittest.TestCase):
             # Pure `workflow_call` callees: the caller holds the group.
             "sbom.yml",
             "reusable-rust-nextest.yml",
-            # Serializes at the `tag` job (`release` group) so the
-            # read-only dry-run/repair paths stay unserialized.
-            "release.yml",
-            # Serializes at the `production`/`release` lane jobs only, so a
-            # sleeping promotion can never queue an operator rollback
-            # behind it (see the header comment in the workflow).
+            # Serializes at the `production` lane job only, so a sleeping
+            # promotion can never queue an operator rollback behind it (see
+            # the header comment in the workflow).
             "deploy-production.yml",
         }
         for name, workflow in self.workflows.items():
@@ -7596,15 +7682,10 @@ class WorkflowTests(unittest.TestCase):
             if name in ("sbom.yml", "reusable-rust-nextest.yml"):
                 # Gaining an own trigger forces a concurrency decision here.
                 self.assertEqual(triggers, {"workflow_call"}, name)
-            if name == "release.yml":
-                self.assertEqual(
-                    workflow["jobs"]["tag"].get("concurrency", {}).get("group"),
-                    "release", name)
             if name == "deploy-production.yml":
-                for job_id in ("production", "release"):
-                    self.assertEqual(
-                        workflow["jobs"][job_id].get("concurrency", {}).get("group"),
-                        "deploy-production", f"{name}:{job_id}")
+                self.assertEqual(
+                    workflow["jobs"]["production"].get("concurrency", {}).get("group"),
+                    "deploy-production", f"{name}:production")
             if name in exempt:
                 continue
             with self.subTest(workflow=name):
