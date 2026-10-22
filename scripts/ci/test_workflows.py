@@ -4152,6 +4152,33 @@ class WorkflowTests(unittest.TestCase):
             r"--test lfg_interactions(?: --test \S+)* -- --ignored --test-threads=1",
         )
 
+    def test_tickets_postgres_acceptance_receives_disposable_database_url(self):
+        job = self.workflows["check.yml"]["jobs"]["tickets-postgres"]
+        prepare = next(
+            step for step in job["steps"]
+            if step.get("name") == "Prepare guarded test database"
+        )
+        self.assertIn("createdb -h agent-testdb -U agent_test two_bot_test_ci", prepare["run"])
+        # The rust:bookworm job container ships no PostgreSQL client; a
+        # bare createdb fails with exit 127, so the install must precede it.
+        self.assertIn("apt-get install -y -qq --no-install-recommends postgresql-client", prepare["run"])
+        self.assertLess(
+            prepare["run"].index("apt-get install"),
+            prepare["run"].index("createdb -h agent-testdb"),
+        )
+        step = next(
+            step for step in job["steps"]
+            if step.get("name") == "Ticket shared router and mock Discord lifecycle acceptance"
+        )
+        # The non-ignored creation-receipt acceptance modules panic in CI
+        # without the guarded bootstrap; the fixture guard rejects any URL
+        # whose database is not two_bot_test_*.
+        self.assertEqual(
+            step["env"]["TWO_TEST_DATABASE_URL"],
+            "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
+        )
+        self.assertLess(job["steps"].index(prepare), job["steps"].index(step))
+
     def test_runtime_postgres_wal_budget_is_bounded(self):
         # Keep the broader runtime-lane budget from main; the smaller target is
         # specific to the longer rust-tests coverage replay.
