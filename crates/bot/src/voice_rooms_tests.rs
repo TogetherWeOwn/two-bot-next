@@ -8737,6 +8737,41 @@ async fn bounded_sibling_wait<T>(future: impl Future<Output = T>) -> T {
     result
 }
 
+fn assert_sibling_worker_lost_reply(response: &InteractionResponse) {
+    let text = response_text(response);
+    let lower = text.to_lowercase();
+    assert!(
+        !lower.contains("warm") && !lower.contains("syncing"),
+        "a known worker lost its reply, not its cache: {text}"
+    );
+    assert!(
+        [
+            "timed out",
+            "unavailable",
+            "not responding",
+            "couldn't",
+            "stopped"
+        ]
+        .iter()
+        .any(|reason| lower.contains(reason)),
+        "state the worker failure honestly: {text}"
+    );
+    assert!(
+        ["try again", "retry", "check", "wait"]
+            .iter()
+            .any(|next| lower.contains(next)),
+        "worker failure needs a next action: {text}"
+    );
+    assert_eq!(
+        response.kind,
+        InteractionResponseType::ChannelMessageWithSource
+    );
+    assert_eq!(
+        response.data.as_ref().and_then(|data| data.flags),
+        Some(MessageFlags::EPHEMERAL)
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn status_wait_is_bounded_with_a_live_unanswered_inbox() {
     let (runtime, _rx) = stalled_worker_runtime();
