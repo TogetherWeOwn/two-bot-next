@@ -1446,6 +1446,7 @@ impl CommandRuntime {
         // first, so an owner-map entry could never execute.
         let owner = match name.as_str() {
             "privacy" => Some(HandlerId::Privacy),
+            "remind" => Some(HandlerId::Remind),
             "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list" => {
                 Some(HandlerId::AutomationAdmin)
             }
@@ -1478,6 +1479,15 @@ impl CommandRuntime {
             "privacy" => {
                 crate::privacy_command::privacy_command(&self.pool, &self.executor, interaction)
                     .await;
+            }
+            "remind" => {
+                crate::remind_runtime::handle(
+                    &self.pool,
+                    &self.executor,
+                    &self.guild_id.to_string(),
+                    interaction,
+                )
+                .await;
             }
             "sticky" => self.sticky_set(interaction).await,
             "sticky-remove" => self.sticky_remove(interaction).await,
@@ -2320,7 +2330,7 @@ impl CommandRuntime {
 /// wire but still the field Discord populates for guild slash commands; the
 /// replacement `channel` object carries the id plus a payload we never read.
 #[allow(deprecated)]
-fn interaction_channel(interaction: &Interaction) -> Option<String> {
+pub(crate) fn interaction_channel(interaction: &Interaction) -> Option<String> {
     interaction
         .channel
         .as_ref()
@@ -2444,6 +2454,7 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     }
     if gates.automations {
         router.register(Box::new(StickyHandler));
+        router.register(Box::new(SliceHandler(HandlerId::Remind)));
         // Custom commands are an automations capability: a refused identity
         // must not even resolve their handlers (4014 isolation depends on the
         // narrowed intent too). Dispatch refuses and publish withholds when

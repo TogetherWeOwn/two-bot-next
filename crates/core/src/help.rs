@@ -49,6 +49,12 @@ const HELP_GROUPS: &[HelpGroup] = &[
         anchor: None,
     },
     HelpGroup {
+        title: "Reminders",
+        requires: None,
+        commands: &["remind"],
+        anchor: None,
+    },
+    HelpGroup {
         title: "Privacy",
         requires: None,
         commands: &["privacy"],

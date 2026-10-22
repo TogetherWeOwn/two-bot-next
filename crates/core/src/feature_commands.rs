@@ -350,6 +350,7 @@ fn is_js_whitespace(c: char) -> bool {
 pub fn feature_commands() -> Vec<CommandDefinition> {
     let mut defs = vec![scorecard_attendance_command()];
     defs.extend(automation_commands());
+    defs.push(crate::remind::command());
     defs.extend(announcement_commands());
     defs
 }

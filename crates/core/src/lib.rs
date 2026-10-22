@@ -181,6 +181,10 @@ pub mod voice_vote_kick_audit;
 #[cfg(feature = "db")]
 pub mod website_store;
 
+pub mod remind;
+#[cfg(feature = "db")]
+pub mod remind_store;
+
 pub use action_outcomes::{
     backoff_ms, backoff_ms_jittered, classify_kick_status, clear_send_bit, jitter_seed,
     lockdown_overwrite, pace_wait_ms, parse_retry_after_secs, retry_after_ms,
