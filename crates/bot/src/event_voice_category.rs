@@ -22,6 +22,7 @@
 //! columns belong to the web card, which consumes the reason vocabulary and
 //! link flags pinned here.
 
+use std::future::Future;
 use std::time::{Duration, Instant};
 
 use twilight_model::guild::Permissions;
