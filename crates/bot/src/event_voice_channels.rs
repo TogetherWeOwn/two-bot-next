@@ -25,8 +25,9 @@ use two_bot_cutover::event_voice::{
 /// is bounded by `REVALIDATE_TIMEOUT_MS` (the same inbox-protection
 /// bound as creator revalidation) so a slow statement cannot hold room
 /// handling. Failures and timeouts are debug-logged (no member or channel
-/// ids on this warm path) and the 60s flush backstop repairs the open
-/// span. Never fails the actor loop.
+/// ids on this warm path) and the 60s guild repair heals them: it re-opens
+/// a lost join and closes a lost leave against the live occupant snapshot
+/// (see [`repair_guild_presence`]). Never fails the actor loop.
 pub async fn record_transition(
     store: &impl RoomPersistence,
     guild: Snowflake,
@@ -49,13 +50,13 @@ pub async fn record_transition(
                 debug!(
                     guild = guild.to_string(),
                     error = %error,
-                    "event voice join span write failed; the flush backstop repairs it"
+                    "event voice join span write failed; the 60s guild repair re-opens it"
                 );
             }
             Err(_) => {
                 debug!(
                     guild = guild.to_string(),
-                    "event voice join span write timed out; the flush backstop repairs it"
+                    "event voice join span write timed out; the 60s guild repair re-opens it"
                 );
             }
         }
@@ -73,13 +74,13 @@ pub async fn record_transition(
                     debug!(
                         guild = guild.to_string(),
                         error = %error,
-                        "event voice leave stamp write failed; the next leave retries it"
+                        "event voice leave stamp write failed; the 60s guild repair closes it"
                     );
                 }
                 Err(_) => {
                     debug!(
                         guild = guild.to_string(),
-                        "event voice leave stamp write timed out; the next leave retries it"
+                        "event voice leave stamp write timed out; the 60s guild repair closes it"
                     );
                 }
             }
@@ -87,9 +88,172 @@ pub async fn record_transition(
     }
 }
 
+/// Minimum gap between guild presence repairs on one actor. The repair is a
+/// backstop behind the packet-paced [`record_transition`] writes: a failed
+/// join or leave heals on the next repair tick, at most this far out.
+pub const EVENT_VOICE_REPAIR_INTERVAL_MS: u64 = 60_000;
+
+/// Total wall-clock budget for the bootstrap occupant flush. Each write
+/// carries the transition's own timeout bound, and this caps their sum, so
+/// a saturated pool delays actor start by about one bound, not one per
+/// occupant. Occupants skipped past the budget are picked up by the next
+/// [`repair_guild_presence`] tick.
+pub const EVENT_VOICE_BOOTSTRAP_BUDGET_MS: u64 = REVALIDATE_TIMEOUT_MS;
+
+/// What one bootstrap occupant flush did, for the actor start log.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BootstrapFlushReport {
+    /// Occupants whose join transition was attempted.
+    pub attempted: u64,
+    /// Occupants skipped past the total budget (repaired next tick).
+    pub skipped: u64,
+}
+
+/// Reconcile one guild's event-voice spans against the authoritative live
+/// occupant snapshot: re-open a lost join per bound channel, and close the
+/// spans of members no longer present. Runs on the actor maintenance tick
+/// (at most every [`EVENT_VOICE_REPAIR_INTERVAL_MS`]); idempotent against
+/// the packet-paced writes, so a repair racing a live transition converges
+/// on the same spans. Every write carries the transition's own timeout
+/// bound, failures are debug-logged per channel (counts only, no member or
+/// channel ids on this warm path), and a failed channel never fails the
+/// actor loop. A member who leaves between the snapshot read and the flush
+/// gains a span the next repair closes: at most one interval of inflation,
+/// self-healing.
+pub async fn repair_guild_presence(
+    store: &impl RoomPersistence,
+    guild: Snowflake,
+    snapshot: &[(Snowflake, Snowflake)],
+) {
+    let bindings = match tokio::time::timeout(
+        Duration::from_millis(REVALIDATE_TIMEOUT_MS),
+        store.event_voice_guild_bindings(guild),
+    )
+    .await
+    {
+        Ok(Ok(bindings)) => bindings,
+        Ok(Err(error)) => {
+            debug!(
+                guild = guild.to_string(),
+                error = %error,
+                "event voice repair bindings read failed; the next repair retries it"
+            );
+            return;
+        }
+        Err(_) => {
+            debug!(
+                guild = guild.to_string(),
+                "event voice repair bindings read timed out; the next repair retries it"
+            );
+            return;
+        }
+    };
+    if bindings.is_empty() {
+        return;
+    }
+    for binding in bindings {
+        let present: Vec<Snowflake> = snapshot
+            .iter()
+            .filter(|(_, channel)| *channel == binding.channel)
+            .map(|(member, _)| *member)
+            .collect();
+        match tokio::time::timeout(
+            Duration::from_millis(REVALIDATE_TIMEOUT_MS),
+            store.flush_event_voice_presence(&binding.event_id, binding.instance, &present),
+        )
+        .await
+        {
+            Ok(Ok(reopened)) => {
+                if reopened > 0 {
+                    debug!(
+                        guild = guild.to_string(),
+                        reopened, "event voice repair re-opened lost join spans"
+                    );
+                }
+            }
+            Ok(Err(error)) => {
+                debug!(
+                    guild = guild.to_string(),
+                    error = %error,
+                    "event voice repair flush failed; the next repair retries it"
+                );
+            }
+            Err(_) => {
+                debug!(
+                    guild = guild.to_string(),
+                    "event voice repair flush timed out; the next repair retries it"
+                );
+            }
+        }
+        match tokio::time::timeout(
+            Duration::from_millis(REVALIDATE_TIMEOUT_MS),
+            store.close_event_voice_spans_absent(&binding.event_id, binding.instance, &present),
+        )
+        .await
+        {
+            Ok(Ok(closed)) => {
+                if closed > 0 {
+                    debug!(
+                        guild = guild.to_string(),
+                        closed, "event voice repair closed spans of absent members"
+                    );
+                }
+            }
+            Ok(Err(error)) => {
+                debug!(
+                    guild = guild.to_string(),
+                    error = %error,
+                    "event voice repair close-absent failed; the next repair retries it"
+                );
+            }
+            Err(_) => {
+                debug!(
+                    guild = guild.to_string(),
+                    "event voice repair close-absent timed out; the next repair retries it"
+                );
+            }
+        }
+    }
+}
+
+/// Flush the actor-start occupant snapshot join-only, under one total
+/// budget: snapshot occupants never sent a transition, so a member already
+/// sitting in a bound event channel gains an open span here. Movers covered
+/// by buffered transitions keep a single span (the join is idempotent), and
+/// channels with no event mapping write nothing. Stops past
+/// [`EVENT_VOICE_BOOTSTRAP_BUDGET_MS`] and counts the rest skipped; the next
+/// [`repair_guild_presence`] tick picks them up.
+pub async fn flush_bootstrap_presence(
+    store: &impl RoomPersistence,
+    guild: Snowflake,
+    occupants: &[(Snowflake, Snowflake)],
+) -> BootstrapFlushReport {
+    let mut report = BootstrapFlushReport::default();
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_millis(EVENT_VOICE_BOOTSTRAP_BUDGET_MS);
+    for (member_id, channel) in occupants {
+        if tokio::time::Instant::now() >= deadline {
+            report.skipped += 1;
+            continue;
+        }
+        report.attempted += 1;
+        record_transition(store, guild, *member_id, None, Some(*channel)).await;
+    }
+    if report.skipped > 0 {
+        debug!(
+            guild = guild.to_string(),
+            attempted = report.attempted,
+            skipped = report.skipped,
+            "event voice bootstrap flush hit its total budget; the 60s guild repair picks up the rest"
+        );
+    }
+    report
+}
+
 /// Claim one event-voice create under `lease`, before any Discord call. The
-/// winner proceeds to create; the loser returns false and must not call
-/// Discord. Both outcomes are audit-logged with event id and instance.
+/// winner (a fresh insert or a re-lease of a cleared or orphaned row)
+/// proceeds to create; the loser returns false and must not call Discord.
+/// Both outcomes are audit-logged with event id and instance.
 pub async fn claim_channel(
     pool: &PgPool,
     event_id: &str,
@@ -177,7 +341,7 @@ pub struct StaleReconcileReport {
     /// Rows whose lease was cleared for retry.
     pub cleared: u64,
     /// Rows skipped (probe transport failure, no lease to clear, lost race,
-    /// bind write failure).
+    /// bind write failure, clear write failure).
     pub skipped: u64,
 }
 
@@ -237,7 +401,31 @@ pub async fn reconcile_stale_claims(
                     report.skipped += 1;
                     continue;
                 };
-                if clear_event_voice_lease(pool, &event_id, instance_starts_at, &lease).await? {
+                // Like the bind arm above: a failed clear skips the row,
+                // never the pass.
+                let cleared = match clear_event_voice_lease(
+                    pool,
+                    &event_id,
+                    instance_starts_at,
+                    &lease,
+                )
+                .await
+                {
+                    Ok(cleared) => cleared,
+                    Err(error) => {
+                        report.skipped += 1;
+                        debug!(
+                            voice_event = "event_voice_clear_failed",
+                            event_id,
+                            instance,
+                            lease,
+                            error = %error,
+                            "stale event voice lease clear failed; continuing with the next row"
+                        );
+                        continue;
+                    }
+                };
+                if cleared {
                     report.cleared += 1;
                     info!(
                         voice_event = "event_voice_lease_cleared",
@@ -273,7 +461,7 @@ pub struct OrphanReconcileReport {
     /// Orphaned rows revived by the retry GET (transient 404).
     pub revived: u64,
     /// Rows skipped (probe transport failure, corrupt binding, orphan write
-    /// failure).
+    /// failure, revive write failure).
     pub skipped: u64,
 }
 
@@ -330,7 +518,24 @@ pub async fn reconcile_bound_channels(
                 );
                 match probe.retry_get_channel(channel).await {
                     Ok(ChannelProbeOutcome::Exists { .. }) => {
-                        revive_event_voice_orphan(pool, &event_id, instance_starts_at).await?;
+                        // Like the orphan-mark arm above: a failed revive
+                        // skips the row, never the pass. The row stays
+                        // orphaned (and counted so); the stale pass
+                        // re-probes it once its lease age lapses.
+                        if let Err(error) =
+                            revive_event_voice_orphan(pool, &event_id, instance_starts_at).await
+                        {
+                            report.skipped += 1;
+                            debug!(
+                                voice_event = "event_voice_revive_failed",
+                                event_id,
+                                instance,
+                                channel_id,
+                                error = %error,
+                                "event voice orphan revive failed; continuing with the next row"
+                            );
+                            continue;
+                        }
                         report.revived += 1;
                         info!(
                             voice_event = "event_voice_channel_revived",

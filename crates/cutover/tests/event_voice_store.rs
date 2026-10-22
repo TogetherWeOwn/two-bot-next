@@ -5,10 +5,10 @@
 use sqlx::Row;
 use time::{Duration, OffsetDateTime};
 use two_bot_cutover::event_voice::{
-    bind_event_voice_channel, bound_event_voice_channels, claim_event_voice_channel,
-    clear_event_voice_lease, flush_event_voice_presence, mark_event_voice_orphaned,
-    record_event_voice_join, record_event_voice_leave, revive_event_voice_orphan,
-    stale_event_voice_claims,
+    bind_event_voice_channel, bound_event_voice_channels, bound_event_voice_channels_for_guild,
+    claim_event_voice_channel, clear_event_voice_lease, close_event_voice_spans_absent,
+    flush_event_voice_presence, mark_event_voice_orphaned, record_event_voice_join,
+    record_event_voice_leave, revive_event_voice_orphan, stale_event_voice_claims,
 };
 use two_bot_testsupport::TestDatabase;
 
@@ -452,5 +452,139 @@ async fn flush_repairs_missing_spans_and_never_closes() {
         .await
         .expect("empty flush runs");
     assert_eq!(empty, 0);
+    db.close().await.expect("fixture teardown");
+}
+
+#[tokio::test]
+async fn reclaim_with_shifted_schedule_updates_the_row_but_keeps_the_lease() {
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    // Whole seconds: timestamptz round-trips at microsecond precision, so a
+    // nanosecond-bearing instant would never compare equal after the read.
+    let at = instance(2).replace_nanosecond(0).expect("truncate nanos");
+    let moved = at + Duration::minutes(30);
+    let ends = at + Duration::hours(2);
+    let ends_moved = moved + Duration::hours(2);
+    assert!(
+        claim_event_voice_channel(pool, "ev-shift", at, at, Some(ends), "tick-a")
+            .await
+            .expect("claim runs")
+    );
+    // The Discord event is rescheduled under the same instance key: the
+    // re-claim loses (tick-a still holds the lease) but the shifted schedule
+    // lands on the row while lease, status and binding stand.
+    assert!(
+        !claim_event_voice_channel(pool, "ev-shift", at, moved, Some(ends_moved), "tick-b")
+            .await
+            .expect("re-claim runs"),
+        "a re-claim against a held lease still loses"
+    );
+    let row: (
+        OffsetDateTime,
+        Option<OffsetDateTime>,
+        Option<String>,
+        String,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT starts_at, ends_at, owner_tick_lease, status, voice_channel_id \
+             FROM event_voice_channels WHERE event_id = 'ev-shift'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("row reads");
+    assert_eq!(row.0, moved, "the shifted starts_at updates the row");
+    assert_eq!(
+        row.1,
+        Some(ends_moved),
+        "the shifted ends_at updates the row"
+    );
+    assert_eq!(row.2.as_deref(), Some("tick-a"), "the lease is untouched");
+    assert_eq!(row.3, "creating", "the status is untouched");
+    assert_eq!(row.4, None, "the binding is untouched");
+    db.close().await.expect("fixture teardown");
+}
+
+#[tokio::test]
+async fn guild_bindings_list_only_live_bound_channels() {
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    let at = instance(2);
+    for event in ["ev-gb-live", "ev-gb-gone", "ev-gb-open", "ev-gb-foreign"] {
+        assert!(claim(pool, event, at, "tick-a").await);
+    }
+    assert!(bind_event_voice_channel(pool, "ev-gb-live", at, "7761")
+        .await
+        .expect("bind runs"));
+    assert!(bind_event_voice_channel(pool, "ev-gb-gone", at, "7762")
+        .await
+        .expect("bind runs"));
+    mark_event_voice_orphaned(pool, "ev-gb-gone", at)
+        .await
+        .expect("orphan runs");
+    assert!(bind_event_voice_channel(pool, "ev-gb-foreign", at, "7763")
+        .await
+        .expect("bind runs"));
+    for (guild, event) in [
+        ("100", "ev-gb-live"),
+        ("100", "ev-gb-gone"),
+        ("100", "ev-gb-open"),
+        ("200", "ev-gb-foreign"),
+    ] {
+        sqlx::query(
+            "INSERT INTO scheduled_events (guild_id, event_id, name, starts_at, updated_at) \
+             VALUES ($1, $2, 'show', '2026-11-01T20:00:00.000Z', '2026-10-22T00:00:00.000Z')",
+        )
+        .bind(guild)
+        .bind(event)
+        .execute(pool)
+        .await
+        .expect("mirror seeds");
+    }
+    let bindings = bound_event_voice_channels_for_guild(pool, "100")
+        .await
+        .expect("guild bindings read");
+    assert_eq!(bindings.len(), 1, "only the live bound row of guild 100");
+    assert_eq!(bindings[0].0, "ev-gb-live");
+    assert_eq!(bindings[0].2, "7761");
+    let foreign = bound_event_voice_channels_for_guild(pool, "200")
+        .await
+        .expect("foreign guild bindings read");
+    assert_eq!(foreign.len(), 1);
+    assert_eq!(foreign[0].0, "ev-gb-foreign");
+    db.close().await.expect("fixture teardown");
+}
+
+#[tokio::test]
+async fn close_absent_stamps_only_the_missing_members() {
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    let at = instance(2);
+    assert!(claim(pool, "ev-absent", at, "tick-a").await);
+    assert!(bind_event_voice_channel(pool, "ev-absent", at, "7771")
+        .await
+        .expect("bind runs"));
+    for user in ["3111", "3112", "3113"] {
+        record_event_voice_join(pool, "7771", user)
+            .await
+            .expect("join runs");
+    }
+    // One member left earlier through the packet path: their closed span is
+    // history the repair must not touch.
+    record_event_voice_leave(pool, "7771", "3113")
+        .await
+        .expect("leave runs");
+    let closed = close_event_voice_spans_absent(pool, "ev-absent", at, &["3111".to_owned()])
+        .await
+        .expect("close-absent runs");
+    assert_eq!(closed, 1, "only the absent member with an open span closes");
+    assert_eq!(span_counts(pool, "3111").await, (1, 1));
+    assert_eq!(span_counts(pool, "3112").await, (1, 0));
+    assert_eq!(span_counts(pool, "3113").await, (1, 0));
+    // Nobody present closes every remaining open span of the instance.
+    let closed_all = close_event_voice_spans_absent(pool, "ev-absent", at, &[])
+        .await
+        .expect("empty close-absent runs");
+    assert_eq!(closed_all, 1);
+    assert_eq!(span_counts(pool, "3111").await, (1, 0));
     db.close().await.expect("fixture teardown");
 }

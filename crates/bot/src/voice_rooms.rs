@@ -24,6 +24,7 @@ use std::{
 use crate::voice_room_plan::{
     category_room_ids, plan_room_diagnosed, RoomPlanError, RoomPlanInput, BOT_ROOM_ACCESS,
 };
+use time::OffsetDateTime;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tracing::{debug, error, info, warn};
 use twilight_cache_inmemory::DefaultInMemoryCache;
@@ -158,6 +159,18 @@ impl std::fmt::Display for StoreError {
             Self::Conflict => "the store reported a conflict",
         })
     }
+}
+
+/// One live event-voice binding: the Discord channel hosting an event
+/// instance's voice room, for the guild presence repair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventVoiceBinding {
+    /// The bound Discord voice channel.
+    pub channel: Snowflake,
+    /// The scheduled event id.
+    pub event_id: String,
+    /// The event instance start (`instance_starts_at`).
+    pub instance: OffsetDateTime,
 }
 
 /// No synchronous database work is allowed on the gateway event loop.
@@ -391,6 +404,41 @@ pub trait RoomPersistence: Send + Sync {
     ) -> impl Future<Output = Result<(), StoreError>> + Send {
         let _ = (channel, member);
         async { Ok::<(), StoreError>(()) }
+    }
+    /// Live event-voice bindings for one guild, for the presence repair.
+    /// Guild scope comes from the scheduled-event mirror. Default empty for
+    /// stores without the event voice tables.
+    fn event_voice_guild_bindings(
+        &self,
+        guild: Snowflake,
+    ) -> impl Future<Output = Result<Vec<EventVoiceBinding>, StoreError>> + Send {
+        let _ = guild;
+        async { Ok::<Vec<EventVoiceBinding>, StoreError>(Vec::new()) }
+    }
+    /// Repair-only backstop: ensure one open span per occupant of the
+    /// instance. Never closes spans; returns rows inserted. Default no-op
+    /// for stores without the event voice tables.
+    fn flush_event_voice_presence(
+        &self,
+        event_id: &str,
+        instance: OffsetDateTime,
+        occupants: &[Snowflake],
+    ) -> impl Future<Output = Result<u64, StoreError>> + Send {
+        let _ = (event_id, instance, occupants);
+        async { Ok::<u64, StoreError>(0) }
+    }
+    /// Stamp `left_at` on the open spans of members absent from the
+    /// authoritative occupant list; returns rows closed. An empty list
+    /// closes every open span of the instance. Default no-op for stores
+    /// without the event voice tables.
+    fn close_event_voice_spans_absent(
+        &self,
+        event_id: &str,
+        instance: OffsetDateTime,
+        present: &[Snowflake],
+    ) -> impl Future<Output = Result<u64, StoreError>> + Send {
+        let _ = (event_id, instance, present);
+        async { Ok::<u64, StoreError>(0) }
     }
 }
 
@@ -657,6 +705,55 @@ impl RoomPersistence for PgRoomStore {
         member: Snowflake,
     ) -> Result<(), StoreError> {
         self.record_event_voice_leave(&channel.to_string(), &member.to_string())
+            .await
+            .map_err(store_error)
+    }
+
+    async fn event_voice_guild_bindings(
+        &self,
+        guild: Snowflake,
+    ) -> Result<Vec<EventVoiceBinding>, StoreError> {
+        // A corrupt (non-numeric) binding cannot map to live channels; the
+        // bound reconcile pass already reports it, so the repair skips it.
+        self.bound_event_voice_channels_for_guild(&guild.to_string())
+            .await
+            .map_err(store_error)
+            .map(|rows| {
+                rows.into_iter()
+                    .filter_map(|(event_id, instance, channel)| {
+                        channel
+                            .parse::<Snowflake>()
+                            .ok()
+                            .map(|channel| EventVoiceBinding {
+                                channel,
+                                event_id,
+                                instance,
+                            })
+                    })
+                    .collect()
+            })
+    }
+
+    async fn flush_event_voice_presence(
+        &self,
+        event_id: &str,
+        instance: OffsetDateTime,
+        occupants: &[Snowflake],
+    ) -> Result<u64, StoreError> {
+        let occupants: Vec<String> = occupants.iter().map(|id| id.to_string()).collect();
+        self.flush_event_voice_presence(event_id, instance, &occupants)
+            .await
+            .map_err(store_error)
+    }
+
+    async fn close_event_voice_spans_absent(
+        &self,
+        event_id: &str,
+        instance: OffsetDateTime,
+        present: &[Snowflake],
+    ) -> Result<u64, StoreError> {
+        let present: Vec<String> = present.iter().map(|id| id.to_string()).collect();
+        self.close_event_voice_spans_absent(event_id, instance, &present)
             .await
             .map_err(store_error)
     }
@@ -9179,6 +9276,7 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut dispatch_ready = false;
     let mut maintenance_ready = false;
+    let mut ev_repair_due_ms: u64 = 0;
     let mut dispatch_budget = 8u8;
     let mut consecutive_inbox_turns = 0u8;
     let mut complete_join_pair = false;
@@ -9271,11 +9369,10 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
     }
     // Snapshot occupants never sent a transition (`publish_snapshot` only
     // sends `Reconcile`): flush them join-only so a member already sitting
-    // in a bound event channel owns an open span. Movers covered by the
-    // buffered transitions above keep a single span (the join is
-    // idempotent), and channels with no event mapping write nothing.
-    // Collected before any await so no live-state lock crosses a store
-    // write; each write carries the transition's own timeout bound.
+    // in a bound event channel owns an open span. Collected before any
+    // await so no live-state lock crosses a store write; the helper caps
+    // the whole flush at one total budget and the 60s repair picks up any
+    // occupants skipped past it.
     let snapshot_occupants: Vec<(Snowflake, Snowflake)> = {
         let live = worker.live.read_state();
         live.members
@@ -9285,16 +9382,12 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
             })
             .collect()
     };
-    for (member_id, channel) in snapshot_occupants {
-        crate::event_voice_channels::record_transition(
-            &worker.store,
-            worker.live.guild_id,
-            member_id,
-            None,
-            Some(channel),
-        )
-        .await;
-    }
+    let _ = crate::event_voice_channels::flush_bootstrap_presence(
+        &worker.store,
+        worker.live.guild_id,
+        &snapshot_occupants,
+    )
+    .await;
     stall.snapshot(worker, last_progress);
     loop {
         tokio::select! {
@@ -9464,6 +9557,31 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                 worker.refresh_empty_grace();
                 worker.send_notices(now_ms).await;
                 worker.flush_kick_audit(now_ms).await;
+                // Event-voice presence repair (at most every 60s): re-open a
+                // lost join and close a lost leave against the live occupant
+                // snapshot. The snapshot is collected before any await so no
+                // live-state lock crosses a store write; guilds with no
+                // bound event channels cost one cheap bindings read.
+                if now_ms >= ev_repair_due_ms {
+                    ev_repair_due_ms = now_ms.saturating_add(
+                        crate::event_voice_channels::EVENT_VOICE_REPAIR_INTERVAL_MS,
+                    );
+                    let repair_snapshot: Vec<(Snowflake, Snowflake)> = {
+                        let live = worker.live.read_state();
+                        live.members
+                            .iter()
+                            .filter_map(|(member_id, member)| {
+                                member.channel_id.map(|channel| (*member_id, channel))
+                            })
+                            .collect()
+                    };
+                    crate::event_voice_channels::repair_guild_presence(
+                        &worker.store,
+                        worker.live.guild_id,
+                        &repair_snapshot,
+                    )
+                    .await;
+                }
                 dispatch_budget = 8;
                 consecutive_inbox_turns = 0;
             }
