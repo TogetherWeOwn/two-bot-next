@@ -5,8 +5,8 @@
 //! without editing this file. The only wiring outside it is the
 //! `mod backpressure_acceptance;` line in `gateway_tests.rs`, plus
 //! `pub(super)` visibility on the four `rsvp.rs` harness helpers reused
-//! here (`connect`, `global_series`, `interaction`, `lane_holding_rest`;
-//! no behavior change to that file).
+//! here (`connect_with_shutdown`, `global_series`, `interaction`,
+//! `lane_holding_rest`; no behavior change to that file).
 //!
 //! Contract under test:
 //!
@@ -46,7 +46,7 @@
 //! hold stalls the serial drain while the burst arrives; the refusal poll
 //! resolves in about a second, inside the hold window.
 
-use super::rsvp::{connect, global_series, interaction, lane_holding_rest};
+use super::rsvp::{connect_with_shutdown, global_series, interaction, lane_holding_rest};
 use super::*;
 use crate::discord_test_common::MockRest;
 use std::sync::atomic::AtomicBool;
@@ -96,7 +96,8 @@ async fn rsvp_burst_against_stalled_drain_refuses_and_counts() {
     )
     .await;
     let refused_before = global_series(REFUSED_SERIES);
-    let (runner, mut ws) = connect(&db, &rest).await;
+    let (shutdown, receiver) = tokio::sync::watch::channel(false);
+    let (runner, mut ws) = connect_with_shutdown(&db, &rest, Some(receiver)).await;
     for sequence in 2..2 + BURST {
         ws.send(Message::text(interaction(sequence, "going").to_string()))
             .await
@@ -149,14 +150,19 @@ async fn rsvp_burst_against_stalled_drain_refuses_and_counts() {
         serde_json::from_slice::<Value>(&edits[0].body).unwrap()["content"],
         "RSVP saved: going."
     );
-    // Survival: ending reception drains admitted work and exits cleanly;
-    // refusals must never wedge the funnel, checkpoint, or worker.
-    drop(ws);
+    // Survival: cooperative shutdown drains admitted work and exits cleanly;
+    // refusals must never wedge the funnel, checkpoint, or worker. A bare
+    // `drop(ws)` cannot end reception (the shard maps a server-side drop to
+    // `Err(Reconnect)` and retries forever), so signal shutdown first and
+    // drop the socket after, like every `rsvp.rs` sibling. The 60 s bound
+    // covers the ~32 admitted dispatches draining under lane contention.
+    shutdown.send_replace(true);
     tokio::time::timeout(std::time::Duration::from_secs(60), runner)
         .await
         .expect("runner exits after the burst")
         .unwrap()
         .unwrap();
+    drop(ws);
     rest.shutdown().await;
     db.close().await;
 }
