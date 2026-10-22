@@ -2526,9 +2526,16 @@ jobs:
         with:
           prefix-key: ${{ runner.os }}-cargo
           save-if: ${{ github.event_name == 'push' }}
+      # The non-ignored creation-receipt acceptance modules require the
+      # guarded disposable bootstrap, as in rust-tests; TestDb suites
+      # connect to agent_test directly and ignore this variable.
+      - name: Prepare guarded test database
+        run: createdb -h agent-testdb -U agent_test two_bot_test_ci
       - name: Ticket lifecycle and migration integration tests
         run: cargo test -p two-bot-cutover --locked --test tickets_store -- --ignored
       - name: Ticket shared router and mock Discord lifecycle acceptance
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         # The ticket skip/budget log-assertion modules assert exact counts via
         # first-match on the process-wide tracing capture; they run serially
         # in the isolated step below, so skip them here where the revision
