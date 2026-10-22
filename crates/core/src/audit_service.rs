@@ -40,20 +40,21 @@ use crate::audit_mirror::{
 };
 use crate::audit_store::{
     AuditClaim, AuditStore, AuditStoreError, DeliveryFailure, DeliveryIntent, PrepareSend,
-    QuarantineReason,
+    QuarantineReason, ReconcileBound,
 };
 
 /// Maximum `channel_history` pages one Reconcile pass reads while proving the
 /// marker. A deep channel once paged past any bound; at the cap the pass
-/// yields (`UncertainAcceptance`, boundary preserved) and stops with
-/// [`DeliverOutcome::ScanBoundReached`] while the row stays reconcile-eligible
-/// for the next owner — never quarantined for merely being unscanned. Marker
-/// identity, floor and empty-history outcomes within the bound are unchanged.
+/// yields (boundary preserved) and stops with [`DeliverOutcome::ScanBoundReached`]
+/// on the first bound hit, leaving the row reconcile-eligible. A second bound
+/// hit quarantines as [`QuarantineReason::ScanBoundExceeded`], not marker absence,
+/// so deep rows cannot rescan the head forever. Marker identity, floor and
+/// empty-history outcomes within the bound are unchanged.
 pub const RECONCILE_MAX_PAGES: usize = 16;
 
 /// Wall-clock budget for one Reconcile boundary scan, checked per page beside
-/// [`RECONCILE_MAX_PAGES`]. Whichever bound hits first stops the pass with
-/// [`DeliverOutcome::ScanBoundReached`].
+/// [`RECONCILE_MAX_PAGES`]. Either bound spends one scan attempt: the first
+/// yields with [`DeliverOutcome::ScanBoundReached`], the second quarantines.
 pub const RECONCILE_SCAN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Static destination wiring for the service.
@@ -113,11 +114,10 @@ pub enum DeliverOutcome {
     /// Terminal hold with the bounded reason stored.
     Quarantined(QuarantineReason),
     /// The boundary scan hit [`RECONCILE_MAX_PAGES`] or [`RECONCILE_SCAN_TIMEOUT`]
-    /// with the marker neither proven nor disproven: the pass yields with an
-    /// `UncertainAcceptance` (boundary preserved) so the row rotates behind
-    /// older rows instead of burning a drain slot every cycle, and stays
-    /// reconcile-eligible for the next owner — which rescans from the head,
-    /// since scan progress is not persisted.
+    /// with the marker neither proven nor disproven: the first bound hit
+    /// durably yields (boundary preserved) and stays reconcile-eligible. The
+    /// next owner rescans from the head; another bound hit quarantines as
+    /// `ScanBoundExceeded` for inspection, so retries cannot loop forever.
     ScanBoundReached,
     /// A store transition refused (stale/lost claim): nothing was sent and
     /// nothing was written by this pass.
@@ -550,8 +550,9 @@ impl<M: AuditMirror> AuditMirrorService<M> {
 
         // Bounded boundary scan (legacy `findMirror` with a cursor): page
         // downward until the marker is proven, the floor drops below the
-        // boundary, history runs out, or the page/time budget is spent — a
-        // merely-unscanned row is never quarantined.
+        // boundary, history runs out, or the page/time budget is spent. The
+        // first bound hit yields; a repeat is a distinct operator quarantine,
+        // never a claim that the marker is absent.
         let scan_deadline = self
             .reconcile_scan_deadline
             .unwrap_or_else(|| Instant::now() + RECONCILE_SCAN_TIMEOUT);
@@ -559,19 +560,15 @@ impl<M: AuditMirror> AuditMirrorService<M> {
         let mut before: Option<String> = None;
         loop {
             if pages >= RECONCILE_MAX_PAGES || Instant::now() >= scan_deadline {
-                // Yield the queue slot: without this a bound-hit row keeps
-                // its `COALESCE(delivery_yielded_at, created_at)` sort key and
-                // burns a drain batch slot plus a full scan every lease cycle.
-                // `UncertainAcceptance` preserves the boundary, so the row
-                // stays reconcile-only for the next owner.
-                let yielded = self
-                    .store
-                    .fail_attempt(claim, DeliveryFailure::UncertainAcceptance)
-                    .await?;
-                return Ok(if yielded {
-                    DeliverOutcome::ScanBoundReached
-                } else {
-                    DeliverOutcome::Unclaimed
+                // The durable two-hit budget survives owner changes and read
+                // errors. First yield rotates the queue; a repeat quarantines
+                // without clearing any acceptance evidence or allowing a POST.
+                return Ok(match self.store.bound_reconcile_scan(claim).await? {
+                    ReconcileBound::Yielded => DeliverOutcome::ScanBoundReached,
+                    ReconcileBound::Quarantined => {
+                        DeliverOutcome::Quarantined(QuarantineReason::ScanBoundExceeded)
+                    }
+                    ReconcileBound::LostClaim => DeliverOutcome::Unclaimed,
                 });
             }
             let page = match self
@@ -756,12 +753,16 @@ mod tests {
         pool.close().await;
     }
 
-    /// Scripted mirror double: the POST script drives the Send pass to
-    /// `Ambiguous`, history always reads empty, and every history read counts.
+    type HistoryPage = Result<Vec<MirrorMessage>, MirrorError>;
+
+    /// Scripted mirror double: empty history is the default; reads and actual
+    /// POSTs count separately so reconciliation cannot hide a second send.
     #[derive(Clone, Default)]
     struct ScriptMirror {
         post_script: Arc<Mutex<VecDeque<Result<String, MirrorError>>>>,
+        history: Arc<Mutex<VecDeque<HistoryPage>>>,
         history_reads: Arc<AtomicU64>,
+        posts: Arc<AtomicU64>,
     }
 
     impl ScriptMirror {
@@ -784,6 +785,7 @@ mod tests {
         {
             authorize.await?;
             let _ = (channel_id, content, nonce);
+            self.posts.fetch_add(1, Ordering::Relaxed);
             Ok(self
                 .post_script
                 .lock()
@@ -811,7 +813,11 @@ mod tests {
         ) -> Result<Vec<MirrorMessage>, MirrorError> {
             let _ = channel_id;
             self.history_reads.fetch_add(1, Ordering::Relaxed);
-            Ok(vec![])
+            self.history
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Ok(vec![]))
         }
     }
 
@@ -839,6 +845,278 @@ mod tests {
             mirror_guild_id: Some(GUILD.to_owned()),
             bot_user_id: BOT.to_owned(),
         }
+    }
+
+    async fn ambiguous_entry(pool: &PgPool, entry: &str, mirror: &ScriptMirror) {
+        let service = AuditMirrorService::new(AuditStore::new(pool), mirror.clone(), config());
+        service.record(&event(entry)).await.expect("record");
+        mirror
+            .post_script
+            .lock()
+            .unwrap()
+            .push_back(Err(MirrorError::Uncertain("synthetic timeout".to_owned())));
+        assert_eq!(
+            service.deliver_entry(entry).await.expect("send pass"),
+            DeliverOutcome::Ambiguous
+        );
+    }
+
+    fn deep_history(mirror: &ScriptMirror) {
+        let mut history = mirror.history.lock().unwrap();
+        assert!(history.is_empty(), "previous scan consumed its pages");
+        for page in 0..RECONCILE_MAX_PAGES {
+            history.push_back(Ok((0..u64::from(HISTORY_PAGE_LIMIT))
+                .map(|offset| MirrorMessage {
+                    id: (900_000 - page as u64 * u64::from(HISTORY_PAGE_LIMIT) - offset)
+                        .to_string(),
+                    author_id: "1234".to_owned(),
+                    content: "synthetic noise".to_owned(),
+                })
+                .collect()));
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_deep_scan_quarantines_across_restart_and_read_error() {
+        let Some((pool, schema)) = test_pool("audit_scan_repeat")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping audit_service test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        let entry = "scan-repeat";
+        let store = AuditStore::new(&pool);
+        let mirror = ScriptMirror::default();
+        ambiguous_entry(&pool, entry, &mirror).await;
+        let service = AuditMirrorService::new(AuditStore::new(&pool), mirror.clone(), config());
+        deep_history(&mirror);
+        let reads_before = mirror.reads();
+        assert_eq!(
+            service.deliver_entry(entry).await.expect("first bound"),
+            DeliverOutcome::ScanBoundReached
+        );
+        assert_eq!(mirror.reads() - reads_before, RECONCILE_MAX_PAGES as u64);
+        let first = store.get(entry).await.expect("row").expect("row exists");
+        assert_eq!(first.state, DeliveryState::Pending);
+        assert_eq!(first.search_before.as_deref(), Some("0"));
+        drop(service);
+
+        // Neither a new service nor an intervening read failure resets the
+        // durable bound-hit evidence. Otherwise deep rows can retry forever.
+        let restarted = AuditMirrorService::new(AuditStore::new(&pool), mirror.clone(), config());
+        mirror
+            .history
+            .lock()
+            .unwrap()
+            .push_back(Err(MirrorError::Uncertain(
+                "synthetic read failure".to_owned(),
+            )));
+        assert_eq!(
+            restarted.deliver_entry(entry).await.expect("read error"),
+            DeliverOutcome::Ambiguous
+        );
+        assert_eq!(
+            store
+                .get(entry)
+                .await
+                .expect("row")
+                .expect("row exists")
+                .last_error,
+            first.last_error,
+            "read errors must not reset bound-hit evidence"
+        );
+        deep_history(&mirror);
+        let reads_before = mirror.reads();
+        let outcome = restarted.deliver_entry(entry).await.expect("second bound");
+        assert!(
+            matches!(outcome, DeliverOutcome::Quarantined(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(mirror.reads() - reads_before, RECONCILE_MAX_PAGES as u64);
+        let terminal = store.get(entry).await.expect("row").expect("row exists");
+        assert_eq!(terminal.state, DeliveryState::Quarantined);
+        assert_eq!(
+            terminal.last_error.as_deref(),
+            Some("discord_reconcile_scan_exhausted")
+        );
+        assert_eq!(terminal.search_before, first.search_before);
+        assert_eq!(terminal.nonce, first.nonce);
+        assert_eq!(terminal.attempts, 1, "scan bounds are not POST attempts");
+        assert!(terminal.mirror_message_id.is_none());
+        assert!(!store
+            .pending_ids()
+            .await
+            .expect("queue")
+            .contains(&entry.to_owned()));
+        assert!(store.claim(entry).await.expect("claim terminal").is_none());
+        assert_eq!(mirror.posts.load(Ordering::Relaxed), 1, "never re-POST");
+        drop_schema(&pool, &schema).await;
+    }
+
+    #[tokio::test]
+    async fn first_scan_bound_can_still_reconcile_after_restart() {
+        let Some((pool, schema)) = test_pool("audit_scan_recover")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping audit_service test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        let entry = "scan-recover";
+        let mirror = ScriptMirror::default();
+        ambiguous_entry(&pool, entry, &mirror).await;
+        let timed = AuditMirrorService::new(AuditStore::new(&pool), mirror.clone(), config())
+            .with_reconcile_scan_deadline(Instant::now() - Duration::from_secs(1));
+        assert_eq!(
+            timed.deliver_entry(entry).await.expect("first timeout"),
+            DeliverOutcome::ScanBoundReached
+        );
+        drop(timed);
+        mirror
+            .history
+            .lock()
+            .unwrap()
+            .push_back(Ok(vec![MirrorMessage {
+                id: "640".to_owned(),
+                author_id: BOT.to_owned(),
+                content: format_audit_event(&event(entry)),
+            }]));
+        let restarted = AuditMirrorService::new(AuditStore::new(&pool), mirror.clone(), config());
+        assert_eq!(
+            restarted
+                .deliver_entry(entry)
+                .await
+                .expect("recover marker"),
+            DeliverOutcome::Reconciled {
+                message_id: "640".to_owned()
+            }
+        );
+        let row = AuditStore::new(&pool)
+            .get(entry)
+            .await
+            .expect("row")
+            .expect("row exists");
+        assert_eq!(row.state, DeliveryState::Delivered);
+        assert!(row.last_error.is_none());
+        assert_eq!(row.attempts, 1);
+        assert_eq!(mirror.posts.load(Ordering::Relaxed), 1);
+        drop_schema(&pool, &schema).await;
+    }
+
+    #[tokio::test]
+    async fn scan_bound_refuses_stale_unprepared_and_accepted_claims() {
+        let Some((pool, schema)) = test_pool("audit_scan_fence")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping audit_service test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        let store = AuditStore::new(&pool);
+        store
+            .record(&event("unprepared"), Some(AUDIT_CH))
+            .await
+            .expect("record");
+        let send = store
+            .claim("unprepared")
+            .await
+            .expect("claim")
+            .expect("owner");
+        assert_eq!(
+            store
+                .bound_reconcile_scan(&send)
+                .await
+                .expect("unprepared fence"),
+            ReconcileBound::LostClaim
+        );
+        let unprepared = store
+            .get("unprepared")
+            .await
+            .expect("row")
+            .expect("row exists");
+        assert_eq!(unprepared.attempts, 0);
+        assert!(unprepared.last_error.is_none());
+
+        let entry = "scan-fence";
+        let mirror = ScriptMirror::default();
+        ambiguous_entry(&pool, entry, &mirror).await;
+        let stale = store.claim(entry).await.expect("claim").expect("owner");
+        sqlx::query("UPDATE operational_audit_log SET delivery_lease_until = clock_timestamp() - interval '1 second' WHERE entry_id = $1")
+            .bind(entry).execute(&pool).await.expect("expire fixture");
+        let timed = AuditMirrorService::new(AuditStore::new(&pool), mirror.clone(), config())
+            .with_reconcile_scan_deadline(Instant::now() - Duration::from_secs(1));
+        assert_eq!(
+            timed.deliver(&stale).await.expect("expired fence"),
+            DeliverOutcome::Unclaimed
+        );
+        let replacement = store
+            .claim(entry)
+            .await
+            .expect("replacement")
+            .expect("owner");
+        assert_eq!(
+            timed.deliver(&stale).await.expect("stale generation"),
+            DeliverOutcome::Unclaimed
+        );
+        let untouched = store.get(entry).await.expect("row").expect("row exists");
+        assert_eq!(untouched.state, DeliveryState::Delivering);
+        assert_eq!(
+            untouched.last_error.as_deref(),
+            Some("discord_post_ambiguous")
+        );
+        assert_eq!(
+            timed.deliver(&replacement).await.expect("first bound"),
+            DeliverOutcome::ScanBoundReached
+        );
+        // Reusing a yielded capability cannot spend a second scan attempt.
+        assert_eq!(
+            timed.deliver(&replacement).await.expect("reused fence"),
+            DeliverOutcome::Unclaimed
+        );
+        let live = store.claim(entry).await.expect("claim").expect("owner");
+        assert!(store.note_accepted(&live, "640").await.expect("accept"));
+        // The claim snapshot predates acceptance. The locked database row is
+        // authoritative: it must not be quarantined or have evidence cleared.
+        assert_eq!(
+            timed.deliver(&live).await.expect("accepted fence"),
+            DeliverOutcome::Unclaimed
+        );
+        let accepted = store.get(entry).await.expect("row").expect("row exists");
+        assert_eq!(accepted.state, DeliveryState::Delivering);
+        assert_eq!(accepted.mirror_message_id.as_deref(), Some("640"));
+        assert!(accepted.accepted_at.is_some());
+        assert!(store.complete(&live).await.expect("complete accepted"));
+        assert_eq!(mirror.posts.load(Ordering::Relaxed), 1);
+        drop_schema(&pool, &schema).await;
+    }
+
+    #[tokio::test]
+    async fn repeated_scan_timeout_quarantines_without_history_reads() {
+        let Some((pool, schema)) = test_pool("audit_scan_timeouts")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping audit_service test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        let entry = "scan-timeouts";
+        let mirror = ScriptMirror::default();
+        ambiguous_entry(&pool, entry, &mirror).await;
+        let timed = AuditMirrorService::new(AuditStore::new(&pool), mirror.clone(), config())
+            .with_reconcile_scan_deadline(Instant::now() - Duration::from_secs(1));
+        let reads_before = mirror.reads();
+        assert_eq!(
+            timed.deliver_entry(entry).await.expect("first timeout"),
+            DeliverOutcome::ScanBoundReached
+        );
+        assert_eq!(
+            timed.deliver_entry(entry).await.expect("second timeout"),
+            DeliverOutcome::Quarantined(QuarantineReason::ScanBoundExceeded)
+        );
+        assert_eq!(mirror.reads(), reads_before);
+        assert_eq!(mirror.posts.load(Ordering::Relaxed), 1);
+        drop_schema(&pool, &schema).await;
     }
 
     /// A past scan deadline stops the Reconcile pass with `ScanBoundReached`
