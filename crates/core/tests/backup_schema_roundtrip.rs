@@ -1533,13 +1533,25 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     assert_eq!(inspected.manifest.version, 9);
     assert_eq!(
         inspected.manifest.missing_tables(),
-        ["scheduled_events_claim", "scheduled_events_tombstone"]
+        [
+            "scheduled_events_claim",
+            "scheduled_events_tombstone",
+            "starboard_config",
+            "starboard_starrers",
+            "starboard_posts"
+        ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
     forget_moderation_history(pool).await;
     let report = restore(pool, &old_path).await.unwrap();
     assert!(report.ok);
-    for name in ["scheduled_events_claim", "scheduled_events_tombstone"] {
+    for name in [
+        "scheduled_events_claim",
+        "scheduled_events_tombstone",
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
+    ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
             identifier(name)
@@ -1570,15 +1582,18 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
     let mut old = inspect(&current_path).unwrap();
     assert_eq!(old.manifest.version, 11);
     // Frozen claim-only v10 shape: the merged v10 writer carried the
-    // epoch-claim guard but predates the delete tombstones.
-    let rows = old.buffers.remove("scheduled_events_tombstone").unwrap();
-    assert!(
-        !rows.is_empty(),
-        "fixture must populate newer scheduled_events_tombstone"
-    );
-    old.manifest
-        .tables
-        .retain(|table| table.name != "scheduled_events_tombstone");
+    // epoch-claim guard but predates the delete tombstones and the three
+    // starboard tables.
+    for name in [
+        "scheduled_events_tombstone",
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
+    ] {
+        let rows = old.buffers.remove(name).unwrap();
+        assert!(!rows.is_empty(), "fixture must populate newer {name}");
+        old.manifest.tables.retain(|table| table.name != name);
+    }
     old.manifest.version = 10;
     old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
     let old_path = directory.path("pre-tombstone-v10.ndjson.gz");
@@ -1587,23 +1602,32 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
     assert_eq!(inspected.manifest.version, 10);
     assert_eq!(
         inspected.manifest.missing_tables(),
-        ["scheduled_events_tombstone"]
+        [
+            "scheduled_events_tombstone",
+            "starboard_config",
+            "starboard_starrers",
+            "starboard_posts"
+        ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
     forget_moderation_history(pool).await;
     let report = restore(pool, &old_path).await.unwrap();
     assert!(report.ok);
-    let count: i64 = sqlx::query_scalar(audited(format!(
-        "SELECT COUNT(*) FROM {}",
-        identifier("scheduled_events_tombstone")
-    )))
-    .fetch_one(pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        count, 0,
-        "v10 restore clears newer scheduled_events_tombstone target rows"
-    );
+    for name in [
+        "scheduled_events_tombstone",
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
+    ] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(name)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "v10 restore clears newer {name} target rows");
+    }
     let claims: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scheduled_events_claim")
         .fetch_one(pool)
         .await
