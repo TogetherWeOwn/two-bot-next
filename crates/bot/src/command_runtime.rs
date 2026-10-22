@@ -1509,7 +1509,15 @@ impl CommandRuntime {
             Ok(reply) => reply,
             Err(error) => {
                 let action_token = ticket_action_token(action);
-                match tickets.warn_ticket_context(interaction, action).await {
+                // Best-effort enrichment: when the failure is itself a SQL
+                // storage failure, skip the decorating lookup instead of
+                // spending a second pool acquisition on a sick store.
+                let context = if error.is_storage_failure() {
+                    None
+                } else {
+                    tickets.warn_ticket_context(interaction, action).await
+                };
+                match context {
                     Some((ticket_id, status)) => {
                         warn!(error_class = ?error.class(), action = %action_token, ticket_id = %ticket_id, status = %status, "ticket action incomplete")
                     }

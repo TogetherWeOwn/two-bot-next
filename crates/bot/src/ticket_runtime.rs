@@ -426,6 +426,13 @@ impl Failure {
             Self::Rest(_) | Self::InvalidEvidence | Self::NoTicket => ErrorClass::Rest,
         }
     }
+    /// True only for SQL storage failures (pool, connection or query), never
+    /// for domain refusals. Warn enrichment skips its decorating store
+    /// lookup then, instead of spending a second pool acquisition on a sick
+    /// store to decorate a failure line.
+    pub fn is_storage_failure(&self) -> bool {
+        matches!(self, Self::Store(StoreError::Database(_)))
+    }
 }
 
 type Result<T> = std::result::Result<T, Failure>;

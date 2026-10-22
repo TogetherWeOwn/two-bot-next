@@ -512,7 +512,8 @@ pub const EVENTSUB_RECONCILE_ERROR_CLASSES: &[&str] = &[
 /// every retire, abandon, purge and successful claim/close counts once. The
 /// vocabulary is closed by the lifecycle observability contract (see
 /// `docs/ticket-lifecycle-observability.md`): every caller passes a member,
-/// so the trailing `close` collapse slot stays zero.
+/// so no collapse traffic lands in the trailing `close` slot and that row
+/// counts genuine close events only.
 pub const TICKET_LIFECYCLE_EVENTS: &[&str] = &["retire", "abandon", "purge", "claim", "close"];
 /// Terminal outcomes for `two_bot_ticket_lifecycle_total{event,outcome}`:
 /// the six success outcomes plus the shared `db_cause` vocabulary for
