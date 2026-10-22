@@ -102,18 +102,24 @@ is found. Ambiguous reads preserve the boundary for a later healthy read;
 HTTP refusals quarantine `PermissionRevoked`; proven exhaustion or passing
 below the boundary quarantines `MarkerMissing`. Reconciliation never POSTs.
 
-Each pass stops after 16 history pages or the 30-second deadline (checked
-before each read). The first bound hit returns `ScanBoundReached` and
-persists a fairness yield plus `discord_reconcile_scan_bound`, retaining the
-original boundary and remaining reconciliation-only. A new owner scans from
-the head again. A second bound hit quarantines `ScanBoundExceeded`
-(`discord_reconcile_scan_exhausted`) for operator inspection rather than
-rescanning the same head forever. The first-hit classification survives
-service restarts and intervening uncertain read failures. A marker within
-the next pass's budget still reconciles normally. Budget exhaustion is not
-proof of a missing marker or a rejected POST; no automatic quarantine reset
-or resend is authorized. See the [store protocol](audit-store.md) for the
-locked owner transition and retained evidence.
+Audit recovery scans at most 16 pages or 30 seconds per claim. The nullable
+`delivery_reconcile_before` field stores only fully validated, marker-checked
+page floors, and a new owner resumes below the saved floor, even after a
+restart or new channel traffic. An in-flight read is cancelled at the deadline;
+its unexamined page cannot establish a checkpoint. Strict numeric progress
+returns `ScanBoundReached`, atomically saves the floor and releases ownership,
+and resets the consecutive no-progress budget. The original pre-POST boundary,
+nonce, attempt count and acceptance evidence never change.
+
+A bound without new progress preserves the cursor, yields and records
+`discord_reconcile_scan_bound`. A second consecutive no-progress bound
+quarantines `ScanBoundExceeded` (`discord_reconcile_scan_exhausted`) for
+inspection. Uncertain reads preserve the cursor and any existing first strike;
+they do not create or erase a strike. A later progressing pass resets it.
+Budget exhaustion is not proof of a missing marker or a rejected POST; no
+automatic quarantine reset or resend is authorized. See the
+[store protocol](audit-store.md) for the locked owner transition, additive
+migration and rollback with the column retained.
 
 Only a validated page can prove a marker, exhaustion or a crossed boundary.
 A repeated full page, or any page with IDs equal to/newer than the requested

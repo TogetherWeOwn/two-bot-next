@@ -43,18 +43,14 @@ use crate::audit_store::{
     QuarantineReason, ReconcileBound,
 };
 
-/// Maximum `channel_history` pages one Reconcile pass reads while proving the
-/// marker. A deep channel once paged past any bound; at the cap the pass
-/// yields (boundary preserved) and stops with [`DeliverOutcome::ScanBoundReached`]
-/// on the first bound hit, leaving the row reconcile-eligible. A second bound
-/// hit quarantines as [`QuarantineReason::ScanBoundExceeded`], not marker absence,
-/// so deep rows cannot rescan the head forever. Marker identity, floor and
-/// empty-history outcomes within the bound are unchanged.
+/// Maximum history pages per Reconcile claim. At the cap, fully inspected
+/// progress is checkpointed for the next owner without rereading the head.
+/// Two consecutive bounds without progress quarantine as
+/// [`QuarantineReason::ScanBoundExceeded`], not proof of marker absence.
 pub const RECONCILE_MAX_PAGES: usize = 16;
 
-/// Wall-clock budget for one Reconcile boundary scan, checked per page beside
-/// [`RECONCILE_MAX_PAGES`]. Either bound spends one scan attempt: the first
-/// yields with [`DeliverOutcome::ScanBoundReached`], the second quarantines.
+/// Wall-clock history-read budget per Reconcile claim, alongside
+/// [`RECONCILE_MAX_PAGES`]. A timed-out page cannot establish a checkpoint.
 pub const RECONCILE_SCAN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Static destination wiring for the service.
@@ -114,10 +110,9 @@ pub enum DeliverOutcome {
     /// Terminal hold with the bounded reason stored.
     Quarantined(QuarantineReason),
     /// The boundary scan hit [`RECONCILE_MAX_PAGES`] or [`RECONCILE_SCAN_TIMEOUT`]
-    /// with the marker neither proven nor disproven: the first bound hit
-    /// durably yields (boundary preserved) and stays reconcile-eligible. The
-    /// next owner rescans from the head; another bound hit quarantines as
-    /// `ScanBoundExceeded` for inspection, so retries cannot loop forever.
+    /// with the marker neither proven nor disproven: checkpoint verified
+    /// progress and yield, preserving the boundary. A first no-progress bound
+    /// also yields; a consecutive no-progress bound quarantines for inspection.
     ScanBoundReached,
     /// A store transition refused (stale/lost claim): nothing was sent and
     /// nothing was written by this pass.
@@ -548,39 +543,48 @@ impl<M: AuditMirror> AuditMirrorService<M> {
             return Ok(DeliverOutcome::Held);
         }
 
-        // Bounded boundary scan (legacy `findMirror` with a cursor): page
-        // downward until the marker is proven, the floor drops below the
-        // boundary, history runs out, or the page/time budget is spent. The
-        // first bound hit yields; a repeat is a distinct operator quarantine,
-        // never a claim that the marker is absent.
+        // Resume below fully inspected history. A progressing bound saves
+        // the floor and yields; only consecutive no-progress bounds quarantine.
+        // Neither transition proves absence or permits another POST.
         let scan_deadline = self
             .reconcile_scan_deadline
             .unwrap_or_else(|| Instant::now() + RECONCILE_SCAN_TIMEOUT);
         let mut pages: usize = 0;
-        let mut before: Option<String> = None;
+        let mut before = row.reconcile_before.clone();
         loop {
             if pages >= RECONCILE_MAX_PAGES || Instant::now() >= scan_deadline {
-                // The durable two-hit budget survives owner changes and read
-                // errors. First yield rotates the queue; a repeat quarantines
-                // without clearing any acceptance evidence or allowing a POST.
-                return Ok(match self.store.bound_reconcile_scan(claim).await? {
-                    ReconcileBound::Yielded => DeliverOutcome::ScanBoundReached,
-                    ReconcileBound::Quarantined => {
-                        DeliverOutcome::Quarantined(QuarantineReason::ScanBoundExceeded)
-                    }
-                    ReconcileBound::LostClaim => DeliverOutcome::Unclaimed,
-                });
+                return Ok(
+                    match self
+                        .store
+                        .bound_reconcile_scan(claim, before.as_deref())
+                        .await?
+                    {
+                        ReconcileBound::Yielded => DeliverOutcome::ScanBoundReached,
+                        ReconcileBound::Quarantined => {
+                            DeliverOutcome::Quarantined(QuarantineReason::ScanBoundExceeded)
+                        }
+                        ReconcileBound::LostClaim => DeliverOutcome::Unclaimed,
+                    },
+                );
             }
-            let page = match self
-                .mirror
-                .channel_history(&destination, before.as_deref(), HISTORY_PAGE_LIMIT)
-                .await
-                .and_then(|page| {
-                    // Enforce the contract even for alternate mirror adapters:
-                    // no marker, boundary or floor may use an invalid page.
-                    validate_history_page(&page, before.as_deref(), HISTORY_PAGE_LIMIT)?;
-                    Ok(page)
-                }) {
+            let read = match tokio::time::timeout_at(
+                scan_deadline.into(),
+                self.mirror
+                    .channel_history(&destination, before.as_deref(), HISTORY_PAGE_LIMIT),
+            )
+            .await
+            {
+                Ok(read) => read,
+                // Re-enter the bound transition with only earlier verified
+                // pages. A cancelled read never establishes a checkpoint.
+                Err(_) => continue,
+            };
+            let page = match read.and_then(|page| {
+                // Enforce the contract even for alternate mirror adapters:
+                // no marker, boundary or floor may use an invalid page.
+                validate_history_page(&page, before.as_deref(), HISTORY_PAGE_LIMIT)?;
+                Ok(page)
+            }) {
                 Ok(page) => page,
                 Err(MirrorError::Rejected(_)) => {
                     // Permission vanished between post and reconcile: terminal.
@@ -626,9 +630,15 @@ impl<M: AuditMirror> AuditMirrorService<M> {
                     .quarantine(claim, QuarantineReason::MarkerMissing)
                     .await;
             }
-            // Keep the lease alive across the scan.
-            self.store.renew(claim).await?;
             before = Some(floor);
+            // A completed budget goes directly through the locked checkpoint
+            // fence. Do not renew a lost/accepted owner while yielding it.
+            if pages < RECONCILE_MAX_PAGES
+                && Instant::now() < scan_deadline
+                && !self.store.renew(claim).await?
+            {
+                return Ok(DeliverOutcome::Unclaimed);
+            }
         }
     }
 
@@ -730,6 +740,11 @@ mod tests {
             .connect_with(options.options([("search_path", schema.as_str())]))
             .await?;
         sqlx::raw_sql(MIGRATION_0340).execute(&pool).await?;
+        sqlx::raw_sql(include_str!(
+            "../../cutover/migrations/0455_audit_reconcile_cursor.sql"
+        ))
+        .execute(&pool)
+        .await?;
         Ok(Some((pool, schema)))
     }
 
@@ -877,7 +892,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_deep_scan_quarantines_across_restart_and_read_error() {
+    async fn repeated_no_progress_quarantines_across_restart_and_read_error() {
         let Some((pool, schema)) = test_pool("audit_scan_repeat")
             .await
             .expect("test database setup")
@@ -897,6 +912,25 @@ mod tests {
             DeliverOutcome::ScanBoundReached
         );
         assert_eq!(mirror.reads() - reads_before, RECONCILE_MAX_PAGES as u64);
+        assert_eq!(
+            store
+                .get(entry)
+                .await
+                .expect("row")
+                .expect("row exists")
+                .reconcile_before
+                .as_deref(),
+            Some("898401")
+        );
+        let timed = AuditMirrorService::new(AuditStore::new(&pool), mirror.clone(), config())
+            .with_reconcile_scan_deadline(Instant::now() - Duration::from_secs(1));
+        assert_eq!(
+            timed
+                .deliver_entry(entry)
+                .await
+                .expect("first no-progress bound"),
+            DeliverOutcome::ScanBoundReached
+        );
         let first = store.get(entry).await.expect("row").expect("row exists");
         assert_eq!(first.state, DeliveryState::Pending);
         assert_eq!(first.search_before.as_deref(), Some("0"));
@@ -926,14 +960,25 @@ mod tests {
             first.last_error,
             "read errors must not reset bound-hit evidence"
         );
-        deep_history(&mirror);
         let reads_before = mirror.reads();
-        let outcome = restarted.deliver_entry(entry).await.expect("second bound");
+        let outcome = timed
+            .deliver_entry(entry)
+            .await
+            .expect("second no-progress bound");
         assert!(
             matches!(outcome, DeliverOutcome::Quarantined(_)),
             "{outcome:?}"
         );
-        assert_eq!(mirror.reads() - reads_before, RECONCILE_MAX_PAGES as u64);
+        assert_eq!(mirror.reads() - reads_before, 0);
+        assert_eq!(
+            store
+                .get(entry)
+                .await
+                .expect("row")
+                .expect("row exists")
+                .reconcile_before,
+            first.reconcile_before
+        );
         let terminal = store.get(entry).await.expect("row").expect("row exists");
         assert_eq!(terminal.state, DeliveryState::Quarantined);
         assert_eq!(
@@ -1025,7 +1070,7 @@ mod tests {
             .expect("owner");
         assert_eq!(
             store
-                .bound_reconcile_scan(&send)
+                .bound_reconcile_scan(&send, None)
                 .await
                 .expect("unprepared fence"),
             ReconcileBound::LostClaim
