@@ -13,7 +13,7 @@
 // / 1.36 MB range. A regression test pins a 200-commit range above 1 MiB.
 //
 // Env: PROD_SHA (40-hex, must be on origin/main), GH_REPO, GITHUB_SERVER_URL,
-// GITHUB_OUTPUT, DIGEST_DATE=YYYY.MM.DD (default today UTC), DRY_RUN=true to
+// GITHUB_OUTPUT, DIGEST_DATE=YYYY-MM-DD (default today UTC), DRY_RUN=true to
 // print without publishing. Needs a full-history checkout with tags.
 
 const { execFileSync } = require("node:child_process");
@@ -220,6 +220,9 @@ function main() {
 	if (!repo) throw new Error("GH_REPO is required");
 	if (!/^\d{4}-\d{2}-\d{2}$/.test(date))
 		throw new Error("DIGEST_DATE must be YYYY-MM-DD");
+	const digestTag = `v${date.replace(/-/g, ".")}`;
+	if (!parseDigestTag(digestTag))
+		throw new Error("DIGEST_DATE must be a real calendar date");
 	const repoUrl = `${process.env.GITHUB_SERVER_URL || "https://github.com"}/${repo}`;
 	try {
 		git("merge-base", "--is-ancestor", sha, "origin/main");
@@ -227,8 +230,15 @@ function main() {
 		throw new Error(`${sha} is not on origin/main; refusing to tag it`);
 	}
 
-	const digestTag = `v${date.replace(/-/g, ".")}`;
 	const lastDigest = latestDigestTag();
+	const latestFlag = !lastDigest || digestTag >= lastDigest ? "--latest" : "--latest=false";
+	// Persist the owed state before any fallible note/publish operation. On a
+	// failure these step outputs survive for the workflow's alert job; success
+	// overwrites released below. Policy skips never call this helper.
+	const pendingDigest = () => output({
+		tag_name: "", released: "false", prod_changed: "true",
+		prev_tag: lastDigest || "",
+	});
 	const lastTarget = lastDigest ? tagTarget(lastDigest) : null;
 	const prevTag = lastDigest || latestSemverReachable(sha);
 
@@ -248,6 +258,7 @@ function main() {
 		// already serve this exact SHA (quiet-day shape) yet the Release is
 		// still owed. Notes range from the previous digest, never the tag
 		// against itself. Dry runs skip the repair (no `gh` calls offline).
+		pendingDigest();
 		const repairPrev =
 			latestDigestTagBefore(digestTag) || latestSemverReachable(existing);
 		const opts = loadOptions("release-please-config.json");
@@ -284,7 +295,7 @@ function main() {
 				digestTag,
 				"--notes-file",
 				notesFile,
-				"--latest",
+				latestFlag,
 			],
 			{ stdio: "inherit" },
 		);
@@ -292,6 +303,16 @@ function main() {
 			tag_name: digestTag,
 			released: "true",
 			prod_changed: "true",
+			prev_tag: lastDigest || "",
+		});
+		return;
+	}
+
+	if (!dryRun && existing) {
+		// Reconcile a lost SBOM dispatch even when production still matches
+		// today's tag. Attaching inventories is idempotent (--clobber).
+		output({
+			tag_name: digestTag, released: "true", prod_changed: "false",
 			prev_tag: lastDigest || "",
 		});
 		return;
@@ -336,6 +357,7 @@ function main() {
 		return;
 	}
 
+	if (!dryRun) pendingDigest();
 	const opts = loadOptions("release-please-config.json");
 	const range = prevTag ? `${prevTag}..${sha}` : sha;
 	const commits = gitLog(range)
@@ -369,7 +391,7 @@ function main() {
 		const notesFile = `${process.env.RUNNER_TEMP || "/tmp"}/digest-notes-${digestTag}.md`;
 		fs.writeFileSync(notesFile, notes);
 		// Creates the tag on the live production commit when it does not exist
-		// yet. A digest is always the newest date, so it is always Latest.
+		// yet. Backdated cuts/repairs must not move Latest backward.
 		execFileSync(
 			"gh",
 			[
@@ -382,7 +404,7 @@ function main() {
 				digestTag,
 				"--notes-file",
 				notesFile,
-				"--latest",
+				latestFlag,
 			],
 			{ stdio: "inherit" },
 		);

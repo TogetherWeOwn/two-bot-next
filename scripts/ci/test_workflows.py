@@ -2112,9 +2112,9 @@ def daily_digest_errors(workflow):
     (/readyz, falling back to the newest recorded successful production
     Deployment: rows whose description is a deploy ID),
     cuts the tag via daily-digest.cjs, and dispatches the SBOM chain for the
-    fresh tag only. The alert job runs only on the silent-failure mode (digest
-    succeeded, production changed, nothing released) through the
-    synthetic-alerts environment, reusing the existing Discord line.
+    fresh or existing release. The alert job consumes owed-digest outputs even
+    on a failed publication through the synthetic-alerts environment, reusing
+    the existing Discord line.
     """
     name = "daily-digest.yml"
     errors = []
@@ -2156,8 +2156,7 @@ def daily_digest_errors(workflow):
     if not runner_allowed("digest", digest.get("runs-on")):
         errors.append(f"{name}:digest: must use the routed runner expression for job 'digest'")
     digest_text = str(digest)
-    for required in ("PRODUCTION_WORKER_URL", "/readyz", "environment=production",
-                     "is_deploy_id_shape",
+    for required in ("PRODUCTION_WORKER_URL", "python3 scripts/digest_resolve.py",
                      "daily-digest.cjs", "gh workflow run release.yml --ref main -f release_tag="):
         if required not in digest_text:
             errors.append(f"{name}:digest: missing pin {required}")
@@ -2170,13 +2169,13 @@ def daily_digest_errors(workflow):
     alert = jobs["alert"]
     if alert.get("needs") != "digest":
         errors.append(f"{name}:alert: must wait for the digest job")
-    expected_alert_if = ("${{ !cancelled() && needs.digest.result == 'success' && "
+    expected_alert_if = ("${{ !cancelled() && "
                          "needs.digest.outputs.prod_changed == 'true' && "
                          "needs.digest.outputs.released != 'true' && "
                          "inputs.dry_run != true }}")
     if alert.get("if") != expected_alert_if:
-        errors.append(f"{name}:alert: must fire only when the digest succeeded yet production "
-                      "changed with nothing released, never on a dry run")
+        errors.append(f"{name}:alert: must consume owed-digest outputs even on failure, "
+                      "never on a dry run")
     if alert.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:alert: must keep contents:read only")
     if alert.get("environment") != "synthetic-alerts":

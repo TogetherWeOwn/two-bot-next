@@ -21,11 +21,17 @@ deployed commit) and compares it to the last digest tag's target:
   from the Conventional Commit subjects (squash-merged PR titles) since the
   previous digest. That run dispatches `release.yml` with the digest tag, as
   its own run, so the digest run never waits for the SBOM chain.
-- Today's tag already exists: repair a missing Release, else skip; tomorrow's
-  digest covers any later production move. Never a second tag for one day.
-- Production moved but no digest tag was made: the `alert` job posts one
-  Discord ops-channel alert reusing the synthetic-alert line. A red digest
-  job is already visible and never alerts.
+- Today's tag already exists: repair a missing Release, else reuse it. Both
+  paths redispatch the idempotent SBOM chain, even on a quiet day, so rerunning
+  a failed dispatch restores the inventory path. Tomorrow's digest covers
+  any later production move. Never a second tag for one day.
+- A cut or repair is owed but fails before publication: the script records
+  `prod_changed=true` and `released=false` before note rendering/publishing.
+  The `alert` job consumes those outputs even on failure and posts one Discord
+  ops-channel alert through the synthetic-alert line. Success overwrites
+  `released=true`; quiet days, rollbacks, dry runs and SBOM-only failures do
+  not raise a missing-digest alert. Failures before the revision/digest state
+  can be established remain red without claiming a production change.
 
 `sbom-target`, `release-sbom` and `attach-sbom` build, scan and attach the
 SBOM assets to the digest release (`docs/supply-chain.md`).
@@ -44,7 +50,11 @@ CI and review on `main`.
 - The first digest ranges its notes from the latest reachable `vX.Y.Z` tag, so
   the pre-digest history stays linked; later digests range from the previous
   digest.
-- A digest is always the newest date, so it is always marked "Latest".
+- Only the newest digest date is marked "Latest". Backdated cuts and older
+  repairs pass `--latest=false`, preserving the newer release's Latest status.
+- `DIGEST_DATE`, when supplied to the script for an offline/manual repair,
+  must be a real `YYYY-MM-DD` calendar date; nonexistent dates are refused
+  before any git or GitHub operation.
 - Notes use only commit subjects (plus `BREAKING CHANGE:` footers), so a PR body
   can no longer drop a note. The `pr-lint` commit-parse guard
   (`.github/scripts/commit-parse-guard.cjs`, `.github/release-parse-exceptions.txt`)
@@ -58,7 +68,7 @@ CI and review on `main`.
 ## Repair and dry run
 
 ```sh
-# Re-cut today's digest (idempotent; repairs a missing Release, else skips).
+# Reconcile today's digest (repair a missing Release and redispatch SBOM).
 gh workflow run daily-digest.yml --ref main
 # Preview the digest notes without tagging, publishing or alerting.
 gh workflow run daily-digest.yml --ref main -f dry_run=true
@@ -81,10 +91,17 @@ already-cut today skip, semver continuity, the off-main refusal and invalid
 inputs. Its ENOBUFS regression builds a 200-commit range above 1 MiB and proves
 the digest completes. Its one non-dry-run case runs a fresh cut against a
 mocked `gh` and pins the single `release create` call's target and its
-`--latest` flag. `scripts/test_digest_alert.py` (worker CI) pins the
-missing-digest alert content and its refusals. `scripts/ci/test_workflows.py`
-pins the workflow shapes, the digest schedule, the alert gate and the
-`contents: write` grant on the tagging job.
+`--latest` flag. `scripts/test_daily_digest_execution.py` drives a failed
+publication through the workflow alert expression and a stubbed Discord
+poster, verifies quiet/dry-run/cancel suppression, executes SBOM redispatch
+for an existing release, and checks older repairs, backdated cuts and invalid
+calendar inputs. `scripts/test_digest_resolve.py` executes the extracted
+`scripts/digest_resolve.py` with offline readyz/Deployment fixtures, including
+automatic rows before recorded rows, failure statuses, malformed bodies, HTTPS
+refusal, 503 revisions and fail-closed behavior. Both run in worker CI.
+`scripts/test_digest_alert.py` pins alert content/refusals;
+`scripts/ci/test_workflows.py` pins the workflow wiring, schedule, alert gate
+and the `contents: write` grant on the tagging job.
 
 The root `src/lib.rs` release-metadata library was added for release-please's
 Rust strategy, which needed a root `[package]` version. It stays as is; nothing
