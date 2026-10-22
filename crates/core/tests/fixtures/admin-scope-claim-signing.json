@@ -1,5 +1,5 @@
 {
-  "description": "Public, synthetic scope-claim signing vectors for the slice-1 canonical-string extension (TOG-35921 section 3.2). Test-only low-entropy secrets: never deploy these keys or register them as caller credentials. Generated with python3 hmac/hashlib, cross-checked with node:crypto. The canonical string carries NO idempotency-key line: Idempotency-Key stays outside the MAC (spec: unchanged).",
+  "description": "Public, synthetic scope-claim signing vectors for the slice-1 canonical-string extension (approved admin API spec section 3.2). Test-only low-entropy secrets: never deploy these keys or register them as caller credentials. Generated with python3 hmac/hashlib, cross-checked with node:crypto. The canonical string carries NO idempotency-key line: Idempotency-Key stays outside the MAC (spec: unchanged).",
   "canonical_layout": [
     "two-internal-action/scope-claim/v1",
     "POST",

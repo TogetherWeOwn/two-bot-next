@@ -1,7 +1,7 @@
 /**
  * Failing acceptance pinning the MCP control-tools bearer binding
- * (TOG-35921 section 3.2 landing zone; acceptance TOG-36192, build
- * TOG-36201). The binding MUST be pinned before slice 4 registers the
+ * (approved admin API spec section 3.2 landing zone). The binding MUST
+ * be pinned before slice 4 registers the
  * first control tool: this file is that pin.
  *
  * Two halves. The closed half (green before and after) proves no control
@@ -43,6 +43,9 @@
  * is pure and synchronous (local checks only, no fetch). Scope ORDER and
  * the scope-to-verb map stay slice 0's; the step-up ceremony and the audit
  * write stay slices 4 and 2's — this file pins the binding they all share.
+ * This seam is NOT registry authority: caller-supplied scopes and step-up
+ * cannot authorize a container action. The HTTP bearer-proof suite pins
+ * that security boundary, including forged claims and legacy v1 attempts.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
