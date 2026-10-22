@@ -26,8 +26,11 @@ at most ten due or closed-unposted polls. Votes expire against the database
 clock, not the next tick. Expect up to one cadence plus workload for the close
 message, not a strict delivery deadline.
 
-Migration `0455_timed_polls.sql` creates `polls` and `poll_votes`. Apply the
-migration and reviewed database role inventory before deploying the binary.
+Migration `0455_timed_polls.sql` creates `polls` and `poll_votes`. Migrations
+0456 and 0457 add the lookup indexes concurrently, each as one statement outside
+a transaction. For an interrupted index build, inspect index validity and the
+migration ledger before retrying; follow [migration recovery](migrations.md).
+Apply the migrations and reviewed database role inventory before deploying the binary.
 Creation quotas share a guild advisory lock. Votes and close share a poll row
 lock; the vote's live edit completes before the acknowledgement settles. The
 closed row freezes final counts so erasing a voter later does not rewrite the

@@ -20,10 +20,6 @@ CREATE TABLE IF NOT EXISTS polls (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (guild_id, id)
 );
-CREATE INDEX IF NOT EXISTS polls_due ON polls (guild_id, ends_at)
-    WHERE status = 'open';
-CREATE INDEX IF NOT EXISTS polls_unposted ON polls (guild_id, closed_at)
-    WHERE status = 'closed' AND results_posted_at IS NULL;
 CREATE TABLE IF NOT EXISTS poll_votes (
     guild_id TEXT NOT NULL,
     poll_id TEXT NOT NULL,
