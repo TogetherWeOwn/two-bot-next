@@ -6,8 +6,9 @@
 //! Contract for `two_bot_core::metrics`, following the existing fixed-size,
 //! allowlist pattern (`presence_capture`, `internal_action`):
 //!
-//! - `EVENTSUB_DELIVERY_KINDS` is exactly
-//!   `["challenge", "notification", "revocation", "tampered", "ignored", "other"]`.
+//! - `EVENTSUB_DELIVERY_KINDS` is exactly the five outcome kinds, then one
+//!   snake_case label per `EventSubError` variant (12), then the trailing
+//!   `other` absorbing unknown strings.
 //! - `EVENTSUB_POST_OUTCOMES` is exactly
 //!   `["attempted", "succeeded", "failed", "other"]`.
 //! - `Metrics::eventsub_received()` increments the label-free counter
@@ -44,6 +45,18 @@ fn stream_metrics_eventsub_vocabularies_are_exactly_the_allowlists() {
             "revocation",
             "tampered",
             "ignored",
+            "invalid_secret",
+            "invalid_header",
+            "body_too_large",
+            "bad_signature",
+            "invalid_timestamp",
+            "stale_timestamp",
+            "invalid_body",
+            "wrong_subscription",
+            "invalid_challenge",
+            "invalid_callback",
+            "invalid_broadcaster_id",
+            "too_many_broadcasters",
             "other"
         ]
     );

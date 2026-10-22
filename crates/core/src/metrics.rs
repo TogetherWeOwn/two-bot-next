@@ -457,15 +457,29 @@ pub const INTERNAL_ACTION_OUTCOMES: &[&str] = &[
 /// `error` when the facts writer failed, `timeout` when the drain missed the
 /// dispatch deadline. Both warn and continue; `other` absorbs unknown reasons.
 pub const COMMUNITY_FACTS_DRAIN_REASONS: &[&str] = &["error", "timeout", "other"];
-/// Verified EventSub deliveries by bounded receiver classification. `other`
-/// captures unknown/future classification errors; no header, body, broadcaster,
-/// subscription, or secret data reaches the label.
-pub const EVENTSUB_DELIVERY_KINDS: [&str; 6] = [
+/// Verified EventSub deliveries by bounded receiver classification. The
+/// twelve `EventSubError` snake_case labels record classify errors by
+/// variant ([`crate::twitch_eventsub::eventsub_error_label`]); `other` stays
+/// the trailing entry absorbing unknown/future strings. No header, body,
+/// broadcaster, subscription, or secret data reaches the label.
+pub const EVENTSUB_DELIVERY_KINDS: [&str; 18] = [
     "challenge",
     "notification",
     "revocation",
     "tampered",
     "ignored",
+    "invalid_secret",
+    "invalid_header",
+    "body_too_large",
+    "bad_signature",
+    "invalid_timestamp",
+    "stale_timestamp",
+    "invalid_body",
+    "wrong_subscription",
+    "invalid_challenge",
+    "invalid_callback",
+    "invalid_broadcaster_id",
+    "too_many_broadcasters",
     "other",
 ];
 /// Go-live post attempts by bounded outcome. The outcome vocabulary is fixed;

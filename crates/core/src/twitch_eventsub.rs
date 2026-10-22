@@ -96,6 +96,29 @@ pub enum EventSubError {
     TooManyBroadcasters,
 }
 
+/// Bounded metric/log label for an [`EventSubError`] variant. Total over the
+/// enum: a future thirteenth variant fails compilation here until the
+/// vocabulary grows with it, so labels can never silently collapse through
+/// `bounded_index`. Every label is a member of
+/// [`crate::metrics::EVENTSUB_DELIVERY_KINDS`]; unknown strings still
+/// collapse to the trailing `other`.
+pub fn eventsub_error_label(error: &EventSubError) -> &'static str {
+    match error {
+        EventSubError::InvalidSecret => "invalid_secret",
+        EventSubError::InvalidHeader => "invalid_header",
+        EventSubError::BodyTooLarge => "body_too_large",
+        EventSubError::BadSignature => "bad_signature",
+        EventSubError::InvalidTimestamp => "invalid_timestamp",
+        EventSubError::StaleTimestamp => "stale_timestamp",
+        EventSubError::InvalidBody => "invalid_body",
+        EventSubError::WrongSubscription => "wrong_subscription",
+        EventSubError::InvalidChallenge => "invalid_challenge",
+        EventSubError::InvalidCallback => "invalid_callback",
+        EventSubError::InvalidBroadcasterId => "invalid_broadcaster_id",
+        EventSubError::TooManyBroadcasters => "too_many_broadcasters",
+    }
+}
+
 /// The EventSub signing secret handed to Twitch at subscription creation.
 /// Twitch requires 10-100 ASCII characters. The value only leaves through
 /// `WebhookSecret::expose()` at the HMAC and subscription-body boundaries.
@@ -596,6 +619,34 @@ mod tests {
     const TS: &str = "2025-10-09T08:53:20.123456789Z";
     const ID: &str = "e76c6bd4-55c9-4987-8304-da1588d8988b";
     const INVITE: &str = "https://discord.gg/example";
+
+    #[test]
+    fn eventsub_error_labels_are_distinct_vocab_members() {
+        let errors = [
+            EventSubError::InvalidSecret,
+            EventSubError::InvalidHeader,
+            EventSubError::BodyTooLarge,
+            EventSubError::BadSignature,
+            EventSubError::InvalidTimestamp,
+            EventSubError::StaleTimestamp,
+            EventSubError::InvalidBody,
+            EventSubError::WrongSubscription,
+            EventSubError::InvalidChallenge,
+            EventSubError::InvalidCallback,
+            EventSubError::InvalidBroadcasterId,
+            EventSubError::TooManyBroadcasters,
+        ];
+        let mut labels: Vec<&str> = errors.iter().map(eventsub_error_label).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), errors.len(), "labels: {labels:?}");
+        for label in &labels {
+            assert!(
+                crate::metrics::EVENTSUB_DELIVERY_KINDS.contains(label),
+                "{label} must be a bounded delivery kind"
+            );
+        }
+    }
 
     fn test_secret() -> WebhookSecret {
         let timestamp = SystemTime::now()

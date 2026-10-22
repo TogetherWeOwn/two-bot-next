@@ -12,14 +12,20 @@
 //! effects, so the route stays dark for posting until provisioning lands.
 //!
 //! Logging carries only scalar `event`/`status`/`error_class` plus the bounded
-//! `message_type` (refusals) and `reason` (revocation ack) scalars: no header
-//! values, challenge, body bytes or query. The callback path never reaches a
+//! `message_type` (refusals), `reason` (revocation ack) and `error_variant`
+//! (classify errors) scalars: no header values, challenge, body bytes or
+//! query. Refusal and classify-error warns are sampled (first, then every
+//! 64th process-wide) so hostile bursts count in counters, never per-request
+//! logs. The callback path never reaches a
 //! trace span (`server::TRACED_PATHS` must not list it; unknown paths render
 //! as `[REDACTED]`).
 
 use std::{
     future::IntoFuture,
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -38,7 +44,9 @@ use two_bot_core::{
     eventsub_receiver_config::EventsubReceiverConfig,
     eventsub_refresh::{refresh_before_verify, RefreshVerifier},
     stream_live_store::deliver_go_live,
-    twitch_eventsub::{classify, verify_delivery, Delivery, DeliveryHeaders, EventSubError},
+    twitch_eventsub::{
+        classify, eventsub_error_label, verify_delivery, Delivery, DeliveryHeaders, EventSubError,
+    },
 };
 
 use crate::eventsub_delivery::{post_metric_counts, DeliveryDeps};
@@ -171,6 +179,51 @@ fn bounded_message_type(value: &str) -> &'static str {
     }
 }
 
+/// Refusal and classify-error warns are hostile-traffic signal, not
+/// per-request logs: the process emits the first warn, then every 64th, so a
+/// forgery burst is counted in counters while the sampled warn keeps the
+/// bounded scalars visible. One process-wide counter covers both `refuse`
+/// and `sampled_classify_warn` so concurrent hostile paths share one budget.
+static REFUSAL_WARN_SAMPLE: AtomicU64 = AtomicU64::new(0);
+const REFUSAL_WARN_SAMPLE_EVERY: u64 = 64;
+
+fn sample_every_n(counter: u64) -> bool {
+    counter % REFUSAL_WARN_SAMPLE_EVERY == 0
+}
+
+fn sampled_refusal_warn_emits() -> bool {
+    // Unit tests pin separation and redaction at full volume, so they emit
+    // every warn; the sampling math itself is pinned by
+    // `refusal_warn_sampling_emits_first_then_every_nth` below.
+    if cfg!(test) {
+        return true;
+    }
+    sample_every_n(REFUSAL_WARN_SAMPLE.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Sampled warn for a classify error: carries the bounded `error_variant`
+/// label ([`eventsub_error_label`]) plus the outcome's `error_class`, so a
+/// `BadSignature` rotation mismatch separates from clock-skew/misconfig
+/// signal in logs alone. Classify-error arms answer through `envelope`/`ack`
+/// directly and warn only here, so each error emits at most one sampled warn.
+fn sampled_classify_warn(
+    status: StatusCode,
+    error_class: &'static str,
+    error_variant: &'static str,
+    message_type: &'static str,
+) {
+    if sampled_refusal_warn_emits() {
+        tracing::warn!(
+            event = "eventsub_receiver",
+            status = status.as_u16(),
+            error_class = error_class,
+            error_variant = error_variant,
+            message_type = message_type,
+            "eventsub delivery classification failed"
+        );
+    }
+}
+
 fn refuse(
     state: &ReceiverState,
     status: StatusCode,
@@ -180,13 +233,15 @@ fn refuse(
     message_type: &'static str,
 ) -> Response {
     let _ = state;
-    tracing::warn!(
-        event = "eventsub_receiver",
-        status = status.as_u16(),
-        error_class = code,
-        message_type = message_type,
-        "eventsub delivery refused"
-    );
+    if sampled_refusal_warn_emits() {
+        tracing::warn!(
+            event = "eventsub_receiver",
+            status = status.as_u16(),
+            error_class = code,
+            message_type = message_type,
+            "eventsub delivery refused"
+        );
+    }
     envelope(status, code, retryable, id)
 }
 
@@ -561,43 +616,47 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
         }
         // Deterministic planning errors: acknowledge with 2xx so Twitch does
         // not retry what will never succeed. Unknown/future classification
-        // errors remain retryable through the fallback below.
-        Err(EventSubError::WrongSubscription) | Err(EventSubError::InvalidBody) => {
-            two_bot_core::metrics::global().eventsub_classified("ignored");
-            tracing::info!(
-                event = "eventsub_receiver",
-                status = 200,
-                "delivery ignored"
+        // errors remain retryable through the fallback below. Every error
+        // arm records its own variant label (never the catch-all `other`)
+        // and warns through the sampled classify helper, so hostile bursts
+        // count in counters with at most one sampled warn each.
+        Err(e @ (EventSubError::WrongSubscription | EventSubError::InvalidBody)) => {
+            let variant = eventsub_error_label(&e);
+            two_bot_core::metrics::global().eventsub_classified(variant);
+            sampled_classify_warn(
+                StatusCode::OK,
+                "acknowledged",
+                variant,
+                bounded_message_type(&message_type),
             );
             ack(id)
         }
-        Err(EventSubError::InvalidChallenge) => {
-            two_bot_core::metrics::global().eventsub_classified("ignored");
+        Err(e @ EventSubError::InvalidChallenge) => {
+            let variant = eventsub_error_label(&e);
+            two_bot_core::metrics::global().eventsub_classified(variant);
             // Same `malformed` error class as a bad notification body, but
             // `message_type = "webhook_callback_verification"` separates
             // failed challenges in logs alone.
-            refuse(
-                state,
+            sampled_classify_warn(
                 StatusCode::BAD_REQUEST,
                 "malformed",
-                false,
-                id,
+                variant,
                 bounded_message_type(&message_type),
-            )
+            );
+            envelope(StatusCode::BAD_REQUEST, "malformed", false, id)
         }
         Err(e) => {
-            let _ = e;
-            two_bot_core::metrics::global().eventsub_classified("other");
+            let variant = eventsub_error_label(&e);
+            two_bot_core::metrics::global().eventsub_classified(variant);
             // A future classify error may be transient. Keep it retryable
             // rather than acknowledging it as a permanent delivery outcome.
-            refuse(
-                state,
+            sampled_classify_warn(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "unavailable",
-                true,
-                id,
+                variant,
                 bounded_message_type(&message_type),
-            )
+            );
+            envelope(StatusCode::SERVICE_UNAVAILABLE, "unavailable", true, id)
         }
     }
 }
@@ -1520,12 +1579,38 @@ mod tests {
                 "delivery arm must classify as {expected}"
             );
         };
+        // Error arms record the bound variant through the total mapping (never
+        // a collapsed literal) and warn once through the sampled helper.
+        let assert_variant_classification = |body: &str| {
+            let calls = body.matches("eventsub_classified(").count();
+            assert_eq!(
+                calls, 1,
+                "error arm must emit exactly one classification, found {calls}"
+            );
+            assert!(
+                body.contains("eventsub_classified(variant)"),
+                "error arm must classify with its bound variant label"
+            );
+            assert!(
+                body.contains("eventsub_error_label(&e)"),
+                "error arm must map the bound error through eventsub_error_label"
+            );
+            assert_eq!(
+                body.matches("sampled_classify_warn(").count(),
+                1,
+                "error arm must warn once through the sampled classify helper"
+            );
+        };
 
         let catch_all = arm("Err(e) => {", "\n    }\n}\n\n#[cfg(test)]");
         assert!(catch_all.contains("StatusCode::SERVICE_UNAVAILABLE"));
         assert!(!catch_all.contains("ack("));
         assert!(catch_all.contains("\"unavailable\""));
-        assert!(catch_all.contains("                true,"));
+        assert!(
+            catch_all
+                .contains("envelope(StatusCode::SERVICE_UNAVAILABLE, \"unavailable\", true, id)"),
+            "catch-all must answer retryable 503 unavailable"
+        );
 
         for (start, end, kind) in [
             (
@@ -1545,23 +1630,38 @@ mod tests {
             ),
             (
                 "Ok(Delivery::Ignored)",
-                "Err(EventSubError::WrongSubscription) | Err(EventSubError::InvalidBody)",
+                "Err(e @ (EventSubError::WrongSubscription",
                 "ignored",
             ),
-            (
-                "Err(EventSubError::WrongSubscription) | Err(EventSubError::InvalidBody)",
-                "Err(EventSubError::InvalidChallenge)",
-                "ignored",
-            ),
-            (
-                "Err(EventSubError::InvalidChallenge)",
-                "Err(e) => {",
-                "ignored",
-            ),
-            ("Err(e) => {", "\n    }\n}\n\n#[cfg(test)]", "other"),
         ] {
             assert_classification(arm(start, end), kind);
         }
+        for (start, end) in [
+            (
+                "Err(e @ (EventSubError::WrongSubscription",
+                "Err(e @ EventSubError::InvalidChallenge)",
+            ),
+            ("Err(e @ EventSubError::InvalidChallenge)", "Err(e) => {"),
+            ("Err(e) => {", "\n    }\n}\n\n#[cfg(test)]"),
+        ] {
+            assert_variant_classification(arm(start, end));
+        }
+    }
+
+    #[test]
+    fn refusal_warn_sampling_emits_first_then_every_nth() {
+        assert!(sample_every_n(0), "the first hostile request always warns");
+        assert!(!sample_every_n(1));
+        assert!(!sample_every_n(REFUSAL_WARN_SAMPLE_EVERY - 1));
+        assert!(sample_every_n(REFUSAL_WARN_SAMPLE_EVERY));
+        assert!(sample_every_n(2 * REFUSAL_WARN_SAMPLE_EVERY));
+        assert_eq!(
+            (0..REFUSAL_WARN_SAMPLE_EVERY * 3)
+                .filter(|count| sample_every_n(*count))
+                .count(),
+            3,
+            "a burst of 3 windows emits exactly 3 sampled warns"
+        );
     }
 
     #[tokio::test(start_paused = true)]
