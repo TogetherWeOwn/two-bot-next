@@ -97,9 +97,8 @@ on:
 
 permissions: {}
 
-# No workflow-level concurrency: only the `production` and `release` jobs
-# below hold the `deploy-production` lane. The guard, gates, soak and recheck
-# jobs run outside it, so a sleeping automatic promotion can never queue an
+# No workflow-level concurrency: only the `production` job below holds the
+# `deploy-production` lane. The guard, gates, soak and recheck jobs run outside it, so a sleeping automatic promotion can never queue an
 # operator rollback behind it. The lane keeps the default single pending
 # slot, so the `recheck` job skips an automatic run while an operator
 # dispatch is active — otherwise the automatic `production` job would enter
@@ -1200,9 +1199,9 @@ jobs:
     # no deploy), and a skipped recheck counts only for manual runs — an
     # automatic run always needs a fresh recheck pass with no skip.
     if: "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && (needs.soak.result == 'success' || needs.soak.result == 'skipped') && ((needs.guard.outputs.auto != 'true' && needs.recheck.result == 'skipped') || (needs.recheck.result == 'success' && needs.recheck.outputs.skip == '')) && (needs.guard.outputs.mode == 'rollback' || needs.guard.outputs.allow_unstaged == 'true' || (needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success'))"
-    # One of the two jobs holding the deploy-production lane (with `release`
-    # below): only a running or pending production job occupies it. The
-    # guard, gates, soak and recheck jobs carry no concurrency, so recovery
+    # The only job holding the deploy-production lane: only a running or
+    # pending production job occupies it. The guard, gates, soak and recheck
+    # jobs carry no concurrency, so recovery
     # dispatches are never queued behind a sleeping promotion. The lane keeps
     # the default single pending slot: a third arrival cancels the queued run,
     # so automatic runs recheck for an active operator dispatch first and skip
@@ -1749,30 +1748,3 @@ jobs:
               sys.exit(1)
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
               summary.write(f"- Takeover confirmed: `{expected}` still serves 100% after the owned probes\n")
-
-  release:
-    name: release
-    # Start the release for the commit that is now live as a SEPARATE release.yml
-    # run. This run, and its deploy-production group (the single production
-    # rollback path), ends here instead of waiting for the tag + SBOM chain.
-    # A rollback serves an older version, so it is never released.
-    needs: [guard, production]
-    if: needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.skip == ''
-    # The second job holding the deploy-production lane: the release dispatch
-    # for the just-deployed SHA serializes behind a running production job.
-    concurrency:
-      group: deploy-production
-      cancel-in-progress: false
-    # Runner routing: see the note on `check` in check.yml.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'release') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
-    timeout-minutes: 5
-    permissions:
-      actions: write # Dispatch release.yml for the deployed SHA (GITHUB_TOKEN dispatches do start runs).
-    steps:
-      - name: Start the release run for the deployed SHA
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # No checkout in this job: gh needs the repo named explicitly.
-          GH_REPO: ${{ github.repository }}
-          SHA: ${{ needs.guard.outputs.sha }}
-        run: gh workflow run release.yml --ref main -f sha="$SHA"

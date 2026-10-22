@@ -36,7 +36,7 @@ ingress "staging-only, dark by default" (`wrangler/src/index.ts:882-883`).
 The historical contract has **18 actions**. The current core allowlist has
 **19** (rechecked 2026-10-10): those 18 plus `event.read`
 (`crates/core/src/internal_actions.rs:653`; nine moderation verbs at `:703`,
-14 idempotency-bound at `:680`). All 19 are assessed below. `docs/parity.md:221`
+14 idempotency-bound at `:680`). All 19 are assessed below. `docs/parity.md:226`
 records the same 19 actions with `event.read` and the `settings.set`
 compare-and-set (`expected_version`); the core constants above are
 authoritative. The legacy `docs/INTERNAL_ACTIONS.md` is not in this checkout;
@@ -105,8 +105,8 @@ ingress gate below admits them.
   an additional inbound HTTP webhook. The runtime commits funnel effects and
   gateway checkpoints; detached dispatch now fans MessageCreate/
   InteractionCreate events (including tickets) to the shared command runtime
-  without awaiting REST or store writes (`crates/bot/src/gateway.rs:1506-1514`,
-  `crates/bot/src/command_runtime.rs:257`, tickets supervisor start/shutdown
+  without awaiting REST or store writes (`crates/bot/src/gateway.rs:1542-1550`,
+  `crates/bot/src/command_runtime.rs:954-993`, tickets supervisor start/shutdown
   at `gateway.rs:180`, `:192-193`). The gateway loop still does not invoke the
   internal-action executor; the ticket runtime shares `ActionExecutor`
   transport through its own guild-fenced handlers

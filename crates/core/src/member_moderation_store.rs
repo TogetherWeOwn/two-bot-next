@@ -404,7 +404,11 @@ impl MemberModerationStore for PgMemberModerationStore {
             "INSERT INTO moderation_audit
              (request_id, guild_id, actor_id, action, target_id, channel_id, reason,
               outcome, idempotency_key, metadata_json, created_at)
-             VALUES ($1, $2, $3, $4, $5, NULL, $6, $7, $8, $9, NOW())
+             SELECT $1, $2, $3, $4, $5, NULL, $6, $7, $8, $9, NOW()
+             WHERE NOT EXISTS (
+               SELECT 1 FROM moderation_audit
+               WHERE guild_id = $2 AND request_id = $10
+             )
              ON CONFLICT (request_id) DO NOTHING",
         )
         .bind(&row.request_id)
@@ -416,6 +420,12 @@ impl MemberModerationStore for PgMemberModerationStore {
         .bind(row.outcome)
         .bind(&row.idempotency_key)
         .bind(&row.metadata_json)
+        // Preserve accepted-effect evidence when only completion is uncertain.
+        .bind(
+            (row.outcome == "in_progress")
+                .then(|| row.request_id.strip_suffix(":in_progress"))
+                .flatten(),
+        )
         .execute(&self.pool)
         .await
         .map_err(db_error)?;

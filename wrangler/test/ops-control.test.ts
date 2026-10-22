@@ -819,7 +819,9 @@ function auditBoundaryFixture(targetBytes: number) {
   const values = {
     TWO_AUTOMATIONS: "\\".repeat(4096),
     TWO_AUTOMOD: "\\".repeat(4096),
-    TWO_MODERATION: "\\".repeat(4096),
+    // TWO_DEPLOY_ENV, not TWO_MODERATION: fixtures must stay PUT-writable,
+    // and both names are 14 characters so the byte tuning is unchanged.
+    TWO_DEPLOY_ENV: "\\".repeat(4096),
     TWO_TEXT_COMMANDS: "\\".repeat(4096),
   };
   const rows: AuditProjection[] = [
@@ -871,7 +873,7 @@ for (const offset of [-1, 0, 1]) {
 test("audit acceptance: oversized newest row never skips ahead to an older small row", async () => {
   const large = configAudit({
     TWO_AUTOMATIONS: "\t".repeat(4096), TWO_AUTOMOD: "\t".repeat(4096),
-    TWO_MODERATION: "\t".repeat(4096), TWO_TEXT_COMMANDS: "\t".repeat(4096),
+    TWO_DEPLOY_ENV: "\t".repeat(4096), TWO_TEXT_COMMANDS: "\t".repeat(4096),
     TWO_ANNOUNCEMENTS: "\t".repeat(4096), TWO_VOICE: "\t".repeat(4096),
     TWO_ANTI_NUKE: "\t".repeat(4096), TWO_TEMP_VOICE: "\t".repeat(4096),
   });

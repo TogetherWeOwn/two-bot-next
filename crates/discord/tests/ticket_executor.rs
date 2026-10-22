@@ -198,6 +198,44 @@ async fn fixed_panel_and_controls_enforce_styles_and_controlled_mentions() {
 }
 
 #[tokio::test]
+async fn claimed_marker_has_no_components_empty_mentions_and_validates_staff() {
+    let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!({"id":"701"}))).await;
+    let rest = executor(&mock);
+    rest.post_ticket_message("600", TicketMessage::Claimed { staff_id: "501" })
+        .await
+        .unwrap();
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 1);
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["content"], "<@501> claimed this ticket.");
+    assert!(
+        body.get("components").is_none(),
+        "claimed marker must not send an empty action row: {body:?}"
+    );
+    assert_eq!(
+        body["allowed_mentions"],
+        json!({"parse":[],"roles":[],"users":[],"replied_user":false})
+    );
+    mock.shutdown().await;
+
+    for bad in ["0", "not-a-snowflake", ""] {
+        let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+        assert!(
+            executor(&mock)
+                .post_ticket_message("600", TicketMessage::Claimed { staff_id: bad })
+                .await
+                .is_err(),
+            "staff id {bad:?} must reject"
+        );
+        assert!(
+            mock.requests().is_empty(),
+            "invalid staff id must not reach REST"
+        );
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn resumed_identity_is_authenticated_bot_user_not_application() {
     let mock = MockRest::start(
         vec![ScriptedResponse::json(200, json!({"id":"400","bot":true}))],

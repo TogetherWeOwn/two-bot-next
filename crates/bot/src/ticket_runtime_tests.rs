@@ -1,9 +1,15 @@
 //! Mock-only proofs; lazy testdb pool never connects in these tests.
 //! Timer proofs use Tokio's paused clock, not elapsed wall time.
 use super::*;
+use crate::command_runtime::CommandRuntime;
 use crate::discord_test_common::{MockRest, ScriptedResponse};
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
+use std::sync::Arc;
+use twilight_model::application::interaction::Interaction;
+use twilight_model::gateway::event::Event;
+use twilight_model::gateway::payload::incoming::InteractionCreate;
+use two_bot_core::tickets::TICKET_OPEN_ID;
 
 fn runtime(mock: &MockRest) -> TicketRuntime {
     let pool = PgPoolOptions::new()
@@ -185,11 +191,12 @@ async fn ticket_history_fetches_all_pages_and_keeps_attachments_and_total_count(
         ScriptedResponse::status(500),
     )
     .await;
-    let snapshot = runtime(&mock)
+    let (snapshot, truncated) = runtime(&mock)
         .capture_history("600")
         .await
         .ok()
         .expect("complete history");
+    assert!(!truncated);
     assert_eq!(snapshot.message_count, 102);
     assert!(snapshot
         .content
@@ -218,11 +225,12 @@ async fn truncated_transcript_still_fetches_later_pages_and_counts_every_message
         ScriptedResponse::status(500),
     )
     .await;
-    let snapshot = runtime(&mock)
+    let (snapshot, truncated) = runtime(&mock)
         .capture_history("600")
         .await
         .ok()
         .expect("complete capped history");
+    assert!(truncated);
     assert_eq!(snapshot.message_count, 101);
     let retained = snapshot
         .content
@@ -271,13 +279,38 @@ async fn exact_full_page_requires_a_final_empty_page() {
         ScriptedResponse::status(500),
     )
     .await;
-    let snapshot = runtime(&mock)
+    let (snapshot, truncated) = runtime(&mock)
         .capture_history("600")
         .await
         .ok()
         .expect("final empty page");
+    assert!(!truncated);
     assert_eq!(snapshot.message_count, 100);
     assert_eq!(mock.requests().len(), 2);
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn marker_text_in_complete_history_reports_not_truncated() {
+    let mut newest = message(2);
+    newest["content"] = json!("ok\n[transcript truncated]");
+    newest["attachments"] = json!([]);
+    let mock = MockRest::start(
+        vec![ScriptedResponse::json(200, json!([newest, message(1)]))],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let (snapshot, truncated) = runtime(&mock)
+        .capture_history("600")
+        .await
+        .ok()
+        .expect("complete history");
+    assert!(
+        !truncated,
+        "user-controlled marker text must not report truncation"
+    );
+    assert!(snapshot.content.ends_with("\n[transcript truncated]"));
+    assert_eq!(snapshot.message_count, 2);
     mock.shutdown().await;
 }
 
@@ -350,5 +383,188 @@ async fn history_requires_explicit_bot_view_and_read_overwrite() {
         assert!(runtime.require_history_access(&doc).is_err());
     }
     assert!(mock.requests().is_empty());
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn component_admission_ignores_generic_ticket_tasks() {
+    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let tickets = runtime(&mock);
+    // A generic ticket task sharing the scope (e.g. RESUMED readiness) must
+    // not consume component budget: all 16 components still admit with one
+    // generic task in flight, and only the 17th component refuses.
+    tickets.spawn(std::future::pending());
+    for member in 0..(MAX_TICKET_COMPONENT_IN_FLIGHT as u64) {
+        assert!(
+            tickets.try_spawn_component(Some(member), |permit| async move {
+                let _permit = permit;
+                std::future::pending::<()>().await;
+            }),
+            "component {member} refused while budget remained"
+        );
+    }
+    assert!(
+        !tickets.try_spawn_component(Some(u64::MAX), |permit| async move {
+            let _permit = permit;
+        })
+    );
+    assert!(mock.requests().is_empty());
+    mock.shutdown().await;
+}
+
+/// Wire-format ticket open for saturation tests. Distinctive member and
+/// interaction ids keep log assertions exact under parallel suites.
+fn saturation_open(member: u64, interaction_id: u64) -> Interaction {
+    let roles: Vec<&str> = vec![];
+    serde_json::from_value(json!({
+        "application_id": "400",
+        "authorizing_integration_owners": {"0": "100"},
+        "id": interaction_id.to_string(),
+        "token": format!("ticket-saturation-{member}-{interaction_id}"),
+        "type": 3,
+        "version": 1,
+        "guild_id": "100",
+        "channel": {"id": "600", "type": 0, "name": "ticket-member", "permissions": "0"},
+        "data": {"custom_id": TICKET_OPEN_ID, "component_type": 2},
+        "member": {
+            "roles": roles,
+            "permissions": "0",
+            "deaf": false, "mute": false, "flags": 0,
+            "user": {"id": member.to_string(), "username": "Member", "discriminator": "0", "avatar": null}
+        }
+    }))
+    .expect("wire-format ticket interaction")
+}
+
+/// Command runtime whose ticket budget is already full: 16 admitted
+/// components held pending, so every dispatch through the gateway path
+/// refuses synchronously without spawning and without defer timing.
+fn saturated_command_runtime(mock: &MockRest) -> Arc<CommandRuntime> {
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@agent-testdb:5432/agent_test")
+        .unwrap();
+    let executor =
+        ActionExecutor::with_proxy("ticket-test-token".into(), Some(mock.origin())).unwrap();
+    let tickets = Arc::new(
+        TicketRuntime::new(
+            pool.clone(),
+            executor.clone(),
+            TicketConfig {
+                guild_id: "100".into(),
+                category_id: "200".into(),
+                panel_channel_id: "700".into(),
+                staff_role_id: "300".into(),
+                cooldown_seconds: COOLDOWN_SECONDS,
+            },
+            std::collections::HashMap::new(),
+        )
+        .unwrap(),
+    );
+    tickets.set_bot_id(400);
+    for member in 0..(MAX_TICKET_COMPONENT_IN_FLIGHT as u64) {
+        assert!(
+            tickets.try_spawn_component(Some(member), |permit| async move {
+                let _permit = permit;
+                std::future::pending::<()>().await;
+            }),
+            "setup must fill the component budget"
+        );
+    }
+    CommandRuntime::with_tickets(pool, executor, tickets)
+}
+
+/// Read the ticket component drops series from the process-global metrics
+/// exposition. Lower-bound asserts only: parallel suites share the registry.
+fn global_drops() -> u64 {
+    two_bot_core::metrics::global()
+        .render(None)
+        .lines()
+        .filter(|line| line.starts_with("two_bot_ticket_component_drops_total "))
+        .map(|line| {
+            line.rsplit_once(' ')
+                .and_then(|(_, value)| value.parse::<u64>().ok())
+                .unwrap_or_else(|| panic!("bad sample: {line}"))
+        })
+        .sum()
+}
+
+#[tokio::test]
+async fn component_refusal_records_saturation_evidence_through_dispatch() {
+    crate::tracing_capture::global();
+    let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+    let runtime = saturated_command_runtime(&mock);
+    let _guard = runtime.dispatch_guard();
+
+    // Eight refusals from distinct members through the real gateway path.
+    // The counter check is a lower bound because parallel suites share the
+    // global registry; the log check below is exact. Removing the dispatch
+    // record call fails this test: our refusals add nothing to the counter
+    // and our ids never appear in the capture.
+    let drops_before = global_drops();
+    for index in 0..8u64 {
+        let event = Event::InteractionCreate(Box::new(InteractionCreate(saturation_open(
+            80_000 + index,
+            940_000 + index,
+        ))));
+        assert!(
+            !runtime.dispatch(&event),
+            "dispatch {index} must refuse on the saturated budget"
+        );
+    }
+    let drops_after = global_drops();
+    assert!(
+        drops_after >= drops_before + 8,
+        "every dispatch refusal increments the drops counter ({drops_before} -> {drops_after})"
+    );
+
+    // The sampled warn fires through dispatch too: the first refusal on this
+    // runtime logs its interaction id with the saturation code. Scoping by
+    // our distinctive ids keeps this exact under parallel suites.
+    let logged = crate::tracing_capture::global().text();
+    assert!(
+        logged
+            .lines()
+            .any(|line| line.contains("ticket_component_admission_saturated")
+                && (940_000..940_008).any(|id| line.contains(&id.to_string()))),
+        "a dispatch refusal must log the saturation code with its interaction id"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn component_saturation_warn_samples_to_one_line_per_window() {
+    let capture = crate::tracing_capture::global();
+    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let tickets = runtime(&mock);
+
+    // Three refusals in one window on a fresh runtime: the counter moves
+    // three times but the log samples to exactly one line. Distinctive
+    // interaction ids keep the count exact under parallel suites.
+    let drops_before = global_drops();
+    tickets.record_component_saturation(941_001);
+    tickets.record_component_saturation(941_002);
+    tickets.record_component_saturation(941_003);
+    assert!(
+        global_drops() >= drops_before + 3,
+        "every refusal increments the drops counter even when the log samples it out"
+    );
+    let logged = capture.text();
+    let lines: Vec<&str> = logged
+        .lines()
+        .filter(|line| {
+            line.contains("ticket_component_admission_saturated")
+                && (line.contains("941001") || line.contains("941002") || line.contains("941003"))
+        })
+        .collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "one sampled line per window, got: {lines:?}"
+    );
+    assert!(
+        lines[0].contains("two_bot_ticket_component_drops_total"),
+        "the sampled line points on-call at the counter series: {}",
+        lines[0]
+    );
     mock.shutdown().await;
 }
