@@ -1,14 +1,13 @@
 //! Protected acceptance corpus: the builder must not edit this file.
-//! Real migrated disposable Postgres, LFG service/router, HTTP executor and jobs
-//! supervisor; only Discord is a loopback double. No implementation diff informed
+//! Real migrated disposable Postgres, LFG service/router and HTTP executor;
+//! only Discord is a loopback double. The supervised-job case lives in the bot
+//! crate (`crates/bot/src/lfg_lifecycle_jobs_acceptance.rs`), the only place
+//! the binary's own `crate::jobs` resolves. No implementation diff informed
 //! these expectations. See tests/lfg-lifecycle.acceptance.json for the contract.
 #![cfg(feature = "db")]
 
 #[allow(dead_code)]
 mod common;
-#[allow(dead_code)]
-#[path = "../../bot/src/jobs.rs"]
-mod jobs;
 
 use common::{MockRest, RestRequest, ScriptedResponse};
 use serde_json::{json, Value};
@@ -16,7 +15,6 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
-use std::time::Duration;
 use time::OffsetDateTime;
 use two_bot_core::{
     lfg::{self, LfgPost, LfgSelectAction, LfgStatus},
@@ -192,7 +190,7 @@ fn create() -> LfgRequest {
 fn lifecycle_job_attempts_have_their_own_counter_not_the_other_bucket() {
     let metrics = two_bot_core::metrics::Metrics::default();
     metrics.job_success("lfg_sweep", 123);
-    metrics.job_failure("lfg_sweep", jobs::ErrorClass::Rest);
+    metrics.job_failure("lfg_sweep", two_bot_core::metrics::JobErrorClass::Rest);
     let rendered = metrics.render(None);
     assert!(rendered.contains("two_bot_job_runs_total{job=\"lfg_sweep\",outcome=\"success\"} 1\n"));
     assert!(rendered.contains("two_bot_job_runs_total{job=\"lfg_sweep\",outcome=\"failure\"} 1\n"));
@@ -621,69 +619,5 @@ async fn creation_and_close_still_require_manage_events_at_the_router() {
             .filter(|r| r.path.ends_with("/callback"))
             .count(),
         2
-    );
-}
-
-#[tokio::test]
-async fn lifecycle_work_runs_under_the_existing_supervised_job_seam() {
-    let f = Fixture::new(ok_rest).await;
-    f.seed(&post("lfg-job", OLD, Some("5001"), OLD)).await;
-    let action: jobs::JobAction = {
-        let service = Arc::clone(&f.service);
-        let executor = Arc::clone(&f.executor);
-        Arc::new(move || {
-            let service = Arc::clone(&service);
-            let executor = Arc::clone(&executor);
-            Box::pin(async move {
-                service
-                    .sweep_lifecycle(&executor, GUILD, BOT, clock(), 3)
-                    .await
-                    .map(|_| ())
-                    .map_err(|_| jobs::ErrorClass::Database)
-            })
-        })
-    };
-    let status = jobs::statuses(&["lfg_sweep"], false);
-    let (shutdown, receiver) = tokio::sync::watch::channel(false);
-    let supervisor = tokio::spawn(jobs::supervise(
-        vec![jobs::Job {
-            name: "lfg_sweep",
-            cadence: Duration::from_secs(3600),
-            cadence_source: None,
-            startup_jitter: Duration::ZERO,
-            timeout: Duration::from_secs(10),
-            action,
-        }],
-        Arc::clone(&status),
-        receiver,
-    ));
-    // Synchronize on the real supervisor's completion, not a guessed sleep or
-    // paused clock competing with PostgreSQL/loopback I/O.
-    let completed = tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            let snapshot = status.read().await;
-            if snapshot["lfg_sweep"].last_success.is_some()
-                || snapshot["lfg_sweep"].last_error_class.is_some()
-            {
-                break snapshot["lfg_sweep"].clone();
-            }
-            drop(snapshot);
-            tokio::task::yield_now().await;
-        }
-    })
-    .await;
-    shutdown.send(true).expect("stop supervisor");
-    supervisor.await.expect("supervisor joined");
-    let saved = f.saved("lfg-job").await;
-    f.finish().await;
-    let completed = completed.expect("bounded job completion");
-    assert!(
-        completed.last_success.is_some(),
-        "sweep uses the existing job success/failure contract"
-    );
-    assert_eq!(
-        saved.status,
-        LfgStatus::Closed,
-        "the scheduled action must change real persisted state"
     );
 }
