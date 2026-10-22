@@ -56,10 +56,11 @@
 //!   Precedence between overlapping skip rules is the builder's choice; the
 //!   fixtures isolate one rule per role except where noted.
 //!
-//! Database cases run only against the guarded disposable fixture
-//! (`TWO_TEST_DATABASE_URL`, agent-testdb / CI Postgres), mirroring
-//! `ops_audit_acceptance_tests::database`: skipped locally when unset, a hard
-//! failure in CI without it. Tests named `*_stays_silent_*`,
+//! Database cases run only against a guarded disposable fixture
+//! (agent-testdb / CI Postgres): the `TWO_TEST_DATABASE_URL` bootstrap when
+//! set, the CI-service bootstrap on CI lanes that provide the service but not
+//! the var (the ignored-db lanes run `cargo test onboarding_`, which matches
+//! this module), skipped locally when unset. Tests named `*_stays_silent_*`,
 //! `dry_run_*` and `corrupt_*` are controls that hold before and after the
 //! behavior change; every other test fails until the contract is met.
 #![cfg(test)]
@@ -203,14 +204,50 @@ async fn discord(state: Arc<Mutex<DiscordState>>) -> MockRest {
     .await
 }
 
+/// CI-service bootstrap for lanes that run this module without the guarded
+/// var: the ignored-db lanes provide the disposable agent-testdb service (and
+/// its `two_bot_test_ci` bootstrap database) but set no
+/// `TWO_TEST_DATABASE_URL`. Same guard-approved shape as the `rust-tests`
+/// lane's var, so the suite runs its real assertions there instead of
+/// failing in setup.
+const CI_SERVICE_BOOTSTRAP: &str = "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci";
+
+/// Picks the disposable-fixture bootstrap URL: the guarded var when set, the
+/// CI-service address on CI without it, `None` for a local skip. Pure so the
+/// lane matrix is pinned below without a database.
+fn bootstrap_url(var: Option<String>, ci: bool) -> Option<String> {
+    if let Some(url) = var {
+        return Some(url);
+    }
+    ci.then(|| CI_SERVICE_BOOTSTRAP.to_owned())
+}
+
+#[test]
+fn bootstrap_prefers_the_guarded_var() {
+    let url = bootstrap_url(Some("postgres://guarded".to_owned()), true).unwrap();
+    assert_eq!(url, "postgres://guarded");
+}
+
+#[test]
+fn bootstrap_falls_back_to_the_ci_service_without_the_var() {
+    assert_eq!(
+        bootstrap_url(None, true).as_deref(),
+        Some(CI_SERVICE_BOOTSTRAP)
+    );
+}
+
+#[test]
+fn bootstrap_skips_locally_without_the_var() {
+    assert_eq!(bootstrap_url(None, false), None);
+}
+
 /// Mirrors `ops_audit_acceptance_tests::database`: disposable migrated
 /// fixture, skipped off-CI when the guarded URL is absent.
 async fn database(test: &str) -> Option<TestDatabase> {
-    let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
-        assert!(
-            std::env::var("GITHUB_ACTIONS").is_err(),
-            "CI must supply the guarded test database"
-        );
+    let Some(url) = bootstrap_url(
+        std::env::var("TWO_TEST_DATABASE_URL").ok(),
+        std::env::var("GITHUB_ACTIONS").is_ok(),
+    ) else {
         eprintln!("SKIP {test}: TWO_TEST_DATABASE_URL is not set");
         return None;
     };

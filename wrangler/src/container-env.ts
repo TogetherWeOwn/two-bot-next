@@ -44,6 +44,8 @@ export const FORWARDED_FLAGS = [
   // Onboarding and self-roles.
   "TWO_ONBOARDING_MODE",
   "TWO_ONBOARDING_DRY_RUN",
+  "TWO_ONBOARDING_JOIN_ROLES",
+  "TWO_ONBOARDING_MEMBER_ROLE",
   "TWO_SELF_ROLE_PANELS",
   "TWO_SELF_ROLE_DRY_RUN",
   // Guild command registry drift CLI and opt-in boot publish (TOG-10860).
