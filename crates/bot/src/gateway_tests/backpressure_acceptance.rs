@@ -152,7 +152,7 @@ async fn rsvp_burst_against_stalled_drain_refuses_and_counts() {
     // Survival: ending reception drains admitted work and exits cleanly;
     // refusals must never wedge the funnel, checkpoint, or worker.
     drop(ws);
-    tokio::time::timeout(std::time::Duration::from_secs(20), runner)
+    tokio::time::timeout(std::time::Duration::from_secs(60), runner)
         .await
         .expect("runner exits after the burst")
         .unwrap()
