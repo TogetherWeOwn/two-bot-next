@@ -1,12 +1,61 @@
 //! Twilight → core event translation.
 //!
-//! S1 covers the member/voice/message spine; the remaining subscribed events
-//! (reactions, invites, interactions, audit-log entries) arrive as
-//! [`CoreEvent::Unmodelled`] with a stable `kind` tag so S3+ can promote them
-//! one slice at a time without changing the adapter signature.
+//! Member, voice, message and reaction events are modelled. Remaining
+//! subscribed kinds arrive as [`CoreEvent::Unmodelled`] with a stable tag.
 
-use twilight_model::gateway::event::Event;
-use two_bot_core::{CoreEvent, VoiceSessionDelta};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use sha2::{Digest, Sha256};
+use twilight_model::{
+    channel::message::EmojiReactionType,
+    gateway::{event::Event, GatewayReaction},
+};
+use two_bot_core::{
+    events::{ReactionDelivery, ReactionEmoji, ReactionEvent},
+    CoreEvent, VoiceSessionDelta,
+};
+
+/// Replay-stable identity from the gateway session and dispatch sequence.
+/// The session is hashed, not copied into diagnostic or persisted event IDs.
+/// Order is fixed-width and comparable within the same session only.
+#[must_use]
+pub fn reaction_delivery(session_id: &str, sequence: u64) -> ReactionDelivery {
+    let session = hex::encode(Sha256::digest(session_id.as_bytes()));
+    ReactionDelivery {
+        event_id: format!("reaction:{session}:{sequence}"),
+        event_order: format!("{session}:{sequence:020}"),
+    }
+}
+
+fn local_delivery() -> ReactionDelivery {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let ordinal = NEXT.fetch_add(1, Ordering::Relaxed);
+    let now = two_bot_core::funnel::now_millis_for_test();
+    ReactionDelivery {
+        event_id: format!("reaction:local:{}:{now}:{ordinal}", std::process::id()),
+        event_order: format!("{now:020}:{ordinal:020}"),
+    }
+}
+
+fn reaction_event(
+    reaction: &GatewayReaction,
+    delivery: Option<&ReactionDelivery>,
+) -> ReactionEvent {
+    ReactionEvent {
+        guild_id: reaction.guild_id.map(|id| id.get()),
+        channel_id: reaction.channel_id.get(),
+        message_id: reaction.message_id.get(),
+        user_id: reaction.user_id.get(),
+        message_author_id: reaction.message_author_id.map(|id| id.get()),
+        member_is_bot: reaction.member.as_ref().map(|member| member.user.bot),
+        emoji: match &reaction.emoji {
+            EmojiReactionType::Unicode { name } => ReactionEmoji::Unicode(name.clone()),
+            EmojiReactionType::Custom { id, .. } => ReactionEmoji::Custom(id.get()),
+        },
+        burst: reaction.burst,
+        delivery: delivery.cloned().unwrap_or_else(local_delivery),
+    }
+}
 
 /// Translate one twilight gateway dispatch into a framework-free core event.
 ///
@@ -16,6 +65,21 @@ use two_bot_core::{CoreEvent, VoiceSessionDelta};
 /// the in-memory session map).
 #[must_use]
 pub fn event_to_core(event: &Event) -> Option<CoreEvent> {
+    event_to_core_inner(event, None)
+}
+
+/// Translate with an ingress-minted identity. Gateway consumers must use this
+/// entry point for replay handling; `event_to_core` can only mint a local
+/// identity because a parsed payload has no session or sequence metadata.
+#[must_use]
+pub fn event_to_core_with_delivery(
+    event: &Event,
+    delivery: &ReactionDelivery,
+) -> Option<CoreEvent> {
+    event_to_core_inner(event, Some(delivery))
+}
+
+fn event_to_core_inner(event: &Event, delivery: Option<&ReactionDelivery>) -> Option<CoreEvent> {
     match event {
         Event::MemberAdd(add) => Some(CoreEvent::MemberJoined {
             guild_id: add.guild_id.get(),
@@ -46,13 +110,18 @@ pub fn event_to_core(event: &Event) -> Option<CoreEvent> {
             author_id: message.author.id.get(),
             author_is_bot: message.author.bot,
         }),
+        Event::ReactionAdd(reaction) => {
+            Some(CoreEvent::ReactionAdded(reaction_event(reaction, delivery)))
+        }
+        Event::ReactionRemove(reaction) => Some(CoreEvent::ReactionRemoved(reaction_event(
+            reaction, delivery,
+        ))),
+        Event::MessageDelete(message) => Some(CoreEvent::MessageDeleted {
+            guild_id: message.guild_id.map(|id| id.get()),
+            channel_id: message.channel_id.get(),
+            message_id: message.id.get(),
+        }),
         // Modelled in later slices; tagged so coverage is auditable.
-        Event::ReactionAdd(_) => Some(CoreEvent::Unmodelled {
-            kind: "reaction_add".to_owned(),
-        }),
-        Event::ReactionRemove(_) => Some(CoreEvent::Unmodelled {
-            kind: "reaction_remove".to_owned(),
-        }),
         Event::InviteCreate(_) => Some(CoreEvent::Unmodelled {
             kind: "invite_create".to_owned(),
         }),
