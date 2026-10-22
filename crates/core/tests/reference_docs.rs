@@ -60,8 +60,8 @@ a required value or an implemented consumer. Secret defaults are never rendered.
   Keys in\n\
   legacy `HOT_WIRED` are labeled “reload-report hot” (the `RefreshReport::hot`\n\
   partition in `settings.rs`); every other storable key reports cold.\n\n\
-Live snapshot consumers at `1643438` (canonical table; ten `live()` call\n\
-sites total: nine across the six non-voice rows below, plus the voice\n\
+Live snapshot consumers at `1643438` (canonical table; eleven `live()` call\n\
+sites total: ten across the seven non-voice rows below, plus the voice\n\
 gateway closure):\n\n\
 | Runtime | Call sites | Reads | When |\n\
 | --- | --- | --- | --- |\n\
@@ -70,6 +70,7 @@ gateway closure):\n\n\
 | audit | `audit_runtime.rs:308`, `:438` | 3 mirror destinations (`:60-63`) | every record (`:483`) and sweep (`:497`), once installed |\n\
 | ticket | `ticket_runtime.rs:643-644`, `:1185-1189` | 3 destinations + cooldown (`:228-261`) | every execute/recovery and purge |\n\
 | self-role | `self_role_handlers.rs:204-211` | `TWO_SELF_ROLE_PANELS` (`:53`) | every dispatch (`:215`, `:292`, `:334`) and sweep (`:383-438`) |\n\
+| command dispatch | `command_runtime.rs:1263-1266` | `TWO_ANNOUNCEMENTS` (`feed_jobs.rs:244`) | every feed invocation; RSVP prepare reuses the same resolver (`gateway.rs:1498-1501`) |\n\
 | gateway classifier | `gateway.rs:774-789`, `:918` | human/welcome channel sets (`:800-817`) | every guild message; classifier + facts sink swap together (`leveling_runtime.rs:766`) |\n\
 | voice | `gateway.rs:2082` closure | empty grace (`voice_rooms.rs:9415`), invite code (`:9460`) | spawn (`:7753-7757`), maintenance (`:3319`), `/invite` (`:13306-13307`) |\n\n\
 The thirty-nine keys in `STORE_READ_KEYS`\n\
@@ -113,7 +114,11 @@ malformed row keeps the last good destinations like the audit mirror, and the sa
 refresh resolves `TWO_TICKET_COOLDOWN_SECONDS` from the layered snapshot with\n\
 last-good fallback (`crates/bot/src/ticket_runtime.rs:613-638`); the feed poller\n\
 re-checks `TWO_ANNOUNCEMENTS` from the snapshot on every tick and skips while\n\
-a stored `0` stands (`crates/bot/src/feed_jobs.rs:250-267`, `:385-419`); self-role\n\
+a stored `0` stands (`crates/bot/src/feed_jobs.rs:250-267`, `:385-419`); feed\n\
+and RSVP command dispatch re-check the same gate on every invocation and\n\
+refuse with the disabled reply while a stored `0` stands\n\
+(`crates/bot/src/command_runtime.rs:1305-1323`, `crates/bot/src/gateway.rs:1498-1501`,\n\
+`crates/discord/src/rsvp.rs:86`, `crates/core/src/router.rs:308-341`); self-role\n\
 dispatch and recovery resolve `TWO_SELF_ROLE_PANELS` from the snapshot on every\n\
 interaction and sweep, falling back to the boot catalogue on absent or unparsable\n\
 rows (`crates/bot/src/self_role_handlers.rs:59-74`, `:215`, `:292`, `:334`, `:379`);\n\

@@ -30,8 +30,8 @@ Keys in
 legacy `HOT_WIRED` are labeled “reload-report hot” (the `RefreshReport::hot`
 partition in `settings.rs`); every other storable key reports cold.
 
-Live snapshot consumers at `1643438` (canonical table; ten `live()` call
-sites total: nine across the six non-voice rows below, plus the voice
+Live snapshot consumers at `1643438` (canonical table; eleven `live()` call
+sites total: ten across the seven non-voice rows below, plus the voice
 gateway closure):
 
 | Runtime | Call sites | Reads | When |
@@ -41,6 +41,7 @@ gateway closure):
 | audit | `audit_runtime.rs:308`, `:438` | 3 mirror destinations (`:60-63`) | every record (`:483`) and sweep (`:497`), once installed |
 | ticket | `ticket_runtime.rs:643-644`, `:1185-1189` | 3 destinations + cooldown (`:228-261`) | every execute/recovery and purge |
 | self-role | `self_role_handlers.rs:204-211` | `TWO_SELF_ROLE_PANELS` (`:53`) | every dispatch (`:215`, `:292`, `:334`) and sweep (`:383-438`) |
+| command dispatch | `command_runtime.rs:1263-1266` | `TWO_ANNOUNCEMENTS` (`feed_jobs.rs:244`) | every feed invocation; RSVP prepare reuses the same resolver (`gateway.rs:1498-1501`) |
 | gateway classifier | `gateway.rs:774-789`, `:918` | human/welcome channel sets (`:800-817`) | every guild message; classifier + facts sink swap together (`leveling_runtime.rs:766`) |
 | voice | `gateway.rs:2082` closure | empty grace (`voice_rooms.rs:9415`), invite code (`:9460`) | spawn (`:7753-7757`), maintenance (`:3319`), `/invite` (`:13306-13307`) |
 
@@ -85,7 +86,11 @@ malformed row keeps the last good destinations like the audit mirror, and the sa
 refresh resolves `TWO_TICKET_COOLDOWN_SECONDS` from the layered snapshot with
 last-good fallback (`crates/bot/src/ticket_runtime.rs:613-638`); the feed poller
 re-checks `TWO_ANNOUNCEMENTS` from the snapshot on every tick and skips while
-a stored `0` stands (`crates/bot/src/feed_jobs.rs:250-267`, `:385-419`); self-role
+a stored `0` stands (`crates/bot/src/feed_jobs.rs:250-267`, `:385-419`); feed
+and RSVP command dispatch re-check the same gate on every invocation and
+refuse with the disabled reply while a stored `0` stands
+(`crates/bot/src/command_runtime.rs:1305-1323`, `crates/bot/src/gateway.rs:1498-1501`,
+`crates/discord/src/rsvp.rs:86`, `crates/core/src/router.rs:308-341`); self-role
 dispatch and recovery resolve `TWO_SELF_ROLE_PANELS` from the snapshot on every
 interaction and sweep, falling back to the boot catalogue on absent or unparsable
 rows (`crates/bot/src/self_role_handlers.rs:59-74`, `:215`, `:292`, `:334`, `:379`);
@@ -192,7 +197,7 @@ Catalog entries: 134.
 | `DISCORD_VOICE_LOG_CHANNEL_ID` | hot | Not specified in Next | stored, applied live by runtime refresh (reload-report hot) | Destination for voice-session logs. |
 | `LOG_LEVEL` | cold | Not specified in Next | stored unwired | Container two_bot tracing level when RUST_LOG is unset (info default); RUST_LOG overrides. |
 | `TEMP_VOICE_ENABLED` | cold | Not specified in Next | stored unwired | Legacy temporary-voice enable flag; classification does not imply runtime wiring. |
-| `TWO_ANNOUNCEMENTS` | hot | `false` | stored, applied live by runtime refresh (reload-report hot) | Enable announcement command publication and routing; stored rows apply live to the feed poller while the command surface reads boot. |
+| `TWO_ANNOUNCEMENTS` | hot | `false` | stored, applied live by runtime refresh (reload-report hot) | Enable announcement command publication and routing; stored rows apply live to the feed poller and feed/RSVP command dispatch while publication and LFG stay boot-gated. |
 | `TWO_ANTI_NUKE` | cold | Not specified in Next | stored unwired | Enable anti-nuke protection. |
 | `TWO_ANTI_NUKE_DRY_RUN` | cold | Not specified in Next | stored unwired | Observe anti-nuke decisions without executing protective writes. |
 | `TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS` | hot | Not specified in Next | stored, applied live by runtime refresh | Maximum age of anti-nuke events considered for action. |

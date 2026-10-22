@@ -11,11 +11,12 @@ use twilight_model::{
 use two_bot_core::{
     attendance_totals_text, checkin_duplicate_text, checkin_idempotency_key,
     checkin_occurrence_full_text, checkin_recorded_text, classify, compensate_checkin_write,
-    compensate_rsvp_write, list_rsvps, now_iso, parse_attendance_occurrence, partition_rsvps,
-    put_rsvp_with_audit, record_checkin, require_manage_events, rsvp_event_full_text,
-    rsvp_rate_limited_text, rsvp_saved_text, validate_event_id, validate_occurrence_id,
-    AttendanceProof, CheckinWrite, ClassifierConfig, ClassifyInput, HandlerId, InteractionRouter,
-    RsvpAudit, RsvpRecord, RsvpStatus, RsvpStoreError, SlashOutcome,
+    compensate_rsvp_write, list_rsvps, live_gate_announcements_slash, now_iso,
+    parse_attendance_occurrence, partition_rsvps, put_rsvp_with_audit, record_checkin,
+    require_manage_events, rsvp_event_full_text, rsvp_rate_limited_text, rsvp_saved_text,
+    validate_event_id, validate_occurrence_id, AttendanceProof, CheckinWrite, ClassifierConfig,
+    ClassifyInput, HandlerId, InteractionRouter, RsvpAudit, RsvpRecord, RsvpStatus, RsvpStoreError,
+    SlashOutcome,
 };
 
 use crate::{
@@ -69,6 +70,7 @@ pub async fn prepare_rsvp_interaction(
     router: &InteractionRouter,
     executor: &ActionExecutor,
     interaction: Interaction,
+    announcements_live: bool,
 ) -> Result<PreparedRsvp, DiscordError> {
     let RoutedInteraction::Slash { name, outcome } = route_interaction(router, &interaction, None)
     else {
@@ -77,6 +79,11 @@ pub async fn prepare_rsvp_interaction(
     if !is_rsvp_command(name.as_str()) {
         return Ok(PreparedRsvp::ignored());
     }
+    // Per-invocation live overlay: the caller resolves the announcements bit
+    // from the live snapshot store-first over boot (this crate cannot read
+    // the bot's poller snapshot); a stored `0` refuses with the disabled
+    // reply before any defer.
+    let outcome = live_gate_announcements_slash(outcome, announcements_live);
     if let Some(response) = response_for_slash(&outcome) {
         // Receipt callbacks wait out brief governed-lane occupancy instead of
         // dropping the acknowledgement; exhaustion still fails the command.
@@ -144,6 +151,11 @@ pub async fn complete_rsvp_interaction(
 
 /// Returns false for another feature; authorization and acknowledgement must
 /// succeed before any store or paced Discord read.
+///
+/// This combined path resolves no live announcements state: it prepares
+/// live-on, so the router's boot outcome decides exactly as before.
+/// Production RSVP runs the ordered prepare/complete split, where the
+/// gateway passes the resolved live bit into `prepare`.
 pub async fn handle_rsvp_interaction(
     router: &InteractionRouter,
     pool: &Pool<Postgres>,
@@ -151,7 +163,7 @@ pub async fn handle_rsvp_interaction(
     classifier: &ClassifierConfig,
     interaction: &Interaction,
 ) -> Result<bool, DiscordError> {
-    let prepared = prepare_rsvp_interaction(router, executor, interaction.clone()).await?;
+    let prepared = prepare_rsvp_interaction(router, executor, interaction.clone(), true).await?;
     complete_rsvp_interaction(prepared, pool, executor, classifier).await
 }
 

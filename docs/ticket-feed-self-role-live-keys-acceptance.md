@@ -47,8 +47,10 @@ unparsable rows):
 Service existence stays boot-gated by design: a boot-off feed poller
 registers no job and a boot-empty catalogue builds no self-role service,
 so enabling from a boot-disabled deployment needs a restart (same reason
-`TWO_AUTOMOD` stays cold). Registration, the live-identity fence, boot
-validation, and the announcement command surface are unchanged.
+`TWO_AUTOMOD` stays cold). Registration, the live-identity fence and boot
+validation are unchanged; feed and RSVP command dispatch re-check the live
+announcements gate per invocation (refusing with the disabled reply while a
+stored `0` stands) while publication and LFG stay boot-gated.
 
 ## Not covered here
 
