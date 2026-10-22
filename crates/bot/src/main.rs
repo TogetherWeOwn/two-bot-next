@@ -128,6 +128,8 @@ mod self_role_runtime;
 mod shutdown;
 #[cfg(test)]
 mod smoke_error_contract_tests;
+#[cfg(test)]
+mod ticket_component_admission_acceptance_tests;
 mod ticket_runtime;
 #[cfg(test)]
 #[path = "../../core/tests/support/tracing_capture.rs"]
@@ -139,6 +141,12 @@ mod tuning_test_support;
 mod website_jobs;
 #[cfg(test)]
 mod website_roster_cap_acceptance_tests;
+#[cfg(test)]
+mod worker_supervision_acceptance_tests;
+#[cfg(test)]
+mod worker_supervision_builder_tests;
+#[cfg(test)]
+mod worker_supervision_review_tests;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -516,6 +524,12 @@ async fn run(cli_args: &[String]) {
         let _ = latch_rx.wait_for(|latched| *latched).await;
         *latch_mark_task.lock().expect("latch mark") = Some(Instant::now());
     });
+    // Supervisor handles for the supervised workers (raid, join-risk,
+    // containment), filled by the gateway task below and joined after the
+    // supervisor drains: retaining them here is what holds the process open
+    // for the worker drains instead of aborting them with the runtime.
+    let worker_supervisors: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
 
     // Filled by the gateway task; read by the shared maintenance tick.
     let automod_slot: automod_gateway::Slot = Arc::default();
@@ -528,6 +542,12 @@ async fn run(cli_args: &[String]) {
         let self_roles = self_roles.clone();
         let member = member.clone();
         let linger_stop = stopping.clone();
+        // Cloned before the move: each supervised worker (raid, join-risk,
+        // containment) subscribes its own drain receiver below, and its
+        // supervisor handle is retained in the shared slot for the shutdown
+        // join after the supervisor drains.
+        let worker_shutdown = shutdown.clone();
+        let worker_supervisors_task = Arc::clone(&worker_supervisors);
         let gateway_span = logging::gateway_span(guild_id);
         let task = async move {
             // A panic is caught only to name it on /readyz; the task still ends
@@ -694,27 +714,50 @@ async fn run(cli_args: &[String]) {
                             )
                         })?,
                     };
-                    let raid =
-                        raid_runtime::start_from_env(pool.clone(), raid_executor.clone(), guild_id);
+                    let (raid, raid_supervisor) = raid_runtime::start_from_env(
+                        pool.clone(),
+                        raid_executor.clone(),
+                        guild_id,
+                        worker_shutdown.subscribe(),
+                    );
+                    worker_supervisors_task
+                        .lock()
+                        .expect("worker supervisors")
+                        .push(raid_supervisor);
                     // Join-risk delivery (R2) shares the raid observer slot:
                     // the pipeline takes one observer, so risk chains behind
                     // the raid watch and both stay behind the funnel's join
                     // row. Without exact TWO_ANTI_NUKE=1 on the staging guild
                     // the chain is the raid watch alone.
-                    pipeline.set_join_observer(join_risk_runtime::chain_from_env(
+                    let (join_chain, risk_supervisor) = join_risk_runtime::chain_from_env(
                         pool.clone(),
                         raid_executor.clone(),
                         guild_id,
                         raid,
-                    ));
+                        worker_shutdown.subscribe(),
+                    );
+                    pipeline.set_join_observer(join_chain);
+                    if let Some(supervisor) = risk_supervisor {
+                        worker_supervisors_task
+                            .lock()
+                            .expect("worker supervisors")
+                            .push(supervisor);
+                    }
                     // Containment (R3) watches the audit-log entry slot, a
                     // separate observer from the join slot above. Without
                     // exact TWO_ANTI_NUKE=1 on the staging guild there is no
                     // observer at all; dry-run is the default and only an
                     // armed worker executes removals.
-                    if let Some(containment) =
-                        containment_runtime::start_from_env(pool.clone(), raid_executor, guild_id)
-                    {
+                    if let Some((containment, supervisor)) = containment_runtime::start_from_env(
+                        pool.clone(),
+                        raid_executor,
+                        guild_id,
+                        worker_shutdown.subscribe(),
+                    ) {
+                        worker_supervisors_task
+                            .lock()
+                            .expect("worker supervisors")
+                            .push(supervisor);
                         pipeline.set_audit_entry_observer(containment);
                     }
                     // Automod shares the command runtime's REST executor; it never
@@ -888,6 +931,17 @@ async fn run(cli_args: &[String]) {
         .map(|latched_at| latched_at.elapsed())
         .unwrap_or_default();
     eventsub_reconcile::join(reconcile_task, reconcile_join_budget(elapsed)).await;
+    // The supervised workers (raid, join-risk, containment) have been
+    // draining concurrently since the latch; join their retained supervisor
+    // handles with what is left of the same shutdown deadline so the process
+    // stays open for the drains instead of aborting them with the runtime.
+    // The lock is released before any await: only the handles move on.
+    let supervisors = worker_supervisors
+        .lock()
+        .expect("worker supervisors")
+        .drain(..)
+        .collect::<Vec<_>>();
+    join_worker_supervisors(supervisors, &latch_mark).await;
     if result.is_err() {
         tracing::error!(
             msg = "shutdown_failed",
@@ -1061,6 +1115,45 @@ fn reconcile_join_budget(elapsed_since_latch: Duration) -> Duration {
     shutdown::deadline()
         .saturating_sub(elapsed_since_latch)
         .min(eventsub_reconcile::SHUTDOWN_DRAIN)
+}
+
+/// Join-or-abort retained worker-supervisor handles within what is left of
+/// the service shutdown deadline, after [`eventsub_reconcile::join`]. The
+/// elapsed time is re-read before each supervisor so the joins share one
+/// remaining budget instead of stacking a fresh drain per worker. A zero
+/// budget still reaps an already-finished supervisor and only aborts one
+/// that outlived the deadline it already had concurrently.
+async fn join_worker_supervisors(
+    supervisors: Vec<tokio::task::JoinHandle<()>>,
+    latch_mark: &std::sync::Mutex<Option<Instant>>,
+) {
+    for mut supervisor in supervisors {
+        let elapsed = latch_mark
+            .lock()
+            .expect("latch mark")
+            .map(|latched_at| latched_at.elapsed())
+            .unwrap_or_default();
+        let budget = shutdown::deadline().saturating_sub(elapsed);
+        match tokio::time::timeout(budget, &mut supervisor).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::error!(
+                    panicked = error.is_panic(),
+                    "worker supervisor ended abnormally during shutdown join"
+                );
+            }
+            Err(_) => {
+                tracing::error!(
+                    event = "worker_supervisor",
+                    error_class = "worker_shutdown_join_exceeded",
+                    budget_ms = budget.as_millis() as u64,
+                    "worker supervisor did not finish within the remaining shutdown deadline; aborting it, so its worker drain is cut short"
+                );
+                supervisor.abort();
+                let _ = supervisor.await;
+            }
+        }
+    }
 }
 
 /// A configured gateway is essential: never leave a health-only zombie after

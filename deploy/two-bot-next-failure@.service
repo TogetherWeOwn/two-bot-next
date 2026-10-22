@@ -1,0 +1,36 @@
+# Failure handler for the two-bot-next oneshot units (template).
+#
+# Each backup/drill unit names this as OnFailure=two-bot-next-failure@%n.service,
+# so a failed, timed-out or refused run writes ONE critical journal line that
+# names the unit. Alert on that line or on `systemctl --failed`; see docs/backup.md
+# "Failure signal". The handler only logs: it reads no credentials, touches no
+# database and sends nothing off the host.
+#
+#   sudo cp deploy/two-bot-next-failure@.service /etc/systemd/system/
+#
+# Host installation stays with the Operator; this file installs nothing.
+
+[Unit]
+Description=Report that %i failed (two-bot-next)
+
+[Service]
+Type=oneshot
+TimeoutStartSec=30s
+User=twobot
+Group=twobot
+ExecStart=/usr/bin/systemd-cat -t two-bot-next-unit-failed -p crit /usr/bin/echo "unit failed: %i - inspect with journalctl -u %i"
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+UMask=0077
+CapabilityBoundingSet=
+AmbientCapabilities=

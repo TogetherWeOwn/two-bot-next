@@ -727,8 +727,9 @@ windows go ~6.5 h uncovered: while coverage is gone genuine burns go unfiled
 and open cards stay unclosed. Live runs read the existing `staging`
 environment bearer `STAGING_METRICS_SCRAPE_TOKEN` for `/ops/metrics`, bound
 with `deployment: false` so the five-minute scrape adds no staging deployment
-record (the main-only branch policy still applies); without it the run warns
-and stays green. Prove the path by dispatching the workflow with the fire and
+record (the main-only branch policy still applies); without the bearer or
+the staging Worker URL the run fails closed with an error naming the unset
+binding. Prove the path by dispatching the workflow with the fire and
 clear fixtures: a separate `fixture` job, which binds no environment and
 holds no scrape bearer, runs the real verdict and the real issue calls under
 the `slow-burn-test` label without touching the live ring.
@@ -2715,6 +2716,33 @@ Source: [`automation_quota.rs`](../crates/core/src/automation_quota.rs),
 [`scheduled_store.rs`](../crates/core/src/scheduled_store.rs),
 [`feeds_store.rs`](../crates/core/src/feeds_store.rs),
 [`lfg_store.rs`](../crates/core/src/lfg_store.rs).
+
+### Scheduled delivery uncertainty
+
+Before a scheduled POST, the store arms `delivery_uncertain` under the current
+claim token. Timeout/transport loss, an unusable receipt, or failed completion
+with unconfirmed cleanup retains that fence and occurrence nonce. Restart and
+lease expiry never authorize another POST or advance a one-shot/recurring run.
+Only proven no-effect refusal or confirmed cleanup permits retry. Admission
+completion must be confirmed too; an accepted DELETE or missing id is not proof
+of cleanup.
+
+Diagnostic: `scheduled_delivery_uncertain`; safe next action:
+`inspect_channel_before_cancel_or_replace`. The attempt audit uses
+`delivery_uncertain` or `persistence_failed_uncertain`, never clean success.
+Inspect the target channel and the schedule's audit first. An already-authorized
+administrator may then cancel with `/schedule-remove`, or intentionally replace
+the definition through the existing schedule workflow. Replacement is a **new
+send** and can duplicate a surviving old message. Do not clear the fence, force
+retry, or infer absence from missing/unreadable/bounded channel history. This
+slice performs no automatic history scan, even for a positive receipt.
+
+Migration 0142 is additive and conservatively fences existing nonce/claim rows;
+NULL fences fail closed. Restoring a pre-0142 archive re-fences its pending
+nonce/claim rows the same way; current archives restore the recorded fence
+faithfully. Rollout must stop old blind-replay writers first. Do
+not downgrade to a binary that ignores the fence; retain it when reverting code.
+This is source behavior, not evidence of a migration or live release.
 
 ## Backup, restore and drill commands
 
