@@ -532,7 +532,7 @@ class WorkflowSurfaceTests(unittest.TestCase):
         self.assertIn("test_job_inputs.py", self.selector)
 
     def test_consumer_jobs_wait_on_selector(self):
-        for job in ("check", "rust-tests", "ignored-db-stores",
+        for job in ("check", "rust-tests", "patch-coverage", "ignored-db-stores",
                     "ignored-db-runtime", "community-db", "feeds-db",
                     "tickets-postgres", "worker", "supply-chain", "ci-ok",
                     "fuzz-compile"):
@@ -564,7 +564,7 @@ class WorkflowSurfaceTests(unittest.TestCase):
         head = self.text.split("\n  ci-ok:")[1].split("steps:", 1)[0]
         self.assertIn("always()", head)
         for job in ("job-inputs", "container-inputs", "supply-chain", "check", "rust-tests",
-                    "ignored-db-stores", "ignored-db-runtime", "worker",
+                    "patch-coverage", "ignored-db-stores", "ignored-db-runtime", "worker",
                     "parity-docs", "self-role-store", "community-db",
                     "feeds-db", "tickets-postgres", "moderation-db", "fuzz-compile"):
             self.assertIn(job, head)
@@ -640,8 +640,8 @@ class WorkflowSurfaceTests(unittest.TestCase):
                    "\n".join(lines))
 
     # The `check` lane always runs, so its Rust/DB steps carry the selector
-    # guard per step; the three Rust test lanes skip at the job level instead.
-    RUST_LANES = ("rust-tests", "ignored-db-stores", "ignored-db-runtime")
+    # guard per step; the four Rust test lanes skip at the job level instead.
+    RUST_LANES = ("rust-tests", "patch-coverage", "ignored-db-stores", "ignored-db-runtime")
     LANE_GUARD = "if: needs.job-inputs.outputs.rust != 'false'"
 
     # What a step must not do on a rust=false PR: that run never installs the
@@ -756,6 +756,7 @@ class VoiceSelectionTest(unittest.TestCase):
             "scripts/staging_voice_synthetic.py",
             "scripts/test_staging_voice_synthetic_dry_run_acceptance.py",
             "scripts/test_staging_voice_synthetic_gateway_intake_acceptance.py",
+            "scripts/test_staging_voice_synthetic_owned_room_acceptance.py",
             ".github/workflows/voice-synthetic.yml",
             "./crates/bot/src/voice_room_plan.rs",
         ):

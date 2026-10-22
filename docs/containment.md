@@ -111,8 +111,12 @@ A pure plan is **not** permission to execute it. A subsequent adapter must:
    blockers inside the incident transaction. After starting an incident, persist
    the trigger as `Contain`. Core proposals alone provide **no** concurrency or
    restart guarantee. `containment_store` (migration
-   `0370_containment_claims.sql`, legacy 0015 shape) now provides these claims
-   but is not wired to the gateway, executor or any arming path.
+   `0370_containment_claims.sql`, legacy 0015 shape) provides these claims,
+   wired through `containment_runtime`: the gateway installs it as the
+   audit-entry observer (`crates/bot/src/main.rs:708-711`), and the worker
+   claims each entry (`crates/bot/src/containment_runtime.rs:491`) under exact
+   `TWO_ANTI_NUKE=1` on the staging guild, armed only by explicit
+   `TWO_ANTI_NUKE_DRY_RUN=0` outside session mode.
 5. Capture complete role/member snapshots, perform whole-plan preflight before
    writes, enforce the 5s request timeout, and never automatically retry unknown
    outcomes. Use the shared executor boundary rather than duplicating it.

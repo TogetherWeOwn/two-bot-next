@@ -236,8 +236,9 @@ def _checked_by_narrowed(base_cell, head_cell, *, allow_coverage_lane_move=False
     to ``check``, ``check all`` to ``check advisories``, ``doc`` to
     ``check``) fails. Tokens are compared whole: a substring never
     satisfies. A backticked name followed by ``lane`` is a CI lane, not a
-    command. The only approved lane move is Patch coverage from ``check`` to
-    ``rust-tests``; every gate must otherwise keep its named lane. An
+    command. The approved Patch coverage lane moves are ``check`` to
+    ``rust-tests`` and ``rust-tests`` to ``patch-coverage``; every gate must
+    otherwise keep its named lane. An
     interpreter swap around a script path (``python3 scripts/...`` to
     ``uv run scripts/...``) keeps its identity through the script path.
     """
@@ -254,10 +255,9 @@ def _checked_by_narrowed(base_cell, head_cell, *, allow_coverage_lane_move=False
     if base_lanes:
         if not head_lanes:
             return True
-        approved_coverage_move = (
-            allow_coverage_lane_move
-            and base_lanes == {"check"}
-            and head_lanes == {"rust-tests"}
+        approved_coverage_move = allow_coverage_lane_move and (
+            (base_lanes == {"check"} and head_lanes == {"rust-tests"})
+            or (base_lanes == {"rust-tests"} and head_lanes == {"patch-coverage"})
         )
         if base_lanes != head_lanes and not approved_coverage_move:
             return True

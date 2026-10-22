@@ -110,7 +110,7 @@ def cutover_healthy_double():
     readyz = (200, json.dumps({
         "components": [["process", "ready"], ["gateway", "ready"]],
         "jobs": {"counter": {"parked": False, "running": True}},
-        "build_revision": "abc123", "build_id": "42",
+        "build_revision": "0123456789abcdef0123456789abcdef01234567", "build_id": "700-1",
     }).encode())
     calls = []
 

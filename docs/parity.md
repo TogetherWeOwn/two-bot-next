@@ -30,7 +30,7 @@ Original registry surface: `CORE_COMMAND_DATA` (always published) = leveling onl
 | 13 | `/rota-acknowledge` | `message-link` String req | `ManageGuild` + must be configured primary actor | **DROP** — staging-only rota measurement experiment, never enabled in prod; post-cutover decision: stays dropped, re-enable only via a new staging-measurement card (staging guild only, never prod without a parity-row update) |
 | 14 | `/command` | `name` req ≤32, `template` req ≤2000 (`{user} {username} {server} {channel}`), `description` opt ≤100, `text-trigger` opt ≤33 | `ManageGuild` (builder + runtime) | **S4** |
 | 15 | `/command-remove` | `name` req ≤32 | `ManageGuild` | **S4** |
-| 16 | `/command-list` | none | `ManageGuild` | **S4** |
+| 16 | `/command-list` | `page` opt ≥1 (1-based, default 1) | `ManageGuild` | **S4** |
 | 17 | `/schedule` | `body` req ≤2000; `in-minutes` 1–525600 opt; `every-minutes` 60–525600 opt (one required) | `ManageGuild`, runs in invoking channel | **S4** |
 | 18 | `/schedule-remove` | non-empty `id` prefix req ≤128 | `ManageGuild` | **S4** |
 | 19 | `/schedule-list` | `page` opt ≥1 (1-based, default 1) | `ManageGuild` | **S4** |
@@ -88,6 +88,7 @@ golden exception or a claim of whole-baseline registry parity.
 | `lfg-close` | docs/parity.md §1 #27 copy | Picker copy only: `id` says it comes from the posted signup. Options and permissions stay legacy-identical except for its separately listed `max_length` bound. |
 | `command` | docs/parity.md §1 #14 caps | Advertise only `max_length` matching the runtime caps (`name` 32, `template` 2000, `description` 100, `text-trigger` 33); every other field stays legacy-identical. |
 | `command-remove` | docs/parity.md §1 #15 caps | Advertise only `max_length` 32 on `name`, matching the runtime cap; every other field stays legacy-identical. |
+| `command-list` | docs/parity.md §1 #16 page | Add the Next-only optional integer `page` (`min_value` 1, default 1) for whole-row pages including disabled commands and triggers. Command name, description and permissions stay legacy-identical; quota and registry behavior do not change. |
 | `schedule` | docs/parity.md §1 #17 caps | Advertise only `max_length` 2000 on `body`, matching the runtime cap; every other field stays legacy-identical. |
 | `schedule-remove` | docs/parity.md §1 #18 caps | Advertise only `max_length` 128 on `id`; empty and overlong prefixes are refused before resolution. |
 | `sticky` | docs/parity.md §1 #20 caps | Advertise only `max_length` 2000 on `body`, matching the runtime cap; every other field stays legacy-identical. |
@@ -251,7 +252,7 @@ backfill, not this read path.
 |---|---|---|
 | Structured JSON logs (`{ts,level,msg,…}`, `debug/info/error`, `LOG_LEVEL`) | ~208 line names: lifecycle, funnel, onboarding, audit mirror, alerts, automod/moderation, rota, REST/backoff | **S2+** ([stable lifecycle log contract](logging.md); remaining feature names port with their slices) |
 | Audit channels (audit/voice/moderation, metadata-only `key=value`, 300/2000 truncation, audit-event identity prefix) |arches fallback voice/moderation → audit | **S5** |
-| Audit kill switch (`audit-switch --halt/--resume/--status`) | presence = halt | **S5** |
+| Audit kill switch (`audit_switch`, [usage](audit-store.md#operator-handle)) | presence = halt | **S5** |
 | Rate limits: staging-verifier 3 retries ≤30s; REST pacing §6; internal buckets §6; raid-watch 5 joins/60s + 900s cooldown; ticket cooldown 300s; containment per-executor cooldown | alert cooldowns + sweep/lease bounds (audit 5-min lease, 1-h recheck, claim ≤25) | with feature (**S3/S4/S5**), internal buckets [TOG-9880](/TOG/issues/TOG-9880) |
 | Automod (staging-only unless live-approved; `dryRun` unless `ENFORCE=1`; 6 filters; sanctions `1:delete,2:warn,3:timeout:600`; target-protection before delete) | bad-word NFKC matching, invite/link checks, `bat/cmd/…` attachment blocklist; whitespace edge accepted ([TOG-12582](/TOG/issues/TOG-12582)): legacy JS `\s` treats U+FEFF as blank and U+0085 as non-blank while Rust `split_whitespace` does the opposite, but both collapse to empty-vs-nonempty only for these two codepoints and all repeat-expiry blanks stay agreed (NEL: [TOG-10052](/TOG/issues/TOG-10052), format chars: [TOG-10048](/TOG/issues/TOG-10048)) | **S4** (staging gate until soak) |
 | Anti-nuke (default alerts-only; weights kick/ban/webhook=1, channel/role delete=3; quarantine strips dangerous perms below bot hierarchy; join-risk flag-only) | `containment_alert` always logged; `**Join burst**` raid alerts, no DMs/pings | **S4** (staging gate until soak) |
