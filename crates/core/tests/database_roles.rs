@@ -323,6 +323,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
     )
     .await?;
     as_role(pool, &roles[1], "INSERT INTO public.voice_creators (guild_id, channel_id) VALUES ('100', '200'); SELECT * FROM public.voice_creators; UPDATE public.voice_creators SET default_limit = 5 WHERE guild_id = '100'; INSERT INTO public.voice_rooms (guild_id, channel_id, creator_channel_id, owner_id, original_creator_id, name_seed, created_at) VALUES ('100', '500', '200', '300', '300', '7', now()); SELECT * FROM public.voice_rooms; INSERT INTO public.voice_owner_grants (guild_id, channel_id, member_id, revision) VALUES ('100', '500', '300', 'runtime-test-revision'); SELECT * FROM public.voice_owner_grants; INSERT INTO public.voice_join_grants (guild_id, room_channel_id, member_id) VALUES ('100', '500', '301'); SELECT * FROM public.voice_join_grants; DELETE FROM public.voice_join_grants WHERE guild_id = '100'; UPDATE public.voice_owner_grants SET pending = FALSE WHERE guild_id = '100'; DELETE FROM public.voice_owner_grants WHERE guild_id = '100'; UPDATE public.voice_rooms SET owner_id = '301' WHERE guild_id = '100'; INSERT INTO public.voice_text_companions (guild_id, room_channel_id, text_channel_id, text_channels, created_at) VALUES ('100', '500', '600', TRUE, now()); SELECT * FROM public.voice_text_companions; INSERT INTO public.voice_access_controls (guild_id) VALUES ('100'); SELECT * FROM public.voice_access_controls; UPDATE public.voice_access_controls SET room_creation_enabled = FALSE WHERE guild_id = '100'; INSERT INTO public.voice_logging_settings (guild_id) VALUES ('100'); SELECT * FROM public.voice_logging_settings; UPDATE public.voice_logging_settings SET detail_level = 'full' WHERE guild_id = '100'; DELETE FROM public.voice_logging_settings WHERE guild_id = '100'; DELETE FROM public.voice_access_controls WHERE guild_id = '100'; DELETE FROM public.voice_text_companions WHERE guild_id = '100'; DELETE FROM public.voice_rooms WHERE guild_id = '100'; DELETE FROM public.voice_creators WHERE guild_id = '100'; INSERT INTO public.voice_vote_kick_audit (guild_id, vote_id, event, room_id, initiator_id, target_id, outcome, occurred_at) VALUES ('100', '700', 'vote_started', '500', '301', '303', 'started', now()); SELECT * FROM public.voice_vote_kick_audit; DELETE FROM public.voice_vote_kick_audit WHERE guild_id = '100'").await?;
+    voice_settings_audit_runtime_regression(pool, roles).await?;
     denied(pool, &roles[2], "SELECT * FROM public.voice_creators").await?;
     denied(pool, &roles[2], "SELECT * FROM public.voice_rooms").await?;
     denied(pool, &roles[2], "SELECT * FROM public.voice_owner_grants").await?;
@@ -490,6 +491,8 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
          format!("REVOKE DELETE ON public.discord_send_admission FROM {runtime}")),
         (format!("GRANT DELETE ON public.voice_create_reservations TO {runtime}"),
          format!("REVOKE DELETE ON public.voice_create_reservations FROM {runtime}")),
+        (format!("REVOKE INSERT ON public.voice_settings_audit FROM {runtime}"),
+         format!("GRANT INSERT ON public.voice_settings_audit TO {runtime}")),
         ("GRANT SELECT ON public.voice_create_reservations TO PUBLIC".to_owned(),
          "REVOKE SELECT ON public.voice_create_reservations FROM PUBLIC".to_owned()),
         (format!("GRANT TRUNCATE ON public.discord_send_admission TO {runtime}"),
@@ -723,6 +726,99 @@ async fn exercise_member_store(pool: &PgPool, runtime: &str) -> Result<(), sqlx:
     }.await;
     runtime_pool.close().await;
     result
+}
+
+/// Voice configuration audit regression: the reviewed plan lets the runtime
+/// allocate a voice revision and append audit rows, while the append-only
+/// trigger refuses UPDATE/DELETE and the reader cannot allocate or read.
+async fn voice_settings_audit_runtime_regression(
+    pool: &PgPool,
+    roles: &[String],
+) -> Result<(), sqlx::Error> {
+    require(
+        sqlx::query_scalar::<_, bool>(
+            r#"SELECT has_table_privilege($1::text, 'public.voice_settings_audit', 'SELECT')
+                AND has_table_privilege($1::text, 'public.voice_settings_audit', 'INSERT')
+                AND has_table_privilege($1::text, 'public.voice_settings_audit', 'UPDATE')
+                AND has_table_privilege($1::text, 'public.voice_settings_audit', 'DELETE')
+                AND NOT has_table_privilege($1::text, 'public.voice_settings_audit', 'TRUNCATE, REFERENCES, TRIGGER')
+                AND NOT has_table_privilege($2::text, 'public.voice_settings_audit', 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')"#,
+        )
+        .bind(&roles[1])
+        .bind(&roles[2])
+        .fetch_one(pool)
+        .await?,
+        "voice audit least-privilege ACL differs",
+    )?;
+    // The runtime allocates a revision, appends one audit row, and stamps the
+    // allocated revision and actor onto a config row via the cross-writer
+    // trigger, then removes only its own config probe row.
+    as_role(
+        pool,
+        &roles[1],
+        r#"DO $voice_audit$
+        DECLARE
+            allocated bigint;
+            stamped bigint;
+        BEGIN
+            INSERT INTO public.voice_settings_audit (guild_id, actor)
+                VALUES ('100', 'role-probe') RETURNING version INTO allocated;
+            IF allocated IS NULL OR allocated <= 0 THEN
+                RAISE EXCEPTION 'runtime did not allocate a voice revision';
+            END IF;
+            PERFORM set_config('two.voice_version', allocated::text, true);
+            PERFORM set_config('two.voice_actor', 'role-probe', true);
+            PERFORM set_config('two.voice_guild', '100', true);
+            INSERT INTO public.voice_creators (guild_id, channel_id)
+                VALUES ('100', '200');
+            SELECT version INTO stamped FROM public.voice_creators
+                WHERE guild_id = '100' AND channel_id = '200';
+            IF stamped IS DISTINCT FROM allocated THEN
+                RAISE EXCEPTION 'runtime config write did not stamp the allocated revision';
+            END IF;
+            IF NOT EXISTS (SELECT FROM public.voice_creators
+                WHERE guild_id = '100' AND channel_id = '200'
+                  AND updated_by = 'role-probe') THEN
+                RAISE EXCEPTION 'runtime config write did not stamp the actor';
+            END IF;
+            DELETE FROM public.voice_creators WHERE guild_id = '100' AND channel_id = '200';
+        END;
+        $voice_audit$;"#,
+    )
+    .await?;
+    // Append-only: UPDATE and DELETE carry the privilege but the trigger
+    // refuses them; TRUNCATE never had the privilege.
+    for sql in [
+        "UPDATE public.voice_settings_audit SET actor = 'mutant' WHERE guild_id = '100'",
+        "DELETE FROM public.voice_settings_audit WHERE guild_id = '100'",
+    ] {
+        match as_role(pool, &roles[1], sql).await {
+            Err(sqlx::Error::Database(error))
+                if error
+                    .message()
+                    .contains("voice settings audit is append only") => {}
+            _ => {
+                return Err(sqlx::Error::InvalidArgument(format!(
+                    "voice audit mutation was not refused: {sql}"
+                )))
+            }
+        }
+    }
+    denied(pool, &roles[1], "TRUNCATE public.voice_settings_audit").await?;
+    // No direct revision allocation or audit access for the reader.
+    for sql in [
+        "SELECT nextval('public.voice_settings_audit_version_seq')",
+        "SELECT last_value FROM public.voice_settings_audit_version_seq",
+        "SELECT setval('public.voice_settings_audit_version_seq', 1)",
+        "SELECT * FROM public.voice_settings_audit",
+        "INSERT INTO public.voice_settings_audit (guild_id, actor) VALUES ('100', 'reader')",
+        "UPDATE public.voice_settings_audit SET actor = 'reader'",
+        "DELETE FROM public.voice_settings_audit",
+        "TRUNCATE public.voice_settings_audit",
+    ] {
+        denied(pool, &roles[2], sql).await?;
+    }
+    Ok(())
 }
 
 async fn automod_runtime_role_regression(
