@@ -6298,6 +6298,11 @@ class WorkflowTests(unittest.TestCase):
         for label, change in changes.items():
             with self.subTest(change=label):
                 self.assertTrue(mutate(change))
+        # The inventory pin fails closed if the workflow disappears or gains a job.
+        missing = deepcopy(workflows)
+        del missing["staging-events-read.yml"]
+        self.assertTrue(workflow_policy_errors(missing))
+        self.assertEqual(workflow_policy_errors(workflows), [])
 
     def test_staging_privacy_verify_read_shape_is_pinned(self):
         workflows = self.workflows
@@ -6384,7 +6389,7 @@ class WorkflowTests(unittest.TestCase):
                 self.assertTrue(mutate(change))
         # The inventory pin fails closed if the workflow disappears or gains a job.
         missing = deepcopy(workflows)
-        del missing["staging-events-read.yml"]
+        del missing["staging-privacy-verify-read.yml"]
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
 

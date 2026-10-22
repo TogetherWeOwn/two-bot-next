@@ -103,7 +103,7 @@ import unicodedata
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import staging_automation_read_smoke as pins  # noqa: E402
+import staging_automation_read_smoke as pins
 
 SCHEMA_VERSION = 1
 URL_ENV = "TWO_BOT_STAGING_PRIVACY_RO_DATABASE_URL"
@@ -412,11 +412,13 @@ def valid_actor(value):
             and not any(unicodedata.category(char) == "Cc" for char in value))
 
 
-def parse_audit_rows(output):
+def parse_audit_rows(output, forbidden_actors=()):
     rows = []
     for raw in csv_rows(output):
         if len(raw) != 2 or not valid_actor(raw[0]) or recorded_instant(raw[1]) is None:
             raise ReadFailed("a row had an unexpected shape; nothing was written")
+        if raw[0] in forbidden_actors:
+            raise ReadFailed("an audit row named the fixture subject; nothing was written")
         rows.append({"actor": raw[0], "opted_out_at": raw[1]})
     if len(rows) > AUDIT_QUERY_LIMIT:
         raise ReadFailed("more rows than the query limit; nothing was written")
@@ -503,7 +505,11 @@ def read_verify(alias, env, psql, now):
               for table in COUNT_TABLES}
     sweep_extra = {table: parse_count(run_psql(psql, pg_env, SWEEP_SQL[table], variables))
                    for table in SWEEP_TABLES}
-    audit_rows = parse_audit_rows(run_psql(psql, pg_env, AUDIT_ROWS_SQL, variables))
+    # The audit writer accepts a caller-supplied actor, so a fixture run could
+    # store the member or guild id as the actor. Rejecting those values keeps
+    # the retained artifact subject-free instead of publishing an id as a label.
+    audit_rows = parse_audit_rows(run_psql(psql, pg_env, AUDIT_ROWS_SQL, variables),
+                                  forbidden_actors={member, guild})
     artifact = build_artifact(alias, format_instant(now), counts, sweep_extra, audit_rows)
     if artifact_errors(artifact):
         raise ReadFailed("the artifact failed its own shape check; nothing was written")
@@ -526,7 +532,8 @@ def main(argv=None, env=None, now=None, psql=None):
     except ReadFailed as error:
         print(f"failed: {error}", file=sys.stderr)
         return 1
-    except Exception as error:  # noqa: BLE001 - a traceback could quote the member or the login
+    # Broad by design, with no traceback: it could quote the member or the login.
+    except Exception as error:
         print(f"failed: unexpected {type(error).__name__}; nothing was written", file=sys.stderr)
         return 1
     args.output.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")

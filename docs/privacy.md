@@ -215,11 +215,15 @@ from an input, so a dispatch cannot aim the read at another member.
 The read-only login `TWO_BOT_STAGING_PRIVACY_RO_DATABASE_URL` must name
 role `two_bot_privacy_verify_ro` on database `two_bot` at the host pinned
 in `STAGING_PRIVACY_VERIFY_EXPECTED_HOST`. The role holds column-limited
-`SELECT` on exactly six tables: the match columns the predicates evaluate
-(`events`, `members`, `invite_snapshots`, `community_facts`,
-`privacy_opt_outs`, `privacy_opt_out_audit`; the sweep's `metadata`,
-`source_event_id` and `idempotency_key` match columns included) and nothing
-else. Every statement runs in a `READ ONLY` transaction with a 10 s
+`SELECT` on exactly six tables, covering every column the queries read:
+`events` (`guild_id`, `member_id`, `metadata`, `idempotency_key`),
+`members` (`guild_id`, `member_id`), `invite_snapshots` (`guild_id`,
+`inviter_id`), `community_facts` (`guild_id`, `actor_id`, `metadata`,
+`source_event_id`, `idempotency_key`), `privacy_opt_outs` (`guild_id`,
+`member_id`), and `privacy_opt_out_audit` (`guild_id`, `member_id`,
+`actor`, `opted_out_at`, `id`; `actor` and `opted_out_at` are projected,
+`id` orders the receipts), and nothing else. Every statement runs in a
+`READ ONLY` transaction with a 10 s
 statement timeout after a `current_user`/`current_database()` identity
 probe.
 

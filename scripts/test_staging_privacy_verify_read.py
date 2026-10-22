@@ -22,7 +22,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import staging_privacy_verify_read as reader  # noqa: E402
+import staging_privacy_verify_read as reader
 
 ROOT = Path(__file__).resolve().parents[1]
 NOW = datetime(2026, 10, 22, 8, 0, 0, tzinfo=timezone.utc)
@@ -485,6 +485,19 @@ class ReadTests(unittest.TestCase):
         fixture = Fixture(self, audit=f"{'x' * 128},2026-10-22T07:01:00.000Z\n")
         code, _, err = fixture.run()
         self.assertEqual((code, err), (0, ""))
+
+    def test_an_actor_naming_the_fixture_subject_fails_closed(self):
+        stamp = "2026-10-22T07:01:00.000Z\n"
+        for label, actor in (("member id as actor", MEMBER),
+                             ("guild id as actor", "1545644954272137297")):
+            with self.subTest(case=label):
+                fixture = Fixture(self, audit=f"{actor},{stamp}")
+                code, out, err = fixture.run()
+                self.assertEqual(code, 1, err)
+                self.assertFalse(fixture.output.exists())
+                self.assertIn("fixture subject", err)
+                self.assertNotIn(MEMBER, err + out)
+                self.assertNotIn("1545644954272137297", err + out)
 
     def test_a_wrong_server_identity_stops_before_the_counts_are_read(self):
         for identity in ("two_bot_migrator,two_bot\n", "two_bot_privacy_verify_ro,neondb\n",
