@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/discord", "crates/bot", "crates/cutover", "crates/store", "crates/testsupport"]
+members = ["crates/core", "crates/discord", "crates/bot", "crates/cutover", "crates/store", "crates/testsupport", "crates/voice-probe"]
 exclude = ["fuzz"]
-default-members = [".", "crates/core", "crates/discord", "crates/bot", "crates/cutover", "crates/store"]
+default-members = [".", "crates/core", "crates/discord", "crates/bot", "crates/cutover", "crates/store", "crates/voice-probe"]
 
 # One native Rust release strategy versions the whole workspace. The root
 # library exposes release metadata; it is not a crates.io distribution.
