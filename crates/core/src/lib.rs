@@ -73,6 +73,9 @@ pub mod game_activity;
 pub mod game_activity_store;
 pub mod gateway_funnel;
 pub mod gateway_session;
+pub mod giveaway;
+#[cfg(feature = "db")]
+pub mod giveaway_store;
 pub mod handlers;
 pub mod health;
 pub mod help;
@@ -265,6 +268,23 @@ pub use feature_commands::{
 pub use funnel::{
     format_iso_millis, idempotency_key, is_measurable_gate_clearing, now_iso, parse_iso_millis,
     EventType, FunnelEvent, Snowflake, MESSAGE_RUNGS,
+};
+pub use giveaway::{
+    adjudicate_eligibility, draw, draw_seed, eligible_hash, extend_deadline_ms, is_due,
+    mint_draw_nonce, parse_requirements, parse_reroll_kind, reroll_kind_single, resume_deadline_ms,
+    single_reroll_pool, transition, validate_duration_seconds, validate_new_giveaway,
+    validate_prize, validate_winners_count, Eligibility, GiveawayError, GiveawayEvent,
+    GiveawayRequirements, GiveawayStatus, MemberStanding, NewGiveawayInput, RerollKind,
+    ValidatedGiveaway, DURATION_MAX_SECONDS, DURATION_MIN_SECONDS, EXTEND_MAX_SECONDS,
+    EXTEND_MIN_SECONDS, FIRST_DRAW_NO, PRIZE_MAX_CHARS, PRIZE_MIN_CHARS, REQUIREMENT_MAX_AGE_DAYS,
+    REROLL_KIND_FULL, WINNERS_MAX, WINNERS_MIN,
+};
+#[cfg(feature = "db")]
+pub use giveaway_store::{
+    claim_due_giveaway, complete_draw, create_giveaway, delete_giveaway, get_draws, get_giveaway,
+    insert_draw, latest_draw_no, list_entries, mark_announced, mark_drawn, release_claim,
+    set_giveaway_status, upsert_entry, GiveawayDrawRow, GiveawayEntryRow, GiveawayRow, NewDraw,
+    NewGiveaway,
 };
 pub use handlers::{
     ChannelClass, FactsSink, FunnelHandlers, FunnelStore, GateClearedInput, HandlerOutcome,

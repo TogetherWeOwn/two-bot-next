@@ -26,6 +26,21 @@
       "predicate": "guild_id = $1 AND created_by = $2"
     },
     {
+      "table": "giveaway_entries",
+      "columns": ["user_id", "giveaway_id"],
+      "predicate": "guild_id = $1 AND (user_id = $2 OR giveaway_id IN (SELECT id FROM giveaways WHERE guild_id = $1 AND created_by = $2))"
+    },
+    {
+      "table": "giveaway_draws",
+      "columns": ["giveaway_id", "winner_ids", "reroll_kind"],
+      "predicate": "guild_id = $1 AND (giveaway_id IN (SELECT id FROM giveaways WHERE guild_id = $1 AND created_by = $2) OR winner_ids ? $2 OR reroll_kind = 'single:' || $2)"
+    },
+    {
+      "table": "giveaways",
+      "columns": ["created_by"],
+      "predicate": "guild_id = $1 AND created_by = $2"
+    },
+    {
       "table": "events",
       "columns": ["member_id", "metadata", "idempotency_key"],
       "predicate": "guild_id = $1 AND (member_id = $2 OR metadata ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)') OR idempotency_key ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)'))"
