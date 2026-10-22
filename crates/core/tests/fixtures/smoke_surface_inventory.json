@@ -629,7 +629,18 @@
       "gate": "announcements",
       "default_member_permissions": "32",
       "dm_permission": false,
-      "options": [],
+      "options": [
+        {
+          "name": "page",
+          "description": "Page of the feed relay list (1-based)",
+          "type": "integer",
+          "required": false,
+          "min_value": 1,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        }
+      ],
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Needs seeded feed relays (DB); the no-DB offline rule excludes it."

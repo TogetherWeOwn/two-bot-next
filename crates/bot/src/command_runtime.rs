@@ -63,19 +63,23 @@ use twilight_model::{
     gateway::GatewayReaction,
     http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
 };
+use two_bot::voice_rooms::voice_claims_custom_id;
 use two_bot_core::{
     afk::store as afk_store,
     automod_runtime::FunnelDisposition,
     commands::PERM_MANAGE_GUILD,
     feeds::{
-        feed_list_text, feed_removed_text, plan_command, FeedCommand, FeedCommandContext,
-        FeedCommandPlan, FeedError, FeedKind, FEED_REMOVAL_RECOVERY_REQUIRED_TEXT,
+        feed_list_page, feed_list_page_invalid_text, feed_list_page_underflow_text,
+        feed_removed_text, plan_command, FeedCommand, FeedCommandContext, FeedCommandPlan,
+        FeedError, FeedKind, FEED_REMOVAL_RECOVERY_REQUIRED_TEXT,
     },
     feeds_store::{add_feed, list_feeds, remove_feed, write_audit, FeedAudit, FeedRemoval},
     funnel::now_millis_for_test,
     mention_reply,
     moderation::ModerationAction,
-    render_elapsed, set_confirmation,
+    render_elapsed,
+    router::replies::EXPIRED_COMPONENT_REPLY,
+    set_confirmation,
     sticky::{
         activity_eligible, decide_activity, normalize_debounce, sticky_removed_reply,
         sticky_set_reply, store, validate_body, ActivityDecision, ActivityOutcome, PutSticky,
@@ -1139,6 +1143,13 @@ impl CommandRuntime {
             return;
         };
         let Some(input) = service.component_input(interaction) else {
+            // Stale reference (removed panel, replaced source message, or
+            // removed option): one expired-control reply, zero mutation.
+            // Malformed input stays silent.
+            if service.stale_component(interaction) {
+                self.answer(interaction, ephemeral(EXPIRED_COMPONENT_REPLY))
+                    .await;
+            }
             return;
         };
         if !self.defer(interaction, "self-role").await {
@@ -1146,6 +1157,38 @@ impl CommandRuntime {
         }
         let result = service.handle(&input).await;
         self.finish(interaction, result.reply(input.panel.color))
+            .await;
+    }
+
+    /// One expired-control reply for genuinely unowned, in-scope components
+    /// and modal submits. The router has already fenced the guild (foreign
+    /// and missing guilds route `Ignore`) and the surface gates (known ids on
+    /// disabled surfaces route `Ignore`), so `Unknown` here means unowned,
+    /// not merely unserved. Voice-owned controls belong to the voice sink,
+    /// which answers each exactly once; bot authors stay silent.
+    async fn answer_stale_control(&self, interaction: &Interaction, routed: &RoutedInteraction) {
+        let custom_id = match routed {
+            RoutedInteraction::Component {
+                custom_id,
+                outcome: ComponentOutcome::Unknown,
+                ..
+            }
+            | RoutedInteraction::Modal {
+                custom_id,
+                outcome: ComponentOutcome::Unknown,
+            } => custom_id,
+            _ => return,
+        };
+        // Ownership is the sink's own predicate: bare `two:voice:` ids,
+        // epoch-suffixed runtime join buttons, and `votekick:` ballots. A bare
+        // prefix never claims ownership on its own.
+        if voice_claims_custom_id(custom_id) {
+            return;
+        }
+        if author_is_bot(interaction) {
+            return;
+        }
+        self.answer(interaction, ephemeral(EXPIRED_COMPONENT_REPLY))
             .await;
     }
 
@@ -1352,8 +1395,12 @@ impl CommandRuntime {
             }
             return;
         }
-        let RoutedInteraction::Slash { name, outcome } = routed else {
-            return;
+        let (name, outcome) = match routed {
+            RoutedInteraction::Slash { name, outcome } => (name, outcome),
+            other => {
+                self.answer_stale_control(interaction, &other).await;
+                return;
+            }
         };
         // V4 `kick` collision: this router is the only answerer. The guild
         // fence, the moderation gate and the Kick Members check run first, and
@@ -2185,27 +2232,43 @@ impl CommandRuntime {
         }
     }
 
-    /// `/feed-list`: plan → guild-scoped list → ephemeral text. Legacy
-    /// `listFeeds` lists every relay for the guild (not `enabled` only) and
-    /// writes no audit row.
+    /// `/feed-list`: plan → page decode → guild-scoped list → ephemeral
+    /// text. Legacy `listFeeds` lists every relay for the guild (not `enabled`
+    /// only) and writes no audit row. An omitted `page` means page 1; a
+    /// present-but-unusable option refuses without a store read, and
+    /// out-of-range refuses after the same bounded read every list uses.
     async fn feed_list(&self, interaction: &Interaction) {
         let channel_id = interaction_channel(interaction).unwrap_or_default();
         let inputs = self.feed_inputs(interaction);
         let context = inputs.context(&channel_id);
         match plan_command(&context, FeedCommand::List) {
             Ok(FeedCommandPlan::List { guild_id }) => {
-                match list_feeds(&self.pool, &guild_id, false).await {
-                    Ok(feeds) => self.finish(interaction, feed_list_text(&feeds)).await,
-                    Err(err) => {
-                        warn!(reason = feed_store_class(&err), "feed list failed");
-                        self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
+                let reply = match feed_list_page_request(interaction) {
+                    FeedListPage::Invalid => feed_list_page_invalid_text().to_owned(),
+                    FeedListPage::Default => self.list_feed_page(&guild_id, 1).await,
+                    FeedListPage::Page(page) if page < 1 => {
+                        feed_list_page_underflow_text().to_owned()
                     }
-                }
+                    FeedListPage::Page(page) => self.list_feed_page(&guild_id, page).await,
+                };
+                self.finish(interaction, reply).await;
             }
             Ok(plan) => {
                 warn!(?plan, "feed-list planned to a non-list variant");
             }
             Err(err) => self.finish(interaction, err.to_string()).await,
+        }
+    }
+
+    /// One bounded guild-scoped relay read rendered as the requested page.
+    /// A failed read keeps the fixed safe reply and writes no audit row.
+    async fn list_feed_page(&self, guild_id: &str, page: i64) -> String {
+        match list_feeds(&self.pool, guild_id, false).await {
+            Ok(feeds) => feed_list_page(&feeds, page),
+            Err(err) => {
+                warn!(reason = feed_store_class(&err), "feed list failed");
+                FEED_STORE_FAILURE_REPLY.to_owned()
+            }
         }
     }
 
@@ -2531,6 +2594,31 @@ pub(crate) fn feed_remove_option(interaction: &Interaction) -> Option<String> {
         })
 }
 
+/// `/feed-list`'s optional 1-based `page` option, decoded by name first: an
+/// omitted option means page 1, while a present option with a non-integer
+/// wire value is unusable and must refuse rather than silently list page 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FeedListPage {
+    Default,
+    Page(i64),
+    Invalid,
+}
+
+pub(crate) fn feed_list_page_request(interaction: &Interaction) -> FeedListPage {
+    let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
+        &interaction.data
+    else {
+        return FeedListPage::Default;
+    };
+    let Some(page) = data.options.iter().find(|option| option.name == "page") else {
+        return FeedListPage::Default;
+    };
+    match &page.value {
+        CommandOptionValue::Integer(value) => FeedListPage::Page(*value),
+        _ => FeedListPage::Invalid,
+    }
+}
+
 /// Shared sticky/feed/channel/leveling registrations over the narrowed boot
 /// gates; LFG is composed by `InteractionRuntime`. Tests that bypass
 /// `from_env`'s env reads use this same router, matching `from_env`'s
@@ -2593,6 +2681,17 @@ pub(crate) fn ephemeral(text: impl Into<String>) -> InteractionResponse {
             ..Default::default()
         }),
     }
+}
+
+/// Bot-authored interactions stay silent: guild presses carry the author on
+/// the member, DMs on the top-level user.
+fn author_is_bot(interaction: &Interaction) -> bool {
+    interaction.user.as_ref().is_some_and(|user| user.bot)
+        || interaction
+            .member
+            .as_ref()
+            .and_then(|member| member.user.as_ref())
+            .is_some_and(|user| user.bot)
 }
 
 /// Invoker id: guild member's user, else the DM user (legacy reads

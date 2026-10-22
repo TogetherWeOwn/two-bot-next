@@ -253,6 +253,20 @@ re-baseline, missing family is no window). Full semantics live in
 | --- | --- |
 | `two_bot_retention_replay_needed_total` | Skipped retention purges needing Operator replay: one per real guild removal whose purge-queue write hit the schema gap; successful queue writes and rejoin-cancel skips never increment it |
 
+## Containment store error series
+
+Counter emitted by the containment completion path in
+`crates/bot/src/containment_runtime.rs` (`finish`) and rendered by
+`crates/core/src/metrics.rs` (`render`). A failed `complete_incident` also
+surfaces as outcome-unknown in the staff alert, so the alert and the durable
+record never silently disagree. Unknown ops collapse to `other`; no error
+text, query or identifier ever becomes a label. Manual check, not an alert
+input: consumed by no alert rule. Full semantics live in `docs/metrics.md`.
+
+| Series | Meaning |
+| --- | --- |
+| `two_bot_containment_store_errors_total{op}` | Containment-store failures by bounded operation; `op` is `complete_incident` or `other` |
+
 ## Drop-guard poison recovery series
 
 Labelled counter recorded by `recover_drop_poison` in
@@ -260,13 +274,13 @@ Labelled counter recorded by `recover_drop_poison` in
 poisoned drop counts once under its guard and logs one `drop guard recovered
 a poisoned lock` warn carrying the guard name; the drop still releases its
 state from the recovered guard. Unknown guards collapse to the trailing
-`in_flight_guard` slot, and no panic payload, ID, token or body content ever
+`voice_connection_guard` slot, and no panic payload, ID, token or body content ever
 becomes a label. Manual check, not an alert input: consumed by no alert rule.
 Full semantics live in `docs/metrics.md`.
 
 | Series | Meaning |
 | --- | --- |
-| `two_bot_drop_poison_total{guard}` | Poisoned locks recovered by drop guards instead of panicking inside `drop`; `guard` is `command_dispatch_guard`, `schedule_run`, `user_slot` or `in_flight_guard`. Any increase is a fault worth a look in the container logs |
+| `two_bot_drop_poison_total{guard}` | Poisoned locks recovered by drop guards instead of panicking inside `drop`; `guard` is `command_dispatch_guard`, `schedule_run`, `user_slot`, `in_flight_guard`, `ticket_supervisor`, `response_accounting` or `voice_connection_guard`. Any increase is a fault worth a look in the container logs |
 
 ## Scheduled job labels
 
@@ -473,6 +487,15 @@ until the load succeeds or the guild is removed. A credential refusal is
 never retried; that actor respawns only on the next guild snapshot
 (`publish_snapshot` on `GuildCreate`/resumed replay), and voice, channel
 and role events for the guild are dropped until then.
+
+`voice succession handed the room to the longest-present member`
+(info; `apply_succession` in `crates/bot/src/voice_rooms.rs`): the
+reconcile pass handed an ownerless-but-occupied room to its
+longest-present member. Fields: `channel_id`, `previous_owner_id`,
+`next_owner_id` (IDs only, no member names). One line per handoff; the
+`voice_reconcile` aggregate counts it under `succession_enqueued`, and
+the next tick finds the new owner present and stays silent. The refused
+path keeps the existing `voice succession refused` warn.
 
 `voice live view was not ready on a connected gateway; republished from cache`
 (warn; `heal_not_ready` in `crates/bot/src/voice_rooms.rs`, guild-only field,

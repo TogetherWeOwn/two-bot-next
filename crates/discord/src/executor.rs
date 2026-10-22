@@ -3286,14 +3286,14 @@ impl ActionExecutor {
                 content,
                 nonce,
             } => {
-                // `audit::delivery_nonce` mints `oa_...` strings that can never
-                // parse as u64 — carry them as string nonces with enforcement
-                // instead of rejecting them (finding 5). Numeric strings keep
-                // the numeric wire shape.
-                let value = nonce.as_deref().map(|s| match s.parse::<u64>() {
-                    Ok(n) => serde_json::Value::from(n),
-                    Err(_) => serde_json::Value::from(s),
-                });
+                // A string nonce keeps the string wire shape, including
+                // all-decimal values and leading zeroes: the nonce must
+                // round-trip through history verbatim so
+                // `recover_message_by_nonce` can match it (finding 5; cf.
+                // `post_message_with_nonce`, `post_message_confirmed`).
+                // Numeric wire shape stays available through the typed
+                // `post_message(Option<u64>)` path.
+                let value = nonce.as_deref().map(serde_json::Value::from);
                 Ok(ChannelCallOutcome::Posted {
                     message_id: self.send_message(channel_id, content, value, false).await?,
                 })
