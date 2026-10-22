@@ -66,10 +66,12 @@ automatic ticket creation, dashboard UI, legacy import.
   (default 10) marks the suggestion trending: the embed gains a trending flag
   and staff get one notification per suggestion (no repeat pings as the score
   climbs further).
-- No auto-accept and no auto-decline in v1. Thresholds drive staff queue
-  ordering (trending first) and the trending flag only; every terminal state
-  is a deliberate staff action. This keeps the first build reviewable and
-  avoids silently discarding minority suggestions.
+- Thresholds never auto-accept or auto-decline: they drive staff queue
+  ordering (trending first) and the trending flag only. Every
+  threshold-driven terminal state is a deliberate staff action. This keeps
+  the first build reviewable and avoids silently discarding minority
+  suggestions. The only automated terminal transition in v1 is the 90-day
+  retention stale-close below, which is a storage bound, not a verdict.
 - The threshold is a per-guild setting with the default above; changing it
   re-evaluates open suggestions on the next vote, not in a backfill.
 
@@ -112,9 +114,9 @@ Additive migration, new tables (no legacy names to preserve):
   `text`, `status` (`open`, `accepted`, `declined`, `implemented`),
   `upvotes`/`downvotes` counters, `trending` flag, `ticket_id` (nullable
   reference to the linked ticket), `decline_reason` (nullable),
-  `triaged_by`/`triaged_at` (nullable), `created_at`. Partial unique index on
-  open rows per `(guild_id, author_id)` is enforced as a count check inside
-  the advisory-lock transaction, with the lock as the arbiter.
+  `triaged_by`/`triaged_at` (nullable), `created_at`. The 3-open cap is a
+  count check inside the advisory-lock transaction, with the lock as the
+  arbiter; unlike the ticket max-1 rule, no partial unique index applies.
 - `suggestion_votes`: `(suggestion_id, voter_id)` PK, `guild_id`,
   `vote` (+1/-1), `updated_at`. Guild-fenced on every read and write; rows
   cascade on suggestion delete.
@@ -177,7 +179,8 @@ Additive migration, new tables (no legacy names to preserve):
 - [x] Submit flow defined (command, validation, admission, post ordering).
 - [x] Voting defined (buttons, toggle/switch one-vote rules, no implicit or
       weighted votes, locked after triage).
-- [x] Thresholds defined (trending default 10, no auto terminal states).
+- [x] Thresholds defined (trending default 10, thresholds never auto-decide;
+      stale close is a retention bound, not a verdict).
 - [x] Staff triage defined (accept/decline/implement + reopen, auth, reasons,
       ticket handoff as stored link, no ticket-system changes).
 - [x] Anti-spam/rate limits defined (submit cooldown + open cap, vote
