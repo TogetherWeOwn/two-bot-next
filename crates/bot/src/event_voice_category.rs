@@ -4,11 +4,10 @@
 //! There is no default, nothing is auto-picked, and until a usable category
 //! exists the feature is inactive: the website shows the TBD reason
 //! `no_category`, no creates are attempted, and staff get one alert per
-//! config gap (never per-tick spam). Every tick preflights Manage Channels
-//! + View Channel on the configured category before any create; on 403 the
-//! tick stays TBD with reason `perm_denied`, records the per-tick counter,
-//! alerts once per episode, retries with backoff, and never crashes the
-//! tick.
+//! config gap (never per-tick spam). Every tick preflights Manage Channels and
+//! View Channel on the configured category before any create; on 403 the tick
+//! stays TBD with reason `perm_denied`, records the per-tick counter, alerts
+//! once per episode, retries with backoff, and never crashes the tick.
 //!
 //! A moderator moving the live channel to another category is accepted: the
 //! cached parent follows the channel (no fight), while future creates still
