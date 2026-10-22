@@ -272,6 +272,74 @@ test("unconfigured gateway stays dark", async () => {
   }
 });
 
+test("non-dedicated and off-grammar service ids keep the gateway dark", async () => {
+  // Removing the dedicated-id check would let an ordinary website key expose
+  // this route. All requests have valid bearer/target/secret inputs, so an
+  // unrelated input refusal cannot masquerade as reserved-suffix isolation.
+  const invalidIds = [
+    "website-staging",
+    "fixture-scope-key",
+    "fixture-admin-service-extra",
+    "fixture-ADMIN-SERVICE",
+    "-admin-service", // zero prefix characters
+    ".-admin-service",
+    "fixture/key-admin-service",
+    "fixture key-admin-service",
+    "é-admin-service",
+    `${"a".repeat(115)}-admin-service`, // 129 total bytes
+  ];
+  for (const serviceId of invalidIds) {
+    for (const method of ["GET", "POST"]) {
+      const h = harness({ serviceId, serviceSecret: SERVICE_SECRET });
+      const path = method === "GET"
+        ? `/admin/v1/event.read/${TARGET_GUILD}` : "/admin/v1/event.read";
+      const res = await worker.fetch(adminRequest(method, path, `Bearer ${ADMIN_BEARER}`, {
+        guild_id: TARGET_GUILD,
+      }), h.env, h.ctx);
+      const plain = await worker.fetch(adminRequest(method, "/synthetic-unrouted-zz9-probe",
+        `Bearer ${ADMIN_BEARER}`, { guild_id: TARGET_GUILD }), h.env, h.ctx);
+      assert.equal(res.status, plain.status, `${serviceId}: ${method} dark fallthrough status`);
+      assert.equal(await res.text(), await plain.text(), `${serviceId}: ${method} dark body`);
+      assert.equal(res.headers.get("allow"), plain.headers.get("allow"), `${serviceId}: dark Allow`);
+      assert.equal(res.headers.get("www-authenticate"), null, `${serviceId}: never challenges`);
+      assert.deepEqual(h.names, [], `${serviceId}: no DO lookup`);
+      assert.deepEqual(h.forwarded, [], `${serviceId}: no container contact`);
+    }
+  }
+});
+
+test("dedicated service ids at grammar bounds enable signed gateway forwarding", async () => {
+  // Prevent a blanket-dark workaround: 1..114 ASCII [A-Za-z0-9_-] prefix
+  // characters followed by the exact suffix, and >=32-byte secrets, are live.
+  for (const serviceId of ["A-admin-service", "Z_9--admin-service", SERVICE_KEY_ID,
+    `${"a".repeat(114)}-admin-service`]) {
+    for (const method of ["GET", "POST"]) {
+      const serviceSecret = "t".repeat(32);
+      const h = harness({ serviceId, serviceSecret });
+      const path = method === "GET"
+        ? `/admin/v1/event.read/${TARGET_GUILD}` : "/admin/v1/event.read";
+      const res = await worker.fetch(adminRequest(method, path, `Bearer ${ADMIN_BEARER}`, {
+        guild_id: TARGET_GUILD,
+      }), h.env, h.ctx);
+      assert.equal(res.status, 403, `${serviceId}: configured route relays closed dispatch`);
+      assert.deepEqual(await res.json(), {
+        ok: false, request_id: "01H0000000000000000000000A",
+        error: { code: "action_not_allowed", message: "request refused", retryable: false },
+      });
+      assert.equal(h.names.length, 1, `${serviceId}: exactly one DO lookup`);
+      assert.equal(h.forwarded.length, 1, `${serviceId}: exactly one signed forward`);
+      const forward = h.forwarded[0]!;
+      assert.equal(forward.headers["x-two-key-id"], serviceId);
+      assert.equal(forward.headers["x-two-scope"], "read");
+      assert.equal(forward.headers["x-two-guild"], TARGET_GUILD);
+      assert.equal(forward.headers["x-two-signature"], scopedTag(serviceSecret,
+        forward.headers["x-two-timestamp"]!, forward.headers["x-two-nonce"]!, forward.bytes,
+        "read", TARGET_GUILD), `${serviceId}: MAC covers exact forwarded bytes and claims`);
+      assert.equal(JSON.parse(new TextDecoder().decode(forward.bytes)).admin_bearer, ADMIN_BEARER);
+    }
+  }
+});
+
 test("query strings never route to the gateway", async () => {
   // RED until slice 1: the query is never signed, so it must never route.
   // Explicit 404 (the ingress idiom), never the fallthrough and never the
