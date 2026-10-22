@@ -61,6 +61,25 @@ impl InteractionHandler for Stub {
     }
 }
 
+// Discover only the new handler through the existing public API, so the test
+// still compiles on the pre-invites baseline and fails on the missing route.
+fn invites_handler(router: &InteractionRouter) -> HandlerId {
+    let SlashOutcome::Handled { handler } = router.route_slash(&ctx("invites", None)) else {
+        panic!("the always-on /invites command must route to its own handler");
+    };
+    assert!(
+        ![
+            HandlerId::Rank,
+            HandlerId::Leaderboard,
+            HandlerId::Help,
+            HandlerId::Privacy,
+        ]
+        .contains(&handler),
+        "invites must not borrow an unrelated core handler"
+    );
+    handler
+}
+
 /// Baseline production wiring, mirrored from the binary crate.
 ///
 /// - `router_with_commands` (`command_runtime.rs`): channel handlers while
@@ -106,6 +125,8 @@ impl ProductionRegistrations for InteractionRouter {
         ] {
             router.register(Box::new(Stub(id)));
         }
+        let invites = invites_handler(&router);
+        router.register(Box::new(Stub(invites)));
         if member_present {
             for action in [
                 ModerationAction::Ban,
@@ -171,6 +192,7 @@ fn ctx(name: &str, custom_row: Option<bool>) -> SlashContext<'_> {
 fn owner_map(name: &str, member_present: bool) -> Option<HandlerId> {
     match name {
         "privacy" => Some(HandlerId::Privacy),
+        "invites" => Some(invites_handler(&InteractionRouter::new(all_gates_on()))),
         "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list" => {
             Some(HandlerId::AutomationAdmin)
         }
