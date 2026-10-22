@@ -32,6 +32,7 @@ mod custom_composition;
 mod deadline;
 mod force_identify;
 mod invites_acceptance;
+mod invites_net_acceptance;
 mod member_journey;
 mod onboarding;
 mod persistent;
