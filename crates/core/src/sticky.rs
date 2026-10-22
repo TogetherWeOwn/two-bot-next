@@ -572,8 +572,8 @@ pub mod store {
         Ok(())
     }
 
-    /// Re-arm the delivery fence without touching the claim. For an obsolete
-    /// completion (the claim moved on) whose orphan cleanup is unconfirmed:
+    /// Re-arm the delivery fence without touching the claim. For an
+    /// unconfirmed orphan cleanup (obsolete completion or failed record):
     /// a live unrecorded replacement may exist, so future attempts must hold
     /// until an administrator reconfigures. Idempotent and claim-blind on
     /// purpose — setting an already-armed fence is a no-op — and a no-op

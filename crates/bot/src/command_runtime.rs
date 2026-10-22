@@ -1642,7 +1642,9 @@ impl CommandRuntime {
                     Err(err) => {
                         // Record failed — the post may be live but unrecorded.
                         // Only proven orphan absence reopens the window;
-                        // anything else keeps the fence the claim armed.
+                        // anything else re-arms the fence claim-blind: an
+                        // administrator reconfigure during the POST may have
+                        // disarmed the fence the claim armed.
                         warn!(
                             reason = db_class(&err),
                             "sticky record failed; confirming orphan absence"
@@ -1662,6 +1664,10 @@ impl CommandRuntime {
                                 ActivityOutcome::Held
                             }
                             Err(cleanup_err) => {
+                                // An administrator reconfigure during the POST
+                                // may have disarmed the claim's fence; re-arm
+                                // claim-blind before diagnosing.
+                                self.fence_uncertain(&guild_id, &channel_id).await;
                                 self.diagnose_uncertain(
                                     &guild_id,
                                     &channel_id,
@@ -2155,8 +2161,9 @@ impl CommandRuntime {
         outcome
     }
 
-    /// Re-arm the delivery fence after an obsolete attempt's unconfirmed
-    /// cleanup; a no-op when the administrator removed the row. A failed
+    /// Re-arm the delivery fence after an unconfirmed orphan cleanup
+    /// (obsolete completion or failed record); a no-op when the
+    /// administrator removed the row. A failed
     /// write is logged — without a claim no further post is possible until
     /// the store recovers, and the next attempt re-fences if needed.
     async fn fence_uncertain(&self, guild_id: &str, channel_id: &str) {
