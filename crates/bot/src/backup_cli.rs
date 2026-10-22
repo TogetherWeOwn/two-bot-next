@@ -168,6 +168,9 @@ two-bot operator commands
       target's current counts). Without --dry-run, --force is required and
       TWO_RESTORE_URL must name the target. The target variable is
       deliberately NOT TWO_DATABASE_URL: restoring replaces target data.
+      A target that normalizes to the live database is refused (exit 2,
+      code=restore_live_target_refused), even with --force; --dry-run
+      still previews without that comparison.
       Requires a fresh migrated target without moderation history. --force
       confirms intent, not authorization or a safety-guard bypass.
       `RESTORE VERIFIED` on the last line, and exit 0, is the only success.
@@ -204,7 +207,9 @@ two-bot operator commands
       Plan (default) or apply a sealed snapshot to the staging guild.
       Refuses tampered backups (exit 3) before any Discord call; refuses
       the live guild and any non-staging token. --apply requires
-      --confirm-staging-guild.
+      --confirm-staging-guild. Completion prints per operation only as
+      each operation lands; a mid-apply failure names landed vs pending
+      operations (code=guild_restore_apply_failed).
 ";
 
 /// The subcommands whose help is `USAGE`; `db` and `erase-member` parse
@@ -539,6 +544,28 @@ async fn cmd_restore(args: &[String]) -> i32 {
 
     if dry_run {
         return cmd_restore_dry_run(&file, url.as_deref()).await;
+    }
+
+    // A prod URL in TWO_RESTORE_URL plus --force used to wipe production: the
+    // guard above only checked presence and scheme, never the target's value.
+    // Refuse by normalized value (scheme alias, host case, default ports and
+    // credential/query spellings cannot evade it) plus production database
+    // markers, before any file parse or connection attempt. --force confirms
+    // intent, never a live target; --dry-run previews without this comparison.
+    // Fixed refusal: the URLs and their secrets never reach output.
+    if let Some(target) = url.as_deref() {
+        if two_bot_core::database_url::restore_target_is_live(
+            target,
+            env_var("TWO_DATABASE_URL").as_deref(),
+        ) {
+            eprintln!(
+                "restore: refusing a live database target; restores go to scratch only. code=restore_live_target_refused"
+            );
+            eprintln!(
+                "restore: TWO_RESTORE_URL must not name the live database. See docs/backup.md."
+            );
+            return 2;
+        }
     }
 
     // Every failure is a bounded constant from `open_restore_pool`: the URL and
@@ -1310,11 +1337,11 @@ async fn cmd_guild_config_restore(args: &[String]) -> i32 {
         if apply { "applying" } else { "planned" },
         plan.counts.operations
     );
-    for op in &plan.operations {
-        println!("{} {}", if apply { "DID" } else { "WOULD" }, op.label);
-    }
 
     if !apply {
+        for op in &plan.operations {
+            println!("WOULD {}", op.label);
+        }
         println!(
             "guild-config-restore: counts={:?}; add --confirm-staging-guild --apply to write",
             (
@@ -1328,13 +1355,36 @@ async fn cmd_guild_config_restore(args: &[String]) -> i32 {
         return 0;
     }
 
-    let restored_ids = match guild_config_restore::apply_restore_plan(&mut api, &plan).await {
-        Ok(ids) => ids,
-        Err(err) => {
-            eprintln!("guild-config-restore: apply failed: {err}");
-            return 1;
-        }
-    };
+    // Completion prints only as each operation lands: pre-printing every DID
+    // left operators believing pending operations had run when the apply
+    // failed halfway. A mid-apply failure names landed vs pending operations
+    // (labels only, never request bodies) with a stable code.
+    let restored_ids =
+        match guild_config_restore::apply_restore_plan_with_progress(&mut api, &plan, |op| {
+            println!("DID {}", op.label)
+        })
+        .await
+        {
+            Ok(ids) => ids,
+            Err((err, landed)) => {
+                eprintln!(
+                    "guild-config-restore: apply failed: {err} code=guild_restore_apply_failed"
+                );
+                let (landed_ops, pending_ops) =
+                    plan.operations.split_at(landed.min(plan.operations.len()));
+                if landed_ops.is_empty() {
+                    eprintln!("guild-config-restore: landed (0): none");
+                } else {
+                    for op in landed_ops {
+                        eprintln!("guild-config-restore: landed: {}", op.label);
+                    }
+                }
+                for op in pending_ops {
+                    eprintln!("guild-config-restore: pending: {}", op.label);
+                }
+                return 1;
+            }
+        };
     let after = match api.capture().await {
         Ok(after) => after,
         Err(err) => {
