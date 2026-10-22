@@ -796,7 +796,7 @@ mod tests {
                  SELECT 'guild-a', 'member-' || g, '2026-07-01T00:00:00.000Z'::timestamptz
                  FROM generate_series(1, 5000) g",
             )
-            .execute(*target)
+            .execute(target)
             .await
             .expect("seed members");
         }
