@@ -218,4 +218,65 @@ mod tests {
     fn lifecycle_events_yield_nothing() {
         assert_eq!(event_to_core(&Event::GatewayClose(None)), None);
     }
+
+    fn reaction_like() -> GatewayReaction {
+        GatewayReaction {
+            burst: false,
+            burst_colors: Vec::new(),
+            channel_id: Id::new(7),
+            emoji: EmojiReactionType::Unicode {
+                name: "⭐".to_owned(),
+            },
+            guild_id: Some(Id::new(1)),
+            member: None,
+            message_author_id: None,
+            message_id: Id::new(8),
+            user_id: Id::new(2),
+        }
+    }
+
+    #[test]
+    fn reaction_delivery_is_replay_stable_and_session_scoped() {
+        let first = reaction_delivery("session-a", 9);
+        let replay = reaction_delivery("session-a", 9);
+        assert_eq!(first, replay, "gateway replay must mint the same identity");
+        assert!(!first.event_id.is_empty() && !first.event_order.is_empty());
+        assert_ne!(
+            first,
+            reaction_delivery("session-b", 9),
+            "order is comparable within one session only"
+        );
+        assert!(
+            reaction_delivery("session-a", 9).event_order
+                < reaction_delivery("session-a", 10).event_order,
+            "fixed-width sequence orders lexicographically"
+        );
+    }
+
+    #[test]
+    fn with_delivery_carries_supplied_identity_without_delivery_mints_local() {
+        let event = Event::ReactionAdd(Box::new(
+            twilight_model::gateway::payload::incoming::ReactionAdd(reaction_like()),
+        ));
+        let supplied = reaction_delivery("session-a", 9);
+        let carried = event_to_core_with_delivery(&event, &supplied);
+        assert_eq!(
+            carried.as_ref().and_then(CoreEvent::starboard_delivery_key),
+            Some((supplied.event_id.clone(), supplied.event_order.clone())),
+            "ingress-minted identity survives translation"
+        );
+        let local_a = event_to_core(&event).expect("reaction models");
+        let local_b = event_to_core(&event).expect("reaction models");
+        for local in [&local_a, &local_b] {
+            let (id, order) = local
+                .starboard_delivery_key()
+                .expect("reactions carry a delivery key");
+            assert!(id.starts_with("reaction:local:") && !order.is_empty());
+        }
+        assert_ne!(
+            local_a.starboard_delivery_key(),
+            local_b.starboard_delivery_key(),
+            "local fallback never reuses an identity"
+        );
+    }
 }
