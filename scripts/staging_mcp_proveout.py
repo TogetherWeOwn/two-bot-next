@@ -9,18 +9,36 @@ logged command shows the bearer as ***.
 
 Probes against $STAGING_MCP_URL (default the staging Worker /mcp) with
 `User-Agent: two-bot-next-staging-rollout/1.0`:
-  * initialize -> result must carry a non-empty protocolVersion.
-  * tools/list -> result.tools must be exactly the five read-only tools.
-  * tools/call each of the five -> bodies are recorded. While staging is
-    fenced (/readyz 503 ownership_fenced/not_owner) the container-backed tools
-    (get_status, get_gateway, get_backfill_progress, get_audit) may return
-    JSON-RPC -32000 "container request failed"; that is expected, not a failure.
-    A successful get_audit must carry the bounded {available, rows, truncated}
-    excerpt envelope. get_config (redacted Worker snapshot), initialize,
-    tools/list and unknown-tool -32601 are Worker-side and must succeed regardless.
+  * initialize -> result must carry a shipped supported string protocolVersion.
+  * tools/list -> exactly five unique read-only tools with their shipped
+    zero-argument object input schemas.
+  * tools/call each of the five -> bodies are recorded. A container-backed
+    -32000 (get_status, get_gateway, get_backfill_progress, get_audit) is
+    only an expected fence when the dispatcher explicitly corroborates it
+    with STAGING_MCP_EXPECT_FENCE=1; without that flag a -32000 fails proof
+    as uncorroborated, because the same code also covers timeout, oversize
+    and malformed-upstream failures. A successful get_audit must carry the
+    bounded {available, rows, truncated} excerpt envelope. get_config
+    (redacted Worker snapshot), initialize, tools/list and unknown-tool
+    -32601 are Worker-side and must succeed regardless.
   * tools/call unknown tool -> JSON-RPC -32601.
   * wrong bearer (fixed dummy, never the real token) and no bearer ->
     HTTP 401 with WWW-Authenticate: Bearer.
+
+Every authenticated JSON-RPC reply is bound to its request before any
+nested field is trusted: the envelope must be a JSON-RPC 2.0 object whose
+numeric id matches the request exactly (probe order 1-8) and that carries
+exactly one well-formed result or error (an explicit error:null alongside
+a valid result stays success). Tool results must carry content as a list
+of typed blocks (empty allowed) without isError. Violations fail the
+stage with a fixed reason code and next action:
+ENVELOPE_VERSION, ENVELOPE_ID, ENVELOPE_FRAMING, CONTENT_INVALID,
+FENCE_UNCORROBORATED, JSON_DUPLICATE_KEY, PROTOCOL_UNSUPPORTED,
+TOOL_SCHEMA_INVALID. Duplicate decoded object keys at any depth are refused
+before admission, including escape-equivalent names and identical values;
+recording retains bounded redacted text, never a last-key-wins dictionary.
+The JSON artifact carries proof_disposition
+(proved iff exit 0, else failed).
 
 Output: redacted commands and safely redacted responses on stdout, plus a
 sanitized JSON artifact with the same bounded response bodies. The bearer is
@@ -34,6 +52,9 @@ refusal (nothing was sent).
 
 Usage (the workflow supplies the environment):
   python3 scripts/staging_mcp_proveout.py --output staging-mcp-proveout-<run_id>.json
+
+Offline contract check (no network, no staging calls, no secrets):
+  PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_staging_mcp_proveout*.py' -v
 """
 
 import argparse
@@ -51,6 +72,11 @@ UA = "two-bot-next-staging-rollout/1.0"
 DEFAULT_URL = "https://two-bot-next-staging.5150.workers.dev/mcp"
 TOKEN_ENV = "STAGING_MCP_TOKEN"
 URL_ENV = "STAGING_MCP_URL"
+# Explicit fence corroboration: only the exact value "1" lets a
+# container-backed -32000 pass as the expected fence. Unset, empty or any
+# other value fails proof. The flag never touches the staging-host fence,
+# the auth probes or any production path.
+EXPECT_FENCE_ENV = "STAGING_MCP_EXPECT_FENCE"
 MIN_TOKEN_LENGTH = 32
 STAGING_HOST = re.compile(r"two-bot-next-staging\.[a-z0-9-]+\.workers\.dev")
 # Response bound (64 KiB, matching MCP_MAX_BODY_BYTES in wrangler/src/mcp.ts
@@ -63,6 +89,16 @@ MAX_BODY_BYTES = 64 * 1024
 MAX_JSON_DEPTH = 32
 REQUEST_TIMEOUT_SECONDS = 25
 SCHEMA_VERSION = 1
+# Mirror wrangler/src/mcp.ts: initialize requests the preferred version, but
+# proof also accepts the other shipped version negotiated by the server.
+PROTOCOL_VERSION = "2025-06-18"
+SUPPORTED_PROTOCOL_VERSIONS = (PROTOCOL_VERSION, "2025-03-26")
+# Only this fixed schema dialect is proved. Metadata and unused definitions
+# cannot change which arguments are accepted; unknown constraints can.
+SCHEMA_METADATA = {
+    "title", "description", "$comment", "$schema", "$id", "$defs", "definitions",
+    "default", "examples", "deprecated", "readOnly", "writeOnly",
+}
 
 EXPECTED_TOOLS = [
     "get_status",
@@ -174,6 +210,59 @@ def do_post(url, payload, token_or_none, timeout=REQUEST_TIMEOUT_SECONDS):
 
 def _bounded_text_fallback(body, secret=None):
     if secret:
+        # Rejected JSON can still reflect an escaped bearer. Redact individual
+        # string literals without collapsing duplicate keys or rewriting safe
+        # escapes: recording must retain the ambiguity that admission refused.
+        # Malformed bodies (stray quotes, raw controls, invalid escapes) can
+        # hide an escaped bearer outside decodable literals, so redaction also
+        # substitutes the secret in any raw-or-\uXXXX mix independent of quote
+        # alignment, and undecodable literals become a placeholder.
+        def redact_literal(match):
+            literal = match.group()
+            try:
+                decoded = json.loads(literal, strict=False)
+            except ValueError:
+                return '"***"'
+            return json.dumps(decoded.replace(secret, "***")) if secret in decoded else literal
+
+        body = re.sub(r'"(?:[^"\\]|\\.)*"', redact_literal, body)
+        # Alignment-independent escaped-bearer substitution: each secret char
+        # may appear raw or as \uXXXX (either u case, any hex case), plus the
+        # short JSON escapes. This catches stray-quote misalignment where the
+        # literal regex cannot align into decodable spans.
+        short_forms = {
+            '"': '\\"', "\\": "\\\\", "/": "\\/",
+            "\b": "\\b", "\f": "\\f", "\n": "\\n",
+            "\r": "\\r", "\t": "\\t",
+        }
+
+        def _hex_pattern(code):
+            return "".join(
+                f"[{h}{h.upper()}]" if h in "abcdef" else h
+                for h in f"{code:04x}"
+            )
+
+        parts = []
+        for char in secret:
+            alternatives = [re.escape(char)]
+            point = ord(char)
+            if point <= 0xFFFF:
+                alternatives.append(f"\\\\[uU]{_hex_pattern(point)}")
+            else:
+                code = point - 0x10000
+                high = 0xD800 + (code >> 10)
+                low = 0xDC00 + (code & 0x3FF)
+                alternatives.append(
+                    f"\\\\[uU]{_hex_pattern(high)}\\\\[uU]{_hex_pattern(low)}"
+                )
+            short = short_forms.get(char)
+            if short is not None:
+                escaped_short = re.escape(short)
+                if escaped_short not in alternatives:
+                    alternatives.append(escaped_short)
+            parts.append(f"(?:{'|'.join(alternatives)})")
+        if parts:
+            body = re.sub("".join(parts), "***", body)
         body = body.replace(secret, "***")
     candidate = body[:MAX_BODY_BYTES]
     envelope_bytes = len(b'{"_text":""}')
@@ -202,25 +291,55 @@ def _reject_json_constant(_value):
     raise ValueError("non-standard JSON constant")
 
 
-def load_bounded_json(body):
-    """Load JSON if it passes the depth and finite-number bounds."""
-    try:
-        parsed = json.loads(body, parse_constant=_reject_json_constant)
-    except Exception:
-        return False, None
+class DuplicateJsonKey(ValueError):
+    """Repeated decoded member name (never include remote keys or values)."""
+
+
+def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise DuplicateJsonKey("duplicate JSON member")
+        result[key] = value
+    return result
+
+
+def _decode_bounded_json(body):
+    parsed = json.loads(body, parse_constant=_reject_json_constant,
+                        object_pairs_hook=_unique_object)
     # Decoder and encoder recursion limits differ. Check iteratively before
     # handing parsed containers to either the stdout or artifact encoder.
     pending = [(parsed, 0)]
     while pending:
         value, depth = pending.pop()
         if isinstance(value, float) and not math.isfinite(value):
-            return False, None
+            raise ValueError("non-finite JSON number")
         if isinstance(value, (dict, list)):
             if depth >= MAX_JSON_DEPTH:
-                return False, None
+                raise ValueError("JSON depth over the cap")
             children = value.values() if isinstance(value, dict) else value
             pending.extend((child, depth + 1) for child in children)
-    return True, parsed
+    return parsed
+
+
+def load_bounded_json(body):
+    """Load unambiguous JSON within the depth and finite-number bounds."""
+    try:
+        return True, _decode_bounded_json(body)
+    except Exception:
+        return False, None
+
+
+def parse_rpc_reply(stage, shape, body, rpc_id):
+    """Admit original JSON, independently of bounded/redacted recording."""
+    try:
+        parsed = _decode_bounded_json(body)
+    except DuplicateJsonKey:
+        return None, (f"{stage}: repeated JSON member [JSON_DUPLICATE_KEY] "
+                      f"next: verify the Worker returns unique JSON object keys")
+    except Exception:
+        parsed = None
+    return parsed, envelope_failure(stage, shape, parsed, rpc_id)
 
 
 def parse_json_or_text(body, secret=None):
@@ -259,6 +378,89 @@ def jsonrpc_code(err):
     return code if isinstance(code, int) and not isinstance(code, bool) else None
 
 
+def envelope_failure(stage, shape, parsed, rpc_id):
+    """Bind an authenticated reply to its request; None when bound.
+
+    Checks, in order: the reply is a JSON-RPC 2.0 object, its numeric id
+    matches the request exactly, and it carries exactly one well-formed
+    result or error (explicit null members count as absent, so error:null
+    alongside a valid result stays success; a well-formed error is a dict
+    with an integer code and a string message). `shape` names the stage's
+    expected payload so the failure stays actionable. Failures carry the
+    stage id, a fixed reason code and a next action, and never echo remote
+    bytes or the bearer.
+    """
+    if not isinstance(parsed, dict):
+        return (f"{stage}: expected {shape} in a JSON-RPC 2.0 reply "
+                f"[ENVELOPE_FRAMING] next: verify the Worker answered "
+                f"with a JSON-RPC reply")
+    if parsed.get("jsonrpc") != "2.0":
+        return (f"{stage}: expected {shape} in a JSON-RPC 2.0 reply "
+                f"[ENVELOPE_VERSION] next: verify the Worker answers "
+                f"JSON-RPC 2.0")
+    reply_id = parsed.get("id")
+    if type(reply_id) is not int or reply_id != rpc_id:
+        return (f"{stage}: reply id must match request id {rpc_id} for "
+                f"{shape} [ENVELOPE_ID] next: verify the reply id "
+                f"matches the request id")
+    has_result = "result" in parsed and parsed["result"] is not None
+    has_error = "error" in parsed and parsed["error"] is not None
+    error = parsed.get("error")
+    if has_result == has_error or (
+            has_error and (not isinstance(error, dict)
+                           or jsonrpc_code(error) is None
+                           or not isinstance(error.get("message"), str))):
+        return (f"{stage}: expected exactly one well-formed result or "
+                f"error for {shape} [ENVELOPE_FRAMING] next: verify the "
+                f"reply carries exactly one well-formed result or error")
+    return None
+
+
+def is_zero_argument_schema(schema):
+    """Match the shipped toolEntries contract, not arbitrary JSON Schema."""
+    return (
+        isinstance(schema, dict)
+        and schema.get("type") == "object"
+        and isinstance(schema.get("properties"), dict)
+        and not schema["properties"]
+        and schema.get("additionalProperties") is False
+        and schema.get("required", []) == []
+        and not (set(schema) - SCHEMA_METADATA - {
+            "type", "properties", "additionalProperties", "required",
+        })
+    )
+
+
+def tool_content_failure(stage, result):
+    """Validate the emitted tool-content contract; None when valid.
+
+    Content must be a list of blocks (empty allowed; each non-empty entry
+    a dict with a string type), and an explicit isError:true always fails,
+    even with otherwise valid content. isError is an optional boolean, so
+    a present non-boolean value (1, "true", ...) is malformed too; an
+    explicit null counts as absent, matching the envelope rule.
+    """
+    if not isinstance(result, dict):
+        return (f"{stage}: expected result.content as a list of typed "
+                f"blocks [CONTENT_INVALID] next: verify the tool result "
+                f"carries a content block list without isError")
+    is_error = result.get("isError")
+    if is_error is True or (is_error is not None
+                            and not isinstance(is_error, bool)):
+        return (f"{stage}: tool result reports isError [CONTENT_INVALID] "
+                f"next: verify the tool result carries a content block "
+                f"list without isError")
+    content = result.get("content")
+    if not isinstance(content, list) or any(
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("type"), str)
+            for entry in content):
+        return (f"{stage}: expected result.content as a list of typed "
+                f"blocks [CONTENT_INVALID] next: verify the tool result "
+                f"carries a content block list without isError")
+    return None
+
+
 def is_audit_excerpt(value):
     """Check the bounded envelope; the Worker enforces the row-field allowlist."""
     return (
@@ -286,6 +488,9 @@ def main():
         return fail_refusal(
             "staging MCP URL must be the exact staging https URL "
             "two-bot-next-staging.<sub>.workers.dev/mcp; nothing sent")
+    # Explicit fence corroboration from the dispatcher; anything but the
+    # exact value "1" leaves generic -32000 uncorroborated (proof failure).
+    expect_fence = os.environ.get(EXPECT_FENCE_ENV) == "1"
 
     probes = []
     failures = []
@@ -338,35 +543,55 @@ def main():
         "id": rpc_id,
         "method": "initialize",
         "params": {
-            "protocolVersion": "2025-06-18",
+            "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {},
             "clientInfo": {"name": "staging-mcp-proveout", "version": "1.0"},
         },
     }
     status, headers, body = fetch("initialize", redacted_request_line("initialize", rpc_id, '"params":{...}'), payload, token)
     if body is not None:
-        _valid_json, parsed = load_bounded_json(body)
-        result = parsed.get("result") if isinstance(parsed, dict) else None
-        if status != 200 or not isinstance(result, dict) or not result.get("protocolVersion"):
-            failures.append("initialize: expected HTTP 200 with result.protocolVersion")
+        if status != 200:
+            failure = f"initialize: expected HTTP 200, got HTTP {status}"
+        else:
+            parsed, failure = parse_rpc_reply(
+                "initialize", "result.protocolVersion", body, rpc_id)
+        if failure is None:
+            result = parsed.get("result")
+            version = result.get("protocolVersion") if isinstance(result, dict) else None
+            if not isinstance(version, str) or version not in SUPPORTED_PROTOCOL_VERSIONS:
+                failure = ("initialize: expected a shipped string protocolVersion "
+                           "[PROTOCOL_UNSUPPORTED] next: verify supported protocol "
+                           "negotiation against the Worker contract")
+        if failure is not None:
+            failures.append(failure)
     rpc_id += 1
 
     # 2. tools/list (authenticated).
     payload = {"jsonrpc": "2.0", "id": rpc_id, "method": "tools/list", "params": {}}
     status, headers, body = fetch("tools/list", redacted_request_line("tools/list", rpc_id), payload, token)
     if body is not None:
-        _valid_json, parsed = load_bounded_json(body)
-        result = parsed.get("result") if isinstance(parsed, dict) else None
-        tools = result.get("tools") if isinstance(result, dict) else None
-        names = None
-        if isinstance(tools, list) and all(
-                isinstance(t, dict) and isinstance(t.get("name"), str) for t in tools):
-            names = sorted(t["name"] for t in tools)
-        if status != 200 or names != sorted(EXPECTED_TOOLS):
-            failures.append(
-                "tools/list: expected exactly "
-                f"{','.join(sorted(EXPECTED_TOOLS))}, got unexpected tool names"
-            )
+        if status != 200:
+            failure = f"tools/list: expected HTTP 200, got HTTP {status}"
+        else:
+            parsed, failure = parse_rpc_reply("tools/list", "result.tools", body, rpc_id)
+        if failure is None:
+            result = parsed.get("result")
+            tools = result.get("tools") if isinstance(result, dict) else None
+            names = None
+            if isinstance(tools, list) and all(
+                    isinstance(t, dict) and isinstance(t.get("name"), str) for t in tools):
+                names = sorted(t["name"] for t in tools)
+            if names != sorted(EXPECTED_TOOLS):
+                failure = (
+                    "tools/list: expected exactly "
+                    f"{','.join(sorted(EXPECTED_TOOLS))}, got unexpected tool names"
+                )
+            elif not all(is_zero_argument_schema(t.get("inputSchema")) for t in tools):
+                failure = ("tools/list: expected shipped zero-argument input schemas "
+                           "[TOOL_SCHEMA_INVALID] next: verify each tool advertises "
+                           "the Worker's zero-argument object contract")
+        if failure is not None:
+            failures.append(failure)
     rpc_id += 1
 
     # 3-7. tools/call each of the five (authenticated, bodies recorded).
@@ -386,25 +611,36 @@ def main():
         if body is None:
             rpc_id += 1
             continue
-        _valid_json, parsed = load_bounded_json(body)
-        if status != 200 or not isinstance(parsed, dict):
-            failures.append(f"tools/call {tool}: expected HTTP 200 JSON-RPC envelope")
-        elif "error" in parsed and parsed["error"] is not None:
-            err = parsed["error"] if isinstance(parsed["error"], dict) else {}
-            code = jsonrpc_code(err)
-            if tool in CONTAINER_BACKED and code == -32000:
-                print(f"NOTE: tools/call {tool} returned -32000 (fenced container); expected while staging is fenced.", flush=True)
-            elif tool == "get_config":
-                failures.append(f"tools/call get_config: must succeed Worker-side, got error {code}")
-            else:
-                failures.append(f"tools/call {tool}: unexpected JSON-RPC error code {code}")
+        stage = f"tools/call {tool}"
+        if status != 200:
+            failure = f"{stage}: expected HTTP 200, got HTTP {status}"
         else:
-            result = parsed.get("result") if isinstance(parsed, dict) else None
-            if not isinstance(result, dict) or "content" not in result:
-                failures.append(f"tools/call {tool}: expected result.content envelope")
-            elif tool == "get_audit":
-                if not is_audit_excerpt(result.get("structuredContent")):
-                    failures.append("tools/call get_audit: expected bounded audit excerpt envelope")
+            parsed, failure = parse_rpc_reply(stage, "result.content", body, rpc_id)
+        if failure is None:
+            if "error" in parsed and parsed["error"] is not None:
+                # The envelope check above guarantees a dict with an int
+                # code and a string message.
+                code = jsonrpc_code(parsed["error"])
+                if tool in CONTAINER_BACKED and code == -32000:
+                    if expect_fence:
+                        print(f"NOTE: tools/call {tool} returned -32000 (fenced container); expected while staging is fenced.", flush=True)
+                    else:
+                        failure = (f"{stage}: container error -32000 without corroborated "
+                                   f"fence evidence [FENCE_UNCORROBORATED] next: rerun with "
+                                   f"STAGING_MCP_EXPECT_FENCE=1 only while staging is fenced, "
+                                   f"else investigate the container error")
+                elif tool == "get_config":
+                    failure = f"tools/call get_config: must succeed Worker-side, got error {code}"
+                else:
+                    failure = f"tools/call {tool}: unexpected JSON-RPC error code {code}"
+            else:
+                result = parsed.get("result")
+                failure = tool_content_failure(stage, result)
+                if failure is None and tool == "get_audit":
+                    if not is_audit_excerpt(result.get("structuredContent")):
+                        failure = "tools/call get_audit: expected bounded audit excerpt envelope"
+        if failure is not None:
+            failures.append(failure)
         rpc_id += 1
 
     # 8. tools/call unknown tool (authenticated) -> -32601.
@@ -421,15 +657,21 @@ def main():
         token,
     )
     if body is not None:
-        _valid_json, parsed = load_bounded_json(body)
-        err = parsed.get("error") if isinstance(parsed, dict) else None
-        err = err if isinstance(err, dict) else {}
-        code = jsonrpc_code(err)
-        if status != 200 or code != -32601:
-            failures.append(
-                "tools/call unknown: expected JSON-RPC -32601, "
-                f"got HTTP {status}, JSON-RPC code {code}"
-            )
+        if status != 200:
+            failure = f"tools/call unknown: expected HTTP 200, got HTTP {status}"
+        else:
+            parsed, failure = parse_rpc_reply("tools/call unknown", "error -32601", body, rpc_id)
+        if failure is None:
+            err = parsed.get("error")
+            err = err if isinstance(err, dict) else {}
+            code = jsonrpc_code(err)
+            if code != -32601:
+                failure = (
+                    "tools/call unknown: expected JSON-RPC -32601, "
+                    f"got HTTP {status}, JSON-RPC code {code}"
+                )
+        if failure is not None:
+            failures.append(failure)
     rpc_id += 1
 
     # 9. Wrong bearer (fixed dummy, never the real token) -> 401 Bearer.
@@ -465,6 +707,7 @@ def main():
         "mcp_url": url,
         "user_agent": UA,
         "expected_tools": sorted(EXPECTED_TOOLS),
+        "proof_disposition": "proved" if not failures else "failed",
         "note": "Bearer redacted from logged, stored and uploaded response values.",
         "probes": probes,
         "failures": failures,

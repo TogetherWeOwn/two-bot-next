@@ -18,6 +18,10 @@ _HISTORY_SPEC = importlib.util.spec_from_file_location(
     "synthetic_alert_history", ROOT / "scripts/synthetic_alert_history.py")
 _HISTORY_MODULE = importlib.util.module_from_spec(_HISTORY_SPEC)
 _HISTORY_SPEC.loader.exec_module(_HISTORY_MODULE)
+_TRACKER_SPEC = importlib.util.spec_from_file_location(
+    "slow_burn_tracker", ROOT / "scripts/slow_burn_tracker.py")
+_TRACKER_MODULE = importlib.util.module_from_spec(_TRACKER_SPEC)
+_TRACKER_SPEC.loader.exec_module(_TRACKER_MODULE)
 ALERT_STEPS = _HISTORY_MODULE.ALERT_STEPS
 DECIDE_STEPS = _HISTORY_MODULE.DECIDE_STEPS
 JOB_NAMES = _HISTORY_MODULE.JOB_NAMES
@@ -29,8 +33,11 @@ JOB_INVENTORY = {
     "check.yml": {"check", "moderation-db", "parity-docs", "self-role-store", "job-inputs", "container-inputs", "container",
                   "community-db", "feeds-db", "tickets-postgres", "worker", "supply-chain", "ci-ok",
                   # `check` is now the lint lane; the test steps it used to
-                  # carry run in these three parallel lanes, all gated by ci-ok.
-                  "rust-tests", "ignored-db-stores", "ignored-db-runtime",
+                  # carry run in these parallel lanes, all gated by ci-ok.
+                  # `patch-coverage` is the HARD patch-coverage measurement,
+                  # split out of `rust-tests` so the two signals fail
+                  # independently.
+                  "rust-tests", "patch-coverage", "ignored-db-stores", "ignored-db-runtime",
                   # Compile-only libFuzzer build, gated by ci-ok like the Rust lanes.
                   "fuzz-compile",
                   # Promoted nextest lane (shared reusable), gated by ci-ok
@@ -42,7 +49,7 @@ JOB_INVENTORY = {
                            "pinned-history-guard"},
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
-    "release.yml": {"tag", "sbom-target", "release-sbom", "attach-sbom"},
+    "release.yml": {"tag", "sbom-target", "release-sbom", "attach-sbom", "verdict"},
     "staging-migrate.yml": {"plan", "claim", "apply"},
     "production-migrate.yml": {"plan", "claim", "apply"},
     # TOG-14008: manual staging-only Worker rollback drill; pinned shape below.
@@ -51,6 +58,9 @@ JOB_INVENTORY = {
     "staging-container-drill.yml": {"container-drill"},
     # Manual read-only staging events read for the B2 soak; pinned shape below.
     "staging-events-read.yml": {"read"},
+    # Manual read-only staging event-store retention census (counts, digests
+    # and timestamps only, log only); pinned shape below.
+    "staging-retention-census.yml": {"census"},
     # Manual read-only authenticated MCP prove-out (TOG-23456); pinned shape below.
     "staging-mcp-proveout.yml": {"proveout"},
     # Manual read-only staging ownership status read; pinned shape below.
@@ -262,6 +272,105 @@ def skip_blocks_test(skip, name):
     return skip.rsplit("::", 1)[-1] in name
 
 
+# Quarantined red backfill acceptance (TOG-34944): 15 ignored tests that run
+# in NO lane — skipped in the check.yml coverage sweep, the check.yml store
+# lane and the nightly sweep — because their builders have not landed yet.
+# Each entry maps the test fn to the build card tracking it. Shrink-only: a
+# builder PR removes the "quarantined red" marker (keeping the DB ignore),
+# un-skips its family in all three lanes AND ratchets this pin down in the
+# same PR. Growth fails closed; see backfill_quarantine_errors.
+BACKFILL_QUARANTINE = {
+    # Audit-log family: TOG-22948 lands the fetcher + backfill_audit_entries.
+    "audit_log_pagination_limit_1_to_100_before_after_covers_45d_window": "TOG-22948",
+    "audit_log_requests_ride_rate_limit_client_never_direct_rest": "TOG-22948",
+    "audit_cursor_persists_per_window_and_resumes_mid_window": "TOG-22948",
+    "audit_rows_hold_ids_timestamps_enums_only": "TOG-22948",
+    "audit_429_retry_after_pauses_without_losing_place": "TOG-22948",
+    # Event-users/reactions/pins family: TOG-22951 lands the three fetchers.
+    "event_users_paginate_through_rate_limit_client_with_max_100": "TOG-22951",
+    "reaction_users_paginate_through_rate_limit_client": "TOG-22951",
+    "pins_list_through_rate_limit_client_persists_metadata_only": "TOG-22951",
+    "blocklisted_users_skipped_for_per_user_rows_while_aggregates_keep_counting": "TOG-22951",
+    "persisted_rows_hold_ids_timestamps_enums_only": "TOG-22951",
+    "resume_continues_from_persisted_cursors_per_family": "TOG-22951",
+    # Bans/invites/onboarding family: TOG-22952 lands the family fetchers.
+    "bans_fetch_applies_blocklist_and_counts_everyone": "TOG-22952",
+    "invite_rows_hold_metadata_only": "TOG-22952",
+    "onboarding_rows_hold_ids_enums_metadata_only": "TOG-22952",
+    "bans_invites_onboarding_resume_continues_from_persisted_cursors": "TOG-22952",
+}
+BACKFILL_QUARANTINE_SUITES = (
+    "backfill_audit_log",
+    "backfill_bans_invites_onboarding",
+    "backfill_event_users_reactions_pins",
+)
+
+
+def ignored_test_reasons(suite):
+    """Map ignored test fns to their ignore-mark source line.
+
+    Same discovery as ignored_test_names, but keeps the `#[ignore ...]`
+    line so the quarantine tripwire can require a tracking ref in it.
+    Unsupported syntax fails closed exactly like ignored_test_names.
+    """
+    [path] = ROOT.glob(f"crates/*/tests/{suite}.rs")
+    text = path.read_text(encoding="utf-8")
+    marks = list(IGNORE_MARK.finditer(text))
+    reasons = {}
+    for mark in marks:
+        line_end = text.find("\n", mark.end())
+        if line_end == -1:
+            continue
+        name = _match_fn_name(text, _skip_trivia(text, line_end + 1))
+        if name is not None:
+            line_start = text.rfind("\n", 0, mark.start()) + 1
+            reasons[name] = text[line_start:line_end]
+    if len(reasons) != len(marks):
+        raise ValueError(
+            f"{path.name}: discovered {len(reasons)} of {len(marks)} ignored test functions; "
+            "extend the scanner for the unsupported declaration",
+        )
+    return reasons
+
+
+def backfill_quarantine_members(reasons):
+    """Select explicit quarantine markers, not passing tests' DB opt-ins."""
+    return {name: reason for name, reason in reasons.items() if "quarantined red" in reason}
+
+
+def backfill_quarantine_errors(pinned, current):
+    """Shrink-only tripwire for the quarantined red backfill tests.
+
+    `pinned` maps test fn -> tracking ref (BACKFILL_QUARANTINE); `current`
+    maps test fn -> ignore-mark line, derived from the suite sources.
+    Only reasons marked "quarantined red" are quarantine members. A fixed
+    test can retain its plain DB ignore while leaving quarantine.
+    Growth is blocked outright; shrinkage must ratchet the pin down in the
+    same PR; every surviving member must carry its tracking ref in its
+    ignore reason. Returns a list of error strings (empty when clean).
+    """
+    current = backfill_quarantine_members(current)
+    errors = []
+    for name in sorted(set(current) - set(pinned)):
+        errors.append(
+            f"{name}: quarantine grew; blocked: fix the test or quarantine it "
+            "with a tracking ref in BACKFILL_QUARANTINE",
+        )
+    removed = sorted(set(pinned) - set(current))
+    if removed:
+        errors.append(
+            "quarantine shrank (good): ratchet BACKFILL_QUARANTINE down to "
+            f"{sorted(set(pinned) & set(current))} in this PR "
+            f"(fixed: {', '.join(removed)})",
+        )
+    for name in sorted(set(pinned) & set(current)):
+        if pinned[name] not in current[name]:
+            errors.append(
+                f"{name}: ignore reason must carry tracking ref {pinned[name]}",
+            )
+    return errors
+
+
 # Staging deploy push filter. Each deploy restarts the bot container and drops the
 # gateway for ~2 minutes, so a push that touches only non-runtime paths must not
 # start one (the B2 soak needs a stable staging). The filter is a deny-list so an
@@ -450,16 +559,17 @@ ERROR_RATE_MARKERS = (
 
 
 def production_error_rate_gate_errors(workflow, name="deploy-production.yml"):
-    """The production error-rate gate mirrors staging against production.
+    """The production error-rate gate scrapes live production, never a rehearsal.
 
-    Exactly one expression in exactly one production step may read the
-    rehearsal input, it must use the pinned dispatch-only expression (an
-    automatic trigger never carries inputs), and that step must be the
-    error-rate gate step: it judges the rehearsal firing when armed and
-    scrapes live production /ops/metrics otherwise, failing the stage so
-    auto-rollback runs. The scrape token is the production binding only;
-    the staging token must never appear. Reviewed tooling runs from the
-    workflow commit (../tooling), never the guarded SHA.
+    Failure injection never runs against production (10-20 20:54Z forced
+    drill): the dispatch input stays declared (an opt-in boolean) only so the
+    guard can refuse it with a pointer to staging, and the input is read
+    exactly once, by the guard. No production step carries the drill switch
+    or a rehearsal flag. The error_rate_gate step scrapes live production
+    /ops/metrics and fails the stage so auto-rollback runs. The scrape token
+    is the production binding only; the staging token must never appear.
+    Reviewed tooling runs from the workflow commit (../tooling), never the
+    guarded SHA.
     """
     errors = []
     inputs = (((workflow.get("on") or {}).get("workflow_dispatch") or {}).get("inputs") or {})
@@ -467,31 +577,30 @@ def production_error_rate_gate_errors(workflow, name="deploy-production.yml"):
     if drill.get("type") != "boolean" or drill.get("default") not in (False, "false") \
             or str(drill.get("required")).lower() != "false":
         errors.append(f"{name}: inject_error_rate_spike must stay an opt-in boolean defaulting to false")
+    if str(workflow).count("inputs.inject_error_rate_spike") != 1:
+        errors.append(f"{name}: inject_error_rate_spike may be read only by the guard (which refuses it)")
     jobs = workflow.get("jobs", {}) or {}
     steps = ((jobs.get("production") or {}).get("steps") or [])
-    armed = [step for step in steps
-             if isinstance(step, dict) and "INJECT_ERROR_RATE_SPIKE" in str(step)]
-    if len(armed) != 1:
-        errors.append(f"{name}: exactly one production step may carry the error-rate drill switch")
+    for marker in ("INJECT_ERROR_RATE_SPIKE", "inject_error_rate_spike", "--rehearsal-firing", "rehearsal"):
+        if marker in str(jobs.get("production") or {}):
+            errors.append(f"{name}: production job must never carry the drill marker {marker}")
+    gates = [step for step in steps if isinstance(step, dict) and step.get("id") == "error_rate_gate"]
+    if len(gates) != 1:
+        errors.append(f"{name}: exactly one production step must be the error_rate_gate")
         return errors
-    step = armed[0]
-    if step.get("id") != "error_rate_gate":
-        errors.append(f"{name}: the error-rate drill switch must live on the error_rate_gate step")
+    step = gates[0]
     # After a rollback restore there is no snapshot to roll back to: the
     # gate must not fail the recovery run red with no action possible.
     if step.get("if") != "env.MODE == 'deploy'":
         errors.append(f"{name}: error_rate_gate must run in deploy mode only")
     env = step.get("env") or {}
-    if env.get("INJECT_ERROR_RATE_SPIKE") != ERROR_RATE_EXPRESSION:
-        errors.append(f"{name}: error-rate rehearsal must use the pinned dispatch-only expression")
     if env.get("METRICS_SCRAPE_TOKEN") != "${{ secrets.PRODUCTION_METRICS_SCRAPE_TOKEN }}":
         errors.append(f"{name}: error_rate_gate must bind the production scrape token by name")
     if env.get("PRODUCTION_URL") != "${{ vars.PRODUCTION_WORKER_URL }}":
         errors.append(f"{name}: error_rate_gate must read the production Worker URL from vars")
     run = str(step.get("run") or "")
     for needle in ("../tooling/wrangler/scripts/promotion-error-gate.mjs", "--metrics-url", "--evidence",
-                   "--sha", "--user-agent", "--rehearsal-firing",
-                   '[ "$INJECT_ERROR_RATE_SPIKE" = "true" ]'):
+                   "--sha", "--user-agent"):
         if run.count(needle) != 1:
             errors.append(f"{name}: error_rate_gate step must contain exactly one {needle}")
     # The evidence filename appears exactly twice: the --evidence write path
@@ -641,6 +750,26 @@ def staging_pinned_sha_errors(workflows):
         steps = job.get("steps") or []
         checkouts = [step for step in steps
                      if str(step.get("uses", "")).startswith("actions/checkout@")]
+        if job_id == "deploy":
+            # The deploy job carries one extra checkout: reviewed tooling
+            # from the workflow head, so the deploy-ID steps run even when
+            # the deployed pin predates the script. It must be exactly that
+            # shape — the workflow head at shallow depth, never the
+            # deployed ref — and credentialless like every checkout.
+            tooling = [step for step in checkouts
+                       if (step.get("with") or {}).get("path") == "tooling"]
+            if len(tooling) != 1:
+                errors.append("deploy-staging.yml:deploy: must carry exactly one "
+                              "workflow-head tooling checkout")
+            else:
+                tooling_with = tooling[0].get("with") or {}
+                if tooling_with.get("ref") != "${{ github.sha }}":
+                    errors.append("deploy-staging.yml:deploy: tooling checkout must pin "
+                                  "the workflow head, never the deployed ref")
+                if tooling_with.get("fetch-depth") != "1":
+                    errors.append("deploy-staging.yml:deploy: tooling checkout must stay shallow")
+            checkouts = [step for step in checkouts
+                         if (step.get("with") or {}).get("path") != "tooling"]
         if len(checkouts) != 1:
             errors.append(f"deploy-staging.yml:{job_id}: must check out exactly once")
             continue
@@ -813,7 +942,9 @@ def staging_deploy_identity_errors(workflow, name="deploy-staging.yml"):
     SHA-from-build_revision step and poison the next rollback snapshot's
     serving_sha (recorded from the workers/message annotation). No other
     github.sha may appear in the deploy job outside the two pinned
-    dispatch-or-head expressions (checkout ref, SHA-step env).
+    dispatch-or-head expressions (checkout ref, SHA-step env) and the
+    workflow-head tooling checkout ref (which runs deploy_id.py for pins
+    whose commits predate it).
     """
     errors = []
     jobs = workflow.get("jobs") or {}
@@ -852,9 +983,90 @@ def staging_deploy_identity_errors(workflow, name="deploy-staging.yml"):
             "github-actions:${{ github.run_id }}:${{ env.DEPLOY_SHA }}":
         errors.append(f"{name}:deploy: rollback actor must name the validated deploy SHA")
     text = str(deploy)
-    if text.count("github.sha") != text.count(DEPLOY_SHA_EXPRESSION) or text.count("github.sha") != 2:
-        errors.append(f"{name}:deploy: github.sha may only appear in the checkout ref and "
-                      "SHA-step dispatch-or-head expressions")
+    if text.count("github.sha") != text.count(DEPLOY_SHA_EXPRESSION) + 1 or text.count("github.sha") != 3:
+        errors.append(f"{name}:deploy: github.sha may only appear in the checkout ref, "
+                      "the SHA-step dispatch-or-head expressions and the tooling checkout ref")
+    return errors
+
+
+def staging_deploy_id_errors(workflow, name="deploy-staging.yml"):
+    """The staging deploy ID is derived in-lane and recorded as a Deployment.
+
+    The compute step derives `YYYY.MM.DD.N+sha7` from the validated deploy
+    SHA inside the serialized staging lane (N counts today's recorded staging
+    deploy IDs, so a queued entry cannot mint a duplicate) and exports it
+    before the prepare step stamps it. Both ID steps run reviewed tooling
+    from the workflow's own commit, since a pinned drill deploys a commit
+    whose checkout may predate the script. The record step stores the deploy
+    as a GitHub Deployment carrying the ID — never a tag or Release — with
+    success only when the rollout verify and the error-rate gate both
+    passed; it runs after the auto-rollback so bookkeeping can never gate
+    recovery. No other step may call deploy_id.py.
+    """
+    errors = []
+    jobs = workflow.get("jobs") or {}
+    deploy = jobs.get("deploy") or {}
+    steps = deploy.get("steps") or []
+
+    def find(label, predicate):
+        found = [step for step in steps if predicate(step)]
+        if len(found) != 1:
+            errors.append(f"{name}:deploy: must carry exactly one {label}")
+            return None, -1
+        return found[0], steps.index(found[0])
+
+    compute, compute_at = find(
+        "deploy-ID compute step",
+        lambda step: step.get("name") == "Compute the deploy ID for this staging deploy")
+    if compute is not None:
+        if (compute.get("env") or {}).get("GH_TOKEN") != "${{ github.token }}":
+            errors.append(f"{name}:deploy: compute step must list Deployments with github.token")
+        run = str(compute.get("run") or "")
+        if ("tooling/scripts/deploy_id.py next --environment staging --sha \"$DEPLOY_SHA\""
+                not in run or '>> "$GITHUB_ENV"' not in run):
+            errors.append(f"{name}:deploy: compute step must derive the staging ID "
+                          "from the validated deploy SHA via reviewed tooling")
+    prepare, prepare_at = find(
+        "staging identity snapshot step",
+        lambda step: step.get("name") == "Snapshot staging identity and generate per-deploy image provenance")
+    if compute_at >= 0 and prepare_at >= 0 and compute_at > prepare_at:
+        errors.append(f"{name}:deploy: compute step must run before the prepare step stamps the ID")
+    verify, _ = find(
+        "rollout verify step",
+        lambda step: step.get("name") == "Verify exact new rollout and serving Worker/container readiness")
+    if verify is not None and verify.get("id") != "verify":
+        errors.append(f"{name}:deploy: verify step must carry id verify for the record step")
+    gate, gate_at = find("promotion error-rate gate step",
+                         lambda step: step.get("id") == "error_rate_gate")
+    record, record_at = find(
+        "deployment record step",
+        lambda step: step.get("name") == "Record the staging deployment")
+    if record is not None:
+        if record.get("if") != "always() && steps.deploy.outcome == 'success'":
+            errors.append(f"{name}:deploy: record step must run whenever a deploy went out")
+        env = record.get("env") or {}
+        if env.get("GH_TOKEN") != "${{ github.token }}":
+            errors.append(f"{name}:deploy: record step must create the Deployment with github.token")
+        if env.get("VERIFY_OUTCOME") != "${{ steps.verify.outcome }}":
+            errors.append(f"{name}:deploy: record step must judge the rollout verify outcome")
+        if env.get("GATE_OUTCOME") != "${{ steps.error_rate_gate.outcome }}":
+            errors.append(f"{name}:deploy: record step must judge the error-rate gate outcome")
+        run = str(record.get("run") or "")
+        if ("tooling/scripts/deploy_id.py record --environment staging --sha \"$DEPLOY_SHA\""
+                not in run or '--deploy-id "$DEPLOY_ID"' not in run):
+            errors.append(f"{name}:deploy: record step must record the staging ID "
+                          "for the validated deploy SHA via reviewed tooling")
+        if "--rollback" in run:
+            errors.append(f"{name}:deploy: staging has no rollback mode to record")
+    if gate_at >= 0 and record_at >= 0 and record_at < gate_at:
+        errors.append(f"{name}:deploy: record step must run after the error-rate gate judges")
+    rollback_at = next((index for index, step in enumerate(steps)
+                        if step.get("id") == "auto_rollback"), -1)
+    if rollback_at >= 0 and record_at >= 0 and record_at < rollback_at:
+        errors.append(f"{name}:deploy: record step must run after the auto-rollback "
+                      "so bookkeeping can never gate recovery")
+    if str(deploy).count("deploy_id.py") != 2:
+        errors.append(f"{name}:deploy: only the compute and record steps may call deploy_id.py")
     return errors
 
 
@@ -1491,6 +1703,92 @@ def staging_events_read_errors(workflow):
     return errors
 
 
+CENSUS_ENV = {
+    "TWO_BOT_STAGING_PLAN_DATABASE_URL": "${{ secrets.TWO_BOT_STAGING_PLAN_DATABASE_URL }}",
+    "TWO_BOT_STAGING_HOST": "${{ vars.TWO_BOT_STAGING_HOST }}",
+    "TWO_BOT_STAGING_DATABASE": "${{ vars.TWO_BOT_STAGING_DATABASE }}",
+    "TWO_BOT_STAGING_BRANCH_ID": "${{ vars.TWO_BOT_STAGING_BRANCH_ID }}",
+}
+CENSUS_COMMAND = "set -o pipefail\npython3 scripts/staging_retention_census.py\n"
+
+
+def staging_retention_census_errors(workflow):
+    """Manual staging-only read-only event-store retention census.
+
+    Dispatch-only with no inputs. One job runs only from main through the
+    existing no-reviewer `staging-migrate-plan` environment (the plan
+    binding's login holds only two_bot_migrator_ro), on the routed runner
+    for job `census`, with its own non-cancelling concurrency group and a
+    30 minute timeout covering the script's single ~900 s in-job sleep.
+    Exactly two unconditional steps: pinned checkout without persisted
+    credentials, and one bash Run step that calls the reviewed script with
+    the secret plus the three non-secret staging pins via the environment
+    only. Log only, no artifact upload: counts, digests and timestamps
+    never leave the run log and summary. No wrangler, no production path,
+    no apply route, no `set -x`.
+    """
+    name = "staging-retention-census.yml"
+    errors = []
+    if "env" in workflow:
+        errors.append(f"{name}: workflow-level env must stay absent; bindings belong only on the Run step")
+    on = workflow.get("on") or {}
+    if set(on) != {"workflow_dispatch"}:
+        errors.append(f"{name}: must be dispatch-only (no push/pull_request/schedule)")
+    elif on.get("workflow_dispatch") not in (None, {}, ""):
+        errors.append(f"{name}: workflow_dispatch must take no inputs")
+    if workflow.get("permissions") != {}:
+        errors.append(f"{name}: top-level permissions must stay empty")
+    if workflow.get("concurrency") != {"group": "staging-retention-census", "cancel-in-progress": "false"}:
+        errors.append(f"{name}: must use its own staging-retention-census group without cancelling")
+    jobs = workflow.get("jobs") or {}
+    if set(jobs) != {"census"}:
+        errors.append(f"{name}: jobs must be exactly census")
+        return errors
+    job = jobs["census"]
+    if job.get("environment") != "staging-migrate-plan":
+        errors.append(f"{name}:census: must read the staging-migrate-plan Environment binding")
+    if job.get("if") != "github.ref == 'refs/heads/main'":
+        errors.append(f"{name}:census: must run only from main")
+    if job.get("permissions") != {"contents": "read"}:
+        errors.append(f"{name}:census: must keep contents:read only")
+    if job.get("timeout-minutes") != "30":
+        errors.append(f"{name}:census: timeout must stay 30 minutes")
+    if not runner_allowed("census", job.get("runs-on")):
+        errors.append(f"{name}:census: must use the routed runner expression for job 'census'")
+    for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
+        if key in job:
+            errors.append(f"{name}:census: must not set {key} (bindings stay on the single Run step)")
+    text = str(job).lower().replace(" ", "")
+    for marker in ("wrangler", "production", "tojson(secrets", "secrets[", "set-x", "setx", "xtrace",
+                   "inputs.", "migrator_database_url", "--apply", "upload-artifact",
+                   "download-artifact", "createextension"):
+        if marker in text:
+            errors.append(f"{name}:census: must not contain {marker!r}")
+    secrets = set(re.findall(r"secrets\.([a-z0-9_]+)", text))
+    if secrets != {"two_bot_staging_plan_database_url"}:
+        errors.append(f"{name}:census: must read exactly the plan-database secret")
+    steps = job.get("steps") or []
+    if len(steps) != 2 or any(key in step for step in steps for key in ("if", "continue-on-error")):
+        errors.append(f"{name}:census: must run exactly checkout and the census, unconditionally")
+        return errors
+    checkout, run = steps
+    # Scoped to the Run step: the routed runner expression names its own
+    # CI_OVERFLOW_* vars, which must not count as census pins.
+    if set(re.findall(r"vars\.([a-z0-9_]+)", str(run).lower())) != {"two_bot_staging_host",
+                                                                   "two_bot_staging_database",
+                                                                   "two_bot_staging_branch_id"}:
+        errors.append(f"{name}:census: Run step may reference only the three staging pins")
+    if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
+            or (checkout.get("with") or {}).get("persist-credentials") != "false" \
+            or (checkout.get("with") or {}).get("fetch-depth") != "1":
+        errors.append(f"{name}:census: checkout must be pinned, shallow and must not persist credentials")
+    if run.get("env") != CENSUS_ENV:
+        errors.append(f"{name}:census: Run step must bind exactly the plan secret and the three pins")
+    if run.get("run") != CENSUS_COMMAND or "uses" in run or run.get("shell") != "bash":
+        errors.append(f"{name}:census: Run step must call the script over bash with pipefail")
+    return errors
+
+
 MCP_PROVEOUT_ENV = {
     "STAGING_MCP_TOKEN": "${{ secrets.STAGING_MCP_TOKEN }}",
     "STAGING_MCP_URL": "https://two-bot-next-staging.5150.workers.dev/mcp",
@@ -1820,6 +2118,97 @@ def gradual_promote_proof_errors(workflow):
     return errors
 
 
+def release_errors(workflow):
+    """The release chain fails closed on an empty dispatch, never as a quiet green.
+
+    release.yml is dispatch-only with the sha, dry_run and release_tag
+    inputs, and every job but the verdict is input-guarded: an all-default
+    dispatch skips tag, sbom-target, release-sbom and attach-sbom and would
+    read green with nothing published. One verdict job runs after all four
+    (no input guard, always() so failures still judge): it fails the run
+    with an error naming the skipped jobs and why when every input sits at
+    its default, fails on any failed or cancelled dependency, and passes
+    otherwise, so the sha, dry_run and release_tag dispatches behave exactly
+    as before (their designed skips stay green). Every real job carries an
+    explicit timeout: tag 10 minutes, the SBOM plumbing (sbom-target,
+    attach-sbom) and the verdict 5.
+    """
+    name = "release.yml"
+    errors = []
+    if "env" in workflow:
+        errors.append(f"{name}: workflow-level env must stay absent")
+    on = workflow.get("on") or {}
+    if set(on) != {"workflow_dispatch"}:
+        errors.append(f"{name}: must be dispatch-only (no push/pull_request/schedule)")
+    else:
+        dispatch = on.get("workflow_dispatch") or {}
+        inputs = (dispatch.get("inputs") or {}) if isinstance(dispatch, dict) else {}
+        if set(dispatch) != {"inputs"} or set(inputs) != {"sha", "dry_run", "release_tag"}:
+            errors.append(f"{name}: workflow_dispatch must carry exactly sha, dry_run and release_tag")
+        else:
+            sha = inputs.get("sha") or {}
+            dry_run = inputs.get("dry_run") or {}
+            release_tag = inputs.get("release_tag") or {}
+            if sha.get("type") != "string" or sha.get("default") != "":
+                errors.append(f"{name}: sha must be a string defaulting to empty")
+            if dry_run.get("type") != "boolean" or dry_run.get("default") not in (False, "false"):
+                errors.append(f"{name}: dry_run must be an opt-in boolean defaulting to false")
+            if release_tag.get("type") != "string" or release_tag.get("default") != "":
+                errors.append(f"{name}: release_tag must be a string defaulting to empty")
+    if workflow.get("permissions") != {}:
+        errors.append(f"{name}: top-level permissions must stay empty")
+    jobs = workflow.get("jobs") or {}
+    if set(jobs) != {"tag", "sbom-target", "release-sbom", "attach-sbom", "verdict"}:
+        errors.append(f"{name}: jobs must be exactly tag, sbom-target, release-sbom, attach-sbom and verdict")
+        return errors
+    for job_id, expected_timeout in (("tag", "10"), ("sbom-target", "5"), ("attach-sbom", "5")):
+        if jobs[job_id].get("timeout-minutes") != expected_timeout:
+            errors.append(f"{name}:{job_id}: timeout must stay {expected_timeout} minutes")
+    verdict = jobs["verdict"]
+    if verdict.get("name") != "release verdict (fail closed on empty dispatch)":
+        errors.append(f"{name}:verdict: consumer job identity changed")
+    if verdict.get("needs") != ["tag", "sbom-target", "release-sbom", "attach-sbom"]:
+        errors.append(f"{name}:verdict: must run after tag, sbom-target, release-sbom and attach-sbom")
+    if verdict.get("if") != "${{ always() }}":
+        errors.append(f"{name}:verdict: must run with if: always() so failures still judge")
+    if verdict.get("permissions") != {"contents": "read"}:
+        errors.append(f"{name}:verdict: must keep contents:read only")
+    if not runner_allowed("verdict", verdict.get("runs-on")):
+        errors.append(f"{name}:verdict: must use the routed runner expression for job 'verdict'")
+    if verdict.get("timeout-minutes") != "5":
+        errors.append(f"{name}:verdict: timeout must stay 5 minutes")
+    for key in ("uses", "environment", "services", "container",
+                "continue-on-error", "strategy", "env"):
+        if key in verdict:
+            errors.append(f"{name}:verdict: must not set {key} (it judges with inputs and results only)")
+    if "secrets." in str(verdict):
+        errors.append(f"{name}:verdict: must never read a secret")
+    steps = verdict.get("steps", [])
+    if len(steps) != 1 or any("if" in step or "continue-on-error" in step for step in steps):
+        errors.append(f"{name}:verdict: must run exactly one unconditional verdict step")
+        return errors
+    step = steps[0]
+    if step.get("env") != {"DISPATCH_SHA": "${{ inputs.sha }}",
+                           "DRY_RUN": "${{ inputs.dry_run }}",
+                           "RELEASE_TAG": "${{ inputs.release_tag }}",
+                           "TAG_RESULT": "${{ needs.tag.result }}",
+                           "SBOM_TARGET_RESULT": "${{ needs.sbom-target.result }}",
+                           "RELEASE_SBOM_RESULT": "${{ needs.release-sbom.result }}",
+                           "ATTACH_SBOM_RESULT": "${{ needs.attach-sbom.result }}"}:
+        errors.append(f"{name}:verdict: step must bind exactly the dispatch inputs and job results "
+                      "via the environment")
+    run = str(step.get("run") or "")
+    for needle in ("DISPATCH_SHA", "DRY_RUN", "RELEASE_TAG", "skipped",
+                   "failure", "cancelled", "::error::"):
+        if needle not in run:
+            errors.append(f"{name}:verdict: missing pin {needle}")
+    if run.count("sys.exit(1)") != 1:
+        errors.append(f"{name}:verdict: must fail exactly once, on an empty dispatch or a failed dependency")
+    if "uses" in step or "${{" in run:
+        errors.append(f"{name}:verdict: step must use the environment only, never an inline expression")
+    return errors
+
+
 def production_errors(workflow):
     """deploy-production is the one live route: dispatch, green-staging completion or schedule, chained to staging."""
     name = "deploy-production.yml"
@@ -1944,17 +2333,134 @@ def production_errors(workflow):
                      'refuse("the production Environment has no required reviewers")'):
         if required not in script:
             errors.append(f"{name}:guard: missing check {required}")
-    # The rollback drill proves the fail-to-rollback chain, which exists
-    # only on a deploy-mode run with takeover: the guard receives the switch
-    # and refuses anything else, so the drill never leaves its build serving.
+    # Failure injection never runs against production (10-20 20:54Z): the
+    # guard receives the drill switch only to refuse it, pointing to staging.
     guard_env = (guard.get("steps") or [{}])[0].get("env", {})
     if guard_env.get("INJECT_ERROR_RATE_SPIKE") != "${{ inputs.inject_error_rate_spike }}":
         errors.append(f"{name}:guard: must receive the drill switch as an input env")
-    for required in ("inject_error_rate_spike needs deploy mode",
-                     "inject_error_rate_spike needs takeover true",
-                     "inject_error_rate_spike never applies to an automatic run"):
+    for required in ('if spike == "true":\n    refuse("failure injection never runs against production',
+                     "dispatch deploy-staging with inject_error_rate_spike true"):
         if required not in script:
-            errors.append(f"{name}:guard: missing drill refusal {required}")
+            errors.append(f"{name}:guard: missing production drill refusal {required!r}")
+    # A deploy always takes over (10-20 13:31Z: a manual deploy without
+    # takeover left production fenced); only the explicit cutover_hold
+    # input keeps the fence held.
+    inputs = ((on.get("workflow_dispatch") or {}).get("inputs") or {})
+    takeover_input = inputs.get("takeover") or {}
+    hold_input = inputs.get("cutover_hold") or {}
+    if takeover_input.get("type") != "boolean" or takeover_input.get("default") not in (True, "true"):
+        errors.append(f"{name}: takeover must be a boolean defaulting to true")
+    if hold_input.get("type") != "boolean" or hold_input.get("default") not in (False, "false"):
+        errors.append(f"{name}: cutover_hold must be an opt-in boolean defaulting to false")
+    if guard_env.get("CUTOVER_HOLD") != "${{ inputs.cutover_hold }}":
+        errors.append(f"{name}:guard: must receive cutover_hold as an input env")
+    if 'takeover = "false" if cutover_hold == "true" else "true"' not in script:
+        errors.append(f"{name}:guard: deploy mode must take over unless cutover_hold")
+    # Recovery never waits for a human: a reviewer-less rollback runs only
+    # on a verified production rollback snapshot of its exact target.
+    for required in ('snapshot_run = verified_rollback_snapshot() if not reviewers and mode == "rollback" else None',
+                     'collection(f"repos/{repo}/actions/artifacts"',
+                     "target != (version, image, sha)",
+                     'receipt.get("provenance_complete") is not True',
+                     'PRODUCTION_WORKFLOW = ".github/workflows/deploy-production.yml"',
+                     'origin.get("head_repository_id") != origin.get("repository_id")'):
+        if required not in script:
+            errors.append(f"{name}:guard: missing rollback snapshot check {required!r}")
+    return errors
+
+
+def production_deploy_id_errors(workflow, name="deploy-production.yml"):
+    """The production deploy ID is derived in-lane, stamped, gated and recorded.
+
+    The compute step derives `YYYY.MM.DD.N+sha7` from the guarded SHA inside
+    the deploy-production lane (N counts today's recorded production deploy
+    IDs, so a queued entry cannot mint a duplicate) before the render step stamps it;
+    the readyz gate judges it; the record step stores the deploy as a GitHub
+    Deployment with environment=production carrying the ID — never a tag or
+    Release — with success only when the readyz gate passed and the
+    error-rate gate did not fail. It runs after the auto-rollback so
+    bookkeeping can never gate recovery. Rollbacks mint a fresh event ID
+    and name themselves, since the restored build keeps its original
+    stamped ID. No other step may call deploy_id.py.
+    """
+    errors = []
+    jobs = workflow.get("jobs") or {}
+    production = jobs.get("production") or {}
+    steps = production.get("steps") or []
+
+    def find(label, predicate):
+        found = [step for step in steps if predicate(step)]
+        if len(found) != 1:
+            errors.append(f"{name}:production: must carry exactly one {label}")
+            return None, -1
+        return found[0], steps.index(found[0])
+
+    compute, compute_at = find(
+        "deploy-ID compute step",
+        lambda step: step.get("name") == "Compute the deploy ID for this production deploy")
+    if compute is not None:
+        if (compute.get("env") or {}).get("GH_TOKEN") != "${{ github.token }}":
+            errors.append(f"{name}:production: compute step must list Deployments with github.token")
+        run = str(compute.get("run") or "")
+        if ("tooling/scripts/deploy_id.py next --environment production --sha \"$SHA\"" not in run
+                or '>> "$GITHUB_ENV"' not in run):
+            errors.append(f"{name}:production: compute step must derive the production ID "
+                          "from the guarded SHA")
+    render, render_at = find(
+        "deploy config render step",
+        lambda step: step.get("name") == "Render the production deploy config with build identity")
+    if render is not None and '--deploy-id "$DEPLOY_ID"' not in str(render.get("run") or ""):
+        errors.append(f"{name}:production: render step must stamp the computed deploy ID")
+    if compute_at >= 0 and render_at >= 0 and compute_at > render_at:
+        errors.append(f"{name}:production: compute step must run before the render step stamps the ID")
+    gate, _ = find(
+        "readyz gate step",
+        lambda step: step.get("name") == "Gate on stable /health + /readyz gateway-ready")
+    if gate is not None:
+        run = str(gate.get("run") or "")
+        # The flag is conditional: real runs judge the computed ID only when
+        # the deployed Dockerfile can stamp it, while a caller without an
+        # exported ID (the stamping-transition suites run the gate without
+        # one) or a pre-stamping guarded SHA judges the legacy shape.
+        for required in ('deploy_id_arg=(--deploy-id "$DEPLOY_ID")',
+                         '"${deploy_id_arg[@]}"'):
+            if required not in run:
+                errors.append(f"{name}:production: readyz gate must judge the computed "
+                              "deploy ID when one is exported")
+    error_gate, error_gate_at = find("promotion error-rate gate step",
+                                     lambda step: step.get("id") == "error_rate_gate")
+    record, record_at = find(
+        "deployment record step",
+        lambda step: step.get("name") == "Record the production deployment")
+    if record is not None:
+        condition = str(record.get("if") or "")
+        if ("steps.deploy.outcome == 'success'" not in condition
+                or "steps.rollback.outcome == 'success'" not in condition):
+            errors.append(f"{name}:production: record step must run whenever a deploy "
+                          "or rollback went out")
+        env = record.get("env") or {}
+        if env.get("GH_TOKEN") != "${{ github.token }}":
+            errors.append(f"{name}:production: record step must create the Deployment with github.token")
+        if env.get("GATE_OUTCOME") != "${{ steps.gate.outcome }}":
+            errors.append(f"{name}:production: record step must judge the readyz gate outcome")
+        if env.get("ERROR_GATE_OUTCOME") != "${{ steps.error_rate_gate.outcome }}":
+            errors.append(f"{name}:production: record step must judge the error-rate gate outcome")
+        run = str(record.get("run") or "")
+        if ("tooling/scripts/deploy_id.py record --environment production --sha \"$SHA\"" not in run
+                or '--deploy-id "$DEPLOY_ID"' not in run):
+            errors.append(f"{name}:production: record step must record environment=production "
+                          "for the guarded SHA")
+        if '"$MODE" = "rollback"' not in run or "--rollback" not in run:
+            errors.append(f"{name}:production: record step must name rollback records")
+    if error_gate_at >= 0 and record_at >= 0 and record_at < error_gate_at:
+        errors.append(f"{name}:production: record step must run after the error-rate gate judges")
+    rollback_at = next((index for index, step in enumerate(steps)
+                        if step.get("id") == "auto_rollback"), -1)
+    if rollback_at >= 0 and record_at >= 0 and record_at < rollback_at:
+        errors.append(f"{name}:production: record step must run after the auto-rollback "
+                      "so bookkeeping can never gate recovery")
+    if str(production).count("deploy_id.py") != 2:
+        errors.append(f"{name}:production: only the compute and record steps may call deploy_id.py")
     return errors
 
 
@@ -2385,6 +2891,16 @@ def voice_synthetic_errors(workflow):
     return errors
 
 
+SYNTHETIC_MISSING_BINDING_RUN = {
+    "staging": ('echo "::error::Staging synthetic has zero probe samples because '
+                'STAGING_WORKER_URL is unset; refusing to report green"\n'
+                'exit 1\n'),
+    "prod-passive": ('echo "::error::Production synthetic has zero probe samples because '
+                     'PRODUCTION_WORKER_URL is unset; refusing to report green"\n'
+                     'exit 1\n'),
+}
+
+
 def synthetic_user_flow_errors(workflow):
     """Five-minute user-flow synthetic (docs/synthetic-user-flow.md).
 
@@ -2392,8 +2908,9 @@ def synthetic_user_flow_errors(workflow):
     the `synthetic-alerts` environment. Two jobs: `staging` runs the reviewed
     staging health-contract probe, `prod-passive` runs the reviewed passive
     production probe (observe and alert only, never a deploy gate). Each job
-    has an optional target probe, a notice when its binding is absent, an
-    always() evidence upload, an always() decide step, and a gated post step.
+    has an optional target probe, a fail-closed error when its binding is
+    absent (zero samples never read green), an always() evidence upload, an
+    always() decide step, and a gated post step.
     The decide step reads recent run history with actions:read, alerts after
     two failures, and writes the event to GITHUB_OUTPUT; the post step runs
     only when an event is due so a no-op is skipped (never success), and only
@@ -2402,6 +2919,8 @@ def synthetic_user_flow_errors(workflow):
     """
     name = "synthetic-user-flow.yml"
     errors = []
+    if "defaults" in workflow:
+        errors.append(f"{name}: workflow-level defaults must stay absent (fail-closed shell)")
     if "env" in workflow:
         errors.append(f"{name}: workflow-level env must stay absent")
     on = workflow.get("on") or {}
@@ -2441,7 +2960,7 @@ def synthetic_user_flow_errors(workflow):
             errors.append(f"{name}:{job_id}: timeout must stay 10 minutes")
         if not runner_allowed(job_id, job.get("runs-on")):
             errors.append(f"{name}:{job_id}: must use the routed runner expression for job '{job_id}'")
-        for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
+        for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy", "defaults"):
             if key in job:
                 errors.append(f"{name}:{job_id}: must not set {key}")
         steps = job.get("steps") or []
@@ -2457,9 +2976,19 @@ def synthetic_user_flow_errors(workflow):
         expected_target = "STAGING_WORKER_URL" if job_id == "staging" else "PRODUCTION_WORKER_URL"
         if probe_step.get("id") != "probe" or expected_target not in str(probe_step.get("if", "")):
             errors.append(f"{name}:{job_id}: probe must be skipped when {expected_target} is unset")
-        expected_notice = expected_target + " is unset"
-        if expected_notice not in str(notice.get("run", "")) or "::warning::" not in str(notice.get("run", "")):
-            errors.append(f"{name}:{job_id}: missing-binding skip must emit a notice")
+        if notice.get("run") != SYNTHETIC_MISSING_BINDING_RUN[job_id]:
+            errors.append(f"{name}:{job_id}: missing-binding notice must run exactly the "
+                          "reviewed error and exit 1 command (fail closed)")
+        if "shell" in notice:
+            errors.append(f"{name}:{job_id}: missing-binding notice must not override shell")
+        expected_notice_if = (
+            f"steps.probe.outcome == 'skipped' && vars.{expected_target} == ''"
+            + (" && !inputs.force_fail" if job_id == "staging" else ""))
+        if notice.get("if") != expected_notice_if:
+            errors.append(f"{name}:{job_id}: missing-binding notice must keep its probe-skipped gate")
+        if "continue-on-error" in notice:
+            errors.append(f"{name}:{job_id}: missing-binding notice must not set "
+                          "continue-on-error (fail closed)")
         if upload.get("if") != "always()":
             errors.append(f"{name}:{job_id}: upload must run with if: always() so failures keep their artifact")
         if not str(upload.get("uses", "")).startswith("actions/upload-artifact@"):
@@ -2578,6 +3107,8 @@ def slow_burn_tracker_errors(workflow):
     """
     name = "slow-burn-tracker.yml"
     errors = []
+    if "defaults" in workflow:
+        errors.append(f"{name}: workflow-level defaults must stay absent (fail-closed shell)")
     if "env" in workflow:
         errors.append(f"{name}: workflow-level env must stay absent")
     on = workflow.get("on") or {}
@@ -2622,7 +3153,7 @@ def slow_burn_tracker_errors(workflow):
             errors.append(f"{name}:{job_id}: timeout must stay 10 minutes")
         if not runner_allowed(job_id, job.get("runs-on")):
             errors.append(f"{name}:{job_id}: must use the routed runner expression for job '{job_id}'")
-        for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
+        for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy", "defaults"):
             if key in job:
                 errors.append(f"{name}:{job_id}: must not set {key}")
         text = str(job).lower().replace(" ", "")
@@ -2645,6 +3176,12 @@ def slow_burn_tracker_errors(workflow):
         if run_step.get("run") != command or "uses" in run_step:
             errors.append(f"{name}:{job_id}: run step must run exactly the reviewed tracker command, "
                           "with inputs passed via env only")
+        if "if" in run_step:
+            errors.append(f"{name}:{job_id}: run step must not set if (fail closed)")
+        if "shell" in run_step:
+            errors.append(f"{name}:{job_id}: run step must not override shell (fail closed)")
+        if "continue-on-error" in run_step:
+            errors.append(f"{name}:{job_id}: run step must not set continue-on-error (fail closed)")
         if upload.get("if") != "always()":
             errors.append(f"{name}:{job_id}: upload must run with if: always() so failures keep their artifact")
         if not str(upload.get("uses", "")).startswith("actions/upload-artifact@"):
@@ -2703,11 +3240,124 @@ def slow_burn_tracker_errors(workflow):
     return errors
 
 
+FIVE_MINUTE_SCHEDULERS = ("slow-burn-tracker.yml", "synthetic-user-flow.yml")
+
+
+def scheduled_binding_audit_errors(workflows):
+    """Five-minute watchers must fail closed on missing bindings.
+
+    Both `*/5` schedules exist to watch production health every five
+    minutes; an unconfigured watcher that warns and exits green reads as a
+    clean bill of health forever. The audit pins the `*/5` inventory (a new
+    five-minute watcher needs its fail-closed entry here) and each
+    watcher's fail-closed unconfigured path: slow-burn's tracker step
+    hands both bindings to scripts/slow_burn_tracker.py, which exits 1
+    with an ::error:: naming the unset binding (proved below against the
+    reviewed script, and pinned per binding in
+    scripts/test_slow_burn_tracker.py), and the handoff step itself
+    carries no if or continue-on-error; synthetic's missing-binding
+    notice keeps its probe-skipped gate and fails the job with an
+    ::error:: naming the unset target var, with no continue-on-error.
+    """
+    name = "scheduled-binding-audit"
+    errors = []
+    five_min = sorted(
+        path for path, workflow in workflows.items()
+        for slot in ((workflow.get("on") or {}).get("schedule") or [])
+        if isinstance(slot, dict) and slot.get("cron") == "*/5 * * * *")
+    if five_min != sorted(FIVE_MINUTE_SCHEDULERS):
+        errors.append(
+            f"{name}: */5 schedules must stay exactly "
+            f"{', '.join(sorted(FIVE_MINUTE_SCHEDULERS))} (a new five-minute "
+            "watcher needs its fail-closed audit entry)")
+        return errors
+    slow_burn_workflow = workflows.get("slow-burn-tracker.yml") or {}
+    if "defaults" in slow_burn_workflow:
+        errors.append(f"{name}: slow-burn-tracker.yml: workflow-level defaults must "
+                      "stay absent (fail-closed shell)")
+    tracker = (slow_burn_workflow.get("jobs") or {}).get("tracker") or {}
+    if "defaults" in tracker:
+        errors.append(f"{name}: slow-burn-tracker.yml:tracker: job-level defaults "
+                      "must stay absent (fail-closed shell)")
+    runs = [step for step in tracker.get("steps") or []
+            if "scripts/slow_burn_tracker.py" in str(step.get("run", ""))]
+    if len(runs) != 1:
+        errors.append(f"{name}: slow-burn-tracker.yml: tracker job must invoke "
+                      "scripts/slow_burn_tracker.py exactly once")
+    else:
+        handoff = runs[0].get("env") or {}
+        if "STAGING_WORKER_URL" not in handoff or "METRICS_SCRAPE_TOKEN" not in handoff:
+            errors.append(f"{name}: slow-burn-tracker.yml: tracker step must hand both "
+                          "bindings to the tracker script via env")
+        if "if" in runs[0]:
+            errors.append(f"{name}: slow-burn-tracker.yml: tracker step must not set "
+                          "if (fail closed)")
+        if "shell" in runs[0]:
+            errors.append(f"{name}: slow-burn-tracker.yml: tracker step must not "
+                          "override shell")
+        if "continue-on-error" in runs[0]:
+            errors.append(f"{name}: slow-burn-tracker.yml: tracker step must not set "
+                          "continue-on-error (fail closed)")
+    with tempfile.TemporaryDirectory() as tmp:
+        evidence = str(Path(tmp) / "evidence.json")
+        expo = str(Path(tmp) / "expo.prom")
+        with patch("sys.stdout") as stdout:
+            code = _TRACKER_MODULE.main(
+                ["--evidence-out", evidence, "--exposition-out", expo],
+                {"GITHUB_REPOSITORY": "TogetherWeOwn/two-bot-next",
+                 "GITHUB_RUN_ID": "0",
+                 "GITHUB_SERVER_URL": "https://github.com",
+                 "GH_TOKEN": "audit-token",
+                 "STAGING_WORKER_URL": "", "METRICS_SCRAPE_TOKEN": ""})
+        writes = stdout.write.call_args_list
+        out = writes[0].args[0] if writes else ""
+        if (code == 0 or "::error::" not in out
+                or "STAGING_WORKER_URL" not in out
+                or "METRICS_SCRAPE_TOKEN" not in out):
+            errors.append(f"{name}: slow-burn-tracker.yml: an unconfigured tracker run "
+                          "must exit non-zero with an ::error:: naming the unset bindings")
+    synthetic_workflow = workflows.get("synthetic-user-flow.yml") or {}
+    if "defaults" in synthetic_workflow:
+        errors.append(f"{name}: synthetic-user-flow.yml: workflow-level defaults must "
+                      "stay absent (fail-closed shell)")
+    synthetic = synthetic_workflow.get("jobs") or {}
+    targets = (("staging", "STAGING_WORKER_URL"),
+               ("prod-passive", "PRODUCTION_WORKER_URL"))
+    for job_id, target in targets:
+        job = synthetic.get(job_id) or {}
+        if "defaults" in job:
+            errors.append(f"{name}: synthetic-user-flow.yml:{job_id}: job-level defaults "
+                          "must stay absent (fail-closed shell)")
+        steps = job.get("steps") or []
+        notices = [step for step in steps
+                   if str(step.get("name", "")).startswith("Fail closed when the ")]
+        if len(notices) != 1:
+            errors.append(f"{name}: synthetic-user-flow.yml:{job_id}: must keep its "
+                          "missing-binding notice step")
+            continue
+        if notices[0].get("run") != SYNTHETIC_MISSING_BINDING_RUN[job_id]:
+            errors.append(f"{name}: synthetic-user-flow.yml:{job_id}: missing-binding "
+                          f"notice must run exactly the reviewed ::error:: naming {target} "
+                          "and exit 1 command")
+        if "shell" in notices[0]:
+            errors.append(f"{name}: synthetic-user-flow.yml:{job_id}: missing-binding "
+                          "notice must not override shell")
+        notice_if = str(notices[0].get("if", ""))
+        if "steps.probe.outcome" not in notice_if or target not in notice_if:
+            errors.append(f"{name}: synthetic-user-flow.yml:{job_id}: missing-binding "
+                          f"notice must keep its probe-skipped gate on {target}")
+        if "continue-on-error" in notices[0]:
+            errors.append(f"{name}: synthetic-user-flow.yml:{job_id}: missing-binding "
+                          "notice must not set continue-on-error (fail closed)")
+    return errors
+
+
 def workflow_policy_errors(workflows):
     errors = []
     errors.extend(staging_gateway_injection_errors(workflows))
     errors.extend(staging_error_rate_gate_errors(workflows))
     errors.extend(staging_fault_injection_errors(workflows))
+    errors.extend(scheduled_binding_audit_errors(workflows))
     # Fail closed on new workflows/jobs, including reusable-workflow alternatives.
     # An intentional addition needs an explicit policy change and independent review.
     if set(workflows) != set(JOB_INVENTORY):
@@ -2721,16 +3371,20 @@ def workflow_policy_errors(workflows):
             errors.extend(production_schema_gate_errors(workflow))
             errors.extend(production_roles_gate_errors(workflow))
             errors.extend(production_error_rate_gate_errors(workflow))
+            errors.extend(production_deploy_id_errors(workflow))
             continue
         if name == "deploy-staging.yml":
             errors.extend(staging_dispatch_errors(workflow))
             errors.extend(staging_active_errors(workflow))
             errors.extend(staging_pinned_sha_errors(workflows))
             errors.extend(staging_deploy_identity_errors(workflow))
+            errors.extend(staging_deploy_id_errors(workflow))
             errors.extend(soak_hold_errors(workflow))
             errors.extend(pinned_history_guard_errors(workflow))
             errors.extend(schema_gate_errors(workflow))
             errors.extend(roles_gate_errors(workflow))
+        if name == "release.yml":
+            errors.extend(release_errors(workflow))
         if name == "voice-synthetic.yml":
             # Pinned shape above; the generic environment scan below would
             # flag its voice-synthetic Environment binding.
@@ -2761,6 +3415,12 @@ def workflow_policy_errors(workflows):
             # Manual read-only events read: pinned shape above; the generic
             # environment scan below would flag its Environment binding.
             errors.extend(staging_events_read_errors(workflow))
+            continue
+        if name == "staging-retention-census.yml":
+            # Manual read-only retention census: pinned shape above; the
+            # generic environment scan below would flag its Environment
+            # binding.
+            errors.extend(staging_retention_census_errors(workflow))
             continue
         if name == "staging-mcp-proveout.yml":
             # Manual read-only authenticated MCP prove-out: pinned shape
@@ -2859,14 +3519,66 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(step["env"][base_key], expected_base)
                 self.assertEqual(step["env"][head_key], expected_head)
 
-    def test_rust_tests_timeout_leaves_headroom_for_coverage_measurement(self):
-        # The HARD patch-coverage step re-runs the suite under llvm-cov
-        # (measured 30 min of a 42m16s job; four earlier runs of this design
-        # took 36-42 min), so every event keeps 60 minutes: a slow runner
-        # reports a coverage verdict, not a job timeout.
+    def test_rust_tests_timeout_leaves_headroom_for_the_suite(self):
+        # Suite-only since the HARD patch-coverage measurement split into its
+        # own job: the combined job outgrew 60 minutes (59m54s on main, one
+        # 60m07s mid-measurement kill), while the replay alone measured ~30
+        # min of a 42m16s job. 45 minutes keeps comfortable headroom for a
+        # cache-cold or slow runner without letting a hung suite burn an hour.
         job = self.workflows["check.yml"]["jobs"]["rust-tests"]
+        # BaseLoader keeps scalars as strings; "45" is the 45-minute limit.
+        self.assertEqual(job["timeout-minutes"], "45")
+        # The measurement lives in `patch-coverage` now: no step there may
+        # re-merge it into this lane.
+        names = [step.get("name") for step in job["steps"]]
+        self.assertNotIn("Patch coverage (HARD, 80% of added lines)", names)
+
+    def test_patch_coverage_timeout_covers_the_measurement(self):
+        # The HARD patch-coverage measurement keeps the 60-minute ceiling the
+        # combined job needed: the llvm-cov replay alone measured ~30 min of
+        # a 42m16s job, and main heads have since reached 59m54s combined.
+        # A slow runner reports a coverage verdict, not a job timeout.
+        job = self.workflows["check.yml"]["jobs"]["patch-coverage"]
         # BaseLoader keeps scalars as strings; "60" is the 60-minute limit.
         self.assertEqual(job["timeout-minutes"], "60")
+
+    def test_rust_lane_cargo_cache_entries_are_pinned(self):
+        # The `check` entry is written by `rust-tests` and restored by the two
+        # ignored-db lanes, which rebuild the same non-instrumented graph. The
+        # `patch-coverage` lane builds a unique instrumented graph under
+        # `target/llvm-cov-target` that no other lane produces, so it owns a
+        # separate writable `coverage` entry: restore-only would cold-build the
+        # instrumented dependencies on every run after a cache rotation and
+        # erode the 60-minute ceiling the split exists to protect. Two writers
+        # must never share one entry (no concurrent save race on `check`).
+        jobs = self.workflows["check.yml"]["jobs"]
+        # (shared-key, save-if); BaseLoader keeps scalars as strings.
+        expected = {
+            "check": ("lint", "${{ github.event_name == 'push' }}"),
+            "rust-tests": ("check", "${{ github.event_name == 'push' }}"),
+            "patch-coverage": ("coverage", "${{ github.event_name == 'push' }}"),
+            "ignored-db-stores": ("check", "false"),
+            "ignored-db-runtime": ("check", "false"),
+        }
+        writers = []
+        for job_id, (shared_key, save_if) in expected.items():
+            cache = next(
+                (step for step in jobs[job_id]["steps"]
+                 if step.get("name") == "Restore cargo cache"),
+                None,
+            )
+            with self.subTest(job=job_id):
+                self.assertIsNotNone(cache, "Restore cargo cache step is missing")
+                self.assertEqual(cache["with"]["shared-key"], shared_key)
+                self.assertEqual(cache["with"]["save-if"], save_if)
+            if save_if != "false":
+                writers.append((job_id, shared_key))
+        seen = set()
+        for job_id, shared_key in writers:
+            self.assertNotIn(
+                shared_key, seen,
+                f"{job_id} races another writer on shared-key {shared_key}")
+            seen.add(shared_key)
 
     def test_rust_test_container_pins_disposable_database_service_address(self):
         job = self.workflows["check.yml"]["jobs"]["rust-tests"]
@@ -2875,7 +3587,27 @@ class WorkflowTests(unittest.TestCase):
             if step.get("name") == "Job-container prerequisites (loopback forward to agent-testdb)"
         )
         self.assertEqual(prerequisites.get("shell"), "bash")
-        run = prerequisites["run"]
+        self.assert_loopback_forward_is_pinned(prerequisites["run"])
+
+    def test_patch_coverage_container_pins_disposable_database_service_address(self):
+        # Same hardening as rust-tests: the coverage replay runs long database
+        # suites, and a main run lost service-alias DNS mid-suite. The block
+        # stays byte-identical to the rust-tests copy: shared setup, not a
+        # forked copy that can drift.
+        jobs = self.workflows["check.yml"]["jobs"]
+        runs = {}
+        for job_id in ("rust-tests", "patch-coverage"):
+            prerequisites = next(
+                step for step in jobs[job_id]["steps"]
+                if step.get("name") == "Job-container prerequisites (loopback forward to agent-testdb)"
+            )
+            self.assertEqual(prerequisites.get("shell"), "bash")
+            runs[job_id] = prerequisites["run"]
+        self.assert_loopback_forward_is_pinned(runs["patch-coverage"])
+        self.assertEqual(runs["rust-tests"], runs["patch-coverage"],
+                         "the lanes' loopback-forward blocks drifted apart")
+
+    def assert_loopback_forward_is_pinned(self, run):
         self.assertIn("set -e", run)
         hosts_tmp = run.index('hosts_tmp="${RUNNER_TEMP:?RUNNER_TEMP must be set}/hosts"')
         resolve = run.index("getent ahostsv4 agent-testdb")
@@ -2956,10 +3688,13 @@ class WorkflowTests(unittest.TestCase):
         # ran the PG18 default (max_wal_size 1GB) on the same 1 GiB tmpfs, and
         # the stores lane PANICed with ENOSPC mid-suite. Every lane that mounts
         # the bounded service must carry its own budget and verify it.
-        # rust-tests is tighter because its coverage replay exhausted 1 GiB at
-        # 512 MB (run 39360867142). The other lanes stay at 512/64 MB.
+        # rust-tests and patch-coverage are tighter because the coverage replay
+        # exhausted 1 GiB at 512 MB (run 39360867142); rust-tests keeps the
+        # budget the replay needed when it ran there. The other lanes stay at
+        # 512/64 MB.
         budgets = {
             "rust-tests": ("128MB", "32MB"),
+            "patch-coverage": ("128MB", "32MB"),
             "ignored-db-stores": ("512MB", "64MB"),
             "ignored-db-runtime": ("512MB", "64MB"),
         }
@@ -3081,12 +3816,13 @@ class WorkflowTests(unittest.TestCase):
             for workflow, job_id in (
                 ("check.yml", "check"),
                 ("check.yml", "rust-tests"),
+                ("check.yml", "patch-coverage"),
                 ("check.yml", "ignored-db-stores"),
                 ("check.yml", "ignored-db-runtime"),
                 ("reusable-rust-nextest.yml", "nextest"),
             )
         ]
-        self.assertEqual(len(lanes), 5)
+        self.assertEqual(len(lanes), 6)
         guards = []
         for workflow, job_id in lanes:
             with self.subTest(workflow=workflow, job=job_id):
@@ -3118,7 +3854,7 @@ class WorkflowTests(unittest.TestCase):
                 self.assertIn('if [ "$free_bytes" -lt "$floor" ]', run)
                 self.assertIn("exit 1", run)
                 guards.append((workflow, job_id, run))
-        # All five copies stay byte-identical: a single-copy exit-1 removal or
+        # All six copies stay byte-identical: a single-copy exit-1 removal or
         # -lt/-gt inversion must fail offline instead of silently disabling
         # the only fail-fast protection for that lane.
         bodies = [run for _, _, run in guards]
@@ -3173,7 +3909,7 @@ class WorkflowTests(unittest.TestCase):
         # max_wal_size is a soft checkpoint target, not a hard ceiling: the
         # pre-suite report cannot show peak WAL. Every Postgres lane brackets
         # its run with an always-runs post-suite report for ENOSPC triage.
-        for job_id in ("rust-tests", "ignored-db-stores", "ignored-db-runtime"):
+        for job_id in ("rust-tests", "patch-coverage", "ignored-db-stores", "ignored-db-runtime"):
             with self.subTest(job=job_id):
                 job = self.workflows["check.yml"]["jobs"][job_id]
                 steps = job["steps"]
@@ -3184,9 +3920,12 @@ class WorkflowTests(unittest.TestCase):
                     if step.get("name") == "Report Postgres storage headroom (post-suite)"
                 )
                 self.assertEqual(post.get("if"), "always()")
+                # patch-coverage runs no plain `cargo test` step: its suite is
+                # the llvm-cov replay inside the Patch coverage step.
                 test_steps = [
                     index for index, candidate in enumerate(steps)
                     if "cargo test" in str(candidate.get("run", ""))
+                    or "Patch coverage" in str(candidate.get("name", ""))
                 ]
                 self.assertTrue(test_steps)
                 self.assertGreater(steps.index(post), max(test_steps))
@@ -3344,7 +4083,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("'min_wal_size': '64MB'", verify["run"])
 
     def test_patch_coverage_runs_with_db_and_includes_ignored_tests(self):
-        job = self.workflows["check.yml"]["jobs"]["rust-tests"]
+        job = self.workflows["check.yml"]["jobs"]["patch-coverage"]
         step = next(
             step for step in job["steps"]
             if step.get("name") == "Patch coverage (HARD, 80% of added lines)"
@@ -3636,12 +4375,13 @@ class WorkflowTests(unittest.TestCase):
             "always() && !cancelled() && steps.prepare_test_databases.outcome == 'success' "
             "&& steps.verify_disposable_postgres.outcome == 'success'",
         )
-        test_steps = [
-            index for index, candidate in enumerate(job["steps"])
-            if "cargo test" in str(candidate.get("run", ""))
-        ]
-        self.assertTrue(test_steps)
-        self.assertGreater(job["steps"].index(step), max(test_steps))
+        # The measurement rides alone in its own job: no plain `cargo test`
+        # step may re-merge the suite signal into this lane.
+        self.assertEqual(
+            [candidate.get("name") for candidate in job["steps"]
+             if "cargo test" in str(candidate.get("run", ""))],
+            [],
+        )
         self.assertEqual(
             next(candidate for candidate in job["steps"]
                  if candidate.get("name") == "Prepare isolated test databases")["id"],
@@ -3716,10 +4456,9 @@ class WorkflowTests(unittest.TestCase):
 
     def test_patch_coverage_ignored_sweep_skips_tests_that_cannot_pass_there(self):
         # The ignored sweep tolerates failures, but the flake ledger reads
-        # every FAILED line it prints as a flake. No ignored test in these
-        # suites can pass under its two_bot_test_ci URL, so the sweep skips
-        # each one. Names come from the sources: a new ignored test in one of
-        # these suites fails here until the sweep skips it too.
+        # every FAILED line it prints as a flake. Skip exact-URL opt-ins and
+        # explicitly quarantined red tests, not passing DB opt-ins in those
+        # backfill suites. Names and quarantine markers come from the sources.
         # Exact-URL suites: a fail-closed run elsewhere still executes them.
         # The stream go-live ledger suite shares the strict agent_test
         # guard; its dedicated replay below stays fail-closed.
@@ -3735,7 +4474,7 @@ class WorkflowTests(unittest.TestCase):
         )
         jobs = self.workflows["check.yml"]["jobs"]
         step = next(
-            step for step in jobs["rust-tests"]["steps"]
+            step for step in jobs["patch-coverage"]["steps"]
             if step.get("name") == "Patch coverage (HARD, 80% of added lines)"
         )
         [sweep] = [
@@ -3772,13 +4511,14 @@ class WorkflowTests(unittest.TestCase):
                     )
         [store_lane] = [line for line in runs if "--test backfill_audit_log" in line]
         store_skips = re.findall(r"--skip (\S+)", store_lane)
+        quarantined = set()
         for suite in red_suites:
-            names = ignored_test_names(suite)
-            self.assertTrue(names, suite)
-            expected.update(names)
-            for name in names:
-                with self.subTest(suite=suite, test=name):
-                    self.assertIn(name, store_skips)
+            quarantined.update(backfill_quarantine_members(ignored_test_reasons(suite)))
+        expected.update(quarantined)
+        self.assertEqual(
+            set(store_skips), quarantined,
+            "store skip set must match quarantine; un-skip graduated tests in the fail-closed lane",
+        )
         # The internal-events DB test is skipped by its module-qualified
         # path: the bare function name would also match a same-named test
         # in any other module swept here. The qualified pin in the
@@ -3787,6 +4527,170 @@ class WorkflowTests(unittest.TestCase):
         expected.add("database::actions_persist_rows_and_preserve_other_events_and_guilds")
         self.assertEqual(len(sweep_skips), len(set(sweep_skips)))
         self.assertEqual(set(sweep_skips) - {"regenerate_reference_docs"}, expected)
+
+    def test_backfill_quarantine_tripwire_reports_growth_shrinkage_and_untracked(self):
+        pinned = {"alpha": "TOG-1", "beta": "TOG-2"}
+        clean = {
+            "alpha": '#[ignore = "quarantined red, tracked by TOG-1"]',
+            "beta": '#[ignore = "quarantined red, tracked by TOG-2"]',
+        }
+        self.assertEqual(backfill_quarantine_errors(pinned, clean), [])
+        grown = dict(clean, gamma='#[ignore = "quarantined red, tracked by TOG-3"]')
+        [growth] = backfill_quarantine_errors(pinned, grown)
+        self.assertIn("gamma", growth)
+        self.assertIn("grew", growth)
+        [shrinkage] = backfill_quarantine_errors(
+            pinned, {"alpha": clean["alpha"]},
+        )
+        self.assertIn("shrank", shrinkage)
+        self.assertIn("BACKFILL_QUARANTINE", shrinkage)
+        self.assertIn("beta", shrinkage)
+        untracked = dict(clean, alpha='#[ignore = "quarantined red, requires authorized TEST_DATABASE_URL"]')
+        [missing] = backfill_quarantine_errors(pinned, untracked)
+        self.assertIn("alpha", missing)
+        self.assertIn("TOG-1", missing)
+
+    def test_fixed_backfill_test_can_keep_database_ignore_after_quarantine_ratchet(self):
+        reason = '#[ignore = "requires authorized TEST_DATABASE_URL"]'
+        [shrinkage] = backfill_quarantine_errors({"alpha": "TOG-1"}, {"alpha": reason})
+        self.assertIn("shrank", shrinkage)
+        self.assertIn("alpha", shrinkage)
+        self.assertEqual(backfill_quarantine_errors({}, {"alpha": reason}), [])
+
+    def test_fixed_backfill_family_can_leave_coverage_and_store_skip_sets(self):
+        reasons = ignored_test_reasons
+        for suite in BACKFILL_QUARANTINE_SUITES:
+            fixed = set(ignored_test_names(suite))
+            current = {}
+            for candidate in BACKFILL_QUARANTINE_SUITES:
+                current.update(reasons(candidate))
+            for name in fixed:
+                current[name] = '#[ignore = "requires authorized TEST_DATABASE_URL"]'
+            pinned = {name: ref for name, ref in BACKFILL_QUARANTINE.items() if name not in fixed}
+            mutated = deepcopy(self.workflows)
+            for workflow in ("check.yml", "nightly.yml"):
+                for job in mutated[workflow]["jobs"].values():
+                    for step in job.get("steps", []):
+                        if "run" in step:
+                            for name in fixed:
+                                step["run"] = step["run"].replace(f"--skip {name}", "")
+            store = next(
+                step for job in mutated["check.yml"]["jobs"].values()
+                for step in job.get("steps", [])
+                if "--test backfill_audit_log" in step.get("run", "")
+            )
+            nightly = next(
+                step for step in mutated["nightly.yml"]["jobs"]["sweep"]["steps"]
+                if step.get("name") == "Full workspace sweep including ignored tests"
+            )
+            with patch.object(self, "workflows", mutated), patch(
+                f"{__name__}.ignored_test_reasons",
+                side_effect=lambda candidate: (
+                    {name: current[name] for name in fixed}
+                    if candidate == suite else reasons(candidate)
+                ),
+            ), patch(f"{__name__}.BACKFILL_QUARANTINE", pinned):
+                # Proper graduation keeps the DB opt-in and un-skips all three sites.
+                with self.subTest(suite=suite, graduation="complete"):
+                    self.test_patch_coverage_ignored_sweep_skips_tests_that_cannot_pass_there()
+                    self._assert_backfill_quarantine_skip_sites(current)
+                    self.assertEqual(backfill_quarantine_errors(pinned, current), [])
+                name = sorted(fixed)[0]
+                for site, step in (("store", store), ("nightly", nightly)):
+                    original = step["run"]
+                    # Cargo also accepts substring and module-qualified skips.
+                    for token in (name, name[:-1], f"database::{name}"):
+                        with self.subTest(suite=suite, site=site, stale_skip=token):
+                            step["run"] = original.rstrip() + f" --skip {token}"
+                            try:
+                                message = (
+                                    "store skip set must match quarantine" if site == "store"
+                                    else "un-skip graduated backfill tests in the nightly sweep"
+                                )
+                                with self.assertRaisesRegex(AssertionError, message):
+                                    self._assert_backfill_quarantine_skip_sites(current)
+                                if site == "store":
+                                    with self.assertRaisesRegex(AssertionError, message):
+                                        self.test_patch_coverage_ignored_sweep_skips_tests_that_cannot_pass_there()
+                            finally:
+                                step["run"] = original
+
+    def _assert_backfill_quarantine_skip_sites(self, current):
+        # All three skip sites pin every quarantined test: the coverage sweep
+        # and the store lane (check.yml) plus the nightly sweep (nightly.yml).
+        check_jobs = self.workflows["check.yml"]["jobs"]
+        coverage_step = next(
+            step for step in check_jobs["patch-coverage"]["steps"]
+            if step.get("name") == "Patch coverage (HARD, 80% of added lines)"
+        )
+        [coverage_sweep] = [
+            line for line in shell_logical_lines(coverage_step["run"])
+            if line.startswith("cov_run ") and "--workspace --lib --bins --tests" in line
+            and "-- --ignored" in line
+        ]
+        coverage_skips = set(re.findall(r"--skip (\S+)", coverage_sweep))
+        [store_lane] = [
+            line
+            for job in check_jobs.values() for candidate in job.get("steps", [])
+            for line in shell_logical_lines(str(candidate.get("run", "")))
+            if "--test backfill_audit_log" in line
+        ]
+        store_skips = set(re.findall(r"--skip (\S+)", store_lane))
+        [nightly_sweep] = [
+            line
+            for candidate in self.workflows["nightly.yml"]["jobs"]["sweep"]["steps"]
+            if candidate.get("name") == "Full workspace sweep including ignored tests"
+            for line in shell_logical_lines(str(candidate.get("run", "")))
+        ]
+        nightly_skips = set(re.findall(r"--skip (\S+)", nightly_sweep))
+        self.assertEqual(
+            store_skips, set(BACKFILL_QUARANTINE),
+            "store skip set must match quarantine; un-skip graduated tests in the fail-closed lane",
+        )
+        graduated = set(current) - set(backfill_quarantine_members(current))
+        blocked = {}
+        for name in sorted(graduated):
+            # These backfill fns are top-level: unrelated module-only filters
+            # such as channel_moderation_store:: cannot block their bare paths.
+            matches = sorted(
+                skip for skip in nightly_skips
+                if skip.rsplit("::", 1)[-1] and skip_blocks_test(skip, name)
+            )
+            if matches:
+                blocked[name] = matches
+        self.assertEqual(blocked, {}, "un-skip graduated backfill tests in the nightly sweep")
+        for name in sorted(BACKFILL_QUARANTINE):
+            with self.subTest(quarantined=name):
+                self.assertIn(name, coverage_skips)
+                self.assertIn(name, store_skips)
+                self.assertIn(name, nightly_skips)
+
+    def test_backfill_quarantine_is_tracked_counted_and_shrink_only(self):
+        # TOG-34944: the 15 nowhere-run red backfill tests are quarantined,
+        # never silent. Tracked: each ignore reason carries its build card.
+        # Counted: the pin asserts 15. Shrink-only: growth fails, and a fix
+        # ratchets the pin down in the same PR.
+        self.assertEqual(len(BACKFILL_QUARANTINE), 15)
+        current = {}
+        for suite in BACKFILL_QUARANTINE_SUITES:
+            current.update(ignored_test_reasons(suite))
+        self.assertEqual(backfill_quarantine_errors(BACKFILL_QUARANTINE, current), [])
+        self._assert_backfill_quarantine_skip_sites(current)
+        # Both workflow comments restate the quarantine at test granularity
+        # with tracking refs: every name and every ref appears in a `#`
+        # comment line, so the prose cannot drift from the pin.
+        for workflow in ("check.yml", "nightly.yml"):
+            comments = "\n".join(
+                line
+                for line in (ROOT / ".github/workflows" / workflow).read_text().splitlines()
+                if line.strip().startswith("#")
+            )
+            for name in sorted(BACKFILL_QUARANTINE):
+                with self.subTest(workflow=workflow, comment=name):
+                    self.assertIn(name, comments)
+            for ref in sorted(set(BACKFILL_QUARANTINE.values())):
+                with self.subTest(workflow=workflow, comment=ref):
+                    self.assertIn(ref, comments)
 
     def test_fail_closed_gate_sees_qualified_skip_tokens(self):
         # Cargo matches --skip against the full test path, so a qualified
@@ -3839,7 +4743,7 @@ class WorkflowTests(unittest.TestCase):
         )
 
     def test_coverage_replays_strict_agent_test_targets_and_fails_closed(self):
-        job = self.workflows["check.yml"]["jobs"]["rust-tests"]
+        job = self.workflows["check.yml"]["jobs"]["patch-coverage"]
         step = next(
             step for step in job["steps"]
             if step.get("name") == "Patch coverage (HARD, 80% of added lines)"
@@ -4166,30 +5070,30 @@ class WorkflowTests(unittest.TestCase):
                     label,
                 )
                 self.assertTrue(workflow_policy_errors(changed), label)
-        # Production holds the pinned mirror, not a forwarding route: an
-        # extra reader, an armed default, a staging token or unpinned
+        # Production carries no rehearsal path at all (10-20 20:54Z forced
+        # drill): the guard alone reads the switch, to refuse it. Re-arming
+        # any production step, an armed default, a staging token or unpinned
         # tooling there fails the policy.
         self.assertEqual(production_error_rate_gate_errors(workflows["deploy-production.yml"]), [])
         prod_steps = workflows["deploy-production.yml"]["jobs"]["production"]["steps"]
-        prod_armed = [s for s in prod_steps if "INJECT_ERROR_RATE_SPIKE" in str(s)]
-        self.assertEqual(len(prod_armed), 1)
-        self.assertEqual(prod_armed[0].get("id"), "error_rate_gate")
-        prod_index = prod_steps.index(prod_armed[0])
+        self.assertEqual([s for s in prod_steps if "INJECT_ERROR_RATE_SPIKE" in str(s)], [])
+        gate = [s for s in prod_steps if s.get("id") == "error_rate_gate"]
+        self.assertEqual(len(gate), 1)
+        prod_index = prod_steps.index(gate[0])
         prod_mutations = {
-            # An automatic trigger could read it / default armed.
-            "expression without dispatch guard": lambda w: w["jobs"]["production"]["steps"][prod_index]["env"]
-                .__setitem__("INJECT_ERROR_RATE_SPIKE", "${{ inputs.inject_error_rate_spike }}"),
-            "expression constant true": lambda w: w["jobs"]["production"]["steps"][prod_index]["env"]
+            "drill switch re-armed on the gate": lambda w: w["jobs"]["production"]["steps"][prod_index]["env"]
+                .__setitem__("INJECT_ERROR_RATE_SPIKE", ERROR_RATE_EXPRESSION),
+            "drill switch constant true": lambda w: w["jobs"]["production"]["steps"][prod_index]["env"]
                 .__setitem__("INJECT_ERROR_RATE_SPIKE", "true"),
-            "rehearsal flag unconditional": lambda w: w["jobs"]["production"]["steps"][prod_index]
-                .__setitem__("run", "node ../tooling/wrangler/scripts/promotion-error-gate.mjs "
-                             "--rehearsal-firing '[\"rest_5xx_rate\"]'"),
+            "rehearsal flag on the gate": lambda w: w["jobs"]["production"]["steps"][prod_index]
+                .__setitem__("run", str(w["jobs"]["production"]["steps"][prod_index]["run"])
+                             + " --rehearsal-firing '[\"rest_5xx_rate\"]'"),
             "input defaults true": lambda w: w["on"]["workflow_dispatch"]["inputs"]["inject_error_rate_spike"]
                 .__setitem__("default", True),
             "input removed": lambda w: w["on"]["workflow_dispatch"]["inputs"].pop("inject_error_rate_spike"),
-            "second reader step": lambda w: w["jobs"]["production"]["steps"][0]
-                .setdefault("env", {}).__setitem__("INJECT_ERROR_RATE_SPIKE", "true"),
-            "switch off the gate step": lambda w: w["jobs"]["production"]["steps"][prod_index]
+            "another production step reads it": lambda w: w["jobs"]["production"]["steps"][0]
+                .setdefault("env", {}).__setitem__("SPIKE", "${{ inputs.inject_error_rate_spike }}"),
+            "gate step removed": lambda w: w["jobs"]["production"]["steps"][prod_index]
                 .__setitem__("id", "unrelated"),
             "gate without the deploy-mode condition": lambda w: w["jobs"]["production"]["steps"][prod_index]
                 .pop("if"),
@@ -4279,13 +5183,16 @@ class WorkflowTests(unittest.TestCase):
                         if "staging_schema_gate.py" in str(step.get("run", "")))
         self.assertEqual(gate_run["env"]["SOURCE_SHA"], DEPLOY_SHA_EXPRESSION)
 
+        # Deploy step indices: the workflow-head tooling checkout sits at [1],
+        # so the SHA step is [2] there (schema-gate and roles-gate are
+        # unchanged at [1]).
         def swap_shape_after_equality(workflow):
-            run = workflow["jobs"]["deploy"]["steps"][1]["run"]
+            run = workflow["jobs"]["deploy"]["steps"][2]["run"]
             lines = run.splitlines()
             case_i = next(i for i, line in enumerate(lines) if line.strip().startswith("case "))
             test_i = next(i for i, line in enumerate(lines) if "git rev-parse HEAD" in line)
             lines[case_i], lines[test_i] = lines[test_i], lines[case_i]
-            workflow["jobs"]["deploy"]["steps"][1]["run"] = "\n".join(lines)
+            workflow["jobs"]["deploy"]["steps"][2]["run"] = "\n".join(lines)
 
         mutations = {
             # A push (or an empty dispatch) must deploy the workflow head, never a constant.
@@ -4296,29 +5203,29 @@ class WorkflowTests(unittest.TestCase):
             "checkout ref removed": lambda w: w["jobs"]["deploy"]["steps"][0]["with"].pop("ref"),
             "deploy checkout shallow": lambda w: w["jobs"]["deploy"]["steps"][0]["with"]
                 .__setitem__("fetch-depth", "1"),
-            "SHA env constant": lambda w: w["jobs"]["deploy"]["steps"][1]["env"]
+            "SHA env constant": lambda w: w["jobs"]["deploy"]["steps"][2]["env"]
                 .__setitem__("SOURCE_SHA", "abc"),
-            "ancestry check dropped": lambda w: w["jobs"]["deploy"]["steps"][1]
+            "ancestry check dropped": lambda w: w["jobs"]["deploy"]["steps"][2]
                 .__setitem__("run", "\n".join(line for line in
-                                             w["jobs"]["deploy"]["steps"][1]["run"].splitlines()
+                                             w["jobs"]["deploy"]["steps"][2]["run"].splitlines()
                                              if "merge-base" not in line)),
-            "ancestry rejection goes green": lambda w: w["jobs"]["deploy"]["steps"][1]
-                .__setitem__("run", w["jobs"]["deploy"]["steps"][1]["run"]
+            "ancestry rejection goes green": lambda w: w["jobs"]["deploy"]["steps"][2]
+                .__setitem__("run", w["jobs"]["deploy"]["steps"][2]["run"]
                              .replace("exit 1", "exit 0")),
             "ancestry-only rejection goes green": lambda w: [
-                job["steps"][1].__setitem__(
-                    "run", job["steps"][1]["run"].replace(
+                job["steps"][2 if job is w["jobs"]["deploy"] else 1].__setitem__(
+                    "run", job["steps"][2 if job is w["jobs"]["deploy"] else 1]["run"].replace(
                         'git merge-base --is-ancestor "$SOURCE_SHA" origin/main || '
                         '{ echo "::error::$SOURCE_SHA is not an ancestor of origin/main" >&2; exit 1; }',
                         'git merge-base --is-ancestor "$SOURCE_SHA" origin/main || '
                         '{ echo "::error::$SOURCE_SHA is not an ancestor of origin/main" >&2; exit 0; }'))
                 for job in (w["jobs"]["schema-gate"], w["jobs"]["roles-gate"], w["jobs"]["deploy"])],
-            "hex enforcement dropped": lambda w: w["jobs"]["deploy"]["steps"][1]
+            "hex enforcement dropped": lambda w: w["jobs"]["deploy"]["steps"][2]
                 .__setitem__("run", "\n".join(line for line in
-                                             w["jobs"]["deploy"]["steps"][1]["run"].splitlines()
+                                             w["jobs"]["deploy"]["steps"][2]["run"].splitlines()
                                              if "${#SOURCE_SHA}" not in line)),
             "shape check after equality": swap_shape_after_equality,
-            "second sha reader": lambda w: w["jobs"]["deploy"]["steps"][2]
+            "second sha reader": lambda w: w["jobs"]["deploy"]["steps"][3]
                 .setdefault("env", {}).__setitem__("EXTRA_SHA", DEPLOY_SHA_EXPRESSION),
             "sha input removed": lambda w: w["on"]["workflow_dispatch"]["inputs"].pop("sha"),
             "sha input boolean": lambda w: w["on"]["workflow_dispatch"]["inputs"]["sha"]
@@ -4725,6 +5632,48 @@ class WorkflowTests(unittest.TestCase):
                 workflows = deepcopy(self.workflows)
                 workflows["nightly.yml"]["jobs"]["pipeline-benchmark"]["uses"] = target
                 self.assertTrue(workflow_policy_errors(workflows))
+
+    def test_production_dispatch_safety_rules_are_pinned(self):
+        # 10-20 incidents: a manual deploy without takeover left production
+        # fenced (13:31Z), the rollback then refused for want of a human
+        # reviewer, and a forced drill degraded production (20:54Z).
+        production = self.workflows["deploy-production.yml"]
+        self.assertEqual(production_errors(production), [])
+        guard_step = production["jobs"]["guard"]["steps"][0]
+
+        def without(pin):
+            def change(w):
+                step = w["jobs"]["guard"]["steps"][0]
+                self.assertIn(pin, step["run"])
+                step["run"] = step["run"].replace(pin, "")
+            return change
+
+        mutations = {
+            "takeover defaults false": lambda w: w["on"]["workflow_dispatch"]["inputs"]["takeover"]
+                .__setitem__("default", False),
+            "cutover_hold removed": lambda w: w["on"]["workflow_dispatch"]["inputs"].pop("cutover_hold"),
+            "cutover_hold defaults true": lambda w: w["on"]["workflow_dispatch"]["inputs"]["cutover_hold"]
+                .__setitem__("default", True),
+            "cutover_hold not wired": lambda w: w["jobs"]["guard"]["steps"][0]["env"].pop("CUTOVER_HOLD"),
+            "deploy takeover default dropped":
+                without('takeover = "false" if cutover_hold == "true" else "true"'),
+            "production drill refusal dropped":
+                without('refuse("failure injection never runs against production'),
+            "snapshot path dropped":
+                without('snapshot_run = verified_rollback_snapshot() if not reviewers and mode == "rollback" else None'),
+            "snapshot pagination dropped":
+                without('collection(f"repos/{repo}/actions/artifacts"'),
+            "snapshot target binding dropped": without("target != (version, image, sha)"),
+            "snapshot provenance dropped": without('receipt.get("provenance_complete") is not True'),
+            "snapshot fork filter dropped":
+                without('origin.get("head_repository_id") != origin.get("repository_id")'),
+        }
+        self.assertIn("inputs.cutover_hold", str(guard_step))
+        for label, change in mutations.items():
+            with self.subTest(label):
+                workflow = deepcopy(production)
+                change(workflow)
+                self.assertTrue(production_errors(workflow), label)
 
     def test_production_route_is_automatic_or_dispatch_and_gated(self):
         production = self.workflows["deploy-production.yml"]
@@ -5391,6 +6340,78 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
 
+    def test_staging_retention_census_shape_is_pinned(self):
+        workflows = self.workflows
+        self.assertEqual(staging_retention_census_errors(workflows["staging-retention-census.yml"]), [])
+
+        def mutate(change):
+            copy = deepcopy(workflows["staging-retention-census.yml"])
+            change(copy)
+            return staging_retention_census_errors(copy)
+
+        def job(copy):
+            return copy["jobs"]["census"]
+
+        changes = {
+            "push trigger": lambda w: w["on"].update({"push": {"branches": ["main"]}}),
+            "schedule trigger": lambda w: w["on"].update({"schedule": [{"cron": "0 * * * *"}]}),
+            "dispatch input": lambda w: w["on"].update(
+                {"workflow_dispatch": {"inputs": {"mode": {"type": "string"}}}}),
+            "top-level permissions": lambda w: w.update({"permissions": {"contents": "read"}}),
+            "workflow-level secret": lambda w: w.update(
+                {"env": {"T": "${{ secrets.TWO_BOT_STAGING_PLAN_DATABASE_URL }}"}}),
+            "cancelling concurrency": lambda w: w["concurrency"].update({"cancel-in-progress": "true"}),
+            "shared concurrency group": lambda w: w["concurrency"].update({"group": "deploy-staging"}),
+            "second job": lambda w: w["jobs"].update({"again": deepcopy(job(w))}),
+            "wrong environment": lambda w: job(w).update({"environment": "staging"}),
+            "production environment": lambda w: job(w).update({"environment": "production"}),
+            "no environment": lambda w: job(w).pop("environment"),
+            "branch condition removed": lambda w: job(w).pop("if"),
+            "any branch": lambda w: job(w).update({"if": "github.ref != ''"}),
+            "write grant": lambda w: job(w).update({"permissions": {"contents": "write"}}),
+            "shorter timeout": lambda w: job(w).update({"timeout-minutes": "5"}),
+            "longer timeout": lambda w: job(w).update({"timeout-minutes": "60"}),
+            "unrouted runner": lambda w: job(w).update({"runs-on": "ubuntu-latest"}),
+            "other job's routing": lambda w: job(w).update(
+                {"runs-on": ROUTED_RUNNER.format(job="check")}),
+            "job-level secret": lambda w: job(w).update(
+                {"env": {"T": "${{ secrets.TWO_BOT_STAGING_PLAN_DATABASE_URL }}"}}),
+            "container": lambda w: job(w).update({"container": {"image": "postgres"}}),
+            "step condition": lambda w: job(w)["steps"][1].update({"if": "always()"}),
+            "continue on error": lambda w: job(w)["steps"][1].update({"continue-on-error": "true"}),
+            "artifact upload": lambda w: job(w)["steps"].append(
+                {"uses": "actions/upload-artifact@pinned"}),
+            "persisted credentials": lambda w: job(w)["steps"][0]["with"].update(
+                {"persist-credentials": "true"}),
+            "extra secret": lambda w: job(w)["steps"][1]["env"].update(
+                {"X": "${{ secrets.TWO_BOT_STAGING_MIGRATOR_DATABASE_URL }}"}),
+            "dropped login secret": lambda w: job(w)["steps"][1]["env"].pop(
+                "TWO_BOT_STAGING_PLAN_DATABASE_URL"),
+            "dropped host pin": lambda w: job(w)["steps"][1]["env"].pop(
+                "TWO_BOT_STAGING_HOST"),
+            "blanket secrets": lambda w: job(w)["steps"][1]["env"].update({"ALL": "${{ toJSON(secrets) }}"}),
+            "pin as input": lambda w: job(w)["steps"][1]["env"].update(
+                {"TWO_BOT_STAGING_HOST": "${{ inputs.host }}"}),
+            "inline expression": lambda w: job(w)["steps"][1].update(
+                {"run": "set -o pipefail\npython3 scripts/staging_retention_census.py ${{ vars.X }}\n"}),
+            "missing pipefail": lambda w: job(w)["steps"][1].update(
+                {"run": "python3 scripts/staging_retention_census.py\n"}),
+            "missing shell": lambda w: job(w)["steps"][1].pop("shell"),
+            "shell trace": lambda w: job(w)["steps"][1].update({"run": "set -x\n" + CENSUS_COMMAND}),
+            "other script": lambda w: job(w)["steps"][1].update(
+                {"run": CENSUS_COMMAND.replace("staging_retention_census", "other")}),
+            "wrangler action": lambda w: job(w)["steps"].insert(
+                1, {"uses": "cloudflare/wrangler-action@pinned"}),
+        }
+        for label, change in changes.items():
+            with self.subTest(change=label):
+                self.assertTrue(mutate(change))
+        # The inventory pin fails closed if the workflow disappears or gains a job.
+        missing = deepcopy(workflows)
+        del missing["staging-retention-census.yml"]
+        self.assertTrue(workflow_policy_errors(missing))
+        self.assertEqual(workflow_policy_errors(workflows), [])
+
     def test_staging_ownership_status_shape_is_pinned(self):
         workflows = self.workflows
         self.assertEqual(staging_ownership_status_errors(workflows["staging-ownership-status.yml"]), [])
@@ -5496,6 +6517,16 @@ class WorkflowTests(unittest.TestCase):
             "pull_request_target trigger": lambda w: w["on"].update({"pull_request_target": None}),
             "workflow_run trigger": lambda w: w["on"].update({"workflow_run": {"workflows": ["check"]}}),
             "workflow-level secret": lambda w: w.update({"env": {"T": bearer}}),
+            "workflow-level shell default": lambda w: w.update(
+                {"defaults": {"run": {"shell": "echo {0}"}}}),
+            "live job shell default": lambda w: live_job(w).update(
+                {"defaults": {"run": {"shell": "echo {0}"}}}),
+            "fixture job shell default": lambda w: fixture_job(w).update(
+                {"defaults": {"run": {"shell": "echo {0}"}}}),
+            "live run step shell override": lambda w: live_job(w)["steps"][3].update(
+                {"shell": "echo {0}"}),
+            "fixture run step shell override": lambda w: fixture_job(w)["steps"][2].update(
+                {"shell": "echo {0}"}),
             "third job": lambda w: w["jobs"].update({"again": deepcopy(live_job(w))}),
             "fixture job dropped": lambda w: w["jobs"].pop("fixture"),
             # Live job: exactly the existing staging bearer, from main only.
@@ -5594,6 +6625,120 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
 
+    def test_synthetic_missing_binding_notices_cannot_hide_failure(self):
+        mutations = {
+            "dead branch": lambda run: run.replace(
+                "exit 1", "if false; then\nexit 1\nfi"),
+            "early success": lambda run: run.replace("exit 1", "exit 0\nexit 1"),
+            "uncalled function": lambda run: run.replace(
+                "exit 1", "unused() {\nexit 1\n}"),
+            "heredoc": lambda run: run.replace(
+                "exit 1", "cat <<'EOF'\nexit 1\nEOF"),
+        }
+        for job_id in ("staging", "prod-passive"):
+            original = self.workflows["synthetic-user-flow.yml"]["jobs"][job_id]["steps"][2]
+            baseline = subprocess.run(
+                ["bash", "--noprofile", "--norc", "-c", original["run"]],
+                env={"PATH": os.defpath}, capture_output=True, text=True, timeout=5)
+            self.assertEqual(baseline.returncode, 1)
+            self.assertIn("::error::", baseline.stdout)
+            for label, transform in mutations.items():
+                with self.subTest(job=job_id, mutation=label):
+                    changed = deepcopy(self.workflows)
+                    notice = changed["synthetic-user-flow.yml"]["jobs"][job_id]["steps"][2]
+                    notice["run"] = transform(notice["run"])
+                    result = subprocess.run(
+                        ["bash", "--noprofile", "--norc", "-c", notice["run"]],
+                        env={"PATH": os.defpath}, capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, 0)
+                    self.assertTrue(scheduled_binding_audit_errors(changed), label)
+                    self.assertTrue(synthetic_user_flow_errors(changed["synthetic-user-flow.yml"]), label)
+                    self.assertTrue(workflow_policy_errors(changed), label)
+            for scope in ("step", "job", "workflow"):
+                with self.subTest(job=job_id, mutation="shell override", scope=scope):
+                    changed = deepcopy(self.workflows)
+                    workflow = changed["synthetic-user-flow.yml"]
+                    job = workflow["jobs"][job_id]
+                    if scope == "step":
+                        job["steps"][2]["shell"] = "echo {0}"
+                    else:
+                        holder = job if scope == "job" else workflow
+                        holder["defaults"] = {"run": {"shell": "echo {0}"}}
+                    self.assertTrue(scheduled_binding_audit_errors(changed))
+                    self.assertTrue(synthetic_user_flow_errors(workflow))
+                    self.assertTrue(workflow_policy_errors(changed))
+
+    def test_five_minute_schedulers_fail_closed_on_missing_bindings(self):
+        workflows = self.workflows
+        self.assertEqual(scheduled_binding_audit_errors(workflows), [])
+
+        def tracker_run_step(copy):
+            steps = copy["slow-burn-tracker.yml"]["jobs"]["tracker"]["steps"]
+            return next(step for step in steps
+                        if "slow_burn_tracker.py" in step.get("run", ""))
+
+        def tracker_env(copy):
+            return tracker_run_step(copy)["env"]
+
+        def notice_step(copy, job_id):
+            steps = copy["synthetic-user-flow.yml"]["jobs"][job_id]["steps"]
+            return next(step for step in steps
+                        if str(step.get("name", "")).startswith("Fail closed when the "))
+
+        def notice_run(copy, job_id, transform):
+            notice_step(copy, job_id)["run"] = transform(notice_step(copy, job_id)["run"])
+
+        mutations = {
+            "slow-burn schedule coarsened": lambda w: w["slow-burn-tracker.yml"]["on"][
+                "schedule"].__setitem__(0, {"cron": "*/6 * * * *"}),
+            "nightly gains a five-minute schedule": lambda w: w["nightly.yml"]["on"][
+                "schedule"].__setitem__(0, {"cron": "*/5 * * * *"}),
+            "tracker drops the bearer handoff": lambda w: tracker_env(w).pop(
+                "METRICS_SCRAPE_TOKEN"),
+            "tracker drops the url handoff": lambda w: tracker_env(w).pop(
+                "STAGING_WORKER_URL"),
+            "tracker run step gated": lambda w: tracker_run_step(w).__setitem__(
+                "if", "false"),
+            "tracker run tolerates failure": lambda w: tracker_run_step(w).__setitem__(
+                "continue-on-error", True),
+            "tracker run step shell override": lambda w: tracker_run_step(w).__setitem__(
+                "shell", "echo {0}"),
+            "tracker job shell default": lambda w: w["slow-burn-tracker.yml"]["jobs"][
+                "tracker"].__setitem__("defaults", {"run": {"shell": "echo {0}"}}),
+            "slow-burn workflow shell default": lambda w: w["slow-burn-tracker.yml"].__setitem__(
+                "defaults", {"run": {"shell": "echo {0}"}}),
+            "staging notice gated off": lambda w: notice_step(w, "staging").__setitem__(
+                "if", "false"),
+            "staging notice tolerates failure": lambda w: notice_step(w, "staging").__setitem__(
+                "continue-on-error", True),
+            "staging notice neutralizes its exit": lambda w: notice_run(
+                w, "staging", lambda run: run.replace("exit 1", "exit 1 || true")),
+            "staging notice warns": lambda w: notice_run(
+                w, "staging", lambda run: run.replace("::error::", "::warning::")),
+            "staging notice loses its exit": lambda w: notice_run(
+                w, "staging", lambda run: run.replace("exit 1", "exit 0")),
+            "staging notice drops the binding name": lambda w: notice_run(
+                w, "staging", lambda run: run.replace("STAGING_WORKER_URL", "the target var")),
+            "staging notice renamed": lambda w: notice_step(w, "staging").update(
+                {"name": "Note"}),
+            "prod notice warns": lambda w: notice_run(
+                w, "prod-passive", lambda run: run.replace("::error::", "::warning::")),
+            "prod notice loses its exit": lambda w: notice_run(
+                w, "prod-passive", lambda run: run.replace("exit 1", "exit 0")),
+            "prod notice gated off": lambda w: notice_step(w, "prod-passive").__setitem__(
+                "if", "false"),
+            "prod notice tolerates failure": lambda w: notice_step(w, "prod-passive").__setitem__(
+                "continue-on-error", True),
+            "prod notice neutralizes its exit": lambda w: notice_run(
+                w, "prod-passive", lambda run: run.replace("exit 1", "exit 1 || true")),
+        }
+        for label, change in mutations.items():
+            with self.subTest(change=label):
+                changed = deepcopy(workflows)
+                change(changed)
+                self.assertTrue(scheduled_binding_audit_errors(changed), label)
+                self.assertTrue(workflow_policy_errors(changed), label)
+
     def test_gradual_promote_proof_shape_is_pinned(self):
         workflows = self.workflows
         self.assertEqual(gradual_promote_proof_errors(workflows["gradual-promote-proof.yml"]), [])
@@ -5667,7 +6812,7 @@ class WorkflowTests(unittest.TestCase):
         }
         installers = {job: steps for job, steps in installers.items() if steps}
         self.assertEqual(set(installers), {
-            "check", "rust-tests", "ignored-db-stores", "ignored-db-runtime",
+            "check", "rust-tests", "patch-coverage", "ignored-db-stores", "ignored-db-runtime",
             "moderation-db", "self-role-store", "community-db", "tickets-postgres", "feeds-db",
             "fuzz-compile",
         })
@@ -6361,6 +7506,14 @@ class WorkflowTests(unittest.TestCase):
                         # Read-only fetch of the producing plan
                         # run's manifest artifact for the provenance gate.
                         expected = {"contents": "read", "actions": "read"}
+                    elif (name, job_id) == ("deploy-staging.yml", "deploy"):
+                        # Derives the deploy ID from today's staging
+                        # Deployments, then records this one.
+                        expected = {"contents": "read", "deployments": "write"}
+                    elif (name, job_id) == ("deploy-production.yml", "production"):
+                        # Derives the deploy ID from today's production
+                        # Deployments, then records this one.
+                        expected = {"contents": "read", "deployments": "write"}
                     elif (name, job_id) == ("deploy-production.yml", "guard"):
                         expected = {"contents": "read", "actions": "read", "checks": "read"}
                     elif (name, job_id) == ("deploy-production.yml", "recheck"):
@@ -6396,6 +7549,70 @@ class WorkflowTests(unittest.TestCase):
                     for step in job.get("steps", []):
                         if step.get("uses", "").startswith("actions/checkout@"):
                             self.assertEqual(step["with"]["persist-credentials"], "false")
+
+    def test_every_job_declares_a_timeout(self):
+        # Direct jobs state a ceiling instead of burning the six-hour default.
+        # Reusable callers cannot declare timeout-minutes: execution ceilings
+        # belong to the callee jobs. Local callees are also in self.workflows;
+        # pinned organization callees own their ceilings in their source repo.
+        # Numeric ceilings stay at or below 360; expressions (the push-dependent
+        # lanes) only need to be present and non-blank.
+        for name, workflow in self.workflows.items():
+            for job_id, job in workflow["jobs"].items():
+                with self.subTest(workflow=name, job=job_id):
+                    if "uses" in job:
+                        self.assertNotIn("timeout-minutes", job)
+                        continue
+                    self.assertIn("timeout-minutes", job)
+                    ceiling = job["timeout-minutes"]
+                    self.assertIsNotNone(ceiling)
+                    self.assertTrue(str(ceiling).strip())
+                    if re.fullmatch(r"\d+", str(ceiling)):
+                        self.assertGreaterEqual(int(ceiling), 1)
+                        self.assertLessEqual(int(ceiling), 360)
+
+    def test_own_trigger_workflows_serialize_at_the_top_level(self):
+        # A workflow with its own triggers (anything beyond a pure
+        # `workflow_call` callee) declares top-level `concurrency`, so two
+        # dispatches or pushes cannot race each other on the shared runners.
+        # Pure callees are serialized by their callers instead; the two
+        # deploy-side workflows below serialize at the lane jobs on purpose
+        # (a top-level group would queue work that must stay unqueued).
+        exempt = {
+            # Pure `workflow_call` callees: the caller holds the group.
+            "sbom.yml",
+            "reusable-rust-nextest.yml",
+            # Serializes at the `tag` job (`release` group) so the
+            # read-only dry-run/repair paths stay unserialized.
+            "release.yml",
+            # Serializes at the `production`/`release` lane jobs only, so a
+            # sleeping promotion can never queue an operator rollback
+            # behind it (see the header comment in the workflow).
+            "deploy-production.yml",
+        }
+        for name, workflow in self.workflows.items():
+            on = workflow.get("on") or {}
+            triggers = {on} if isinstance(on, str) else set(on)
+            if name in ("sbom.yml", "reusable-rust-nextest.yml"):
+                # Gaining an own trigger forces a concurrency decision here.
+                self.assertEqual(triggers, {"workflow_call"}, name)
+            if name == "release.yml":
+                self.assertEqual(
+                    workflow["jobs"]["tag"].get("concurrency", {}).get("group"),
+                    "release", name)
+            if name == "deploy-production.yml":
+                for job_id in ("production", "release"):
+                    self.assertEqual(
+                        workflow["jobs"][job_id].get("concurrency", {}).get("group"),
+                        "deploy-production", f"{name}:{job_id}")
+            if name in exempt:
+                continue
+            with self.subTest(workflow=name):
+                concurrency = workflow.get("concurrency")
+                self.assertIsInstance(concurrency, dict)
+                group = concurrency.get("group")
+                self.assertIsNotNone(group)
+                self.assertTrue(str(group).strip())
 
 
 if __name__ == "__main__":

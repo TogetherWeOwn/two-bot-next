@@ -1,8 +1,9 @@
 //! Explicit opt-in, isolated-schema integration test. No inherited DATABASE_URL
 //! or credentials: only the agent-testdb container is allowed here.
 
+use std::future::Future;
 use std::sync::{
-    atomic::{AtomicI64, Ordering},
+    atomic::{AtomicI64, AtomicU64, Ordering},
     Arc,
 };
 use std::time::Duration;
@@ -68,6 +69,67 @@ fn panel_key(audit: &SelfRoleAudit) -> PanelKey {
 #[tokio::test]
 #[ignore = "requires agent-testdb; run explicitly with --ignored"]
 async fn leases_recovery_ordering_and_atomic_settlement() -> TestResult {
+    with_isolated_schema(|pool| async move { exercise(&pool).await }).await
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb; run explicitly with --ignored"]
+async fn acknowledgement_oversized_row_refused_at_journal() -> TestResult {
+    with_isolated_schema(|pool| async move { exercise_acknowledgement_row_bound(&pool).await })
+        .await
+}
+
+static SCHEMA_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn schema_name_at(pid: u32, timestamp: Duration) -> String {
+    let nonce = timestamp.as_nanos();
+    let sequence = SCHEMA_SEQ.fetch_add(1, Ordering::Relaxed);
+    // At most 61 bytes: prefix 11 + PID 8 + separators 2 + nanos 24 + sequence 16.
+    // Keep the sequence inside PostgreSQL's 63-byte identifier limit.
+    format!("self_roles_{pid:x}_{nonce:x}_{sequence:016x}")
+}
+
+#[test]
+fn schema_names_are_distinct_and_bounded_when_the_clock_repeats() {
+    let barrier = std::sync::Barrier::new(8);
+    let names = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    (0..32)
+                        .map(|_| schema_name_at(u32::MAX, Duration::MAX))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().expect("schema allocation worker"))
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(names.len(), 256);
+    assert_eq!(
+        names.iter().collect::<std::collections::HashSet<_>>().len(),
+        names.len(),
+        "concurrent fixtures must not share a schema when PID and timestamp repeat"
+    );
+    for name in names {
+        assert!(name.len() <= 63, "Postgres must not truncate {name}");
+        assert!(name.starts_with("self_roles_"));
+        assert!(name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'));
+    }
+}
+
+/// One generated schema per scenario, dropped after the scenario runs.
+async fn with_isolated_schema<F, Fut>(scenario: F) -> TestResult
+where
+    F: FnOnce(PgPool) -> Fut,
+    Fut: Future<Output = TestResult>,
+{
     let options = PgConnectOptions::new()
         .host("agent-testdb")
         .port(5432)
@@ -78,13 +140,11 @@ async fn leases_recovery_ordering_and_atomic_settlement() -> TestResult {
         .max_connections(1)
         .connect_with(options.clone())
         .await?;
-    // Generated identifier contains digits/underscore only. Each run gets its
-    // own namespace, and cleanup never touches another test's tables.
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_nanos();
-    let schema = format!("self_roles_{}_{}", std::process::id(), nonce);
-    // Audited: identifier is a fixed prefix plus numeric PID and timestamp.
+    // Generated identifier contains lowercase ASCII/digits/underscores only.
+    // Each scenario owns its namespace; cleanup uses that exact same identifier.
+    let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    let schema = schema_name_at(std::process::id(), timestamp);
+    // Audited: bounded identifier is a fixed prefix plus hex PID, time and sequence.
     // https://docs.rs/sqlx/0.9.0/sqlx/struct.AssertSqlSafe.html
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
         .execute(&admin)
@@ -104,13 +164,83 @@ async fn leases_recovery_ordering_and_atomic_settlement() -> TestResult {
         })
         .connect_with(options)
         .await?;
-    let result = exercise(&pool).await;
+    let result = scenario(pool.clone()).await;
     pool.close().await;
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&admin)
         .await?;
     admin.close().await;
     result
+}
+
+/// Journal-level pin for the 512 B acknowledgement row bound. The pure helper
+/// is pinned by offline tests, but only this test journals an oversized row
+/// through `journal_role_exchange`, so the estimate fed into the cap check
+/// cannot regress (for example to zero) without a red suite.
+async fn exercise_acknowledgement_row_bound(pool: &PgPool) -> TestResult {
+    sqlx::raw_sql(include_str!("../migrations/0200_self_roles.sql"))
+        .execute(pool)
+        .await?;
+    sqlx::raw_sql(include_str!(
+        "../migrations/0201_self_role_intent_initialization.sql"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../migrations/0202_self_role_compensation_phase.sql"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../migrations/0203_self_role_pending_exchange.sql"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../migrations/0204_self_role_terminal_repair.sql"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../migrations/0205_self_role_exchange_receipts.sql"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../migrations/0206_self_role_exchange_baselines.sql"
+    ))
+    .execute(pool)
+    .await?;
+    let store = SelfRoleStore::new(pool.clone());
+    // 160 B fixed + 400 B event id + 3 B role id = 563 B, over the bound.
+    let event_id = "e".repeat(400);
+    let audit = row(&event_id, &event_id);
+    let claim = store
+        .claim_audit(&audit)
+        .await?
+        .expect("fresh audit must claim");
+    let intent = ExchangeIntent {
+        role_id: "101".into(),
+        adding: true,
+        compensating: false,
+    };
+    let result = store.journal_role_exchange(&claim, None, &intent).await;
+    assert!(
+        result.is_err(),
+        "oversized row must be refused, got {result:?}"
+    );
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("row") && msg.contains("512"),
+        "refusal must name the row bound: {msg}"
+    );
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM self_role_exchanges WHERE event_id=$1")
+            .bind(&event_id)
+            .fetch_one(pool)
+            .await?;
+    assert_eq!(count, 0, "a refused attempt must never partially write");
+    Ok(())
 }
 
 async fn exchange_owner_state(pool: &PgPool, event: &str) -> TestResult<(String, Option<String>)> {
@@ -2645,6 +2775,471 @@ async fn exercise_atomic_finish_wait(pool: &PgPool) -> TestResult {
     assert_eq!(
         stored_effects(pool, &audit.event_id).await?,
         AuditEffects::default()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb; run explicitly with --ignored"]
+async fn settlement_writers_degrade_ahead_of_acknowledgement_migration() -> TestResult {
+    with_isolated_schema(|pool| async move { exercise_settlement_legacy_fallback(&pool).await })
+        .await
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb; run explicitly with --ignored"]
+async fn settlement_link_guards_refuse_self_and_cross_event_links() -> TestResult {
+    with_isolated_schema(|pool| async move { exercise_settlement_link_guards(&pool).await }).await
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb; run explicitly with --ignored"]
+async fn settlement_negative_expiry_bound_settles_nothing() -> TestResult {
+    with_isolated_schema(|pool| async move { exercise_settlement_negative_expiry(&pool).await })
+        .await
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb; run explicitly with --ignored"]
+async fn settlement_settled_rows_reject_further_writes() -> TestResult {
+    with_isolated_schema(|pool| async move { exercise_settlement_row_guards(&pool).await }).await
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb; run explicitly with --ignored"]
+async fn settlement_note_then_complete_sequences() -> TestResult {
+    with_isolated_schema(|pool| async move { exercise_settlement_note_then_complete(&pool).await })
+        .await
+}
+
+/// Base self-role schema plus the acknowledgement columns, for settlement
+/// scenarios that run against the migrated shape.
+async fn apply_settlement_schema(pool: &PgPool) -> TestResult {
+    for migration in [
+        include_str!("../migrations/0200_self_roles.sql"),
+        include_str!("../migrations/0201_self_role_intent_initialization.sql"),
+        include_str!("../migrations/0202_self_role_compensation_phase.sql"),
+        include_str!("../migrations/0203_self_role_pending_exchange.sql"),
+        include_str!("../migrations/0204_self_role_terminal_repair.sql"),
+        include_str!("../migrations/0205_self_role_exchange_receipts.sql"),
+        include_str!("../migrations/0206_self_role_exchange_baselines.sql"),
+        include_str!("../migrations/0449_self_role_ticket_acknowledgement.sql"),
+    ] {
+        sqlx::raw_sql(migration).execute(pool).await?;
+    }
+    Ok(())
+}
+
+/// A negative expiry bound settles nothing: without the guard the negated
+/// interval would match every in-flight ticket across all events.
+async fn exercise_settlement_negative_expiry(pool: &PgPool) -> TestResult {
+    apply_settlement_schema(pool).await?;
+    let store = SelfRoleStore::new(pool.clone());
+    let claim = store
+        .claim_audit(&row("negative-expiry", "negative-expiry"))
+        .await?
+        .expect("fresh audit must claim");
+    let intent = ExchangeIntent {
+        role_id: "101".into(),
+        adding: true,
+        compensating: false,
+    };
+    store
+        .journal_role_exchange(&claim, None, &intent)
+        .await?
+        .expect("ticket must journal");
+    assert_eq!(
+        store
+            .expire_stale_exchanges(time::Duration::seconds(-1))
+            .await?,
+        0,
+        "a negative bound must settle nothing"
+    );
+    let (settled_as, settled): (Option<String>, bool) = sqlx::query_as(
+        "SELECT settled_as, settled_at IS NOT NULL FROM self_role_exchanges \
+         WHERE event_id = 'negative-expiry'",
+    )
+    .fetch_one(pool)
+    .await?;
+    assert!(
+        settled_as.is_none(),
+        "negative expiry must not settle the row"
+    );
+    assert!(!settled, "negative expiry must not stamp the row");
+    Ok(())
+}
+
+/// Settled rows reject further settlement writes, and retirement preserves
+/// the earlier decision: notes and bumps refuse pending-but-settled rows, a
+/// second supersede refuses, and retiring a superseded ambiguous completion
+/// keeps `superseded_settled`.
+async fn exercise_settlement_row_guards(pool: &PgPool) -> TestResult {
+    apply_settlement_schema(pool).await?;
+    let store = SelfRoleStore::new(pool.clone());
+    let intent = ExchangeIntent {
+        role_id: "101".into(),
+        adding: true,
+        compensating: false,
+    };
+    // Expire a stale pending ticket, then refuse notes and bumps on it.
+    let expired_claim = store
+        .claim_audit(&row("settled-guards-expired", "settled-guards-expired"))
+        .await?
+        .expect("fresh audit must claim");
+    let expired = store
+        .journal_role_exchange(&expired_claim, None, &intent)
+        .await?
+        .expect("ticket must journal");
+    sqlx::query(
+        "UPDATE self_role_exchanges SET created_at = clock_timestamp() - make_interval(hours => 2) \
+         WHERE event_id = 'settled-guards-expired'",
+    )
+    .execute(pool)
+    .await?;
+    assert_eq!(
+        store
+            .expire_stale_exchanges(time::Duration::hours(1))
+            .await?,
+        1,
+        "the stale ticket must expire"
+    );
+    assert!(
+        !store.note_wire_retry(&expired).await?,
+        "settled pending rows never bump"
+    );
+    assert!(
+        !store
+            .note_ambiguous_outcome(&expired, "timeout_no_response")
+            .await?,
+        "settled pending rows never take timeout notes"
+    );
+    // A second supersede of the same row refuses.
+    let supersede_claim = store
+        .claim_audit(&row("settled-guards-supersede", "settled-guards-supersede"))
+        .await?
+        .expect("fresh audit must claim");
+    let first = store
+        .journal_role_exchange(&supersede_claim, None, &intent)
+        .await?
+        .expect("first ticket must journal");
+    let second = store
+        .journal_role_exchange(&supersede_claim, None, &intent)
+        .await?
+        .expect("second ticket must journal");
+    let third = store
+        .journal_role_exchange(&supersede_claim, None, &intent)
+        .await?
+        .expect("third ticket must journal");
+    assert!(
+        store.supersede_role_exchange(&first, &second).await?,
+        "the first supersede must link"
+    );
+    assert!(
+        !store.supersede_role_exchange(&first, &third).await?,
+        "an already-settled row must not re-supersede"
+    );
+    // Retiring a superseded ambiguous completion keeps its decision.
+    let retire_claim = store
+        .claim_audit(&row("settled-guards-retire", "settled-guards-retire"))
+        .await?
+        .expect("fresh audit must claim");
+    let ambiguous = store
+        .journal_role_exchange(&retire_claim, None, &intent)
+        .await?
+        .expect("ambiguous ticket must journal");
+    assert!(
+        store
+            .complete_role_exchange(&ambiguous, ExchangeReceipt::Response { status: 500 })
+            .await?,
+        "ambiguous completion must apply"
+    );
+    let replacement = store
+        .journal_role_exchange(&retire_claim, None, &intent)
+        .await?
+        .expect("replacement must journal");
+    assert!(
+        store
+            .supersede_role_exchange(&ambiguous, &replacement)
+            .await?,
+        "a completed ambiguous row must supersede"
+    );
+    store
+        .retire_role_receipts(&retire_claim, None)
+        .await?
+        .expect("live owner must retire");
+    let (settled_as,): (Option<String>,) = sqlx::query_as(
+        "SELECT settled_as FROM self_role_exchanges \
+         WHERE event_id = 'settled-guards-retire' AND disposition = 'response'",
+    )
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(
+        settled_as.as_deref(),
+        Some("superseded_settled"),
+        "retirement must preserve the supersede decision"
+    );
+    Ok(())
+}
+
+/// A definite receipt clears an earlier timeout note on the same ticket,
+/// while a later ambiguous receipt replaces the class: completion always
+/// overwrites `outcome_class`.
+async fn exercise_settlement_note_then_complete(pool: &PgPool) -> TestResult {
+    apply_settlement_schema(pool).await?;
+    let store = SelfRoleStore::new(pool.clone());
+    let intent = ExchangeIntent {
+        role_id: "101".into(),
+        adding: true,
+        compensating: false,
+    };
+    let cleared_claim = store
+        .claim_audit(&row(
+            "note-then-complete-cleared",
+            "note-then-complete-cleared",
+        ))
+        .await?
+        .expect("fresh audit must claim");
+    let cleared = store
+        .journal_role_exchange(&cleared_claim, None, &intent)
+        .await?
+        .expect("ticket must journal");
+    assert!(
+        store
+            .note_ambiguous_outcome(&cleared, "timeout_no_response")
+            .await?,
+        "the timeout note must land"
+    );
+    assert!(
+        store
+            .complete_role_exchange(&cleared, ExchangeReceipt::Response { status: 204 })
+            .await?,
+        "definite completion must apply after the note"
+    );
+    let (class,): (Option<String>,) = sqlx::query_as(
+        "SELECT outcome_class FROM self_role_exchanges \
+         WHERE event_id = 'note-then-complete-cleared'",
+    )
+    .fetch_one(pool)
+    .await?;
+    assert!(
+        class.is_none(),
+        "a definite receipt must clear the timeout note"
+    );
+    let replaced_claim = store
+        .claim_audit(&row(
+            "note-then-complete-replaced",
+            "note-then-complete-replaced",
+        ))
+        .await?
+        .expect("fresh audit must claim");
+    let replaced = store
+        .journal_role_exchange(&replaced_claim, None, &intent)
+        .await?
+        .expect("ticket must journal");
+    assert!(
+        store
+            .note_ambiguous_outcome(&replaced, "timeout_no_response")
+            .await?,
+        "the timeout note must land"
+    );
+    assert!(
+        store
+            .complete_role_exchange(&replaced, ExchangeReceipt::Response { status: 500 })
+            .await?,
+        "ambiguous completion must apply after the note"
+    );
+    let (class,): (Option<String>,) = sqlx::query_as(
+        "SELECT outcome_class FROM self_role_exchanges \
+         WHERE event_id = 'note-then-complete-replaced'",
+    )
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(
+        class.as_deref(),
+        Some("response_ambiguous"),
+        "an ambiguous receipt must replace the timeout note"
+    );
+    Ok(())
+}
+
+/// Ahead of migration 0449 the build must behave exactly as before: receipts
+/// still land and retirement still works, while settlement writes degrade to
+/// "wrote nothing" instead of failing. Bad input still fails closed even
+/// without the columns.
+async fn exercise_settlement_legacy_fallback(pool: &PgPool) -> TestResult {
+    for migration in [
+        include_str!("../migrations/0200_self_roles.sql"),
+        include_str!("../migrations/0201_self_role_intent_initialization.sql"),
+        include_str!("../migrations/0202_self_role_compensation_phase.sql"),
+        include_str!("../migrations/0203_self_role_pending_exchange.sql"),
+        include_str!("../migrations/0204_self_role_terminal_repair.sql"),
+        include_str!("../migrations/0205_self_role_exchange_receipts.sql"),
+        include_str!("../migrations/0206_self_role_exchange_baselines.sql"),
+    ] {
+        sqlx::raw_sql(migration).execute(pool).await?;
+    }
+    let store = SelfRoleStore::new(pool.clone());
+    let audit = row("legacy-fallback", "legacy-fallback");
+    let claim = store
+        .claim_audit(&audit)
+        .await?
+        .expect("fresh audit must claim");
+    let intent = ExchangeIntent {
+        role_id: "101".into(),
+        adding: true,
+        compensating: false,
+    };
+    let ticket = store
+        .journal_role_exchange(&claim, None, &intent)
+        .await?
+        .expect("journal must succeed");
+    // The ambiguous receipt lands through the legacy statement.
+    assert!(
+        store
+            .complete_role_exchange(&ticket, ExchangeReceipt::Response { status: 500 })
+            .await?,
+        "ambiguous completion must still apply ahead of the migration"
+    );
+    let (disposition, status): (String, Option<i16>) = sqlx::query_as(
+        "SELECT disposition, response_status FROM self_role_exchanges \
+         WHERE event_id = 'legacy-fallback'",
+    )
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(disposition, "response");
+    assert_eq!(status, Some(500));
+    // Settlement writes degrade to "wrote nothing".
+    assert!(
+        !store.note_wire_retry(&ticket).await?,
+        "retry bump must degrade ahead of the migration"
+    );
+    assert!(
+        !store
+            .note_ambiguous_outcome(&ticket, "timeout_no_response")
+            .await?,
+        "timeout note must degrade ahead of the migration"
+    );
+    assert!(
+        store
+            .note_ambiguous_outcome(&ticket, "bogus")
+            .await
+            .is_err(),
+        "unknown classes fail closed even without the columns"
+    );
+    let replacement = store
+        .journal_role_exchange(&claim, None, &intent)
+        .await?
+        .expect("replacement must journal");
+    assert!(
+        !store.supersede_role_exchange(&ticket, &replacement).await?,
+        "supersede must degrade ahead of the migration"
+    );
+    assert_eq!(
+        store
+            .expire_stale_exchanges(time::Duration::hours(1))
+            .await?,
+        0,
+        "expiry settles nothing ahead of the migration"
+    );
+    let (pending_id,): (String,) = sqlx::query_as(
+        "SELECT exchange_id FROM self_role_exchanges WHERE event_id = 'legacy-fallback' \
+         AND disposition = 'pending'",
+    )
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(
+        SelfRoleStore::pending_retry_candidates(pool, "legacy-fallback").await?,
+        vec![pending_id],
+        "unfiltered pending fallback must keep listing the pending ticket"
+    );
+    // Retirement keeps working through the legacy statement.
+    store
+        .retire_role_receipts(&claim, None)
+        .await?
+        .expect("live owner must retire");
+    let (retired,): (bool,) = sqlx::query_as(
+        "SELECT retired_at IS NOT NULL FROM self_role_exchanges \
+         WHERE event_id = 'legacy-fallback' AND disposition = 'response'",
+    )
+    .fetch_one(pool)
+    .await?;
+    assert!(retired, "completed ticket must retire");
+    Ok(())
+}
+
+/// The explicit supersede link refuses nonsense (self-links, cross-event
+/// links) and settlement notes refuse completed rows, without over-refusing
+/// a genuine same-event replacement.
+async fn exercise_settlement_link_guards(pool: &PgPool) -> TestResult {
+    for migration in [
+        include_str!("../migrations/0200_self_roles.sql"),
+        include_str!("../migrations/0201_self_role_intent_initialization.sql"),
+        include_str!("../migrations/0202_self_role_compensation_phase.sql"),
+        include_str!("../migrations/0203_self_role_pending_exchange.sql"),
+        include_str!("../migrations/0204_self_role_terminal_repair.sql"),
+        include_str!("../migrations/0205_self_role_exchange_receipts.sql"),
+        include_str!("../migrations/0206_self_role_exchange_baselines.sql"),
+        include_str!("../migrations/0449_self_role_ticket_acknowledgement.sql"),
+    ] {
+        sqlx::raw_sql(migration).execute(pool).await?;
+    }
+    let store = SelfRoleStore::new(pool.clone());
+    let intent = ExchangeIntent {
+        role_id: "101".into(),
+        adding: true,
+        compensating: false,
+    };
+    let claim = store
+        .claim_audit(&row("link-guards", "link-guards"))
+        .await?
+        .expect("fresh audit must claim");
+    let first = store
+        .journal_role_exchange(&claim, None, &intent)
+        .await?
+        .expect("first ticket must journal");
+    let second = store
+        .journal_role_exchange(&claim, None, &intent)
+        .await?
+        .expect("second ticket must journal");
+    assert!(
+        !store.supersede_role_exchange(&first, &first).await?,
+        "a ticket must not supersede itself"
+    );
+    let other_claim = store
+        .claim_audit(&row("link-guards-other", "link-guards-other"))
+        .await?
+        .expect("other audit must claim");
+    let other = store
+        .journal_role_exchange(&other_claim, None, &intent)
+        .await?
+        .expect("other ticket must journal");
+    assert!(
+        !store.supersede_role_exchange(&first, &other).await?,
+        "a replacement must belong to the same event"
+    );
+    assert!(
+        store
+            .complete_role_exchange(&first, ExchangeReceipt::NoSend)
+            .await?,
+        "definite completion must still apply"
+    );
+    assert!(
+        !store.note_wire_retry(&first).await?,
+        "completed rows never bump"
+    );
+    assert!(
+        !store
+            .note_ambiguous_outcome(&first, "timeout_no_response")
+            .await?,
+        "completed rows never take timeout notes"
+    );
+    let third = store
+        .journal_role_exchange(&claim, None, &intent)
+        .await?
+        .expect("third ticket must journal");
+    assert!(
+        store.supersede_role_exchange(&second, &third).await?,
+        "a genuine same-event replacement must link"
     );
     Ok(())
 }

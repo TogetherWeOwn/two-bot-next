@@ -69,6 +69,10 @@
       "sha256": "d4f98434aa21dca034e64f3e0a766539450deaeb9fc4aff2fc1f7c7f48a11d6e",
       "justification": "Upgrade existing legacy scheduled queues to BIGINT and add claim/nonce columns for TOG-10081 without changing locked migration 0140 or row facts."
     },
+    "crates/cutover/migrations/0142_scheduled_delivery_uncertainty.sql": {
+      "sha256": "941f5ec8e504cf16a426bdbc5d59a2ab94b89abf726c00b9310de73089f55f67",
+      "justification": "Fence possibly accepted scheduled occurrences durably and conservatively preserve pending legacy sends."
+    },
     "crates/cutover/migrations/0150_sticky_messages.sql": {
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes.",
       "sha256": "17d867f772c9f37325c50be959d9f184958e1a632eb47a000ac9ec13b9c30f57"
@@ -441,6 +445,10 @@
       "sha256": "f5f5cdfc03f21d0a5329afc4924c92fc42a1aac97a25337dc48bf766542f4e39",
       "justification": "Per-guild template-assistant monthly-cap ledger (no member columns): one row per guild with month_key plus build_count and a nonnegativity check; cutover chain copy, IF NOT EXISTS. Numbered 0447 because the store chain owns 0446; global migration numbers remain unique across both chains."
     },
+    "crates/cutover/migrations/0449_self_role_ticket_acknowledgement.sql": {
+      "sha256": "0e39d7b88d4109475359640a38d066d8a2b31b168bc7f46a324bb4db3cb92c8c",
+      "justification": "Self-role ticket-row acknowledgement lifecycle: nullable settled_at/settled_as/superseded_by/outcome_class plus attempt_no defaulting to 1 on self_role_exchanges with closed-set checks, so ambiguous sends persist per send and pre-existing rows read back unsettled; additive IF NOT EXISTS, backout drops the five columns. Numbered 0449 because the cutover chain owns 0447/0448; global migration numbers remain unique across both chains."
+    },
     "crates/cutover/migrations/0450_scheduled_events_claim.sql": {
       "sha256": "0023e4e828e6efe2b8939fc2a364de4f265baaed72be4680d4d1ab6e6442d09e",
       "justification": "Per-guild epoch-claim gate for the scheduled-event mirror: new table scheduled_events_claim(guild_id PK, epoch TEXT); the swap claims observed_at before DELETE so strictly older fetches roll back instead of resurrecting deleted rows. Additive, IF NOT EXISTS; numbered 0450 because open work owns 0449; rollback drops the table."
@@ -448,6 +456,14 @@
     "crates/store/migrations/0451_scheduled_events_claim.sql": {
       "sha256": "7a76512da8e7033e41a655955db9a7e243e55d92bf2a747312f2809399b927b2",
       "justification": "Store-chain copy of the scheduled_events_claim epoch gate (cutover 0450): one new table, IF NOT EXISTS, no writes to the existing mirror. Numbered 0451 because cutover owns 0450; global migration numbers remain unique across both chains."
+    },
+    "crates/cutover/migrations/0452_scheduled_events_tombstone.sql": {
+      "sha256": "2be34c33d7a002668ed9f51e41172f208ac59b2b9d713763bba9aa3ba8e06adb",
+      "justification": "Delete tombstones for the scheduled-event mirror: new table scheduled_events_tombstone(guild_id, event_id, deleted_at TEXT; PK(guild_id, event_id)); the swap records one row per DELETE-removed id so equal-stamp replays cannot resurrect removed rows. Additive, IF NOT EXISTS, no covering index (guild PK prefix serves the bounded per-guild scans); numbered 0452 as the next free global migration; rollback drops the table."
+    },
+    "crates/store/migrations/0453_scheduled_events_tombstone.sql": {
+      "sha256": "21775bde6ded22b7b0c8e025365b70ecab9bb1961a98b7d34eb26ab713dd6a1e",
+      "justification": "Store-chain copy of the scheduled_events_tombstone delete layer (cutover 0452): one new table, IF NOT EXISTS, no writes to the existing mirror. Numbered 0453 because cutover owns 0452; global migration numbers remain unique across both chains."
     }
   }
 }

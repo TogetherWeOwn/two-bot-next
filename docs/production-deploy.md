@@ -19,9 +19,11 @@ since Environment settings can drift.
 1. The `production` GitHub Environment has at least one required reviewer
    with prevent self-review on, and restricts deployment branches to the
    single custom branch `main`. Live state checked 2026-10-15: no required
-   reviewers, only a branch policy. Add a required reviewer before any
-   rollback or live-SHA cure: the guard refuses staging-history waivers
-   without human reviewers even with `PRODUCTION_AUTO_APPROVE=true`.
+   reviewers, only a branch policy (the owner removed every human approval by
+   policy). With `PRODUCTION_AUTO_APPROVE=true` a rollback still runs without
+   a reviewer when its target is a verified rollback snapshot (see **Roll
+   back**); only the live-SHA cure (`allow_unstaged`) still needs a human
+   reviewer.
 2. The repository-level `PRODUCTION_WORKER_URL` variable holds the production
    Worker's `https://` URL. It must differ from `STAGING_WORKER_URL`. Keep this
    as the single source for both deploy and passive synthetic checks: remove any
@@ -39,10 +41,15 @@ reviewers and a main-only branch policy. `PRODUCTION_AUTO_APPROVE=true`
 excuses only the missing-reviewers refusal, and only when the latest
 `deploy-staging` run on the SHA is a completed success; the main-only branch
 policy stays mandatory with or without it
-(see [PRODUCTION_AUTO_APPROVE](#production_auto_approve)). A rollback or a
-live-SHA takeover redeploy waives staging history, so it still needs human
-reviewers even with auto-approve on: until a reviewer is added those two
-dispatches are refused. A job that
+(see [PRODUCTION_AUTO_APPROVE](#production_auto_approve)). A live-SHA
+takeover redeploy waives staging history, so it still needs human reviewers
+even with auto-approve on. A rollback with auto-approve on and no reviewers
+runs only when its `rollback`, `image` and `sha` together equal the complete
+provenance receipt (`has_previous`, `provenance_complete`) inside a
+`production-rollback-snapshot` artifact at most 14 days old, uploaded by a
+deploy-production run on `main` of this repository; anything else refuses
+(10-20 13:31Z: the designed rollback was refused for want of a reviewer
+while production stayed fenced). A job that
 names a missing Environment makes GitHub create it with no protection, so the
 guard checks before the deploy job can run. This repository is public, so
 required reviewers work on every plan; no Enterprise plan is needed.
@@ -91,6 +98,25 @@ live-SHA takeover redeploy serve no new schema and skip this gate job
 (guard-validated modes only; the production job accepts exactly those),
 so recovery never waits on it.
 
+For a new build, `production_schema_gate.py` accepts only the existing
+`runner_version=1` read-only `mode=plan` report for `migration_target=production`,
+the exact canonical lowercase 40-hex requested SHA and `role=two_bot_migrator_ro`,
+with strict integer zero apply counts. Returned host/database/branch fields
+must match independently verified, normalized environment pins; neither the
+manifest nor raw untrimmed variables are a replacement identity oracle. Both
+pending arrays must be strictly increasing positive i64 integers. Minimal,
+malformed or contradictory evidence refuses before publication. Valid clean
+and drift reports are saved atomically; errors publish no new evidence.
+
+The terminal stdout line is JSON with stable `verdict`, `code` and `next_action`:
+`schema_clean` exits 0, `schema_drift` exits 1, input/binding/manifest refusals
+exit 2, and subprocess/execution/output errors exit 3. The script's existing
+recovery-only invocation returns `recovery_waived` (not `clean`) without a DB
+read. Connection warnings remain advisory. See the shared
+[code/action and evidence contract](runbook.md#schema-gate-evidence-and-terminal-results)
+for exact remediation tokens; no raw child stderr, rejected values, exception
+text or traceback is relayed. No apply path, target scope or waiver is added.
+
 Before step 2, a role gate also runs the read-only `two-bot db roles verify`
 on the same `production-migrate-plan` binding and refuses a new build whose
 grants lag the migrations. Migrations create tables but grant nothing: the
@@ -118,7 +144,8 @@ and a redeploy of a prior good commit, must always set `sha` explicitly: an empt
 build that just broke production (the guard refuses a rollback without `sha`).
 Dispatch again with `rollback` set to the previous version ID
 from the failed run's summary, `image` set to the previous container image
-digest from the same summary's rollback-snapshot line, and `takeover: true`.
+digest from the same summary's rollback-snapshot line, and `takeover: true`
+(the default).
 Set `sha` to the commit that version was built
 from (full SHA or an unambiguous 7-40 character hex prefix; the guard resolves
 a prefix and records the full SHA): take all three from that summary line, which the pre-deploy snapshot
@@ -129,7 +156,10 @@ The three inputs are validated as one
 receipt before anything is restored: the rollback script refuses unless the
 Worker version's stamped deploy message (`wrangler deploy --message <sha>`)
 equals `sha` (the resolved full SHA), the version appears in the 100%-serving deployment history,
-and the image comes from a completed rollout. A merely CI-green SHA paired
+and the image comes from a completed rollout, or a replaced one whose
+record shows every step completed and every instance updated (a rollout
+can be replaced before it finishes, so status alone never proves the
+image served). A merely CI-green SHA paired
 with the wrong version therefore refuses before traffic moves instead of
 failing the gate after the restore; do not widen the guard to admit one.
 The `/readyz` gate after the
@@ -164,10 +194,11 @@ change with `--message` as above) before the deploy the snapshot precedes,
 or the next manual rollback to it will refuse. The
 rollback passes the same guard and the same Environment approval, except the
 guard never needs deploy-staging history for a rollback: aged-out staging
-runs must not block recovery. It still needs a human Environment reviewer:
-with no required reviewers the guard refuses the waiver even with
-`PRODUCTION_AUTO_APPROVE=true`, so add a reviewer before relying on
-rollback. The step restores BOTH the named Worker version
+runs must not block recovery. It needs no human reviewer when
+`PRODUCTION_AUTO_APPROVE=true` and the three inputs match a verified
+rollback snapshot (above) — the summary line names all three, so a rollback
+dispatched from it always matches; the guard records the snapshot's run in
+its summary. The step restores BOTH the named Worker version
 and the named container image (a Worker-only rollback leaves the new image
 serving), hands ownership to the restored version, and requires the same
 stable gateway-ready gate. Without the takeover the fence stays held,
@@ -179,7 +210,7 @@ not the container image.
 **Stale bot, live SHA.** When the bot is stale but the live build is good
 (the owner's first-response cure), re-serve it without staging history:
 dispatch in deploy mode with `sha` set to the currently live commit,
-`takeover: true`, and `allow_unstaged: true`. The guard still requires the
+`takeover: true` (the default), and `allow_unstaged: true`. The guard still requires the
 SHA on main with green `ci-ok`/`worker check` and the operator's confirmation
 that the SHA is live; it waives only the staging-history check. Like a
 rollback, it still needs a human Environment reviewer and is refused without
@@ -261,24 +292,27 @@ two-bot-next-production-rollout/1.0`): it scrapes live production
 auto-rollback below restores the pre-deploy snapshot (Worker version AND
 container image). Live enforcement needs the `PRODUCTION_METRICS_SCRAPE_TOKEN`
 secret (a `production` environment secret, 32+ chars); without it the step
-records a skip, never a pass. The dispatch-only `inject_error_rate_spike`
-input judges a rehearsal 5xx firing instead, proving the fail-to-rollback
-chain with no traffic — a push or an automatic trigger can never arm it.
-The drill needs `takeover: true` in deploy mode: without takeover a failed
-gate cannot roll back (so the drill would leave its build serving and prove
-nothing), and after a rollback restore there is nothing to roll back to (so
-the gate does not run in rollback mode at all). Any other combination
-refuses in the guard before anything deploys.
+records a skip, never a pass. The gate does not run in rollback mode (after
+a restore there is nothing to roll back to). **Failure injection never runs
+against production**: the guard refuses any run with
+`inject_error_rate_spike: true`, in every mode, and points to staging
+(`gh workflow run deploy-staging.yml --ref main -f inject_error_rate_spike=true`,
+see [staging-rollout-gate.md](staging-rollout-gate.md)). The production gate
+step has no rehearsal path left to arm. On 10-20 20:54Z a forced production
+drill deployed, failed the ownership read, and its auto-rollback refused on
+image provenance, leaving production degraded until the next automatic
+deploy.
 
 ## Build identity and the `/readyz` gate
 
 A deploy stamps its image the way `deploy-staging` does. The rendered Wrangler
 config sets `image_vars` on the production container: `BOT_BUILD_REVISION` is
-the guarded 40-character lowercase hexadecimal SHA, and `BOT_BUILD_ID` is
+the guarded 40-character lowercase hexadecimal SHA, `BOT_BUILD_ID` is
 `<run id>-<run attempt>`: exactly two non-empty decimal components, each at most
-20 digits and 64 characters total. Wrangler passes both to `docker build` as
+20 digits and 64 characters total, and `BOT_DEPLOY_ID` is the deploy ID
+`YYYY.MM.DD.N+sha7` (see below). Wrangler passes all three to `docker build` as
 build arguments, the Rust binary compiles them in, and `/readyz` reports them as
-`build_revision` and `build_id`. Neither value is secret. The SHA comes from the
+`build_revision`, `build_id` and `deploy_id`. No value is secret. The SHA comes from the
 guard, not `GITHUB_SHA`: a dispatch runs on the head of `main`, which can be
 newer than the commit being deployed.
 
@@ -297,23 +331,24 @@ single production container. Nothing else changes, and
 
 The gate polls `/readyz` every 10 seconds for up to 30 attempts. In deploy
 mode it passes an answer only when its JSON `build_revision` equals the
-guarded SHA **and** its `build_id` equals this run's `<run id>-<run
-attempt>`: the build ID proves the new container serves, not a previous
+guarded SHA, its `build_id` equals this run's `<run id>-<run
+attempt>`, **and** its `deploy_id` equals this run's deploy ID: the build ID
+and deploy ID prove the new container serves, not a previous
 build of the same SHA still draining. Rollback mode checks the revision
 only, because the serving version was built by an older run.
 
 | `/readyz` answer | Result |
 |---|---|
-| 200 with gateway `ready`, revision is the SHA, `build_id` is this run's (deploy) or any stamped id (rollback), held for 18 consecutive polls (~3 min) | Pass: gateway ready and stable |
-| 503 with the SHA and a passing build id (same rule) | Keep polling, then fail (auto-rollback only after a takeover; see below): a parked gateway never certifies a build |
+| 200 with gateway `ready`, revision is the SHA, `build_id` and `deploy_id` are this run's (deploy) or any stamped values (rollback), held for 18 consecutive polls (~3 min) | Pass: gateway ready and stable |
+| 503 with the SHA and passing build/deploy ids (same rule) | Keep polling, then fail (auto-rollback only after a takeover; see below): a parked gateway never certifies a build |
 | 200 with gateway `starting` or `down` | Keep polling, then fail (auto-rollback only after a takeover; see below) |
 | 503 `{"error":"ownership_fenced"}` with no build fields | Keep polling; fail at the end. The fence releases at cutover step 3.5, so the identity match is established only after the takeover |
-| Revision is the SHA but `build_id` is another run's (deploy mode) | Keep polling; fail at the end: the previous container still serves this SHA |
+| Revision is the SHA but `build_id` or `deploy_id` is another run's (deploy mode) | Keep polling; fail at the end: the previous container still serves this SHA |
 | `build_revision` is another SHA | Keep polling; fail at the end |
 | `build_revision` and `build_id` are both `unknown` (not stamped) | Deploy: keep polling; fail at the end. Rollback: recorded as a pre-stamp version, not a failure, but only on 200 with gateway `ready`; otherwise keep polling, then fail |
 | `build_revision` is `unknown` and `build_id` is not | Keep polling; fail at the end |
-| `build_revision` or `build_id` is missing or not a string, or the body is not a JSON object | Keep polling; fail at the end |
-| Body exceeds 65,536 bytes, JSON repeats an object key, nests past the depth bound, or `build_revision`/`build_id` has an unexpected shape | Keep polling; fail at the end with a fixed single-line reason that echoes no remote value |
+| `build_revision` or `build_id` is missing or not a string, `deploy_id` is missing in deploy mode, or the body is not a JSON object | Keep polling; fail at the end |
+| Body exceeds 65,536 bytes, JSON repeats an object key, nests past the depth bound, or `build_revision`/`build_id`/`deploy_id` has an unexpected shape | Keep polling; fail at the end with a fixed single-line reason that echoes no remote value |
 | Any other status, including `000` (no answer) | Keep polling; fail at the end |
 
 A single 503 (gateway `starting`) poll never passes the gate — the 10-15
@@ -344,8 +379,8 @@ before UTF-8 decoding or JSON parsing; exact-cap valid evidence is still
 graded normally. This byte limit matches the staging probe's body cap.
 
 Remote identity shapes are validated before any value enters diagnostics:
-only `unknown`, a 40-character hex revision, or a bounded digits-digits
-build ID can appear in output. Newline, pipe, control, overlong and
+only `unknown`, a 40-character hex revision, a bounded digits-digits
+build ID, or a canonical deploy ID can appear in output. Newline, pipe, control, overlong and
 secret-shaped values yield the fixed unexpected-shape refusal above. The
 raw `/health` and `/readyz` bodies reach the log only through
 `production_deploy.py excerpt`, which prints the first 2048 body bytes as
@@ -365,6 +400,41 @@ reports, so `sha` must be that version's commit. A version built before this
 change reports `unknown` for both fields. The gate records that as a pre-stamp
 version and does not fail the rollback. Any other revision fails it.
 
+### Deploy IDs, `/version` and Deployment records
+
+Every staging and production deploy carries a deploy ID `YYYY.MM.DD.N+sha7`:
+the UTC calendar date, N = the Nth deploy of that environment that day
+(starting at 1), and the 7-character short SHA of the deployed commit. The
+compute step derives N inside the deploy lane as one plus the count of that
+environment's recorded deploy IDs created on that UTC date
+(`scripts/deploy_id.py next`): only Deployment rows whose description is a
+deploy ID count, since Actions auto-creates `environment:` rows (each deploy
+job's own run included) that carry none. The lanes serialize deploys, so the
+count cannot race. A malformed ID, or an ID naming another commit, refuses
+before anything is rendered or snapshotted.
+
+The ID is stamped into the image as `BOT_DEPLOY_ID` next to the revision and
+build ID, compiled into the binary, and reported on `/readyz` as `deploy_id`
+(which the gates judge) and on the always-200 `/version` endpoint as
+`{"deploy_id", "sha", "build_id"}` (which judges nothing, so deploy records
+can read what serves without judging readiness). The Worker proxies
+`/version` like `/readyz`. A build from before stamping reports `unknown`;
+rollback mode ignores the reported ID because the restored build carries its
+original stamped ID. Deploy mode likewise judges the legacy
+revision/build-ID shape for a guarded SHA whose Dockerfile predates the
+`BOT_DEPLOY_ID` ARG, since that binary can never report a deploy ID.
+
+After the gates judge, the record step stores the deploy as a GitHub
+Deployment with `environment` set to `staging` or `production`, the deploy
+ID as its description and `{"deploy_id"}` as its payload — never a tag or
+Release — and posts its `success`/`failure` status with links to the run and
+the Worker. A rollback mints a fresh event ID and names itself in the
+payload, since its event ID differs from the restored build's stamped ID.
+The record step runs after the auto-rollback, so a record failure fails the
+run red with the service already restored: bookkeeping never gates
+recovery. `scripts/ci/test_workflows.py` pins the compute/record step
+shapes and their order against the stamp, gate and rollback steps.
+
 ## Production ownership takeover (P2–P4)
 
 Implements P2–P4 of the approved design
@@ -374,11 +444,17 @@ relaxes the staging gate. This step never activates production: GO stays the
 cutover lead's separate decision on the B4 execution card
 ([cutover-sequence.md](cutover-sequence.md) §§4–5).
 
-**Requesting it.** Dispatch with `takeover: true` (default `false`). The guard
-validates the flag and records `Takeover: requested/not requested` in the run
-summary. With `false` the job deploys and stops: the fence stays held, fenced
-answers carry no build fields, and the gate fails without being a rollback
-signal.
+**Requesting it.** A deploy ALWAYS takes over, manual or automatic: a
+manual deploy can never leave production fenced (10-20 13:31Z: a manual
+dispatch without `takeover: true` served 503 `ownership_fenced`/`not_owner`
+for 23 minutes). `takeover` now defaults to `true`, and `takeover: false` no
+longer skips a deploy's takeover (the guard prints a notice). The only way to
+deploy without the takeover is the explicit B4 cutover hold,
+`cutover_hold: true` (deploy mode only, default `false`): the guard records
+`Takeover: SKIPPED by cutover_hold: the ownership fence STAYS HELD` in the
+run summary, the job deploys and stops, fenced answers carry no build
+fields, and the gate fails without being a rollback signal. In rollback mode
+`takeover` still selects the post-restore ownership read and confirmation.
 
 **Order inside the `production` job** (same Environment approval as the deploy):
 
@@ -444,11 +520,14 @@ exact value `true` changes the guard. With it set, the guard:
 - accepts a `production` Environment with no required reviewers, provided the
   latest `deploy-staging` run on the SHA is a completed success. With no
   reviewers and the variable unset, the guard refuses;
-- never applies to a rollback or a live-SHA takeover redeploy
-  (`allow_unstaged`): those waive the staging history the automated approval
-  vouches through, so they still need the human Environment reviewers.
-  Until a required reviewer is added, those two dispatches are refused;
-- records `Approval: automated (PRODUCTION_AUTO_APPROVE)` in the run summary.
+- accepts a rollback with no reviewers only when its `rollback`, `image` and
+  `sha` match a verified rollback snapshot (see **Roll back**); any other
+  rollback target still needs a human reviewer;
+- never applies to a live-SHA takeover redeploy (`allow_unstaged`): it waives
+  the staging history the automated approval vouches through, so it still
+  needs the human Environment reviewers and is refused until one is added;
+- records `Approval: automated (PRODUCTION_AUTO_APPROVE)` (or, for a
+  snapshot-backed rollback, `Approval: automated rollback`) in the run summary.
 
 It does not remove reviewers. If the Environment has required reviewers,
 GitHub still pauses the `production` job until one of them approves, and the
@@ -471,7 +550,8 @@ production revision) through the watch deadline `T_0 + 48 h`:
 ```sh
 python3 scripts/cutover_watch_checkpoint.py --checkpoint +15m \
     --expected-sha <40-hex> --expected-build-id <run-id>-<attempt> \
-    --production-url https://<production-worker>/
+    --production-url https://<production-worker>/ \
+    --format markdown
 ```
 
 `--checkpoint` is one of the five labels `+15m`, `+1h`, `+6h`, `+24h`,
@@ -484,6 +564,13 @@ revision/build-ID match; anything short of a full match is EXTEND, never
 GO, and a ROLLBACK decision stays human. Checkpoints follow
 [cutover.md](cutover.md) §48-hour watch. Poll read-only on a short cadence
 (suggested 60 s); record findings, not every healthy poll.
+
+`--format json` emits the same checkpoint as a one-line machine receipt
+instead of the table row, with stable `reason` ids and a `next_action`:
+
+```json
+{"checkpoint": "+15m", "verdict": "GO", "reason": "ready_match", "reason_detail": "/readyz 200: all 4 components ready, revision matches the SHA, build 700-1", "origin": "https://two-bot-next-production.<sub>.workers.dev", "expected": {"build_revision": "<40-hex>", "build_id": "<run>-<attempt>"}, "observed": {"build_revision": "<40-hex>", "build_id": "<run>-<attempt>"}, "next_action": "paste the GO row onto the execution card and continue the watch"}
+```
 
 ### Watch header (record once at T_0)
 

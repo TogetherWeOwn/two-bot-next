@@ -35,6 +35,7 @@ COPY . .
 # Non-secret build provenance, compiled into readiness (not a runtime override).
 ARG BOT_BUILD_REVISION=unknown
 ARG BOT_BUILD_ID=unknown
+ARG BOT_DEPLOY_ID=unknown
 RUN cargo build --release --locked
 
 # The runtime base already ships Debian trust data (ca-certificates) and the
@@ -44,8 +45,10 @@ FROM gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe
 # Non-secret build provenance (main #137/#156), recorded as image labels.
 ARG BOT_BUILD_REVISION=unknown
 ARG BOT_BUILD_ID=unknown
+ARG BOT_DEPLOY_ID=unknown
 LABEL org.opencontainers.image.revision=$BOT_BUILD_REVISION \
-      com.togetherweown.build-id=$BOT_BUILD_ID
+      com.togetherweown.build-id=$BOT_BUILD_ID \
+      com.togetherweown.deploy-id=$BOT_DEPLOY_ID
 
 # Non-root user: the bot never needs container root.
 USER 65532:65532
