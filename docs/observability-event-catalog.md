@@ -54,6 +54,8 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 | `gateway drain failed; restart required` | `crates/bot/src/main.rs` (`supervise_gateway_bounded`) | Drain path failed; restart required |
 | `container service failed` | `crates/bot/src/main.rs` (`run`) | Service supervisor failed (`startup_phase=service_supervisor`) |
 | `shutdown_deadline_exceeded: abandoning in-flight work` | `crates/bot/src/main.rs` (`supervise_gateway_bounded`) | Drain deadline elapsed; in-flight work abandoned |
+| `worker supervisor ended abnormally during shutdown join` | `crates/bot/src/main.rs` (`join_worker_supervisors`) | A retained worker supervisor (raid, containment or join-risk drain) ended with an error during the shutdown join; `panicked` distinguishes a panic from a cancellation. The remaining supervisors still join |
+| `worker supervisor did not finish within the remaining shutdown deadline; aborting it, so its worker drain is cut short` | `crates/bot/src/main.rs` (`join_worker_supervisors`) | Error; the supervisor outlived its share of the shutdown deadline (`budget_ms`, `event = "worker_supervisor"`, `error_class = "worker_shutdown_join_exceeded"`) and was aborted, so its worker's in-flight item and queued inbox are discarded uncounted |
 | `listening` | `crates/bot/src/server.rs` (`bind`) | HTTP listener bound; one line per process start |
 | `SIGTERM received; draining` | `crates/bot/src/server.rs` (`shutdown_signal`) | SIGTERM observed; effects drain before exit |
 | `SIGINT received; draining` | `crates/bot/src/server.rs` (`shutdown_signal`) | SIGINT observed; effects drain before exit |

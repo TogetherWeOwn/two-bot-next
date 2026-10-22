@@ -197,7 +197,7 @@ test(`${OPS_DASHBOARD_PATH}: CSP authorizes only the unchanged page's inline blo
   // CSP hashes are header-only, so they do not rewrite the body. Re-pin when the static page changes.
   assert.equal(
     createHash("sha256").update(html).digest("hex"),
-    "3436cd503436829a3ceb93ddbebc6174f156714ce997a8c2e302aeebc892f638",
+    "2651b00c52e19eba4acbd611a97f083a17f9ed836fe1b37b8d64d585179b33b7",
   );
   const headers = new Headers(res.headers);
   headers.delete("content-security-policy");
@@ -259,6 +259,9 @@ function runPageScript(script: string, fetchImpl: StubFetch) {
     fetch: fetchImpl,
     setInterval: () => 0,
     clearInterval: () => {},
+    setTimeout: (fn: () => void, ms: number) => setTimeout(fn, ms).unref(),
+    clearTimeout,
+    AbortController,
     console,
   };
   vm.createContext(sandbox);
