@@ -530,3 +530,144 @@ async fn ballot_delivery_binding_and_cast_do_not_enqueue_active_edits() {
     assert!(!worker.dispatch_one(2).await);
     assert!(trace.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn ballot_delivery_late_bind_after_timer_expiry_requeues_terminal_edit() {
+    let (mut worker, trace) = setup().await;
+    worker.bind_kick_message(VOTE, MESSAGE);
+    worker.kick_refresh(VOTE_KICK_TTL_MS);
+    assert!(worker.dispatch_one(VOTE_KICK_TTL_MS + 1).await);
+    assert!(!worker.dispatch_one(VOTE_KICK_TTL_MS + 2).await);
+    // A type-7 callback rendered before the timer settle lands late and
+    // restores the live-looking ballot; the post-callback bind repairs it.
+    worker.bind_kick_message(VOTE, MESSAGE);
+    assert!(worker.dispatch_one(VOTE_KICK_TTL_MS + 3).await);
+    let calls = trace.lock().unwrap().clone();
+    assert_eq!(calls.len(), 2);
+    assert!(calls
+        .iter()
+        .all(|call| call.starts_with("edit_prompt:900:901:") && call.contains("expired")));
+    assert!(!worker.dispatch_one(VOTE_KICK_TTL_MS + 4).await);
+}
+
+#[tokio::test]
+async fn ballot_delivery_late_bind_after_passed_success_requeues_terminal_edit() {
+    let (mut worker, trace) = setup().await;
+    worker.bind_kick_message(VOTE, MESSAGE);
+    // A passed vote whose enforcement succeeded: the same success outcome
+    // the enforcement arm reports through `correct_kick_ballot`.
+    let update = VoteKickUpdate {
+        vote: VoteKickRef {
+            id: VOTE,
+            guild_id: GUILD,
+            room_id: ROOM,
+            target_id: TARGET,
+        },
+        status: VoteKickStatus::Passed,
+        progress: VoteProgress {
+            yes: 3,
+            required: 3,
+            total: 4,
+        },
+        kick: None,
+    };
+    worker.kick_ballots.get_mut(&VOTE).expect("ballot").update = update;
+    worker.correct_kick_ballot(VOTE, EnforcementOutcome::ConnectDeniedAndDisconnected);
+    worker.enqueue_kick_ballot(update);
+    assert!(worker.dispatch_one(1).await);
+    assert!(!worker.dispatch_one(2).await);
+    worker.bind_kick_message(VOTE, MESSAGE);
+    assert!(worker.dispatch_one(3).await);
+    let calls = trace.lock().unwrap().clone();
+    assert_eq!(calls.len(), 2);
+    assert!(calls
+        .iter()
+        .all(|call| call.starts_with("edit_prompt:900:901:") && call.contains("passed")));
+    assert!(!worker.dispatch_one(4).await);
+}
+
+#[tokio::test]
+async fn ballot_delivery_retryable_edit_errors_are_not_lifecycle_failures() {
+    for error in [
+        RoomHttpError::RateLimited {
+            retry_after_ms: 2_000,
+            global: false,
+        },
+        RoomHttpError::UnknownOutcome,
+    ] {
+        let (mut worker, _) = setup().await;
+        worker.bind_kick_message(VOTE, MESSAGE);
+        worker.kick_refresh(VOTE_KICK_TTL_MS);
+        worker
+            .http
+            .component_edit_errors
+            .lock()
+            .unwrap()
+            .push_back(error);
+        assert!(worker.dispatch_one(VOTE_KICK_TTL_MS + 1).await);
+        assert!(
+            worker.failures().is_empty(),
+            "a retried edit is not a failure"
+        );
+        // The scheduled retry succeeds; still nothing recorded.
+        assert!(worker.dispatch_one(VOTE_KICK_TTL_MS + 10_000_000).await);
+        assert!(worker.failures().is_empty());
+        assert_eq!(worker.http.component_edits.lock().unwrap().len(), 2);
+    }
+    // A terminal refusal still records exactly one failure and never retries.
+    let (mut worker, _) = setup().await;
+    worker.bind_kick_message(VOTE, MESSAGE);
+    worker.kick_refresh(VOTE_KICK_TTL_MS);
+    worker
+        .http
+        .component_edit_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::AccessDenied);
+    assert!(worker.dispatch_one(VOTE_KICK_TTL_MS + 1).await);
+    assert_eq!(worker.failures().len(), 1);
+    assert!(!worker.dispatch_one(u64::MAX).await);
+}
+
+#[tokio::test(start_paused = true)]
+async fn ballot_delivery_button_press_binds_message_when_initial_capture_failed() {
+    let trace = Trace::default();
+    let runtime = kick_room_runtime(
+        &trace,
+        true,
+        vec![
+            voice_member_in(KICK_VOTER, KICK_ROOM),
+            voice_member_in(302, KICK_ROOM),
+            voice_member_in(KICK_TARGET, KICK_ROOM),
+        ],
+    );
+    let capture = CaptureReplies {
+        inner: Replies::new(trace.clone()),
+        message: Err(RoomHttpError::UnknownOutcome),
+    };
+    let open = kick_sink_interaction(KICK_TARGET, KICK_VOTER);
+    assert!(VoiceResponder::start_kick_vote(&runtime, &capture, &open).await);
+    // The component callback carries the public ballot message; the press
+    // binds it so later timer edits have a target.
+    let callback = crate::command_runtime_tests::message(901, 900, true, Some(GUILD));
+    let want = format!("edit_prompt:900:{}:", callback.id.get());
+    let mut press = component_interaction(
+        &vote_button_id(open.id.get(), VoteBallot::Yes),
+        None,
+        KICK_VOTER,
+    );
+    press.message = Some(callback);
+    let replies = Replies::new(trace.clone());
+    VoiceResponder::respond_with(&runtime, &replies, &press, None, None).await;
+    tokio::time::advance(Duration::from_millis(VOTE_KICK_TTL_MS)).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let calls = trace.lock().unwrap().clone();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.starts_with(&want) && call.contains("expired"))
+            .count(),
+        1,
+        "{calls:?}"
+    );
+}

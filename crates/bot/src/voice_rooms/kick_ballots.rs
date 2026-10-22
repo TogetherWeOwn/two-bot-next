@@ -62,9 +62,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .map_or_else(|| vote_update_message(update), KickBallot::response)
     }
 
-    /// Called after the callback: a late type-7 response must not overwrite an
-    /// enforcement correction that landed while that callback was in flight.
-    /// A vote's first message binding is immutable, even on delayed buttons.
+    /// Called after the callback: a late type-7 response must not overwrite a
+    /// timer settlement or enforcement correction that landed while that
+    /// callback was in flight. A vote's first message binding is immutable,
+    /// even on delayed buttons.
     pub(super) fn bind_kick_message(&mut self, vote_id: Snowflake, message: MessageRef) {
         if message.channel_id == 0 || message.message_id == 0 {
             return;
@@ -75,8 +76,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         if ballot.message.is_some_and(|previous| previous != message) {
             return;
         }
-        let first = ballot.message.replace(message).is_none();
-        if (first && ballot.update.status != VoteKickStatus::Active)
+        ballot.message = Some(message);
+        // A callback rendered before a timer settle can restore live buttons:
+        // any binding of a settled ballot re-renders the latest state.
+        if ballot.update.status != VoteKickStatus::Active
             || ballot
                 .outcome
                 .is_some_and(|outcome| outcome != EnforcementOutcome::ConnectDeniedAndDisconnected)
@@ -137,18 +140,22 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         match result {
             Ok(()) | Err(RoomHttpError::NotFound | RoomHttpError::Cancelled) => {}
             Err(error) => {
-                self.record(LifecycleFailure::Discord {
-                    channel_id: message.channel_id,
+                // Rate limits are retries, never outcomes: record only the
+                // errors that will not be retried.
+                let retryable = matches!(
                     error,
-                });
+                    RoomHttpError::UnknownOutcome | RoomHttpError::RateLimited { .. }
+                ) && attempts.saturating_add(1) < QUEUE_MAX_ATTEMPTS;
+                if !retryable {
+                    self.record(LifecycleFailure::Discord {
+                        channel_id: message.channel_id,
+                        error,
+                    });
+                }
                 if error == RoomHttpError::Unauthorized {
                     self.halted = true;
                     self.halted_by_discord = true;
-                } else if matches!(
-                    error,
-                    RoomHttpError::UnknownOutcome | RoomHttpError::RateLimited { .. }
-                ) && attempts.saturating_add(1) < QUEUE_MAX_ATTEMPTS
-                {
+                } else if retryable {
                     let delay = match error {
                         RoomHttpError::RateLimited { retry_after_ms, .. } => {
                             retry_after_ms.max(1_000)
