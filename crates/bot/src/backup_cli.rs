@@ -791,6 +791,16 @@ async fn cmd_backup_upload(args: &[String]) -> i32 {
         );
         return 1;
     }
+    // Mirror the restore drill: refuse an over-cap dump before buffering it
+    // in memory for signing. Strict `>` so an exactly-at-cap dump uploads.
+    if size > dump_file::MAX_DUMP_BYTES {
+        eprintln!(
+            "backup-upload-s3: {} is {size} bytes, exceeding the {}-byte dump cap; refusing rather than buffering it code=backup_upload_dump_too_large",
+            dump_path.display(),
+            dump_file::MAX_DUMP_BYTES
+        );
+        return 1;
+    }
 
     let std_env = |name: &str| env_var(name);
     let target = match s3::load_s3_target(&std_env) {
@@ -815,6 +825,19 @@ async fn cmd_backup_upload(args: &[String]) -> i32 {
             return 1;
         }
     };
+    // Re-check after the read: a dump that grew past the cap between the
+    // metadata precheck and the read is still refused before signing or any
+    // S3 PUT. (The read call shape above is pinned by the frozen
+    // stable-codes suite, so bounded streaming needs test-author
+    // coordination and stays a follow-up.)
+    if body.len() as u64 > dump_file::MAX_DUMP_BYTES {
+        eprintln!(
+            "backup-upload-s3: {} exceeds the {}-byte dump cap; refusing to sign or upload it code=backup_upload_dump_too_large",
+            dump_path.display(),
+            dump_file::MAX_DUMP_BYTES
+        );
+        return 1;
+    }
 
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -957,17 +980,54 @@ fn snapshot_upload_argv(upload_raw: Option<&str>, path: &Path) -> Option<(String
 // guild-config-snapshot
 // ---------------------------------------------------------------------------
 
+/// Removes our temp file unless a successful rename disarms it. Every
+/// post-create failure path (write, permissions, fsync, rename) drops through
+/// here, so no `.tmp` partial survives a failed write. Only our own temp is
+/// removed; siblings are never touched. The guard arms only after the temp is
+/// created, so a creation failure never deletes a pre-existing path.
+struct TmpGuard<'a> {
+    tmp: &'a Path,
+    armed: bool,
+}
+
+impl Drop for TmpGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(self.tmp);
+        }
+    }
+}
+
 fn atomic_json(path: &Path, value: &serde_json::Value) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     }
-    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    // Unique temp per call (pid + nanos): exclusive creation can never
+    // collide with a stale temp from a crashed run, and `create_new` refuses
+    // a planted symlink or file at the temp path instead of following or
+    // truncating it (CWE-59). A collision fails closed with the existing
+    // "cannot write" error.
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = path.with_extension(format!("{}.{unique}.tmp", std::process::id()));
+    // Stays unarmed until the temp exists: a creation failure returns the
+    // existing error without removing a pre-existing path.
+    let mut guard = TmpGuard {
+        tmp: &tmp,
+        armed: false,
+    };
     let text = serde_json::to_string_pretty(value).map_err(|e| format!("cannot serialise: {e}"))?;
     {
         use std::io::Write;
-        let mut file = std::fs::File::create(&tmp)
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
             .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        guard.armed = true;
         #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         #[cfg(unix)]
@@ -979,6 +1039,7 @@ fn atomic_json(path: &Path, value: &serde_json::Value) -> Result<(), String> {
             .map_err(|e| format!("cannot fsync {}: {e}", tmp.display()))?;
     }
     std::fs::rename(&tmp, path).map_err(|e| format!("cannot rename to {}: {e}", path.display()))?;
+    guard.armed = false;
     if let Some(parent) = path.parent() {
         let dir = std::fs::File::open(parent).map_err(|e| e.to_string())?;
         dir.sync_all().map_err(|e| e.to_string())?;
@@ -1228,6 +1289,11 @@ async fn cmd_guild_config_snapshot() -> i32 {
 // guild-config-restore
 // ---------------------------------------------------------------------------
 
+/// Operator-supplied guild snapshots refuse past 8 MiB, mirroring
+/// `http::MAX_RESPONSE_BYTES`. Guild snapshots are KB-scale; the boundary is
+/// strict `>` so an exactly-at-cap snapshot still restores.
+const MAX_SNAPSHOT_BYTES: u64 = 8 * 1024 * 1024;
+
 async fn cmd_guild_config_restore(args: &[String]) -> i32 {
     let apply = args.iter().any(|a| a == "--apply");
     let confirmed = args.iter().any(|a| a == "--confirm-staging-guild");
@@ -1278,7 +1344,72 @@ async fn cmd_guild_config_restore(args: &[String]) -> i32 {
         return 2;
     }
 
-    let text = match std::fs::read_to_string(&snapshot_arg) {
+    // Gate before open: a FIFO opened for reading blocks until a writer
+    // connects, so non-regular and over-cap snapshots are refused via
+    // metadata first and `File::open` only sees likely-regular files. A
+    // missing file falls through to the existing read error below.
+    if let Ok(meta) = std::fs::metadata(&snapshot_arg) {
+        if !meta.is_file() {
+            eprintln!(
+                "guild-config-restore: cannot read snapshot {snapshot_arg}: not a regular file"
+            );
+            return 2;
+        }
+        if meta.len() > MAX_SNAPSHOT_BYTES {
+            eprintln!(
+                "guild-config-restore: snapshot {snapshot_arg} is {} bytes, exceeding the {MAX_SNAPSHOT_BYTES}-byte snapshot cap; refusing rather than buffering it",
+                meta.len()
+            );
+            return 2;
+        }
+    }
+    // Open once. The descriptor is re-checked after open for a path swapped
+    // between the gate and the open; the bounded `take` read mirrors the
+    // restore drill, so a file that grows past the cap mid-read is still
+    // refused before parsing.
+    let snapshot_file = match std::fs::File::open(&snapshot_arg) {
+        Ok(file) => file,
+        Err(err) => {
+            eprintln!("guild-config-restore: cannot read snapshot {snapshot_arg}: {err}");
+            return 2;
+        }
+    };
+    // Descriptor-level recheck: refuse a path swapped for a non-regular or
+    // over-cap file between the pre-open gate and the open.
+    if let Ok(meta) = snapshot_file.metadata() {
+        if !meta.is_file() {
+            eprintln!(
+                "guild-config-restore: cannot read snapshot {snapshot_arg}: not a regular file"
+            );
+            return 2;
+        }
+        if meta.len() > MAX_SNAPSHOT_BYTES {
+            eprintln!(
+                "guild-config-restore: snapshot {snapshot_arg} is {} bytes, exceeding the {MAX_SNAPSHOT_BYTES}-byte snapshot cap; refusing rather than buffering it",
+                meta.len()
+            );
+            return 2;
+        }
+    }
+    let bytes = {
+        use std::io::Read as _;
+        let mut limited = snapshot_file.take(MAX_SNAPSHOT_BYTES + 1);
+        let mut bytes = Vec::new();
+        match limited.read_to_end(&mut bytes) {
+            Ok(_) => bytes,
+            Err(err) => {
+                eprintln!("guild-config-restore: cannot read snapshot {snapshot_arg}: {err}");
+                return 2;
+            }
+        }
+    };
+    if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
+        eprintln!(
+            "guild-config-restore: snapshot {snapshot_arg} grew past the {MAX_SNAPSHOT_BYTES}-byte snapshot cap; refusing to parse it"
+        );
+        return 2;
+    }
+    let text = match String::from_utf8(bytes) {
         Ok(text) => text,
         Err(err) => {
             eprintln!("guild-config-restore: cannot read snapshot {snapshot_arg}: {err}");
@@ -2349,6 +2480,69 @@ mod tests {
         std::env::set_var("GUILD_CONFIG_CDN_BASE", "http://127.0.0.1:1");
         let exit = super::cmd_guild_config_snapshot().await;
         assert_eq!(exit, 1);
+        clear_stable_code_env();
+    }
+
+    #[tokio::test]
+    async fn read_cap_cover_restore_missing_snapshot() {
+        // A missing --snapshot keeps the pre-existing read error (exit 2):
+        // the open-once refactor must not change that message.
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        std::env::set_var("DISCORD_STAGING_BOT_TOKEN", TOKEN);
+        std::env::set_var(
+            "DISCORD_STAGING_GUILD_ID",
+            two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID,
+        );
+        let dir = Credentials::new();
+        let missing = dir.0.join("no-such-snapshot.json");
+        let args = vec![
+            "--snapshot".to_owned(),
+            missing.to_string_lossy().into_owned(),
+        ];
+        let exit = super::cmd_guild_config_restore(&args).await;
+        assert_eq!(exit, 2);
+        clear_stable_code_env();
+    }
+
+    #[tokio::test]
+    async fn read_cap_cover_restore_non_regular_snapshot() {
+        // A directory passed as --snapshot is refused before any read: the
+        // metadata check sees a non-regular file and exits 2.
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        std::env::set_var("DISCORD_STAGING_BOT_TOKEN", TOKEN);
+        std::env::set_var(
+            "DISCORD_STAGING_GUILD_ID",
+            two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID,
+        );
+        let dir = Credentials::new();
+        let args = vec![
+            "--snapshot".to_owned(),
+            dir.0.to_string_lossy().into_owned(),
+        ];
+        let exit = super::cmd_guild_config_restore(&args).await;
+        assert_eq!(exit, 2);
+        clear_stable_code_env();
+    }
+
+    #[tokio::test]
+    async fn read_cap_cover_restore_invalid_utf8_snapshot() {
+        // Non-UTF-8 bytes keep the pre-existing read error (exit 2): the
+        // bounded take-read plus from_utf8 must match read_to_string here.
+        let _env = STABLE_CODE_ENV_LOCK.lock().await;
+        clear_stable_code_env();
+        std::env::set_var("DISCORD_STAGING_BOT_TOKEN", TOKEN);
+        std::env::set_var(
+            "DISCORD_STAGING_GUILD_ID",
+            two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID,
+        );
+        let dir = Credentials::new();
+        let path = dir.0.join("binary.json");
+        std::fs::write(&path, [0xffu8, 0xfe, 0x00, 0x62]).unwrap();
+        let args = vec!["--snapshot".to_owned(), path.to_string_lossy().into_owned()];
+        let exit = super::cmd_guild_config_restore(&args).await;
+        assert_eq!(exit, 2);
         clear_stable_code_env();
     }
 

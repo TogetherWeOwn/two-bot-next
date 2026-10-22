@@ -276,6 +276,9 @@ jobs:
       - name: Scratch drill schema provenance (offline)
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_restore_drill_schema.py' -v
 
+      - name: Deploy unit bounds, failure hook and drill age refusal (offline)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_deploy_units.py' -v
+
       - name: Cutover runbook links resolve (offline)
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cutover_doc_links.py' -v
 
@@ -2938,10 +2941,10 @@ jobs:
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fetch --locked
       # Builds all twenty-five libFuzzer targets. No campaign or generated corpus
-      # output; the existing weekly run replays the bounded eventsub_delivery,
+      # output; the per-PR seed replay below covers the bounded eventsub_delivery,
       # helix_token, custom_command_template, fb_page_events, database_url,
-      # feeds_http, self_role_custom_id, and helix_subscription_listing seeds
-      # below. Bounded vote_kick and helix_token smokes are manual (README).
+      # feeds_http, self_role_custom_id, and helix_subscription_listing seeds.
+      # Bounded vote_kick and helix_token smokes are manual (README).
       # The `+nightly-2026-10-01` selector is load-bearing: rustup resolves the
       # toolchain from the repo-root rust-toolchain.toml (stable 1.98.1) even
       # with working-directory fuzz/, so a bare `cargo fuzz build` runs under
@@ -3140,6 +3143,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_prod_passive_probe_duplicate_key_acceptance.py -v
       - name: Verify synthetic alert delivery (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_synthetic_alert.py -v
+      - name: Verify synthetic history admission boundaries (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_synthetic_alert_admission.py -v
       - name: Verify synthetic alert dry-run (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_synthetic_alert_dry_run_acceptance.py -v
       - name: Verify dry-run exit-code pins (offline fixtures)
@@ -3179,16 +3184,18 @@ jobs:
       - name: Verify runner routing for every workflow job
         if: needs.job-inputs.outputs.worker != 'false'
         run: python3 ../scripts/test-runner-routing.py
-      - name: Verify offline release on promote
+      - name: Verify the daily digest release (offline fixtures)
         if: needs.job-inputs.outputs.worker != 'false'
-        # Version bumps, notes, rollback guard and off-main refusal against a
-        # throwaway git repository (no network, no token).
-        run: node ../scripts/test-release-on-promote.cjs
-      - name: Verify release latest repair guard
-        if: needs.job-inputs.outputs.worker != 'false'
-        # Repairing an older tag's missing release must not move "Latest"
-        # backward (mocked gh against a throwaway git repository).
-        run: node --test ../scripts/test-release-on-promote-latest-repair.cjs
+        # Digest tags, notes, quiet-day and rollback skips, off-main refusal
+        # and the 200-commit ENOBUFS regression against a throwaway git
+        # repository (no network, no token).
+        run: node ../scripts/test-daily-digest.cjs
+      - name: Verify the production digest resolver (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_digest_resolve.py -v
+      - name: Verify digest failure, repair and SBOM replay (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_daily_digest_execution.py -v
+      - name: Verify the missing-digest alert (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_digest_alert.py -v
       - name: Verify the commit-parse guard
         if: needs.job-inputs.outputs.worker != 'false'
         # The PR-side guard uses release-please's pinned conventional-commit

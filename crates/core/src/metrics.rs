@@ -691,6 +691,11 @@ struct Values {
     /// process restart, so the runbook pairs it with the error log line. No
     /// guild id, SQLSTATE or error text ever becomes a label.
     retention_replay_needed: u64,
+    /// Ticket component interactions refused before spawning because the
+    /// runtime or the member was saturated. Label-free counter; resets on
+    /// process restart, so the runbook pairs it with the sampled saturation
+    /// log line. No member id, token or interaction id ever becomes a label.
+    ticket_component_drops: u64,
     /// Event-store consumer lag (S1): `received_at - event_time` spread in
     /// seconds for the newest observed capture row. Last writer wins; 0 when
     /// no row has been observed. Single label-free series — no message,
@@ -1339,6 +1344,19 @@ impl Metrics {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         values.retention_replay_needed = values.retention_replay_needed.saturating_add(1);
+    }
+
+    /// One ticket component interaction refused before spawning: the runtime
+    /// held `MAX_TICKET_COMPONENT_IN_FLIGHT` executions or the member held
+    /// the per-member cap. Call exactly once per refusal from the ticket
+    /// dispatch path; admitted work never calls this. Label-free counter;
+    /// no member id, token or interaction id ever becomes a label.
+    pub fn ticket_component_drop(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.ticket_component_drops = values.ticket_component_drops.saturating_add(1);
     }
 
     /// One storage-layer failure. Unknown `op` values collapse
@@ -2225,6 +2243,12 @@ impl Metrics {
             "two_bot_retention_replay_needed_total",
             "counter",
             values.retention_replay_needed,
+        );
+        scalar(
+            &mut out,
+            "two_bot_ticket_component_drops_total",
+            "counter",
+            values.ticket_component_drops,
         );
         header(
             &mut out,
@@ -3357,6 +3381,29 @@ mod tests {
         let series: Vec<_> = text
             .lines()
             .filter(|line| line.starts_with("two_bot_retention_replay_needed_total "))
+            .collect();
+        assert_eq!(series.len(), 1);
+        let (_, value) = series[0].rsplit_once(' ').unwrap();
+        assert!(value.parse::<f64>().is_ok(), "bad sample: {}", series[0]);
+    }
+
+    #[test]
+    fn ticket_component_drops_counter_is_label_free_and_zero_fresh() {
+        // Refused ticket components render as one label-free counter series —
+        // 0 on a fresh registry, +1 per refusal — so no member id, token or
+        // interaction id can reach exposition.
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("# TYPE two_bot_ticket_component_drops_total counter\n"));
+        assert!(text.contains("two_bot_ticket_component_drops_total 0\n"));
+        metrics.ticket_component_drop();
+        metrics.ticket_component_drop();
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_ticket_component_drops_total 2\n"));
+        assert!(!text.contains("two_bot_ticket_component_drops_total{"));
+        let series: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("two_bot_ticket_component_drops_total "))
             .collect();
         assert_eq!(series.len(), 1);
         let (_, value) = series[0].rsplit_once(' ').unwrap();
