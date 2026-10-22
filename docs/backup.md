@@ -144,10 +144,10 @@ unsupported. A failed write or validation leaves existing published recovery
 points untouched; a crash may leave a temporary file, but retention and drill
 selectors ignore it.
 
-### Coverage and recovery semantics (v4, v5, v6, v7, v8, v9, v10 and v11)
+### Coverage and recovery semantics (v4 through v12)
 
 `DUMP_TABLES` in `crates/core/src/backup/dump_file.rs` is the single ordered
-inventory for both dump and restore. It includes **98 durable tables from the
+inventory for both dump and restore. It includes **100 durable tables from the
 current cutover migrations**, including the bot-owned website-contract backing
 tables, the member-moderation ledger, the self-role send receipts
 (`self_role_exchanges`) plus their uncertainty baselines
@@ -169,10 +169,12 @@ the stream go-live ledger (`stream_live_claims`: 0440/0443), guild game-activity
 aggregates (`game_activity_guild_aggregates`: 0441/0442), the assistant
 monthly-cap ledger (`assistant_monthly_builds`: 0446/0447), the
 scheduled-event epoch-claim guard (`scheduled_events_claim`: 0450/0451) and
-its delete tombstones (`scheduled_events_tombstone`: 0452/0453).
+its delete tombstones (`scheduled_events_tombstone`: 0452/0453), and timed
+polls (`polls`, then `poll_votes`: 0455) with their frozen counts, live-display
+recovery marker and durable delivery fences.
 `OPTIONAL_LEGACY_TABLES` is empty: the coverage
 test fails if a covered table is not migrated. A dump from a fresh Rust schema
-has 98 table entries. A missing current table refuses a dump/restore: migrate
+has 100 table entries. A missing current table refuses a dump/restore: migrate
 the target first.
 Each readable version requires its historical inventory and waives only
 versioned additions introduced later:
@@ -186,7 +188,10 @@ versioned additions introduced later:
 | v8 | `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES` |
 | v9 | `V10_ADDED_TABLES`, `V11_ADDED_TABLES`: `scheduled_events_claim`, `scheduled_events_tombstone` |
 | v10 | `V11_ADDED_TABLES`: `scheduled_events_tombstone` |
-| v11 | None: the full current inventory is required |
+| v11 | `V12_ADDED_TABLES`: `polls`, `poll_votes` |
+| v12 | None: the full current inventory is required |
+
+All v4–v10 rows above may also omit `V12_ADDED_TABLES` (timed polls).
 
 These are narrow waivers, not permission to omit arbitrary tables. An
 incomplete new archive refuses at inspection. The frozen 85-table v4 fixture
@@ -199,10 +204,11 @@ target state. In particular, restoring v8 without guild counters clears both
 counters; it cannot recover assistant usage that predates its persistence.
 Restoring v9 without the claim guard clears the guard and the tombstones; the
 mirror re-fences on the next winning fetch. Restoring a claim-only v10 clears
-the tombstones while keeping the epoch fence. Use a v11 recovery point to
-preserve the monthly cap and both mirror fences. Current v11 archives must
-include the monthly cap and both mirror-fence tables, so routine restores
-retain their archived state. Tombstone `deleted_at` cells must be real dates in
+the tombstones while keeping the epoch fence. Restoring v11 without polls
+clears both destination polls and votes. Use a v12 recovery point to preserve
+timed polls as well as the monthly cap and both mirror fences. Current v12
+archives must include all of those tables, so routine restores retain their
+archived state. Tombstone `deleted_at` cells must be real dates in
 exact `YYYY-MM-DDTHH:MM:SS.sssZ` form: inspection refuses missing, null,
 non-string or noncanonical values before restore opens a write transaction.
 Rollback-delta import enforces the same rule during parsing and revalidates the

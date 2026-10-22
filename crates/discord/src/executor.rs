@@ -2884,6 +2884,7 @@ impl ActionExecutor {
 
     /// Poll embeds/buttons use the same single-attempt governed mutation lane.
     /// Creation requires an ID receipt; an edit needs only its successful status.
+    #[cfg(feature = "db")]
     pub(crate) async fn write_poll_message(
         &self,
         channel_id: &str,

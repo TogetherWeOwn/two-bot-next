@@ -22,7 +22,7 @@ The existing `TWO_ANNOUNCEMENTS` flag and configured-guild fence cover creation,
 votes, early close and the scheduled job. The boot identity further narrows
 that flag. The `polls` job runs every 15 seconds through the shared supervisor,
 which skips missed ticks and never overlaps one job's attempts. A tick processes
-at most ten due or closed-unposted polls. Votes expire against the database
+at most ten due, closed-unposted or dirty-display polls. Votes expire against the database
 clock, not the next tick. Expect up to one cadence plus workload for the close
 message, not a strict delivery deadline.
 
@@ -30,9 +30,14 @@ Migration `0455_timed_polls.sql` creates `polls` and `poll_votes`. Migrations
 0456 and 0457 add the lookup indexes concurrently, each as one statement outside
 a transaction. For an interrupted index build, inspect index validity and the
 migration ledger before retrying; follow [migration recovery](migrations.md).
-Apply the migrations and reviewed database role inventory before deploying the binary.
-Creation quotas share a guild advisory lock. Votes and close share a poll row
-lock; the vote's live edit completes before the acknowledgement settles. The
+Migration 0458 adds the durable dirty-display marker. Apply the migrations and
+reviewed database role inventory before deploying the binary.
+Creation quotas share a guild advisory lock. A vote and its dirty-display marker
+commit before the live edit, so cancellation cannot undo a displayed vote.
+The edit re-reads durable counts under the same row lock as close, rather than
+sending a stale pre-close snapshot. Failed/cancelled edits remain dirty and the
+next tick retries only the idempotent message PATCH. The vote's live edit
+completes before the acknowledgement settles. The
 closed row freezes final counts so erasing a voter later does not rewrite the
 published aggregate. Member erasure removes that member's votes and authored
 polls (including their question/options); author deletion removes dependent
@@ -53,7 +58,9 @@ is **not automatically repeated**. This favors no duplicate results over silentl
 sending a second message. It does not promise exactly-once delivery across the
 Discord-send/database-settlement crash window. An open poll without a message
 receipt or a closed poll with an armed results fence requires reconciliation;
-there may have been no send, or Discord may already have accepted it.
+there may have been no send, or Discord may already have accepted it. Expired
+message-less reservations are closed and fenced without any creation/results
+send, freeing quota while preserving the unresolved receipt for inspection.
 
 Inspection is read-only first:
 

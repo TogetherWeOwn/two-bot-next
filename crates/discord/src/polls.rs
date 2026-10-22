@@ -220,20 +220,47 @@ async fn execute(
                         .into(),
                 );
             }
-            let counts = poll_store::counts(&mut tx, &guild, &poll)
-                .await
-                .map_err(db_error)?;
-            rest.write_poll_message(
-                &poll.channel,
-                poll.message.as_deref(),
-                render(&poll, &counts, false, false),
-            )
-            .await?;
+            // A displayed vote must already be durable. A failed or cancelled
+            // PATCH leaves the dirty marker committed for the next tick.
             tx.commit().await.map_err(db_error)?;
+            refresh_display(pool, rest, &guild, &poll.id).await?;
             Ok("Vote saved. Click another choice to change it.".into())
         }
         _ => Ok(refused()),
     }
+}
+
+/// Re-read under the same lock used by closers: never apply an older open
+/// snapshot after a close. Retrying this PATCH cannot create another message.
+async fn refresh_display(
+    pool: &PgPool,
+    rest: &ActionExecutor,
+    guild: &str,
+    id: &str,
+) -> Result<(), DiscordError> {
+    let (mut tx, poll) = poll_store::lock(pool, guild, id).await.map_err(db_error)?;
+    let Some(poll) = poll.filter(|p| p.open && p.display_dirty) else {
+        return Ok(());
+    };
+    let Some(message) = poll.message.as_deref() else {
+        return Ok(());
+    };
+    let counts = poll_store::counts(&mut tx, guild, &poll)
+        .await
+        .map_err(db_error)?;
+    rest.write_poll_message(
+        &poll.channel,
+        Some(message),
+        render(&poll, &counts, false, false),
+    )
+    .await?;
+    sqlx::query("UPDATE polls SET display_dirty=false WHERE guild_id=$1 AND id=$2")
+        .bind(guild)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)
 }
 
 /// Shared manual/scheduled close. The durable send fence is committed before
@@ -253,7 +280,9 @@ async fn close(
         return Ok("Only the poll author may close it.".into());
     }
     if author.is_none() && poll.open && !poll.expired {
-        return Ok("Poll is not due.".into());
+        tx.rollback().await.map_err(db_error)?;
+        refresh_display(pool, rest, guild, id).await?;
+        return Ok("Poll display reconciled.".into());
     }
     if poll.posted {
         return Ok("Poll already closed; results were posted.".into());
@@ -264,9 +293,6 @@ async fn close(
                 .into(),
         );
     }
-    let Some(message) = poll.message.as_deref() else {
-        return Ok("Poll creation is pending confirmation.".into());
-    };
     let counts = poll_store::counts(&mut tx, guild, &poll)
         .await
         .map_err(db_error)?;
@@ -274,6 +300,11 @@ async fn close(
         .await
         .map_err(db_error)?;
     tx.commit().await.map_err(db_error)?;
+    // Expired invisible reservations release quota without inventing a
+    // receipt or replaying a possibly accepted creation/results send.
+    let Some(message) = poll.message.as_deref() else {
+        return Ok("Poll closed; creation receipt still requires confirmation.".into());
+    };
     rest.write_poll_message(
         &poll.channel,
         Some(message),

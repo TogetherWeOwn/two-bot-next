@@ -477,6 +477,10 @@
       "sha256": "5812817285cf576e1737f64a46db304c1e34f6427a95456802ff53168999be7b",
       "justification": "Concurrent unposted-poll recovery index split from new table creation and from the other concurrent index. One statement per sqlx no-transaction migration avoids implicit transaction blocks. No row writes; inspect index validity and ledger before retrying an interrupted build."
     },
+    "crates/cutover/migrations/0458_poll_display_recovery.sql": {
+      "sha256": "5828a5677ecd6137c0d1142eac6c7a36c96a9ba0f49a9caa378fb4344d15ed5a",
+      "justification": "Durable dirty-display marker: commit accepted votes before the idempotent message edit and reconcile cancelled or failed edits on the bounded poll tick. Additive constant-default Boolean with IF NOT EXISTS; no data deletion or replay of creation/results. Apply before the runtime binary; binary rollback preserves rows and marker."
+    },
     "crates/cutover/migrations/0454_sticky_delivery_uncertainty.sql": {
       "sha256": "c813acffc8d44d4f3175acab3aadd9c81a2e611f7962fbba1725a828c3cee4fc",
       "justification": "Uncertain-delivery fence for sticky re-posts: one NOT NULL DEFAULT FALSE column delivery_uncertain on sticky_messages, armed by the atomic claim and disarmed only by confirmed record, proven no-send, confirmed orphan absence, or administrator reconfigure. Additive, IF NOT EXISTS; numbered 0454 because main owns 0452 (scheduled tombstone) and 0453 (store copy); global migration numbers remain unique across both chains; rollback drops the column."

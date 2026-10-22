@@ -405,7 +405,6 @@ impl InteractionRouter {
                 HandlerId::FeedList,
                 HandlerId::Rsvp,
                 HandlerId::RsvpAttendance,
-                HandlerId::Poll,
             ] {
                 register(id);
             }
@@ -436,6 +435,9 @@ impl InteractionRouter {
         // LFG pair (`InteractionRuntime::with_router`, ungated).
         register(HandlerId::Lfg);
         register(HandlerId::LfgClose);
+        // InteractionRuntime always registers the poll marker; routing still
+        // enforces announcements and the configured guild before execution.
+        register(HandlerId::Poll);
         router
     }
 
