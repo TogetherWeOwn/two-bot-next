@@ -364,20 +364,26 @@ pub const DISPATCH_LANES: &[&str] = &[
 /// single checkpoint failure stops the worker, so there is no
 /// benign-singleton case.
 pub const CHECKPOINT_FAILURE_STAGES: &[&str] = &["pre_commit", "commit"];
-/// Drop-guard names for `two_bot_drop_poison_total{guard}`: the four guards
+/// Drop-guard names for `two_bot_drop_poison_total{guard}`: the seven guards
 /// whose `Drop` bodies recover a poisoned lock instead of panicking (which
 /// would abort the process when the drop runs during unwinding).
 /// `command_dispatch_guard` stops the command task scope,
 /// `schedule_run` finishes a feed poll schedule, `user_slot` releases an
 /// interaction admission count, `in_flight_guard` releases a voice REST
-/// attempt slot. Exactly these four series exist; unknown guards collapse
-/// to the trailing `in_flight_guard` slot only when the allowlist grows.
+/// attempt slot, `ticket_supervisor` stops the ticket task scope,
+/// `response_accounting` retires a REST response's rate-limit entries, and
+/// `voice_connection_guard` disconnects the voice sink. Exactly these seven
+/// series exist; unknown guards collapse to the trailing
+/// `voice_connection_guard` slot only when the allowlist grows.
 /// Panic payloads are never labels.
 pub const DROP_POISON_GUARDS: &[&str] = &[
     "command_dispatch_guard",
     "schedule_run",
     "user_slot",
     "in_flight_guard",
+    "ticket_supervisor",
+    "response_accounting",
+    "voice_connection_guard",
 ];
 /// Presence-capture outcomes for `two_bot_presence_capture_total{outcome}`
 /// (event-store S3): `inserted` for a first delivery that stored a row,
@@ -685,6 +691,11 @@ struct Values {
     /// process restart, so the runbook pairs it with the error log line. No
     /// guild id, SQLSTATE or error text ever becomes a label.
     retention_replay_needed: u64,
+    /// Ticket component interactions refused before spawning because the
+    /// runtime or the member was saturated. Label-free counter; resets on
+    /// process restart, so the runbook pairs it with the sampled saturation
+    /// log line. No member id, token or interaction id ever becomes a label.
+    ticket_component_drops: u64,
     /// Event-store consumer lag (S1): `received_at - event_time` spread in
     /// seconds for the newest observed capture row. Last writer wins; 0 when
     /// no row has been observed. Single label-free series — no message,
@@ -1335,6 +1346,19 @@ impl Metrics {
         values.retention_replay_needed = values.retention_replay_needed.saturating_add(1);
     }
 
+    /// One ticket component interaction refused before spawning: the runtime
+    /// held `MAX_TICKET_COMPONENT_IN_FLIGHT` executions or the member held
+    /// the per-member cap. Call exactly once per refusal from the ticket
+    /// dispatch path; admitted work never calls this. Label-free counter;
+    /// no member id, token or interaction id ever becomes a label.
+    pub fn ticket_component_drop(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.ticket_component_drops = values.ticket_component_drops.saturating_add(1);
+    }
+
     /// One storage-layer failure. Unknown `op` values collapse
     /// to `other`; no error text, query or identifier is retained.
     pub fn db_error(&self, op: &str) {
@@ -1406,7 +1430,7 @@ impl Metrics {
     /// One poisoned lock recovered by a drop guard instead of panicking
     /// inside `drop` (which aborts the process during unwinding). Call once
     /// per poisoned drop, with a [`DROP_POISON_GUARDS`] member. Unknown
-    /// guards collapse to `in_flight_guard` only when the allowlist grows;
+    /// guards collapse to `voice_connection_guard` only when the allowlist grows;
     /// panic payloads are never labels. No IDs, tokens or bodies are
     /// retained. Lock-free and saturating: safe to call from a `Drop` body
     /// while any thread holds or poisoned the `Values` mutex.
@@ -2219,6 +2243,12 @@ impl Metrics {
             "two_bot_retention_replay_needed_total",
             "counter",
             values.retention_replay_needed,
+        );
+        scalar(
+            &mut out,
+            "two_bot_ticket_component_drops_total",
+            "counter",
+            values.ticket_component_drops,
         );
         header(
             &mut out,
@@ -3053,11 +3083,18 @@ mod tests {
         metrics.drop_poison("user_slot");
         metrics.drop_poison("in_flight_guard");
         metrics.drop_poison("user_slot");
+        metrics.drop_poison("ticket_supervisor");
+        metrics.drop_poison("response_accounting");
+        metrics.drop_poison("response_accounting");
+        metrics.drop_poison("voice_connection_guard");
         let text = metrics.render(None);
         assert!(text.contains("two_bot_drop_poison_total{guard=\"command_dispatch_guard\"} 1\n"));
         assert!(text.contains("two_bot_drop_poison_total{guard=\"schedule_run\"} 1\n"));
         assert!(text.contains("two_bot_drop_poison_total{guard=\"user_slot\"} 2\n"));
         assert!(text.contains("two_bot_drop_poison_total{guard=\"in_flight_guard\"} 1\n"));
+        assert!(text.contains("two_bot_drop_poison_total{guard=\"ticket_supervisor\"} 1\n"));
+        assert!(text.contains("two_bot_drop_poison_total{guard=\"response_accounting\"} 2\n"));
+        assert!(text.contains("two_bot_drop_poison_total{guard=\"voice_connection_guard\"} 1\n"));
         // Fixed cardinality: exactly the allowlisted series render.
         assert_eq!(
             text.lines()
@@ -3134,7 +3171,7 @@ mod tests {
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
         assert!(!text.contains("secret"));
-        assert!(text.contains("two_bot_drop_poison_total{guard=\"in_flight_guard\"} 100\n"));
+        assert!(text.contains("two_bot_drop_poison_total{guard=\"voice_connection_guard\"} 100\n"));
     }
 
     #[test]
@@ -3344,6 +3381,29 @@ mod tests {
         let series: Vec<_> = text
             .lines()
             .filter(|line| line.starts_with("two_bot_retention_replay_needed_total "))
+            .collect();
+        assert_eq!(series.len(), 1);
+        let (_, value) = series[0].rsplit_once(' ').unwrap();
+        assert!(value.parse::<f64>().is_ok(), "bad sample: {}", series[0]);
+    }
+
+    #[test]
+    fn ticket_component_drops_counter_is_label_free_and_zero_fresh() {
+        // Refused ticket components render as one label-free counter series —
+        // 0 on a fresh registry, +1 per refusal — so no member id, token or
+        // interaction id can reach exposition.
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("# TYPE two_bot_ticket_component_drops_total counter\n"));
+        assert!(text.contains("two_bot_ticket_component_drops_total 0\n"));
+        metrics.ticket_component_drop();
+        metrics.ticket_component_drop();
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_ticket_component_drops_total 2\n"));
+        assert!(!text.contains("two_bot_ticket_component_drops_total{"));
+        let series: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("two_bot_ticket_component_drops_total "))
             .collect();
         assert_eq!(series.len(), 1);
         let (_, value) = series[0].rsplit_once(' ').unwrap();

@@ -1,5 +1,8 @@
 //! Real shard + runtime composition, with only loopback Discord traffic and
 //! the parent's guarded, isolated TestDb. All database tests are opt-in.
+#[path = "feed_list_pages_acceptance.rs"]
+mod feed_list_pages_acceptance;
+
 use super::*;
 
 use std::collections::HashMap;

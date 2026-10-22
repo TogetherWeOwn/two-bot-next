@@ -54,6 +54,30 @@ leaves scrape-bearer access open (and vice versa); doubly-unconfigured still
 404s, otherwise unauthenticated callers get 401. The static page stays
 reachable (it holds no data).
 
+## Observation freshness
+
+- Connect immediately retires the prior observation while waiting for a fresh
+  report. A valid report shows READY (200) or NOT READY (503), with its browser
+  observation time (`updated`, UTC). This is a snapshot, not continuous health.
+- Connected pages retry every 15 seconds. One request may be active; the next
+  poll cancels superseded work. The **10-second total deadline** covers both
+  response headers and JSON body consumption. Timeout, network/access failures
+  and invalid reports replace readiness with an explicit failure and retry
+  guidance; they never renew its observation time.
+- After **30 seconds** without a new valid report, the panel becomes stale and
+  loses success styling even if another poll has not run. The last observation
+  time remains visible; it is historical, not evidence that the bot is healthy.
+  Browser timers can pause in suspended tabs: keep the page active for monitoring
+  and reconnect after resuming rather than trusting a frozen screen.
+- Disconnect aborts pending work, stops polling/expiry timers, clears both
+  credential inputs and labels the panel disconnected. Enter credentials and
+  Connect to resume. Reconnect also aborts old work; late responses cannot
+  restore a disconnected, timed-out or superseded observation.
+- For unavailable/stale status, wait for the next retry or check connectivity
+  and access credentials, then reconnect. A new valid report restores fresh
+  readiness. A 503 NOT READY is a bot report, not a browser transport failure;
+  use its component/job details for triage.
+
 ## Break-glass
 
 - **Staging** keeps its `workers.dev` route (`workers_dev = true`) as the

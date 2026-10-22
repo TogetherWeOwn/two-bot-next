@@ -174,6 +174,7 @@ class CutoverVerdictAcceptance(unittest.TestCase):
                 return reply({"status": "ok"}) if url.endswith("/health") else reply(ready_payload())
 
             with mock.patch("socket.socket", side_effect=AssertionError("network forbidden")), \
+                    mock.patch.object(probe.time, "time", return_value=NOW), \
                     contextlib.redirect_stdout(io.StringIO()):
                 code = probe.main(["--base-url", origin], fetch_fn=fetch)
             self.assertEqual(code, 0)
