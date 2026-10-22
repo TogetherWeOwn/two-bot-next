@@ -762,7 +762,8 @@ async fn host_checkin_authorized_self_and_on_behalf_retain_host_checkin_proof() 
         &attendance(402, MANAGE_EVENTS, OTHER, &occ),
     )
     .await;
-    assert_eq!(counts(fixture.pool()).await, (0, 0, 2));
+    // Two recorded check-ins: two facts, two audit rows; the duplicate wrote neither.
+    assert_eq!(counts(fixture.pool()).await, (0, 2, 2));
     let rows: Vec<(String, String, String, String, String, String, String)> = sqlx::query_as(
         "SELECT event_type, source_event_id, actor_id, source, classification, metadata, idempotency_key FROM community_facts ORDER BY id")
         .fetch_all(fixture.pool()).await.unwrap();
@@ -830,7 +831,8 @@ async fn host_checkin_authorized_self_and_on_behalf_retain_host_checkin_proof() 
     assert_eq!(gets[12].path, guild_member_path(USER));
     assert_eq!(gets[13].path, scheduled_event_path(EVENT));
     assert_eq!(gets[14].path, guild_member_path(USER));
-    assert_eq!(counts(fixture.pool()).await, (0, 0, 3));
+    // The labeled repeat is a third recorded check-in: three facts, three audit rows.
+    assert_eq!(counts(fixture.pool()).await, (0, 3, 3));
     fixture.close().await;
     mock.shutdown().await;
 }
@@ -1512,8 +1514,8 @@ async fn failed_compensation_keeps_refusal_and_emits_one_diagnostic() {
     .await;
     assert_reply(&mock, "That member is no longer in this server.", true);
     assert_eq!(mock.requests().len(), 7);
-    // The failed compensation kept this attempt's attendance fact.
-    assert_eq!(counts(checkin_db.pool()).await, (0, 0, 1));
+    // The failed compensation kept this attempt's attendance fact and its audit row.
+    assert_eq!(counts(checkin_db.pool()).await, (0, 1, 1));
     assert_single_failure(compensation_failures_since(mark), "checkin");
     mock.shutdown().await;
     checkin_db.close().await;

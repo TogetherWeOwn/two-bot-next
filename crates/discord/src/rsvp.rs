@@ -12,7 +12,7 @@ use two_bot_core::{
     attendance_totals_text, checkin_duplicate_text, checkin_idempotency_key,
     checkin_occurrence_full_text, checkin_recorded_text, classify, compensate_checkin_write,
     compensate_rsvp_write, list_rsvps, now_iso, parse_attendance_occurrence, partition_rsvps,
-    put_rsvp_with_audit, record_checkin, require_manage_events, rsvp_event_full_text,
+    put_rsvp_with_audit, record_checkin_with_audit, require_manage_events, rsvp_event_full_text,
     rsvp_rate_limited_text, rsvp_saved_text, validate_event_id, validate_occurrence_id,
     AttendanceProof, CheckinWrite, ClassifierConfig, ClassifyInput, HandlerId, InteractionRouter,
     RsvpAudit, RsvpRecord, RsvpStatus, RsvpStoreError, SlashOutcome,
@@ -509,32 +509,47 @@ async fn execute(
                     is_test: false,
                 },
             );
-            let inserted = record_checkin(
+            // The attendance fact and its required audit row commit in one
+            // transaction: a failed audit insert rolls the fact back, so no
+            // partial write can survive this path. The audit id carries the
+            // interaction id (`checkin:<interaction id>`), reusing the RSVP
+            // idempotency pattern.
+            let occurred_at = now_iso();
+            let audit_id = format!("checkin:{}", interaction.id);
+            let (inserted, audit_inserted) = record_checkin_with_audit(
                 pool,
                 &CheckinWrite {
                     guild_id: guild_id.clone(),
                     event_occurrence_id: resolved.canonical_id.clone(),
                     member_id: member_id_str.clone(),
-                    occurred_at: now_iso(),
+                    occurred_at: occurred_at.clone(),
                     proof: AttendanceProof::HostCheckin,
                     classifier_version: verdict.classifier_version,
                     classification: verdict.classification,
                     matched_rule: verdict.matched_rule,
                 },
+                &RsvpAudit::for_checkin(
+                    &audit_id,
+                    &guild_id,
+                    &actor_id,
+                    &resolved.canonical_id,
+                    &member_id_str,
+                    &occurred_at,
+                ),
             )
             .await
             .map_err(|err| match err {
                 RsvpStoreError::OccurrenceAtCapacity => checkin_occurrence_full_text(),
-                // Event capacity, RSVP rate and retention floors cannot come
-                // out of a check-in write; transport failures stay generic.
+                // A failed audit insert refuses with the pre-existing
+                // unattributed text; fact-step failures keep it too. Event
+                // capacity, RSVP rate and retention floors cannot come out
+                // of a check-in write; transport failures stay generic.
                 // Every variant is mapped: a refused or failed write is never
                 // reported as recorded.
                 RsvpStoreError::EventAtCapacity
                 | RsvpStoreError::RsvpRateLimited
                 | RsvpStoreError::CutoffTooRecent
                 | RsvpStoreError::Db(_)
-                // Unreachable on the check-in path (`record_checkin` writes
-                // no audit row); mapped only for exhaustiveness.
                 | RsvpStoreError::AuditDb(_)
                 | RsvpStoreError::UnknownStatus(_) => "Attendance was not recorded.".to_owned(),
             })?;
@@ -544,13 +559,23 @@ async fn execute(
                     &resolved.canonical_id,
                 ));
             }
+            // A retried audit id dedupes while the fact still records: name
+            // the collision at DEBUG instead of discarding the boolean. The
+            // fields carry only the audit id — never the interaction token.
+            if !audit_inserted {
+                tracing::debug!(
+                    msg = "checkin_audit_duplicate",
+                    audit_id = %audit_id,
+                );
+            }
             // RA-03 race fence: the anchor event or target membership may have
             // vanished between the pre-write RA-02 reads and the commit. The
-            // `record_checkin` transaction only bounds the occurrence count —
-            // it cannot see Discord-side removal — so re-read the same live
-            // evidence here; on loss or lookup failure compensate (delete
-            // exactly this attempt's fact) and refuse. Duplicates return above
-            // without revalidation: they wrote nothing.
+            // `record_checkin_with_audit` transaction only bounds the
+            // occurrence count — it cannot see Discord-side removal — so
+            // re-read the same live evidence here; on loss or lookup failure
+            // compensate (delete exactly this attempt's fact and audit row)
+            // and refuse. Duplicates return above without revalidation: they
+            // wrote nothing.
             if let Err(refusal) = revalidate_attendance(
                 executor,
                 &guild_id,
@@ -562,6 +587,7 @@ async fn execute(
                 if compensate_checkin_write(
                     pool,
                     &checkin_idempotency_key(&resolved.canonical_id, &member_id_str),
+                    &audit_id,
                 )
                 .await
                 .is_err()

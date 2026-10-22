@@ -323,12 +323,50 @@ pub struct CheckinWrite {
 /// The shared table lock serializes with concurrent opt-outs (which take
 /// SHARE ROW EXCLUSIVE over these tables): whoever locks first wins, so a
 /// write that passes the gate can never land after the purge.
+///
+/// Callers that must audit the check-in use [`record_checkin_with_audit`]:
+/// the fact and its audit row commit in one transaction, so a failed audit
+/// insert rolls the fact back with it. This standalone path writes no audit
+/// row.
 pub async fn record_checkin(
     pool: &Pool<Postgres>,
     checkin: &CheckinWrite,
 ) -> Result<bool, RsvpStoreError> {
+    let (inserted, _) = record_checkin_inner(pool, checkin, None).await?;
+    Ok(inserted)
+}
+
+/// Record one verified-attendance fact with its required audit row, sharing
+/// one transaction like [`put_rsvp_with_audit`]: the fact insert and the
+/// audit insert commit together, so a failed audit insert rolls the fact
+/// back and no partial write can survive this path. Returns
+/// `(fact_inserted, audit_inserted)`: duplicates, `rsvp` proofs and
+/// suppressed pairs report `(false, false)` with no audit write, and a
+/// retried audit id dedupes (`ON CONFLICT DO NOTHING`) exactly as
+/// [`write_audit`] does — the fact still records while `audit_inserted`
+/// reports `false`, so the caller must handle that boolean explicitly
+/// instead of discarding it. An audit-step transport failure surfaces as
+/// [`RsvpStoreError::AuditDb`], distinct from a fact-step
+/// [`RsvpStoreError::Db`].
+pub async fn record_checkin_with_audit(
+    pool: &Pool<Postgres>,
+    checkin: &CheckinWrite,
+    audit: &RsvpAudit,
+) -> Result<(bool, bool), RsvpStoreError> {
+    record_checkin_inner(pool, checkin, Some(audit)).await
+}
+
+/// The transactional check-in write shared by [`record_checkin`] and
+/// [`record_checkin_with_audit`], so admission order, lock order, gate order
+/// and row SQL stay identical on both paths. The audit insert runs only when
+/// the fact insert lands, inside the same transaction.
+async fn record_checkin_inner(
+    pool: &Pool<Postgres>,
+    checkin: &CheckinWrite,
+    audit: Option<&RsvpAudit>,
+) -> Result<(bool, bool), RsvpStoreError> {
     if !checkin.proof.writes_fact() {
-        return Ok(false);
+        return Ok((false, false));
     }
     let key = checkin_idempotency_key(&checkin.event_occurrence_id, &checkin.member_id);
     let source = checkin_source(&checkin.event_occurrence_id);
@@ -341,7 +379,7 @@ pub async fn record_checkin(
         .await?;
     if crate::privacy::suppressed_in(&mut tx, &checkin.guild_id, &checkin.member_id).await? {
         tx.rollback().await?;
-        return Ok(false);
+        return Ok((false, false));
     }
     sqlx::query(
         "SELECT pg_advisory_xact_lock(hashtextextended(
@@ -357,7 +395,7 @@ pub async fn record_checkin(
             .fetch_optional(&mut *tx)
             .await?;
     if duplicate.is_some() {
-        return Ok(false);
+        return Ok((false, false));
     }
     let facts: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM community_facts WHERE guild_id = $1 AND source = $2",
@@ -398,8 +436,18 @@ pub async fn record_checkin(
     ))
     .fetch_optional(&mut *tx)
     .await?;
+    let fact_inserted = inserted.is_some();
+    // Only a landed fact earns its audit row, in the same transaction: a
+    // duplicate, suppression or lost race writes no audit row, and a failed
+    // audit insert rolls the fact back with it.
+    let audit_inserted = match (fact_inserted, audit) {
+        (true, Some(audit)) => insert_audit_row(&mut *tx, audit)
+            .await
+            .map_err(RsvpStoreError::AuditDb)?,
+        _ => false,
+    };
     tx.commit().await?;
-    Ok(inserted.is_some())
+    Ok((fact_inserted, audit_inserted))
 }
 
 /// RA-03 compensation (TOG-19773): undo exactly the RSVP write one attempt
@@ -458,14 +506,24 @@ pub async fn compensate_rsvp_write(
 }
 
 /// RA-03 compensation (TOG-19773): remove the attendance fact one attempt
-/// inserted when post-write revalidation finds a membership gone. The delete
-/// keys on the exact idempotency key, so only this identity's fact can match.
+/// inserted when post-write revalidation finds a membership gone, plus the
+/// audit row that attempt wrote. The fact delete keys on the exact
+/// idempotency key, so only this identity's fact can match; the audit delete
+/// keys on this attempt's id, so a refused attempt leaves neither row — like
+/// [`compensate_rsvp_write`], which always removes its attempt's audit row
+/// too. The fact delete runs first: if it fails, both rows remain and the
+/// caller reports the `compensation_failed` diagnostic.
 pub async fn compensate_checkin_write(
     pool: &Pool<Postgres>,
     idempotency_key: &str,
+    audit_id: &str,
 ) -> Result<(), RsvpStoreError> {
     sqlx::query("DELETE FROM community_facts WHERE idempotency_key = $1")
         .bind(idempotency_key)
+        .execute(pool)
+        .await?;
+    sqlx::query("DELETE FROM announcements_audit_log WHERE id = $1")
+        .bind(audit_id)
         .execute(pool)
         .await?;
     Ok(())
@@ -1158,6 +1216,95 @@ mod tests {
         drop_schema(&pool, &schema).await;
     }
 
+    /// Check-in audit parity: a recorded fact commits its audit row in the
+    /// same transaction; a retried audit id dedupes while the fact still
+    /// records; a duplicate writes neither; and a failed audit insert rolls
+    /// the fact back, so no partial write survives.
+    #[tokio::test]
+    async fn checkin_with_audit_commits_fact_and_audit_atomically() {
+        let Some((pool, schema)) = test_pool("checkin_audit")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping rsvp_store test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        let audit = |id: &str, member: &str| {
+            RsvpAudit::for_checkin(
+                id,
+                "1545644954272137297",
+                "host-1",
+                "occ-audit",
+                member,
+                "2026-09-02T10:00:00.000Z",
+            )
+        };
+        // Recorded: one fact, one audit row.
+        assert_eq!(
+            record_checkin_with_audit(
+                &pool,
+                &checkin("occ-audit", "m1", "2026-09-02T10:00:00.000Z"),
+                &audit("checkin:1", "m1"),
+            )
+            .await
+            .expect("recorded"),
+            (true, true)
+        );
+        // Duplicate: neither a new fact nor a new audit row, even with a
+        // fresh audit id.
+        assert_eq!(
+            record_checkin_with_audit(
+                &pool,
+                &checkin("occ-audit", "m1", "2026-09-02T10:01:00.000Z"),
+                &audit("checkin:2", "m1"),
+            )
+            .await
+            .expect("duplicate"),
+            (false, false)
+        );
+        // Retried audit id: the new member's fact still records while the
+        // audit dedupes — the caller must handle that `false` explicitly.
+        assert_eq!(
+            record_checkin_with_audit(
+                &pool,
+                &checkin("occ-audit", "m2", "2026-09-02T10:02:00.000Z"),
+                &audit("checkin:1", "m2"),
+            )
+            .await
+            .expect("audit retry"),
+            (true, false)
+        );
+        let counts: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM community_facts),
+                    (SELECT COUNT(*) FROM announcements_audit_log)",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("counts");
+        assert_eq!(counts, (2, 1));
+        // A failed audit insert rolls the fact back: dropping the audit
+        // table stands in for an unavailable audit write.
+        sqlx::query("DROP TABLE announcements_audit_log")
+            .execute(&pool)
+            .await
+            .expect("drop audit table");
+        assert!(matches!(
+            record_checkin_with_audit(
+                &pool,
+                &checkin("occ-audit", "m3", "2026-09-02T10:03:00.000Z"),
+                &audit("checkin:3", "m3"),
+            )
+            .await,
+            Err(RsvpStoreError::AuditDb(_))
+        ));
+        let facts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM community_facts")
+            .fetch_one(&pool)
+            .await
+            .expect("facts");
+        assert_eq!(facts, 2, "refused audit write leaves no fact");
+        drop_schema(&pool, &schema).await;
+    }
+
     /// RA-03 retention: history older than the cutoff is purged from both
     /// tables while floored rows survive; a cutoff newer than the audit
     /// floor is refused before any delete, and a malformed cutoff fails as
@@ -1321,9 +1468,13 @@ mod tests {
             .expect("m2"),
             "m2 records"
         );
-        compensate_checkin_write(&pool, &checkin_idempotency_key("occ-comp", "m1"))
-            .await
-            .expect("compensate m1");
+        compensate_checkin_write(
+            &pool,
+            &checkin_idempotency_key("occ-comp", "m1"),
+            "audit-missing",
+        )
+        .await
+        .expect("compensate m1");
         let keys: Vec<String> = sqlx::query_scalar("SELECT idempotency_key FROM community_facts")
             .fetch_all(&pool)
             .await
