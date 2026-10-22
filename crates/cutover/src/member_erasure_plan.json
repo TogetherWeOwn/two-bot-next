@@ -263,6 +263,76 @@
   ],
   "allowlist": [
     {
+      "table": "voice_creators",
+      "column": "updated_by",
+      "reason": "Retained voice configuration attribution, like guild_settings.updated_by; member activity erasure must not delete or broaden active voice policy."
+    },
+    {
+      "table": "voice_access_controls",
+      "column": "updated_by",
+      "reason": "Retained voice configuration attribution, like guild_settings.updated_by; member activity erasure must not delete or broaden active voice policy."
+    },
+    {
+      "table": "voice_logging_settings",
+      "column": "updated_by",
+      "reason": "Retained voice configuration attribution, like guild_settings.updated_by; member activity erasure must not delete or broaden active voice policy."
+    },
+    {
+      "table": "voice_guild_settings",
+      "column": "updated_by",
+      "reason": "Retained voice configuration attribution, like guild_settings.updated_by; member activity erasure must not delete or broaden active voice policy."
+    },
+    {
+      "table": "voice_channel_templates",
+      "column": "updated_by",
+      "reason": "Retained voice configuration attribution, like guild_settings.updated_by; member activity erasure must not delete or broaden active voice policy."
+    },
+    {
+      "table": "voice_game_aliases",
+      "column": "updated_by",
+      "reason": "Retained voice configuration attribution, like guild_settings.updated_by; member activity erasure must not delete or broaden active voice policy."
+    },
+    {
+      "table": "voice_random_lists",
+      "column": "updated_by",
+      "reason": "Retained voice configuration attribution, like guild_settings.updated_by; member activity erasure must not delete or broaden active voice policy."
+    },
+    {
+      "table": "voice_random_list_choices",
+      "column": "updated_by",
+      "reason": "Retained voice configuration attribution, like guild_settings.updated_by; member activity erasure must not delete or broaden active voice policy."
+    },
+    {
+      "table": "voice_logging",
+      "column": "updated_by",
+      "reason": "Retained voice configuration attribution, like guild_settings.updated_by; member activity erasure must not delete or broaden active voice policy."
+    },
+    {
+      "table": "voice_logging_mention_members",
+      "column": "updated_by",
+      "reason": "Retained voice configuration attribution, like guild_settings.updated_by; member activity erasure must not delete or broaden active voice policy."
+    },
+    {
+      "table": "voice_logging_mention_roles",
+      "column": "updated_by",
+      "reason": "Retained voice configuration attribution, like guild_settings.updated_by; member activity erasure must not delete or broaden active voice policy."
+    },
+    {
+      "table": "voice_command_roles",
+      "column": "updated_by",
+      "reason": "Retained voice configuration attribution, like guild_settings.updated_by; member activity erasure must not delete or broaden active voice policy."
+    },
+    {
+      "table": "voice_command_role_members",
+      "column": "updated_by",
+      "reason": "Retained voice configuration attribution, like guild_settings.updated_by; member activity erasure must not delete or broaden active voice policy."
+    },
+    {
+      "table": "voice_settings_audit",
+      "column": "actor",
+      "reason": "Immutable voice configuration audit and concurrency history, like guild_settings_audit; retain attribution and replay evidence, never disable its append-only guard for member erasure."
+    },
+    {
       "table": "guild_settings",
       "column": "updated_by",
       "reason": "Configuration attribution is retained with active guild safety/permission settings; member erasure must not delete or broaden policy configuration. A separate reviewed configuration change is required."

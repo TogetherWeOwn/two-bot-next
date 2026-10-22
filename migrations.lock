@@ -468,6 +468,10 @@
     "crates/cutover/migrations/0454_sticky_delivery_uncertainty.sql": {
       "sha256": "c813acffc8d44d4f3175acab3aadd9c81a2e611f7962fbba1725a828c3cee4fc",
       "justification": "Uncertain-delivery fence for sticky re-posts: one NOT NULL DEFAULT FALSE column delivery_uncertain on sticky_messages, armed by the atomic claim and disarmed only by confirmed record, proven no-send, confirmed orphan absence, or administrator reconfigure. Additive, IF NOT EXISTS; numbered 0454 because main owns 0452 (scheduled tombstone) and 0453 (store copy); global migration numbers remain unique across both chains; rollback drops the column."
+    },
+    "crates/cutover/migrations/0455_voice_settings_versions.sql": {
+      "sha256": "581fbee8e2769a57b4a61f1cef47a74fb2bb264d4b28cf2bbd8fbdf3c10f1ffa",
+      "justification": "Version and attribute voice configuration rows; append-only per-guild change audit, transactional row stamping, voice action allowlist and durable first-save revision. Existing attribution remains unknown; migration is additive apart from replacing the action CHECK with a superset."
     }
   }
 }
