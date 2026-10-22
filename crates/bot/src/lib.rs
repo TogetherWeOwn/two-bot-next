@@ -3,6 +3,11 @@
 mod voice_room_plan;
 pub mod voice_rooms;
 
+// Bounded gateway reconnect schedule: the gateway receive loop paces
+// `Reconnect` failures on it, and the voice-actor load backoff shares its
+// jitter stream. The supervised episode runner stays in the binary.
+pub mod gateway_backoff;
+
 // Required event-voice category config + per-tick fail-closed preflight
 // (host decision D4): the gate the T-15 ticker consults before any create.
 pub mod event_voice_category;
