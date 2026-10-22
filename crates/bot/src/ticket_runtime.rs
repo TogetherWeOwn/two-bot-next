@@ -1382,6 +1382,10 @@ mod cursor_budget_interaction_tests;
 mod lifecycle_observability_acceptance_tests;
 
 #[cfg(test)]
+#[path = "ticket_lifecycle_review_guard_acceptance_tests.rs"]
+mod review_guard_acceptance_tests;
+
+#[cfg(test)]
 #[path = "ticket_capture_cap_acceptance_tests.rs"]
 mod capture_cap_acceptance_tests;
 
