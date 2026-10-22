@@ -1461,10 +1461,10 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v10-source.ndjson.gz");
+    let current_path = directory.path("v11-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 10);
+    assert_eq!(old.manifest.version, 11);
     for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -1510,10 +1510,10 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v10-source.ndjson.gz");
+    let current_path = directory.path("v11-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 10);
+    assert_eq!(old.manifest.version, 11);
     let rows = old.buffers.remove("scheduled_events_claim").unwrap();
     assert!(
         !rows.is_empty(),
@@ -1546,6 +1546,56 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     assert_eq!(
         count, 0,
         "v9 restore clears newer scheduled_events_claim target rows"
+    );
+    let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(members > 0, "older covered data is restored, not discarded");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v10_archive_restores_and_clears_newer_registry() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    seed(pool).await;
+    let directory = ArchiveDirectory::new();
+    let current_path = directory.path("v11-source.ndjson.gz");
+    dump(pool, &current_path).await.unwrap();
+    let mut old = inspect(&current_path).unwrap();
+    assert_eq!(old.manifest.version, 11);
+    let rows = old.buffers.remove("admin_api_tokens").unwrap();
+    assert!(
+        !rows.is_empty(),
+        "fixture must populate newer admin_api_tokens"
+    );
+    old.manifest
+        .tables
+        .retain(|table| table.name != "admin_api_tokens");
+    old.manifest.version = 10;
+    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
+    let old_path = directory.path("pre-registry-v10.ndjson.gz");
+    write_archive(&old_path, &old);
+    let inspected = inspect(&old_path).expect("pre-change v10 archive remains readable");
+    assert_eq!(inspected.manifest.version, 10);
+    assert_eq!(inspected.manifest.missing_tables(), ["admin_api_tokens"]);
+    // This test deliberately replaces a reused isolated rehearsal target.
+    forget_moderation_history(pool).await;
+    let report = restore(pool, &old_path).await.unwrap();
+    assert!(report.ok);
+    let count: i64 = sqlx::query_scalar(audited(format!(
+        "SELECT COUNT(*) FROM {}",
+        identifier("admin_api_tokens")
+    )))
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        count, 0,
+        "v10 restore clears newer admin_api_tokens target rows"
     );
     let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
         .fetch_one(pool)

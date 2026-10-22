@@ -1,4 +1,4 @@
-//! The v10 backup envelope (also reads v3/v4/v5/v6/v7/v8/v9): manifest / rows / end marker, gzipped NDJSON.
+//! The v11 backup envelope (also reads v3/v4/v5/v6/v7/v8/v9/v10): manifest / rows / end marker, gzipped NDJSON.
 //!
 //! Port of the file half of legacy `src/store/dump.ts`. The writer side lives
 //! in [`super::dump`]; everything here touches no database, so every refusal
@@ -127,6 +127,11 @@ pub const DUMP_TABLES: &[&str] = &[
     "guild_settings_revision",
     "guild_settings",
     "guild_settings_audit",
+    // Admin API token registry (0452/0453, v11): operator-issued tokens with
+    // hash-only secrets. Archived so a restore keeps admin API access working
+    // (secrets are shown once at issuance and cannot be re-derived); see
+    // [`V11_ADDED_TABLES`]. No foreign keys, so order here is free.
+    "admin_api_tokens",
     "audit_kill_switch",
     "internal_nonces",
     "internal_clock_high_water",
@@ -246,6 +251,12 @@ pub const V9_ADDED_TABLES: &[&str] =
 /// contain the guard so a restored mirror keeps its stale-fetch fence.
 pub const V10_ADDED_TABLES: &[&str] = &["scheduled_events_claim"];
 
+/// Tables first covered by v11 (admin API token registry, migrations
+/// 0452/0453). Older archives may omit the registry; restore clears the
+/// destination rows, as for every versioned addition. New archives must
+/// contain the registry so issued tokens survive recovery.
+pub const V11_ADDED_TABLES: &[&str] = &["admin_api_tokens"];
+
 /// Covered tables not created by the current cutover migration set, if any.
 /// Keep legacy data when such tables exist, but do not require nonexistent
 /// legacy subsystems. A table created by migrations must leave this list
@@ -321,8 +332,8 @@ pub fn is_destination_owned(table: &str, column: &str) -> bool {
         .any(|(owned_table, owned_column)| *owned_table == table && *owned_column == column)
 }
 
-/// Write complete v10 coverage; the reader also accepts frozen v3/v4/v5/v6/v7/v8/v9 coverage.
-pub const DUMP_VERSION: u32 = 10;
+/// Write complete v11 coverage; the reader also accepts frozen v3/v4/v5/v6/v7/v8/v9/v10 coverage.
+pub const DUMP_VERSION: u32 = 11;
 
 /// A table name in the dump, validated against [`DUMP_TABLES`].
 pub type DumpTable = String;
@@ -856,10 +867,11 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                     && version != 7
                     && version != 8
                     && version != 9
+                    && version != 10
                     && version != u64::from(DUMP_VERSION)
                 {
                     return Err(refuse(format!(
-                        "dump version {version}, this build reads 3, 4, 5, 6, 7, 8, 9 and {DUMP_VERSION}"
+                        "dump version {version}, this build reads 3, 4, 5, 6, 7, 8, 9, 10 and {DUMP_VERSION}"
                     )));
                 }
                 retain_within_cap(&mut retained, &obj, limits.retained)?;
@@ -1136,9 +1148,9 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
         let _ = count;
     }
     // Historical inventories are pinned by fixtures. Each old version waives
-    // only tables first covered by a later version. New v10 archives require
-    // the full inventory, including both guild counters (0441/0442/0446/0447)
-    // and the epoch-claim guard (0450/0451).
+    // only tables first covered by a later version. New v11 archives require
+    // the full inventory, including both guild counters (0441/0442/0446/0447),
+    // the epoch-claim guard (0450/0451) and the token registry (0452/0453).
     let version = obj.get("version").and_then(Value::as_u64);
     let missing: Vec<&str> = DUMP_TABLES
         .iter()
@@ -1153,6 +1165,7 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
                     && !V8_ADDED_TABLES.contains(name)
                     && !V9_ADDED_TABLES.contains(name)
                     && !V10_ADDED_TABLES.contains(name)
+                    && !V11_ADDED_TABLES.contains(name)
                     && !OPTIONAL_LEGACY_TABLES.contains(name)
             }
             Some(5) => {
@@ -1161,6 +1174,7 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
                     && !V8_ADDED_TABLES.contains(name)
                     && !V9_ADDED_TABLES.contains(name)
                     && !V10_ADDED_TABLES.contains(name)
+                    && !V11_ADDED_TABLES.contains(name)
                     && !OPTIONAL_LEGACY_TABLES.contains(name)
             }
             Some(6) => {
@@ -1168,20 +1182,28 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
                     && !V8_ADDED_TABLES.contains(name)
                     && !V9_ADDED_TABLES.contains(name)
                     && !V10_ADDED_TABLES.contains(name)
+                    && !V11_ADDED_TABLES.contains(name)
                     && !OPTIONAL_LEGACY_TABLES.contains(name)
             }
             Some(7) => {
                 !V8_ADDED_TABLES.contains(name)
                     && !V9_ADDED_TABLES.contains(name)
                     && !V10_ADDED_TABLES.contains(name)
+                    && !V11_ADDED_TABLES.contains(name)
                     && !OPTIONAL_LEGACY_TABLES.contains(name)
             }
             Some(8) => {
                 !V9_ADDED_TABLES.contains(name)
                     && !V10_ADDED_TABLES.contains(name)
+                    && !V11_ADDED_TABLES.contains(name)
                     && !OPTIONAL_LEGACY_TABLES.contains(name)
             }
-            Some(9) => !V10_ADDED_TABLES.contains(name) && !OPTIONAL_LEGACY_TABLES.contains(name),
+            Some(9) => {
+                !V10_ADDED_TABLES.contains(name)
+                    && !V11_ADDED_TABLES.contains(name)
+                    && !OPTIONAL_LEGACY_TABLES.contains(name)
+            }
+            Some(10) => !V11_ADDED_TABLES.contains(name) && !OPTIONAL_LEGACY_TABLES.contains(name),
             _ => !OPTIONAL_LEGACY_TABLES.contains(name),
         })
         .map(|(_, name)| name)
@@ -1941,6 +1963,7 @@ mod tests {
                     && !V8_ADDED_TABLES.contains(name)
                     && !V9_ADDED_TABLES.contains(name)
                     && !V10_ADDED_TABLES.contains(name)
+                    && !V11_ADDED_TABLES.contains(name)
             })
             .collect();
         assert_eq!(names, expected);
@@ -1955,6 +1978,7 @@ mod tests {
                 "assistant_monthly_builds",
                 "member_season_xp",
                 "scheduled_events_claim",
+                "admin_api_tokens",
                 "stream_live_claims",
                 "voice_create_reservations",
                 "retention_guild_purge_queue",
@@ -2002,7 +2026,7 @@ mod tests {
         assert_eq!(contents.manifest.missing_tables(), ["event_store"]);
         // The same inventory at the current version refuses: new archives must
         // cover the event store.
-        assert_eq!(DUMP_VERSION, 10);
+        assert_eq!(DUMP_VERSION, 11);
         let mut current = v5;
         current["version"] = serde_json::json!(DUMP_VERSION);
         assert!(validate_manifest(&current)
@@ -2088,7 +2112,7 @@ mod tests {
             .contains("event_store"));
         let mut current = v5;
         current["version"] = serde_json::json!(DUMP_VERSION);
-        assert_eq!(DUMP_VERSION, 10, "frozen v5 test pins the v10 bump");
+        assert_eq!(DUMP_VERSION, 11, "frozen v5 test pins the v11 bump");
         assert!(validate_manifest(&current)
             .unwrap_err()
             .to_string()
@@ -2106,7 +2130,7 @@ mod tests {
         // A v6 recovery point written before the seasonal XP projection (0100)
         // declares every covered table except member_season_xp and stays
         // readable; promoting it to v7 without the table is refused. This is
-        // the frozen-manifest guard for the v7 bump (now pinned at v10):
+        // the frozen-manifest guard for the v7 bump (now pinned at v11):
         // building the old manifest from today's inventory (as the v5 tests
         // do) would silently include the new table and miss the refusal.
         let mut v6 = manifest(without(
@@ -2139,7 +2163,7 @@ mod tests {
             "member_season_xp",
         ));
         assert_eq!(v7_gap["version"], serde_json::json!(DUMP_VERSION));
-        assert_eq!(DUMP_VERSION, 10, "frozen v6 test pins the v10 bump");
+        assert_eq!(DUMP_VERSION, 11, "frozen v6 test pins the v11 bump");
         assert!(validate_manifest(&v7_gap)
             .unwrap_err()
             .to_string()
@@ -2206,8 +2230,8 @@ mod tests {
         let mut v7_gap = v6.clone();
         v7_gap["version"] = serde_json::json!(DUMP_VERSION);
         assert_eq!(
-            DUMP_VERSION, 10,
-            "frozen pre-retention test pins the v10 bump"
+            DUMP_VERSION, 11,
+            "frozen pre-retention test pins the v11 bump"
         );
         let err = validate_manifest(&v7_gap).unwrap_err().to_string();
         assert!(err.contains("retention_guild_purge_queue"), "{err}");
@@ -2259,7 +2283,7 @@ mod tests {
             "stream_live_claims",
         ));
         assert_eq!(v8_gap["version"], serde_json::json!(DUMP_VERSION));
-        assert_eq!(DUMP_VERSION, 10, "frozen v7 test pins the v10 bump");
+        assert_eq!(DUMP_VERSION, 11, "frozen v7 test pins the v11 bump");
         assert!(validate_manifest(&v8_gap)
             .unwrap_err()
             .to_string()
@@ -2300,13 +2324,13 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 10, "new dumps require both guild counters");
+        assert_eq!(DUMP_VERSION, 11, "new dumps require both guild counters");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v10 archive inspects");
+        .expect("complete v11 archive inspects");
         for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
             let mut gap = current.clone();
             gap["tables"]
@@ -2354,13 +2378,13 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 10, "new dumps require the epoch-claim guard");
+        assert_eq!(DUMP_VERSION, 11, "new dumps require the epoch-claim guard");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v10 archive inspects");
+        .expect("complete v11 archive inspects");
         let mut gap = current.clone();
         gap["tables"]
             .as_array_mut()
@@ -2373,6 +2397,55 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("scheduled_events_claim"), "{error}");
+    }
+
+    #[test]
+    fn v10_archives_read_without_registry_but_v11_requires_it() {
+        // Literal name, not V11_ADDED_TABLES: this reproduces the pre-change
+        // inventory even if the version waiver is accidentally removed.
+        let tables = complete_tables(&BTreeMap::new())
+            .into_iter()
+            .filter(|table| table["name"] != "admin_api_tokens")
+            .collect();
+        let mut old = manifest(tables);
+        for version in 4..=10 {
+            old["version"] = serde_json::json!(version);
+            let contents = inspect_bytes(&gzip_lines(&[
+                old.clone(),
+                serde_json::json!({"kind":"end","rows":0}),
+            ]))
+            .expect("old archives without the v11 token registry stay readable");
+            assert_eq!(contents.manifest.version, version);
+            assert_eq!(contents.manifest.missing_tables(), ["admin_api_tokens"]);
+            let mut gap = old.clone();
+            gap["tables"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|table| table["name"] != "events");
+            assert!(validate_manifest(&gap)
+                .unwrap_err()
+                .to_string()
+                .contains("missing tables: events"));
+        }
+        assert_eq!(DUMP_VERSION, 11, "new dumps require the token registry");
+        let current = manifest(complete_tables(&BTreeMap::new()));
+        inspect_bytes(&gzip_lines(&[
+            current.clone(),
+            serde_json::json!({"kind":"end","rows":0}),
+        ]))
+        .expect("complete v11 archive inspects");
+        let mut gap = current.clone();
+        gap["tables"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|table| table["name"] != "admin_api_tokens");
+        let error = inspect_bytes(&gzip_lines(&[
+            gap,
+            serde_json::json!({"kind":"end","rows":0}),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("admin_api_tokens"), "{error}");
     }
 
     #[test]

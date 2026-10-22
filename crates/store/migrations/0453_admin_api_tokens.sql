@@ -1,0 +1,34 @@
+-- 0453_admin_api_tokens: store-chain mirror of the admin token registry.
+--
+-- Same `admin_api_tokens` table as cutover 0452 (token id, sha256 secret
+-- hash, scopes, guild allowlist, bounded lifetime, revocation/last-use
+-- lifecycle columns). The store chain alone never reaches
+-- staging/production; this mirror keeps single-chain checkouts and the
+-- roles scratch database on the same shape. `IF NOT EXISTS` throughout, so
+-- cross-running both chains against one schema stays safe in either order.
+-- Rollback is `DROP TABLE IF EXISTS admin_api_tokens`. Numbered 0453
+-- because cutover owns 0452; global migration numbers remain unique across
+-- both chains. The live-lookup index builds inside the migration
+-- transaction (CONCURRENTLY cannot run there, and concurrent builds
+-- deadlock CI's migrators); the table is empty at first apply. Bot schema
+-- range: 0001-0999. Database tests use test containers only.
+
+CREATE TABLE IF NOT EXISTS admin_api_tokens (
+  token_id      TEXT         PRIMARY KEY,
+  secret_hash   TEXT         NOT NULL,
+  scopes        TEXT[]       NOT NULL,
+  guild_ids     BIGINT[]     NOT NULL,
+  label         TEXT,
+  issued_by     TEXT,
+  issued_at     TIMESTAMPTZ  NOT NULL,
+  expires_at    TIMESTAMPTZ  NOT NULL,
+  revoked_at    TIMESTAMPTZ,
+  last_used_at  TIMESTAMPTZ,
+  CONSTRAINT admin_api_tokens_id_shape CHECK (token_id ~ '^adm_[0-9a-f]{16}$'),
+  CONSTRAINT admin_api_tokens_scopes_closed CHECK (scopes <@ ARRAY['read', 'moderate', 'admin']),
+  CONSTRAINT admin_api_tokens_guilds_nonempty CHECK (cardinality(guild_ids) > 0),
+  CONSTRAINT admin_api_tokens_expiry_ordered CHECK (expires_at > issued_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_admin_api_tokens_live
+  ON admin_api_tokens (revoked_at, expires_at);

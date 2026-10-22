@@ -69,6 +69,10 @@ pub struct TableSpec {
 /// here, and on any entry here that appears in neither list (outside the two
 /// documented feed tables).
 pub const TABLE_SPECS: &[TableSpec] = &[
+    // Admin API token registry (0452/0453): issuance plus the revocation and
+    // last-use lifecycle writes; expires_at is a future deadline, not a
+    // write time, so it stays out of the measure.
+    TableSpec { table: "admin_api_tokens", measure: TableMeasure::Columns(&["issued_at", "revoked_at", "last_used_at"]) },
     TableSpec { table: "announcements_audit_log", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec { table: "assistant_monthly_builds", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "audit_kill_switch", measure: TableMeasure::Columns(&["engaged_at"]) },
