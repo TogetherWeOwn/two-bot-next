@@ -202,6 +202,40 @@ activates Execute. The ledger scope is exactly the two expiry migrations
 bounds cannot move between them. An empty cohort or empty family is a
 reported limitation, never a pass.
 
+### Agent observation contract
+
+The default text report and optional `--json` output project the same admitted
+result. JSON is exactly one document (no progress prose): `schema_version: 1`,
+`status`, `observations`, `limitations`, `error`. Each observation has a stable
+`id`, `code`, typed `value` and `next_action`; limitations omit `value`. IDs are
+`observed_before`, `observed_after`, `migrations`, `indexes`, `counts`,
+`cohort_before`, `cohort_after`, optional `digest_match`, `mode` and `counters`.
+Codes are `observed` or `unobserved`; mode/counters always have null values.
+Limitation IDs/codes are `empty_cohort`, `pgcrypto_absent` and `empty_families`.
+Empty cohorts and absent pgcrypto suppress `digest_match`; a mismatch is observed
+data, not a read failure. None of these observations proves retention execution.
+
+Database timestamps accept ISO dates with space/T, up to six fractional digits,
+and explicit Z or signed HH, HHMM, HH:MM or HH:MM:SS zones (hours 00–15,
+minutes/seconds 00–59). Calendar-invalid, infinite, unzoned or suffixed values
+fail closed. Output is UTC `YYYY-MM-DD HH:MM:SS[.ffffff]+00`; bounds are compared
+as instants and every cohort count must be 0–1000, in both digest variants.
+Capture clocks retain millisecond RFC3339. SQL and the frozen window are unchanged.
+
+`observed` exits 0, including limitations. `refused` exits 2; `read_failed` and
+`publication_failed` exit 1. Failed JSON documents contain no observations and
+an error with only `code`, boolean `retryable` and fixed `next_action`. Text-mode
+failures prefix the structured line with the fixed refusal or read cause. Summary
+write failures are protected too: no raw OS/exception text, traceback or success
+marker. On success `GITHUB_STEP_SUMMARY` receives the same text projection even
+in JSON mode; read/refusal failures do not append a partial census.
+
+Verify offline, without database/network access or a real interval sleep:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_staging_retention_census.py' -v
+```
+
 ## Staging fixture census (manual)
 
 `staging-fixture-census.yml` is the point-in-time companion: it runs the

@@ -706,6 +706,31 @@ impl RoomHttp {
         Ok(())
     }
 
+    /// Read the original callback message without retaining the interaction
+    /// token. One bounded GET, no bot authentication or callback retry.
+    pub async fn interaction_message(
+        &self,
+        application: Id<ApplicationMarker>,
+        token: &str,
+    ) -> Result<MessageRef, RoomHttpError> {
+        let request = self
+            .http
+            .interaction(application)
+            .response(token)
+            .try_into_request()
+            .map_err(classify_http_error)?;
+        let body = self.send_request(request, || true, false).await?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|_| RoomHttpError::InvalidRequest)?;
+        let channel_id = value
+            .get("channel_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|id| id.parse::<u64>().ok())
+            .filter(|id| *id != 0)
+            .ok_or(RoomHttpError::InvalidRequest)?;
+        parse_posted_message(channel_id, &body)
+    }
+
     /// Complete the deferred response, never a second initial response.
     /// `attachments` carries `/export` file bytes; `components` carries the
     /// `/import` Confirm/Cancel buttons. Both are omitted when empty, so a

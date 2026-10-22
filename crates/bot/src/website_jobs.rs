@@ -388,7 +388,7 @@ pub async fn serve(
     if let Some(service) = self_roles {
         registered.push(service.recovery_job());
     }
-    let status = registered_statuses(&registered, &parked).await;
+    let status = prepare_job_statuses(&registered, &parked, &shutdown).await?;
     let public = server::serve(listener, gateway, status.clone(), shutdown.clone());
     let http = async {
         match (receiver, eventsub_receiver) {
@@ -467,7 +467,26 @@ fn retention_registration(config: &Config) -> RetentionRegistration {
     }
 }
 
-async fn registered_statuses(registered: &[Job], parked: &[&str]) -> jobs::SharedStatus {
+/// Prepare boot status, cancelling boot-owned siblings on registration failure.
+async fn prepare_job_statuses(
+    registered: &[Job],
+    parked: &[&str],
+    shutdown: &watch::Sender<bool>,
+) -> std::io::Result<jobs::SharedStatus> {
+    registered_statuses(registered, parked)
+        .await
+        .map_err(|error| {
+            // The boot owner joins reconcile after serve returns, even when
+            // registration fails before serve_jobs installs its shutdown guard.
+            shutdown.send_replace(true);
+            std::io::Error::other(error)
+        })
+}
+
+async fn registered_statuses(
+    registered: &[Job],
+    parked: &[&str],
+) -> Result<jobs::SharedStatus, jobs::UnregisteredJob> {
     // NAMES already carries the DB-only settings poll alongside the
     // REST-backed domains, so the status map lists all eleven jobs.
     let mut names: Vec<&'static str> = NAMES
@@ -489,11 +508,15 @@ async fn registered_statuses(registered: &[Job], parked: &[&str]) -> jobs::Share
     let status = jobs::statuses(&names, true);
     {
         let mut entries = status.write().await;
+        // Fail fast before unparking anything: an unknown name is a
+        // registration bug, not a status to invent.
+        jobs::check_registered(registered, &entries)?;
         for job in registered {
-            entries
-                .get_mut(job.name)
-                .expect("known registered job")
-                .parked = false;
+            // Proven by the check above: every registered name resolves.
+            let Some(entry) = entries.get_mut(job.name) else {
+                unreachable!("registered_statuses validated every job name: {}", job.name);
+            };
+            entry.parked = false;
         }
         for name in parked {
             if let Some(entry) = entries.get_mut(*name) {
@@ -501,7 +524,7 @@ async fn registered_statuses(registered: &[Job], parked: &[&str]) -> jobs::Share
             }
         }
     }
-    status
+    Ok(status)
 }
 
 /// First listener termination stops admission everywhere and drains its sibling.
@@ -540,7 +563,17 @@ pub(crate) async fn serve_jobs(
     shutdown: watch::Sender<bool>,
     http: impl std::future::Future<Output = std::io::Result<()>>,
 ) -> std::io::Result<()> {
+    // Registration failures must also cancel sibling tasks owned by boot.
     let shutdown = Shutdown(shutdown);
+    // Fail fast before spawning the supervisor task or draining HTTP: its
+    // completion is joined with `let _`, so a registration error returned from
+    // inside the task would read as a silent idle instead of a boot failure.
+    // The guard is scoped: the read lock must be released before the
+    // supervisor spawns, or the jobs' first status write would block on it.
+    {
+        let statuses = status.read().await;
+        jobs::check_registered(&registered, &statuses).map_err(std::io::Error::other)?;
+    }
     let supervisor = tokio::spawn(jobs::supervise(registered, status, shutdown.0.subscribe()));
     let result = drain_http(http, shutdown.0.subscribe()).await;
     shutdown.0.send_replace(true);

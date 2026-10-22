@@ -704,7 +704,7 @@ async fn supervise_once<M: AuditMirror + Clone + 'static>(
     .await
     .expect("audit_retry ran once");
     stop.send(true).unwrap();
-    task.await.unwrap();
+    task.await.unwrap().unwrap();
     finished
 }
 
