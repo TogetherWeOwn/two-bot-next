@@ -43,7 +43,7 @@ gateway closure):
 | gateway classifier | `gateway.rs:774-789`, `:918` | human/welcome channel sets (`:800-817`) | every guild message; classifier + facts sink swap together (`leveling_runtime.rs:766`) |
 | voice | `gateway.rs:2082` closure | empty grace (`voice_rooms.rs:9415`), invite code (`:9460`) | spawn (`:7753-7757`), maintenance (`:3319`), `/invite` (`:13306-13307`) |
 
-The thirty-six keys in `STORE_READ_KEYS`
+The thirty-eight keys in `STORE_READ_KEYS`
 (`crates/core/tests/reference_docs.rs`) say “applied live by runtime refresh”
 instead of “stored unwired”: containment applies `TWO_ANTI_NUKE_WINDOW_SECONDS`,
 `TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS`, `TWO_ANTI_NUKE_HEAT_THRESHOLD` and
@@ -158,7 +158,7 @@ gates (`feature_commands.rs`), moderation (`moderation.rs`), onboarding
 (`onboarding.rs`), automod (`automod.rs`), scorecard and classifier
 (`community.rs`). An empty ID list never contains a live ID.
 
-Catalog entries: 134.
+Catalog entries: 136.
 
 | Key | Class | Parsed default | Application | Description |
 | --- | --- | --- | --- | --- |
@@ -257,6 +257,8 @@ Catalog entries: 134.
 | `TWO_MODERATION_AUDIT_SECRET` | env_only | Not rendered (secret) | environment only | Authentication secret for moderation audit handoff; never rendered. |
 | `TWO_MODERATION_PROTECTED_ROLE_IDS` | env_only | `[]` | environment only | Roles moderation may not target; strict comma-separated 17-20 digit snowflakes with no spaces or empty segments (empty segments and leading/trailing commas refused, padding refused); missing or empty means no roles. |
 | `TWO_ONBOARDING_DRY_RUN` | hot | `false` | stored, applied live by runtime refresh | Suppress onboarding role writes, legacy/anchor welcomes and session goodbyes. A stored non-0/1 rendering is ignored (deployment wins). |
+| `TWO_ONBOARDING_JOIN_ROLES` | hot | Not specified in Next | stored, applied live by runtime refresh | Auto-role list: deployment comma-separated canonical nonzero role ids, stored JSON array of at most 10 distinct strings; never everyone. Stored overrides refresh per join, corrupt values disable grants. Session/dry-run suppress grants. |
+| `TWO_ONBOARDING_MEMBER_ROLE` | hot | Not specified in Next | stored, applied live by runtime refresh | Member role granted by the Verify button: canonical nonzero role-id string, never everyone. Stored overrides refresh per press; corrupt values disable verification. Session/dry-run suppress grants. |
 | `TWO_ONBOARDING_MODE` | env_only | `"legacy"` | environment only | Onboarding selector: legacy, session or anchor; session suppresses role writes. |
 | `TWO_ONBOARDING_ROTA_MEASUREMENT` | env_only | Not specified in Next | environment only | Dropped staging rota measurement gate; env-only refusal is retained. |
 | `TWO_ONBOARDING_ROTA_NOTICE` | env_only | Not specified in Next | environment only | Dropped staging rota notice gate; env-only refusal is retained. |
