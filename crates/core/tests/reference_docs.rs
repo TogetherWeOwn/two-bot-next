@@ -63,7 +63,7 @@ Live snapshot consumers at `1643438` (canonical table; eight `live()` call\n\
 sites across five runtimes, plus voice through the gateway closure):\n\n\
 | Runtime | Call sites | Reads | When |\n\
 | --- | --- | --- | --- |\n\
-| automod | `automod_gateway.rs:211-223`, `:295` | 10 live lists, thresholds, enforce flag (`:116-127`) | every message delivery |\n\
+| automod | `automod_gateway.rs:211-223`, `:305` | 10 live lists, thresholds, enforce flag (`:116-127`) | every message delivery |\n\
 | feed | `feed_jobs.rs:235-237` | `TWO_FEED_POLL_SECONDS` (`:207`) | supervisor cadence + per-tick gate (`:246-289`) |\n\
 | audit | `audit_runtime.rs:308`, `:438` | 3 mirror destinations (`:60-63`) | every record (`:483`) and sweep (`:497`), once installed |\n\
 | ticket | `ticket_runtime.rs:457`, `:981` | 3 ticket destinations (`:172-175`) | every execute/recovery and purge |\n\
@@ -90,7 +90,7 @@ while refused (`crates/bot/src/containment_runtime.rs:318-330`,\n\
 dry-run row keeps the boot value (`:159-168`) while a malformed channel row\n\
 fails the job; message-path automod\n\
 applies its ten live lists, thresholds and the enforce flag from the snapshot\n\
-on every delivery (`crates/bot/src/automod_gateway.rs:116-127`, `:211-223`, `:295`);\n\
+on every delivery (`crates/bot/src/automod_gateway.rs:116-127`, `:211-223`, `:305`);\n\
 the feed poller applies `TWO_FEED_POLL_SECONDS` from the snapshot to the\n\
 supervisor cadence and its per-tick schedule gate, so a changed interval\n\
 reschedules the next run to last-run + new interval without a restart\n\
@@ -205,7 +205,7 @@ const BOOT_ENV: &[&str] = &[
 /// Catalog keys whose dashboard-stored values are applied at runtime through
 /// the live snapshot or per-runtime store refreshes, not boot env or the
 /// reload-report path: automod's per-delivery live refresh
-/// (`automod_gateway.rs:211-223`, `:295`), the feed poller's per-tick gate
+/// (`automod_gateway.rs:211-223`, `:305`), the feed poller's per-tick gate
 /// (`feed_jobs.rs:235-237`), the audit mirror's per-record/sweep refresh
 /// (`audit_runtime.rs:308`, `:438`), ticket's per-operation refresh
 /// (`ticket_runtime.rs:457`, `:981`), the gateway classifier's per-message

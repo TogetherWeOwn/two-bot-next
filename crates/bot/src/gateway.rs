@@ -1460,15 +1460,15 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             two_bot_core::metrics::global().gateway_missed_events(missed);
                         }
                         // A duplicate key in a MESSAGE_UPDATE refuses the
-                        // automod edit below; the same bytes must neither
-                        // route through last-wins Twilight parsing (the event
-                        // path would still produce a verdict input) nor fail
-                        // the runner (the checkpoint would never advance past
-                        // a deterministic refusal). Skip the parse and dispatch
-                        // nothing: the worker still commits the checkpoint, so
-                        // a resume replays nothing.
+                        // automod edit below; selection is by decoded `t` so
+                        // escaped spellings still match. The same bytes must
+                        // neither route through last-wins Twilight parsing (the
+                        // event path would still produce a verdict input) nor
+                        // fail the runner (the checkpoint would never advance
+                        // past a deterministic refusal). Skip the parse and
+                        // dispatch nothing; the checkpoint still commits.
                         let duplicate_refused = automod_enabled
-                            && text.contains("MESSAGE_UPDATE")
+                            && crate::automod_gateway::is_message_update_dispatch(&text)
                             && two_bot_core::duplicate_keys::reject_duplicate_keys(
                                 text.as_bytes(),
                             )

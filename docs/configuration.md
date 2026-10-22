@@ -34,7 +34,7 @@ sites across five runtimes, plus voice through the gateway closure):
 
 | Runtime | Call sites | Reads | When |
 | --- | --- | --- | --- |
-| automod | `automod_gateway.rs:211-223`, `:295` | 10 live lists, thresholds, enforce flag (`:116-127`) | every message delivery |
+| automod | `automod_gateway.rs:211-223`, `:305` | 10 live lists, thresholds, enforce flag (`:116-127`) | every message delivery |
 | feed | `feed_jobs.rs:235-237` | `TWO_FEED_POLL_SECONDS` (`:207`) | supervisor cadence + per-tick gate (`:246-289`) |
 | audit | `audit_runtime.rs:308`, `:438` | 3 mirror destinations (`:60-63`) | every record (`:483`) and sweep (`:497`), once installed |
 | ticket | `ticket_runtime.rs:457`, `:981` | 3 ticket destinations (`:172-175`) | every execute/recovery and purge |
@@ -62,7 +62,7 @@ while refused (`crates/bot/src/containment_runtime.rs:318-330`,
 dry-run row keeps the boot value (`:159-168`) while a malformed channel row
 fails the job; message-path automod
 applies its ten live lists, thresholds and the enforce flag from the snapshot
-on every delivery (`crates/bot/src/automod_gateway.rs:116-127`, `:211-223`, `:295`);
+on every delivery (`crates/bot/src/automod_gateway.rs:116-127`, `:211-223`, `:305`);
 the feed poller applies `TWO_FEED_POLL_SECONDS` from the snapshot to the
 supervisor cadence and its per-tick schedule gate, so a changed interval
 reschedules the next run to last-run + new interval without a restart
