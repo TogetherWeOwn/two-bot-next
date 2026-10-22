@@ -272,6 +272,20 @@ pub async fn open_db(args: &Args, migrations_off: bool) -> CutoverDb {
     }
 }
 
+/// Read UTF-8 text from `reader`, buffering at most `cap` bytes. Takes
+/// `cap + 1` so an over-cap source is detected without ever buffering past the
+/// cap; the boundary is strict `>` (exactly `cap` bytes is accepted).
+/// `Ok(None)` means over cap; read and decode failures are returned as-is.
+pub fn read_text_capped<R: std::io::Read>(
+    reader: R,
+    cap: usize,
+) -> std::io::Result<Option<String>> {
+    use std::io::Read;
+    let mut text = String::new();
+    reader.take(cap as u64 + 1).read_to_string(&mut text)?;
+    Ok((text.len() <= cap).then_some(text))
+}
+
 /// Current time as ISO-8601 UTC millis.
 #[must_use]
 pub fn now_iso() -> String {
@@ -299,7 +313,7 @@ pub fn now_iso() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::Args;
+    use super::{read_text_capped, Args};
 
     #[test]
     fn scan_page_hint_saturates_and_stays_within_the_cli_range() {
@@ -408,5 +422,40 @@ mod tests {
         assert_eq!(args.get("input"), Some("second"));
         assert!(args.has("json"));
         assert!(!args.has("apply"));
+    }
+
+    /// Infinite source that errors once more than `limit` bytes were handed
+    /// out, so deleting the `.take()` fails loudly instead of hanging.
+    struct Endless {
+        served: usize,
+        limit: usize,
+    }
+    impl std::io::Read for Endless {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.served + buf.len() > self.limit {
+                return Err(std::io::Error::other("read past the cap"));
+            }
+            buf.fill(b'x');
+            self.served += buf.len();
+            Ok(buf.len())
+        }
+    }
+
+    #[test]
+    fn read_text_capped_never_reads_past_cap_plus_one() {
+        let source = Endless {
+            served: 0,
+            limit: 65,
+        };
+        assert!(read_text_capped(source, 64).unwrap().is_none());
+    }
+
+    #[test]
+    fn read_text_capped_accepts_at_cap_and_refuses_one_over() {
+        assert_eq!(
+            read_text_capped(&b"abcd"[..], 4).unwrap().as_deref(),
+            Some("abcd")
+        );
+        assert!(read_text_capped(&b"abcde"[..], 4).unwrap().is_none());
     }
 }
