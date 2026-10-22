@@ -1018,6 +1018,9 @@ impl TicketRuntime {
                 return Ok(());
             }
         };
+        // Reattachment must not post controls into a reparented, retopiced or
+        // de-privated channel: prove the creation receipt before history/post.
+        self.verify_creation_channel(&doc, ticket, channel, &config)?;
         if !self
             .executor
             .ticket_history_readable(&config.guild_id, &self.bot_id()?, &doc)
