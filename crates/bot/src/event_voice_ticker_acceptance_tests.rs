@@ -1094,7 +1094,7 @@ async fn create_429_pauses_only_the_create_route() {
             retry_after_secs: 120,
         });
     }
-    let mut create_event = base_event(now_ms);
+    let create_event = base_event(now_ms);
     let create_id = create_event["event_id"].as_str().expect("id").to_owned();
     let mut move_event = base_event(now_ms);
     move_event["instance_starts_at_ms"] = json!(now_ms + 25 * HOUR_MS);
@@ -1559,7 +1559,7 @@ async fn twenty_events_same_t15_earliest_ten_win() {
     }
     events.swap(0, 19);
     events.swap(4, 11);
-    let mut expected: Vec<String> = events
+    let mut expected: Vec<(i64, String, String)> = events
         .iter()
         .map(|e| {
             (
@@ -2020,9 +2020,15 @@ async fn create_403_records_perm_denied_without_crashing_tick() {
     allowed["instance_starts_at_ms"] = json!(now_ms + 6 * MINUTE_MS);
     let allowed_id = allowed["event_id"].as_str().expect("id").to_owned();
 
-    let outcome = tick(&mock, &guild, &[denied, allowed], Some(category.as_str()), now_ms)
-        .await
-        .expect("a 403 never crashes the tick");
+    let outcome = tick(
+        &mock,
+        &guild,
+        &[denied, allowed],
+        Some(category.as_str()),
+        now_ms,
+    )
+    .await
+    .expect("a 403 never crashes the tick");
     let requests = mock.requests();
     mock.shutdown().await;
 
