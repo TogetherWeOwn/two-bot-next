@@ -592,9 +592,7 @@ fn rename_of(outcome: &Value) -> Option<&str> {
 }
 
 fn audit_of(outcome: &Value) -> Option<&Value> {
-    outcome
-        .get("audit")
-        .and_then(|audit| if audit.is_null() { None } else { Some(audit) })
+    outcome.get("audit").filter(|&audit| !audit.is_null())
 }
 
 fn assert_tick_clock(outcome: &Value, now_ms: i64) {
@@ -1743,9 +1741,7 @@ fn power_reason(response: &Value) -> &str {
 }
 
 fn power_audit(response: &Value) -> Option<&Value> {
-    response
-        .get("audit")
-        .and_then(|audit| if audit.is_null() { None } else { Some(audit) })
+    response.get("audit").filter(|&audit| !audit.is_null())
 }
 
 fn assert_power_audit(response: &Value, power: &str, decision: &str, now_ms: i64) {
