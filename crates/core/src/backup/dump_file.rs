@@ -1966,6 +1966,7 @@ mod tests {
                     && !V8_ADDED_TABLES.contains(name)
                     && !V9_ADDED_TABLES.contains(name)
                     && !V10_ADDED_TABLES.contains(name)
+                    && !V11_ADDED_TABLES.contains(name)
             })
             .collect();
         assert_eq!(names, expected);
@@ -1980,6 +1981,8 @@ mod tests {
                 "assistant_monthly_builds",
                 "member_season_xp",
                 "scheduled_events_claim",
+                "event_voice_channels",
+                "event_voice_presence",
                 "stream_live_claims",
                 "voice_create_reservations",
                 "retention_guild_purge_queue",
