@@ -2713,6 +2713,35 @@ impl ActionExecutor {
         self.call_once_raw(req, &[200, 204]).await
     }
 
+    /// Delete one message with a proven-absence receipt, for orphan rollback
+    /// that must distinguish "gone" from "unknown" (sticky re-post): `Ok(true)`
+    /// deleted, `Ok(false)` the message was already absent (Discord's 404
+    /// proves absence, so a retry is safe), `Err` the outcome is uncertain —
+    /// including rejections, which prove only that this delete did not land,
+    /// not that the orphan is gone. Retirement keeps best-effort
+    /// [`Self::delete_message`].
+    pub async fn delete_message_with_absence_receipt(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        reason: &str,
+    ) -> Result<bool, DiscordError> {
+        let channel: Id<ChannelMarker> = snowflake(channel_id)?;
+        let message: Id<MessageMarker> = snowflake(message_id)?;
+        let reason = audit_reason(reason)?;
+        let req = Self::request_of(
+            self.inner
+                .factory
+                .delete_message(channel, message)
+                .reason(&reason),
+        )?;
+        // request_of maps pre-send build failures to Rejected (finding 7).
+        let mut res = self.call_once_raw(req, &[200, 204, 404]).await?;
+        let deleted = res.status != 404;
+        res.complete().await;
+        Ok(deleted)
+    }
+
     /// Post a message with mention suppression (legacy
     /// `allowed_mentions: { parse: [] }`). Asserts the legacy 2000 UTF-16-unit
     /// ceiling before sending; requires a valid message id receipt. An
