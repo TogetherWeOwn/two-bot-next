@@ -432,11 +432,13 @@ as dynamic labels.
   `exclusion_violation`, `database`, `pool_timeout`, `pool_closed`,
   `worker_crashed`, `connection`, `row_not_found`, `query`)
   (`crates/core/src/metrics.rs` `TICKET_LIFECYCLE_OUTCOMES`, sharing
-  `crates/core/src/error_chain.rs` `db_cause`). Recorded once per terminal
-  ticket event in `crates/bot/src/ticket_runtime.rs` alongside its
-  `ticket_lifecycle` log line; the purge pass reports its deleted count, not
-  one per pass. No member text, channel name, ticket id or error string
-  becomes a label; the closed vocabulary has no `other` row.
+  `crates/core/src/error_chain.rs` `db_cause`). Recorded once per
+  instrumented terminal ticket event in `crates/bot/src/ticket_runtime.rs`
+  (retire, abandon, purge, successful staff-button claim/close; recovery
+  completions excluded) alongside its `ticket_lifecycle` log line; the purge
+  pass reports its deleted count, not one per pass. No member text, channel
+  name, ticket id or error string becomes a label; the closed vocabulary has
+  no `other` row.
 - Log fields (coordinated with blocked structured-log work, which owns JSON
   formatting): `voice_event="voice_operation"` with `op`/`outcome`,
   `voice_event="voice_reconcile"` with plan counts,

@@ -127,8 +127,8 @@ definitions and their alert-response sections in
 
 When a ticket vanishes or a member is stuck on Creating, start with the
 `ticket_lifecycle` container lines (one per retire, abandon, purge and
-successful claim/close, with `ticket_id`, `prior_status` and a
-fixed-vocabulary `cause`) and the
+successful staff-button claim/close executed through the button path, with
+`ticket_id`, `prior_status` and a fixed-vocabulary `cause`) and the
 `two_bot_ticket_lifecycle_total{event,outcome}` counter, then the
 `ticket recovery deferred` / `ticket action incomplete` warns, which cite
 the action, ticket and status. The series, labels and causes are listed in

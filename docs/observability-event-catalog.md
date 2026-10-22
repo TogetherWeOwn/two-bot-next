@@ -242,12 +242,14 @@ outcomes. See `docs/metrics.md` for the full label table.
 Counter emitted by the ticket runtime in `crates/bot/src/ticket_runtime.rs`
 (`emit_lifecycle` and `purge`) and rendered by
 `crates/core/src/metrics.rs`. Every retire, abandon, purge and successful
-claim/close counts once with a fixed-vocabulary cause; the purge pass
-counts one per deleted transcript body and reports a `db_cause` outcome
-when its storage write fails. No member text, channel name, ticket id or
-error string ever becomes a label. No alert rule consumes this family yet;
-read it alongside the `ticket_lifecycle` log lines. Full series, label and
-cause vocabularies live in `docs/ticket-lifecycle-observability.md` and
+staff-button claim/close executed through the button path counts once with
+a fixed-vocabulary cause; the purge pass counts one per deleted transcript
+body and reports a `db_cause` outcome when its storage write fails.
+Recovery completions and the open-path controls-post rollback are not
+instrumented. No member text, channel name, ticket id or error string ever
+becomes a label. No alert rule consumes this family yet; read it alongside
+the `ticket_lifecycle` log lines. Full series, label and cause vocabularies
+live in `docs/ticket-lifecycle-observability.md` and
 `docs/metrics.md`.
 
 | Series | Meaning |

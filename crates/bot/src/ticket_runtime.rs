@@ -94,9 +94,11 @@ fn recovery_action_token(action: &RecoveryAction) -> Option<&'static str> {
 }
 
 /// Emit one `ticket_lifecycle` line and its counter sample for a terminal
-/// ticket event. Every retire, abandon, successful claim and successful close
-/// reports exactly once with a fixed-vocabulary cause; the purge pass
-/// reports separately with its deleted count. See
+/// ticket event. Every retire, abandon, and successful staff-button claim and
+/// close executed through the button path reports exactly once with a
+/// fixed-vocabulary cause; the purge pass reports separately with its deleted
+/// count. Recovery completions and the open-path controls-post rollback reach
+/// their terminal states without emitting. See
 /// `docs/ticket-lifecycle-observability.md` for the vocabularies.
 fn emit_lifecycle(
     event: &'static str,

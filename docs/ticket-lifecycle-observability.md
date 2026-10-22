@@ -1,8 +1,14 @@
 # Ticket lifecycle observability
 
-Every terminal ticket lifecycle event emits one structured log line and one
+Each instrumented ticket lifecycle event emits one structured log line and one
 counter sample, so agents and operators can answer "why did this ticket
-vanish / why is this member stuck on Creating" from logs. Emission lives in
+vanish / why is this member stuck on Creating" from logs. Instrumented events
+are retire, abandon, purge, and successful staff-button claim/close executed
+through the button path (table below). Recovery completions
+(`recover_saved_close`, `retry_cleanup`, `delete_interrupted_create`, the
+single-match `find_creating_channel` rollback, and `abandon_unsaved_close`)
+and the open-path controls-post rollback reach their terminal states without a
+`ticket_lifecycle` line or counter sample. Emission lives in
 `crates/bot/src/ticket_runtime.rs` (`emit_lifecycle` and `purge`); the
 counter lives in `crates/core/src/metrics.rs`. See [tickets.md](tickets.md)
 for the lifecycle itself.
@@ -25,7 +31,7 @@ labels; the vocabulary is closed (no `other` row).
 | `purge` | `deleted` | `retention_expired` | The purge pass deleted expired transcript bodies; counts one per deleted body, not one per pass |
 | `purge` | `<db_cause>` | `<db_cause>` | The purge pass storage write failed; the failure class survives (see below) |
 | `claim` | `claimed` | `staff_claim` | A staffer claimed the ticket |
-| `close` | `closed` | `staff_close` | A close completed through cleanup |
+| `close` | `closed` | `staff_close` | A staff close completed through the button path |
 
 Storage-failure outcomes reuse the shared `db_cause` vocabulary
 (`crates/core/src/error_chain.rs`): `unique_violation`,

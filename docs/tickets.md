@@ -36,12 +36,13 @@ Framework-specific references: [sqlx 0.9 transactions](https://docs.rs/sqlx/0.9.
 
 ## Observability
 
-Every retire, abandon, purge and successful claim/close emits one
-`ticket_lifecycle` log line and one
-`two_bot_ticket_lifecycle_total{event,outcome}` sample with a
+Every retire, abandon, purge and successful staff-button claim/close
+executed through the button path emits one `ticket_lifecycle` log line and
+one `two_bot_ticket_lifecycle_total{event,outcome}` sample with a
 fixed-vocabulary cause; the `ticket recovery deferred` and `ticket action
-incomplete` warns cite the action, ticket and status. The series, labels
-and causes are listed in
+incomplete` warns cite the action, ticket and status. Recovery completions
+and the open-path controls-post rollback reach their terminal states
+without emitting. The series, labels and causes are listed in
 [ticket-lifecycle-observability.md](ticket-lifecycle-observability.md).
 
 ## Verification

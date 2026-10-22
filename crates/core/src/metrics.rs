@@ -527,8 +527,9 @@ pub const EVENTSUB_RECONCILE_ERROR_CLASSES: &[&str] = &[
     "other",
 ];
 /// Ticket lifecycle events for `two_bot_ticket_lifecycle_total{event,outcome}`:
-/// every retire, abandon, purge and successful claim/close counts once. The
-/// vocabulary is closed by the lifecycle observability contract (see
+/// every retire, abandon, purge and successful staff-button claim/close
+/// executed through the button path counts once. The vocabulary is closed by
+/// the lifecycle observability contract (see
 /// `docs/ticket-lifecycle-observability.md`): every caller passes a member,
 /// so no collapse traffic lands in the trailing `close` slot and that row
 /// counts genuine close events only.
@@ -1592,12 +1593,13 @@ impl Metrics {
 
     /// One terminal ticket lifecycle event (see [`TICKET_LIFECYCLE_EVENTS`]
     /// and [`TICKET_LIFECYCLE_OUTCOMES`]). Call once per retire, abandon,
-    /// successful claim and successful close, alongside the matching
-    /// `ticket_lifecycle` log line; the purge pass calls
-    /// [`Self::ticket_lifecycle_n`] with its deleted count instead. Unknown
-    /// events/outcomes collapse to the trailing slots only when the
-    /// allowlists grow; today every caller passes a member. No member text,
-    /// channel name, ticket id or error string ever becomes a label.
+    /// and successful staff-button claim/close executed through the button
+    /// path, alongside the matching `ticket_lifecycle` log line; the purge
+    /// pass calls [`Self::ticket_lifecycle_n`] with its deleted count
+    /// instead. Unknown events/outcomes collapse to the trailing slots only
+    /// when the allowlists grow; today every caller passes a member. No
+    /// member text, channel name, ticket id or error string ever becomes a
+    /// label.
     pub fn ticket_lifecycle(&self, event: &str, outcome: &str) {
         self.ticket_lifecycle_n(event, outcome, 1);
     }
@@ -1606,17 +1608,29 @@ impl Metrics {
     /// purge pass reports its deleted count here (one sample per deleted
     /// transcript body, not one per pass). Zero is a no-op. Unknown
     /// events/outcomes collapse to the trailing slots only when the
-    /// allowlists grow.
+    /// allowlists grow. A normalized pair outside the rendered per-event
+    /// subset routes to that event's `query` trapdoor before incrementing,
+    /// so every call stays observable.
     pub fn ticket_lifecycle_n(&self, event: &str, outcome: &str, count: u64) {
         if count == 0 {
             return;
+        }
+        let event_index = bounded_index(event, TICKET_LIFECYCLE_EVENTS);
+        let mut outcome_index = bounded_index(outcome, TICKET_LIFECYCLE_OUTCOMES);
+        // Trapdoor: the exposition renders per-event outcome subsets, so a
+        // normalized pair outside them would vanish from the scrape. Route to
+        // this event's rendered `query` trapdoor instead, preserving the call.
+        if !lifecycle_series_rendered(
+            TICKET_LIFECYCLE_EVENTS[event_index],
+            TICKET_LIFECYCLE_OUTCOMES[outcome_index],
+        ) {
+            outcome_index = bounded_index("query", TICKET_LIFECYCLE_OUTCOMES);
         }
         let mut values = self
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let counter = &mut values.ticket_lifecycle[bounded_index(event, TICKET_LIFECYCLE_EVENTS)]
-            [bounded_index(outcome, TICKET_LIFECYCLE_OUTCOMES)];
+        let counter = &mut values.ticket_lifecycle[event_index][outcome_index];
         *counter = counter.saturating_add(count);
     }
 
