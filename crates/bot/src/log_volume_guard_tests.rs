@@ -536,6 +536,7 @@ fn job_caps_cover_every_job_label_and_presence_sheds_first() {
                         | "self_role_recovery"
                         | "member_unban_sweep"
                         | "automod_expiry"
+                        | "polls"
                         | "other"
                 ),
                 "{} never sheds; shed it only through its feature flag, not the log guard",
