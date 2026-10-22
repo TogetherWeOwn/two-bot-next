@@ -454,8 +454,8 @@
       "justification": "Store-chain copy of the scheduled_events_claim epoch gate (cutover 0450): one new table, IF NOT EXISTS, no writes to the existing mirror. Numbered 0451 because cutover owns 0450; global migration numbers remain unique across both chains."
     },
     "crates/cutover/migrations/0452_event_voice_channels.sql": {
-      "sha256": "23c7ef889bdbe4aef64821d9806aa497d15aafcae4e13997311059a48137ab5a",
-      "justification": "Event voice channel idempotency key plus presence spans: event_voice_channels keyed UNIQUE (event_id, instance_starts_at) with timestamptz starts/ends, lease + channel binding columns, and event_voice_presence spans (natural PK, one open span per member via partial unique index). Additive, IF NOT EXISTS; numbered 0452 above both chains; rollback drops the indexes and tables."
+      "sha256": "6755c2271d288433c968685eea5409f476098636686330275191f58af56d6ade",
+      "justification": "Event voice channel idempotency key plus presence spans: event_voice_channels keyed UNIQUE (event_id, instance_starts_at) with timestamptz starts/ends, lease plus UNIQUE channel binding, and event_voice_presence spans (natural PK, one open span per member via inline EXCLUDE). Additive, IF NOT EXISTS, constraints inline; numbered 0452; rollback drops the tables."
     }
   }
 }
