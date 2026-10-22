@@ -280,9 +280,10 @@ pub use giveaway::{
 };
 #[cfg(feature = "db")]
 pub use giveaway_store::{
-    claim_due_giveaway, create_giveaway, delete_giveaway, get_draws, get_giveaway, insert_draw,
-    latest_draw_no, list_entries, mark_announced, mark_drawn, release_claim, set_giveaway_status,
-    upsert_entry, GiveawayDrawRow, GiveawayEntryRow, GiveawayRow, NewDraw, NewGiveaway,
+    claim_due_giveaway, complete_draw, create_giveaway, delete_giveaway, get_draws, get_giveaway,
+    insert_draw, latest_draw_no, list_entries, mark_announced, mark_drawn, release_claim,
+    set_giveaway_status, upsert_entry, GiveawayDrawRow, GiveawayEntryRow, GiveawayRow, NewDraw,
+    NewGiveaway,
 };
 pub use handlers::{
     ChannelClass, FactsSink, FunnelHandlers, FunnelStore, GateClearedInput, HandlerOutcome,

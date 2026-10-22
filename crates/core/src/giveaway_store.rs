@@ -384,9 +384,10 @@ pub async fn release_claim(
 /// Complete the draw phase: flip a claimed giveaway to `drawn` and release
 /// the claim. Only the claim holder completes, and only while the giveaway
 /// is still `open`: a late completion after a moderator paused or cancelled
-/// the row returns `false` instead of resurrecting it as drawn. The caller
-/// inserts the draw row first, then calls this, then announces and calls
-/// [`mark_announced`].
+/// the row returns `false` instead of resurrecting it as drawn. Prefer
+/// [`complete_draw`], which inserts the draw row and runs this guarded
+/// transition in one transaction; this stays as the guarded-transition
+/// primitive for callers that already hold a draw row.
 pub async fn mark_drawn(
     pool: &Pool<Postgres>,
     guild_id: &str,
@@ -409,9 +410,65 @@ pub async fn mark_drawn(
     Ok(completed == 1)
 }
 
-/// Mark the announcement posted. A `drawn` row with NULL `announced_at`
-/// still owes its announcement, so a restart re-announces from the stored
-/// draw row instead of re-drawing.
+/// Complete the draw phase atomically: insert the draw row and flip the
+/// claimed giveaway to `drawn` in one transaction, releasing the claim.
+/// Returns the stored row on success, or `None` when the claim token is
+/// stale or the giveaway is no longer `open`: the insert rolls back, so a
+/// superseded worker or a moderator cancel/pause between claim and
+/// completion leaves no orphan draw row behind. A racing worker's 23505 on
+/// the draw PK still propagates as `Err`.
+pub async fn complete_draw(
+    pool: &Pool<Postgres>,
+    input: &NewDraw,
+    claim_token: &str,
+    updated_at: OffsetDateTime,
+) -> Result<Option<GiveawayDrawRow>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let row = sqlx::query_as::<_, GiveawayDrawRow>(
+        "INSERT INTO giveaway_draws
+           (guild_id, giveaway_id, draw_no, drawn_at, eligible_count,
+            eligible_hash, seed, winner_ids, reroll_kind)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         RETURNING guild_id, giveaway_id, draw_no, drawn_at, eligible_count,
+                   eligible_hash, seed, winner_ids, reroll_kind",
+    )
+    .bind(&input.guild_id)
+    .bind(&input.giveaway_id)
+    .bind(input.draw_no)
+    .bind(input.drawn_at)
+    .bind(input.eligible_count)
+    .bind(&input.eligible_hash)
+    .bind(&input.seed)
+    .bind(&input.winner_ids)
+    .bind(input.reroll_kind.as_deref())
+    .fetch_one(&mut *tx)
+    .await?;
+    let completed = sqlx::query(
+        "UPDATE giveaways
+            SET status = 'drawn', claim_token = NULL, claimed_at = NULL, updated_at = $4
+          WHERE guild_id = $1 AND id = $2 AND claim_token = $3 AND status = 'open'",
+    )
+    .bind(&input.guild_id)
+    .bind(&input.giveaway_id)
+    .bind(claim_token)
+    .bind(updated_at)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if completed == 1 {
+        tx.commit().await?;
+        Ok(Some(row))
+    } else {
+        tx.rollback().await?;
+        Ok(None)
+    }
+}
+
+/// Mark the announcement posted. Only a `drawn` row that still lacks a
+/// stamp advances: NULL `announced_at` on a drawn row is the only signal an
+/// announcement is still owed after a restart, so an early call on another
+/// status or a second announcer returns `false` instead of hiding or
+/// overwriting the marker.
 pub async fn mark_announced(
     pool: &Pool<Postgres>,
     guild_id: &str,
@@ -420,7 +477,7 @@ pub async fn mark_announced(
 ) -> Result<bool, sqlx::Error> {
     let marked = sqlx::query(
         "UPDATE giveaways SET announced_at = $3, updated_at = $3
-          WHERE guild_id = $1 AND id = $2",
+          WHERE guild_id = $1 AND id = $2 AND status = 'drawn' AND announced_at IS NULL",
     )
     .bind(guild_id)
     .bind(giveaway_id)

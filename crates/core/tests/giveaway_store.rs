@@ -13,7 +13,9 @@
 //! deliberately leaves to the builder: CRUD round-trips, entry-upsert
 //! idempotency through the store API, the claim-lease lifecycle (contention
 //! yields exactly one winner, expired leases reclaim, only the holder
-//! completes or releases), and raced draw inserts leaving one row.
+//! completes or releases), atomic draw completion (a failed guard rolls the
+//! insert back), the drawn-once announcement guard, and raced draw inserts
+//! leaving one row.
 
 use sqlx::types::time::OffsetDateTime;
 use two_bot_core::giveaway_store as store;
@@ -346,18 +348,118 @@ async fn mark_drawn_completes_only_for_the_holder() -> Result<(), sqlx::Error> {
 }
 
 #[tokio::test]
-async fn mark_announced_records_the_post() -> Result<(), sqlx::Error> {
-    let Some(fixture) = connect("mark_announced_records_the_post").await else {
+async fn mark_announced_only_stamps_a_drawn_row_once() -> Result<(), sqlx::Error> {
+    let Some(fixture) = connect("mark_announced_only_stamps_a_drawn_row_once").await else {
+        return Ok(());
+    };
+    let pool = fixture.pool().clone();
+    store::create_giveaway(&pool, &new_giveaway("gw_open", at(900))).await?;
+    store::create_giveaway(&pool, &new_giveaway("gw_paused", at(900))).await?;
+    store::create_giveaway(&pool, &new_giveaway("gw_cancelled", at(900))).await?;
+    assert!(store::set_giveaway_status(&pool, GUILD, "gw_paused", "paused", at(10), "open").await?);
+    assert!(
+        store::set_giveaway_status(&pool, GUILD, "gw_cancelled", "cancelled", at(10), "open")
+            .await?
+    );
+    for id in ["gw_open", "gw_paused", "gw_cancelled", "missing"] {
+        assert!(
+            !store::mark_announced(&pool, GUILD, id, at(3_700)).await?,
+            "{id} must refuse the stamp"
+        );
+    }
+    // Drive the open giveaway to drawn through the composed completion, then
+    // the first announcement stamps and a second announcer keeps the marker.
+    let claimed = store::claim_due_giveaway(&pool, GUILD, at(3_600), at(0), "lease-1")
+        .await?
+        .expect("open due giveaway leases");
+    assert_eq!(claimed.id, "gw_open");
+    store::complete_draw(
+        &pool,
+        &new_draw("gw_open", 0, None, SEED_0),
+        "lease-1",
+        at(3_605),
+    )
+    .await?
+    .expect("holder completes");
+    assert!(store::mark_announced(&pool, GUILD, "gw_open", at(3_700)).await?);
+    assert!(!store::mark_announced(&pool, GUILD, "gw_open", at(3_701)).await?);
+    let announced = store::get_giveaway(&pool, GUILD, "gw_open")
+        .await?
+        .expect("giveaway reads back");
+    assert_eq!(announced.announced_at, Some(at(3_700)));
+    fixture.close().await.expect("drop test database");
+    Ok(())
+}
+
+#[tokio::test]
+async fn complete_draw_rolls_back_when_the_guard_fails() -> Result<(), sqlx::Error> {
+    let Some(fixture) = connect("complete_draw_rolls_back_when_the_guard_fails").await else {
         return Ok(());
     };
     let pool = fixture.pool().clone();
     store::create_giveaway(&pool, &new_giveaway("gw01h455k", at(900))).await?;
-    assert!(store::mark_announced(&pool, GUILD, "gw01h455k", at(3_700)).await?);
-    let announced = store::get_giveaway(&pool, GUILD, "gw01h455k")
+    store::claim_due_giveaway(&pool, GUILD, at(3_600), at(0), "lease-1")
+        .await?
+        .expect("due giveaway leases");
+    // A superseded worker's token completes nothing and persists no draw row.
+    assert_eq!(
+        store::complete_draw(
+            &pool,
+            &new_draw("gw01h455k", 0, None, SEED_0),
+            "lease-wrong",
+            at(3_605)
+        )
+        .await?,
+        None
+    );
+    assert!(store::get_draws(&pool, GUILD, "gw01h455k")
+        .await?
+        .is_empty());
+    let open = store::get_giveaway(&pool, GUILD, "gw01h455k")
         .await?
         .expect("giveaway reads back");
-    assert_eq!(announced.announced_at, Some(at(3_700)));
-    assert!(!store::mark_announced(&pool, GUILD, "missing", at(3_700)).await?);
+    assert_eq!(open.status, "open");
+    assert_eq!(open.claim_token.as_deref(), Some("lease-1"));
+    // A moderator cancel between claim and completion refuses the same way.
+    assert!(
+        store::set_giveaway_status(&pool, GUILD, "gw01h455k", "cancelled", at(3_606), "open")
+            .await?
+    );
+    assert_eq!(
+        store::complete_draw(
+            &pool,
+            &new_draw("gw01h455k", 0, None, SEED_0),
+            "lease-1",
+            at(3_607)
+        )
+        .await?,
+        None
+    );
+    assert!(store::get_draws(&pool, GUILD, "gw01h455k")
+        .await?
+        .is_empty());
+    // Reopened, the holder's completion stores the row and draws the giveaway.
+    assert!(
+        store::set_giveaway_status(&pool, GUILD, "gw01h455k", "open", at(3_608), "cancelled")
+            .await?
+    );
+    let row = store::complete_draw(
+        &pool,
+        &new_draw("gw01h455k", 0, None, SEED_0),
+        "lease-1",
+        at(3_609),
+    )
+    .await?
+    .expect("holder completes");
+    assert_eq!(row.draw_no, 0);
+    assert_eq!(row.seed, SEED_0);
+    assert_eq!(store::get_draws(&pool, GUILD, "gw01h455k").await?.len(), 1);
+    let drawn = store::get_giveaway(&pool, GUILD, "gw01h455k")
+        .await?
+        .expect("giveaway reads back");
+    assert_eq!(drawn.status, "drawn");
+    assert_eq!(drawn.claim_token, None);
+    assert_eq!(drawn.updated_at, at(3_609));
     fixture.close().await.expect("drop test database");
     Ok(())
 }
