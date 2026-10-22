@@ -4275,12 +4275,14 @@ mod tests {
     #[derive(Clone)]
     struct FaultyStore {
         inner: MemMemberStore,
+        fail_claim_once: Arc<std::sync::atomic::AtomicBool>,
         fail_complete_once: Arc<std::sync::atomic::AtomicBool>,
         fail_stage_once: Arc<std::sync::atomic::AtomicBool>,
         fail_warning_ack_once: Arc<std::sync::atomic::AtomicBool>,
         fail_audit_once: Arc<std::sync::atomic::AtomicBool>,
         fail_complete_unban_once: Arc<std::sync::atomic::AtomicBool>,
         fail_release_once: Arc<std::sync::atomic::AtomicBool>,
+        audit_attempts: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl FaultyStore {
@@ -4288,12 +4290,14 @@ mod tests {
             use std::sync::atomic::AtomicBool;
             Self {
                 inner,
+                fail_claim_once: Arc::new(AtomicBool::new(false)),
                 fail_complete_once: Arc::new(AtomicBool::new(false)),
                 fail_stage_once: Arc::new(AtomicBool::new(false)),
                 fail_warning_ack_once: Arc::new(AtomicBool::new(false)),
                 fail_audit_once: Arc::new(AtomicBool::new(false)),
                 fail_complete_unban_once: Arc::new(AtomicBool::new(false)),
                 fail_release_once: Arc::new(AtomicBool::new(false)),
+                audit_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
         }
 
@@ -4301,9 +4305,22 @@ mod tests {
             flag.swap(false, std::sync::atomic::Ordering::SeqCst)
         }
 
+        fn arm_claim(&self) {
+            self.fail_claim_once
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
         fn arm_complete(&self) {
             self.fail_complete_once
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// Every `record_audit` call, including writes the inner store
+        /// suppresses (accepted-effect precedence) or fails: deleting an
+        /// audit call changes this count even when the ledger does not.
+        fn audit_attempts(&self) -> usize {
+            self.audit_attempts
+                .load(std::sync::atomic::Ordering::SeqCst)
         }
 
         fn arm_stage(&self) {
@@ -4344,6 +4361,9 @@ mod tests {
             request_hash: &str,
             claimed_at: &str,
         ) -> Result<ClaimState, StoreError> {
+            if Self::fail_once(&self.fail_claim_once) {
+                return Err(StoreError::new("injected claim failure"));
+            }
             self.inner
                 .claim(guild_id, idempotency_key, action, request_hash, claimed_at)
                 .await
@@ -4390,6 +4410,8 @@ mod tests {
         }
 
         async fn record_audit(&self, row: &AuditRow) -> Result<(), StoreError> {
+            self.audit_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if Self::fail_once(&self.fail_audit_once) {
                 return Err(StoreError::new("injected audit failure"));
             }
@@ -4618,6 +4640,56 @@ mod tests {
         );
         assert_eq!(discord.call_count("kick"), 1);
         assert_eq!(store.inner.audits().len(), 1);
+    }
+
+    // A claim-store failure surfaces the original error and still leaves its
+    // bound `in_progress` audit row: the failure audit must not depend on the
+    // claim it reports on.
+    #[tokio::test]
+    async fn claim_store_error_returns_original_error_and_audits_in_progress() {
+        let discord = MockMemberDiscord::new();
+        let store = FaultyStore::wrap(MemMemberStore::new());
+        let svc = MemberModerationService::new(discord.clone(), store.clone(), policy(), || {
+            1_700_000_000_000
+        });
+
+        store.arm_claim();
+        let exec = execution(ModerationAction::Kick);
+        let err = svc.execute(&exec).await.expect_err("claim fails");
+        assert!(
+            matches!(err, MemberError::Store(ref store) if store.message == "injected claim failure"),
+            "original store error surfaces, got {err:?}"
+        );
+        assert_eq!(discord.call_count("kick"), 0);
+        assert_eq!(store.audit_attempts(), 1);
+        let audits = store.inner.audits();
+        assert_eq!(audits.len(), 1);
+        assert_bound_failure_audit(&audits[0], &exec, "in_progress", "claim");
+    }
+
+    // A completion-store failure after an accepted effect still attempts the
+    // `in_progress` audit write even though accepted-effect suppression drops
+    // the row: deleting the call turns the attempt count red.
+    #[tokio::test]
+    async fn complete_store_error_attempts_suppressed_in_progress_audit() {
+        let discord = MockMemberDiscord::new();
+        let store = FaultyStore::wrap(MemMemberStore::new());
+        let svc = MemberModerationService::new(discord.clone(), store.clone(), policy(), || {
+            1_700_000_000_000
+        });
+
+        store.arm_complete();
+        let err = svc
+            .execute(&execution(ModerationAction::Kick))
+            .await
+            .expect_err("completion fails");
+        assert!(matches!(err, MemberError::Store(_)));
+        assert_eq!(discord.call_count("kick"), 1);
+        // One accepted row plus the suppressed `in_progress` attempt.
+        assert_eq!(store.audit_attempts(), 2);
+        let audits = store.inner.audits();
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].outcome, "kicked");
     }
 
     // F3 (scheduled effect): a completion failure after the dispatched
