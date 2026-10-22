@@ -582,6 +582,18 @@ fn captured_logs(cap: &Capture) -> String {
     String::from_utf8(cap.0.lock().expect("capture lock").clone()).expect("utf8 logs")
 }
 
+/// MockRest snapshots are cumulative. Scope the one-callback assertion and
+/// reply selection to the requests produced by this dispatch only.
+async fn dispatch_callback(
+    runtime: &Arc<CommandRuntime>,
+    mock: &MockRest,
+    ix: &Interaction,
+) -> Value {
+    let before = mock.requests().len();
+    runtime.on_interaction(ix).await;
+    only_callback(&mock.requests()[before..])
+}
+
 async fn dispatch_set(
     runtime: &Arc<CommandRuntime>,
     mock: &MockRest,
@@ -589,12 +601,7 @@ async fn dispatch_set(
     month: i64,
     day: i64,
 ) -> Value {
-    let before = callbacks(&mock.requests()).len();
-    runtime.on_interaction(&set_ix(member, month, day)).await;
-    let reqs = mock.requests();
-    let found = callbacks(&reqs);
-    assert_eq!(found.len(), before + 1, "set answers exactly one callback");
-    serde_json::from_slice(&found[before].body).expect("callback json")
+    dispatch_callback(runtime, mock, &set_ix(member, month, day)).await
 }
 
 async fn sweep(pool: &PgPool, executor: &ActionExecutor, now_ms: i64) {
@@ -785,6 +792,51 @@ async fn help_still_answers_through_dispatch_fixture() {
     mock.shutdown().await;
 }
 
+#[tokio::test]
+async fn repeated_dispatches_select_their_own_callback() {
+    let mock = MockRest::start(Vec::new(), ScriptedResponse::json(200, json!({}))).await;
+    let runtime = runtime_for(lazy_pool(), executor_for(&mock));
+    let mut help = birthday_ix(opt_sub("set", Vec::new()), ALICE, Permissions::empty());
+    if let Some(InteractionData::ApplicationCommand(data)) = help.data.as_mut() {
+        data.name = "help".to_owned();
+        data.options.clear();
+    }
+    let first = dispatch_callback(&runtime, &mock, &help).await;
+    assert_ephemeral(&first, "first help");
+    assert!(!content_of(&first).is_empty(), "help answers");
+
+    let mut unknown = birthday_ix(opt_sub("set", Vec::new()), ALICE, Permissions::empty());
+    if let Some(InteractionData::ApplicationCommand(data)) = unknown.data.as_mut() {
+        data.name = "zzz-no-such-command".to_owned();
+    }
+    let second = dispatch_callback(&runtime, &mock, &unknown).await;
+    assert_ephemeral(&second, "unknown command");
+    assert!(
+        !content_of(&second).is_empty(),
+        "unknown command is refused"
+    );
+    assert_ne!(
+        content_of(&first),
+        content_of(&second),
+        "select the new reply"
+    );
+
+    let mut help_again = birthday_ix(opt_sub("set", Vec::new()), ALICE, Permissions::empty());
+    if let Some(InteractionData::ApplicationCommand(data)) = help_again.data.as_mut() {
+        data.name = "help".to_owned();
+        data.options.clear();
+    }
+    let third = dispatch_callback(&runtime, &mock, &help_again).await;
+    assert_ephemeral(&third, "second help");
+    assert_eq!(content_of(&third), content_of(&first), "help answers again");
+    assert_eq!(
+        callbacks(&mock.requests()).len(),
+        3,
+        "snapshot is cumulative"
+    );
+    mock.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // Database acceptance (vacuous skip without TWO_TEST_DATABASE_URL)
 // ---------------------------------------------------------------------------
@@ -805,8 +857,7 @@ async fn set_show_remove_round_trip() {
     assert_callback_mention_safe(&content, "set");
     assert!(content.contains("May"), "set names the month: {content:?}");
 
-    runtime.on_interaction(&show_ix(ALICE)).await;
-    let reply = only_callback(&mock.requests());
+    let reply = dispatch_callback(&runtime, &mock, &show_ix(ALICE)).await;
     assert_ephemeral(&reply, "show");
     let content = content_of(&reply).to_owned();
     assert_concise(&content, "show");
@@ -826,13 +877,12 @@ async fn set_show_remove_round_trip() {
         content_of(&reply).contains("June"),
         "update names the new month"
     );
-    runtime.on_interaction(&show_ix(ALICE)).await;
-    let shown = content_of(&only_callback(&mock.requests())).to_owned();
+    let reply = dispatch_callback(&runtime, &mock, &show_ix(ALICE)).await;
+    let shown = content_of(&reply).to_owned();
     assert!(shown.contains("June"), "show follows the update: {shown:?}");
     assert!(!shown.contains("May"), "update replaces: {shown:?}");
 
-    runtime.on_interaction(&remove_ix(ALICE)).await;
-    let reply = only_callback(&mock.requests());
+    let reply = dispatch_callback(&runtime, &mock, &remove_ix(ALICE)).await;
     assert_ephemeral(&reply, "remove");
     let lowered = content_of(&reply).to_lowercase();
     assert!(
@@ -840,8 +890,8 @@ async fn set_show_remove_round_trip() {
         "remove confirms: {lowered:?}"
     );
 
-    runtime.on_interaction(&show_ix(ALICE)).await;
-    let lowered = content_of(&only_callback(&mock.requests())).to_lowercase();
+    let reply = dispatch_callback(&runtime, &mock, &show_ix(ALICE)).await;
+    let lowered = content_of(&reply).to_lowercase();
     assert!(
         lowered.contains("not set") || lowered.contains("no birthday"),
         "show after remove reports unset: {lowered:?}"
@@ -881,8 +931,8 @@ async fn invalid_dates_refused_with_zero_state() {
         );
     }
 
-    runtime.on_interaction(&show_ix(ALICE)).await;
-    let lowered = content_of(&only_callback(&mock.requests())).to_lowercase();
+    let reply = dispatch_callback(&runtime, &mock, &show_ix(ALICE)).await;
+    let lowered = content_of(&reply).to_lowercase();
     assert!(
         lowered.contains("not set") || lowered.contains("no birthday"),
         "refusals store nothing: {lowered:?}"
@@ -954,23 +1004,20 @@ async fn config_requires_manage_guild_and_bounds_cheer() {
 
     // Router-enforced permission: the same refusal as any other ManageGuild
     // command, not a handler-side text.
-    runtime
-        .on_interaction(&config_ix(
-            Some(CHANNEL_ID),
-            None,
-            None,
-            ALICE,
-            Permissions::empty(),
-        ))
-        .await;
-    let denied = content_of(&only_callback(&mock.requests())).to_owned();
+    let reply = dispatch_callback(
+        &runtime,
+        &mock,
+        &config_ix(Some(CHANNEL_ID), None, None, ALICE, Permissions::empty()),
+    )
+    .await;
+    let denied = content_of(&reply).to_owned();
     let mut command_ix = birthday_ix(opt_sub("set", Vec::new()), ALICE, Permissions::empty());
     if let Some(InteractionData::ApplicationCommand(data)) = command_ix.data.as_mut() {
         data.name = "command".to_owned();
         data.options.clear();
     }
-    runtime.on_interaction(&command_ix).await;
-    let reference = content_of(&only_callback(&mock.requests())).to_owned();
+    let reply = dispatch_callback(&runtime, &mock, &command_ix).await;
+    let reference = content_of(&reply).to_owned();
     assert_eq!(
         denied, reference,
         "config refusal matches the router permission refusal"
@@ -984,32 +1031,26 @@ async fn config_requires_manage_guild_and_bounds_cheer() {
         "<@8101> yo",
         "2000 miles of @everyone",
     ] {
-        runtime
-            .on_interaction(&config_ix(
-                None,
-                None,
-                Some(hostile),
-                ALICE,
-                Permissions::MANAGE_GUILD,
-            ))
-            .await;
-        let lowered = content_of(&only_callback(&mock.requests())).to_lowercase();
+        let reply = dispatch_callback(
+            &runtime,
+            &mock,
+            &config_ix(None, None, Some(hostile), ALICE, Permissions::MANAGE_GUILD),
+        )
+        .await;
+        let lowered = content_of(&reply).to_lowercase();
         assert!(
             lowered.contains("invalid"),
             "hostile template refused: {hostile:?} -> {lowered:?}"
         );
     }
     let long = "x".repeat(MAX_CHEER_TEMPLATE_CHARS + 1);
-    runtime
-        .on_interaction(&config_ix(
-            None,
-            None,
-            Some(&long),
-            ALICE,
-            Permissions::MANAGE_GUILD,
-        ))
-        .await;
-    let lowered = content_of(&only_callback(&mock.requests())).to_lowercase();
+    let reply = dispatch_callback(
+        &runtime,
+        &mock,
+        &config_ix(None, None, Some(&long), ALICE, Permissions::MANAGE_GUILD),
+    )
+    .await;
+    let lowered = content_of(&reply).to_lowercase();
     assert!(
         lowered.contains("invalid"),
         "overlong template refused: {lowered:?}"
@@ -1017,16 +1058,18 @@ async fn config_requires_manage_guild_and_bounds_cheer() {
 
     // Valid config confirms; the refused templates left zero stored state,
     // so the sweep below uses the default cheer, not hostile text.
-    runtime
-        .on_interaction(&config_ix(
+    let reply = dispatch_callback(
+        &runtime,
+        &mock,
+        &config_ix(
             Some(CHANNEL_ID),
             Some(8130),
             None,
             ALICE,
             Permissions::MANAGE_GUILD,
-        ))
-        .await;
-    let reply = only_callback(&mock.requests());
+        ),
+    )
+    .await;
     assert_ephemeral(&reply, "config");
     let lowered = content_of(&reply).to_lowercase();
     assert!(
@@ -1065,24 +1108,24 @@ async fn own_query_only_never_leaks_other_member() {
     let reply = dispatch_set(&runtime, &mock, BRUNO, 7, 4).await;
     assert!(content_of(&reply).contains("July"));
 
-    runtime.on_interaction(&show_ix(BRUNO)).await;
-    let shown = content_of(&only_callback(&mock.requests())).to_owned();
+    let reply = dispatch_callback(&runtime, &mock, &show_ix(BRUNO)).await;
+    let shown = content_of(&reply).to_owned();
     assert!(shown.contains("July"), "Bruno sees his own: {shown:?}");
     assert!(
         !shown.contains("May"),
         "Bruno never sees Alice's: {shown:?}"
     );
 
-    runtime.on_interaction(&show_ix(ALICE)).await;
-    let shown = content_of(&only_callback(&mock.requests())).to_owned();
+    let reply = dispatch_callback(&runtime, &mock, &show_ix(ALICE)).await;
+    let shown = content_of(&reply).to_owned();
     assert!(shown.contains("May"), "Alice sees her own: {shown:?}");
     assert!(
         !shown.contains("July"),
         "Alice never sees Bruno's: {shown:?}"
     );
 
-    runtime.on_interaction(&show_ix(NOBODY)).await;
-    let lowered = content_of(&only_callback(&mock.requests())).to_lowercase();
+    let reply = dispatch_callback(&runtime, &mock, &show_ix(NOBODY)).await;
+    let lowered = content_of(&reply).to_lowercase();
     assert!(
         lowered.contains("not set") || lowered.contains("no birthday"),
         "unset member reports unset: {lowered:?}"
@@ -1221,6 +1264,13 @@ async fn sweep_cycles_birthday_role_for_the_day() {
         .await;
     let reply = dispatch_set(&runtime, &mock, ALICE, 5, 1).await;
     assert!(content_of(&reply).contains("May"));
+    // Persist the stale holder as a tracked member with tomorrow's birthday.
+    // The sweep can discover Cara through stored membership, not a guessed id.
+    let reply = dispatch_set(&runtime, &mock, CARA, 5, 2).await;
+    assert!(
+        content_of(&reply).contains("May"),
+        "stale holder is tracked"
+    );
 
     sweep(&pool, &executor, utc_ms("2026-05-01T12:00:00.000Z")).await;
 
