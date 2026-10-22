@@ -14,6 +14,7 @@ pub mod gateway_backoff;
 // Visibility widens (`pub(crate)` -> `pub`) with no logic change.
 pub mod containment_runtime;
 pub mod join_risk_runtime;
+pub mod lane_jitter;
 pub mod raid_runtime;
 
 // Shared by the raid/containment tuning test modules; declared once so the
