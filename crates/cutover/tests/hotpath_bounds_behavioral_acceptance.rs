@@ -535,7 +535,7 @@ fn funnel_store(db: &TestDatabase) -> PgFunnelStore {
     PgFunnelStore::new(db.pool().clone())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn small_history_projects_exact_membership() {
     let Some(bootstrap) = bootstrap_url("funnel small history") else {
         return;
@@ -560,7 +560,7 @@ async fn small_history_projects_exact_membership() {
     db.close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn unknown_member_has_no_membership() {
     let Some(bootstrap) = bootstrap_url("funnel unknown member") else {
         return;
@@ -574,7 +574,7 @@ async fn unknown_member_has_no_membership() {
     db.close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn over_cap_history_still_projects_exactly() {
     let Some(bootstrap) = bootstrap_url("funnel over cap") else {
         return;
