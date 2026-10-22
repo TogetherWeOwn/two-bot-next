@@ -4,12 +4,24 @@
 Not a Rust parser or data-flow analysis: review new secret-bearing types and
 explicit expose() calls too. Comments/literals are blanked to preserve lines.
 """
+import argparse
+import contextlib
+import io
+import json
+import os
 import pathlib
 import re
 import sys
+import tempfile
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+# Coverage floors: the guard fails instead of passing vacuously when the scan
+# sees fewer files or Debug-derived types than this. Measured 464 files and
+# 1169 Debug-derived types on 2026-10-21; re-baseline deliberately (never to
+# make a red guard green) when the tree shrinks for good.
+MIN_SCANNED_FILES = 400
+MIN_DEBUG_DERIVED_TYPES = 1000
 # The attribute run may hold several derive attributes (in either order, with
 # other attributes between them); Debug in ANY of them counts. Doc comments
 # are already blanked to whitespace before matching, so plain `\s*` covers
@@ -155,7 +167,15 @@ def blank_literals(source):
     return re.sub(pattern, lambda m: re.sub(r"[^\n]", " ", m.group()), source)
 
 
-def violations(source, path="fixture.rs"):
+def violations(source, path="fixture.rs", _stats=None, exceptions=None):
+    """Raw credential fields under derived Debug in one file.
+
+    When `_stats` is given, count each Debug-derived type in
+    `_stats["debug_types"]` and record every exercised exception key in
+    `_stats["used"]`, so the caller can floor coverage and spot stale
+    allowlist entries. `exceptions` overrides EXCEPTIONS (tests only).
+    """
+    active = EXCEPTIONS if exceptions is None else exceptions
     clean = blank_literals(source)
     results = []
     for match in DERIVE.finditer(clean):
@@ -164,6 +184,8 @@ def violations(source, path="fixture.rs"):
         )
         if "Debug" not in traits.split(",") and not re.search(r"\bDebug\b", traits):
             continue
+        if _stats is not None:
+            _stats["debug_types"] += 1
         start = match.end()
         end, depth = start, 1
         while end < len(clean) and depth:
@@ -173,7 +195,9 @@ def violations(source, path="fixture.rs"):
         for name, field_type, field_start in named_fields(body):
             if not SENSITIVE.search(name) or not has_raw_outside_secret(field_type):
                 continue
-            if (path, match["name"], name) in EXCEPTIONS:
+            if (path, match["name"], name) in active:
+                if _stats is not None:
+                    _stats["used"].add((path, match["name"], name))
                 continue
             line = source.count("\n", 0, start + field_start) + 1
             results.append(f"{path}:{line}: {match['name']}.{name} is raw under derived Debug; use Secret<T>")
@@ -185,11 +209,89 @@ def violations(source, path="fixture.rs"):
                 for field in split_top_level(payload)
             ):
                 continue
-            if (path, match["name"], name) in EXCEPTIONS:
+            if (path, match["name"], name) in active:
+                if _stats is not None:
+                    _stats["used"].add((path, match["name"], name))
                 continue
             line = source.count("\n", 0, start + variant_start) + 1
             results.append(f"{path}:{line}: {match['name']}::{name} is raw under derived Debug; use Secret<T>")
     return results
+
+
+def scan_paths(root):
+    """Crate sources plus top-level src/, mirroring the snowflake gate."""
+    paths = []
+    if (root / "crates").is_dir():
+        paths.extend((root / "crates").glob("*/src/**/*.rs"))
+    if (root / "src").is_dir():
+        paths.extend((root / "src").glob("**/*.rs"))
+    return sorted(set(paths))
+
+
+def check(root=ROOT, min_files=MIN_SCANNED_FILES,
+          min_debug=MIN_DEBUG_DERIVED_TYPES, exceptions=None):
+    """Scan `root` and grade coverage: findings, floors and stale exceptions."""
+    active = EXCEPTIONS if exceptions is None else exceptions
+    stats = {"debug_types": 0, "used": set()}
+    findings = []
+    paths = scan_paths(root)
+    for path in paths:
+        findings.extend(violations(path.read_text(), path.relative_to(root).as_posix(),
+                                   _stats=stats, exceptions=active))
+    stale = sorted(set(active) - stats["used"])
+    errors = []
+    if len(paths) < min_files:
+        errors.append(f"secret Debug guard: scanned {len(paths)} files, "
+                      f"below the {min_files}-file floor")
+    if stats["debug_types"] < min_debug:
+        errors.append(f"secret Debug guard: found {stats['debug_types']} "
+                      f"Debug-derived types, below the {min_debug}-type floor")
+    for entry in stale:
+        errors.append(f"stale exception {entry[0]} {entry[1]} {entry[2]}: "
+                      f"no longer matches a raw credential field")
+    return {
+        "scanned_files": len(paths),
+        "debug_types": stats["debug_types"],
+        "exceptions_total": len(active),
+        "exceptions_used": sorted(stats["used"]),
+        "stale_exceptions": stale,
+        "findings": findings,
+        "errors": errors,
+    }
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--test", action="store_true",
+                        help="run the guard's unit tests")
+    parser.add_argument("--json", action="store_true",
+                        help="print counts and findings as JSON")
+    parser.add_argument("--root", type=pathlib.Path, default=ROOT,
+                        help="repository root to scan")
+    args = parser.parse_args(argv)
+    if args.test:
+        unittest.main(argv=[sys.argv[0]])
+    result = check(args.root)
+    failed = bool(result["findings"] or result["errors"])
+    if args.json:
+        print(json.dumps({
+            "scanned_files": result["scanned_files"],
+            "debug_derived_types": result["debug_types"],
+            "exceptions_total": result["exceptions_total"],
+            "exceptions_used": len(result["exceptions_used"]),
+            "stale_exceptions": [list(entry) for entry in result["stale_exceptions"]],
+            "findings": result["findings"],
+            "errors": result["errors"],
+            "verdict": "FAIL" if failed else "PASS",
+        }, indent=2))
+    else:
+        for finding in result["findings"]:
+            print(finding, file=sys.stderr)
+        for error in result["errors"]:
+            print(error, file=sys.stderr)
+        if not failed:
+            print("secret Debug guard: no raw credential fields under derived Debug")
+    return 1 if failed else 0
 
 
 class GuardTests(unittest.TestCase):
@@ -291,16 +393,125 @@ class GuardTests(unittest.TestCase):
         self.assertFalse(violations(code, "crates/core/src/voice_naming.rs"))
         self.assertTrue(violations(code, "other.rs"))
 
+    def test_floors_are_the_documented_contract(self):
+        self.assertEqual(MIN_SCANNED_FILES, 400)
+        self.assertEqual(MIN_DEBUG_DERIVED_TYPES, 1000)
+        self.assertEqual(len(EXCEPTIONS), 4)
+
+    def test_scan_covers_crates_and_top_level_src(self):
+        root = _scratch_root(self)
+        bad = '#[derive(Debug)] struct Bad { token: String, }\n'
+        (root / "crates" / "demo" / "src").mkdir(parents=True)
+        (root / "crates" / "demo" / "src" / "bad.rs").write_text(bad)
+        (root / "src").mkdir()
+        (root / "src" / "top.rs").write_text(bad)
+        result = check(root, min_files=0, min_debug=0, exceptions={})
+        self.assertEqual(result["scanned_files"], 2)
+        self.assertEqual(result["debug_types"], 2)
+        self.assertEqual(len(result["findings"]), 2)
+        self.assertTrue(any("crates/demo/src/bad.rs" in f for f in result["findings"]))
+        self.assertTrue(any("src/top.rs" in f for f in result["findings"]))
+        self.assertEqual(result["errors"], [])
+
+    def test_empty_tree_fails_the_file_floor(self):
+        root = _scratch_root(self)
+        result = check(root, min_files=1, min_debug=0, exceptions={})
+        self.assertEqual(result["scanned_files"], 0)
+        self.assertEqual(result["findings"], [])
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertIn("0 files", result["errors"][0])
+        self.assertIn("floor", result["errors"][0])
+
+    def test_floors_are_inclusive_bounds(self):
+        root = _scratch_root(self)
+        (root / "src").mkdir()
+        (root / "src" / "one.rs").write_text('#[derive(Debug)] struct One { id: u64, }\n')
+        at = check(root, min_files=1, min_debug=1, exceptions={})
+        self.assertEqual(at["errors"], [])
+        over = check(root, min_files=2, min_debug=2, exceptions={})
+        self.assertEqual(len(over["errors"]), 2)
+
+    def test_renamed_exception_entry_is_stale(self):
+        cases = [
+            # (relpath, type, field, file body or None for a missing file)
+            ("crates/demo/src/w.rs", "Widget", "token",
+             '#[derive(Debug)] struct Widget { token_id: u64, }\n'),
+            ("crates/demo/src/w.rs", "Widget", "token",
+             '#[derive(Debug)] struct Gadget { token: String, }\n'),
+            ("crates/demo/src/gone.rs", "Widget", "token", None),
+        ]
+        for relpath, typename, field, body in cases:
+            with self.subTest(relpath=relpath, body=body):
+                root = _scratch_root(self)
+                if body is not None:
+                    target = root / relpath
+                    target.parent.mkdir(parents=True)
+                    target.write_text(body)
+                result = check(root, min_files=0, min_debug=0,
+                               exceptions={(relpath, typename, field): "audited"})
+                self.assertEqual(result["stale_exceptions"], [(relpath, typename, field)])
+                self.assertEqual(len(result["errors"]), 1)
+                self.assertIn("stale exception", result["errors"][0])
+
+    def test_live_exception_is_used_not_stale(self):
+        root = _scratch_root(self)
+        (root / "src").mkdir()
+        (root / "src" / "w.rs").write_text(
+            '#[derive(Debug)] struct Widget { token: String, }\n')
+        key = ("src/w.rs", "Widget", "token")
+        result = check(root, min_files=0, min_debug=0, exceptions={key: "audited"})
+        self.assertEqual(result["findings"], [])
+        self.assertEqual(result["stale_exceptions"], [])
+        self.assertEqual(result["exceptions_used"], [key])
+        self.assertEqual(result["errors"], [])
+
+    def test_secret_wrapped_exception_goes_stale(self):
+        # The exception is no longer needed once the field is wrapped: the
+        # allowlist must shrink with the code instead of rotting.
+        root = _scratch_root(self)
+        (root / "src").mkdir()
+        (root / "src" / "w.rs").write_text(
+            '#[derive(Debug)] struct Widget { token: Secret<String>, }\n')
+        key = ("src/w.rs", "Widget", "token")
+        result = check(root, min_files=0, min_debug=0, exceptions={key: "audited"})
+        self.assertEqual(result["stale_exceptions"], [key])
+
+    def test_json_counts(self):
+        root = _scratch_root(self)
+        (root / "src").mkdir()
+        (root / "src" / "w.rs").write_text(
+            '#[derive(Debug)] struct Widget { token: String, }\n')
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = main(["--root", str(root), "--json"])
+        self.assertEqual(code, 1)
+        packet = json.loads(out.getvalue())
+        self.assertEqual(packet["scanned_files"], 1)
+        self.assertEqual(packet["debug_derived_types"], 1)
+        self.assertEqual(packet["exceptions_used"], 0)
+        self.assertEqual(packet["verdict"], "FAIL")
+        self.assertEqual(len(packet["findings"]), 1)
+
+    def test_human_output_keeps_the_pass_line(self):
+        # Against the real tree: pins the production floors as holding and
+        # the pass line byte-identical.
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = main(["--root", str(ROOT)])
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertEqual(out.getvalue(),
+                         "secret Debug guard: no raw credential fields under derived Debug\n")
+        self.assertEqual(err.getvalue(), "")
+
+
+def _scratch_root(test):
+    tmp = tempfile.TemporaryDirectory(
+        dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")
+        or os.environ.get("PAPERCLIP_SCRATCH_DIR")
+        or os.environ.get("RUNNER_TEMP"))
+    test.addCleanup(tmp.cleanup)
+    return pathlib.Path(tmp.name)
+
 
 if __name__ == "__main__":
-    if "--test" in sys.argv:
-        unittest.main(argv=[sys.argv[0]])
-    else:
-        findings = []
-        for path in sorted((ROOT / "crates").glob("*/src/**/*.rs")):
-            findings.extend(violations(path.read_text(), path.relative_to(ROOT).as_posix()))
-        for finding in findings:
-            print(finding, file=sys.stderr)
-        if findings:
-            sys.exit(1)
-        print("secret Debug guard: no raw credential fields under derived Debug")
+    raise SystemExit(main())

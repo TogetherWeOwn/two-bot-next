@@ -72,6 +72,9 @@ also consumes mismatched attempts; do not undo a burn on later validation/error.
   unknown/stale records only. It commits a proven terminal outcome, not a lease.
 - `list_unknown_event_intents(guild_id)` lists `unknown` event intents for one
   guild oldest first, without hashes, keys or payloads. Read-only.
+  `list_unknown_event_intents_limited(guild_id, limit)` returns the same rows
+  as a bounded page (25 by default, at most 100) plus the total fenced count,
+  backing the `reconcile-event --list` truncation receipt.
 - `resolve_event_intent(intent_id, action, guild_id, key_mapping, response, evidence)`
   closes one exact unknown event intent in a single transaction. A confirmed
   upsert effect registers its key mapping before the receipt commits; cancels

@@ -66,6 +66,9 @@ and the Worker (`packetFilename` in `wrangler/src/alert-rules.ts`).
 | `gateway_reconnect_flapping` | successful transport reconnections rise in 3 consecutive samples (single blips stay log-only; first sample is baseline, flat/reset clears) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-gateway-reconnect-flapping) |
 | `handler_duration_saturated` | **ticket**: handler p99 past 1 s (tail above 1% with >= 10 completions, >= 2 slow) in 3 consecutive windows | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-handler-duration-saturated) |
 | `job_failure_share:<job>` | **ticket**: per-job failures above 10% of recent runs (>= 10 runs, >= 2 failures; sub-floor windows accumulate) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-job-failure-share) |
+| `rest_token_invalid` | **page**: bot-token latch reads 1 on any valid sample (credential death; first sample may fire, only a corrected restart clears) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-rest-token-invalid) |
+| `rest_refusal_surge` | **page**: guard invalid + refused requests grow 10+ between samples (first sample is baseline-only, a backwards counter re-baselines only that family, quiet windows resolve) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-rest-refusal-surge) |
+| `rest_global_responses_stuck` | **page**: global-pause response bodies unresolved for 3 consecutive valid samples (a valid zero resolves; paused/remaining gauges stay rule-free by design) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-rest-global-responses-stuck) |
 
 Out of scope for paging (log-only findings, still recorded on the watch log):
 single gateway session starts (sustained reconnect flapping pages via

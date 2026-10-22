@@ -672,6 +672,31 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
     .await?
     .rows_affected();
 
+    // Pre-0142 archives carry no delivery_uncertain column: their restored
+    // pending rows would land at DEFAULT FALSE and replay past the fence.
+    // Re-fence exactly like the 0142 backfill when the archive never
+    // recorded the column. Archives that recorded it restore faithfully
+    // (the drill asserts the exact roundtrip); targets without the column
+    // predate the fence and take no update.
+    let archive_fenced = manifest
+        .tables
+        .iter()
+        .find(|table| table.name == "scheduled_messages")
+        .is_some_and(|table| table.columns.iter().any(|c| c == "delivery_uncertain"));
+    if !archive_fenced
+        && columns_of(&mut tx, "scheduled_messages")
+            .await?
+            .iter()
+            .any(|(name, _)| name == "delivery_uncertain")
+    {
+        sqlx::query(
+            "UPDATE scheduled_messages SET delivery_uncertain = TRUE
+              WHERE occurrence_nonce IS NOT NULL OR claim_token IS NOT NULL",
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+
     // v3 predates the required singleton. Clearing stale target data is not
     // enough: settings writes would subsequently fail without this baseline.
     // Never synthesize application settings/history or replace an archived row.

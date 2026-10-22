@@ -535,6 +535,10 @@ impl SelfRoleRuntime {
     /// A receipt is a sender fact, not current ownership. Persist it before any
     /// aggregate checkpoint can fail after generation transfer. Cancellation or
     /// receipt-write failure leaves the durable ticket unresolved, never no-send.
+    /// A journaled send with no received response (timeout/transport loss) is
+    /// not a receipt, but the timeout is recorded so the pending ticket stops
+    /// being invisible. A lost race (a receipt landed first), an already
+    /// settled ticket, or a pre-migration database simply records nothing.
     async fn complete_step_receipt(
         &self,
         ticket: &ExchangeTicket,
@@ -543,6 +547,16 @@ impl SelfRoleRuntime {
         if let Some(receipt) = step_receipt(exchange) {
             if !store_io(self.store.complete_role_exchange(ticket, receipt)).await? {
                 return Err(RuntimeError::Store(StoreErrorKind::UnmatchedReceipt));
+            }
+        } else if exchange.is_ok() {
+            if let Err(error) = store_io(
+                self.store
+                    .note_ambiguous_outcome(ticket, "timeout_no_response"),
+            )
+            .await
+            {
+                // The journaled ticket already records pending uncertainty.
+                warn!(?error, "self-role timeout outcome note failed");
             }
         }
         Ok(())
