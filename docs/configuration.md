@@ -30,8 +30,8 @@ Keys in
 legacy `HOT_WIRED` are labeled “reload-report hot” (the `RefreshReport::hot`
 partition in `settings.rs`); every other storable key reports cold.
 
-Live snapshot consumers at `1643438` (canonical table; eight `live()` call
-sites total: seven across the five non-voice rows below, plus the voice
+Live snapshot consumers at `1643438` (canonical table; nine `live()` call
+sites total: eight across the six non-voice rows below, plus the voice
 gateway closure):
 
 | Runtime | Call sites | Reads | When |
@@ -41,9 +41,10 @@ gateway closure):
 | audit | `audit_runtime.rs:308`, `:438` | 3 mirror destinations (`:60-63`) | every record (`:483`) and sweep (`:497`), once installed |
 | ticket | `ticket_runtime.rs:457`, `:981` | 3 ticket destinations (`:172-175`) | every execute/recovery and purge |
 | gateway classifier | `gateway.rs:774-789`, `:918` | human/welcome channel sets (`:800-817`) | every guild message; classifier + facts sink swap together (`leveling_runtime.rs:766`) |
+| community | `community_jobs.rs:181-183` | 5 scorecard/presence/inactivity keys (`:170-176`) | every tick: probe (`:396`), scorecard (`:548`), sweep (`:634`) |
 | voice | `gateway.rs:2082` closure | empty grace (`voice_rooms.rs:9415`), invite code (`:9460`) | spawn (`:7753-7757`), maintenance (`:3319`), `/invite` (`:13306-13307`) |
 
-The thirty-six keys in `STORE_READ_KEYS`
+The forty-one keys in `STORE_READ_KEYS`
 (`crates/core/tests/reference_docs.rs`) say “applied live by runtime refresh”
 instead of “stored unwired”: containment applies `TWO_ANTI_NUKE_WINDOW_SECONDS`,
 `TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS`, `TWO_ANTI_NUKE_HEAT_THRESHOLD` and
@@ -84,14 +85,19 @@ malformed row keeps the last good destinations like the audit mirror; the gatewa
 `TWO_COMMUNITY_HUMAN_CHANNEL_IDS` and `TWO_COMMUNITY_WELCOME_CHANNEL_IDS`
 from the snapshot on every guild message, refreshing the channel classifier
 and the community-facts sink together before the message's channel class is
-stamped (`crates/bot/src/gateway.rs:774-789`, `:918`, `crates/discord/src/leveling_runtime.rs:766`), with malformed entries filtered silently so a wholly-malformed row applies as the empty set (`crates/core/src/community.rs:252-260`); the voice sweep applies `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` from the snapshot on spawn and every maintenance refresh, so a stored per-guild grace reaches the deletion sweep without a restart (`crates/bot/src/voice_rooms.rs:7753-7757`, `:3319`), and the invite responder applies `TWO_GUILD_INVITE_CODE` per `/invite` interaction (`crates/bot/src/voice_rooms.rs:13306-13307`), falling back to the live vanity code when the row is absent or invalid (`:9462-9467`). Two boot-only edges
+stamped (`crates/bot/src/gateway.rs:774-789`, `:918`, `crates/discord/src/leveling_runtime.rs:766`), with malformed entries filtered silently so a wholly-malformed row applies as the empty set (`crates/core/src/community.rs:252-260`); the voice sweep applies `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` from the snapshot on spawn and every maintenance refresh, so a stored per-guild grace reaches the deletion sweep without a restart (`crates/bot/src/voice_rooms.rs:7753-7757`, `:3319`), and the invite responder applies `TWO_GUILD_INVITE_CODE` per `/invite` interaction (`crates/bot/src/voice_rooms.rs:13306-13307`), falling back to the live vanity code when the row is absent or invalid (`:9462-9467`); the community jobs apply `TWO_COMMUNITY_SCORECARD`, `TWO_COMMUNITY_RECOMMENDATIONS`, `TWO_COMMUNITY_CORRECTION_CYCLES`, `TWO_PRESENCE_PROBE` and `TWO_INACTIVITY_DAYS` from the snapshot on every tick, layering stored rows over the boot gates with boot fallback for absent or unparsable counts (`crates/bot/src/community_jobs.rs:170-268`), where a stored `0` on either enable gate skips that tick while the sweep re-reads its horizon per run. Five boot-only edges
 remain: the voice room-name policy is
 built once at boot from the process environment
-(`crates/bot/src/gateway.rs:2080`); and gateway intents plus ticket command
+(`crates/bot/src/gateway.rs:2080`); gateway intents plus ticket command
 publication read the ticket destination keys once at boot
 (`crates/bot/src/gateway.rs:150`, `crates/bot/src/command_runtime.rs:431`), so a stored ticket
 destination reaches already-published commands only through the per-operation
-refresh above. Every other
+refresh above; the community-facts sink arms once at boot
+(`crates/bot/src/main.rs:697-698`), so a live scorecard `0` stops scoring but
+not capture; the scorecard command surface publishes at boot
+(`crates/bot/src/main.rs:1004`, `crates/bot/src/command_runtime.rs:440`); and
+a boot-parked community job needs a restart to start ticking, like the parked
+audit runtime. Every other
 storable row's stored value is unwired.
 
 Gateway boot reads process environment only, through a fixed set of loaders:
@@ -215,11 +221,11 @@ Catalog entries: 134.
 | `TWO_BULK_JOIN_WINDOW_UNTIL` | hot | Not specified in Next | stored, applied live by runtime refresh | End of the temporary bulk-join window. |
 | `TWO_COMMUNITY_AUTOMATION_ACTOR_IDS` | hot | `[]` | stored unwired | Automation actors excluded from human community activity. |
 | `TWO_COMMUNITY_CLASSIFIER_VERSION` | hot | `"community-v1"` | stored unwired | Version label for community classification. |
-| `TWO_COMMUNITY_CORRECTION_CYCLES` | cold | `0` | stored unwired | Non-negative count of operator scorecard corrections. |
+| `TWO_COMMUNITY_CORRECTION_CYCLES` | hot | `0` | stored, applied live by runtime refresh (reload-report hot) | Non-negative count of operator scorecard corrections. |
 | `TWO_COMMUNITY_HUMAN_CHANNEL_IDS` | hot | `[]` | stored, applied live by runtime refresh (reload-report hot) | Channels considered for human community activity. |
 | `TWO_COMMUNITY_RAID_ACTOR_IDS` | hot | `[]` | stored unwired | Known raid actors excluded from human activity classification. |
-| `TWO_COMMUNITY_RECOMMENDATIONS` | cold | `true` | stored unwired | Permit scorecard recommendations unless explicitly disabled with 0. |
-| `TWO_COMMUNITY_SCORECARD` | cold | `false` | stored unwired | Enable the weekly scorecard job. Live fact capture covers event_attended, voice_session_started, voice_session_ended, message_created, rules_accepted and member_joined. |
+| `TWO_COMMUNITY_RECOMMENDATIONS` | hot | `true` | stored, applied live by runtime refresh (reload-report hot) | Permit scorecard recommendations unless explicitly disabled with 0. |
+| `TWO_COMMUNITY_SCORECARD` | hot | `false` | stored, applied live by runtime refresh (reload-report hot) | Enable the weekly scorecard job. Live fact capture covers event_attended, voice_session_started, voice_session_ended, message_created, rules_accepted and member_joined. |
 | `TWO_COMMUNITY_STAGING_ACTOR_IDS` | hot | `[]` | stored unwired | Staging actors excluded from human community activity. |
 | `TWO_COMMUNITY_STAGING_GUILD_IDS` | hot | `[]` | stored unwired | Staging guilds excluded from human community activity. |
 | `TWO_COMMUNITY_TEST_ACTOR_IDS` | hot | `[]` | stored unwired | Test actors excluded from human community activity. |
@@ -235,7 +241,7 @@ Catalog entries: 134.
 | `TWO_GUILD_INVITE_CODE` | hot | Not specified in Next | stored, applied live by runtime refresh (reload-report hot) | Stored per-guild invite code; wins over the gateway vanity code on the /invite path, invalid rows fail closed to the fallback. |
 | `TWO_HEALTH_BIND_HOST` | env_only | Not specified in Next | environment only | Legacy health listener interface; environment-only network bind. |
 | `TWO_HEALTH_PORT` | env_only | Not specified in Next | environment only | Legacy health listener port; Container uses LISTEN_ADDR instead. |
-| `TWO_INACTIVITY_DAYS` | cold | Not specified in Next | stored unwired | Inactivity horizon used for community nudges. |
+| `TWO_INACTIVITY_DAYS` | hot | Not specified in Next | stored, applied live by runtime refresh (reload-report hot) | Inactivity horizon used for community nudges. |
 | `TWO_INTERNAL_ACTIONS` | env_only | Not specified in Next | environment only | Master gate for website-origin internal actions; never dashboard-writable. |
 | `TWO_INTERNAL_ALLOW_ADD_MEMBER` | env_only | Not specified in Next | environment only | Capability gate for internal member-add actions. |
 | `TWO_INTERNAL_ALLOW_AUTOMATIONS` | env_only | Not specified in Next | environment only | Capability gate for internal automation actions. |
@@ -264,7 +270,7 @@ Catalog entries: 134.
 | `TWO_ONBOARDING_ROTA_PSEUDONYM_KEY` | env_only | Not rendered (secret) | environment only | Dropped rota pseudonym secret; env-only refusal is retained. |
 | `TWO_ONBOARDING_ROTA_READER_IDS` | env_only | Not specified in Next | environment only | Dropped staging rota reader boundary; env-only refusal is retained. |
 | `TWO_OWEN_USER_ID` | env_only | `""` | environment only | Owen bot identity, required and snowflake-validated when moderation is enabled. |
-| `TWO_PRESENCE_PROBE` | cold | Not specified in Next | stored unwired | Enable the presence-probe surface. |
+| `TWO_PRESENCE_PROBE` | hot | Not specified in Next | stored, applied live by runtime refresh (reload-report hot) | Enable the presence-probe surface. |
 | `TWO_RAID_JOIN_THRESHOLD` | hot | Not specified in Next | stored, applied live by runtime refresh (reload-report hot) | Join count threshold for the raid watch. |
 | `TWO_RAID_WINDOW_SECONDS` | hot | Not specified in Next | stored, applied live by runtime refresh (reload-report hot) | Join aggregation window for the raid watch. |
 | `TWO_REDIRECT_BIND_HOST` | env_only | Not specified in Next | environment only | Legacy redirect listener interface; environment-only network bind. |
