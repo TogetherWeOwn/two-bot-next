@@ -131,6 +131,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('web_v1', 'contract_meta', 'view'),
     ('web_v1', 'live_counts', 'view'),
     ('web_v1', 'rank_counts', 'view'),
+    ('web_v1', 'rank_ladder', 'view'),
     ('web_v1', 'members', 'view'),
     ('web_v1', 'member_milestones', 'view'),
     ('web_v1', 'upcoming_events', 'view'),
