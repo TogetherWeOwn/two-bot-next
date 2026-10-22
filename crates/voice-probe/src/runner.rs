@@ -20,9 +20,7 @@ use time::OffsetDateTime;
 use tokio::net::UdpSocket;
 use tokio::time::{timeout, Instant};
 
-use crate::discovery::{
-    decode_response, encode_request, encode_response, is_discovery_request,
-};
+use crate::discovery::{decode_response, encode_request, encode_response, is_discovery_request};
 use crate::evidence::Evidence;
 use crate::stats::{loss_pct, summarize_rtt};
 
@@ -251,11 +249,7 @@ async fn run_discovery(
 
 /// Wait until `deadline` for a discovery response to `ssrc`. Strays and
 /// transient receive noise are skipped; only the deadline ends the wait.
-async fn await_discovery(
-    socket: &UdpSocket,
-    ssrc: u32,
-    deadline: Instant,
-) -> Option<SocketAddr> {
+async fn await_discovery(socket: &UdpSocket, ssrc: u32, deadline: Instant) -> Option<SocketAddr> {
     let mut buf = [0u8; RECV_BUF_LEN];
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -284,11 +278,7 @@ struct RttPhase {
 
 /// Collect one RTT sample per first-seen sequence. Duplicates and strays
 /// are ignored; only this phase's receipts count toward loss.
-fn record_rtt(
-    buf: &[u8],
-    seen: &mut HashSet<u32>,
-    samples_ms: &mut Vec<f64>,
-) {
+fn record_rtt(buf: &[u8], seen: &mut HashSet<u32>, samples_ms: &mut Vec<f64>) {
     if let Some((seq, send_ts)) = decode_rtt(buf) {
         if seen.insert(seq) {
             let rtt_us = now_micros().saturating_sub(send_ts);
@@ -392,10 +382,7 @@ mod tests {
 
         assert_eq!(packet.len(), RTT_PACKET_LEN);
         assert_eq!(&packet[0..4], b"TWOP");
-        assert_eq!(
-            decode_rtt(&packet),
-            Some((41, 1_760_000_000_000_000))
-        );
+        assert_eq!(decode_rtt(&packet), Some((41, 1_760_000_000_000_000)));
     }
 
     #[test]
@@ -429,10 +416,7 @@ mod tests {
             ProbeError::Resolve("bad host".to_owned()).to_string(),
             "cannot resolve echo target: bad host"
         );
-        let io = ProbeError::Socket(std::io::Error::new(
-            std::io::ErrorKind::AddrInUse,
-            "in use",
-        ));
+        let io = ProbeError::Socket(std::io::Error::new(std::io::ErrorKind::AddrInUse, "in use"));
         assert!(io.to_string().starts_with("probe socket failed: "));
         assert!(io.to_string().contains("in use"));
     }
@@ -508,7 +492,9 @@ mod tests {
     async fn echo_fails_when_bind_port_is_occupied() {
         let held = StdUdpSocket::bind(loopback(0)).unwrap();
         let port = held.local_addr().unwrap().port();
-        let config = EchoConfig { bind: loopback(port) };
+        let config = EchoConfig {
+            bind: loopback(port),
+        };
 
         let result = run_echo(&config, async {}).await;
 

@@ -13,9 +13,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tokio::net::UdpSocket;
 use two_bot_voice_probe::discovery::{decode_response, encode_response, is_discovery_request};
-use two_bot_voice_probe::runner::{
-    decode_rtt, run_echo_on, run_probe, EchoStats, ProbeConfig,
-};
+use two_bot_voice_probe::runner::{decode_rtt, run_echo_on, run_probe, EchoStats, ProbeConfig};
 
 fn loopback(port: u16) -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, port))
@@ -41,7 +39,11 @@ fn short_probe(echo: SocketAddr) -> ProbeConfig {
     }
 }
 
-async fn spawn_echo() -> (SocketAddr, tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<EchoStats>) {
+async fn spawn_echo() -> (
+    SocketAddr,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<EchoStats>,
+) {
     let socket = UdpSocket::bind(loopback(0)).await.unwrap();
     let addr = socket.local_addr().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -151,7 +153,7 @@ async fn discovery_response_carries_the_echo_observed_source() {
     // SSRC and names a loopback source.
     let (addr, shutdown, echo) = spawn_echo().await;
     let probe = UdpSocket::bind(loopback(0)).await.unwrap();
-    let request = two_bot_voice_probe::discovery::encode_request(0x0D15_C0);
+    let request = two_bot_voice_probe::discovery::encode_request(0x000D_15C0);
     probe.send_to(&request, addr).await.unwrap();
 
     let mut buf = [0u8; 2048];
@@ -162,9 +164,6 @@ async fn discovery_response_carries_the_echo_observed_source() {
 
     shutdown.send(()).ok();
     echo.await.unwrap();
-    let response = decode_response(&buf[..n], 0x0D15_C0).unwrap();
-    assert_eq!(
-        response.source.ip(),
-        IpAddr::from(Ipv4Addr::LOCALHOST)
-    );
+    let response = decode_response(&buf[..n], 0x000D_15C0).unwrap();
+    assert_eq!(response.source.ip(), IpAddr::from(Ipv4Addr::LOCALHOST));
 }

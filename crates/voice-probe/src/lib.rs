@@ -11,6 +11,7 @@
 //! The crate is standalone by design: it depends only on `tokio`, `serde`,
 //! `serde_json` and `time`, and touches no gateway or Discord code paths.
 
+pub mod cli;
 pub mod discovery;
 pub mod evidence;
 pub mod runner;

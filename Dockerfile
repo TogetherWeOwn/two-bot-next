@@ -29,6 +29,7 @@ RUN mkdir -p src crates/core/src crates/discord/src crates/bot/src crates/cutove
     && echo '' > crates/store/src/lib.rs \
     && echo '' > crates/testsupport/src/lib.rs \
     && echo '' > crates/voice-probe/src/lib.rs \
+    && echo 'fn main(){}' > crates/voice-probe/src/main.rs \
     && cargo fetch --locked
 
 # Real sources; the release profile (opt-level=z, lto, strip) targets the
