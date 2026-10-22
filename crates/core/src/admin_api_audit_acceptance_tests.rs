@@ -154,7 +154,7 @@ fn assert_columns(
 
 /// Primary-key columns for one table, ordinal order.
 async fn primary_key_columns(pool: &PgPool, table: &str) -> Vec<String> {
-    sqlx::query_as(
+    sqlx::query_scalar(
         "SELECT kcu.column_name \
          FROM information_schema.table_constraints tc \
          JOIN information_schema.key_column_usage kcu \
@@ -246,7 +246,7 @@ async fn claim(
     verb: &str,
     plan_hash: &str,
 ) -> Vec<String> {
-    sqlx::query_as(
+    sqlx::query_scalar(
         "UPDATE admin_confirms SET used_at = clock_timestamp() \
          WHERE confirm_id = $1 AND used_at IS NULL AND expires_at > clock_timestamp() \
            AND token_id = $2 AND guild_id = $3 AND verb = $4 AND plan_hash = $5 \
@@ -263,7 +263,7 @@ async fn claim(
 }
 
 async fn used(pool: &PgPool, confirm_id: &str) -> bool {
-    sqlx::query_as("SELECT used_at IS NOT NULL FROM admin_confirms WHERE confirm_id = $1")
+    sqlx::query_scalar("SELECT used_at IS NOT NULL FROM admin_confirms WHERE confirm_id = $1")
         .bind(confirm_id)
         .fetch_one(pool)
         .await
@@ -273,7 +273,7 @@ async fn used(pool: &PgPool, confirm_id: &str) -> bool {
 /// Minimal `internal_idempotency` parent for log-row tests. `key_hash`
 /// distinguishes parents within one fixture database.
 async fn seed_intent(pool: &PgPool, key_hash: &str) -> i64 {
-    sqlx::query_as(
+    sqlx::query_scalar(
         "INSERT INTO internal_idempotency \
          (caller_hash, key_hash, action, payload_hash, state, guild_id) \
          VALUES ($1, $2, 'moderation.warn', $3, 'in_flight', $4) \
@@ -335,7 +335,7 @@ async fn control_unattributed_log_insert_still_lands() {
     // Existing columns only: this SELECT is identical pre- and post-slice,
     // so the control is green in both states.
     let phases: Vec<String> =
-        sqlx::query_as("SELECT phase FROM internal_action_log WHERE intent_id = $1")
+        sqlx::query_scalar("SELECT phase FROM internal_action_log WHERE intent_id = $1")
             .bind(intent_id)
             .fetch_all(pool)
             .await
@@ -844,7 +844,7 @@ async fn audit_created_at_defaults_to_now() {
     )
     .await
     .expect("audit row without created_at lands");
-    let fresh: bool = sqlx::query_as(
+    let fresh: bool = sqlx::query_scalar(
         "SELECT created_at > clock_timestamp() - interval '5 minutes' \
           AND created_at <= clock_timestamp() + interval '1 minute' \
          FROM admin_api_audit",
@@ -898,7 +898,7 @@ async fn audit_retention_purge_keeps_recent_clears_old() {
     .await
     .expect("retention purge runs");
     assert_eq!(purged.rows_affected(), 1, "exactly the old row purges");
-    let survivors: Vec<String> = sqlx::query_as("SELECT decision FROM admin_api_audit")
+    let survivors: Vec<String> = sqlx::query_scalar("SELECT decision FROM admin_api_audit")
         .fetch_all(pool)
         .await
         .expect("read survivors");
