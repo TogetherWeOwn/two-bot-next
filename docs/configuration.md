@@ -40,6 +40,7 @@ Live snapshot consumers (canonical table; gateway facts and attendance share
 | audit | `audit_runtime.rs:308`, `:438` | 3 mirror destinations (`CHANNEL_KEYS`) | every record (`:483`) and sweep (`:497`), once installed |
 | ticket | `ticket_runtime.rs:749-752`, `:1491` | 3 destinations + cooldown (`:311-339`, `:719-744`) | every execute/recovery and purge; effective ops changes included |
 | self-role | `self_role_handlers.rs:213-219`, `:419-441` | `TWO_SELF_ROLE_PANELS` (`:53`) | every dispatch (`:224`, `:309`, `:377`, `:419`) and sweep (`:472-473`); retirement waits for durable work |
+| command dispatch | `command_runtime.rs::on_interaction_with_live` | `TWO_ANNOUNCEMENTS` (`feed_jobs.rs::live_announcements_with`, `feed_jobs.rs::live_announcements_on`) | every feed invocation through `router.rs::live_gate_announcements_slash`; RSVP prepare reuses the same resolver (`gateway.rs` RSVP admission, `interactions.rs::prepare`, `rsvp.rs::prepare_rsvp_interaction`) |
 | gateway classifier | `gateway.rs::refresh_channel_classifier_from_poller`, `gateway.rs::apply_dispatch` | seven channel + exclusion sets through `community_classifier.rs::classifier_config_from_live` | guild `MessageCreate`, `VoiceStateUpdate`, `MemberAdd`, `MemberUpdate`, `MemberRemove`, before fact collection/drain; classifier + facts sink swap together |
 | attendance | `community_classifier.rs::LiveClassifier`, `rsvp.rs::execute`; installed by `main.rs::build_interaction_runtime` and `command_runtime.rs::CommandRuntime::build` | same seven channel + exclusion sets | execution-time read in both `handle` and `prepare`/`complete`, after successful acknowledgement and live membership reads, immediately before target classification |
 | community | `community_jobs.rs:185-187` | 5 scorecard/presence/inactivity keys (`:174-180`) | every tick: probe (`:400`), scorecard (`:552`), sweep (`:638`) |
@@ -87,7 +88,11 @@ refresh resolves `TWO_TICKET_COOLDOWN_SECONDS` from the effective layered values
 including ops apply, clearing and expiry without a database revision change, with
 last-good fallback (`crates/bot/src/ticket_runtime.rs:719-744`); the feed poller
 re-checks `TWO_ANNOUNCEMENTS` from the snapshot on every tick and skips while
-a stored `0` stands (`crates/bot/src/feed_jobs.rs:250-267`, `:385-419`); self-role
+a stored `0` stands (`crates/bot/src/feed_jobs.rs:250-267`, `:385-419`); feed
+and RSVP command dispatch re-check the same gate on every invocation and
+refuse with the disabled reply while a stored `0` stands
+(`crates/bot/src/command_runtime.rs:1305-1323`, `crates/bot/src/gateway.rs:1498-1501`,
+`crates/discord/src/rsvp.rs:86`, `crates/core/src/router.rs:308-341`); self-role
 dispatch and recovery resolve `TWO_SELF_ROLE_PANELS` from the snapshot on every
 interaction and sweep, falling back to the boot catalogue on absent or unparsable
 rows (`crates/bot/src/self_role_handlers.rs:59-83`, `:224`, `:309`, `:377`, `:419`).
@@ -237,7 +242,7 @@ Catalog entries: 136.
 | `DISCORD_VOICE_LOG_CHANNEL_ID` | hot | Not specified in Next | stored, applied live by runtime refresh (reload-report hot) | Destination for voice-session logs. |
 | `LOG_LEVEL` | cold | Not specified in Next | stored unwired | Container two_bot tracing level when RUST_LOG is unset (info default); RUST_LOG overrides. |
 | `TEMP_VOICE_ENABLED` | cold | Not specified in Next | stored unwired | Legacy temporary-voice enable flag; classification does not imply runtime wiring. |
-| `TWO_ANNOUNCEMENTS` | hot | `false` | stored, applied live by runtime refresh (reload-report hot) | Enable announcement command publication and routing; stored rows apply live to the feed poller while the command surface reads boot. |
+| `TWO_ANNOUNCEMENTS` | hot | `false` | stored, applied live by runtime refresh (reload-report hot) | Enable announcement command publication and routing; stored rows apply live to the feed poller and feed/RSVP command dispatch while publication and LFG stay boot-gated. |
 | `TWO_ANTI_NUKE` | cold | Not specified in Next | stored unwired | Enable anti-nuke protection. |
 | `TWO_ANTI_NUKE_DRY_RUN` | cold | Not specified in Next | stored unwired | Observe anti-nuke decisions without executing protective writes. |
 | `TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS` | hot | Not specified in Next | stored, applied live by runtime refresh | Maximum age of anti-nuke events considered for action. |
