@@ -46,6 +46,7 @@ use std::collections::HashMap;
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -77,11 +78,11 @@ const PENNED_CLASSES: [&str; 5] = [
 // `crate::gateway` and `crate::activation`. The stub modules below provide
 // exactly those references; the dragged unit tests duplicate the binary's own
 // suite and are not the acceptance verdict — the `receiver_*` tests are.
-// The included module's `DeliveryDeps::{ledger, sender}` fields are only
-// *constructed* here (behavior is asserted through `Err` classes and
-// `config`), so allow the resulting dead-code: without this, clippy
-// `-D warnings` fails this harness-only target.
-#[allow(dead_code)]
+// The valid-inputs control below reads `DeliveryDeps::{ledger, sender}`
+// as `Arc` ownership counts (calling either would do I/O and break the
+// offline contract), so the included module has no unread fields: lint
+// waivers are forbidden by the floor guard, so the harness reads what it
+// constructs instead of silencing the warning.
 #[path = "../src/eventsub_delivery.rs"]
 mod eventsub_delivery;
 
@@ -225,6 +226,21 @@ async fn valid_delivery_inputs_still_build() {
     assert_eq!(deps.config.broadcasters, ["111", "222"]);
     assert_eq!(deps.config.invite_url, "https://discord.gg/example");
     assert_eq!(deps.config.channel_id, "777");
+    // The split must not drop the wiring the config rides with: the built
+    // deps hand over sole ownership of the pool-backed ledger and the
+    // governed sender (`production` wraps both in fresh `Arc`s and retains
+    // no clone). Read as counts only — calling either would do I/O and
+    // break the offline contract.
+    assert_eq!(
+        Arc::strong_count(&deps.ledger),
+        1,
+        "built deps must own the delivery ledger"
+    );
+    assert_eq!(
+        Arc::strong_count(&deps.sender),
+        1,
+        "built deps must own the governed sender"
+    );
 }
 
 #[test]
