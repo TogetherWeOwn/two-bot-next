@@ -35,7 +35,7 @@
 //!
 //! Synthetic fixtures only: no Discord, network, or database.
 
-use hmac::Mac as _;
+use hmac::{KeyInit as _, Mac as _};
 use two_bot_core::internal_actions::{body_hash, canonical_string, parse_keys, sign, KeyRing};
 
 const SCOPE_TAG: &str = "two-internal-action/scope-claim/v1";
