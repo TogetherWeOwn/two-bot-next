@@ -111,6 +111,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'scheduled_events_tombstone', 'table'),
     ('public', 'event_voice_channels', 'table'),
     ('public', 'event_voice_presence', 'table'),
+    ('public', 'admin_api_tokens', 'table'),
     ('public', '_sqlx_migrations', 'ledger'),
     ('public', '_two_bot_migrations', 'ledger'),
     ('public', 'events_id_seq', 'sequence'),

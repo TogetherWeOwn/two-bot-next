@@ -92,6 +92,14 @@ transition hook and the reconcile passes read and write both tables through
 the app pool. The presence spans carry a member column (`user_id`, erased
 via the scheduled-event mirror); the channel row carries no member identity.
 
+The admin API token registry (`admin_api_tokens`) is ordinary `table` kind
+for the same reason: the container authorizer reads the token row through
+the app pool when the later transport slices land (slice 0 ships the table
+with no reader yet). Secrets are hash-only; `issued_by` is operator
+attribution retained by the erasure allowlist. The table carries no member
+column, so there is nothing to erase and no reader grant beyond the app
+pool.
+
 The reader cannot read bot base tables, including through inherited/public or
 column-level grants. Normal PostgreSQL views deliberately run with their owner's
 base-table privileges: only the reviewed `web_v1` projection is exposed. Do not
