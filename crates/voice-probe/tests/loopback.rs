@@ -19,15 +19,6 @@ fn loopback(port: u16) -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, port))
 }
 
-/// A port nothing is listening on: bind an ephemeral port, read it, drop it.
-fn closed_port() -> u16 {
-    StdUdpSocket::bind(loopback(0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 fn short_probe(echo: SocketAddr) -> ProbeConfig {
     ProbeConfig {
         drain: Duration::from_millis(200),
@@ -95,7 +86,12 @@ async fn loopback_short_run_has_zero_loss() {
 
 #[tokio::test]
 async fn missing_echo_fails_discovery_but_completes_the_run() {
-    let config = short_probe(loopback(closed_port()));
+    // Silent target: bound and held for the whole probe so no other test can
+    // grab the port, but never read — every packet times out. Releasing the
+    // port instead races parallel tests: a reused port delivers this probe's
+    // discovery requests to another test's socket.
+    let held = StdUdpSocket::bind(loopback(0)).unwrap();
+    let config = short_probe(held.local_addr().unwrap());
 
     let evidence = run_probe(&config).await.unwrap();
 
