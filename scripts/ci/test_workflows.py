@@ -34,10 +34,12 @@ JOB_INVENTORY = {
                   "community-db", "feeds-db", "tickets-postgres", "worker", "supply-chain", "ci-ok",
                   # `check` is now the lint lane; the test steps it used to
                   # carry run in these parallel lanes, all gated by ci-ok.
-                  # `patch-coverage` is the HARD patch-coverage measurement,
-                  # split out of `rust-tests` so the two signals fail
-                  # independently.
-                  "rust-tests", "patch-coverage", "ignored-db-stores", "ignored-db-runtime",
+                  # The HARD patch-coverage measurement is sharded: the plan
+                  # selects the legs, the shard matrix runs them, and
+                  # `patch-coverage` merges and gates, so the unit-test signal
+                  # and the coverage verdict fail independently.
+                  "rust-tests", "coverage-plan", "coverage-shard",
+                  "patch-coverage", "ignored-db-stores", "ignored-db-runtime",
                   # Compile-only libFuzzer build, gated by ci-ok like the Rust lanes.
                   "fuzz-compile",
                   # Promoted nextest lane (shared reusable), gated by ci-ok
@@ -3520,43 +3522,47 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(step["env"][head_key], expected_head)
 
     def test_rust_tests_timeout_leaves_headroom_for_the_suite(self):
-        # Suite-only since the HARD patch-coverage measurement split into its
-        # own job: the combined job outgrew 60 minutes (59m54s on main, one
+        # Suite-only since the HARD patch-coverage measurement split out of
+        # this lane: the combined job outgrew 60 minutes (59m54s on main, one
         # 60m07s mid-measurement kill), while the replay alone measured ~30
         # min of a 42m16s job. 45 minutes keeps comfortable headroom for a
         # cache-cold or slow runner without letting a hung suite burn an hour.
         job = self.workflows["check.yml"]["jobs"]["rust-tests"]
         # BaseLoader keeps scalars as strings; "45" is the 45-minute limit.
         self.assertEqual(job["timeout-minutes"], "45")
-        # The measurement lives in `patch-coverage` now: no step there may
-        # re-merge it into this lane.
+        # The measurement lives in the sharded coverage jobs now: no step here
+        # may re-merge it into this lane.
         names = [step.get("name") for step in job["steps"]]
         self.assertNotIn("Patch coverage (HARD, 80% of added lines)", names)
 
-    def test_patch_coverage_timeout_covers_the_measurement(self):
-        # The HARD patch-coverage measurement keeps the 60-minute ceiling the
-        # combined job needed: the llvm-cov replay alone measured ~30 min of
-        # a 42m16s job, and main heads have since reached 59m54s combined.
-        # A slow runner reports a coverage verdict, not a job timeout.
-        job = self.workflows["check.yml"]["jobs"]["patch-coverage"]
-        # BaseLoader keeps scalars as strings; "60" is the 60-minute limit.
-        self.assertEqual(job["timeout-minutes"], "60")
+    def test_coverage_shard_and_merge_timeouts_cover_their_work(self):
+        # The old single coverage job needed a 60-minute ceiling: the llvm-cov
+        # replay alone measured ~30 min of a 42m16s job, with one 60m07s
+        # mid-measurement kill. Shards carry a subset of the legs plus one
+        # instrumented build, so 45 minutes keeps headroom for a cache-cold or
+        # slow runner; the merge only downloads, unions and gates, so 15 is
+        # plenty. A slow runner reports a coverage verdict, not a job timeout.
+        jobs = self.workflows["check.yml"]["jobs"]
+        # BaseLoader keeps scalars as strings.
+        self.assertEqual(jobs["coverage-shard"]["timeout-minutes"], "45")
+        self.assertEqual(jobs["patch-coverage"]["timeout-minutes"], "15")
 
     def test_rust_lane_cargo_cache_entries_are_pinned(self):
         # The `check` entry is written by `rust-tests` and restored by the two
         # ignored-db lanes, which rebuild the same non-instrumented graph. The
-        # `patch-coverage` lane builds a unique instrumented graph under
-        # `target/llvm-cov-target` that no other lane produces, so it owns a
-        # separate writable `coverage` entry: restore-only would cold-build the
-        # instrumented dependencies on every run after a cache rotation and
-        # erode the 60-minute ceiling the split exists to protect. Two writers
-        # must never share one entry (no concurrent save race on `check`).
+        # coverage shards build a unique instrumented graph under
+        # `target/llvm-cov-target` that no other lane produces, so each shard
+        # owns a separate writable `coverage-shard-N` entry: restore-only
+        # would cold-build the instrumented dependencies on every run after a
+        # cache rotation. Two writers must never share one entry (no
+        # concurrent save race on `check`).
         jobs = self.workflows["check.yml"]["jobs"]
         # (shared-key, save-if); BaseLoader keeps scalars as strings.
         expected = {
             "check": ("lint", "${{ github.event_name == 'push' }}"),
             "rust-tests": ("check", "${{ github.event_name == 'push' }}"),
-            "patch-coverage": ("coverage", "${{ github.event_name == 'push' }}"),
+            "coverage-shard": ("coverage-shard-${{ matrix.shard_index }}",
+                               "${{ github.event_name == 'push' }}"),
             "ignored-db-stores": ("check", "false"),
             "ignored-db-runtime": ("check", "false"),
         }
@@ -3589,22 +3595,22 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(prerequisites.get("shell"), "bash")
         self.assert_loopback_forward_is_pinned(prerequisites["run"])
 
-    def test_patch_coverage_container_pins_disposable_database_service_address(self):
-        # Same hardening as rust-tests: the coverage replay runs long database
+    def test_coverage_shard_container_pins_disposable_database_service_address(self):
+        # Same hardening as rust-tests: the coverage legs run long database
         # suites, and a main run lost service-alias DNS mid-suite. The block
         # stays byte-identical to the rust-tests copy: shared setup, not a
         # forked copy that can drift.
         jobs = self.workflows["check.yml"]["jobs"]
         runs = {}
-        for job_id in ("rust-tests", "patch-coverage"):
+        for job_id in ("rust-tests", "coverage-shard"):
             prerequisites = next(
                 step for step in jobs[job_id]["steps"]
                 if step.get("name") == "Job-container prerequisites (loopback forward to agent-testdb)"
             )
             self.assertEqual(prerequisites.get("shell"), "bash")
             runs[job_id] = prerequisites["run"]
-        self.assert_loopback_forward_is_pinned(runs["patch-coverage"])
-        self.assertEqual(runs["rust-tests"], runs["patch-coverage"],
+        self.assert_loopback_forward_is_pinned(runs["coverage-shard"])
+        self.assertEqual(runs["rust-tests"], runs["coverage-shard"],
                          "the lanes' loopback-forward blocks drifted apart")
 
     def assert_loopback_forward_is_pinned(self, run):
@@ -3688,13 +3694,13 @@ class WorkflowTests(unittest.TestCase):
         # ran the PG18 default (max_wal_size 1GB) on the same 1 GiB tmpfs, and
         # the stores lane PANICed with ENOSPC mid-suite. Every lane that mounts
         # the bounded service must carry its own budget and verify it.
-        # rust-tests and patch-coverage are tighter because the coverage replay
+        # rust-tests and coverage-shard are tighter because the coverage replay
         # exhausted 1 GiB at 512 MB (run 39360867142); rust-tests keeps the
         # budget the replay needed when it ran there. The other lanes stay at
         # 512/64 MB.
         budgets = {
             "rust-tests": ("128MB", "32MB"),
-            "patch-coverage": ("128MB", "32MB"),
+            "coverage-shard": ("128MB", "32MB"),
             "ignored-db-stores": ("512MB", "64MB"),
             "ignored-db-runtime": ("512MB", "64MB"),
         }
@@ -3816,7 +3822,7 @@ class WorkflowTests(unittest.TestCase):
             for workflow, job_id in (
                 ("check.yml", "check"),
                 ("check.yml", "rust-tests"),
-                ("check.yml", "patch-coverage"),
+                ("check.yml", "coverage-shard"),
                 ("check.yml", "ignored-db-stores"),
                 ("check.yml", "ignored-db-runtime"),
                 ("reusable-rust-nextest.yml", "nextest"),
@@ -3909,7 +3915,7 @@ class WorkflowTests(unittest.TestCase):
         # max_wal_size is a soft checkpoint target, not a hard ceiling: the
         # pre-suite report cannot show peak WAL. Every Postgres lane brackets
         # its run with an always-runs post-suite report for ENOSPC triage.
-        for job_id in ("rust-tests", "patch-coverage", "ignored-db-stores", "ignored-db-runtime"):
+        for job_id in ("rust-tests", "coverage-shard", "ignored-db-stores", "ignored-db-runtime"):
             with self.subTest(job=job_id):
                 job = self.workflows["check.yml"]["jobs"][job_id]
                 steps = job["steps"]
@@ -3920,8 +3926,8 @@ class WorkflowTests(unittest.TestCase):
                     if step.get("name") == "Report Postgres storage headroom (post-suite)"
                 )
                 self.assertEqual(post.get("if"), "always()")
-                # patch-coverage runs no plain `cargo test` step: its suite is
-                # the llvm-cov replay inside the Patch coverage step.
+                # coverage-shard runs no plain `cargo test` step: its suite is
+                # the llvm-cov legs inside the Patch coverage legs step.
                 test_steps = [
                     index for index, candidate in enumerate(steps)
                     if "cargo test" in str(candidate.get("run", ""))
@@ -4082,15 +4088,14 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("'max_wal_size': '512MB'", verify["run"])
         self.assertIn("'min_wal_size': '64MB'", verify["run"])
 
-    def test_patch_coverage_runs_with_db_and_includes_ignored_tests(self):
-        job = self.workflows["check.yml"]["jobs"]["patch-coverage"]
+    def test_coverage_shard_runs_with_db_and_includes_ignored_tests(self):
+        job = self.workflows["check.yml"]["jobs"]["coverage-shard"]
         step = next(
             step for step in job["steps"]
-            if step.get("name") == "Patch coverage (HARD, 80% of added lines)"
+            if step.get("name") == "Patch coverage legs (shard instrumented run, no report)"
         )
-        expected_base = "${{ github.event.merge_group.base_sha || (github.event.pull_request && format('{0}^1', github.sha)) || github.event.before || 'origin/main' }}"
-        self.assertEqual(step["env"]["QUALITY_BASE"], expected_base)
-        self.assertEqual(step["env"]["QUALITY_HEAD"], "${{ github.sha }}")
+        self.assertEqual(step["env"]["SHARD_LEGS"], "${{ matrix.legs }}")
+        self.assertEqual(step["env"]["SHARD_INDEX"], "${{ matrix.shard_index }}")
         self.assertIn("--ignore-run-fail", step["run"])
         self.assertIn("--features two-bot-core/db", step["run"])
         self.assertIn("--lib --bins --tests", step["run"])
@@ -4102,7 +4107,7 @@ class WorkflowTests(unittest.TestCase):
             "--locked -- channel_moderation --include-ignored --test-threads=1",
             step["run"],
         )
-        self.assertIn('report_path="$GITHUB_WORKSPACE/lcov.info"', step["run"])
+        self.assertIn('report_path="$GITHUB_WORKSPACE/lcov-shard-$SHARD_INDEX.info"', step["run"])
         self.assertIn('[ ! -s "$report_path" ]', step["run"])
         self.assertIn(
             'llvm-cov report --workspace --lcov --output-path "$report_path"',
@@ -4454,7 +4459,7 @@ class WorkflowTests(unittest.TestCase):
                         ):
                             ignored_test_names("discovery")
 
-    def test_patch_coverage_ignored_sweep_skips_tests_that_cannot_pass_there(self):
+    def test_coverage_shard_ignored_sweep_skips_tests_that_cannot_pass_there(self):
         # The ignored sweep tolerates failures, but the flake ledger reads
         # every FAILED line it prints as a flake. Skip exact-URL opt-ins and
         # explicitly quarantined red tests, not passing DB opt-ins in those
@@ -4474,8 +4479,8 @@ class WorkflowTests(unittest.TestCase):
         )
         jobs = self.workflows["check.yml"]["jobs"]
         step = next(
-            step for step in jobs["patch-coverage"]["steps"]
-            if step.get("name") == "Patch coverage (HARD, 80% of added lines)"
+            step for step in jobs["coverage-shard"]["steps"]
+            if step.get("name") == "Patch coverage legs (shard instrumented run, no report)"
         )
         [sweep] = [
             line for line in shell_logical_lines(step["run"])
@@ -4592,7 +4597,7 @@ class WorkflowTests(unittest.TestCase):
             ), patch(f"{__name__}.BACKFILL_QUARANTINE", pinned):
                 # Proper graduation keeps the DB opt-in and un-skips all three sites.
                 with self.subTest(suite=suite, graduation="complete"):
-                    self.test_patch_coverage_ignored_sweep_skips_tests_that_cannot_pass_there()
+                    self.test_coverage_shard_ignored_sweep_skips_tests_that_cannot_pass_there()
                     self._assert_backfill_quarantine_skip_sites(current)
                     self.assertEqual(backfill_quarantine_errors(pinned, current), [])
                 name = sorted(fixed)[0]
@@ -4611,7 +4616,7 @@ class WorkflowTests(unittest.TestCase):
                                     self._assert_backfill_quarantine_skip_sites(current)
                                 if site == "store":
                                     with self.assertRaisesRegex(AssertionError, message):
-                                        self.test_patch_coverage_ignored_sweep_skips_tests_that_cannot_pass_there()
+                                        self.test_coverage_shard_ignored_sweep_skips_tests_that_cannot_pass_there()
                             finally:
                                 step["run"] = original
 
@@ -4620,8 +4625,8 @@ class WorkflowTests(unittest.TestCase):
         # and the store lane (check.yml) plus the nightly sweep (nightly.yml).
         check_jobs = self.workflows["check.yml"]["jobs"]
         coverage_step = next(
-            step for step in check_jobs["patch-coverage"]["steps"]
-            if step.get("name") == "Patch coverage (HARD, 80% of added lines)"
+            step for step in check_jobs["coverage-shard"]["steps"]
+            if step.get("name") == "Patch coverage legs (shard instrumented run, no report)"
         )
         [coverage_sweep] = [
             line for line in shell_logical_lines(coverage_step["run"])
@@ -4743,18 +4748,27 @@ class WorkflowTests(unittest.TestCase):
         )
 
     def test_coverage_replays_strict_agent_test_targets_and_fails_closed(self):
-        job = self.workflows["check.yml"]["jobs"]["patch-coverage"]
+        job = self.workflows["check.yml"]["jobs"]["coverage-shard"]
         step = next(
             step for step in job["steps"]
-            if step.get("name") == "Patch coverage (HARD, 80% of added lines)"
+            if step.get("name") == "Patch coverage legs (shard instrumented run, no report)"
         )
         run = step["run"]
         wrapper = run[run.index("cov_run() {"):run.index("# Main sweep")]
-        start = run.index("export TWO_TEST_DATABASE_URL=postgres://agent_test@")
-        end = run.index("export TWO_TEST_DATABASE_URL=postgres://agent_test:@", start)
+        # The section URL export and its legs are shard-guarded: execute from
+        # the section guard opener through the last leg's `fi`, so the block
+        # stays syntactically balanced.
+        guard = run.index("if selected_any core-stream_live_store")
+        export = run.index("export TWO_TEST_DATABASE_URL=postgres://agent_test@")
+        self.assertLess(guard, export)
+        start = guard
+        end = run.index("if selected_any discord-internal_events")
         # Execute the real replay block and failure wrapper, but replace Cargo
         # with a fixture that records its arguments and effective target URL.
+        # The wrapper now carries the shard-selection helpers, so run it with
+        # a two-leg SHARD_LEGS: only the selected legs execute.
         targets = ("stream_live_store", "mutation_429_proves_no_effect_channel")
+        legs = "core-stream_live_store discord-mutation_429_proves_no_effect_channel"
         with tempfile.TemporaryDirectory() as directory:
             stub = Path(directory) / "cargo-llvm-cov"
             stub.write_text(
@@ -4766,7 +4780,8 @@ class WorkflowTests(unittest.TestCase):
             for failure in ("", *targets):
                 with self.subTest(failure=failure):
                     result = subprocess.run(
-                        ["bash", "-c", "set -euo pipefail; " + wrapper + run[start:end]],
+                        ["bash", "-c",
+                         f"set -euo pipefail; SHARD_LEGS='{legs}'; " + wrapper + run[start:end]],
                         env=dict(os.environ, COV=str(stub), FAIL_TARGET=failure),
                         capture_output=True, text=True, check=False,
                     )
@@ -4790,6 +4805,149 @@ class WorkflowTests(unittest.TestCase):
                             self.assertIn("--test-threads=1", matches[0])
                             self.assertRegex(matches[0], r"-- --(?:include-)?ignored(?: |$)")
                             self.assertNotIn("--ignore-run-fail", matches[0])
+
+    def test_coverage_plan_emits_the_shard_matrix(self):
+        # The planner selects the legs (changed crates plus reverse
+        # dependents; full set on workspace-wide changes, pushes to main and
+        # schedules) and partitions them into shards. The matrix it emits
+        # drives the coverage-shard job; empty shards are dropped so every
+        # matrix entry runs at least one leg.
+        job = self.workflows["check.yml"]["jobs"]["coverage-plan"]
+        self.assertEqual(job.get("name"), "coverage plan")
+        self.assertEqual(job.get("permissions"), {"contents": "read"})
+        self.assertIn("job-inputs", job.get("needs", []))
+        self.assertIn("needs.job-inputs.outputs.rust != 'false'", job.get("if", ""))
+        self.assertIn("coverage-plan", job.get("runs-on", ""))
+        outputs = job.get("outputs", {})
+        for key in ("matrix", "expected-shards", "legs", "widened", "reason"):
+            self.assertIn(key, outputs)
+        self.assertIn("steps.plan.outputs.matrix", outputs["matrix"])
+        self.assertIn("steps.plan.outputs.expected-shards", outputs["expected-shards"])
+        step = next(step for step in job["steps"] if step.get("id") == "plan")
+        self.assertEqual(step.get("name"), "Plan coverage shards")
+        self.assertIn("scripts/ci/plan-coverage-shards.py", step["run"])
+        self.assertIn("--shards 4", step["run"])
+        self.assertIn("--output plan.json", step["run"])
+        self.assertIn('"shard_index"', step["run"])
+        self.assertIn('"legs"', step["run"])
+        self.assertIn("expected-shards", step["run"])
+        # Empty shards never reach the matrix: a shard with no legs would
+        # export an empty LCOV and fail the merge.
+        self.assertIn("if shard", step["run"])
+
+    def test_coverage_shard_matrix_comes_from_the_plan(self):
+        job = self.workflows["check.yml"]["jobs"]["coverage-shard"]
+        self.assertEqual(job.get("name"), "coverage shard")
+        self.assertEqual(job.get("permissions"), {"contents": "read"})
+        self.assertIn("job-inputs", job.get("needs", []))
+        self.assertIn("coverage-plan", job.get("needs", []))
+        self.assertIn("needs.job-inputs.outputs.rust != 'false'", job.get("if", ""))
+        strategy = job.get("strategy", {})
+        # BaseLoader keeps scalars as strings; "false" disables fail-fast so
+        # every shard reports its own verdict and timing.
+        self.assertEqual(strategy.get("fail-fast"), "false")
+        self.assertIn("needs.coverage-plan.outputs.matrix", strategy.get("matrix", ""))
+        self.assertIn("coverage-shard", job.get("runs-on", ""))
+        upload = next(
+            step for step in job["steps"]
+            if step.get("name") == "Upload shard coverage report"
+        )
+        self.assertIn("actions/upload-artifact@", upload.get("uses", ""))
+        self.assertEqual(upload["with"]["name"], "coverage-shard-${{ matrix.shard_index }}")
+        self.assertEqual(upload["with"]["path"], "lcov-shard-${{ matrix.shard_index }}.info")
+        self.assertEqual(upload["with"]["if-no-files-found"], "error")
+
+    def test_coverage_shard_leg_selection_matches_the_planner(self):
+        # Every planner leg id guards exactly one legs block, and the
+        # unknown-id validation list matches the planner's FULL_LEGS: a leg
+        # the planner can emit but no guard runs would silently
+        # under-measure its crates, and an id the guards accept but the
+        # planner never emits is dead code.
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "shard_planner", ROOT / "scripts/ci/plan-coverage-shards.py")
+        planner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(planner)
+        expected = [leg["id"] for leg in planner.FULL_LEGS]
+        job = self.workflows["check.yml"]["jobs"]["coverage-shard"]
+        step = next(
+            step for step in job["steps"]
+            if step.get("name") == "Patch coverage legs (shard instrumented run, no report)"
+        )
+        run = step["run"]
+        self.assertIn("selected() {", run)
+        self.assertIn("selected_any() {", run)
+        self.assertIn("::error::unknown coverage leg", run)
+        for leg_id in expected:
+            with self.subTest(leg=leg_id):
+                self.assertEqual(
+                    run.count(f"if selected {leg_id}; then"), 1,
+                    f"leg {leg_id} must guard exactly one block")
+        guards = set(re.findall(r"if selected ([a-z0-9_-]+); then", run))
+        self.assertEqual(guards, set(expected))
+        validated = re.search(r'case " ([a-z0-9_ -]+) " in', run)[1].split()
+        self.assertEqual(validated, expected)
+
+    def test_coverage_shard_caches_the_instrumented_build(self):
+        # Each shard restores its own rust-cache entry and reports sccache
+        # stats for the hit rate; the GitHub cache backend is ref-scoped by
+        # the platform, so PR writes can never poison main's entries.
+        job = self.workflows["check.yml"]["jobs"]["coverage-shard"]
+        env = job.get("env", {})
+        self.assertEqual(env.get("RUSTC_WRAPPER"), "sccache")
+        self.assertEqual(env.get("SCCACHE_GHA_ENABLED"), "true")
+        start = next(
+            step for step in job["steps"] if step.get("name") == "Start sccache")
+        self.assertTrue(start.get("uses", "").startswith("mozilla-actions/sccache-action@"))
+        stats = next(
+            step for step in job["steps"]
+            if step.get("name") == "sccache stats (advisory speed evidence)")
+        self.assertIn("sccache --show-stats", stats.get("run", ""))
+
+    def test_patch_coverage_merge_unions_shards_and_gates(self):
+        # The merge keeps the required `patch coverage` check name: it
+        # downloads every shard report, unions them with strict N-of-N, and
+        # applies the unchanged HARD 80%-of-added-lines bar. It runs whenever
+        # Rust was selected and planning succeeded, even when a shard failed,
+        # so a partial shard set fails here instead of reading as measured.
+        job = self.workflows["check.yml"]["jobs"]["patch-coverage"]
+        self.assertEqual(job.get("name"), "patch coverage")
+        self.assertEqual(job.get("permissions"), {"contents": "read"})
+        for needed in ("job-inputs", "coverage-plan", "coverage-shard"):
+            self.assertIn(needed, job.get("needs", []))
+        condition = job.get("if", "")
+        self.assertIn("always()", condition)
+        self.assertIn("!cancelled()", condition)
+        self.assertIn("needs.job-inputs.outputs.rust != 'false'", condition)
+        self.assertIn("needs.coverage-plan.result == 'success'", condition)
+        # Download, union and gate only: no toolchain, container or database.
+        self.assertNotIn("container", job)
+        self.assertNotIn("services", job)
+        text = str(job.get("steps", []))
+        self.assertNotIn("rust-toolchain@", text)
+        self.assertNotIn("cargo llvm-cov", text)
+        download = next(
+            step for step in job["steps"]
+            if step.get("name") == "Download shard coverage reports")
+        self.assertTrue(download.get("uses", "").startswith("actions/download-artifact@"))
+        self.assertEqual(download["with"]["pattern"], "coverage-shard-*")
+        self.assertEqual(download["with"]["merge-multiple"], "true")
+        merge = next(
+            step for step in job["steps"]
+            if step.get("name") == "Merge coverage shards")
+        self.assertEqual(
+            merge.get("env", {}).get("EXPECTED_SHARDS"),
+            "${{ needs.coverage-plan.outputs.expected-shards }}")
+        self.assertIn("scripts/ci/merge-coverage-shards.py", merge["run"])
+        self.assertIn('--expected-shards "$EXPECTED_SHARDS"', merge["run"])
+        gate = next(
+            step for step in job["steps"]
+            if step.get("name") == "Patch coverage (HARD, 80% of added lines)"
+        )
+        expected_base = "${{ github.event.merge_group.base_sha || (github.event.pull_request && format('{0}^1', github.sha)) || github.event.before || 'origin/main' }}"
+        self.assertEqual(gate["env"]["QUALITY_BASE"], expected_base)
+        self.assertEqual(gate["env"]["QUALITY_HEAD"], "${{ github.sha }}")
+        self.assertIn("scripts/ci/check-patch-coverage.py", gate["run"])
 
     def test_voice_synthetic_shape_is_pinned_and_mutations_fail(self):
         import copy
@@ -6812,7 +6970,8 @@ class WorkflowTests(unittest.TestCase):
         }
         installers = {job: steps for job, steps in installers.items() if steps}
         self.assertEqual(set(installers), {
-            "check", "rust-tests", "patch-coverage", "ignored-db-stores", "ignored-db-runtime",
+            "check", "rust-tests", "coverage-plan", "coverage-shard",
+            "ignored-db-stores", "ignored-db-runtime",
             "moderation-db", "self-role-store", "community-db", "tickets-postgres", "feeds-db",
             "fuzz-compile",
         })

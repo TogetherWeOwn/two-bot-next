@@ -2,14 +2,16 @@
 
 Deterministic CI gates (no reviewer needed). WARN reports without failing;
 HARD fails the PR. Gates run in their designated lanes in `check.yml` on the
-existing routed runner. Patch coverage runs in `patch-coverage`, alongside its
-own disposable Postgres service, rather than the lint-only `check` lane.
+existing routed runner. Patch coverage is sharded: `coverage-plan` selects the
+legs, the `coverage-shard` matrix runs them alongside per-shard disposable
+Postgres services, and `patch-coverage` merges and gates — rather than the
+lint-only `check` lane.
 
 - Patch coverage (HARD): `cargo llvm-cov --workspace --lib --bins --tests
   --features two-bot-core/db -- --include-ignored` plus
   `scripts/ci/check-patch-coverage.py` requires 80% line coverage over the
-  lines the PR adds. Measurement uses the `patch-coverage` lane's disposable
-  Postgres service and test database so ignored database-backed tests can run.
+  lines the PR adds. Measurement uses the coverage shards' disposable
+  Postgres services and test databases so ignored database-backed tests can run.
   Non-ignored tests run at full parallelism; ignored tests run serially
   (`--test-threads=1`): the ignored stores share tables and locks, so
   parallel runs race. The reference-docs regen is skipped: it rewrites
@@ -26,10 +28,11 @@ own disposable Postgres service, rather than the lint-only `check` lane.
   C-quotes (non-ASCII or escaped file names) are decoded to the same
   repository-relative names the LCOV report uses, so they count like any
   other changed file; a diff header the parser cannot read fails closed
-  instead of dropping the file from the denominator. The step runs in its own
-  job so the unit-test signal and the coverage verdict fail independently,
-  and uses `always()` so a failure never suppresses coverage output.
-  Measurement also uses
+  instead of dropping the file from the denominator. The legs run in their own
+  sharded jobs so the unit-test signal and the coverage verdict fail
+  independently, each legs step uses `always()` so a failure never suppresses
+  coverage output, and the merge refuses anything but exactly N-of-N valid
+  shard reports. Measurement also uses
   `--ignore-run-fail` to preserve LCOV output when tests invoked by llvm-cov fail.
   A build or report-generation failure fails this gate.
 - Dependency advisories (HARD): the `cargo-deny` step (`check all`, which

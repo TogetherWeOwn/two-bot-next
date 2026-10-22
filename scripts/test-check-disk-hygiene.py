@@ -5,8 +5,8 @@ Two consecutive main `check` failures died in the `cargo test --workspace
 ran out of space (98 MB left), then `rust-lld` bus error. Unit tests passed
 in the same jobs; infra disk-fit, not a code regression.
 
-The old single `check` job is now five parallel lanes (`check` lints,
-`rust-tests`, `patch-coverage`, `ignored-db-stores` and `ignored-db-runtime`
+The old single `check` job is now parallel lanes (`check` lints,
+`rust-tests`, `coverage-shard`, `ignored-db-stores` and `ignored-db-runtime`
 test); each runs in its own job container, so each keeps the guards (TOG-12134):
 - every lane pins dev/test debuginfo to `line-tables-only`: smaller linked
   binaries, backtraces stay useful.
@@ -95,7 +95,7 @@ def step_body(body, step_name):
     return "\n".join(taken)
 
 
-LANES = ("check", "rust-tests", "patch-coverage", "ignored-db-stores", "ignored-db-runtime")
+LANES = ("check", "rust-tests", "coverage-shard", "ignored-db-stores", "ignored-db-runtime")
 PREREQUISITES = "Job-container prerequisites"
 GUARD = "Guard runner disk headroom"
 VERIFY = "Verify disposable Postgres defaults"
