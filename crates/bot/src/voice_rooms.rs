@@ -872,6 +872,62 @@ mod voice_actor_load_backoff_tests {
     }
 }
 
+/// Delay before retrying actor initialization after `failed_attempts`
+/// consecutive failures (1-based) with full jitter: a deterministic draw in
+/// `[1 ms, voice_actor_load_backoff(failed_attempts)]`, so guild actors
+/// retrying the same store outage spread instead of waking in lockstep. The
+/// deterministic helper stays as the bound (the 1 s → 60 s progression and
+/// its cap hold by construction); the same `seed` replays the same sample,
+/// so tests pin ranges without a clock or RNG. Production seeds by guild id:
+/// stable per guild, spread across guilds.
+#[must_use]
+pub fn voice_actor_load_backoff_jittered(failed_attempts: u32, seed: u64) -> Duration {
+    let base_ms = voice_actor_load_backoff(failed_attempts)
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    Duration::from_millis(
+        1 + (crate::gateway_backoff::jitter_stream(seed, failed_attempts) % base_ms),
+    )
+}
+
+#[cfg(test)]
+mod voice_actor_load_backoff_jittered_tests {
+    use super::{voice_actor_load_backoff, voice_actor_load_backoff_jittered, Duration};
+
+    #[test]
+    fn jittered_backoff_stays_within_the_deterministic_progression() {
+        for failed_attempts in 1..=6u32 {
+            let base = voice_actor_load_backoff(failed_attempts);
+            for seed in 0..8u64 {
+                let sample = voice_actor_load_backoff_jittered(failed_attempts, seed);
+                assert!(
+                    sample >= Duration::from_millis(1) && sample <= base,
+                    "failures {failed_attempts} seed {seed}: {sample:?} outside [1 ms, {base:?}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn jittered_backoff_spreads_guild_retries_and_replays_per_seed() {
+        use std::collections::HashSet;
+        // Three consecutive failures have a 4 s base: after a store outage
+        // every guild actor retries in lockstep today.
+        let distinct: HashSet<Duration> = (0..32u64)
+            .map(|seed| voice_actor_load_backoff_jittered(3, seed))
+            .collect();
+        assert!(
+            distinct.len() >= 8,
+            "only {} distinct delays across 32 seeds",
+            distinct.len()
+        );
+        assert_eq!(
+            voice_actor_load_backoff_jittered(3, 42),
+            voice_actor_load_backoff_jittered(3, 42)
+        );
+    }
+}
+
 /// A failed `GuildRoomWorker::load` must not silently drop the guild actor:
 /// count it and warn (throttled). Transient failures retry in place with
 /// capped backoff (see [`voice_actor_load_backoff`]); a credential refusal
@@ -8269,7 +8325,17 @@ where
         // Clear before invalidating the views so a concurrent dispatch
         // cannot heal a view this transport loss is about to invalidate.
         self.gateway_connected.store(false, Ordering::Release);
-        for actor in self.actors.lock().expect("voice runtime lock").values() {
+        // Drop-reachable (`VoiceConnectionGuard::drop` via `VoiceEventSink`)
+        // and shared with live disconnects: recover silently so a poisoned
+        // registry still invalidates its views instead of panicking during
+        // unwinding. No counter: non-drop callers must never be miscounted
+        // as drop poison.
+        for actor in self
+            .actors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+        {
             actor.live.transport_lost();
         }
         // Game-activity wiring: transport loss invalidates live voice state,
@@ -8578,8 +8644,8 @@ where
 /// brief database outage during `GuildCreate` no longer leaves the guild
 /// actorless until the next snapshot. Bounds: each attempt is abandoned
 /// after [`VOICE_ACTOR_LOAD_ATTEMPT_TIMEOUT`] (the load is reads only, so
-/// abandoning it replays nothing), consecutive failures wait
-/// [`voice_actor_load_backoff`] between attempts, and the same single
+/// abandoning it replays nothing), consecutive failures wait the guild-seeded
+/// [`voice_actor_load_backoff_jittered`] between attempts, and the same single
 /// spawned task owns every attempt — retries never spawn a second actor.
 ///
 /// While a load attempt is in flight, every inbox command waits in order
@@ -8658,7 +8724,9 @@ async fn load_actor_worker<S: RoomPersistence, H: RoomWrites>(
         // instead of hanging across the backoff window. State stays queued.
         purge_unanswerable_buffered(&mut buffered);
         failed_attempts = failed_attempts.saturating_add(1);
-        let wait = tokio::time::sleep(voice_actor_load_backoff(failed_attempts));
+        // Jittered by guild id: after a store outage every guild actor
+        // wakes from the same deterministic backoff in lockstep.
+        let wait = tokio::time::sleep(voice_actor_load_backoff_jittered(failed_attempts, guild_id));
         tokio::pin!(wait);
         loop {
             tokio::select! {

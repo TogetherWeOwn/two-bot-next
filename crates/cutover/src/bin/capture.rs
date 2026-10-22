@@ -296,7 +296,7 @@ async fn store_counters(
         .iter()
         .map(|inv| two_bot_cutover::invite_store::CounterRow {
             code: inv.code.clone(),
-            uses: inv.uses.unwrap_or(0) as i64,
+            uses: inv.uses.unwrap_or(0),
             inviter_id: inv.inviter.as_ref().map(|u| u.id.get().to_string()),
             channel_id: inv.channel.as_ref().map(|c| c.id.get().to_string()),
         })

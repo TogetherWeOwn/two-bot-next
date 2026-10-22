@@ -675,6 +675,8 @@ pub trait MemberModerationStore: Send + Sync {
     /// Dispatchers request one job at a time so a cancelled first request
     /// cannot strand a batch of never-dispatched expiries. Running rows are
     /// never reclaimed by age; prepared bans require reconciliation.
+    /// Each call claims at most `limit.clamp(0, 25)` jobs; repeated calls
+    /// complete every due unban.
     fn claim_due_unbans(
         &self,
         guild_id: &str,
@@ -2150,6 +2152,10 @@ impl MemberModerationStore for MemMemberStore {
                 })
                 .collect()
         };
+        // The double activates every staged row newest-first: it models the
+        // claim contract (bounded claims completing across calls), not the
+        // Postgres page schedule (bounded oldest-first activation). Tests for
+        // the single-pass bound run against Postgres, not this double.
         staged.sort_by(|a, b| b.cmp(a));
         for (_, id, guild_id, user_id) in staged {
             self.serialize_member(&guild_id, &user_id, || async {

@@ -1298,6 +1298,9 @@ pub async fn run_shard<I: InviteSource + 'static>(
     let in_flight_acks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let receive_pipeline = Arc::clone(&pipeline);
     let receive_voice = voice.clone();
+    // Twilight owns reconnect backoff; add only a small decorrelation spread,
+    // reseeded per run, not a second growing retry schedule.
+    let reconnect_seed = two_bot_core::jitter_seed();
     let events = futures_util::stream::unfold(
         (
             shard,
@@ -1335,6 +1338,9 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         shard = Shard::with_config(shard.id(), shard.config().clone());
                         info!("cold resume committed; requesting voice snapshot via identify");
                     }
+                    // Fresh per poll: a poll only ends by emitting work, so a
+                    // new poll means the transport delivered since.
+                    let mut reconnect_failures = 0u32;
                     loop {
                         let item = match shard.next().await {
                             Some(item) => item,
@@ -1346,8 +1352,16 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             Err(error) if matches!(error.kind(), twilight_gateway::error::ReceiveMessageErrorType::Reconnect) => {
                                 transport_disconnected(&state, &generation).await;
                                 voice_disconnected(voice.as_ref());
+                                // Twilight already backed off the failed connect.
+                                // Decorrelate shards without stacking a growing wait.
+                                let delay = two_bot::gateway_backoff::wait_reconnect_spread(
+                                    reconnect_seed,
+                                    reconnect_failures,
+                                ).await;
+                                reconnect_failures = reconnect_failures.saturating_add(1);
                                 warn!(
                                     msg = "gateway_reconnect_failed",
+                                    wait_ms = delay.as_millis().min(u128::from(u64::MAX)) as u64,
                                     "gateway reconnect failed; Twilight will retry"
                                 );
                                 continue;
@@ -2099,6 +2113,10 @@ pub async fn build_voice_runtime(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "gateway_drop_poison_acceptance_tests.rs"]
+mod drop_poison_acceptance_tests;
 
 #[cfg(test)]
 mod tests {
