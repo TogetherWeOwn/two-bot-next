@@ -1345,14 +1345,15 @@ export class TwoBotContainer extends Container<Env> {
             headers: withSecurityHeaders({ "cache-control": "no-store" }),
           });
         }
-        const rows = await ops.listAudit();
-        return Response.json({ deploymentId: id, rows }, {
+        const history = await ops.readAudit(id);
+        return Response.json(history, {
           headers: withSecurityHeaders({ "cache-control": "no-store" }),
         });
       });
     } catch (error) {
       if (error instanceof OwnershipRefused) return refused(error);
-      return opsRefused(error);
+      // GETs are reads; PUT/POST are mutations with reconcile-then-retry refusals.
+      return opsRefused(error, request.method === "GET");
     }
   }
 

@@ -71,13 +71,18 @@ Exit status: 0 census complete (limitations included), 1 census failed,
 2 refused by a fence.
 
 Usage (the workflow supplies the environment):
-  python3 scripts/staging_retention_census.py
+  python3 scripts/staging_retention_census.py [--json]
+
+Agent result schema and offline verification: docs/ci-security.md,
+"Agent observation contract". JSON changes output only, never query scope or mode.
 """
 
 import argparse
 import csv
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 import io
+import json
 import os
 import re
 import shutil
@@ -107,10 +112,11 @@ FAMILIES = ("PRESENCE_UPDATE", "VOICE_STATE_UPDATE", "VOICE_SERVER_UPDATE",
 
 COUNT_RE = re.compile(r"[0-9]+")
 DIGEST_RE = re.compile(r"[0-9a-f]{64}")
-# psql renders timestamptz as `2026-10-20 20:00:00+00` (fraction and zone
-# suffix vary); the prefix check keeps the shape strict without pinning the
-# suffix. Migration installed_on and cohort bounds share this shape.
-TIMESTAMP_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}:[0-9]{2}")
+# PostgreSQL ISO timestamps: microsecond precision, explicit numeric zone or Z.
+# Full shape admission precedes calendar/offset validation; no text is echoed.
+TIMESTAMP_RE = re.compile(
+    r"([0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?)"
+    r"(Z|([+-])([0-9]{2})(?::?([0-9]{2})(?::([0-9]{2}))?)?)")
 # libpq parameters a login URL may carry. Anything else (host=, options=,
 # service=, passfile=, ...) could redirect the connection or change the session.
 URL_PARAMS = {
@@ -429,13 +435,34 @@ def csv_rows(text):
 def parse_count(value):
     if not isinstance(value, str) or not COUNT_RE.fullmatch(value):
         raise ReadFailed("a row had an unexpected shape; nothing was reported")
-    return int(value)
+    try:
+        return int(value)
+    except ValueError:
+        raise ReadFailed("a row had an unexpected shape; nothing was reported") from None
+
+
+def timestamp_instant(value):
+    match = TIMESTAMP_RE.fullmatch(value) if isinstance(value, str) else None
+    if match is None:
+        raise ReadFailed("a row had an unexpected shape; nothing was reported")
+    local, _, sign, hours, minutes, seconds = match.groups()
+    hour, minute, second = int(hours or 0), int(minutes or 0), int(seconds or 0)
+    # PostgreSQL numeric displacements are less than 16 hours.
+    if hour > 15 or minute > 59 or second > 59:
+        raise ReadFailed("a row had an unexpected shape; nothing was reported")
+    offset = timedelta(hours=hour, minutes=minute, seconds=second)
+    if sign == "-":
+        offset = -offset
+    try:
+        return datetime.fromisoformat(local).replace(
+            tzinfo=timezone(offset)).astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        raise ReadFailed("a row had an unexpected shape; nothing was reported") from None
 
 
 def parse_timestamp(value):
-    if not isinstance(value, str) or not TIMESTAMP_RE.match(value):
-        raise ReadFailed("a row had an unexpected shape; nothing was reported")
-    return value
+    instant = timestamp_instant(value)
+    return instant.isoformat(sep=" ").removesuffix("+00:00") + "+00"
 
 
 def check_identity(output, database_pin):
@@ -456,7 +483,7 @@ def parse_migrations(output):
     for raw in csv_rows(output):
         if len(raw) != 3 or not COUNT_RE.fullmatch(raw[0]) or raw[2] not in ("t", "f"):
             raise ReadFailed("a row had an unexpected shape; nothing was reported")
-        version = int(raw[0])
+        version = parse_count(raw[0])
         if version not in MIGRATION_VERSIONS or version in found:
             raise ReadFailed("a row had an unexpected shape; nothing was reported")
         found[version] = (parse_timestamp(raw[1]), raw[2] == "t")
@@ -495,6 +522,8 @@ def parse_cohort(output, with_digest):
     if with_digest and len(raw) != 4 or not with_digest and len(raw) != 3:
         raise ReadFailed("a row had an unexpected shape; nothing was reported")
     count = parse_count(raw[0])
+    if count > COHORT_LIMIT:
+        raise ReadFailed("a row had an unexpected shape; nothing was reported")
     rest = raw[1:] if with_digest else (None, *raw[1:])
     digest, minimum, maximum = rest[0], rest[1], rest[2]
     if count == 0:
@@ -504,6 +533,8 @@ def parse_cohort(output, with_digest):
     if not minimum or not maximum:
         raise ReadFailed("a row had an unexpected shape; nothing was reported")
     minimum, maximum = parse_timestamp(minimum), parse_timestamp(maximum)
+    if timestamp_instant(minimum) > timestamp_instant(maximum):
+        raise ReadFailed("a row had an unexpected shape; nothing was reported")
     if with_digest:
         if not digest or not DIGEST_RE.fullmatch(digest):
             raise ReadFailed("a row had an unexpected shape; nothing was reported")
@@ -519,47 +550,155 @@ def parse_anchor(output):
     return parse_count(rows[0][0])
 
 
-def format_report(observed_before, observed_after, migrations, indexes, counts,
-                  before, after, pgcrypto):
-    lines = ["## staging retention census",
-             f"observed_before: {observed_before}",
-             f"observed_after: {observed_after}"]
-    ledger = []
-    for version in MIGRATION_VERSIONS:
-        entry = migrations[version]
-        if entry is None:
-            ledger.append(f"{version} not applied")
-        else:
-            installed, success = entry
-            ledger.append(f"{version} applied {'success' if success else 'FAILURE'} {installed}")
-    lines.append("migrations: " + "; ".join(ledger))
-    lines.append("indexes: {} {}, {} {}".format(
-        CLASS_INDEX, "present" if indexes[CLASS_INDEX] else "absent",
-        TIME_INDEX, "present" if indexes[TIME_INDEX] else "absent"))
-    for family in FAMILIES:
-        eligible, fresh, total = counts[family]
-        lines.append(f"{family}: eligible_old={eligible} fresh={fresh} total={total}")
-    lines.append("counts note: pre-exclusion upper bounds; lifecycle exclusions not applied")
-    before_count, before_digest, before_min, before_max = before
-    after_count, after_digest, after_min, after_max = after
-    lines.append("cohort before: count={} digest={} min={} max={}".format(
-        before_count, before_digest or "-", before_min or "-", before_max or "-"))
-    lines.append("cohort after: count={} digest={} min={} max={}".format(
-        after_count, after_digest or "-", after_min or "-", after_max or "-"))
-    if before_count == 0 or after_count == 0:
-        lines.append("limitation: empty cohort; preservation unobserved")
-    elif not pgcrypto:
-        lines.append("limitation: pgcrypto absent; cohort has count/min/max without a digest")
-    else:
-        lines.append(f"digest_match: {str(before_digest == after_digest).lower()}")
+@dataclass(frozen=True)
+class Observation:
+    id: str
+    code: str
+    value: str | bool | dict | None
+    next_action: str
+
+    def document(self):
+        return {"id": self.id, "code": self.code, "value": self.value,
+                "next_action": self.next_action}
+
+
+@dataclass(frozen=True)
+class Limitation:
+    id: str
+    code: str
+    next_action: str
+
+    def document(self):
+        return {"id": self.id, "code": self.code, "next_action": self.next_action}
+
+
+@dataclass(frozen=True)
+class CensusError:
+    code: str
+    retryable: bool
+    next_action: str
+
+    def document(self):
+        return {"code": self.code, "retryable": self.retryable,
+                "next_action": self.next_action}
+
+
+@dataclass(frozen=True)
+class CensusResult:
+    status: str
+    observations: tuple[Observation, ...] = ()
+    limitations: tuple[Limitation, ...] = ()
+    error: CensusError | None = None
+
+    def document(self):
+        # Explicit allowlist: never serialize exceptions, environments or raw rows.
+        return {"schema_version": 1, "status": self.status,
+                "observations": [row.document() for row in self.observations],
+                "limitations": [row.document() for row in self.limitations],
+                "error": self.error.document() if self.error else None}
+
+
+def cohort_value(capture):
+    count, digest, minimum, maximum = capture
+    return {"count": count, "digest": digest, "minimum": minimum, "maximum": maximum}
+
+
+def build_result(observed_before, observed_after, migrations, indexes, counts,
+                 before, after, pgcrypto):
+    """Project admitted aggregates only; never infer execution from observations."""
+    values = (
+        ("observed_before", observed_before, "Compare capture times with the frozen window."),
+        ("observed_after", observed_after, "Compare capture times with the frozen window."),
+        ("migrations", {str(version): None if migrations[version] is None else
+                        {"installed_on": migrations[version][0],
+                         "success": migrations[version][1]}
+                        for version in MIGRATION_VERSIONS},
+         "Inspect missing or unsuccessful ledger entries; do not apply from this report."),
+        ("indexes", {name: indexes[name] for name in (CLASS_INDEX, TIME_INDEX)},
+         "Compare index presence with the expiry migration contract."),
+        ("counts", {family: dict(zip(("eligible_old", "fresh", "total"), counts[family]))
+                    for family in FAMILIES},
+         "Treat eligible_old as a pre-exclusion upper bound, not a deletion count."),
+        ("cohort_before", cohort_value(before), "Compare only these frozen-window captures."),
+        ("cohort_after", cohort_value(after), "Compare only these frozen-window captures."),
+    )
+    observations = [Observation(key, "observed", value, action) for key, value, action in values]
+    limitations = []
+    if before[0] == 0 or after[0] == 0:
+        limitations.append(Limitation("empty_cohort", "empty_cohort",
+                                      "Preservation is unobserved; obtain a nonempty cohort."))
+    if not pgcrypto:
+        limitations.append(Limitation("pgcrypto_absent", "pgcrypto_absent",
+                                      "Preservation is unobserved; no digest is available."))
+    if before[0] and after[0] and pgcrypto:
+        observations.append(Observation(
+            "digest_match", "observed", before[1] == after[1],
+            "Investigate mismatches; equality alone does not prove retention execution."))
     if all(total == 0 for _, _, total in counts.values()):
-        lines.append("limitation: no rows in the retention families")
+        limitations.append(Limitation("empty_families", "empty_families",
+                                      "Obtain nonempty family evidence before drawing conclusions."))
+    for key in ("mode", "counters"):
+        observations.append(Observation(key, "unobserved", None,
+                                        "Obtain separate runtime evidence; never infer execution here."))
+    return CensusResult("observed", tuple(observations), tuple(limitations))
+
+
+def render_text(result):
+    """Render the same named values/codes/actions as the optional JSON document."""
+    lines = ["## staging retention census"]
+    if result.error:
+        error = result.error
+        return (f"{error.code}: retryable={str(error.retryable).lower()} "
+                f"next_action: {error.next_action}\n")
+    for row in result.observations:
+        key, value = row.id, row.value
+        if key == "migrations":
+            ledger = []
+            for version, entry in value.items():
+                if entry is None:
+                    ledger.append(f"{version} not applied")
+                else:
+                    success = 'success' if entry['success'] else 'FAILURE'
+                    ledger.append(f"{version} applied {success} {entry['installed_on']}")
+            text = "migrations: " + "; ".join(ledger)
+        elif key == "indexes":
+            text = "indexes: " + ", ".join(
+                f"{name} {'present' if present else 'absent'}" for name, present in value.items())
+        elif key == "counts":
+            text = "counts: pre-exclusion upper bounds; lifecycle exclusions not applied"
+        elif key in ("cohort_before", "cohort_after"):
+            text = "{} (cohort {}: count={} digest={} min={} max={})".format(
+                key, key.removeprefix("cohort_"), value["count"], value["digest"] or "-",
+                value["minimum"] or "-", value["maximum"] or "-")
+        elif key in ("mode", "counters"):
+            text = f"{key}: not observed by this read path"
+        else:
+            text = f"{key}: {str(value).lower() if isinstance(value, bool) else value}"
+        lines.append(f"{text} [code={row.code}; next_action: {row.next_action}]")
+        if key == "counts":
+            for family, buckets in value.items():
+                lines.append(f"{family}: eligible_old={buckets['eligible_old']} "
+                             f"fresh={buckets['fresh']} total={buckets['total']}")
+    phrases = {
+        "empty_cohort": "empty cohort; preservation unobserved",
+        "pgcrypto_absent": "pgcrypto absent; cohort has count/min/max without a digest",
+        "empty_families": "no rows in the retention families",
+    }
+    for row in result.limitations:
+        lines.append(f"limitation: {phrases[row.code]} [id={row.id}; code={row.code}; "
+                     f"next_action: {row.next_action}]")
     lines.append("mode/counters: not observed by this read path")
     return "\n".join(lines) + "\n"
 
 
-def run_census(env, psql, clock, sleep_fn):
-    """Every fence, then A/B/C-before, one sleep, C-after. Returns the report."""
+def format_report(observed_before, observed_after, migrations, indexes, counts,
+                  before, after, pgcrypto):
+    return render_text(build_result(observed_before, observed_after, migrations, indexes,
+                                    counts, before, after, pgcrypto))
+
+
+def run_census(env, psql, clock, sleep_fn, *, structured=False):
+    """Every fence, then A/B/C-before, one sleep, C-after; no partial result."""
     pg, _, database_pin = database_target(env)
     pg_env = psql_environment(pg, env)
     if not psql:
@@ -583,41 +722,66 @@ def run_census(env, psql, clock, sleep_fn):
     cohort_query = cohort_sql(anchor) if pgcrypto else cohort_nodigest_sql(anchor)
     observed_before = format_instant(clock())
     before = parse_cohort(run_psql(psql, pg_env, cohort_query), pgcrypto)
-    print(f"sleeping {SLEEP_SECONDS}s to observe one natural DryRun interval",
-          flush=True)
+    if not structured:
+        print(f"sleeping {SLEEP_SECONDS}s to observe one natural DryRun interval",
+              flush=True)
     sleep_fn(SLEEP_SECONDS)
     observed_after = format_instant(clock())
     after = parse_cohort(run_psql(psql, pg_env, cohort_query), pgcrypto)
-    return format_report(observed_before, observed_after, migrations, indexes,
-                         counts, before, after, pgcrypto)
+    result = build_result(observed_before, observed_after, migrations, indexes,
+                          counts, before, after, pgcrypto)
+    return result if structured else render_text(result)
+
+
+def failure_result(code):
+    actions = {
+        "refused": "Correct the staging binding or identity fence before retrying.",
+        "read_failed": "Inspect the read-only runner and admitted result shapes before retrying.",
+        "publication_failed": "Correct the summary/output destination before rerunning the census.",
+    }
+    return CensusResult(code, error=CensusError(code, code != "refused", actions[code]))
 
 
 def main(argv=None, env=None, clock=None, psql=None, sleep_fn=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
-    parser.parse_args(argv)
+    parser.add_argument("--json", action="store_true", help="emit one versioned observation document")
+    args = parser.parse_args(argv)
     env = os.environ if env is None else env
     clock = clock or (lambda: datetime.now(timezone.utc))
-    psql = shutil.which("psql") if psql is None else psql
     sleep_fn = time.sleep if sleep_fn is None else sleep_fn
+    publishing = False
+    legacy_error = None
     try:
-        report = run_census(env, psql, clock, sleep_fn)
+        psql = shutil.which("psql") if psql is None else psql
+        result = run_census(env, psql, clock, sleep_fn, structured=True)
+        publishing = True
+        report = render_text(result)
+        output = json.dumps(result.document(), sort_keys=True) + "\n" if args.json else report
+        summary = env.get("GITHUB_STEP_SUMMARY")
+        if summary:
+            with open(summary, "a", encoding="utf-8") as handle:
+                handle.write(report)
+        print(output, end="")
+        if not args.json:
+            print("ok: census complete")
+        return 0
     except Refused as error:
-        print(str(error), file=sys.stderr)
-        return 2
+        result = failure_result("refused")
+        # Refused messages are fixed vocabulary; text mode keeps the cause.
+        legacy_error = f"{error}\n" + render_text(result)
     except ReadFailed as error:
-        print(f"failed: {error}", file=sys.stderr)
-        return 1
-    except Exception as error:  # a traceback could quote the login
-        print(f"failed: unexpected {type(error).__name__}; nothing was reported",
-              file=sys.stderr)
-        return 1
-    summary = env.get("GITHUB_STEP_SUMMARY")
-    if summary:
-        with open(summary, "a", encoding="utf-8") as handle:
-            handle.write(report)
-    print(report, end="")
-    print("ok: census complete")
-    return 0
+        result = failure_result("read_failed")
+        # ReadFailed messages are fixed vocabulary, never psql output.
+        legacy_error = f"failed: {error}\n" + render_text(result)
+    except Exception as error:  # a traceback or OS message could quote the login
+        result = failure_result("publication_failed" if publishing else "read_failed")
+        if not publishing and type(error) is ValueError:
+            legacy_error = "failed: unexpected ValueError; nothing was reported\n"
+    if args.json:
+        print(json.dumps(result.document(), sort_keys=True))
+    else:
+        print(legacy_error or render_text(result), end="", file=sys.stderr)
+    return 2 if result.status == "refused" else 1
 
 
 if __name__ == "__main__":

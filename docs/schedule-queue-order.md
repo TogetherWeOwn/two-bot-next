@@ -24,7 +24,7 @@ predicates in memory:
 | `list_scheduled_window` | `ORDER BY next_run_at, id LIMIT 25 OFFSET 25` (one bounded hidden window, only for `page` past the first window when the count proves overflow) | skip the first 25 of the sorted rows, then take the next 25 |
 | `claim_due` | `enabled AND next_run_at <= now ORDER BY next_run_at, id LIMIT 1`, then park at `lease_until_ms(now)` | `Queue::claim` |
 | `complete_run` | recurring rows advance from the run instant; one-shot rows disable | `Queue::complete` |
-| `retry_scheduled` | re-queue at `now + clamp_retry_delay_ms(hint)` | `Queue::fail` on a retryable status |
+| `retry_scheduled` | re-queue at `now + clamp_retry_delay_ms(hint)`; preserve any armed uncertainty unless no effect/cleanup is confirmed | `Queue::fail` models delay only, not delivery safety |
 
 Each ticker pass claims at most `TICKER_BATCH_LIMIT` (10) rows.
 
@@ -58,14 +58,15 @@ no row is claimed, posted or audited; the `/readyz` status map lists
    the lease, while it still drains the other due rows. When the lease
    expires, the row is reclaimed exactly once. The lease saturates at
    `u64::MAX` instead of wrapping.
-4. **Bounded retries.** `post_failure_retryable` retries on no response, 429
-   and 5xx. Other 4xx statuses are permanent. `clamp_retry_delay_ms` keeps
-   every delay between 1 s and 15 min, and uses 30 s when the response has no
-   hint. A retry-after of zero still waits the 1 s floor, so a tick never
-   spins on the same row. A hostile `u64::MAX` hint is capped at 15 min, so
-   the row is retried rather than parked forever. Failing rows at the head do
-   not stop later due rows from posting in the same tick. A permanent failure
-   advances or disables the row like a run.
+4. **Bounded retries, not blind replay.** The pure `post_failure_retryable`
+   helper models legacy delay policy, not proof of delivery absence. The runtime
+   retries only proven no-effect refusals (including local admission blocking
+   and 429) or confirmed cleanup. Timeout, transport loss, 5xx, unusable success
+   receipts and unconfirmed completion retain the durable fence instead.
+   `clamp_retry_delay_ms` bounds delays to 1 s–15 min (default 30 s); reclaim
+   parks rows at the 60 s lease. At most ten claims per tick, with due-order
+   parking, keep unrelated rows progressing. A definitive permanent refusal
+   still advances/disables the occurrence, with a failure audit.
 5. **Prefix resolution.** `resolve_scheduled_id` returns `Unique` only for a
    single match. Missing prefixes, case mismatches and literal LIKE
    metacharacters (`%`, `_`) are refused as `Missing`. Shared prefixes are

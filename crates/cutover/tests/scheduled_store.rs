@@ -18,9 +18,9 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Postgres, QueryBuilder};
 
 use two_bot_core::{
-    audit_scheduled, claim_due, complete_run, delete_scheduled, format_iso_ms, get_scheduled,
-    list_scheduled, put_scheduled, resolve_scheduled_id_store, retry_scheduled,
-    ScheduledAuditInput, ScheduledWrite,
+    audit_scheduled, begin_scheduled_delivery, claim_due, complete_run, delete_scheduled,
+    format_iso_ms, get_scheduled, list_scheduled, put_scheduled, resolve_scheduled_id_store,
+    retry_scheduled, ScheduledAuditInput, ScheduledWrite,
 };
 static SCHEMA_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -149,6 +149,7 @@ async fn migrate(pool: &PgPool) {
     for migration in [
         include_str!("../migrations/0140_scheduled_messages.sql"),
         include_str!("../migrations/0141_scheduled_messages_legacy_upgrade.sql"),
+        include_str!("../migrations/0142_scheduled_delivery_uncertainty.sql"),
         include_str!("../migrations/0150_sticky_messages.sql"),
     ] {
         sqlx::raw_sql(migration)
@@ -303,7 +304,7 @@ async fn legacy_queue_upgrade_preserves_rows_and_decodes_store_shape() {
                 .unwrap();
             }
             let before: Vec<(String,)> = sqlx::query_as(
-                "SELECT (to_jsonb(s) - 'claim_token' - 'claimed_at' - 'occurrence_nonce')::TEXT
+                "SELECT (to_jsonb(s) - 'claim_token' - 'claimed_at' - 'occurrence_nonce' - 'delivery_uncertain')::TEXT
                  FROM scheduled_messages s ORDER BY id",
             )
             .fetch_all(&mut *tx)
@@ -320,9 +321,15 @@ async fn legacy_queue_upgrade_preserves_rows_and_decodes_store_shape() {
                 .execute(&mut *tx)
                 .await
                 .unwrap();
+                sqlx::raw_sql(include_str!(
+                    "../migrations/0142_scheduled_delivery_uncertainty.sql"
+                ))
+                .execute(&mut *tx)
+                .await
+                .unwrap();
             }
             let after: Vec<(String,)> = sqlx::query_as(
-                "SELECT (to_jsonb(s) - 'claim_token' - 'claimed_at' - 'occurrence_nonce')::TEXT
+                "SELECT (to_jsonb(s) - 'claim_token' - 'claimed_at' - 'occurrence_nonce' - 'delivery_uncertain')::TEXT
                  FROM scheduled_messages s ORDER BY id",
             )
             .fetch_all(&mut *tx)
@@ -345,6 +352,15 @@ async fn legacy_queue_upgrade_preserves_rows_and_decodes_store_shape() {
             assert_eq!(
                 rows[0].claimed_at.as_deref(),
                 has_claim_columns.then_some("2026-01-01T00:00:00.000Z")
+            );
+            // 0142 backfills pending work fenced, idle definitions open.
+            assert_eq!(
+                rows[0].delivery_uncertain, has_claim_columns,
+                "a pre-upgrade claim backfills fenced"
+            );
+            assert!(
+                !rows[1].delivery_uncertain,
+                "an idle legacy row stays unfenced"
             );
             for invalid in [
                 "UPDATE scheduled_messages SET interval_seconds = 59 WHERE id = 'legacy-hourly'",
@@ -938,6 +954,412 @@ async fn audit_rows_record_outcomes() {
         .await
         .unwrap();
         assert_eq!(count, 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn fresh_definitions_start_unfenced() {
+    with_db(|pool| async move {
+        let pool = &pool;
+        let guild = "sched-fence-fresh";
+
+        assert!(put_scheduled(pool, &write(guild, "fresh", &iso(T0), None))
+            .await
+            .unwrap());
+        let row = get_scheduled(pool, guild, "fresh").await.unwrap().unwrap();
+        assert!(
+            !row.delivery_uncertain,
+            "new definitions are sendable until the pre-wire fence arms"
+        );
+        let rows = list_scheduled(pool, guild).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].delivery_uncertain);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn legacy_pending_occurrences_backfill_fenced() {
+    with_db(|pool| async move {
+        let pool = &pool;
+        let guild = "sched-fence-backfill";
+
+        // Roll back to the pre-0142 shape, seed legacy pending/idle rows with
+        // raw SQL (the store write requires the fence column), then re-apply
+        // 0142 and prove the backfill plus preserved facts.
+        sqlx::raw_sql("ALTER TABLE scheduled_messages DROP COLUMN delivery_uncertain;")
+            .execute(pool)
+            .await
+            .unwrap();
+        for (id, nonce, claim, enabled) in [
+            ("pending-nonce", Some("nonce-1"), None, true),
+            ("pending-claim", None, Some("claim-1"), true),
+            ("pending-both", Some("nonce-2"), Some("claim-2"), true),
+            ("idle", None, None, true),
+            ("disabled-pending", Some("nonce-3"), None, false),
+        ] {
+            sqlx::query(
+                "INSERT INTO scheduled_messages
+                   (id, guild_id, channel_id, body, next_run_at, interval_seconds, enabled,
+                    created_by, created_at, updated_by, updated_at,
+                    claim_token, claimed_at, occurrence_nonce)
+                 VALUES ($1, $2, 'chan9', 'hello', $3, NULL, $4,
+                         'admin1', $5, 'admin1', $5, $6, $7, $8)",
+            )
+            .bind(id)
+            .bind(guild)
+            .bind(iso(T0))
+            .bind(enabled)
+            .bind(iso(T0))
+            .bind(claim)
+            .bind(claim.map(|_| iso(T0)))
+            .bind(nonce)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        sqlx::raw_sql(include_str!(
+            "../migrations/0142_scheduled_delivery_uncertainty.sql"
+        ))
+        .execute(pool)
+        .await
+        .unwrap();
+
+        for (id, fenced) in [
+            ("pending-nonce", true),
+            ("pending-claim", true),
+            ("pending-both", true),
+            ("idle", false),
+            ("disabled-pending", true),
+        ] {
+            let row = get_scheduled(pool, guild, id).await.unwrap().unwrap();
+            assert_eq!(
+                row.delivery_uncertain, fenced,
+                "{id}: nonce-or-claim backfills fenced, idle stays open"
+            );
+            assert_eq!(row.body, "hello", "{id}: definition facts survive");
+            assert_eq!(row.next_run_at, iso(T0));
+        }
+
+        // New definitions after the upgrade stay unfenced.
+        assert!(put_scheduled(pool, &write(guild, "after", &iso(T0), None))
+            .await
+            .unwrap());
+        let after = get_scheduled(pool, guild, "after").await.unwrap().unwrap();
+        assert!(!after.delivery_uncertain);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn null_fence_reads_fail_closed() {
+    with_db(|pool| async move {
+        let pool = &pool;
+        let guild = "sched-fence-null";
+
+        assert!(put_scheduled(pool, &write(guild, "nullf", &iso(T0), None))
+            .await
+            .unwrap());
+        sqlx::query("UPDATE scheduled_messages SET delivery_uncertain = NULL WHERE guild_id = $1 AND id = $2")
+            .bind(guild)
+            .bind("nullf")
+            .execute(pool)
+            .await
+            .unwrap();
+
+        let row = get_scheduled(pool, guild, "nullf").await.unwrap().unwrap();
+        assert!(
+            row.delivery_uncertain,
+            "an unreadable fence must read fenced"
+        );
+        let rows = list_scheduled(pool, guild).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].delivery_uncertain);
+        let claimed = claim_due(pool, guild, &iso(NOW), "claim-null", &iso(LEASE), "nonce-null")
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert!(
+            claimed[0].delivery_uncertain,
+            "claim must also fail closed on NULL"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn restart_reclaim_preserves_fence_and_nonce() {
+    with_db(|pool| async move {
+        let pool = &pool;
+        let guild = "sched-fence-reclaim";
+
+        assert!(
+            put_scheduled(pool, &write(guild, "reclaim", &iso(T0), None))
+                .await
+                .unwrap()
+        );
+        let claimed = claim_due(pool, guild, &iso(NOW), "claim-1", &iso(LEASE), "nonce-1")
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert!(!claimed[0].delivery_uncertain);
+        assert!(
+            begin_scheduled_delivery(pool, guild, "reclaim", "claim-1")
+                .await
+                .unwrap(),
+            "the live claim arms the fence"
+        );
+        let armed = get_scheduled(pool, guild, "reclaim")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(armed.delivery_uncertain);
+        assert_eq!(armed.occurrence_nonce.as_deref(), Some("nonce-1"));
+
+        // A restart after lease expiry reclaims the same occurrence: the fence
+        // and original nonce survive, the fresh nonce is ignored.
+        let restarted = claim_due(
+            pool,
+            guild,
+            &iso(LEASE),
+            "claim-2",
+            &iso(LEASE + 60_000),
+            "nonce-2",
+        )
+        .await
+        .unwrap();
+        assert_eq!(restarted.len(), 1);
+        assert_eq!(
+            restarted[0].occurrence_nonce.as_deref(),
+            Some("nonce-1"),
+            "expiry never mints a new identity for fenced work"
+        );
+        assert!(
+            restarted[0].delivery_uncertain,
+            "expiry never clears the fence"
+        );
+        assert_eq!(restarted[0].claim_token.as_deref(), Some("claim-2"));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn begin_fences_only_the_matching_live_claim() {
+    with_db(|pool| async move {
+        let pool = &pool;
+        let guild = "sched-fence-begin";
+
+        assert!(put_scheduled(pool, &write(guild, "begin", &iso(T0), None))
+            .await
+            .unwrap());
+        assert_eq!(
+            claim_due(pool, guild, &iso(NOW), "claim-1", &iso(LEASE), "nonce-1")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            !begin_scheduled_delivery(pool, guild, "begin", "claim-wrong")
+                .await
+                .unwrap(),
+            "a wrong claim arms nothing"
+        );
+        assert!(
+            begin_scheduled_delivery(pool, guild, "begin", "claim-1")
+                .await
+                .unwrap(),
+            "the matching live claim arms"
+        );
+        assert!(
+            !begin_scheduled_delivery(pool, guild, "begin", "claim-1")
+                .await
+                .unwrap(),
+            "an armed occurrence never re-arms"
+        );
+
+        // Replacement is a new generation: claim, nonce and fence clear, and
+        // the old claim authorizes no send.
+        let mut replaced = write(guild, "begin", &iso(T0 + 5_000), None);
+        replaced.created_by = "admin1".to_owned();
+        replaced.created_at = iso(T0);
+        assert!(put_scheduled(pool, &replaced).await.unwrap());
+        let fresh = get_scheduled(pool, guild, "begin").await.unwrap().unwrap();
+        assert!(fresh.claim_token.is_none());
+        assert!(fresh.occurrence_nonce.is_none());
+        assert!(!fresh.delivery_uncertain);
+        assert!(
+            !begin_scheduled_delivery(pool, guild, "begin", "claim-1")
+                .await
+                .unwrap(),
+            "a replaced claim authorizes no send"
+        );
+
+        // Disabled rows and nonce-less claims never arm.
+        assert_eq!(
+            claim_due(
+                pool,
+                guild,
+                &iso(NOW + 60_000),
+                "claim-2",
+                &iso(LEASE + 60_000),
+                "nonce-2"
+            )
+            .await
+            .unwrap()
+            .len(),
+            1
+        );
+        sqlx::query(
+            "UPDATE scheduled_messages SET enabled = FALSE WHERE guild_id = $1 AND id = $2",
+        )
+        .bind(guild)
+        .bind("begin")
+        .execute(pool)
+        .await
+        .unwrap();
+        assert!(
+            !begin_scheduled_delivery(pool, guild, "begin", "claim-2")
+                .await
+                .unwrap(),
+            "a disabled row arms nothing"
+        );
+        sqlx::query(
+            "UPDATE scheduled_messages SET enabled = TRUE, occurrence_nonce = NULL
+              WHERE guild_id = $1 AND id = $2",
+        )
+        .bind(guild)
+        .bind("begin")
+        .execute(pool)
+        .await
+        .unwrap();
+        assert!(
+            !begin_scheduled_delivery(pool, guild, "begin", "claim-2")
+                .await
+                .unwrap(),
+            "a nonce-less claim arms nothing"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn reset_clears_fence_only_after_proven_no_effect_or_completion() {
+    with_db(|pool| async move {
+        let pool = &pool;
+        let guild = "sched-fence-reset";
+
+        // Uncertain retain: fence and nonce survive the requeue.
+        assert!(put_scheduled(pool, &write(guild, "retain", &iso(T0), None))
+            .await
+            .unwrap());
+        assert_eq!(
+            claim_due(pool, guild, &iso(NOW), "claim-r", &iso(LEASE), "nonce-r")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(begin_scheduled_delivery(pool, guild, "retain", "claim-r")
+            .await
+            .unwrap());
+        assert!(
+            retry_scheduled(pool, guild, "retain", "claim-r", &iso(NOW + 30_000), true)
+                .await
+                .unwrap()
+        );
+        let retained = get_scheduled(pool, guild, "retain").await.unwrap().unwrap();
+        assert!(retained.delivery_uncertain);
+        assert_eq!(retained.occurrence_nonce.as_deref(), Some("nonce-r"));
+        assert!(retained.claim_token.is_none());
+
+        // Proven no-effect reset: fence and nonce clear together.
+        assert!(put_scheduled(pool, &write(guild, "reset", &iso(T0), None))
+            .await
+            .unwrap());
+        assert_eq!(
+            claim_due(pool, guild, &iso(NOW), "claim-s", &iso(LEASE), "nonce-s")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(begin_scheduled_delivery(pool, guild, "reset", "claim-s")
+            .await
+            .unwrap());
+        assert!(
+            retry_scheduled(pool, guild, "reset", "claim-s", &iso(NOW + 30_000), false)
+                .await
+                .unwrap()
+        );
+        let cleared = get_scheduled(pool, guild, "reset").await.unwrap().unwrap();
+        assert!(!cleared.delivery_uncertain);
+        assert!(cleared.occurrence_nonce.is_none());
+
+        // Completion clears the fence for one-shots and recurring rows alike.
+        assert!(put_scheduled(pool, &write(guild, "done", &iso(T0), None))
+            .await
+            .unwrap());
+        assert_eq!(
+            claim_due(pool, guild, &iso(NOW), "claim-d", &iso(LEASE), "nonce-d")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(begin_scheduled_delivery(pool, guild, "done", "claim-d")
+            .await
+            .unwrap());
+        let completed = complete_run(pool, guild, "done", &iso(NOW), Some("msg-1"), "claim-d")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!completed.delivery_uncertain);
+        assert!(completed.occurrence_nonce.is_none());
+
+        // Replacement clears the fence for the new generation.
+        assert!(put_scheduled(pool, &write(guild, "repl", &iso(T0), None))
+            .await
+            .unwrap());
+        assert_eq!(
+            claim_due(pool, guild, &iso(NOW), "claim-p", &iso(LEASE), "nonce-p")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(begin_scheduled_delivery(pool, guild, "repl", "claim-p")
+            .await
+            .unwrap());
+        let mut replaced = write(guild, "repl", &iso(T0 + 5_000), None);
+        replaced.created_by = "admin1".to_owned();
+        replaced.created_at = iso(T0);
+        assert!(put_scheduled(pool, &replaced).await.unwrap());
+        let next = get_scheduled(pool, guild, "repl").await.unwrap().unwrap();
+        assert!(!next.delivery_uncertain);
+        assert!(next.occurrence_nonce.is_none());
+        assert!(next.claim_token.is_none());
+
+        // Preserve on an unfenced row keeps it unfenced with the nonce.
+        assert!(put_scheduled(pool, &write(guild, "open", &iso(T0), None))
+            .await
+            .unwrap());
+        assert_eq!(
+            claim_due(pool, guild, &iso(NOW), "claim-o", &iso(LEASE), "nonce-o")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            retry_scheduled(pool, guild, "open", "claim-o", &iso(NOW + 30_000), true)
+                .await
+                .unwrap()
+        );
+        let open = get_scheduled(pool, guild, "open").await.unwrap().unwrap();
+        assert!(!open.delivery_uncertain);
+        assert_eq!(open.occurrence_nonce.as_deref(), Some("nonce-o"));
     })
     .await;
 }
