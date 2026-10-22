@@ -87,6 +87,22 @@ impl LfgInteractions {
         }
     }
 
+    /// Extract the rendered `components` array for a send, degrading to an
+    /// empty list when it is missing or not an array. Mirrors the adjacent
+    /// `content` degradation (`unwrap_or_default()`): the send proceeds.
+    #[must_use]
+    pub fn payload_components(payload: &Value) -> &[Value] {
+        match payload.get("components").and_then(Value::as_array) {
+            Some(components) => components.as_slice(),
+            None => {
+                tracing::error!(
+                    "lfg render degraded: missing or non-array components; sending with empty components"
+                );
+                &[]
+            }
+        }
+    }
+
     /// Take a place in the bounded queue, then wait for the execution permit.
     /// Refuses immediately, holding nothing, when the queue is full.
     async fn admit(&self) -> Result<(Admission<'_>, tokio::sync::SemaphorePermit<'_>), LfgError> {
@@ -267,7 +283,7 @@ impl LfgInteractions {
                                 .post_message_with_components(
                                     &post.channel_id,
                                     payload["content"].as_str().unwrap_or_default(),
-                                    payload["components"].as_array().expect("rendered array"),
+                                    Self::payload_components(&payload),
                                     &nonce,
                                 )
                                 .await;
@@ -447,7 +463,7 @@ impl LfgInteractions {
                 &post.channel_id,
                 message_id,
                 payload["content"].as_str().unwrap_or_default(),
-                payload["components"].as_array().expect("rendered array"),
+                Self::payload_components(&payload),
             )
             .await?;
         Ok(())
