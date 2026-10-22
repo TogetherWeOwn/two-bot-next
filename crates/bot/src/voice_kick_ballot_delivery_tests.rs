@@ -1,16 +1,7 @@
 #![cfg(test)]
 
-use std::str::FromStr as _;
-
 use super::*;
-use twilight_model::{
-    channel::{
-        message::{MessageFlags, MessageType},
-        Message,
-    },
-    id::Id,
-    util::Timestamp,
-};
+use twilight_model::channel::Message;
 use two_bot_core::voice_vote_kick::{VOTE_KICK_COOLDOWN_MS, VOTE_KICK_TTL_MS};
 
 const ROOM: u64 = 500;
@@ -24,43 +15,33 @@ const MESSAGE: MessageRef = MessageRef {
 type Worker = GuildRoomWorker<Store, Http>;
 
 fn ballot_message(message_id: u64, channel_id: u64) -> Message {
-    Message {
-        activity: None,
-        application: None,
-        application_id: None,
-        attachments: vec![],
-        author: user(77),
-        call: None,
-        channel_id: Id::new(channel_id),
-        components: vec![],
-        content: "ballot".to_owned(),
-        edited_timestamp: None,
-        embeds: vec![],
-        flags: Some(MessageFlags::empty()),
-        guild_id: Some(Id::new(GUILD)),
-        id: Id::new(message_id),
-        #[allow(deprecated)]
-        interaction: None,
-        interaction_metadata: None,
-        kind: MessageType::Regular,
-        member: None,
-        mention_channels: vec![],
-        mention_everyone: false,
-        mention_roles: vec![],
-        mentions: vec![],
-        message_snapshots: vec![],
-        pinned: false,
-        poll: None,
-        reactions: vec![],
-        reference: None,
-        referenced_message: None,
-        role_subscription_data: None,
-        sticker_items: vec![],
-        timestamp: Timestamp::from_str("2026-09-30T12:00:00.000+00:00").expect("fixture stamp"),
-        thread: None,
-        tts: false,
-        webhook_id: None,
-    }
+    // Twilight's `Message.interaction` is deprecated, so the struct-literal
+    // form needs a waiver the floor guard forbids on new lines. Build
+    // through JSON like the sibling `channel`/`user` fixtures instead; the
+    // author is pinned to the shared `user(77)` fixture by construction.
+    let mut message: Message = serde_json::from_value(serde_json::json!({
+        "id": message_id.to_string(),
+        "channel_id": channel_id.to_string(),
+        "guild_id": GUILD.to_string(),
+        "author": {
+            "id": "77", "username": "fixture",
+            "discriminator": "0001", "avatar": null,
+        },
+        "content": "ballot",
+        "timestamp": "2026-09-30T12:00:00.000+00:00",
+        "tts": false,
+        "mention_everyone": false,
+        "mentions": [],
+        "mention_roles": [],
+        "attachments": [],
+        "embeds": [],
+        "pinned": false,
+        "flags": 0,
+        "type": 0,
+    }))
+    .expect("fixture message");
+    message.author = user(77);
+    message
 }
 
 #[tokio::test]
