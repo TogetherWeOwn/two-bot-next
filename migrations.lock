@@ -1,7 +1,7 @@
 {
   "version": 1,
   "migrations": {
-    "crates/store/migrations/0454_starboard.sql": {
+    "crates/store/migrations/0456_starboard.sql": {
       "sha256": "ef1013d4b13d1fbdcbfbfc5eeee9dda23bde54e58d6f0472c2d8f32272e0f7fc",
       "justification": "Add inert starboard configuration, distinct starrers and unique post records to the store chain."
     },
