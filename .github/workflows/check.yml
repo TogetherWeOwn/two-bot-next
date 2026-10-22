@@ -832,7 +832,16 @@ jobs:
         # first-match on the process-wide tracing capture; they run serially
         # in their own step below, so skip them here where sibling and
         # revision tests emit the same messages concurrently.
-        run: cargo test --workspace --lib --bins --features two-bot-core/db --locked -- --skip ticket_runtime::cursor_budget
+        run: |
+          cargo test --workspace --lib --bins --features two-bot-core/db --locked -- --skip ticket_runtime::cursor_budget --skip settings_jobs::tests::ops_overrides_acceptance_tests::
+
+      # The ops fixture mutates process env; a private DB/reader does not
+      # isolate it from the supervised guild poll in the threaded sweep.
+      - name: cargo test (isolated ops override acceptance)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: |
+          cargo test -p two-bot --bin two-bot --features two-bot-core/db --locked settings_jobs::tests::ops_overrides_acceptance_tests:: -- --test-threads=1
 
       # Global metric deltas must not be satisfied by a sibling hostile-name test.
       # Reuse the compiled feature graph, in a fresh process with serial tests.
@@ -1233,7 +1242,11 @@ jobs:
           cov_run "$COV" llvm-cov --workspace --lib --bins --tests \
             --features two-bot-core/db --locked --ignore-run-fail --no-report -- \
             --skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump \
-            --skip seeded_aggregates_render_exactly_guild_scoped_and_read_only
+            --skip seeded_aggregates_render_exactly_guild_scoped_and_read_only \
+            --skip settings_jobs::tests::ops_overrides_acceptance_tests::
+          # Run the env-mutating ops acceptance alone, before switching away
+          # from its disposable bootstrap URL. Failure remains fail-closed.
+          cov_run "$COV" llvm-cov --no-report -p two-bot --bin two-bot --features two-bot-core/db --locked -- settings_jobs::tests::ops_overrides_acceptance_tests:: --test-threads=1 --skip regenerate_reference_docs
           # The member-moderation suite's guard panics without MEMBER_TESTDB, so
           # export it before the ignored sweep: the suite runs green here
           # instead of printing 32 FAILED lines that the flake ledger
