@@ -27,7 +27,8 @@ name: synthetic-user-flow
 # is the single source for deploy and passive synthetic checks; remove any
 # production Environment override. The `synthetic-alerts` environment secret
 # SYNTHETIC_ALERT_WEBHOOK_URL carries the Discord webhook.
-# Missing target vars skip that probe with a notice; an event that needs a
+# Missing target vars fail that job with an error naming the unset variable,
+# so a run with zero probe samples never reads green; an event that needs a
 # notification fails if the webhook is missing or delivery fails.
 on:
   schedule:
@@ -70,9 +71,11 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/staging_health_contract_probe.py --evidence "synthetic-staging-$RUN_ID.json"
-      - name: Notice missing staging target binding
+      - name: Fail closed when the staging target binding is missing
         if: steps.probe.outcome == 'skipped' && vars.STAGING_WORKER_URL == '' && !inputs.force_fail
-        run: echo "::warning::Skipping staging synthetic because STAGING_WORKER_URL is unset"
+        run: |
+          echo "::error::Staging synthetic has zero probe samples because STAGING_WORKER_URL is unset; refusing to report green"
+          exit 1
       - name: Upload the staging evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -126,9 +129,11 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/prod_passive_probe.py --evidence "synthetic-prod-$RUN_ID.json"
-      - name: Notice missing production target binding
+      - name: Fail closed when the production target binding is missing
         if: steps.probe.outcome == 'skipped' && vars.PRODUCTION_WORKER_URL == ''
-        run: echo "::warning::Skipping production synthetic because PRODUCTION_WORKER_URL is unset"
+        run: |
+          echo "::error::Production synthetic has zero probe samples because PRODUCTION_WORKER_URL is unset; refusing to report green"
+          exit 1
       - name: Upload the prod evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

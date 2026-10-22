@@ -1226,6 +1226,7 @@ jobs:
     environment: production
     permissions:
       contents: read
+      deployments: write # derive the deploy ID from today's production Deployments, then record this one
     env:
       SHA: ${{ needs.guard.outputs.sha }}
       MODE: ${{ needs.guard.outputs.mode }}
@@ -1271,6 +1272,17 @@ jobs:
             echo "::error::PRODUCTION_WORKER_URL equals STAGING_WORKER_URL; refusing to gate production on staging"
             exit 1
           fi
+      # The deploy ID (`YYYY.MM.DD.N+sha7`, scripts/deploy_id.py) is derived
+      # here, inside the deploy-production lane: N is one plus the count of
+      # today's production Deployments, so a queued lane entry cannot mint a
+      # duplicate. Rollbacks mint one too: the record names the deploy event,
+      # while the restored build keeps reporting its original stamped ID.
+      - name: Compute the deploy ID for this production deploy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: | # zizmor: ignore[github-env] the script prints only DEPLOY_ID=<canonical id> (shape-enforced, no newlines); the SHA is the guarded SHA
+          set -euo pipefail
+          python3 ../tooling/scripts/deploy_id.py next --environment production --sha "$SHA" >> "$GITHUB_ENV"
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
@@ -1328,8 +1340,9 @@ jobs:
           retention-days: 14
           compression-level: 0
       # Build identity, as deploy-staging stamps it: the image gets
-      # BOT_BUILD_REVISION (the guarded SHA) and BOT_BUILD_ID (run id and
-      # attempt) through `image_vars`, which /readyz then reports. The SHA is
+      # BOT_BUILD_REVISION (the guarded SHA), BOT_BUILD_ID (run id and
+      # attempt) and BOT_DEPLOY_ID (the compute step's `YYYY.MM.DD.N+sha7`)
+      # through `image_vars`, which /readyz then reports. The SHA is
       # the guard's, not GITHUB_SHA: a dispatch runs on main's head, which may
       # be newer than the commit being deployed.
       - name: Render the production deploy config with build identity
@@ -1339,7 +1352,8 @@ jobs:
           config="$RUNNER_TEMP/production-deploy.json"
           python3 ../tooling/scripts/production_deploy.py render \
             --config wrangler.toml --out "$config" \
-            --sha "$SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
+            --sha "$SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --deploy-id "$DEPLOY_ID"
           echo "PRODUCTION_DEPLOY_CONFIG=$config" >> "$GITHUB_ENV"
       - name: Deploy to production
         id: deploy
@@ -1506,7 +1520,8 @@ jobs:
       # Same contract as staging, plus the build identity and stability:
       # /health must be 200, which proves the Container/DO bindings are wired.
       # /readyz must answer 200 with gateway=ready and this run's build
-      # identity: the guarded SHA and this run's `<run id>-<attempt>`. A
+      # identity: the guarded SHA, this run's `<run id>-<attempt>` and this
+      # run's `YYYY.MM.DD.N+sha7` deploy ID. A
       # truthful 503 while the gateway reconnects is NEVER a pass: the gate
       # keeps polling, and anything short of 200-with-gateway-ready fails the
       # run and rolls back below. The build ID matters because a replaced
@@ -1517,7 +1532,10 @@ jobs:
       # cannot certify. Any miss resets the streak. Rollback checks the
       # revision only (the serving version was built by an older run) and
       # accepts an unstamped pre-stamp target as a recorded outcome, never a
-      # different revision as a pass.
+      # different revision as a pass. A guarded SHA from before stamping (no
+      # BOT_DEPLOY_ID ARG in its Dockerfile) judges the legacy
+      # revision/build-ID shape in deploy mode too, since its binary can
+      # never report a deploy ID.
       - name: Gate on stable /health + /readyz gateway-ready
         id: gate
         env:
@@ -1529,6 +1547,14 @@ jobs:
           readyz="$RUNNER_TEMP/production-readyz.json"
           # The same explicit agent name the staging gate sends (scripts/staging_rollout.py).
           agent="two-bot-next-production-rollout/1.0"
+          # The compute step always exports DEPLOY_ID, but a guarded SHA that
+          # predates stamping (its Dockerfile has no BOT_DEPLOY_ID ARG) can
+          # never report it: judge the legacy revision/build-ID shape then,
+          # exactly like a caller without an exported ID.
+          deploy_id_arg=()
+          if [ -n "${DEPLOY_ID:-}" ] && grep -q '^ARG BOT_DEPLOY_ID' ../Dockerfile; then
+            deploy_id_arg=(--deploy-id "$DEPLOY_ID")
+          fi
           poll() {
             # Match production_deploy.py's 64 KiB cap. A failed transfer can
             # still report 200 with a valid prefix: never grade that as a pass.
@@ -1540,7 +1566,7 @@ jobs:
             code=$(curl -s --max-time 10 --max-filesize 65536 -H "User-Agent: $agent" -o "$readyz" -w '%{http_code}' "$url/readyz") || code=000
             # The verdict follows the script's exit code; `state` carries its
             # fixed-vocabulary reason either way.
-            if state=$(python3 ../tooling/scripts/production_deploy.py readyz --status "$code" --body "$readyz" --sha "$SHA" --mode "$MODE" --build-id "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" 2>&1); then
+            if state=$(python3 ../tooling/scripts/production_deploy.py readyz --status "$code" --body "$readyz" --sha "$SHA" --mode "$MODE" --build-id "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" "${deploy_id_arg[@]}" 2>&1); then
               return 0
             else
               return 1
@@ -1649,6 +1675,36 @@ jobs:
             --evidence "$RUNNER_TEMP/production-auto-rollback-evidence.json"
           python3 -c 'import json, os; print(json.dumps(json.load(open(os.environ["RUNNER_TEMP"] + "/production-auto-rollback-evidence.json")), sort_keys=True))'
           echo "- Auto-rollback: restored the pre-deploy Worker version and container image with takeover (the run still fails)" >> "$GITHUB_STEP_SUMMARY"
+      # Record the deploy as a GitHub Deployment carrying the deploy ID (never
+      # a tag or Release): success only when the readyz gate passed and the
+      # error-rate gate did not fail (it skips in rollback mode). A rollback
+      # record names itself, since its event ID differs from the restored
+      # build's stamped ID. Runs after the auto-rollback so bookkeeping can
+      # never gate recovery: a failed record fails the run red with the
+      # service already restored. Without a deploy or rollback there is
+      # nothing to record.
+      - name: Record the production deployment
+        if: always() && (steps.deploy.outcome == 'success' || steps.rollback.outcome == 'success')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GATE_OUTCOME: ${{ steps.gate.outcome }}
+          ERROR_GATE_OUTCOME: ${{ steps.error_rate_gate.outcome }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
+        run: |
+          set -euo pipefail
+          status=failure
+          if [ "$GATE_OUTCOME" = "success" ] && [ "$ERROR_GATE_OUTCOME" != "failure" ] \
+              && [ "$ERROR_GATE_OUTCOME" != "cancelled" ]; then
+            status=success
+          fi
+          rollback=()
+          if [ "$MODE" = "rollback" ]; then
+            rollback=(--rollback)
+          fi
+          python3 ../tooling/scripts/deploy_id.py record --environment production --sha "$SHA" \
+            --deploy-id "$DEPLOY_ID" --state "$status" "${rollback[@]}" --run-url "$RUN_URL" \
+            --environment-url "$WORKER_URL"
       - name: Upload the auto-rollback evidence
         if: always() && steps.auto_rollback.outcome == 'success'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

@@ -232,6 +232,58 @@ fn validate_input_shape(input: &Map<String, Value>, label: &str) -> Result<(), R
             }
         }
     }
+    // The guild-settings planner copies these fields verbatim into the guild
+    // PATCH. A mistyped value would 400 mid-plan after roles/channels already
+    // landed, so refuse it here. Absent fields stay valid; only present values
+    // must match the documented Discord-bound shape.
+    if let Some(value) = guild.get("name") {
+        if !nonempty_string(Some(value)) {
+            return Err(shape_error(
+                &format!("{label}.guild.name"),
+                "a nonempty string",
+            ));
+        }
+    }
+    if let Some(value) = guild.get("description") {
+        if !value.is_null() && !value.is_string() {
+            return Err(shape_error(
+                &format!("{label}.guild.description"),
+                "a string or null",
+            ));
+        }
+    }
+    for field in [
+        "verification_level",
+        "default_message_notifications",
+        "explicit_content_filter",
+        "afk_timeout",
+        "system_channel_flags",
+    ] {
+        if let Some(value) = guild.get(field) {
+            if value.as_i64().is_none_or(|value| value < 0) {
+                return Err(shape_error(
+                    &format!("{label}.guild.{field}"),
+                    "a nonnegative integer",
+                ));
+            }
+        }
+    }
+    if let Some(value) = guild.get("preferred_locale") {
+        if !nonempty_string(Some(value)) {
+            return Err(shape_error(
+                &format!("{label}.guild.preferred_locale"),
+                "a nonempty string",
+            ));
+        }
+    }
+    if let Some(value) = guild.get("premium_progress_bar_enabled") {
+        if !value.is_boolean() {
+            return Err(shape_error(
+                &format!("{label}.guild.premium_progress_bar_enabled"),
+                "a boolean",
+            ));
+        }
+    }
     for collection in ["roles", "channels", "emojis"] {
         let Some(value) = input.get(collection) else {
             continue;
@@ -277,6 +329,27 @@ fn validate_input_shape(input: &Map<String, Value>, label: &str) -> Result<(), R
                     return Err(shape_error(&format!("{path}.position"), "an integer"));
                 }
             }
+            // `role_body` copies these verbatim into role create/patch bodies.
+            // Scoped to roles: a same-named additive field on another
+            // collection is intentionally ignored.
+            if collection == "roles" {
+                if let Some(value) = row.get("permissions") {
+                    if !decimal_mask(Some(value)) {
+                        return Err(shape_error(
+                            &format!("{path}.permissions"),
+                            "an unsigned decimal permission mask string",
+                        ));
+                    }
+                }
+                if let Some(value) = row.get("color") {
+                    if value.as_i64().is_none_or(|value| value < 0) {
+                        return Err(shape_error(
+                            &format!("{path}.color"),
+                            "a nonnegative integer",
+                        ));
+                    }
+                }
+            }
             if collection == "channels" {
                 if row
                     .get("type")
@@ -294,6 +367,29 @@ fn validate_input_shape(input: &Map<String, Value>, label: &str) -> Result<(), R
                             &format!("{path}.parent_id"),
                             "null or a nonempty ID string",
                         ));
+                    }
+                }
+                // `channel_core_body` copies these verbatim into channel
+                // create/patch bodies. Absent channel-specific fields stay
+                // valid; null stays valid only for the nullable topic.
+                for field in ["bitrate", "user_limit", "rate_limit_per_user"] {
+                    if let Some(value) = row.get(field) {
+                        if value.as_i64().is_none_or(|value| value < 0) {
+                            return Err(shape_error(
+                                &format!("{path}.{field}"),
+                                "a nonnegative integer",
+                            ));
+                        }
+                    }
+                }
+                if let Some(value) = row.get("topic") {
+                    if !value.is_null() && !value.is_string() {
+                        return Err(shape_error(&format!("{path}.topic"), "a string or null"));
+                    }
+                }
+                if let Some(value) = row.get("nsfw") {
+                    if !value.is_boolean() {
+                        return Err(shape_error(&format!("{path}.nsfw"), "a boolean"));
                     }
                 }
                 if let Some(value) = row.get("permission_overwrites") {

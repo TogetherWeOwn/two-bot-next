@@ -70,6 +70,11 @@ gh workflow run release.yml --ref main -f release_tag=vX.Y.Z
 gh workflow run release.yml --ref main -f dry_run=true
 ```
 
+A dispatch with every input at its default selects no release path, so the
+`verdict` job fails the run and names the skipped jobs and why instead of
+reading green with nothing published. The `sha`, `dry_run` and `release_tag`
+dispatches behave exactly as before.
+
 ## Offline verification
 
 `scripts/test-release-on-promote.cjs` (worker CI) pins the parsing, the bump
