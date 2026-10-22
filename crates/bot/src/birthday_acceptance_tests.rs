@@ -109,8 +109,9 @@
 //! two-bot birthday_acceptance`.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
@@ -364,6 +365,18 @@ fn runtime_for(pool: PgPool, executor: ActionExecutor) -> Arc<CommandRuntime> {
 #[derive(Default)]
 struct DiscoState {
     roles: Mutex<HashMap<String, HashSet<String>>>,
+    channel: Mutex<Option<Value>>,
+    guild_roles: Mutex<Option<Value>>,
+    guild_channels: Mutex<Vec<Value>>,
+    uncertain_post: AtomicBool,
+    hold_role_put: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+
+fn cosmetic_roles() -> Value {
+    json!([
+        {"id": GUILD_S, "permissions": "0", "position": 0, "managed": false},
+        {"id": ROLE_ID, "permissions": "0", "position": 1, "managed": false}
+    ])
 }
 
 async fn start_stateful(state: Arc<DiscoState>) -> MockRest {
@@ -373,6 +386,25 @@ async fn start_stateful(state: Arc<DiscoState>) -> MockRest {
         if req.method == "POST" && seg.last() == Some(&"callback") {
             return ScriptedResponse::json(200, json!({"id": "990000000000000001"}));
         }
+        if req.method == "GET" && path == "/api/v10/channels/8129" {
+            let channel = state.channel.lock().expect("channel lock");
+            return ScriptedResponse::json(
+                200,
+                channel
+                    .clone()
+                    .unwrap_or_else(|| json!({"id": CHANNEL_S, "guild_id": GUILD_S, "type": 0})),
+            );
+        }
+        if req.method == "GET" && path == "/api/v10/guilds/8128/roles" {
+            let roles = state.guild_roles.lock().expect("guild roles lock");
+            return ScriptedResponse::json(200, roles.clone().unwrap_or_else(cosmetic_roles));
+        }
+        if req.method == "GET" && path == "/api/v10/guilds/8128/channels" {
+            return ScriptedResponse::json(
+                200,
+                json!(*state.guild_channels.lock().expect("guild channels lock")),
+            );
+        }
         if req.method == "POST"
             && seg.len() == 5
             && seg.first() == Some(&"api")
@@ -380,7 +412,13 @@ async fn start_stateful(state: Arc<DiscoState>) -> MockRest {
             && seg.get(2) == Some(&"channels")
             && seg.get(4) == Some(&"messages")
         {
-            return ScriptedResponse::json(200, json!({"id": "990000000000000002"}));
+            let response = ScriptedResponse::json(200, json!({"id": "990000000000000002"}));
+            return if state.uncertain_post.swap(false, Ordering::SeqCst) {
+                // Discord has accepted the send but the response cannot be read.
+                response.truncated_body()
+            } else {
+                response
+            };
         }
         if seg.len() >= 6
             && seg.first() == Some(&"api")
@@ -399,7 +437,16 @@ async fn start_stateful(state: Arc<DiscoState>) -> MockRest {
                         set.remove(&role);
                     }
                 }
-                return ScriptedResponse::json(200, json!({"id": "990000000000000003"}));
+                let response = ScriptedResponse::json(200, json!({"id": "990000000000000003"}));
+                if req.method == "PUT" {
+                    if let Some(seen) = state.hold_role_put.lock().expect("hold lock").take() {
+                        // The role lands before the response: cancellation here
+                        // models a crash after Discord accepted the grant.
+                        let _ = seen.send(());
+                        return response.delayed(Duration::from_secs(30));
+                    }
+                }
+                return response;
             }
             if req.method == "GET" && seg.len() == 6 {
                 let map = state.roles.lock().expect("roles lock");
@@ -439,6 +486,39 @@ async fn test_db(url: &str) -> TestDatabase {
 
 fn utc_ms(stamp: &str) -> i64 {
     parse_iso_millis(stamp).expect("fixture stamp")
+}
+
+/// Observe persisted birthday state without prescribing the builder's schema.
+async fn birthday_rows(pool: &PgPool) -> Vec<(String, Vec<String>)> {
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name LIKE '%birthday%' ORDER BY table_name",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("birthday table inventory");
+    let mut snapshot = Vec::new();
+    for table in tables {
+        let quoted = table.replace('"', "\"\"");
+        let rows: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT to_jsonb(t)::text FROM public.\"{quoted}\" AS t ORDER BY to_jsonb(t)::text"
+        ))
+        .fetch_all(pool)
+        .await
+        .expect("birthday row snapshot");
+        snapshot.push((table, rows));
+    }
+    snapshot
+}
+
+fn assert_invalid_reply(reply: &Value, what: &str) {
+    assert_ephemeral(reply, what);
+    let content = content_of(reply);
+    assert!(
+        content.to_lowercase().contains("invalid"),
+        "{what}: explicit refusal: {content:?}"
+    );
+    assert_concise(content, what);
+    assert_callback_mention_safe(content, what);
 }
 
 fn callbacks(reqs: &[RestRequest]) -> Vec<&RestRequest> {
@@ -1094,6 +1174,254 @@ async fn config_requires_manage_guild_and_bounds_cheer() {
     db.close().await.expect("drop test database");
 }
 
+/// Catch accepting a foreign/voice/thread channel or partially saving the
+/// otherwise-valid role when the channel is refused.
+#[tokio::test]
+async fn unsafe_channels_refused_without_stored_settings() {
+    let Some(url) = db_url() else { return };
+    let db = test_db(&url).await;
+    let pool = db.pool().clone();
+    let state = Arc::new(DiscoState::default());
+    let mock = start_stateful(Arc::clone(&state)).await;
+    let executor = executor_for(&mock);
+    let runtime = runtime_for(pool.clone(), executor.clone());
+    let reply = dispatch_set(&runtime, &mock, ALICE, 5, 1).await;
+    assert!(content_of(&reply).contains("May"));
+    let before = birthday_rows(&pool).await;
+
+    for (guild, kind) in [("9999", 0), (GUILD_S, 2), (GUILD_S, 11), (GUILD_S, 4)] {
+        *state.channel.lock().expect("channel lock") = Some(json!({
+            "id": CHANNEL_S, "guild_id": guild, "type": kind
+        }));
+        let reply = dispatch_callback(
+            &runtime,
+            &mock,
+            &config_ix(
+                Some(CHANNEL_ID),
+                Some(8130),
+                Some("Not saved {user}"),
+                ALICE,
+                Permissions::MANAGE_GUILD,
+            ),
+        )
+        .await;
+        assert_invalid_reply(&reply, "unsafe channel");
+        assert_eq!(
+            birthday_rows(&pool).await,
+            before,
+            "invalid channel stores no partial config"
+        );
+        sweep(&pool, &executor, utc_ms("2026-05-01T12:00:00.000Z")).await;
+        assert!(
+            channel_posts(&mock.requests(), CHANNEL_S).is_empty(),
+            "invalid channel never cheers"
+        );
+        assert!(
+            role_ops(&mock.requests(), "PUT").is_empty(),
+            "invalid channel never saves the role either"
+        );
+    }
+
+    mock.shutdown().await;
+    db.close().await.expect("drop test database");
+}
+
+/// Catch permission escalation via nonzero guild permissions, managed roles,
+/// @everyone, a role absent from this guild, or channel-level access grants.
+#[tokio::test]
+async fn unsafe_roles_refused_without_stored_settings() {
+    let Some(url) = db_url() else { return };
+    let db = test_db(&url).await;
+    let pool = db.pool().clone();
+    let state = Arc::new(DiscoState::default());
+    let mock = start_stateful(Arc::clone(&state)).await;
+    let executor = executor_for(&mock);
+    let runtime = runtime_for(pool.clone(), executor.clone());
+    let reply = dispatch_set(&runtime, &mock, ALICE, 5, 1).await;
+    assert!(content_of(&reply).contains("May"));
+    let before = birthday_rows(&pool).await;
+
+    for (role, permissions, managed, listed, overwrite_allow) in [
+        (8130, "8", false, true, "0"),
+        (8130, "1024", false, true, "0"),
+        (8130, "0", true, true, "0"),
+        (GUILD_ID, "0", false, true, "0"),
+        (8131, "0", false, false, "0"),
+        (8130, "0", false, true, "1024"),
+    ] {
+        let mut roles = cosmetic_roles();
+        if listed && role != GUILD_ID {
+            roles[1] = json!({"id": role.to_string(), "permissions": permissions, "position": 1, "managed": managed});
+        }
+        *state.guild_roles.lock().expect("guild roles lock") = Some(roles);
+        *state.guild_channels.lock().expect("guild channels lock") = vec![json!({
+            "id": CHANNEL_S, "guild_id": GUILD_S, "type": 0,
+            "permission_overwrites": [{"id": role.to_string(), "type": 0, "allow": overwrite_allow, "deny": "0"}]
+        })];
+        let reply = dispatch_callback(
+            &runtime,
+            &mock,
+            &config_ix(
+                Some(CHANNEL_ID),
+                Some(role),
+                Some("Not saved {user}"),
+                ALICE,
+                Permissions::MANAGE_GUILD,
+            ),
+        )
+        .await;
+        assert_invalid_reply(&reply, "unsafe role");
+        assert_eq!(
+            birthday_rows(&pool).await,
+            before,
+            "invalid role stores no partial config"
+        );
+        sweep(&pool, &executor, utc_ms("2026-05-01T12:00:00.000Z")).await;
+        assert!(
+            channel_posts(&mock.requests(), CHANNEL_S).is_empty(),
+            "invalid role never saves the channel either"
+        );
+        assert!(
+            role_ops(&mock.requests(), "PUT").is_empty(),
+            "invalid role never grants"
+        );
+    }
+
+    mock.shutdown().await;
+    db.close().await.expect("drop test database");
+}
+
+/// A same-guild news channel is a supported target, not an unsafe channel.
+#[tokio::test]
+async fn same_guild_news_channel_accepts_cosmetic_role() {
+    let Some(url) = db_url() else { return };
+    let db = test_db(&url).await;
+    let pool = db.pool().clone();
+    let state = Arc::new(DiscoState::default());
+    *state.channel.lock().expect("channel lock") = Some(json!({
+        "id": CHANNEL_S, "guild_id": GUILD_S, "type": 5
+    }));
+    let mock = start_stateful(Arc::clone(&state)).await;
+    let executor = executor_for(&mock);
+    let runtime = runtime_for(pool.clone(), executor.clone());
+    let reply = dispatch_callback(
+        &runtime,
+        &mock,
+        &config_ix(
+            Some(CHANNEL_ID),
+            Some(8130),
+            None,
+            ALICE,
+            Permissions::MANAGE_GUILD,
+        ),
+    )
+    .await;
+    assert_ephemeral(&reply, "news config");
+    let lowered = content_of(&reply).to_lowercase();
+    assert!(
+        lowered.contains("configur") || lowered.contains("saved") || lowered.contains("updated")
+    );
+    let reply = dispatch_set(&runtime, &mock, ALICE, 5, 1).await;
+    assert!(content_of(&reply).contains("May"));
+    sweep(&pool, &executor, utc_ms("2026-05-01T12:00:00.000Z")).await;
+    let requests = mock.requests();
+    let posts = channel_posts(&requests, CHANNEL_S);
+    assert_eq!(posts.len(), 1, "news channel receives a cheer");
+    assert_cheer(posts[0], ALICE, "news cheer");
+    assert!(member_roles(&state, &ALICE.to_string()).contains(ROLE_ID));
+
+    mock.shutdown().await;
+    db.close().await.expect("drop test database");
+}
+
+/// Catch raw interaction payloads bypassing the published no-year surface or
+/// silently replacing a stored birthday while ignoring unknown/duplicate input.
+#[tokio::test]
+async fn raw_set_year_and_extra_options_refused_without_replacing_state() {
+    let Some(url) = db_url() else { return };
+    let db = test_db(&url).await;
+    let pool = db.pool().clone();
+    let mock = start_stateful(Arc::new(DiscoState::default())).await;
+    let runtime = runtime_for(pool.clone(), executor_for(&mock));
+    let reply = dispatch_set(&runtime, &mock, ALICE, 5, 1).await;
+    assert!(content_of(&reply).contains("May"));
+    let before = birthday_rows(&pool).await;
+
+    for extra in [
+        opt_int("year", 1990),
+        opt_int("extra", 1),
+        opt_int("month", 7),
+        opt("member", CommandOptionValue::User(Id::new(BRUNO))),
+    ] {
+        let ix = birthday_ix(
+            opt_sub("set", vec![opt_int("month", 6), opt_int("day", 15), extra]),
+            ALICE,
+            Permissions::empty(),
+        );
+        let reply = dispatch_callback(&runtime, &mock, &ix).await;
+        assert_invalid_reply(&reply, "raw set options");
+        assert_eq!(
+            birthday_rows(&pool).await,
+            before,
+            "raw options cannot replace stored state"
+        );
+        let reply = dispatch_callback(&runtime, &mock, &show_ix(ALICE)).await;
+        assert!(
+            content_of(&reply).contains("May"),
+            "the original birthday survives"
+        );
+        assert!(
+            !content_of(&reply).contains("June"),
+            "the replacement was refused"
+        );
+    }
+
+    mock.shutdown().await;
+    db.close().await.expect("drop test database");
+}
+
+/// Catch treating a forged target option as an own query or exposing the
+/// target's stored birthday from a raw Discord payload.
+#[tokio::test]
+async fn raw_show_target_options_refused_without_reading_birthdays() {
+    let Some(url) = db_url() else { return };
+    let db = test_db(&url).await;
+    let pool = db.pool().clone();
+    let mock = start_stateful(Arc::new(DiscoState::default())).await;
+    let runtime = runtime_for(pool.clone(), executor_for(&mock));
+    let reply = dispatch_set(&runtime, &mock, ALICE, 5, 1).await;
+    assert!(content_of(&reply).contains("May"));
+    let reply = dispatch_set(&runtime, &mock, BRUNO, 7, 4).await;
+    assert!(content_of(&reply).contains("July"));
+    let before = birthday_rows(&pool).await;
+
+    for name in ["member", "user", "target"] {
+        let ix = birthday_ix(
+            opt_sub(
+                "show",
+                vec![opt(name, CommandOptionValue::User(Id::new(BRUNO)))],
+            ),
+            ALICE,
+            Permissions::empty(),
+        );
+        let reply = dispatch_callback(&runtime, &mock, &ix).await;
+        assert_invalid_reply(&reply, "targeted show");
+        let content = content_of(&reply);
+        assert!(
+            !content.contains("May") && !content.contains("July"),
+            "refusal reveals neither birthday"
+        );
+        assert_eq!(
+            birthday_rows(&pool).await,
+            before,
+            "targeted show never mutates state"
+        );
+    }
+
+    mock.shutdown().await;
+    db.close().await.expect("drop test database");
+}
+
 #[tokio::test]
 async fn own_query_only_never_leaks_other_member() {
     let Some(url) = db_url() else { return };
@@ -1370,6 +1698,185 @@ async fn restart_never_double_posts_nor_strands_role() {
     db.close().await.expect("drop test database");
 }
 
+/// Catch retrying a send whose success response was lost, including after a
+/// fresh pool/executor restart. Delivery uncertainty is not permission to resend.
+#[tokio::test]
+async fn uncertain_cheer_never_auto_resends_after_restart() {
+    let Some(url) = db_url() else { return };
+    let db = test_db(&url).await;
+    let pool = db.pool().clone();
+    let state = Arc::new(DiscoState::default());
+    let mock = start_stateful(Arc::clone(&state)).await;
+    let executor = executor_for(&mock);
+    let runtime = runtime_for(pool.clone(), executor.clone());
+    let reply = dispatch_callback(
+        &runtime,
+        &mock,
+        &config_ix(
+            Some(CHANNEL_ID),
+            Some(8130),
+            None,
+            ALICE,
+            Permissions::MANAGE_GUILD,
+        ),
+    )
+    .await;
+    assert_ephemeral(&reply, "config");
+    let reply = dispatch_set(&runtime, &mock, ALICE, 5, 1).await;
+    assert!(content_of(&reply).contains("May"));
+    state.uncertain_post.store(true, Ordering::SeqCst);
+    let now = utc_ms("2026-05-01T12:00:00.000Z");
+    // A failed receipt may surface as ErrorClass or be recorded internally;
+    // the observable contract is one wire send, never a blind retry.
+    let _outcome = MemberRuntime::run_birthday_sweep(&pool, &executor, GUILD_S, now).await;
+    assert_eq!(
+        channel_posts(&mock.requests(), CHANNEL_S).len(),
+        1,
+        "uncertain send is attempted once"
+    );
+
+    let pool2 = db.independent_pool().await.expect("restart pool");
+    let executor2 = executor_for(&mock);
+    sweep(&pool2, &executor2, now).await;
+    sweep(&pool, &executor, now).await;
+    assert_eq!(
+        channel_posts(&mock.requests(), CHANNEL_S).len(),
+        1,
+        "durable sending receipt fences every retry"
+    );
+    sweep(&pool2, &executor2, utc_ms("2026-05-02T12:00:00.000Z")).await;
+    assert!(
+        !member_roles(&state, &ALICE.to_string()).contains(ROLE_ID),
+        "uncertain cheer does not strand the role"
+    );
+
+    pool2.close().await;
+    mock.shutdown().await;
+    db.close().await.expect("drop test database");
+}
+
+/// Catch deleting the only cleanup witness along with the member's birthday.
+#[tokio::test]
+async fn removal_keeps_next_day_role_cleanup_after_restart() {
+    let Some(url) = db_url() else { return };
+    let db = test_db(&url).await;
+    let pool = db.pool().clone();
+    let state = Arc::new(DiscoState::default());
+    let mock = start_stateful(Arc::clone(&state)).await;
+    let executor = executor_for(&mock);
+    let runtime = runtime_for(pool.clone(), executor.clone());
+    runtime
+        .on_interaction(&config_ix(
+            Some(CHANNEL_ID),
+            Some(8130),
+            None,
+            ALICE,
+            Permissions::MANAGE_GUILD,
+        ))
+        .await;
+    let reply = dispatch_set(&runtime, &mock, ALICE, 5, 1).await;
+    assert!(content_of(&reply).contains("May"));
+    sweep(&pool, &executor, utc_ms("2026-05-01T12:00:00.000Z")).await;
+    assert!(
+        member_roles(&state, &ALICE.to_string()).contains(ROLE_ID),
+        "role granted before removal"
+    );
+    let reply = dispatch_callback(&runtime, &mock, &remove_ix(ALICE)).await;
+    assert_ephemeral(&reply, "remove");
+    let reply = dispatch_callback(&runtime, &mock, &show_ix(ALICE)).await;
+    let lowered = content_of(&reply).to_lowercase();
+    assert!(lowered.contains("not set") || lowered.contains("no birthday"));
+    drop(runtime);
+
+    let pool2 = db.independent_pool().await.expect("restart pool");
+    let executor2 = executor_for(&mock);
+    sweep(&pool2, &executor2, utc_ms("2026-05-02T12:00:00.000Z")).await;
+    assert!(
+        !member_roles(&state, &ALICE.to_string()).contains(ROLE_ID),
+        "removed birthday retains cleanup witness"
+    );
+    assert!(
+        role_ops(&mock.requests(), "DELETE").contains(&(ALICE.to_string(), ROLE_ID.to_owned())),
+        "cleanup reaches Discord"
+    );
+    assert_eq!(
+        channel_posts(&mock.requests(), CHANNEL_S).len(),
+        1,
+        "removed birthday is never re-cheered"
+    );
+
+    pool2.close().await;
+    mock.shutdown().await;
+    db.close().await.expect("drop test database");
+}
+
+/// Catch recording the role ledger only after PUT succeeds: cancel the worker
+/// while Discord already holds the role but has not acknowledged the grant.
+#[tokio::test]
+async fn role_ledger_precedes_put_and_survives_remove_during_crash() {
+    let Some(url) = db_url() else { return };
+    let db = test_db(&url).await;
+    let pool = db.pool().clone();
+    let state = Arc::new(DiscoState::default());
+    let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+    *state.hold_role_put.lock().expect("hold lock") = Some(seen_tx);
+    let mock = start_stateful(Arc::clone(&state)).await;
+    let executor = executor_for(&mock);
+    let runtime = runtime_for(pool.clone(), executor.clone());
+    runtime
+        .on_interaction(&config_ix(
+            Some(CHANNEL_ID),
+            Some(8130),
+            None,
+            ALICE,
+            Permissions::MANAGE_GUILD,
+        ))
+        .await;
+    let reply = dispatch_set(&runtime, &mock, ALICE, 5, 1).await;
+    assert!(content_of(&reply).contains("May"));
+    let task_pool = pool.clone();
+    let task_executor = executor.clone();
+    let task = tokio::spawn(async move {
+        MemberRuntime::run_birthday_sweep(
+            &task_pool,
+            &task_executor,
+            GUILD_S,
+            utc_ms("2026-05-01T12:00:00.000Z"),
+        )
+        .await
+    });
+    let seen = tokio::time::timeout(Duration::from_secs(5), seen_rx).await;
+    task.abort();
+    let _cancelled = task.await;
+    assert!(
+        matches!(seen, Ok(Ok(()))),
+        "sweep reached the role PUT before cancellation"
+    );
+    assert!(
+        member_roles(&state, &ALICE.to_string()).contains(ROLE_ID),
+        "Discord applied the unacknowledged grant"
+    );
+    let reply = dispatch_callback(&runtime, &mock, &remove_ix(ALICE)).await;
+    assert_ephemeral(&reply, "remove after crash");
+    drop(runtime);
+
+    let pool2 = db.independent_pool().await.expect("restart pool");
+    let executor2 = executor_for(&mock);
+    sweep(&pool2, &executor2, utc_ms("2026-05-02T12:00:00.000Z")).await;
+    assert!(
+        !member_roles(&state, &ALICE.to_string()).contains(ROLE_ID),
+        "pre-PUT ledger preserves cleanup after removal and restart"
+    );
+    assert!(
+        role_ops(&mock.requests(), "DELETE").contains(&(ALICE.to_string(), ROLE_ID.to_owned())),
+        "unacknowledged grant is cleaned on the wire"
+    );
+
+    pool2.close().await;
+    mock.shutdown().await;
+    db.close().await.expect("drop test database");
+}
+
 #[tokio::test]
 async fn sweep_caps_daily_cheers_but_roles_every_celebrant() {
     let Some(url) = db_url() else { return };
@@ -1425,6 +1932,48 @@ async fn sweep_caps_daily_cheers_but_roles_every_celebrant() {
         "every celebrant is still granted the role: {puts:?}"
     );
 
+    // Catch a per-invocation LIMIT 25 that lets overflow through on the next
+    // tick, or two independent workers each claiming their own daily budget.
+    let pool2 = db.independent_pool().await.expect("restart pool");
+    let executor2 = executor_for(&mock);
+    let now = utc_ms("2026-05-01T13:00:00.000Z");
+    for _ in 0..3 {
+        let (one, two) = tokio::join!(
+            MemberRuntime::run_birthday_sweep(&pool, &executor, GUILD_S, now),
+            MemberRuntime::run_birthday_sweep(&pool2, &executor2, GUILD_S, now),
+        );
+        assert!(one.is_ok() && two.is_ok(), "concurrent sweeps succeed");
+        assert_eq!(
+            channel_posts(&mock.requests(), CHANNEL_S).len(),
+            CELEBRANT_CHEER_CAP,
+            "daily cap survives repeated concurrent/restart sweeps"
+        );
+    }
+    assert_eq!(
+        role_ops(&mock.requests(), "PUT").len() as u64,
+        CAP_CELEBRANTS,
+        "repeat sweeps never re-grant"
+    );
+    for id in CAP_FIRST_ID..CAP_FIRST_ID + CAP_CELEBRANTS {
+        assert!(
+            member_roles(&state, &id.to_string()).contains(ROLE_ID),
+            "overflow {id} still has the day role"
+        );
+    }
+    // The budget is per date, not a permanent lifetime limit.
+    let next_date = utc_ms("2027-05-01T12:00:00.000Z");
+    let (one, two) = tokio::join!(
+        MemberRuntime::run_birthday_sweep(&pool, &executor, GUILD_S, next_date),
+        MemberRuntime::run_birthday_sweep(&pool2, &executor2, GUILD_S, next_date),
+    );
+    assert!(one.is_ok() && two.is_ok(), "cold concurrent sweeps succeed");
+    assert_eq!(
+        channel_posts(&mock.requests(), CHANNEL_S).len(),
+        2 * CELEBRANT_CHEER_CAP,
+        "new date has one shared cheer budget"
+    );
+
+    pool2.close().await;
     mock.shutdown().await;
     db.close().await.expect("drop test database");
 }
