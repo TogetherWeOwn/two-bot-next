@@ -117,7 +117,7 @@ remain: the voice room-name policy is\n\
 built once at boot from the process environment\n\
 (`crates/bot/src/gateway.rs:2080`); and gateway intents plus ticket command\n\
 publication read the ticket destination keys once at boot\n\
-(`crates/bot/src/gateway.rs:150`, `crates/bot/src/command_runtime.rs:431`), so a stored ticket\n\
+(`crates/bot/src/gateway.rs:150`, `crates/bot/src/command_runtime.rs:435`), so a stored ticket\n\
 destination reaches already-published commands only through the per-operation\n\
 refresh above. Every other\n\
 storable row's stored value is unwired.\n\n\
