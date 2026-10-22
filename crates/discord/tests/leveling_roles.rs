@@ -54,12 +54,13 @@ async fn ordinary_grants_are_idempotent_and_never_remove_roles() {
         level: 1,
         role_id: "5555".into(),
     }];
-    let plan = plan_reward_roles(1, &ladder, &["6666".into()], true, false);
+    let plan = plan_reward_roles(1, &ladder, &["6666".into()], true, false).unwrap();
     executor
         .execute_reward_roles(GUILD, USER, &plan, None)
         .await
         .unwrap();
-    let again = plan_reward_roles(1, &ladder, &["5555".into(), "6666".into()], true, false);
+    let again =
+        plan_reward_roles(1, &ladder, &["5555".into(), "6666".into()], true, false).unwrap();
     executor
         .execute_reward_roles(GUILD, USER, &again, None)
         .await
@@ -179,12 +180,13 @@ async fn forbidden_or_unreadable_role_readbacks_and_mutation_errors_are_observab
     let mock = MockRest::start(vec![], ScriptedResponse::status(403)).await;
     let mut plan = revoke_plan();
     plan.revoke.clear();
-    assert!(matches!(
-        executor(&mock)
-            .execute_reward_roles(GUILD, USER, &plan, None)
-            .await,
-        Err(DiscordError::Rejected(_))
-    ));
+    // A refused write after preflight is reported, not an opaque error.
+    let (applied, failed, skipped) = executor(&mock)
+        .execute_reward_roles(GUILD, USER, &plan, None)
+        .await
+        .unwrap();
+    assert!(applied.is_empty() && skipped.is_empty());
+    assert_eq!(failed.map(|(id, _)| id), Some("5555".to_owned()));
     assert_eq!(mock.requests().len(), 1);
     mock.shutdown().await;
 }
