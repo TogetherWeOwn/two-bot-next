@@ -718,7 +718,9 @@ fn baseline_adapter_stays_live_after_green() {
 fn hmac_service_key_path_authorizes_without_a_token() {
     // Slice 0 adds its step AFTER this gate; the gate itself keeps its
     // signature and behavior. Passes before and after the build.
-    let secret = "fixture-hmac-secret-at-least-32-bytes!";
+    // Derived (never a hardcoded HMAC-secret literal): body_hash returns 64
+    // hex chars, clearing the 32-byte key minimum.
+    let secret = body_hash(b"admin-token-registry-acceptance-hmac-secret");
     let keys = KeyRing::new(parse_keys(&format!("test-key:{secret}")).expect("test key parses"));
     let raw = br#"{"action":"event.read"}"#;
     let now_secs = std::time::SystemTime::now()
@@ -860,6 +862,8 @@ mod registry_db {
 
     const TEST_TOKEN: &str = "adm_0123456789abcdef";
     const TEST_HASH: &str = super::FIXTURE_SECRET_SHA256;
+    // sqlx binds `&str` as TEXT and Postgres has no text→timestamptz
+    // cast, so every use of these below carries `::timestamptz`.
     const ISSUED: &str = "2026-09-01T00:00:00Z";
     const EXPIRES: &str = "2026-11-30T00:00:00Z";
 
@@ -896,13 +900,27 @@ mod registry_db {
         .expect("probe registry table")
     }
 
+    /// Assert a rejected write failed with the expected SQLSTATE (the
+    /// *reason*), not just rejection: a type error (42804) here means the
+    /// test's own binds are wrong, not the constraint.
+    fn assert_sqlstate(err: &sqlx::Error, expected: &str, context: &str) {
+        let db_err = err
+            .as_database_error()
+            .unwrap_or_else(|| panic!("{context}: expected a Postgres error, got {err:?}"));
+        assert_eq!(
+            db_err.code().as_deref(),
+            Some(expected),
+            "{context}: wrong SQLSTATE"
+        );
+    }
+
     /// Insert the standard live token (revoked_at/last_used_at default).
     async fn insert_live_token(pool: &sqlx::PgPool, token_id: &str) {
         sqlx::query(
             "INSERT INTO admin_api_tokens
              (token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
              VALUES ($1, $2, '{read}', '{326474832151838730}',
-                     'fixture holder', 'fixture operator', $3, $4)",
+                     'fixture holder', 'fixture operator', $3::timestamptz, $4::timestamptz)",
         )
         .bind(token_id)
         .bind(TEST_HASH)
@@ -1023,7 +1041,7 @@ mod registry_db {
         // Lifecycle columns stay writable: revoke and touch work.
         sqlx::query(
             "UPDATE admin_api_tokens
-                SET revoked_at = $1, last_used_at = $1
+                SET revoked_at = $1::timestamptz, last_used_at = $1::timestamptz
               WHERE token_id = $2",
         )
         .bind(EXPIRES)
@@ -1047,21 +1065,22 @@ mod registry_db {
         let Some(db) = connect("scope-check").await else {
             return;
         };
-        let bad = sqlx::query(
+        let err = sqlx::query(
             "INSERT INTO admin_api_tokens
              (token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
-             VALUES ('adm_2000000000000000', $1, '{read,superuser}', '{1}', 'h', 'o', $2, $3)",
+             VALUES ('adm_2000000000000000', $1, '{read,superuser}', '{1}', 'h', 'o', $2::timestamptz, $3::timestamptz)",
         )
         .bind(TEST_HASH)
         .bind(ISSUED)
         .bind(EXPIRES)
         .execute(db.pool())
-        .await;
-        assert!(bad.is_err(), "unknown scopes must be rejected");
+        .await
+        .expect_err("unknown scopes must be rejected");
+        assert_sqlstate(&err, "23514", "scope CHECK");
         sqlx::query(
             "INSERT INTO admin_api_tokens
              (token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
-             VALUES ('adm_2000000000000001', $1, '{}', '{1}', 'h', 'o', $2, $3)",
+             VALUES ('adm_2000000000000001', $1, '{}', '{1}', 'h', 'o', $2::timestamptz, $3::timestamptz)",
         )
         .bind(TEST_HASH)
         .bind(ISSUED)
@@ -1076,28 +1095,30 @@ mod registry_db {
         let Some(db) = connect("guild-allowlist").await else {
             return;
         };
-        let empty = sqlx::query(
+        let err = sqlx::query(
             "INSERT INTO admin_api_tokens
              (token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
-             VALUES ('adm_2100000000000000', $1, '{read}', '{}', 'h', 'o', $2, $3)",
+             VALUES ('adm_2100000000000000', $1, '{read}', '{}', 'h', 'o', $2::timestamptz, $3::timestamptz)",
         )
         .bind(TEST_HASH)
         .bind(ISSUED)
         .bind(EXPIRES)
         .execute(db.pool())
-        .await;
-        assert!(empty.is_err(), "empty guild_ids must be rejected");
-        let null = sqlx::query(
+        .await
+        .expect_err("empty guild_ids must be rejected");
+        assert_sqlstate(&err, "23514", "guild CHECK");
+        let err = sqlx::query(
             "INSERT INTO admin_api_tokens
              (token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
-             VALUES ('adm_2100000000000001', $1, '{read}', NULL, 'h', 'o', $2, $3)",
+             VALUES ('adm_2100000000000001', $1, '{read}', NULL, 'h', 'o', $2::timestamptz, $3::timestamptz)",
         )
         .bind(TEST_HASH)
         .bind(ISSUED)
         .bind(EXPIRES)
         .execute(db.pool())
-        .await;
-        assert!(null.is_err(), "NULL guild_ids must be rejected");
+        .await
+        .expect_err("NULL guild_ids must be rejected");
+        assert_sqlstate(&err, "23502", "guild NOT NULL");
     }
 
     #[tokio::test]
@@ -1109,29 +1130,31 @@ mod registry_db {
             ("adm_2200000000000000", EXPIRES, EXPIRES),
             ("adm_2200000000000001", EXPIRES, ISSUED),
         ] {
-            let bad = sqlx::query(
+            let err = sqlx::query(
                 "INSERT INTO admin_api_tokens
                  (token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
-                 VALUES ($1, $2, '{read}', '{1}', 'h', 'o', $3, $4)",
+                 VALUES ($1, $2, '{read}', '{1}', 'h', 'o', $3::timestamptz, $4::timestamptz)",
             )
             .bind(token_id)
             .bind(TEST_HASH)
             .bind(issued)
             .bind(expires)
             .execute(db.pool())
-            .await;
-            assert!(bad.is_err(), "{token_id}: expires_at must exceed issued_at");
+            .await
+            .expect_err("{token_id}: expires_at must exceed issued_at");
+            assert_sqlstate(&err, "23514", "expiry CHECK");
         }
-        let null = sqlx::query(
+        let err = sqlx::query(
             "INSERT INTO admin_api_tokens
              (token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
-             VALUES ('adm_2200000000000002', $1, '{read}', '{1}', 'h', 'o', $2, NULL)",
+             VALUES ('adm_2200000000000002', $1, '{read}', '{1}', 'h', 'o', $2::timestamptz, NULL)",
         )
         .bind(TEST_HASH)
         .bind(ISSUED)
         .execute(db.pool())
-        .await;
-        assert!(null.is_err(), "NULL expires_at must be rejected");
+        .await
+        .expect_err("NULL expires_at must be rejected");
+        assert_sqlstate(&err, "23502", "expiry NOT NULL");
     }
 
     #[tokio::test]
@@ -1140,18 +1163,19 @@ mod registry_db {
             return;
         };
         insert_live_token(db.pool(), TEST_TOKEN).await;
-        let duplicate = sqlx::query(
+        let err = sqlx::query(
             "INSERT INTO admin_api_tokens
              (token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
-             VALUES ($1, $2, '{admin}', '{2}', 'other', 'other', $3, $4)",
+             VALUES ($1, $2, '{admin}', '{2}', 'other', 'other', $3::timestamptz, $4::timestamptz)",
         )
         .bind(TEST_TOKEN)
         .bind(TEST_HASH)
         .bind(ISSUED)
         .bind(EXPIRES)
         .execute(db.pool())
-        .await;
-        assert!(duplicate.is_err(), "duplicate token_id must be rejected");
+        .await
+        .expect_err("duplicate token_id must be rejected");
+        assert_sqlstate(&err, "23505", "token_id uniqueness");
     }
 
     #[tokio::test]
