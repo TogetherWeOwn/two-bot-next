@@ -1314,6 +1314,12 @@ jobs:
           PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/two-bot-coverage-tests
         run: |
           set -euo pipefail
+          # Each shard runs a leg subset on its own runner, so no earlier
+          # leg can be relied on to create the scratch dir (the monolith's
+          # sweep legs did so implicitly via create_dir_all). The
+          # member-moderation backup tests dump archives directly into it,
+          # so create it explicitly before any leg runs.
+          mkdir -p "${PAPERCLIP_RUN_SCRATCH_DIR:?scratch required}"
           rustup component add llvm-tools-preview
           archive="$RUNNER_TEMP/cargo-llvm-cov.tar.gz"
           for attempt in 1 2 3; do
