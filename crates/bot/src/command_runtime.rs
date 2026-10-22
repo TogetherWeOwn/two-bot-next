@@ -1508,7 +1508,15 @@ impl CommandRuntime {
         let reply = match tickets.execute(interaction, action).await {
             Ok(reply) => reply,
             Err(error) => {
-                warn!(error_class = ?error.class(), "ticket action incomplete");
+                let action_token = ticket_action_token(action);
+                match tickets.warn_ticket_context(interaction, action).await {
+                    Some((ticket_id, status)) => {
+                        warn!(error_class = ?error.class(), action = %action_token, ticket_id = %ticket_id, status = %status, "ticket action incomplete")
+                    }
+                    None => {
+                        warn!(error_class = ?error.class(), action = %action_token, "ticket action incomplete")
+                    }
+                }
                 error.reply()
             }
         };
@@ -2120,6 +2128,16 @@ impl CommandRuntime {
                 "sticky audit write failed"
             );
         }
+    }
+}
+
+/// Fixed-vocabulary token for the `ticket action incomplete` warn's `action`
+/// field.
+fn ticket_action_token(action: TicketAction) -> &'static str {
+    match action {
+        TicketAction::Open => "open",
+        TicketAction::Claim => "claim",
+        TicketAction::Close => "close",
     }
 }
 

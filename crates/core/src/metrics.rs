@@ -508,6 +508,38 @@ pub const EVENTSUB_RECONCILE_ERROR_CLASSES: &[&str] = &[
     "reconcile_failed",
     "other",
 ];
+/// Ticket lifecycle events for `two_bot_ticket_lifecycle_total{event,outcome}`:
+/// every retire, abandon, purge and successful claim/close counts once. The
+/// vocabulary is closed by the lifecycle observability contract (see
+/// `docs/ticket-lifecycle-observability.md`): every caller passes a member,
+/// so the trailing `close` collapse slot stays zero.
+pub const TICKET_LIFECYCLE_EVENTS: &[&str] = &["retire", "abandon", "purge", "claim", "close"];
+/// Terminal outcomes for `two_bot_ticket_lifecycle_total{event,outcome}`:
+/// the six success outcomes plus the shared `db_cause` vocabulary for
+/// storage failures (`crate::error_chain::db_cause`). Labels never carry
+/// member text, channel names, ticket ids or error strings. The trailing
+/// `query` slot is the collapse trapdoor, matching `db_cause` itself, which
+/// maps unrecognised failures to `query`.
+pub const TICKET_LIFECYCLE_OUTCOMES: &[&str] = &[
+    "retired",
+    "abandoned",
+    "already_gone",
+    "deleted",
+    "claimed",
+    "closed",
+    "unique_violation",
+    "foreign_key_violation",
+    "not_null_violation",
+    "check_violation",
+    "exclusion_violation",
+    "database",
+    "pool_timeout",
+    "pool_closed",
+    "worker_crashed",
+    "connection",
+    "row_not_found",
+    "query",
+];
 const BUCKETS_MICROS: &[u64] = &[
     1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000,
 ];
@@ -679,6 +711,7 @@ struct Values {
     eventsub_reconcile_passes: [u64; EVENTSUB_RECONCILE_OUTCOMES.len()],
     eventsub_reconcile_actions: [u64; EVENTSUB_RECONCILE_ACTIONS.len()],
     eventsub_reconcile_errors: [u64; EVENTSUB_RECONCILE_ERROR_CLASSES.len()],
+    ticket_lifecycle: [[u64; TICKET_LIFECYCLE_OUTCOMES.len()]; TICKET_LIFECYCLE_EVENTS.len()],
 }
 
 /// Storage is fixed-size, except the per-actor voice stall map, which is
@@ -1475,6 +1508,36 @@ impl Metrics {
         *counter = counter.saturating_add(1);
     }
 
+    /// One terminal ticket lifecycle event (see [`TICKET_LIFECYCLE_EVENTS`]
+    /// and [`TICKET_LIFECYCLE_OUTCOMES`]). Call once per retire, abandon,
+    /// successful claim and successful close, alongside the matching
+    /// `ticket_lifecycle` log line; the purge pass calls
+    /// [`Self::ticket_lifecycle_n`] with its deleted count instead. Unknown
+    /// events/outcomes collapse to the trailing slots only when the
+    /// allowlists grow; today every caller passes a member. No member text,
+    /// channel name, ticket id or error string ever becomes a label.
+    pub fn ticket_lifecycle(&self, event: &str, outcome: &str) {
+        self.ticket_lifecycle_n(event, outcome, 1);
+    }
+
+    /// Ticket lifecycle events counted with a pass-level multiplicity: the
+    /// purge pass reports its deleted count here (one sample per deleted
+    /// transcript body, not one per pass). Zero is a no-op. Unknown
+    /// events/outcomes collapse to the trailing slots only when the
+    /// allowlists grow.
+    pub fn ticket_lifecycle_n(&self, event: &str, outcome: &str, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.ticket_lifecycle[bounded_index(event, TICKET_LIFECYCLE_EVENTS)]
+            [bounded_index(outcome, TICKET_LIFECYCLE_OUTCOMES)];
+        *counter = counter.saturating_add(count);
+    }
+
     /// Current audit mirror delivery-halt state (M4.48): `true` while the
     /// persistent kill switch is engaged, `false` once it is cleared. Call
     /// once per readable `audit_retry` sweep from the store's `delivery_halt`
@@ -2244,6 +2307,21 @@ impl Metrics {
                 "two_bot_eventsub_reconcile_errors_total{{error_class=\"{error_class}\"}} {count}"
             )
             .unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_ticket_lifecycle_total",
+            "counter",
+            "Terminal ticket lifecycle events by bounded event and outcome; purge counts one per deleted transcript body.",
+        );
+        for (event, outcomes) in TICKET_LIFECYCLE_EVENTS.iter().zip(values.ticket_lifecycle) {
+            for (outcome, count) in TICKET_LIFECYCLE_OUTCOMES.iter().zip(outcomes) {
+                writeln!(
+                    out,
+                    "two_bot_ticket_lifecycle_total{{event=\"{event}\",outcome=\"{outcome}\"}} {count}"
+                )
+                .unwrap();
+            }
         }
         for (name, count) in [
             (
@@ -3436,6 +3514,60 @@ mod tests {
         assert!(
             text.contains("two_bot_eventsub_reconcile_errors_total{error_class=\"other\"} 100\n")
         );
+    }
+
+    #[test]
+    fn ticket_lifecycle_counts_once_per_event_and_by_deleted_count() {
+        let metrics = Metrics::default();
+        metrics.ticket_lifecycle("retire", "retired");
+        metrics.ticket_lifecycle("abandon", "already_gone");
+        metrics.ticket_lifecycle("claim", "claimed");
+        metrics.ticket_lifecycle("close", "closed");
+        metrics.ticket_lifecycle_n("purge", "deleted", 2);
+        metrics.ticket_lifecycle_n("purge", "deleted", 0);
+        metrics.ticket_lifecycle("purge", "pool_closed");
+        let text = metrics.render(None);
+        assert!(text
+            .contains("two_bot_ticket_lifecycle_total{event=\"retire\",outcome=\"retired\"} 1\n"));
+        assert!(text.contains(
+            "two_bot_ticket_lifecycle_total{event=\"abandon\",outcome=\"already_gone\"} 1\n"
+        ));
+        assert!(text
+            .contains("two_bot_ticket_lifecycle_total{event=\"claim\",outcome=\"claimed\"} 1\n"));
+        assert!(
+            text.contains("two_bot_ticket_lifecycle_total{event=\"close\",outcome=\"closed\"} 1\n")
+        );
+        assert!(text
+            .contains("two_bot_ticket_lifecycle_total{event=\"purge\",outcome=\"deleted\"} 2\n"));
+        assert!(text.contains(
+            "two_bot_ticket_lifecycle_total{event=\"purge\",outcome=\"pool_closed\"} 1\n"
+        ));
+        // Fixed cardinality: 5 events x (6 success outcomes + 12 db_cause outcomes).
+        let series: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("two_bot_ticket_lifecycle_total{"))
+            .collect();
+        assert_eq!(
+            series.len(),
+            TICKET_LIFECYCLE_EVENTS.len() * TICKET_LIFECYCLE_OUTCOMES.len()
+        );
+        assert_eq!(TICKET_LIFECYCLE_EVENTS.len(), 5);
+        assert_eq!(TICKET_LIFECYCLE_OUTCOMES.len(), 18);
+    }
+
+    #[test]
+    fn ticket_lifecycle_hostile_labels_collapse_without_new_series() {
+        let metrics = Metrics::default();
+        let before = metrics.render(None).lines().count();
+        for id in 0..100 {
+            let hostile = format!("{id}\"\\\nsecret=value");
+            metrics.ticket_lifecycle(&hostile, &hostile);
+        }
+        let text = metrics.render(None);
+        assert_eq!(text.lines().count(), before);
+        assert!(!text.contains("secret"));
+        assert!(text
+            .contains("two_bot_ticket_lifecycle_total{event=\"close\",outcome=\"query\"} 100\n"));
     }
 
     #[test]
