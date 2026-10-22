@@ -86,6 +86,14 @@ transaction, and reads the guild high-water back through it before touching
 the mirror. The table carries no member column, so there is nothing to
 erase and no reader grant beyond the app pool.
 
+The admin API token registry (`admin_api_tokens`) is ordinary `table` kind
+for the same reason: the container authorizer reads the token row through
+the app pool when the later transport slices land (slice 0 ships the table
+with no reader yet). Secrets are hash-only; `issued_by` is operator
+attribution retained by the erasure allowlist. The table carries no member
+column, so there is nothing to erase and no reader grant beyond the app
+pool.
+
 The giveaway tables (`giveaways`, `giveaway_entries`, `giveaway_draws`) are
 ordinary `table` kind for the same reason: the giveaway store creates,
 enters, leases and draws through the app pool. Unlike the tables above they

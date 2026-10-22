@@ -644,10 +644,10 @@ async fn store_chain_enforces_the_giveaway_foreign_keys() -> Result<(), sqlx::Er
         return Ok(());
     };
     let pool = fixture.pool().clone();
-    // The store chain (0456, the copy the production boot runner applies)
-    // carries the same composite foreign keys as the cutover chain (0455):
+    // The store chain (0459, the copy the production boot runner applies)
+    // carries the same composite foreign keys as the cutover chain (0458):
     // orphan entries and draws fail, and a parent delete with live children
-    // is refused. Stripping either FOREIGN KEY line from 0456 must turn
+    // is refused. Stripping either FOREIGN KEY line from 0459 must turn
     // these assertions red.
     let missing_entry = store::upsert_entry(&pool, GUILD, "gw-missing", "100000000000001", at(1))
         .await

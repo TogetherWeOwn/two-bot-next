@@ -463,6 +463,64 @@ async fn nested_inviter_session_keys_and_owned_children_are_included() {
     db.close().await.unwrap();
 }
 
+/// A recorded host check-in names the checked-in member in the audit row's
+/// `target_key` while the acting host stays the `actor_id`, so member
+/// erasure must match the target key too: erasing the checked-in member
+/// removes the row even though its actor (the host) differs.
+#[tokio::test]
+async fn checkin_audit_target_key_namesake_is_erased() {
+    let Some(db) = database().await else { return };
+    seed(db.pool()).await;
+    // On-behalf host check-in of USER: actor OTHER, member USER in the
+    // target key, seeded through the same constructor the handler uses.
+    let audit = two_bot_core::RsvpAudit::for_checkin(
+        "checkin:erase-target",
+        GUILD,
+        OTHER,
+        "1546451670500642999:2026-09-30",
+        USER,
+        "2026-10-01T00:00:00.000Z",
+    );
+    assert!(
+        two_bot_core::write_audit(db.pool(), &audit).await.unwrap(),
+        "check-in audit row seeds"
+    );
+    let before = erase_member(db.pool(), GUILD, USER, ErasureMode::DryRun)
+        .await
+        .unwrap();
+    assert_eq!(
+        before
+            .iter()
+            .find(|row| row.table == "announcements_audit_log")
+            .unwrap()
+            .rows,
+        2
+    );
+    assert_eq!(
+        erase_member(
+            db.pool(),
+            GUILD,
+            USER,
+            ErasureMode::Execute { actor: ACTOR }
+        )
+        .await
+        .unwrap(),
+        before
+    );
+    let remaining: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM announcements_audit_log WHERE guild_id = $1")
+            .bind(GUILD)
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        remaining,
+        [format!("{GUILD}:{OTHER}")],
+        "only the other member's row survives"
+    );
+    db.close().await.unwrap();
+}
+
 /// An operator-released request never had its Discord effect proven. Its ledger
 /// row is the only thing that makes a delayed delivery of the old key refuse
 /// instead of claiming afresh and repeating the mutation, so no erasure may

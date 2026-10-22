@@ -69,6 +69,10 @@ pub struct TableSpec {
 /// here, and on any entry here that appears in neither list (outside the two
 /// documented feed tables).
 pub const TABLE_SPECS: &[TableSpec] = &[
+    // Admin API token registry (0456/0457): issuance plus the revocation and
+    // last-use lifecycle writes; expires_at is a future deadline, not a
+    // write time, so it stays out of the measure.
+    TableSpec { table: "admin_api_tokens", measure: TableMeasure::Columns(&["issued_at", "revoked_at", "last_used_at"]) },
     TableSpec { table: "announcements_audit_log", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec { table: "assistant_monthly_builds", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "audit_kill_switch", measure: TableMeasure::Columns(&["engaged_at"]) },
@@ -118,7 +122,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
         measure: TableMeasure::Unmeasurable("transient restart-recovery queue with no timestamp column (occurred_at_ms is a gateway event time); rows hold no durable member state", DISPOSITION_ACCEPT_WITH_REASON),
     },
     TableSpec { table: "gateway_sessions", measure: TableMeasure::Columns(&["updated_at"]) },
-    // Timed-entry giveaways (0455/0456): every definition mutation stamps
+    // Timed-entry giveaways (0458/0459): every definition mutation stamps
     // updated_at (create, claim, release, status, draw, announce), so its
     // maximum is the row's last write. Entries and draws are insert-only;
     // their insert stamps are the last write.
