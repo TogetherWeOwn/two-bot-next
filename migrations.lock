@@ -452,6 +452,14 @@
     "crates/store/migrations/0451_scheduled_events_claim.sql": {
       "sha256": "7a76512da8e7033e41a655955db9a7e243e55d92bf2a747312f2809399b927b2",
       "justification": "Store-chain copy of the scheduled_events_claim epoch gate (cutover 0450): one new table, IF NOT EXISTS, no writes to the existing mirror. Numbered 0451 because cutover owns 0450; global migration numbers remain unique across both chains."
+    },
+    "crates/cutover/migrations/0452_giveaways.sql": {
+      "justification": "Giveaways slice 1: new guild-scoped giveaways (claim-lease draw ticker), giveaway_entries (weight reserved at 1) and giveaway_draws (eligible_hash, seed, winner_ids, reroll_kind) tables with range checks; additive IF NOT EXISTS. Numbered 0452; the store chain owns the 0453 copy; global migration numbers remain unique across both chains.",
+      "sha256": "f3e819cb7580bde5ae43787b7b7696c0bacb8da2437bf45cb75274fef6ce26f4"
+    },
+    "crates/store/migrations/0453_giveaways.sql": {
+      "justification": "Store-chain copy of the giveaways slice-1 tables (cutover 0452): giveaways, giveaway_entries and giveaway_draws, identical DDL, additive IF NOT EXISTS. Numbered 0453 because cutover owns 0452; global migration numbers remain unique across both chains.",
+      "sha256": "b04f2f2a526ed978cefb4c7c4e84454ac0360dea385dea4a54a3dd42a0a6dd53"
     }
   }
 }
