@@ -44,7 +44,7 @@
 use super::*;
 use crate::{
     command_runtime::CommandRuntime,
-    discord_test_common::{MockRest, ScriptedResponse},
+    discord_test_common::{MockRest, RestRequest, ScriptedResponse},
 };
 use serde_json::json;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -343,6 +343,17 @@ fn assert_log_field(line: &str, field: &str, value: &str) {
     );
 }
 
+/// Visible channel-marker posts (mirrors the member-truthfulness slice):
+/// a committed claim posts exactly one `POST .../channels/600/messages`.
+fn marker_posts(requests: &[RestRequest]) -> Vec<&RestRequest> {
+    requests
+        .iter()
+        .filter(|request| {
+            request.method == "POST" && request.path.ends_with("/channels/600/messages")
+        })
+        .collect()
+}
+
 fn stale_created_at() -> i64 {
     now_millis_for_test() - INTERRUPTED_AFTER_MS - 60_000
 }
@@ -569,8 +580,13 @@ async fn abandon_creating_false_counts_already_gone_and_logs() {
 #[ignore = "requires agent-testdb or CI service container"]
 async fn claim_success_counts_and_logs_once() {
     let db = TestDb::new().await;
-    // Claim performs no Discord I/O: authorize plus two store calls.
-    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    // A committed claim posts one visible channel marker (merged main
+    // behavior): script its 200 + id receipt.
+    let mock = MockRest::start(
+        vec![ScriptedResponse::json(200, json!({"id":"900"}))],
+        ScriptedResponse::status(500),
+    )
+    .await;
     let runtime = runtime(db.pool.clone(), &mock);
     active_as(&runtime, "lc-claim-1", "500", "600").await;
     let claim = button(TicketAction::Claim, "100", "501", vec!["300"], 0);
@@ -580,7 +596,29 @@ async fn claim_success_counts_and_logs_once() {
 
     let ticket = runtime.store.get("lc-claim-1").await.unwrap().unwrap();
     assert_eq!(ticket.claimed_by.as_deref(), Some("501"));
-    assert!(mock.requests().is_empty(), "claim stays off the wire");
+    // Exactly one marker POST naming the claimant; no other Discord I/O.
+    let requests = mock.requests();
+    let markers = marker_posts(&requests);
+    assert_eq!(
+        markers.len(),
+        1,
+        "committed claim posts one channel marker: {requests:?}"
+    );
+    let body: Value = serde_json::from_slice(&markers[0].body).unwrap();
+    let content = body["content"].as_str().expect("visible marker content");
+    assert!(
+        content.contains("<@501>"),
+        "marker must name the claimant: {content}"
+    );
+    assert!(
+        content.to_lowercase().contains("claim"),
+        "marker must describe the claim: {content}"
+    );
+    assert_eq!(
+        requests.len(),
+        1,
+        "claim performs no other Discord I/O: {requests:?}"
+    );
     let text = two_bot_core::metrics::global().render(None);
     let series = format!("{SERIES}{{event=\"claim\",outcome=\"claimed\"}}");
     assert!(
@@ -847,9 +885,15 @@ async fn recovery_deferred_warn_carries_action_ticket_and_status() {
 #[ignore = "requires agent-testdb or CI service container"]
 async fn ticket_action_incomplete_warn_carries_action_ticket_and_status() {
     let db = TestDb::new().await;
+    // Wire order per interaction is defer, then (inside execute) the claim-1
+    // channel marker, then the deferred-reply edit. The marker consumes one
+    // script slot, so without it the second defer receives the wrong receipt
+    // and fails before execute runs. Edits keep their `{}` bodies (tolerated
+    // edit failures, as before); only the defers must succeed.
     let mock = MockRest::start(
         vec![
             ScriptedResponse::status(204),
+            ScriptedResponse::json(200, json!({"id":"900"})),
             ScriptedResponse::json(200, json!({})),
             ScriptedResponse::status(204),
             ScriptedResponse::json(200, json!({})),
