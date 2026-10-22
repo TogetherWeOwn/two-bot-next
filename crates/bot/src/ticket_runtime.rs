@@ -198,12 +198,17 @@ where
         let status = ticket.status.as_str();
         // The timeout arm reports no attempted action: the future never
         // finished selecting one. `None` likewise covers a transcript-probe
-        // failure before any action was selected.
-        let (result, attempted) =
-            match bounded(remaining.min(RECOVERY_ITEM_TIMEOUT), action(ticket)).await {
-                Ok(outcome) => outcome,
-                Err(error) => (Err(error), None),
-            };
+        // failure before any action was selected. The timeout wraps the
+        // tuple future directly (`bounded` only wraps `Result` futures).
+        let (result, attempted) = match tokio::time::timeout(
+            remaining.min(RECOVERY_ITEM_TIMEOUT),
+            action(ticket),
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(_) => (Err(Failure::Timeout), None),
+        };
         if let Err(error) = result {
             failed = Some(error.class());
             match attempted {
