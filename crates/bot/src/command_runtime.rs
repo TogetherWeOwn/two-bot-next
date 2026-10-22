@@ -551,6 +551,12 @@ impl CommandRuntime {
         &self.interactions.router
     }
 
+    /// Default bump-reminder cooldown in seconds (DISBOARD's 2-hour cooldown).
+    /// Used when `TWO_BUMP_COOLDOWN_SECS` is absent or unparseable.
+    pub(crate) fn bump_default_cooldown_secs(&self) -> u64 {
+        7200
+    }
+
     /// Bootstrap before constructing the shard, reusing this runtime's router,
     /// pool and executor (including its proxy and shared pacing state).
     pub(crate) async fn initialize_custom_commands(
