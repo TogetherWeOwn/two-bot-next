@@ -123,6 +123,17 @@ impl Poll {
     }
 
     async fn tick(&self) -> Result<(), ErrorClass> {
+        // The /ops override layer polls first and always, independent of
+        // pool init: the incident lever must land during a Postgres outage
+        // too (the tick still fails as Database below), and a guild
+        // early-return must never skip the ops read. Fully-qualified core
+        // items keep this file's header line numbers (cited by the
+        // configuration reference) unshifted.
+        if let Some(fetched) = poll_ops_record().await {
+            let mut writer = self.writer.lock().await;
+            let outcome = writer.apply_ops(fetched.as_ref().ok(), std::time::Instant::now());
+            log_ops(&outcome, fetched.as_ref().err());
+        }
         let pool = self
             .pool
             .get_or_try_init(|| async {
@@ -139,45 +150,38 @@ impl Poll {
 }
 
 async fn poll_once(pool: &PgPool, writer: &Mutex<LiveSettingsWriter>) -> Result<(), ErrorClass> {
-    // The /ops override layer polls first and always: the incident lever
-    // must land during a Postgres outage too, and a guild early-return must
-    // never skip the ops read (an ops-only change takes effect next tick).
-    // The heavy paths use fully-qualified core items so this file's header
-    // line numbers (cited by the configuration reference) never shift.
-    let ops_outcome = poll_ops_record().await;
-    if let Some(fetched) = ops_outcome {
-        let mut writer = writer.lock().await;
-        let outcome = writer.apply_ops(fetched.as_ref().ok(), std::time::Instant::now());
-        log_ops(&outcome, fetched.as_ref().err());
-    }
     let store = SettingsStore::new(pool);
     let (revision, rows) = store.poll_marks().await.map_err(|_| ErrorClass::Database)?;
-    let guild_moved = writer.lock().await.needs_refresh(revision, rows);
-    let snapshot = if guild_moved {
-        let snapshot = store
-            .load_snapshot()
-            .await
-            .map_err(|_| ErrorClass::Database)?;
-        if let Err(reason) = validate_snapshot(&snapshot) {
-            // Refuse the whole snapshot: a partial apply could pair a new value
-            // with a stale neighbouring row.
-            tracing::error!(reason, "settings_snapshot_rejected");
-            return Err(ErrorClass::Configuration);
+    {
+        let writer = writer.lock().await;
+        if !writer.needs_refresh(revision, rows) {
+            return Ok(());
         }
-        Some(snapshot)
-    } else {
-        None
-    };
-    if let Some(snapshot) = &snapshot {
-        let report = writer.lock().await.publish(snapshot);
-        log_applied(&report);
     }
+    let snapshot = store
+        .load_snapshot()
+        .await
+        .map_err(|_| ErrorClass::Database)?;
+    if let Err(reason) = validate_snapshot(&snapshot) {
+        // Refuse the whole snapshot: a partial apply could pair a new value
+        // with a stale neighbouring row.
+        tracing::error!(reason, "settings_snapshot_rejected");
+        return Err(ErrorClass::Configuration);
+    }
+    let report = writer.lock().await.publish(&snapshot);
+    log_applied(&report);
     Ok(())
 }
 
 /// Fetch one /ops record, or `None` when the layer is disabled (no URL).
 /// Fetch failures resolve to `Some(Err(..))` so the writer can age the last
 /// good record toward expiry; only a missing URL skips the apply.
+///
+/// Test note: the URL is process-global per tick, so only one test in the
+/// suite may set it (the protected ops acceptance test — do not add
+/// another, concurrent tickers would share its mock). The runners isolate
+/// that test: nextest runs each test in its own process, and nightly runs
+/// single-threaded.
 async fn poll_ops_record(
 ) -> Option<Result<two_bot_core::settings::OpsRecord, two_bot_core::ops_fetch::OpsFetchError>> {
     let Some(url) = two_bot_core::ops_fetch::ops_url_from_env() else {

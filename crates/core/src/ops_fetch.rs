@@ -100,6 +100,8 @@ fn parse_ops_url(raw: &str) -> Option<Uri> {
 }
 
 /// GET the ops record at `url`, exactly as given, with an optional bearer.
+/// The deadline covers the whole fetch — connect, headers, and body — so a
+/// stalled body cannot starve the guild poll behind it.
 ///
 /// A fresh client per call (feeds_connector precedent): the 15 s cadence
 /// makes pool reuse worthless and keeps test-global clients out of the
@@ -110,6 +112,12 @@ pub async fn fetch_ops_record(
     token: Option<&str>,
     timeout: Duration,
 ) -> Result<OpsRecord, OpsFetchError> {
+    tokio::time::timeout(timeout, fetch_inner(url, token))
+        .await
+        .map_err(|_| OpsFetchError::Timeout)?
+}
+
+async fn fetch_inner(url: &Uri, token: Option<&str>) -> Result<OpsRecord, OpsFetchError> {
     let https = HttpsConnectorBuilder::new()
         .with_webpki_roots()
         .https_or_http()
@@ -128,9 +136,9 @@ pub async fn fetch_ops_record(
     let request = request
         .body(Empty::<Bytes>::new())
         .map_err(|_| OpsFetchError::Transport)?;
-    let response = tokio::time::timeout(timeout, client.request(request))
+    let response = client
+        .request(request)
         .await
-        .map_err(|_| OpsFetchError::Timeout)?
         .map_err(|_| OpsFetchError::Transport)?;
     if !response.status().is_success() {
         return Err(OpsFetchError::Status(response.status().as_u16()));
@@ -354,6 +362,29 @@ mod tests {
         .await;
         assert_eq!(
             fetch_ops_record(&slow.url, None, Duration::from_millis(50)).await,
+            Err(OpsFetchError::Timeout)
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_stalled_body_times_out() {
+        // Headers flush at once; the body stalls past the deadline. The
+        // timeout covers the whole fetch, not just connect + headers.
+        let stalled = MockOps::serve(|_seen| {
+            axum::Router::new().route(
+                "/ops/config",
+                axum::routing::get(|| async {
+                    let body = futures_util::stream::once(async {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        Ok::<_, std::convert::Infallible>(Bytes::from_static(b"too late"))
+                    });
+                    axum::body::Body::from_stream(body)
+                }),
+            )
+        })
+        .await;
+        assert_eq!(
+            fetch_ops_record(&stalled.url, None, Duration::from_millis(50)).await,
             Err(OpsFetchError::Timeout)
         );
     }
