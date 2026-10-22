@@ -13,6 +13,11 @@ written to reminder logs or audit records.
 
 The existing activation-fenced automation scheduler must be enabled; its normal
 15-second cadence also handles these reminders, at most two events per tick.
+Ordinary scheduled messages run first: a failure that stops their batch also
+skips reminders for that tick. Reminder database or result-audit errors fail the
+shared job's health signal rather than being reported as a healthy tick; prior
+scheduled-message completions remain committed. Sustained scheduler/store
+trouble can therefore cause a reminder window to be missed.
 It reads the guild-scoped scheduled-event mirror and stored RSVPs, not a new live
 Discord lookup. A mirror update after dispatch admission cannot recall a message
 already in flight. As with other mirrored event views, a Discord cancellation
