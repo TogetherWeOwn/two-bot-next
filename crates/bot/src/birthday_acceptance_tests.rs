@@ -115,14 +115,12 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
-use twilight_model::application::command::CommandType;
 use twilight_model::application::interaction::application_command::{
-    CommandData, CommandDataOption, CommandOptionValue,
+    CommandDataOption, CommandOptionValue,
 };
-use twilight_model::application::interaction::{Interaction, InteractionData, InteractionType};
-use twilight_model::guild::{MemberFlags, Permissions};
+use twilight_model::application::interaction::{Interaction, InteractionData};
+use twilight_model::guild::Permissions;
 use twilight_model::id::{AnonymizableId, Id};
-use twilight_model::oauth::ApplicationIntegrationMap;
 use twilight_model::user::User;
 use two_bot_core::commands::{CommandOption, CommandOptionType};
 use two_bot_core::{
@@ -279,59 +277,26 @@ fn opt_int(name: &str, value: i64) -> CommandDataOption {
 }
 
 /// One `/birthday …` interaction from `member` with `permissions` and a fresh
-/// id/token, so repeated dispatches never collide on nonce recovery.
-#[allow(deprecated)]
+/// id/token, so repeated dispatches never collide on nonce recovery. Built on
+/// the shared `slash` helper (which owns the deprecated wire fields), then
+/// re-homed to this suite's guild and actor.
 fn birthday_ix(
     subcommand: CommandDataOption,
     member: u64,
     permissions: Permissions,
 ) -> Interaction {
     let n = NEXT_IX.fetch_add(1, Ordering::Relaxed);
-    Interaction {
-        app_permissions: None,
-        application_id: Id::new(1111),
-        authorizing_integration_owners: ApplicationIntegrationMap {
-            guild: Some(AnonymizableId::Id(Id::new(GUILD_ID))),
-            user: None,
-        },
-        channel: None,
-        channel_id: Some(Id::new(CHANNEL_ID)),
-        context: None,
-        data: Some(InteractionData::ApplicationCommand(Box::new(CommandData {
-            guild_id: None,
-            id: Id::new(1),
-            name: "birthday".to_owned(),
-            kind: CommandType::ChatInput,
-            options: vec![subcommand],
-            resolved: None,
-            target_id: None,
-        }))),
-        entitlements: Vec::new(),
-        guild: None,
-        guild_id: Some(Id::new(GUILD_ID)),
-        guild_locale: None,
-        id: Id::new(n),
-        kind: InteractionType::ApplicationCommand,
-        locale: None,
-        member: Some(twilight_model::guild::PartialMember {
-            avatar: None,
-            avatar_decoration_data: None,
-            banner: None,
-            communication_disabled_until: None,
-            deaf: false,
-            flags: MemberFlags::empty(),
-            joined_at: None,
-            mute: false,
-            nick: None,
-            permissions: Some(permissions),
-            premium_since: None,
-            roles: Vec::new(),
-            user: Some(user(member)),
-        }),
-        message: None,
-        token: format!("birthday-test-{n}"),
-        user: Some(user(member)),
-    }
+    let mut ix =
+        crate::command_runtime_tests::slash("birthday", Some(CHANNEL_ID), vec![subcommand]);
+    ix.id = Id::new(n);
+    ix.token = format!("birthday-test-{n}");
+    ix.guild_id = Some(Id::new(GUILD_ID));
+    ix.authorizing_integration_owners.guild = Some(AnonymizableId::Id(Id::new(GUILD_ID)));
+    let resolved = ix.member.as_mut().expect("guild member");
+    resolved.user = Some(user(member));
+    resolved.permissions = Some(permissions);
+    ix.user = Some(user(member));
+    ix
 }
 
 fn set_ix(member: u64, month: i64, day: i64) -> Interaction {
