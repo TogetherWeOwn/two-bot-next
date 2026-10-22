@@ -206,35 +206,37 @@ fn assert_unique_violation<T>(result: Result<T, sqlx::Error>, what: &str) {
     );
 }
 
+/// Seed row for [`mint`]: one row in `admin_confirms`. Bundled so the helper
+/// stays under the lint argument limit with no waiver.
+struct ConfirmSeed<'a> {
+    confirm_id: &'a str,
+    token_id: &'a str,
+    guild_id: &'a str,
+    verb: &'a str,
+    plan_hash: &'a str,
+    params_hash: &'a str,
+    expires_in_seconds: i64,
+}
+
 /// Mint one confirm expiring `expires_in_seconds` from now (negative = already
 /// expired). The builder's production mint wraps this shape with
 /// `expires_in_seconds = 300` and unit tests pinning that TTL.
-#[allow(clippy::too_many_arguments)]
-async fn mint(
-    pool: &PgPool,
-    confirm_id: &str,
-    token_id: &str,
-    guild_id: &str,
-    verb: &str,
-    plan_hash: &str,
-    params_hash: &str,
-    expires_in_seconds: i64,
-) {
+async fn mint(pool: &PgPool, seed: &ConfirmSeed<'_>) {
     sqlx::query(
         "INSERT INTO admin_confirms \
          (confirm_id, token_id, guild_id, verb, plan_hash, params_hash, expires_at) \
          VALUES ($1, $2, $3, $4, $5, $6, clock_timestamp() + ($7 * interval '1 second'))",
     )
-    .bind(confirm_id)
-    .bind(token_id)
-    .bind(guild_id)
-    .bind(verb)
-    .bind(plan_hash)
-    .bind(params_hash)
-    .bind(expires_in_seconds)
+    .bind(seed.confirm_id)
+    .bind(seed.token_id)
+    .bind(seed.guild_id)
+    .bind(seed.verb)
+    .bind(seed.plan_hash)
+    .bind(seed.params_hash)
+    .bind(seed.expires_in_seconds)
     .execute(pool)
     .await
-    .unwrap_or_else(|error| panic!("mint confirm {confirm_id}: {error}"));
+    .unwrap_or_else(|error| panic!("mint confirm {}: {error}", seed.confirm_id));
 }
 
 /// The claim every builder implementation must execute: one atomic statement,
@@ -431,34 +433,36 @@ async fn internal_action_log_carries_nullable_admin_attribution() {
     fixture.close().await.unwrap();
 }
 
-/// One audit row write through the builder's column contract.
-#[allow(clippy::too_many_arguments)]
-async fn write_audit(
-    pool: &PgPool,
-    token_id: &str,
-    scope: &str,
-    guild_id: &str,
-    verb: &str,
-    params: &serde_json::Value,
+/// Audit row for [`write_audit`]: one row in `admin_api_audit`. Bundled so the
+/// helper stays under the lint argument limit with no waiver.
+struct AuditRow<'a> {
+    token_id: &'a str,
+    scope: &'a str,
+    guild_id: &'a str,
+    verb: &'a str,
+    params: &'a serde_json::Value,
     dry_run: bool,
-    confirm_id: Option<&str>,
-    decision: &str,
+    confirm_id: Option<&'a str>,
+    decision: &'a str,
     receipt: Option<i64>,
-) -> Result<(), sqlx::Error> {
+}
+
+/// One audit row write through the builder's column contract.
+async fn write_audit(pool: &PgPool, row: &AuditRow<'_>) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO admin_api_audit \
          (token_id, scope, guild_id, verb, params_redacted, dry_run, confirm_id, decision, receipt) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
-    .bind(token_id)
-    .bind(scope)
-    .bind(guild_id)
-    .bind(verb)
-    .bind(sqlx::types::Json(params))
-    .bind(dry_run)
-    .bind(confirm_id)
-    .bind(decision)
-    .bind(receipt)
+    .bind(row.token_id)
+    .bind(row.scope)
+    .bind(row.guild_id)
+    .bind(row.verb)
+    .bind(sqlx::types::Json(row.params))
+    .bind(row.dry_run)
+    .bind(row.confirm_id)
+    .bind(row.decision)
+    .bind(row.receipt)
     .execute(pool)
     .await
     .map(|_| ())
@@ -475,68 +479,78 @@ async fn audit_rows_land_for_allowed_denied_and_dry_run_with_attribution() {
     let pool = fixture.pool();
     mint(
         pool,
-        "cfm_audit_confirmed_01",
-        &token_id('a'),
-        GUILD,
-        "moderation.ban",
-        &hex64(10),
-        &hex64(11),
-        300,
+        &ConfirmSeed {
+            confirm_id: "cfm_audit_confirmed_01",
+            token_id: &token_id('a'),
+            guild_id: GUILD,
+            verb: "moderation.ban",
+            plan_hash: &hex64(10),
+            params_hash: &hex64(11),
+            expires_in_seconds: 300,
+        },
     )
     .await;
     write_audit(
         pool,
-        &token_id('1'),
-        "moderate",
-        GUILD,
-        "moderation.warn",
-        &json!({"limit": 25}),
-        false,
-        None,
-        "allowed",
-        None,
+        &AuditRow {
+            token_id: &token_id('1'),
+            scope: "moderate",
+            guild_id: GUILD,
+            verb: "moderation.warn",
+            params: &json!({"limit": 25}),
+            dry_run: false,
+            confirm_id: None,
+            decision: "allowed",
+            receipt: None,
+        },
     )
     .await
     .expect("allowed audit row lands");
     write_audit(
         pool,
-        &token_id('2'),
-        "read",
-        GUILD,
-        "channel.create",
-        &json!({"limit": 1}),
-        false,
-        None,
-        "denied",
-        None,
+        &AuditRow {
+            token_id: &token_id('2'),
+            scope: "read",
+            guild_id: GUILD,
+            verb: "channel.create",
+            params: &json!({"limit": 1}),
+            dry_run: false,
+            confirm_id: None,
+            decision: "denied",
+            receipt: None,
+        },
     )
     .await
     .expect("denied audit row lands");
     write_audit(
         pool,
-        &token_id('3'),
-        "admin",
-        GUILD,
-        "moderation.ban",
-        &json!({"dry_run": true}),
-        true,
-        None,
-        "dry_run",
-        None,
+        &AuditRow {
+            token_id: &token_id('3'),
+            scope: "admin",
+            guild_id: GUILD,
+            verb: "moderation.ban",
+            params: &json!({"dry_run": true}),
+            dry_run: true,
+            confirm_id: None,
+            decision: "dry_run",
+            receipt: None,
+        },
     )
     .await
     .expect("dry-run audit row lands");
     write_audit(
         pool,
-        &token_id('a'),
-        "admin",
-        GUILD,
-        "moderation.ban",
-        &json!({}),
-        false,
-        Some("cfm_audit_confirmed_01"),
-        "confirmed",
-        None,
+        &AuditRow {
+            token_id: &token_id('a'),
+            scope: "admin",
+            guild_id: GUILD,
+            verb: "moderation.ban",
+            params: &json!({}),
+            dry_run: false,
+            confirm_id: Some("cfm_audit_confirmed_01"),
+            decision: "confirmed",
+            receipt: None,
+        },
     )
     .await
     .expect("confirmed audit row lands");
@@ -594,15 +608,17 @@ async fn audit_decision_vocabulary_is_closed() {
     for decision in ["maybe", "ALLOWED", ""] {
         let result = write_audit(
             pool,
-            &token_id('b'),
-            "read",
-            GUILD,
-            "guild.read",
-            &json!({}),
-            false,
-            None,
-            decision,
-            None,
+            &AuditRow {
+                token_id: &token_id('b'),
+                scope: "read",
+                guild_id: GUILD,
+                verb: "guild.read",
+                params: &json!({}),
+                dry_run: false,
+                confirm_id: None,
+                decision,
+                receipt: None,
+            },
         )
         .await;
         assert_check_violation(result, &format!("decision {decision:?}"));
@@ -620,15 +636,17 @@ async fn audit_scope_vocabulary_is_closed() {
     for (nibble, scope) in [('c', "read"), ('d', "moderate"), ('e', "admin")] {
         write_audit(
             pool,
-            &token_id(nibble),
-            scope,
-            GUILD,
-            "guild.read",
-            &json!({}),
-            false,
-            None,
-            "allowed",
-            None,
+            &AuditRow {
+                token_id: &token_id(nibble),
+                scope,
+                guild_id: GUILD,
+                verb: "guild.read",
+                params: &json!({}),
+                dry_run: false,
+                confirm_id: None,
+                decision: "allowed",
+                receipt: None,
+            },
         )
         .await
         .unwrap_or_else(|error| panic!("scope {scope} lands: {error}"));
@@ -636,15 +654,17 @@ async fn audit_scope_vocabulary_is_closed() {
     for scope in ["superuser", "ADMIN", ""] {
         let result = write_audit(
             pool,
-            &token_id('f'),
-            scope,
-            GUILD,
-            "guild.read",
-            &json!({}),
-            false,
-            None,
-            "allowed",
-            None,
+            &AuditRow {
+                token_id: &token_id('f'),
+                scope,
+                guild_id: GUILD,
+                verb: "guild.read",
+                params: &json!({}),
+                dry_run: false,
+                confirm_id: None,
+                decision: "allowed",
+                receipt: None,
+            },
         )
         .await;
         assert_check_violation(result, &format!("scope {scope:?}"));
@@ -662,15 +682,17 @@ async fn audit_params_redacted_rejects_secret_bearing_keys() {
     let pool = fixture.pool();
     write_audit(
         pool,
-        &token_id('0'),
-        "read",
-        GUILD,
-        "guild.read",
-        &json!({"limit": 25, "guild_id": GUILD, "dry_run": true}),
-        false,
-        None,
-        "allowed",
-        None,
+        &AuditRow {
+            token_id: &token_id('0'),
+            scope: "read",
+            guild_id: GUILD,
+            verb: "guild.read",
+            params: &json!({"limit": 25, "guild_id": GUILD, "dry_run": true}),
+            dry_run: false,
+            confirm_id: None,
+            decision: "allowed",
+            receipt: None,
+        },
     )
     .await
     .expect("structural params land");
@@ -698,15 +720,17 @@ async fn audit_params_redacted_rejects_secret_bearing_keys() {
         let hostile = serde_json::Value::Object(object);
         let result = write_audit(
             pool,
-            &token_id('0'),
-            "read",
-            GUILD,
-            "guild.read",
-            &hostile,
-            false,
-            None,
-            "allowed",
-            None,
+            &AuditRow {
+                token_id: &token_id('0'),
+                scope: "read",
+                guild_id: GUILD,
+                verb: "guild.read",
+                params: &hostile,
+                dry_run: false,
+                confirm_id: None,
+                decision: "allowed",
+                receipt: None,
+            },
         )
         .await;
         assert_check_violation(result, &format!("params key {key:?}"));
@@ -730,15 +754,17 @@ async fn audit_token_id_shape_is_pinned() {
     ] {
         let result = write_audit(
             pool,
-            token,
-            "read",
-            GUILD,
-            "guild.read",
-            &json!({}),
-            false,
-            None,
-            "allowed",
-            None,
+            &AuditRow {
+                token_id: token,
+                scope: "read",
+                guild_id: GUILD,
+                verb: "guild.read",
+                params: &json!({}),
+                dry_run: false,
+                confirm_id: None,
+                decision: "allowed",
+                receipt: None,
+            },
         )
         .await;
         assert_check_violation(result, &format!("token_id {token:?}"));
@@ -756,15 +782,17 @@ async fn audit_guild_id_is_a_snowflake() {
     for guild in ["not-a-guild", "123", "123456789012345678901", ""] {
         let result = write_audit(
             pool,
-            &token_id('4'),
-            "read",
-            guild,
-            "guild.read",
-            &json!({}),
-            false,
-            None,
-            "allowed",
-            None,
+            &AuditRow {
+                token_id: &token_id('4'),
+                scope: "read",
+                guild_id: guild,
+                verb: "guild.read",
+                params: &json!({}),
+                dry_run: false,
+                confirm_id: None,
+                decision: "allowed",
+                receipt: None,
+            },
         )
         .await;
         assert_check_violation(result, &format!("guild_id {guild:?}"));
@@ -784,29 +812,33 @@ async fn audit_receipt_is_a_nullable_bigint() {
     let intent_id = seed_intent(pool, &hex64(4)).await;
     write_audit(
         pool,
-        &token_id('5'),
-        "moderate",
-        GUILD,
-        "moderation.warn",
-        &json!({}),
-        false,
-        None,
-        "denied",
-        None,
+        &AuditRow {
+            token_id: &token_id('5'),
+            scope: "moderate",
+            guild_id: GUILD,
+            verb: "moderation.warn",
+            params: &json!({}),
+            dry_run: false,
+            confirm_id: None,
+            decision: "denied",
+            receipt: None,
+        },
     )
     .await
     .expect("NULL receipt lands");
     write_audit(
         pool,
-        &token_id('6'),
-        "moderate",
-        GUILD,
-        "moderation.warn",
-        &json!({}),
-        false,
-        None,
-        "allowed",
-        Some(intent_id),
+        &AuditRow {
+            token_id: &token_id('6'),
+            scope: "moderate",
+            guild_id: GUILD,
+            verb: "moderation.warn",
+            params: &json!({}),
+            dry_run: false,
+            confirm_id: None,
+            decision: "allowed",
+            receipt: Some(intent_id),
+        },
     )
     .await
     .expect("intent receipt lands");
@@ -835,15 +867,17 @@ async fn audit_created_at_defaults_to_now() {
     let pool = fixture.pool();
     write_audit(
         pool,
-        &token_id('7'),
-        "read",
-        GUILD,
-        "guild.read",
-        &json!({}),
-        false,
-        None,
-        "allowed",
-        None,
+        &AuditRow {
+            token_id: &token_id('7'),
+            scope: "read",
+            guild_id: GUILD,
+            verb: "guild.read",
+            params: &json!({}),
+            dry_run: false,
+            confirm_id: None,
+            decision: "allowed",
+            receipt: None,
+        },
     )
     .await
     .expect("audit row without created_at lands");
@@ -881,15 +915,17 @@ async fn audit_retention_purge_keeps_recent_clears_old() {
     .expect("old audit row seeds");
     write_audit(
         pool,
-        &token_id('9'),
-        "read",
-        GUILD,
-        "guild.read",
-        &json!({}),
-        false,
-        None,
-        "denied",
-        None,
+        &AuditRow {
+            token_id: &token_id('9'),
+            scope: "read",
+            guild_id: GUILD,
+            verb: "guild.read",
+            params: &json!({}),
+            dry_run: false,
+            confirm_id: None,
+            decision: "denied",
+            receipt: None,
+        },
     )
     .await
     .expect("recent audit row seeds");
@@ -919,13 +955,15 @@ async fn internal_action_log_attributed_insert_round_trips() {
     let pool = fixture.pool();
     mint(
         pool,
-        "cfm_log_attributed_01",
-        &token_id('b'),
-        GUILD,
-        "moderation.ban",
-        &hex64(12),
-        &hex64(13),
-        300,
+        &ConfirmSeed {
+            confirm_id: "cfm_log_attributed_01",
+            token_id: &token_id('b'),
+            guild_id: GUILD,
+            verb: "moderation.ban",
+            plan_hash: &hex64(12),
+            params_hash: &hex64(13),
+            expires_in_seconds: 300,
+        },
     )
     .await;
     let intent_id = seed_intent(pool, &hex64(5)).await;
@@ -1013,13 +1051,15 @@ async fn confirm_claim_is_single_use() {
     let token = token_id('c');
     mint(
         pool,
-        "cfm_single_use_01",
-        &token,
-        GUILD,
-        "moderation.ban",
-        &hex64(30),
-        &hex64(31),
-        300,
+        &ConfirmSeed {
+            confirm_id: "cfm_single_use_01",
+            token_id: &token,
+            guild_id: GUILD,
+            verb: "moderation.ban",
+            plan_hash: &hex64(30),
+            params_hash: &hex64(31),
+            expires_in_seconds: 300,
+        },
     )
     .await;
     assert_eq!(
@@ -1051,13 +1091,15 @@ async fn confirm_claim_is_single_use() {
     );
     mint(
         pool,
-        "cfm_single_use_race",
-        &token,
-        GUILD,
-        "moderation.ban",
-        &hex64(32),
-        &hex64(33),
-        300,
+        &ConfirmSeed {
+            confirm_id: "cfm_single_use_race",
+            token_id: &token,
+            guild_id: GUILD,
+            verb: "moderation.ban",
+            plan_hash: &hex64(32),
+            params_hash: &hex64(33),
+            expires_in_seconds: 300,
+        },
     )
     .await;
     // Hoisted: `join!` binds both futures before polling, so a temporary
@@ -1099,13 +1141,15 @@ async fn confirm_claim_refuses_expired() {
     let token = token_id('d');
     mint(
         pool,
-        "cfm_expired_01",
-        &token,
-        GUILD,
-        "moderation.ban",
-        &hex64(34),
-        &hex64(35),
-        -60,
+        &ConfirmSeed {
+            confirm_id: "cfm_expired_01",
+            token_id: &token,
+            guild_id: GUILD,
+            verb: "moderation.ban",
+            plan_hash: &hex64(34),
+            params_hash: &hex64(35),
+            expires_in_seconds: -60,
+        },
     )
     .await;
     assert!(
@@ -1139,13 +1183,15 @@ async fn confirm_claim_refuses_binding_mismatch() {
     let token = token_id('e');
     mint(
         pool,
-        "cfm_bound_01",
-        &token,
-        GUILD,
-        "moderation.ban",
-        &hex64(36),
-        &hex64(37),
-        300,
+        &ConfirmSeed {
+            confirm_id: "cfm_bound_01",
+            token_id: &token,
+            guild_id: GUILD,
+            verb: "moderation.ban",
+            plan_hash: &hex64(36),
+            params_hash: &hex64(37),
+            expires_in_seconds: 300,
+        },
     )
     .await;
     assert!(
@@ -1229,13 +1275,15 @@ async fn confirm_id_is_unique() {
     let pool = fixture.pool();
     mint(
         pool,
-        "cfm_unique_01",
-        &token_id('0'),
-        GUILD,
-        "moderation.ban",
-        &hex64(50),
-        &hex64(51),
-        300,
+        &ConfirmSeed {
+            confirm_id: "cfm_unique_01",
+            token_id: &token_id('0'),
+            guild_id: GUILD,
+            verb: "moderation.ban",
+            plan_hash: &hex64(50),
+            params_hash: &hex64(51),
+            expires_in_seconds: 300,
+        },
     )
     .await;
     let result = sqlx::query(
@@ -1359,13 +1407,15 @@ async fn live_confirm_inside_five_minute_horizon_claims() {
     let token = token_id('3');
     mint(
         pool,
-        "cfm_horizon_01",
-        &token,
-        GUILD,
-        "moderation.ban",
-        &hex64(55),
-        &hex64(56),
-        299,
+        &ConfirmSeed {
+            confirm_id: "cfm_horizon_01",
+            token_id: &token,
+            guild_id: GUILD,
+            verb: "moderation.ban",
+            plan_hash: &hex64(55),
+            params_hash: &hex64(56),
+            expires_in_seconds: 299,
+        },
     )
     .await;
     assert_eq!(
