@@ -95,12 +95,16 @@ in-scope controls, and stays silent everywhere else:
   silent, as do known ids on disabled surfaces (the router yields `Ignore`
   while the surface gate is off).
 - Stale self-role references — a `two:self-role:` id that parses but names
-  a removed panel, a replaced source message, or a removed option — get the
-  reply with zero role/store mutation. Malformed ids and shapes stay silent.
-- Well-formed `two:voice:` controls belong to the voice sink, which answers
-  each exactly once: the runtime stays silent and never double-acknowledges.
-  A `two:voice:`-prefixed id that fails `parse_voice_custom_id` is unowned
-  (a prefix alone never claims ownership) and gets the reply.
+  a removed panel, a replaced source message (in any channel), or a removed
+  option — get the reply with zero role/store mutation. Malformed ids and
+  shapes stay silent.
+- Voice-owned controls belong to the voice sink, which answers each exactly
+  once: the runtime stays silent and never double-acknowledges. Ownership is
+  `voice_claims_custom_id`, shared with the sink: bare `two:voice:` ids that
+  parse, runtime join buttons with the 32-hex worker-epoch suffix, and
+  `votekick:<vote>:yes|no` ballots. A `two:voice:`-prefixed id that fails
+  `parse_voice_custom_id` is unowned (a prefix alone never claims ownership)
+  and gets the reply.
 - Router-claimed controls on live surfaces (onboarding pickers, tickets)
   stay silent even with no service attached: recognized but unserved is not
   stale.

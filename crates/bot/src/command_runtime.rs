@@ -61,6 +61,7 @@ use twilight_model::{
     gateway::GatewayReaction,
     http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
 };
+use two_bot::voice_rooms::voice_claims_custom_id;
 use two_bot_core::{
     automod_runtime::FunnelDisposition,
     commands::PERM_MANAGE_GUILD,
@@ -78,7 +79,6 @@ use two_bot_core::{
         RemoveOutcome, StickyAudit, StickyAuditAction, StickyAuditOutcome,
     },
     tickets::TicketAction,
-    voice_custom_id::parse_voice_custom_id,
     ChannelModerationStore, ComponentHandler, ComponentOutcome, FeatureGates, HandlerId,
     InteractionHandler, InteractionRouter, ModerationGates, RouterGates, RouterRefusal,
     SlashOutcome, SurfaceFlags,
@@ -1129,8 +1129,8 @@ impl CommandRuntime {
     /// and modal submits. The router has already fenced the guild (foreign
     /// and missing guilds route `Ignore`) and the surface gates (known ids on
     /// disabled surfaces route `Ignore`), so `Unknown` here means unowned,
-    /// not merely unserved. Well-formed voice controls belong to the voice
-    /// sink, which answers each exactly once; bot authors stay silent.
+    /// not merely unserved. Voice-owned controls belong to the voice sink,
+    /// which answers each exactly once; bot authors stay silent.
     async fn answer_stale_control(&self, interaction: &Interaction, routed: &RoutedInteraction) {
         let custom_id = match routed {
             RoutedInteraction::Component {
@@ -1144,9 +1144,10 @@ impl CommandRuntime {
             } => custom_id,
             _ => return,
         };
-        // A bare `two:voice:` prefix never claims ownership: only an id that
-        // parses as a voice action belongs to the voice sink.
-        if parse_voice_custom_id(custom_id).is_some() {
+        // Ownership is the sink's own predicate: bare `two:voice:` ids,
+        // epoch-suffixed runtime join buttons, and `votekick:` ballots. A bare
+        // prefix never claims ownership on its own.
+        if voice_claims_custom_id(custom_id) {
             return;
         }
         if author_is_bot(interaction) {

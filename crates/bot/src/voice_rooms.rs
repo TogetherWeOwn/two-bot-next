@@ -11524,6 +11524,33 @@ fn parse_vote_button(custom_id: &str) -> Option<VoiceCommand> {
     Some(VoiceCommand::Ballot { vote_id, ballot })
 }
 
+/// Whether the voice sink claims this component/modal id, so the shared
+/// stale-control path must stay silent instead of answering expired. Covers the
+/// same shapes the sink parses: bare `two:voice:` ids, runtime join buttons
+/// with the 32-hex worker-epoch suffix (via [`split_runtime_join_id`], shared
+/// with `join_component_action`), and `votekick:` ballots (via
+/// [`parse_vote_button`]). A prefix alone never claims ownership.
+#[must_use]
+pub fn voice_claims_custom_id(custom_id: &str) -> bool {
+    if parse_voice_custom_id(custom_id).is_some() {
+        return true;
+    }
+    if split_runtime_join_id(custom_id).is_some_and(|(core, epoch)| {
+        epoch.is_some()
+            && matches!(
+                parse_voice_custom_id(core),
+                Some(
+                    VoiceAction::JoinApprove { .. }
+                        | VoiceAction::JoinDeny { .. }
+                        | VoiceAction::JoinBlock { .. }
+                )
+            )
+    }) {
+        return true;
+    }
+    parse_vote_button(custom_id).is_some()
+}
+
 /// Button custom ID for one ballot. Inverse of [`parse_vote_button`].
 fn vote_button_id(vote_id: Snowflake, ballot: VoteBallot) -> String {
     let vote = match ballot {
@@ -13526,7 +13553,8 @@ pub use private_runtime::PrivacyCommand;
 
 mod join_requests;
 use join_requests::{
-    handle_join_interaction, join_component_action, JoinDecisionCommand, JoinReply,
+    handle_join_interaction, join_component_action, split_runtime_join_id, JoinDecisionCommand,
+    JoinReply,
 };
 
 #[cfg(test)]

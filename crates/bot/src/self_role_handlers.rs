@@ -249,11 +249,13 @@ impl SelfRoleService {
     /// True only for a stale self-role reference: the id parses and the press
     /// is otherwise well-formed, but the panel, source message, or option it
     /// names is gone. The caller answers one expired-control reply and mutates
-    /// nothing. Malformed ids/shapes, foreign guilds, bots, and channel
-    /// mismatches are not stale: silence. Mirrors `component_input`, except
-    /// the channel comes from the source message itself (`Interaction::channel_id`
-    /// is deprecated upstream; the message is the authority for which source
-    /// message the press belongs to).
+    /// nothing. Malformed ids/shapes, foreign guilds, and bots are not stale:
+    /// silence. A message-id mismatch is stale in any channel (the panel moved
+    /// on; the custom id already binds the press to it), while a live message
+    /// id in the wrong channel is spoofed, not stale. Mirrors `component_input`,
+    /// except the channel comes from the source message itself
+    /// (`Interaction::channel_id` is deprecated upstream; the message is the
+    /// authority for which source message the press belongs to).
     pub(crate) fn stale_component(&self, interaction: &Interaction) -> bool {
         if interaction.kind != InteractionType::MessageComponent
             || !interaction
@@ -285,16 +287,20 @@ impl SelfRoleService {
         let Some(message) = interaction.message.as_ref() else {
             return false;
         };
-        if message.channel_id.get().to_string() != panel.channel_id
-            || message
-                .guild_id
-                .is_some_and(|id| Some(id) != interaction.guild_id)
+        if message
+            .guild_id
+            .is_some_and(|id| Some(id) != interaction.guild_id)
         {
             return false;
         }
         if message.id.get().to_string() != panel.message_id {
-            // Same panel and channel, new source message: the panel moved on.
+            // Same panel, new source message in any channel: the panel moved
+            // on and this press is on its former source.
             return true;
+        }
+        if message.channel_id.get().to_string() != panel.channel_id {
+            // Live message id in the wrong channel: spoofed, not stale.
+            return false;
         }
         match (panel.mode, data.component_type, parsed.option_key) {
             (PanelMode::Button, ComponentType::Button, Some(option_key))
