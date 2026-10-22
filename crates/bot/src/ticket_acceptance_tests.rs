@@ -242,6 +242,7 @@ async fn shared_router_lifecycle_defers_ephemerally_and_edits_without_leaking_tr
             ScriptedResponse::json(200, json!({"id":"900"})),
             ScriptedResponse::json(200, json!({})),
             ScriptedResponse::status(204),
+            ScriptedResponse::json(200, json!({"id":"901"})),
             ScriptedResponse::json(200, json!({})),
             ScriptedResponse::status(204),
             ScriptedResponse::json(200, channel()),
@@ -280,7 +281,7 @@ async fn shared_router_lifecycle_defers_ephemerally_and_edits_without_leaking_tr
     assert_eq!(ticket.claimed_by.as_deref(), Some("501"));
     assert!(tickets.store.transcript_exists(&ticket.id).await.unwrap());
     let requests = mock.requests();
-    assert_eq!(requests.len(), 14);
+    assert_eq!(requests.len(), 15);
     let callbacks: Vec<_> = requests
         .iter()
         .filter(|r| r.path.ends_with("/callback"))
@@ -313,6 +314,7 @@ async fn lifecycle_races_and_transcript_commit_precede_discord_delete() {
             ScriptedResponse::json(201, json!({"id":"600"})),
             ScriptedResponse::json(200, json!({"id":"900"})),
             ScriptedResponse::json(200, json!({"id":"200","guild_id":"100","type":4})),
+            ScriptedResponse::json(200, json!({"id":"901"})),
             ScriptedResponse::json(200, channel()),
             ScriptedResponse::status(204),
             ScriptedResponse::json(
@@ -1078,6 +1080,7 @@ async fn ticket_copy_success_confirmation_claim_and_close_are_pinned() {
             ScriptedResponse::json(200, json!({"id":"200","guild_id":"100","type":4})),
             ScriptedResponse::json(201, json!({"id":"600"})),
             ScriptedResponse::json(200, json!({"id":"900"})),
+            ScriptedResponse::json(200, json!({"id":"901"})),
             ScriptedResponse::json(200, channel()),
             ScriptedResponse::status(204),
             ScriptedResponse::json(200, json!([history(1)])),

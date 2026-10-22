@@ -378,20 +378,26 @@ pub const DISPATCH_LANES: &[&str] = &[
 /// single checkpoint failure stops the worker, so there is no
 /// benign-singleton case.
 pub const CHECKPOINT_FAILURE_STAGES: &[&str] = &["pre_commit", "commit"];
-/// Drop-guard names for `two_bot_drop_poison_total{guard}`: the four guards
+/// Drop-guard names for `two_bot_drop_poison_total{guard}`: the seven guards
 /// whose `Drop` bodies recover a poisoned lock instead of panicking (which
 /// would abort the process when the drop runs during unwinding).
 /// `command_dispatch_guard` stops the command task scope,
 /// `schedule_run` finishes a feed poll schedule, `user_slot` releases an
 /// interaction admission count, `in_flight_guard` releases a voice REST
-/// attempt slot. Exactly these four series exist; unknown guards collapse
-/// to the trailing `in_flight_guard` slot only when the allowlist grows.
+/// attempt slot, `ticket_supervisor` stops the ticket task scope,
+/// `response_accounting` retires a REST response's rate-limit entries, and
+/// `voice_connection_guard` disconnects the voice sink. Exactly these seven
+/// series exist; unknown guards collapse to the trailing
+/// `voice_connection_guard` slot only when the allowlist grows.
 /// Panic payloads are never labels.
 pub const DROP_POISON_GUARDS: &[&str] = &[
     "command_dispatch_guard",
     "schedule_run",
     "user_slot",
     "in_flight_guard",
+    "ticket_supervisor",
+    "response_accounting",
+    "voice_connection_guard",
 ];
 /// Presence-capture outcomes for `two_bot_presence_capture_total{outcome}`
 /// (event-store S3): `inserted` for a first delivery that stored a row,
@@ -1455,7 +1461,7 @@ impl Metrics {
     /// One poisoned lock recovered by a drop guard instead of panicking
     /// inside `drop` (which aborts the process during unwinding). Call once
     /// per poisoned drop, with a [`DROP_POISON_GUARDS`] member. Unknown
-    /// guards collapse to `in_flight_guard` only when the allowlist grows;
+    /// guards collapse to `voice_connection_guard` only when the allowlist grows;
     /// panic payloads are never labels. No IDs, tokens or bodies are
     /// retained. Lock-free and saturating: safe to call from a `Drop` body
     /// while any thread holds or poisoned the `Values` mutex.
@@ -3124,11 +3130,18 @@ mod tests {
         metrics.drop_poison("user_slot");
         metrics.drop_poison("in_flight_guard");
         metrics.drop_poison("user_slot");
+        metrics.drop_poison("ticket_supervisor");
+        metrics.drop_poison("response_accounting");
+        metrics.drop_poison("response_accounting");
+        metrics.drop_poison("voice_connection_guard");
         let text = metrics.render(None);
         assert!(text.contains("two_bot_drop_poison_total{guard=\"command_dispatch_guard\"} 1\n"));
         assert!(text.contains("two_bot_drop_poison_total{guard=\"schedule_run\"} 1\n"));
         assert!(text.contains("two_bot_drop_poison_total{guard=\"user_slot\"} 2\n"));
         assert!(text.contains("two_bot_drop_poison_total{guard=\"in_flight_guard\"} 1\n"));
+        assert!(text.contains("two_bot_drop_poison_total{guard=\"ticket_supervisor\"} 1\n"));
+        assert!(text.contains("two_bot_drop_poison_total{guard=\"response_accounting\"} 2\n"));
+        assert!(text.contains("two_bot_drop_poison_total{guard=\"voice_connection_guard\"} 1\n"));
         // Fixed cardinality: exactly the allowlisted series render.
         assert_eq!(
             text.lines()
@@ -3205,7 +3218,7 @@ mod tests {
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
         assert!(!text.contains("secret"));
-        assert!(text.contains("two_bot_drop_poison_total{guard=\"in_flight_guard\"} 100\n"));
+        assert!(text.contains("two_bot_drop_poison_total{guard=\"voice_connection_guard\"} 100\n"));
     }
 
     #[test]

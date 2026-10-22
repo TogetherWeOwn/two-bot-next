@@ -662,7 +662,7 @@ struct VoiceConnectionGuard(Option<Arc<dyn VoiceEventSink>>);
 impl Drop for VoiceConnectionGuard {
     fn drop(&mut self) {
         if let Some(voice) = &self.0 {
-            voice.disconnect();
+            voice.disconnect_from_drop();
         }
     }
 }
@@ -1005,6 +1005,7 @@ fn apply_dispatch<I: InviteSource>(
                         // log its SQL/HTTP source.
                         tracing::warn!(
                             error = %error,
+                            committed_awards = error.committed_awards().len(),
                             "gateway leveling dispatch failed"
                         );
                         leveling_dispatch_failure()
@@ -2143,6 +2144,10 @@ pub async fn build_voice_runtime(
 #[cfg(test)]
 #[path = "gateway_drop_poison_acceptance_tests.rs"]
 mod drop_poison_acceptance_tests;
+
+#[cfg(test)]
+#[path = "gateway_drop_poison_counter_acceptance_tests.rs"]
+mod drop_poison_counter_acceptance_tests;
 
 #[cfg(test)]
 mod tests {

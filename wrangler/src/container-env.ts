@@ -378,6 +378,13 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   // settings snapshot, never from the process environment, so there is
   // nothing to forward.
   TWO_GUILD_INVITE_CODE: "store-only guild setting; read from the live settings snapshot, never from the process environment",
+  // /ops override enforcement (Slice 0a): the Rust settings poll GETs this
+  // URL on every tick for the DO ops record. URL-shaped values are never
+  // flags (the allowlist test rejects `_URL`), so it travels only here.
+  TWO_OPS_CONFIG_URL: "ops-record fetch URL; reaches the Container only through an explicit containerEnvVars line when the Operator sets it, never this flag allowlist",
+  // Bearer the container sends on that fetch: the ops control token's value,
+  // forwarded only while the fetch URL is set, on its own secret line.
+  TWO_OPS_CONFIG_TOKEN: SECRET,
 };
 
 /**

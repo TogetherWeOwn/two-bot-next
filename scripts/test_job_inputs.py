@@ -186,6 +186,15 @@ class SelectionTests(unittest.TestCase):
                 selected = inputs.classify(path)
                 self.assertEqual(selected, {RUST, WORKER, PARITY}, path)
 
+    def test_receiver_contract_doc_selects_its_worker_conformance_check(self):
+        path = "docs/internal-actions-receiver.md"
+        self.assertIn(path, inputs.WORKER_DOCS)
+        self.assertEqual(inputs.classify(path), {WORKER})
+        self.assertEqual(
+            jobs([path]),
+            {RUST: False, WORKER: True, PARITY: False,
+             SUPPLY: False, DOCS: True})
+
     def test_worker_tree_selects_worker_only(self):
         for path in ["wrangler/src/index.ts",
                      "wrangler/test/container-env.test.ts",
