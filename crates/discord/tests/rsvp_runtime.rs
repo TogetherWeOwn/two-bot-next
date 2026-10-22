@@ -1237,7 +1237,8 @@ async fn failed_final_reply_does_not_retry_committed_effects() {
         .handle(&attendance(601, MANAGE_EVENTS, USER, &occ))
         .await
         .is_err());
-    assert_eq!(counts(fixture.pool()).await, (1, 1, 1));
+    // The committed check-in leaves its fact and its audit row behind the failed edit.
+    assert_eq!(counts(fixture.pool()).await, (1, 2, 1));
     assert_eq!(mock.requests().len(), 13);
     assert!(runtime
         .handle(&attendance(602, MANAGE_EVENTS, USER, &occ))
@@ -1248,7 +1249,8 @@ async fn failed_final_reply_does_not_retry_committed_effects() {
         &two_bot_core::checkin_duplicate_text(USER, &occ),
         true,
     );
-    assert_eq!(counts(fixture.pool()).await, (1, 1, 1));
+    // The duplicate adds no fact and no audit row.
+    assert_eq!(counts(fixture.pool()).await, (1, 2, 1));
     fixture.close().await;
     mock.shutdown().await;
 }
