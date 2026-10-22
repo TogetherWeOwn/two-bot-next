@@ -113,6 +113,39 @@ pub const MAX_AUDIT_REASON_CHARS: usize = 512;
 /// Legacy message ceiling asserted before sending.
 pub const MAX_MESSAGE_CHARS: usize = 2000;
 
+/// Outcome of applying a reward plan: the role ids written (grants first,
+/// then revokes, in plan order), the first refused role with its
+/// fixed-vocabulary refusal reason, and the role ids never attempted because
+/// the first refusal aborts the rest.
+pub type RewardRoleReport = (Vec<String>, Option<(String, String)>, Vec<String>);
+
+/// Fixed-vocabulary reason a role write failed. A confirmed Discord refusal
+/// keeps its status (`Discord refused the request with 403`); every other
+/// failure is its [`DiscordError::cause`] token, never transport detail.
+fn refusal_reason(error: &DiscordError) -> String {
+    match error {
+        DiscordError::Rejected(_) => error.to_string(),
+        other => other.cause().to_owned(),
+    }
+}
+
+/// The report for a plan whose write at `failed_index` (grants first, then
+/// revokes) was refused: everything after it was never attempted.
+fn refused_report(
+    plan: &two_bot_core::leveling::RewardRolePlan,
+    applied: Vec<String>,
+    failed_index: usize,
+    error: &DiscordError,
+) -> RewardRoleReport {
+    let mut writes = plan.grant.iter().chain(plan.revoke.iter()).cloned();
+    let failed = writes.nth(failed_index).unwrap_or_default();
+    (
+        applied,
+        Some((failed, refusal_reason(error))),
+        writes.collect(),
+    )
+}
+
 /// Discord failure modes (legacy `ModerationDiscord` `ActionError` codes).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DiscordError {
@@ -1457,16 +1490,19 @@ impl ActionExecutor {
     }
 
     /// Apply the domain plan through the shared pacing/request factory. All
-    /// local validation and the entire revoke preflight precede any mutation;
-    /// Discord cannot promise atomicity if permissions change after preflight.
-    /// PUT/DELETE role endpoints are idempotent; errors are returned, not hidden.
+    /// local validation and the entire revoke preflight precede any mutation
+    /// and stay `Err`; Discord cannot promise atomicity if permissions change
+    /// after preflight. PUT/DELETE role endpoints are idempotent. Once writes
+    /// start, the first refusal aborts the rest (grants first, then revokes)
+    /// and returns the [`RewardRoleReport`] instead of an opaque error, so the
+    /// caller can tell applied roles from the refused one and the skipped tail.
     pub async fn execute_reward_roles(
         &self,
         guild_id: u64,
         member_id: u64,
         plan: &two_bot_core::leveling::RewardRolePlan,
         revoke_fence: Option<StagingRevokeFence>,
-    ) -> Result<(), DiscordError> {
+    ) -> Result<RewardRoleReport, DiscordError> {
         let guild = snowflake(&guild_id.to_string())?;
         let member = snowflake(&member_id.to_string())?;
         let grants: Vec<Id<RoleMarker>> = plan
@@ -1496,25 +1532,42 @@ impl ActionExecutor {
             self.preflight_reward_revokes(guild_id, &plan.revoke)
                 .await?;
         }
-        for role in grants {
+        let mut applied = Vec::with_capacity(grants.len() + revokes.len());
+        for (index, role) in grants.iter().enumerate() {
             let request = Self::request_of(
                 self.inner
                     .factory
-                    .add_guild_member_role(guild, member, role)
+                    .add_guild_member_role(guild, member, *role)
                     .reason(&grant_reason),
-            )?;
-            self.call_once_raw_paced(request, &[200, 204]).await?;
+            );
+            if let Err(error) = self.reward_role_write(request).await {
+                return Ok(refused_report(plan, applied, index, &error));
+            }
+            applied.push(plan.grant[index].clone());
         }
-        for role in revokes {
+        for (index, role) in revokes.iter().enumerate() {
             let request = Self::request_of(
                 self.inner
                     .factory
-                    .remove_guild_member_role(guild, member, role)
+                    .remove_guild_member_role(guild, member, *role)
                     .reason(revoke_reason.as_deref().expect("validated revoke reason")),
-            )?;
-            self.call_once_raw_paced(request, &[200, 204]).await?;
+            );
+            if let Err(error) = self.reward_role_write(request).await {
+                return Ok(refused_report(plan, applied, grants.len() + index, &error));
+            }
+            applied.push(plan.revoke[index].clone());
         }
-        Ok(())
+        Ok((applied, None, Vec::new()))
+    }
+
+    /// One paced role write; a request that failed to build is the failure.
+    async fn reward_role_write(
+        &self,
+        request: Result<Request, DiscordError>,
+    ) -> Result<(), DiscordError> {
+        self.call_once_raw_paced(request?, &[200, 204])
+            .await
+            .map(|_| ())
     }
 
     async fn preflight_reward_revokes(
@@ -2713,6 +2766,35 @@ impl ActionExecutor {
         self.call_once_raw(req, &[200, 204]).await
     }
 
+    /// Delete one message with a proven-absence receipt, for orphan rollback
+    /// that must distinguish "gone" from "unknown" (sticky re-post): `Ok(true)`
+    /// deleted, `Ok(false)` the message was already absent (Discord's 404
+    /// proves absence, so a retry is safe), `Err` the outcome is uncertain —
+    /// including rejections, which prove only that this delete did not land,
+    /// not that the orphan is gone. Retirement keeps best-effort
+    /// [`Self::delete_message`].
+    pub async fn delete_message_with_absence_receipt(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        reason: &str,
+    ) -> Result<bool, DiscordError> {
+        let channel: Id<ChannelMarker> = snowflake(channel_id)?;
+        let message: Id<MessageMarker> = snowflake(message_id)?;
+        let reason = audit_reason(reason)?;
+        let req = Self::request_of(
+            self.inner
+                .factory
+                .delete_message(channel, message)
+                .reason(&reason),
+        )?;
+        // request_of maps pre-send build failures to Rejected (finding 7).
+        let mut res = self.call_once_raw(req, &[200, 204, 404]).await?;
+        let deleted = res.status != 404;
+        res.complete().await;
+        Ok(deleted)
+    }
+
     /// Post a message with mention suppression (legacy
     /// `allowed_mentions: { parse: [] }`). Asserts the legacy 2000 UTF-16-unit
     /// ceiling before sending; requires a valid message id receipt. An
@@ -3204,14 +3286,14 @@ impl ActionExecutor {
                 content,
                 nonce,
             } => {
-                // `audit::delivery_nonce` mints `oa_...` strings that can never
-                // parse as u64 — carry them as string nonces with enforcement
-                // instead of rejecting them (finding 5). Numeric strings keep
-                // the numeric wire shape.
-                let value = nonce.as_deref().map(|s| match s.parse::<u64>() {
-                    Ok(n) => serde_json::Value::from(n),
-                    Err(_) => serde_json::Value::from(s),
-                });
+                // A string nonce keeps the string wire shape, including
+                // all-decimal values and leading zeroes: the nonce must
+                // round-trip through history verbatim so
+                // `recover_message_by_nonce` can match it (finding 5; cf.
+                // `post_message_with_nonce`, `post_message_confirmed`).
+                // Numeric wire shape stays available through the typed
+                // `post_message(Option<u64>)` path.
+                let value = nonce.as_deref().map(serde_json::Value::from);
                 Ok(ChannelCallOutcome::Posted {
                     message_id: self.send_message(channel_id, content, value, false).await?,
                 })

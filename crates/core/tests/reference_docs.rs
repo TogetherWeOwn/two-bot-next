@@ -50,7 +50,7 @@ a required value or an implemented consumer. Secret defaults are never rendered.
   (`crates/bot/src/settings_jobs.rs:146-160`), exposed through `settings_jobs::live`\n\
   (`crates/bot/src/settings_jobs.rs:53`). Every consumer reads store-first:\n\
   a stored row wins and an absent row falls back to the boot value, except\n\
-  the invite responder, which falls back to the live vanity code; a malformed\n\
+  the invite responder, which falls back to the live vanity code; a live /ops override wins over the stored row while the container polls an ops record, falling back to the row on clear or expiry; a malformed\n\
   row falls back to a safe value, refuses, or filters entries depending on\n\
   the runtime (see below), and `None` while parked or pre-first-poll layers\n\
   nothing. Gateway\n\
@@ -117,7 +117,7 @@ remain: the voice room-name policy is\n\
 built once at boot from the process environment\n\
 (`crates/bot/src/gateway.rs:2080`); and gateway intents plus ticket command\n\
 publication read the ticket destination keys once at boot\n\
-(`crates/bot/src/gateway.rs:150`, `crates/bot/src/command_runtime.rs:431`), so a stored ticket\n\
+(`crates/bot/src/gateway.rs:150`, `crates/bot/src/command_runtime.rs:435`), so a stored ticket\n\
 destination reaches already-published commands only through the per-operation\n\
 refresh above. Every other\n\
 storable row's stored value is unwired.\n\n\

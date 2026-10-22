@@ -44,6 +44,8 @@ mod db_log;
 mod discord_test_common;
 mod dispatch;
 #[cfg(test)]
+mod drop_poison_test_serial;
+#[cfg(test)]
 mod duplicate_pool_registration_acceptance_tests;
 mod erasure_cli;
 mod event_cli;
@@ -121,6 +123,8 @@ mod schedule_runtime;
 mod scheduled_jobs;
 mod server;
 mod settings_jobs;
+#[cfg(test)]
+mod stale_control_expired_reply_acceptance_tests;
 // TOG-10292: boot composes the gated service below; fixture-only seams keep
 // the module-level allowance.
 #[allow(dead_code)]
