@@ -933,7 +933,7 @@ fn apply_dispatch<I: InviteSource>(
             (None, Some(dispatch)) => (
                 two_bot_discord::automod::event_to_automod(
                     &dispatch.event,
-                    crate::automod_gateway::receipt_ms(&dispatch.observed_at),
+                    crate::automod_gateway::received_at_ms(&dispatch.observed_at)?,
                 )?,
                 dispatch.observed_at.clone(),
             ),
@@ -1518,7 +1518,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         // A partial MESSAGE_UPDATE omits fields a full Twilight
                         // Message needs: decode its raw IDs before parsing.
                         let edit = if automod_enabled && !duplicate_refused {
-                            crate::automod_gateway::partial_edit(&text, crate::automod_gateway::receipt_ms(&observed_at))
+                            crate::automod_gateway::partial_edit_received(&text, &observed_at)
                                 .map(|delivery| Box::new((delivery, observed_at.clone())))
                         } else {
                             None
