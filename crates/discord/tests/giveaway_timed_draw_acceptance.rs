@@ -75,10 +75,10 @@
 //!    id, ids and outcomes only (never prize text), and a unique id per
 //!    write (a re-announce must not primary-key-conflict).
 //! 10. Announce order and content: the message edit precedes the channel
-//!    winners post; the winners post contains each winner as `<@id>` plus
-//!    the draw `seed` and the giveaway `draw_nonce`. Create posts the entry
-//!    message (prize text plus a `gw:<id>` button) to the invocation
-//!    channel.
+//!     winners post; the winners post contains each winner as `<@id>` plus
+//!     the draw `seed` and the giveaway `draw_nonce`. Create posts the entry
+//!     message (prize text plus a `gw:<id>` button) to the invocation
+//!     channel.
 //!
 //! Deliberately unpinned: reply copy and ack shapes (deferred or immediate);
 //! default `winners_count`/`max_entries`; `drawing`-status internals and the
@@ -902,7 +902,7 @@ async fn deadline_tick_draws_and_announces() {
     assert_eq!(draw.winners.len(), 1);
     assert!(draw.winners[0] == ALICE || draw.winners[0] == BOB);
     assert!(draw.reroll_kind.is_none());
-    let mut eligible = vec![ALICE.to_owned(), BOB.to_owned()];
+    let mut eligible = [ALICE.to_owned(), BOB.to_owned()];
     eligible.sort();
     assert_eq!(draw.eligible_hash, sha256_hex(&eligible.join(",")));
     assert_eq!(
@@ -1509,7 +1509,7 @@ async fn draw_excludes_departed_and_role_stripped_entrants() {
     assert_eq!(draws2[0].eligible_count, 2);
     assert_eq!(draws2[0].winners.len(), 1);
     assert!(draws2[0].winners[0] == ALICE || draws2[0].winners[0] == CAROL);
-    let mut eligible = vec![ALICE.to_owned(), CAROL.to_owned()];
+    let mut eligible = [ALICE.to_owned(), CAROL.to_owned()];
     eligible.sort();
     assert_eq!(draws2[0].eligible_hash, sha256_hex(&eligible.join(",")));
     fixture.close().await;
