@@ -317,7 +317,7 @@ fn goodbye(member_id: u64) -> OnboardingJob {
 fn verify_press(nonce: u64) -> OnboardingJob {
     let interaction: Interaction = serde_json::from_value(json!({
         "application_id": "111", "authorizing_integration_owners": {"0": "22"},
-        "id": format!("500{nonce}"), "token": format!("mock-callback-{nonce}"),
+        "id": nonce.to_string(), "token": format!("mock-callback-{nonce}"),
         "type": 3, "version": 1, "guild_id": "22",
         "member": {"user": {"id": "44", "username": "member", "discriminator": "0"},
                    "roles": [], "deaf": false, "mute": false, "flags": 0},
@@ -905,7 +905,8 @@ async fn verify_button_grants_member_role_once_and_double_press_is_idempotent() 
     let mock = discord(Arc::clone(&state)).await;
     store_config(db.pool(), KEY_MEMBER_ROLE, json!(MEMBER_ROLE)).await;
     let live = runtime(db.pool(), &mock, &vars());
-    live.handle(verify_press(1), NOW)
+    let first_nonce = rand::random_range(1..=u64::MAX);
+    live.handle(verify_press(first_nonce), NOW)
         .await
         .expect("the first press must succeed");
     let grants = puts(&mock);
@@ -917,7 +918,13 @@ async fn verify_button_grants_member_role_once_and_double_press_is_idempotent() 
     // A double-click is a second press with a fresh interaction: no duplicate
     // grant, no loud error, and the live roles (not the interaction snapshot)
     // prove the member already holds the role.
-    live.handle(verify_press(2), NOW + 1)
+    let second_nonce = loop {
+        let candidate = rand::random_range(1..=u64::MAX);
+        if candidate != first_nonce {
+            break candidate;
+        }
+    };
+    live.handle(verify_press(second_nonce), NOW + 1)
         .await
         .expect("the second press must succeed");
     assert_eq!(puts(&mock).len(), 1, "the double-click must not re-PUT");
@@ -957,7 +964,7 @@ async fn verify_without_config_refuses_quietly() {
     };
     let mock = discord(Arc::new(Mutex::new(DiscordState::default()))).await;
     runtime(db.pool(), &mock, &vars())
-        .handle(verify_press(1), NOW)
+        .handle(verify_press(rand::random_range(1..=u64::MAX)), NOW)
         .await
         .expect("an unconfigured press must succeed");
     assert!(puts(&mock).is_empty(), "no member role means no grant");
@@ -985,7 +992,7 @@ async fn verify_grant_survives_rejoin_without_duplicate() {
     let mock = discord(Arc::clone(&state)).await;
     store_config(db.pool(), KEY_MEMBER_ROLE, json!(MEMBER_ROLE)).await;
     let live = runtime(db.pool(), &mock, &vars());
-    live.handle(verify_press(1), NOW)
+    live.handle(verify_press(rand::random_range(1..=u64::MAX)), NOW)
         .await
         .expect("the press must succeed");
     assert_eq!(puts(&mock).len(), 1, "the press grants once");
