@@ -55,7 +55,9 @@ exact head commit. Never bypass or weaken a check.
 
 `check.yml` runs its Rust work as parallel lanes that all start once `job-inputs`
 finishes: `check` (lint: offline guards, cargo-deny, fmt, clippy), `rust tests`
-(unit, integration and doc tests), `rust nextest` (workspace lib/bins under
+(unit, integration and doc tests), `patch coverage` (the HARD patch-coverage
+measurement, split out of `rust tests` so the two signals fail independently),
+`rust nextest` (workspace lib/bins under
 cargo-nextest with one retry, JUnit and a flake ledger) and two database lanes,
 `ignored db (stores)` and `ignored db (runtime)`. The single `ci-ok` aggregate waits on both selectors
 (`job-inputs` and `container-inputs`), every selected lane, `worker check`, the
@@ -71,7 +73,7 @@ Deterministic quality gates (per-PR advisories HARD, ast-grep and Semgrep
 HARD, required voice synthetic, test-target inventory HARD) run as steps of
 the `check` lane on the existing routed runner; see
 [`docs/quality-gates.md`](docs/quality-gates.md). Patch coverage (HARD) runs in
-`rust-tests` with the disposable Postgres service and ignored database-backed
+`patch-coverage` with the disposable Postgres service and ignored database-backed
 tests. New checks start in WARN (report, never fail) and flip to HARD only with
 their backlog burned down.
 
@@ -79,7 +81,7 @@ Every Rust setup step in `check.yml` installs the exact version from
 `rust-toolchain.toml`, including fmt/clippy components where required. Do not use
 floating `stable`: Cargo still follows the repository pin, so differing versions
 can cause component-install conflicts before fmt runs. The offline workflow
-policy suite pins all nine installers to the repository version; bump them and
+policy suite pins all ten installers to the repository version; bump them and
 the toolchain and builder-image pins together.
 
 ### Pull-request size labels (advisory)
@@ -105,12 +107,12 @@ issue. Blank issues are off. Report a vulnerability privately; see
 
 ## Releases
 
-Each successful production promote tags the deployed commit `vX.Y.Z` and
-publishes a GitHub Release from the Conventional Commit subjects since the
-previous tag (`release.yml`, called by `deploy-production`). There is no release
-PR and no freeze. One flat `vX.Y.Z` tag covers the whole repository, not one
-release per crate. See [`docs/releases.md`](docs/releases.md). Never tag or
-release by hand.
+The daily `daily-digest` workflow tags the live production commit `vYYYY.MM.DD`
+when production has moved forward since the last digest, and publishes a GitHub
+Release from Conventional Commit subjects. Deploys never create version tags.
+There is no release PR or freeze. One digest tag covers the whole repository,
+not one release per crate. See [`docs/releases.md`](docs/releases.md) for repair
+and dry-run dispatches. Never tag or release by hand.
 
 Release notes use the [Common Changelog](https://common-changelog.org/)
 categories, in its order: **Changed** (`perf`, `revert`), **Added** (`feat`),
@@ -119,8 +121,9 @@ categories, in its order: **Changed** (`perf`, `revert`), **Added** (`feat`),
 entry, so write it for a reader of the release notes: imperative mood, one
 user-facing change.
 
-Versioning is SemVer, starting at `0.1.0`; `1.0.0` marks the production
-cutover. `feat!` / `BREAKING CHANGE` bumps major (minor while `0.x`).
+Release tags use UTC calendar dates. Cargo package versions stay at `0.4.0`;
+`feat!` and `BREAKING CHANGE` still appear in the breaking-changes notes but
+no longer choose a SemVer bump.
 
 ## Local development
 

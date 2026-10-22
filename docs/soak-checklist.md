@@ -133,8 +133,8 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s1-15: 16 — `/command-list`
 
 - **Method:** `manual` (not an execution verdict).
-- **Action:** Create soak-faq and invoke /command-list as manager and normal member.
-- **Expected:** Manager sees the fixture definition without secrets; normal member is denied.
+- **Action:** Create enough enabled/disabled fixture commands with text triggers to span pages; as manager, invoke /command-list with no page, traverse all valid pages, and try invalid/unavailable pages. Check the empty list after cleanup and invoke as a normal member.
+- **Expected:** Manager sees every whole name/trigger/on-off row exactly once in name order without secrets; each nonempty page fits 2,000 UTF-16 units with page/total and a next-page hint when applicable. Missing page equals page:1; empty page 1 keeps its existing reply; invalid/unavailable pages are refused without mutation; normal member is denied.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 
 ### s1-16: 17 — `/schedule`
@@ -842,10 +842,10 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
-### s8-03: Audit kill switch (`audit-switch --halt/--resume/--status`) — presence = halt
+### s8-03: Audit kill switch (`audit_switch`, [usage](audit-store.md#operator-handle)) — presence = halt
 
 - **Method:** `waived` (not an execution verdict).
-- **Action:** Run audit-switch halt/status/resume against local authorized test-container fixture only, never staging/production DB.
+- **Action:** Run `audit_switch --status`, `audit_switch --halt --actor <snowflake>`, `audit_switch --resume` ([usage](audit-store.md#operator-handle)) against local authorized test-container fixture only, never staging/production DB.
 - **Expected:** Switch presence halts, status reports accurately, resume clears only the fixture switch and pending audit resumes safely.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
@@ -1051,7 +1051,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Reason:** Proposed staging-execution waiver: this store, gate-diagnostic, failure-path, test-only, standards-only or CI-only slice is reproducible only with local mock fixtures or isolated test containers under the safety contract (no live fault injection, clock change, staging/production SQL or credential handling); the owning slice's exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
 - **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
-### s12-18: Durable join-risk event claim store over the existing flags table (unwired, no new migration)
+### s12-18: Durable join-risk event claim store over the existing flags table (no new migration), wired via the join-risk runtime
 
 - **Method:** `waived` (not an execution verdict).
 - **Action:** Run the #362 join-risk claim fixture on authorized test containers: 10-way concurrent exactly-once claims, serialized burst scoring with threshold-equality bonus, old-account evidence, cross-guild isolation, out-of-window exclusion, bulk-suppression persistence, duplicate replay and the legacy-0015 upgrade shape.
@@ -1182,11 +1182,11 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Owner:** [TOG-10119](/TOG/issues/TOG-10119), [TOG-13123](/TOG/issues/TOG-13123)
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
-### s12-32: EventSub subscription reconcile at startup plus a bounded hourly interval (#989, open)
+### s12-32: EventSub subscription reconcile at startup plus a bounded hourly interval (#989)
 
 - **Method:** `manual` (not an execution verdict).
-- **Action:** After the open reconcile slice merges, first re-verify the flag names and cited file:line at its merge head and refresh the parity row; then on staging with the receiver enabled, restart the container and observe one bounded reconcile interval tick with an empty and a populated broadcaster allowlist.
-- **Expected:** Reconcile runs at startup and on the hourly interval only while the receiver flag is exactly on, an empty allowlist parks without subscriptions, and no reconcile runs while the flag is off; until the slice lands, HEAD runs no reconcile (library-only planner; the receiver only acks revocations).
+- **Action:** On staging with the receiver enabled, restart the container and observe one bounded reconcile interval tick with an empty and a populated broadcaster allowlist.
+- **Expected:** Reconcile runs at startup and on the hourly interval only while the receiver flag is exactly on, an empty allowlist parks without subscriptions, and no reconcile runs while the flag is off.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 - **Owner:** [TOG-13123](/TOG/issues/TOG-13123)
 
@@ -1237,7 +1237,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 - **Method:** `automated` (not an execution verdict).
 - **Action:** Run the voice publish pins: the router merge and yield tests in `crates/core/src/router.rs`, the staging manifest drift tests in `crates/core/tests/staging_publish_manifest.rs`, and the generated command reference check in `crates/core/tests/reference_docs.rs`.
-- **Expected:** With `TWO_VOICE=1` the merged publish set carries the 29 builtins then the 21 voice names (voice `kick` loses first-wins to moderation `/kick`), `/templateassistant` only with the assistant gate too, names and default permissions equal the manifest, and none publish with the gate off.
+- **Expected:** With `TWO_VOICE=1` the merged publish set carries the 29 builtins then the 21 voice names (voice `kick` loses first-wins to moderation `/kick`), `/templateassistant` unpublished in every gate state until its slice lands, names and default permissions equal the manifest, and none publish with the gate off.
 - **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result; fixture proof only. Deployed `/voice` registry read-back and the temp-voice staging scenario stay on [TOG-10119](/TOG/issues/TOG-10119) and are not covered by this row.
 - **Owner:** [TOG-10093](/TOG/issues/TOG-10093), [TOG-10119](/TOG/issues/TOG-10119)
 - **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib router::tests::voice && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib router::tests::templateassistant && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test staging_publish_manifest && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test reference_docs committed_references_match_compiled_metadata

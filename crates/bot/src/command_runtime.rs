@@ -217,7 +217,10 @@ pub(crate) struct CommandDispatchGuard(Arc<CommandRuntime>);
 
 impl Drop for CommandDispatchGuard {
     fn drop(&mut self) {
-        let mut tasks = self.0.tasks.lock().expect("command task scope");
+        let mut tasks = two_bot_core::metrics::recover_drop_poison(
+            self.0.tasks.lock(),
+            "command_dispatch_guard",
+        );
         tasks.stopped = true;
         for lane in &mut tasks.lanes {
             for handle in lane.drain(..) {
@@ -999,10 +1002,24 @@ impl CommandRuntime {
                         if TicketAction::from_custom_id(&component.custom_id).is_some()
                 );
                 if let Some(tickets) = self.tickets.as_ref().filter(|_| is_ticket) {
-                    tickets.spawn(async move {
+                    // Ticket components never entered the shared
+                    // user-slot/lane admission: the ticket runtime admits
+                    // synchronously before spawning, and overload gets the
+                    // same one-call ephemeral busy reply as the shared lanes
+                    // instead of silence. The busy target is captured before
+                    // the handler moves the interaction.
+                    let busy = self.busy_target(&interaction);
+                    let interaction_id = interaction.id.get();
+                    let user = interaction.author_id().map(|id| id.get());
+                    let admitted = tickets.try_spawn_component(user, |permit| async move {
+                        let _permit = permit;
                         runtime.on_interaction(&interaction).await;
                     });
-                    true
+                    if !admitted {
+                        tickets.record_component_saturation(interaction_id);
+                        self.reply_busy(busy);
+                    }
+                    admitted
                 } else {
                     self.admit_interaction(interaction)
                 }
@@ -1370,8 +1387,9 @@ impl CommandRuntime {
             self.answer(interaction, response).await;
             return;
         }
+        // No `"help"` entry: the help arm above owns `/help` and returns
+        // first, so an owner-map entry could never execute.
         let owner = match name.as_str() {
-            "help" => Some(HandlerId::Help),
             "privacy" => Some(HandlerId::Privacy),
             "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list" => {
                 Some(HandlerId::AutomationAdmin)
@@ -2236,9 +2254,16 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
             HandlerId::FeedAdd,
             HandlerId::FeedRemove,
             HandlerId::FeedList,
+            // The ordered RSVP surface executes these ids; registration
+            // documents the ownership the router outcome names.
+            HandlerId::Rsvp,
+            HandlerId::RsvpAttendance,
         ] {
             router.register(Box::new(SliceHandler(id)));
         }
+    }
+    if gates.scorecard {
+        router.register(Box::new(SliceHandler(HandlerId::ScorecardAttendance)));
     }
     // Leveling is not an activation-fenced capability: the core rank and
     // leaderboard commands stay available to every permitted identity.
@@ -2322,3 +2347,7 @@ pub(crate) fn publication_definitions(
         .map(Some)
         .map_err(|_| RegistrySyncError::Invalid)
 }
+
+#[cfg(test)]
+#[path = "command_runtime_poison_acceptance.rs"]
+mod dispatch_guard_poison_acceptance;

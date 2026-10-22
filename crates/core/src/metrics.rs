@@ -5,7 +5,10 @@ use serde::Serialize;
 use std::{
     collections::HashMap,
     fmt::Write,
-    sync::{Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        LockResult, Mutex, MutexGuard, OnceLock,
+    },
     time::Duration,
 };
 
@@ -361,6 +364,21 @@ pub const DISPATCH_LANES: &[&str] = &[
 /// single checkpoint failure stops the worker, so there is no
 /// benign-singleton case.
 pub const CHECKPOINT_FAILURE_STAGES: &[&str] = &["pre_commit", "commit"];
+/// Drop-guard names for `two_bot_drop_poison_total{guard}`: the four guards
+/// whose `Drop` bodies recover a poisoned lock instead of panicking (which
+/// would abort the process when the drop runs during unwinding).
+/// `command_dispatch_guard` stops the command task scope,
+/// `schedule_run` finishes a feed poll schedule, `user_slot` releases an
+/// interaction admission count, `in_flight_guard` releases a voice REST
+/// attempt slot. Exactly these four series exist; unknown guards collapse
+/// to the trailing `in_flight_guard` slot only when the allowlist grows.
+/// Panic payloads are never labels.
+pub const DROP_POISON_GUARDS: &[&str] = &[
+    "command_dispatch_guard",
+    "schedule_run",
+    "user_slot",
+    "in_flight_guard",
+];
 /// Presence-capture outcomes for `two_bot_presence_capture_total{outcome}`
 /// (event-store S3): `inserted` for a first delivery that stored a row,
 /// `duplicate` for a same-key retry absorbed by the shared dedup key, and
@@ -623,6 +641,19 @@ struct Values {
     voice_watchdog_stucks: u64,
     /// Halt-latch recoveries via credential re-probe.
     voice_halt_recoveries: u64,
+    /// Fair-scheduling bound: at most this many consecutive guild-actor
+    /// inbox turns before a ready dispatch, timer or maintenance branch
+    /// runs. Published by each actor at startup from its single source of
+    /// truth; 0 until the first actor publishes. Label-free gauge.
+    voice_actor_inbox_turn_bound: u64,
+    /// Guild-actor inbox commands processed, across all guild actors.
+    /// Compare with dispatch turns: inbox turns climbing while dispatch
+    /// turns stay flat means the actor is draining churn without
+    /// dispatching. Label-free counter.
+    voice_actor_inbox_turns: u64,
+    /// Guild-actor dispatch turns that ran, across all guild actors,
+    /// whether or not the turn progressed. Label-free counter.
+    voice_actor_dispatch_turns: u64,
     /// Live views republished by the not-ready-while-connected self-heal.
     voice_live_self_heals: u64,
     voice_vote_kick: [u64; VOICE_VOTE_KICK_OUTCOMES.len()],
@@ -654,6 +685,11 @@ struct Values {
     /// process restart, so the runbook pairs it with the error log line. No
     /// guild id, SQLSTATE or error text ever becomes a label.
     retention_replay_needed: u64,
+    /// Ticket component interactions refused before spawning because the
+    /// runtime or the member was saturated. Label-free counter; resets on
+    /// process restart, so the runbook pairs it with the sampled saturation
+    /// log line. No member id, token or interaction id ever becomes a label.
+    ticket_component_drops: u64,
     /// Event-store consumer lag (S1): `received_at - event_time` spread in
     /// seconds for the newest observed capture row. Last writer wins; 0 when
     /// no row has been observed. Single label-free series — no message,
@@ -670,13 +706,34 @@ struct Values {
 
 /// Storage is fixed-size, except the per-actor voice stall map, which is
 /// bounded by the live guild-actor set. Unknown labels collapse to
-/// `other`, including hostile input.
+/// `other`, including hostile input. Drop-poison counts live outside the
+/// `Values` mutex in per-instance atomics: recording from a `Drop` body
+/// must complete even while another thread holds (or poisoned) that mutex,
+/// and must never block behind a scrape or an unrelated writer.
 #[derive(Default)]
-pub struct Metrics(Mutex<Values>);
+pub struct Metrics(Mutex<Values>, [AtomicU64; DROP_POISON_GUARDS.len()]);
 
 pub fn global() -> &'static Metrics {
     static METRICS: OnceLock<Metrics> = OnceLock::new();
     METRICS.get_or_init(Metrics::default)
+}
+
+/// Recover a drop-guard lock acquisition: on poison, count one
+/// `two_bot_drop_poison_total{guard}`, log one fixed-vocabulary warn, and
+/// hand back the recovered guard so the drop still releases its state.
+/// Panicking inside `drop` aborts the process when the drop runs during
+/// unwinding; this helper is the only poison path a `Drop` body needs.
+/// `guard` must be a [`DROP_POISON_GUARDS`] member. Never panics and never
+/// takes another lock: recording is a lock-free atomic increment.
+pub fn recover_drop_poison<'a, T>(
+    result: LockResult<MutexGuard<'a, T>>,
+    guard: &str,
+) -> MutexGuard<'a, T> {
+    result.unwrap_or_else(|poisoned| {
+        global().drop_poison(guard);
+        tracing::warn!(guard, "drop guard recovered a poisoned lock");
+        poisoned.into_inner()
+    })
 }
 
 /// The recorded contribution for `actor`, fenced by generation: an older
@@ -1153,6 +1210,23 @@ impl Metrics {
         })
     }
 
+    /// One actor's recorded live-not-ready age in seconds, or `None` when
+    /// the actor has no recorded contribution. Test/diagnostic seam only:
+    /// the actor key is process-local and this lookup is never rendered,
+    /// labelled or persisted. Pins the watchdog sibling's not-ready
+    /// republication per actor, where the public maximum cannot.
+    #[doc(hidden)]
+    pub fn voice_actor_live_not_ready_secs(&self, actor: u64) -> Option<u64> {
+        let values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values
+            .voice_actors
+            .get(&actor)
+            .map(|entry| entry.live_not_ready_secs)
+    }
+
     /// Age of the oldest in-flight voice REST attempt in seconds; 0 idles it.
     /// Last writer wins.
     pub fn set_voice_rest_in_flight_age_secs(&self, age_secs: u64) {
@@ -1214,6 +1288,35 @@ impl Metrics {
         values.voice_halt_recoveries = values.voice_halt_recoveries.saturating_add(1);
     }
 
+    /// Publish the fair-scheduling bound: at most `bound` consecutive
+    /// guild-actor inbox turns before a ready dispatch, timer or
+    /// maintenance branch runs. Called once per actor at startup with the
+    /// actor's single source of truth; last writer wins.
+    pub fn set_voice_actor_inbox_turn_bound(&self, bound: u64) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .voice_actor_inbox_turn_bound = bound;
+    }
+
+    /// One guild-actor inbox command processed.
+    pub fn voice_actor_inbox_turn(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.voice_actor_inbox_turns = values.voice_actor_inbox_turns.saturating_add(1);
+    }
+
+    /// One guild-actor dispatch turn that ran, whether or not it progressed.
+    pub fn voice_actor_dispatch_turn(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.voice_actor_dispatch_turns = values.voice_actor_dispatch_turns.saturating_add(1);
+    }
+
     /// One untracked creator-channel orphan needing manual deletion after
     /// failed `/create` compensation (TOG-13543). No channel ID is retained.
     pub fn voice_orphan(&self) {
@@ -1235,6 +1338,19 @@ impl Metrics {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         values.retention_replay_needed = values.retention_replay_needed.saturating_add(1);
+    }
+
+    /// One ticket component interaction refused before spawning: the runtime
+    /// held `MAX_TICKET_COMPONENT_IN_FLIGHT` executions or the member held
+    /// the per-member cap. Call exactly once per refusal from the ticket
+    /// dispatch path; admitted work never calls this. Label-free counter;
+    /// no member id, token or interaction id ever becomes a label.
+    pub fn ticket_component_drop(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.ticket_component_drops = values.ticket_component_drops.saturating_add(1);
     }
 
     /// One storage-layer failure. Unknown `op` values collapse
@@ -1303,6 +1419,20 @@ impl Metrics {
         let counter =
             &mut values.checkpoint_failures[bounded_index(stage, CHECKPOINT_FAILURE_STAGES)];
         *counter = counter.saturating_add(1);
+    }
+
+    /// One poisoned lock recovered by a drop guard instead of panicking
+    /// inside `drop` (which aborts the process during unwinding). Call once
+    /// per poisoned drop, with a [`DROP_POISON_GUARDS`] member. Unknown
+    /// guards collapse to `in_flight_guard` only when the allowlist grows;
+    /// panic payloads are never labels. No IDs, tokens or bodies are
+    /// retained. Lock-free and saturating: safe to call from a `Drop` body
+    /// while any thread holds or poisoned the `Values` mutex.
+    pub fn drop_poison(&self, guard: &str) {
+        let counter = &self.1[bounded_index(guard, DROP_POISON_GUARDS)];
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            Some(count.saturating_add(1))
+        });
     }
 
     /// One signed website-action receiver execution (TOG-20119). Call exactly
@@ -1912,6 +2042,30 @@ impl Metrics {
         );
         header(
             &mut out,
+            "two_bot_voice_actor_inbox_turn_bound",
+            "gauge",
+            "At most this many consecutive guild-actor inbox turns before a ready dispatch, timer or maintenance branch runs; 0 until the first actor publishes.",
+        );
+        writeln!(
+            out,
+            "two_bot_voice_actor_inbox_turn_bound {}",
+            values.voice_actor_inbox_turn_bound
+        )
+        .unwrap();
+        scalar(
+            &mut out,
+            "two_bot_voice_actor_inbox_turns_total",
+            "counter",
+            values.voice_actor_inbox_turns,
+        );
+        scalar(
+            &mut out,
+            "two_bot_voice_actor_dispatch_turns_total",
+            "counter",
+            values.voice_actor_dispatch_turns,
+        );
+        header(
+            &mut out,
             "two_bot_voice_vote_kick_total",
             "counter",
             "Vote-kick starts, refusals by refusal code and terminal enforcements by enforcement code; vote results are audit-only.",
@@ -2005,6 +2159,23 @@ impl Metrics {
         }
         header(
             &mut out,
+            "two_bot_drop_poison_total",
+            "counter",
+            "Poisoned locks recovered by drop guards instead of panicking inside drop (which aborts during unwinding); every recovery also logs one warn with the guard name.",
+        );
+        let drop_poisons = self
+            .1
+            .each_ref()
+            .map(|counter| counter.load(Ordering::Relaxed));
+        for (guard, count) in DROP_POISON_GUARDS.iter().zip(drop_poisons) {
+            writeln!(
+                out,
+                "two_bot_drop_poison_total{{guard=\"{guard}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
             "two_bot_internal_actions_total",
             "counter",
             "Signed website-action receiver executions by bounded family and outcome; refusals share the warn-summary classes.",
@@ -2066,6 +2237,12 @@ impl Metrics {
             "two_bot_retention_replay_needed_total",
             "counter",
             values.retention_replay_needed,
+        );
+        scalar(
+            &mut out,
+            "two_bot_ticket_component_drops_total",
+            "counter",
+            values.ticket_component_drops,
         );
         header(
             &mut out,
@@ -2262,6 +2439,10 @@ fn scalar(out: &mut String, name: &str, kind: &str, value: u64) {
     header(out, name, kind, "Process-local health metric.");
     writeln!(out, "{name} {value}").unwrap();
 }
+
+#[cfg(test)]
+#[path = "metrics_drop_poison_acceptance_tests.rs"]
+mod drop_poison_acceptance_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2889,6 +3070,98 @@ mod tests {
     }
 
     #[test]
+    fn drop_poisons_stay_bounded_and_count_per_guard() {
+        let metrics = Metrics::default();
+        metrics.drop_poison("command_dispatch_guard");
+        metrics.drop_poison("schedule_run");
+        metrics.drop_poison("user_slot");
+        metrics.drop_poison("in_flight_guard");
+        metrics.drop_poison("user_slot");
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_drop_poison_total{guard=\"command_dispatch_guard\"} 1\n"));
+        assert!(text.contains("two_bot_drop_poison_total{guard=\"schedule_run\"} 1\n"));
+        assert!(text.contains("two_bot_drop_poison_total{guard=\"user_slot\"} 2\n"));
+        assert!(text.contains("two_bot_drop_poison_total{guard=\"in_flight_guard\"} 1\n"));
+        // Fixed cardinality: exactly the allowlisted series render.
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("two_bot_drop_poison_total{"))
+                .count(),
+            DROP_POISON_GUARDS.len()
+        );
+    }
+
+    fn global_drop_poison_count(guard: &str) -> u64 {
+        let prefix = format!("two_bot_drop_poison_total{{guard=\"{guard}\"}} ");
+        global()
+            .render(None)
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .and_then(|count| count.parse().ok())
+            .expect("allowlisted guard series renders")
+    }
+
+    #[test]
+    fn recover_drop_poison_counts_only_a_poisoned_lock() {
+        // Only this test touches the `schedule_run` series in the core lib
+        // test binary, so exact deltas on the process-global counter hold.
+        let lock = Mutex::new(7_u32);
+        let start = global_drop_poison_count("schedule_run");
+        {
+            let guard = recover_drop_poison(lock.lock(), "schedule_run");
+            assert_eq!(*guard, 7);
+        }
+        assert_eq!(global_drop_poison_count("schedule_run"), start);
+
+        let holder = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = lock.lock().expect("uncontended");
+            std::panic::panic_any("poison the lock");
+        }));
+        assert!(holder.is_err());
+        assert!(lock.is_poisoned());
+        {
+            let mut guard = recover_drop_poison(lock.lock(), "schedule_run");
+            assert_eq!(*guard, 7);
+            *guard = 8;
+        }
+        assert_eq!(global_drop_poison_count("schedule_run"), start + 1);
+        // Poison is sticky: a second recovery counts again.
+        drop(recover_drop_poison(lock.lock(), "schedule_run"));
+        assert_eq!(global_drop_poison_count("schedule_run"), start + 2);
+    }
+
+    #[test]
+    fn drop_poison_counters_saturate_at_u64_max() {
+        // Seeds the atomic seam directly: no stable public API sets a
+        // counter, and acceptance must not bind to the storage layout.
+        let metrics = Metrics::default();
+        let slot = bounded_index("user_slot", DROP_POISON_GUARDS);
+        metrics.1[slot].store(u64::MAX - 1, Ordering::Relaxed);
+        metrics.drop_poison("user_slot");
+        metrics.drop_poison("user_slot");
+        metrics.drop_poison("user_slot");
+        let text = metrics.render(None);
+        assert!(text.contains(&format!(
+            "two_bot_drop_poison_total{{guard=\"user_slot\"}} {}\n",
+            u64::MAX
+        )));
+    }
+
+    #[test]
+    fn drop_poison_hostile_labels_collapse_without_new_series() {
+        let metrics = Metrics::default();
+        let before = metrics.render(None).lines().count();
+        for id in 0..100 {
+            let hostile = format!("{id}\"\\\nsecret=value");
+            metrics.drop_poison(&hostile);
+        }
+        let text = metrics.render(None);
+        assert_eq!(text.lines().count(), before);
+        assert!(!text.contains("secret"));
+        assert!(text.contains("two_bot_drop_poison_total{guard=\"in_flight_guard\"} 100\n"));
+    }
+
+    #[test]
     fn gateway_snapshot_reports_counters_and_last_ready_resume() {
         let metrics = Metrics::default();
         let fresh = metrics.gateway_snapshot();
@@ -3102,6 +3375,61 @@ mod tests {
     }
 
     #[test]
+    fn ticket_component_drops_counter_is_label_free_and_zero_fresh() {
+        // Refused ticket components render as one label-free counter series —
+        // 0 on a fresh registry, +1 per refusal — so no member id, token or
+        // interaction id can reach exposition.
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("# TYPE two_bot_ticket_component_drops_total counter\n"));
+        assert!(text.contains("two_bot_ticket_component_drops_total 0\n"));
+        metrics.ticket_component_drop();
+        metrics.ticket_component_drop();
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_ticket_component_drops_total 2\n"));
+        assert!(!text.contains("two_bot_ticket_component_drops_total{"));
+        let series: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("two_bot_ticket_component_drops_total "))
+            .collect();
+        assert_eq!(series.len(), 1);
+        let (_, value) = series[0].rsplit_once(' ').unwrap();
+        assert!(value.parse::<f64>().is_ok(), "bad sample: {}", series[0]);
+    }
+
+    #[test]
+    fn voice_actor_fair_scheduling_series_are_label_free() {
+        // The fair-scheduling diagnosis is one gauge (the bound) plus two
+        // counters (inbox turns vs dispatch turns), all label-free, so no
+        // guild, member or channel label can reach exposition. The bound
+        // reads 0 until the first actor publishes; the counters only move
+        // when their turn kind runs.
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("# TYPE two_bot_voice_actor_inbox_turn_bound gauge\n"));
+        assert!(text.contains("two_bot_voice_actor_inbox_turn_bound 0\n"));
+        assert!(text.contains("# TYPE two_bot_voice_actor_inbox_turns_total counter\n"));
+        assert!(text.contains("two_bot_voice_actor_inbox_turns_total 0\n"));
+        assert!(text.contains("# TYPE two_bot_voice_actor_dispatch_turns_total counter\n"));
+        assert!(text.contains("two_bot_voice_actor_dispatch_turns_total 0\n"));
+        metrics.set_voice_actor_inbox_turn_bound(32);
+        metrics.voice_actor_inbox_turn();
+        metrics.voice_actor_inbox_turn();
+        metrics.voice_actor_dispatch_turn();
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_actor_inbox_turn_bound 32\n"));
+        assert!(text.contains("two_bot_voice_actor_inbox_turns_total 2\n"));
+        assert!(text.contains("two_bot_voice_actor_dispatch_turns_total 1\n"));
+        assert!(!text.contains("two_bot_voice_actor_inbox_turn_bound{"));
+        assert!(!text.contains("two_bot_voice_actor_inbox_turns_total{"));
+        assert!(!text.contains("two_bot_voice_actor_dispatch_turns_total{"));
+        // Last writer wins for the gauge.
+        metrics.set_voice_actor_inbox_turn_bound(8);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_actor_inbox_turn_bound 8\n"));
+    }
+
+    #[test]
     fn event_store_consumer_lag_gauge_is_a_label_free_duration() {
         // S1 AC 4: the consumer lag setter renders as one label-free gauge
         // series — the newest observed `received_at - event_time` spread, 0
@@ -3197,6 +3525,9 @@ mod tests {
         assert!(text.contains("two_bot_voice_live_self_heal_total 0\n"));
         metrics.set_voice_actor_live_not_ready(1, 1, 0);
         metrics.set_voice_actor_live_not_ready(2, 1, 95);
+        assert_eq!(metrics.voice_actor_live_not_ready_secs(1), Some(0));
+        assert_eq!(metrics.voice_actor_live_not_ready_secs(2), Some(95));
+        assert_eq!(metrics.voice_actor_live_not_ready_secs(3), None);
         let text = metrics.render(None);
         assert!(text.contains("two_bot_voice_live_not_ready_seconds 95\n"));
         assert!(!text.contains("two_bot_voice_live_not_ready_seconds{"));

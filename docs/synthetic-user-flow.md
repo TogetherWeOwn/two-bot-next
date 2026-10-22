@@ -114,13 +114,67 @@ transition send nothing and need no webhook. When an alert or recovery transitio
 is due, a missing webhook fails that step, so a silent notification path cannot
 read as delivered.
 
+### History admission and decision receipt
+
+History is admitted before sorting, constructing a jobs URL or replaying any
+checkpoint. Runs/jobs roots must be objects with object-array collections;
+steps must also be an object array. Run IDs and run numbers must be positive
+signed-64-bit integers, never booleans, floats or numeric strings. Events and
+job/step names must be nonempty strings. Optional job IDs and step numbers use
+the same integer rule. IDs and ordering numbers must be unique, including
+across run pages; later pages must contain older run numbers. Every row on a
+fetched page is validated, including unrelated/current runs and jobs, before
+a matching job is read or a checkpoint can stop reconstruction.
+
+When present, counts must be nonnegative signed-64-bit integers consistent
+with the page; a jobs count must match the entire single page (at most 100).
+A partial jobs page cannot prove a unique target. Missing optional counts,
+status and conclusion fields remain readable for older records, but do not
+prove delivery or a decided-none checkpoint. Present status must be completed;
+conclusions must be null or a supported Actions conclusion (`success`,
+`failure`, `neutral`, `cancelled`, `skipped`, `timed_out`, `action_required`,
+`stale`, `startup_failure`). Multiple matching target jobs or probe/decide/post
+steps are unknown history, even if their values agree. Cancelled/timed-out
+posts do not prove delivery; a skipped post proves a checkpoint only with the
+existing successful-decide and normally-finished-job conditions above.
+
+Malformed, ambiguous, incomplete or unsupported history raises a safe
+`HistoryError` with `code=history_unknown` and
+`next_action=inspect_workflow_history`, never raw remote values. Failed current
+probes still decide ALERT (exit 0); healthy probes emit no event and fail the
+decide step (exit 1), never a false recovery. No current probe sample also
+fails (exit 1), without reading history. The 15-run page size, 200-prior-run
+replay bound and 1 MiB response cap remain; pagination additionally stops after
+15 pages so filtered rows cannot evade that budget. Hitting the page budget
+without a checkpoint reports unknown, not an exhausted history.
+
+Optional `--decide-only --json` prints one bounded JSON object to stdout:
+`schema_version: 1`, stable `check_id: synthetic-user-flow:<env>`, bounded
+string `run_id` (decimal current ID or `unknown`), nullable `event`, boolean
+`history_known`, `code` and `next_action`. Known decisions use
+`decision_ready` / `none`; unknown history uses the values above; an absent
+probe uses `no_probe_sample` / `none` with `history_known` false, since no
+history was read. This receipt is a decision, not proof
+of delivery or exactly-once posting. `GITHUB_OUTPUT` still receives precisely
+`event=alert`, `event=recovery` or `event=`. Without that file, JSON mode moves
+the event line to stderr to keep stdout valid JSON. Without `--json`, text
+output is unchanged. JSON is refused with posting or dry-run modes (exit 2).
+No retry, alert threshold, transport policy or live workflow flag is changed.
+
+Offline verification (mocked history/post boundaries, no GitHub/Discord calls):
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_synthetic_alert*.py' -v
+```
+
 ## Operator bindings
 
 - Repository variables `STAGING_WORKER_URL` and `PRODUCTION_WORKER_URL`:
   the staging and production Worker origins. `PRODUCTION_WORKER_URL` is the
   single source for deploy and passive synthetic checks; remove any production
-  Environment override of the same name. A missing variable skips that target
-  with a visible warning instead of producing recurring configuration failures.
+  Environment override of the same name. A missing variable fails that job
+  with an error naming the unset variable, so a run with zero probe samples
+  never reads green; the decide step also fails closed on any skipped probe.
 - Environment `synthetic-alerts`, secret `SYNTHETIC_ALERT_WEBHOOK_URL`: the
   Discord webhook. Never paste it into a command, log, or report.
 

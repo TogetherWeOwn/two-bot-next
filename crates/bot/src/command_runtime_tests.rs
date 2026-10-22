@@ -20,6 +20,9 @@
 #[path = "member_dispatch_authority_acceptance.rs"]
 mod member_dispatch_authority_acceptance;
 
+#[path = "custom_command_list_pages_acceptance.rs"]
+mod custom_command_list_pages_acceptance;
+
 use std::collections::VecDeque;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -3154,10 +3157,9 @@ async fn ready_publish_carries_the_voice_set_only_while_voice_is_live() {
                 "/{name} publishes iff voice is live (voice={voice})"
             );
         }
-        assert_eq!(
-            names.contains(&"templateassistant"),
-            voice && assistant,
-            "/templateassistant needs both gates (voice={voice} assistant={assistant})"
+        assert!(
+            !names.contains(&"templateassistant"),
+            "/templateassistant stays unpublished until its slice lands (voice={voice} assistant={assistant})"
         );
         if voice {
             let import = body
@@ -3176,6 +3178,114 @@ async fn ready_publish_carries_the_voice_set_only_while_voice_is_live() {
             assert!(names.contains(&expected), "{expected} must still publish");
         }
         mock.shutdown().await;
+    }
+}
+
+#[test]
+fn production_router_matches_composed_production_wiring() {
+    use two_bot_core::{HandlerId, InteractionHandler, InteractionRouter, ModerationAction};
+
+    #[derive(Debug)]
+    struct Marker(HandlerId);
+    impl InteractionHandler for Marker {
+        fn id(&self) -> HandlerId {
+            self.0
+        }
+    }
+
+    fn every_handler_id() -> Vec<HandlerId> {
+        let mut ids = vec![
+            HandlerId::Rank,
+            HandlerId::Leaderboard,
+            HandlerId::Help,
+            HandlerId::Privacy,
+            HandlerId::ScorecardAttendance,
+            HandlerId::AutomationAdmin,
+            HandlerId::AutomationCustom,
+            HandlerId::Rsvp,
+            HandlerId::RsvpAttendance,
+            HandlerId::Lfg,
+            HandlerId::LfgClose,
+            HandlerId::FeedAdd,
+            HandlerId::FeedRemove,
+            HandlerId::FeedList,
+        ];
+        ids.extend(ModerationAction::ALL.map(HandlerId::Moderation));
+        ids
+    }
+
+    // Composition mirrors production: the real `router_with_commands`, the
+    // member verbs `CommandRuntime::build` adds while the member consumer
+    // exists, and the LFG pair `InteractionRuntime::with_router` adds. Only
+    // `handler_for` presence is compared.
+    fn composed(gates: RouterGates, member_present: bool) -> InteractionRouter {
+        let mut router = router_with_commands(gates);
+        if member_present {
+            for action in [
+                ModerationAction::Ban,
+                ModerationAction::TempBan,
+                ModerationAction::Kick,
+                ModerationAction::Timeout,
+                ModerationAction::Warn,
+            ] {
+                router.register(Box::new(Marker(HandlerId::Moderation(action))));
+            }
+        }
+        router.register(Box::new(Marker(HandlerId::Lfg)));
+        router.register(Box::new(Marker(HandlerId::LfgClose)));
+        router
+    }
+
+    let all_on = RouterGates {
+        configured_guild: Some(GUILD),
+        scorecard: true,
+        automations: true,
+        announcements: true,
+        moderation: true,
+        voice: true,
+        voice_assistant: true,
+        tickets: true,
+        self_roles: true,
+        onboarding_picker: true,
+        session_picker: true,
+    };
+    // Every registration gate on/off, crossed with the member consumer.
+    for scorecard in [false, true] {
+        for automations in [false, true] {
+            for announcements in [false, true] {
+                for moderation in [false, true] {
+                    for member_present in [false, true] {
+                        let gates = RouterGates {
+                            scorecard,
+                            automations,
+                            announcements,
+                            moderation,
+                            ..all_on
+                        };
+                        let real = composed(gates, member_present);
+                        let seam = InteractionRouter::production_router(gates, member_present);
+                        for id in every_handler_id() {
+                            assert_eq!(
+                                real.handler_for(&id).is_some(),
+                                seam.handler_for(&id).is_some(),
+                                "{id:?} registration drifted (scorecard={scorecard} \
+                                 automations={automations} announcements={announcements} \
+                                 moderation={moderation} member={member_present})"
+                            );
+                        }
+                        // The exception list is the same five verbs the owner
+                        // map guards on the consumer, and nothing else.
+                        let exceptions =
+                            InteractionRouter::intentional_registration_exceptions(member_present);
+                        assert_eq!(
+                            exceptions.len(),
+                            if member_present { 0 } else { 5 },
+                            "member={member_present}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 

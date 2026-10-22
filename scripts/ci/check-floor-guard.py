@@ -42,6 +42,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 CONSTRAINTS = "CONSTRAINTS.md"
 
+# Bounded-subprocess policy (docs/bounded-subprocess-checks.md): every child
+# wait is finite so a stalled child fails closed here instead of hanging
+# until the external CI ceiling. Local Git reads answer in well under a
+# second; 30s bounds the stall without touching valid runs.
+GIT_TIMEOUT_SECONDS = 30
+
 # Reuse the coverage gate's exact Git header decoding, including C quotes
 # and the trailing TAB Git emits for spaced paths.
 _COVERAGE_SPEC = importlib.util.spec_from_file_location(
@@ -236,8 +242,9 @@ def _checked_by_narrowed(base_cell, head_cell, *, allow_coverage_lane_move=False
     to ``check``, ``check all`` to ``check advisories``, ``doc`` to
     ``check``) fails. Tokens are compared whole: a substring never
     satisfies. A backticked name followed by ``lane`` is a CI lane, not a
-    command. The only approved lane move is Patch coverage from ``check`` to
-    ``rust-tests``; every gate must otherwise keep its named lane. An
+    command. The approved Patch coverage lane moves are ``check`` to
+    ``rust-tests`` and ``rust-tests`` to ``patch-coverage``; every gate must
+    otherwise keep its named lane. An
     interpreter swap around a script path (``python3 scripts/...`` to
     ``uv run scripts/...``) keeps its identity through the script path.
     """
@@ -254,10 +261,9 @@ def _checked_by_narrowed(base_cell, head_cell, *, allow_coverage_lane_move=False
     if base_lanes:
         if not head_lanes:
             return True
-        approved_coverage_move = (
-            allow_coverage_lane_move
-            and base_lanes == {"check"}
-            and head_lanes == {"rust-tests"}
+        approved_coverage_move = allow_coverage_lane_move and (
+            (base_lanes == {"check"} and head_lanes == {"rust-tests"})
+            or (base_lanes == {"rust-tests"} and head_lanes == {"patch-coverage"})
         )
         if base_lanes != head_lanes and not approved_coverage_move:
             return True
@@ -519,15 +525,28 @@ def scan(added, removed, deleted, exceptions=(), today=None):
 
 
 def _git(root, *args):
-    return subprocess.run(
-        ["git", *args], cwd=root, capture_output=True, text=True
-    )
+    try:
+        return subprocess.run(
+            ["git", *args], cwd=root, capture_output=True, text=True,
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise ValueError(
+            f"git {' '.join(args)} timeout after {GIT_TIMEOUT_SECONDS}s; "
+            "next: re-run the guard; if the stall repeats, inspect the git "
+            "invocation and runner state") from error
+    except OSError as error:
+        raise ValueError(
+            f"git {' '.join(args)} spawn failed ({error}); "
+            "next: re-run the guard on a runner with git installed") from error
 
 
 def _merge_base(root, base_ref, head_ref):
     mb = _git(root, "merge-base", base_ref, head_ref)
     if mb.returncode != 0:
-        raise NoMergeBase(f"no merge base against {base_ref}")
+        raise NoMergeBase(
+            f"no merge base against {base_ref}; next: fetch the base ref "
+            "and re-run the guard")
     return mb.stdout.strip()
 
 
@@ -553,7 +572,9 @@ def collect(root, base, head_ref="HEAD"):
         "--src-prefix=a/", "--dst-prefix=b/", base, head_ref, "--",
     )
     if diff.returncode != 0:
-        raise ValueError(f"git diff failed with exit code {diff.returncode}")
+        raise ValueError(
+            f"git diff failed with exit code {diff.returncode}; next: "
+            "verify the refs exist and re-run the guard")
     added, removed = [], []
     old_path, new_path, in_hunk = None, None, False
     for line in diff.stdout.splitlines():
@@ -574,7 +595,10 @@ def collect(root, base, head_ref="HEAD"):
         root, "diff", "--name-status", "-z", "--find-renames", base, head_ref, "--"
     )
     if status.returncode != 0:
-        raise ValueError(f"git diff --name-status failed with exit code {status.returncode}")
+        raise ValueError(
+            "git diff --name-status failed with exit code "
+            f"{status.returncode}; next: verify the refs exist and re-run "
+            "the guard")
     deleted = []
     changes = iter(status.stdout.rstrip("\0").split("\0"))
     for change in changes:
@@ -609,7 +633,8 @@ def collect(root, base, head_ref="HEAD"):
     others = _git(root, "ls-files", "--others", "--exclude-standard", "-z")
     if others.returncode != 0:
         raise ValueError(
-            f"git ls-files failed with exit code {others.returncode}"
+            f"git ls-files failed with exit code {others.returncode}; next: "
+            "verify the workspace is a git checkout and re-run the guard"
         )
     for name in others.stdout.split("\0"):
         if not name:

@@ -57,6 +57,18 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# Bounded-subprocess policy (docs/bounded-subprocess-checks.md): every child
+# wait is finite so a stalled child fails closed here instead of hanging
+# until the external CI ceiling. Local Git diffs answer in well under a
+# second; 30s bounds the stall without touching valid runs. Both diff calls
+# below share this one value.
+GIT_TIMEOUT_SECONDS = 30
+
+
+class JobInputsError(RuntimeError):
+    """A change diff timed out or never spawned; jobs cannot skip."""
+
+
 RUST = "rust"
 WORKER = "worker"
 PARITY = "parity"
@@ -130,7 +142,9 @@ WORKER_PREFIX = "wrangler/"
 # smoke-surface-inventory for the same family of smoke content reads),
 # privacy/database-roles/rollback-delta/backup by the voice owner-grant
 # journal documentation regression
-# (crates/core/tests/voice_owner_grants_docs.rs).
+# (crates/core/tests/voice_owner_grants_docs.rs), tickets by the ticket
+# component admission acceptance suite (include_str! in
+# crates/bot/src/ticket_component_admission_acceptance_tests.rs).
 # parity.md and the baseline also gate parity-docs. Existence-only docs
 # (staging-soak/preflight: the preconditions binary checks is_file,
 # never content) and runbook/container-readiness (worker tests only) fall
@@ -153,6 +167,7 @@ RUST_DOCS = frozenset({
     "docs/database-roles.md",
     "docs/rollback-delta.md",
     "docs/backup.md",
+    "docs/tickets.md",
 })
 PARITY_DOCS = frozenset({
     "docs/parity.md",
@@ -177,6 +192,7 @@ DOCS_PREFIX = "docs/"
 WORKER_WORKFLOWS = frozenset({
     ".github/workflows/supply-chain.yml",
     ".github/workflows/release.yml",
+    ".github/workflows/daily-digest.yml",
     ".github/workflows/deploy-production.yml",
     ".github/workflows/deploy-staging.yml",
 })
@@ -341,7 +357,9 @@ VOICE_EXACT = frozenset({
     "scripts/job-inputs.py",
     "scripts/staging_voice_synthetic.py",
     "scripts/test_staging_voice_synthetic.py",
+    "scripts/test_staging_voice_synthetic_dry_run_acceptance.py",
     "scripts/test_staging_voice_synthetic_gateway_intake_acceptance.py",
+    "scripts/test_staging_voice_synthetic_owned_room_acceptance.py",
     "wrangler/src/container-env.ts",
 })
 
@@ -391,7 +409,20 @@ def git_diff_names(base_ref, head_ref, root=ROOT, diff_filter=None):
     if diff_filter is not None:
         command.append(f"--diff-filter={diff_filter}")
     command.append(f"{base_ref}..{head_ref}")
-    output = subprocess.run(command, capture_output=True, text=True, check=True)
+    try:
+        output = subprocess.run(
+            command, capture_output=True, text=True, check=True,
+            timeout=GIT_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as error:
+        raise JobInputsError(
+            f"job-inputs: git diff timeout after {GIT_TIMEOUT_SECONDS}s; "
+            "next: re-run the selector; if the stall repeats, inspect the "
+            "git invocation and runner state") from error
+    except OSError as error:
+        raise JobInputsError(
+            f"job-inputs: git diff spawn failed ({error}); "
+            "next: re-run the selector on a runner with git "
+            "installed") from error
     return [line for line in output.stdout.splitlines() if line.strip()]
 
 
@@ -416,7 +447,12 @@ def main(argv=None):
     except subprocess.CalledProcessError as exc:
         # Undecidable diff (shallow clone, missing ref): fail closed.
         print(f"job-inputs: git diff failed ({exc.returncode}); "
-              "selecting full jobs", flush=True)
+              "selecting full jobs; next: verify the refs exist and "
+              "re-run the selector", flush=True)
+        return 2
+    except JobInputsError as exc:
+        # Undecidable diff (stalled or unspawnable git): fail closed.
+        print(f"{exc}; selecting full jobs", flush=True)
         return 2
     jobs = selection(changed, deleted)
     jobs[VOICE] = voice_selected(changed, deleted)
