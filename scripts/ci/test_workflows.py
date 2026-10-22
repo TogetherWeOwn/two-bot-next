@@ -4166,7 +4166,7 @@ class WorkflowTests(unittest.TestCase):
             ignored_sweep,
         )
         guarded = [run for run in cov_runs if "llvm-cov --no-report -p " in run]
-        self.assertEqual(len(guarded), 14)
+        self.assertEqual(len(guarded), 15)
         for run in guarded:
             with self.subTest(guarded=run):
                 self.assertIn("--test-threads=1", run)
@@ -4175,7 +4175,8 @@ class WorkflowTests(unittest.TestCase):
                 # Deliberate: a guard panic in a guarded suite fails the step.
                 self.assertNotIn("--ignore-run-fail", run)
         # needle -> carries `--features db` (core/discord suites need the db
-        # feature to build their guarded targets; cutover suites do not).
+        # feature to build their guarded targets; cutover and store suites do
+        # not).
         guarded_needles = {
             "--test stream_live_store": True,
             "--test mutation_429_proves_no_effect_channel": True,
@@ -4191,6 +4192,8 @@ class WorkflowTests(unittest.TestCase):
             "--test reengagement_list_db": False,
             "--test game_activity_report_db": False,
             "--test member_moderation_db": True,
+            "--test starboard_store": False,
+            "--test starboard_api": False,
         }
         for needle, wants_db_feature in guarded_needles.items():
             with self.subTest(needle=needle):
