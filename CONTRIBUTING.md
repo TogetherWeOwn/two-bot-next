@@ -55,7 +55,9 @@ exact head commit. Never bypass or weaken a check.
 
 `check.yml` runs its Rust work as parallel lanes that all start once `job-inputs`
 finishes: `check` (lint: offline guards, cargo-deny, fmt, clippy), `rust tests`
-(unit, integration and doc tests), `rust nextest` (workspace lib/bins under
+(unit, integration and doc tests), `patch coverage` (the HARD patch-coverage
+measurement, split out of `rust tests` so the two signals fail independently),
+`rust nextest` (workspace lib/bins under
 cargo-nextest with one retry, JUnit and a flake ledger) and two database lanes,
 `ignored db (stores)` and `ignored db (runtime)`. The single `ci-ok` aggregate waits on both selectors
 (`job-inputs` and `container-inputs`), every selected lane, `worker check`, the
@@ -71,7 +73,7 @@ Deterministic quality gates (per-PR advisories HARD, ast-grep and Semgrep
 HARD, required voice synthetic, test-target inventory HARD) run as steps of
 the `check` lane on the existing routed runner; see
 [`docs/quality-gates.md`](docs/quality-gates.md). Patch coverage (HARD) runs in
-`rust-tests` with the disposable Postgres service and ignored database-backed
+`patch-coverage` with the disposable Postgres service and ignored database-backed
 tests. New checks start in WARN (report, never fail) and flip to HARD only with
 their backlog burned down.
 
@@ -79,7 +81,7 @@ Every Rust setup step in `check.yml` installs the exact version from
 `rust-toolchain.toml`, including fmt/clippy components where required. Do not use
 floating `stable`: Cargo still follows the repository pin, so differing versions
 can cause component-install conflicts before fmt runs. The offline workflow
-policy suite pins all nine installers to the repository version; bump them and
+policy suite pins all ten installers to the repository version; bump them and
 the toolchain and builder-image pins together.
 
 ### Pull-request size labels (advisory)

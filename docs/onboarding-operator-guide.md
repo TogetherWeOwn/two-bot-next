@@ -83,7 +83,7 @@ configure the container (see [runbook.md](runbook.md#logs-and-keepalive)).
 ## Prompt decisions
 
 `decide_prompt` (`crates/core/src/onboarding.rs:157`) runs in legacy check
-order: bots first, then the rules gate, then the once-per-member guard.
+order: bots first, then the rules gate, then the guard that lasts one stay (a processed goodbye clears it, so a rejoin is welcomed again).
 
 | Inputs | Decision |
 |---|---|

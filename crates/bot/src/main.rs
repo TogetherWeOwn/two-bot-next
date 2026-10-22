@@ -17,6 +17,8 @@ mod backfill_retention_chains;
 mod backup_cli;
 #[cfg(test)]
 mod backup_cli_pool_open_tests;
+#[cfg(test)]
+mod backup_stable_error_codes_acceptance_tests;
 // Pure burn math: no runtime caller yet, the offline pin test is the consumer.
 #[allow(dead_code)]
 mod burn_rate;
@@ -39,6 +41,8 @@ mod db_log;
 #[path = "../../discord/tests/common/mod.rs"]
 mod discord_test_common;
 mod dispatch;
+#[cfg(test)]
+mod duplicate_pool_registration_acceptance_tests;
 mod erasure_cli;
 mod event_cli;
 mod eventsub_delivery;
@@ -50,10 +54,13 @@ mod feed_jobs;
 mod gateway;
 #[cfg(test)]
 mod slow_burn_ticket_tests;
-// Bounded reconnect schedule and runner: no runtime caller yet. Test-only
-// until the gateway loop adopts it, so it lives in test builds instead of
-// shipping dead code to the container.
+// Supervised reconnect runner: test-only until the gateway loop adopts it,
+// so it lives in test builds instead of shipping dead code to the
+// container. The retry schedule itself lives in the library
+// (`two_bot::gateway_backoff`, re-exported here) and the gateway receive
+// loop already paces `Reconnect` failures on it.
 #[cfg(test)]
+#[path = "gateway_supervised.rs"]
 mod gateway_backoff;
 mod gateway_commands;
 mod gateway_failure;

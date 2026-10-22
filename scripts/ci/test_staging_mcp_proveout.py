@@ -173,7 +173,7 @@ class AuditContractTests(unittest.TestCase):
                 if tool == "get_audit":
                     envelope.update(audit_reply)
                 elif tool == "no_such_tool":
-                    envelope["error"] = {"code": -32601}
+                    envelope["error"] = {"code": -32601, "message": "unknown tool"}
                 else:
                     envelope["result"] = {"content": []}
             return 200, {}, json.dumps(envelope)
@@ -205,12 +205,13 @@ class AuditContractTests(unittest.TestCase):
                 }}), (0, []))
 
     def test_audit_container_failure_is_expected_while_fenced(self):
-        self.assertEqual(self.run_proveout({"error": {
-            "code": -32000, "message": "container request failed",
-        }}), (0, []))
+        with mock.patch.dict(os.environ, {proveout.EXPECT_FENCE_ENV: "1"}):
+            self.assertEqual(self.run_proveout({"error": {
+                "code": -32000, "message": "container request failed",
+            }}), (0, []))
 
     def test_other_audit_errors_still_fail(self):
-        code, failures = self.run_proveout({"error": {"code": -32603}})
+        code, failures = self.run_proveout({"error": {"code": -32603, "message": "x"}})
         self.assertEqual(code, 1)
         self.assertEqual(failures, ["tools/call get_audit: unexpected JSON-RPC error code -32603"])
 
@@ -319,15 +320,20 @@ class HostileBodyTests(unittest.TestCase):
               + ["tools/call unknown", "wrong bearer", "no bearer"])
 
     def run_main(self, overrides=None):
+        # Baseline envelopes are bound to their requests (jsonrpc 2.0 with
+        # the probe-order numeric id), so overrides exercise shape handling
+        # rather than envelope binding.
         responses = [
-            (200, {}, json.dumps({"result": {"protocolVersion": "2025-06-18"}})),
-            (200, {}, json.dumps({"result": {"tools": [
+            (200, {}, json.dumps({"jsonrpc": "2.0", "id": 1, "result": {
+                "protocolVersion": "2025-06-18"}})),
+            (200, {}, json.dumps({"jsonrpc": "2.0", "id": 2, "result": {"tools": [
                 {"name": tool} for tool in proveout.EXPECTED_TOOLS]}})),
-        ] + [(200, {}, json.dumps({"result": {
+        ] + [(200, {}, json.dumps({"jsonrpc": "2.0", "id": 3 + offset, "result": {
             "content": [], "structuredContent": {
                 "available": True, "rows": [], "truncated": False}}}))
-             for _ in proveout.EXPECTED_TOOLS] + [
-            (200, {}, '{"error":{"code":-32601}}'),
+             for offset in range(len(proveout.EXPECTED_TOOLS))] + [
+            (200, {}, '{"jsonrpc":"2.0","id":8,'
+             '"error":{"code":-32601,"message":"unknown tool"}}'),
             (401, {"www-authenticate": "Bearer"}, "{}"),
             (401, {"www-authenticate": "Bearer"}, "{}"),
         ]
@@ -367,12 +373,19 @@ class HostileBodyTests(unittest.TestCase):
         return artifact
 
     def test_valid_script_and_fenced_container_errors(self):
-        for overrides in ({}, {i: (200, {}, '{"error":{"code":-32000}}')
-                               for i in (2, 3, 4)}):
-            with self.subTest(overrides=overrides):
-                code, _, artifact, _ = self.run_main(overrides)
-                self.assertEqual(code, 0)
-                self.assertEqual(artifact["failures"], [])
+        code, _, artifact, _ = self.run_main({})
+        self.assertEqual(code, 0)
+        self.assertEqual(artifact["failures"], [])
+        # Corroborated fence: bound -32000 envelopes plus the explicit
+        # dispatcher expectation still pass.
+        overrides = {i: (200, {}, json.dumps(
+            {"jsonrpc": "2.0", "id": i + 1, "error": {
+                "code": -32000, "message": "container request failed"}}))
+            for i in (2, 3, 4)}
+        with mock.patch.dict(os.environ, {proveout.EXPECT_FENCE_ENV: "1"}):
+            code, _, artifact, _ = self.run_main(overrides)
+        self.assertEqual(code, 0)
+        self.assertEqual(artifact["failures"], [])
 
     def test_mid_depth_json_falls_back_before_serialization(self):
         for depth in (900, 2000):
@@ -404,25 +417,102 @@ class HostileBodyTests(unittest.TestCase):
         ]
         for body in bodies:
             with self.subTest(body=body):
+                body = {"jsonrpc": "2.0", "id": 2, **body}
                 self.assert_shape_failure(1, json.dumps(body))
 
     def test_wrong_typed_errors_are_shape_failures(self):
         for index in range(2, 8):
             for error in ("x", ["x"], True, 1):
                 with self.subTest(index=index, error=error):
-                    self.assert_shape_failure(index, json.dumps({"error": error}))
+                    self.assert_shape_failure(index, json.dumps({
+                        "jsonrpc": "2.0", "id": index + 1, "error": error}))
 
     def test_non_integer_error_codes_are_shape_failures(self):
         for index in range(2, 8):
             for code in ("\ud800x", "-32000", -32000.0, -32601.0, True, ["x"]):
                 with self.subTest(index=index, code=code):
-                    self.assert_shape_failure(index, json.dumps({"error": {"code": code}}))
+                    self.assert_shape_failure(index, json.dumps({
+                        "jsonrpc": "2.0", "id": index + 1,
+                        "error": {"code": code}}))
+
+    def test_non_200_authenticated_replies_name_the_http_status(self):
+        # One case per authenticated stage family: transport and credential
+        # failures must report the HTTP status, never an envelope code.
+        transports = [
+            (401, {}, "unauthorized"),
+            (503, {}, "<html>busy</html>"),
+            (None, {}, "network-error"),
+        ]
+        for index in (0, 1, 2, 7):
+            for status, headers, body in transports:
+                with self.subTest(stage=self.PROBES[index], status=status):
+                    code, _stdout, artifact, _raw = self.run_main({
+                        index: (status, headers, body)})
+                    self.assertEqual(code, 1)
+                    self.assertEqual(len(artifact["failures"]), 1)
+                    failure = artifact["failures"][0]
+                    self.assertTrue(
+                        failure.startswith(self.PROBES[index] + ":"))
+                    self.assertIn(f"HTTP {status}", failure)
+                    self.assertNotIn("ENVELOPE", failure)
+                    self.assertEqual(
+                        artifact["proof_disposition"], "failed")
+
+    def test_error_without_string_message_fails_framing(self):
+        errors = [
+            {"code": -32601},
+            {"code": -32601, "message": None},
+            {"code": -32601, "message": 123},
+            {"code": -32601, "message": True},
+            {"code": -32601, "message": ["x"]},
+        ]
+        for index in (0, 2, 7):
+            for error in errors:
+                with self.subTest(stage=self.PROBES[index], error=error):
+                    code, _stdout, artifact, _raw = self.run_main({
+                        index: (200, {}, json.dumps({
+                            "jsonrpc": "2.0", "id": index + 1,
+                            "error": error}))})
+                    self.assertEqual(code, 1)
+                    self.assertEqual(len(artifact["failures"]), 1)
+                    self.assertIn("[ENVELOPE_FRAMING]", artifact["failures"][0])
+
+    def test_message_less_32000_is_not_a_corroborated_fence(self):
+        body = json.dumps({"jsonrpc": "2.0", "id": 3, "error": {"code": -32000}})
+        with mock.patch.dict(os.environ, {proveout.EXPECT_FENCE_ENV: "1"}):
+            code, _stdout, artifact, _raw = self.run_main({2: (200, {}, body)})
+        self.assertEqual(code, 1)
+        self.assertEqual(len(artifact["failures"]), 1)
+        self.assertIn("[ENVELOPE_FRAMING]", artifact["failures"][0])
+
+    def test_non_boolean_is_error_fails_content(self):
+        for is_error in (1, "true", "false", 0):
+            with self.subTest(isError=is_error):
+                code, _stdout, artifact, _raw = self.run_main({
+                    2: (200, {}, json.dumps({
+                        "jsonrpc": "2.0", "id": 3, "result": {
+                            "content": [{"type": "text", "text": "ok"}],
+                            "isError": is_error}}))})
+                self.assertEqual(code, 1)
+                self.assertEqual(len(artifact["failures"]), 1)
+                self.assertIn("[CONTENT_INVALID]", artifact["failures"][0])
+
+    def test_explicit_is_error_false_still_passes(self):
+        code, _stdout, artifact, _raw = self.run_main({
+            2: (200, {}, json.dumps({
+                "jsonrpc": "2.0", "id": 3, "result": {
+                    "content": [{"type": "text", "text": "ok"}],
+                    "isError": False}}))})
+        self.assertEqual(code, 0)
+        self.assertEqual(artifact["failures"], [])
 
     def test_wrong_typed_audit_structured_content_is_shape_failure(self):
         for structured in (["x"], "x", True, 1):
             with self.subTest(structured=structured):
-                self.assert_shape_failure(6, json.dumps({"result": {
-                    "content": [], "structuredContent": structured}}))
+                self.assert_shape_failure(6, json.dumps({
+                    "jsonrpc": "2.0", "id": 7, "result": {
+                        "content": [],
+                        "structuredContent": structured}}))
 
     def test_top_level_json_values_fail_envelope_probes_without_crashing(self):
         for index in range(8):
@@ -525,14 +615,16 @@ class OutputSafetyTests(unittest.TestCase):
     def test_unicode_json_display_fallback_does_not_reject_valid_shape(self):
         padding = "🧪" * 15000
         cases = [
-            (0, {"result": {"protocolVersion": "2025-06-18", "pad": padding}}),
-            (1, {"result": {"tools": [
+            (0, {"jsonrpc": "2.0", "id": 1, "result": {
+                "protocolVersion": "2025-06-18", "pad": padding}}),
+            (1, {"jsonrpc": "2.0", "id": 2, "result": {"tools": [
                 {"name": tool} for tool in proveout.EXPECTED_TOOLS], "pad": padding}}),
-        ] + [(index, {"result": {
+        ] + [(index, {"jsonrpc": "2.0", "id": index + 1, "result": {
             "content": [{"type": "text", "text": padding}],
             "structuredContent": {"available": True, "rows": [], "truncated": False},
         }}) for index in range(2, 2 + len(proveout.EXPECTED_TOOLS))] + [
-            (7, {"error": {"code": -32601, "message": padding}}),
+            (7, {"jsonrpc": "2.0", "id": 8,
+                 "error": {"code": -32601, "message": padding}}),
         ]
         for index, envelope in cases:
             with self.subTest(probe=HostileBodyTests.PROBES[index]):

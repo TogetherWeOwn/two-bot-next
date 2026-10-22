@@ -23,8 +23,9 @@ use twilight_model::{
 use two_bot_core::{
     custom_command_service as service, custom_command_store as store,
     custom_commands::{
-        accepted_text_trigger, builtin_command_names, format_command_list, render_template,
+        accepted_text_trigger, builtin_command_names, format_command_list_page, render_template,
         AuditRecord, AutomationMessageAcceptance, PutCommandInput, StoredCommand, TemplateContext,
+        INVALID_COMMAND_LIST_PAGE,
     },
     router::InteractionHandler,
     HandlerId, InteractionRouter, SlashOutcome,
@@ -549,10 +550,26 @@ impl CustomCommandRuntime {
             .ok_or(CustomCommandError::Context)?
             .to_string();
         if data.name == "command-list" {
+            // Routing already enforced guild/application, ManageGuild and the
+            // feature gate. Reject forged types/duplicates before a store read.
+            let mut options = data.options.iter().filter(|option| option.name == "page");
+            let page = match options.next().map(|option| &option.value) {
+                None => 1,
+                Some(CommandOptionValue::Integer(value)) if *value > 0 => {
+                    let Ok(page) = usize::try_from(*value) else {
+                        return Ok(INVALID_COMMAND_LIST_PAGE.to_owned());
+                    };
+                    page
+                }
+                Some(_) => return Ok(INVALID_COMMAND_LIST_PAGE.to_owned()),
+            };
+            if options.next().is_some() {
+                return Ok(INVALID_COMMAND_LIST_PAGE.to_owned());
+            }
             let rows = store::list_commands(&self.pool, guild)
                 .await
                 .map_err(|_| CustomCommandError::Storage)?;
-            return Ok(format_command_list(&rows));
+            return Ok(format_command_list_page(&rows, page).unwrap_or_else(str::to_owned));
         }
         let Some(name) = string_option(data, "name") else {
             return Ok("A command name is required.".to_owned());

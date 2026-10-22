@@ -1888,7 +1888,23 @@ impl ActionExecutor {
         Ok(self
             .get_json_observed_inner(path, false)
             .await?
-            .map(|(data, _)| data))
+            .map(|(data, _, _)| data))
+    }
+
+    /// Same paced read as [`Self::get_json`], plus the raw wire-body length in
+    /// bytes. The length is measured over the collected response bytes before
+    /// parsing, so JSON-insignificant bytes (whitespace, duplicate keys,
+    /// `\uXXXX` escapes) count exactly as Discord sent them — unlike a
+    /// re-serialized `Value`, which compacts them away. Callers enforcing a
+    /// wire-body cap use this instead of measuring the parsed value.
+    pub async fn get_json_with_body_len(
+        &self,
+        path: &str,
+    ) -> Result<Option<(serde_json::Value, usize)>, String> {
+        Ok(self
+            .get_json_observed_inner(path, false)
+            .await?
+            .map(|(data, _, body_len)| (data, body_len)))
     }
 
     /// Permission evidence must distinguish denied/absent (403/404) from an
@@ -1910,16 +1926,20 @@ impl ActionExecutor {
         &self,
         path: &str,
     ) -> Result<Option<(serde_json::Value, String)>, String> {
-        self.get_json_observed_inner(path, true).await
+        Ok(self
+            .get_json_observed_inner(path, true)
+            .await?
+            .map(|(data, observed_at, _)| (data, observed_at)))
     }
 
     /// Shared observed-read loop: `backfill_wait` selects the unclamped
-    /// backfill 429 wait; the general read keeps the 60 s clamp.
+    /// backfill 429 wait; the general read keeps the 60 s clamp. Returns the
+    /// parsed value, the request-start stamp, and the raw wire-body length.
     async fn get_json_observed_inner(
         &self,
         path: &str,
         backfill_wait: bool,
-    ) -> Result<Option<(serde_json::Value, String)>, String> {
+    ) -> Result<Option<(serde_json::Value, String, usize)>, String> {
         let route = raw_get_route(path)?;
         let mut attempt: u32 = 0;
         // A 429 proves the attempt reached Discord, so its sleep-then-retry
@@ -1965,7 +1985,7 @@ impl ActionExecutor {
                 200..=299 => {
                     return Ok(serde_json::from_slice(&res.body)
                         .ok()
-                        .map(|data| (data, observed_at)));
+                        .map(|data| (data, observed_at, res.body.len())));
                 }
                 429 => {
                     // Every 429 spends one read attempt, like 5xx/transport:
