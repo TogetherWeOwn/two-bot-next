@@ -398,6 +398,16 @@ impl Failure {
 
 type Result<T> = std::result::Result<T, Failure>;
 
+/// Maximum history data pages fetched per capture (100 messages each):
+/// fetching stops at the cap even when the channel runs deeper, so a huge
+/// channel cannot page Discord without bound. A full 10th page is followed
+/// by one boundary probe (11 fetches at most): an empty probe proves the
+/// history is exactly 1000 and completes without the marker, anything else
+/// proves depth and completes with the shared truncation marker. The
+/// capture still validates every stored page; histories under the cap are
+/// byte-identical, and `message_count` covers stored messages only.
+const MAX_HISTORY_PAGES: usize = 10;
+
 /// An admitted ticket component execution. Both slots release on drop —
 /// including when the handler is aborted — so admission is held exactly until
 /// the handler settles.
@@ -571,7 +581,14 @@ impl TicketRuntime {
     }
 
     fn stop_tasks(&self) {
-        let mut tasks = self.tasks.lock().expect("ticket task scope");
+        // Drop-reachable (`TicketSupervisor::drop`) and shared with async
+        // shutdown: recover silently so a poisoned scope still aborts its
+        // tasks instead of panicking during unwinding. No counter: non-drop
+        // callers must never be miscounted as drop poison.
+        let mut tasks = self
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.stopping.store(true, Ordering::Release);
         tasks.abort_all();
     }
@@ -885,11 +902,13 @@ impl TicketRuntime {
     pub(crate) async fn capture_history(&self, channel: &str) -> Result<TranscriptSnapshot> {
         let mut before: Option<String> = None;
         let mut capture = history::HistoryCapture::default();
+        let mut pages = 0;
         loop {
             let page = self
                 .executor
                 .fetch_channel_messages(channel, before.as_deref(), 100)
                 .await?;
+            pages += 1;
             if page.len() > 100 {
                 return Err(Failure::InvalidEvidence);
             }
@@ -915,6 +934,25 @@ impl TicketRuntime {
                     .map_err(|_| Failure::InvalidEvidence)?;
             }
             if count < 100 {
+                break;
+            }
+            if pages >= MAX_HISTORY_PAGES {
+                // A full 10th page cannot prove the end (see
+                // exact_full_page_requires_a_final_empty_page): fetch one
+                // boundary probe past its floor. Empty proves exactly 1000
+                // (complete, no marker); anything else proves depth, so cap
+                // with the marker without storing the probe page.
+                let probe_before = floor.ok_or(Failure::InvalidEvidence)?.to_string();
+                let probe = self
+                    .executor
+                    .fetch_channel_messages(channel, Some(probe_before.as_str()), 100)
+                    .await?;
+                if probe.len() > 100 {
+                    return Err(Failure::InvalidEvidence);
+                }
+                if !probe.is_empty() {
+                    capture.mark_page_capped();
+                }
                 break;
             }
             before = Some(floor.ok_or(Failure::InvalidEvidence)?.to_string());
@@ -1249,6 +1287,10 @@ fn panels(messages: Vec<Value>) -> Result<Vec<PanelMessage>> {
 mod tests;
 
 #[cfg(test)]
+#[path = "ticket_drop_poison_acceptance_tests.rs"]
+mod drop_poison_acceptance_tests;
+
+#[cfg(test)]
 #[path = "ticket_timer_tests.rs"]
 mod timer_tests;
 
@@ -1279,3 +1321,11 @@ mod cursor_budget_acceptance_tests;
 #[cfg(test)]
 #[path = "ticket_cursor_budget_interaction_tests.rs"]
 mod cursor_budget_interaction_tests;
+
+#[cfg(test)]
+#[path = "ticket_capture_cap_acceptance_tests.rs"]
+mod capture_cap_acceptance_tests;
+
+#[cfg(test)]
+#[path = "ticket_capture_cap_boundary_tests.rs"]
+mod capture_cap_boundary_tests;

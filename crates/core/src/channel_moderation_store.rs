@@ -66,6 +66,9 @@ pub struct ChannelModerationStore {
 pub const DB_POOL_MAX_DEFAULT: u32 = 5;
 /// Legacy statement timeout (`statementTimeoutMillis ?? 15_000`).
 pub const STATEMENT_TIMEOUT_MS: u64 = 15_000;
+/// Acquire bound for the moderation pool open: a hung database refuses within
+/// 10 s instead of hanging on the 30 s SQLx default (statement-leg parity).
+pub const ACQUIRE_TIMEOUT_SECS: u64 = 10;
 
 /// Read the one TLS policy setting; an unset value is `Required`.
 fn tls_policy_from_env() -> Result<crate::database_tls::TlsPolicy, sqlx::Error> {
@@ -118,6 +121,7 @@ impl ChannelModerationStore {
         options = options.options([("statement_timeout", format!("{}ms", STATEMENT_TIMEOUT_MS))]);
         let pool = PgPoolOptions::new()
             .max_connections(pool_max)
+            .acquire_timeout(std::time::Duration::from_secs(ACQUIRE_TIMEOUT_SECS))
             .connect_with(options)
             .await
             .map_err(|_| sqlx::Error::InvalidArgument("database connection failed".to_owned()))?;
@@ -1715,3 +1719,7 @@ mod tests {
         store.cleanup().await;
     }
 }
+
+#[cfg(test)]
+#[path = "channel_moderation_pool_timeout_acceptance_tests.rs"]
+mod pool_timeout_acceptance_tests;

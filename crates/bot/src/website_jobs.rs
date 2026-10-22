@@ -12,8 +12,9 @@ use two_bot_core::{
     database_tls::{self, TlsPolicy},
     diagnose_rank_roles, match_rank_roles, normalize_events, now_iso, plan_rank_heal,
     read_raid_windows, replace_events, write_counter, write_rank_snapshot, Config, JobGate,
-    RankHeal, RankRungProblem, RawScheduledEvent, RosterMember, WebsiteStoreError,
-    LIVE_COUNTER_INTERVAL_MS, RANK_SNAPSHOT_INTERVAL_MS, SCHEDULED_EVENTS_INTERVAL_MS,
+    RankHeal, RankRungProblem, RawScheduledEvent, RosterMember, ScheduledEventsSkip,
+    WebsiteStoreError, LIVE_COUNTER_INTERVAL_MS, RANK_SNAPSHOT_INTERVAL_MS,
+    SCHEDULED_EVENTS_INTERVAL_MS,
 };
 use two_bot_discord::executor::{ActionExecutor, DiscordError};
 use two_bot_discord::internal_events::canonical_snowflake;
@@ -937,19 +938,29 @@ fn publication_stopped(shutdown: &watch::Receiver<bool>) -> bool {
 /// storage; the last good snapshot is kept by construction.
 pub(crate) const MAX_SCHEDULED_EVENTS_BODY_BYTES: usize = 1_048_576;
 
+/// Maximum age at the events publication boundary. This is independent of
+/// the ten-minute poll cadence: it bounds the pending observation, not the
+/// lifetime of the last good mirror between ticks.
+pub(crate) const MAX_SCHEDULED_EVENTS_SNAPSHOT_AGE: time::Duration = time::Duration::minutes(5);
+
+/// Strict five-minute age predicate: only observations strictly older than
+/// [`MAX_SCHEDULED_EVENTS_SNAPSHOT_AGE`] are stale. Exactly five minutes old
+/// is still fresh. Pure so the boundary pins deterministically; the seam
+/// samples `now` at the gate and passes it in.
+fn snapshot_age_exceeded(observed: time::OffsetDateTime, now: time::OffsetDateTime) -> bool {
+    now - observed > MAX_SCHEDULED_EVENTS_SNAPSHOT_AGE
+}
+
 /// One Events snapshot attempt with the observation stamp injected.
 /// Production stamps `observed_at` from the real clock in [`snapshot_once`]
-/// immediately before the GET (TOG-20273); age-bound tests inject a fixed
-/// stamp here instead of racing the clock.
+/// immediately before the GET; age-bound tests inject a fixed stamp here
+/// instead of waiting for a slow response.
 ///
-/// Whole-response gates, in order: the raw wire-body cap (measured over the
-/// collected response bytes — unknown fields and JSON-insignificant bytes
-/// included, never over known fields alone or a re-serialization), then the
-/// existing shape/normalize/store path unchanged (including the epoch-claim
-/// StaleSnapshot gate: an older-than-committed fetch still rolls back and is
-/// logged here). The 5-minute age skip (decision §4) is NOT enforced here
-/// yet: the follow-up age slice pins it through this seam first, then wires
-/// the check.
+/// Whole-response gates, in order: the raw wire-body cap (including unknown
+/// fields and JSON-insignificant bytes), shape/normalization, then snapshot
+/// age before storage. Older-than-five-minute observations skip the whole
+/// replacement, including empty snapshots, with `StaleSnapshot`. The store's
+/// independent epoch claim still rejects older-than-committed observations.
 pub(crate) async fn snapshot_events_once(
     pool: &PgPool,
     rest: &ActionExecutor,
@@ -978,6 +989,17 @@ pub(crate) async fn snapshot_events_once(
         .collect::<Result<Vec<_>, _>>()?;
     let events = normalize_events(&raw).ok_or(ErrorClass::Rest)?;
     if publication_stopped(shutdown) {
+        return Ok(());
+    }
+    let observed =
+        time::OffsetDateTime::parse(observed_at, &time::format_description::well_known::Rfc3339)
+            .map_err(|_| ErrorClass::Configuration)?;
+    if snapshot_age_exceeded(observed, time::OffsetDateTime::now_utc()) {
+        tracing::warn!(
+            job = "events",
+            skip = ?ScheduledEventsSkip::StaleSnapshot,
+            "snapshot exceeded the age bound; publication skipped"
+        );
         return Ok(());
     }
     // Epoch-claim gate (main #1472): a strictly older fetch rolls the whole
