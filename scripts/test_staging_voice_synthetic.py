@@ -96,6 +96,43 @@ class EvaluateTest(unittest.TestCase):
                  obs()["channels"][2]]
         self.assertEqual(verdicts(obs(channels_before=before, channels=wrong))["position"], "FAIL")
 
+    def test_a_predecessor_swept_mid_run_does_not_fail_position(self):
+        # The empty-room sweep deleted the snapshotted predecessor between the
+        # before/after channel reads: the room directly below the creator is
+        # correctly placed, and the detail names the swept predecessor.
+        human = {"id": "5003", "parent_id": CAT, "type": 2, "position": 17,
+                 "permission_overwrites": [{"id": "111", "type": 1, "allow": OWNER_ALLOW}]}
+        before = [obs()["channels"][0], human, obs()["channels"][2]]
+        after = [obs()["channels"][0], obs()["channels"][1], obs()["channels"][2]]
+        result = synth.evaluate(obs(channels_before=before, channels=after))
+        position = next(c for c in result if c["check"] == "position")
+        self.assertEqual(position["verdict"], "PASS")
+        self.assertIn("swept since the snapshot: ['5003']", position["detail"])
+
+    def test_only_surviving_predecessors_anchor_the_slot(self):
+        # Of two snapshotted predecessors one is swept mid-run: the room must
+        # follow the survivor, not the ghost and not the creator.
+        swept = {"id": "5003", "parent_id": CAT, "type": 2, "position": 17,
+                 "permission_overwrites": [{"id": "111", "type": 1, "allow": OWNER_ALLOW}]}
+        stayed = {"id": "5005", "parent_id": CAT, "type": 2, "position": 18,
+                  "permission_overwrites": [{"id": "113", "type": 1, "allow": OWNER_ALLOW}]}
+        before = [obs()["channels"][0], swept, stayed, obs()["channels"][2]]
+        good = [obs()["channels"][0], dict(stayed, position=17),
+                dict(obs()["channels"][1], position=18), obs()["channels"][2]]
+        self.assertEqual(verdicts(obs(channels_before=before, channels=good))["position"], "PASS")
+        bad = [obs()["channels"][0], dict(obs()["channels"][1], position=17),
+               dict(stayed, position=18), obs()["channels"][2]]
+        self.assertEqual(verdicts(obs(channels_before=before, channels=bad))["position"], "FAIL")
+
+    def test_a_swept_predecessor_does_not_excuse_a_misplaced_room(self):
+        # The predecessor is gone but the room landed after an unrelated
+        # channel instead of below the creator: still a misplacement.
+        human = {"id": "5003", "parent_id": CAT, "type": 2, "position": 17,
+                 "permission_overwrites": [{"id": "111", "type": 1, "allow": OWNER_ALLOW}]}
+        before = [obs()["channels"][0], human, obs()["channels"][2]]
+        after = [obs()["channels"][0], obs()["channels"][2], dict(obs()["channels"][1], position=70)]
+        self.assertEqual(verdicts(obs(channels_before=before, channels=after))["position"], "FAIL")
+
     def test_a_fixed_channel_after_the_creator_is_not_part_of_its_block(self):
         fixed = {"id": "5004", "parent_id": CAT, "type": 2, "position": 20,
                  "permission_overwrites": [{"id": "222", "type": 0, "allow": OWNER_ALLOW}]}
