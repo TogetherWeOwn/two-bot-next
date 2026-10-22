@@ -558,6 +558,36 @@ impl RateLimitGuard {
     }
 
     fn observe_bare_retry_after(&self, route: &str, timing: Option<f64>, observed_at: Instant) {
+        // Live path (admission + body settle): fail loud on a poisoned
+        // guard. `Drop` must never call this; it calls
+        // `observe_bare_retry_after_from_drop` instead.
+        let mut state = self.state.lock().expect("Discord guard state");
+        self.observe_bare_retry_after_locked(&mut state, route, timing, observed_at);
+    }
+
+    /// Drop-only `observe_bare_retry_after`: panicking inside `drop` aborts
+    /// the process when the drop runs during unwinding, so a poisoned guard
+    /// is recovered with one counted `response_accounting` increment
+    /// instead. Called only from `ResponseAccounting::drop`; live callers
+    /// use loud `observe_bare_retry_after`.
+    fn observe_bare_retry_after_from_drop(
+        &self,
+        route: &str,
+        timing: Option<f64>,
+        observed_at: Instant,
+    ) {
+        let mut state =
+            two_bot_core::metrics::recover_drop_poison(self.state.lock(), "response_accounting");
+        self.observe_bare_retry_after_locked(&mut state, route, timing, observed_at);
+    }
+
+    fn observe_bare_retry_after_locked(
+        &self,
+        state: &mut State,
+        route: &str,
+        timing: Option<f64>,
+        observed_at: Instant,
+    ) {
         let wait = timing
             .filter(|secs| secs.is_finite() && *secs >= 0.0)
             .and_then(|secs| Duration::try_from_secs_f64(secs).ok());
@@ -568,14 +598,6 @@ impl RateLimitGuard {
         let until = observed_at
             .checked_add(wait)
             .unwrap_or(observed_at + self.config.window);
-        // Drop-reachable (`ResponseAccounting::drop`) and shared with live
-        // admission: recover silently so a poisoned guard still records the
-        // retry instead of panicking during unwinding. No counter: non-drop
-        // callers must never be miscounted as drop poison.
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Preserve a learned bucket mapping: replacing it with the raw route
         // would discard an existing longer deadline on the named bucket.
         let bucket = state
@@ -751,23 +773,36 @@ impl RateLimitGuard {
     }
 
     fn finish_global(&self, id: u64, timing: Option<f64>, observed_at: Instant) {
+        // Live path (admission + body settle): fail loud on a poisoned
+        // guard. `Drop` must never call this; it calls
+        // `finish_global_from_drop` instead.
         let until = self.global_until(timing, observed_at);
-        // Drop-reachable (`ResponseAccounting::drop`) and shared with live
-        // settlement: recover silently so a poisoned guard still retires the
-        // entry instead of panicking during unwinding. No counter: non-drop
-        // callers must never be miscounted as drop poison.
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self.state.lock().expect("Discord guard state");
+        Self::finish_global_locked(&mut state, id, until);
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
+    /// Drop-only `finish_global`: panicking inside `drop` aborts the process
+    /// when the drop runs during unwinding, so a poisoned guard is recovered
+    /// with one counted `response_accounting` increment instead. Called only
+    /// from `ResponseAccounting::drop`; live callers use loud `finish_global`.
+    fn finish_global_from_drop(&self, id: u64, timing: Option<f64>, observed_at: Instant) {
+        let until = self.global_until(timing, observed_at);
+        let mut state =
+            two_bot_core::metrics::recover_drop_poison(self.state.lock(), "response_accounting");
+        Self::finish_global_locked(&mut state, id, until);
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
+    fn finish_global_locked(state: &mut State, id: u64, until: Instant) {
         state
             .pending_global
             .retain(|(pending_id, _)| *pending_id != id);
         // Only replace this response's provisional timing. Never shorten a
         // restriction learned from another response, even while bodies overlap.
         state.global_until = Some(state.global_until.map_or(until, |old| old.max(until)));
-        drop(state);
-        self.changed.notify_waiters();
     }
 
     #[must_use]
@@ -1071,11 +1106,14 @@ impl<'a> ResponseAccounting<'a> {
 impl Drop for ResponseAccounting<'_> {
     fn drop(&mut self) {
         if let Some(route) = self.bare_route.take() {
-            self.guard
-                .observe_bare_retry_after(&route, self.retry_after_header, self.observed_at);
+            self.guard.observe_bare_retry_after_from_drop(
+                &route,
+                self.retry_after_header,
+                self.observed_at,
+            );
         }
         if let Some(id) = self.global_header.take() {
-            self.guard.finish_global(
+            self.guard.finish_global_from_drop(
                 id,
                 self.retry_after_header.or(self.reset_after_header),
                 self.observed_at,
@@ -1087,6 +1125,10 @@ impl Drop for ResponseAccounting<'_> {
 #[cfg(test)]
 #[path = "ratelimit_drop_poison_acceptance_tests.rs"]
 mod drop_poison_acceptance_tests;
+
+#[cfg(test)]
+#[path = "ratelimit_drop_poison_counter_acceptance_tests.rs"]
+mod drop_poison_counter_acceptance_tests;
 
 #[cfg(test)]
 mod tests {
