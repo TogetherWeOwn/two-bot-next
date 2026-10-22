@@ -284,9 +284,11 @@ impl Fixture {
     }
 }
 
-/// A throwaway DATABASE (not schema) with a pinned session timezone, so
-/// the session-timezone test cannot pass vacuously: every connection the
-/// store pool opens inherits the database-level setting.
+/// A throwaway DATABASE (not schema) per zone, with every pooled
+/// connection pinned via `after_connect` + `SET TIME ZONE` so the
+/// session-timezone test cannot pass vacuously. Connect options cannot
+/// do this: sqlx pins `TimeZone: UTC` in every startup packet, which
+/// also defeats `ALTER DATABASE ... SET`.
 struct TimezoneFixture {
     admin: Pool<Postgres>,
     pool: Pool<Postgres>,
@@ -322,14 +324,22 @@ impl TimezoneFixture {
             .execute(&admin)
             .await
             .unwrap();
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-            "ALTER DATABASE {database} SET timezone = '{timezone}'"
-        )))
-        .execute(&admin)
-        .await
-        .unwrap();
+        // Static per-zone SQL: the pool pins each connection after sqlx's
+        // UTC startup packet, so `SHOW timezone` reports the pinned zone.
+        let zone_sql: &'static str = match timezone {
+            "UTC" => "SET TIME ZONE 'UTC'",
+            "America/New_York" => "SET TIME ZONE 'America/New_York'",
+            "Pacific/Kiritimati" => "SET TIME ZONE 'Pacific/Kiritimati'",
+            other => panic!("unsupported test timezone {other}"),
+        };
         let pool = PgPoolOptions::new()
             .max_connections(2)
+            .after_connect(move |conn, _| {
+                Box::pin(async move {
+                    sqlx::query(zone_sql).execute(&mut *conn).await?;
+                    Ok(())
+                })
+            })
             .connect_with(
                 options
                     .database(&database)
@@ -722,7 +732,7 @@ async fn due_window_is_identical_under_any_session_timezone() {
             .store()
             .due_event_voice_occurrences(B_T15)
             .await
-            .expect("due query under {name} must succeed");
+            .expect("due query under the pinned session zone must succeed");
         assert_eq!(due.len(), 1, "exactly B is due at B T-15 under {name}");
         let rows = fx
             .store()
