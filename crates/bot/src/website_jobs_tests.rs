@@ -1,5 +1,6 @@
 use super::*;
 use serde_json::json;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use two_bot_core::{activation::LiveCapability, apply_web_contract, RankKey};
 use two_bot_testsupport::{guard_database_url, TestDatabase};
 
@@ -9,6 +10,9 @@ use crate::{
 };
 
 use crate::tracing_capture;
+
+#[path = "website_event_age_acceptance_tests.rs"]
+mod website_event_age_acceptance_tests;
 
 #[test]
 fn admission_lazy_pool_rejects_query_secrets_before_sqlx_logging() {
@@ -1544,8 +1548,8 @@ fn unconnected_pool() -> PgPool {
 
 /// The injected-stamp seam behaves exactly like the production `run_once`
 /// path (which stamps `now_iso()` before delegating): an in-bounds snapshot
-/// still attempts publication. The age bound itself is NOT asserted here —
-/// the follow-up age slice pins 5-minute staleness through this seam.
+/// still attempts publication. Keep the observation safely inside the five-minute
+/// age bound; the protected age suite pins the stale boundary independently.
 #[tokio::test]
 async fn events_seam_with_injected_stamp_reaches_storage() {
     let mock = MockRest::start(
@@ -1555,14 +1559,11 @@ async fn events_seam_with_injected_stamp_reaches_storage() {
     .await;
     let pool = unconnected_pool();
     let (_stop, shutdown) = watch::channel(false);
-    let outcome = snapshot_events_once(
-        &pool,
-        &executor(&mock),
-        "2222",
-        &shutdown,
-        "2026-10-01T18:00:00.000Z",
-    )
-    .await;
+    let observed_at = (OffsetDateTime::now_utc() - time::Duration::seconds(30))
+        .format(&Rfc3339)
+        .unwrap();
+    let outcome =
+        snapshot_events_once(&pool, &executor(&mock), "2222", &shutdown, &observed_at).await;
     assert_eq!(
         mock.requests().len(),
         1,
@@ -1683,10 +1684,10 @@ async fn events_tick_accepts_whitespace_padded_wire_body_at_cap() {
 
 /// The seam's injected stamp — not store time — is what the mirror stores and
 /// orders by. A fresh row must carry the injected stamp exactly, and a seeded
-/// newer row must survive a snapshot taken with an older injected stamp
-/// (TOG-20273 last-observed-wins through the seam; the epoch-claim gate rolls
-/// the older snapshot back, so the newer row survives with its stamp
-/// untouched). Stamping at store time instead of using the injected value
+/// newer row must survive a snapshot taken with a still-fresh older injected
+/// stamp. The epoch-claim gate, not the age guard, rolls the older snapshot
+/// back, so the newer row survives with its stamp untouched.
+/// Stamping at store time instead of using the injected value
 /// fails both assertions: the fresh row would carry now(), and the older
 /// snapshot would win the epoch claim and clobber the seeded row.
 #[tokio::test]
@@ -1704,6 +1705,13 @@ async fn events_seam_stores_the_injected_stamp_and_keeps_newer_rows() {
         .expect("create migrated agent-testdb fixture");
     let pool = db.pool();
     apply_web_contract(pool).await.unwrap();
+    let now = OffsetDateTime::now_utc();
+    let observed_at = (now - time::Duration::seconds(30))
+        .format(&Rfc3339)
+        .unwrap();
+    let newer_at = (now - time::Duration::seconds(10))
+        .format(&Rfc3339)
+        .unwrap();
     // Guild 3333: seed event 3000 with a stamp newer than the snapshot's
     // injected stamp but older than any store-time stamp, so a store-time
     // regression wins the epoch claim and clobbers it while the injected
@@ -1712,7 +1720,7 @@ async fn events_seam_stores_the_injected_stamp_and_keeps_newer_rows() {
     let mut seeded = event();
     seeded["guild_id"] = json!("3333");
     let seed = normalize_events(&[raw_event(&seeded, "3333").unwrap()]).unwrap();
-    replace_events(pool, "3333", "2026-10-15T12:00:00.000Z", &seed)
+    replace_events(pool, "3333", &newer_at, &seed)
         .await
         .unwrap();
     let mut fresh = event();
@@ -1726,26 +1734,14 @@ async fn events_seam_stores_the_injected_stamp_and_keeps_newer_rows() {
     )
     .await;
     let (_stop, shutdown) = watch::channel(false);
-    snapshot_events_once(
-        pool,
-        &executor(&mock),
-        "2222",
-        &shutdown,
-        "2026-10-01T18:00:00.000Z",
-    )
-    .await
-    .unwrap();
-    // Older than guild 3333's committed epoch: the whole swap rolls back and
-    // the seam reports Ok (stale skip), writing nothing.
-    snapshot_events_once(
-        pool,
-        &executor(&mock),
-        "3333",
-        &shutdown,
-        "2026-10-01T18:00:00.000Z",
-    )
-    .await
-    .unwrap();
+    snapshot_events_once(pool, &executor(&mock), "2222", &shutdown, &observed_at)
+        .await
+        .unwrap();
+    // Still fresh, but older than guild 3333's committed epoch: the whole swap
+    // rolls back and the seam reports Ok (epoch skip), writing nothing.
+    snapshot_events_once(pool, &executor(&mock), "3333", &shutdown, &observed_at)
+        .await
+        .unwrap();
     assert_eq!(mock.requests().len(), 2);
     let rows: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT guild_id, event_id, updated_at FROM scheduled_events \
@@ -1757,20 +1753,183 @@ async fn events_seam_stores_the_injected_stamp_and_keeps_newer_rows() {
     assert_eq!(
         rows,
         [
-            (
-                "2222".to_owned(),
-                "3001".to_owned(),
-                "2026-10-01T18:00:00.000Z".to_owned(),
-            ),
-            (
-                "3333".to_owned(),
-                "3000".to_owned(),
-                "2026-10-15T12:00:00.000Z".to_owned(),
-            ),
+            ("2222".to_owned(), "3001".to_owned(), observed_at),
+            ("3333".to_owned(), "3000".to_owned(), newer_at),
         ],
         "the fresh row must carry the injected stamp exactly (not store time), \
          and the seeded newer row must survive the older snapshot"
     );
     mock.shutdown().await;
     db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn events_seam_refuses_malformed_observed_at_before_storage() {
+    for observed_at in ["", "not-a-timestamp", "2026-99-99T25:61:61Z"] {
+        let mock = MockRest::start(
+            vec![ScriptedResponse::json(200, json!([event()]))],
+            ScriptedResponse::status(500),
+        )
+        .await;
+        let pool = unconnected_pool();
+        pool.close().await;
+        let (_stop, shutdown) = watch::channel(false);
+        let outcome =
+            snapshot_events_once(&pool, &executor(&mock), "2222", &shutdown, observed_at).await;
+        let requests = mock.requests();
+        mock.shutdown().await;
+        assert_eq!(
+            outcome,
+            Err(ErrorClass::Configuration),
+            "invalid observation time must refuse before publication; Database would mean storage was reached"
+        );
+        assert!(requests.len() <= 1, "invalid timestamps must not retry");
+        assert!(requests.iter().all(|request| request.method == "GET"));
+        assert_eq!(pool.size(), 0, "the closed pool must stay offline");
+    }
+}
+
+/// Seed independently of the mirror writer, with an epoch older than the
+/// 301-second observation. Without the age guard, the incoming snapshot would
+/// win the epoch claim and overwrite or delete the last-good rows.
+async fn assert_stale_events_preserve_last_good(body: Value) {
+    let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
+        assert!(
+            std::env::var("GITHUB_ACTIONS").is_err(),
+            "CI must supply the guarded test database"
+        );
+        eprintln!("SKIP stale event retention: TWO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let db = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+        .await
+        .expect("create migrated agent-testdb fixture");
+    let pool = db.pool();
+    apply_web_contract(pool).await.unwrap();
+    let seed_at = (OffsetDateTime::now_utc() - time::Duration::seconds(600))
+        .format(&Rfc3339)
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO scheduled_events \
+         (guild_id, event_id, name, starts_at, channel_id, description, status, updated_at) \
+         VALUES ('2222', '3000', 'Café 🎉', '2026-10-25T19:00:00.000Z', '4444', \
+                 E'Line one\\nLine two — unchanged', 'scheduled', $1), \
+                ('2222', '3001', 'Second event', '2026-10-26T20:30:00.000Z', NULL, \
+                 NULL, 'active', $1)",
+    )
+    .bind(&seed_at)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO scheduled_events_claim (guild_id, epoch) VALUES ('2222', $1)")
+        .bind(&seed_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    let read_rows = "SELECT to_jsonb(e) FROM scheduled_events e ORDER BY guild_id, event_id";
+    let before: Vec<Value> = sqlx::query_scalar(read_rows).fetch_all(pool).await.unwrap();
+    let expected = vec![
+        json!({
+            "guild_id": "2222", "event_id": "3000", "name": "Café 🎉",
+            "starts_at": "2026-10-25T19:00:00.000Z", "channel_id": "4444",
+            "description": "Line one\nLine two — unchanged", "status": "scheduled",
+            "updated_at": seed_at
+        }),
+        json!({
+            "guild_id": "2222", "event_id": "3001", "name": "Second event",
+            "starts_at": "2026-10-26T20:30:00.000Z", "channel_id": null,
+            "description": null, "status": "active", "updated_at": seed_at
+        }),
+    ];
+    let mock = MockRest::start(
+        vec![ScriptedResponse::json(200, body)],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let (_stop, shutdown) = watch::channel(false);
+    let observed_at = (OffsetDateTime::now_utc() - time::Duration::seconds(301))
+        .format(&Rfc3339)
+        .unwrap();
+    let outcome =
+        snapshot_events_once(pool, &executor(&mock), "2222", &shutdown, &observed_at).await;
+    let after: Vec<Value> = sqlx::query_scalar(read_rows).fetch_all(pool).await.unwrap();
+    let epochs: Vec<(String, String)> =
+        sqlx::query_as("SELECT guild_id, epoch FROM scheduled_events_claim ORDER BY guild_id")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    let requests = mock.requests();
+    mock.shutdown().await;
+    db.close().await.expect("drop disposable test database");
+    assert_eq!(
+        before, expected,
+        "independent seed pins every last-good field"
+    );
+    assert_eq!(
+        outcome,
+        Ok(()),
+        "301-second snapshots must skip successfully"
+    );
+    assert_eq!(
+        after, before,
+        "the stale path must preserve every stored field, UTF-8 byte, null, timestamp and row"
+    );
+    assert_eq!(
+        epochs,
+        [("2222".to_owned(), seed_at)],
+        "an age-refused snapshot must not advance the committed epoch"
+    );
+    assert!(requests.len() <= 1, "stale snapshots must not retry");
+    assert!(requests.iter().all(|request| request.method == "GET"));
+}
+
+#[tokio::test]
+async fn events_seam_age_301_changed_rows_preserve_all_last_good_fields() {
+    assert_stale_events_preserve_last_good(json!([
+        {
+            "id": "3000", "guild_id": "2222", "name": "Stale replacement",
+            "scheduled_start_time": "2026-11-01T21:00:00Z", "status": 2,
+            "channel_id": "5555", "description": "Must not replace the stored bytes"
+        },
+        {
+            "id": "3002", "guild_id": "2222", "name": "Must not be inserted",
+            "scheduled_start_time": "2026-11-02T22:00:00Z", "status": 1,
+            "channel_id": null, "description": null
+        }
+    ]))
+    .await;
+}
+
+#[tokio::test]
+async fn events_seam_age_301_empty_response_preserves_all_last_good_fields() {
+    assert_stale_events_preserve_last_good(json!([])).await;
+}
+
+/// The age bound is strictly greater than five minutes: exactly 300 s stays
+/// fresh, 300 s plus one nanosecond is stale. Deterministic pure-predicate
+/// pin; the seam suites cover 299/301 through `snapshot_events_once` but
+/// cannot hit exactly 300 s because the gate samples `now_utc()` internally.
+#[test]
+fn snapshot_age_bound_is_strictly_greater_than_five_minutes() {
+    let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+    for (age, exceeded) in [
+        (time::Duration::seconds(299), false),
+        (time::Duration::seconds(300), false),
+        (
+            time::Duration::seconds(300) + time::Duration::nanoseconds(1),
+            true,
+        ),
+        (time::Duration::seconds(301), true),
+    ] {
+        assert_eq!(
+            snapshot_age_exceeded(now - age, now),
+            exceeded,
+            "age {age:?} must {} the five-minute bound",
+            if exceeded { "exceed" } else { "not exceed" },
+        );
+    }
+    assert!(
+        !snapshot_age_exceeded(now + time::Duration::seconds(1), now),
+        "a future observation is never stale"
+    );
 }
