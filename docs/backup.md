@@ -14,6 +14,61 @@ against scratch Postgres only (tests: agent-testdb `two_next_backup_test` /
 (`TWO_RESTORE_URL`, never `TWO_DATABASE_URL`) and real restores additionally
 require `--force`. This confirmation is not authorization to target production.
 
+## Stable failure codes
+
+Every `backup`, `backup-upload` and `guild-config-snapshot` failure line
+ends with a stable `code=<snake>` token so agents can match failure classes
+without substring-matching English. The human-readable text is unchanged;
+the code is additive. Success lines (`backup: done`, `RESTORE VERIFIED`,
+`DRY RUN VERIFIED`, `guild-config-snapshot: stored`,
+`backup-upload-s3: stored`, `snapshot and drift report uploaded`) carry no
+code and are byte-identical.
+
+`two-bot backup`:
+
+- `backup_usage` — unexpected extra argument (usage refusal, exit 2).
+- `backup_missing_database_url` — `TWO_DATABASE_URL` unset or not Postgres.
+- `backup_retention_refused` — `TWO_BACKUP_KEEP` would prune every backup.
+- `backup_dest_create_failed` — cannot create the destination directory.
+- `backup_pool_open_failed` — cannot open the database pool (redacted).
+- `backup_stat_failed` — dump written but cannot be statted.
+- `backup_empty_event_log` — zero `events` rows; refusing a hollow backup.
+- `backup_dump_failed` — the dump itself failed.
+- `backup_prune_failed` — retention pruning failed.
+
+`two-bot backup-upload <dump>`:
+
+- `backup_upload_usage` — expected exactly one argument.
+- `backup_upload_not_regular_file` — the path is not a regular file.
+- `backup_upload_empty_file` — refusing to upload an empty file.
+- `backup_upload_s3_target` — S3 target/env misconfigured.
+- `backup_upload_read_failed` — cannot read the dump file.
+- `backup_upload_put_status` — PUT returned a non-2xx status.
+- `backup_upload_put_failed` — the PUT request failed.
+
+`two-bot guild-config-snapshot`:
+
+- `snapshot_usage` — unexpected extra argument (usage refusal, exit 2).
+- `snapshot_token_load_failed` — cannot load the staging token.
+- `snapshot_token_check_refused` — the token failed the staging check.
+- `snapshot_guild_id_failed` — `DISCORD_STAGING_GUILD_ID` missing/wrong.
+- `snapshot_governed_api_failed` — cannot build the governed API client.
+- `snapshot_identity_failed` — API identity assertion failed.
+- `snapshot_capture_failed` — guild capture failed.
+- `snapshot_atomic_write_failed` — atomic snapshot/drift write failed.
+- `snapshot_reread_failed` — cannot re-read the written snapshot.
+- `snapshot_hash_changed` — snapshot hash changed after the write.
+- `snapshot_seal_missing` — written snapshot lacks its integrity seal.
+- `snapshot_local_only_refused` — no upload command; local-only refused.
+
+Bounded upload helper (`backup` and `guild-config-snapshot`: external
+upload command; argv and child output never echoed):
+
+- `upload_exit_nonzero` — helper exited nonzero.
+- `upload_spawn_failed` — helper failed to start.
+- `upload_wait_failed` — waiting on the helper failed.
+- `upload_timed_out` — helper exceeded its 30-minute budget; terminated.
+
 ## The format
 
 Gzipped NDJSON, one object per line: `manifest` / `row` / `end`. New dumps
@@ -313,7 +368,7 @@ bounded-helper contract from the nightly backup above: a hung helper is
 terminated and reaped (direct child only), the run fails, and both files
 stay on disk. The snapshot + drift report land in
 `TWO_GUILD_CONFIG_BACKUP_DIR` (default `./guild-config-backups`;
-`crates/bot/src/backup_cli.rs:1044`, usage at `:200`).
+`crates/bot/src/backup_cli.rs:1067`, usage at `:200`).
 
 Both guild-config commands first read `CREDENTIALS_DIRECTORY/discord_staging_token`
 (the service's `LoadCredential` contract). Only an absent credential/no configured

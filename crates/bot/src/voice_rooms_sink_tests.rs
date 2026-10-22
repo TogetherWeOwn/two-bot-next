@@ -5,6 +5,8 @@ use twilight_model::gateway::payload::incoming::{
 };
 use two_bot_discord::MemPipeline;
 
+#[path = "voice_actor_init_jitter_adoption_tests.rs"]
+mod init_jitter_adoption;
 #[path = "voice_actor_init_recovery_tests.rs"]
 mod init_recovery;
 

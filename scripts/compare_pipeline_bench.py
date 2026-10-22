@@ -4,6 +4,7 @@
 import argparse
 import json
 import math
+import re
 import sys
 from pathlib import Path
 
@@ -68,12 +69,63 @@ def compare(baseline, actual, tolerance=0.25, max_rss_mib=200, advisories=None):
     return failures
 
 
+# Argparse-time bound checks, mirroring the timing_seconds precedent: a bad
+# flag refuses before any file read. Messages reuse the exact compare()
+# vocabulary so the CLI and library refusals stay one fixed text.
+TOLERANCE_REFUSAL = "tolerance must be finite and nonnegative"
+RSS_REFUSAL = "RSS limit must be positive and at most the 256 MiB lite ceiling"
+
+
+def valid_tolerance(raw):
+    """One finite, nonnegative argparse type for --tolerance."""
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(TOLERANCE_REFUSAL) from None
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(TOLERANCE_REFUSAL)
+    return value
+
+
+def valid_rss_limit(raw):
+    """One finite, positive, lite-capped argparse type for --max-rss-mib."""
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(RSS_REFUSAL) from None
+    if not math.isfinite(value) or not 0 < value <= 256:
+        raise argparse.ArgumentTypeError(RSS_REFUSAL)
+    return value
+
+
+class BenchParser(argparse.ArgumentParser):
+    """Feed -inf/-nan/scientific values to their type check.
+
+    argparse reads a value starting with "-" as another flag unless it
+    looks like a negative number, and the stdlib match covers only -1/-0.5
+    spellings. Without this, `--tolerance -inf` dies as "expected one
+    argument" instead of reaching the bound check and its fixed refusal.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Digit runs allow single underscores between digits, matching the
+        # float() literal rules, so `-1_0` reaches its type check instead of
+        # dying as "expected one argument".
+        self._negative_number_matcher = re.compile(
+            r"^-\d(?:_?\d)*$|^-(?:\d(?:_?\d)*)?\.\d(?:_?\d)*$|^-\d(?:_?\d)*\.$"
+            r"|^-\d(?:_?\d)*(\.(?:\d(?:_?\d)*)?)?[eE][+-]?\d(?:_?\d)*$|^-(\.\d(?:_?\d)*)[eE][+-]?\d(?:_?\d)*$"
+            r"|^-inf(inity)?$|^-nan$",
+            re.IGNORECASE,
+        )
+
+
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = BenchParser(description=__doc__)
     parser.add_argument("actual", type=Path)
     parser.add_argument("--baseline", type=Path, default=Path("docs/pipeline-benchmark-baseline.json"))
-    parser.add_argument("--tolerance", type=float, default=0.25)
-    parser.add_argument("--max-rss-mib", type=float, default=200)
+    parser.add_argument("--tolerance", type=valid_tolerance, default=0.25)
+    parser.add_argument("--max-rss-mib", type=valid_rss_limit, default=200)
     args = parser.parse_args()
     try:
         advisories = []
