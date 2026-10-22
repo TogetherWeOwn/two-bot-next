@@ -19,6 +19,21 @@ its new attribution, not the previous inviter. Unknown rejoins do not retain
 an old credit. Counts come from committed Postgres gateway state, not a
 process-local counter, and survive a bot restart.
 
+## Welcome attribution
+
+Eligible welcome messages name the inviter from the member's latest committed
+join, using a bounded, escaped display name (or a plain member ID fallback).
+Only the welcomed member may be notified; the inviter is never added to the
+mention allowlist. Unknown current joins and leaves never inherit an earlier
+join's inviter. Suppressed attribution remains absent. This read does not
+re-diff invite counters or bypass the existing welcome eligibility/dry-run gates.
+
+Same-timestamp membership facts retain their durable event order. On a legacy
+event-key collision, a distinct gateway membership delivery gets a stable
+session/sequence suffix; the checkpoint still rejects replay atomically with
+the effects. Non-membership event keys and existing first-delivery keys stay
+unchanged. No historical rows are rewritten.
+
 ## Missing access
 
 The bot must be able to read the server's invites (Manage Server /

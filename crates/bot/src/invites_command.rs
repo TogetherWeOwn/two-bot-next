@@ -180,7 +180,42 @@ async fn counts(
     Ok(rows)
 }
 
-async fn member_name(executor: &ActionExecutor, guild: u64, member: &str) -> String {
+/// Latest committed membership only: never recover credit from an older join.
+pub(crate) async fn current_inviter(
+    pool: &PgPool,
+    guild: u64,
+    member: u64,
+) -> Result<Option<String>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL statement_timeout = '5s'")
+        .execute(&mut *tx)
+        .await?;
+    let inviter = sqlx::query_scalar(
+        r#"WITH latest AS (
+            SELECT event_type, source, metadata FROM events
+            WHERE guild_id = $1 AND member_id = $2
+              AND event_type IN ('member_join', 'member_leave')
+            ORDER BY occurred_at DESC, id DESC LIMIT 1
+        ), attributed AS (
+            SELECT CASE WHEN metadata IS JSON OBJECT
+                        THEN metadata::jsonb ->> 'inviterId' END AS inviter
+            FROM latest WHERE event_type = 'member_join' AND source LIKE 'invite:%'
+        )
+        SELECT inviter FROM attributed
+        WHERE inviter <> $2 AND
+              CASE WHEN inviter ~ '^[1-9][0-9]{0,19}$'
+                   THEN inviter::numeric <= 18446744073709551615
+                   ELSE false END"#,
+    )
+    .bind(guild.to_string())
+    .bind(member.to_string())
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(inviter)
+}
+
+pub(crate) async fn member_name(executor: &ActionExecutor, guild: u64, member: &str) -> String {
     let body = executor
         .get_json_strict(&format!("/guilds/{guild}/members/{member}"))
         .await
