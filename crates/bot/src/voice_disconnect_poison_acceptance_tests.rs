@@ -8,6 +8,7 @@
 #![cfg(test)]
 
 use super::*;
+use crate::drop_poison_test_serial::DROP_POISON_SERIAL;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 async fn disconnect(poison_actors: bool, poison_view: bool) {
@@ -36,7 +37,12 @@ async fn disconnect(poison_actors: bool, poison_view: bool) {
     }
 
     let sink: Arc<dyn VoiceEventSink> = runtime.clone();
-    let outcome = catch_unwind(AssertUnwindSafe(|| sink.disconnect_from_drop()));
+    // A poisoned registry counts on the process-global series: hold the
+    // shared lock so this cleanup cannot land in a delta window.
+    let outcome = {
+        let _serial = DROP_POISON_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        catch_unwind(AssertUnwindSafe(|| sink.disconnect_from_drop()))
+    };
     let gateway_disconnected = !runtime.gateway_connected.load(Ordering::Acquire);
     let (ready, after_generation, not_ready_since) = {
         let live = actor.live.read_state();

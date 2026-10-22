@@ -18,13 +18,11 @@
 
 use super::*;
 use crate::discord_test_common::{MockRest, ScriptedResponse};
+use crate::drop_poison_test_serial::DROP_POISON_SERIAL;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::LazyLock;
 use tokio::sync::oneshot;
 
 const GUARD: &str = "ticket_supervisor";
-
-static SERIAL: LazyLock<std::sync::Mutex<()>> = LazyLock::new(|| std::sync::Mutex::new(()));
 
 /// Rendered `two_bot_drop_poison_total{guard="..."}` count, or `None` while
 /// the series does not exist (pre-Builder: `DROP_POISON_GUARDS` lacks it).
@@ -110,7 +108,7 @@ async fn supervisor_drop_with_counter(poisoned: bool, expected_delta: u64) {
     // Serialise the counter window: parallel tests share the global, so an
     // unguarded delta could mix increments from another test's drop.
     let (outcome, before, after) = {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = DROP_POISON_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let before = drop_poison_count(GUARD);
         let outcome = catch_unwind(AssertUnwindSafe(|| drop(supervisor)));
         let after = drop_poison_count(GUARD);
@@ -197,7 +195,7 @@ async fn poisoned_live_stop_tasks_panics_without_counter_or_mutation() {
     // original name; the drop-only variant gets a new name called only from
     // `Drop`.
     let (outcome, before, after) = {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = DROP_POISON_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let before = drop_poison_count(GUARD).unwrap_or(0);
         let outcome = catch_unwind(AssertUnwindSafe(|| runtime.stop_tasks()));
         let after = drop_poison_count(GUARD).unwrap_or(0);

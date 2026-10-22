@@ -20,12 +20,10 @@
 #![cfg(test)]
 
 use super::*;
+use crate::drop_poison_test_serial::DROP_POISON_SERIAL;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::LazyLock;
 
 const GUARD: &str = "response_accounting";
-
-static SERIAL: LazyLock<std::sync::Mutex<()>> = LazyLock::new(|| std::sync::Mutex::new(()));
 
 fn drop_poison_count(guard: &str) -> Option<u64> {
     let rendered = two_bot_core::metrics::global().render(None);
@@ -92,7 +90,7 @@ async fn global_drop_with_counter(poisoned: bool, existing_deadline: bool, expec
     }
 
     let (outcome, before, after) = {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = DROP_POISON_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let before = drop_poison_count(GUARD);
         let outcome = catch_unwind(AssertUnwindSafe(|| drop(accounting)));
         let after = drop_poison_count(GUARD);
@@ -153,7 +151,7 @@ async fn bare_drop_with_counter(poisoned: bool, expected_delta: u64) {
     }
 
     let (outcome, before, after) = {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = DROP_POISON_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let before = drop_poison_count(GUARD);
         let outcome = catch_unwind(AssertUnwindSafe(|| drop(accounting)));
         let after = drop_poison_count(GUARD);
@@ -229,7 +227,7 @@ async fn both_drop_with_counter(poisoned: bool, expected_delta: u64) {
     }
 
     let (outcome, before, after) = {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = DROP_POISON_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let before = drop_poison_count(GUARD);
         let outcome = catch_unwind(AssertUnwindSafe(|| drop(accounting)));
         let after = drop_poison_count(GUARD);
@@ -304,7 +302,7 @@ async fn poisoned_both_headers_drop_counts_exactly_two() {
 
 #[tokio::test(start_paused = true)]
 async fn poisoned_live_bare_settle_panics_without_counter() {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = DROP_POISON_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let guard = RateLimitGuard::new(GuardConfig::default()).expect("REST guard");
     let headers = bare_headers();
     let mut accounting = ResponseAccounting::new(&guard, 429, &headers, true);
@@ -333,7 +331,7 @@ async fn poisoned_live_bare_settle_panics_without_counter() {
 
 #[tokio::test(start_paused = true)]
 async fn poisoned_live_global_settle_panics_without_counter() {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = DROP_POISON_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let guard = RateLimitGuard::new(GuardConfig::default()).expect("REST guard");
     let headers = global_headers();
     let mut accounting = ResponseAccounting::new(&guard, 429, &headers, true);
@@ -363,7 +361,7 @@ async fn poisoned_live_global_settle_panics_without_counter() {
 
 #[tokio::test(start_paused = true)]
 async fn poisoned_live_observe_bucket_with_bare_retry_after_panics_without_counter() {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = DROP_POISON_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let guard = RateLimitGuard::new(GuardConfig::default()).expect("REST guard");
     poison(&guard);
     let before = drop_poison_count(GUARD).unwrap_or(0);
@@ -380,7 +378,7 @@ async fn poisoned_live_observe_bucket_with_bare_retry_after_panics_without_count
 
 #[tokio::test(start_paused = true)]
 async fn poisoned_live_observe_global_panics_without_counter() {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = DROP_POISON_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let guard = RateLimitGuard::new(GuardConfig::default()).expect("REST guard");
     poison(&guard);
     let before = drop_poison_count(GUARD).unwrap_or(0);
