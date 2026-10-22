@@ -46,6 +46,8 @@ table and the test are updated together.
 | `two_bot_send_admissions_total{outcome}` | 4 | `admitted`, `blocked`, `storage_error`, `other` |
 | `two_bot_gateway_prefix_trigger_refused_total{reason}` | 2 | `verdict`, `other` |
 | `two_bot_dispatch_drops_total{lane}` | 6 | `messages`, `interactions`, `registry`, `privileged`, `busy`, `reactions` |
+| `two_bot_raid_dropped_joins_total{reason}` | 2 | `queue_full`, `queue_closed`; fixed queue-drop reasons, no per-member/guild labels |
+| `two_bot_join_risk_dropped_joins_total{reason}` | 2 | `queue_full`, `queue_closed`; fixed queue-drop reasons, no per-member/guild labels |
 | `two_bot_voice_vote_kick_total{outcome}` | 26 | `started` + 2 worker refusals + 15 vote-core refusals (including `cooldown`, `initiator_limited`) + 7 enforcements + `other` |
 | `two_bot_voice_names_total{outcome}` | 16 | 1 create + 5 template-render outcomes + 9 dispatch outcomes (including `name_blocked` for rename or custom-override refusal) + `other` |
 | `two_bot_gateway_checkpoint_failures_total{stage}` | 2 | `pre_commit`, `commit` |
