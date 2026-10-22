@@ -3118,6 +3118,10 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_container_drill_dryrun_acceptance.py -v
       - name: Verify staging ownership-takeover retry (offline fixtures)
         run: node --test scripts/test-ownership-control.mjs
+      - name: Verify ownership control response validation (offline fixtures)
+        run: node --test scripts/test-ownership-control-response-validation.mjs
+      - name: Verify ownership response audit fields and CLI projection (offline fixtures)
+        run: node --test scripts/test-ownership-control-response.mjs
       - name: Verify production ownership-status retry (offline fixtures)
         run: node --test scripts/test-production-ownership-control.mjs
       - name: Verify staging ownership status read (offline fixtures)
@@ -3204,6 +3208,9 @@ jobs:
       - name: Verify runner routing for every workflow job
         if: needs.job-inputs.outputs.worker != 'false'
         run: python3 ../scripts/test-runner-routing.py
+      - name: Verify commit-parser step attribution (offline fixtures)
+        if: needs.job-inputs.outputs.worker != 'false'
+        run: python3 ../scripts/test-commit-parse-guard-ci.py
       - name: Verify the daily digest release (offline fixtures)
         if: needs.job-inputs.outputs.worker != 'false'
         # Digest tags, notes, quiet-day and rollback skips, off-main refusal
@@ -3216,13 +3223,15 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_daily_digest_execution.py -v
       - name: Verify the missing-digest alert (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_digest_alert.py -v
-      - name: Verify the commit-parse guard
+      - name: Install pinned commit-parser fixture
         if: needs.job-inputs.outputs.worker != 'false'
         # The PR-side guard uses release-please's pinned conventional-commit
         # parser, in an isolated install with lifecycle scripts disabled.
         run: | # zizmor: ignore[adhoc-packages] pinned commit parser fixture only
           npm install --prefix "$RUNNER_TEMP/release-fixture" --ignore-scripts --no-audit --no-fund release-please@17.6.0
-          NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-commit-parse-guard.cjs
+      - name: Verify the commit-parse guard
+        if: needs.job-inputs.outputs.worker != 'false'
+        run: NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-commit-parse-guard.cjs
 
   # Single always-run aggregator for the path-filtered matrix. GitHub counts
   # a skipped job as passing and leaves a required context pending when its
