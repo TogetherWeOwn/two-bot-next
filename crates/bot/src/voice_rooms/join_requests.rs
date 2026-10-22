@@ -326,6 +326,7 @@ where
         .run_join_decision(guild_id, JoinDecisionCommand { actor_id, click })
         .await
     {
+        None if runtime.has_actor(guild_id) => ephemeral_response(WORKER_LOST_REPLY),
         None => ephemeral_response(WARMING),
         Some(JoinReply::Refused(text)) => ephemeral_response(&text),
         Some(JoinReply::Decided(text)) => decided_response(&text),
@@ -340,8 +341,9 @@ where
     H: RoomWrites + Send + 'static,
 {
     /// Run one press through the guild actor. `None` when the guild has no
-    /// live actor yet or its inbox already drained.
-    async fn run_join_decision(
+    /// live actor yet, when its inbox already drained, or when no answer
+    /// arrived within `WORKER_ACK_WAIT`.
+    pub(super) async fn run_join_decision(
         &self,
         guild: Snowflake,
         decision: JoinDecisionCommand,
@@ -352,7 +354,10 @@ where
             .tx
             .send(ActorCommand::JoinDecision { decision, reply })
             .ok()?;
-        inbox.await.ok()
+        tokio::time::timeout(WORKER_ACK_WAIT, inbox)
+            .await
+            .ok()?
+            .ok()
     }
 }
 

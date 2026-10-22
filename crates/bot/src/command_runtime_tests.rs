@@ -19,6 +19,8 @@
 
 #[path = "member_dispatch_authority_acceptance.rs"]
 mod member_dispatch_authority_acceptance;
+#[path = "sticky_uncertain_acceptance_tests.rs"]
+mod sticky_uncertain_acceptance_tests;
 
 #[path = "custom_command_list_pages_acceptance.rs"]
 mod custom_command_list_pages_acceptance;
@@ -59,8 +61,8 @@ use two_bot_core::{
 use two_bot_discord::ActionExecutor;
 
 use crate::command_runtime::{
-    actor_id, ephemeral, feed_add_options, feed_remove_option, new_id, router_with_commands,
-    sticky_options, CommandRuntime, RegistrySyncError,
+    actor_id, ephemeral, feed_add_options, feed_list_page_request, feed_remove_option, new_id,
+    router_with_commands, sticky_options, CommandRuntime, FeedListPage, RegistrySyncError,
 };
 use crate::internal_action_http::MODERATION_METRICS_LOCK;
 use crate::member_runtime::{sweep_job, MemberRuntime};
@@ -2906,6 +2908,36 @@ fn feed_remove_option_extracts_id() {
 }
 
 #[test]
+fn feed_list_page_request_defaults_and_refuses_unusable_values() {
+    let missing = slash("feed-list", Some(CHANNEL), Vec::new());
+    assert_eq!(feed_list_page_request(&missing), FeedListPage::Default);
+    for (value, expected) in [
+        (CommandOptionValue::Integer(1), FeedListPage::Page(1)),
+        (CommandOptionValue::Integer(2), FeedListPage::Page(2)),
+        (
+            CommandOptionValue::Integer(i64::MAX),
+            FeedListPage::Page(i64::MAX),
+        ),
+        // Range is refused by the reply composer, not the decoder.
+        (CommandOptionValue::Integer(0), FeedListPage::Page(0)),
+        (CommandOptionValue::Integer(-2), FeedListPage::Page(-2)),
+    ] {
+        let interaction = slash("feed-list", Some(CHANNEL), vec![option("page", value)]);
+        assert_eq!(feed_list_page_request(&interaction), expected);
+    }
+    // A present option with a non-integer wire value must refuse, never
+    // silently list the default page.
+    for value in [
+        CommandOptionValue::String("second".to_owned()),
+        CommandOptionValue::Number(1.5),
+        CommandOptionValue::Boolean(true),
+    ] {
+        let interaction = slash("feed-list", Some(CHANNEL), vec![option("page", value)]);
+        assert_eq!(feed_list_page_request(&interaction), FeedListPage::Invalid);
+    }
+}
+
+#[test]
 fn new_id_is_unique_hex_that_validate_id_accepts() {
     let first = new_id();
     let second = new_id();
@@ -4369,10 +4401,10 @@ async fn failed_defer_leaves_set_and_remove_state_untouched() {
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
-async fn unconfirmed_replacement_preserves_previous_and_releases_claim() {
+async fn unusable_success_receipt_retains_uncertainty_fence() {
     let db = TestDb::new().await;
     db.seed(Some("8888"), 120_000, 5).await;
-    for body in [
+    for (index, body) in [
         "{}",
         "not JSON",
         r#"{"id":null}"#,
@@ -4380,9 +4412,15 @@ async fn unconfirmed_replacement_preserves_previous_and_releases_claim() {
         r#"{"id":""}"#,
         r#"{"id":"0"}"#,
         r#"{"id":"abc"}"#,
-        r#"{"id":"+123"}"#,
+        // "+123" is covered by its own seeded test below: the executor
+        // accepts it (`u64` parses a leading '+') while the runtime
+        // all-digits guard rejects it, so only a fresh fence exercises
+        // the Ok(_) unusable-receipt branch.
         r#"{"id":"18446744073709551616"}"#,
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let (runtime, mock) = db_runtime_script(
             &db,
             vec![RestResponse {
@@ -4399,31 +4437,123 @@ async fn unconfirmed_replacement_preserves_previous_and_releases_claim() {
             ActivityOutcome::Held,
             "{body}"
         );
+        let (remembered, last_id, claim) = db.row().await.expect("row retained");
+        assert_eq!(remembered, "remember this", "{body}");
+        assert_eq!(last_id.as_deref(), Some("8888"), "{body}");
+        assert!(
+            claim.is_some(),
+            "uncertain delivery keeps the fence for {body}"
+        );
+        // Only the first attempt reaches the wire; the fence holds the rest.
         assert_eq!(
-            db.row().await,
-            Some(("remember this".into(), Some("8888".into()), None)),
+            mock.posts_to("/messages").await.len(),
+            usize::from(index == 0),
             "{body}"
         );
-        assert_eq!(mock.posts_to("/messages").await.len(), 1);
         assert!(mock.deletes().is_empty(), "no retirement for {body}");
         mock.shutdown().await;
     }
-    let audits = db.audits().await;
-    assert_eq!(audits.len(), 9);
-    assert!(audits
-        .iter()
-        .all(|(action, outcome)| action == "sticky.run" && outcome == "post_failed"));
+    assert_eq!(
+        db.audits().await,
+        vec![("sticky.run".to_owned(), "post_failed".to_owned())],
+        "only the first attempt audits; fenced holds stay silent"
+    );
+    // The fence outlives the 60s claim lease: a probe past expiry is held,
+    // and the next accepted message holds without posting a duplicate.
+    assert!(
+        store::claim_sticky_post(
+            &db.pool,
+            GUILD_S,
+            CHANNEL_S,
+            "lease-probe",
+            now_millis_for_test() + 120_000,
+        )
+        .await
+        .expect("lease probe")
+        .is_none(),
+        "uncertainty survives lease expiry"
+    );
     let (runtime, mock) = db_runtime(&db, vec![]).await;
     assert_eq!(
         runtime
             .on_message(&message(25, CHANNEL, false, Some(GUILD)))
             .await,
-        ActivityOutcome::Reposted
+        ActivityOutcome::Held
     );
+    assert!(
+        mock.posts_to("/messages").await.is_empty(),
+        "fenced channel sends no duplicate"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn plus_prefixed_receipt_id_retains_uncertainty_fence() {
+    // The executor accepts "+123" (`u64::from_str` allows a leading '+')
+    // but the runtime all-digits guard routes it to the Ok(_) branch. A
+    // fresh fence is required: sharing the loop above would hold before
+    // the wire and never execute that branch.
+    let db = TestDb::new().await;
+    db.seed(Some("8888"), 120_000, 5).await;
+    let (runtime, mock) = db_runtime_script(
+        &db,
+        vec![RestResponse {
+            status: 200,
+            body: Some(r#"{"id":"+123"}"#.into()),
+            delay: Duration::ZERO,
+        }],
+    )
+    .await;
     assert_eq!(
-        mock.deletes().len(),
+        runtime
+            .on_message(&message(26, CHANNEL, false, Some(GUILD)))
+            .await,
+        ActivityOutcome::Held,
+    );
+    let (remembered, last_id, claim) = db.row().await.expect("row retained");
+    assert_eq!(remembered, "remember this");
+    assert_eq!(last_id.as_deref(), Some("8888"));
+    assert!(claim.is_some(), "unusable receipt keeps the fence armed");
+    assert_eq!(
+        mock.posts_to("/messages").await.len(),
         1,
-        "subsequent confirmed replacement retires previous"
+        "the POST reaches the wire before the receipt is judged unusable"
+    );
+    assert!(mock.deletes().is_empty(), "no retirement");
+    assert_eq!(
+        db.audits().await,
+        vec![("sticky.run".to_owned(), "post_failed".to_owned())],
+    );
+    // The fence outlives the 60s claim lease: a probe past expiry is held,
+    // and the next accepted message holds without posting a duplicate.
+    // (Reverting the Ok(_) branch to release would turn the claim, probe
+    // and follow-up assertions red.)
+    assert!(
+        store::claim_sticky_post(
+            &db.pool,
+            GUILD_S,
+            CHANNEL_S,
+            "plus-probe",
+            now_millis_for_test() + 120_000,
+        )
+        .await
+        .expect("lease probe")
+        .is_none(),
+        "uncertainty survives lease expiry"
+    );
+    mock.shutdown().await;
+    let (runtime, mock) = db_runtime(&db, vec![]).await;
+    assert_eq!(
+        runtime
+            .on_message(&message(27, CHANNEL, false, Some(GUILD)))
+            .await,
+        ActivityOutcome::Held
+    );
+    assert!(
+        mock.posts_to("/messages").await.is_empty(),
+        "fenced channel sends no duplicate"
     );
     mock.shutdown().await;
     db.close().await;
@@ -4534,7 +4664,7 @@ async fn debounce_window_holds_the_repost() {
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
-async fn post_failure_releases_claim_and_audits_post_failed() {
+async fn post_transport_failure_retains_uncertainty_fence() {
     let db = TestDb::new().await;
     db.seed(Some("8000000000000000004"), 120_000, 5).await;
     // First request (the replacement post) fails 500; default 200 after.
@@ -4550,19 +4680,22 @@ async fn post_failure_releases_claim_and_audits_post_failed() {
     );
     let (_, last_id, claim) = db.row().await.expect("row exists");
     assert_eq!(last_id.as_deref(), Some("8000000000000000004"), "unchanged");
-    assert_eq!(claim, None, "claim released for the next activity");
+    assert!(claim.is_some(), "ambiguous 500 keeps the fence");
 
-    // The released claim lets the very next activity re-post successfully.
+    // The fence holds the next activity: no duplicate reaches the wire.
     let outcome = runtime
         .on_message(&message(23, CHANNEL, false, Some(GUILD)))
         .await;
-    assert_eq!(outcome, ActivityOutcome::Reposted);
-    // Failed attempt + the retry both hit the wire; only the retry lands.
-    assert_eq!(mock.posts_to("/messages").await.len(), 2);
-    let audits = db.audits().await;
+    assert_eq!(outcome, ActivityOutcome::Held);
     assert_eq!(
-        audits.last().map(|(a, o)| (a.as_str(), o.as_str())),
-        Some(("sticky.run", "ok"))
+        mock.posts_to("/messages").await.len(),
+        1,
+        "failed attempt only; no retry while fenced"
+    );
+    assert_eq!(
+        db.audits().await.len(),
+        1,
+        "fenced hold audits nothing more"
     );
     mock.shutdown().await;
     db.close().await;
@@ -4645,6 +4778,496 @@ async fn obsolete_post_after_admin_update_preserves_admin_state() {
     assert!(
         db.audits().await.is_empty(),
         "lost claim writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn obsolete_post_after_admin_update_with_failed_cleanup_rearms_fence() {
+    let db = TestDb::new().await;
+    db.seed(Some("8000000000000000013"), 120_000, 5).await;
+    // Hold the accepted POST open so the administrator update lands between
+    // the wire post and the store record; the orphan DELETE then fails
+    // (403), leaving a possibly-live replacement that must re-arm the
+    // fence. The script is consumed in request order: POST, then DELETE.
+    let (runtime, mock) = db_runtime_script(
+        &db,
+        vec![
+            RestResponse {
+                status: 200,
+                body: None,
+                delay: Duration::from_millis(1000),
+            },
+            RestResponse::status(403),
+        ],
+    )
+    .await;
+    let msg = message(32, CHANNEL, false, Some(GUILD));
+    let (outcome, _) = tokio::join!(runtime.on_message(&msg), async {
+        wait_for(
+            || {
+                mock.requests()
+                    .iter()
+                    .any(|r| r.method == "POST" && r.path.ends_with("/messages"))
+            },
+            "replacement POST entered",
+        )
+        .await;
+        // Independent administrator path: the upsert clears the claim and
+        // disarms the fence but preserves the live post columns.
+        let updated = store::put_sticky(
+            &db.pool,
+            &PutSticky {
+                guild_id: GUILD_S,
+                channel_id: CHANNEL_S,
+                body: "admin v2",
+                debounce_seconds: 5,
+                enabled: true,
+                actor_id: "admin-9",
+                now_ms: now_millis_for_test(),
+            },
+        )
+        .await
+        .expect("admin update");
+        assert!(!updated, "seed row already existed");
+    });
+    assert_eq!(outcome, ActivityOutcome::Held, "lost claim reports held");
+
+    // The orphan replacement cleanup was attempted exactly once.
+    let deletes = mock.deletes();
+    assert_eq!(deletes.len(), 1, "one orphan cleanup: {deletes:?}");
+    assert_eq!(
+        deletes[0].path, "/api/v10/channels/3333/messages/9000000000000000000",
+        "orphan id from the held POST",
+    );
+
+    // Administrator state wins on the row, but the unconfirmed cleanup
+    // re-arms the fence: the claim stays cleared (the re-arm is
+    // claim-blind) while delivery_uncertain blocks the next window.
+    let (body, last_id, claim) = db.row().await.expect("row exists");
+    assert_eq!(body, "admin v2");
+    assert_eq!(
+        last_id.as_deref(),
+        Some("8000000000000000013"),
+        "obsolete record cannot overwrite the live post",
+    );
+    assert_eq!(
+        claim, None,
+        "admin update cleared the claim; the re-arm adds none"
+    );
+    assert_eq!(
+        db.audits().await,
+        vec![("sticky.run".to_owned(), "post_failed".to_owned())],
+        "unconfirmed cleanup audits failure, never success"
+    );
+
+    // The re-armed fence outlives the 60s claim lease: a probe past expiry
+    // is held, and the next accepted message holds without posting a
+    // duplicate. (Deleting the moved-on fence_uncertain call turns the
+    // probe red and lets the follow-up duplicate.)
+    assert!(
+        store::claim_sticky_post(
+            &db.pool,
+            GUILD_S,
+            CHANNEL_S,
+            "rearm-probe",
+            now_millis_for_test() + 120_000,
+        )
+        .await
+        .expect("lease probe")
+        .is_none(),
+        "moved-on re-arm survives lease expiry"
+    );
+    mock.shutdown().await;
+    let (runtime, mock) = db_runtime(&db, vec![]).await;
+    assert_eq!(
+        runtime
+            .on_message(&message(33, CHANNEL, false, Some(GUILD)))
+            .await,
+        ActivityOutcome::Held
+    );
+    assert!(
+        mock.posts_to("/messages").await.is_empty(),
+        "fenced channel sends no duplicate"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn failed_record_with_admin_update_during_cleanup_rearms_fence() {
+    let db = TestDb::new().await;
+    db.seed(Some("8000000000000000017"), 120_000, 5).await;
+    // Scoped completion-only fault, as in
+    // completion_db_failure_audits_post_failed_and_preserves_newer_claim:
+    // the trigger rejects only the record that carries this test's orphan
+    // id. The claim and the administrator upsert pass through.
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION sticky_test_fail_orphan() RETURNS trigger AS $$
+         BEGIN
+           IF NEW.last_message_id = '9000000000000000000' THEN
+             RAISE EXCEPTION 'scoped completion-only failure';
+           END IF;
+           RETURN NEW;
+         END;
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install fault function");
+    sqlx::query("DROP TRIGGER IF EXISTS sticky_test_fail_orphan_trg ON sticky_messages")
+        .execute(&db.pool)
+        .await
+        .expect("drop stale fault trigger");
+    sqlx::query(
+        "CREATE TRIGGER sticky_test_fail_orphan_trg
+           BEFORE UPDATE ON sticky_messages FOR EACH ROW
+           EXECUTE FUNCTION sticky_test_fail_orphan()",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install fault trigger");
+
+    // Hold the orphan DELETE open so the administrator update lands between
+    // the failed record and the failed cleanup (403): the row is disarmed
+    // at diagnose time with a possibly-live orphan, the same state as an
+    // update landing during the POST. The script is consumed in request
+    // order: POST, then DELETE.
+    let (runtime, mock) = db_runtime_script(
+        &db,
+        vec![
+            RestResponse {
+                status: 200,
+                body: None,
+                delay: Duration::ZERO,
+            },
+            RestResponse {
+                status: 403,
+                body: None,
+                delay: Duration::from_millis(1000),
+            },
+        ],
+    )
+    .await;
+    let msg = message(36, CHANNEL, false, Some(GUILD));
+    let (outcome, _) = tokio::join!(runtime.on_message(&msg), async {
+        wait_for(
+            || {
+                mock.requests()
+                    .iter()
+                    .any(|r| r.method == "DELETE" && r.path.contains("/messages/"))
+            },
+            "orphan DELETE entered",
+        )
+        .await;
+        // Independent administrator path: the upsert clears the claim and
+        // disarms the fence but preserves the live post columns.
+        let updated = store::put_sticky(
+            &db.pool,
+            &PutSticky {
+                guild_id: GUILD_S,
+                channel_id: CHANNEL_S,
+                body: "admin v3",
+                debounce_seconds: 5,
+                enabled: true,
+                actor_id: "admin-9",
+                now_ms: now_millis_for_test(),
+            },
+        )
+        .await
+        .expect("admin update");
+        assert!(!updated, "seed row already existed");
+    });
+    assert_eq!(outcome, ActivityOutcome::Held, "failed record reports held");
+
+    // The orphan replacement cleanup was attempted exactly once.
+    let deletes = mock.deletes();
+    assert_eq!(deletes.len(), 1, "one orphan cleanup: {deletes:?}");
+    assert_eq!(
+        deletes[0].path, "/api/v10/channels/3333/messages/9000000000000000000",
+        "orphan id from the accepted POST",
+    );
+
+    // Administrator state wins on the row, but the unconfirmed cleanup
+    // re-arms the fence: the claim stays cleared (the re-arm is
+    // claim-blind) while delivery_uncertain blocks the next window.
+    let (body, last_id, claim) = db.row().await.expect("row exists");
+    assert_eq!(body, "admin v3");
+    assert_eq!(
+        last_id.as_deref(),
+        Some("8000000000000000017"),
+        "failed record cannot overwrite the live post",
+    );
+    assert_eq!(
+        claim, None,
+        "admin update cleared the claim; the re-arm adds none"
+    );
+    assert_eq!(
+        db.audits().await,
+        vec![("sticky.run".to_owned(), "post_failed".to_owned())],
+        "unconfirmed cleanup audits failure, never success"
+    );
+
+    // The re-armed fence outlives the 60s claim lease: a probe past expiry
+    // is held, and the next accepted message holds without posting a
+    // duplicate. (Deleting the record-failed fence_uncertain call turns the
+    // probe red and lets the follow-up duplicate.)
+    assert!(
+        store::claim_sticky_post(
+            &db.pool,
+            GUILD_S,
+            CHANNEL_S,
+            "rearm-probe",
+            now_millis_for_test() + 120_000,
+        )
+        .await
+        .expect("lease probe")
+        .is_none(),
+        "record-failed re-arm survives lease expiry"
+    );
+    mock.shutdown().await;
+    let (runtime, mock) = db_runtime(&db, vec![]).await;
+    assert_eq!(
+        runtime
+            .on_message(&message(37, CHANNEL, false, Some(GUILD)))
+            .await,
+        ActivityOutcome::Held
+    );
+    assert!(
+        mock.posts_to("/messages").await.is_empty(),
+        "fenced channel sends no duplicate"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn ambiguous_post_error_with_admin_update_during_post_rearms_fence() {
+    let db = TestDb::new().await;
+    db.seed(Some("8000000000000000021"), 120_000, 5).await;
+    // Hold the ambiguous POST (500) open so the administrator update lands
+    // mid-flight: the claim's fence is disarmed at diagnose time with a
+    // possibly-live post, and only a claim-blind re-arm holds the window.
+    let (runtime, mock) = db_runtime_script(
+        &db,
+        vec![RestResponse {
+            status: 500,
+            body: None,
+            delay: Duration::from_millis(1000),
+        }],
+    )
+    .await;
+    let msg = message(40, CHANNEL, false, Some(GUILD));
+    let (outcome, _) = tokio::join!(runtime.on_message(&msg), async {
+        wait_for(
+            || {
+                mock.requests()
+                    .iter()
+                    .any(|r| r.method == "POST" && r.path.ends_with("/messages"))
+            },
+            "ambiguous POST entered",
+        )
+        .await;
+        // Independent administrator path: the upsert clears the claim and
+        // disarms the fence but preserves the live post columns.
+        let updated = store::put_sticky(
+            &db.pool,
+            &PutSticky {
+                guild_id: GUILD_S,
+                channel_id: CHANNEL_S,
+                body: "admin v4",
+                debounce_seconds: 5,
+                enabled: true,
+                actor_id: "admin-9",
+                now_ms: now_millis_for_test(),
+            },
+        )
+        .await
+        .expect("admin update");
+        assert!(!updated, "seed row already existed");
+    });
+    assert_eq!(
+        outcome,
+        ActivityOutcome::Held,
+        "ambiguous error reports held"
+    );
+
+    // The ambiguous attempt reached the wire exactly once; with no usable
+    // receipt there is no orphan cleanup to attempt.
+    assert_eq!(
+        mock.posts_to("/messages").await.len(),
+        1,
+        "failed attempt only"
+    );
+    assert!(mock.deletes().is_empty(), "no orphan id, no cleanup");
+
+    // Administrator state wins on the row, but the ambiguous outcome
+    // re-arms the fence: the claim stays cleared (the re-arm is
+    // claim-blind) while delivery_uncertain blocks the next window.
+    let (body, last_id, claim) = db.row().await.expect("row exists");
+    assert_eq!(body, "admin v4");
+    assert_eq!(
+        last_id.as_deref(),
+        Some("8000000000000000021"),
+        "ambiguous post records nothing",
+    );
+    assert_eq!(
+        claim, None,
+        "admin update cleared the claim; the re-arm adds none"
+    );
+    assert_eq!(
+        db.audits().await,
+        vec![("sticky.run".to_owned(), "post_failed".to_owned())],
+        "ambiguous outcome audits failure, never success"
+    );
+
+    // The re-armed fence outlives the 60s claim lease: a probe past expiry
+    // is held, and the next accepted message holds without posting a
+    // duplicate. (Deleting the ambiguous-error fence_uncertain call turns
+    // the probe red and lets the follow-up duplicate.)
+    assert!(
+        store::claim_sticky_post(
+            &db.pool,
+            GUILD_S,
+            CHANNEL_S,
+            "rearm-probe",
+            now_millis_for_test() + 120_000,
+        )
+        .await
+        .expect("lease probe")
+        .is_none(),
+        "ambiguous-error re-arm survives lease expiry"
+    );
+    mock.shutdown().await;
+    let (runtime, mock) = db_runtime(&db, vec![]).await;
+    assert_eq!(
+        runtime
+            .on_message(&message(41, CHANNEL, false, Some(GUILD)))
+            .await,
+        ActivityOutcome::Held
+    );
+    assert!(
+        mock.posts_to("/messages").await.is_empty(),
+        "fenced channel sends no duplicate"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn unusable_receipt_with_admin_update_during_post_rearms_fence() {
+    let db = TestDb::new().await;
+    db.seed(Some("8000000000000000022"), 120_000, 5).await;
+    // Plus-prefixed receipt the executor accepts but the runtime
+    // all-digits guard rejects, held open so the administrator update
+    // lands mid-flight: the post may be live but can be neither recorded
+    // nor deleted, and only a claim-blind re-arm holds the window.
+    let (runtime, mock) = db_runtime_script(
+        &db,
+        vec![RestResponse {
+            status: 200,
+            body: Some(r#"{"id":"+123"}"#.into()),
+            delay: Duration::from_millis(1000),
+        }],
+    )
+    .await;
+    let msg = message(42, CHANNEL, false, Some(GUILD));
+    let (outcome, _) = tokio::join!(runtime.on_message(&msg), async {
+        wait_for(
+            || {
+                mock.requests()
+                    .iter()
+                    .any(|r| r.method == "POST" && r.path.ends_with("/messages"))
+            },
+            "unusable-receipt POST entered",
+        )
+        .await;
+        // Independent administrator path: the upsert clears the claim and
+        // disarms the fence but preserves the live post columns.
+        let updated = store::put_sticky(
+            &db.pool,
+            &PutSticky {
+                guild_id: GUILD_S,
+                channel_id: CHANNEL_S,
+                body: "admin v5",
+                debounce_seconds: 5,
+                enabled: true,
+                actor_id: "admin-9",
+                now_ms: now_millis_for_test(),
+            },
+        )
+        .await
+        .expect("admin update");
+        assert!(!updated, "seed row already existed");
+    });
+    assert_eq!(
+        outcome,
+        ActivityOutcome::Held,
+        "unusable receipt reports held"
+    );
+
+    // The POST reached the wire before the receipt was judged unusable;
+    // the unusable id leaves no orphan cleanup to attempt.
+    assert_eq!(
+        mock.posts_to("/messages").await.len(),
+        1,
+        "the POST reaches the wire before the receipt is judged unusable"
+    );
+    assert!(mock.deletes().is_empty(), "no orphan id, no cleanup");
+
+    // Administrator state wins on the row, but the unusable receipt
+    // re-arms the fence: the claim stays cleared (the re-arm is
+    // claim-blind) while delivery_uncertain blocks the next window.
+    let (body, last_id, claim) = db.row().await.expect("row exists");
+    assert_eq!(body, "admin v5");
+    assert_eq!(
+        last_id.as_deref(),
+        Some("8000000000000000022"),
+        "unusable receipt records nothing",
+    );
+    assert_eq!(
+        claim, None,
+        "admin update cleared the claim; the re-arm adds none"
+    );
+    assert_eq!(
+        db.audits().await,
+        vec![("sticky.run".to_owned(), "post_failed".to_owned())],
+        "unusable receipt audits failure, never success"
+    );
+
+    // The re-armed fence outlives the 60s claim lease: a probe past expiry
+    // is held, and the next accepted message holds without posting a
+    // duplicate. (Deleting the unusable-receipt fence_uncertain call turns
+    // the probe red and lets the follow-up duplicate.)
+    assert!(
+        store::claim_sticky_post(
+            &db.pool,
+            GUILD_S,
+            CHANNEL_S,
+            "rearm-probe",
+            now_millis_for_test() + 120_000,
+        )
+        .await
+        .expect("lease probe")
+        .is_none(),
+        "unusable-receipt re-arm survives lease expiry"
+    );
+    mock.shutdown().await;
+    let (runtime, mock) = db_runtime(&db, vec![]).await;
+    assert_eq!(
+        runtime
+            .on_message(&message(43, CHANNEL, false, Some(GUILD)))
+            .await,
+        ActivityOutcome::Held
+    );
+    assert!(
+        mock.posts_to("/messages").await.is_empty(),
+        "fenced channel sends no duplicate"
     );
     mock.shutdown().await;
     db.close().await;
@@ -5601,28 +6224,76 @@ async fn feed_list_at_capacity_keeps_every_configured_guild_id_discoverable() {
     assert_eq!(rows_before.len(), 25, "seeded capacity");
     let (runtime, mock) = db_runtime(&db, Vec::new()).await;
 
+    // Whole rows page instead of squeezing sources: the default reply is
+    // page 1 with navigation, and every id stays reachable exactly once
+    // across the reachable pages.
     runtime
         .on_interaction(&slash("feed-list", Some(CHANNEL), Vec::new()))
         .await;
+    let first = patch_contents(&mock)[0].clone();
+    let total: usize = first
+        .split("Page 1 of ")
+        .nth(1)
+        .expect("default reply announces its total")
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .expect("numeric total");
+    assert!((2..=25).contains(&total), "capacity pages: {first}");
+    for page in 2..=total as i64 {
+        runtime
+            .on_interaction(&slash(
+                "feed-list",
+                Some(CHANNEL),
+                vec![option("page", CommandOptionValue::Integer(page))],
+            ))
+            .await;
+    }
 
-    // deferred_reply pins the ephemeral defer (flags 64) and mention safety
-    // (allowed_mentions parse []) on the single completion.
-    let json = mock.deferred_reply();
-    let content = json["content"].as_str().expect("list content");
-    assert!(
-        content.encode_utf16().count() <= 2000,
-        "response exceeds the 2,000 UTF-16 unit limit ({} units): {content}",
-        content.encode_utf16().count()
+    // One ephemeral defer (flags 64) plus one mention-safe completion
+    // (allowed_mentions parse []) per invocation, no extra calls.
+    let requests = mock.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.method == "POST" && r.path.ends_with("/callback"))
+            .count(),
+        total,
+        "one defer per page"
     );
-    for id in &own_ids {
+    let contents = patch_contents(&mock);
+    assert_eq!(contents.len(), total, "one completion per page");
+    let mut seen = Vec::new();
+    for (index, content) in contents.iter().enumerate() {
+        let page = index + 1;
         assert!(
-            content.contains(&format!("`{id}`")),
-            "configured-guild relay {id} discoverable at capacity: {content}"
+            content.encode_utf16().count() <= 2000,
+            "page {page} exceeds the 2,000 UTF-16 unit limit ({} units): {content}",
+            content.encode_utf16().count()
+        );
+        assert!(
+            content.contains(&format!("Page {page} of {total}")),
+            "page {page} identifies itself: {content}"
+        );
+        assert!(
+            content.contains("/feed-list") && content.contains("page"),
+            "page {page} gives usable navigation: {content}"
+        );
+        assert!(
+            !content.contains(&foreign_id),
+            "other guild's relay never listed: {content}"
+        );
+        seen.extend(
+            content
+                .lines()
+                .filter_map(|line| line.strip_prefix('`')?.split_once('`').map(|(id, _)| id))
+                .map(str::to_owned),
         );
     }
-    assert!(
-        !content.contains(&foreign_id),
-        "other guild's relay never listed: {content}"
+    assert_eq!(
+        seen, own_ids,
+        "every configured-guild id reachable exactly once, in stable order"
     );
     assert_eq!(
         db.feed_rows().await,
@@ -5635,6 +6306,28 @@ async fn feed_list_at_capacity_keeps_every_configured_guild_id_discoverable() {
     );
     mock.shutdown().await;
     db.close().await;
+}
+
+/// Completion bodies for every invocation so far, pinning mention safety
+/// (`allowed_mentions` parse `[]`) on each PATCH the way `deferred_reply`
+/// does for the single-completion case.
+fn patch_contents(mock: &MockRest) -> Vec<String> {
+    mock.requests()
+        .iter()
+        .filter(|r| r.method == "PATCH")
+        .map(|r| {
+            let json: serde_json::Value = serde_json::from_slice(&r.body).expect("completion json");
+            assert_eq!(
+                json["allowed_mentions"]["parse"],
+                serde_json::json!([]),
+                "mention-safe completion"
+            );
+            json["content"]
+                .as_str()
+                .expect("completion content")
+                .to_owned()
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -9160,6 +9853,10 @@ async fn worker_trigger_gate_observes_sticky_http_and_state() {
     );
     assert!(after["claim_token"].is_null(), "record releases claim");
     assert!(after["claimed_at"].is_null(), "record clears claim time");
+    assert_eq!(
+        after["delivery_uncertain"], false,
+        "record disarms the delivery fence"
+    );
     assert_eq!(
         audits().await,
         vec![(
