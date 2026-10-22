@@ -40,8 +40,8 @@ const GATEWAY_RS_EVENTS: [&str; 20] = [
     "retention purge skipped; schema gap, operator replay required",
 ];
 
-/// `crates/bot/src/main.rs`: the nine cataloged `tracing` messages.
-const MAIN_RS_TRACED_EVENTS: [&str; 9] = [
+/// `crates/bot/src/main.rs`: the eleven cataloged `tracing` messages.
+const MAIN_RS_TRACED_EVENTS: [&str; 11] = [
     "gateway intents resolved",
     "durable gateway initialized; shard connecting",
     "gateway prerequisites missing; gateway parked, /readyz reports down",
@@ -51,6 +51,8 @@ const MAIN_RS_TRACED_EVENTS: [&str; 9] = [
     "shutdown_deadline_exceeded: abandoning in-flight work",
     "feature gates invalid; ordered interaction surface parked",
     "moderation gates invalid; ordered interaction surface parked",
+    "worker supervisor ended abnormally during shutdown join",
+    "worker supervisor did not finish within the remaining shutdown deadline; aborting it, so its worker drain is cut short",
 ];
 
 /// `crates/bot/src/main.rs`: cataloged drain outcomes that surface as
