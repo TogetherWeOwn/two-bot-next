@@ -8,7 +8,7 @@
 use std::collections::HashSet;
 
 use sqlx::{Pool, Postgres};
-use two_bot_core::{InviteSnapshotStore, InviteState, Snowflake};
+use two_bot_core::{metrics, InviteSnapshotStore, InviteState, Snowflake};
 
 /// Postgres-backed [`InviteSnapshotStore`]. Same sync→async bridge as
 /// [`PgFunnelStore`](crate::PgFunnelStore): methods dispatch with
@@ -34,14 +34,6 @@ impl PgInviteSnapshots {
     pub fn pool(&self) -> &Pool<Postgres> {
         &self.pool
     }
-
-    /// Run an async query from the sync trait methods.
-    fn block_on<F, T>(&self, fut: F) -> T
-    where
-        F: std::future::Future<Output = T>,
-    {
-        tokio::task::block_in_place(|| self.handle.block_on(fut))
-    }
 }
 
 /// Legacy `updated_at` shape: millis precision with a `Z` suffix.
@@ -57,22 +49,35 @@ fn snapshot_stamp() -> String {
 }
 
 impl InviteSnapshotStore for PgInviteSnapshots {
-    /// # Panics
-    ///
-    /// Propagates a database failure as a panic: the sync
-    /// [`InviteSnapshotStore`] seam has no fallible channel, matching
-    /// [`PgFunnelStore`](crate::PgFunnelStore) behaviour.
+    /// On a persistent DB error degrades to an empty snapshot with an error
+    /// metric after bounded retries, never panicking — matching
+    /// [`PgFunnelStore`](crate::PgFunnelStore) read behaviour.
     fn load(&self, guild_id: Snowflake) -> Vec<InviteState> {
         let guild_id = guild_id.to_string();
-        self.block_on(async {
+        match crate::retry::block_on_retry(&self.handle, || async {
             sqlx::query_as::<_, (String, i32, Option<String>, Option<String>)>(
                 "SELECT code, uses, inviter_id, channel_id FROM invite_snapshots WHERE guild_id = $1",
             )
             .bind(&guild_id)
             .fetch_all(&self.pool)
             .await
-        })
-        .expect("invite snapshot load failed")
+        }) {
+            Ok(rows) => rows,
+            Err(error) => {
+                metrics::global().db_error("other");
+                tracing::warn!(
+                    error = %error,
+                    "invite snapshot load degraded to empty after retries"
+                );
+                // Fail closed as no snapshot: an empty baseline credits
+                // nothing (growth needs a witnessed `before`), exactly like
+                // the stale-baseline re-seed path — the outage
+                // under-attributes joins instead of over-crediting them, and
+                // the next healthy sync re-seeds the baseline. A rotation
+                // against an empty read returns `None` having stored nothing.
+                Vec::new()
+            }
+        }
         .into_iter()
         // `max_uses`/`temporary` are in-memory baseline pins for this slice:
         // the `invite_snapshots` table carries no such columns yet, so a
@@ -92,11 +97,15 @@ impl InviteSnapshotStore for PgInviteSnapshots {
 
     /// # Panics
     ///
-    /// See [`InviteSnapshotStore::load`].
+    /// Propagates a database failure as a panic after bounded retries are
+    /// exhausted: the sync [`InviteSnapshotStore`] seam has no fallible
+    /// channel. The message keeps its fixed vocabulary so the sync task's
+    /// death is greppable; the release profile unwinds, so the panic kills
+    /// only that task, never the supervisor.
     fn store_all(&self, guild_id: Snowflake, states: &[InviteState]) {
         let guild_id = guild_id.to_string();
         let stamp = snapshot_stamp();
-        self.block_on(async {
+        crate::retry::block_on_retry(&self.handle, || async {
             let mut tx = self.pool.begin().await?;
             // Serialize with concurrent opt-outs so the suppressed set below
             // is fresh. Lock order matches the opt-out's sorted order.
@@ -127,7 +136,9 @@ impl InviteSnapshotStore for PgInviteSnapshots {
                 )
                 .bind(&guild_id)
                 .bind(&s.code)
-                .bind(i32::try_from(s.uses).expect("invite uses exceeds Postgres INTEGER range"))
+                // Saturate hostile counters: Discord controls `uses`, and a value
+                // past the INTEGER range must clamp, never panic the sync task.
+                .bind(i32::try_from(s.uses).unwrap_or(i32::MAX))
                 .bind(inviter)
                 .bind(s.channel_id.map(|id| id.to_string()))
                 .bind(&stamp)
@@ -141,11 +152,13 @@ impl InviteSnapshotStore for PgInviteSnapshots {
 
     /// # Panics
     ///
-    /// See [`InviteSnapshotStore::load`].
+    /// Propagates a database failure as a panic after bounded retries are
+    /// exhausted, with the same fixed-vocabulary, task-local unwind
+    /// contract as [`InviteSnapshotStore::store_all`].
     fn delete_missing(&self, guild_id: Snowflake, live_codes: &HashSet<String>) {
         let guild_id = guild_id.to_string();
         let live: Vec<String> = live_codes.iter().cloned().collect();
-        self.block_on(async {
+        crate::retry::block_on_retry(&self.handle, || async {
             // `<> ALL(...)` with an empty array is true for every row, which
             // is exactly the "no invites live" case: clear the snapshot.
             sqlx::query("DELETE FROM invite_snapshots WHERE guild_id = $1 AND code <> ALL($2)")

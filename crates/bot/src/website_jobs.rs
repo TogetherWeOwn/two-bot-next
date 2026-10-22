@@ -11,9 +11,9 @@ use two_bot_core::{
     build_community_snapshot, build_counter_reading,
     database_tls::{self, TlsPolicy},
     diagnose_rank_roles, match_rank_roles, normalize_events, now_iso, plan_rank_heal,
-    read_raid_windows, replace_events, write_counter, write_rank_snapshot, Config, RankHeal,
-    RankRungProblem, RawScheduledEvent, RosterMember, WebsiteStoreError, LIVE_COUNTER_INTERVAL_MS,
-    RANK_SNAPSHOT_INTERVAL_MS, SCHEDULED_EVENTS_INTERVAL_MS,
+    read_raid_windows, replace_events, write_counter, write_rank_snapshot, Config, JobGate,
+    RankHeal, RankRungProblem, RawScheduledEvent, RosterMember, WebsiteStoreError,
+    LIVE_COUNTER_INTERVAL_MS, RANK_SNAPSHOT_INTERVAL_MS, SCHEDULED_EVENTS_INTERVAL_MS,
 };
 use two_bot_discord::executor::{ActionExecutor, DiscordError};
 use two_bot_discord::internal_events::canonical_snowflake;
@@ -47,14 +47,57 @@ mod tests;
 mod snapshot_tests;
 
 #[cfg(test)]
+#[path = "website_rank_repair_acceptance_tests.rs"]
+mod rank_repair_acceptance_tests;
+
+#[cfg(test)]
 #[path = "website_event_identity_acceptance_tests.rs"]
 mod event_identity_acceptance_tests;
+
+#[cfg(test)]
+#[path = "website_jobgate_acceptance_tests.rs"]
+mod jobgate_acceptance_tests;
+
+#[cfg(test)]
+#[path = "website_events_dispatch_tests.rs"]
+mod events_dispatch_tests;
 
 #[derive(Clone, Copy)]
 pub enum Kind {
     Counter,
     Rank,
     Events,
+}
+
+impl Kind {
+    /// Whole-tick Events entry point with [`JobGate`] single-flight: a tick
+    /// that cannot acquire the gate skips at once (`Ok`, no fetch, no
+    /// publish, no queue, no error); otherwise the guard is held across the
+    /// delegated tick, so overlapping ticks cannot both run. Counter and rank
+    /// ticks never take this path.
+    pub async fn run_events_tick(
+        pool: &PgPool,
+        rest: &ActionExecutor,
+        guild: &str,
+        observation: &Mutex<()>,
+        shutdown: &watch::Receiver<bool>,
+        rank_heal: bool,
+        gate: &JobGate,
+    ) -> Result<(), ErrorClass> {
+        let Some(_guard) = gate.try_acquire() else {
+            return Ok(());
+        };
+        snapshot_once(
+            Kind::Events,
+            pool,
+            rest,
+            guild,
+            observation,
+            shutdown,
+            rank_heal,
+        )
+        .await
+    }
 }
 
 /// Cadence overrides are compiled only into tests, never the deployed binary.
@@ -89,6 +132,7 @@ pub(crate) struct Context {
     pub(crate) rest: ActionExecutor,
     pub(crate) guild: String,
     observation: Mutex<()>,
+    events_gate: JobGate,
 }
 
 impl Context {
@@ -105,6 +149,42 @@ impl Context {
                 Ok(db.pool().clone())
             })
             .await
+    }
+
+    /// One supervised website tick: Events ticks run through the shared
+    /// [`JobGate`] single-flight entry point, so overlapping Events ticks
+    /// cannot both run; every other kind runs direct via [`run_once`] and
+    /// never touches the gate. The scheduler closure calls this instead of
+    /// branching itself, so the routing stays unit-testable next to the tick
+    /// it guards.
+    async fn run_tick(
+        &self,
+        kind: Kind,
+        shutdown: &watch::Receiver<bool>,
+        rank_heal: bool,
+    ) -> Result<(), ErrorClass> {
+        if matches!(kind, Kind::Events) {
+            return Kind::run_events_tick(
+                self.pool().await?,
+                &self.rest,
+                &self.guild,
+                &self.observation,
+                shutdown,
+                rank_heal,
+                &self.events_gate,
+            )
+            .await;
+        }
+        run_once(
+            kind,
+            self.pool().await?,
+            &self.rest,
+            &self.guild,
+            &self.observation,
+            shutdown,
+            rank_heal,
+        )
+        .await
     }
 }
 
@@ -218,6 +298,7 @@ pub async fn serve(
                     rest,
                     guild: guild.to_string(),
                     observation: Mutex::new(()),
+                    events_gate: JobGate::default(),
                 });
                 // The rank tick is the only website job with a Discord write
                 // path: the ladder self-heal grants roles under the bot
@@ -252,15 +333,7 @@ pub async fn serve(
                                     biased;
                                     _ = server::shutdown_requested(shutdown.clone()) => Ok(()),
                                     result = async {
-                                        run_once(
-                                            kind,
-                                            context.pool().await?,
-                                            &context.rest,
-                                            &context.guild,
-                                            &context.observation,
-                                            &shutdown,
-                                            rank_heal,
-                                        ).await
+                                        context.run_tick(kind, &shutdown, rank_heal).await
                                     } => result,
                                 }
                             })
@@ -534,12 +607,45 @@ pub(crate) async fn get(rest: &ActionExecutor, path: &str) -> Result<Value, Erro
         .ok_or(ErrorClass::Rest)
 }
 
+/// [`get`] plus the raw wire-body length, for callers enforcing a wire-body
+/// cap. The length is measured over the collected response bytes, never over
+/// a re-serialization of the parsed value.
+async fn get_with_body_len(
+    rest: &ActionExecutor,
+    path: &str,
+) -> Result<(Value, usize), ErrorClass> {
+    rest.get_json_with_body_len(path)
+        .await
+        .map_err(|_| ErrorClass::Rest)?
+        .ok_or(ErrorClass::Rest)
+}
+
 fn snowflake(value: &Value) -> Result<u64, ErrorClass> {
     value
         .as_str()
         .and_then(|id| id.parse::<u64>().ok())
         .filter(|id| *id != 0)
         .ok_or(ErrorClass::Rest)
+}
+
+fn roster_member(member: &Value) -> Result<RosterMember, ErrorClass> {
+    let user = &member["user"];
+    let id = snowflake(&user["id"])?;
+    let is_bot = match user.get("bot") {
+        None => false,
+        Some(v) => v.as_bool().ok_or(ErrorClass::Rest)?,
+    };
+    let roles = member["roles"]
+        .as_array()
+        .ok_or(ErrorClass::Rest)?
+        .iter()
+        .map(|role| snowflake(role).map(|id| id.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(RosterMember {
+        user_id: id.to_string(),
+        is_bot,
+        roles,
+    })
 }
 
 fn roster_page(page: &Value, after: &mut u64) -> Result<Vec<RosterMember>, ErrorClass> {
@@ -549,27 +655,13 @@ fn roster_page(page: &Value, after: &mut u64) -> Result<Vec<RosterMember>, Error
     }
     let mut members = Vec::with_capacity(page.len());
     for member in page {
-        let user = &member["user"];
-        let id = snowflake(&user["id"])?;
+        let parsed = roster_member(member)?;
+        let id = snowflake(&member["user"]["id"])?;
         if id <= *after {
             return Err(ErrorClass::Rest);
         }
         *after = id;
-        let is_bot = match user.get("bot") {
-            None => false,
-            Some(v) => v.as_bool().ok_or(ErrorClass::Rest)?,
-        };
-        let roles = member["roles"]
-            .as_array()
-            .ok_or(ErrorClass::Rest)?
-            .iter()
-            .map(|role| snowflake(role).map(|id| id.to_string()))
-            .collect::<Result<Vec<_>, _>>()?;
-        members.push(RosterMember {
-            user_id: id.to_string(),
-            is_bot,
-            roles,
-        });
+        members.push(parsed);
     }
     Ok(members)
 }
@@ -577,6 +669,27 @@ fn roster_page(page: &Value, after: &mut u64) -> Result<Vec<RosterMember>, Error
 pub(crate) enum RosterScan {
     Complete(Vec<RosterMember>),
     Truncated,
+}
+
+/// Only a confirmed 404 proves departure. Other failed reads, misbound user
+/// identities and incomplete role facts are never an empty membership.
+async fn rank_repair_member(
+    rest: &ActionExecutor,
+    guild: &str,
+    member_id: &str,
+) -> Result<Option<RosterMember>, ErrorClass> {
+    let Some(value) = rest
+        .get_json_strict(&format!("/guilds/{guild}/members/{member_id}"))
+        .await
+        .map_err(|_| ErrorClass::Rest)?
+    else {
+        return Ok(None);
+    };
+    let member = roster_member(&value)?;
+    if member.user_id != member_id {
+        return Err(ErrorClass::Rest);
+    }
+    Ok(Some(member))
 }
 
 /// Discord's paginated roster is the denominator, never approximate counts.
@@ -688,12 +801,14 @@ fn heal_error(error: DiscordError) -> ErrorClass {
     }
 }
 
-/// Grant every missing lower rung in `plan`, then report whether the tick may
-/// publish (`true`) or stopped mid-heal (`false`: grants already applied stay
-/// applied — Discord has no rollback — and the next tick publishes them).
+/// Revalidate each candidate in `plan` immediately before its grant, then
+/// report whether repair completed (`true`) or stopped mid-heal (`false`).
+/// Completion still requires authoritative post-repair verification before
+/// publication; Discord grants already applied cannot be rolled back.
 /// Fails closed before any mutation when the plan is empty or over bound,
 /// when the guild roles carry no provable hierarchy, or when any target sits
-/// at or above the bot's highest role.
+/// at or above the bot's highest role. The original candidate queue never
+/// grows: at most 25 eligibility reads and 25 grants, even under role churn.
 async fn heal_rank_ladder(
     rest: &ActionExecutor,
     guild: &str,
@@ -730,6 +845,15 @@ async fn heal_rank_ladder(
         );
         return Err(ErrorClass::Configuration);
     };
+    let ladder_roles = roles_array
+        .iter()
+        .map(|role| {
+            let id = snowflake(&role["id"])?;
+            let name = role["name"].as_str().ok_or(ErrorClass::Rest)?;
+            Ok((id.to_string(), name.to_owned()))
+        })
+        .collect::<Result<Vec<_>, ErrorClass>>()?;
+    let ladder = match_rank_roles(&ladder_roles).ok_or(ErrorClass::Configuration)?;
     let mut positions = HashMap::new();
     for role in roles_array {
         let (Some(id), Some(position)) = (role["id"].as_str(), role["position"].as_i64()) else {
@@ -774,6 +898,26 @@ async fn heal_rank_ladder(
         if publication_stopped(shutdown) {
             return Ok(false);
         }
+        let observed = rank_repair_member(rest, guild, &grant.member_id)
+            .await
+            .inspect_err(|_| {
+                tracing::warn!(
+                    job = "rank",
+                    "rank self-heal eligibility unverified; publication skipped"
+                );
+            })?;
+        let Some(member) = observed else {
+            continue;
+        };
+        // Targets were already filtered against the tick's fixed raid windows.
+        // Recompute this member's current missing rungs, never trusting the old
+        // higher rank or a previously successful PUT as eligibility evidence.
+        if !plan_rank_heal(std::slice::from_ref(&member), &ladder, &[]).contains(grant) {
+            continue;
+        }
+        if publication_stopped(shutdown) {
+            return Ok(false);
+        }
         rest.set_member_role(
             guild,
             &grant.member_id,
@@ -783,6 +927,12 @@ async fn heal_rank_ladder(
         )
         .await
         .map_err(heal_error)?;
+        tracing::info!(
+            job = "rank",
+            member = grant.member_id.as_str(),
+            role = grant.key.label(),
+            "rank ladder self-heal grant applied; observation pending"
+        );
     }
     Ok(true)
 }
@@ -815,6 +965,75 @@ fn publication_stopped(shutdown: &watch::Receiver<bool>) -> bool {
     *shutdown.borrow() || shutdown.has_changed().is_err()
 }
 
+/// Raw scheduled-events response-body cap, 1 MiB (bounded-claim decision §4).
+/// Bodies over this refuse as [`ErrorClass::Rest`] before any row reaches
+/// storage; the last good snapshot is kept by construction.
+pub(crate) const MAX_SCHEDULED_EVENTS_BODY_BYTES: usize = 1_048_576;
+
+/// One Events snapshot attempt with the observation stamp injected.
+/// Production stamps `observed_at` from the real clock in [`snapshot_once`]
+/// immediately before the GET (TOG-20273); age-bound tests inject a fixed
+/// stamp here instead of racing the clock.
+///
+/// Whole-response gates, in order: the raw wire-body cap (measured over the
+/// collected response bytes — unknown fields and JSON-insignificant bytes
+/// included, never over known fields alone or a re-serialization), then the
+/// existing shape/normalize/store path unchanged (including the epoch-claim
+/// StaleSnapshot gate: an older-than-committed fetch still rolls back and is
+/// logged here). The 5-minute age skip (decision §4) is NOT enforced here
+/// yet: the follow-up age slice pins it through this seam first, then wires
+/// the check.
+pub(crate) async fn snapshot_events_once(
+    pool: &PgPool,
+    rest: &ActionExecutor,
+    guild: &str,
+    shutdown: &watch::Receiver<bool>,
+    observed_at: &str,
+) -> Result<(), ErrorClass> {
+    let (response, body_len) = get_with_body_len(
+        rest,
+        &format!("/guilds/{guild}/scheduled-events?with_user_count=true"),
+    )
+    .await?;
+    // Measure the wire bytes, not the parsed value: an unknown-field pad must
+    // count toward the cap exactly like a long description does, and
+    // JSON-insignificant bytes (whitespace, duplicate keys, \uXXXX escapes)
+    // count as Discord sent them. A re-serialized measure would compact those
+    // away and admit an over-cap body.
+    if body_len > MAX_SCHEDULED_EVENTS_BODY_BYTES {
+        return Err(ErrorClass::Rest);
+    }
+    let raw = response
+        .as_array()
+        .ok_or(ErrorClass::Rest)?
+        .iter()
+        .map(|value| raw_event(value, guild))
+        .collect::<Result<Vec<_>, _>>()?;
+    let events = normalize_events(&raw).ok_or(ErrorClass::Rest)?;
+    if publication_stopped(shutdown) {
+        return Ok(());
+    }
+    // Epoch-claim gate (main #1472): a strictly older fetch rolls the whole
+    // swap back and reports StaleSnapshot; the tick logs the skip and keeps
+    // the newer snapshot.
+    match replace_events(pool, guild, observed_at, &events).await {
+        Ok(None) => Ok(()),
+        Ok(Some(skip)) => {
+            // Warn, not info: the runner never overlaps ticks
+            // (`jobs.rs` skips while one is active), so a lost claim
+            // means wall-clock skew froze the whole events mirror until
+            // real time passes the stored epoch.
+            tracing::warn!(
+                job = "events",
+                skip = ?skip,
+                "stale snapshot lost the epoch claim; publication skipped"
+            );
+            Ok(())
+        }
+        Err(_) => Err(ErrorClass::Database),
+    }
+}
+
 async fn snapshot_once(
     kind: Kind,
     pool: &PgPool,
@@ -830,37 +1049,7 @@ async fn snapshot_once(
         // began, so a mutation that lands while the GET is in flight keeps
         // its newer row instead of being overwritten by this older fetch.
         let fetched_at = now_iso();
-        let response = get(
-            rest,
-            &format!("/guilds/{guild}/scheduled-events?with_user_count=true"),
-        )
-        .await?;
-        let raw = response
-            .as_array()
-            .ok_or(ErrorClass::Rest)?
-            .iter()
-            .map(|value| raw_event(value, guild))
-            .collect::<Result<Vec<_>, _>>()?;
-        let events = normalize_events(&raw).ok_or(ErrorClass::Rest)?;
-        if publication_stopped(shutdown) {
-            return Ok(());
-        }
-        return match replace_events(pool, guild, &fetched_at, &events).await {
-            Ok(None) => Ok(()),
-            Ok(Some(skip)) => {
-                // Warn, not info: the runner never overlaps ticks
-                // (`jobs.rs` skips while one is active), so a lost claim
-                // means wall-clock skew froze the whole events mirror until
-                // real time passes the stored epoch.
-                tracing::warn!(
-                    job = "events",
-                    skip = ?skip,
-                    "stale snapshot lost the epoch claim; publication skipped"
-                );
-                Ok(())
-            }
-            Err(_) => Err(ErrorClass::Database),
-        };
+        return snapshot_events_once(pool, rest, guild, shutdown, &fetched_at).await;
     }
     // Both kinds publish the denominator. Hold one shared lane from the first
     // observation through commit so a slow rank tick cannot overwrite a newer
@@ -974,14 +1163,32 @@ async fn snapshot_once(
         if !heal_rank_ladder(rest, guild, &guild_object["roles"], &plan, shutdown).await? {
             return Ok(());
         }
-        for grant in &plan {
-            if let Some(member) = members
-                .iter_mut()
-                .find(|member| member.user_id == grant.member_id)
-            {
-                if !member.roles.iter().any(|held| held == &grant.role_id) {
-                    member.roles.push(grant.role_id.clone());
-                }
+        // Refresh every affected member, including skipped candidates. The
+        // initial plan bounds this set at 25. Only observed roles may enter the
+        // snapshot; a successful PUT is not proof the role stuck or stayed.
+        let mut affected: Vec<&str> = plan.iter().map(|grant| grant.member_id.as_str()).collect();
+        affected.sort_unstable();
+        affected.dedup();
+        for member_id in affected {
+            if publication_stopped(shutdown) {
+                return Ok(());
+            }
+            let observed = rank_repair_member(rest, guild, member_id)
+                .await
+                .inspect_err(|_| {
+                    tracing::warn!(
+                        job = "rank",
+                        "rank self-heal post-repair state unverified; publication skipped"
+                    );
+                })?;
+            if let Some(observed) = observed {
+                let member = members
+                    .iter_mut()
+                    .find(|member| member.user_id == member_id)
+                    .ok_or(ErrorClass::Rest)?;
+                *member = observed;
+            } else {
+                members.retain(|member| member.user_id != member_id);
             }
         }
         snapshot = build_community_snapshot(&members, &ladder, &windows).ok_or(ErrorClass::Rest)?;
@@ -992,25 +1199,9 @@ async fn snapshot_once(
             );
             return Err(ErrorClass::Configuration);
         }
-        let mut repaired: Vec<String> = plan
-            .iter()
-            .map(|grant| {
-                format!(
-                    "{}:{}({})",
-                    grant.member_id,
-                    grant.key.label(),
-                    grant.role_id
-                )
-            })
-            .collect();
-        repaired.sort();
-        repaired.dedup();
-        let repaired = repaired.join(",");
         tracing::info!(
             job = "rank",
-            grants = plan.len(),
-            repairs = repaired.as_str(),
-            "rank ladder self-healed: granted missing lower rungs"
+            "rank ladder self-healed: verified observed nested roles"
         );
     }
     if publication_stopped(shutdown) {
