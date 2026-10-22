@@ -1,4 +1,4 @@
-//! The v12 backup envelope (also reads v3/v4/v5/v6/v7/v8/v9/v10/v11): manifest / rows / end marker, gzipped NDJSON.
+//! The v13 backup envelope (also reads v3/v4/v5/v6/v7/v8/v9/v10/v11/v12): manifest / rows / end marker, gzipped NDJSON.
 //!
 //! Port of the file half of legacy `src/store/dump.ts`. The writer side lives
 //! in [`super::dump`]; everything here touches no database, so every refusal
@@ -133,6 +133,11 @@ pub const DUMP_TABLES: &[&str] = &[
     "guild_settings_revision",
     "guild_settings",
     "guild_settings_audit",
+    // Admin API token registry (0456/0457, v12): operator-issued tokens with
+    // hash-only secrets. Archived so a restore keeps admin API access working
+    // (secrets are shown once at issuance and cannot be re-derived); see
+    // [`V12_ADDED_TABLES`]. No foreign keys, so order here is free.
+    "admin_api_tokens",
     "audit_kill_switch",
     "internal_nonces",
     "internal_clock_high_water",
@@ -192,7 +197,7 @@ pub const DUMP_TABLES: &[&str] = &[
     "retention_guild_purge_queue",
     "retention_deletion_requests",
     "event_store",
-    // Timed polls (0455, v12): preserve questions, votes and delivery fences.
+    // Timed polls (0458, v13): preserve questions, votes and delivery fences.
     // The composite FK requires the parent before its votes on restore.
     "polls",
     "poll_votes",
@@ -264,9 +269,17 @@ pub const V10_ADDED_TABLES: &[&str] = &["scheduled_events_claim"];
 /// written by the merged v10 writer stay readable and clear the tombstones.
 pub const V11_ADDED_TABLES: &[&str] = &["scheduled_events_tombstone"];
 
-/// Timed poll state first covered by v12. Historical archives may omit both
+/// Tables first covered by v12 (admin API token registry, migrations
+/// 0456/0457). Older archives may omit the registry; restore clears the
+/// destination rows, as for every versioned addition. New archives must
+/// contain the registry so issued tokens survive recovery. v11 is a readable
+/// legacy shape: tombstone-only archives written by the merged v11 writer
+/// stay readable and clear the registry.
+pub const V12_ADDED_TABLES: &[&str] = &["admin_api_tokens"];
+
+/// Timed poll state first covered by v13. Historical archives may omit both
 /// tables; current archives must preserve votes and durable delivery fences.
-pub const V12_ADDED_TABLES: &[&str] = &["polls", "poll_votes"];
+pub const V13_ADDED_TABLES: &[&str] = &["polls", "poll_votes"];
 
 /// Covered tables not created by the current cutover migration set, if any.
 /// Keep legacy data when such tables exist, but do not require nonexistent
@@ -343,8 +356,8 @@ pub fn is_destination_owned(table: &str, column: &str) -> bool {
         .any(|(owned_table, owned_column)| *owned_table == table && *owned_column == column)
 }
 
-/// Write complete v12 coverage; the reader also accepts frozen v3 through v11 coverage.
-pub const DUMP_VERSION: u32 = 12;
+/// Write complete v13 coverage; the reader also accepts frozen v3 through v12 coverage.
+pub const DUMP_VERSION: u32 = 13;
 
 /// A table name in the dump, validated against [`DUMP_TABLES`].
 pub type DumpTable = String;
@@ -898,10 +911,11 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                     && version != 9
                     && version != 10
                     && version != 11
+                    && version != 12
                     && version != u64::from(DUMP_VERSION)
                 {
                     return Err(refuse(format!(
-                        "dump version {version}, this build reads 3, 4, 5, 6, 7, 8, 9, 10, 11 and {DUMP_VERSION}"
+                        "dump version {version}, this build reads 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 and {DUMP_VERSION}"
                     )));
                 }
                 retain_within_cap(&mut retained, &obj, limits.retained)?;
@@ -1184,8 +1198,9 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
             .ok_or_else(|| refuse(format!("manifest table {name} has an invalid row count")))?;
         let _ = count;
     }
-    // Historical inventories waive only later additions. Current v12 archives
-    // require every table, including poll state and its durable delivery fences.
+    // Historical inventories waive only later additions. Published v12 still
+    // requires the token registry; v13 also requires poll state and its durable
+    // delivery fences. Restoring an older archive clears omitted later tables.
     let version = obj.get("version").and_then(Value::as_u64);
     let missing: Vec<&str> = DUMP_TABLES
         .iter()
@@ -1202,6 +1217,7 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
                     && !V10_ADDED_TABLES.contains(name)
                     && !V11_ADDED_TABLES.contains(name)
                     && !V12_ADDED_TABLES.contains(name)
+                    && !V13_ADDED_TABLES.contains(name)
                     && !OPTIONAL_LEGACY_TABLES.contains(name)
             }
             Some(5) => {
@@ -1212,6 +1228,7 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
                     && !V10_ADDED_TABLES.contains(name)
                     && !V11_ADDED_TABLES.contains(name)
                     && !V12_ADDED_TABLES.contains(name)
+                    && !V13_ADDED_TABLES.contains(name)
                     && !OPTIONAL_LEGACY_TABLES.contains(name)
             }
             Some(6) => {
@@ -1221,6 +1238,7 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
                     && !V10_ADDED_TABLES.contains(name)
                     && !V11_ADDED_TABLES.contains(name)
                     && !V12_ADDED_TABLES.contains(name)
+                    && !V13_ADDED_TABLES.contains(name)
                     && !OPTIONAL_LEGACY_TABLES.contains(name)
             }
             Some(7) => {
@@ -1229,6 +1247,7 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
                     && !V10_ADDED_TABLES.contains(name)
                     && !V11_ADDED_TABLES.contains(name)
                     && !V12_ADDED_TABLES.contains(name)
+                    && !V13_ADDED_TABLES.contains(name)
                     && !OPTIONAL_LEGACY_TABLES.contains(name)
             }
             Some(8) => {
@@ -1236,20 +1255,28 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
                     && !V10_ADDED_TABLES.contains(name)
                     && !V11_ADDED_TABLES.contains(name)
                     && !V12_ADDED_TABLES.contains(name)
+                    && !V13_ADDED_TABLES.contains(name)
                     && !OPTIONAL_LEGACY_TABLES.contains(name)
             }
             Some(9) => {
                 !V10_ADDED_TABLES.contains(name)
                     && !V11_ADDED_TABLES.contains(name)
                     && !V12_ADDED_TABLES.contains(name)
+                    && !V13_ADDED_TABLES.contains(name)
                     && !OPTIONAL_LEGACY_TABLES.contains(name)
             }
             Some(10) => {
                 !V11_ADDED_TABLES.contains(name)
                     && !V12_ADDED_TABLES.contains(name)
+                    && !V13_ADDED_TABLES.contains(name)
                     && !OPTIONAL_LEGACY_TABLES.contains(name)
             }
-            Some(11) => !V12_ADDED_TABLES.contains(name) && !OPTIONAL_LEGACY_TABLES.contains(name),
+            Some(11) => {
+                !V12_ADDED_TABLES.contains(name)
+                    && !V13_ADDED_TABLES.contains(name)
+                    && !OPTIONAL_LEGACY_TABLES.contains(name)
+            }
+            Some(12) => !V13_ADDED_TABLES.contains(name) && !OPTIONAL_LEGACY_TABLES.contains(name),
             _ => !OPTIONAL_LEGACY_TABLES.contains(name),
         })
         .map(|(_, name)| name)

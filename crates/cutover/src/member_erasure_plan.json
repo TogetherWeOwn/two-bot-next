@@ -341,6 +341,11 @@
       "table": "self_role_exchanges",
       "column": "superseded_by",
       "reason": "Replacement-ticket reference on self-role acknowledgement tickets: holds the opaque gen_random_uuid exchange_id of the superseding ticket, never a member identity, so there is no member PII to erase. The value is deleted with its ticket row by the self_role_exchanges plan predicate."
+    },
+    {
+      "table": "admin_api_tokens",
+      "column": "issued_by",
+      "reason": "Operator attribution for admin API token issuance: names the issuing operator, never a guild member. Retained like member_erasure_audit.actor; guild-local member erasure must never rewrite credential issuance accountability."
     }
   ]
 }

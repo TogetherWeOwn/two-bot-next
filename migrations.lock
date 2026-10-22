@@ -465,25 +465,33 @@
       "sha256": "21775bde6ded22b7b0c8e025365b70ecab9bb1961a98b7d34eb26ab713dd6a1e",
       "justification": "Store-chain copy of the scheduled_events_tombstone delete layer (cutover 0452): one new table, IF NOT EXISTS, no writes to the existing mirror. Numbered 0453 because cutover owns 0452; global migration numbers remain unique across both chains."
     },
-    "crates/cutover/migrations/0455_timed_polls.sql": {
+    "crates/cutover/migrations/0458_timed_polls.sql": {
       "sha256": "3d81d9e0f4cebd19d6b90a668766a1d5a1729396488b3a8f52c93050129b9204",
-      "justification": "Add bounded polls and one-vote-per-member poll_votes with guild-local keys, due indexes, immutable final count snapshots and durable results uncertainty fencing. Additive IF NOT EXISTS only; no existing data or relations changed. Roll back the binary without dropping poll rows; preserve them in backups and rollback deltas. Deployment requires migrator and runtime-role inventory application before the binary."
+      "justification": "Add bounded polls and one-vote-per-member poll_votes with guild-local keys, due indexes, immutable final count snapshots and durable results uncertainty fencing. Additive IF NOT EXISTS only; no existing data or relations changed. Roll back the binary without dropping poll rows; preserve them in backups and rollback deltas. Deployment requires migrator and runtime-role inventory application before the binary. Renumbered before merge after published admin registry migrations 0456/0457; SQL bytes unchanged, no deployed poll migration history."
     },
-    "crates/cutover/migrations/0456_polls_due_index.sql": {
+    "crates/cutover/migrations/0459_polls_due_index.sql": {
       "sha256": "3ea5d7bf115f57eee50bedfd288e131a5857cb58121a744de694226420535742",
-      "justification": "Concurrent due-poll lookup index split from new table creation. IF NOT EXISTS table creation cannot prove the relation empty on reapply. One concurrent-index statement in a sqlx no-transaction migration; no row writes. Inspect index validity and ledger before retrying an interrupted build; preserve data on binary rollback."
+      "justification": "Concurrent due-poll lookup index split from new table creation. IF NOT EXISTS table creation cannot prove the relation empty on reapply. One concurrent-index statement in a sqlx no-transaction migration; no row writes. Inspect index validity and ledger before retrying an interrupted build; preserve data on binary rollback. Renumbered before merge after published admin registry migrations 0456/0457; SQL bytes unchanged, no deployed poll migration history."
     },
-    "crates/cutover/migrations/0457_polls_unposted_index.sql": {
+    "crates/cutover/migrations/0460_polls_unposted_index.sql": {
       "sha256": "5812817285cf576e1737f64a46db304c1e34f6427a95456802ff53168999be7b",
-      "justification": "Concurrent unposted-poll recovery index split from new table creation and from the other concurrent index. One statement per sqlx no-transaction migration avoids implicit transaction blocks. No row writes; inspect index validity and ledger before retrying an interrupted build."
+      "justification": "Concurrent unposted-poll recovery index split from new table creation and from the other concurrent index. One statement per sqlx no-transaction migration avoids implicit transaction blocks. No row writes; inspect index validity and ledger before retrying an interrupted build. Renumbered before merge after published admin registry migrations 0456/0457; SQL bytes unchanged, no deployed poll migration history."
     },
-    "crates/cutover/migrations/0458_poll_display_recovery.sql": {
+    "crates/cutover/migrations/0461_poll_display_recovery.sql": {
       "sha256": "5828a5677ecd6137c0d1142eac6c7a36c96a9ba0f49a9caa378fb4344d15ed5a",
-      "justification": "Durable dirty-display marker: commit accepted votes before the idempotent message edit and reconcile cancelled or failed edits on the bounded poll tick. Additive constant-default Boolean with IF NOT EXISTS; no data deletion or replay of creation/results. Apply before the runtime binary; binary rollback preserves rows and marker."
+      "justification": "Durable dirty-display marker: commit accepted votes before the idempotent message edit and reconcile cancelled or failed edits on the bounded poll tick. Additive constant-default Boolean with IF NOT EXISTS; no data deletion or replay of creation/results. Apply before the runtime binary; binary rollback preserves rows and marker. Renumbered before merge after published admin registry migrations 0456/0457; SQL bytes unchanged, no deployed poll migration history."
     },
     "crates/cutover/migrations/0454_sticky_delivery_uncertainty.sql": {
       "sha256": "c813acffc8d44d4f3175acab3aadd9c81a2e611f7962fbba1725a828c3cee4fc",
       "justification": "Uncertain-delivery fence for sticky re-posts: one NOT NULL DEFAULT FALSE column delivery_uncertain on sticky_messages, armed by the atomic claim and disarmed only by confirmed record, proven no-send, confirmed orphan absence, or administrator reconfigure. Additive, IF NOT EXISTS; numbered 0454 because main owns 0452 (scheduled tombstone) and 0453 (store copy); global migration numbers remain unique across both chains; rollback drops the column."
+    },
+    "crates/cutover/migrations/0456_admin_api_tokens.sql": {
+      "sha256": "3452a9adac7ee312a3f10f4150d34effff441e3fac32931a1e8bc08860ac4be2",
+      "justification": "Admin API scoped-token registry (slice 0): new table with shaped token id, 64-lowercase-hex secret_hash CHECK, closed-set scopes, non-empty guild_ids with NULL elements refused, ordered issued/expires bounds and nullable revoked/last_used; live-lookup index on (revoked_at, expires_at). Hardened before first merge; additive IF NOT EXISTS, no binary reads it yet; rollback drops the table. Numbered 0456 after main claimed 0452/0453 for tombstones and 0454 for sticky uncertainty during review; never merged or deployed under the old numbers. SQL body unchanged."
+    },
+    "crates/store/migrations/0457_admin_api_tokens.sql": {
+      "sha256": "622bcbc5cfc2561432290c293e15d30d89997435970088c6e4c01f37e20f962d",
+      "justification": "Store-chain mirror of cutover 0456, including the pre-merge 64-lowercase-hex secret_hash CHECK and refusal of NULL guild elements: identical table and index, IF NOT EXISTS, no writes to existing tables. Numbered 0457 because cutover owns 0456; global migration numbers remain unique across both chains. Renumbered before first merge after main claimed 0454; SQL body unchanged."
     }
   }
 }

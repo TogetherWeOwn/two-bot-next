@@ -44,6 +44,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_db_pool_idle_connections` | Current idle connections |
 | `two_bot_db_pool_max_connections` | Configured maximum |
 | `two_bot_db_errors_total{op}` | Recorded storage-layer failures: send-admission SQL uses `op="admission"`, voice actor load uses `op="other"`; unknown instrumented operations also collapse to `other`. Not a database-wide total |
+| `two_bot_containment_store_errors_total{op}` | Containment-store failures; `op` is `complete_incident` or `other`. A failed completion increments `complete_incident` once and marks the staff alert outcome-unknown because the terminal outcome could not be durably recorded. Fixed two series from process start; no guild, actor, incident or error text labels |
 | `two_bot_send_admissions_total{outcome}` | Send-admission `admit()` decisions; `outcome` is `admitted`, `blocked`, `storage_error` (also counted in `two_bot_db_errors_total{op="admission"}`) or `other` |
 | `two_bot_gateway_prefix_trigger_refused_total{reason}` | In-scope prefix candidates refused by the automod verdict before any trigger lookup; `reason` is `verdict` (contained, timed-out, uninspected, unrecorded or missing verdict) or `other`. The worker records candidates even when its capture-only gate prevents detached dispatch. Unmatched content (no trigger), scope mismatches, bot/webhook messages and disabled text-command gates never increment this family |
 | `two_bot_job_runs_total{job,outcome}` | Completed attempts; outcome is `success` or `failure` (including returned errors, timeouts and isolated panics) |
@@ -327,6 +328,11 @@ as dynamic labels.
   by `Metrics::db_error`; send-admission SQL (admit/extend/complete storage
   failures) reports as `admission`, and failed voice actor store loads
   report as `other`.
+- `two_bot_containment_store_errors_total{op}` — `op` is `complete_incident`
+  or `other` (`CONTAINMENT_STORE_OPS`). Recorded by
+  `Metrics::containment_store_error`; a failed containment completion counts
+  once and marks the staff alert outcome-unknown, without retrying the write.
+  Unknown operations collapse to `other`; no error text becomes a label.
 - `two_bot_send_admissions_total{outcome}` — `outcome` is `admitted`,
   `blocked`, `storage_error` or `other`. Recorded once per `admit()`
   decision by the Postgres admission gate; failed `complete()`/`extend()`
