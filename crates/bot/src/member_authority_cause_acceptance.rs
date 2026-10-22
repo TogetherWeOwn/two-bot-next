@@ -535,7 +535,7 @@ async fn successful_warn_records_no_authority_cause_warn() {
     let logs = capture.text().split_off(start);
 
     let requests = rest.requests();
-    assert_eq!(completion_content(&requests), "Warned.");
+    assert_eq!(completion_content(&requests), "Warned 3333.");
     assert!(
         guild_mutations(&requests).is_empty(),
         "a warn writes the ledger, never Discord: {requests:?}"
