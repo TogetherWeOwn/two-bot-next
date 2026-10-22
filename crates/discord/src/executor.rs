@@ -2882,6 +2882,49 @@ impl ActionExecutor {
         .await
     }
 
+    /// Poll embeds/buttons use the same single-attempt governed mutation lane.
+    /// Creation requires an ID receipt; an edit needs only its successful status.
+    pub(crate) async fn write_poll_message(
+        &self,
+        channel_id: &str,
+        message_id: Option<&str>,
+        mut body: serde_json::Value,
+    ) -> Result<String, DiscordError> {
+        let channel: Id<ChannelMarker> = snowflake(channel_id)?;
+        body["allowed_mentions"] = serde_json::json!({"parse": []});
+        crate::message_safety::sanitize_message(&mut body);
+        crate::message_safety::validate_create(&body)?;
+        let route = match message_id {
+            Some(id) => {
+                if let Some(b) = body.as_object_mut() {
+                    b.remove("nonce");
+                    b.remove("enforce_nonce");
+                }
+                let message: Id<MessageMarker> = snowflake(id)?;
+                Route::UpdateMessage {
+                    channel_id: channel.get(),
+                    message_id: message.get(),
+                }
+            }
+            None => Route::CreateMessage {
+                channel_id: channel.get(),
+            },
+        };
+        let bytes = serde_json::to_vec(&body)
+            .map_err(|_| DiscordError::Rejected("invalid poll body".into()))?;
+        let request = Request::builder(&route)
+            .body(bytes)
+            .build()
+            .map_err(|_| DiscordError::Rejected("invalid poll request".into()))?;
+        let mut response = self.call_once_raw_paced(request, &[200, 201]).await?;
+        let id = match message_id {
+            Some(id) => id.to_owned(),
+            None => mutation_receipt_id(&response.body)?,
+        };
+        response.complete_confirmed().await?;
+        Ok(id)
+    }
+
     /// Refresh content and selects. Edits must suppress mentions independently of POST.
     pub async fn edit_message_with_components(
         &self,

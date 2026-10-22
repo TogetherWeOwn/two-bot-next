@@ -353,6 +353,11 @@ pub async fn serve(
                 let registration = community_jobs::register(context.clone());
                 registered.extend(registration.jobs);
                 parked = registration.parked;
+                if let Some(job) = crate::poll_jobs::register(context.clone(), &activation) {
+                    registered.push(job);
+                } else {
+                    parked.push(crate::poll_jobs::NAME);
+                }
                 if scheduled_parked {
                     parked.push(scheduled_jobs::NAMES[0]);
                 }
@@ -494,6 +499,7 @@ async fn registered_statuses(
         .chain(community_jobs::NAMES)
         .chain(audit_runtime::NAMES)
         .chain(scheduled_jobs::NAMES)
+        .chain([crate::poll_jobs::NAME])
         .chain(member_runtime::NAMES)
         .chain([RECOVERY_JOB_NAME])
         .chain([feed_jobs::NAME])

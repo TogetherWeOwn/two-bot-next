@@ -76,6 +76,12 @@ const HELP_GROUPS: &[HelpGroup] = &[
         anchor: None,
     },
     HelpGroup {
+        title: "Polls (2–10 choices; 1 minute–7 days; author closes early)",
+        requires: None,
+        commands: &["poll"],
+        anchor: None,
+    },
+    HelpGroup {
         title: "RSVPs",
         requires: None,
         commands: &["rsvp", "rsvp-attendance"],

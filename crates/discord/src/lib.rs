@@ -47,6 +47,8 @@ pub mod onboarding_config;
 pub mod onboarding_messages;
 pub mod onboarding_permissions;
 pub mod pipeline;
+#[cfg(feature = "db")]
+pub(crate) mod polls;
 pub mod ratelimit_guard;
 #[cfg(feature = "db")]
 pub mod rsvp;

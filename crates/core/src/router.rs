@@ -126,6 +126,7 @@ pub enum HandlerId {
     AutomationCustom,
     Rsvp,
     RsvpAttendance,
+    Poll,
     Lfg,
     LfgClose,
     FeedAdd,
@@ -142,6 +143,7 @@ pub enum ComponentHandler {
     SelfRole,
     Tickets,
     LfgSignup,
+    PollVote,
 }
 
 /// Contract feature slices implement so the router can hand a routed
@@ -403,6 +405,7 @@ impl InteractionRouter {
                 HandlerId::FeedList,
                 HandlerId::Rsvp,
                 HandlerId::RsvpAttendance,
+                HandlerId::Poll,
             ] {
                 register(id);
             }
@@ -650,6 +653,11 @@ impl InteractionRouter {
                 gate: RowGate::Automations,
                 permission_refusal: Some(RouterRefusal::ManageServerRequired),
             },
+            "poll" => Row {
+                handler: HandlerId::Poll,
+                gate: RowGate::Announcements,
+                permission_refusal: None,
+            },
             "rsvp" => Row {
                 handler: HandlerId::Rsvp,
                 gate: RowGate::Announcements,
@@ -732,6 +740,11 @@ impl InteractionRouter {
                 return ComponentOutcome::Ignore;
             }
             ComponentHandler::Tickets
+        } else if custom_id.starts_with("poll:") {
+            if !self.gates.announcements || !self.guild_ok(guild_id) {
+                return ComponentOutcome::Ignore;
+            }
+            ComponentHandler::PollVote
         } else if let Some(_suffix) = custom_id.strip_prefix(LFG_PREFIX) {
             if !self.gates.announcements || !self.guild_ok(guild_id) {
                 return ComponentOutcome::Ignore;

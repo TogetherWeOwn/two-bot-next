@@ -49,7 +49,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_job_runs_total{job,outcome}` | Completed attempts; outcome is `success` or `failure` (including returned errors, timeouts and isolated panics) |
 | `two_bot_job_last_success_timestamp_seconds{job}` | Last successful completion time in Unix seconds; zero means no success recorded |
 | `two_bot_job_consecutive_failures{job}` | Failed completions since the last success; resets to zero on success |
-| `two_bot_job_last_error_class{job,class}` | One-hot class of the last failed completion; clears on success; fixed 16 × 7 = 112 series |
+| `two_bot_job_last_error_class{job,class}` | One-hot class of the last failed completion; clears on success; fixed 17 × 7 = 119 series |
 | `two_bot_voice_operations_total{op,outcome}` | Finished room create/move/delete outcomes; `op` is `create`, `move` or `delete`, `outcome` is `success`, `category_full`, `discord`, `persistence`, `cancelled` or `refused` (create admission refused: cap or rolling burst); retries and 429 backoffs are not outcomes |
 | `two_bot_voice_reconcile_actions_total{action}` | Reconcile changes: newly queued deletes/ownership handoffs and actual access-state transitions; `action` is `delete_enqueued`, `suspended`, `resumed` or `succession_enqueued`. Repeated unchanged passes do not increment these counters |
 | `two_bot_voice_dead_letters_total{action}` | Queue writes that exhausted `QUEUE_MAX_ATTEMPTS` (10); `action` is `create`, `move`, `delete`, `companion`, `ownership`, `kick`, `rename`, `limit` or `other` |
@@ -133,8 +133,8 @@ The supervisor records all three job metrics centrally after each completed
 attempt. Individual periodic jobs need no instrumentation. The current scheduled
 labels are `counter`, `rank`, `scheduled_events`, `presence_probe`,
 `community_scorecard`, `inactivity`, `audit_retry`, `self_role_recovery`, `feeds`,
-`member_unban_sweep`, `automod_expiry`, `settings` and `scheduled_messages`
-(the two 15 s tickers). The community, audit, recovery, feed, unban-sweep,
+`member_unban_sweep`, `automod_expiry`, `settings`, `scheduled_messages` and `polls`
+(the last three are 15 s tickers). The community, audit, recovery, feed, unban-sweep,
 automod-expiry and ticker names may be parked by configuration.
 All allowlisted series are exposed from process startup at zero, even before the
 first run. A zero success timestamp does not distinguish a parked, never-started,
@@ -275,7 +275,7 @@ as dynamic labels.
 - `two_bot_job_last_error_class{job,class}` — `job` uses the list above;
   `class` is one of `database`, `rest`, `configuration`, `timeout`, `panic`,
   `feed` or `recovery_required` (the fixed `ErrorClass` variants). Each of the
-  16 jobs has one series per class (112 total); exactly the latest failure's class
+  17 jobs has one series per class (119 total); exactly the latest failure's class
   is `1`, and every class is `0` before a failure or after success. Unknown job
   names fold into `other`; class labels are fixed enum names, never error text.
 - `two_bot_voice_operations_total{op,outcome}` — `op` is `create`, `move`

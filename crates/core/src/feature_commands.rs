@@ -294,6 +294,7 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
                 CommandOptionType::Integer,
             )
             .min_value(1)]),
+        crate::polls::command(),
     ]
 }
 

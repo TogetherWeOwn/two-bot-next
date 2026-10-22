@@ -124,6 +124,7 @@ pub const JOBS: &[&str] = &[
     "inactivity",
     "audit_retry",
     "scheduled_messages",
+    "polls",
     "feeds",
     "self_role_recovery",
     "member_unban_sweep",

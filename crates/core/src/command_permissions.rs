@@ -78,7 +78,8 @@ use PolicyHook::{
 /// no help command) and the Next-only `/privacy` member self-serve
 /// (parity row 32).
 /// No Administrator-only exception: preserve the legacy resolved-bit check.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 32] = [
+pub const COMMAND_PERMISSIONS: [CommandPermission; 33] = [
+    row(33, "poll", BuiltinSlash, 0, None),
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),
