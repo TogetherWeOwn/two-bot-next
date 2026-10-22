@@ -166,7 +166,7 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     ("TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS", SettingClass::EnvOnly),
     // --- cold: read once at boot ---
     ("TWO_AUTOMOD", SettingClass::Cold),
-    ("TWO_ANNOUNCEMENTS", SettingClass::Cold),
+    ("TWO_ANNOUNCEMENTS", SettingClass::Hot),
     ("TWO_AUTOMATIONS", SettingClass::Cold),
     ("TWO_TEXT_COMMANDS", SettingClass::Cold),
     ("TEMP_VOICE_ENABLED", SettingClass::Cold),
@@ -186,10 +186,10 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     ("TWO_COMMUNITY_SCORECARD", SettingClass::Cold),
     ("TWO_COMMUNITY_RECOMMENDATIONS", SettingClass::Cold),
     ("TWO_COMMUNITY_CORRECTION_CYCLES", SettingClass::Cold),
-    ("TWO_SELF_ROLE_PANELS", SettingClass::Cold),
+    ("TWO_SELF_ROLE_PANELS", SettingClass::Hot),
     ("TWO_PRESENCE_PROBE", SettingClass::Cold),
     ("TWO_INACTIVITY_DAYS", SettingClass::Cold),
-    ("TWO_TICKET_COOLDOWN_SECONDS", SettingClass::Cold),
+    ("TWO_TICKET_COOLDOWN_SECONDS", SettingClass::Hot),
     ("LOG_LEVEL", SettingClass::Cold),
     // --- hot: channel/role ids, thresholds, lists, dry-runs ---
     ("DISCORD_ANCHOR_WELCOME_CHANNEL_ID", SettingClass::Hot),
@@ -276,6 +276,9 @@ pub const HOT_WIRED: &[&str] = &[
     "TWO_COMMUNITY_WELCOME_CHANNEL_IDS",
     "TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS",
     "TWO_GUILD_INVITE_CODE",
+    "TWO_TICKET_COOLDOWN_SECONDS",
+    "TWO_ANNOUNCEMENTS",
+    "TWO_SELF_ROLE_PANELS",
 ];
 
 /// The catalogue class for `key`, or `None` for a name this file has never
@@ -775,11 +778,19 @@ pub enum WriteRefusal {
     NullCharacter,
     #[error("refused: {0} accepts only a boolean, 0 or 1")]
     InvalidGateValue(String),
+    #[error("refused: {0} accepts only a non-negative integer number of seconds")]
+    InvalidCooldownValue(String),
+    #[error("refused: {0} accepts only a JSON array of self-role panels")]
+    InvalidPanelsValue(String),
 }
 
 /// Dry-run gates the env parsers accept only as `0` or `1`; a stored value
 /// that renders to anything else would be refused at every hot refresh.
-const ZERO_ONE_GATE_KEYS: &[&str] = &["TWO_ONBOARDING_DRY_RUN", "TWO_SELF_ROLE_DRY_RUN"];
+const ZERO_ONE_GATE_KEYS: &[&str] = &[
+    "TWO_ONBOARDING_DRY_RUN",
+    "TWO_SELF_ROLE_DRY_RUN",
+    "TWO_ANNOUNCEMENTS",
+];
 
 /// Postgres JSONB cannot represent decoded NUL in strings or object keys.
 /// Inspect the domain value, not its encoding (literal `\\u0000` is valid).
@@ -832,6 +843,28 @@ pub fn validate_write(
             .is_some_and(|rendered| rendered != "0" && rendered != "1")
     {
         return Err(WriteRefusal::InvalidGateValue(key.to_owned()));
+    }
+    // The ticket cooldown renders exactly what the boot reader parses, so a
+    // stored value that does not parse as u64 would never apply live: refuse
+    // it with the key named rather than storing an inert row.
+    if key == "TWO_TICKET_COOLDOWN_SECONDS"
+        && value
+            .as_ref()
+            .and_then(to_env_string)
+            .is_some_and(|rendered| rendered.parse::<u64>().is_err())
+    {
+        return Err(WriteRefusal::InvalidCooldownValue(key.to_owned()));
+    }
+    // The panel catalogue renders as compact JSON, the shape the strict boot
+    // parser accepts, so run that same parser here: a stored catalogue the
+    // loader refuses would silently fall back to boot on every read.
+    if key == "TWO_SELF_ROLE_PANELS"
+        && value
+            .as_ref()
+            .and_then(to_env_string)
+            .is_some_and(|rendered| crate::parse_self_role_panels(&rendered).is_err())
+    {
+        return Err(WriteRefusal::InvalidPanelsValue(key.to_owned()));
     }
     Ok(ValidatedWrite {
         guild_id: guild_id.to_owned(),
@@ -900,12 +933,14 @@ mod tests {
         "TWO_FEED_POLL_SECONDS",
         "TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS",
         "TWO_GUILD_INVITE_CODE",
+        "TWO_ANNOUNCEMENTS",
+        "TWO_SELF_ROLE_PANELS",
+        "TWO_TICKET_COOLDOWN_SECONDS",
     ];
 
     const EXPECTED_COLD: &[&str] = &[
         "LOG_LEVEL",
         "TEMP_VOICE_ENABLED",
-        "TWO_ANNOUNCEMENTS",
         "TWO_ANTI_NUKE",
         "TWO_ANTI_NUKE_DRY_RUN",
         "TWO_AUTOMATIONS",
@@ -915,7 +950,6 @@ mod tests {
         "TWO_COMMUNITY_SCORECARD",
         "TWO_INACTIVITY_DAYS",
         "TWO_PRESENCE_PROBE",
-        "TWO_SELF_ROLE_PANELS",
         "TWO_TEMP_VOICE",
         "TWO_TEMP_VOICE_CATEGORY_ID",
         "TWO_TEMP_VOICE_CREATE_COOLDOWN_SECONDS",
@@ -928,7 +962,6 @@ mod tests {
         "TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS",
         "TWO_TEMP_VOICE_SWEEP_SECONDS",
         "TWO_TEXT_COMMANDS",
-        "TWO_TICKET_COOLDOWN_SECONDS",
     ];
 
     const EXPECTED_ENV_ONLY: &[&str] = &[
@@ -1052,7 +1085,7 @@ mod tests {
 
     #[test]
     fn hot_wired_is_a_hot_subset() {
-        assert_eq!(HOT_WIRED.len(), 26);
+        assert_eq!(HOT_WIRED.len(), 29);
         for key in HOT_WIRED {
             assert_eq!(classify_key(key), Some(SettingClass::Hot), "{key}");
         }

@@ -109,7 +109,7 @@ async fn stored_destination_rows_move_the_live_ticket_config_without_restart() {
 
     let (mut writer, live) = live_channel();
     // A stored category row wins over the boot deployment value on the next
-    // refresh; panel, staff and the cold cooldown are untouched.
+    // refresh; panel, staff and cooldown have no rows so are untouched.
     writer.publish(&SettingsSnapshot {
         revision: 1,
         rows: vec![SettingRow {
@@ -149,6 +149,79 @@ async fn stored_destination_rows_move_the_live_ticket_config_without_restart() {
         runtime.config_for_test(),
         TicketConfig::from_vars(&deployment_vars(), 100, COOLDOWN_SECONDS).unwrap()
     );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn stored_cooldown_rows_move_the_live_ticket_cooldown_without_restart() {
+    let mock = MockRest::start(Vec::new(), ScriptedResponse::status(500)).await;
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@agent-testdb:5432/agent_test")
+        .unwrap();
+    let executor =
+        ActionExecutor::with_proxy("ticket-test-token".into(), Some(mock.origin())).unwrap();
+    let mut deployment = deployment_vars();
+    deployment.insert(COOLDOWN_KEY.to_owned(), COOLDOWN_SECONDS.to_string());
+    let runtime = TicketRuntime::new(
+        pool,
+        executor,
+        TicketConfig::from_vars(&deployment, 100, COOLDOWN_SECONDS).unwrap(),
+        deployment,
+    )
+    .unwrap();
+
+    let (mut writer, live) = live_channel();
+    let cooldown_row = |value: serde_json::Value| SettingRow {
+        guild_id: "100".to_owned(),
+        key: COOLDOWN_KEY.to_owned(),
+        value,
+        version: 1,
+    };
+    // Stored rows win in both directions over the boot deployment value.
+    writer.publish(&SettingsSnapshot {
+        revision: 1,
+        rows: vec![cooldown_row(json!(600))],
+    });
+    runtime.refresh_config_with(Some(&live));
+    assert_eq!(runtime.config_for_test().cooldown_seconds, 600);
+    writer.publish(&SettingsSnapshot {
+        revision: 2,
+        rows: vec![cooldown_row(json!(60))],
+    });
+    runtime.refresh_config_with(Some(&live));
+    assert_eq!(runtime.config_for_test().cooldown_seconds, 60);
+
+    // A malformed stored row keeps the last good cooldown while destinations
+    // still move.
+    writer.publish(&SettingsSnapshot {
+        revision: 3,
+        rows: vec![
+            SettingRow {
+                guild_id: "100".to_owned(),
+                key: COOLDOWN_KEY.to_owned(),
+                value: json!("never"),
+                version: 1,
+            },
+            SettingRow {
+                guild_id: "100".to_owned(),
+                key: "DISCORD_TICKET_CATEGORY_ID".to_owned(),
+                value: json!("201"),
+                version: 1,
+            },
+        ],
+    });
+    runtime.refresh_config_with(Some(&live));
+    let config = runtime.config_for_test();
+    assert_eq!(config.cooldown_seconds, 60);
+    assert_eq!(config.category_id, "201");
+
+    // Deleting the row hands the cooldown back to the boot deployment value.
+    writer.publish(&SettingsSnapshot {
+        revision: 4,
+        rows: vec![],
+    });
+    runtime.refresh_config_with(Some(&live));
+    assert_eq!(runtime.config_for_test().cooldown_seconds, COOLDOWN_SECONDS);
     mock.shutdown().await;
 }
 

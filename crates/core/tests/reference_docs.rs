@@ -108,7 +108,15 @@ operations apply\n\
 `DISCORD_TICKET_CATEGORY_ID`, `DISCORD_TICKET_PANEL_CHANNEL_ID` and\n\
 `DISCORD_TICKET_STAFF_ROLE_ID` from the snapshot on every execute, recovery\n\
 and purge (`crates/bot/src/ticket_runtime.rs:172-175`, `:457`, `:981`), where a\n\
-malformed row keeps the last good destinations like the audit mirror; the gateway funnel applies\n\
+malformed row keeps the last good destinations like the audit mirror, and the same\n\
+refresh resolves `TWO_TICKET_COOLDOWN_SECONDS` from the layered snapshot with\n\
+last-good fallback (`crates/bot/src/ticket_runtime.rs:613-638`); the feed poller\n\
+re-checks `TWO_ANNOUNCEMENTS` from the snapshot on every tick and skips while\n\
+a stored `0` stands (`crates/bot/src/feed_jobs.rs:250-267`, `:385-419`); self-role\n\
+dispatch and recovery resolve `TWO_SELF_ROLE_PANELS` from the snapshot on every\n\
+interaction and sweep, falling back to the boot catalogue on absent or unparsable\n\
+rows (`crates/bot/src/self_role_handlers.rs:59-74`, `:215`, `:292`, `:334`, `:379`);\n\
+the gateway funnel applies\n\
 `TWO_COMMUNITY_HUMAN_CHANNEL_IDS` and `TWO_COMMUNITY_WELCOME_CHANNEL_IDS`\n\
 from the snapshot on every guild message, refreshing the channel classifier\n\
 and the community-facts sink together before the message's channel class is\n\
@@ -216,7 +224,11 @@ const BOOT_ENV: &[&str] = &[
 /// (`containment_runtime.rs:61-67`, `:278-286`), join-risk
 /// (`join_risk_runtime.rs:66-70`, `:239-249`), raid
 /// (`raid_runtime.rs:45-48`, `:194-202`) and onboarding's per-event
-/// `CONFIG_KEYS` merge (`onboarding.rs:21-30`, `:271`).
+/// `CONFIG_KEYS` merge (`onboarding.rs:21-30`, `:271`), ticket's per-operation
+/// cooldown refresh (`ticket_runtime.rs:613-638`), the feed poller's per-tick
+/// announcements gate (`feed_jobs.rs:250-267`, `:385-419`) and self-role's
+/// per-dispatch catalogue resolve
+/// (`self_role_handlers.rs:59-74`, `:215`, `:292`, `:334`, `:379`).
 /// These rows say “applied live by runtime refresh” in the table below;
 /// every other storable key keeps the legacy `HOT_WIRED`/boot-env labels.
 const STORE_READ_KEYS: &[&str] = &[
@@ -256,6 +268,9 @@ const STORE_READ_KEYS: &[&str] = &[
     "TWO_COMMUNITY_WELCOME_CHANNEL_IDS",
     "TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS",
     "TWO_GUILD_INVITE_CODE",
+    "TWO_TICKET_COOLDOWN_SECONDS",
+    "TWO_ANNOUNCEMENTS",
+    "TWO_SELF_ROLE_PANELS",
 ];
 
 fn repository_root() -> PathBuf {
