@@ -5,6 +5,7 @@ import importlib.util
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import tempfile
 import tomllib
@@ -4790,9 +4791,11 @@ class WorkflowTests(unittest.TestCase):
                         self.assertIn("patch coverage measurement failed", result.stderr)
                     else:
                         self.assertEqual(result.returncode, 0, result.stderr)
+                        invocations = result.stdout.splitlines()
+                        self.assertEqual(len(invocations), len(targets), result.stdout)
                         for target in targets:
                             matches = [
-                                line for line in result.stdout.splitlines()
+                                line for line in invocations
                                 if f"--test {target} " in line
                             ]
                             self.assertEqual(len(matches), 1, target)
@@ -4805,6 +4808,51 @@ class WorkflowTests(unittest.TestCase):
                             self.assertIn("--test-threads=1", matches[0])
                             self.assertRegex(matches[0], r"-- --(?:include-)?ignored(?: |$)")
                             self.assertNotIn("--ignore-run-fail", matches[0])
+
+    def test_coverage_shard_rejects_unknown_leg_before_replay(self):
+        job = self.workflows["check.yml"]["jobs"]["coverage-shard"]
+        step = next(
+            step for step in job["steps"]
+            if step.get("name") == "Patch coverage legs (shard instrumented run, no report)"
+        )
+        run = step["run"]
+        wrapper = run[run.index("cov_run() {"):run.index("# Main sweep")]
+        result = subprocess.run(
+            ["bash", "-c", "set -euo pipefail; " + wrapper],
+            env=dict(os.environ, SHARD_LEGS="unknown-leg"),
+            capture_output=True, text=True, check=False, timeout=15,
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("::error::unknown coverage leg: unknown-leg", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_coverage_selection_oracles_reject_fail_open_mutants(self):
+        mutations = (
+            ("test_coverage_replays_strict_agent_test_targets_and_fails_closed",
+             "*) return 1 ;;", "*) return 0 ;;"),
+            ("test_coverage_shard_rejects_unknown_leg_before_replay",
+             'echo "::error::unknown coverage leg: $leg" >&2; exit 1 ;;',
+             'echo "::error::unknown coverage leg: $leg" >&2; ;;'),
+        )
+        for method, old, new in mutations:
+            with self.subTest(mutant=old):
+                mutated = deepcopy(self.workflows)
+                step = next(
+                    step for step in mutated["check.yml"]["jobs"]["coverage-shard"]["steps"]
+                    if step.get("name") == "Patch coverage legs (shard instrumented run, no report)"
+                )
+                self.assertEqual(step["run"].count(old), 1)
+                step["run"] = step["run"].replace(old, new)
+                probe = WorkflowTests(method)
+                probe.workflows = mutated
+                result = unittest.TestResult()
+                # A separate TestResult captures failures inside subTest too;
+                # the actual workflow file remains untouched.
+                with patch.object(probe, "setUp", return_value=None):
+                    probe.run(result)
+                self.assertEqual(result.errors, [])
+                self.assertEqual(len(result.failures), 1, result.failures)
+                self.assertEqual(result.testsRun, 1)
 
     def test_coverage_plan_emits_the_shard_matrix(self):
         # The planner selects the legs (changed crates plus reverse
@@ -4856,6 +4904,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(upload["with"]["name"], "coverage-shard-${{ matrix.shard_index }}")
         self.assertEqual(upload["with"]["path"], "lcov-shard-${{ matrix.shard_index }}.info")
         self.assertEqual(upload["with"]["if-no-files-found"], "error")
+        self.assertEqual(upload["with"].get("overwrite"), "true")
 
     def test_coverage_shard_leg_selection_matches_the_planner(self):
         # Every planner leg id guards exactly one legs block, and the
@@ -4887,6 +4936,31 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(guards, set(expected))
         validated = re.search(r'case " ([a-z0-9_ -]+) " in', run)[1].split()
         self.assertEqual(validated, expected)
+
+    def test_coverage_planner_sweep_commands_match_executed_commands_with_every_skip(self):
+        spec = importlib.util.spec_from_file_location(
+            "sweep_shard_planner", ROOT / "scripts/ci/plan-coverage-shards.py")
+        planner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(planner)
+        step = next(
+            step for step in self.workflows["check.yml"]["jobs"]["coverage-shard"]["steps"]
+            if step.get("name") == "Patch coverage legs (shard instrumented run, no report)"
+        )
+        sweeps = [leg for leg in planner.FULL_LEGS
+                  if leg["id"] in ("sweep-nonignored", "sweep-ignored")]
+        self.assertEqual([leg["id"] for leg in sweeps], ["sweep-nonignored", "sweep-ignored"])
+        for leg in sweeps:
+            with self.subTest(leg=leg["id"]):
+                [block] = re.findall(
+                    rf"if selected {re.escape(leg['id'])}; then\n(.*?)\nfi",
+                    step["run"], re.DOTALL,
+                )
+                [command] = [line for line in shell_logical_lines(block)
+                             if line.startswith("cov_run ")]
+                executed = ["cargo" if token == "$COV" else token
+                            for token in shlex.split(command)[1:]]
+                self.assertEqual(shlex.split(leg["command"]), executed,
+                                 f"{leg['id']} must describe the actual command, including all skips")
 
     def test_coverage_shard_caches_the_instrumented_build(self):
         # Each shard restores its own rust-cache entry and reports sccache
@@ -4940,6 +5014,8 @@ class WorkflowTests(unittest.TestCase):
             "${{ needs.coverage-plan.outputs.expected-shards }}")
         self.assertIn("scripts/ci/merge-coverage-shards.py", merge["run"])
         self.assertIn('--expected-shards "$EXPECTED_SHARDS"', merge["run"])
+        self.assertIn("--source-root /__w/two-bot-next/two-bot-next",
+                      " ".join(shell_logical_lines(merge["run"])))
         gate = next(
             step for step in job["steps"]
             if step.get("name") == "Patch coverage (HARD, 80% of added lines)"
