@@ -177,14 +177,11 @@ async fn poll_once(pool: &PgPool, writer: &Mutex<LiveSettingsWriter>) -> Result<
 /// Fetch failures resolve to `Some(Err(..))` so the writer can age the last
 /// good record toward expiry; only a missing URL skips the apply.
 ///
-/// Test note: the URL is process-global per tick, so only one test in the
-/// suite may set it (the protected ops acceptance test — do not add
-/// another). `cargo test` threads share the variable, so a concurrent
-/// ticker can observe the acceptance mock; in practice the serialized
-/// fixture setup separates the two DB tests' tick windows, while nextest
-/// (per-test processes) and nightly (single-threaded) isolate them fully.
-/// If the supervised no-republish assertion ever flakes, serialize those
-/// two tests instead of touching the poll.
+/// The URL is process-global per tick. Threaded lib-test sweeps must run
+/// the env-mutating ops acceptance case separately from the supervised
+/// guild poll (fixture DDL locks do not isolate test bodies). Nextest uses
+/// per-test processes; the authenticated wiring probe also owns a child
+/// process so its URL and token cannot leak into another poll.
 async fn poll_ops_record(
 ) -> Option<Result<two_bot_core::settings::OpsRecord, two_bot_core::ops_fetch::OpsFetchError>> {
     let Some(url) = two_bot_core::ops_fetch::ops_url_from_env() else {
@@ -304,6 +301,97 @@ mod tests;
 #[cfg(test)]
 mod ops_log_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ops_env_bearer_reaches_authenticated_poll() {
+        use two_bot_core::ops_fetch::{OpsFetchError, OPS_CONFIG_TOKEN_ENV, OPS_CONFIG_URL_ENV};
+
+        const CHILD_MODE: &str = "OPS_FETCH_WIRING_MODE";
+        const TEST_NAME: &str =
+            "settings_jobs::ops_log_tests::ops_env_bearer_reaches_authenticated_poll";
+        let Ok(mode) = std::env::var(CHILD_MODE) else {
+            // Each env case runs in its own process. No variable is mutated
+            // in the threaded parent, including the coverage environment.
+            for mode in ["unset", "empty", "set"] {
+                let output = tokio::task::spawn_blocking(move || {
+                    let mut command = std::process::Command::new(
+                        std::env::current_exe().expect("test executable"),
+                    );
+                    command
+                        .args([TEST_NAME, "--exact", "--nocapture"])
+                        .env(CHILD_MODE, mode)
+                        .env_remove(OPS_CONFIG_TOKEN_ENV);
+                    match mode {
+                        "empty" => {
+                            command.env(OPS_CONFIG_TOKEN_ENV, "");
+                        }
+                        "set" => {
+                            command.env(OPS_CONFIG_TOKEN_ENV, "fixture-token");
+                        }
+                        _ => {}
+                    }
+                    command.output().expect("isolated ops poll probe")
+                })
+                .await
+                .expect("probe task");
+                assert!(
+                    output.status.success()
+                        && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                    "isolated ops poll probe ({mode}) failed: {} {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+            }
+            return;
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("authenticated ops mock");
+        let url = format!(
+            "http://{}/ops/config",
+            listener.local_addr().expect("mock address")
+        );
+        let app = axum::Router::new().route(
+            "/ops/config",
+            axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                use axum::response::IntoResponse;
+                if headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    != Some("Bearer fixture-token")
+                {
+                    return axum::http::StatusCode::UNAUTHORIZED.into_response();
+                }
+                axum::Json(serde_json::json!({
+                    "epoch": 7,
+                    "overrides": {"TWO_AUTOMOD_MENTION_LIMIT": "9"},
+                    "deploymentId": "mock-ops-deployment",
+                    "baseline": {},
+                    "enforcement": "pending",
+                }))
+                .into_response()
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock serve");
+        });
+        std::env::set_var(OPS_CONFIG_URL_ENV, url);
+        let fetched = poll_ops_record().await.expect("configured ops fetch");
+        if mode == "set" {
+            let record = fetched.expect("env bearer authenticates the production poll");
+            assert_eq!(record.epoch, 7);
+            assert_eq!(
+                record
+                    .overrides
+                    .get("TWO_AUTOMOD_MENTION_LIMIT")
+                    .map(String::as_str),
+                Some("9")
+            );
+        } else {
+            assert_eq!(fetched, Err(OpsFetchError::Status(401)));
+        }
+        server.abort();
+    }
 
     /// Covers every `log_ops` arm without touching the process environment
     /// or a database (the apply-side semantics are pinned in core and the

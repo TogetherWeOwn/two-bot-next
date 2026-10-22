@@ -46,8 +46,8 @@ pub enum OpsFetchError {
     #[error("ops fetch timed out")]
     Timeout,
     /// The request never completed: refused, unreachable, or an unsendable
-    /// bearer. A bearer that cannot form a header fails the fetch rather
-    /// than downgrading to unauthenticated.
+    /// bearer. A bearer that cannot form a header, or targets plain HTTP
+    /// outside explicit loopback, fails rather than downgrading to unauthenticated.
     #[error("ops fetch refused or unreachable")]
     Transport,
     /// The endpoint answered a non-success status (the code, for the log).
@@ -76,11 +76,20 @@ pub fn ops_url_from_env() -> Option<Uri> {
 /// pasted space is a real mismatch, not trimmable).
 #[must_use]
 pub fn ops_token_from_env() -> Option<String> {
-    let token = std::env::var(OPS_CONFIG_TOKEN_ENV).ok()?;
-    if token.is_empty() {
-        None
-    } else {
-        Some(token)
+    parse_ops_token(std::env::var(OPS_CONFIG_TOKEN_ENV).ok())
+}
+
+fn parse_ops_token(token: Option<String>) -> Option<String> {
+    token.filter(|value| !value.is_empty())
+}
+
+fn bearer_transport_allowed(url: &Uri) -> bool {
+    match url.scheme_str() {
+        Some("https") => true,
+        Some("http") => url.authority().is_some_and(|authority| {
+            crate::send_admission::is_loopback_http(&format!("http://{authority}"))
+        }),
+        _ => false,
     }
 }
 
@@ -105,8 +114,9 @@ fn parse_ops_url(raw: &str) -> Option<Uri> {
 ///
 /// A fresh client per call (feeds_connector precedent): the 15 s cadence
 /// makes pool reuse worthless and keeps test-global clients out of the
-/// picture. Plain HTTP and HTTPS both dial; anything else never reaches
-/// here (`parse_ops_url` refuses it first).
+/// picture. A bearer requires HTTPS or explicit loopback HTTP; other HTTP
+/// targets fail before dialing. Tokenless HTTP remains available for fixtures.
+/// Other schemes never reach here (`parse_ops_url` refuses them first).
 pub async fn fetch_ops_record(
     url: &Uri,
     token: Option<&str>,
@@ -118,6 +128,9 @@ pub async fn fetch_ops_record(
 }
 
 async fn fetch_inner(url: &Uri, token: Option<&str>) -> Result<OpsRecord, OpsFetchError> {
+    if token.is_some() && !bearer_transport_allowed(url) {
+        return Err(OpsFetchError::Transport);
+    }
     let https = HttpsConnectorBuilder::new()
         .with_webpki_roots()
         .https_or_http()
@@ -388,6 +401,77 @@ mod tests {
             fetch_ops_record(&stalled.url, None, Duration::from_millis(50)).await,
             Err(OpsFetchError::Timeout)
         );
+    }
+
+    #[test]
+    fn ops_token_parser_preserves_nonempty_tokens_verbatim() {
+        assert_eq!(parse_ops_token(None), None);
+        assert_eq!(parse_ops_token(Some(String::new())), None);
+        assert_eq!(
+            parse_ops_token(Some("fixture".to_owned())),
+            Some("fixture".to_owned())
+        );
+        assert_eq!(
+            parse_ops_token(Some(" fixture ".to_owned())),
+            Some(" fixture ".to_owned())
+        );
+    }
+
+    #[test]
+    fn bearer_transport_requires_https_or_explicit_loopback_http() {
+        for raw in [
+            "https://ops.example.invalid/ops/config",
+            "http://127.0.0.1:1234/ops/config",
+            "http://127.0.0.2:1234/ops/config",
+            "http://localhost:1234/ops/config",
+            "http://[::1]:1234/ops/config",
+        ] {
+            assert!(
+                bearer_transport_allowed(&raw.parse().expect("fixture URI")),
+                "{raw}"
+            );
+        }
+        for raw in [
+            "http://ops.example.invalid/ops/config",
+            "http://0.0.0.0:1234/ops/config",
+            "http://192.0.2.1:1234/ops/config",
+            "http://localhost.evil:1234/ops/config",
+            "http://fixture@localhost:1234/ops/config",
+            "ftp://127.0.0.1:1234/ops/config",
+            "/ops/config",
+        ] {
+            assert!(
+                !bearer_transport_allowed(&raw.parse().expect("fixture URI")),
+                "{raw}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_non_loopback_bearer_fails_closed_before_sending() {
+        let mock = MockOps::serve(record_handler).await;
+        // Linux can dial an unspecified IPv4 address locally, but it is not
+        // an explicit loopback target. The guard must reject before dialing.
+        let url: Uri = mock
+            .url
+            .to_string()
+            .replace("127.0.0.1", "0.0.0.0")
+            .parse()
+            .expect("non-loopback fixture URI");
+        assert_eq!(
+            fetch_ops_record(&url, Some("test-token"), Duration::from_secs(5)).await,
+            Err(OpsFetchError::Transport)
+        );
+        assert!(mock.auths().is_empty());
+        // Tokenless HTTP behavior remains unchanged.
+        assert_eq!(
+            fetch_ops_record(&url, None, Duration::from_secs(5))
+                .await
+                .expect("tokenless local fixture fetch")
+                .epoch,
+            4
+        );
+        assert_eq!(mock.auths(), vec![None]);
     }
 
     #[tokio::test]

@@ -54,14 +54,14 @@ pub const POLL_SECONDS: u64 = 15;
 /// (Slice 0a staleness bound).
 ///
 /// Two bounds, one constant. Healthy case: the poll GETs the record every
-/// [`POLL_SECONDS`], so a PUT is visible at runtime within ~15 s and every
-/// re-read heartbeats the layer. Outage case: a 5xx, a malformed body, an
-/// unreachable endpoint, or a persistently older epoch keeps the last good
-/// record — but only for [`MAX_OPS_STALENESS`] (300 s, twenty missed polls).
-/// Past that the layer expires back to the guild rows: a stale incident
-/// lever must not rule forever, and twenty quiet polls mean the operator
-/// cannot see what the bot enforces. Transient Worker/DO blips recover via
-/// heartbeat long before the bound.
+/// [`POLL_SECONDS`], so a PUT is visible at runtime within ~15 s and a
+/// current-epoch re-read heartbeats the layer. Outage case: a 5xx, a malformed
+/// body, an unreachable endpoint, or a persistently older epoch (including
+/// epoch 0 after arming) keeps the last good record — but only for
+/// [`MAX_OPS_STALENESS`] (300 s, twenty missed polls). Past that the layer
+/// expires back to the guild rows without resetting the epoch watermark:
+/// an older record cannot re-arm it. The same or a newer epoch can restore
+/// the layer after expiry. A stale incident lever must not rule forever.
 pub const MAX_OPS_STALENESS: Duration = Duration::from_secs(300);
 
 /// Prefix test, kept alongside the exact-name table (legacy
@@ -776,7 +776,8 @@ pub struct LiveSettings {
 pub struct LiveSettingsWriter {
     tx: watch::Sender<Arc<SettingsCache>>,
     cache: SettingsCache,
-    /// Epoch of the applied /ops record (`0` = none ever applied).
+    /// Highest applied /ops epoch (`0` = none ever applied). Retained when
+    /// the overlay expires so a persistently older record cannot resurrect it.
     ops_epoch: u64,
     /// When the override layer last saw a fresh record (applied or
     /// heartbeat). `None` until the first one; staleness past
@@ -824,17 +825,25 @@ impl LiveSettingsWriter {
     /// Apply one /ops-config poll outcome as the top settings layer (Slice
     /// 0a). `record` is `None` on fetch/parse failure. A record applies iff
     /// its epoch is newer than the last applied one; an older epoch is
-    /// ignored and the last good record stays live. A same-epoch re-read
-    /// heartbeats the staleness clock without republishing; an epoch-0
-    /// record is transparent. Time is injected (`now`) so tests pin the
-    /// [`MAX_OPS_STALENESS`] boundary without sleeping.
+    /// ignored while the last good record ages toward expiry. A same-epoch
+    /// re-read heartbeats the clock without republishing, or restores the
+    /// overlay after expiry. Epoch 0 is transparent only before any apply;
+    /// after that it ages the layer like any other older epoch. Expiry keeps
+    /// the epoch watermark so an older record can never re-arm the layer.
+    /// Time is injected (`now`) so tests pin the [`MAX_OPS_STALENESS`]
+    /// boundary without sleeping.
     pub fn apply_ops(&mut self, record: Option<&OpsRecord>, now: Instant) -> OpsApplyOutcome {
         match record {
-            Some(record) if record.epoch == 0 => OpsApplyOutcome::Transparent,
+            Some(record) if record.epoch == 0 && self.ops_epoch == 0 => {
+                OpsApplyOutcome::Transparent
+            }
             Some(record) if record.epoch > self.ops_epoch => self.apply_fresh_record(record, now),
             Some(record) if record.epoch == self.ops_epoch => {
-                // Reached only with a nonzero epoch (epoch 0 matches the
-                // first arm): the record is confirmed still current.
+                // An expired overlay needs its payload restored, not just
+                // a heartbeat. The watermark survives the expiry.
+                if self.ops_fresh_at.is_none() {
+                    return self.apply_fresh_record(record, now);
+                }
                 self.ops_fresh_at = Some(now);
                 OpsApplyOutcome::Heartbeat {
                     epoch: record.epoch,
@@ -846,7 +855,6 @@ impl LiveSettingsWriter {
                 let stale_epoch = maybe_record.map(|record| record.epoch);
                 if self.ops_expired(now) {
                     self.cache.ops = HashMap::new();
-                    self.ops_epoch = 0;
                     self.ops_fresh_at = None;
                     self.republish_live();
                     OpsApplyOutcome::Expired
@@ -1912,6 +1920,115 @@ mod ops_tests {
         );
         assert_eq!(outcome, OpsApplyOutcome::Expired);
         assert_eq!(live.get(GUILD, KEY), None);
+    }
+
+    #[test]
+    fn epoch_zero_after_armed_ages_and_expires_on_every_read_api() {
+        let (mut writer, live) = live_channel();
+        writer.publish(&guild_snapshot(1, vec![(GUILD, KEY, json!(5))]));
+        let applied_at = Instant::now();
+        writer.apply_ops(Some(&ops_record(5, &[(KEY, "9")])), applied_at);
+        let reset = ops_record(0, &[]);
+        assert_eq!(
+            writer.apply_ops(Some(&reset), applied_at + MAX_OPS_STALENESS),
+            OpsApplyOutcome::StaleIgnored {
+                epoch: 0,
+                current: 5
+            }
+        );
+        assert_eq!(live.get(GUILD, KEY), Some(json!("9")));
+        assert_eq!(
+            writer.apply_ops(
+                Some(&reset),
+                applied_at + MAX_OPS_STALENESS + Duration::from_secs(1)
+            ),
+            OpsApplyOutcome::Expired
+        );
+        assert_eq!(live.get(GUILD, KEY), Some(json!(5)));
+        assert_eq!(live.snapshot().get(GUILD, KEY), Some(&json!(5)));
+        assert_eq!(
+            live.env_snapshot(Some(GUILD)).get(KEY).map(String::as_str),
+            Some("5")
+        );
+        assert_eq!(
+            writer.apply_ops(
+                Some(&reset),
+                applied_at + MAX_OPS_STALENESS + Duration::from_secs(16)
+            ),
+            OpsApplyOutcome::StaleIgnored {
+                epoch: 0,
+                current: 5
+            }
+        );
+    }
+
+    #[test]
+    fn expired_overlay_never_resurrects_an_older_epoch() {
+        for expire_with_stale in [false, true] {
+            let (mut writer, live) = live_channel();
+            writer.publish(&guild_snapshot(1, vec![(GUILD, KEY, json!(5))]));
+            let applied_at = Instant::now();
+            writer.apply_ops(Some(&ops_record(5, &[(KEY, "9")])), applied_at);
+            let stale = ops_record(3, &[(KEY, "1")]);
+            let expired_at = applied_at + MAX_OPS_STALENESS + Duration::from_secs(1);
+            assert_eq!(
+                writer.apply_ops(expire_with_stale.then_some(&stale), expired_at),
+                OpsApplyOutcome::Expired
+            );
+            let before = live.snapshot();
+            for seconds in [15, 315, 615] {
+                assert_eq!(
+                    writer.apply_ops(Some(&stale), expired_at + Duration::from_secs(seconds)),
+                    OpsApplyOutcome::StaleIgnored {
+                        epoch: 3,
+                        current: 5
+                    }
+                );
+                assert_eq!(live.get(GUILD, KEY), Some(json!(5)));
+                assert_eq!(live.snapshot().get(GUILD, KEY), Some(&json!(5)));
+                assert_eq!(
+                    live.env_snapshot(Some(GUILD)).get(KEY).map(String::as_str),
+                    Some("5")
+                );
+                assert!(Arc::ptr_eq(&before, &live.snapshot()));
+            }
+        }
+    }
+
+    #[test]
+    fn equal_or_newer_epoch_restores_an_expired_overlay() {
+        for recovery_epoch in [5, 6] {
+            let (mut writer, live) = live_channel();
+            let applied_at = Instant::now();
+            let record = ops_record(5, &[(KEY, "9")]);
+            writer.apply_ops(Some(&record), applied_at);
+            let expired_at = applied_at + MAX_OPS_STALENESS + Duration::from_secs(1);
+            assert_eq!(writer.apply_ops(None, expired_at), OpsApplyOutcome::Expired);
+            assert_eq!(live.get(GUILD, KEY), None);
+            let recovered_at = expired_at + Duration::from_secs(15);
+            let recovery = ops_record(recovery_epoch, &[(KEY, "9")]);
+            assert_eq!(
+                writer.apply_ops(Some(&recovery), recovered_at),
+                OpsApplyOutcome::Applied {
+                    epoch: recovery_epoch,
+                    keys: vec![KEY.to_owned()]
+                }
+            );
+            assert_eq!(live.get(GUILD, KEY), Some(json!("9")));
+            assert_eq!(live.snapshot().get(GUILD, KEY), Some(&json!("9")));
+            assert_eq!(
+                live.env_snapshot(Some(GUILD)).get(KEY).map(String::as_str),
+                Some("9")
+            );
+            let before = live.snapshot();
+            assert_eq!(
+                writer.apply_ops(Some(&recovery), recovered_at + Duration::from_secs(15)),
+                OpsApplyOutcome::Heartbeat {
+                    epoch: recovery_epoch
+                }
+            );
+            assert!(Arc::ptr_eq(&before, &live.snapshot()));
+        }
     }
 
     #[test]
