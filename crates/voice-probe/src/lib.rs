@@ -13,4 +13,5 @@
 
 pub mod discovery;
 pub mod evidence;
+pub mod runner;
 pub mod stats;
