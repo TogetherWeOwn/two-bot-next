@@ -1,8 +1,8 @@
 /**
  * Failing acceptance for the slice-1 Worker admin gateway skeleton
- * (TOG-35921 section 3.2; acceptance TOG-36192, build TOG-36201).
+ * (approved admin API spec sections 3.2 and 5.2).
  *
- * The RED side for the edge half: every test below FAILS against the current
+ * The RED side for the edge half: gateway behavior fails against the current
  * Worker (no /admin/v1 route exists, so requests fall through to the
  * redirect handler's 404) and passes once the Builder lands the gate plus
  * the service-key signing. Test files only; no `src` changes. The Builder
@@ -16,7 +16,7 @@
  *    wrong-scheme, and over-long bearers are one indistinguishable refusal;
  * 2. the closed prove-out: no verb executes. With a well-formed bearer the
  *    gateway signs exactly one service-key request with MAC-covered
- *    scope/guild claims, the container refuses the unknown verb, and the
+ *    scope/guild claims and bearer proof, the container refuses the verb, and the
  *    gateway relays that refusal without retrying or executing anything;
  * 3. the skeleton stays dark unless the service key is configured, answers
  *    405 with `Allow` for other methods, never routes query strings, and
@@ -32,8 +32,10 @@
  * forward is what proves the signing path closed); relayed refusals keep
  * the container status/code with the fixed `request refused` message (the
  * ingress projection rule: container text never leaves); bearer shape
- * `Bearer <1..4096 chars>`. Bearer VALUE validation (registry lookup) is
- * slice 0's; this file pins mechanics only and works before and after it.
+ * `Bearer adm_<16 lowercase hex>.<32+ base64url chars>` (<=4096 chars).
+ * Only syntax is checked at the edge; VALUE validation belongs to the
+ * authoritative container. POST takes body.guild_id; GET takes the final
+ * path segment. No caller scope, identity or guild is invented.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -42,7 +44,10 @@ import worker, { type Env } from "../src/index.ts";
 
 const SERVICE_KEY_ID = "fixture-admin-service";
 const SERVICE_SECRET = "s".repeat(40);
-const ADMIN_BEARER = "synthetic-admin-bearer-0123456789abcdef";
+const TOKEN_ID = "adm_0123456789abcdef";
+const ADMIN_BEARER = `${TOKEN_ID}.${"a".repeat(40)}`;
+const INVALID_BEARER = `${TOKEN_ID}.${"z".repeat(40)}`;
+const TARGET_GUILD = "123456789012345678";
 const PROBE_VERB = "probe_no_such_verb";
 const SENTINEL = "synthetic-admin-gateway-do-not-echo";
 const SCOPE_TAG = "two-internal-action/scope-claim/v1";
@@ -55,9 +60,11 @@ interface Forwarded {
 }
 
 function harness(
-  serviceSecret: string | undefined = SERVICE_SECRET,
-  serviceId: string | undefined = SERVICE_KEY_ID,
+  bindings: { serviceSecret?: string; serviceId?: string } = {
+    serviceSecret: SERVICE_SECRET, serviceId: SERVICE_KEY_ID,
+  },
 ) {
+  const { serviceSecret, serviceId } = bindings;
   const names: string[] = [];
   const forwarded: Forwarded[] = [];
   const env = {
@@ -75,26 +82,30 @@ function harness(
             req.headers.forEach((value, key) => {
               headers[key] = value;
             });
+            const bytes = new Uint8Array(await req.arrayBuffer());
             forwarded.push({
               method: req.method,
               url: req.url,
               headers,
-              bytes: new Uint8Array(await req.arrayBuffer()),
+              bytes,
             });
-            // Canned receiver refusal for the unknown verb, mimicking the
-            // container's fixed envelope and request-id echo.
+            // The stub is the authority seam, NOT an edge token registry.
+            // A missing/wrong proof is refused even under a valid service key.
+            // Every authenticated verb stays closed until gateway audit exists.
+            const body = JSON.parse(new TextDecoder().decode(bytes)) as Record<string, unknown>;
+            const authenticated = body["admin_bearer"] === ADMIN_BEARER;
             const requestId = req.headers.get("x-request-id") ?? "unknown";
             return Response.json(
               {
                 ok: false,
                 error: {
-                  code: "action_not_allowed",
-                  message: "Internal action refused",
+                  code: authenticated ? "action_not_allowed" : "unauthorized",
+                  message: SENTINEL,
                   retryable: false,
                 },
                 request_id: requestId,
               },
-              { status: 403, headers: { "content-type": "application/json" } },
+              { status: authenticated ? 403 : 401, headers: { "content-type": "application/json" } },
             );
           },
         };
@@ -170,7 +181,10 @@ const BAD_BEARERS: [string, string | null][] = [
   ["empty token", "Bearer "],
   ["wrong scheme", "Token synthetic-admin-bearer"],
   ["over-long token", `Bearer ${"b".repeat(4097)}`],
-  ["sentinel token", `Bearer ${SENTINEL}-not-a-real-credential`],
+  ["missing secret", `Bearer ${TOKEN_ID}.`],
+  ["short secret", `Bearer ${TOKEN_ID}.short`],
+  ["bad token id", `Bearer adm_NOT_HEX_00000000.${"a".repeat(40)}`],
+  ["embedded whitespace", `Bearer ${TOKEN_ID}.${"a".repeat(32)} bad`],
 ];
 
 test("unauthenticated POST /admin/v1 is refused at the edge", async () => {
@@ -179,7 +193,7 @@ test("unauthenticated POST /admin/v1 is refused at the edge", async () => {
   for (const [label, auth] of BAD_BEARERS) {
     const h = harness();
     const res = await worker.fetch(
-      adminRequest("POST", `/admin/v1/${PROBE_VERB}`, auth, { probe: "acceptance" }),
+      adminRequest("POST", `/admin/v1/${PROBE_VERB}`, auth, { guild_id: TARGET_GUILD, params: { probe: "acceptance" } }),
       h.env,
       h.ctx,
     );
@@ -193,7 +207,7 @@ test("unauthenticated GET /admin/v1 is refused at the edge", async () => {
   // (1) Same gate for reads: GET without a bearer never reaches the skeleton.
   for (const [label, auth] of BAD_BEARERS) {
     const h = harness();
-    const res = await worker.fetch(adminRequest("GET", `/admin/v1/${PROBE_VERB}`, auth), h.env, h.ctx);
+    const res = await worker.fetch(adminRequest("GET", `/admin/v1/${PROBE_VERB}/${TARGET_GUILD}`, auth), h.env, h.ctx);
     await assertEdge401(res, `GET ${label}`);
     assert.deepEqual(h.names, [], `${label}: no DO lookup before auth`);
     assert.deepEqual(h.forwarded, [], `${label}: no container contact before auth`);
@@ -207,7 +221,7 @@ test("other methods answer 405 with Allow", async () => {
   for (const method of ["PUT", "DELETE", "PATCH"]) {
     const h = harness();
     const res = await worker.fetch(
-      adminRequest(method, `/admin/v1/${PROBE_VERB}`, `Bearer ${ADMIN_BEARER}`, { probe: 1 }),
+      adminRequest(method, `/admin/v1/${PROBE_VERB}`, `Bearer ${ADMIN_BEARER}`, { guild_id: TARGET_GUILD, params: { probe: 1 } }),
       h.env,
       h.ctx,
     );
@@ -223,21 +237,24 @@ test("unconfigured gateway stays dark", async () => {
   // not exist. Dark means fallthrough-identical (compared against a
   // definitely-unrouted path, so this never couples to the redirect
   // handler's exact shapes): never a gateway refusal, never a forward.
-  const misconfigured: [string | undefined, string | undefined][] = [
-    [undefined, SERVICE_KEY_ID],
-    ["short-secret", SERVICE_KEY_ID],
-    [SERVICE_SECRET, undefined],
+  const misconfigured = [
+    { serviceId: SERVICE_KEY_ID },
+    { serviceSecret: "short-secret", serviceId: SERVICE_KEY_ID },
+    { serviceSecret: SERVICE_SECRET },
+    {},
   ];
-  for (const [secret, id] of misconfigured) {
+  for (const bindings of misconfigured) {
     for (const method of ["GET", "POST"]) {
-      const h = harness(secret, id);
+      const h = harness(bindings);
+      assert.equal(Object.hasOwn(h.env, "ADMIN_GATEWAY_SERVICE_KEY"), "serviceSecret" in bindings);
+      assert.equal(Object.hasOwn(h.env, "ADMIN_GATEWAY_SERVICE_KEY_ID"), "serviceId" in bindings);
       const res = await worker.fetch(
-        adminRequest(method, `/admin/v1/${PROBE_VERB}`, `Bearer ${ADMIN_BEARER}`, { probe: 1 }),
+        adminRequest(method, `/admin/v1/${PROBE_VERB}`, `Bearer ${ADMIN_BEARER}`, { guild_id: TARGET_GUILD, params: { probe: 1 } }),
         h.env,
         h.ctx,
       );
       const plain = await worker.fetch(
-        adminRequest(method, "/synthetic-unrouted-zz9-probe", `Bearer ${ADMIN_BEARER}`, { probe: 1 }),
+        adminRequest(method, "/synthetic-unrouted-zz9-probe", `Bearer ${ADMIN_BEARER}`, { guild_id: TARGET_GUILD, params: { probe: 1 } }),
         h.env,
         h.ctx,
       );
@@ -262,7 +279,7 @@ test("query strings never route to the gateway", async () => {
   for (const method of ["GET", "POST"]) {
     const h = harness();
     const res = await worker.fetch(
-      adminRequest(method, `/admin/v1/${PROBE_VERB}?signed=no`, `Bearer ${ADMIN_BEARER}`, { probe: 1 }),
+      adminRequest(method, `/admin/v1/${PROBE_VERB}?signed=no`, `Bearer ${ADMIN_BEARER}`, { guild_id: TARGET_GUILD, params: { probe: 1 } }),
       h.env,
       h.ctx,
     );
@@ -279,7 +296,7 @@ test("valid bearer proves the closed path: one signed forward, refusal relayed",
   // correlated request id. Nothing executes, nothing retries.
   const h = harness();
   const res = await worker.fetch(
-    adminRequest("POST", `/admin/v1/${PROBE_VERB}`, `Bearer ${ADMIN_BEARER}`, { probe: "acceptance" }),
+    adminRequest("POST", `/admin/v1/${PROBE_VERB}`, `Bearer ${ADMIN_BEARER}`, { guild_id: TARGET_GUILD, params: { probe: "acceptance" } }),
     h.env,
     h.ctx,
   );
@@ -296,7 +313,8 @@ test("valid bearer proves the closed path: one signed forward, refusal relayed",
   assert.equal(forward.headers["x-two-key-id"], SERVICE_KEY_ID, "forward uses the service key id");
   const scope = forward.headers["x-two-scope"];
   const guild = forward.headers["x-two-guild"];
-  assert.ok(scope && guild, "forward carries scope/guild claims");
+  assert.equal(scope, "read", "unknown probe uses the closed read claim");
+  assert.equal(guild, TARGET_GUILD, "signed guild equals the explicit request target");
   assert.match(forward.headers["x-two-timestamp"] ?? "", /^\d{1,15}$/, "forward timestamp shape");
   assert.match(
     forward.headers["x-two-nonce"] ?? "",
@@ -330,7 +348,9 @@ test("valid bearer proves the closed path: one signed forward, refusal relayed",
     "forwarded MAC binds the claim bytes (a flipped claim must not verify)",
   );
   const body = JSON.parse(new TextDecoder().decode(forward.bytes)) as Record<string, unknown>;
-  assert.equal(typeof body["action"], "string", "forwarded body carries a string action");
+  assert.equal(body["action"], PROBE_VERB, "forwarded action is not invented");
+  assert.equal(body["guild_id"], TARGET_GUILD, "body and signed guild agree");
+  assert.equal(body["admin_bearer"], ADMIN_BEARER, "MAC-covered body carries transient bearer proof");
   assert.equal(
     forward.headers["x-request-id"],
     "ABCDEFGHJKMNPQRSTVWXYZ012345",
@@ -340,7 +360,7 @@ test("valid bearer proves the closed path: one signed forward, refusal relayed",
   // A second call mints a fresh envelope: nonces never repeat across
   // requests, so a static-nonce signer fails here, not in production.
   const res2 = await worker.fetch(
-    adminRequest("POST", `/admin/v1/${PROBE_VERB}`, `Bearer ${ADMIN_BEARER}`, { probe: "acceptance" }),
+    adminRequest("POST", `/admin/v1/${PROBE_VERB}`, `Bearer ${ADMIN_BEARER}`, { guild_id: TARGET_GUILD, params: { probe: "acceptance" } }),
     h.env,
     h.ctx,
   );
@@ -351,6 +371,84 @@ test("valid bearer proves the closed path: one signed forward, refusal relayed",
     h.forwarded[1]!.headers["x-two-nonce"],
     "each forward mints a fresh nonce",
   );
+});
+
+test("valid-shaped invalid bearer reaches authority and returns the fixed 401", async () => {
+  for (const method of ["POST", "GET"]) {
+    const h = harness();
+    const path = method === "GET"
+      ? `/admin/v1/${PROBE_VERB}/${TARGET_GUILD}` : `/admin/v1/${PROBE_VERB}`;
+    const res = await worker.fetch(adminRequest(method, path, `Bearer ${INVALID_BEARER}`, {
+      guild_id: TARGET_GUILD,
+    }), h.env, h.ctx);
+    await assertEdge401(res, `${method} invalid VALUE`);
+    assert.equal(h.forwarded.length, 1, "registry proof requires exactly one authority contact");
+    const body = JSON.parse(new TextDecoder().decode(h.forwarded[0]!.bytes));
+    assert.equal(body.admin_bearer, INVALID_BEARER, "authority receives the actual presented proof");
+  }
+});
+
+test("GET target guild comes from the validated path, never an invented default", async () => {
+  const h = harness();
+  const res = await worker.fetch(adminRequest("GET", `/admin/v1/${PROBE_VERB}/${TARGET_GUILD}`,
+    `Bearer ${ADMIN_BEARER}`), h.env, h.ctx);
+  assert.equal(res.status, 403);
+  assert.equal(h.forwarded.length, 1);
+  const forward = h.forwarded[0]!;
+  assert.equal(forward.headers["x-two-guild"], TARGET_GUILD);
+  assert.equal(forward.headers["x-two-scope"], "read");
+  assert.equal(forward.headers["x-two-signature"], scopedTag(SERVICE_SECRET,
+    forward.headers["x-two-timestamp"]!, forward.headers["x-two-nonce"]!, forward.bytes,
+    "read", TARGET_GUILD));
+  assert.equal(JSON.parse(new TextDecoder().decode(forward.bytes)).guild_id, TARGET_GUILD);
+});
+
+test("missing and malformed target guilds never contact the container", async () => {
+  for (const guild of [undefined, "", "0", "-1", "abc", "1e3", "1".repeat(21), 123]) {
+    const h = harness();
+    const res = await worker.fetch(adminRequest("POST", `/admin/v1/${PROBE_VERB}`,
+      `Bearer ${ADMIN_BEARER}`, { guild_id: guild }), h.env, h.ctx);
+    assert.equal(res.status, 400, `invalid guild ${String(guild)} must not be invented or coerced`);
+    assert.deepEqual(h.forwarded, []);
+  }
+  const h = harness();
+  const res = await worker.fetch(adminRequest("GET", `/admin/v1/${PROBE_VERB}`,
+    `Bearer ${ADMIN_BEARER}`), h.env, h.ctx);
+  assert.equal(res.status, 400, "GET without target guild is invalid");
+  assert.deepEqual(h.forwarded, []);
+});
+
+test("caller identity and scope overrides cannot replace request bearer binding", async () => {
+  const h = harness();
+  const req = adminRequest("POST", "/admin/v1/event.read", `Bearer ${INVALID_BEARER}`, {
+    guild_id: TARGET_GUILD, admin_bearer: ADMIN_BEARER, token_id: TOKEN_ID,
+    scope: "admin", holder_kind: "human",
+    params: { token_id: TOKEN_ID, scope: "admin" },
+  });
+  req.headers.set("x-two-scope", "admin");
+  req.headers.set("x-two-guild", "987654321098765432");
+  const res = await worker.fetch(req, h.env, h.ctx);
+  await assertEdge401(res, "unbound argument override");
+  assert.equal(h.forwarded.length, 1);
+  const forward = h.forwarded[0]!;
+  const body = JSON.parse(new TextDecoder().decode(forward.bytes));
+  assert.equal(body.admin_bearer, INVALID_BEARER, "proof comes only from request identity");
+  assert.equal(forward.headers["x-two-scope"], "read", "scope comes from code, not caller headers");
+  assert.equal(forward.headers["x-two-guild"], TARGET_GUILD);
+});
+
+test("known verbs relay authoritative refusal and never become edge control tools", async () => {
+  for (const verb of ["event.read", "moderation.warn", "role.assign"]) {
+    const h = harness();
+    const res = await worker.fetch(adminRequest("POST", `/admin/v1/${verb}`,
+      `Bearer ${ADMIN_BEARER}`, { guild_id: TARGET_GUILD }), h.env, h.ctx);
+    assert.equal(res.status, 403, `${verb}: closed until audit exists`);
+    assert.deepEqual(await res.json(), {
+      ok: false, request_id: "ABCDEFGHJKMNPQRSTVWXYZ012345",
+      error: { code: "action_not_allowed", message: "request refused", retryable: false },
+    });
+    assert.equal(h.forwarded.length, 1, "no retry or local executor");
+  }
 });
 
 test("brute-force guessing trips the cap", async () => {
@@ -364,11 +462,11 @@ test("brute-force guessing trips the cap", async () => {
       new Request(`https://probe.invalid/admin/v1/${PROBE_VERB}`, {
         method: "POST",
         headers: {
-          authorization: `Bearer wrong-guess-${i}`,
+          authorization: `Bearer malformed-${i}`,
           "content-type": "application/json",
           "cf-connecting-ip": "203.0.113.77",
         },
-        body: JSON.stringify({ probe: "acceptance" }),
+        body: JSON.stringify({ guild_id: TARGET_GUILD, params: { probe: "acceptance" } }),
       }),
       h.env,
       h.ctx,

@@ -1,6 +1,5 @@
-//! Scope-claim signing pins for slice 1 ([TOG-35921](/TOG/issues/TOG-35921)
-//! section 3.2; acceptance [TOG-36192](/TOG/issues/TOG-36192), build
-//! [TOG-36201](/TOG/issues/TOG-36201)).
+//! Scope-claim signing pins for slice 1 of the approved admin API spec,
+//! section 3.2 (public synthetic fixtures only).
 //!
 //! This file is the GREEN side of the acceptance pair: every test here passes
 //! before and after the slice-1 build. It pins what the Builder must NOT

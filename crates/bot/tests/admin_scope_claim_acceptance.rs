@@ -1,6 +1,5 @@
 //! Failing acceptance for slice-1 scope-claim verification
-//! ([TOG-35921](/TOG/issues/TOG-35921) section 3.2; acceptance
-//! [TOG-36192](/TOG/issues/TOG-36192), build [TOG-36201](/TOG/issues/TOG-36201)).
+//! (approved admin API spec sections 3.2 and 5.2).
 //!
 //! The RED side of the acceptance pair: every `valid_` / `fail_closed` /
 //! `scoped_*` test below FAILS against the current binary (the receiver only
@@ -148,6 +147,7 @@ struct SignedRequest {
     signature: String,
     scope: Option<String>,
     guild: Option<String>,
+    extra_headers: Vec<(&'static str, String)>,
 }
 
 /// Mint a scope-claimed request whose tag covers `sign_scope`/`sign_guild`
@@ -169,6 +169,7 @@ fn mint(
         signature: sign_scoped(secret, &timestamp, &nonce, raw, sign_scope, sign_guild),
         scope: send_scope.map(str::to_owned),
         guild: send_guild.map(str::to_owned),
+        extra_headers: Vec::new(),
     }
 }
 
@@ -181,6 +182,7 @@ fn mint_v1(secret: &str, raw: &[u8]) -> SignedRequest {
         nonce,
         scope: None,
         guild: None,
+        extra_headers: Vec::new(),
     }
 }
 
@@ -245,6 +247,8 @@ async fn spawn_bot(fixture_url: &str) -> (Bot, SocketAddr) {
         .env("GUILD_ID", TWO_STAGING_GUILD_ID)
         .env("DATABASE_URL", fixture_url)
         .env("TWO_INTERNAL_ACTIONS", "1")
+        .env("TWO_INTERNAL_ALLOW_EVENT_READ", "1")
+        .env("TWO_INTERNAL_ALLOW_SETTINGS", "1")
         .env("TWO_INTERNAL_BIND", format!("127.0.0.1:{receiver_port}"))
         .env(
             "TWO_INTERNAL_KEYS",
@@ -344,6 +348,15 @@ fn post_with_fresh_headers(
     key_id: &str,
     make: impl Fn() -> (SignedRequest, Option<String>),
 ) -> Result<(String, SignedRequest), String> {
+    post_body_with_fresh_headers(addr, key_id, PROBE_BODY, make)
+}
+
+fn post_body_with_fresh_headers(
+    addr: SocketAddr,
+    key_id: &str,
+    raw: &str,
+    make: impl Fn() -> (SignedRequest, Option<String>),
+) -> Result<(String, SignedRequest), String> {
     const ATTEMPTS: usize = 3;
     let mut last_note = String::from("no attempts");
     for _ in 0..ATTEMPTS {
@@ -363,7 +376,8 @@ fn post_with_fresh_headers(
         if let Some(key) = &idempotency {
             headers.push(("idempotency-key", key.clone()));
         }
-        match raw_post(addr, PROBE_BODY, &headers) {
+        headers.extend(signed.extra_headers.clone());
+        match raw_post(addr, raw, &headers) {
             Ok(response) if status_code(&response).is_some() => return Ok((response, signed)),
             Ok(response) => {
                 last_note = describe_response(&response);
@@ -514,8 +528,8 @@ async fn scope_claim_tamper_matrix_refuses_indistinguishably() {
     // cases below must match this same body, not merely the status.
     let (bad_signature, _) = post_with_fresh_headers(addr, FIXTURE_KEY_ID, || {
         let mut signed = mint_v1(&secret, PROBE_BODY.as_bytes());
-        signed.signature.pop();
-        signed.signature.push('0');
+        let last = signed.signature.pop().expect("signature byte");
+        signed.signature.push(if last == '0' { '1' } else { '0' });
         (signed, None)
     })
     .expect("bad-signature refusal");
@@ -718,6 +732,318 @@ async fn scoped_requests_ignore_idempotency_key_for_verify() {
         (0, 0),
         "dispatch refusals claim nothing and audit nothing"
     );
+    bot.stop().await;
+    db.close().await.expect("drops fixture database");
+}
+
+// Bearer proof is distinct from service authentication. These are real receiver
+// tests; the binding module's local scope checks are never registry authority.
+const TOKEN_ID: &str = "adm_0123456789abcdef";
+const TOKEN_SECRET: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+fn bearer() -> String {
+    format!("{TOKEN_ID}.{TOKEN_SECRET}")
+}
+
+async fn seed_read_token(pool: &sqlx::PgPool) {
+    // The frozen slice-0 base lacks holder columns. Exercise that baseline and
+    // the approved repaired schema without inventing a migration in tests.
+    let has_holder: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'admin_api_tokens'
+         AND column_name = 'holder_kind')",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("inspect fixture schema");
+    let query = if has_holder {
+        sqlx::query(
+            "INSERT INTO admin_api_tokens
+             (token_id, secret_hash, scopes, guild_ids, holder_id, holder_kind, issued_at, expires_at)
+             VALUES ($1, $2, ARRAY['read'], ARRAY[123456789012345678]::bigint[],
+                     'fixture-reader', 'human', now(), now() + interval '1 hour')",
+        )
+    } else {
+        sqlx::query(
+            "INSERT INTO admin_api_tokens
+             (token_id, secret_hash, scopes, guild_ids, issued_at, expires_at)
+             VALUES ($1, $2, ARRAY['read'], ARRAY[123456789012345678]::bigint[],
+                     now(), now() + interval '1 hour')",
+        )
+    };
+    query
+        .bind(TOKEN_ID)
+        .bind(body_hash(TOKEN_SECRET.as_bytes()))
+        .execute(pool)
+        .await
+        .expect("seed hash-only read token");
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM admin_api_tokens WHERE token_id = $1")
+            .bind(TOKEN_ID)
+            .fetch_one(pool)
+            .await
+            .expect("confirm registry fixture");
+    assert_eq!(count, 1, "refusal must test a real registered identity");
+}
+
+fn admin_body(action: &str, guild: &str, proof: Option<&str>) -> String {
+    let mut value = serde_json::json!({
+        "action": action, "guild_id": guild, "params": {},
+        "token_id": TOKEN_ID, "holder_kind": "human",
+    });
+    if let Some(proof) = proof {
+        value["admin_bearer"] = Value::String(proof.to_owned());
+    }
+    value.to_string()
+}
+
+#[tokio::test]
+async fn service_key_alone_cannot_impersonate_a_registered_bearer() {
+    let Some(db) = migrated().await else { return };
+    seed_read_token(db.pool()).await;
+    let (bot, addr) = spawn_bot(&db_url(&db)).await;
+    let wrong_secret = format!("{TOKEN_ID}.{}", "z".repeat(40));
+    for proof in [None, Some(wrong_secret.as_str())] {
+        let raw = admin_body("event.read", PROBE_GUILD, proof);
+        let (response, signed) = post_body_with_fresh_headers(addr, FIXTURE_KEY_ID, &raw, || {
+            (
+                mint(
+                    &fixture_secret(),
+                    raw.as_bytes(),
+                    "read",
+                    PROBE_GUILD,
+                    Some("read"),
+                    Some(PROBE_GUILD),
+                ),
+                None,
+            )
+        })
+        .expect("signed bearer impersonation attempt");
+        assert_eq!(
+            status_code(&response),
+            Some(401),
+            "valid service MAC and registered token_id are not bearer proof: {}",
+            describe_response(&response)
+        );
+        assert_eq!(error_of(&response)["code"], "unauthorized");
+        assert!(
+            nonce_burned(db.pool(), &signed.nonce).await,
+            "service MAC verifies and burns nonce before registry refusal"
+        );
+        assert!(
+            !response.contains(TOKEN_SECRET),
+            "auth failures never echo token secrets"
+        );
+        assert!(
+            !response.contains(&wrong_secret),
+            "auth failures never echo presented proof"
+        );
+    }
+    assert_eq!(
+        terminal_rows(db.pool()).await,
+        (0, 0),
+        "no execution intent or receipt"
+    );
+    bot.stop().await;
+    db.close().await.expect("drops fixture database");
+}
+
+#[tokio::test]
+async fn freshly_signed_claims_cannot_widen_registry_scope_or_guild() {
+    let Some(db) = migrated().await else { return };
+    seed_read_token(db.pool()).await;
+    let (bot, addr) = spawn_bot(&db_url(&db)).await;
+    let proof = bearer();
+    let cases = [
+        ("widened scope", "event.read", "admin", PROBE_GUILD),
+        ("widened guild", "event.read", "read", "987654321098765432"),
+        (
+            "ungranted write",
+            "moderation.warn",
+            "moderate",
+            PROBE_GUILD,
+        ),
+    ];
+    for (label, action, scope, guild) in cases {
+        let raw = admin_body(action, guild, Some(&proof));
+        let (response, signed) = post_body_with_fresh_headers(addr, FIXTURE_KEY_ID, &raw, || {
+            (
+                mint(
+                    &fixture_secret(),
+                    raw.as_bytes(),
+                    scope,
+                    guild,
+                    Some(scope),
+                    Some(guild),
+                ),
+                None,
+            )
+        })
+        .expect("freshly signed authority-widening attempt");
+        assert_eq!(
+            status_code(&response),
+            Some(403),
+            "{label}: genuine bearer plus forged service claim must refuse: {}",
+            describe_response(&response)
+        );
+        assert!(
+            nonce_burned(db.pool(), &signed.nonce).await,
+            "{label}: valid MAC reached authorization"
+        );
+        assert!(
+            !response.contains(TOKEN_SECRET),
+            "{label}: secret is transient auth input only"
+        );
+    }
+    assert_eq!(
+        terminal_rows(db.pool()).await,
+        (0, 0),
+        "no execution intent or receipt"
+    );
+    bot.stop().await;
+    db.close().await.expect("drops fixture database");
+}
+
+#[tokio::test]
+async fn known_and_unknown_scoped_verbs_stay_closed_even_with_live_bearer_and_flags() {
+    let Some(db) = migrated().await else { return };
+    seed_read_token(db.pool()).await;
+    let (bot, addr) = spawn_bot(&db_url(&db)).await;
+    let proof = bearer();
+    // event.read/settings.get flags are explicitly ON in this process. A
+    // default-off flag, bogus verb alone, or invalid MAC cannot prove closure.
+    for action in [
+        "event.read",
+        "settings.get",
+        "probe.no_such_verb_acceptance",
+    ] {
+        let raw = admin_body(action, PROBE_GUILD, Some(&proof));
+        let (response, signed) = post_body_with_fresh_headers(addr, FIXTURE_KEY_ID, &raw, || {
+            (
+                mint(
+                    &fixture_secret(),
+                    raw.as_bytes(),
+                    "read",
+                    PROBE_GUILD,
+                    Some("read"),
+                    Some(PROBE_GUILD),
+                ),
+                None,
+            )
+        })
+        .expect("closed scoped call");
+        assert_eq!(
+            status_code(&response),
+            Some(403),
+            "{action}: authentication succeeds but no scoped verb executes: {}",
+            describe_response(&response)
+        );
+        assert_eq!(
+            error_of(&response)["code"],
+            "action_not_allowed",
+            "{action}: closed dispatch refusal"
+        );
+        assert!(
+            nonce_burned(db.pool(), &signed.nonce).await,
+            "{action}: valid scoped MAC burns nonce"
+        );
+        assert_eq!(
+            terminal_rows(db.pool()).await,
+            (0, 0),
+            "{action}: never claims or executes"
+        );
+    }
+    bot.stop().await;
+    db.close().await.expect("drops fixture database");
+}
+
+#[tokio::test]
+async fn legacy_v1_with_admin_bearer_cannot_bypass_the_scoped_closed_surface() {
+    let Some(db) = migrated().await else { return };
+    seed_read_token(db.pool()).await;
+    let (bot, addr) = spawn_bot(&db_url(&db)).await;
+    let proof = bearer();
+    let raw = admin_body("event.read", PROBE_GUILD, Some(&proof));
+    let (response, _) = post_body_with_fresh_headers(addr, FIXTURE_KEY_ID, &raw, || {
+        (mint_v1(&fixture_secret(), raw.as_bytes()), None)
+    })
+    .expect("legacy admin bearer call");
+    assert_eq!(
+        status_code(&response),
+        Some(401),
+        "v1 is not a downgrade escape for admin bearer requests: {}",
+        describe_response(&response)
+    );
+    assert_eq!(error_of(&response)["code"], "unauthorized");
+    assert_eq!(
+        terminal_rows(db.pool()).await,
+        (0, 0),
+        "no execution through legacy envelope"
+    );
+    bot.stop().await;
+    db.close().await.expect("drops fixture database");
+}
+
+#[tokio::test]
+async fn malformed_self_signed_and_duplicate_claim_headers_fail_before_nonce_burn() {
+    let Some(db) = migrated().await else { return };
+    let (bot, addr) = spawn_bot(&db_url(&db)).await;
+    for (scope, guild) in [
+        ("READ", PROBE_GUILD),
+        ("read,admin", PROBE_GUILD),
+        ("read", "0"),
+        ("read", "18446744073709551616"),
+        ("read", "-1"),
+    ] {
+        let (response, signed) = post_with_fresh_headers(addr, FIXTURE_KEY_ID, || {
+            (
+                mint(
+                    &fixture_secret(),
+                    PROBE_BODY.as_bytes(),
+                    scope,
+                    guild,
+                    Some(scope),
+                    Some(guild),
+                ),
+                None,
+            )
+        })
+        .expect("malformed self-signed claims");
+        assert_eq!(
+            status_code(&response),
+            Some(401),
+            "malformed signed claim refuses"
+        );
+        assert!(
+            !nonce_burned(db.pool(), &signed.nonce).await,
+            "invalid grammar burns nothing"
+        );
+    }
+    for (header, value) in [("x-two-scope", PROBE_SCOPE), ("x-two-guild", PROBE_GUILD)] {
+        let (response, signed) = post_with_fresh_headers(addr, FIXTURE_KEY_ID, || {
+            let mut signed = mint(
+                &fixture_secret(),
+                PROBE_BODY.as_bytes(),
+                PROBE_SCOPE,
+                PROBE_GUILD,
+                Some(PROBE_SCOPE),
+                Some(PROBE_GUILD),
+            );
+            signed.extra_headers.push((header, value.to_owned()));
+            (signed, None)
+        })
+        .expect("duplicate scope/guild headers");
+        assert_eq!(
+            status_code(&response),
+            Some(401),
+            "duplicate {header} refuses even when identical"
+        );
+        assert!(
+            !nonce_burned(db.pool(), &signed.nonce).await,
+            "duplicate header burns nothing"
+        );
+    }
+    assert_eq!(terminal_rows(db.pool()).await, (0, 0));
     bot.stop().await;
     db.close().await.expect("drops fixture database");
 }
