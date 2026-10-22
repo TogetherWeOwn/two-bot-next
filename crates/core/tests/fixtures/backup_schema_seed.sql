@@ -251,6 +251,9 @@ VALUES ('100000000000000001', '100000000000000011', 'Backup event', '2026-08-02T
 INSERT INTO scheduled_events_claim (guild_id, epoch)
 VALUES ('100000000000000001', '2026-08-01T10:00:00.000Z'),
        ('100000000000000002', '2026-08-01T11:00:00.000Z');
+INSERT INTO scheduled_events_tombstone (guild_id, event_id, deleted_at)
+VALUES ('100000000000000001', '100000000000000012', '2026-08-01T10:00:00.000Z'),
+       ('100000000000000002', '100000000000000013', '2026-08-01T11:00:00.000Z');
 INSERT INTO counter_snapshots
     (guild_id, human_member_count, human_member_count_at, online_count, online_count_at)
 VALUES ('100000000000000001', 123, '2026-08-01T09:00:00.000Z', 13, '2026-08-01T09:01:00.000Z');
@@ -319,7 +322,7 @@ VALUES (79, '100000000000000001', 'TWO_STICKY_ENABLED', NULL,
         '100000000000000002', '2026-08-01T10:00:00.123456Z'),
        (91, '100000000000000001', 'TWO_FEEDS_ENABLED', 'false', NULL,
         '100000000000000004', '2026-08-01T10:01:00Z');
--- Admin API token registry (0452/0453): one live read token and one revoked
+-- Admin API token registry (0454/0455): one live read token and one revoked
 -- read+moderate token. Hashes are hash-shaped seed data (md5 doubled to 64
 -- hex), never real secrets; the sha256 property is pinned by the slice-0
 -- acceptance suite, not the backup roundtrip.

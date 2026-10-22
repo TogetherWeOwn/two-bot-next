@@ -47,6 +47,7 @@ time = { workspace = true, optional = true }
 axum = { workspace = true }
 anyhow = { workspace = true }
 two-bot-cutover = { version = "0.4.0", path = "../cutover" }
+two-bot-store = { version = "0.4.0", path = "../store" }
 sqlx = { workspace = true }
 two-bot-testsupport = { path = "../testsupport", version = "0.4.0" }
 futures-util = { workspace = true, features = ["sink"] }

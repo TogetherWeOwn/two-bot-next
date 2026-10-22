@@ -108,6 +108,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'game_activity_guild_aggregates', 'table'),
     ('public', 'assistant_monthly_builds', 'table'),
     ('public', 'scheduled_events_claim', 'table'),
+    ('public', 'scheduled_events_tombstone', 'table'),
     ('public', 'admin_api_tokens', 'table'),
     ('public', '_sqlx_migrations', 'ledger'),
     ('public', '_two_bot_migrations', 'ledger'),

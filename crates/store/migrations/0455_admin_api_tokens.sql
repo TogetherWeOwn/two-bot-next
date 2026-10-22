@@ -1,16 +1,17 @@
--- 0452_admin_api_tokens: scoped-token registry for the admin API (slice 0).
+-- 0455_admin_api_tokens: store-chain mirror of the admin token registry.
+-- Renumbered from 0453: main claimed 0452/0453 for the scheduled-events
+-- tombstones while this slice was in review. Never merged under the old
+-- number, so no deployment applied it there.
 --
--- `admin_api_tokens` is the authoritative registry behind container
--- authorization of admin API calls: one row per operator-issued token with
--- its sha256 secret hash (the secret itself is never stored), scope set,
--- guild allowlist, bounded lifetime and revocation/last-use lifecycle
--- columns. Slice 0 ships the table plus the pure scope/authorize predicates
--- (`InternalFlags::admin_token_authorizes`); no binary reads or writes this
--- table yet, so dropping it breaks nothing. `IF NOT EXISTS` throughout,
--- matching the S6 convention, so cross-running the store and cutover chains
--- against one schema stays safe in either order. Rollback is
--- `DROP TABLE IF EXISTS admin_api_tokens`; re-applying this file restores
--- the registry. The live-lookup index builds inside the migration
+-- Same `admin_api_tokens` table as cutover 0454 (token id, sha256 secret
+-- hash, scopes, guild allowlist, bounded lifetime, revocation/last-use
+-- lifecycle columns). The store chain alone never reaches
+-- staging/production; this mirror keeps single-chain checkouts and the
+-- roles scratch database on the same shape. `IF NOT EXISTS` throughout, so
+-- cross-running both chains against one schema stays safe in either order.
+-- Rollback is `DROP TABLE IF EXISTS admin_api_tokens`. Numbered 0455
+-- because cutover owns 0454; global migration numbers remain unique across
+-- both chains. The live-lookup index builds inside the migration
 -- transaction (CONCURRENTLY cannot run there, and concurrent builds
 -- deadlock CI's migrators); the table is empty at first apply. Bot schema
 -- range: 0001-0999. Database tests use test containers only.
