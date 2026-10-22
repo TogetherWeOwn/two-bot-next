@@ -75,6 +75,8 @@
 //!
 //! [TOG-35921]: https://github.com/TogetherWeOwn/two-bot-next
 
+#![cfg(test)]
+
 use serde_json::json;
 use sqlx::PgPool;
 use two_bot_testsupport::TestDatabase;
@@ -207,6 +209,7 @@ fn assert_unique_violation<T>(result: Result<T, sqlx::Error>, what: &str) {
 /// Mint one confirm expiring `expires_in_seconds` from now (negative = already
 /// expired). The builder's production mint wraps this shape with
 /// `expires_in_seconds = 300` and unit tests pinning that TTL.
+#[allow(clippy::too_many_arguments)]
 async fn mint(
     pool: &PgPool,
     confirm_id: &str,
