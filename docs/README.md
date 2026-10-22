@@ -188,6 +188,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Expected-join tests](expected-joins-acceptance.md)
 - [E2E command matrix](staging-e2e-command-matrix.md)
 - [E2E record form](staging-e2e-run-record.md)
+- [Fixture census](staging-fixture-census.md)
 - [Health-contract probe](staging-health-contract-probe.md)
 - [Migration claim](staging-migrate-claim.md)
 - [Rollout acceptance](staging-rollout-gate.md)
