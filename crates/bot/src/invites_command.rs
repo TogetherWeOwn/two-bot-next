@@ -39,7 +39,7 @@ WITH latest AS (
     SELECT inviter FROM attributed
     WHERE inviter <> member_id AND
           CASE WHEN inviter ~ '^[1-9][0-9]{0,19}$'
-               THEN inviter::numeric <= 18446744073709551615
+               THEN inviter::numeric <= $3::text::numeric
                ELSE false END
 ), counts AS (
     SELECT inviter, count(*) AS attributed_count FROM valid GROUP BY inviter
@@ -174,6 +174,7 @@ async fn counts(
     let rows = sqlx::query_as(COUNTS_SQL)
         .bind(guild.to_string())
         .bind(target.to_string())
+        .bind(u64::MAX.to_string())
         .fetch_all(&mut *tx)
         .await?;
     tx.commit().await?;
@@ -204,11 +205,12 @@ pub(crate) async fn current_inviter(
         SELECT inviter FROM attributed
         WHERE inviter <> $2 AND
               CASE WHEN inviter ~ '^[1-9][0-9]{0,19}$'
-                   THEN inviter::numeric <= 18446744073709551615
+                   THEN inviter::numeric <= $3::text::numeric
                    ELSE false END"#,
     )
     .bind(guild.to_string())
     .bind(member.to_string())
+    .bind(u64::MAX.to_string())
     .fetch_optional(&mut *tx)
     .await?;
     tx.commit().await?;
