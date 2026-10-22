@@ -239,12 +239,21 @@ fn hostile_rank_name_renders_neutralized_single_line() {
         3,
         "the hostile name collapses to one line, got {rendered:?}"
     );
-    for raw in ["<@", "@everyone", "**", "`code`"] {
+    for raw in ["<@", "@everyone", "`code`"] {
         assert!(
             !rendered.contains(raw),
             "no raw {raw:?} survives, got {rendered:?}"
         );
     }
+    let name_line = rendered.lines().next().expect("rank has a name line");
+    let name_slot = name_line
+        .strip_prefix("**")
+        .and_then(|rest| rest.strip_suffix("**"))
+        .expect("the name line keeps the pinned bold wrapper");
+    assert!(
+        !name_slot.contains("**"),
+        "no raw \"**\" survives inside the name slot, got {rendered:?}"
+    );
     assert!(
         rendered.contains('\u{200b}'),
         "mentions are neutralized with a zero-width break, got {rendered:?}"
