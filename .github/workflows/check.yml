@@ -276,6 +276,9 @@ jobs:
       - name: Scratch drill schema provenance (offline)
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_restore_drill_schema.py' -v
 
+      - name: Deploy unit bounds, failure hook and drill age refusal (offline)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_deploy_units.py' -v
+
       - name: Cutover runbook links resolve (offline)
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cutover_doc_links.py' -v
 
