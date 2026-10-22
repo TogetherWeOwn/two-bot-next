@@ -241,8 +241,14 @@ verification needs all-time counts.
 
 The run uploads `staging-privacy-verify-read-<run_id>.json` (14 days):
 guild alias, collection timestamp, the six counts, the two sweep counts,
-and the capped receipt rows. Member, guild pins, sources and metadata
-never reach the artifact, the log or the step summary.
+and the capped receipt rows. Only the exact identity-free actor labels
+`member:self-serve` and `operator:fixture-check` may be published. Any other
+actor fails the whole read without an artifact or summary, even if it has
+a valid service shape or occurs only in the overflow witness. Labels are
+not normalized or replaced. The independent artifact validator enforces
+the same closed allowlist without needing member or guild bindings. Member,
+guild pins, sources and metadata never reach the artifact, the log or the
+step summary.
 
 ## Retention and explicit exceptions
 

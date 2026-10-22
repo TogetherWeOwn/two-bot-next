@@ -481,10 +481,15 @@ class ReadTests(unittest.TestCase):
                 self.assertFalse(fixture.output.exists())
                 self.assertIn("unexpected shape", err)
                 self.assertNotIn("1545644954272137297", err + out)
-        # The 128-byte boundary passes.
+        # The service accepts this shape, but an unreviewed label must not publish.
+        self.assertTrue(reader.valid_actor("x" * 128))
         fixture = Fixture(self, audit=f"{'x' * 128},2026-10-22T07:01:00.000Z\n")
-        code, _, err = fixture.run()
-        self.assertEqual((code, err), (0, ""))
+        code, out, err = fixture.run()
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("not approved", err)
+        self.assertFalse(fixture.output.exists())
+        self.assertFalse(fixture.summary.exists())
 
     def test_an_actor_naming_the_fixture_subject_fails_closed(self):
         stamp = "2026-10-22T07:01:00.000Z\n"
@@ -498,6 +503,80 @@ class ReadTests(unittest.TestCase):
                 self.assertIn("fixture subject", err)
                 self.assertNotIn(MEMBER, err + out)
                 self.assertNotIn("1545644954272137297", err + out)
+
+    def test_an_actor_containing_the_member_id_fails_closed_for_both_aliases(self):
+        for alias in ("g", "h"):
+            for label, actor in (("prefix", f"member:{MEMBER}"),
+                                 ("suffix", f"{MEMBER}:fixture"),
+                                 ("embedded", f"member:{MEMBER}:fixture")):
+                with self.subTest(alias=alias, case=label):
+                    fixture = Fixture(self, audit=f"{actor},2026-10-22T07:01:00.000Z\n")
+                    code, out, err = fixture.run(guild=alias)
+                    self.assertEqual(code, 1)
+                    self.assertEqual(out, "")
+                    self.assertIn("not approved", err)
+                    self.assertFalse(fixture.output.exists())
+                    self.assertFalse(fixture.summary.exists())
+                    for value in (actor, MEMBER, reader.pins.STAGING_GUILD_ID, H_PIN):
+                        self.assertNotIn(value, out + err)
+
+    def test_actors_naming_either_guild_fail_closed_for_both_aliases(self):
+        for alias in ("g", "h"):
+            for guild_label, pin in (("G", reader.pins.STAGING_GUILD_ID), ("H", H_PIN)):
+                for form, actor in (("bare", pin), ("embedded", f"operator:{pin}:fixture")):
+                    with self.subTest(alias=alias, guild=guild_label, form=form):
+                        fixture = Fixture(self, audit=f"{actor},2026-10-22T07:01:00.000Z\n")
+                        code, out, err = fixture.run(guild=alias)
+                        self.assertEqual(code, 1)
+                        self.assertEqual(out, "")
+                        self.assertIn(err, (
+                            "failed: an audit row named the fixture subject; nothing was written\n",
+                            "failed: an audit actor was not approved; nothing was written\n"))
+                        self.assertFalse(fixture.output.exists())
+                        self.assertFalse(fixture.summary.exists())
+                        for value in (actor, MEMBER, reader.pins.STAGING_GUILD_ID, H_PIN):
+                            self.assertNotIn(value, out + err)
+
+    def test_unreviewed_actor_text_is_not_published_or_normalized(self):
+        for label, actor in (("unknown", "operator:unreviewed"),
+                             ("leading space", " member:self-serve"),
+                             ("trailing space", "member:self-serve "),
+                             ("case change", "Member:self-serve"),
+                             ("suffix", "operator:fixture-check:extra")):
+            with self.subTest(case=label):
+                fixture = Fixture(self, audit=f"{actor},2026-10-22T07:01:00.000Z\n")
+                code, out, err = fixture.run()
+                self.assertEqual(code, 1)
+                self.assertEqual(out, "")
+                self.assertIn("not approved", err)
+                self.assertNotIn(actor, err)
+                self.assertFalse(fixture.output.exists())
+                self.assertFalse(fixture.summary.exists())
+
+    def test_an_unapproved_overflow_witness_prevents_partial_publication(self):
+        rows = "member:self-serve,2026-10-22T07:01:00.000Z\n" * 10
+        rows += f"operator:{MEMBER}:fixture,2026-10-22T07:02:00.000Z\n"
+        fixture = Fixture(self, audit=rows)
+        code, out, err = fixture.run()
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("not approved", err)
+        self.assertNotIn(MEMBER, err)
+        self.assertFalse(fixture.output.exists())
+        self.assertFalse(fixture.summary.exists())
+
+    def test_final_validation_stops_an_identity_bearing_row_if_the_parser_is_bypassed(self):
+        fixture = Fixture(self)
+        with mock.patch.object(reader, "parse_audit_rows", return_value=[{
+                "actor": f"operator:{MEMBER}:fixture",
+                "opted_out_at": "2026-10-22T07:01:00.000Z"}]):
+            code, out, err = fixture.run()
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertEqual(err, "failed: the artifact failed its own shape check; nothing was written\n")
+        self.assertNotIn(MEMBER, err)
+        self.assertFalse(fixture.output.exists())
+        self.assertFalse(fixture.summary.exists())
 
     def test_a_wrong_server_identity_stops_before_the_counts_are_read(self):
         for identity in ("two_bot_migrator,two_bot\n", "two_bot_privacy_verify_ro,neondb\n",
@@ -605,6 +684,20 @@ class ShapeTests(unittest.TestCase):
             {table: 0 for table in reader.COUNT_TABLES},
             {table: 0 for table in reader.SWEEP_TABLES},
             [{"actor": "member:self-serve", "opted_out_at": "2026-10-22T07:01:00.000Z"}])
+
+    def test_final_validation_rejects_unreviewed_actors_without_fixture_context(self):
+        actors = (("member", MEMBER), ("G", reader.pins.STAGING_GUILD_ID), ("H", H_PIN))
+        for alias in ("g", "h"):
+            for label, value in actors:
+                for form, actor in (("bare", value), ("embedded", f"operator:{value}:fixture")):
+                    with self.subTest(alias=alias, subject=label, form=form):
+                        artifact = self.good()
+                        artifact["guild"] = alias
+                        artifact["audit"]["rows"][0]["actor"] = actor
+                        self.assertEqual(reader.artifact_errors(artifact), ["audit row 1"])
+        artifact = self.good()
+        artifact["audit"]["rows"][0]["actor"] = "operator:unreviewed"
+        self.assertEqual(reader.artifact_errors(artifact), ["audit row 1"])
 
     def test_the_artifact_contract_rejects_extra_fields(self):
         good = self.good()

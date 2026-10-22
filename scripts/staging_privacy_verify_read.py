@@ -51,8 +51,10 @@ Fences, all before the first connection (exit 2, nothing was sent):
   * every count must parse as an integer within its sanity ceiling (below);
     an out-of-range count fails closed before an artifact is written;
   * every receipt actor must mirror the service's actor shape (nonempty,
-    at most 128 bytes, no control characters) and every receipt timestamp
-    must be a real UTC instant; anything else fails closed;
+    at most 128 bytes, no control characters) AND exactly match a reviewed,
+    identity-free fixture label (`member:self-serve` or
+    `operator:fixture-check`). Every receipt timestamp must be a real UTC
+    instant; anything else fails closed, including the overflow witness;
   * the database login comes only from
     $TWO_BOT_STAGING_PRIVACY_RO_DATABASE_URL and must name role
     two_bot_privacy_verify_ro on database two_bot at the exact host pinned
@@ -133,6 +135,10 @@ AUDIT_ROW_CAP = 10
 AUDIT_QUERY_LIMIT = AUDIT_ROW_CAP + 1  # one extra row detects overflow
 COUNT_SANITY_MAX = 1_000_000
 ACTOR_MAX_BYTES = 128
+# Caller-supplied attribution is untrusted even when its service shape is valid.
+# Publish only these identity-free fixture labels; additions need code review,
+# not a dispatcher input or an environment binding.
+PUBLISHABLE_ACTORS = frozenset({"member:self-serve", "operator:fixture-check"})
 PSQL_TIMEOUT_SECONDS = 60
 
 INSTANT_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,3})?Z")
@@ -419,6 +425,8 @@ def parse_audit_rows(output, forbidden_actors=()):
             raise ReadFailed("a row had an unexpected shape; nothing was written")
         if raw[0] in forbidden_actors:
             raise ReadFailed("an audit row named the fixture subject; nothing was written")
+        if raw[0] not in PUBLISHABLE_ACTORS:
+            raise ReadFailed("an audit actor was not approved; nothing was written")
         rows.append({"actor": raw[0], "opted_out_at": raw[1]})
     if len(rows) > AUDIT_QUERY_LIMIT:
         raise ReadFailed("more rows than the query limit; nothing was written")
@@ -476,6 +484,7 @@ def artifact_errors(artifact):
     for index, row in enumerate(rows, start=1):
         if (not isinstance(row, dict) or set(row) != {"ordinal", "actor", "opted_out_at"}
                 or row["ordinal"] != index or not valid_actor(row["actor"])
+                or row["actor"] not in PUBLISHABLE_ACTORS
                 or recorded_instant(row["opted_out_at"]) is None):
             errors.append(f"audit row {index}")
     return errors
