@@ -61,10 +61,12 @@ for (const script of ['ownership-control.mjs', 'production-ownership-control.mjs
     OWNERSHIP_ACTOR: 'github-actions:1:abc',
   };
   const invoke = (body, args = ['status']) => {
-    const preload = `globalThis.fetch = async () => new Response(${JSON.stringify(body)}, {status: 200});`;
+    // The preload is a fixed string: the probe body travels via environment,
+    // never interpolated into constructed code.
+    const preload = 'globalThis.fetch = async () => new Response(process.env.OWNERSHIP_PROBE_BODY, {status: 200});';
     // execFile timeout kills a hung child; the node:test timeout alone only
     // marks the test failed while open pipes keep the runner alive.
-    return runFile(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(preload)}`, scriptPath, ...args], { env, timeout: 30_000 });
+    return runFile(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(preload)}`, scriptPath, ...args], { env: { ...env, OWNERSHIP_PROBE_BODY: body }, timeout: 30_000 });
   };
 
   test(`${script}: real CLI status prints only allowlisted fields`, { timeout: 30_000 }, async () => {
