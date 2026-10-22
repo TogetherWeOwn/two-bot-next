@@ -709,9 +709,13 @@ async fn events_mirror_swaps_atomically_and_keeps_last_good_on_failure() {
     assert_eq!(ids, vec!["event-1".to_owned()]);
 
     // A successful empty response deletes the last event (zero rows is real).
+    // The stamp moves forward: the swap above tombstoned `old` at OBSERVED_AT,
+    // and a tick at or below the tombstone high-water is stale relative to
+    // that delete, so it changes nothing.
+    const EMPTIED_AT: &str = "2026-08-25T20:00:01.000Z";
     {
         let _guard = gate.try_acquire().expect("acquire");
-        replace_events(&pool, GUILD, OBSERVED_AT, &[])
+        replace_events(&pool, GUILD, EMPTIED_AT, &[])
             .await
             .expect("empty swap");
     }
@@ -721,11 +725,12 @@ async fn events_mirror_swaps_atomically_and_keeps_last_good_on_failure() {
         .expect("count");
     assert_eq!(count.0, 0);
 
-    // Reseed, then a malformed response never reaches the store: the last
-    // good snapshot stays in place.
+    // Reseed at a still-newer stamp, then a malformed response never reaches
+    // the store: the last good snapshot stays in place.
+    const RESEEDED_AT: &str = "2026-08-25T20:00:02.000Z";
     {
         let _guard = gate.try_acquire().expect("acquire");
-        replace_events(&pool, GUILD, OBSERVED_AT, &seed)
+        replace_events(&pool, GUILD, RESEEDED_AT, &seed)
             .await
             .expect("reseed");
     }
