@@ -82,14 +82,14 @@ Write migrations that stay silent:
 
 Four exact `creating-index` findings are waived: the transactional event-store
 indexes in migrations 0444 and 0445, and the same-file new-table live-lookup
-indexes in migrations 0454 and 0455. The waiver matches only each migration path
+indexes in migrations 0456 and 0457. The waiver matches only each migration path
 and the complete normalized `CREATE INDEX` statement; any changed statement,
 additional index in any of these files, or index in another migration remains
 subject to strict lint. This exception is documented beside the checker
 configuration and is grounded in the observed CI deadlock: `CREATE INDEX
 CONCURRENTLY` waits on open snapshots while parallel disposable-database test
 migrators wait on SQLx's advisory lock, producing PostgreSQL `40P01`, and it
-cannot run inside the migration transaction at all. The 0454/0455 tables are
+cannot run inside the migration transaction at all. The 0456/0457 tables are
 empty at first apply, and the `IF NOT EXISTS` re-apply no-ops both statements.
 It does not relax any other migration check or the required lint gate.
 

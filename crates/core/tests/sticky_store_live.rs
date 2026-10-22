@@ -11,18 +11,21 @@
 //! lookalike hosts are not approved test containers. Each live test creates
 //! its own scratch schema and drops it at the end.
 //!
-//! Applies the real `0150_sticky_messages.sql` migration (single-statement
-//! `raw_sql`, so the checked-in file is what gets verified), then drives
+//! Applies the real `0150_sticky_messages.sql` migration plus the
+//! `0454_sticky_delivery_uncertainty.sql` fence column (single-statement
+//! `raw_sql`, so the checked-in files are what gets verified), then drives
 //! the card acceptance end to end: bursts coalesce to one re-post, remove
-//! clears state, updates preserve the live post columns.
+//! clears state, updates preserve the live post columns, and an uncertain
+//! delivery fences the channel past lease expiry until a definitive
+//! outcome or an administrator reconfigure.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{ConnectOptions, PgPool};
 use two_bot_core::sticky::store::{
-    audit_sticky, claim_sticky_post, delete_sticky, get_sticky, put_sticky, record_sticky_post,
-    release_sticky_post,
+    audit_sticky, claim_sticky_post, delete_sticky, get_sticky, mark_sticky_delivery_uncertain,
+    put_sticky, record_sticky_post, release_sticky_post,
 };
 use two_bot_core::sticky::{
     decide_activity, ActivityDecision, PutSticky, RemoveOutcome, StickyAudit, StickyAuditAction,
@@ -38,6 +41,8 @@ fn now_ms() -> i64 {
 
 const TEST_URL: &str = "postgres://agent_test:@agent-testdb:5432/agent_test";
 const DDL: &str = include_str!("../../cutover/migrations/0150_sticky_messages.sql");
+const DDL_UNCERTAINTY: &str =
+    include_str!("../../cutover/migrations/0454_sticky_delivery_uncertainty.sql");
 
 fn test_options(url: &str) -> Result<PgConnectOptions, &'static str> {
     // sqlx applies query-string overrides (host, hostaddr, user, dbname,
@@ -141,6 +146,10 @@ async fn sticky_live_round_trip() {
         .execute(&pool)
         .await
         .expect("0150 migration applies cleanly");
+    sqlx::raw_sql(DDL_UNCERTAINTY)
+        .execute(&pool)
+        .await
+        .expect("0454 fence migration applies cleanly");
 
     let now = now_ms();
     let (guild, held, burst, gone) = ("g-live", "c-held", "c-burst", "c-remove");
@@ -340,6 +349,11 @@ async fn sticky_live_legacy_upgrade() {
             .await
             .expect("upgrade legacy schema");
     }
+    // The fence column lands after the legacy upgrade, as in production.
+    sqlx::raw_sql(DDL_UNCERTAINTY)
+        .execute(&pool)
+        .await
+        .expect("fence migration applies to upgraded schema");
     let (typed,): (i64,) = sqlx::query_as(
         "SELECT count(*) FROM information_schema.columns
          WHERE table_schema = $1 AND data_type = 'timestamp with time zone'
@@ -468,5 +482,101 @@ async fn sticky_live_legacy_upgrade() {
         .await
         .expect("old and new audits coexist");
     assert_eq!(count, 2);
+    cleanup(pool, options, schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires reachable agent-testdb (STICKY_TEST_DATABASE_URL override); CI runs --ignored in ignored-db-stores"]
+async fn sticky_live_uncertainty_fence() {
+    let (pool, options, schema) = scratch_pool("fence").await;
+    sqlx::raw_sql(DDL)
+        .execute(&pool)
+        .await
+        .expect("0150 migration applies cleanly");
+    sqlx::raw_sql(DDL_UNCERTAINTY)
+        .execute(&pool)
+        .await
+        .expect("0454 fence migration applies cleanly");
+
+    let now = now_ms();
+    let (guild, channel) = ("g-fence", "c-fence");
+    assert!(put_sticky(
+        &pool,
+        &PutSticky {
+            guild_id: guild,
+            channel_id: channel,
+            body: "fenced sticky",
+            debounce_seconds: 1,
+            enabled: true,
+            actor_id: "admin-1",
+            now_ms: now,
+        },
+    )
+    .await
+    .expect("put sticky"));
+
+    // The atomic claim arms the fence: a probe past the 60s lease is held.
+    assert!(claim_sticky_post(&pool, guild, channel, "first", now)
+        .await
+        .expect("first claim")
+        .is_some());
+    assert!(
+        claim_sticky_post(&pool, guild, channel, "lease-probe", now + 120_000)
+            .await
+            .expect("probe past lease expiry")
+            .is_none(),
+        "uncertainty survives lease expiry"
+    );
+
+    // A proven no-send release disarms: the window reopens.
+    release_sticky_post(&pool, guild, channel, "first")
+        .await
+        .expect("release");
+    assert!(claim_sticky_post(&pool, guild, channel, "retry", now)
+        .await
+        .expect("retry claim")
+        .is_some());
+
+    // A confirmed record disarms too.
+    assert!(
+        record_sticky_post(&pool, guild, channel, "m-1", now, "retry")
+            .await
+            .expect("record")
+    );
+
+    // An obsolete attempt re-arms without a claim; only an administrator
+    // reconfigure clears it again.
+    mark_sticky_delivery_uncertain(&pool, guild, channel)
+        .await
+        .expect("re-arm fence");
+    assert!(
+        claim_sticky_post(&pool, guild, channel, "fenced", now + 120_000)
+            .await
+            .expect("fenced probe")
+            .is_none(),
+        "re-armed fence holds past debounce and lease"
+    );
+    assert!(!put_sticky(
+        &pool,
+        &PutSticky {
+            guild_id: guild,
+            channel_id: channel,
+            body: "fenced sticky v2",
+            debounce_seconds: 1,
+            enabled: true,
+            actor_id: "admin-2",
+            now_ms: now + 120_000,
+        },
+    )
+    .await
+    .expect("admin update"));
+    assert!(
+        claim_sticky_post(&pool, guild, channel, "after-admin", now + 120_000)
+            .await
+            .expect("post-admin claim")
+            .is_some(),
+        "administrator reconfigure resets the fence"
+    );
+
     cleanup(pool, options, schema).await;
 }

@@ -49,7 +49,7 @@ STRICT_RULES = frozenset(RULES) - {"dropping-object"}
 # These exact transactional indexes are narrowly waived: concurrent builds
 # deadlocked CI's parallel disposable-database migrators (40P01) while they
 # waited on SQLx's advisory lock with open snapshots, and CONCURRENTLY
-# cannot run inside sqlx's migration transaction at all. The 0454/0455
+# cannot run inside sqlx's migration transaction at all. The 0456/0457
 # entries index a table created earlier in the same file: empty at first
 # apply, and the IF NOT EXISTS re-apply is a no-op for both statements.
 # Keep every other creating-index finding strict, including any other
@@ -66,12 +66,12 @@ TRANSACTIONAL_INDEX_WAIVERS = {
         "on event_store (event_type, event_time, id)",
     ),
     (
-        "crates/cutover/migrations/0454_admin_api_tokens.sql",
+        "crates/cutover/migrations/0456_admin_api_tokens.sql",
         "create index if not exists idx_admin_api_tokens_live "
         "on admin_api_tokens (revoked_at, expires_at)",
     ),
     (
-        "crates/store/migrations/0455_admin_api_tokens.sql",
+        "crates/store/migrations/0457_admin_api_tokens.sql",
         "create index if not exists idx_admin_api_tokens_live "
         "on admin_api_tokens (revoked_at, expires_at)",
     ),

@@ -2,7 +2,8 @@
 
 ## Implementation and deployment boundary
 
-The container source integrates an opt-in private `POST /internal/actions`
+**Direct-container support is not the shipped Worker capability set.** The
+container source integrates an opt-in private `POST /internal/actions`
 listener with the durable store, announcement executor, event-read,
 event-mutation, settings, automations, moderation, membership and
 channel-moderation executors, nonce-commit authentication capability and strict
@@ -20,10 +21,16 @@ channel-moderation verbs (`moderation.purge`, `moderation.slowmode`,
 `moderation.lockdown`, `moderation.unlock`), regardless of the core action
 catalogue's broader defaults. Every other verb stays refused by the per-effect
 fences.
-The public health/readiness/metrics router has no action route. A merged,
-deployed receiver is dark until the Operator enables it, and it is reachable
-only through the staging-only Worker ingress described in
-[Staging ingress](#staging-ingress-default-dark).
+The public health/readiness/metrics router has no action route. The shipped
+Worker exposes only the staging ingress below, dark until separately enabled.
+Its explicit container wiring carries neither role keys nor the optional
+`TWO_INTERNAL_ALLOW_*` gates: `role.assign` has no configured role target, and
+the gated verbs above stay refused. The ungated `announcement.post` and
+`event.upsert` paths remain subject to receiver authentication, target validation
+and durable execution fences; this is not evidence that either has run.
+Adding secrets cannot enable unforwarded role/capability gates. Do not stage
+those inputs to try to enable them. Widening forwarding requires a separate
+reviewed change; direct-container configuration support is not rollout authority.
 
 No signing key, secret custodian or export authority is supplied by this code.
 Key creation and transfer into the website's staging secret store stay on HOLD
@@ -39,22 +46,74 @@ Production has no ingress, route, variable or secret for this receiver.
 | --- | --- |
 | Gate | Worker var `INTERNAL_ACTIONS_INGRESS = "1"`, declared only under `[env.staging.vars]`, **and** the Operator's Worker secret `TWO_INTERNAL_ACTIONS` exactly `1`. Either one missing, or any other value, leaves the route absent: today's response, no container contact. `wrangler/scripts/check-env-bindings.py` fails a top-level or production declaration and any `TWO_INTERNAL_*` var in `wrangler.toml`. |
 | Route | Exactly `POST /internal/actions`, no query string, no trailing slash. Everything else, including other methods, is today's behavior (404). |
-| Request bounds | `application/json` (optionally `; charset=utf-8`), no `Content-Encoding`, body 1 byte to 2 MiB (413 over, declared or streamed), body read within 5 s (408), whole request within 20 s (504). Per-IP token bucket (burst 20, 1/s) and 8 concurrent requests per isolate answer 429 before the container is touched. |
-| Headers | Only `X-TWO-Key-Id`, `X-TWO-Timestamp`, `X-TWO-Nonce`, `X-TWO-Signature` (required), `Idempotency-Key` and `Content-Type` reach the container, each a single printable token within the receiver's own length caps. `Authorization`, `Cookie`, `X-Forwarded-*` and any caller-supplied deployment header are dropped. The Worker stamps the deployment id itself. |
+| Request bounds | `application/json` (optionally `; charset=utf-8`), no `Content-Encoding`, body 1 byte to 2 MiB (413 over, declared or streamed); separate budgets below. Per-IP token bucket (burst 20, 1/s) and 8 concurrent requests per isolate answer 429 before the container is touched. |
+| Headers | The forwarded-header table below is the allowlist, including validated/minted `x-request-id`. `Authorization`, `Cookie`, `X-Forwarded-*` and any caller-supplied deployment header are dropped. The Worker stamps `x-two-bot-deployment-id` itself for the DO ownership fence; it is not caller authentication. |
 | Body | Forwarded byte for byte; the signature covers the raw bytes. Never re-serialized. |
 | Fence | Forwarded only inside the Durable Object's ownership gate. A stale, fenced or missing deployment answers 503 `unavailable` and never reaches the container. |
 | Startup | Public ingress never starts the container; probes and the keepalive do. While the container is not running the answer is 503 `unavailable`. |
 | Answers | The receiver's JSON envelope is validated against the [relayed answer contract](#relayed-answer-contract) and projected: successes keep their action-specific result verbatim beside the correlated id (plus the optional top-level settings version), refusals keep their table status/code/retryability with the fixed message. Headers relayed are `Content-Type`, `Idempotent-Replay` and `Retry-After` only, `Cache-Control: no-store`. Any non-JSON, oversize, transport-failure, malformed, contradictory or unknown-code answer (including SDK startup text that embeds error messages) becomes the fixed `unavailable` envelope. Worker refusals use the same envelope with a fixed message. |
-| Logs | Scalar `internal_actions_ingress` events: `status` and `error_class` only. Never header values, nonce, signature, body or query. |
+| Logs | Refusal events use exactly the scalar log fields below; not a success/access log for every request. Never raw header values, nonce, signature, body or query. The sole header-derived log value is the shape-validated correlation id. |
+
+### Intake, forwarding and correlation
+
+The Worker reads the inbound body within a separate 5-second budget before the
+20-second forwarding budget begins. These are not a single whole-request limit.
+The forwarding budget includes the DO/receiver round trip and bounded response
+collection, not a fresh budget for each hop. A forwarding timeout can leave an
+effect outcome unknown; cancellation is not proof that nothing happened.
+
+| Phase | Budget (ms) | Starts | Status | Code | Retryable | Next action |
+| --- | --- | --- | --- | --- | --- | --- |
+| Intake | 5000 | Before forwarding | 408 | `request_timeout` | true | Retry same Idempotency-Key; fresh nonce/signature |
+| Forwarding | 20000 | After body read | 504 | `upstream_timeout` | true | Unknown outcome: retry same Idempotency-Key; reconcile needs_reconciliation first |
+
+Both timeouts use the fixed `request refused` message. Intake timeout contacts
+no container. Honor `Retry-After` when present. For any uncertain outcome, keep
+the same intent's `Idempotency-Key`, with a fresh timestamp/nonce/signature for
+each attempt; never mint a new intent key to escape `in_progress` or
+`needs_reconciliation`. The latter requires reconciliation before resubmission.
+A response-read abort can instead become Worker `503 unavailable`; it is not
+proof of no effect either (see [next actions](#relayed-answer-contract)).
+
+| Forwarded header | Value policy |
+| --- | --- |
+| x-two-key-id | Required single printable ASCII token, no comma; at most 128 bytes |
+| x-two-timestamp | Required single printable ASCII token, no comma; at most 15 bytes |
+| x-two-nonce | Required single printable ASCII token, no comma; at most 32 bytes |
+| x-two-signature | Required single printable ASCII token, no comma; at most 71 bytes |
+| idempotency-key | Optional at ingress; when present a single printable ASCII token, no comma; at most 200 bytes. Receiver action rules still apply |
+| content-type | Required accepted JSON media type; at most 128 bytes |
+| x-request-id | Validated or minted; 26-character Crockford base32; correlation only, not identity |
+
+A caller's generated-shape `x-request-id` is preserved; absent, malformed or
+list-valued ids are replaced. It joins the forwarded request, response JSON
+`request_id`, DO and receiver logs. Shape validation does not make it a trusted
+caller identity or a deduplication key. Signing headers remain untrusted until
+the receiver verifies HMAC and burns the nonce; ingress validation alone does
+not authenticate them.
+
+| Log field | Value / provenance |
+| --- | --- |
+| event | Fixed `internal_actions_ingress` |
+| status | Worker-selected numeric refusal status |
+| error_class | Fixed refusal code, never remote exception text |
+| request_id | Validated/minted request correlation id, not authenticated identity |
+| release | Worker-supplied container build SHA, normalized to 7–40 lowercase hex characters or `unknown`; never a caller deployment header |
+| log_url | https://developers.cloudflare.com/workers/observability/logs/workers-logs/ |
+
+`release` is container build correlation, not a Worker-version or caller claim;
+`log_url` is the fixed public log-query guide, not a request URL or an
+account-scoped log link. Neither exposes secrets. Missing build context uses
+`unknown`; the caller cannot supply a release through request headers.
 
 Authentication is unchanged: legacy v1 HMAC and a durable nonce burn at the
 receiver. The ingress adds no bearer, key or second identity.
 
 ### Container wiring
 
-The three plain settings and the signing secret are **not** in
-`FORWARDED_FLAGS`. They reach the container through explicit `containerEnvVars`
-lines, and only while `TWO_INTERNAL_ACTIONS` is exactly `1`:
+These are the complete receiver inputs shipped by `containerEnvVars`
+(`wrangler/src/index.ts`), **not** `FORWARDED_FLAGS`. They reach the container
+only while `TWO_INTERNAL_ACTIONS` is exactly `1`:
 
 | Name | Source |
 | --- | --- |
@@ -63,8 +122,22 @@ lines, and only while `TWO_INTERNAL_ACTIONS` is exactly `1`:
 | `TWO_INTERNAL_CALLERS` | Worker secret, e.g. `web-staging:website-staging` |
 | `TWO_INTERNAL_CONTAINER` | Worker constant `1`: the Worker sets it to mark the process as running inside the container network, where the wildcard bind is reachable only via `containerFetch` and the startup port check. That network is presumed private but unverified. The marker is a deployment claim, not a proof: the bot trusts it only because the Worker (not the Operator) sets it. A wildcard bind without exactly this marker is refused. |
 | `TWO_INTERNAL_CHANNEL_KEYS` | Worker secret, e.g. `smoke-throwaway:<channel snowflake in the TWO Staging guild>` |
-| `TWO_INTERNAL_ROLE_KEYS` | Worker secret, e.g. `member:<role snowflake in the TWO Staging guild>`; empty stages no role and every `role.assign` key refuses |
 | `TWO_INTERNAL_KEYS` | Worker secret `web-staging:<64 hex>`; never a var, never logged |
+
+`NOT_FORWARDED` in `wrangler/src/container-env.ts` deliberately excludes the
+following. Setting them as Worker secrets cannot change the container's
+capabilities; this table is not an instruction to create or stage them.
+
+| Not forwarded | Effect |
+| --- | --- |
+| `TWO_INTERNAL_ROLE_KEYS` | No allowlisted role target; `role.assign` refuses |
+| `TWO_INTERNAL_ALLOW_ADD_MEMBER` | `guild.add_member` stays gated off |
+| `TWO_INTERNAL_ALLOW_AUTOMATIONS` | Automation export/import stay gated off |
+| `TWO_INTERNAL_ALLOW_AUTOMATIONS_OVERWRITE` | Automation overwrite stays gated off |
+| `TWO_INTERNAL_ALLOW_EVENT_CANCEL` | `event.cancel` stays gated off |
+| `TWO_INTERNAL_ALLOW_EVENT_READ` | `event.read` stays gated off |
+| `TWO_INTERNAL_ALLOW_MODERATION` | Member/channel moderation stay gated off, even with `TWO_MODERATION=1` |
+| `TWO_INTERNAL_ALLOW_SETTINGS` | Settings get/set stay gated off |
 
 Fixed receiver port: **8091** (health stays on `BOT_PORT` 8080, and the two may
 not be equal while the receiver is enabled). While enabled, 8091 joins the
@@ -92,7 +165,7 @@ and if they differ redeploy the intended SHA through the workflow first (full ru
 in `docs/production-deploy.md`).
 
 1. Merge this change. `deploy-staging` deploys it dark; `/health` and `/readyz` are unchanged.
-2. Operator stages `TWO_INTERNAL_CALLERS`, `TWO_INTERNAL_CHANNEL_KEYS` and `TWO_INTERNAL_ROLE_KEYS` (plain values).
+2. Operator stages `TWO_INTERNAL_CALLERS` and `TWO_INTERNAL_CHANNEL_KEYS` (plain values), only under the separately authorized enablement contract; no role keys or optional capability gates travel through this Worker.
 3. Operator generates the key on the Operator host and stages `TWO_INTERNAL_KEYS`, and sets the website's `staging` environment secret `BOT_SHARED_SECRET` to the same value, without printing it.
 4. Operator applies migrations `0423` (settings CAS) and `0424` (event outcome) first (the bot does not apply migrations; an enabled receiver's finish fails without the columns), then stages `TWO_INTERNAL_ACTIONS` as `1` **last**, deploys the version, and transfers ownership. The container restart applies the settings: an invalid combination exits the process (the receiver boots all-or-nothing) and keeps staging red until step 5.
 5. Rollback: stage deletion of `TWO_INTERNAL_ACTIONS` (`wrangler versions secret delete --env staging TWO_INTERNAL_ACTIONS --message <sha>`, same precheck and stamp as above), deploy and transfer ownership; or use the existing Worker-version rollback. The route is absent again and the next container start carries no receiver setting.
@@ -190,6 +263,10 @@ rows, provenance, audit facts and replay readback on disposable databases only.
 
 ## Configuration contract
 
+This is the direct-container parser contract, not the Worker secret allowlist.
+For the shipped deployment use [Container wiring](#container-wiring); a parser
+accepting an input does not mean the Worker forwards it.
+
 `two_bot_core::internal_action_config::InternalActionConfig::from_env` returns
 `None` when `TWO_INTERNAL_ACTIONS` is absent or exactly `0`. In that case it
 never reads receiver keys or bind settings. Exactly `1` requests a receiver;
@@ -234,6 +311,8 @@ only the bind address and counts, never keys, secrets or caller mappings.
 
 ## HTTP boundary and execution ownership
 
+The following bounds belong to the Rust listener, independently of the Worker's
+[sequential intake/forwarding budgets](#intake-forwarding-and-correlation).
 Only exact `POST /internal/actions` is accepted; query strings and alternate
 paths are refused. The boundary requires singleton v1 signing headers and
 `application/json` (optionally `charset=utf-8`), rejects content encoding, and
@@ -325,6 +404,10 @@ by the receiver); a missing, misshapen or mismatched id fails closed. Extra
 fields and the receiver's message text never leave: callers see the shapes
 below and nothing else.
 
+These are receiver wire shapes, not a claim that every family is enabled through
+the shipped Worker. [Container wiring](#container-wiring) determines which gates
+and role targets can reach it.
+
 Success (`200` only, `result` always an object, no `error` key):
 
 | Family | `result` | Notes |
@@ -371,9 +454,27 @@ the human gloss):
 | `replayed` / `version_conflict` (409) | Same key already decided or superseded: read the stored outcome, use a new key only for a new intent. |
 | 401 / 403 | Fix the caller: signing key, timestamp/nonce freshness, action allowlist. Do not retry the bytes. |
 | `malformed` (400), `not_found` (404), `method_not_allowed` (405), `discord_rejected` (422), `no_effect` (502) | Fix the request: shape, route, verb, payload or target state. |
-| `unavailable` (503, Worker-only) | Staging/Operator state: dark route, cold container, fenced deployment, oversize or an unusable receiver answer. Not a receiver verdict. |
+| `unavailable` (503, Worker-only) | Inspect container readiness, ownership and correlated logs; transport failure, oversize, deadline-aborted response collection or an unusable receiver answer is not a receiver verdict or proof of no effect. Retry the same intent key only, with fresh signing headers. A dark route is absent (404), not this envelope. |
 
 ## Tests
+
+`wrangler/test/receiver-docs.test.ts` checks this source of truth offline against
+`BODY_TIMEOUT_MS`/`REQUEST_TIMEOUT_MS`, synthetic `handleActionsIngress` outputs,
+validated/minted headers, actual refusal log fields and the real DO's startup
+environment with excluded inputs present. Negative fixtures restore the stale
+deadline, header, log and role-key claims and must fail conformance. The
+`WORKER_DOCS` selector registers this input; `npm test` discovers the check.
+From `wrangler/`:
+
+```sh
+node --import ./test/cloudflare-loader.mjs --test test/receiver-docs.test.ts test/internal-actions.test.ts test/container-env.test.ts test/span-correlation.test.ts
+npm run typecheck
+npm test
+```
+
+These commands use synthetic fixtures only. Do not execute enablement or
+rollback examples as documentation validation; this correction authorizes no
+secret staging, ingress change, deployment or capability widening.
 
 The configuration unit tests use only the existing public signing vectors. They
 exercise dark defaults, strict enable values, missing/non-Unicode settings,

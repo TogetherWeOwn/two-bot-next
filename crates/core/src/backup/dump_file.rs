@@ -133,7 +133,7 @@ pub const DUMP_TABLES: &[&str] = &[
     "guild_settings_revision",
     "guild_settings",
     "guild_settings_audit",
-    // Admin API token registry (0454/0455, v12): operator-issued tokens with
+    // Admin API token registry (0456/0457, v12): operator-issued tokens with
     // hash-only secrets. Archived so a restore keeps admin API access working
     // (secrets are shown once at issuance and cannot be re-derived); see
     // [`V12_ADDED_TABLES`]. No foreign keys, so order here is free.
@@ -266,7 +266,7 @@ pub const V10_ADDED_TABLES: &[&str] = &["scheduled_events_claim"];
 pub const V11_ADDED_TABLES: &[&str] = &["scheduled_events_tombstone"];
 
 /// Tables first covered by v12 (admin API token registry, migrations
-/// 0454/0455). Older archives may omit the registry; restore clears the
+/// 0456/0457). Older archives may omit the registry; restore clears the
 /// destination rows, as for every versioned addition. New archives must
 /// contain the registry so issued tokens survive recovery. v11 is a readable
 /// legacy shape: tombstone-only archives written by the merged v11 writer
@@ -1193,7 +1193,7 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
     // only tables first covered by a later version. New v12 archives require
     // the full inventory, including both guild counters (0441/0442/0446/0447),
     // the epoch-claim guard (0450/0451), the delete tombstones (0452/0453)
-    // and the token registry (0454/0455).
+    // and the token registry (0456/0457).
     let version = obj.get("version").and_then(Value::as_u64);
     let missing: Vec<&str> = DUMP_TABLES
         .iter()
