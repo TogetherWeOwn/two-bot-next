@@ -15,14 +15,11 @@ fn loopback(port: u16) -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, port))
 }
 
-/// An ephemeral port that is (momentarily) free.
-fn free_port() -> u16 {
-    StdUdpSocket::bind(loopback(0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+/// Spawned-echo port for the loopback probe test. Below the default Linux
+/// ephemeral range, so `:0` binds never hand it out; the child echo is the
+/// only user. (Binding `:0` and releasing races parallel tests: another
+/// test can grab the port before the child binds it.)
+const ECHO_PORT: u16 = 18751;
 
 /// A child process reaped on drop, so a failing test never leaks an echo.
 struct ChildGuard(Child);
@@ -76,7 +73,7 @@ fn usage_error_exits_two() {
 
 #[test]
 fn probe_loopback_prints_evidence_and_exits_zero() {
-    let port = free_port();
+    let port = ECHO_PORT;
     let echo = ChildGuard(
         voice_probe()
             .args(["--mode", "echo", "--bind", &format!("127.0.0.1:{port}")])
