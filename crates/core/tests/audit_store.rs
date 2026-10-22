@@ -71,6 +71,9 @@ impl TestDb {
         let pool = Self::connect(&options, &schema).await?;
         if migrate {
             sqlx::raw_sql(MIGRATION).execute(&pool).await?;
+            // Expected-schema fixture only; this is not shipped-migration proof.
+            sqlx::query("ALTER TABLE operational_audit_log ADD COLUMN IF NOT EXISTS delivery_reconcile_before TEXT NULL")
+                .execute(&pool).await?;
         }
         Ok(Self {
             admin,
