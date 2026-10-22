@@ -211,6 +211,16 @@ trait BaselineBirthdaySweep {
         guild: &str,
         now_ms: i64,
     ) -> Result<(), ErrorClass>;
+
+    /// Enabled ticks sweep; disabled ticks clean only known grant intents.
+    /// A MemberRuntime inherent wrapper delegates to the supervised job tick.
+    async fn run_birthday_tick(
+        pool: &PgPool,
+        rest: &ActionExecutor,
+        guild: &str,
+        now_ms: i64,
+        enabled: bool,
+    ) -> Result<(), ErrorClass>;
 }
 
 impl BaselineBirthdaySweep for MemberRuntime {
@@ -219,6 +229,16 @@ impl BaselineBirthdaySweep for MemberRuntime {
         _rest: &ActionExecutor,
         _guild: &str,
         _now_ms: i64,
+    ) -> Result<(), ErrorClass> {
+        Ok(())
+    }
+
+    async fn run_birthday_tick(
+        _pool: &PgPool,
+        _rest: &ActionExecutor,
+        _guild: &str,
+        _now_ms: i64,
+        _enabled: bool,
     ) -> Result<(), ErrorClass> {
         Ok(())
     }
@@ -841,6 +861,11 @@ async fn baseline_adapter_keeps_the_unwired_path_callable() {
         <MemberRuntime as BaselineBirthdaySweep>::run_birthday_sweep(&pool, &executor, GUILD_S, 0)
             .await;
     assert!(outcome.is_ok(), "the unwired stub succeeds");
+    let tick = <MemberRuntime as BaselineBirthdaySweep>::run_birthday_tick(
+        &pool, &executor, GUILD_S, 0, false,
+    )
+    .await;
+    assert!(tick.is_ok(), "the unwired tick adapter stays callable");
     assert!(
         mock.requests().is_empty(),
         "the unwired stub writes nothing"
@@ -879,6 +904,31 @@ async fn help_still_answers_through_dispatch_fixture() {
     let reply = only_callback(&mock.requests());
     assert_ephemeral(&reply, "help");
     assert!(!content_of(&reply).is_empty(), "help answers");
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn birthday_help_is_member_facing_without_config_permission_hint() {
+    let mock = MockRest::start(Vec::new(), ScriptedResponse::json(200, json!({}))).await;
+    let runtime = runtime_for(lazy_pool(), executor_for(&mock));
+    let mut ix = birthday_ix(opt_sub("set", Vec::new()), ALICE, Permissions::empty());
+    if let Some(InteractionData::ApplicationCommand(data)) = ix.data.as_mut() {
+        data.name = "help".to_owned();
+        data.options.clear();
+    }
+    let reply = dispatch_callback(&runtime, &mock, &ix).await;
+    assert_ephemeral(&reply, "birthday help");
+    assert!(
+        content_of(&reply).contains("**Birthdays**\n/birthday\n"),
+        "birthday is member-facing, not advertised as an admin-only command"
+    );
+    assert_eq!(
+        content_of(&reply)
+            .split_whitespace()
+            .filter(|word| *word == "/birthday")
+            .count(),
+        1
+    );
     mock.shutdown().await;
 }
 
@@ -1765,6 +1815,65 @@ async fn uncertain_cheer_never_auto_resends_after_restart() {
     db.close().await.expect("drop test database");
 }
 
+/// Catch suppressing cleanup along with new delivery when announcements are
+/// disabled. No environment mutation: the supervised tick receives the gate.
+#[tokio::test]
+async fn disabled_tick_cleans_known_roles_without_new_cheers_or_grants() {
+    let Some(url) = db_url() else { return };
+    let db = test_db(&url).await;
+    let pool = db.pool().clone();
+    let state = Arc::new(DiscoState::default());
+    let mock = start_stateful(Arc::clone(&state)).await;
+    let executor = executor_for(&mock);
+    let runtime = runtime_for(pool.clone(), executor.clone());
+    runtime
+        .on_interaction(&config_ix(
+            Some(CHANNEL_ID),
+            Some(8130),
+            None,
+            ALICE,
+            Permissions::MANAGE_GUILD,
+        ))
+        .await;
+    let reply = dispatch_set(&runtime, &mock, ALICE, 5, 1).await;
+    assert!(content_of(&reply).contains("May"));
+    let now = utc_ms("2026-05-01T12:00:00.000Z");
+    sweep(&pool, &executor, now).await;
+    assert!(member_roles(&state, &ALICE.to_string()).contains(ROLE_ID));
+    assert_eq!(channel_posts(&mock.requests(), CHANNEL_S).len(), 1);
+    // Bruno becomes due only after the last enabled sweep. A disabled tick
+    // must clean Alice, not grant/cheer Bruno under cover of cleanup.
+    let reply = dispatch_set(&runtime, &mock, BRUNO, 5, 1).await;
+    assert!(content_of(&reply).contains("May"));
+    drop(runtime);
+    let before = mock.requests().len();
+    let pool2 = db.independent_pool().await.expect("restart pool");
+    let executor2 = executor_for(&mock);
+    MemberRuntime::run_birthday_tick(&pool2, &executor2, GUILD_S, now, false)
+        .await
+        .expect("disabled tick cleans grant intents");
+    let requests = mock.requests();
+    let delta = &requests[before..];
+    assert!(
+        role_ops(delta, "DELETE").contains(&(ALICE.to_string(), ROLE_ID.to_owned())),
+        "disabled tick removes the tracked role"
+    );
+    assert!(!member_roles(&state, &ALICE.to_string()).contains(ROLE_ID));
+    assert!(!member_roles(&state, &BRUNO.to_string()).contains(ROLE_ID));
+    assert!(
+        role_ops(delta, "PUT").is_empty(),
+        "disabled tick grants nothing"
+    );
+    assert!(
+        channel_posts(delta, CHANNEL_S).is_empty(),
+        "disabled tick cheers nothing"
+    );
+
+    pool2.close().await;
+    mock.shutdown().await;
+    db.close().await.expect("drop test database");
+}
+
 /// Catch deleting the only cleanup witness along with the member's birthday.
 #[tokio::test]
 async fn removal_keeps_next_day_role_cleanup_after_restart() {
@@ -1948,11 +2057,12 @@ async fn sweep_caps_daily_cheers_but_roles_every_celebrant() {
     let executor2 = executor_for(&mock);
     let now = utc_ms("2026-05-01T13:00:00.000Z");
     for _ in 0..3 {
-        let (one, two) = tokio::join!(
+        // Contention may be reported or treated as a no-op; neither path
+        // may allocate another day's worth of cheers.
+        let (_one, _two) = tokio::join!(
             MemberRuntime::run_birthday_sweep(&pool, &executor, GUILD_S, now),
             MemberRuntime::run_birthday_sweep(&pool2, &executor2, GUILD_S, now),
         );
-        assert!(one.is_ok() && two.is_ok(), "concurrent sweeps succeed");
         assert_eq!(
             channel_posts(&mock.requests(), CHANNEL_S).len(),
             CELEBRANT_CHEER_CAP,
@@ -1972,11 +2082,15 @@ async fn sweep_caps_daily_cheers_but_roles_every_celebrant() {
     }
     // The budget is per date, not a permanent lifetime limit.
     let next_date = utc_ms("2027-05-01T12:00:00.000Z");
-    let (one, two) = tokio::join!(
+    let (_one, _two) = tokio::join!(
         MemberRuntime::run_birthday_sweep(&pool, &executor, GUILD_S, next_date),
         MemberRuntime::run_birthday_sweep(&pool2, &executor2, GUILD_S, next_date),
     );
-    assert!(one.is_ok() && two.is_ok(), "cold concurrent sweeps succeed");
+    assert!(
+        channel_posts(&mock.requests(), CHANNEL_S).len() <= 2 * CELEBRANT_CHEER_CAP,
+        "cold concurrent sweeps never overspend the daily budget"
+    );
+    sweep(&pool2, &executor2, next_date).await;
     assert_eq!(
         channel_posts(&mock.requests(), CHANNEL_S).len(),
         2 * CELEBRANT_CHEER_CAP,

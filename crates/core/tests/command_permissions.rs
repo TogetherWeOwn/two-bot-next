@@ -92,22 +92,29 @@ fn all_30_rows_equal_parity_section1() {
     }
     assert_eq!(seen, (1..=30).collect::<HashSet<_>>());
     // The 30 legacy parity rows plus the Next-only `/help` discovery command
-    // (parity row 31 — legacy has no help command) and the Next-only
-    // `/privacy` member self-serve (parity row 32). Neither Next-only row
-    // appears in the legacy §1 table above; the registry-equality test below
-    // covers every published builtin instead.
-    assert_eq!(COMMAND_PERMISSIONS.len(), 32);
+    // (parity row 31 — legacy has no help command), Next-only `/privacy`
+    // member self-serve (parity row 32), and Next-only `/birthday` (row 33).
+    // These Next-only rows do not appear in the legacy §1 table above;
+    // the registry-equality test below covers every published builtin instead.
+    assert_eq!(COMMAND_PERMISSIONS.len(), 33);
     assert_eq!(
         COMMAND_PERMISSIONS
             .iter()
             .map(|row| row.command)
             .collect::<HashSet<_>>()
             .len(),
-        32
+        33
     );
     let help = command_permission("help").expect("help has a permission row");
     assert_eq!(help.required_permissions, 0);
     assert_eq!(help.surface, CommandSurface::BuiltinSlash);
+    let birthday = command_permission("birthday").expect("birthday has a permission row");
+    assert_eq!(
+        birthday.required_permissions, 0,
+        "own birthday is open by default"
+    );
+    assert_eq!(birthday.surface, CommandSurface::BuiltinSlash);
+    assert_eq!(birthday.parity_row, 33);
 }
 
 #[test]
@@ -123,7 +130,7 @@ fn permission_table_equals_the_complete_published_registry() {
         .iter()
         .filter(|row| row.surface == CommandSurface::BuiltinSlash)
         .collect();
-    assert_eq!(builtins.len(), 29);
+    assert_eq!(builtins.len(), 30);
     assert_eq!(published.len(), builtins.len() + 1);
     for row in builtins {
         let definition = published
@@ -247,7 +254,42 @@ fn every_routed_builtin_name_has_a_permission_row() {
             other => panic!("{name} is published or retained but does not route: {other:?}"),
         }
     }
-    assert_eq!(routed, 29, "every retained builtin routes");
+    assert_eq!(routed, 30, "every retained builtin routes");
+}
+
+#[test]
+fn birthday_has_its_own_handler_and_announcement_gate() {
+    let context = SlashContext {
+        name: "birthday",
+        guild_id: Some(GUILD),
+        actor_permissions: Some(0),
+        custom_row: Some(true),
+    };
+    match InteractionRouter::new(all_on()).route_slash(&context) {
+        SlashOutcome::Handled { handler } => {
+            // Keep this acceptance fixture compilable before the new variant
+            // exists while still pinning the selected HandlerId exactly.
+            assert_eq!(format!("{handler:?}"), "Birthday");
+        }
+        other => panic!("ordinary members route to the birthday builtin: {other:?}"),
+    }
+    let off = RouterGates {
+        announcements: false,
+        ..all_on()
+    };
+    let router = InteractionRouter::new(off);
+    assert_eq!(
+        router.route_slash(&context),
+        SlashOutcome::Refuse {
+            refusal: two_bot_core::router::RouterRefusal::AnnouncementsDisabled
+        },
+        "the announcement gate fences the birthday handler"
+    );
+    assert!(router
+        .publish_set(&[])
+        .expect("publish set")
+        .iter()
+        .all(|def| def.name != "birthday"));
 }
 
 #[test]
