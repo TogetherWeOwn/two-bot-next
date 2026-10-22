@@ -4440,7 +4440,7 @@ class WorkflowTests(unittest.TestCase):
             ignored_sweep,
         )
         guarded = [run for run in cov_runs if "llvm-cov --no-report -p " in run]
-        self.assertEqual(len(guarded), 15)
+        self.assertEqual(len(guarded), 16)
         for run in guarded:
             with self.subTest(guarded=run):
                 self.assertIn("--test-threads=1", run)
