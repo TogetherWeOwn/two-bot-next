@@ -7290,6 +7290,84 @@ async fn access_changed_delivers_past_a_full_inbox() {
     runtime.remove_guild(GUILD);
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn a_confirmed_import_hands_its_settings_to_the_worker_past_a_full_inbox() {
+    // Full-inbox sibling of `a_confirmed_import_hands_its_settings_to_the_worker`:
+    // `/import` already wrote the store and replied "Saved", so the saved
+    // settings must reach the worker even when fire-and-forget sends refuse.
+    let trace = Trace::default();
+    let bytes = serde_json::to_vec(&full_config()).unwrap();
+    let (runtime, _) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (_, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let (confirm_id, _) = preview_buttons(&preview.expect("preview"));
+    // The worker has loaded (the preview read it); fill the inbox gate
+    // synchronously so the actor cannot drain mid-burst, then confirm.
+    let actor = runtime.ensure_actor(GUILD).expect("live actor");
+    let mut refused = false;
+    for member in 0..10_000u64 {
+        if !actor.try_send_command(ActorCommand::Display {
+            member_id: 900_000 + member,
+            display: "x".to_owned(),
+        }) {
+            refused = true;
+            break;
+        }
+    }
+    assert!(refused, "burst must fill the inbox gate to refusal");
+    let confirm = component_interaction(&confirm_id, manager(), UPLOADER);
+    let (_, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(response_text(&response.expect("applied")).starts_with("Import applied:"));
+    // The probe queues behind the flood and the saved update, so its answer
+    // proves the update applied despite the full gate.
+    let (settings, _) = runtime
+        .naming_probe(GUILD)
+        .await
+        .expect("probe answers after a full-gate save");
+    assert_eq!(settings, NameSettings::from_config(&full_config()));
+    runtime.remove_guild(GUILD);
+}
+
+#[tokio::test]
+async fn display_seed_batch_applies_every_entry() {
+    // Startup seeding travels as one batch so a guild with more cached
+    // members than inbox slots still seeds every name (owners included).
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    apply_command(
+        &mut worker,
+        ActorCommand::DisplaySeed(vec![
+            (MEMBER, "Alex".to_owned()),
+            (MEMBER + 1, "Blair".to_owned()),
+        ]),
+        0,
+        &ActorInboxBackpressure::default(),
+    );
+    assert!(
+        worker.name_directory.knows(MEMBER),
+        "seed batch must carry every entry"
+    );
+    assert!(
+        worker.name_directory.knows(MEMBER + 1),
+        "seed batch must carry every entry"
+    );
+}
+
+#[test]
+fn display_seed_buffers_while_actor_initializes() {
+    // The seed batch is fire-and-forget state: it must survive the init
+    // window instead of failing fast like reply-bearing commands.
+    let mut buffered = std::collections::VecDeque::new();
+    buffer_init_command(
+        &mut buffered,
+        ActorCommand::DisplaySeed(vec![(MEMBER, "Alex".to_owned())]),
+    );
+    assert_eq!(buffered.len(), 1, "seed batch must buffer during init");
+    purge_unanswerable_buffered(&mut buffered);
+    assert_eq!(buffered.len(), 1, "seed batch must survive a failure purge");
+}
+
 async fn wait_for_trace(trace: &Trace, entry: &str) -> bool {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {

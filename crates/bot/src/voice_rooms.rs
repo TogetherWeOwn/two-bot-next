@@ -7270,10 +7270,11 @@ struct GuildActor {
 /// received bufferable command, so a draining actor never wedges.
 /// Reply-bearing commands bypass the gate: dropping a reply would hang its
 /// caller, while fire-and-forget state reconverges on the next frame, with
-/// two exceptions: a refused ticketed `Join` drops its ticket, and only a
+/// exceptions: a refused ticketed `Join` drops its ticket, and only a
 /// fresh channel transition re-tickets, so the member rejoins to get a room;
-/// and creation-policy updates bypass losslessly, so a saved switch never
-/// leaves the worker on the previous policy past the cap.
+/// and control-plane updates bypass losslessly — saved creation-policy and
+/// naming-settings switches, plus the startup display-name seed batch — so
+/// a saved switch never leaves the worker on the previous state past the cap.
 const VOICE_ACTOR_INBOX_CAP: usize = 256;
 
 /// Backpressure ledger for one guild actor's inbox
@@ -7282,8 +7283,10 @@ const VOICE_ACTOR_INBOX_CAP: usize = 256;
 /// releases one, so the in-flight count is the live inbox depth.
 /// Reply-bearing traffic never touches the ledger (see
 /// [`ActorCommand::is_bufferable`]), which keeps the acquire/release
-/// pairing exact: every bufferable send in the runtime goes through
-/// [`GuildActor::try_send_command`].
+/// pairing exact for gated traffic: every gated bufferable send goes through
+/// [`GuildActor::try_send_command`], while the rare lossless control-plane
+/// sends skip acquisition and skew the count by at most one slot each (see
+/// [`GuildActor::send_command_lossless`]).
 #[derive(Debug, Clone, Default)]
 struct ActorInboxBackpressure {
     in_flight: Arc<AtomicUsize>,
@@ -7307,8 +7310,8 @@ impl ActorInboxBackpressure {
     /// commands consume permits, so only they release: reply-bearing
     /// receives must not inflate capacity. Saturating: a receive must
     /// never drive the count negative (which would wedge the gate shut);
-    /// production sends always acquire first, so saturation only engages
-    /// for test-only direct sends.
+    /// gated production sends always acquire first, so saturation only
+    /// engages for lossless control-plane sends and test-only direct sends.
     fn release_for(&self, command: &ActorCommand) {
         if command.is_bufferable() {
             let _ = self
@@ -7360,12 +7363,15 @@ impl GuildActor {
 
     /// Deliver a control-plane command past the inbox gate. The channel is
     /// unbounded, so this only fails when the actor is gone; it never blocks
-    /// and never counts a refusal. Creation-policy updates use this: a refused
-    /// `AccessChanged` would leave the worker enforcing the previous policy
-    /// after the administrator already saw "Saved". Reception still releases
-    /// the entry's bufferable ledger slot, so each concurrent lossless send
-    /// skews the gate by at most one slot; administrator saves are rare
-    /// enough that the bound stays effective.
+    /// and never counts a refusal. Saved creation-policy and naming-settings
+    /// updates use this: a refused `AccessChanged` would leave the worker
+    /// enforcing the previous policy after the administrator already saw
+    /// "Saved", and a refused `NameSettingsChanged` would likewise keep the
+    /// previous settings and skip the prompt reload. The startup
+    /// display-name seed travels as one batch here for the same reason.
+    /// Reception still releases the entry's bufferable ledger slot, so each
+    /// concurrent lossless send skews the gate by at most one slot;
+    /// administrator saves are rare enough that the bound stays effective.
     fn send_command_lossless(&self, command: ActorCommand) -> bool {
         self.tx.send(command).is_ok()
     }
@@ -7396,6 +7402,11 @@ enum ActorCommand {
         member_id: Snowflake,
         display: String,
     },
+    /// Startup display-name seed: one batch for every cached member, so a
+    /// guild with more members than inbox slots still seeds every name
+    /// (room owners included) instead of refusing the tail. Sent losslessly
+    /// like other control-plane updates; each entry applies as a `Display`.
+    DisplaySeed(Vec<(Snowflake, String)>),
     /// The guild's voice configuration was written (`/import`): automatic
     /// names use the same settings `/name` Restore reads from now on.
     NameSettingsChanged(NameSettings),
@@ -7513,6 +7524,7 @@ impl ActorCommand {
             self,
             ActorCommand::Reconcile
                 | ActorCommand::Display { .. }
+                | ActorCommand::DisplaySeed(_)
                 | ActorCommand::NameSettingsChanged(_)
                 | ActorCommand::RoomFactsChanged(_)
                 | ActorCommand::Join { .. }
@@ -8525,8 +8537,14 @@ where
         let Some(actor) = self.live_actor(guild_id) else {
             return;
         };
-        for (member_id, display) in cached_display_names(cache, guild_id) {
-            let _ = actor.try_send_command(ActorCommand::Display { member_id, display });
+        // One lossless batch, not one gated send per member: a guild with
+        // more cached members than inbox slots would otherwise refuse the
+        // tail (room-owner names included), and the periodic settings reload
+        // never repopulates the directory. The batch skews the gate by at
+        // most one slot (see `send_command_lossless`).
+        let seed = cached_display_names(cache, guild_id);
+        if !seed.is_empty() {
+            let _ = actor.send_command_lossless(ActorCommand::DisplaySeed(seed));
         }
     }
 
@@ -8548,10 +8566,13 @@ where
         inbox.await.ok()
     }
 
-    /// Hand freshly written voice settings to the guild worker.
+    /// Hand freshly written voice settings to the guild worker. Lossless:
+    /// the store write already succeeded and the administrator saw "Saved",
+    /// so a full inbox must not leave the worker on the previous settings
+    /// (or skip the `name_settings_read_ms` reset that prompts a reload).
     fn name_settings_updated(&self, guild_id: Snowflake, config: &VoiceConfiguration) {
         if let Some(actor) = self.live_actor(guild_id) {
-            let _ = actor.try_send_command(ActorCommand::NameSettingsChanged(
+            let _ = actor.send_command_lossless(ActorCommand::NameSettingsChanged(
                 NameSettings::from_config(config),
             ));
         }
@@ -9633,6 +9654,11 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
         ActorCommand::Reconcile => worker.reconcile(),
         ActorCommand::Display { member_id, display } => {
             worker.name_directory.insert(member_id, display);
+        }
+        ActorCommand::DisplaySeed(entries) => {
+            for (member_id, display) in entries {
+                worker.name_directory.insert(member_id, display);
+            }
         }
         ActorCommand::NameSettingsChanged(settings) => {
             worker.update_name_settings(settings);
