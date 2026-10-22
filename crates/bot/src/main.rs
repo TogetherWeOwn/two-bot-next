@@ -95,6 +95,8 @@ mod onboarding;
 #[cfg(test)]
 mod onboarding_queue_cause_forwarding_tests;
 #[cfg(test)]
+mod onboarding_receipt_bounds_tests;
+#[cfg(test)]
 mod onboarding_tests;
 #[cfg(test)]
 mod onboarding_unknown_only_acceptance_tests;

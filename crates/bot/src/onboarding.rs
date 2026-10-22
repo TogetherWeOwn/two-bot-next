@@ -1386,4 +1386,81 @@ mod tests {
             .expect("guild present");
         assert!(!config.gates.dry_run);
     }
+
+    /// A channel REST error fails the welcome path loudly instead of becoming
+    /// a silent skip. No database: identity and channel reads are REST-only,
+    /// so the pool is a never-dialed lazy handle.
+    #[tokio::test]
+    async fn first_postable_channel_rest_error_is_discord_not_skip() {
+        use crate::discord_test_common::{MockRest, RestRequest, ScriptedResponse};
+        use two_bot_core::onboarding::{GAME_PICKS, PLATFORM_PICKS};
+
+        crate::gateway::ensure_crypto_provider();
+        let rest = MockRest::with_responder(|request: &RestRequest| {
+            let path = request.path.strip_prefix("/api/v10").unwrap();
+            match (request.method.as_str(), path) {
+                ("GET", "/guilds/22") => {
+                    ScriptedResponse::json(200, serde_json::json!({"id":"22","owner_id":"888"}))
+                }
+                ("GET", "/guilds/22/roles") => {
+                    let mut roles = vec![
+                        serde_json::json!({"id":"22","permissions":"1051648"}),
+                        serde_json::json!({"id":"77","permissions":"0"}),
+                    ];
+                    roles.extend(
+                        GAME_PICKS
+                            .iter()
+                            .chain(PLATFORM_PICKS.iter())
+                            .map(|pick| serde_json::json!({"id":pick.role_id,"permissions":"0"})),
+                    );
+                    ScriptedResponse::json(200, serde_json::Value::Array(roles))
+                }
+                ("GET", path) if path.starts_with("/guilds/22/members/") => {
+                    let id = path.strip_prefix("/guilds/22/members/").unwrap();
+                    ScriptedResponse::json(200, serde_json::json!({"user":{"id":id},"roles":[]}))
+                }
+                ("GET", path) if path.starts_with("/channels/") => ScriptedResponse::status(503),
+                _ => panic!("unexpected mock Discord route: {} {}", request.method, path),
+            }
+        })
+        .await;
+        let executor =
+            ActionExecutor::with_proxy("onboarding-test-only-token".into(), Some(rest.origin()))
+                .unwrap();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://127.0.0.1:1/unreadable")
+            .expect("lazy pool");
+        let vars = HashMap::from([
+            ("DISCORD_GUILD_ID".to_owned(), "22".to_owned()),
+            ("TWO_ONBOARDING_MODE".to_owned(), "session".to_owned()),
+            ("TWO_ONBOARDING_DRY_RUN".to_owned(), "0".to_owned()),
+            ("DISCORD_LANDING_CHANNEL_IDS".to_owned(), "12".to_owned()),
+            ("DISCORD_GOODBYE_CHANNEL_IDS".to_owned(), "13".to_owned()),
+            (
+                "DISCORD_ANCHOR_WELCOME_CHANNEL_ID".to_owned(),
+                "14".to_owned(),
+            ),
+            (
+                "DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID".to_owned(),
+                "10".to_owned(),
+            ),
+            (
+                "DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID".to_owned(),
+                "11".to_owned(),
+            ),
+        ]);
+        let runtime = OnboardingRuntime::new(pool, executor, &vars, 22, 999).unwrap();
+        let config = OnboardingConfig::from_map(&vars)
+            .expect("deployment map must parse")
+            .expect("guild present");
+        let error = runtime
+            .first_postable(&config, &[12u64])
+            .await
+            .expect_err("channel REST error must fail, not skip");
+        assert!(
+            matches!(error, RuntimeError::Discord),
+            "unexpected error: {error:?}"
+        );
+    }
 }
