@@ -3744,6 +3744,13 @@ class WorkflowTests(unittest.TestCase):
             if step.get("name") == "Prepare guarded test database"
         )
         self.assertIn("createdb -h agent-testdb -U agent_test two_bot_test_ci", prepare["run"])
+        # The rust:bookworm job container ships no PostgreSQL client; a
+        # bare createdb fails with exit 127, so the install must precede it.
+        self.assertIn("apt-get install -y -qq --no-install-recommends postgresql-client", prepare["run"])
+        self.assertLess(
+            prepare["run"].index("apt-get install"),
+            prepare["run"].index("createdb -h agent-testdb"),
+        )
         step = next(
             step for step in job["steps"]
             if step.get("name") == "Ticket shared router and mock Discord lifecycle acceptance"
