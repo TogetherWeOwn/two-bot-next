@@ -2010,6 +2010,7 @@ mod tests {
                     && !V9_ADDED_TABLES.contains(name)
                     && !V10_ADDED_TABLES.contains(name)
                     && !V11_ADDED_TABLES.contains(name)
+                    && !V12_ADDED_TABLES.contains(name)
             })
             .collect();
         assert_eq!(names, expected);
@@ -2029,7 +2030,9 @@ mod tests {
                 "voice_create_reservations",
                 "retention_guild_purge_queue",
                 "retention_deletion_requests",
-                "event_store"
+                "event_store",
+                "polls",
+                "poll_votes"
             ]
         );
         assert_eq!(contents.buffers["voice_rooms"][0]["channel_id"], "500");
@@ -2072,7 +2075,7 @@ mod tests {
         assert_eq!(contents.manifest.missing_tables(), ["event_store"]);
         // The same inventory at the current version refuses: new archives must
         // cover the event store.
-        assert_eq!(DUMP_VERSION, 11);
+        assert_eq!(DUMP_VERSION, 12);
         let mut current = v5;
         current["version"] = serde_json::json!(DUMP_VERSION);
         assert!(validate_manifest(&current)
@@ -2158,7 +2161,7 @@ mod tests {
             .contains("event_store"));
         let mut current = v5;
         current["version"] = serde_json::json!(DUMP_VERSION);
-        assert_eq!(DUMP_VERSION, 11, "frozen v5 test pins the v11 bump");
+        assert_eq!(DUMP_VERSION, 12, "frozen v5 test pins the v12 writer bump");
         assert!(validate_manifest(&current)
             .unwrap_err()
             .to_string()
@@ -2176,7 +2179,7 @@ mod tests {
         // A v6 recovery point written before the seasonal XP projection (0100)
         // declares every covered table except member_season_xp and stays
         // readable; promoting it to v7 without the table is refused. This is
-        // the frozen-manifest guard for the v7 bump (now pinned at v11):
+        // the frozen-manifest guard for the v7 bump (now pinned at v12):
         // building the old manifest from today's inventory (as the v5 tests
         // do) would silently include the new table and miss the refusal.
         let mut v6 = manifest(without(
@@ -2209,7 +2212,7 @@ mod tests {
             "member_season_xp",
         ));
         assert_eq!(v7_gap["version"], serde_json::json!(DUMP_VERSION));
-        assert_eq!(DUMP_VERSION, 11, "frozen v6 test pins the v11 bump");
+        assert_eq!(DUMP_VERSION, 12, "frozen v6 test pins the v12 writer bump");
         assert!(validate_manifest(&v7_gap)
             .unwrap_err()
             .to_string()
@@ -2276,8 +2279,8 @@ mod tests {
         let mut v7_gap = v6.clone();
         v7_gap["version"] = serde_json::json!(DUMP_VERSION);
         assert_eq!(
-            DUMP_VERSION, 11,
-            "frozen pre-retention test pins the v11 bump"
+            DUMP_VERSION, 12,
+            "frozen pre-retention test pins the v12 writer bump"
         );
         let err = validate_manifest(&v7_gap).unwrap_err().to_string();
         assert!(err.contains("retention_guild_purge_queue"), "{err}");
@@ -2329,7 +2332,7 @@ mod tests {
             "stream_live_claims",
         ));
         assert_eq!(v8_gap["version"], serde_json::json!(DUMP_VERSION));
-        assert_eq!(DUMP_VERSION, 11, "frozen v7 test pins the v11 bump");
+        assert_eq!(DUMP_VERSION, 12, "frozen v7 test pins the v12 writer bump");
         assert!(validate_manifest(&v8_gap)
             .unwrap_err()
             .to_string()
@@ -2370,13 +2373,13 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 11, "new dumps require both guild counters");
+        assert_eq!(DUMP_VERSION, 12, "new dumps require both guild counters");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v11 archive inspects");
+        .expect("complete v12 archive inspects");
         for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
             let mut gap = current.clone();
             gap["tables"]
@@ -2424,13 +2427,13 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 11, "new dumps require the epoch-claim guard");
+        assert_eq!(DUMP_VERSION, 12, "new dumps require the epoch-claim guard");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v11 archive inspects");
+        .expect("complete v12 archive inspects");
         let mut gap = current.clone();
         gap["tables"]
             .as_array_mut()
@@ -2478,13 +2481,13 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 11, "new dumps require the delete tombstones");
+        assert_eq!(DUMP_VERSION, 12, "new dumps require the delete tombstones");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v11 archive inspects");
+        .expect("complete v12 archive inspects");
         let mut gap = current.clone();
         gap["tables"]
             .as_array_mut()
@@ -2497,6 +2500,124 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("scheduled_events_tombstone"), "{error}");
+    }
+
+    // Frozen from the v11 inventory at d58548ddd9, before timed polls. Never
+    // derive this fixture from DUMP_TABLES: that would silently backfill polls
+    // into an allegedly historical recovery point.
+    fn pre_poll_v11_manifest() -> Value {
+        let names: Vec<String> = serde_json::from_str(include_str!(
+            "../../tests/fixtures/pre-poll-v11-tables.json"
+        ))
+        .unwrap();
+        let tables = names
+            .iter()
+            .map(|name| {
+                serde_json::json!({
+                    "name": name, "columns": [], "column_types": [], "count": 0
+                })
+            })
+            .collect();
+        let mut old = manifest(tables);
+        old["version"] = serde_json::json!(11);
+        old
+    }
+
+    #[test]
+    fn frozen_v11_without_polls_reads_but_v12_requires_each_poll_table() {
+        let old = pre_poll_v11_manifest();
+        let contents = inspect_bytes(&gzip_lines(&[
+            old.clone(),
+            serde_json::json!({"kind":"end","rows":0}),
+        ]))
+        .expect("genuine pre-poll v11 inventory must remain readable");
+        assert_eq!(contents.manifest.version, 11);
+        assert_eq!(contents.manifest.missing_tables(), ["polls", "poll_votes"]);
+        assert!(!contents
+            .manifest
+            .tables
+            .iter()
+            .any(|table| table.name == "polls"));
+        assert!(!contents
+            .manifest
+            .tables
+            .iter()
+            .any(|table| table.name == "poll_votes"));
+        assert_eq!(DUMP_VERSION, 12);
+        let mut current = old;
+        current["version"] = serde_json::json!(12);
+        let error = inspect_bytes(&gzip_lines(&[
+            current,
+            serde_json::json!({"kind":"end","rows":0}),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("polls"), "{error}");
+        assert!(error.contains("poll_votes"), "{error}");
+        for name in ["polls", "poll_votes"] {
+            let mut gap = manifest(complete_tables(&BTreeMap::new()));
+            gap["tables"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|table| table["name"] != name);
+            let error = inspect_bytes(&gzip_lines(&[
+                gap,
+                serde_json::json!({"kind":"end","rows":0}),
+            ]))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(name), "{error}");
+        }
+    }
+
+    #[test]
+    fn poll_version_waiver_never_waives_unrelated_tables_or_v11_tombstones() {
+        for version in [11, 12] {
+            for name in ["events", "scheduled_events_tombstone"] {
+                let mut gap = pre_poll_v11_manifest();
+                gap["version"] = serde_json::json!(version);
+                // At v12 include both new tables, so the unrelated omission is
+                // tested without another error masking it.
+                if version == 12 {
+                    for poll_table in ["polls", "poll_votes"] {
+                        gap["tables"]
+                            .as_array_mut()
+                            .unwrap()
+                            .push(serde_json::json!({
+                                "name": poll_table, "columns": [], "column_types": [], "count": 0
+                            }));
+                    }
+                }
+                gap["tables"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|table| table["name"] != name);
+                let error = inspect_bytes(&gzip_lines(&[
+                    gap,
+                    serde_json::json!({"kind":"end","rows":0}),
+                ]))
+                .unwrap_err()
+                .to_string();
+                assert!(error.contains(name), "version {version}: {error}");
+            }
+        }
+        // The historical boundary remains v11, not the current writer version.
+        let mut v10 = pre_poll_v11_manifest();
+        v10["version"] = serde_json::json!(10);
+        v10["tables"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|table| table["name"] != "scheduled_events_tombstone");
+        let contents = inspect_bytes(&gzip_lines(&[
+            v10,
+            serde_json::json!({"kind":"end","rows":0}),
+        ]))
+        .expect("v10 predates tombstones and polls");
+        assert_eq!(contents.manifest.version, 10);
+        assert_eq!(
+            contents.manifest.missing_tables(),
+            ["scheduled_events_tombstone", "polls", "poll_votes"]
+        );
     }
 
     #[test]
@@ -2561,7 +2682,9 @@ mod tests {
         future[0]["version"] = serde_json::json!(DUMP_VERSION + 1);
         let message = inspect_bytes(&gzip_lines(&future)).unwrap_err().to_string();
         assert!(
-            message.contains(&format!("reads 3, 4, 5, 6, 7, 8, 9, 10 and {DUMP_VERSION}")),
+            message.contains(&format!(
+                "reads 3, 4, 5, 6, 7, 8, 9, 10, 11 and {DUMP_VERSION}"
+            )),
             "unknown versions are refused with the readable list: {message}"
         );
     }

@@ -1461,11 +1461,18 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v11-source.ndjson.gz");
+    let current_path = directory.path("v12-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 11);
-    for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
+    assert_eq!(old.manifest.version, 12);
+    for name in [
+        "assistant_monthly_builds",
+        "game_activity_guild_aggregates",
+        "scheduled_events_claim",
+        "scheduled_events_tombstone",
+        "polls",
+        "poll_votes",
+    ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
         old.manifest.tables.retain(|table| table.name != name);
@@ -1478,13 +1485,27 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
     assert_eq!(inspected.manifest.version, 8);
     assert_eq!(
         inspected.manifest.missing_tables(),
-        ["game_activity_guild_aggregates", "assistant_monthly_builds"]
+        [
+            "game_activity_guild_aggregates",
+            "assistant_monthly_builds",
+            "scheduled_events_claim",
+            "scheduled_events_tombstone",
+            "polls",
+            "poll_votes"
+        ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
     forget_moderation_history(pool).await;
     let report = restore(pool, &old_path).await.unwrap();
     assert!(report.ok);
-    for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
+    for name in [
+        "assistant_monthly_builds",
+        "game_activity_guild_aggregates",
+        "scheduled_events_claim",
+        "scheduled_events_tombstone",
+        "polls",
+        "poll_votes",
+    ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
             identifier(name)
@@ -1510,11 +1531,16 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v11-source.ndjson.gz");
+    let current_path = directory.path("v12-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 11);
-    for name in ["scheduled_events_claim", "scheduled_events_tombstone"] {
+    assert_eq!(old.manifest.version, 12);
+    for name in [
+        "scheduled_events_claim",
+        "scheduled_events_tombstone",
+        "polls",
+        "poll_votes",
+    ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
         old.manifest.tables.retain(|table| table.name != name);
@@ -1527,13 +1553,23 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     assert_eq!(inspected.manifest.version, 9);
     assert_eq!(
         inspected.manifest.missing_tables(),
-        ["scheduled_events_claim", "scheduled_events_tombstone"]
+        [
+            "scheduled_events_claim",
+            "scheduled_events_tombstone",
+            "polls",
+            "poll_votes"
+        ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
     forget_moderation_history(pool).await;
     let report = restore(pool, &old_path).await.unwrap();
     assert!(report.ok);
-    for name in ["scheduled_events_claim", "scheduled_events_tombstone"] {
+    for name in [
+        "scheduled_events_claim",
+        "scheduled_events_tombstone",
+        "polls",
+        "poll_votes",
+    ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
             identifier(name)
@@ -1559,10 +1595,10 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v11-source.ndjson.gz");
+    let current_path = directory.path("v12-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 11);
+    assert_eq!(old.manifest.version, 12);
     // Frozen claim-only v10 shape: the merged v10 writer carried the
     // epoch-claim guard but predates the delete tombstones.
     let rows = old.buffers.remove("scheduled_events_tombstone").unwrap();
@@ -1573,6 +1609,11 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
     old.manifest
         .tables
         .retain(|table| table.name != "scheduled_events_tombstone");
+    for name in ["polls", "poll_votes"] {
+        let rows = old.buffers.remove(name).unwrap();
+        assert!(!rows.is_empty(), "fixture must populate newer {name}");
+        old.manifest.tables.retain(|table| table.name != name);
+    }
     old.manifest.version = 10;
     old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
     let old_path = directory.path("pre-tombstone-v10.ndjson.gz");
@@ -1581,7 +1622,7 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
     assert_eq!(inspected.manifest.version, 10);
     assert_eq!(
         inspected.manifest.missing_tables(),
-        ["scheduled_events_tombstone"]
+        ["scheduled_events_tombstone", "polls", "poll_votes"]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
     forget_moderation_history(pool).await;
@@ -1598,6 +1639,16 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
         count, 0,
         "v10 restore clears newer scheduled_events_tombstone target rows"
     );
+    for name in ["polls", "poll_votes"] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(name)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "v10 restore clears newer {name} target rows");
+    }
     let claims: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scheduled_events_claim")
         .fetch_one(pool)
         .await
@@ -1611,6 +1662,183 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
         .await
         .unwrap();
     assert!(members > 0, "older covered data is restored, not discarded");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn frozen_pre_poll_v11_restore_clears_destination_polls_and_child_votes() {
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    seed(pool).await;
+    // Literal pre-poll inventory from d58548ddd9, not today's DUMP_TABLES
+    // minus whatever additions the implementation currently happens to name.
+    let historical: Vec<String> =
+        serde_json::from_str(include_str!("fixtures/pre-poll-v11-tables.json")).unwrap();
+    let before = snapshot(pool, &historical).await;
+    let directory = ArchiveDirectory::new();
+    let current_path = directory.path("poll-source-v12.ndjson.gz");
+    dump(pool, &current_path).await.unwrap();
+    let mut old = inspect(&current_path).unwrap();
+    assert_eq!(old.manifest.version, 12);
+    assert_eq!(old.buffers["polls"].len(), 1, "nonempty destination parent");
+    assert_eq!(
+        old.buffers["poll_votes"].len(),
+        1,
+        "nonempty destination child"
+    );
+    old.manifest.tables = historical
+        .iter()
+        .map(|name| {
+            old.manifest
+                .tables
+                .iter()
+                .find(|table| table.name == *name)
+                .unwrap_or_else(|| panic!("missing historical table {name}"))
+                .clone()
+        })
+        .collect();
+    old.buffers.retain(|name, _| historical.contains(name));
+    old.manifest
+        .sequence_marks
+        .retain(|mark| historical.contains(&mark.table));
+    old.manifest.version = 11;
+    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
+    let path = directory.path("pre-poll-v11.ndjson.gz");
+    write_archive(&path, &old);
+    let inspected = inspect(&path).unwrap();
+    assert_eq!(inspected.manifest.version, 11);
+    assert_eq!(inspected.manifest.missing_tables(), ["polls", "poll_votes"]);
+    assert_eq!(
+        inspected
+            .manifest
+            .tables
+            .iter()
+            .map(|table| table.name.clone())
+            .collect::<Vec<_>>(),
+        historical
+    );
+    assert!(!inspected.buffers.contains_key("polls"));
+    assert!(!inspected.buffers.contains_key("poll_votes"));
+    sqlx::query("UPDATE polls SET question='destination-only poll'")
+        .execute(pool)
+        .await
+        .unwrap();
+    forget_moderation_history(pool).await;
+    let counts: (i64, i64) =
+        sqlx::query_as("SELECT (SELECT count(*) FROM polls), (SELECT count(*) FROM poll_votes)")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        counts,
+        (1, 1),
+        "restore must actually clear a populated FK pair"
+    );
+    let report = restore(pool, &path).await.expect("real pre-poll restore");
+    assert!(report.ok);
+    assert!(report.dropped_columns.is_empty());
+    let counts: (i64, i64) =
+        sqlx::query_as("SELECT (SELECT count(*) FROM polls), (SELECT count(*) FROM poll_votes)")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        counts,
+        (0, 0),
+        "v11 must clear both newer parent and child state"
+    );
+    assert_eq!(
+        snapshot(pool, &historical).await,
+        before,
+        "older covered data survives the same restore"
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v12_nonempty_poll_roundtrip_preserves_votes_counts_receipt_and_dirty_state() {
+    let Some(db) = database().await else { return };
+    seed(db.pool()).await;
+    sqlx::raw_sql(
+        "UPDATE polls SET display_dirty=TRUE WHERE id='backup:poll'; \
+         INSERT INTO polls (guild_id,id,question,options_json,channel_id,message_id,created_by,ends_at,status,display_dirty) \
+         VALUES ('100000000000000001','backup:open-poll','Open poll 雪','[\"one\",\"two\"]', \
+         '100000000000000003','100000000000000008','100000000000000002','2030-01-01T00:00:00Z','open',FALSE); \
+         INSERT INTO poll_votes (guild_id,poll_id,user_id,option_index,voted_at) \
+         VALUES ('100000000000000001','backup:open-poll','100000000000000004',1,'2026-08-01T09:31:00Z');"
+    ).execute(db.pool()).await.unwrap();
+    let tables = vec!["polls".to_owned(), "poll_votes".to_owned()];
+    let before = snapshot(db.pool(), &tables).await;
+    assert_eq!(before["polls"].rows.len(), 2);
+    assert_eq!(before["poll_votes"].rows.len(), 2);
+    let directory = ArchiveDirectory::new();
+    let original = directory.path("nonempty-polls-v12.ndjson.gz");
+    let manifest = dump(db.pool(), &original).await.unwrap();
+    assert_eq!(manifest.version, 12);
+    let mut contents = inspect(&original).unwrap();
+    assert!(contents.manifest.missing_tables().is_empty());
+    for name in ["polls", "poll_votes"] {
+        let table = contents
+            .manifest
+            .tables
+            .iter()
+            .find(|table| table.name == name)
+            .unwrap();
+        assert_eq!(table.count, 2, "v12 must publish nonempty {name}");
+        assert_eq!(contents.buffers[name].len(), 2);
+    }
+    let closed = contents.buffers["polls"]
+        .iter()
+        .find(|row| row["id"] == "backup:poll")
+        .unwrap();
+    assert_eq!(closed["question"], "Backup poll | 雪\nquestion");
+    assert_eq!(closed["counts_json"], "[1, 0]");
+    assert_eq!(closed["results_message_id"], "100000000000000007");
+    assert!(closed["results_posted_at"].is_string());
+    assert_eq!(closed["display_dirty"], "true");
+    let open = contents.buffers["polls"]
+        .iter()
+        .find(|row| row["id"] == "backup:open-poll")
+        .unwrap();
+    assert_eq!(open["display_dirty"], "false");
+    assert_eq!(open["counts_json"], Value::Null);
+    assert_eq!(open["results_message_id"], Value::Null);
+    assert_eq!(open["results_posted_at"], Value::Null);
+    contents.manifest.tables.reverse();
+    let reversed = directory.path("reversed-polls-v12.ndjson.gz");
+    write_archive(&reversed, &contents);
+    let target = database().await.expect("test bootstrap already configured");
+    sqlx::query(BACKUP_IDENTITY)
+        .execute(target.pool())
+        .await
+        .unwrap();
+    let report = restore(target.pool(), &reversed)
+        .await
+        .expect("restore v12 FK pair");
+    assert!(report.ok);
+    assert!(report.dropped_columns.is_empty());
+    assert_eq!(
+        snapshot(target.pool(), &tables).await,
+        before,
+        "every poll column, dirty flag, receipt timestamp and vote cell survives"
+    );
+    let votes: Vec<(String, String, i32)> =
+        sqlx::query_as("SELECT poll_id,user_id,option_index::int FROM poll_votes ORDER BY poll_id")
+            .fetch_all(target.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        votes,
+        vec![
+            (
+                "backup:open-poll".to_owned(),
+                "100000000000000004".to_owned(),
+                1
+            ),
+            ("backup:poll".to_owned(), "100000000000000002".to_owned(), 0),
+        ]
+    );
+    target.close().await.unwrap();
     db.close().await.unwrap();
 }
 
