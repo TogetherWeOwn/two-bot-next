@@ -123,7 +123,7 @@ this proves the build answers readiness and the guild publishes the surface.
 | `GET /readyz` | 200 and every component ready; a parked or down container fails | `SMOKE-READYZ-NOT-READY`, `SMOKE-READYZ-CHECKPOINT-READ-FAILED` |
 | `readyz build identity` | `build_revision` equals `--expected-sha` | `SMOKE-BUILD-MISMATCH` |
 | `identity and command list` | the token is the staging application and the guild command list reads | `SMOKE-DISCORD-REFUSED` |
-| `/rank`, `/leaderboard`, `/help` | listed once with an admitted identity and their own resource binds it ([registry admission](#registry-admission)) | `SMOKE-REGISTRY-MISSING`, `SMOKE-REGISTRY-DETAIL-MISMATCH` |
+| `/rank`, `/leaderboard`, `/help`, `/privacy`, `/invites` | listed once with an admitted identity and their own resource binds it ([registry admission](#registry-admission)) | `SMOKE-REGISTRY-MISSING`, `SMOKE-REGISTRY-DETAIL-MISMATCH` |
 | every other built-in | unpublished: `skipped` (gate off or publish pending); published: listed once with an admitted identity and its own resource binds it | `SMOKE-REGISTRY-DETAIL-MISMATCH`, `SMOKE-DISCORD-REFUSED` |
 
 ### Registry admission
