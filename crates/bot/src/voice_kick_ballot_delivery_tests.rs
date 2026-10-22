@@ -1,6 +1,16 @@
 #![cfg(test)]
 
+use std::str::FromStr as _;
+
 use super::*;
+use twilight_model::{
+    channel::{
+        message::{MessageFlags, MessageType},
+        Message,
+    },
+    id::Id,
+    util::Timestamp,
+};
 use two_bot_core::voice_vote_kick::{VOTE_KICK_COOLDOWN_MS, VOTE_KICK_TTL_MS};
 
 const ROOM: u64 = 500;
@@ -12,6 +22,46 @@ const MESSAGE: MessageRef = MessageRef {
 };
 
 type Worker = GuildRoomWorker<Store, Http>;
+
+fn ballot_message(message_id: u64, channel_id: u64) -> Message {
+    Message {
+        activity: None,
+        application: None,
+        application_id: None,
+        attachments: vec![],
+        author: user(77),
+        call: None,
+        channel_id: Id::new(channel_id),
+        components: vec![],
+        content: "ballot".to_owned(),
+        edited_timestamp: None,
+        embeds: vec![],
+        flags: Some(MessageFlags::empty()),
+        guild_id: Some(Id::new(GUILD)),
+        id: Id::new(message_id),
+        #[allow(deprecated)]
+        interaction: None,
+        interaction_metadata: None,
+        kind: MessageType::Regular,
+        member: None,
+        mention_channels: vec![],
+        mention_everyone: false,
+        mention_roles: vec![],
+        mentions: vec![],
+        message_snapshots: vec![],
+        pinned: false,
+        poll: None,
+        reactions: vec![],
+        reference: None,
+        referenced_message: None,
+        role_subscription_data: None,
+        sticker_items: vec![],
+        timestamp: Timestamp::from_str("2026-09-30T12:00:00.000+00:00").expect("fixture stamp"),
+        thread: None,
+        tts: false,
+        webhook_id: None,
+    }
+}
 
 #[tokio::test]
 async fn ballot_delivery_binding_reports_unavailable_or_closed_actor() {
@@ -649,7 +699,7 @@ async fn ballot_delivery_button_press_binds_message_when_initial_capture_failed(
     assert!(VoiceResponder::start_kick_vote(&runtime, &capture, &open).await);
     // The component callback carries the public ballot message; the press
     // binds it so later timer edits have a target.
-    let callback = crate::command_runtime_tests::message(901, 900, true, Some(GUILD));
+    let callback = ballot_message(901, 900);
     let want = format!("edit_prompt:900:{}:", callback.id.get());
     let mut press = component_interaction(
         &vote_button_id(open.id.get(), VoteBallot::Yes),
