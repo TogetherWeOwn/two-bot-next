@@ -144,7 +144,7 @@ struct JobCap {
 
 /// One row per `metrics::JOBS` entry, in the same order. The hourly
 /// presence probe parks first; the durable checkpoint marker never sheds.
-const JOB_CAPS: [JobCap; 16] = [
+const JOB_CAPS: [JobCap; 17] = [
     JobCap {
         job: "invite_snapshot",
         shed_order: None,
@@ -188,6 +188,10 @@ const JOB_CAPS: [JobCap; 16] = [
     JobCap {
         job: "scheduled_messages",
         shed_order: Some(5),
+    },
+    JobCap {
+        job: "polls",
+        shed_order: None,
     },
     JobCap {
         job: "feeds",
@@ -669,7 +673,7 @@ fn exposition_series_count_matches_the_cardinality_budget() {
         30,
         "route family changed the budget"
     );
-    assert_eq!(metrics::JOBS.len(), 16, "job family changed the budget");
+    assert_eq!(metrics::JOBS.len(), 17, "job family changed the budget");
     assert_eq!(
         metrics::PREFIX_TRIGGER_REFUSED_REASONS.len(),
         2,
@@ -728,9 +732,9 @@ fn exposition_series_count_matches_the_cardinality_budget() {
     assert_eq!(type_headers, 78, "rendered TYPE family count changed");
     let series = text.lines().filter(|line| !line.starts_with('#')).count();
     assert_eq!(
-        series, 726,
-        "exposition grew past the 726-sample budget (4 process-incarnation + 21 events + 4 scalars + 1 latency \
-         + 22 histograms + 180 rest + 11 REST guard + 64 jobs + 112 job-last-error-class + 58 voice + 8 join-occupancy + 26 vote-kick + 16 voice-names + 2 db-errors + 4 send-admissions + 2 prefix-refused + 6 dispatch-drops + 2 checkpoint-failures + 7 drop-poison + 72 internal-actions + 45 moderation-enforcements + 3 facts-drain + 3 presence-capture + 8 automod-decisions + 4 pool + 1 audit-halt + 1 event-store-lag + 1 eventsub-received + 6 eventsub-classified + 4 eventsub-posts + 3 reconcile-passes + 2 reconcile-actions + 5 reconcile-errors + 1 retention-replay-needed + 1 ticket-component-drops + 4 feed-fetches + 12 feed-fetch-errors); \
+        series, 737,
+        "exposition grew past the 737-sample budget (4 process-incarnation + 21 events + 4 scalars + 1 latency \
+         + 22 histograms + 180 rest + 11 REST guard + 68 jobs + 119 job-last-error-class + 58 voice + 8 join-occupancy + 26 vote-kick + 16 voice-names + 2 db-errors + 4 send-admissions + 2 prefix-refused + 6 dispatch-drops + 2 checkpoint-failures + 7 drop-poison + 72 internal-actions + 45 moderation-enforcements + 3 facts-drain + 3 presence-capture + 8 automod-decisions + 4 pool + 1 audit-halt + 1 event-store-lag + 1 eventsub-received + 6 eventsub-classified + 4 eventsub-posts + 3 reconcile-passes + 2 reconcile-actions + 5 reconcile-errors + 1 retention-replay-needed + 1 ticket-component-drops + 4 feed-fetches + 12 feed-fetch-errors); \
          update docs/log-volume-guard.md with the new series"
     );
 }

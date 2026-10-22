@@ -1,6 +1,6 @@
 {
   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
-  "count": 29,
+  "count": 30,
   "dm_permission_all_false": true,
   "commands": [
     {
@@ -621,6 +621,173 @@
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Needs seeded feed relays (DB); the no-DB offline rule excludes it."
+    },
+    {
+      "name": "poll",
+      "description": "Create a timed poll or close your poll",
+      "family": "announcements",
+      "gate": "announcements",
+      "default_member_permissions": null,
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "create",
+          "description": "One changeable vote per member; up to 10 choices",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [],
+          "options": [
+            {
+              "name": "question",
+              "description": "Single poll question",
+              "type": "string",
+              "required": true,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 256,
+              "choices": []
+            },
+            {
+              "name": "option1",
+              "description": "First choice",
+              "type": "string",
+              "required": true,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 80,
+              "choices": []
+            },
+            {
+              "name": "option2",
+              "description": "Second choice",
+              "type": "string",
+              "required": true,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 80,
+              "choices": []
+            },
+            {
+              "name": "duration-minutes",
+              "description": "Close after 1 minute to 7 days",
+              "type": "integer",
+              "required": true,
+              "min_value": 1,
+              "max_value": 10080,
+              "max_length": null,
+              "choices": []
+            },
+            {
+              "name": "option3",
+              "description": "Additional choice",
+              "type": "string",
+              "required": false,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 80,
+              "choices": []
+            },
+            {
+              "name": "option4",
+              "description": "Additional choice",
+              "type": "string",
+              "required": false,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 80,
+              "choices": []
+            },
+            {
+              "name": "option5",
+              "description": "Additional choice",
+              "type": "string",
+              "required": false,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 80,
+              "choices": []
+            },
+            {
+              "name": "option6",
+              "description": "Additional choice",
+              "type": "string",
+              "required": false,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 80,
+              "choices": []
+            },
+            {
+              "name": "option7",
+              "description": "Additional choice",
+              "type": "string",
+              "required": false,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 80,
+              "choices": []
+            },
+            {
+              "name": "option8",
+              "description": "Additional choice",
+              "type": "string",
+              "required": false,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 80,
+              "choices": []
+            },
+            {
+              "name": "option9",
+              "description": "Additional choice",
+              "type": "string",
+              "required": false,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 80,
+              "choices": []
+            },
+            {
+              "name": "option10",
+              "description": "Additional choice",
+              "type": "string",
+              "required": false,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 80,
+              "choices": []
+            }
+          ]
+        },
+        {
+          "name": "close",
+          "description": "Close your poll and publish results",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [],
+          "options": [
+            {
+              "name": "id",
+              "description": "Poll id shown in the poll message",
+              "type": "string",
+              "required": true,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 20,
+              "choices": []
+            }
+          ]
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Needs disposable-database creation, member votes and timed results delivery; covered by poll acceptance rather than the no-DB smoke five. No staging evidence is claimed."
     },
     {
       "name": "ban",

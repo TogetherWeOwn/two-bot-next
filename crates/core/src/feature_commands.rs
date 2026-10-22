@@ -434,6 +434,7 @@ mod tests {
                 "feed-add",
                 "feed-remove",
                 "feed-list",
+                "poll",
             ]
         );
     }
@@ -441,8 +442,8 @@ mod tests {
     #[test]
     fn no_collision_with_leveling_core_or_within_slice() {
         let merged = merge_commands(&[feature_commands()], &[]).expect("slice 2 merges cleanly");
-        // 4 core + 1 scorecard + 8 automation + 7 announcement.
-        assert_eq!(merged.len(), 20);
+        // 4 core + 1 scorecard + 8 automation + 8 announcement.
+        assert_eq!(merged.len(), 21);
         assert_eq!(
             &names(&merged)[..5],
             ["rank", "leaderboard", "help", "privacy", "attendance"]

@@ -60,7 +60,7 @@ fn has_framework_marker(source: &str) -> bool {
 }
 
 /// Emitter sources read at compile time so the suite is fully offline.
-const EMITTER_SOURCES: [(&str, &str); 10] = [
+const EMITTER_SOURCES: [(&str, &str); 11] = [
     ("website_jobs.rs", include_str!("website_jobs.rs")),
     ("settings_jobs.rs", include_str!("settings_jobs.rs")),
     ("community_jobs.rs", include_str!("community_jobs.rs")),
@@ -72,13 +72,14 @@ const EMITTER_SOURCES: [(&str, &str); 10] = [
         include_str!("self_role_handlers.rs"),
     ),
     ("feed_jobs.rs", include_str!("feed_jobs.rs")),
+    ("poll_jobs.rs", include_str!("poll_jobs.rs")),
     ("automod_gateway.rs", include_str!("automod_gateway.rs")),
     ("gateway_metrics.rs", include_str!("gateway_metrics.rs")),
 ];
 
 /// Every scrape job with a supervised emitter, paired with the file that
 /// schedules it. The file must name the job and keep the framework marker.
-const LIVE_JOB_EMITTERS: [(&str, &str); 13] = [
+const LIVE_JOB_EMITTERS: [(&str, &str); 14] = [
     ("counter", "website_jobs.rs"),
     ("rank", "website_jobs.rs"),
     ("scheduled_events", "website_jobs.rs"),
@@ -89,6 +90,7 @@ const LIVE_JOB_EMITTERS: [(&str, &str); 13] = [
     ("audit_retry", "audit_runtime.rs"),
     ("scheduled_messages", "scheduled_jobs.rs"),
     ("feeds", "feed_jobs.rs"),
+    ("polls", "poll_jobs.rs"),
     ("member_unban_sweep", "member_runtime.rs"),
     ("self_role_recovery", "self_role_handlers.rs"),
     ("automod_expiry", "automod_gateway.rs"),
@@ -97,12 +99,13 @@ const LIVE_JOB_EMITTERS: [(&str, &str); 13] = [
 /// Every `website_jobs.rs` call that schedules a live job. Naming the job in
 /// its defining file is not enough: a registration that stops being called
 /// must fail here even while the name still appears elsewhere.
-const REGISTER_CALLS: [&str; 8] = [
+const REGISTER_CALLS: [&str; 9] = [
     "crate::settings_jobs::job(",
     "scheduled_jobs::register(",
     "community_jobs::register(",
     "audit_runtime::register(",
     "feed_jobs::register(",
+    "crate::poll_jobs::register(",
     "member_runtime::sweep_job(",
     ".recovery_job()",
     "automod_gateway::expiry_job(",
@@ -113,7 +116,7 @@ const REGISTER_CALLS: [&str; 8] = [
 /// or `drop(...)` keeps the call while the job never registers, so each entry
 /// pins the sink together with the call, matched against the source with
 /// full-line `//` comments removed.
-const REGISTER_SINKS: [&str; 8] = [
+const REGISTER_SINKS: [&str; 9] = [
     "registered.push(crate::settings_jobs::job(",
     "registered.push(Job {",
     "registered.extend(scheduled)",
@@ -122,6 +125,7 @@ const REGISTER_SINKS: [&str; 8] = [
     "registered.push(crate::automod_gateway::expiry_job(",
     "registered.push(service.recovery_job())",
     "Some(job) => registered.push(job)",
+    "if let Some(job) = crate::poll_jobs::register(context.clone(), &activation) {\n                    registered.push(job);",
 ];
 
 /// Entries the shared `NAMES` loop schedules. Pinned inside the array block
