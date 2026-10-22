@@ -241,13 +241,13 @@ fn history(id: u64) -> Value {
         "content":format!("message-{id}"),"attachments":[{"url":"https://example.test/attachment"}]})
 }
 
-async fn active_as(runtime: &TicketRuntime, id: &str, opener: &str) -> Ticket {
+async fn active_as(runtime: &TicketRuntime, id: &str, opener: &str, channel: &str) -> Ticket {
     match runtime.store.reserve(id, opener, 0, 0).await.unwrap() {
         OpenResult::Created(_) => {}
         _ => panic!("expected reservation"),
     }
-    runtime.store.record_channel(id, "600").await.unwrap();
-    runtime.store.activate(id, "600").await.unwrap()
+    runtime.store.record_channel(id, channel).await.unwrap();
+    runtime.store.activate(id, channel).await.unwrap()
 }
 
 fn sample(text: &str, series: &str) -> Option<u64> {
@@ -361,7 +361,7 @@ async fn retire_missing_open_counts_and_logs_once_with_cause() {
     )
     .await;
     let runtime = runtime(db.pool.clone(), &mock);
-    active_as(&runtime, "lc-retire-1", "500").await;
+    active_as(&runtime, "lc-retire-1", "500", "600").await;
     let ticket = runtime.store.get("lc-retire-1").await.unwrap().unwrap();
 
     let start = capture().text().len();
@@ -572,7 +572,7 @@ async fn claim_success_counts_and_logs_once() {
     // Claim performs no Discord I/O: authorize plus two store calls.
     let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
     let runtime = runtime(db.pool.clone(), &mock);
-    active_as(&runtime, "lc-claim-1", "500").await;
+    active_as(&runtime, "lc-claim-1", "500", "600").await;
     let claim = button(TicketAction::Claim, "100", "501", vec!["300"], 0);
 
     let start = capture().text().len();
@@ -632,7 +632,7 @@ async fn close_success_counts_and_logs_once() {
     )
     .await;
     let runtime = runtime(db.pool.clone(), &mock);
-    active_as(&runtime, "lc-close-1", "500").await;
+    active_as(&runtime, "lc-close-1", "500", "600").await;
     let close = button(
         TicketAction::Close,
         "100",
@@ -689,8 +689,8 @@ async fn close_success_counts_and_logs_once() {
 // Purge.
 // ---------------------------------------------------------------------------
 
-async fn finished_with_transcript(runtime: &TicketRuntime, id: &str, opener: &str) {
-    active_as(runtime, id, opener).await;
+async fn finished_with_transcript(runtime: &TicketRuntime, id: &str, opener: &str, channel: &str) {
+    active_as(runtime, id, opener, channel).await;
     runtime.store.begin_close(id, 1).await.unwrap();
     runtime
         .store
@@ -706,8 +706,8 @@ async fn purge_reports_deleted_count_in_counter_and_log() {
     let db = TestDb::new().await;
     let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
     let runtime = runtime(db.pool.clone(), &mock);
-    finished_with_transcript(&runtime, "lc-purge-1", "501").await;
-    finished_with_transcript(&runtime, "lc-purge-2", "502").await;
+    finished_with_transcript(&runtime, "lc-purge-1", "501", "600").await;
+    finished_with_transcript(&runtime, "lc-purge-2", "502", "601").await;
 
     let start = capture().text().len();
     assert!(runtime.purge().await.is_ok());
@@ -863,7 +863,7 @@ async fn ticket_action_incomplete_warn_carries_action_ticket_and_status() {
         tickets.executor.clone(),
         Arc::clone(&tickets),
     );
-    active_as(&tickets, "lc-warn-1", "500").await;
+    active_as(&tickets, "lc-warn-1", "500", "600").await;
     commands
         .on_interaction(&button(TicketAction::Claim, "100", "501", vec!["300"], 0))
         .await;
