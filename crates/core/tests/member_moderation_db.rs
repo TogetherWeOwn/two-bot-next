@@ -2320,10 +2320,9 @@ async fn postgres_void_requeues_current_expiry_and_fence_refusal_releases_only_n
         let old = format!("old-{i}");
         accepted_unban(&store, guild, user, &old, NOW, NOW).await;
         discord.fail_with("unban", DiscordError::Timeout);
-        assert!(matches!(
-            svc.run_due_unbans(guild).await,
-            Err(MemberError::Discord(DiscordError::Timeout))
-        ));
+        // The timeout fences its row and the sweep continues past it; the
+        // void/retry assertions below are unchanged.
+        assert_eq!(svc.run_due_unbans(guild).await.expect("timeout fenced"), 0);
         let token: String = sqlx::query_scalar(
             "SELECT claim_token FROM moderation_scheduled_unbans WHERE request_id = $1",
         )
@@ -2370,7 +2369,7 @@ async fn postgres_void_requeues_current_expiry_and_fence_refusal_releases_only_n
 #[tokio::test]
 #[ignore = "requires approved agent-testdb or CI Postgres service"]
 async fn postgres_scheduled_unban_queue_lifecycle_and_failed_claim_disposition() {
-    use two_bot_core::member_moderation::{DiscordError, MemberError};
+    use two_bot_core::member_moderation::DiscordError;
     // OVERDUE is two hours before NOW: a sweep at NOW must still claim it,
     // not drop it. FUTURE must be retained untouched by every sweep here.
     const OVERDUE: &str = "2023-11-14T20:13:20.000Z";
@@ -2473,10 +2472,11 @@ async fn postgres_scheduled_unban_queue_lifecycle_and_failed_claim_disposition()
     });
     accepted_unban(&store, guild, "refused-user", "refused-expiry", NOW, NOW).await;
     discord.fail_with("unban", DiscordError::Rejected("already unbanned".into()));
-    assert!(matches!(
-        svc.run_due_unbans(guild).await,
-        Err(MemberError::Discord(DiscordError::Rejected(_)))
-    ));
+    // The refusal is recorded and requeued; the sweep continues past it.
+    assert_eq!(
+        svc.run_due_unbans(guild).await.expect("refusal recorded"),
+        0
+    );
     assert_eq!(unban_state(&pool, "refused-expiry").await, "pending");
     discord.clear_failure("unban");
     assert_eq!(svc.run_due_unbans(guild).await.expect("retry sweep"), 1);
@@ -2484,10 +2484,8 @@ async fn postgres_scheduled_unban_queue_lifecycle_and_failed_claim_disposition()
 
     accepted_unban(&store, guild, "timeout-user", "timeout-expiry", NOW, NOW).await;
     discord.fail_with("unban", DiscordError::Timeout);
-    assert!(matches!(
-        svc.run_due_unbans(guild).await,
-        Err(MemberError::Discord(DiscordError::Timeout))
-    ));
+    // The timeout fences its row and the sweep continues past it.
+    assert_eq!(svc.run_due_unbans(guild).await.expect("timeout fenced"), 0);
     assert_eq!(unban_state(&pool, "timeout-expiry").await, "running");
     assert_eq!(
         svc.run_due_unbans(guild)
@@ -2523,9 +2521,10 @@ async fn postgres_scheduled_unban_queue_lifecycle_and_failed_claim_disposition()
     assert_eq!(unban_state(&pool, "timeout-expiry").await, "done");
 
     // Receipt counts for the waiver ledger: four unbans done (due, overdue,
-    // refused, timeout), the future expiry still pending. Only the two
-    // sweep-driven unbans carry an unban audit: direct store-level completes
-    // close the claim without dispatching, so they audit nothing.
+    // refused, timeout), the future expiry still pending. The two
+    // sweep-driven unbans each carry a success audit plus one failure audit
+    // from their first failed attempt; direct store-level completes close
+    // the claim without dispatching, so they audit nothing.
     let (done, pending, audits): (i64, i64, i64) = sqlx::query_as(
         "SELECT (SELECT COUNT(*) FROM moderation_scheduled_unbans WHERE state = 'done'),
                 (SELECT COUNT(*) FROM moderation_scheduled_unbans WHERE state = 'pending'),
@@ -2535,5 +2534,5 @@ async fn postgres_scheduled_unban_queue_lifecycle_and_failed_claim_disposition()
     .await
     .expect("receipt counts");
     cleanup(admin, pool, schema).await;
-    assert_eq!((done, pending, audits), (4, 1, 2));
+    assert_eq!((done, pending, audits), (4, 1, 4));
 }
