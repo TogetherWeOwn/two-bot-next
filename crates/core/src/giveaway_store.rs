@@ -27,7 +27,11 @@ use sqlx::{Pool, Postgres};
 /// `status` is the [`crate::giveaway::GiveawayStatus`] wire value; transitions
 /// are validated by [`crate::giveaway::transition`] before
 /// [`set_giveaway_status`] persists them.
-#[derive(Clone, Debug, PartialEq, Eq, sqlx::FromRow)]
+///
+/// `Debug` is manual: `draw_nonce` predicts every winner of an open giveaway
+/// and `claim_token` is the draw-ticker lease capability, so both stay out
+/// of diagnostics while every other field remains available.
+#[derive(Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct GiveawayRow {
     pub guild_id: String,
     pub id: String,
@@ -46,6 +50,33 @@ pub struct GiveawayRow {
     pub announced_at: Option<OffsetDateTime>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
+}
+
+impl std::fmt::Debug for GiveawayRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GiveawayRow")
+            .field("guild_id", &self.guild_id)
+            .field("id", &self.id)
+            .field("prize", &self.prize)
+            .field("channel_id", &self.channel_id)
+            .field("message_id", &self.message_id)
+            .field("created_by", &self.created_by)
+            .field("winners_count", &self.winners_count)
+            .field("ends_at", &self.ends_at)
+            .field("status", &self.status)
+            .field("requirements_json", &self.requirements_json)
+            .field("max_entries", &self.max_entries)
+            .field("draw_nonce", &"[REDACTED]")
+            .field(
+                "claim_token",
+                &self.claim_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("claimed_at", &self.claimed_at)
+            .field("announced_at", &self.announced_at)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
 }
 
 /// One `giveaway_entries` row. `weight` is reserved for bonus entries and is
@@ -79,7 +110,10 @@ pub struct GiveawayDrawRow {
 /// duration with [`crate::giveaway::validate_new_giveaway`], mints
 /// `draw_nonce` with [`crate::giveaway::mint_draw_nonce`], and passes
 /// `created_at` for both timestamps; the row starts `open` with no claim.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is manual for the same reason as [`GiveawayRow`]: the pre-draw
+/// nonce must never reach diagnostics.
+#[derive(Clone, PartialEq, Eq)]
 pub struct NewGiveaway {
     pub guild_id: String,
     pub id: String,
@@ -93,6 +127,25 @@ pub struct NewGiveaway {
     pub max_entries: i32,
     pub draw_nonce: String,
     pub created_at: OffsetDateTime,
+}
+
+impl std::fmt::Debug for NewGiveaway {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewGiveaway")
+            .field("guild_id", &self.guild_id)
+            .field("id", &self.id)
+            .field("prize", &self.prize)
+            .field("channel_id", &self.channel_id)
+            .field("message_id", &self.message_id)
+            .field("created_by", &self.created_by)
+            .field("winners_count", &self.winners_count)
+            .field("ends_at", &self.ends_at)
+            .field("requirements_json", &self.requirements_json)
+            .field("max_entries", &self.max_entries)
+            .field("draw_nonce", &"[REDACTED]")
+            .field("created_at", &self.created_at)
+            .finish()
+    }
 }
 
 /// A new draw row. The caller derives `seed` with
@@ -164,22 +217,27 @@ pub async fn get_giveaway(
 }
 
 /// Persist a lifecycle step the caller validated with
-/// [`crate::giveaway::transition`]. Returns `false` when the giveaway is unknown.
+/// [`crate::giveaway::transition`]. Compare-and-set on `expected`: returns
+/// `false` when the giveaway is unknown or no longer in the status the
+/// caller transitioned from, so two racing lifecycle writers cannot
+/// overwrite each other.
 pub async fn set_giveaway_status(
     pool: &Pool<Postgres>,
     guild_id: &str,
     giveaway_id: &str,
     status: &str,
     updated_at: OffsetDateTime,
+    expected: &str,
 ) -> Result<bool, sqlx::Error> {
     let updated = sqlx::query(
         "UPDATE giveaways SET status = $3, updated_at = $4
-          WHERE guild_id = $1 AND id = $2",
+          WHERE guild_id = $1 AND id = $2 AND status = $5",
     )
     .bind(guild_id)
     .bind(giveaway_id)
     .bind(status)
     .bind(updated_at)
+    .bind(expected)
     .execute(pool)
     .await?
     .rows_affected();
@@ -300,19 +358,23 @@ pub async fn claim_due_giveaway(
 /// Release a claim after a retryable failure, so the next tick re-claims the
 /// row. Only the claim holder clears the lease; returns `false` when the
 /// token does not match (the giveaway is unknown, unclaimed, or re-leased).
+/// Stamps `updated_at` like every other `giveaways` mutation, so the
+/// rollback-delta recency measure keeps seeing the row's last write.
 pub async fn release_claim(
     pool: &Pool<Postgres>,
     guild_id: &str,
     giveaway_id: &str,
     claim_token: &str,
+    updated_at: OffsetDateTime,
 ) -> Result<bool, sqlx::Error> {
     let released = sqlx::query(
-        "UPDATE giveaways SET claim_token = NULL, claimed_at = NULL
+        "UPDATE giveaways SET claim_token = NULL, claimed_at = NULL, updated_at = $4
           WHERE guild_id = $1 AND id = $2 AND claim_token = $3",
     )
     .bind(guild_id)
     .bind(giveaway_id)
     .bind(claim_token)
+    .bind(updated_at)
     .execute(pool)
     .await?
     .rows_affected();
@@ -320,9 +382,11 @@ pub async fn release_claim(
 }
 
 /// Complete the draw phase: flip a claimed giveaway to `drawn` and release
-/// the claim. Only the claim holder completes; returns `false` when the
-/// token does not match. The caller inserts the draw row first, then calls
-/// this, then announces and calls [`mark_announced`].
+/// the claim. Only the claim holder completes, and only while the giveaway
+/// is still `open`: a late completion after a moderator paused or cancelled
+/// the row returns `false` instead of resurrecting it as drawn. The caller
+/// inserts the draw row first, then calls this, then announces and calls
+/// [`mark_announced`].
 pub async fn mark_drawn(
     pool: &Pool<Postgres>,
     guild_id: &str,
@@ -333,7 +397,7 @@ pub async fn mark_drawn(
     let completed = sqlx::query(
         "UPDATE giveaways
             SET status = 'drawn', claim_token = NULL, claimed_at = NULL, updated_at = $4
-          WHERE guild_id = $1 AND id = $2 AND claim_token = $3",
+          WHERE guild_id = $1 AND id = $2 AND claim_token = $3 AND status = 'open'",
     )
     .bind(guild_id)
     .bind(giveaway_id)
@@ -429,4 +493,68 @@ pub async fn latest_draw_no(
     .bind(giveaway_id)
     .fetch_one(pool)
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NONCE: &str = "unit-draw-nonce-must-not-leak";
+    const TOKEN: &str = "unit-claim-token-must-not-leak";
+
+    fn row() -> GiveawayRow {
+        GiveawayRow {
+            guild_id: "1545644954272137297".to_owned(),
+            id: "gw01h455k".to_owned(),
+            prize: "unit-prize".to_owned(),
+            channel_id: "221813744719470592".to_owned(),
+            message_id: "221813744719470593".to_owned(),
+            created_by: "123456789012345678".to_owned(),
+            winners_count: 1,
+            ends_at: OffsetDateTime::UNIX_EPOCH,
+            status: "open".to_owned(),
+            requirements_json: serde_json::json!({}),
+            max_entries: 1,
+            draw_nonce: NONCE.to_owned(),
+            claim_token: Some(TOKEN.to_owned()),
+            claimed_at: None,
+            announced_at: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    fn input() -> NewGiveaway {
+        NewGiveaway {
+            guild_id: "1545644954272137297".to_owned(),
+            id: "gw01h455k".to_owned(),
+            prize: "unit-prize".to_owned(),
+            channel_id: "221813744719470592".to_owned(),
+            message_id: "221813744719470593".to_owned(),
+            created_by: "123456789012345678".to_owned(),
+            winners_count: 1,
+            ends_at: OffsetDateTime::UNIX_EPOCH,
+            requirements_json: serde_json::json!({}),
+            max_entries: 1,
+            draw_nonce: NONCE.to_owned(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn debug_redacts_row_secrets_in_both_formats() {
+        let rendered = format!("{:?}\n{:#?}", row(), row());
+        assert!(!rendered.contains(NONCE), "draw nonce leaked: {rendered}");
+        assert!(!rendered.contains(TOKEN), "claim token leaked: {rendered}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+        assert!(rendered.contains("unit-prize"), "{rendered}");
+    }
+
+    #[test]
+    fn debug_redacts_input_nonce_in_both_formats() {
+        let rendered = format!("{:?}\n{:#?}", input(), input());
+        assert!(!rendered.contains(NONCE), "draw nonce leaked: {rendered}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+        assert!(rendered.contains("unit-prize"), "{rendered}");
+    }
 }

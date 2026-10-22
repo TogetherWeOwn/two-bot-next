@@ -118,12 +118,15 @@ async fn giveaway_crud_round_trips_the_definition() -> Result<(), sqlx::Error> {
         .expect("created giveaway reads back");
     assert_eq!(read, created);
     assert_eq!(store::get_giveaway(&pool, GUILD, "missing").await?, None);
-    assert!(store::set_giveaway_status(&pool, GUILD, "gw01h455k", "paused", at(10)).await?);
+    assert!(store::set_giveaway_status(&pool, GUILD, "gw01h455k", "paused", at(10), "open").await?);
     let paused = store::get_giveaway(&pool, GUILD, "gw01h455k")
         .await?
         .expect("paused giveaway reads back");
     assert_eq!(paused.status, "paused");
-    assert!(!store::set_giveaway_status(&pool, GUILD, "missing", "paused", at(10)).await?);
+    assert!(
+        !store::set_giveaway_status(&pool, GUILD, "gw01h455k", "cancelled", at(11), "open").await?
+    );
+    assert!(!store::set_giveaway_status(&pool, GUILD, "missing", "paused", at(10), "open").await?);
     fixture.close().await.expect("drop test database");
     Ok(())
 }
@@ -287,18 +290,19 @@ async fn release_claim_only_honors_the_holder() -> Result<(), sqlx::Error> {
     store::claim_due_giveaway(&pool, GUILD, at(3_600), at(0), "lease-1")
         .await?
         .expect("due giveaway leases");
-    assert!(!store::release_claim(&pool, GUILD, "gw01h455k", "lease-wrong").await?);
+    assert!(!store::release_claim(&pool, GUILD, "gw01h455k", "lease-wrong", at(3_601)).await?);
     let held = store::get_giveaway(&pool, GUILD, "gw01h455k")
         .await?
         .expect("giveaway reads back");
     assert_eq!(held.claim_token.as_deref(), Some("lease-1"));
-    assert!(store::release_claim(&pool, GUILD, "gw01h455k", "lease-1").await?);
+    assert!(store::release_claim(&pool, GUILD, "gw01h455k", "lease-1", at(3_601)).await?);
     let released = store::get_giveaway(&pool, GUILD, "gw01h455k")
         .await?
         .expect("giveaway reads back");
     assert_eq!(released.claim_token, None);
     assert_eq!(released.claimed_at, None);
-    assert!(!store::release_claim(&pool, GUILD, "gw01h455k", "lease-1").await?);
+    assert_eq!(released.updated_at, at(3_601));
+    assert!(!store::release_claim(&pool, GUILD, "gw01h455k", "lease-1", at(3_602)).await?);
     fixture.close().await.expect("drop test database");
     Ok(())
 }
@@ -318,7 +322,20 @@ async fn mark_drawn_completes_only_for_the_holder() -> Result<(), sqlx::Error> {
         .await?
         .expect("giveaway reads back");
     assert_eq!(open.status, "open");
-    assert!(store::mark_drawn(&pool, GUILD, "gw01h455k", "lease-1", at(3_601)).await?);
+    assert!(
+        store::set_giveaway_status(&pool, GUILD, "gw01h455k", "cancelled", at(3_602), "open")
+            .await?
+    );
+    assert!(!store::mark_drawn(&pool, GUILD, "gw01h455k", "lease-1", at(3_603)).await?);
+    let cancelled = store::get_giveaway(&pool, GUILD, "gw01h455k")
+        .await?
+        .expect("giveaway reads back");
+    assert_eq!(cancelled.status, "cancelled");
+    assert!(
+        store::set_giveaway_status(&pool, GUILD, "gw01h455k", "open", at(3_604), "cancelled")
+            .await?
+    );
+    assert!(store::mark_drawn(&pool, GUILD, "gw01h455k", "lease-1", at(3_605)).await?);
     let drawn = store::get_giveaway(&pool, GUILD, "gw01h455k")
         .await?
         .expect("giveaway reads back");
@@ -428,7 +445,9 @@ async fn non_open_giveaways_are_never_due() -> Result<(), sqlx::Error> {
     };
     let pool = fixture.pool().clone();
     store::create_giveaway(&pool, &new_giveaway("gw01h455k", at(900))).await?;
-    assert!(store::set_giveaway_status(&pool, GUILD, "gw01h455k", "cancelled", at(100)).await?);
+    assert!(
+        store::set_giveaway_status(&pool, GUILD, "gw01h455k", "cancelled", at(100), "open").await?
+    );
     assert_eq!(
         store::claim_due_giveaway(&pool, GUILD, at(3_600), at(0), "lease-1")
             .await?

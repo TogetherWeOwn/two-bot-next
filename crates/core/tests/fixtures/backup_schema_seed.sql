@@ -251,6 +251,20 @@ VALUES ('100000000000000001', '100000000000000011', 'Backup event', '2026-08-02T
 INSERT INTO scheduled_events_claim (guild_id, epoch)
 VALUES ('100000000000000001', '2026-08-01T10:00:00.000Z'),
        ('100000000000000002', '2026-08-01T11:00:00.000Z');
+INSERT INTO giveaways
+    (guild_id, id, prize, channel_id, message_id, created_by, winners_count, ends_at,
+     status, requirements_json, max_entries, draw_nonce, created_at, updated_at)
+VALUES ('100000000000000001', '100000000000000021', 'Backup Nitro', '100000000000000003',
+        '100000000000000004', '100000000000000002', 1, '2026-08-02T18:00:00.000Z',
+        'drawn', '{"roles": [], "min_account_age_days": 0}', 1,
+        '0123456789abcdef0123456789abcdef', '2026-08-01T10:00:00.000Z', '2026-08-01T10:00:00.000Z');
+INSERT INTO giveaway_entries (guild_id, giveaway_id, user_id, weight, entered_at)
+VALUES ('100000000000000001', '100000000000000021', '100000000000000005', 1, '2026-08-01T11:00:00.000Z');
+INSERT INTO giveaway_draws
+    (guild_id, giveaway_id, draw_no, drawn_at, eligible_count, eligible_hash, seed,
+     winner_ids, reroll_kind)
+VALUES ('100000000000000001', '100000000000000021', 0, '2026-08-02T18:00:00.000Z', 1,
+        'eligible', 'seed', '["100000000000000005"]', NULL);
 INSERT INTO counter_snapshots
     (guild_id, human_member_count, human_member_count_at, online_count, online_count_at)
 VALUES ('100000000000000001', 123, '2026-08-01T09:00:00.000Z', 13, '2026-08-01T09:01:00.000Z');

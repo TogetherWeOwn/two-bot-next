@@ -207,8 +207,11 @@ pub fn validate_new_giveaway(input: &NewGiveawayInput) -> Result<ValidatedGiveaw
 }
 
 /// Entry requirements (the parsed `requirements_json` column). Every field
-/// defaults, so `"{}"` means "every member may enter".
+/// defaults, so `"{}"` means "every member may enter". Unknown fields are
+/// refused: a misspelled key must fail loudly instead of silently dropping
+/// a gate the moderator thought they set.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GiveawayRequirements {
     /// Required role ids (snowflakes): the member must hold every one.
     #[serde(default)]
@@ -386,8 +389,8 @@ pub fn draw(eligible_user_ids: &[String], seed_hex: &str, winners_count: usize) 
         let digest = sha256_raw(&format!("{seed_hex}:{i}"));
         let rand = u64::from_be_bytes([
             digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
-        ]) as usize;
-        let pick = i + rand % (total - i);
+        ]);
+        let pick = i + (rand % (total - i) as u64) as usize;
         order.swap(i, pick);
     }
     order.truncate(take);
@@ -660,6 +663,10 @@ mod tests {
         ));
         assert!(matches!(
             parse_requirements(r#"{"min_guild_age_days":3651}"#),
+            Err(GiveawayError::InvalidRequirements(_))
+        ));
+        assert!(matches!(
+            parse_requirements(r#"{"min_account_age_days":30,"min_acount_age_days":7}"#),
             Err(GiveawayError::InvalidRequirements(_))
         ));
     }
