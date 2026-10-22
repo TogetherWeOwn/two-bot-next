@@ -54,6 +54,7 @@ async fn ballot_delivery_binding_reports_unavailable_or_closed_actor() {
         GuildActor {
             live: LiveGuild::new(GUILD),
             tx,
+            backpressure: ActorInboxBackpressure::default(),
         },
     );
     assert!(runtime.kick_message(GUILD, VOTE, MESSAGE));
