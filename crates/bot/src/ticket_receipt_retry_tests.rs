@@ -155,7 +155,7 @@ async fn recover_open(evidence: Evidence) -> Vec<String> {
             ("GET", "/api/v10/channels/600") => {
                 ScriptedResponse::json(200, receipt("two-ticket:reattach", evidence))
             }
-            ("GET", "/api/v10/channels/600/messages?limit=100") => {
+            ("GET", "/api/v10/channels/600/messages?limit=50") => {
                 let messages = if controls.load(Ordering::SeqCst) {
                     json!([own_controls()])
                 } else {
