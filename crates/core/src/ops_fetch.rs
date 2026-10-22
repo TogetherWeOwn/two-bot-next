@@ -236,7 +236,7 @@ mod tests {
             axum::routing::get(move |request: axum::extract::Request| async move {
                 seen.lock().expect("auth capture lock").push(
                     request
-                        .headers
+                        .headers()
                         .get(AUTHORIZATION)
                         .and_then(|v| v.to_str().ok().map(str::to_owned)),
                 );
@@ -299,11 +299,12 @@ mod tests {
         // Malformed and off-shape bodies are Parse failures.
         for body in ["not-json{{{", r#"{"epoch": 1}"#] {
             let body = body.to_owned();
+            let value = body.clone();
             let malformed = MockOps::serve(move |_seen| {
                 axum::Router::new().route(
                     "/ops/config",
                     axum::routing::get(move || {
-                        let body = body.clone();
+                        let body = value.clone();
                         async move { body }
                     }),
                 )
@@ -337,7 +338,7 @@ mod tests {
             .expect("probe listen");
         let url: Uri = format!(
             "http://{}/ops/config",
-            listener.local_addr().expect("probe address").port()
+            listener.local_addr().expect("probe address")
         )
         .parse()
         .expect("probe url parses");
