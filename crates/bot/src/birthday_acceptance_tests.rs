@@ -71,8 +71,16 @@
 //!   falls back to a default cheer.
 //! * Role: granted for the day, removed once the day passes, including stale
 //!   grants held by non-celebrants. Grants are idempotent (no redundant PUT).
-//! * Cap: at most [`CELEBRANT_CHEER_CAP`] cheers per guild per sweep, lowest
-//!   member id first; overflow celebrants are still granted the role.
+//! * Cap: at most [`CELEBRANT_CHEER_CAP`] cheers per guild per UTC date across
+//!   repeated/concurrent/restart sweeps, lowest member id first; overflow
+//!   celebrants are still granted the role.
+//! * Config targets: same-guild text/news channels and unmanaged, non-everyone
+//!   cosmetic roles only (permissions exactly zero, no channel access grants).
+//!   Invalid targets never partially save settings.
+//! * Raw set options refuse years/unknowns/duplicates without replacing state;
+//!   raw show target options refuse without exposing either member's birthday.
+//! * A durable sending receipt fences uncertain cheer delivery from auto-resend;
+//!   a pre-PUT role ledger survives worker cancellation and birthday removal.
 //! * Unconfigured guilds sweep to a no-op; partial config degrades (channel
 //!   without role still cheers, role without channel still grants).
 //! * Feb 29 is cheered on Feb 28 in non-leap years (and Feb 29 when it exists).
@@ -498,10 +506,12 @@ async fn birthday_rows(pool: &PgPool) -> Vec<(String, Vec<String>)> {
     .expect("birthday table inventory");
     let mut snapshot = Vec::new();
     for table in tables {
+        // Catalog-derived identifier only, double-quote escaped; there is no
+        // command/member input in this inspection query (SQLx 0.9 safe SQL).
         let quoted = table.replace('"', "\"\"");
-        let rows: Vec<String> = sqlx::query_scalar(&format!(
+        let rows: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT to_jsonb(t)::text FROM public.\"{quoted}\" AS t ORDER BY to_jsonb(t)::text"
-        ))
+        )))
         .fetch_all(pool)
         .await
         .expect("birthday row snapshot");
@@ -1737,8 +1747,8 @@ async fn uncertain_cheer_never_auto_resends_after_restart() {
 
     let pool2 = db.independent_pool().await.expect("restart pool");
     let executor2 = executor_for(&mock);
-    sweep(&pool2, &executor2, now).await;
-    sweep(&pool, &executor, now).await;
+    let _restart = MemberRuntime::run_birthday_sweep(&pool2, &executor2, GUILD_S, now).await;
+    let _repeat = MemberRuntime::run_birthday_sweep(&pool, &executor, GUILD_S, now).await;
     assert_eq!(
         channel_posts(&mock.requests(), CHANNEL_S).len(),
         1,
