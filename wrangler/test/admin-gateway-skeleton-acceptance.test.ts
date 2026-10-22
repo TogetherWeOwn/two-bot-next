@@ -128,7 +128,7 @@ function adminRequest(
   const headers: Record<string, string> = {
     "content-type": "application/json",
     "cf-connecting-ip": `192.0.2.${(callerSeq++ % 200) + 1}`,
-    "x-request-id": "ABCDEFGHJKMNPQRSTVWXYZ012345",
+    "x-request-id": "01H0000000000000000000000A",
   };
   if (auth !== null) headers["authorization"] = auth;
   const hasBody = body !== undefined && method !== "GET" && method !== "HEAD";
@@ -303,7 +303,7 @@ test("valid bearer proves the closed path: one signed forward, refusal relayed",
   assert.equal(res.status, 403, "unknown admin verb relays the container refusal");
   assert.deepEqual(await res.json(), {
     ok: false,
-    request_id: "ABCDEFGHJKMNPQRSTVWXYZ012345",
+    request_id: "01H0000000000000000000000A",
     error: { code: "action_not_allowed", message: "request refused", retryable: false },
   });
   assert.equal(h.forwarded.length, 1, "exactly one forward: no retry, no fan-out");
@@ -353,7 +353,7 @@ test("valid bearer proves the closed path: one signed forward, refusal relayed",
   assert.equal(body["admin_bearer"], ADMIN_BEARER, "MAC-covered body carries transient bearer proof");
   assert.equal(
     forward.headers["x-request-id"],
-    "ABCDEFGHJKMNPQRSTVWXYZ012345",
+    "01H0000000000000000000000A",
     "forward correlates the edge request id",
   );
 
@@ -444,7 +444,7 @@ test("known verbs relay authoritative refusal and never become edge control tool
       `Bearer ${ADMIN_BEARER}`, { guild_id: TARGET_GUILD }), h.env, h.ctx);
     assert.equal(res.status, 403, `${verb}: closed until audit exists`);
     assert.deepEqual(await res.json(), {
-      ok: false, request_id: "ABCDEFGHJKMNPQRSTVWXYZ012345",
+      ok: false, request_id: "01H0000000000000000000000A",
       error: { code: "action_not_allowed", message: "request refused", retryable: false },
     });
     assert.equal(h.forwarded.length, 1, "no retry or local executor");
