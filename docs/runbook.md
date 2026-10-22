@@ -727,8 +727,9 @@ windows go ~6.5 h uncovered: while coverage is gone genuine burns go unfiled
 and open cards stay unclosed. Live runs read the existing `staging`
 environment bearer `STAGING_METRICS_SCRAPE_TOKEN` for `/ops/metrics`, bound
 with `deployment: false` so the five-minute scrape adds no staging deployment
-record (the main-only branch policy still applies); without it the run warns
-and stays green. Prove the path by dispatching the workflow with the fire and
+record (the main-only branch policy still applies); without the bearer or
+the staging Worker URL the run fails closed with an error naming the unset
+binding. Prove the path by dispatching the workflow with the fire and
 clear fixtures: a separate `fixture` job, which binds no environment and
 holds no scrape bearer, runs the real verdict and the real issue calls under
 the `slow-burn-test` label without touching the live ring.
