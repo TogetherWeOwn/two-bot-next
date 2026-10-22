@@ -445,6 +445,13 @@ impl TicketRuntime {
         config: TicketConfig,
         deployment: HashMap<String, String>,
     ) -> std::result::Result<Self, StoreError> {
+        // The layered refresh falls back to deployment on delete: carry the
+        // effective boot cooldown (default included) so a deleted row restores
+        // boot instead of sticking at the last stored value. Production
+        // filters deployment to the destination keys, so the cooldown would
+        // otherwise never be present here.
+        let mut deployment = deployment;
+        deployment.insert(COOLDOWN_KEY.to_owned(), config.cooldown_seconds.to_string());
         Ok(Self {
             store: TicketStore::new(pool, config.guild_id.clone())?,
             executor,

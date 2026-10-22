@@ -160,8 +160,9 @@ async fn stored_cooldown_rows_move_the_live_ticket_cooldown_without_restart() {
         .unwrap();
     let executor =
         ActionExecutor::with_proxy("ticket-test-token".into(), Some(mock.origin())).unwrap();
-    let mut deployment = deployment_vars();
-    deployment.insert(COOLDOWN_KEY.to_owned(), COOLDOWN_SECONDS.to_string());
+    // Production filters deployment to the destination keys; new() carries
+    // the effective boot cooldown itself, so build the map the same way.
+    let deployment = deployment_vars();
     let runtime = TicketRuntime::new(
         pool,
         executor,
