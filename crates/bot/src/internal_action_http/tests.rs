@@ -17,6 +17,7 @@ mod automations;
 mod drain_shutdown;
 mod receipt_lifecycle;
 mod settings;
+mod voice_config_acceptance;
 
 /// Stored `internal_idempotency` receipt row: action, state, response code,
 /// status, resource, affected count, guild, actor, target, resolved role.
