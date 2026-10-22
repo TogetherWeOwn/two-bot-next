@@ -109,7 +109,7 @@ JOB_INVENTORY = {
     "pr-size.yml": {"pr-size", "pr-size-weekly"},
     # Weekly DORA delivery metrics (docs/dora-metrics.md): reads 30 days of
     # production Deployments and commits one JSON file plus a markdown
-    # summary to ops/metrics/ with the job token.
+    # summary to ops/metrics/ on the automation branch with the job token.
     "dora-metrics.yml": {"metrics"},
 }
 # Reusable-workflow calls are allowed only to these non-deploy workflows.
@@ -7641,8 +7641,9 @@ class WorkflowTests(unittest.TestCase):
                         expected = {"contents": "read", "issues": "write"}
                     elif (name, job_id) == ("dora-metrics.yml", "metrics"):
                         # Weekly DORA file: commits the JSON and summary to
-                        # main, reads the production Deployments history and
-                        # verifies each recorded deploy's Actions run.
+                        # the automation branch, reads the production
+                        # Deployments history and verifies each recorded
+                        # deploy's Actions run.
                         expected = {"contents": "write", "deployments": "read",
                                     "actions": "read"}
                     self.assertEqual(job["permissions"], expected)

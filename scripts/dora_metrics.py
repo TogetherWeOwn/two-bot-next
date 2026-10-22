@@ -417,8 +417,10 @@ def build_report(repo, records, automatic, window, recovery, throughput_unresolv
 
 def verdict_line(name, value, target, passed):
     """One markdown table row; nulls read as `n/a`, never as passing."""
-    if value is None or passed is None:
+    if value is None:
         return f"| {name} | n/a | {target} | n/a |"
+    if passed is None:
+        return f"| {name} | {value} | {target} | n/a |"
     mark = "pass" if passed else "FAIL"
     return f"| {name} | {value} | {target} | {mark} |"
 

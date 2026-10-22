@@ -280,6 +280,10 @@ class RenderTests(unittest.TestCase):
         self.assertIn("deployment 9", text)
         self.assertIn("carry no status yet", text)
         self.assertIn("`dora-2026-W43.json`", text)
+        # G5 deploys/day has no target, so no verdict, but the computed
+        # value still renders: one success over 30 days reads 0.03, not n/a.
+        self.assertIn("| G5 deploys/day | 0.03 | >=1/hour when green work exists | n/a |",
+                      text)
 
     def test_empty_week_renders_n_a_without_a_false_pass(self):
         report = dora_metrics.build_report("o/r", [], 0, window(),

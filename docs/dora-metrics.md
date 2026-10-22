@@ -1,9 +1,10 @@
 # Weekly DORA metrics
 
 Every Monday at 07:17 UTC the `dora-metrics` workflow computes four delivery
-numbers over the trailing 30 days and commits them to `ops/metrics/` as
-`dora-YYYY-Www.json` plus a short `dora-YYYY-Www.md` summary. The files are
-generated evidence; do not edit them by hand.
+numbers over the trailing 30 days and commits them to `ops/metrics/` on the
+`automation/dora-metrics` branch as `dora-YYYY-Www.json` plus a short
+`dora-YYYY-Www.md` summary. The files are generated evidence; do not edit
+them by hand.
 
 ## The four numbers
 
@@ -46,8 +47,11 @@ Every input ID (deployment IDs, SHAs, run IDs, verdicts) lands in the JSON
 - Dispatch `dora-metrics` with `dry_run` from any branch to run the real
   computation and upload the files as an artifact without committing.
 - A live dispatch (or the Monday schedule) on `main` commits straight to
-  `main` with the job token; the checkout stays credentialless and the push
-  authenticates per command. A refused or conflicting push fails the run
-  closed; the artifact still preserves that week's numbers.
-- `ops/**` is in `deploy-staging`'s push ignore list, so the weekly commit
-  restarts nothing and promotes nothing.
+  the `automation/dora-metrics` branch with the job token: `main` only
+  accepts pull requests, and the automation branch carries no rulesets. The
+  checkout stays credentialless and the push authenticates per command. A
+  refused or conflicting push fails the run closed; the artifact still
+  preserves that week's numbers.
+- The weekly side-branch push triggers no deploys; `ops/**` is also in
+  `deploy-staging`'s push ignore list, so any future main-side delivery
+  evidence restarts and promotes nothing.

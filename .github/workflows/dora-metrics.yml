@@ -7,17 +7,21 @@ name: dora-metrics
 # carrying a canonical deploy ID count; the Actions automatic `environment:`
 # rows carry none and are tallied as excluded, never scored.
 #
-# The commit goes straight to main with the job GITHUB_TOKEN (contents:write
-# scoped to this job): the files are generated evidence, and a weekly metrics
-# PR would need a human merge every week to say nothing new. The checkout
-# keeps persist-credentials false; the push authenticates per command through
-# a bearer extraheader, so the token never lands in git config. A refused or
-# conflicting push fails the run closed; the artifact below still preserves
-# the numbers for that week.
+# The commit goes to the `automation/dora-metrics` branch with the job
+# GITHUB_TOKEN (contents:write scoped to this job): the branch rulesets
+# require every main commit to arrive through a pull request with checks and
+# merge-queue processing, so a direct push to main would be refused, and a
+# weekly metrics PR would need a human merge every week to say nothing new.
+# The automation branch carries no rulesets; its history is the audit trail.
+# The checkout keeps persist-credentials false; the push authenticates per
+# command through a bearer extraheader, so the token never lands in git
+# config. A refused or conflicting push fails the run closed; the artifact
+# below still preserves the numbers for that week.
 #
-# `ops/**` sits in deploy-staging's push ignore list, so the weekly commit
-# restarts nothing: without that entry every metrics merge would bounce the
-# staging gateway and feed the production promotion queue a no-op SHA.
+# `ops/**` sits in deploy-staging's push ignore list, so any future main-side
+# delivery evidence restarts nothing: without that entry a metrics merge
+# would bounce the staging gateway and feed the production promotion queue a
+# no-op SHA. The weekly side-branch push itself triggers no deploys.
 #
 # Proof: dispatch with dry_run from any branch to run the real computation
 # against the live API and upload the files as an artifact without committing.
@@ -67,6 +71,7 @@ jobs:
           WEEK: ${{ steps.metrics.outputs.week }}
         run: |
           set -euo pipefail
+          branch=automation/dora-metrics
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add "ops/metrics/dora-${WEEK}.json" "ops/metrics/dora-${WEEK}.md"
@@ -74,17 +79,20 @@ jobs:
             echo "no DORA changes to commit"
             exit 0
           fi
-          # Tokenless checkout: authenticate this push only, per command, so
-          # the bearer never lands in .git/config.
+          # Tokenless checkout: authenticate network commands only, per
+          # command, so the bearer never lands in .git/config.
           auth=(-c "http.https://github.com/.extraheader=AUTHORIZATION: bearer ${GH_TOKEN}")
-          git "${auth[@]}" fetch origin main
+          git "${auth[@]}" fetch origin
           git commit -m "chore(metrics): weekly DORA metrics for ${WEEK}"
-          git rebase origin/main || {
-            git rebase --abort
-            echo "::error::DORA commit conflicts with main; refusing to push"
-            exit 1
-          }
-          git "${auth[@]}" push origin HEAD:main
+          # First run creates the branch; later runs replay onto its tip.
+          if git rev-parse --verify -q "origin/${branch}" >/dev/null; then
+            git rebase "origin/${branch}" || {
+              git rebase --abort
+              echo "::error::DORA commit conflicts with ${branch}; refusing to push"
+              exit 1
+            }
+          fi
+          git "${auth[@]}" push origin "HEAD:${branch}"
       - name: Upload the DORA evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

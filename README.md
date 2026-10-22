@@ -158,7 +158,8 @@ fail-closed retention auditing, `/home` available-byte alarms and the Operator r
   writes on rollback. Planned tools are explicitly marked; this is not cutover approval.
 - [Staging soak](docs/staging-soak.md) and [gateway recovery](docs/gateway-recovery.md).
 - [Weekly DORA metrics](docs/dora-metrics.md): change failure rate, recovery
-  time, merge-to-prod lead time and throughput, committed to `ops/metrics/`.
+  time, merge-to-prod lead time and throughput, committed to `ops/metrics/`
+  on the `automation/dora-metrics` branch.
 
 Migration changes must pass the [numbering and checksum guard](docs/migrations.md).
 Add new SQL files and their `migrations.lock` entries together; existing migration
