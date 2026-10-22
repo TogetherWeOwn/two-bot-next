@@ -649,7 +649,7 @@ fn hash_matches_the_sha256_long_vector() {
 #[test]
 fn hash_matches_an_independent_digest() {
     use sha2::{Digest, Sha256};
-    let expected = format!("{:x}", Sha256::digest(FIXTURE_SECRET));
+    let expected = hex::encode(Sha256::digest(FIXTURE_SECRET));
     assert_eq!(expected, FIXTURE_SECRET_SHA256, "fixture literal drifted");
     assert_eq!(
         InternalFlags::hash_admin_token_secret(FIXTURE_SECRET).as_deref(),
