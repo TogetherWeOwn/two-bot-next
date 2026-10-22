@@ -199,7 +199,7 @@ async fn lifecycle_work_runs_under_the_existing_supervised_job_seam() {
     })
     .await;
     shutdown.send(true).expect("stop supervisor");
-    supervisor.await.expect("supervisor joined");
+    assert!(supervisor.await.is_ok(), "supervisor joined");
     let saved = f.saved("lfg-job").await;
     f.finish().await;
     let completed = completed.expect("bounded job completion");
