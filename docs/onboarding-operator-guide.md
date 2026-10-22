@@ -10,7 +10,7 @@ This guide changes no behavior.
 `OnboardingMode` (`crates/core/src/onboarding.rs:49`) selects the welcome flow.
 `TWO_ONBOARDING_MODE` is deployment-only (`env_only` in
 [configuration.md](configuration.md)); stored rows never override it
-(`crates/bot/src/onboarding.rs:130`).
+(`crates/bot/src/onboarding.rs:176`).
 
 | Mode | Value | Behavior |
 |---|---|---|
@@ -48,9 +48,9 @@ adds the deployment routing fields. At the raw config API a missing
 `DISCORD_GUILD_ID` returns `Ok(None)` — disabled, never falling back to a
 production guild or channel — but that path is unreachable in the running
 bot: `OnboardingRuntime::new` always fills `DISCORD_GUILD_ID` from the
-gateway `GUILD_ID` (`crates/bot/src/onboarding.rs:201`), the Worker never
+gateway `GUILD_ID` (`crates/bot/src/onboarding.rs:247`), the Worker never
 forwards `DISCORD_GUILD_ID` (absent from `FORWARDED_DISCORD_IDS`), and a
-`None` config would fail closed as `RuntimeError::Config` (`:238`).
+`None` config would fail closed as `RuntimeError::Config` (`:287`).
 Unsetting `DISCORD_GUILD_ID` does not disable onboarding in the bot.
 
 - Anchor mode requires `DISCORD_ANCHOR_WELCOME_CHANNEL_ID`, else
@@ -64,10 +64,10 @@ Unsetting `DISCORD_GUILD_ID` does not disable onboarding in the bot.
   comma-separated nonzero snowflakes (`channel_ids` there): surrounding
   whitespace and empty entries are skipped; `0`, negative, non-numeric or
   overflowing entries fail closed with `InvalidId`. A conflicting legacy
-  `DISCORD_GUILD_ID` alias fails closed (`crates/bot/src/onboarding.rs:193`).
+  `DISCORD_GUILD_ID` alias fails closed (`crates/bot/src/onboarding.rs:239`).
 
 Stored hot overrides merge per event from a consistent snapshot
-(`crates/bot/src/onboarding.rs:215`): landing/goodbye/anchor/session
+(`crates/bot/src/onboarding.rs:264`): landing/goodbye/anchor/session
 destinations refresh live; mode and guild identity never come from stored
 rows. A stored `TWO_ONBOARDING_DRY_RUN` rendering merges only when it is
 exactly `0`/`1`; a legacy row (`true`, `on`, …) keeps the deployment value
@@ -116,9 +116,26 @@ slip through.
 The executor acquires the store prompt guard (`begin_prompt`) before
 sending and records only after Discord accepts; a failed send drops the
 guard without a marker, so the next event retries. `has_onboarding_prompt`
-is a read fast path, not a send claim. The guard serializes
-join/gate-clear sends but is not exactly-once across a crash between
-Discord acceptance and the Postgres commit (inherited from legacy).
+is a read fast path, not a send claim. An accepted post retains a bounded
+memory-only receipt until recording settles: one immediate record-only retry
+handles a transient rollback, and later retries in the same runtime reconcile
+without posting again. New sends fail closed at 32 unsettled receipts; receipts
+are never evicted to admit another send. The guard serializes join/gate-clear
+sends but is not exactly-once across a restart or independent runtimes between
+Discord acceptance and the Postgres commit. Worker failure can stop the runner
+and lose memory-only receipts on restart.
+
+Welcome/goodbye bot identity evidence is cached for 60 seconds, singleflight
+within the runtime. Successful warm windows without invalidations use one set
+of guild/roles/bot-member reads, not one per welcome. Guild/role/bot-member
+changes, denied or unavailable access, and failed posts invalidate it. An
+invalidation during a load or a live channel check discards that attempt and
+reloads, up to three times. The raced snapshot is never cached or used to post.
+After three invalidated attempts the send fails closed with retryable
+unavailable evidence and does not post. Channel overwrites are still read live
+every time; picker-member access is not cached.
+Anchor substitution changes only the full channel mention, leaving bare IDs,
+longer IDs and user/role mentions untouched.
 
 ## Game-picker selection
 
@@ -212,16 +229,18 @@ member data into evidence.
 | Signal | Meaning | First action |
 |---|---|---|
 | `/readyz` `gateway_failure` class `onboarding_gates_invalid` (`crates/bot/src/gateway_failure.rs:85`) | Deployment `TWO_ONBOARDING_MODE` / `TWO_ONBOARDING_DRY_RUN` value rejected at boot. | Fix the deployment value to the exact surface above; redeploy through the approved path. Do not retry with another credential. |
-| `/readyz` `gateway_failure` class `onboarding_init_failed` (step `onboarding_init`, `crates/bot/src/main.rs:526`) | Onboarding init failed: missing/invalid per-mode channel, failed `/users/@me` identity probe, or conflicting `DISCORD_GUILD_ID` alias. The `from_map` detail is erased at `crates/bot/src/onboarding.rs:202` (every error maps to `RuntimeError::Config`), so no `Missing`/`InvalidId` text ever reaches the operator. | Supply the mode's required channels as nonzero snowflakes; confirm the guild alias matches the gateway `GUILD_ID`; check the identity probe. |
+| `/readyz` `gateway_failure` class `onboarding_init_failed` (step `onboarding_init`, `crates/bot/src/main.rs:526`) | Onboarding init failed: missing/invalid per-mode channel, failed `/users/@me` identity probe, or conflicting `DISCORD_GUILD_ID` alias. The `from_map` detail is erased at `crates/bot/src/onboarding.rs:248` (every error maps to `RuntimeError::Config`), so no `Missing`/`InvalidId` text ever reaches the operator. | Supply the mode's required channels as nonzero snowflakes; confirm the guild alias matches the gateway `GUILD_ID`; check the identity probe. |
 | `two-bot preflight` exit 2 `invalid TWO_ONBOARDING_MODE or TWO_ONBOARDING_DRY_RUN` (`crates/bot/src/preflight.rs:209`) | Same rejection, caught before any Discord REST. | Same fix; no Discord checks ran. |
 | `two-bot preflight` FAIL `level reward coverage` | Onboarding permits level-role writes (legacy/anchor, not dry run) but `--level-role-ids` was not supplied. | Supply `--level-role-ids` from the guild's `level_role_rewards` export, including an explicit empty CSV when none. Not required in session mode or dry run. See [preflight.md](preflight.md#database-backed-level-rewards). |
 | `two-bot preflight` channel/role FAILs | Denied, missing, wrong-guild, wrong-type channel; missing/managed/high role. Administrator does not bypass hierarchy. | Fix overwrites, hierarchy (bot's highest role must sit above every game/level role) or config; see [preflight.md](preflight.md#checks). |
 | `stored TWO_ONBOARDING_DRY_RUN must be exactly "0" or "1" when set; keeping deployment value` (error) | Legacy stored dry-run row refused; deployment value kept, job keeps running. | Clean the stored row to `0`/`1` or delete it (restores deployment default). Never log or paste the stored value. |
 | `onboarding picker configuration unavailable after defer` (warn) | Settings/config failed after the 2.5 s defer; the member got an honest `couldn't load the menu configuration` edit. Terminal: no role or success writes. | Check settings-store health and deployment config; ask the member to re-open the menu. Do not replay roles. |
 | `onboarding picker failed; attempting deferred error reply` (warn, with handler) | Selection processing failed after defer. Role failures reply with the permissions message; other failures ask for a fresh menu submission. | For role failures check Manage Roles plus role positions; otherwise check member/channel reads and Discord status. A delivered error reply is terminal; only a failed error edit stays retryable. |
+| `accepted welcome awaits prompt recording` (warn, message ID only) | Discord accepted the welcome, but the record transaction failed. One immediate record-only retry is attempted; an unsettled receipt remains memory-only. | Check store health. Do not manually resend. Repeated failure can stop the runner; restart is not an exactly-once guarantee. |
+| `welcome receipt capacity exhausted; refusing new sends` (warn) | All 32 memory-only unsettled receipt slots are occupied; no new post was attempted. | Diagnose the record failures; do not clear receipts or restart solely to admit more sends. |
 | `gateway onboarding job invalid` (warn) | Worker-built job failed to serialize. | Record the revision; do not restart to clear it. Escalate with the log line if it repeats. |
 | Silent skip: bot / still-pending / already-prompted; gated join with no later gate-clear | `decide_prompt` / `welcome_trigger` working as designed. | No action. Gated members prompt when `pending` flips true → false. |
-| Silent skip: welcome/goodbye simply absent, nothing logged | No postable destination (none configured or bot lacks View/Send/Embed), or dry run (legacy/anchor welcome, any goodbye). `welcome()`/`goodbye` return `Ok(())` with no log line (`crates/bot/src/onboarding.rs:490,506,425`); the `no_landing_channel` / `no_goodbye_channel` / `dry_run` reason strings live only in core `adjudicate_*` effects, never in logs — do not grep for them. | Check the mode's channel config and the bot's effective channel access via preflight. Dry run needs no action; session welcomes still post. |
+| Silent skip: welcome/goodbye simply absent, nothing logged | No postable destination (none configured or bot lacks View/Send/Embed), or dry run (legacy/anchor welcome, any goodbye). `welcome()`/`goodbye` return `Ok(())` with no log line (`crates/bot/src/onboarding.rs:653,667,493`); the `no_landing_channel` / `no_goodbye_channel` / `dry_run` reason strings live only in core `adjudicate_*` effects, never in logs — do not grep for them. | Check the mode's channel config and the bot's effective channel access via preflight. Dry run needs no action; session welcomes still post. |
 | `command runtime parked; onboarding runtime disabled` (warn, `crates/bot/src/main.rs:535`) | The command runtime failed to build, so onboarding is off. Causes include invalid feature gates, invalid moderation gates, invalid send admission, REST executor build failure, or ticket runtime init failure (`crates/bot/src/command_runtime.rs:408,420,454,461,479`). | Read the `... command runtime disabled` warn logged just before — it carries the reason — and fix that cause; onboarding resumes with the runtime. |
 | Picker reply `No channel is available to you right now.` with saved roles | All picks unavailable (hub also dark). | Check channel visibility/overwrites; roles are correctly kept. |
 | Rising `degraded` in `channel_routed` rows | Primaries dark, members routed to the hub fallback. | Open or re-expose the real rooms; the count is the signal. |
@@ -271,7 +290,8 @@ two-bot --help
 two-bot preflight --help
 ```
 
-Results on this head: fmt clean; core onboarding 43 passed; discord
+Original guide verification (historical, not the welcome-hardening head):
+fmt clean; core onboarding 43 passed; discord
 `onboarding_config` 3 passed; preflight onboarding-relevant 2 passed;
 `reference_docs` 7 passed (so [configuration.md](configuration.md) is
 current); both `--help` outputs print the preflight usage quoted above

@@ -871,6 +871,15 @@ jobs:
       - name: cargo test (docs)
         run: cargo test --workspace --doc --features two-bot-core/db --locked
 
+      # Hosted CI has no persistent-controller pool. Build the exact-head
+      # offline example normally, then execute every protected Python assertion.
+      - name: Welcome path offline acceptance
+        run: |
+          cargo build -p two-bot --example welcome_path_acceptance --features two-bot-core/db --locked --message-format=json > "$RUNNER_TEMP/welcome-path-build.jsonl"
+          welcome_executable=$(python3 -c 'import json, sys; records = (json.loads(line) for line in open(sys.argv[1])); print(next(r["executable"] for r in records if r.get("reason") == "compiler-artifact" and r.get("target", {}).get("name") == "welcome_path_acceptance" and r.get("executable")))' "$RUNNER_TEMP/welcome-path-build.jsonl")
+          WELCOME_PATH_ACCEPTANCE_EXECUTABLE="$welcome_executable" PYTHONDONTWRITEBYTECODE=1 python3 tests/onboarding/test_welcome_path_acceptance.py -v
+          PYTHONDONTWRITEBYTECODE=1 python3 tests/onboarding/test_welcome_path_runner.py -v
+
       - name: Measure metrics RSS (local fixtures only)
         run: cargo run -p two-bot-core --example metrics_rss --locked
 
@@ -1341,6 +1350,14 @@ jobs:
           cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test reengagement_list_db --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
           cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test game_activity_report_db --locked -- --test-threads=1 --skip regenerate_reference_docs
           cov_run "$COV" llvm-cov --no-report -p two-bot-core --features db --locked --test member_moderation_db -- --ignored --test-threads=1 --skip regenerate_reference_docs
+          # The socket-free welcome fixture includes current production source
+          # by path, but examples are not executed by the workspace test sweep.
+          # Read the canonical case list rather than maintaining a second list.
+          welcome_cases=$(python3 -c 'import runpy; print("\n".join(runpy.run_path("tests/onboarding/test_welcome_path_acceptance.py")["CASES"]))')
+          test -n "$welcome_cases"
+          while IFS= read -r welcome_case; do
+            cov_run "$COV" llvm-cov run --no-report -p two-bot --example welcome_path_acceptance --features two-bot-core/db --locked -- "$welcome_case"
+          done <<< "$welcome_cases"
           # Merge every collected profile into the mounted workspace report the gate reads.
           # `report` must carry --workspace: without it the report scopes to
           # the current (root) package only and excludes every crates/*
