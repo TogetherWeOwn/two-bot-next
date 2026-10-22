@@ -1342,6 +1342,21 @@
       "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
     },
     {
+      "id": "s5-bump-reminders",
+      "parity": {
+        "section": 5,
+        "row": [
+          "`bump_reminders`",
+          "one pending bump reminder per guild"
+        ]
+      },
+      "status": "automated",
+      "action": "Run the bump-reminder gateway fixtures against a disposable test database with mock Discord REST, including fresh-bump replacement and runtime restart.",
+      "expected": "One pending reminder per guild survives restart, a fresh bump replaces it, and expiry claims at most one role-only ping; refused success messages never arm.",
+      "evidence": "Attach the exact-head command, sanitized test result and disposable-database guard receipt. This fixture evidence is not staging or production enablement.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot gateway_tests::bump_reminders -- --ignored --test-threads=1"
+    },
+    {
       "id": "s5-14",
       "parity": {
         "section": 5,
