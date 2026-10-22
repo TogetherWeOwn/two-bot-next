@@ -1206,9 +1206,7 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
                     && !V11_ADDED_TABLES.contains(name)
                     && !OPTIONAL_LEGACY_TABLES.contains(name)
             }
-            Some(10) => {
-                !V11_ADDED_TABLES.contains(name) && !OPTIONAL_LEGACY_TABLES.contains(name)
-            }
+            Some(10) => !V11_ADDED_TABLES.contains(name) && !OPTIONAL_LEGACY_TABLES.contains(name),
             _ => !OPTIONAL_LEGACY_TABLES.contains(name),
         })
         .map(|(_, name)| name)
@@ -2409,8 +2407,7 @@ mod tests {
         let tables = complete_tables(&BTreeMap::new())
             .into_iter()
             .filter(|table| {
-                table["name"] != "event_voice_channels"
-                    && table["name"] != "event_voice_presence"
+                table["name"] != "event_voice_channels" && table["name"] != "event_voice_presence"
             })
             .collect();
         let mut old = manifest(tables);

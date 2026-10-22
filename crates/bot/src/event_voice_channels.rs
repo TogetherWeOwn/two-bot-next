@@ -177,22 +177,21 @@ pub async fn reconcile_stale_claims(
                     report.skipped += 1;
                 }
             }
-            Ok(EventProbeOutcome::NoChannel) => match lease {
-                Some(lease) => {
-                    if clear_event_voice_lease(pool, &event_id, instance_starts_at, &lease).await? {
-                        report.cleared += 1;
-                        info!(
-                            voice_event = "event_voice_lease_cleared",
-                            event_id, instance, lease, "stale event voice claim released for retry"
-                        );
-                    } else {
-                        report.skipped += 1;
-                    }
-                }
-                None => {
+            Ok(EventProbeOutcome::NoChannel) => {
+                let Some(lease) = lease else {
+                    report.skipped += 1;
+                    continue;
+                };
+                if clear_event_voice_lease(pool, &event_id, instance_starts_at, &lease).await? {
+                    report.cleared += 1;
+                    info!(
+                        voice_event = "event_voice_lease_cleared",
+                        event_id, instance, lease, "stale event voice claim released for retry"
+                    );
+                } else {
                     report.skipped += 1;
                 }
-            },
+            }
             Err(error) => {
                 report.skipped += 1;
                 debug!(
