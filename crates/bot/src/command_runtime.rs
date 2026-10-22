@@ -557,6 +557,32 @@ impl CommandRuntime {
         7200
     }
 
+    /// Observe one message for bump activity (arm on bumper-bot success
+    /// embeds, sweep the due reminder). Runs before the bot-gated sticky and
+    /// custom-command paths so bumper-bot posts are always seen.
+    pub(crate) async fn observe_bump_message(&self, message: &Message) {
+        crate::bump_runtime::observe_bump_message(
+            &self.pool,
+            &self.executor,
+            self.guild_id,
+            self.bump_default_cooldown_secs(),
+            message,
+        )
+        .await;
+    }
+
+    /// Answer one `/bump` interaction with an immediate ephemeral reply.
+    pub(crate) async fn answer_bump_command(&self, interaction: &Interaction) {
+        crate::bump_runtime::answer_bump_command(
+            &self.pool,
+            &self.executor,
+            self.guild_id,
+            self.bump_default_cooldown_secs(),
+            interaction,
+        )
+        .await;
+    }
+
     /// Bootstrap before constructing the shard, reusing this runtime's router,
     /// pool and executor (including its proxy and shared pacing state).
     pub(crate) async fn initialize_custom_commands(
@@ -980,6 +1006,7 @@ impl CommandRuntime {
                 let runtime = Arc::clone(self);
                 let message = message.0.clone();
                 self.spawn(LANE_MESSAGES, async move {
+                    runtime.observe_bump_message(&message).await;
                     if let Some(custom) = runtime.gateway_commands.get() {
                         custom.handle_message(&message, verdict).await;
                     }
@@ -1368,6 +1395,13 @@ impl CommandRuntime {
                 }
             }
         }
+        // `/bump` without router registration (baseline-built and minimal
+        // routers): answer from the same handler the registered path uses,
+        // before the unknown-command refusal below. Refusals still refuse.
+        if name == "bump" && matches!(outcome, SlashOutcome::Unknown) {
+            self.answer_bump_command(interaction).await;
+            return;
+        }
         if let Some(response) = response_for_slash(&outcome) {
             self.answer(interaction, response).await;
             return;
@@ -1391,6 +1425,13 @@ impl CommandRuntime {
                 None => ephemeral("The command list is still refreshing. Try /help again shortly."),
             };
             self.answer(interaction, response).await;
+            return;
+        }
+        if handler == HandlerId::Bump {
+            // Immediate ephemeral answers (status reads one row, role edits
+            // are single calls). Never send the generic ephemeral defer as
+            // well, and never an owner-map entry: this arm owns `/bump`.
+            self.answer_bump_command(interaction).await;
             return;
         }
         // No `"help"` entry: the help arm above owns `/help` and returns
@@ -2282,6 +2323,9 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     // `/privacy` member self-serve is never activation-fenced either: every
     // member may opt out of analytics in any guild.
     router.register(Box::new(SliceHandler(HandlerId::Privacy)));
+    // `/bump` reminders are never activation-fenced either: every member
+    // may opt in to the bump ping in any guild.
+    router.register(Box::new(SliceHandler(HandlerId::Bump)));
     router
 }
 

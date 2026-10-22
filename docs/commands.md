@@ -20,7 +20,7 @@ Bounds below are registry bounds; a dash means no bound is declared there,
 not that handler validation is unlimited. Permissions are Discord default
 member-permission bitfields, not a replacement for runtime authorization.
 
-Built-in commands: 50.
+Built-in commands: 51.
 
 ## `/access`
 
@@ -79,6 +79,20 @@ Ban a member
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `target` | user | true | — | — | — | — | Member to moderate |
 | `reason` | string | true | — | — | 512 | — | Mandatory audit reason |
+
+## `/bump`
+
+Get pinged when this server can be bumped again.
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `opt-in` | subcommand | false | — | — | — | — | Get pinged when the server can be bumped again. |
+| `opt-out` | subcommand | false | — | — | — | — | Stop the bump pings. |
+| `status` | subcommand | false | — | — | — | — | Show the pending bump reminder. |
+| `help` | subcommand | false | — | — | — | — | Show the bump commands. |
 
 ## `/command`
 

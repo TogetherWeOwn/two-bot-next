@@ -3121,6 +3121,52 @@ impl ActionExecutor {
         Ok(id)
     }
 
+    /// Post a plain message that notifies exactly one role. The caller puts
+    /// the role pill in `content` and repeats the id in `role_id` for the
+    /// allowlist; without the allowlist Discord stays silent. Mass mentions
+    /// are neutralized by the shared content guard while the role pill
+    /// survives it. The mention policy is fixed to this single role — parse,
+    /// users and reply policies cannot enter this boundary. Single attempt,
+    /// no automatic retry: claim-then-post callers must not hide ambiguity.
+    pub async fn post_message_with_role_mention(
+        &self,
+        channel_id: &str,
+        content: &str,
+        role_id: &str,
+    ) -> Result<String, DiscordError> {
+        if utf16_len(content) > MAX_MESSAGE_CHARS {
+            return Err(DiscordError::Rejected(
+                "message exceeds UTF-16 ceiling".into(),
+            ));
+        }
+        let role: Id<RoleMarker> = snowflake(role_id)?;
+        let content = two_bot_core::message_safety::content(content);
+        crate::message_safety::validate_create(&serde_json::json!({
+            "content": content,
+        }))?;
+        let mentions = AllowedMentions {
+            parse: vec![],
+            replied_user: false,
+            roles: vec![role],
+            users: vec![],
+        };
+        let mut builder = self
+            .inner
+            .factory
+            .create_message(snowflake(channel_id)?)
+            .allowed_mentions(Some(&mentions));
+        if !content.is_empty() {
+            builder = builder.content(&content);
+        }
+        let req = Self::explicit_mentions(Self::request_of(builder)?, &mentions)?;
+        // An accepted mutation still needs its validated id receipt; an
+        // unreadable receipt is uncertain, never an empty successful id.
+        let mut res = self.call_once_raw(req, &[200, 201]).await?;
+        let id = mutation_receipt_id(&res.body)?;
+        res.complete().await;
+        Ok(id)
+    }
+
     /// Add or remove one member role, preserving all unrelated roles. The
     /// shared lane owns pacing; mutations are bounded and never auto-retried.
     pub async fn set_member_role(

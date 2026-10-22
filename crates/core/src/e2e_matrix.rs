@@ -122,7 +122,7 @@ const fn row(
 //   staff protection, bot hierarchy, actor hierarchy, in that order.
 // - `Valid:<FIELD>:<BOUNDS>` — option validation before any side effect.
 
-/// The 29-row contract in publish order (core, scorecard, automation,
+/// The 30-row contract in publish order (core, scorecard, automation,
 /// announcement, moderation). The coverage test asserts this is exactly the
 /// all-gates-on [`crate::router::InteractionRouter::publish_set`].
 #[must_use]
@@ -170,6 +170,16 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
                 "Valid:subcommand:required,opt-out|opt-in|status|delete|deletion-status|deletion-receipt",
                 "Valid:request-id:required,max128,deletion-status|deletion-receipt",
             ],
+        ),
+        row(
+            "bump",
+            33,
+            E2eGate::Always,
+            0,
+            "Everyone",
+            "Bump",
+            "Immediate ephemeral reply (no defer): opt-in adds the invoker to the bump role, opt-out removes them, status reports the armed pending reminder or the idle phrase, help lists the subcommands.",
+            &["Valid:subcommand:required,opt-in|opt-out|status|help"],
         ),
         row(
             "attendance",

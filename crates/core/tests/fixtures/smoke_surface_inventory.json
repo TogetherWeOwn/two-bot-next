@@ -1,6 +1,6 @@
 {
   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
-  "count": 29,
+  "count": 30,
   "dm_permission_all_false": true,
   "commands": [
     {
@@ -146,6 +146,59 @@
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Next-only member self-serve with no legacy counterpart; the purge-plus-suppression-plus-receipt path is pinned by the gateway dispatch tests on a disposable database rather than the live smoke five."
+    },
+    {
+      "name": "bump",
+      "description": "Get pinged when this server can be bumped again.",
+      "family": "core",
+      "gate": "always",
+      "default_member_permissions": null,
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "opt-in",
+          "description": "Get pinged when the server can be bumped again.",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "opt-out",
+          "description": "Stop the bump pings.",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "status",
+          "description": "Show the pending bump reminder.",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "help",
+          "description": "Show the bump commands.",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Next-only reminders with no legacy counterpart; the arm-fire-replace path is pinned by the gateway dispatch tests on a disposable database rather than the live smoke five."
     },
     {
       "name": "attendance",

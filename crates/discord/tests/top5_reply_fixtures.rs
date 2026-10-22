@@ -226,6 +226,7 @@ fn open_commands_serve_members_without_special_bits() {
         ("leaderboard", HandlerId::Leaderboard),
         ("help", HandlerId::Help),
         ("privacy", HandlerId::Privacy),
+        ("bump", HandlerId::Bump),
         ("rsvp", HandlerId::Rsvp),
     ] {
         for permissions in [None, Some(0)] {
@@ -246,7 +247,7 @@ fn open_commands_serve_members_without_special_bits() {
 fn disabled_features_refuse_with_documented_copy() {
     let off = InteractionRouter::new(all_off());
     // Always-on core keeps routing while every feature is off.
-    for name in ["rank", "leaderboard", "help", "privacy"] {
+    for name in ["rank", "leaderboard", "help", "privacy", "bump"] {
         assert!(
             matches!(slash_outcome(&off, name), SlashOutcome::Handled { .. }),
             "/{name} stays live while features are off",
