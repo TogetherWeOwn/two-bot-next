@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
-"""Compare same-workload pipeline measurements, independently of required PR CI."""
+"""Compare same-workload pipeline measurements, independently of required PR CI.
+
+Input limits: each report is read bounded before any JSON decode. A report
+that is missing, not a regular file, or unreadable, over 1048576 bytes
+(1 MiB), with a line over 65536 bytes (64 KiB, excluding its terminator), or
+with more than 100000 lines is refused, as is a report that is not valid JSON
+or repeats a JSON object key. Every refusal exits 2 with {"verdict":
+"INVALID", "code": ..., "next_action": ...} on stdout plus an "INVALID
+benchmark:" line on stderr; nothing echoes report content.
+
+Codes: unreadable_input, input_too_large, line_too_long, too_many_records,
+invalid_json, duplicate_keys, invalid_benchmark. A record is one line; JSON
+reports are small single documents, so pretty-print a minified blob whose one
+line would exceed the line cap.
+"""
 
 import argparse
 import json
@@ -15,6 +29,94 @@ METRICS = (
     ("handler_latency_us", "p99"),
     ("db_round_trips_per_event",),
 )
+
+# Intake bounds, enforced on each report before any JSON decode. Each refusal
+# carries a fixed code and next_action; nothing echoes report content.
+MAX_INPUT_BYTES = 1024 * 1024
+MAX_LINE_BYTES = 64 * 1024
+MAX_RECORDS = 100_000
+
+NEXT_ACTION = {
+    "unreadable_input": "point the CLI at readable report files and retry",
+    "input_too_large": "shrink the report below 1 MiB and retry",
+    "line_too_long": "pretty-print lines longer than 64 KiB and retry",
+    "too_many_records": "shrink the report below 100000 lines and retry",
+    "invalid_json": "fix the JSON syntax and retry",
+    "duplicate_keys": "remove the repeated JSON object key and retry",
+    "invalid_benchmark": "fix the benchmark report fields and retry",
+}
+
+INTAKE_DETAIL = {
+    "unreadable_input": "benchmark report is unreadable",
+    "input_too_large": "benchmark report exceeds the 1048576-byte cap",
+    "line_too_long": "benchmark report has a line over the 65536-byte cap",
+    "too_many_records": "benchmark report has more than 100000 lines",
+    "invalid_json": "benchmark report is not valid JSON",
+    "duplicate_keys": "benchmark report repeats a JSON object key",
+}
+
+
+class IntakeRefused(Exception):
+    """A report was refused before comparison; carries a fixed INVALID code."""
+
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    raised message is fixed vocabulary: it names no key, value or path.
+    """
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
+
+
+def _read_report(path):
+    """Read one report bounded; refuse over-cap or unreadable input first.
+
+    One bounded binary read witnesses EOF and enforces the byte, line and
+    record budgets before any decode. Parse only that checked snapshot, even
+    if a producer replaces or grows the report after the read.
+    """
+    if not path.is_file():
+        raise IntakeRefused("unreadable_input")
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(MAX_INPUT_BYTES + 1)
+    except OSError:
+        raise IntakeRefused("unreadable_input") from None
+    if len(data) > MAX_INPUT_BYTES:
+        raise IntakeRefused("input_too_large")
+    raw_lines = data.splitlines()
+    if len(raw_lines) > MAX_RECORDS:
+        raise IntakeRefused("too_many_records")
+    if any(len(line) > MAX_LINE_BYTES for line in raw_lines):
+        raise IntakeRefused("line_too_long")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise IntakeRefused("invalid_json") from None
+
+
+def _invalid(code, detail=None):
+    """Exit-2 refusal: JSON verdict on stdout, fixed line on stderr."""
+    print(f"INVALID benchmark: {detail or INTAKE_DETAIL[code]}", file=sys.stderr)
+    json.dump({"verdict": "INVALID", "code": code,
+               "next_action": NEXT_ACTION[code]}, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+    return 2
 
 
 def metric(report, path):
@@ -128,11 +230,24 @@ def main():
     parser.add_argument("--max-rss-mib", type=valid_rss_limit, default=200)
     args = parser.parse_args()
     try:
+        baseline_text = _read_report(args.baseline)
+        actual_text = _read_report(args.actual)
+    except IntakeRefused as refused:
+        return _invalid(refused.code)
+    try:
+        baseline = json.loads(baseline_text, object_pairs_hook=_reject_duplicate_keys)
+        actual = json.loads(actual_text, object_pairs_hook=_reject_duplicate_keys)
+    except DuplicateKeyError:
+        return _invalid("duplicate_keys")
+    except (ValueError, RecursionError):
+        return _invalid("invalid_json")
+    try:
         advisories = []
-        failures = compare(json.loads(args.baseline.read_text()), json.loads(args.actual.read_text()), args.tolerance, args.max_rss_mib, advisories)
-    except (OSError, ValueError, KeyError, TypeError) as error:
-        print(f"INVALID benchmark: {error}", file=sys.stderr)
-        return 2
+        failures = compare(baseline, actual, args.tolerance, args.max_rss_mib, advisories)
+    except OverflowError:
+        return _invalid("invalid_benchmark", "benchmark metric exceeds numeric range")
+    except (ValueError, KeyError, TypeError) as error:
+        return _invalid("invalid_benchmark", str(error))
     for line in advisories:
         print(f"ADVISORY (does not fail): {line}")
     if failures:
