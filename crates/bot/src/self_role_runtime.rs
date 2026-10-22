@@ -7,8 +7,9 @@
 use std::{
     collections::HashSet,
     future::Future,
+    hash::BuildHasher,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::Duration,
@@ -36,6 +37,29 @@ const STORE_TIMEOUT: Duration = Duration::from_secs(5);
 const STORE_TIMEOUT: Duration = Duration::from_secs(60);
 const LANE_WAIT: Duration = Duration::from_secs(20);
 const LANE_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Process-wide contention sequence: every Busy sleep draws a fresh seed so
+/// simultaneous contenders — and consecutive retries of one claimant — spread
+/// across the jitter window instead of retrying in lockstep.
+static CONTENTION_SEED_SEQ: AtomicU64 = AtomicU64::new(0x9E3779B97F4A7C15);
+
+/// Fresh seed for one Busy sleep on `key` at contention `retry`.
+///
+/// Mixes the panel identity (contenders for different panels differ), the
+/// retry count (one claimant's consecutive sleeps differ), a process-wide
+/// sequence (simultaneous contenders differ) and fresh `RandomState` keys
+/// (processes differ). Call sites must pass the result straight through —
+/// never a fixed seed, or the lockstep returns.
+fn contention_seed(key: &PanelKey, retry: u32) -> u64 {
+    let seq = CONTENTION_SEED_SEQ.fetch_add(1, Ordering::Relaxed);
+    std::collections::hash_map::RandomState::new().hash_one((
+        &key.guild_id,
+        &key.member_id,
+        &key.panel_id,
+        retry,
+        seq,
+    ))
+}
 
 #[derive(Debug, Clone)]
 pub(crate) enum Selection {
@@ -942,6 +966,9 @@ impl SelfRoleRuntime {
             panel_id: panel.id.clone(),
         };
         let deadline = tokio::time::Instant::now() + LANE_WAIT;
+        // The jittered sleeps stay within the local base; trip if the shared const drifts.
+        debug_assert_eq!(two_bot::lane_jitter::LANE_BACKOFF_BASE, LANE_BACKOFF);
+        let mut contention: u32 = 0;
         let lane = loop {
             if owner.lost.load(Ordering::SeqCst)
                 || !store_io(self.store.owns_superseded_claim(&owner.claim)).await?
@@ -951,7 +978,12 @@ impl SelfRoleRuntime {
             match store_io(self.store.claim_panel(&key, None)).await? {
                 PanelClaimResult::Acquired(claim) => break claim,
                 PanelClaimResult::Busy if tokio::time::Instant::now() < deadline => {
-                    tokio::time::sleep(LANE_BACKOFF).await;
+                    let backoff = two_bot::lane_jitter::lane_backoff_jittered(
+                        contention,
+                        contention_seed(&key, contention),
+                    );
+                    contention = contention.saturating_add(1);
+                    tokio::time::sleep(backoff).await;
                 }
                 _ => return Err(RuntimeError::Stale),
             }
@@ -1301,6 +1333,9 @@ impl SelfRoleRuntime {
                 panel_id: panel.id.clone(),
             };
             let deadline = tokio::time::Instant::now() + LANE_WAIT;
+            // The jittered sleeps stay within the local base; trip if the shared const drifts.
+            debug_assert_eq!(two_bot::lane_jitter::LANE_BACKOFF_BASE, LANE_BACKOFF);
+            let mut contention: u32 = 0;
             loop {
                 if lost.load(Ordering::SeqCst) || !store_io(self.store.owns_claim(&event)).await? {
                     return Err(RuntimeError::Stale);
@@ -1333,7 +1368,12 @@ impl SelfRoleRuntime {
                         return Ok(Admission::Rejected("superseded_by_later_event"));
                     }
                     PanelClaimResult::Busy if tokio::time::Instant::now() < deadline => {
-                        tokio::time::sleep(LANE_BACKOFF).await;
+                        let backoff = two_bot::lane_jitter::lane_backoff_jittered(
+                            contention,
+                            contention_seed(&key, contention),
+                        );
+                        contention = contention.saturating_add(1);
+                        tokio::time::sleep(backoff).await;
                     }
                     PanelClaimResult::Busy => {
                         return self.reject(audit, &event, None, "panel_busy").await;

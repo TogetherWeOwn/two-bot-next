@@ -4,6 +4,7 @@
 #![cfg(test)]
 
 use super::{VoiceConnectionGuard, VoiceEventSink};
+use crate::drop_poison_test_serial::DROP_POISON_SERIAL;
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{
@@ -84,7 +85,12 @@ fn connection_guard_drop(poisoned: bool) {
     collector.observe_join(100, 300, joined_at);
     let sink: Arc<dyn VoiceEventSink> = runtime.clone();
     let guard = VoiceConnectionGuard(Some(sink));
-    let outcome = catch_unwind(AssertUnwindSafe(|| drop(guard)));
+    // The poison counter series is process-global: hold the shared lock so
+    // this drop cannot land inside a counter test's delta window.
+    let outcome = {
+        let _serial = DROP_POISON_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        catch_unwind(AssertUnwindSafe(|| drop(guard)))
+    };
     let after = two_bot_core::funnel::now_millis_for_test();
     // End the play interval well after disconnect. An omitted/aborted
     // close_all_opens would incorrectly credit the offline gap as voice time.

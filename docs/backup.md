@@ -1,7 +1,7 @@
 # Backups, restore drills, and sealed guild-config snapshots (TOG-9881)
 
 Rust port of the legacy `two-bot` cutover-data surface (frozen source
-`two-bot` `main @ d5d11793`): v12 dump format with v3/v4/v5/v6/v7/v8/v9/v10/v11 read compatibility,
+`two-bot` `main @ d5d11793`): v13 dump format with v3/v4/v5/v6/v7/v8/v9/v10/v11/v12 read compatibility,
 SigV4 off-box upload, retention
 math, sealed guild-config snapshot + restore planner, and the three timer
 equivalents. Code: `crates/core/src/backup/`, CLI: `two-bot backup |
@@ -102,17 +102,17 @@ upload command; argv and child output never echoed):
 ## The format
 
 Gzipped NDJSON, one object per line: `manifest` / `row` / `end`. New dumps
-write **v12** (including durable voice-create reservations, the retention
+write **v13** (including durable voice-create reservations, the retention
 queues, the seasonal XP projection, the event store: voice capture plus
 presence capture plus member-capture deltas plus message/reaction capture
 plus thread lifecycle plus stage/interaction-observe/audit-log capture plus
 invite/scheduled-event capture, the stream go-live ledger, guild game-activity
 aggregates, the assistant monthly-cap ledger, the scheduled-event
-epoch-claim guard, the scheduled-event delete tombstones and the three
-starboard tables); the reader also accepts
+epoch-claim guard, the scheduled-event delete tombstones and the admin API
+token registry and the three starboard tables); the reader also accepts
 frozen **v3**, pre-reservation **v4**, pre-v6-tables **v5**, pre-seasonal **v6**,
 pre-stream-ledger **v7**, pre-guild-counters **v8**, pre-epoch-claim **v9**,
-pre-tombstone **v10** and pre-starboard **v11**.
+pre-tombstone **v10**, pre-registry **v11** and pre-starboard **v12**.
 Other versions refuse.
 The manifest carries per-table `{name, columns, column_types, count}` taken
 inside one `REPEATABLE READ` transaction, the `events` high-water mark, the
@@ -145,10 +145,10 @@ unsupported. A failed write or validation leaves existing published recovery
 points untouched; a crash may leave a temporary file, but retention and drill
 selectors ignore it.
 
-### Coverage and recovery semantics (v4, v5, v6, v7, v8, v9, v10, v11 and v12)
+### Coverage and recovery semantics (v4, v5, v6, v7, v8, v9, v10, v11, v12 and v13)
 
 `DUMP_TABLES` in `crates/core/src/backup/dump_file.rs` is the single ordered
-inventory for both dump and restore. It includes **101 durable tables from the
+inventory for both dump and restore. It includes **102 durable tables from the
 current cutover migrations**, including the bot-owned website-contract backing
 tables, the member-moderation ledger, the self-role send receipts
 (`self_role_exchanges`) plus their uncertainty baselines
@@ -170,51 +170,55 @@ the stream go-live ledger (`stream_live_claims`: 0440/0443), guild game-activity
 aggregates (`game_activity_guild_aggregates`: 0441/0442), the assistant
 monthly-cap ledger (`assistant_monthly_builds`: 0446/0447), the
 scheduled-event epoch-claim guard (`scheduled_events_claim`: 0450/0451) and
-its delete tombstones (`scheduled_events_tombstone`: 0452/0453), and
-starboard configuration, distinct starrers and post state (`starboard_config`,
-`starboard_starrers`, `starboard_posts`: 0454/0455).
+its delete tombstones (`scheduled_events_tombstone`: 0452/0453) and the
+admin API token registry (`admin_api_tokens`: 0456/0457), plus starboard
+configuration, distinct starrers and post state (`starboard_config`,
+`starboard_starrers`, `starboard_posts`: 0455/0458).
 `OPTIONAL_LEGACY_TABLES` is empty: the coverage
 test fails if a covered table is not migrated. A dump from a fresh Rust schema
-has 101 table entries. A missing current table refuses a dump/restore: migrate
+has 102 table entries. A missing current table refuses a dump/restore: migrate
 the target first.
 Each readable version requires its historical inventory and waives only
 versioned additions introduced later:
 
 | Version | Tables it may omit |
 | --- | --- |
-| v4 | `V5_ADDED_TABLES` (reservations and privacy controls), `V6_ADDED_TABLES` (event store), `V7_ADDED_TABLES` (seasonal XP and retention queues), `V8_ADDED_TABLES` (stream ledger), `V9_ADDED_TABLES` (guild counters), `V10_ADDED_TABLES` (epoch-claim guard), `V11_ADDED_TABLES` (delete tombstones), `V12_ADDED_TABLES` (starboard tables) |
-| v5 | `V6_ADDED_TABLES`, `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES` |
-| v6 | `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES` |
-| v7 | `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES` |
-| v8 | `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES` |
-| v9 | `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`: `scheduled_events_claim`, `scheduled_events_tombstone`, `starboard_config`, `starboard_starrers`, `starboard_posts` |
-| v10 | `V11_ADDED_TABLES`, `V12_ADDED_TABLES`: `scheduled_events_tombstone`, `starboard_config`, `starboard_starrers`, `starboard_posts` |
-| v11 | `V12_ADDED_TABLES`: `starboard_config`, `starboard_starrers`, `starboard_posts` |
-| v12 | None: the full current inventory is required |
+| v4 | `V5_ADDED_TABLES` (reservations and privacy controls), `V6_ADDED_TABLES` (event store), `V7_ADDED_TABLES` (seasonal XP and retention queues), `V8_ADDED_TABLES` (stream ledger), `V9_ADDED_TABLES` (guild counters), `V10_ADDED_TABLES` (epoch-claim guard), `V11_ADDED_TABLES` (delete tombstones), `V12_ADDED_TABLES` (token registry), `V13_ADDED_TABLES` (starboard tables) |
+| v5 | `V6_ADDED_TABLES`, `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES` |
+| v6 | `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES` |
+| v7 | `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES` |
+| v8 | `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES` |
+| v9 | `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES`: `scheduled_events_claim`, `scheduled_events_tombstone`, `admin_api_tokens`, `starboard_config`, `starboard_starrers`, `starboard_posts` |
+| v10 | `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES`: `scheduled_events_tombstone`, `admin_api_tokens`, `starboard_config`, `starboard_starrers`, `starboard_posts` |
+| v11 | `V12_ADDED_TABLES`, `V13_ADDED_TABLES`: `admin_api_tokens`, `starboard_config`, `starboard_starrers`, `starboard_posts` |
+| v12 | `V13_ADDED_TABLES`: `starboard_config`, `starboard_starrers`, `starboard_posts` |
+| v13 | None: the full current inventory is required |
 
 These are narrow waivers, not permission to omit arbitrary tables. An
 incomplete new archive refuses at inspection. The frozen 85-table v4 fixture
-is unchanged from before these additions; older v4–v11 archives need not
+is unchanged from before these additions; older v4–v12 archives need not
 invent entries for the v9 guild counters, the v10 epoch-claim guard, the
-v11 delete tombstones or the v12 starboard tables.
+v11 delete tombstones, the v12 token registry or the v13 starboard tables.
 Restoring an older archive clears
 destination rows for every omitted later table instead of retaining unrelated
 target state. In particular, restoring v8 without guild counters clears both
 counters; it cannot recover assistant usage that predates its persistence.
-Restoring v9 without the claim guard clears the guard and the tombstones; the
-mirror re-fences on the next winning fetch. Restoring a claim-only v10 clears
-the tombstones while keeping the epoch fence. Use a v11 recovery point to
-preserve the monthly cap and both mirror fences. Use v12 to preserve starboard
-settings, starrers and post records too. Restoring a pre-v12 archive clears
-those three tables, so the board is off until configured again. Current v12
-archives must include the monthly cap, both mirror-fence tables and the
-starboard tables, so routine restores retain their archived state. Tombstone
-`deleted_at` cells must be real dates in exact `YYYY-MM-DDTHH:MM:SS.sssZ` form:
-inspection refuses missing, null, non-string or noncanonical values before
-restore opens a write transaction. Rollback-delta import enforces the same rule
-during parsing and revalidates the whole batch before applying constructed
-import rows. Values are not normalized; unrelated tables keep their existing
-timestamp behavior.
+Restoring v9 without the claim guard clears the guard, the tombstones and
+the registry; the mirror re-fences on the next winning fetch. Restoring a
+claim-only v10 clears the tombstones and the registry while keeping the
+epoch fence. Restoring a tombstone-only v11 clears issued tokens; they must
+be re-issued, since secrets are shown once and cannot be re-derived. Use a
+v12 recovery point to preserve the monthly cap, both mirror fences and the
+issued tokens. Use v13 to preserve starboard settings, starrers and post
+records too. Restoring a pre-v13 archive clears those three tables, so the
+board is off until configured again. Current v13 archives must include the
+monthly cap, both mirror-fence tables, the registry and the starboard tables,
+so routine restores retain their archived state. Tombstone `deleted_at` cells must be real dates in
+exact `YYYY-MM-DDTHH:MM:SS.sssZ` form: inspection refuses missing, null,
+non-string or noncanonical values before restore opens a write transaction.
+Rollback-delta import enforces the same rule during parsing and revalidates the
+whole batch before applying constructed import rows. Values are not normalized;
+unrelated tables keep their existing timestamp behavior.
 An optional legacy table may be absent only when there are no archived rows for
 it. Nonempty legacy data without a matching target table refuses **before any
 truncate**, rather than silently discarding it.

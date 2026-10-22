@@ -1461,10 +1461,10 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v12-source.ndjson.gz");
+    let current_path = directory.path("v13-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 12);
+    assert_eq!(old.manifest.version, 13);
     for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -1510,13 +1510,14 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v12-source.ndjson.gz");
+    let current_path = directory.path("v13-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 12);
+    assert_eq!(old.manifest.version, 13);
     for name in [
         "scheduled_events_claim",
         "scheduled_events_tombstone",
+        "admin_api_tokens",
         "starboard_config",
         "starboard_starrers",
         "starboard_posts",
@@ -1536,6 +1537,7 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
         [
             "scheduled_events_claim",
             "scheduled_events_tombstone",
+            "admin_api_tokens",
             "starboard_config",
             "starboard_starrers",
             "starboard_posts"
@@ -1548,6 +1550,7 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     for name in [
         "scheduled_events_claim",
         "scheduled_events_tombstone",
+        "admin_api_tokens",
         "starboard_config",
         "starboard_starrers",
         "starboard_posts",
@@ -1577,15 +1580,16 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v12-source.ndjson.gz");
+    let current_path = directory.path("v13-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 12);
+    assert_eq!(old.manifest.version, 13);
     // Frozen claim-only v10 shape: the merged v10 writer carried the
-    // epoch-claim guard but predates the delete tombstones and the three
-    // starboard tables.
+    // epoch-claim guard but predates the delete tombstones, token registry
+    // and the three starboard tables.
     for name in [
         "scheduled_events_tombstone",
+        "admin_api_tokens",
         "starboard_config",
         "starboard_starrers",
         "starboard_posts",
@@ -1604,6 +1608,7 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
         inspected.manifest.missing_tables(),
         [
             "scheduled_events_tombstone",
+            "admin_api_tokens",
             "starboard_config",
             "starboard_starrers",
             "starboard_posts"
@@ -1615,6 +1620,7 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
     assert!(report.ok);
     for name in [
         "scheduled_events_tombstone",
+        "admin_api_tokens",
         "starboard_config",
         "starboard_starrers",
         "starboard_posts",
@@ -1645,38 +1651,59 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
 }
 
 #[tokio::test]
-async fn v11_archive_restores_and_clears_newer_starboard() {
+async fn v11_archive_restores_and_clears_newer_registry() {
     let Some(db) = database().await else {
         return;
     };
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v12-source.ndjson.gz");
+    let current_path = directory.path("v13-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 12);
+    assert_eq!(old.manifest.version, 13);
     // Frozen tombstone-only v11 shape: the merged v11 writer carried the
-    // delete tombstones but predates the three starboard tables.
-    for name in ["starboard_config", "starboard_starrers", "starboard_posts"] {
+    // delete tombstones but predates the token registry and starboard tables.
+    for name in [
+        "admin_api_tokens",
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
+    ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
         old.manifest.tables.retain(|table| table.name != name);
     }
     old.manifest.version = 11;
     old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
-    let old_path = directory.path("pre-starboard-v11.ndjson.gz");
+    let old_path = directory.path("pre-registry-v11.ndjson.gz");
     write_archive(&old_path, &old);
     let inspected = inspect(&old_path).expect("pre-change v11 archive remains readable");
     assert_eq!(inspected.manifest.version, 11);
     assert_eq!(
         inspected.manifest.missing_tables(),
-        ["starboard_config", "starboard_starrers", "starboard_posts"]
+        [
+            "admin_api_tokens",
+            "starboard_config",
+            "starboard_starrers",
+            "starboard_posts"
+        ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
     forget_moderation_history(pool).await;
     let report = restore(pool, &old_path).await.unwrap();
     assert!(report.ok);
+    let count: i64 = sqlx::query_scalar(audited(format!(
+        "SELECT COUNT(*) FROM {}",
+        identifier("admin_api_tokens")
+    )))
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        count, 0,
+        "v11 restore clears newer admin_api_tokens target rows"
+    );
     for name in ["starboard_config", "starboard_starrers", "starboard_posts"] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -1694,6 +1721,91 @@ async fn v11_archive_restores_and_clears_newer_starboard() {
     assert!(
         tombstones > 0,
         "the v11 delete tombstones are restored, not discarded"
+    );
+    let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(members > 0, "older covered data is restored, not discarded");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v12_archive_restores_and_clears_newer_starboard_preserving_registry() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    seed(pool).await;
+    let directory = ArchiveDirectory::new();
+    let current_path = directory.path("v13-source.ndjson.gz");
+    dump(pool, &current_path).await.unwrap();
+    let mut old = inspect(&current_path).unwrap();
+    assert_eq!(old.manifest.version, 13);
+    // Frozen registry-present v12 shape: the released writer carried the
+    // token registry but predates the three starboard tables.
+    for name in ["starboard_config", "starboard_starrers", "starboard_posts"] {
+        let rows = old.buffers.remove(name).unwrap();
+        assert!(!rows.is_empty(), "fixture must populate newer {name}");
+        old.manifest.tables.retain(|table| table.name != name);
+    }
+    let registry_tables = vec!["admin_api_tokens".to_owned()];
+    let registry_before = snapshot(pool, &registry_tables).await;
+    assert!(
+        !registry_before["admin_api_tokens"].rows.is_empty(),
+        "v12 contains issued tokens"
+    );
+    old.manifest.version = 12;
+    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
+    let old_path = directory.path("pre-starboard-v12.ndjson.gz");
+    write_archive(&old_path, &old);
+    let inspected = inspect(&old_path).expect("pre-change v12 archive remains readable");
+    assert_eq!(inspected.manifest.version, 12);
+    assert_eq!(
+        inspected.manifest.missing_tables(),
+        ["starboard_config", "starboard_starrers", "starboard_posts"]
+    );
+    assert_eq!(
+        inspected.manifest.tables.len(),
+        99,
+        "frozen released v12 coverage"
+    );
+    assert!(inspected
+        .manifest
+        .tables
+        .iter()
+        .any(|table| table.name == "admin_api_tokens" && table.count > 0));
+    sqlx::query("UPDATE admin_api_tokens SET label = 'destination-only registry label'")
+        .execute(pool)
+        .await
+        .unwrap();
+    assert_ne!(snapshot(pool, &registry_tables).await, registry_before);
+    // This test deliberately replaces a reused isolated rehearsal target.
+    forget_moderation_history(pool).await;
+    let report = restore(pool, &old_path).await.unwrap();
+    assert!(report.ok);
+    assert_eq!(
+        snapshot(pool, &registry_tables).await,
+        registry_before,
+        "v12 restores the archived registry instead of clearing or retaining destination tokens"
+    );
+    for name in ["starboard_config", "starboard_starrers", "starboard_posts"] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(name)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "v12 restore clears newer {name} target rows");
+    }
+    let tombstones: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scheduled_events_tombstone")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(
+        tombstones > 0,
+        "the v12 delete tombstones are restored, not discarded"
     );
     let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
         .fetch_one(pool)

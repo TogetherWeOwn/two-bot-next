@@ -87,10 +87,14 @@ Placement and secrecy rules:
 - `MusicGates`: exact-`"1"` `TWO_MUSIC` gate (mirrors `VoiceGates`).
 - `VoicePairing`: per-guild pairing cache. Server and state halves arrive on
   separate dispatches in either order; a bot-leave (`None` channel) drops
-  the guild entry; a server refresh replaces the endpoint. A post-completion
-  server half is kept for a following new session (server-first rejoin), so
-  a region move followed by an external move transiently re-pairs the region
-  half until the new session's own server half lands and heals it.
+  the guild entry; a server refresh replaces the endpoint. A new session id
+  starts a new generation and drops the stale server half, unless a server
+  half arrived after the pair completed (server-first rejoin, kept): a
+  region move followed by an external move therefore transiently re-pairs
+  the region half until the new session's own server half lands and heals
+  it. `reset` before each `UpdateVoiceState` send keeps our own rejoins
+  exact in either order. The voice token rides `Secret<String>`, redacted
+  under `Debug`.
 - `PlayerVoiceUpdate::player_path` / `voice_body`: the exact v4 PATCH path
   and JSON body, snowflakes as strings.
 - `is_staging_guild`: the never-forward-outside-staging fence.
@@ -98,8 +102,19 @@ Placement and secrecy rules:
   No staging var is committed yet: the Operator enables it when the node
   is up.
 
-Still to come (follow-up cards): gateway capture of `VoiceServerUpdate`
-(today dropped on the floor) plus self state, the REST/WS client, the
+Gateway capture (dry-run, staging only) wraps the voice sink
+(`crates/bot/src/music_capture.rs`): `VoiceServerUpdate` plus self
+`VoiceStateUpdate` (resolved from the cache identity) feed `VoicePairing`
+behind `TWO_MUSIC=1` and the staging fence. Each distinct completed
+handshake logs one structured line (guild, channel, `has_token` — never
+token/endpoint values) and is dropped; a self leave with a live pairing
+logs the clear. Redelivered identical halves (mute toggles, duplicate
+dispatches) do not re-log; a changed half logs again as a new handshake.
+A gateway disconnect silently drops pending/complete pairing and dedup state,
+so both fresh halves are required after reconnect, in either arrival order.
+No HTTP, no PATCH, no gateway send in the capture slice.
+
+Still to come (follow-up cards): the REST/WS client, the
 `UpdateVoiceState` send path (the bot never issues gateway voice commands
 today), the second Container / DO binding / JVM image wiring, and the MVP
 command surface (`/play`, `/queue`, `/skip`, `/stop`, `/nowplaying`,

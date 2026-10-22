@@ -64,6 +64,9 @@ JOB_INVENTORY = {
     # Manual read-only staging event-store retention census (counts, digests
     # and timestamps only, log only); pinned shape below.
     "staging-retention-census.yml": {"census"},
+    # Manual read-only staging fixture-scope census (counts, digests and one
+    # observation timestamp only, log only); pinned shape below.
+    "staging-fixture-census.yml": {"fixture-census"},
     # Manual read-only authenticated MCP prove-out (TOG-23456); pinned shape below.
     "staging-mcp-proveout.yml": {"proveout"},
     # Manual read-only staging ownership status read; pinned shape below.
@@ -1791,6 +1794,88 @@ def staging_retention_census_errors(workflow):
     return errors
 
 
+FIXTURE_CENSUS_COMMAND = ("set -o pipefail\n"
+                          "python3 scripts/staging_retention_census.py fixture-scope\n")
+
+
+def staging_fixture_census_errors(workflow):
+    """Manual staging-only read-only point-in-time fixture-scope census.
+
+    Dispatch-only with no inputs. One job runs only from main through the
+    existing no-reviewer `staging-migrate-plan` environment (the plan
+    binding's login holds only two_bot_migrator_ro), on the routed runner
+    for job `fixture-census`, with its own non-cancelling concurrency group
+    and a 10 minute timeout (no in-job sleep: one observation instant).
+    Exactly two unconditional steps: pinned checkout without persisted
+    credentials, and one bash Run step that calls the reviewed script in
+    fixture-scope mode with the secret plus the three non-secret staging
+    pins via the environment only. Log only, no artifact upload: counts,
+    digests and the observation timestamp never leave the run log and
+    summary. No wrangler, no production path, no apply route, no `set -x`,
+    no seed or purge route.
+    """
+    name = "staging-fixture-census.yml"
+    errors = []
+    if "env" in workflow:
+        errors.append(f"{name}: workflow-level env must stay absent; bindings belong only on the Run step")
+    on = workflow.get("on") or {}
+    if set(on) != {"workflow_dispatch"}:
+        errors.append(f"{name}: must be dispatch-only (no push/pull_request/schedule)")
+    elif on.get("workflow_dispatch") not in (None, {}, ""):
+        errors.append(f"{name}: workflow_dispatch must take no inputs")
+    if workflow.get("permissions") != {}:
+        errors.append(f"{name}: top-level permissions must stay empty")
+    if workflow.get("concurrency") != {"group": "staging-fixture-census", "cancel-in-progress": "false"}:
+        errors.append(f"{name}: must use its own staging-fixture-census group without cancelling")
+    jobs = workflow.get("jobs") or {}
+    if set(jobs) != {"fixture-census"}:
+        errors.append(f"{name}: jobs must be exactly fixture-census")
+        return errors
+    job = jobs["fixture-census"]
+    if job.get("environment") != "staging-migrate-plan":
+        errors.append(f"{name}:fixture-census: must read the staging-migrate-plan Environment binding")
+    if job.get("if") != "github.ref == 'refs/heads/main'":
+        errors.append(f"{name}:fixture-census: must run only from main")
+    if job.get("permissions") != {"contents": "read"}:
+        errors.append(f"{name}:fixture-census: must keep contents:read only")
+    if job.get("timeout-minutes") != "10":
+        errors.append(f"{name}:fixture-census: timeout must stay 10 minutes")
+    if not runner_allowed("fixture-census", job.get("runs-on")):
+        errors.append(f"{name}:fixture-census: must use the routed runner expression for job 'fixture-census'")
+    for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
+        if key in job:
+            errors.append(f"{name}:fixture-census: must not set {key} (bindings stay on the single Run step)")
+    text = str(job).lower().replace(" ", "")
+    for marker in ("wrangler", "production", "tojson(secrets", "secrets[", "set-x", "setx", "xtrace",
+                   "inputs.", "migrator_database_url", "--apply", "upload-artifact",
+                   "download-artifact", "createextension"):
+        if marker in text:
+            errors.append(f"{name}:fixture-census: must not contain {marker!r}")
+    secrets = set(re.findall(r"secrets\.([a-z0-9_]+)", text))
+    if secrets != {"two_bot_staging_plan_database_url"}:
+        errors.append(f"{name}:fixture-census: must read exactly the plan-database secret")
+    steps = job.get("steps") or []
+    if len(steps) != 2 or any(key in step for step in steps for key in ("if", "continue-on-error")):
+        errors.append(f"{name}:fixture-census: must run exactly checkout and the census, unconditionally")
+        return errors
+    checkout, run = steps
+    # Scoped to the Run step: the routed runner expression names its own
+    # CI_OVERFLOW_* vars, which must not count as census pins.
+    if set(re.findall(r"vars\.([a-z0-9_]+)", str(run).lower())) != {"two_bot_staging_host",
+                                                                   "two_bot_staging_database",
+                                                                   "two_bot_staging_branch_id"}:
+        errors.append(f"{name}:fixture-census: Run step may reference only the three staging pins")
+    if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
+            or (checkout.get("with") or {}).get("persist-credentials") != "false" \
+            or (checkout.get("with") or {}).get("fetch-depth") != "1":
+        errors.append(f"{name}:fixture-census: checkout must be pinned, shallow and must not persist credentials")
+    if run.get("env") != CENSUS_ENV:
+        errors.append(f"{name}:fixture-census: Run step must bind exactly the plan secret and the three pins")
+    if run.get("run") != FIXTURE_CENSUS_COMMAND or "uses" in run or run.get("shell") != "bash":
+        errors.append(f"{name}:fixture-census: Run step must call the script in fixture-scope mode over bash with pipefail")
+    return errors
+
+
 MCP_PROVEOUT_ENV = {
     "STAGING_MCP_TOKEN": "${{ secrets.STAGING_MCP_TOKEN }}",
     "STAGING_MCP_URL": "https://two-bot-next-staging.5150.workers.dev/mcp",
@@ -3511,6 +3596,12 @@ def workflow_policy_errors(workflows):
             # binding.
             errors.extend(staging_retention_census_errors(workflow))
             continue
+        if name == "staging-fixture-census.yml":
+            # Manual read-only fixture census: pinned shape above; the
+            # generic environment scan below would flag its Environment
+            # binding.
+            errors.extend(staging_fixture_census_errors(workflow))
+            continue
         if name == "staging-mcp-proveout.yml":
             # Manual read-only authenticated MCP prove-out: pinned shape
             # above; the generic environment scan below would flag its
@@ -4151,6 +4242,33 @@ class WorkflowTests(unittest.TestCase):
             step["run"],
             r"--test lfg_interactions(?: --test \S+)* -- --ignored --test-threads=1",
         )
+
+    def test_tickets_postgres_acceptance_receives_disposable_database_url(self):
+        job = self.workflows["check.yml"]["jobs"]["tickets-postgres"]
+        prepare = next(
+            step for step in job["steps"]
+            if step.get("name") == "Prepare guarded test database"
+        )
+        self.assertIn("createdb -h agent-testdb -U agent_test two_bot_test_ci", prepare["run"])
+        # The rust:bookworm job container ships no PostgreSQL client; a
+        # bare createdb fails with exit 127, so the install must precede it.
+        self.assertIn("apt-get install -y -qq --no-install-recommends postgresql-client", prepare["run"])
+        self.assertLess(
+            prepare["run"].index("apt-get install"),
+            prepare["run"].index("createdb -h agent-testdb"),
+        )
+        step = next(
+            step for step in job["steps"]
+            if step.get("name") == "Ticket shared router and mock Discord lifecycle acceptance"
+        )
+        # The non-ignored creation-receipt acceptance modules panic in CI
+        # without the guarded bootstrap; the fixture guard rejects any URL
+        # whose database is not two_bot_test_*.
+        self.assertEqual(
+            step["env"]["TWO_TEST_DATABASE_URL"],
+            "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
+        )
+        self.assertLess(job["steps"].index(prepare), job["steps"].index(step))
 
     def test_runtime_postgres_wal_budget_is_bounded(self):
         # Keep the broader runtime-lane budget from main; the smaller target is
@@ -6542,6 +6660,83 @@ class WorkflowTests(unittest.TestCase):
         # The inventory pin fails closed if the workflow disappears or gains a job.
         missing = deepcopy(workflows)
         del missing["staging-retention-census.yml"]
+        self.assertTrue(workflow_policy_errors(missing))
+        self.assertEqual(workflow_policy_errors(workflows), [])
+
+    def test_staging_fixture_census_shape_is_pinned(self):
+        workflows = self.workflows
+        self.assertEqual(staging_fixture_census_errors(workflows["staging-fixture-census.yml"]), [])
+
+        def mutate(change):
+            copy = deepcopy(workflows["staging-fixture-census.yml"])
+            change(copy)
+            return staging_fixture_census_errors(copy)
+
+        def job(copy):
+            return copy["jobs"]["fixture-census"]
+
+        changes = {
+            "push trigger": lambda w: w["on"].update({"push": {"branches": ["main"]}}),
+            "schedule trigger": lambda w: w["on"].update({"schedule": [{"cron": "0 * * * *"}]}),
+            "dispatch input": lambda w: w["on"].update(
+                {"workflow_dispatch": {"inputs": {"mode": {"type": "string"}}}}),
+            "top-level permissions": lambda w: w.update({"permissions": {"contents": "read"}}),
+            "workflow-level secret": lambda w: w.update(
+                {"env": {"T": "${{ secrets.TWO_BOT_STAGING_PLAN_DATABASE_URL }}"}}),
+            "cancelling concurrency": lambda w: w["concurrency"].update({"cancel-in-progress": "true"}),
+            "shared concurrency group": lambda w: w["concurrency"].update({"group": "deploy-staging"}),
+            "sibling concurrency group": lambda w: w["concurrency"].update({"group": "staging-retention-census"}),
+            "second job": lambda w: w["jobs"].update({"again": deepcopy(job(w))}),
+            "wrong environment": lambda w: job(w).update({"environment": "staging"}),
+            "production environment": lambda w: job(w).update({"environment": "production"}),
+            "no environment": lambda w: job(w).pop("environment"),
+            "branch condition removed": lambda w: job(w).pop("if"),
+            "any branch": lambda w: job(w).update({"if": "github.ref != ''"}),
+            "write grant": lambda w: job(w).update({"permissions": {"contents": "write"}}),
+            "shorter timeout": lambda w: job(w).update({"timeout-minutes": "5"}),
+            "longer timeout": lambda w: job(w).update({"timeout-minutes": "60"}),
+            "unrouted runner": lambda w: job(w).update({"runs-on": "ubuntu-latest"}),
+            "other job's routing": lambda w: job(w).update(
+                {"runs-on": ROUTED_RUNNER.format(job="check")}),
+            "sibling routing": lambda w: job(w).update(
+                {"runs-on": ROUTED_RUNNER.format(job="census")}),
+            "job-level secret": lambda w: job(w).update(
+                {"env": {"T": "${{ secrets.TWO_BOT_STAGING_PLAN_DATABASE_URL }}"}}),
+            "container": lambda w: job(w).update({"container": {"image": "postgres"}}),
+            "step condition": lambda w: job(w)["steps"][1].update({"if": "always()"}),
+            "continue on error": lambda w: job(w)["steps"][1].update({"continue-on-error": "true"}),
+            "artifact upload": lambda w: job(w)["steps"].append(
+                {"uses": "actions/upload-artifact@pinned"}),
+            "persisted credentials": lambda w: job(w)["steps"][0]["with"].update(
+                {"persist-credentials": "true"}),
+            "extra secret": lambda w: job(w)["steps"][1]["env"].update(
+                {"X": "${{ secrets.TWO_BOT_STAGING_MIGRATOR_DATABASE_URL }}"}),
+            "dropped login secret": lambda w: job(w)["steps"][1]["env"].pop(
+                "TWO_BOT_STAGING_PLAN_DATABASE_URL"),
+            "dropped host pin": lambda w: job(w)["steps"][1]["env"].pop(
+                "TWO_BOT_STAGING_HOST"),
+            "blanket secrets": lambda w: job(w)["steps"][1]["env"].update({"ALL": "${{ toJSON(secrets) }}"}),
+            "pin as input": lambda w: job(w)["steps"][1]["env"].update(
+                {"TWO_BOT_STAGING_HOST": "${{ inputs.host }}"}),
+            "inline expression": lambda w: job(w)["steps"][1].update(
+                {"run": FIXTURE_CENSUS_COMMAND + "echo ${{ vars.X }}\n"}),
+            "missing pipefail": lambda w: job(w)["steps"][1].update(
+                {"run": "python3 scripts/staging_retention_census.py fixture-scope\n"}),
+            "missing mode": lambda w: job(w)["steps"][1].update(
+                {"run": CENSUS_COMMAND}),
+            "missing shell": lambda w: job(w)["steps"][1].pop("shell"),
+            "shell trace": lambda w: job(w)["steps"][1].update({"run": "set -x\n" + FIXTURE_CENSUS_COMMAND}),
+            "other script": lambda w: job(w)["steps"][1].update(
+                {"run": FIXTURE_CENSUS_COMMAND.replace("staging_retention_census", "other")}),
+            "wrangler action": lambda w: job(w)["steps"].insert(
+                1, {"uses": "cloudflare/wrangler-action@pinned"}),
+        }
+        for label, change in changes.items():
+            with self.subTest(change=label):
+                self.assertTrue(mutate(change))
+        # The inventory pin fails closed if the workflow disappears or gains a job.
+        missing = deepcopy(workflows)
+        del missing["staging-fixture-census.yml"]
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
 

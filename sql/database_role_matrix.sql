@@ -109,6 +109,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'assistant_monthly_builds', 'table'),
     ('public', 'scheduled_events_claim', 'table'),
     ('public', 'scheduled_events_tombstone', 'table'),
+    ('public', 'admin_api_tokens', 'table'),
     ('public', 'starboard_config', 'table'),
     ('public', 'starboard_starrers', 'table'),
     ('public', 'starboard_posts', 'table'),
