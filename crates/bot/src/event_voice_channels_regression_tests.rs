@@ -378,6 +378,42 @@ async fn bound_reconcile_skips_rows_on_probe_transport_failure() {
 }
 
 #[tokio::test]
+async fn stale_reconcile_skips_conflicting_bind_and_continues() {
+    let Some(db) = ev_db().await else { return };
+    let pool = db.pool();
+    let at = ev_instance(2);
+    assert!(ev_claim(pool, "ev-rs-cf-a", at, "tick-old-a").await);
+    ev_backdate(pool, "ev-rs-cf-a", 6).await;
+    assert!(ev_claim(pool, "ev-rs-cf-b", at, "tick-old-b").await);
+    ev_backdate(pool, "ev-rs-cf-b", 6).await;
+    // A third row already holds 7871: the probe answer for A collides with
+    // the UNIQUE (voice_channel_id) binding, which must skip A, not abort.
+    assert!(ev_claim(pool, "ev-rs-cf-c", at, "tick-c").await);
+    assert!(bind_event_voice_channel(pool, "ev-rs-cf-c", at, "7871")
+        .await
+        .expect("bind runs"));
+
+    let mut probe = ScriptProbe::new();
+    probe.events.insert(
+        "ev-rs-cf-a".to_owned(),
+        Ok(EventProbeOutcome::FoundChannel(7871)),
+    );
+    probe.events.insert(
+        "ev-rs-cf-b".to_owned(),
+        Ok(EventProbeOutcome::FoundChannel(7872)),
+    );
+    let report = reconcile_stale_claims(pool, &probe, 300)
+        .await
+        .expect("a conflicting bind skips its row instead of aborting the pass");
+    assert_eq!(report.probed, 2);
+    assert_eq!(report.bound, 1);
+    assert_eq!(report.skipped, 1);
+    assert_eq!(ev_row(pool, "ev-rs-cf-a").await.2, None);
+    assert_eq!(ev_row(pool, "ev-rs-cf-b").await.2.as_deref(), Some("7872"));
+    db.close().await.expect("fixture teardown");
+}
+
+#[tokio::test]
 async fn worker_transition_opens_and_closes_spans() {
     let Some(db) = ev_db().await else { return };
     let pool = db.pool();
@@ -416,6 +452,35 @@ async fn worker_transition_opens_and_closes_spans() {
     .await
     .expect("open count reads");
     assert_eq!(open_after, 0);
+    db.close().await.expect("fixture teardown");
+}
+
+#[tokio::test]
+async fn worker_transition_presence_writes_are_bounded_under_pool_starvation() {
+    let Some(db) = ev_db().await else { return };
+    let pool = db.pool();
+    // Exhaust the fixture pool (testsupport fixes max_connections at 5):
+    // every presence write then waits on acquisition past any sane bound,
+    // so an unbounded write would hold the actor loop open for the full
+    // acquire timeout (twice on a move). The exhaustion assert fails the
+    // test loudly if the pool size ever changes, instead of passing
+    // vacuously on an unstarved pool.
+    let mut held = Vec::new();
+    for _ in 0..5 {
+        held.push(pool.acquire().await.expect("exhaust the fixture pool"));
+    }
+    assert!(
+        pool.try_acquire().is_none(),
+        "the fixture pool must be exhausted"
+    );
+    let store = PgRoomStore::new(pool.clone());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        record_transition(&store, GUILD, 3203, Some(7861), Some(7862)),
+    )
+    .await
+    .expect("saturated-pool presence writes stay bounded");
+    drop(held);
     db.close().await.expect("fixture teardown");
 }
 

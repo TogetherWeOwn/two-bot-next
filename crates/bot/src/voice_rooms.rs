@@ -3196,7 +3196,7 @@ const OWNER_REPAIR_COOLDOWN_MS: u64 = 60_000;
 /// to 10 s for a connection, but a lobby join must not wait that long.
 const CREATORS_REFRESH_DEBOUNCE_MS: u64 = 10_000;
 const CREATORS_REFRESH_INTERVAL_MS: u64 = 300_000;
-const REVALIDATE_TIMEOUT_MS: u64 = 1_000;
+pub(crate) const REVALIDATE_TIMEOUT_MS: u64 = 1_000;
 /// How long join-path creator re-reads back off after a failed, timed-out or
 /// refused bulk store read: one slow pool must not serialize every later
 /// join behind another long wait. A successful store read clears it early.
@@ -9258,6 +9258,32 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
             last_progress = tokio::time::Instant::now();
         }
         dispatch_ready |= accepted;
+    }
+    // Snapshot occupants never sent a transition (`publish_snapshot` only
+    // sends `Reconcile`): flush them join-only so a member already sitting
+    // in a bound event channel owns an open span. Movers covered by the
+    // buffered transitions above keep a single span (the join is
+    // idempotent), and channels with no event mapping write nothing.
+    // Collected before any await so no live-state lock crosses a store
+    // write; each write carries the transition's own timeout bound.
+    let snapshot_occupants: Vec<(Snowflake, Snowflake)> = {
+        let live = worker.live.read_state();
+        live.members
+            .iter()
+            .filter_map(|(member_id, member)| {
+                member.channel_id.map(|channel| (*member_id, channel))
+            })
+            .collect()
+    };
+    for (member_id, channel) in snapshot_occupants {
+        crate::event_voice_channels::record_transition(
+            &worker.store,
+            worker.live.guild_id,
+            member_id,
+            None,
+            Some(channel),
+        )
+        .await;
     }
     stall.snapshot(worker, last_progress);
     loop {

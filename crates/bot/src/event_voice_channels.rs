@@ -7,9 +7,10 @@
 //! marks its row `orphaned` (lease cleared for one retry), and occupied
 //! rooms are kept untouched.
 
-use crate::voice_rooms::RoomPersistence;
+use crate::voice_rooms::{RoomPersistence, REVALIDATE_TIMEOUT_MS};
 use sqlx::PgPool;
 use std::future::Future;
+use std::time::Duration;
 use time::OffsetDateTime;
 use tracing::{debug, info};
 use two_bot_core::Snowflake;
@@ -20,9 +21,12 @@ use two_bot_cutover::event_voice::{
 };
 
 /// Record one voice-channel transition (join, leave or move) as presence
-/// spans. Called by the guild actor loop before room handling; failures are
-/// debug-logged (no member or channel ids on this warm path) and the 60s
-/// flush backstop repairs the open span. Never fails the actor loop.
+/// spans. Called by the guild actor loop before room handling; each write
+/// is bounded by [`REVALIDATE_TIMEOUT_MS`] (the same inbox-protection
+/// bound as creator revalidation) so a slow statement cannot hold room
+/// handling. Failures and timeouts are debug-logged (no member or channel
+/// ids on this warm path) and the 60s flush backstop repairs the open
+/// span. Never fails the actor loop.
 pub async fn record_transition(
     store: &impl RoomPersistence,
     guild: Snowflake,
@@ -34,22 +38,50 @@ pub async fn record_transition(
         return;
     }
     if let Some(channel) = current {
-        if let Err(error) = store.record_event_voice_join(channel, member).await {
-            debug!(
-                guild = guild.to_string(),
-                error = %error,
-                "event voice join span write failed; the flush backstop repairs it"
-            );
+        match tokio::time::timeout(
+            Duration::from_millis(REVALIDATE_TIMEOUT_MS),
+            store.record_event_voice_join(channel, member),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                debug!(
+                    guild = guild.to_string(),
+                    error = %error,
+                    "event voice join span write failed; the flush backstop repairs it"
+                );
+            }
+            Err(_) => {
+                debug!(
+                    guild = guild.to_string(),
+                    "event voice join span write timed out; the flush backstop repairs it"
+                );
+            }
         }
     }
     if let Some(channel) = previous {
         if Some(channel) != current {
-            if let Err(error) = store.record_event_voice_leave(channel, member).await {
-                debug!(
-                    guild = guild.to_string(),
-                    error = %error,
-                    "event voice leave stamp write failed; the next leave retries it"
-                );
+            match tokio::time::timeout(
+                Duration::from_millis(REVALIDATE_TIMEOUT_MS),
+                store.record_event_voice_leave(channel, member),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    debug!(
+                        guild = guild.to_string(),
+                        error = %error,
+                        "event voice leave stamp write failed; the next leave retries it"
+                    );
+                }
+                Err(_) => {
+                    debug!(
+                        guild = guild.to_string(),
+                        "event voice leave stamp write timed out; the next leave retries it"
+                    );
+                }
             }
         }
     }
@@ -144,7 +176,8 @@ pub struct StaleReconcileReport {
     pub bound: u64,
     /// Rows whose lease was cleared for retry.
     pub cleared: u64,
-    /// Rows skipped (probe transport failure, no lease to clear, lost race).
+    /// Rows skipped (probe transport failure, no lease to clear, lost race,
+    /// bind write failure).
     pub skipped: u64,
 }
 
@@ -162,9 +195,31 @@ pub async fn reconcile_stale_claims(
         match probe.get_event_channel(&event_id).await {
             Ok(EventProbeOutcome::FoundChannel(channel)) => {
                 let channel_id = channel.to_string();
-                if bind_event_voice_channel(pool, &event_id, instance_starts_at, &channel_id)
-                    .await?
+                // A probe answer can collide with another row's binding
+                // (UNIQUE (voice_channel_id)): skip the row, never the pass.
+                let bound = match bind_event_voice_channel(
+                    pool,
+                    &event_id,
+                    instance_starts_at,
+                    &channel_id,
+                )
+                .await
                 {
+                    Ok(bound) => bound,
+                    Err(error) => {
+                        report.skipped += 1;
+                        debug!(
+                            voice_event = "event_voice_bind_failed",
+                            event_id,
+                            instance,
+                            channel_id,
+                            error = %error,
+                            "stale event voice bind failed; continuing with the next row"
+                        );
+                        continue;
+                    }
+                };
+                if bound {
                     report.bound += 1;
                     info!(
                         voice_event = "event_voice_channel_bound",
@@ -217,7 +272,8 @@ pub struct OrphanReconcileReport {
     pub orphaned: u64,
     /// Orphaned rows revived by the retry GET (transient 404).
     pub revived: u64,
-    /// Rows skipped (probe transport failure, corrupt binding).
+    /// Rows skipped (probe transport failure, corrupt binding, orphan write
+    /// failure).
     pub skipped: u64,
 }
 
@@ -250,7 +306,20 @@ pub async fn reconcile_bound_channels(
                 report.kept += 1;
             }
             Ok(ChannelProbeOutcome::Missing) => {
-                mark_event_voice_orphaned(pool, &event_id, instance_starts_at).await?;
+                if let Err(error) =
+                    mark_event_voice_orphaned(pool, &event_id, instance_starts_at).await
+                {
+                    report.skipped += 1;
+                    debug!(
+                        voice_event = "event_voice_orphan_failed",
+                        event_id,
+                        instance,
+                        channel_id,
+                        error = %error,
+                        "event voice orphan mark failed; continuing with the next row"
+                    );
+                    continue;
+                }
                 report.orphaned += 1;
                 info!(
                     voice_event = "event_voice_channel_orphaned",

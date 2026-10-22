@@ -261,8 +261,15 @@ async fn actor_init_disconnect_during_pending_init_writes_nothing() {
     feed(&runtime, &pipeline, voice_event(MEMBER, Some(CREATOR)));
     drive_secs(600).await;
 
+    // Presence-span store writes are connectivity-independent (the
+    // transition hook records them even while disconnected); only Discord
+    // lifecycle writes are barred here.
     assert!(
-        trace.lock().unwrap().is_empty(),
+        trace
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|entry| entry.starts_with("evjoin:") || entry.starts_with("evleave:")),
         "no create/move/delete may be sent while disconnected, trace: {:?}",
         trace.lock().unwrap()
     );

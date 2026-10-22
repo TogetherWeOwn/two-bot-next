@@ -505,6 +505,20 @@ impl RoomPersistence for Store {
         self.owner_pending.lock().unwrap().remove(&channel);
         Ok(())
     }
+    async fn record_event_voice_join(&self, channel: u64, member: u64) -> Result<(), StoreError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("evjoin:{channel}:{member}"));
+        Ok(())
+    }
+    async fn record_event_voice_leave(&self, channel: u64, member: u64) -> Result<(), StoreError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("evleave:{channel}:{member}"));
+        Ok(())
+    }
     async fn claim_create(
         &self,
         _: u64,
@@ -4968,9 +4982,12 @@ async fn creator_join_moves_without_waiting_for_the_actor_tick() {
         tokio::task::yield_now().await;
     }
     assert_eq!(received.elapsed(), Duration::ZERO);
+    // The presence hook records each join ahead of room handling.
     assert_eq!(
         *trace.lock().unwrap(),
         [
+            "evjoin:200:300",
+            "evjoin:200:301",
             "create",
             "persist:500",
             "move:300:500",
@@ -5011,9 +5028,18 @@ async fn runtime_actor_creates_persists_and_moves_room() {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    // The join is recorded twice: once by the buffered transition, once by
+    // the bootstrap occupant flush (the store join is idempotent, so the
+    // second write is a no-op in production).
     assert_eq!(
         *trace.lock().unwrap(),
-        ["create", "persist:500", "move:300:500"]
+        [
+            "evjoin:200:300",
+            "evjoin:200:300",
+            "create",
+            "persist:500",
+            "move:300:500"
+        ]
     );
 }
 

@@ -174,6 +174,14 @@ impl RoomPersistence for Arc<Store> {
     ) -> Result<(), StoreError> {
         self.as_ref().remove_join_grant(guild, room, member).await
     }
+    async fn record_event_voice_join(&self, channel: u64, member: u64) -> Result<(), StoreError> {
+        self.as_ref().record_event_voice_join(channel, member).await
+    }
+    async fn record_event_voice_leave(&self, channel: u64, member: u64) -> Result<(), StoreError> {
+        self.as_ref()
+            .record_event_voice_leave(channel, member)
+            .await
+    }
 }
 
 #[derive(Clone, Default)]
@@ -565,11 +573,13 @@ async fn create_notifies_existing_actor_before_next_join() {
     assert!(response_text(seen.lock().unwrap().as_ref().unwrap()).contains("Created <#500>"));
     feed(&runtime, &pipeline, voice_event(MEMBER, Some(500)));
     wait_trace(&trace, "move:300:501").await;
+    // The presence hook records the join ahead of room handling.
     assert_eq!(
         *trace.lock().unwrap(),
         [
             "create",
             "add_creator:500",
+            "evjoin:500:300",
             "create",
             "persist:501",
             "move:300:501"
@@ -959,6 +969,38 @@ async fn guild_create_seeds_display_names_for_restarted_rooms() {
         .expect("probe deadline")
         .expect("actor exists");
     assert!(directory.knows(MEMBER));
+}
+
+/// Snapshot occupants never sent a transition (`publish_snapshot` only
+/// sends `Reconcile`): the actor bootstrap flushes them join-only, so a
+/// member already sitting in a channel at GuildCreate owns an open span.
+/// Without the flush no join is recorded for the snapshot occupant.
+#[tokio::test]
+async fn guild_create_snapshot_occupant_gets_a_join_span_at_bootstrap() {
+    let (store, http, trace) = fixture();
+    let runtime = runtime(store, http);
+    let pipeline = MemPipeline::for_replay();
+    feed(&runtime, &pipeline, ready_event());
+    let mut guild: serde_json::Value =
+        serde_json::from_str(include_str!("../tests/fixtures/voice_guild.json")).unwrap();
+    guild["roles"][0]["permissions"] = json!(permissions().bits().to_string());
+    guild["members"].as_array_mut().unwrap().push(json!({
+        "user": {"id": MEMBER.to_string(), "username": "alex", "global_name": "Alex", "discriminator": "0"},
+        "roles": [], "deaf": false, "mute": false, "flags": 0, "joined_at": NOW
+    }));
+    guild["voice_states"] = json!([{
+        "channel_id": CREATOR.to_string(), "user_id": MEMBER.to_string(), "session_id": "voice",
+        "deaf": false, "mute": false, "self_deaf": false, "self_mute": false,
+        "self_video": false, "suppress": false
+    }]);
+    feed(
+        &runtime,
+        &pipeline,
+        Event::GuildCreate(Box::new(GuildCreate::Available(
+            serde_json::from_value(guild).unwrap(),
+        ))),
+    );
+    wait_trace(&trace, &format!("evjoin:{CREATOR}:{MEMBER}")).await;
 }
 
 async fn creator_ids(runtime: &Runtime) -> Vec<u64> {
