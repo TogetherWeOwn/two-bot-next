@@ -205,13 +205,29 @@ def continuation_findings(text, unit_name):
 def lint(deploy_dir):
     """One finding per problem, each naming the unit file."""
     findings = []
+    sections_by_unit = {}
     units = sorted(Path(deploy_dir).glob("*.service"))
     if not any(unit.name == HANDLER for unit in units):
         findings.append(f"{HANDLER}: failure handler is missing")
     for unit in units:
-        raw = unit.read_text()
+        # Read bytes so universal-newline translation cannot mask a character.
+        # systemd and Python disagree on NUL, BOM and Unicode line boundaries;
+        # reject nonprinting text before any continuation or directive parsing.
+        try:
+            raw = unit.read_bytes().decode("utf-8")
+        except UnicodeDecodeError:
+            findings.append(f"{unit.name}: unit must be valid UTF-8 text")
+            continue
+        unsupported = next((char for char in raw
+                            if char not in "\t\n" and not char.isprintable()), None)
+        if unsupported is not None:
+            findings.append(
+                f"{unit.name}: unsupported character U+{ord(unsupported):04X}; "
+                f"use printable text, tab and LF only")
+            continue
         findings.extend(continuation_findings(raw, unit.name))
         sections = parse_sections(raw)
+        sections_by_unit[unit.name] = sections
         service_lines = sections.get("Service", [])
         unit_lines = sections.get("Unit", [])
         all_lines = [line for lines in sections.values() for line in lines]
@@ -236,9 +252,8 @@ def lint(deploy_dir):
             if service_exec != [EXPECTED_HANDLER_EXECSTART] or len(total_exec) != 1:
                 findings.append(
                     f"{unit.name}: ExecStart must be the documented systemd-cat command in [Service]")
-    drill = Path(deploy_dir) / DRILL
-    if drill.exists():
-        sections = parse_sections(drill.read_text())
+    sections = sections_by_unit.get(DRILL)
+    if sections is not None:
         service_lines = sections.get("Service", [])
         env_values, env_invalid = effective_environment(service_lines)
         if env_invalid:
@@ -483,6 +498,76 @@ class UnitLintTests(unittest.TestCase):
                     anchor_line + "SyslogIdentifier=backup\\\\\n" + hidden + "\n", 1))
                 self.assertTrue(any(f.startswith(unit + ":") for f in lint(tmp)),
                                 (unit, hidden, lint(tmp)))
+
+    def test_nonprinting_characters_cannot_hide_directives(self):
+        backup = "two-bot-next-backup.service"
+        age = "Environment=TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S=172800\n"
+        for unit, anchor, extra in [
+            (backup, None, "SyslogIdentifier=x\x00TimeoutSec=infinity\n"),
+            (backup, ON_FAILURE + "\n", chr(0xfeff) + "OnFailure=\n"),
+            (DRILL, age, chr(0xfeff) + 'Environment="TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S=999999999"\n'),
+            (backup, None, "SyslogIdentifier=x\x1c[Unit]\nTimeoutSec=infinity\n[Service]\n"),
+            (backup, None, "# note\x0cExecStart=/usr/bin/true \\\nSuccessExitStatus=1\n"),
+        ]:
+            with self.subTest(unit=unit, extra=extra):
+                tmp = self.copy_deploy()
+                path = tmp / unit
+                text = path.read_text()
+                if anchor is None:
+                    text += extra
+                else:
+                    self.assertIn(anchor, text)
+                    text = text.replace(anchor, anchor + extra, 1)
+                path.write_bytes(text.encode("utf-8"))
+                findings = lint(tmp)
+                self.assertTrue(findings and all(f.startswith(unit + ":") for f in findings), findings)
+
+    def test_only_printable_text_tab_and_lf_are_accepted(self):
+        # Include CR as raw bytes: read_text() would silently normalize it to LF.
+        forbidden = [chr(code) for code in range(0xa0)
+                     if code not in (9, 10) and not chr(code).isprintable()]
+        forbidden += [chr(code) for code in (0x00a0, 0x200b, 0x2028, 0x2029, 0xfeff)]
+        for unit in ["two-bot-next-backup.service", DRILL, HANDLER]:
+            for char in forbidden:
+                with self.subTest(unit=unit, code=f"U+{ord(char):04X}"):
+                    tmp = self.copy_deploy()
+                    path = tmp / unit
+                    path.write_bytes(path.read_bytes() + f"# unsupported {char} marker\n".encode("utf-8"))
+                    self.assertTrue(any(
+                        f.startswith(unit + ":") and f"U+{ord(char):04X}" in f
+                        for f in lint(tmp)), lint(tmp))
+        tmp = self.copy_deploy()
+        for path in tmp.glob("*.service"):
+            path.write_bytes(path.read_bytes() + "# Déploiement 🙂\twith LF\n".encode("utf-8"))
+        self.assertEqual(lint(tmp), [])
+
+    def test_invalid_utf8_is_a_named_finding(self):
+        for unit in ["two-bot-next-backup.service", DRILL, HANDLER]:
+            with self.subTest(unit=unit):
+                tmp = self.copy_deploy()
+                path = tmp / unit
+                path.write_bytes(path.read_bytes() + b"# invalid \xff\n")
+                findings = lint(tmp)
+                self.assertTrue(findings and all(f.startswith(unit + ":") for f in findings), findings)
+                self.assertTrue(any("UTF-8" in f for f in findings), findings)
+
+    def test_escaped_backslash_inside_drill_continuation_is_refused(self):
+        # Pin the in-chain parity diagnostic, not just any lint failure: the
+        # broken script can also trip the independent age-order check.
+        anchor = '  exec /opt/two-bot-next/two-bot restore-drill "$latest" --confirm-scratch\'\n'
+        for count in [2, 4]:
+            for hidden in ["SuccessExitStatus=1", "TimeoutSec=infinity"]:
+                with self.subTest(backslashes=count, hidden=hidden):
+                    tmp = self.copy_deploy()
+                    path = tmp / DRILL
+                    text = path.read_text()
+                    self.assertIn(anchor, text)
+                    extra = "  echo marker; " + "\\" * count + "\n" + hidden + "\n"
+                    path.write_text(text.replace(anchor, extra + anchor, 1))
+                    findings = lint(tmp)
+                    self.assertTrue(any(
+                        f.startswith(DRILL + ":") and "escaped trailing backslash" in f
+                        for f in findings), findings)
 
     def test_continuation_cannot_reset_the_failure_hook_behind_a_comment(self):
         # systemd skips comment lines before joining continuations, so this
