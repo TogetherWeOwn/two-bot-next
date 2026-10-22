@@ -21,3 +21,9 @@ pub mod raid_runtime;
 // file is not loaded as two modules (clippy::duplicate_mod).
 #[cfg(test)]
 mod tuning_test_support;
+
+// Shared serial lock for drop-poison counter tests; the binary declares the
+// same file so its counter tests share one lock per test binary (one module
+// per crate, so no clippy::duplicate_mod).
+#[cfg(test)]
+mod drop_poison_test_serial;

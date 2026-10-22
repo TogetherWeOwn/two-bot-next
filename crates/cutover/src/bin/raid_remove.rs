@@ -90,6 +90,8 @@ async fn run(args: Args, guild: String) -> Result<i32, String> {
         None => HashSet::new(),
     };
     let mut audit = FileAudit::open(Path::new(audit), &guild)?;
+    // Refuse before any removal if this run's records cannot fit the audit cap.
+    audit.ensure_capacity(ids.iter().filter(|id| !audit.done.contains(*id)).count())?;
     // No client or token access in dry-run mode. No alternate credentials.
     let executor = if mode == RemovalMode::Execute {
         let token = std::env::var("DISCORD_TOKEN").map_err(|_| {

@@ -81,7 +81,9 @@ export const SIGNING_HEADERS = [
   ["x-two-nonce", 32],
   ["x-two-signature", 71],
 ] as const;
-const IDEMPOTENCY_HEADER = ["idempotency-key", 200] as const;
+export const IDEMPOTENCY_HEADER = ["idempotency-key", 200] as const;
+/** Inbound `content-type` header byte cap, enforced before the media-type allowlist. */
+export const CONTENT_TYPE_MAX_BYTES = 128;
 const HEADER_VALUE = /^[\x21-\x2b\x2d-\x7e]+$/;
 const CONTENT_TYPES = ["application/json", "application/json; charset=utf-8"];
 
@@ -165,7 +167,7 @@ export function allowlistedHeaders(
 ): { headers: Headers } | { refusal: Response } {
   const media = source.get("content-type");
   if (
-    media === null || media.length > 128 || !CONTENT_TYPES.includes(media.toLowerCase()) ||
+    media === null || media.length > CONTENT_TYPE_MAX_BYTES || !CONTENT_TYPES.includes(media.toLowerCase()) ||
     source.has("content-encoding")
   ) {
     return { refusal: refuse(415, "unsupported_media_type", false, undefined, requestId, release) };
