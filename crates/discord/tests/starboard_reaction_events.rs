@@ -116,11 +116,11 @@ fn reaction_remove_models_through_adapter_with_routing_id() {
 fn message_delete_models_through_adapter_with_routing_id() {
     // AC1: MESSAGE_DELETE is currently dropped (None); the builder models it
     // so the PR-2 runtime can mark board posts source-deleted.
-    let event = Event::MessageDelete(Box::new(MessageDelete {
+    let event = Event::MessageDelete(MessageDelete {
         channel_id: Id::new(CHANNEL),
         guild_id: Some(Id::new(GUILD)),
         id: Id::new(MESSAGE),
-    }));
+    });
     assert_modelled(&event, "MESSAGE_DELETE");
 }
 
