@@ -69,48 +69,81 @@ const PRODUCTION_DATABASE_NAMES: [&str; 6] = [
     "two_live",
 ];
 
+/// What the restore guard can prove about a URL's live-target identity.
+#[derive(Debug, PartialEq, Eq)]
+enum TargetProof {
+    /// Unparsable input or a non-Postgres scheme: the caller falls through
+    /// to the existing invalid-URL refusal, which already handles these.
+    Unparsed,
+    /// Parsable, but the effective target cannot be named exactly the way
+    /// the driver and server resolve it: fail closed and refuse.
+    Unprovable,
+    /// The (host, port, database) the URL actually connects to.
+    Known {
+        host: String,
+        port: u16,
+        dbname: String,
+    },
+}
+
 /// Live-target identity for the restore refusal: the (host, port, database)
-/// a URL actually connects to, with every spelling variation folded away.
+/// a URL actually connects to, with every spelling variation folded away —
+/// or proof that the target cannot be named exactly and must be refused.
 ///
 /// Evasion audit (operator-error threat model; the operator types both URLs):
 /// - `postgres://` vs `postgresql://` canonicalized (sqlx accepts both).
-/// - Host lowercased (DNS is case-insensitive).
+/// - Authority host percent-decoded before lowercasing: sqlx decodes a socket
+///   host (`postgres://%2Fvar%2Frun%2Fpostgresql/app`), so the encoded and
+///   `?host=` spellings of one socket compare equal. A decoded socket path
+///   (containing `/`) can never collide with a TCP hostname; DNS is
+///   case-insensitive.
 /// - Missing port means 5432, so `:5432` cannot evade an unported live URL.
 /// - `?host=` / `?hostaddr=`, `?port=`, `?dbname=` folded in (libpq/sqlx let
 ///   query keys override the authority/path); last value wins, matching
-///   option-map collection.
+///   option-map collection. An *empty* `?host=`/`?hostaddr=`/`?dbname=`
+///   override is unprovable: sqlx applies it unconditionally (empty host =
+///   local socket, empty dbname = the server falls back to the username),
+///   so the URL no longer names the target the guard compared.
 /// - Userinfo and every other query key ignored, so a different password or
 ///   `sslmode` cannot evade the comparison.
 /// - A missing host (unix-socket URLs such as `postgres:///db?host=...`)
 ///   compares as the empty string instead of failing open, so query
 ///   overrides still apply and identical socket targets refuse.
-/// - Database is the first path segment, percent-decoded exactly as the
-///   driver decodes it before connecting; an empty path and `/` both mean
-///   the driver's default database and compare equal (fail-closed: name the
-///   database explicitly to restore). Case preserved (Postgres names are
-///   case-sensitive).
-/// - Unparsable input or a non-Postgres scheme yields `None`: the caller falls
-///   through to the existing invalid-URL refusal. This helper never invents a
-///   refusal it cannot prove.
-fn target_identity(raw: &str) -> Option<(String, u16, String)> {
-    let url = url::Url::parse(raw.trim()).ok()?;
+/// - Database is the full path with all leading slashes removed, then
+///   percent-decoded — the driver's own rule (sqlx-postgres parses the path
+///   with `trim_start_matches('/')`), so `//prod` names `prod` exactly as
+///   the connection does. Case preserved (Postgres names are case-sensitive).
+/// - An omitted database (empty path and no nonempty `?dbname=`) is
+///   unprovable: sqlx seeds it from `PGDATABASE` and Postgres otherwise
+///   connects to the database named after the user, so neither the marker
+///   list nor the live comparison can be trusted. Name the database
+///   explicitly to restore.
+/// - Unparsable input or a non-Postgres scheme yields `Unparsed`: the caller
+///   falls through to the existing invalid-URL refusal. A parsable URL whose
+///   effective target cannot be named exactly yields `Unprovable`: refusing
+///   an unnameable restore target is the fail-closed contract.
+fn target_identity(raw: &str) -> TargetProof {
+    let url = match url::Url::parse(raw.trim()) {
+        Ok(url) => url,
+        Err(_) => return TargetProof::Unparsed,
+    };
     if url.scheme() != "postgres" && url.scheme() != "postgresql" {
-        return None;
+        return TargetProof::Unparsed;
     }
-    let mut host = url.host_str().unwrap_or_default().to_lowercase();
+    let mut host = percent_encoding::percent_decode_str(url.host_str().unwrap_or_default())
+        .decode_utf8_lossy()
+        .to_lowercase();
     let mut port = url.port().unwrap_or(5432);
-    let mut dbname = url
-        .path_segments()
-        .and_then(|mut segments| segments.next())
-        .map(|segment| {
-            percent_encoding::percent_decode_str(segment)
-                .decode_utf8_lossy()
-                .into_owned()
-        })
-        .unwrap_or_default();
+    let mut dbname = percent_encoding::percent_decode_str(url.path().trim_start_matches('/'))
+        .decode_utf8_lossy()
+        .into_owned();
+    let mut unprovable = false;
     for (key, value) in url.query_pairs() {
         match key.as_ref() {
-            "host" | "hostaddr" if !value.is_empty() => {
+            "host" | "hostaddr" | "dbname" if value.is_empty() => {
+                unprovable = true;
+            }
+            "host" | "hostaddr" => {
                 host = value.to_lowercase();
             }
             "port" => {
@@ -118,23 +151,31 @@ fn target_identity(raw: &str) -> Option<(String, u16, String)> {
                     port = overridden;
                 }
             }
-            "dbname" if !value.is_empty() => {
+            "dbname" => {
                 dbname = value.into_owned();
             }
             _ => {}
         }
     }
-    Some((host, port, dbname))
+    if unprovable || dbname.is_empty() {
+        return TargetProof::Unprovable;
+    }
+    TargetProof::Known { host, port, dbname }
 }
 
 /// True when `candidate` must be refused as a restore target: it normalizes
-/// to the live database, or its database name is a production marker. `live`
-/// is `TWO_DATABASE_URL` when set; with no live URL only the marker list
-/// applies. Never echoes either input (returns `bool`, not a message).
+/// to the live database, its database name is a production marker, or its
+/// effective target cannot be proven different from live (omitted database,
+/// empty overrides — see `target_identity`). `live` is `TWO_DATABASE_URL`
+/// when set; with no live URL only the marker list applies. A live URL that
+/// is itself unprovable also refuses: it cannot be proven different from the
+/// candidate. Never echoes either input (returns `bool`, not a message).
 #[must_use]
 pub fn restore_target_is_live(candidate: &str, live: Option<&str>) -> bool {
-    let Some((host, port, dbname)) = target_identity(candidate) else {
-        return false;
+    let (host, port, dbname) = match target_identity(candidate) {
+        TargetProof::Unprovable => return true,
+        TargetProof::Unparsed => return false,
+        TargetProof::Known { host, port, dbname } => (host, port, dbname),
     };
     if PRODUCTION_DATABASE_NAMES.contains(&dbname.to_lowercase().as_str()) {
         return true;
@@ -142,8 +183,10 @@ pub fn restore_target_is_live(candidate: &str, live: Option<&str>) -> bool {
     let Some(live) = live else {
         return false;
     };
-    let Some((live_host, live_port, live_db)) = target_identity(live) else {
-        return false;
+    let (live_host, live_port, live_db) = match target_identity(live) {
+        TargetProof::Unprovable => return true,
+        TargetProof::Unparsed => return false,
+        TargetProof::Known { host, port, dbname } => (host, port, dbname),
     };
     host == live_host && port == live_port && dbname == live_db
 }
@@ -409,6 +452,92 @@ mod tests {
             Some("postgres://u:p@db-host/two_prod")
         ));
         assert!(restore_target_is_live("postgres://u:p@h/pr%6Fd", None));
+    }
+
+    #[test]
+    fn restore_derives_double_slash_databases_like_the_driver() {
+        // sqlx parses the path with `trim_start_matches('/')`, so `//prod`
+        // names `prod`: the guard derives the database the same way instead
+        // of reading only the first (empty) path segment.
+        assert!(restore_target_is_live(
+            "postgres://u:p@db-host//prod",
+            Some("postgres://u:p@db-host/prod")
+        ));
+        assert!(restore_target_is_live(
+            "postgres://u:p@db-host///two_prod",
+            Some("postgres://u:p@db-host/two_prod")
+        ));
+        // Markers fire on double-slash spellings with no live URL either.
+        assert!(restore_target_is_live(
+            "postgres://u:p@db-host//two_prod",
+            None
+        ));
+        // A genuinely different double-slash database still proceeds.
+        assert!(!restore_target_is_live(
+            "postgres://u:p@db-host//scratch_db",
+            Some("postgres://u:p@db-host/other_db")
+        ));
+    }
+
+    #[test]
+    fn restore_folds_encoded_socket_hosts_both_directions() {
+        let encoded = "postgres://%2Fvar%2Frun%2Fpostgresql/app";
+        let query = "postgres:///app?host=/var/run/postgresql";
+        // Both spellings connect to the same socket and database: each
+        // refuses when the other is live.
+        assert!(restore_target_is_live(encoded, Some(query)));
+        assert!(restore_target_is_live(query, Some(encoded)));
+        // A different socket stays a different target.
+        assert!(!restore_target_is_live(
+            "postgres:///app?host=/other/socket",
+            Some(encoded)
+        ));
+    }
+
+    #[test]
+    fn restore_refuses_targets_that_name_no_database() {
+        // An omitted database is unprovable: the driver seeds it from
+        // `PGDATABASE` and the server otherwise falls back to the username,
+        // so the guard refuses instead of comparing an empty name.
+        assert!(restore_target_is_live(
+            "postgres://prod@db-host",
+            Some("postgres://prod@db-host/prod")
+        ));
+        assert!(restore_target_is_live("postgres://u:p@db-host/", None));
+        assert!(restore_target_is_live(
+            "postgres://u:p@db-host",
+            Some("postgres://u:p@other/scratch_db")
+        ));
+        // A live URL that names no database cannot be proven different from
+        // the candidate either.
+        assert!(restore_target_is_live(
+            "postgres://u:p@db-host/scratch_db",
+            Some("postgres://u:p@db-host")
+        ));
+    }
+
+    #[test]
+    fn restore_refuses_empty_host_and_dbname_overrides() {
+        // sqlx applies empty overrides unconditionally while the naive read
+        // skips them, so a target carrying one no longer names the compared
+        // target: fail closed.
+        assert!(restore_target_is_live(
+            "postgres://u:p@decoy-host/app?host=",
+            Some("postgres://u:p@other/scratch_db")
+        ));
+        assert!(restore_target_is_live(
+            "postgres://u:p@decoy-host/app?hostaddr=",
+            Some("postgres://u:p@other/scratch_db")
+        ));
+        assert!(restore_target_is_live(
+            "postgres://u:p@db-host/scratch_db?dbname=",
+            Some("postgres://u:p@db-host/postgres")
+        ));
+        // Empty overrides on the live side are unprovable too.
+        assert!(restore_target_is_live(
+            "postgres://u:p@db-host/scratch_db",
+            Some("postgres://u:p@db-host/scratch_db?dbname=")
+        ));
     }
 
     #[test]

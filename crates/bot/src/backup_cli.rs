@@ -168,7 +168,8 @@ two-bot operator commands
       target's current counts). Without --dry-run, --force is required and
       TWO_RESTORE_URL must name the target. The target variable is
       deliberately NOT TWO_DATABASE_URL: restoring replaces target data.
-      A target that normalizes to the live database is refused (exit 2,
+      A target that normalizes to the live database, or whose database
+      cannot be proven (name it explicitly), is refused (exit 2,
       code=restore_live_target_refused), even with --force; --dry-run
       still previews without that comparison.
       Requires a fresh migrated target without moderation history. --force
@@ -549,9 +550,11 @@ async fn cmd_restore(args: &[String]) -> i32 {
     // A prod URL in TWO_RESTORE_URL plus --force used to wipe production: the
     // guard above only checked presence and scheme, never the target's value.
     // Refuse by normalized value (scheme alias, host case, default ports and
-    // credential/query spellings cannot evade it) plus production database
-    // markers, before any file parse or connection attempt. --force confirms
-    // intent, never a live target; --dry-run previews without this comparison.
+    // credential/query spellings cannot evade it), production database
+    // markers, and unprovable targets (an omitted database or an empty
+    // override cannot be proven different from live), before any file parse
+    // or connection attempt. --force confirms intent, never a live target;
+    // --dry-run previews without this comparison.
     // Fixed refusal: the URLs and their secrets never reach output.
     if let Some(target) = url.as_deref() {
         if two_bot_core::database_url::restore_target_is_live(
