@@ -2228,7 +2228,7 @@ mod tests {
         let mut v7_gap = v6.clone();
         v7_gap["version"] = serde_json::json!(DUMP_VERSION);
         assert_eq!(
-            DUMP_VERSION, 10,
+            DUMP_VERSION, 11,
             "frozen pre-retention test pins the v11 bump"
         );
         let err = validate_manifest(&v7_gap).unwrap_err().to_string();
