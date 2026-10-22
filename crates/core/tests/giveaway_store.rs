@@ -17,7 +17,9 @@
 //! insert back), the drawn-once announcement guard, raced draw inserts
 //! leaving one row, and composite foreign keys binding entries and draws
 //! to a live giveaway (missing parents fail, live children refuse a
-//! parent delete, the child-first store delete still succeeds).
+//! parent delete, the child-first store delete still succeeds) on BOTH
+//! chains: the cutover fixtures chain and the store chain the production
+//! boot runner applies, so neither copy can silently lose the constraint.
 
 use sqlx::types::time::OffsetDateTime;
 use two_bot_core::giveaway_store as store;
@@ -43,6 +45,29 @@ async fn connect(test: &str) -> Option<TestDatabase> {
             TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
                 .await
                 .expect("create migrated test database"),
+        ),
+        Err(_) => {
+            assert_ne!(
+                std::env::var("GITHUB_ACTIONS").as_deref(),
+                Ok("true"),
+                "CI must configure giveaway_store ({test})"
+            );
+            eprintln!("SKIP giveaway_store ({test}): TWO_TEST_DATABASE_URL not set");
+            None
+        }
+    }
+}
+
+/// Same as [`connect`], but migrates the store chain
+/// (`crates/store/migrations`, the copy the production boot runner applies)
+/// instead of the cutover fixtures chain, so the giveaway constraints are
+/// pinned where they ship, not just where the fixtures live.
+async fn connect_store(test: &str) -> Option<TestDatabase> {
+    match std::env::var("TWO_TEST_DATABASE_URL") {
+        Ok(url) => Some(
+            TestDatabase::create(&url, &sqlx::migrate!("../store/migrations"))
+                .await
+                .expect("create store-chain test database"),
         ),
         Err(_) => {
             assert_ne!(
@@ -608,6 +633,41 @@ async fn child_rows_stay_bound_to_their_giveaway() -> Result<(), sqlx::Error> {
     .fetch_one(&pool)
     .await?;
     assert_eq!((entries, draws), (0, 0), "explicit delete removes all rows");
+    fixture.close().await.expect("drop test database");
+    Ok(())
+}
+
+#[tokio::test]
+async fn store_chain_enforces_the_giveaway_foreign_keys() -> Result<(), sqlx::Error> {
+    let Some(fixture) = connect_store("store_chain_enforces_the_giveaway_foreign_keys").await
+    else {
+        return Ok(());
+    };
+    let pool = fixture.pool().clone();
+    // The store chain (0455, the copy the production boot runner applies)
+    // carries the same composite foreign keys as the cutover chain (0454):
+    // orphan entries and draws fail, and a parent delete with live children
+    // is refused. Stripping either FOREIGN KEY line from 0455 must turn
+    // these assertions red.
+    let missing_entry = store::upsert_entry(&pool, GUILD, "gw-missing", "100000000000001", at(1))
+        .await
+        .expect_err("store-chain entry without a giveaway must fail");
+    assert_sqlstate(&missing_entry, "23503");
+    let missing_draw = store::insert_draw(&pool, &new_draw("gw-missing", 0, None, SEED_0))
+        .await
+        .expect_err("store-chain draw without a giveaway must fail");
+    assert_sqlstate(&missing_draw, "23503");
+    store::create_giveaway(&pool, &new_giveaway("gw01h455k", at(900))).await?;
+    assert!(store::upsert_entry(&pool, GUILD, "gw01h455k", "100000000000001", at(1)).await?);
+    store::insert_draw(&pool, &new_draw("gw01h455k", 0, None, SEED_0)).await?;
+    let refused = sqlx::query("DELETE FROM giveaways WHERE guild_id = $1 AND id = $2")
+        .bind(GUILD)
+        .bind("gw01h455k")
+        .execute(&pool)
+        .await
+        .expect_err("store-chain parent delete with live children must fail");
+    assert_sqlstate(&refused, "23503");
+    assert!(store::delete_giveaway(&pool, GUILD, "gw01h455k").await?);
     fixture.close().await.expect("drop test database");
     Ok(())
 }
