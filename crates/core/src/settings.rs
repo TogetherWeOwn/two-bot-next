@@ -1929,13 +1929,13 @@ mod ops_tests {
                 ("TWO_ONBOARDING_DRY_RUN", "x"),
             ],
         );
-        match writer.apply_ops(Some(&record), Instant::now()) {
-            OpsApplyOutcome::Applied { epoch, keys } => {
-                assert_eq!(epoch, 1);
-                assert_eq!(keys, vec![KEY.to_owned()]);
+        assert_eq!(
+            writer.apply_ops(Some(&record), Instant::now()),
+            OpsApplyOutcome::Applied {
+                epoch: 1,
+                keys: vec![KEY.to_owned()],
             }
-            other => panic!("expected Applied, got {other:?}"),
-        }
+        );
         assert_eq!(live.get(GUILD, KEY), Some(json!("8")));
         for key in [
             "TWO_MODERATION",
