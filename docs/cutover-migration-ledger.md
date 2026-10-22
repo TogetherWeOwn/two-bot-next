@@ -73,6 +73,7 @@ All migrations are up-only; there are no down files. The `direction` column is
 | 0130_custom_commands | up | automation_commands, automation_audit_log | re-runnable | Drop both tables; command definitions are re-creatable by owners. |
 | 0140_scheduled_messages | up | scheduled_messages, automation_audit_log | re-runnable | Drop `scheduled_messages`; drain pending sends first. |
 | 0141_scheduled_messages_legacy_upgrade | up | scheduled_messages | backout-script | Type change (`interval_seconds` to BIGINT) plus claim columns: backout restores the old type with an explicit cast and drops the claim columns. |
+| 0142_scheduled_delivery_uncertainty | up | scheduled_messages | backout-script | Additive fence; existing nonce/claim rows backfill uncertain, and pre-0142 archives re-fence pending rows at restore. Retain the column and fence on rollback; never downgrade to a blind-replay writer or clear pending uncertainty. Stop older writers before rollout. |
 | 0150_sticky_messages | up | sticky_messages, automation_audit_log | backout-script | TEXT-to-timestamptz conversions plus claim columns: backout restores TEXT columns and drops the claim columns. |
 | 0160_rsvp | up | event_rsvps, community_facts, announcements_audit_log | re-runnable | Drop the three tables; RSVP state is re-collectable from events. |
 | 0170_lfg | up | lfg_posts, lfg_roles, lfg_signups | re-runnable | Drop the three tables; open groups must close first. |
@@ -140,7 +141,7 @@ All migrations are up-only; there are no down files. The `direction` column is
 | 0449_self_role_ticket_acknowledgement | up | self_role_exchanges | re-runnable | Guarded `ADD COLUMN IF NOT EXISTS` with closed-set `CHECK`s. Backout: drop the five acknowledgement columns; tickets written after apply lose their settlement state but keep their dispositions. No member PII in the columns. |
 | 0450_scheduled_events_claim | up | scheduled_events_claim | backout-script | Guarded `CREATE TABLE IF NOT EXISTS`. Backout: deploy the previous binary, then drop the table; dropping it under the claim-aware binary fails every events swap. The mirror itself stays readable. No member PII in the table. |
 | 0452_scheduled_events_tombstone | up | scheduled_events_tombstone | backout-script | Guarded `CREATE TABLE IF NOT EXISTS`. Backout: deploy the previous binary, then drop the table; dropping it under the tombstone-aware binary fails every events swap. The mirror itself stays readable. No member PII in the table. |
-| 0454_event_voice_channels | up | event_voice_channels, event_voice_presence | backout-script | Guarded `CREATE TABLE IF NOT EXISTS` with inline UNIQUE/EXCLUDE. Backout: deploy the previous binary, then drop both tables; dropping them under the aware binary fails every event-voice claim and presence write. Presence spans carry member `user_id` (erasure-covered via the scheduled-event mirror). |
+| 0455_event_voice_channels | up | event_voice_channels, event_voice_presence | backout-script | Guarded `CREATE TABLE IF NOT EXISTS` with inline UNIQUE/EXCLUDE. Backout: deploy the previous binary, then drop both tables; dropping them under the aware binary fails every event-voice claim and presence write. Presence spans carry member `user_id` (erasure-covered via the scheduled-event mirror). |
 
 ## Notes
 

@@ -254,7 +254,7 @@ VALUES ('100000000000000001', '2026-08-01T10:00:00.000Z'),
 INSERT INTO scheduled_events_tombstone (guild_id, event_id, deleted_at)
 VALUES ('100000000000000001', '100000000000000012', '2026-08-01T10:00:00.000Z'),
        ('100000000000000002', '100000000000000013', '2026-08-01T11:00:00.000Z');
--- Event voice pair (0454, v12): one claimed instance plus one closed and one
+-- Event voice pair (0455, v12): one claimed instance plus one closed and one
 -- open presence span, so the roundtrip covers the nullable lease/left_at.
 INSERT INTO event_voice_channels
     (event_id, instance_starts_at, starts_at, ends_at, status, owner_tick_lease,

@@ -1893,6 +1893,23 @@ fn shipped_drill_script(archives: &Path, binary: &Path) -> String {
         .strip_prefix("/usr/bin/bash -o pipefail -c '")
         .and_then(|rest| rest.strip_suffix('\''))
         .expect("drill runs one single-quoted bash -o pipefail script");
+    // systemd also unquotes C escapes in the word and turns `%%` into `%`.
+    let mut unescaped = String::new();
+    let mut chars = script.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (c, chars.peek().copied()) {
+            ('\\', Some(next @ ('\\' | '"'))) => {
+                unescaped.push(next);
+                chars.next();
+            }
+            ('%', Some('%')) => {
+                unescaped.push('%');
+                chars.next();
+            }
+            _ => unescaped.push(c),
+        }
+    }
+    let script = unescaped.as_str();
     for shipped in ["/var/backups/two-bot-next/", "/opt/two-bot-next/two-bot "] {
         assert_eq!(script.matches(shipped).count(), 1, "{shipped} in {script}");
     }
@@ -2059,7 +2076,9 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
                     "TWO_RESTORE_DRILL_BOOTSTRAP_URL",
                     "postgres://agent_test:@agent-testdb:5432/postgres",
                 )
-                .env("TWO_RESTORE_DRILL_EVIDENCE_DIR", &evidence_root),
+                .env("TWO_RESTORE_DRILL_EVIDENCE_DIR", &evidence_root)
+                // The unit's own `Environment=` bound; the archive is seconds old.
+                .env("TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S", "172800"),
             &format!("restore drill, month {month}"),
         );
         let dir = assert_drill_verified(&drill, archive);
@@ -2225,5 +2244,86 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
             .unwrap();
     }
     admin.close().await;
+    db.close().await.unwrap();
+}
+
+async fn scheduled_pending(pool: &PgPool) -> (Option<String>, Option<String>, bool) {
+    sqlx::query_as(
+        "SELECT claim_token, occurrence_nonce, delivery_uncertain
+           FROM scheduled_messages WHERE id = $1",
+    )
+    .bind("pending")
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn restore_refences_pre_0142_pending_scheduled_rows() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    // A live pending occurrence as a pre-0142 writer left it: claimed with a
+    // nonce while the fence column did not exist yet.
+    sqlx::query(
+        "INSERT INTO scheduled_messages
+           (id, guild_id, channel_id, body, next_run_at, interval_seconds, enabled,
+            last_run_at, last_message_id, created_by, created_at, updated_by, updated_at,
+            claim_token, claimed_at, occurrence_nonce, delivery_uncertain)
+         VALUES ('pending', 'guild', 'channel', 'synthetic body', '2026-10-02T00:00:00Z',
+                 60, TRUE, NULL, NULL, 'actor', '2026-10-01T00:00:00Z', 'actor',
+                 '2026-10-01T00:00:00Z', 'synthetic-claim', '2026-10-01T00:00:00Z',
+                 'synthetic-nonce', FALSE)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let directory = ArchiveDirectory::new();
+    let fresh = directory.path("scheduled.ndjson.gz");
+    dump(pool, &fresh).await.unwrap();
+
+    // A current archive restores the recorded fence faithfully.
+    let report = restore(pool, &fresh).await.unwrap();
+    assert!(report.ok);
+    let (claim, nonce, fenced) = scheduled_pending(pool).await;
+    assert_eq!(claim.as_deref(), Some("synthetic-claim"));
+    assert_eq!(nonce.as_deref(), Some("synthetic-nonce"));
+    assert!(!fenced, "a recorded clear fence restores faithfully");
+
+    // Strip the fence column the way a pre-0142 writer never wrote it: the
+    // manifest entry (with its parallel type) and every row cell go together.
+    let mut old = copy_contents(&inspect(&fresh).unwrap());
+    let table = old
+        .manifest
+        .tables
+        .iter_mut()
+        .find(|table| table.name == "scheduled_messages")
+        .expect("scheduled table in manifest");
+    let at = table
+        .columns
+        .iter()
+        .position(|column| column == "delivery_uncertain")
+        .expect("fence column in fresh dump");
+    table.columns.remove(at);
+    if !table.column_types.is_empty() {
+        table.column_types.remove(at);
+    }
+    for row in old
+        .buffers
+        .get_mut("scheduled_messages")
+        .expect("scheduled rows")
+    {
+        row.remove("delivery_uncertain");
+    }
+    let archive = directory.path("scheduled-pre0142.ndjson.gz");
+    write_archive(&archive, &old);
+
+    let report = restore(pool, &archive).await.unwrap();
+    assert!(report.ok);
+    let (claim, nonce, fenced) = scheduled_pending(pool).await;
+    assert_eq!(claim.as_deref(), Some("synthetic-claim"));
+    assert_eq!(nonce.as_deref(), Some("synthetic-nonce"));
+    assert!(fenced, "an old archive never proves the occurrence unsent");
     db.close().await.unwrap();
 }

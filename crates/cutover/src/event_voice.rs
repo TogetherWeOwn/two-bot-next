@@ -1,4 +1,4 @@
-//! Event voice channel claims and presence spans (migration 0454).
+//! Event voice channel claims and presence spans (migration 0455).
 //!
 //! One row per event instance in `event_voice_channels`, keyed
 //! `UNIQUE (event_id, instance_starts_at)`: the create path claims with

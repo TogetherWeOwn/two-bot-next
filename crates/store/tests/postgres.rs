@@ -134,6 +134,15 @@ async fn migrations_contract_and_checksum_guard() {
     .await
     .unwrap();
     assert_eq!(ranks, 5);
+    // Pins the store-embedded contract copy: Store::connect applies
+    // crates/store/sql/web_v1.sql, so a revert there must fail here.
+    let ladder: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM {web}.rank_ladder"
+    )))
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(ladder, 5);
     // Corrupt only this test's ledger: a deployed checksum mismatch must fail.
     sqlx::query(
         "UPDATE _two_bot_migrations SET checksum = decode('00', 'hex') WHERE version = 400",

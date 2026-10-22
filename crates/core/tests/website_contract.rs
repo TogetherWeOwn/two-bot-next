@@ -193,7 +193,7 @@ async fn intervals_are_the_contract_values() {
     assert_eq!(LIVE_COUNTER_INTERVAL_MS, 60_000);
     assert_eq!(RANK_SNAPSHOT_INTERVAL_MS, 600_000);
     assert_eq!(SCHEDULED_EVENTS_INTERVAL_MS, 10 * 60 * 1000);
-    assert_eq!(WEB_CONTRACT_VIEWS.len(), 9);
+    assert_eq!(WEB_CONTRACT_VIEWS.len(), 10);
 }
 
 #[tokio::test]
@@ -350,7 +350,7 @@ async fn contract_refuses_a_missing_or_unsafe_current_schema_before_ddl() {
             .fetch_one(&public)
             .await
             .expect("public preserved");
-    assert_eq!(public_views, 9);
+    assert_eq!(public_views, 10);
     sqlx::raw_sql("DROP SCHEMA \"tog10090-unsafe\" CASCADE;")
         .execute(&public)
         .await
@@ -577,6 +577,60 @@ async fn rank_tick_writes_ladder_ranks_and_exclusions_atomically() {
         "raid accounts hidden"
     );
     assert!(view_members.contains(&"prospect".to_owned()));
+
+    fixture.close().await.expect("drop test database");
+}
+
+#[tokio::test]
+async fn rank_ladder_publishes_one_row_per_rung_with_role_ids() {
+    // Producer for the rank cards' Discord role ids: one row per ladder rung,
+    // NULL role ids until the rank collector matches the rung. rank_counts is
+    // untouched by the new view.
+    let fixture = connect().await;
+    let pool = fixture.pool().clone();
+
+    let ladder: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT rank_key, role_id FROM web_v1.rank_ladder ORDER BY rank_key")
+            .fetch_all(&pool)
+            .await
+            .expect("rank_ladder");
+    assert_eq!(ladder.len(), 5);
+    assert!(
+        ladder.iter().all(|(_, role)| role.is_none()),
+        "unmatched rungs publish NULL, never a placeholder"
+    );
+
+    sqlx::query("UPDATE rank_ladder SET role_id = 'role-' || rank_key")
+        .execute(&pool)
+        .await
+        .expect("match rungs to roles");
+    let ladder: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT rank_key, role_id FROM web_v1.rank_ladder ORDER BY rank_key")
+            .fetch_all(&pool)
+            .await
+            .expect("rank_ladder matched");
+    assert_eq!(ladder.len(), 5);
+    for (key, role) in &ladder {
+        assert_eq!(
+            role,
+            &Some(format!("role-{key}")),
+            "rung carries its role id"
+        );
+    }
+    let mut keys: Vec<&str> = ladder.iter().map(|(key, _)| key.as_str()).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    assert_eq!(keys.len(), 5, "exactly one row per rank_key");
+
+    // rank_counts keeps serving all five rungs in ladder order.
+    let counts: Vec<(String,)> = sqlx::query_as("SELECT rank_key FROM web_v1.rank_counts")
+        .fetch_all(&pool)
+        .await
+        .expect("rank_counts");
+    assert_eq!(
+        counts.into_iter().map(|(key,)| key).collect::<Vec<_>>(),
+        ["prospect", "member", "soldier", "veteran", "legend"]
+    );
 
     fixture.close().await.expect("drop test database");
 }
@@ -1448,6 +1502,7 @@ async fn contract_meta_pins_version_and_view_shapes() {
                 "snapshot_at",
             ],
         ),
+        ("rank_ladder", &["rank_key", "role_id"]),
         (
             "upcoming_events",
             &["event_id", "name", "starts_at", "channel_id", "description"],

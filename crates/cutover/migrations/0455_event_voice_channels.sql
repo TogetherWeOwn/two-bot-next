@@ -1,5 +1,5 @@
--- 0454_event_voice_channels: idempotent event voice channels + presence spans.
--- (Numbered 0454: the merged scheduled-event tombstone work owns 0452/0453.)
+-- 0455_event_voice_channels: idempotent event voice channels + presence spans.
+-- (Numbered 0455: the merged sticky delivery fence owns 0454.)
 --
 -- `event_voice_channels` keys one row per event instance
 -- (`UNIQUE (event_id, instance_starts_at)`): the create path claims with

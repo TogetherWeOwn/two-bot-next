@@ -76,11 +76,12 @@ async fn deep_channel_stops_paging_with_truncation_marker() {
     script.push(ScriptedResponse::json(200, json!([message(1)])));
     let total_pages = script.len();
     let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
-    let snapshot = runtime(&mock)
+    let (snapshot, truncated) = runtime(&mock)
         .capture_history("600")
         .await
         .ok()
         .expect("capped capture completes");
+    assert!(truncated, "capped capture must report truncated");
     let requests = mock.requests();
     let fetches = requests
         .iter()
@@ -117,11 +118,12 @@ async fn small_history_is_byte_identical_within_cap() {
         ScriptedResponse::status(500),
     )
     .await;
-    let snapshot = runtime(&mock)
+    let (snapshot, truncated) = runtime(&mock)
         .capture_history("600")
         .await
         .ok()
         .expect("small capture completes");
+    assert!(!truncated, "small capture must report not truncated");
     assert_eq!(snapshot.message_count, 102);
     let expected = (1..=102)
         .map(|id| {

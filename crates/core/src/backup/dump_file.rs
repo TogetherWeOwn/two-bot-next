@@ -122,7 +122,7 @@ pub const DUMP_TABLES: &[&str] = &[
     // in-flight fetch resurrect rows); see [`V11_ADDED_TABLES`]. No foreign
     // keys, so order beside the mirror is free.
     "scheduled_events_tombstone",
-    // Event voice channels (0454, v12): the per-instance idempotency row plus
+    // Event voice channels (0455, v12): the per-instance idempotency row plus
     // the per-member presence spans behind after-party ownership. Archived so
     // a restore keeps the claim (an excluded row would let a second worker
     // create a duplicate channel) and the attendance spans; see
@@ -268,7 +268,7 @@ pub const V10_ADDED_TABLES: &[&str] = &["scheduled_events_claim"];
 pub const V11_ADDED_TABLES: &[&str] = &["scheduled_events_tombstone"];
 
 /// Tables first covered by v12 (event voice channels + presence spans,
-/// migration 0454). Older archives may omit both; restore clears the
+/// migration 0455). Older archives may omit both; restore clears the
 /// destination rows, as for every versioned addition. New archives must
 /// contain both so a restored worker keeps its create claims and the
 /// attendance spans behind after-party ownership.
@@ -1194,7 +1194,7 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
     // only tables first covered by a later version. New v12 archives require
     // the full inventory, including both guild counters (0441/0442/0446/0447),
     // the epoch-claim guard (0450/0451), the delete tombstones (0452/0453)
-    // and the event voice pair (0454).
+    // and the event voice pair (0455).
     let version = obj.get("version").and_then(Value::as_u64);
     let missing: Vec<&str> = DUMP_TABLES
         .iter()

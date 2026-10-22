@@ -3056,6 +3056,24 @@ pub struct GuildRoomWorker<S, H> {
     /// ownership action per room is queued; exhausted cohorts wait a minute.
     ownership_repairs: HashMap<Snowflake, u64>,
     ownership_queued: HashSet<Snowflake>,
+    /// Commit waiters for queued ownership handoffs, by room. An accepted
+    /// handoff registers one sender; the first `UpdateOwnership` execution
+    /// settles the room's waiters and retries stay silent, so a success reply
+    /// always observes its own commit. A command that already timed out
+    /// dropped its receiver, so its send fails silently.
+    ownership_commit_waiters: HashMap<Snowflake, Vec<oneshot::Sender<OwnershipCommit>>>,
+    /// Receiver half of the latest accepted handoff's commit wait, taken by
+    /// the `Ownership` command arm to stage the reply. Direct `apply_ownership`
+    /// callers leave it behind; the next accept overwrites it.
+    pending_commit_wait: Option<oneshot::Receiver<OwnershipCommit>>,
+    /// An `Ownership` command whose reply is waiting on its commit. The actor
+    /// loop drives it right after `apply_command`; the reply is sent exactly
+    /// once, success only when the commit confirms.
+    staged_ownership_reply: Option<StagedOwnershipReply>,
+    /// Deadline bounding the staged reply's commit wait. Set while driving,
+    /// cleared after; the commit attempt inside queue execution honors it so a
+    /// held store cannot strand the reply past the acknowledgement budget.
+    ownership_commit_deadline: Option<tokio::time::Instant>,
     /// Channels whose revoke-only fallback write succeeded while the
     /// new-owner grant is still owed. A revoked-but-ungranted room looks
     /// identical to a category-synced room in the cache (the current owner
@@ -3171,6 +3189,7 @@ pub struct GuildRoomWorker<S, H> {
     /// button carries only that ID; guild, room and target come from here, never
     /// from the payload.
     vote_refs: HashMap<Snowflake, VoteKickRef>,
+    kick_ballots: HashMap<Snowflake, kick_ballots::KickBallot>,
     active_votes: Vec<VoteKickRef>,
     /// Who started each vote this session, by vote ID. The vote core binds the
     /// target but not the initiator, and every audit row names both.
@@ -3298,6 +3317,32 @@ pub(crate) const REVALIDATE_TIMEOUT_MS: u64 = 1_000;
 /// refused bulk store read: one slow pool must not serialize every later
 /// join behind another long wait. A successful store read clears it early.
 const REVALIDATE_COOLDOWN_MS: u64 = 30_000;
+
+/// How long a voice reply waits for the guild worker's answer: ownership,
+/// privacy, vote-kick, `/name`, join-request decisions and `/setup` status.
+/// Discord wants the interaction answered within three seconds, so a worker
+/// that is stalled, overloaded or gone is reported as a transient failure
+/// instead of leaving the interaction on "thinking" while it holds one of
+/// the 16 responder permits. Same two-second ceiling as `/limit`
+/// (`LIMIT_ACK_WAIT`); the permit is released when the wait ends.
+const WORKER_ACK_WAIT: Duration = Duration::from_millis(2_000);
+
+/// Share of the reply budget the worker spends driving an ownership handoff's
+/// first commit attempt before answering (`drive_staged_ownership`). Kept
+/// inside `WORKER_ACK_WAIT` so the worker's recorded-but-finalizing answer
+/// always lands before the caller gives up waiting for it.
+const OWNERSHIP_COMMIT_WAIT: Duration = Duration::from_millis(1_500);
+
+/// Reply when the guild worker exists but its answer never arrived (stalled,
+/// dropped or closed inbox): a transient failure with a next action, never a
+/// cold-cache claim and never success.
+const WORKER_LOST_REPLY: &str = "The voice worker stopped answering — try again in a moment.";
+
+/// Reply when an ownership handoff is queued but its durable commit did not
+/// confirm inside `OWNERSHIP_COMMIT_WAIT`. The handoff stays queued and keeps
+/// retrying in the background, so "still being finalized" is the truth.
+const OWNERSHIP_FINALIZING: &str =
+    "Recorded — the ownership change is still being finalized. Try again in a moment.";
 
 /// Repeat bookkeeping for one tracked failure. `last_attempt_ms` is the
 /// actor's monotonic clock, so a restart begins a fresh budget.
@@ -3430,6 +3475,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             queue: ActionQueue::new(),
             ownership_repairs,
             ownership_queued: HashSet::new(),
+            ownership_commit_waiters: HashMap::new(),
+            pending_commit_wait: None,
+            staged_ownership_reply: None,
+            ownership_commit_deadline: None,
             grants_owed: Mutex::new(HashSet::new()),
             renames: RenameCoalescer::new(),
             desired_names: HashMap::new(),
@@ -3479,6 +3528,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             halted_by_discord: false,
             votes: VoteKickCore::new(),
             vote_refs: HashMap::new(),
+            kick_ballots: HashMap::new(),
             active_votes: Vec::new(),
             vote_initiators: HashMap::new(),
             fenced_initiators: HashSet::new(),
@@ -4219,6 +4269,15 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         updated.owner_id = next.owner_id;
         updated.original_creator_id = next.original_creator_id;
         self.rooms.insert(channel, updated);
+        // One structured transition per handoff: the reconcile aggregate
+        // counts it, this line names it. The next tick finds the new owner
+        // present and stays silent, so repeats never re-emit.
+        info!(
+            channel_id = channel.to_string(),
+            previous_owner_id = previous_owner_id,
+            next_owner_id = next.owner_id,
+            "voice succession handed the room to the longest-present member"
+        );
         self.queue_owner_handoff(channel, previous_owner_id);
         true
     }
@@ -4227,13 +4286,16 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// actor: resolve the caller's current room, decide with the pure core,
     /// apply the handoff to the worker row and persist it through the urgent
     /// [`RoomAction::UpdateOwnership`] lane. Returns the ephemeral reply text.
-    /// Refusals change nothing. Both commands act on the caller's current
-    /// room, except an admin invoking `/transfer` without a tracked room of
-    /// their own, who may name any occupied room by its recipient. A
-    /// membership racing the decision heals on the next `reconcile`
-    /// succession pass; a retried interaction replays safely (reclaim is
-    /// idempotent, a former owner's transfer replay fails authorization), so
-    /// no interaction-ID dedupe is needed here.
+    /// An accepted handoff also registers a commit waiter settled by the
+    /// first `UpdateOwnership` execution, so the staged reply observes the
+    /// commit instead of preceding it. Refusals change nothing. Both commands
+    /// act on the caller's current room, except an admin invoking `/transfer`
+    /// without a tracked room of their own, who may name any occupied room by
+    /// its recipient; that remote transfer names the room channel instead of
+    /// saying "this room". A membership racing the decision heals on the next
+    /// `reconcile` succession pass; a retried interaction replays safely
+    /// (reclaim is idempotent, a former owner's transfer replay fails
+    /// authorization), so no interaction-ID dedupe is needed here.
     fn apply_ownership(
         &mut self,
         actor_id: Snowflake,
@@ -4257,7 +4319,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 target_id,
             },
         };
-        let (channel, room, occupants) = {
+        let (channel, room, occupants, actor_in_room) = {
             let live = self.live.read_state();
             if !live.ready {
                 return "The voice worker isn't warmed up yet — try again in a moment.".to_owned();
@@ -4294,7 +4356,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             let Some(room) = self.rooms.get(&channel).cloned() else {
                 return "That voice channel isn't a temporary room I manage.".to_owned();
             };
-            (channel, room, live.ownership_snapshot(channel))
+            let actor_in_room = own == Some(channel);
+            (
+                channel,
+                room,
+                live.ownership_snapshot(channel),
+                actor_in_room,
+            )
         };
         let ownership = RoomOwnership {
             owner_id: room.owner_id,
@@ -4328,13 +4396,25 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         // reconcile (and the persisted handoff) stop skipping this channel.
         self.uncertain_moves.remove(&channel);
         self.queue_owner_handoff(channel, previous_owner_id);
+        // The reply observes the commit: register a waiter settled by the
+        // first UpdateOwnership execution, for the command arm to stage on.
+        let (commit_tx, commit_rx) = oneshot::channel();
+        self.ownership_commit_waiters
+            .entry(channel)
+            .or_default()
+            .push(commit_tx);
+        self.pending_commit_wait = Some(commit_rx);
         match command {
             OwnershipCommand::Reclaim if was_creator => {
                 "You're the owner of this room again.".to_owned()
             }
             OwnershipCommand::Reclaim => "The room's owner is gone, so it's yours now.".to_owned(),
             OwnershipCommand::Transfer { target_id } => {
-                format!("Transferred ownership of this room to <@{target_id}>.")
+                if actor_in_room {
+                    format!("Transferred ownership of this room to <@{target_id}>.")
+                } else {
+                    format!("Transferred ownership of <#{channel}> to <@{target_id}>.")
+                }
             }
         }
     }
@@ -4354,6 +4434,82 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     original_creator_id: room.original_creator_id,
                 },
             );
+        }
+    }
+
+    /// Settle a room's commit waiters with the first attempt's outcome.
+    /// Retries find no waiters and stay silent; a command that already timed
+    /// out dropped its receiver, so its send fails silently.
+    fn notify_ownership_commit(&mut self, channel_id: Snowflake, outcome: OwnershipCommit) {
+        if let Some(waiters) = self.ownership_commit_waiters.remove(&channel_id) {
+            for waiter in waiters {
+                let _ = waiter.send(outcome);
+            }
+        }
+    }
+
+    /// Answer a staged `Ownership` reply. Pumps the guild queue until the
+    /// handoff's first commit attempt settles the waiter or
+    /// `OWNERSHIP_COMMIT_WAIT` passes, then sends the success text only when
+    /// the commit confirmed. The deadline bounds the reply, not the attempt:
+    /// a dispatch already in flight when the budget expires still runs to
+    /// completion — abandoning one would lose its action and a cancelled
+    /// Discord write may already have landed — but the reply goes out as
+    /// finalizing first, and the resumed attempt finishes unbounded while
+    /// its late commit stays silent.
+    async fn drive_staged_ownership(&mut self, now_ms: u64) {
+        let Some(mut staged) = self.staged_ownership_reply.take() else {
+            return;
+        };
+        let deadline = tokio::time::Instant::now() + OWNERSHIP_COMMIT_WAIT;
+        self.ownership_commit_deadline = Some(deadline);
+        loop {
+            if let Ok(outcome) = staged.waiter.try_recv() {
+                let StagedOwnershipReply { reply, success, .. } = staged;
+                let _ = reply.send(match outcome {
+                    OwnershipCommit::Committed => success,
+                    OwnershipCommit::Pending => OWNERSHIP_FINALIZING.to_owned(),
+                });
+                self.ownership_commit_deadline = None;
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let StagedOwnershipReply { reply, .. } = staged;
+                let _ = reply.send(OWNERSHIP_FINALIZING.to_owned());
+                // Dropping the waiter keeps the attempt's late commit
+                // silent; the handoff itself stays queued for retry.
+                self.ownership_commit_deadline = None;
+                return;
+            }
+            // Pumping executes whatever is due in queue order — the handoff
+            // when its turn comes. Race one pump against the reply budget:
+            // a held Discord grant must not hold the reply past the
+            // deadline. Always yield past a miss so a queue that keeps
+            // reporting progress cannot spin the reply budget away
+            // without advancing the clock.
+            let mut pump = Box::pin(self.dispatch_one(now_ms));
+            let expired = tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => true,
+                _ = pump.as_mut() => false,
+            };
+            if expired {
+                let StagedOwnershipReply { reply, waiter, .. } = staged;
+                // Close the waiter before the in-flight attempt reaches
+                // its store leg: the commit step only honors the reply
+                // deadline while a waiter is still listening, so the
+                // held write finishes unbounded instead of timing out
+                // against a budget nobody is waiting on.
+                drop(waiter);
+                let _ = reply.send(OWNERSHIP_FINALIZING.to_owned());
+                // The reply is out; the attempt still owns its queued
+                // action, so run it to completion instead of cancelling.
+                // Awaiting consumes the heap-pinned pump, ending its
+                // borrow of `self` before the deadline is cleared.
+                pump.await;
+                self.ownership_commit_deadline = None;
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -4721,6 +4877,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// result once, and queue the room-scoped enforcement exactly once (the
     /// core emits the decision only on the first transition to passed).
     fn settle_vote(&mut self, update: VoteKickUpdate) -> VoteKickUpdate {
+        self.kick_ballots
+            .entry(update.vote.id)
+            .or_insert_with(|| kick_ballots::KickBallot::new(update))
+            .update = update;
         if update.status != VoteKickStatus::Active {
             // A finished vote answers later ballots with its terminal status;
             // only the pass that still held it active records the result.
@@ -4775,10 +4935,15 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         self.vote_refs.remove(&vote_id);
         if self.queue.has_queued_kick(vote_id)
             || self.active_votes.iter().any(|vote| vote.id == vote_id)
+            || self
+                .kick_ballots
+                .get(&vote_id)
+                .is_some_and(kick_ballots::KickBallot::pending)
         {
             self.fenced_initiators.insert(vote_id);
         } else {
             self.vote_initiators.remove(&vote_id);
+            self.kick_ballots.remove(&vote_id);
         }
     }
 
@@ -4797,11 +4962,16 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .filter(|vote_id| {
                 !self.queue.has_queued_kick(*vote_id)
                     && !self.active_votes.iter().any(|vote| vote.id == *vote_id)
+                    && !self
+                        .kick_ballots
+                        .get(vote_id)
+                        .is_some_and(kick_ballots::KickBallot::pending)
             })
             .collect();
         for vote_id in released {
             self.fenced_initiators.remove(&vote_id);
             self.vote_initiators.remove(&vote_id);
+            self.kick_ballots.remove(&vote_id);
         }
         for evicted in self.votes.drain_evicted() {
             self.forget_vote_maps(evicted);
@@ -4844,6 +5014,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             None,
         ));
         metrics::global().voice_vote_kick(outcome.as_str());
+        self.correct_kick_ballot(vote_id, outcome);
     }
 
     /// Append buffered audit rows, one batch per call. Driven by the actor's
@@ -5071,6 +5242,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             };
             let update = self.settle_vote(update);
             if update.status != VoteKickStatus::Active {
+                self.enqueue_kick_ballot(update);
                 finished.push(update);
             }
         }
@@ -5652,6 +5824,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             // write is due and the guild is not rate limited.
             if self.queue.backed_off(self.live.guild_id, now_ms) {
                 return false;
+            }
+            if self.dispatch_kick_ballot(now_ms).await {
+                return true;
             }
             return self.dispatch_voice_status(now_ms).await;
         };
@@ -6396,6 +6571,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         .lock()
                         .expect("grant-owed marker")
                         .remove(&channel_id);
+                    self.notify_ownership_commit(channel_id, OwnershipCommit::Pending);
                     self.queue.mark_succeeded(&action);
                     return true;
                 };
@@ -6436,6 +6612,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                                 elapsed_ms(now_ms, started),
                             );
                         }
+                        self.notify_ownership_commit(channel_id, OwnershipCommit::Pending);
                         return true;
                     }
                 };
@@ -6472,15 +6649,38 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             );
                         }
                     }
+                    self.notify_ownership_commit(channel_id, OwnershipCommit::Pending);
                     return true;
                 }
-                match self.store.update_ownership(&room, &intent.revision).await {
-                    Ok(true) => {
+                // A staged Ownership reply bounds its own commit: an attempt
+                // past the reply budget stays queued and keeps retrying, but
+                // the reply must already have gone out as finalizing. Once
+                // that reply is out its waiter is gone, so a resumed attempt
+                // finishes unbounded instead of cancelling a write nobody
+                // is waiting on.
+                let commit_deadline = self.ownership_commit_deadline.filter(|_| {
+                    self.ownership_commit_waiters
+                        .get(&channel_id)
+                        .is_some_and(|waiters| waiters.iter().any(|tx| !tx.is_closed()))
+                });
+                let committed = if let Some(deadline) = commit_deadline {
+                    tokio::time::timeout_at(
+                        deadline,
+                        self.store.update_ownership(&room, &intent.revision),
+                    )
+                    .await
+                    .ok()
+                } else {
+                    Some(self.store.update_ownership(&room, &intent.revision).await)
+                };
+                match committed {
+                    Some(Ok(true)) => {
                         self.ownership_queued.remove(&channel_id);
                         self.ownership_repairs.remove(&channel_id);
+                        self.notify_ownership_commit(channel_id, OwnershipCommit::Committed);
                         self.queue.mark_succeeded(&action);
                     }
-                    Ok(false) => {
+                    Some(Ok(false)) => {
                         self.record(LifecycleFailure::Persistence {
                             channel_id: Some(channel_id),
                             error: StoreError::Conflict,
@@ -6490,8 +6690,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             "owner cleanup completion superseded",
                             elapsed_ms(now_ms, started),
                         );
+                        self.notify_ownership_commit(channel_id, OwnershipCommit::Pending);
                     }
-                    Err(error) => {
+                    Some(Err(error)) => {
                         self.record(LifecycleFailure::Persistence {
                             channel_id: Some(channel_id),
                             error,
@@ -6506,6 +6707,15 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                                 elapsed_ms(now_ms, started),
                             );
                         }
+                        self.notify_ownership_commit(channel_id, OwnershipCommit::Pending);
+                    }
+                    None => {
+                        self.owner_action_failed(
+                            action,
+                            "ownership commit exceeded the reply budget",
+                            elapsed_ms(now_ms, started),
+                        );
+                        self.notify_ownership_commit(channel_id, OwnershipCommit::Pending);
                     }
                 }
             }
@@ -7483,7 +7693,12 @@ enum ActorCommand {
         vote_id: Snowflake,
         voter_id: Snowflake,
         ballot: VoteBallot,
-        reply: oneshot::Sender<KickReply>,
+        reply: oneshot::Sender<Result<InteractionResponse, KickRefusal>>,
+    },
+    /// Bind the public callback message after its send, retaining no token.
+    KickMessage {
+        vote_id: Snowflake,
+        message: MessageRef,
     },
     /// V4: resolve the tracked room a member is currently in, if any. The
     /// shared router uses this to tell vote-kick targets (voice owns the
@@ -7639,6 +7854,28 @@ mod voice_actor_init_buffer_tests {
 pub enum OwnershipCommand {
     Reclaim,
     Transfer { target_id: Snowflake },
+}
+
+/// How the first durable commit attempt for a queued ownership handoff ended,
+/// as far as the waiting reply goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnershipCommit {
+    /// The store accepted the handoff (`Ok(true)`): success copy may go out.
+    Committed,
+    /// Anything else — refused revision, store error, held store, lost room,
+    /// or an attempt still queued past the reply budget: the reply says the
+    /// change is recorded and still being finalized.
+    Pending,
+}
+
+/// An `Ownership` command parked while its commit attempt runs.
+struct StagedOwnershipReply {
+    /// Where the final text goes, exactly once.
+    reply: oneshot::Sender<String>,
+    /// Fires on the first commit attempt for the handoff's room.
+    waiter: oneshot::Receiver<OwnershipCommit>,
+    /// Success text, sent only when the commit confirms.
+    success: String,
 }
 
 pub type KickReply = Result<VoteKickUpdate, KickRefusal>;
@@ -7855,6 +8092,17 @@ where
             .get(&guild)
             .filter(|actor| !actor.tx.is_closed())
             .cloned()
+    }
+
+    /// True when the guild has an actor entry at all, even one whose inbox
+    /// already closed. Reply mapping uses this instead of `live_actor`: a
+    /// lost reply from a known worker is a transient failure, never a cold
+    /// cache. Only a guild with no entry at all is still warming up.
+    fn has_actor(&self, guild: Snowflake) -> bool {
+        self.actors
+            .lock()
+            .expect("voice runtime lock")
+            .contains_key(&guild)
     }
 
     /// Interaction member.permissions includes source-channel overwrites, so
@@ -8171,19 +8419,26 @@ where
     }
 
     /// Snapshot the live worker for `/setup`. `None` when the guild has no
-    /// actor yet (before the first GuildCreate) or its inbox already drained.
+    /// actor yet (before the first GuildCreate), when its inbox already
+    /// drained, or when no answer arrived within `WORKER_ACK_WAIT`; the
+    /// caller renders a degraded panel for `None` either way.
     pub async fn worker_status(&self, guild: Snowflake) -> Option<WorkerStatus> {
         let actor = self.live_actor(guild)?;
         let (reply, inbox) = oneshot::channel();
         actor.tx.send(ActorCommand::Status(reply)).ok()?;
-        inbox.await.ok()
+        tokio::time::timeout(WORKER_ACK_WAIT, inbox)
+            .await
+            .ok()?
+            .ok()
     }
 
     /// Run one V2 ownership command (`/reclaim`, `/transfer`) on the live
     /// worker and return the ephemeral reply text. The decision, worker-row
     /// update and urgent persistence enqueue happen together in the guild
-    /// actor. `None` when the guild has no actor yet (before the first
-    /// GuildCreate) or its inbox already drained.
+    /// actor, and the worker holds the reply for the first commit attempt, so
+    /// success copy means committed. `None` when the guild has no actor yet
+    /// (before the first GuildCreate), when its inbox already drained, or
+    /// when no answer arrived within `WORKER_ACK_WAIT`.
     pub async fn run_ownership(
         &self,
         guild: Snowflake,
@@ -8202,13 +8457,17 @@ where
                 reply,
             })
             .ok()?;
-        inbox.await.ok()
+        tokio::time::timeout(WORKER_ACK_WAIT, inbox)
+            .await
+            .ok()?
+            .ok()
     }
 
     /// Run one V3 owner command (`/private`, `/public`) on the live worker
     /// and return the ephemeral reply text. `actor_display` names the Join
     /// channel when the caller owns the room. `None` when the guild has no
-    /// live actor.
+    /// live actor, when its inbox already drained, or when no answer arrived
+    /// within `WORKER_ACK_WAIT`.
     pub async fn run_privacy(
         &self,
         guild: Snowflake,
@@ -8229,11 +8488,16 @@ where
                 reply,
             })
             .ok()?;
-        inbox.await.ok()
+        tokio::time::timeout(WORKER_ACK_WAIT, inbox)
+            .await
+            .ok()?
+            .ok()
     }
 
     /// Start a vote-kick through the guild actor. `vote_id` is the initiating
-    /// interaction ID. `None` when the guild has no live actor.
+    /// interaction ID. `None` when the guild has no live actor, when its
+    /// inbox already drained, or when no answer arrived within
+    /// `WORKER_ACK_WAIT`.
     pub async fn kick_start(
         &self,
         guild: Snowflake,
@@ -8254,18 +8518,22 @@ where
                 reply,
             })
             .ok()?;
-        inbox.await.ok()
+        tokio::time::timeout(WORKER_ACK_WAIT, inbox)
+            .await
+            .ok()?
+            .ok()
     }
 
     /// Cast one ballot through the guild actor. `None` when the guild has no
-    /// live actor.
+    /// live actor, when its inbox already drained, or when no answer arrived
+    /// within `WORKER_ACK_WAIT`.
     pub async fn kick_ballot(
         &self,
         guild: Snowflake,
         vote_id: Snowflake,
         voter_id: Snowflake,
         ballot: VoteBallot,
-    ) -> Option<KickReply> {
+    ) -> Option<Result<InteractionResponse, KickRefusal>> {
         let actor = self.live_actor(guild)?;
         let (reply, inbox) = oneshot::channel();
         actor
@@ -8277,20 +8545,49 @@ where
                 reply,
             })
             .ok()?;
-        inbox.await.ok()
+        tokio::time::timeout(WORKER_ACK_WAIT, inbox)
+            .await
+            .ok()?
+            .ok()
+    }
+
+    fn kick_message(&self, guild: Snowflake, vote_id: Snowflake, message: MessageRef) -> bool {
+        let queued = self.live_actor(guild).is_some_and(|actor| {
+            actor
+                .tx
+                .send(ActorCommand::KickMessage { vote_id, message })
+                .is_ok()
+        });
+        if !queued {
+            warn!(
+                guild = guild.to_string(),
+                vote_id = vote_id.to_string(),
+                "voice ballot reference not queued: actor unavailable"
+            );
+        }
+        queued
     }
 
     /// Resolve the tracked room a member is currently in, if any. `None`
-    /// when the guild has no live actor, while evidence is stale, or when
-    /// the member is not in a tracked room.
-    pub async fn kick_room_of(&self, guild: Snowflake, member: Snowflake) -> Option<Snowflake> {
+    /// when the guild has no live actor, when its inbox already drained, or
+    /// when no answer arrived within `WORKER_ACK_WAIT`; `Some(None)` when the
+    /// worker answered while evidence is stale or the member is not in a
+    /// tracked room.
+    pub async fn kick_room_of(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+    ) -> Option<Option<Snowflake>> {
         let actor = self.live_actor(guild)?;
         let (reply, inbox) = oneshot::channel();
         actor
             .tx
             .send(ActorCommand::KickRoomOf { member, reply })
             .ok()?;
-        inbox.await.ok()?
+        tokio::time::timeout(WORKER_ACK_WAIT, inbox)
+            .await
+            .ok()?
+            .ok()
     }
 
     /// Invalidate first: even an in-flight task cannot write after GuildDelete.
@@ -9361,6 +9658,9 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
             .await;
         }
         let accepted = apply_command(worker, command, now_ms);
+        // An Ownership command stages its reply on the durable commit;
+        // drive it before the next command so replies stay ordered.
+        worker.drive_staged_ownership(now_ms).await;
         metrics::global().voice_actor_inbox_turn();
         if accepted {
             last_progress = tokio::time::Instant::now();
@@ -9427,6 +9727,9 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                     .await;
                 }
                 let accepted = apply_command(worker, command, now_ms);
+                // An Ownership command stages its reply on the durable commit;
+                // drive it before the next command so replies stay ordered.
+                worker.drive_staged_ownership(now_ms).await;
                 consecutive_inbox_turns = consecutive_inbox_turns.saturating_add(1);
                 metrics::global().voice_actor_inbox_turn();
                 if accepted {
@@ -9692,7 +9995,22 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             command,
             reply,
         } => {
-            let _ = reply.send(worker.apply_ownership(actor_id, is_admin, command));
+            let text = worker.apply_ownership(actor_id, is_admin, command);
+            // An accepted handoff stages its reply on the commit: the actor
+            // loop drives it right after this dispatch. Anything else
+            // (refusal, halt, cold worker) answers immediately.
+            match worker.pending_commit_wait.take() {
+                Some(waiter) => {
+                    worker.staged_ownership_reply = Some(StagedOwnershipReply {
+                        reply,
+                        waiter,
+                        success: text,
+                    });
+                }
+                None => {
+                    let _ = reply.send(text);
+                }
+            }
         }
         ActorCommand::Limit {
             actor_id,
@@ -9727,7 +10045,13 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             ballot,
             reply,
         } => {
-            let _ = reply.send(worker.kick_cast(vote_id, voter_id, ballot, now_ms));
+            let response = worker
+                .kick_cast(vote_id, voter_id, ballot, now_ms)
+                .map(|update| worker.kick_ballot_response(&update));
+            let _ = reply.send(response);
+        }
+        ActorCommand::KickMessage { vote_id, message } => {
+            worker.bind_kick_message(vote_id, message);
         }
         ActorCommand::KickRoomOf { member, reply } => {
             let _ = reply.send(worker.kick_room_of(member));
@@ -12489,7 +12813,14 @@ where
             // the router to answer), so a refusal here is exactly once.
             // `kick_start` revalidates atomically, so a join in between
             // cannot corrupt the ledger.
-            let Some(room_id) = runtime.kick_room_of(guild_id, target).await else {
+            let lookup = runtime.kick_room_of(guild_id, target).await;
+            // A known worker that never answered is a transient failure; a
+            // failed lookup must not claim the target has no tracked room.
+            if lookup.is_none() && runtime.has_actor(guild_id) {
+                reply(ephemeral_response(WORKER_LOST_REPLY)).await;
+                return true;
+            }
+            let Some(Some(room_id)) = lookup else {
                 reply(ephemeral_response(kick_refusal_text(
                     &KickRefusal::NotARoom,
                 )))
@@ -12500,6 +12831,9 @@ where
                 .kick_start(guild_id, interaction.id.get(), room_id, initiator, target)
                 .await
             {
+                None if runtime.has_actor(guild_id) => {
+                    reply(ephemeral_response(WORKER_LOST_REPLY)).await;
+                }
                 None => {
                     reply(ephemeral_response(
                         "Voice state is syncing right now. Try again shortly.",
@@ -12521,14 +12855,17 @@ where
                 return true;
             };
             match runtime.kick_ballot(guild_id, vote_id, voter, ballot).await {
+                None if runtime.has_actor(guild_id) => {
+                    reply(ephemeral_response(WORKER_LOST_REPLY)).await;
+                }
                 None => {
                     reply(ephemeral_response(
                         "Voice state is syncing right now. Try again shortly.",
                     ))
                     .await;
                 }
-                Some(Ok(update)) => {
-                    reply(vote_update_message(&update)).await;
+                Some(Ok(response)) => {
+                    reply(response).await;
                 }
                 Some(Err(refusal)) => {
                     reply(ephemeral_response(kick_refusal_text(&refusal))).await;
@@ -12833,7 +13170,13 @@ where
                 )
                 .await
                 .unwrap_or_else(|| {
-                    "The voice worker isn't warmed up yet — try again in a moment.".to_owned()
+                    // A known worker that never answered is a transient
+                    // failure, not a cold cache.
+                    if runtime.has_actor(guild_id) {
+                        WORKER_LOST_REPLY.to_owned()
+                    } else {
+                        "The voice worker isn't warmed up yet — try again in a moment.".to_owned()
+                    }
                 });
             reply(ephemeral_response(&text)).await;
             true
@@ -12864,7 +13207,13 @@ where
                 )
                 .await
                 .unwrap_or_else(|| {
-                    "The voice worker isn't warmed up yet — try again in a moment.".to_owned()
+                    // A known worker that never answered is a transient
+                    // failure, not a cold cache.
+                    if runtime.has_actor(guild_id) {
+                        WORKER_LOST_REPLY.to_owned()
+                    } else {
+                        "The voice worker isn't warmed up yet — try again in a moment.".to_owned()
+                    }
                 });
             reply(ephemeral_response(&text)).await;
             true
@@ -12926,7 +13275,13 @@ where
                 )
                 .await
                 .unwrap_or_else(|| {
-                    "The voice worker isn't warmed up yet — try again in a moment.".to_owned()
+                    // A known worker that never answered is a transient
+                    // failure, not a cold cache.
+                    if runtime.has_actor(guild_id) {
+                        WORKER_LOST_REPLY.to_owned()
+                    } else {
+                        "The voice worker isn't warmed up yet — try again in a moment.".to_owned()
+                    }
                 });
             reply(ephemeral_response(&text)).await;
             true
@@ -13327,9 +13682,27 @@ pub trait InteractionReplies: Send + Sync {
         interaction: &Interaction,
         response: InteractionResponse,
     ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
+    /// Read the public initial response after its callback, retaining only its
+    /// channel/message IDs. Writers without this capability leave no binding.
+    fn original_message(
+        &self,
+        interaction: &Interaction,
+    ) -> impl Future<Output = Result<Option<MessageRef>, RoomHttpError>> + Send {
+        let _ = interaction;
+        async { Ok(None) }
+    }
 }
 
 impl InteractionReplies for RoomHttp {
+    async fn original_message(
+        &self,
+        interaction: &Interaction,
+    ) -> Result<Option<MessageRef>, RoomHttpError> {
+        self.interaction_message(interaction.application_id, &interaction.token)
+            .await
+            .map(Some)
+    }
+
     async fn defer(&self, interaction: &Interaction) -> Result<(), RoomHttpError> {
         let response = InteractionResponse {
             kind: InteractionResponseType::DeferredChannelMessageWithSource,
@@ -13540,9 +13913,30 @@ where
             let response =
                 Self::capture_response(runtime, interaction, invite_code, inventory.as_ref()).await;
             if let Some(response) = response {
+                let updated = response.kind == InteractionResponseType::UpdateMessage;
                 if let Err(error) = replies.respond(interaction, response).await {
                     warn!(interaction_id = interaction.id.get().to_string(), %error,
                         "voice ballot response failed; not retried");
+                }
+                if updated {
+                    if let (
+                        Some(VoiceCommand::Ballot { vote_id, .. }),
+                        Some(guild),
+                        Some(message),
+                    ) = (
+                        runtime.parse_voice_command(interaction),
+                        interaction_guild(interaction),
+                        interaction.message.as_ref(),
+                    ) {
+                        runtime.kick_message(
+                            guild,
+                            vote_id,
+                            MessageRef {
+                                channel_id: message.channel_id.get(),
+                                message_id: message.id.get(),
+                            },
+                        );
+                    }
                 }
             }
             return;
@@ -13620,18 +14014,35 @@ where
         ) else {
             return false;
         };
-        let Some(room) = runtime.kick_room_of(guild, target).await else {
+        let Some(Some(room)) = runtime.kick_room_of(guild, target).await else {
             return false;
         };
-        if runtime.kick_room_of(guild, initiator).await != Some(room) {
+        if runtime.kick_room_of(guild, initiator).await != Some(Some(room)) {
             return false;
         }
         let Some(response) = Self::capture_response(runtime, interaction, None, None).await else {
             return false;
         };
+        let public_ballot = response.kind == InteractionResponseType::ChannelMessageWithSource
+            && response
+                .data
+                .as_ref()
+                .is_some_and(|data| data.components.is_some());
         if let Err(error) = replies.respond(interaction, response).await {
             warn!(interaction_id = interaction.id.get().to_string(), %error,
                 "voice vote response failed; not retried");
+        }
+        if public_ballot {
+            // Even an ambiguous callback may have posted the ballot. This GET
+            // cannot create a duplicate and tokens never enter worker state.
+            match replies.original_message(interaction).await {
+                Ok(Some(message)) => {
+                    runtime.kick_message(guild, interaction.id.get(), message);
+                }
+                Ok(None) => {}
+                Err(error) => warn!(interaction_id = interaction.id.get().to_string(), %error,
+                    "voice ballot reference unavailable; not retried"),
+            }
         }
         true
     }
@@ -13771,6 +14182,7 @@ where
 /// Public so the binary's voice boot can spawn [`flush_loop`](game_activity::flush_loop);
 /// the aggregates stay guild-level-only (never a per-member row, reader or view).
 pub mod game_activity;
+mod kick_ballots;
 #[path = "voice_rooms_limit.rs"]
 mod limit;
 mod presence;

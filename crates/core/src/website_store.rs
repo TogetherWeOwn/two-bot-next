@@ -42,10 +42,11 @@ pub const WEB_CONTRACT_VERSION: &str = "1.0";
 
 /// Every view in the contract, in `sql/web_v1.sql` order. The website reads
 /// exactly these; a view added here needs a `web_v1` edit, not a migration.
-pub const WEB_CONTRACT_VIEWS: [&str; 9] = [
+pub const WEB_CONTRACT_VIEWS: [&str; 10] = [
     "contract_meta",
     "live_counts",
     "rank_counts",
+    "rank_ladder",
     "members",
     "member_milestones",
     "upcoming_events",
