@@ -50,6 +50,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [October 1 tabletop](incident-tabletop-2026-10-01.md)
 - [October 6 tabletop](incident-tabletop-2026-10-06.md)
 - [Gateway incident review](production-incident-2026-10-15-postmortem.md)
+- [Ops audit reads](ops-control.md)
 
 ## Storage and internal actions
 
@@ -176,6 +177,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Rollback tabletop](voice-rollback-trigger-drill.md)
 - [Freeze readback receipt](voice-t5-freeze-readback-receipt.md)
 - [Publish diff form](voice/publish-diff-record-template.md)
+- [Music node spike](music-voice-node-spike.md)
 
 ## Staging acceptance
 
