@@ -3062,6 +3062,9 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: wrangler/package-lock.json
+      - name: Audit Worker dependencies (high/critical gate)
+        if: needs.job-inputs.outputs.worker != 'false'
+        run: npm audit --audit-level=high --include=dev --json
       - run: npm ci
         if: needs.job-inputs.outputs.worker != 'false'
       - run: npm run typecheck
