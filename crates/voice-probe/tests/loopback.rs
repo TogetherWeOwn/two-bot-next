@@ -166,7 +166,10 @@ async fn discovery_response_carries_the_echo_observed_source() {
 
 #[tokio::test]
 async fn ipv6_loopback_probe_succeeds() {
-    let socket = UdpSocket::bind("[::1]:0").await.unwrap();
+    let Ok(socket) = UdpSocket::bind("[::1]:0").await else {
+        eprintln!("skipping: IPv6 loopback unavailable");
+        return;
+    };
     let addr = socket.local_addr().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let echo = tokio::spawn(async move {

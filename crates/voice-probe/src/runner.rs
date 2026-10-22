@@ -206,6 +206,11 @@ pub async fn run_echo_on(
             () = &mut shutdown => break,
             result = socket.recv_from(&mut buf) => {
                 let (n, peer) = result?;
+                if peer.port() == 0 {
+                    // Unreplyable source: answering would fail EINVAL and
+                    // take the server down with it.
+                    continue;
+                }
                 if is_discovery_request(&buf[..n]) {
                     let ssrc = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
                     let reply = encode_response(ssrc, peer);
@@ -257,16 +262,22 @@ async fn run_discovery(
             .await
             .map_err(ProbeError::Socket)?;
         let deadline = Instant::now() + config.discovery_timeout;
-        if let Some(source) = await_discovery(socket, config.ssrc, deadline).await {
+        if let Some(source) = await_discovery(socket, config.ssrc, echo, deadline).await {
             return Ok((true, Some(source)));
         }
     }
     Ok((false, None))
 }
 
-/// Wait until `deadline` for a discovery response to `ssrc`. Strays and
-/// transient receive noise are skipped; only the deadline ends the wait.
-async fn await_discovery(socket: &UdpSocket, ssrc: u32, deadline: Instant) -> Option<SocketAddr> {
+/// Wait until `deadline` for a discovery response to `ssrc` from
+/// `expected_peer`. Datagrams from other senders, strays, and transient
+/// receive noise are skipped; only the deadline ends the wait.
+async fn await_discovery(
+    socket: &UdpSocket,
+    ssrc: u32,
+    expected_peer: SocketAddr,
+    deadline: Instant,
+) -> Option<SocketAddr> {
     let mut buf = [0u8; RECV_BUF_LEN];
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -274,7 +285,10 @@ async fn await_discovery(socket: &UdpSocket, ssrc: u32, deadline: Instant) -> Op
             return None;
         }
         match timeout(remaining, socket.recv_from(&mut buf)).await {
-            Ok(Ok((n, _))) => {
+            Ok(Ok((n, sender))) => {
+                if sender != expected_peer {
+                    continue;
+                }
                 if let Ok(response) = decode_response(&buf[..n], ssrc) {
                     return Some(response.source);
                 }
@@ -305,7 +319,8 @@ fn record_rtt(buf: &[u8], seen: &mut HashSet<u32>, samples_ms: &mut Vec<f64>) {
 }
 
 /// Run the RTT send window plus the drain grace. Send failure is fatal;
-/// receive noise is ignored: missing packets surface as loss, not errors.
+/// only receipts from `echo` count: strays and other senders are ignored,
+/// and missing packets surface as loss, not errors.
 async fn run_rtt(
     socket: &UdpSocket,
     echo: SocketAddr,
@@ -329,8 +344,10 @@ async fn run_rtt(
                 sent += 1;
             }
             result = socket.recv_from(&mut buf) => {
-                if let Ok((n, _)) = result {
-                    record_rtt(&buf[..n], &mut seen, &mut samples_ms);
+                if let Ok((n, sender)) = result {
+                    if sender == echo {
+                        record_rtt(&buf[..n], &mut seen, &mut samples_ms);
+                    }
                 }
             }
         }
@@ -340,7 +357,11 @@ async fn run_rtt(
     while Instant::now() < drain_until {
         let remaining = drain_until.saturating_duration_since(Instant::now());
         match timeout(remaining, socket.recv_from(&mut buf)).await {
-            Ok(Ok((n, _))) => record_rtt(&buf[..n], &mut seen, &mut samples_ms),
+            Ok(Ok((n, sender))) => {
+                if sender == echo {
+                    record_rtt(&buf[..n], &mut seen, &mut samples_ms);
+                }
+            }
             _ => break,
         }
     }
@@ -463,7 +484,13 @@ mod tests {
             .await
             .unwrap();
 
-        let found = await_discovery(&probe, 5, Instant::now() + Duration::from_secs(2)).await;
+        let found = await_discovery(
+            &probe,
+            5,
+            echo.local_addr().unwrap(),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .await;
 
         assert_eq!(found, Some(probe.local_addr().unwrap()));
     }
@@ -482,7 +509,13 @@ mod tests {
         let response = encode_response(5, target);
         echo.send_to(&response, target).await.unwrap();
 
-        let found = await_discovery(&probe, 5, Instant::now() + Duration::from_secs(2)).await;
+        let found = await_discovery(
+            &probe,
+            5,
+            echo.local_addr().unwrap(),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .await;
 
         assert_eq!(found, Some(target));
     }
@@ -491,9 +524,104 @@ mod tests {
     async fn discovery_wait_times_out() {
         let probe = UdpSocket::bind(loopback(0)).await.unwrap();
 
-        let found = await_discovery(&probe, 5, Instant::now() + Duration::from_millis(50)).await;
+        let found = await_discovery(
+            &probe,
+            5,
+            loopback(9),
+            Instant::now() + Duration::from_millis(50),
+        )
+        .await;
 
         assert_eq!(found, None);
+    }
+
+    #[tokio::test]
+    async fn discovery_wait_ignores_responses_from_other_senders() {
+        let probe = UdpSocket::bind(loopback(0)).await.unwrap();
+        let echo = UdpSocket::bind(loopback(0)).await.unwrap();
+        let decoy = UdpSocket::bind(loopback(0)).await.unwrap();
+        let target = probe.local_addr().unwrap();
+        // Valid shape and SSRC, but from the wrong sender: the silent echo
+        // must keep the exchange failed.
+        let spoof = encode_response(5, target);
+        decoy.send_to(&spoof, target).await.unwrap();
+
+        let found = await_discovery(
+            &probe,
+            5,
+            echo.local_addr().unwrap(),
+            Instant::now() + Duration::from_millis(100),
+        )
+        .await;
+
+        assert_eq!(found, None);
+    }
+
+    /// Live verbatim echo until aborted; the probe-side socket stays with
+    /// the caller so decoys can target it directly.
+    async fn spawn_verbatim_echo() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let socket = UdpSocket::bind(loopback(0)).await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut buf = [0u8; RECV_BUF_LEN];
+            loop {
+                let Ok((n, peer)) = socket.recv_from(&mut buf).await else {
+                    break;
+                };
+                if socket.send_to(&buf[..n], peer).await.is_err() {
+                    break;
+                }
+            }
+        });
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn rtt_ignores_packets_from_other_senders() {
+        let probe = UdpSocket::bind(loopback(0)).await.unwrap();
+        let probe_addr = probe.local_addr().unwrap();
+        let (echo_addr, echo_task) = spawn_verbatim_echo().await;
+        // Decoys pre-seeded into the probe's buffer with sequences the run
+        // never sends, so any counted decoy inflates `received` past `sent`.
+        let decoy = UdpSocket::bind(loopback(0)).await.unwrap();
+        for seq in 1_000_000..1_000_010u32 {
+            let fake = encode_rtt(seq, now_micros());
+            decoy.send_to(&fake, probe_addr).await.unwrap();
+        }
+        let mut config = short_probe(echo_addr);
+        config.duration = Duration::from_millis(300);
+
+        let phase = run_rtt(&probe, echo_addr, &config).await.unwrap();
+        echo_task.abort();
+
+        assert!(phase.sent > 0);
+        assert_eq!(phase.received, phase.sent);
+    }
+
+    #[tokio::test]
+    async fn rtt_drain_ignores_packets_from_other_senders() {
+        let probe = UdpSocket::bind(loopback(0)).await.unwrap();
+        let probe_addr = probe.local_addr().unwrap();
+        let (echo_addr, echo_task) = spawn_verbatim_echo().await;
+        // Decoys land mid-drain, after the 20 ms send window has closed.
+        let decoy = UdpSocket::bind(loopback(0)).await.unwrap();
+        let decoy_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            for seq in 2_000_000..2_000_005u32 {
+                let fake = encode_rtt(seq, now_micros());
+                decoy.send_to(&fake, probe_addr).await.ok();
+            }
+        });
+        let mut config = short_probe(echo_addr);
+        config.duration = Duration::from_millis(20);
+        config.drain = Duration::from_millis(300);
+
+        let phase = run_rtt(&probe, echo_addr, &config).await.unwrap();
+        echo_task.abort();
+        decoy_task.await.unwrap();
+
+        assert!(phase.sent > 0);
+        assert_eq!(phase.received, phase.sent);
     }
 
     #[tokio::test]
