@@ -20,6 +20,9 @@
 #[path = "member_dispatch_authority_acceptance.rs"]
 mod member_dispatch_authority_acceptance;
 
+#[path = "custom_command_list_pages_acceptance.rs"]
+mod custom_command_list_pages_acceptance;
+
 use std::collections::VecDeque;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};

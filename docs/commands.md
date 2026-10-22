@@ -101,7 +101,9 @@ List this server's custom commands
 - Default permissions: ManageGuild (`32`)
 - Available in DMs: false
 
-No options.
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `page` | integer | false | 1 | — | — | — | Page of the custom-command list (1-based) |
 
 ## `/command-remove`
 

@@ -96,6 +96,11 @@ export const FORWARDED_FLAGS = [
   // Staging-only synthetic voice test identities (docs/voice-synthetic.md).
   "TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS",
   "TWO_TEMP_VOICE_SWEEP_SECONDS",
+  // Staging-only music voice-node spike (docs/music-voice-node-spike.md):
+  // attaches the Lavalink voice-update forwarder. Staging vars only, same
+  // treatment as TWO_VOICE; the node password travels as its own Container
+  // secret, never through this flag allowlist.
+  "TWO_MUSIC",
   // Template assistant (V12): non-secret endpoint URL + model name; the
   // endpoint credential (if any) travels as its own Container secret, never
   // through this flag allowlist.
