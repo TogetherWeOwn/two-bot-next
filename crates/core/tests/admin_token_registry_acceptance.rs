@@ -16,12 +16,12 @@
 //!
 //! 1. Migrations in both chains (the store chain alone never reaches
 //!    staging/production, so the cutover file is the canonical one):
-//!    `crates/cutover/migrations/0454_admin_api_tokens.sql` and
-//!    `crates/store/migrations/0455_admin_api_tokens.sql`. Both create the
+//!    `crates/cutover/migrations/0456_admin_api_tokens.sql` and
+//!    `crates/store/migrations/0457_admin_api_tokens.sql`. Both create the
 //!    same `admin_api_tokens` table (`IF NOT EXISTS` throughout, so
 //!    cross-running the chains stays safe in either order), document
 //!    `DROP TABLE` rollback in the file header, and gain reviewed checksum
-//!    entries in `migrations.lock`. Numbers 0456+ stay reserved for the
+//!    entries in `migrations.lock`. Numbers 0458+ stay reserved for the
 //!    later audit/confirm slice; the numbering gate rejects a version
 //!    shared across chains. Table shape: `token_id` TEXT PRIMARY KEY
 //!    (`adm_` + 16 lowercase hex chars), `secret_hash` TEXT (sha256 hex of
@@ -56,15 +56,15 @@
 //!    HMAC/flag behavior: the scope/token step is additive and runs after
 //!    them. A valid service-key request still authorizes with no token.
 //! 4. `sql/database_role_matrix.sql` gains the `admin_api_tokens` row and
-//!    `docs/cutover-migration-ledger.md` gains the 0454 row, so the table
+//!    `docs/cutover-migration-ledger.md` gains the 0456 row, so the table
 //!    the tests prove is the table the runtime can read.
 //!
 //! Review pins (same protected file, no new suite): `secret_hash` must
 //! match `^[0-9a-f]{64}$` through a CHECK named
 //! `admin_api_tokens_hash_shape` in both chains; `guild_ids` refuses NULL
 //! elements (`array_position(guild_ids, NULL) IS NULL`); malformed
-//! `token_id` inserts fail 23514; and the store 0455 DDL equals the
-//! cutover 0454 DDL once comments are stripped, so a store-only
+//! `token_id` inserts fail 23514; and the store 0457 DDL equals the
+//! cutover 0456 DDL once comments are stripped, so a store-only
 //! constraint or index edit fails loudly.
 //!
 //! Secrets: hash-only storage is pinned here (database row scan plus the
@@ -137,8 +137,8 @@ const NEVER_VERBS: [&str; 8] = [
     "moderation.Warn",
 ];
 
-const CUTOVER_MIGRATION: &str = "0454_admin_api_tokens.sql";
-const STORE_MIGRATION: &str = "0455_admin_api_tokens.sql";
+const CUTOVER_MIGRATION: &str = "0456_admin_api_tokens.sql";
+const STORE_MIGRATION: &str = "0457_admin_api_tokens.sql";
 
 const TABLE_COLUMNS: [&str; 10] = [
     "token_id",
@@ -854,8 +854,8 @@ fn role_matrix_covers_the_registry() {
 fn cutover_ledger_records_the_migration() {
     let ledger = read_manifest_file("../../docs/cutover-migration-ledger.md");
     assert!(
-        ledger.contains("0454_admin_api_tokens"),
-        "the cutover ledger must record 0454_admin_api_tokens"
+        ledger.contains("0456_admin_api_tokens"),
+        "the cutover ledger must record 0456_admin_api_tokens"
     );
 }
 
@@ -938,7 +938,7 @@ fn store_migration_matches_cutover_ddl() {
     }
     assert_eq!(
         store, cutover,
-        "store 0455 must mirror cutover 0454 exactly (comments aside)"
+        "store 0457 must mirror cutover 0456 exactly (comments aside)"
     );
 }
 
@@ -1029,7 +1029,7 @@ mod registry_db {
         };
         assert!(
             table_exists(db.pool()).await,
-            "admin_api_tokens is missing: migration 0454 was not applied"
+            "admin_api_tokens is missing: migration 0456 was not applied"
         );
         let columns: Vec<(String, String, String)> = sqlx::query_as(
             "SELECT column_name, udt_name, is_nullable
@@ -1081,7 +1081,7 @@ mod registry_db {
         let Some(db) = connect("lookup-index").await else {
             return;
         };
-        assert!(table_exists(db.pool()).await, "0454 was not applied");
+        assert!(table_exists(db.pool()).await, "0456 was not applied");
         let defs: Vec<String> = sqlx::query_scalar(
             "SELECT indexdef FROM pg_indexes WHERE tablename = 'admin_api_tokens'",
         )
@@ -1310,7 +1310,7 @@ mod registry_db {
         let Some(db) = connect("rollback").await else {
             return;
         };
-        assert!(table_exists(db.pool()).await, "0454 was not applied");
+        assert!(table_exists(db.pool()).await, "0456 was not applied");
         insert_live_token(db.pool(), TEST_TOKEN).await;
         sqlx::query("DROP TABLE admin_api_tokens")
             .execute(db.pool())

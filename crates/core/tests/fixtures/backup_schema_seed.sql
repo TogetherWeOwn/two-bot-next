@@ -322,7 +322,7 @@ VALUES (79, '100000000000000001', 'TWO_STICKY_ENABLED', NULL,
         '100000000000000002', '2026-08-01T10:00:00.123456Z'),
        (91, '100000000000000001', 'TWO_FEEDS_ENABLED', 'false', NULL,
         '100000000000000004', '2026-08-01T10:01:00Z');
--- Admin API token registry (0454/0455): one live read token and one revoked
+-- Admin API token registry (0456/0457): one live read token and one revoked
 -- read+moderate token. Hashes are hash-shaped seed data (md5 doubled to 64
 -- hex), never real secrets; the sha256 property is pinned by the slice-0
 -- acceptance suite, not the backup roundtrip.
