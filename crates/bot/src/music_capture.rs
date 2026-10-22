@@ -112,8 +112,8 @@ impl MusicVoiceTap {
     /// unknown bot identity, a server half without endpoint — is ignored
     /// silently. Each distinct completed handshake logs one structured line
     /// (guild, channel, `has_token`) and is dropped: dry-run only.
-    /// Redelivered identical halves (mute toggles, region refreshes) do not
-    /// re-log; a changed half or a rejoin after leave logs again.
+    /// Redelivered identical halves (mute toggles, duplicate dispatches)
+    /// do not re-log; a changed half or a rejoin after leave logs again.
     fn observe(&self, event: &Event, bot_id: Option<Snowflake>) {
         match event {
             Event::VoiceServerUpdate(update) => {
@@ -157,21 +157,25 @@ impl MusicVoiceTap {
                         }
                     }
                     None => {
-                        {
+                        let had_pairing = {
                             let mut pairing = self.pairing.lock().expect("music pairing lock");
+                            let had = pairing.contains(guild_id);
                             pairing.observe_state(guild_id, &update.session_id, None);
-                        }
+                            had
+                        };
                         self.last_logged
                             .lock()
                             .expect("music pairing lock")
                             .remove(&guild_id);
-                        self.clears.fetch_add(1, Ordering::Relaxed);
-                        tracing::info!(
-                            msg = "music_voice_pairing_cleared",
-                            guild = guild_id,
-                            has_token = false,
-                            "music voice pairing cleared on leave (dry-run)"
-                        );
+                        if had_pairing {
+                            self.clears.fetch_add(1, Ordering::Relaxed);
+                            tracing::info!(
+                                msg = "music_voice_pairing_cleared",
+                                guild = guild_id,
+                                has_token = false,
+                                "music voice pairing cleared on leave (dry-run)"
+                            );
+                        }
                     }
                 }
             }
@@ -182,9 +186,11 @@ impl MusicVoiceTap {
     /// Log a completed handshake unless it repeats the last logged one.
     ///
     /// Discord re-emits self voice state on every mute/deafen/video toggle
-    /// with the same session and channel, and repeats server halves on
-    /// region moves: without this, one handshake logs a line per dispatch
-    /// instead of one line per handshake.
+    /// with the same session and channel, and duplicate server halves
+    /// arrive on retries: without this, one handshake logs a line per
+    /// dispatch instead of one line per handshake. A half that actually
+    /// changed (a new endpoint after a region move) is a new handshake
+    /// and logs again.
     fn note_completed(&self, update: &PlayerVoiceUpdate) {
         let mut last_logged = self.last_logged.lock().expect("music pairing lock");
         if last_logged.get(&update.guild_id) == Some(update) {
@@ -535,6 +541,18 @@ mod tests {
     }
 
     #[test]
+    fn leave_without_pairing_is_silent() {
+        let tap = tap(Some(STAGING));
+        tap.observe(&state_event(STAGING, BOT, "session", None), Some(BOT));
+        assert_eq!(tap.clears(), 0, "a leave with no pairing clears nothing");
+        tap.observe(&server_event(STAGING, "token", Some("endpoint")), Some(BOT));
+        tap.observe(&state_event(STAGING, BOT, "session", None), Some(BOT));
+        assert_eq!(tap.clears(), 1, "a leave drops the pending half");
+        tap.observe(&state_event(STAGING, BOT, "session", None), Some(BOT));
+        assert_eq!(tap.clears(), 1, "a redelivered leave clears nothing new");
+    }
+
+    #[test]
     fn missing_endpoint_skips_server_half() {
         let tap = tap(Some(STAGING));
         tap.observe(&server_event(STAGING, "token", None), Some(BOT));
@@ -559,7 +577,7 @@ mod tests {
             Some(BOT),
         );
         assert_eq!(tap.dry_runs(), 1);
-        // Mute toggles and region refreshes redeliver identical halves.
+        // Mute toggles and duplicate dispatches redeliver identical halves.
         tap.observe(&server_event(STAGING, "token", Some("endpoint")), Some(BOT));
         tap.observe(
             &state_event(STAGING, BOT, "session", Some(CHANNEL)),

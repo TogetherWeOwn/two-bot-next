@@ -107,9 +107,10 @@ Gateway capture (dry-run, staging only) wraps the voice sink
 `VoiceStateUpdate` (resolved from the cache identity) feed `VoicePairing`
 behind `TWO_MUSIC=1` and the staging fence. Each distinct completed
 handshake logs one structured line (guild, channel, `has_token` — never
-token/endpoint values) and is dropped; a self leave logs the clear.
-Redelivered identical halves (mute toggles, region refreshes) do not
-re-log. No HTTP, no PATCH, no gateway send in the capture slice.
+token/endpoint values) and is dropped; a self leave with a live pairing
+logs the clear. Redelivered identical halves (mute toggles, duplicate
+dispatches) do not re-log; a changed half logs again as a new handshake.
+No HTTP, no PATCH, no gateway send in the capture slice.
 
 Still to come (follow-up cards): the REST/WS client, the
 `UpdateVoiceState` send path (the bot never issues gateway voice commands
