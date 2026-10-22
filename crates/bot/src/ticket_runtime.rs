@@ -26,6 +26,7 @@ use two_bot_discord::{
     ActionExecutor, DiscordError,
 };
 
+use crate::interaction_admission::{UserSlot, UserSlots, PER_USER_IN_FLIGHT};
 use crate::jobs::{ErrorClass, JobAction};
 
 const RECOVERY_CADENCE: Duration = Duration::from_secs(RECOVERY_INTERVAL_SECONDS);
@@ -38,6 +39,28 @@ const RECOVERY_ITEM_TIMEOUT: Duration = Duration::from_secs(20);
 const RECOVERY_ROWS_BUDGET: Duration = Duration::from_secs(180);
 const IDENTITY_TIMEOUT: Duration = Duration::from_secs(6);
 const PANEL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Concurrently admitted ticket component executions per runtime. Admission
+/// is non-waiting and happens before spawning: beyond this bound (or the
+/// per-member cap) dispatch refuses synchronously with one ephemeral busy
+/// acknowledgement on the shared busy lane instead of queueing a waiter.
+/// Ticket work is at least as heavy as shared interactions, so the bound
+/// matches the shared interaction lane rather than exceeding it.
+pub(crate) const MAX_TICKET_COMPONENT_IN_FLIGHT: usize = 16;
+
+/// Seconds between saturation `warn!` lines per runtime. The drops counter
+/// increments on every refusal; the log samples the first refusal in each
+/// window so a burst is O(1) lines.
+const COMPONENT_SATURATION_LOG_WINDOW_SECS: u64 = 60;
+
+// Ticket fairness rides the shared per-member budget: one member holds at
+// most PER_USER_IN_FLIGHT executions, strictly below the global cap, so a
+// single-member burst can never fill the runtime and another member at
+// available capacity still makes progress.
+const _: () = assert!(
+    PER_USER_IN_FLIGHT < MAX_TICKET_COMPONENT_IN_FLIGHT,
+    "per-member ticket budget must leave room for other members"
+);
 
 #[path = "ticket_history.rs"]
 mod history;
@@ -305,6 +328,14 @@ pub(crate) struct TicketRuntime {
     started: AtomicBool,
     stopping: AtomicBool,
     tasks: TaskMutex<JoinSet<()>>,
+    /// Ticket component executions admitted per member; see
+    /// [`crate::interaction_admission`]. Held inside the spawned handler
+    /// until it settles, so the slot releases on success, failure,
+    /// cancellation and shutdown.
+    component_slots: UserSlots,
+    /// Last sampled saturation `warn!`; the drops counter increments
+    /// un-sampled on every refusal.
+    last_component_drop_log: TaskMutex<Option<std::time::Instant>>,
 }
 
 pub(crate) enum Failure {
@@ -361,6 +392,22 @@ impl Failure {
 
 type Result<T> = std::result::Result<T, Failure>;
 
+/// An admitted ticket component execution. The member slot releases on drop —
+/// including when the handler is aborted — so admission is held exactly until
+/// the handler settles.
+pub(crate) struct TicketComponentPermit {
+    _member: Option<UserSlot>,
+}
+
+/// Reap finished tasks; an abnormal end keeps its durable state for recovery.
+fn prune_finished(tasks: &mut JoinSet<()>) {
+    while let Some(result) = tasks.try_join_next() {
+        if result.is_err() {
+            tracing::warn!("ticket task stopped; durable state retained");
+        }
+    }
+}
+
 impl TicketRuntime {
     pub fn new(
         pool: PgPool,
@@ -382,6 +429,8 @@ impl TicketRuntime {
             started: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             tasks: TaskMutex::new(JoinSet::new()),
+            component_slots: UserSlots::default(),
+            last_component_drop_log: TaskMutex::new(None),
         })
     }
 
@@ -438,12 +487,67 @@ impl TicketRuntime {
         if self.stopping.load(Ordering::Acquire) {
             return;
         }
-        while let Some(result) = tasks.try_join_next() {
-            if result.is_err() {
-                tracing::warn!("ticket task stopped; durable state retained");
-            }
-        }
+        prune_finished(&mut tasks);
         tasks.spawn(task);
+    }
+
+    /// Admit one ticket component execution and spawn its handler, or refuse
+    /// synchronously without spawning when the runtime holds
+    /// [`MAX_TICKET_COMPONENT_IN_FLIGHT`] executions or the member holds the
+    /// per-member cap. The bound check, the member-slot claim and the spawn
+    /// are atomic under the task scope, so concurrent dispatches cannot
+    /// over-admit; refused work queues no waiter. The permit moves into the
+    /// spawned handler and releases when it settles — on success, failure,
+    /// cancellation and shutdown — while the global slot is the task itself,
+    /// reaped by the next admission's prune.
+    pub fn try_spawn_component<Fut>(
+        &self,
+        user: Option<u64>,
+        spawn: impl FnOnce(TicketComponentPermit) -> Fut,
+    ) -> bool
+    where
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let mut tasks = self.tasks.lock().expect("ticket task scope");
+        if self.stopping.load(Ordering::Acquire) {
+            return false;
+        }
+        prune_finished(&mut tasks);
+        if tasks.len() >= MAX_TICKET_COMPONENT_IN_FLIGHT {
+            return false;
+        }
+        let member = match user {
+            Some(user) => match self.component_slots.acquire(user) {
+                Some(slot) => Some(slot),
+                None => return false,
+            },
+            None => None,
+        };
+        tasks.spawn(spawn(TicketComponentPermit { _member: member }));
+        true
+    }
+
+    /// Record one refused ticket component: the label-free saturation counter
+    /// increments on every refusal and the log samples the first refusal per
+    /// 60 s per runtime, so a burst is O(1) lines with N counter increments.
+    /// Carries the interaction id only — no member or token labels.
+    pub fn record_component_saturation(&self, interaction_id: u64) {
+        two_bot_core::metrics::global().ticket_component_drop();
+        let mut last = self
+            .last_component_drop_log
+            .lock()
+            .expect("ticket saturation log");
+        let now = std::time::Instant::now();
+        let due = last.is_none_or(|at| {
+            now.duration_since(at).as_secs() >= COMPONENT_SATURATION_LOG_WINDOW_SECS
+        });
+        if due {
+            *last = Some(now);
+            tracing::warn!(
+                interaction_id = interaction_id.to_string(),
+                "ticket component admission saturated (ticket_component_admission_saturated; sampled; see two_bot_ticket_component_drops_total)"
+            );
+        }
     }
 
     fn stop_tasks(&self) {

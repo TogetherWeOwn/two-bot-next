@@ -999,10 +999,24 @@ impl CommandRuntime {
                         if TicketAction::from_custom_id(&component.custom_id).is_some()
                 );
                 if let Some(tickets) = self.tickets.as_ref().filter(|_| is_ticket) {
-                    tickets.spawn(async move {
+                    // Ticket components never entered the shared
+                    // user-slot/lane admission: the ticket runtime admits
+                    // synchronously before spawning, and overload gets the
+                    // same one-call ephemeral busy reply as the shared lanes
+                    // instead of silence. The busy target is captured before
+                    // the handler moves the interaction.
+                    let busy = self.busy_target(&interaction);
+                    let interaction_id = interaction.id.get();
+                    let user = interaction.author_id().map(|id| id.get());
+                    let admitted = tickets.try_spawn_component(user, |permit| async move {
+                        let _permit = permit;
                         runtime.on_interaction(&interaction).await;
                     });
-                    true
+                    if !admitted {
+                        tickets.record_component_saturation(interaction_id);
+                        self.reply_busy(busy);
+                    }
+                    admitted
                 } else {
                     self.admit_interaction(interaction)
                 }

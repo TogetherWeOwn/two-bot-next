@@ -114,6 +114,14 @@ EXEMPT_SERIES = {
         "handler_duration_saturated (per-le deltas with the p99 bound); "
         "documented in docs/metrics.md and the catalog alert-rule rows"
     ),
+    # Ticket admission saturation: backpressure signal with no alert rule.
+    # Documented in docs/metrics.md and docs/tickets.md (saturation code
+    # and on-call next action); the catalog covers event fields, not this
+    # label-free counter.
+    "two_bot_ticket_component_drops_total": (
+        "ticket admission saturation signal documented in docs/metrics.md "
+        "and docs/tickets.md; consumed by no alert rule"
+    ),
 }
 
 _PREDATES_ROWS_REASON = (
