@@ -77,6 +77,11 @@ const PENNED_CLASSES: [&str; 5] = [
 // `crate::gateway` and `crate::activation`. The stub modules below provide
 // exactly those references; the dragged unit tests duplicate the binary's own
 // suite and are not the acceptance verdict — the `receiver_*` tests are.
+// The included module's `DeliveryDeps::{ledger, sender}` fields are only
+// *constructed* here (behavior is asserted through `Err` classes and
+// `config`), so allow the resulting dead-code: without this, clippy
+// `-D warnings` fails this harness-only target.
+#[allow(dead_code)]
 #[path = "../src/eventsub_delivery.rs"]
 mod eventsub_delivery;
 
@@ -135,15 +140,16 @@ fn delivery_config() -> two_bot_core::eventsub_delivery_config::EventsubDelivery
 }
 
 fn lazy_pool() -> sqlx::PgPool {
-    // Never connects: pool construction performs no I/O.
+    // Never connects: pool construction performs no I/O. Still requires a
+    // Tokio context (sqlx `connect_lazy`), so every caller is `#[tokio::test]`.
     sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .connect_lazy("postgres://agent_test@agent-testdb/agent_test")
         .expect("lazy pool never connects")
 }
 
-#[test]
-fn refused_identity_refuses_with_the_identity_class_before_key_derivation() {
+#[tokio::test]
+async fn refused_identity_refuses_with_the_identity_class_before_key_derivation() {
     gateway::ensure_crypto_provider();
     // A refused identity fails before any key derivation, so even a token the
     // admission would reject still reports the identity cause.
@@ -167,8 +173,8 @@ fn refused_identity_refuses_with_the_identity_class_before_key_derivation() {
     }
 }
 
-#[test]
-fn admission_rejection_refuses_with_the_admission_class() {
+#[tokio::test]
+async fn admission_rejection_refuses_with_the_admission_class() {
     gateway::ensure_crypto_provider();
     match eventsub_delivery::build_delivery_deps(
         lazy_pool(),
@@ -185,8 +191,8 @@ fn admission_rejection_refuses_with_the_admission_class() {
     }
 }
 
-#[test]
-fn malformed_proxy_refuses_with_the_proxy_class() {
+#[tokio::test]
+async fn malformed_proxy_refuses_with_the_proxy_class() {
     gateway::ensure_crypto_provider();
     match eventsub_delivery::build_delivery_deps(
         lazy_pool(),
@@ -203,8 +209,8 @@ fn malformed_proxy_refuses_with_the_proxy_class() {
     }
 }
 
-#[test]
-fn valid_delivery_inputs_still_build() {
+#[tokio::test]
+async fn valid_delivery_inputs_still_build() {
     // Control: proves the harness (include, lazy pool, delivery config)
     // compiles and runs, so a red run above is behavioral, not infra.
     gateway::ensure_crypto_provider();
