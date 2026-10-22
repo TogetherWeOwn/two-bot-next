@@ -11527,9 +11527,9 @@ fn parse_vote_button(custom_id: &str) -> Option<VoiceCommand> {
 /// Whether the voice sink claims this component/modal id, so the shared
 /// stale-control path must stay silent instead of answering expired. Covers the
 /// same shapes the sink parses: bare `two:voice:` ids, runtime join buttons
-/// with the 32-hex worker-epoch suffix (via [`split_runtime_join_id`], shared
+/// with the 32-hex worker-epoch suffix (via `split_runtime_join_id`, shared
 /// with `join_component_action`), and `votekick:` ballots (via
-/// [`parse_vote_button`]). A prefix alone never claims ownership.
+/// `parse_vote_button`). A prefix alone never claims ownership.
 #[must_use]
 pub fn voice_claims_custom_id(custom_id: &str) -> bool {
     if parse_voice_custom_id(custom_id).is_some() {
