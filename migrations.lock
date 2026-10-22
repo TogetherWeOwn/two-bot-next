@@ -453,13 +453,21 @@
       "sha256": "7a76512da8e7033e41a655955db9a7e243e55d92bf2a747312f2809399b927b2",
       "justification": "Store-chain copy of the scheduled_events_claim epoch gate (cutover 0450): one new table, IF NOT EXISTS, no writes to the existing mirror. Numbered 0451 because cutover owns 0450; global migration numbers remain unique across both chains."
     },
-    "crates/cutover/migrations/0452_giveaways.sql": {
-      "justification": "Giveaways slice 1: new guild-scoped giveaways (claim-lease draw ticker), giveaway_entries (weight reserved at 1) and giveaway_draws (eligible_hash, seed, winner_ids, reroll_kind) tables with range checks; additive IF NOT EXISTS. Numbered 0452; the store chain owns the 0453 copy; global migration numbers remain unique across both chains.",
-      "sha256": "f3e819cb7580bde5ae43787b7b7696c0bacb8da2437bf45cb75274fef6ce26f4"
+    "crates/cutover/migrations/0452_scheduled_events_tombstone.sql": {
+      "sha256": "2be34c33d7a002668ed9f51e41172f208ac59b2b9d713763bba9aa3ba8e06adb",
+      "justification": "Delete tombstones for the scheduled-event mirror: new table scheduled_events_tombstone(guild_id, event_id, deleted_at TEXT; PK(guild_id, event_id)); the swap records one row per DELETE-removed id so equal-stamp replays cannot resurrect removed rows. Additive, IF NOT EXISTS, no covering index (guild PK prefix serves the bounded per-guild scans); numbered 0452 as the next free global migration; rollback drops the table."
     },
-    "crates/store/migrations/0453_giveaways.sql": {
-      "justification": "Store-chain copy of the giveaways slice-1 tables (cutover 0452): giveaways, giveaway_entries and giveaway_draws, identical DDL, additive IF NOT EXISTS. Numbered 0453 because cutover owns 0452; global migration numbers remain unique across both chains.",
-      "sha256": "b04f2f2a526ed978cefb4c7c4e84454ac0360dea385dea4a54a3dd42a0a6dd53"
+    "crates/store/migrations/0453_scheduled_events_tombstone.sql": {
+      "sha256": "21775bde6ded22b7b0c8e025365b70ecab9bb1961a98b7d34eb26ab713dd6a1e",
+      "justification": "Store-chain copy of the scheduled_events_tombstone delete layer (cutover 0452): one new table, IF NOT EXISTS, no writes to the existing mirror. Numbered 0453 because cutover owns 0452; global migration numbers remain unique across both chains."
+    },
+    "crates/cutover/migrations/0454_giveaways.sql": {
+      "justification": "Giveaways slice 1: new guild-scoped giveaways (claim-lease draw ticker), giveaway_entries (weight reserved at 1) and giveaway_draws (eligible_hash, seed, winner_ids, reroll_kind) tables with range checks; additive IF NOT EXISTS. Renumbered 0452 to 0454 after main claimed 0452/0453 for the scheduled-events tombstones; the store chain owns the 0455 copy; global migration numbers remain unique across both chains; never merged under 0452.",
+      "sha256": "707b261708083dd9d8fa112b4ff08f796e18aaaa0fc6825a0abe4d6b096e9f38"
+    },
+    "crates/store/migrations/0455_giveaways.sql": {
+      "justification": "Store-chain copy of the giveaways slice-1 tables (cutover 0454): giveaways, giveaway_entries and giveaway_draws, identical DDL, additive IF NOT EXISTS. Numbered 0455 because cutover owns 0454; global migration numbers remain unique across both chains; renumbered from 0453 with the cutover copy, never merged under 0453.",
+      "sha256": "eb2eb4f3be79be7f505f04444ec71a9e6a0a0881c922da25487ad30f195b1429"
     }
   }
 }

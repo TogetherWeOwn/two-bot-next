@@ -1,6 +1,6 @@
--- 0453_giveaways: timed-entry giveaways with a verifiable draw (slice 1).
+-- 0455_giveaways: timed-entry giveaways with a verifiable draw (slice 1).
 --
--- Store-chain copy of cutover 0452: `giveaways` (definitions plus the
+-- Store-chain copy of cutover 0454: `giveaways` (definitions plus the
 -- draw-ticker claim lease), `giveaway_entries` (one row per entrant, so the
 -- PK collapses double-clicks and double POSTs), and `giveaway_draws` (one
 -- row per draw round; rerolls insert, never update). The draw seed is
@@ -13,7 +13,7 @@
 -- and `CONCURRENTLY` cannot run in the transactional migrators, so the
 -- due-scan index is a follow-up with the reviewer. Rollback is
 -- `DROP TABLE IF EXISTS giveaway_draws, giveaway_entries, giveaways`.
--- Numbered 0453 because cutover owns 0452; global migration numbers remain
+-- Numbered 0455 because cutover owns 0454; global migration numbers remain
 -- unique across both chains.
 -- Bot schema range: 0001-0999. Database tests use test containers only.
 

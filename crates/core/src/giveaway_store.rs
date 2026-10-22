@@ -4,8 +4,8 @@
 //! the crate's `db` feature so pure-domain unit tests never need a driver.
 //! Validation, eligibility and the draw itself live in [`crate::giveaway`];
 //! this module only moves rows. Tables:
-//! `crates/cutover/migrations/0452_giveaways.sql` (fixtures run this chain)
-//! and the `crates/store/migrations/0453_giveaways.sql` copy the boot runner
+//! `crates/cutover/migrations/0454_giveaways.sql` (fixtures run this chain)
+//! and the `crates/store/migrations/0455_giveaways.sql` copy the boot runner
 //! applies under its own ledger.
 //!
 //! Concurrency contract (the design's §6 restart recovery): `claim_due`

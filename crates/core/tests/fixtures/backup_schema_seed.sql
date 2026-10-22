@@ -251,6 +251,9 @@ VALUES ('100000000000000001', '100000000000000011', 'Backup event', '2026-08-02T
 INSERT INTO scheduled_events_claim (guild_id, epoch)
 VALUES ('100000000000000001', '2026-08-01T10:00:00.000Z'),
        ('100000000000000002', '2026-08-01T11:00:00.000Z');
+INSERT INTO scheduled_events_tombstone (guild_id, event_id, deleted_at)
+VALUES ('100000000000000001', '100000000000000012', '2026-08-01T10:00:00.000Z'),
+       ('100000000000000002', '100000000000000013', '2026-08-01T11:00:00.000Z');
 INSERT INTO giveaways
     (guild_id, id, prize, channel_id, message_id, created_by, winners_count, ends_at,
      status, requirements_json, max_entries, draw_nonce, created_at, updated_at)

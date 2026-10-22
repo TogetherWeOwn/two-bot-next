@@ -1461,10 +1461,10 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v11-source.ndjson.gz");
+    let current_path = directory.path("v12-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 11);
+    assert_eq!(old.manifest.version, 12);
     for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -1510,18 +1510,21 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v11-source.ndjson.gz");
+    let current_path = directory.path("v12-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 11);
-    let rows = old.buffers.remove("scheduled_events_claim").unwrap();
-    assert!(
-        !rows.is_empty(),
-        "fixture must populate newer scheduled_events_claim"
-    );
-    old.manifest
-        .tables
-        .retain(|table| table.name != "scheduled_events_claim");
+    assert_eq!(old.manifest.version, 12);
+    for name in [
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
+        "scheduled_events_claim",
+        "scheduled_events_tombstone",
+    ] {
+        let rows = old.buffers.remove(name).unwrap();
+        assert!(!rows.is_empty(), "fixture must populate newer {name}");
+        old.manifest.tables.retain(|table| table.name != name);
+    }
     old.manifest.version = 9;
     old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
     let old_path = directory.path("pre-epoch-claim-v9.ndjson.gz");
@@ -1530,7 +1533,73 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     assert_eq!(inspected.manifest.version, 9);
     assert_eq!(
         inspected.manifest.missing_tables(),
-        ["scheduled_events_claim"]
+        [
+            "giveaways",
+            "giveaway_entries",
+            "giveaway_draws",
+            "scheduled_events_claim",
+            "scheduled_events_tombstone"
+        ]
+    );
+    // This test deliberately replaces a reused isolated rehearsal target.
+    forget_moderation_history(pool).await;
+    let report = restore(pool, &old_path).await.unwrap();
+    assert!(report.ok);
+    for name in [
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
+        "scheduled_events_claim",
+        "scheduled_events_tombstone",
+    ] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(name)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "v9 restore clears newer {name} target rows");
+    }
+    let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(members > 0, "older covered data is restored, not discarded");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v10_archive_restores_and_clears_newer_tombstone() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    seed(pool).await;
+    let directory = ArchiveDirectory::new();
+    let current_path = directory.path("v12-source.ndjson.gz");
+    dump(pool, &current_path).await.unwrap();
+    let mut old = inspect(&current_path).unwrap();
+    assert_eq!(old.manifest.version, 12);
+    // Frozen claim-only v10 shape: the merged v10 writer carried the
+    // epoch-claim guard but predates the delete tombstones.
+    let rows = old.buffers.remove("scheduled_events_tombstone").unwrap();
+    assert!(
+        !rows.is_empty(),
+        "fixture must populate newer scheduled_events_tombstone"
+    );
+    old.manifest
+        .tables
+        .retain(|table| table.name != "scheduled_events_tombstone");
+    old.manifest.version = 10;
+    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
+    let old_path = directory.path("pre-tombstone-v10.ndjson.gz");
+    write_archive(&old_path, &old);
+    let inspected = inspect(&old_path).expect("pre-change v10 archive remains readable");
+    assert_eq!(inspected.manifest.version, 10);
+    assert_eq!(
+        inspected.manifest.missing_tables(),
+        ["scheduled_events_tombstone"]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
     forget_moderation_history(pool).await;
@@ -1538,14 +1607,22 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     assert!(report.ok);
     let count: i64 = sqlx::query_scalar(audited(format!(
         "SELECT COUNT(*) FROM {}",
-        identifier("scheduled_events_claim")
+        identifier("scheduled_events_tombstone")
     )))
     .fetch_one(pool)
     .await
     .unwrap();
     assert_eq!(
         count, 0,
-        "v9 restore clears newer scheduled_events_claim target rows"
+        "v10 restore clears newer scheduled_events_tombstone target rows"
+    );
+    let claims: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scheduled_events_claim")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(
+        claims > 0,
+        "the v10 epoch-claim guard is restored, not discarded"
     );
     let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
         .fetch_one(pool)
@@ -1563,10 +1640,10 @@ async fn v10_archive_restores_and_clears_newer_giveaways() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v11-source.ndjson.gz");
+    let current_path = directory.path("v12-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 11);
+    assert_eq!(old.manifest.version, 12);
     for name in ["giveaways", "giveaway_entries", "giveaway_draws"] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");

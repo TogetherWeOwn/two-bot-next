@@ -1,4 +1,4 @@
--- 0452_giveaways: timed-entry giveaways with a verifiable draw (slice 1).
+-- 0454_giveaways: timed-entry giveaways with a verifiable draw (slice 1).
 --
 -- Three new guild-scoped tables: `giveaways` (definitions plus the
 -- draw-ticker claim lease), `giveaway_entries` (one row per entrant, so the
@@ -13,7 +13,7 @@
 -- the squawk-strict lint and `CONCURRENTLY` cannot run in the transactional
 -- migrators, so the due-scan index is a follow-up with the reviewer.
 -- Rollback is `DROP TABLE IF EXISTS giveaway_draws, giveaway_entries,
--- giveaways`. Numbered 0452; the store chain owns the 0453 copy; global
+-- giveaways`. Numbered 0454; the store chain owns the 0455 copy; global
 -- migration numbers remain unique across both chains.
 -- Bot schema range: 0001-0999. Database tests use test containers only.
 
