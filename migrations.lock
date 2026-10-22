@@ -454,12 +454,12 @@
       "justification": "Store-chain copy of the scheduled_events_claim epoch gate (cutover 0450): one new table, IF NOT EXISTS, no writes to the existing mirror. Numbered 0451 because cutover owns 0450; global migration numbers remain unique across both chains."
     },
     "crates/cutover/migrations/0452_admin_api_tokens.sql": {
-      "sha256": "1c2289efc56679b11a343884c9b65e4bbbb83685be740394c6ea4f406b1bcaa9",
-      "justification": "Admin API scoped-token registry (slice 0): new table admin_api_tokens(token_id PK with adm_+16hex shape CHECK, sha256 secret_hash, closed-set scopes, non-empty guild_ids, ordered issued/expires bounds, nullable revoked/last_used) plus a (revoked_at, expires_at) live-lookup index. Additive, IF NOT EXISTS, no binary reads it yet; rollback drops the table."
+      "sha256": "ea0f779bf8f5a6b915efe35d458b4686cce853620d4eeeba3e059f09687b3cf6",
+      "justification": "Admin API scoped-token registry (slice 0): new table with shaped token id, 64-lowercase-hex secret_hash CHECK, closed-set scopes, non-empty guild_ids with NULL elements refused, ordered issued/expires bounds and nullable revoked/last_used; live-lookup index on (revoked_at, expires_at). Hardened before first merge; additive IF NOT EXISTS, no binary reads it yet; rollback drops the table."
     },
     "crates/store/migrations/0453_admin_api_tokens.sql": {
-      "sha256": "5346b84c9bd1cc64cc52415d5a6426021c3d9aa39b6ed1d22daea340b3c6e98c",
-      "justification": "Store-chain mirror of the admin_api_tokens registry (cutover 0452): same table and index, IF NOT EXISTS, no writes to existing tables. Numbered 0453 because cutover owns 0452; global migration numbers remain unique across both chains."
+      "sha256": "cad19fc99cde40bfccf30da046668590fea41dda82e21af56ec22c6939c0c5aa",
+      "justification": "Store-chain mirror of cutover 0452, including the pre-merge 64-lowercase-hex secret_hash CHECK and refusal of NULL guild elements: identical table and index, IF NOT EXISTS, no writes to existing tables. Numbered 0453 because cutover owns 0452; global migration numbers remain unique across both chains."
     }
   }
 }

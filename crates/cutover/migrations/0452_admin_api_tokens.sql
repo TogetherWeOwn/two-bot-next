@@ -27,8 +27,11 @@ CREATE TABLE IF NOT EXISTS admin_api_tokens (
   revoked_at    TIMESTAMPTZ,
   last_used_at  TIMESTAMPTZ,
   CONSTRAINT admin_api_tokens_id_shape CHECK (token_id ~ '^adm_[0-9a-f]{16}$'),
+  CONSTRAINT admin_api_tokens_hash_shape CHECK (secret_hash ~ '^[0-9a-f]{64}$'),
   CONSTRAINT admin_api_tokens_scopes_closed CHECK (scopes <@ ARRAY['read', 'moderate', 'admin']),
-  CONSTRAINT admin_api_tokens_guilds_nonempty CHECK (cardinality(guild_ids) > 0),
+  CONSTRAINT admin_api_tokens_guilds_nonempty CHECK (
+    cardinality(guild_ids) > 0 AND array_position(guild_ids, NULL) IS NULL
+  ),
   CONSTRAINT admin_api_tokens_expiry_ordered CHECK (expires_at > issued_at)
 );
 
