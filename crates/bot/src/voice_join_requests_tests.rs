@@ -1617,3 +1617,22 @@ async fn a_revoke_delete_overtaken_by_a_newer_entry_replans_before_retiring() {
     assert_eq!(cached_outsider(&worker), Some(newer));
     assert!(stored_grants(&worker).is_empty());
 }
+
+#[tokio::test(start_paused = true)]
+async fn join_decision_wait_is_bounded_with_a_live_unanswered_inbox() {
+    let (runtime, _rx) = stalled_worker_runtime();
+    let decision = JoinDecisionCommand {
+        actor_id: MEMBER,
+        click: JoinClick {
+            decision: JoinDecision::Approve,
+            room_id: ROOM,
+            request_id: 7,
+            epoch: None,
+        },
+    };
+    assert!(
+        bounded_sibling_wait(runtime.run_join_decision(GUILD, decision))
+            .await
+            .is_none()
+    );
+}

@@ -1664,3 +1664,19 @@ async fn submit_syncs_differing_original_creator_name_so_a_later_join_keeps_it()
     worker.refresh_template_names(1);
     assert_eq!(worker.desired_names[&ROOM], "Ben's den");
 }
+
+#[tokio::test(start_paused = true)]
+async fn name_wait_is_bounded_with_a_live_unanswered_inbox() {
+    let (runtime, _rx) = stalled_worker_runtime();
+    let command = NameCommand {
+        actor_id: MEMBER,
+        is_admin: false,
+        request: restore(),
+        settings: NameSettings::default(),
+        directory: directory(),
+        policy: policy(&[]),
+    };
+    assert!(bounded_sibling_wait(runtime.run_name(GUILD, command))
+        .await
+        .is_none());
+}

@@ -8700,6 +8700,51 @@ async fn runtime_worker_status_reports_live_actor() {
     assert!(!status.halted);
 }
 
+/// Two-second ceiling shared by the sibling worker-wait regression tests
+/// (`/name`, join-request decisions, `/setup` status): mirrors the protected
+/// worker-reply suite's guard so an unbounded production future fails fast
+/// instead of hanging the test.
+const SIBLING_ACK_BOUND: Duration = Duration::from_millis(2_000);
+const SIBLING_TEST_GUARD: Duration = Duration::from_millis(2_100);
+
+/// A runtime whose guild actor never answers: the test holds the inbox
+/// receiver without polling it, so every worker wait must time out.
+fn stalled_worker_runtime() -> (
+    VoiceRuntime<Store, Http>,
+    mpsc::UnboundedReceiver<ActorCommand>,
+) {
+    let runtime = test_runtime(Trace::default());
+    let live = LiveGuild::new(GUILD);
+    live.publish(command_snapshot());
+    let (tx, rx) = mpsc::unbounded_channel();
+    runtime
+        .actors
+        .lock()
+        .unwrap()
+        .insert(GUILD, GuildActor { live, tx });
+    (runtime, rx)
+}
+
+async fn bounded_sibling_wait<T>(future: impl Future<Output = T>) -> T {
+    let start = tokio::time::Instant::now();
+    let result = tokio::time::timeout(SIBLING_TEST_GUARD, future)
+        .await
+        .expect("sibling worker wait must return within the two-second /limit budget");
+    assert!(
+        start.elapsed() <= SIBLING_ACK_BOUND,
+        "sibling worker wait exceeded its documented bound"
+    );
+    result
+}
+
+#[tokio::test(start_paused = true)]
+async fn status_wait_is_bounded_with_a_live_unanswered_inbox() {
+    let (runtime, _rx) = stalled_worker_runtime();
+    assert!(bounded_sibling_wait(runtime.worker_status(GUILD))
+        .await
+        .is_none());
+}
+
 struct Replies {
     trace: Trace,
     defer_error: Option<RoomHttpError>,

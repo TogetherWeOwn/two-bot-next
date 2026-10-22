@@ -3111,12 +3111,13 @@ const REVALIDATE_TIMEOUT_MS: u64 = 1_000;
 /// join behind another long wait. A successful store read clears it early.
 const REVALIDATE_COOLDOWN_MS: u64 = 30_000;
 
-/// How long an ownership, privacy or vote-kick reply waits for the guild
-/// worker's answer. Discord wants the interaction answered within three
-/// seconds, so a worker that is stalled, overloaded or gone is reported as a
-/// transient failure instead of leaving the interaction on "thinking" while
-/// it holds one of the 16 responder permits. Same two-second ceiling as
-/// `/limit` (`LIMIT_ACK_WAIT`); the permit is released when the wait ends.
+/// How long a voice reply waits for the guild worker's answer: ownership,
+/// privacy, vote-kick, `/name`, join-request decisions and `/setup` status.
+/// Discord wants the interaction answered within three seconds, so a worker
+/// that is stalled, overloaded or gone is reported as a transient failure
+/// instead of leaving the interaction on "thinking" while it holds one of
+/// the 16 responder permits. Same two-second ceiling as `/limit`
+/// (`LIMIT_ACK_WAIT`); the permit is released when the wait ends.
 const WORKER_ACK_WAIT: Duration = Duration::from_millis(2_000);
 
 /// Share of the reply budget the worker spends driving an ownership handoff's
@@ -8165,12 +8166,17 @@ where
     }
 
     /// Snapshot the live worker for `/setup`. `None` when the guild has no
-    /// actor yet (before the first GuildCreate) or its inbox already drained.
+    /// actor yet (before the first GuildCreate), when its inbox already
+    /// drained, or when no answer arrived within `WORKER_ACK_WAIT`; the
+    /// caller renders a degraded panel for `None` either way.
     pub async fn worker_status(&self, guild: Snowflake) -> Option<WorkerStatus> {
         let actor = self.live_actor(guild)?;
         let (reply, inbox) = oneshot::channel();
         actor.tx.send(ActorCommand::Status(reply)).ok()?;
-        inbox.await.ok()
+        tokio::time::timeout(WORKER_ACK_WAIT, inbox)
+            .await
+            .ok()?
+            .ok()
     }
 
     /// Run one V2 ownership command (`/reclaim`, `/transfer`) on the live
