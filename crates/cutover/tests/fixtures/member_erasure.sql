@@ -94,6 +94,13 @@ BEGIN
         VALUES (g, '2026-09-28T00:00:00Z', '2026-10-05T00:00:00Z', u, 1, 1, 'fixture', k,
           1, 'completed', 'complete', 'sufficient', '{"fixture_user_id":"' || u || '"}',
           'none', '2026-10-01T00:00:00Z');
+      INSERT INTO polls
+        (guild_id, id, question, options_json, channel_id, message_id, created_by,
+         ends_at, status, closed_at, counts_json, winner_index, results_posted_at, results_message_id)
+        VALUES (g, u, 'fixture poll', '["one","two"]', '999999999999999999',
+          '888888888888888888', u, now(), 'closed', now(), '[1,0]', 0, now(), '777777777777777777');
+      INSERT INTO poll_votes (guild_id, poll_id, user_id, option_index)
+        VALUES (g, u, u, 0);
       INSERT INTO lfg_posts (id, guild_id, channel_id, title, starts_at, status, created_by, created_at)
         VALUES (k, g, '999999999999999999', 'fixture', now(), 'open', u, now());
       INSERT INTO lfg_roles (lfg_id, role_key, label, slots, position)

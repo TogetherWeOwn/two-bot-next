@@ -58,6 +58,10 @@ fn fixture_and_exception_list_are_pinned_to_the_parity_matrix() {
 #[test]
 fn diff_detects_each_kind_of_unlisted_drift_including_exception_bodies() {
     let mutations = [
+        ("poll", "/options/0/options/0/max_length", json!(257)),
+        ("poll", "/options/0/options/1/max_length", json!(81)),
+        ("poll", "/options/0/options/3/max_value", json!(10081)),
+        ("poll", "/default_member_permissions", json!("32")),
         ("purge", "/options/0/min_value", json!(0)),
         ("purge", "/options/0/max_value", json!(101)),
         ("slowmode", "/options/0/min_value", json!(-1)),
@@ -102,7 +106,13 @@ fn diff_detects_each_kind_of_unlisted_drift_including_exception_bodies() {
             .iter_mut()
             .find(|command| command["name"] == name)
             .unwrap();
-        if pointer == "/dm_permission" {
+        if name == "poll" && pointer == "/default_member_permissions" {
+            assert!(
+                command.get("default_member_permissions").is_none(),
+                "member-open poll omits default permissions"
+            );
+            command["default_member_permissions"] = replacement;
+        } else if pointer == "/dm_permission" {
             command["dm_permission"] = replacement;
         } else {
             *command.pointer_mut(pointer).expect("mutation field exists") = replacement;

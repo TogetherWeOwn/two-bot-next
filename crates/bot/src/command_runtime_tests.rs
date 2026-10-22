@@ -1275,6 +1275,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "feed-add"
                         | "feed-remove"
                         | "feed-list"
+                        | "poll"
                         | "purge"
                         | "slowmode"
                         | "lockdown"
@@ -3261,6 +3262,7 @@ async fn ready_publishes_the_complete_merged_registry_once() {
         "feed-add",
         "feed-remove",
         "feed-list",
+        "poll",
     ] {
         assert!(
             names.contains(&expected),
@@ -3301,7 +3303,14 @@ async fn ready_publish_withholds_gated_off_feed_commands() {
             "published set is missing {expected}"
         );
     }
-    for withheld in ["feed-add", "feed-remove", "feed-list", "rsvp", "lfg"] {
+    for withheld in [
+        "feed-add",
+        "feed-remove",
+        "feed-list",
+        "rsvp",
+        "lfg",
+        "poll",
+    ] {
         assert!(
             !names.contains(&withheld),
             "gated-off {withheld} must not publish"
@@ -3366,7 +3375,7 @@ async fn ready_publish_carries_the_voice_set_only_while_voice_is_live() {
             );
         }
         // The non-voice registry is untouched either way.
-        for expected in ["rank", "leaderboard", "sticky", "rsvp", "feed-list"] {
+        for expected in ["rank", "leaderboard", "sticky", "rsvp", "feed-list", "poll"] {
             assert!(names.contains(&expected), "{expected} must still publish");
         }
         mock.shutdown().await;
@@ -3401,6 +3410,7 @@ fn production_router_matches_composed_production_wiring() {
             HandlerId::FeedAdd,
             HandlerId::FeedRemove,
             HandlerId::FeedList,
+            HandlerId::Poll,
         ];
         ids.extend(ModerationAction::ALL.map(HandlerId::Moderation));
         ids
@@ -3408,7 +3418,7 @@ fn production_router_matches_composed_production_wiring() {
 
     // Composition mirrors production: the real `router_with_commands`, the
     // member verbs `CommandRuntime::build` adds while the member consumer
-    // exists, and the LFG pair `InteractionRuntime::with_router` adds. Only
+    // exists, and the LFG pair plus poll `InteractionRuntime::with_router` adds. Only
     // `handler_for` presence is compared.
     fn composed(gates: RouterGates, member_present: bool) -> InteractionRouter {
         let mut router = router_with_commands(gates);
@@ -3425,6 +3435,7 @@ fn production_router_matches_composed_production_wiring() {
         }
         router.register(Box::new(Marker(HandlerId::Lfg)));
         router.register(Box::new(Marker(HandlerId::LfgClose)));
+        router.register(Box::new(Marker(HandlerId::Poll)));
         router
     }
 
@@ -3541,7 +3552,14 @@ async fn resumed_boot_synchronizes_current_gates_once_without_ready() {
         for name in ["rank", "leaderboard", "sticky", "sticky-remove"] {
             assert!(names.contains(&name), "resumed registry is complete");
         }
-        for name in ["feed-add", "feed-remove", "feed-list", "rsvp", "lfg"] {
+        for name in [
+            "feed-add",
+            "feed-remove",
+            "feed-list",
+            "rsvp",
+            "lfg",
+            "poll",
+        ] {
             assert_eq!(
                 names.contains(&name),
                 announcements,

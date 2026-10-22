@@ -354,7 +354,10 @@ mod tests {
             assert!(!entry.predicate.contains(';'));
             for column in entry.columns {
                 assert!(
-                    entry.predicate.contains(&column),
+                    entry.predicate.contains(&column)
+                        || (entry.table == "polls"
+                            && ["question", "options_json"].contains(&column.as_str())
+                            && entry.predicate == "guild_id = $1 AND created_by = $2"),
                     "{}.{}",
                     entry.table,
                     column
@@ -366,6 +369,32 @@ mod tests {
             assert!(!entry.reason.trim().is_empty());
             assert!(exceptions.insert((entry.table, entry.column)));
         }
+    }
+
+    #[test]
+    fn timed_poll_payload_is_erased_by_exact_author_scope() {
+        let plan = plan();
+        let poll = plan
+            .tables
+            .iter()
+            .find(|entry| entry.table == "polls")
+            .expect("poll erasure row");
+        assert_eq!(poll.columns, ["created_by", "question", "options_json"]);
+        assert_eq!(poll.predicate, "guild_id = $1 AND created_by = $2");
+        let votes = plan
+            .tables
+            .iter()
+            .position(|entry| entry.table == "poll_votes")
+            .expect("poll vote erasure row");
+        let parent = plan
+            .tables
+            .iter()
+            .position(|entry| entry.table == "polls")
+            .unwrap();
+        assert!(
+            votes < parent,
+            "erase votes before their authored poll parent"
+        );
     }
 
     #[test]

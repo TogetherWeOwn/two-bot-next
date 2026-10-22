@@ -655,6 +655,16 @@ impl MockRest {
         .await
     }
 
+    /// Gate selected routes without making concurrent tests depend on arrival order.
+    pub async fn with_gated_responder(
+        responder: impl Fn(&RestRequest) -> (ScriptedResponse, Option<Arc<ResponseGate>>)
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        Self::serve(Arc::new(responder), Some(Duration::ZERO), None).await
+    }
+
     async fn serve(
         responder: RestResponder,
         body_delay: Option<Duration>,
