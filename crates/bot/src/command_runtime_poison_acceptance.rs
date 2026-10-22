@@ -578,15 +578,18 @@ fn voice_rooms_shadow_drops_contain_no_lock_expects() {
     let text = std::fs::read_to_string(&path).expect("voice_rooms.rs must read");
     let lines: Vec<&str> = text.lines().collect();
     for drop_impl in ["Drop for GuildRoomWorker", "Drop for VoiceActorMetricGuard"] {
-        let impl_at = lines
-            .iter()
-            .position(|line| line.contains(drop_impl))
-            .unwrap_or_else(|| panic!("{drop_impl} must exist in voice_rooms.rs"));
-        let drop_at = lines[impl_at..]
+        let impl_pos = lines.iter().position(|line| line.contains(drop_impl));
+        assert!(
+            impl_pos.is_some(),
+            "{drop_impl} must exist in voice_rooms.rs"
+        );
+        let impl_at = impl_pos.unwrap();
+        let drop_pos = lines[impl_at..]
             .iter()
             .position(|line| fn_name_at(line) == Some("drop"))
-            .map(|offset| impl_at + offset)
-            .unwrap_or_else(|| panic!("{drop_impl} must declare fn drop"));
+            .map(|offset| impl_at + offset);
+        assert!(drop_pos.is_some(), "{drop_impl} must declare fn drop");
+        let drop_at = drop_pos.unwrap();
         let body: String = lines[drop_at..lines.len().min(drop_at + 15)].join("\n");
         assert!(
             !body.contains(".lock().expect(") && !body.contains(".lock().unwrap("),
