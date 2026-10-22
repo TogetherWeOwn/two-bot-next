@@ -206,24 +206,38 @@ pub async fn run_echo_on(
             () = &mut shutdown => break,
             result = socket.recv_from(&mut buf) => {
                 let (n, peer) = result?;
-                if peer.port() == 0 {
-                    // Unreplyable source: answering would fail EINVAL and
-                    // take the server down with it.
-                    continue;
-                }
-                if is_discovery_request(&buf[..n]) {
-                    let ssrc = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
-                    let reply = encode_response(ssrc, peer);
-                    socket.send_to(&reply, peer).await?;
-                    stats.discovery_replies += 1;
-                } else {
-                    socket.send_to(&buf[..n], peer).await?;
-                    stats.echoed += 1;
-                }
+                serve_echo_packet(&socket, &buf[..n], peer, &mut stats).await?;
             }
         }
     }
     Ok(stats)
+}
+
+/// Reply to one received datagram: shaped discovery replies, verbatim echo
+/// otherwise. Returns whether a reply was sent. Peers with source port 0
+/// are unreplyable — answering them fails EINVAL — so they are skipped
+/// instead of taking the server down with them.
+async fn serve_echo_packet(
+    socket: &UdpSocket,
+    buf: &[u8],
+    peer: SocketAddr,
+    stats: &mut EchoStats,
+) -> Result<bool, std::io::Error> {
+    if peer.port() == 0 {
+        // Unreplyable source: answering would fail EINVAL and take the
+        // server down with it.
+        return Ok(false);
+    }
+    if is_discovery_request(buf) {
+        let ssrc = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let reply = encode_response(ssrc, peer);
+        socket.send_to(&reply, peer).await?;
+        stats.discovery_replies += 1;
+    } else {
+        socket.send_to(buf, peer).await?;
+        stats.echoed += 1;
+    }
+    Ok(true)
 }
 
 /// Local bind for `echo`: the unspecified address of the echo's family on
@@ -603,17 +617,20 @@ mod tests {
         let probe = UdpSocket::bind(loopback(0)).await.unwrap();
         let probe_addr = probe.local_addr().unwrap();
         let (echo_addr, echo_task) = spawn_verbatim_echo().await;
-        // Decoys land mid-drain, after the 20 ms send window has closed.
+        // Decoys land mid-drain: the 300 ms send window at 100/s establishes
+        // sends unconditionally, and the 400 ms decoys fall inside the ~300
+        // to ~600 ms drain instead of racing the first send tick.
         let decoy = UdpSocket::bind(loopback(0)).await.unwrap();
         let decoy_task = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(400)).await;
             for seq in 2_000_000..2_000_005u32 {
                 let fake = encode_rtt(seq, now_micros());
                 decoy.send_to(&fake, probe_addr).await.ok();
             }
         });
         let mut config = short_probe(echo_addr);
-        config.duration = Duration::from_millis(20);
+        config.rate_per_sec = 100;
+        config.duration = Duration::from_millis(300);
         config.drain = Duration::from_millis(300);
 
         let phase = run_rtt(&probe, echo_addr, &config).await.unwrap();
@@ -647,6 +664,37 @@ mod tests {
         let result = run_probe(&config).await;
 
         assert!(matches!(result, Err(ProbeError::Socket(_))));
+    }
+
+    #[tokio::test]
+    async fn echo_skips_port_zero_peer_and_keeps_serving() {
+        let socket = UdpSocket::bind(loopback(0)).await.unwrap();
+        let client = UdpSocket::bind(loopback(0)).await.unwrap();
+        let mut stats = EchoStats {
+            discovery_replies: 0,
+            echoed: 0,
+        };
+        // A datagram from source port 0 is unreplyable: no reply is
+        // attempted, so no EINVAL can escape, and the stats stay untouched.
+        let port_zero = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let served = serve_echo_packet(&socket, b"ping", port_zero, &mut stats)
+            .await
+            .unwrap();
+        assert!(!served);
+        assert_eq!(stats.discovery_replies, 0);
+        assert_eq!(stats.echoed, 0);
+        // The echo still serves the next real peer.
+        let served = serve_echo_packet(&socket, b"ping", client.local_addr().unwrap(), &mut stats)
+            .await
+            .unwrap();
+        assert!(served);
+        assert_eq!(stats.echoed, 1);
+        let mut buf = [0u8; 64];
+        let (n, _) = timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[..n], b"ping");
     }
 
     #[tokio::test]
