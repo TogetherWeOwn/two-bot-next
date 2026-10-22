@@ -292,6 +292,7 @@ pub fn classify(message_type: &str, body: &[u8]) -> Result<Delivery, EventSubErr
         serde_json::from_slice(body).map_err(|_| EventSubError::InvalidBody)?;
     let subscription = value
         .get("subscription")
+        .filter(|subscription| subscription.is_object())
         .ok_or(EventSubError::InvalidBody)?;
     if !subscription_is_stream_online(subscription) {
         return Err(EventSubError::WrongSubscription);
