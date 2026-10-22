@@ -279,7 +279,15 @@ next-cursor/ordering contract, so a saturated page fails with
 First-deploy/bootstrap and no-new-rollout cases also fail; they are not evidence
 that a new revision was rolled out. No automatic rollback or secret mutation is
 performed by `scripts/staging_rollout.py` itself; rollback is a workflow step that
-invokes `scripts/worker_container_rollback.py`.
+invokes `scripts/worker_container_rollback.py`. The local baseline receipt is
+type- and shape-validated before `select_rollout`, `receipt` or `verify` acts
+on it; any malformed member refuses with the single fixed token
+`invalid_baseline_receipt`. Required members are `started`, `application_id`,
+`namespace_id`, `revision`, `build_id`, `deploy_id` and `rollout_ids`. `deploy_id`
+must be canonical `YYYY.MM.DD.N+sha7` (a real date, positive sequence without
+leading zeros, lowercase seven-hex revision). `started` must be a finite positive timestamp
+(the producer writes `time.time()`), and a decodable-but-non-object receipt
+file (a JSON list, null, or string) refuses with the same token.
 
 On success the job prints an allowlisted receipt: application/rollout/Worker
 version, target application version, immutable image digest, build revision/ID and

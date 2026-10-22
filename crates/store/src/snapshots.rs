@@ -127,6 +127,20 @@ impl InviteSnapshotStore for PgInviteSnapshots {
                     .inviter_id
                     .map(|id| id.to_string())
                     .filter(|id| !suppressed.contains(id.as_str()));
+                // Discord-fed `uses` is `u64`; the column is INTEGER. Saturate
+                // out-of-range counters instead of panicking: the snapshot
+                // write proceeds with the clamped value. The warn names only
+                // the guild and code identifiers, never the raw counter.
+                let saturated = two_bot_core::saturate_invite_uses(s.uses);
+                if saturated != s.uses {
+                    tracing::warn!(
+                        guild_id = %guild_id,
+                        code = %s.code,
+                        "invite uses saturated at i32::MAX",
+                    );
+                }
+                // `saturated <= i32::MAX`, so the cast cannot truncate.
+                let uses = saturated as i32;
                 sqlx::query(
                     "INSERT INTO invite_snapshots (guild_id, code, uses, inviter_id, channel_id, updated_at)
                      VALUES ($1, $2, $3, $4, $5, $6::timestamptz)
@@ -136,9 +150,7 @@ impl InviteSnapshotStore for PgInviteSnapshots {
                 )
                 .bind(&guild_id)
                 .bind(&s.code)
-                // Saturate hostile counters: Discord controls `uses`, and a value
-                // past the INTEGER range must clamp, never panic the sync task.
-                .bind(i32::try_from(s.uses).unwrap_or(i32::MAX))
+                .bind(uses)
                 .bind(inviter)
                 .bind(s.channel_id.map(|id| id.to_string()))
                 .bind(&stamp)

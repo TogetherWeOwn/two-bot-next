@@ -95,7 +95,19 @@ remaining gateway/accepted-prefix work:
    `resync_registry` through the shared publisher. Rebuild from current DB
    rows plus **all** builtin definitions. An absent remove does not republish.
    A publication failure must not be reported as a fully synchronized write.
-4. `/command-list` uses the sorted guild rows and `format_command_list`.
+4. `/command-list` lists complete rows in name order, including disabled commands
+   and optional text triggers. It defaults to page 1; `/command-list page:2`
+   retrieves page 2. Each nonempty ephemeral reply identifies `Page N of M` and,
+   when there is another page, gives the next invocation. Rows plus navigation
+   fit Discord's 2,000 UTF-16-unit limit without truncating names, triggers or
+   on/off state. Page selection uses the existing quota-bounded guild snapshot,
+   not a new database pagination query. Missing `page` equals `page:1`; invalid,
+   duplicate, nonpositive or unavailable pages receive a short refusal pointing
+   to `/command-list page:1`, without writes or audit changes. Empty page 1
+   remains `No custom commands defined.`; empty page 2 is out of range.
+   Manage Server and automation gates still apply before page validation/store
+   access; mentions stay suppressed. This does not change quotas, registration
+   or the compiled-only commands CLI.
 5. Dynamic slash dispatch uses `adjudicate_run`; a known row while automations
    are off gets `AUTOMATIONS_DISABLED_REPLY`. Render inside the delivery/audit
    outcome path so both oversize output and REST failure leave a failed
