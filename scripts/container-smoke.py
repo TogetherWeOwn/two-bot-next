@@ -115,12 +115,15 @@ def docker(*args, timeout=30, check=True, text=True):
 def inspect_state(name):
     """The State object of `docker inspect NAME`, or a clean FAIL.
 
-    An empty inspect array or a missing/non-object entry/State is a
-    malformed-probe FAIL naming the inspect check -- never an
-    IndexError/KeyError/TypeError traceback, and Docker output is never
-    echoed into the failure.
+    A non-JSON reply, an empty inspect array or a missing/non-object
+    entry/State is a malformed-probe FAIL naming the inspect check --
+    never an IndexError/KeyError/TypeError traceback, and Docker output
+    is never echoed into the failure.
     """
-    entries = json.loads(docker("inspect", name).stdout)
+    try:
+        entries = json.loads(docker("inspect", name).stdout)
+    except ValueError:
+        raise RuntimeError("docker inspect output is not valid JSON") from None
     require(isinstance(entries, list) and entries, "docker inspect returned no entries")
     require(isinstance(entries[0], dict), "docker inspect entry must be a JSON object")
     state = entries[0].get("State")

@@ -8,8 +8,11 @@ name: staging-mcp-proveout
 # script never prints, stores or uploads it. Response bodies carry no
 # credential and are printed (redacted commands) plus uploaded as a sanitized
 # artifact for the Paperclip post-back. Never runs automatically and has no
-# production path. While staging is fenced (/readyz 503 ownership_fenced),
-# the four container-backed tools may return JSON-RPC -32000; that is expected.
+# production path. A container-backed JSON-RPC -32000 fails proof as
+# uncorroborated (FENCE_UNCORROBORATED) unless the dispatcher explicitly
+# corroborates the fence with STAGING_MCP_EXPECT_FENCE=1; the pinned Run
+# step below sets no such flag, so a fenced-stage run reports the fence
+# instead of passing. Corroborate via /readyz before re-dispatching.
 on:
   workflow_dispatch:
 

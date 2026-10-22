@@ -299,9 +299,9 @@ benchmark job passed; its separate broad sweep failed on database teardown
 statement timeouts and rustdoc bare URLs, so this is not a claim that all nightly
 jobs passed.
 
-The committed [baseline JSON](pipeline-benchmark-baseline.json) retains the first
-successful standalone report verbatim apart from added provenance. It is not
-an average, a synthetic envelope, or the faster repeat. Shared-runner latency
+The original baseline retained the first successful standalone report verbatim
+apart from added provenance, not an average, a synthetic envelope, or the faster
+repeat. It is superseded by the journaled baseline below. Shared-runner latency
 varied by about 6.5× at p50 and 9.8× at p99 between these runs; host contention
 is a hypothesis, not a proven attribution. Treat the 25% comparison as a coarse
 regression signal pending controlled-runner repeatability work, not a stable
@@ -335,6 +335,36 @@ connection, creates/migrates a unique disposable database, and verifies its drop
 before reporting success. See [the benchmark runbook](pipeline-benchmark.md)
 for the build command, configurable workload, controller cache restrictions,
 measurement definitions and non-required nightly integration.
+
+### Journaled gateway pipeline baseline
+
+The committed [baseline JSON](pipeline-benchmark-baseline.json) now retains the
+first hosted success-path measurement at source
+`8ea3f55f848472b6276162e4d1297bfec6fe2539`, measured 2026-10-21 in
+[run 39637827461](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/39637827461).
+This uses GitHub-hosted `ubuntu-latest`, an ephemeral Rust job container and
+job-private Postgres 18.6, not the original self-hosted environment. All metrics
+and evidence come from that one report; there is no per-metric selection.
+
+- Peak RSS: **24.61328125 MiB**; handler p50/p99: **3,606.274 / 91,700.671 µs**.
+- Logical DB exchanges/event: **13.685555555555556**, computed as
+  `(11,417 completed statements + 900 BEGIN exchanges) / 900 measured events`.
+- Mock REST p50/p99: **1,124.991 / 1,550.907 µs**; replay: **29.972988155 s**;
+  total command including setup and verified teardown: **31.071836149 s**.
+- Same workload: 107 members, 10 channels, 600 messages, 300 voice updates,
+  30 REST calls, 900 commits and checkpoint 1017. Both migration chains applied;
+  **942 durable events = 942 journal rows = 942 distinct journaled events**.
+  The disposable database was dropped.
+
+The measurement passed, but the workflow failed its old-baseline comparator:
+`13.686 > 10.562 (25% tolerance)`. This is not a green workflow claim. Per-row
+atomic best-effort journaling deliberately adds savepoint, journal insert,
+watermark upsert and release statements. Retaining that design and refreshing
+the measured baseline are reviewed together in [PR #1554](https://github.com/TogetherWeOwn/two-bot-next/pull/1554).
+The 25% tolerance, strict 200 MiB RSS target and advisory p99 policy are unchanged.
+The old 8.45 figure is historical, not the current journaled pipeline budget.
+Latency across different runner environments is not a performance comparison;
+this synthetic report still proves neither real-guild soak nor production sizing.
 
 ## Reproduce
 
