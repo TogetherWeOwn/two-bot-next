@@ -320,7 +320,7 @@ async fn mock_discord(invites_denied: bool) -> MockRest {
             );
         }
         if request.method == "POST" && path.ends_with("/callback") {
-            return ScriptedResponse::status(200);
+            return ScriptedResponse::status(204);
         }
         if request.method == "PATCH" && path.ends_with("/messages/@original") {
             return ScriptedResponse::json(200, json!({"id": "98"}));
