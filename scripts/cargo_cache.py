@@ -690,7 +690,9 @@ def validate_shared_pool_inventory(pool, policy, inventory, now, max_age):
         canonical = os.path.normpath(raw)
         if raw != canonical or canonical in indexed:
             raise Refusal('ambiguous slot attribution')
-        if type(row.get('live_run')) is not bool or type(row.get('referenced')) is not bool:
+        if (type(row.get('live_run')) is not bool
+                or type(row.get('referenced')) is not bool
+                or ('idle_stale' in row and type(row['idle_stale']) is not bool)):
             raise Refusal('ambiguous slot attribution')
         if not row.get('issue_id') or row.get('status') not in TERMINAL | {
                 'backlog', 'todo', 'in_progress', 'in_review', 'blocked'}:
@@ -827,7 +829,7 @@ def shared_pool_retain(pool, inventory, proc_root='/proc', now=None, max_age=60,
                 # retained output helps nobody. A row the control plane marks
                 # idle_stale passes the nonterminal-status gate; live_run,
                 # referenced, and every gate below are unchanged.
-                if ((row['status'] not in TERMINAL and not row.get('idle_stale'))
+                if ((row['status'] not in TERMINAL and row.get('idle_stale') is not True)
                         or row['live_run'] or row['referenced']):
                     results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
                                      'reason': ('live run, slot reference, or nonterminal issue; '
