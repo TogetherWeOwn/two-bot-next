@@ -13,10 +13,26 @@ against scratch Postgres only (tests: agent-testdb `two_next_backup_test` /
 `two_next_restore_drill`). The restore target is a different variable
 (`TWO_RESTORE_URL`, never `TWO_DATABASE_URL`) and real restores additionally
 require `--force`. This confirmation is not authorization to target production.
+`restore` enforces the rule by value: a target that normalizes to the live
+database (scheme alias, host case, ports defaulted from `PGPORT` exactly as
+the driver seeds them, and credential/query spellings folded away;
+`?host=`/`?hostaddr=`/`?dbname=`/`?port=` overrides honored; database
+derived exactly as the driver derives it, so `//prod` names `prod`;
+socket spellings — encoded authority, `?host=`, redundant separators, `.`
+segments, trailing slash — folded component-wise),
+or whose database name is a production marker (`prod`, `production`,
+`two_prod`, `two_production`, `live`, `two_live`), is refused with a fixed
+message on stderr and exit 2 — even with `--force`, and without echoing
+either URL. A target whose effective target cannot be proven — omitted
+database, an empty `?host=`/`?hostaddr=`/`?dbname=` override, or a socket
+directory mixed with a plain host (the driver's socket slot is sticky) —
+is refused the same way: name the scratch database explicitly.
+`--dry-run` still previews without that comparison.
 
 ## Stable failure codes
 
-Every `backup`, `backup-upload` and `guild-config-snapshot` failure line
+Every `backup`, `restore`, `backup-upload`, `guild-config-snapshot` and
+`guild-config-restore` failure line
 ends with a stable `code=<snake>` token so agents can match failure classes
 without substring-matching English. The human-readable text is unchanged;
 the code is additive. Success lines (`backup: done`, `RESTORE VERIFIED`,
@@ -41,10 +57,18 @@ code and are byte-identical.
 - `backup_upload_usage` — expected exactly one argument.
 - `backup_upload_not_regular_file` — the path is not a regular file.
 - `backup_upload_empty_file` — refusing to upload an empty file.
+- `backup_upload_dump_too_large` — the dump exceeds the 1 GiB cap.
 - `backup_upload_s3_target` — S3 target/env misconfigured.
 - `backup_upload_read_failed` — cannot read the dump file.
 - `backup_upload_put_status` — PUT returned a non-2xx status.
 - `backup_upload_put_failed` — the PUT request failed.
+
+`two-bot restore <dump> --force`:
+
+- `restore_live_target_refused` — `TWO_RESTORE_URL` normalizes to the live
+  database, names a production database, or cannot be proven different
+  (omitted database, empty overrides, socket/host mixes); fixed refusal,
+  exit 2, even with `--force`. `--dry-run` still previews.
 
 `two-bot guild-config-snapshot`:
 
@@ -60,6 +84,12 @@ code and are byte-identical.
 - `snapshot_hash_changed` — snapshot hash changed after the write.
 - `snapshot_seal_missing` — written snapshot lacks its integrity seal.
 - `snapshot_local_only_refused` — no upload command; local-only refused.
+
+`two-bot guild-config-restore --apply`:
+
+- `guild_restore_apply_failed` — a mid-apply failure; the report names
+  landed vs pending operations (labels only). Exit 1. Completion prints
+  `DID <op>` per operation only as each operation lands.
 
 Bounded upload helper (`backup` and `guild-config-snapshot`: external
 upload command; argv and child output never echoed):
@@ -342,6 +372,64 @@ sudo systemctl start two-bot-next-backup      # run one now
 journalctl -u two-bot-next-backup -n 30       # what it did
 ```
 
+## Unit bounds and failure signal
+
+Every `deploy/*.service` is bounded and loud. These are templates; shipping the
+directives installs nothing and starts no timer (host installation stays with the
+Operator). `scripts/test_deploy_units.py` lints every unit, so a new or edited
+unit that drops a directive fails CI naming the file. The lint also pins
+`Type=oneshot` (the start bound only applies to oneshot units) and refuses
+`TimeoutSec=` and `SuccessExitStatus=`/`RestartForceExitStatus=` overrides,
+which would silently drop the bound or the failure hook.
+
+| Unit | `TimeoutStartSec` | Why this long |
+|---|---|---|
+| `two-bot-next-backup.service` | 2 h | dump plus the 30-minute upload deadline |
+| `two-bot-next-guild-config-backup.service` | 2 h | Discord REST reads plus two sequential uploads (snapshot and drift report, 30 min each) |
+| `two-bot-next-restore-drill.service` | 2 h | scratch provision, migrate and restore |
+| `two-bot-next-failure@.service` | 30 s | the handler only writes one log line |
+
+Without a bound, a hung oneshot stays "activating" forever and its timer skips
+every later run. On expiry systemd kills the run and the unit goes `failed`.
+
+**Consuming the signal.** Each of the three units sets
+`OnFailure=two-bot-next-failure@%n.service`. A failed, timed-out or refused run
+starts that template, which writes one `crit`-priority journal line tagged
+`two-bot-next-unit-failed`: `unit failed: <unit> - inspect with journalctl -u <unit>`.
+Alert on that tag (any journal shipper that filters on priority or tag) or on
+`systemctl --failed` / the unit's `failed` state. The handler reads no
+credential, touches no database and sends nothing off the host; delivery to a
+person is the alerting layer's job. Install it next to the other units:
+
+```bash
+sudo cp deploy/two-bot-next-failure@.service /etc/systemd/system/
+journalctl -t two-bot-next-unit-failed --since -2d    # recent failures
+```
+
+**Drill archive age.** The drill refuses to restore an archive older than
+`TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S` (unit default `172800`, 48 h: one missed
+nightly run), measured from the newest `two-funnel-*.ndjson.gz` file's mtime. The
+check runs in the unit's shell script before `restore-drill` allocates any
+database, so a stopped nightly backup cannot pass against an old file. It prints
+one JSON line and, on refusal, the next action on stderr, then exits 1 (which
+fires `OnFailure=`):
+
+```json
+{"verdict":"refuse","code":"archive_stale","archive_age_s":9000000}
+```
+
+| `code` | Verdict | Next action |
+|---|---|---|
+| `archive_fresh` | pass | none; the restore proceeds |
+| `archive_stale` | refuse | the nightly backup stopped: `journalctl -u two-bot-next-backup`, fix it, take a fresh backup, rerun the drill |
+| `archive_missing` | refuse | no archive exists (`archive_age_s` is `null`): run the backup service first |
+| `archive_unreadable` | refuse | the archive cannot be inspected or opened for reading: check backup directory permissions and file ownership |
+| `archive_from_future` | refuse | the file is dated ahead of the host clock: check the clock |
+| `max_age_invalid` | refuse | set the variable to a positive whole number of seconds (no leading zero, at most 9 digits) |
+
+The check is read-only and repeatable, and prints no archive name, path or secret.
+Never `touch` an archive to make the drill pass: the age is the point.
+
 ## Off-box destination
 
 `two-bot backup-upload <file>` PUTs one dump via SigV4 single-PUT. Canonical
@@ -395,7 +483,9 @@ roles; missing managed resources cannot silently become unresolved late writes.
 
 Restore: `two-bot guild-config-restore --snapshot FILE` plans (prints
 `WOULD …`); add `--confirm-staging-guild --apply` to write, `--evidence
-FILE` for the hash-proven receipt. Tampered backups are refused (exit 3)
+FILE` for the hash-proven receipt. Snapshots past 8 MiB are refused (exit 2)
+before buffering or any Discord read; non-regular `--snapshot` inputs
+(devices, FIFOs) are refused the same way. Tampered backups are refused (exit 3)
 before any Discord read or write; pre-seal snapshots warn and proceed.
 Apply ends with the post-restore hash compared against the remapped source:
 mismatch → exit 1 with the residual operations listed.

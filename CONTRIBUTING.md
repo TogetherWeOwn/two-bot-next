@@ -110,12 +110,12 @@ issue. Blank issues are off. Report a vulnerability privately; see
 
 ## Releases
 
-Each successful production promote tags the deployed commit `vX.Y.Z` and
-publishes a GitHub Release from the Conventional Commit subjects since the
-previous tag (`release.yml`, called by `deploy-production`). There is no release
-PR and no freeze. One flat `vX.Y.Z` tag covers the whole repository, not one
-release per crate. See [`docs/releases.md`](docs/releases.md). Never tag or
-release by hand.
+The daily `daily-digest` workflow tags the live production commit `vYYYY.MM.DD`
+when production has moved forward since the last digest, and publishes a GitHub
+Release from Conventional Commit subjects. Deploys never create version tags.
+There is no release PR or freeze. One digest tag covers the whole repository,
+not one release per crate. See [`docs/releases.md`](docs/releases.md) for repair
+and dry-run dispatches. Never tag or release by hand.
 
 Release notes use the [Common Changelog](https://common-changelog.org/)
 categories, in its order: **Changed** (`perf`, `revert`), **Added** (`feat`),
@@ -124,8 +124,9 @@ categories, in its order: **Changed** (`perf`, `revert`), **Added** (`feat`),
 entry, so write it for a reader of the release notes: imperative mood, one
 user-facing change.
 
-Versioning is SemVer, starting at `0.1.0`; `1.0.0` marks the production
-cutover. `feat!` / `BREAKING CHANGE` bumps major (minor while `0.x`).
+Release tags use UTC calendar dates. Cargo package versions stay at `0.4.0`;
+`feat!` and `BREAKING CHANGE` still appear in the breaking-changes notes but
+no longer choose a SemVer bump.
 
 ## Local development
 
@@ -136,6 +137,18 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
 ```
+
+The ops-override DB acceptance test mutates process environment. With the test
+DB configured, run it separately from parallel workspace tests (CI does this in
+both the unit-test and coverage lanes):
+
+```sh
+cargo test --workspace --features two-bot-core/db --locked -- --skip settings_jobs::tests::ops_overrides_acceptance_tests::
+cargo test -p two-bot --bin two-bot --features two-bot-core/db --locked settings_jobs::tests::ops_overrides_acceptance_tests:: -- --test-threads=1
+```
+
+Nextest already isolates each test in its own process. On the controller, use the
+bounded cache wrapper for both compiling commands, as required by `AGENTS.md`.
 
 ### Pre-push checklist
 

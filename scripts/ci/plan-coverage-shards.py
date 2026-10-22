@@ -37,8 +37,15 @@ FULL_LEGS = [
             "cargo llvm-cov --workspace --lib --bins --tests "
             "--features two-bot-core/db --locked --ignore-run-fail --no-report -- "
             "--skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump "
-            "--skip seeded_aggregates_render_exactly_guild_scoped_and_read_only"
+            "--skip seeded_aggregates_render_exactly_guild_scoped_and_read_only "
+            "--skip settings_jobs::tests::ops_overrides_acceptance_tests::"
         ),
+        "supplemental_commands": [
+            "cargo llvm-cov --no-report -p two-bot --bin two-bot "
+            "--features two-bot-core/db --locked -- "
+            "settings_jobs::tests::ops_overrides_acceptance_tests:: "
+            "--test-threads=1 --skip regenerate_reference_docs"
+        ],
         "crates": list(ALL_CRATES),
     },
     {

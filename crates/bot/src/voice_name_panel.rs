@@ -1410,12 +1410,20 @@ where
     H: RoomWrites + Send + 'static,
 {
     /// Run one `/name` step through the guild actor. `None` when the guild
-    /// has no live actor yet or its inbox already drained.
-    async fn run_name(&self, guild: Snowflake, command: NameCommand) -> Option<NameReply> {
+    /// has no live actor yet, when its inbox already drained, or when no
+    /// answer arrived within `WORKER_ACK_WAIT`.
+    pub(super) async fn run_name(
+        &self,
+        guild: Snowflake,
+        command: NameCommand,
+    ) -> Option<NameReply> {
         let actor = self.live_actor(guild)?;
         let (reply, inbox) = oneshot::channel();
         actor.tx.send(ActorCommand::Name { command, reply }).ok()?;
-        inbox.await.ok()
+        tokio::time::timeout(WORKER_ACK_WAIT, inbox)
+            .await
+            .ok()?
+            .ok()
     }
 }
 
@@ -1492,6 +1500,7 @@ where
         policy: Arc::clone(&runtime.name_policy),
     };
     let response = match runtime.run_name(guild_id, command).await {
+        None if runtime.has_actor(guild_id) => ephemeral_response(WORKER_LOST_REPLY),
         None => ephemeral_response(NOT_WARM),
         Some(NameReply::Refused(text) | NameReply::Applied(text)) => ephemeral_response(&text),
         Some(NameReply::Panel { room_id, text }) => panel_response(room_id, &text),

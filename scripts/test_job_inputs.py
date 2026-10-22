@@ -186,6 +186,15 @@ class SelectionTests(unittest.TestCase):
                 selected = inputs.classify(path)
                 self.assertEqual(selected, {RUST, WORKER, PARITY}, path)
 
+    def test_receiver_contract_doc_selects_its_worker_conformance_check(self):
+        path = "docs/internal-actions-receiver.md"
+        self.assertIn(path, inputs.WORKER_DOCS)
+        self.assertEqual(inputs.classify(path), {WORKER})
+        self.assertEqual(
+            jobs([path]),
+            {RUST: False, WORKER: True, PARITY: False,
+             SUPPLY: False, DOCS: True})
+
     def test_worker_tree_selects_worker_only(self):
         for path in ["wrangler/src/index.ts",
                      "wrangler/test/container-env.test.ts",
@@ -199,13 +208,15 @@ class SelectionTests(unittest.TestCase):
         # preflight) fall through to the worker-only docs rule.
         # docs/backup.md reads content in the voice owner-grant journal
         # regression, so it selects rust despite the preconditions
-        # existence check.
+        # existence check. docs/tickets.md is embedded by the ticket
+        # component admission acceptance suite.
         rust_docs = ["docs/cutover.md",
                      "docs/commands.md", "docs/configuration.md",
                      "docs/voice-rooms.md",
                      "docs/soak-checklist.json", "docs/soak-checklist.md",
                      "docs/privacy.md", "docs/database-roles.md",
-                     "docs/rollback-delta.md", "docs/backup.md"]
+                     "docs/rollback-delta.md", "docs/backup.md",
+                     "docs/tickets.md"]
         for path in rust_docs:
             with self.subTest(path=path):
                 self.assertEqual(inputs.classify(path), {RUST}, path)
