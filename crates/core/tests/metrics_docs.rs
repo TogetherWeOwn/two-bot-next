@@ -244,6 +244,7 @@ const KNOWN_COUNTERS: &[&str] = &[
     "two_bot_gateway_resumes_total",
     "two_bot_gateway_disconnects_total",
     "two_bot_gateway_missed_events_total",
+    "two_bot_gateway_rsvp_refused_total",
     "two_bot_rest_requests_total",
     "two_bot_rest_guard_invalid_requests_total",
     "two_bot_rest_guard_rejected_requests_total",

@@ -577,6 +577,9 @@ fn start_rsvp_drain(
         while let Some(accepted) = receiver.recv().await {
             let acknowledged = complete_acknowledgement(&runtime, accepted.acknowledgement).await;
             let _ = accepted.completed.send(acknowledged);
+            // Release admission only after the serial drain completes the
+            // entry; the drop is the in-flight accounting.
+            drop(accepted.permit);
         }
     });
     (sender, task, Arc::new(std::sync::Mutex::new(Vec::new())))
