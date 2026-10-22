@@ -117,12 +117,13 @@ fn executor(origin: String) -> ActionExecutor {
 }
 
 fn runtime(gates: RouterGates, origin: String) -> Arc<CommandRuntime> {
+    let automations = gates.automations;
     CommandRuntime::new(
         lazy_pool(),
         executor(origin),
         router_with_commands(gates),
         gates.configured_guild.expect("configured guild"),
-        false,
+        automations,
     )
 }
 
@@ -166,12 +167,13 @@ fn service(origin: String) -> Arc<SelfRoleService> {
 }
 
 fn roles_runtime(gates: RouterGates, origin: String) -> Arc<CommandRuntime> {
+    let automations = gates.automations;
     CommandRuntime::new_with_self_roles(
         lazy_pool(),
         executor(origin.clone()),
         router_with_commands(gates),
         SR_GUILD,
-        false,
+        automations,
         service(origin),
     )
 }
@@ -595,12 +597,13 @@ async fn disabled_self_role_surface_stays_silent() {
     let mock = new_mock().await;
     let origin = mock.origin();
     let service = service(origin.clone());
+    let automations = gates.automations;
     let runtime = CommandRuntime::new_with_self_roles(
         lazy_pool(),
         executor(origin),
         router_with_commands(gates),
         SR_GUILD,
-        false,
+        automations,
         Arc::clone(&service),
     );
     let interaction = sr_button(SR_EVENT + 6, &custom_id, ComponentType::Button, Vec::new());
