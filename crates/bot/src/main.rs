@@ -95,6 +95,8 @@ mod moderation_release_cli;
 mod observability_event_conformance_tests;
 mod onboarding;
 #[cfg(test)]
+mod onboarding_autorole_acceptance_tests;
+#[cfg(test)]
 mod onboarding_queue_cause_forwarding_tests;
 #[cfg(test)]
 mod onboarding_tests;
