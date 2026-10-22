@@ -246,6 +246,75 @@ impl SelfRoleService {
         })
     }
 
+    /// True only for a stale self-role reference: the id parses and the press
+    /// is otherwise well-formed, but the panel, source message, or option it
+    /// names is gone. The caller answers one expired-control reply and mutates
+    /// nothing. Malformed ids/shapes, foreign guilds, bots, and channel
+    /// mismatches are not stale: silence. Mirrors `component_input`, except
+    /// the channel comes from the source message itself (`Interaction::channel_id`
+    /// is deprecated upstream; the message is the authority for which source
+    /// message the press belongs to).
+    pub(crate) fn stale_component(&self, interaction: &Interaction) -> bool {
+        if interaction.kind != InteractionType::MessageComponent
+            || !interaction
+                .guild_id
+                .is_some_and(|id| id.get().to_string() == self.runtime.guild_id)
+        {
+            return false;
+        }
+        let Some(InteractionData::MessageComponent(data)) = &interaction.data else {
+            return false;
+        };
+        let Some(parsed) = parse_self_role_custom_id(&data.custom_id) else {
+            return false;
+        };
+        let member = interaction
+            .member
+            .as_ref()
+            .and_then(|member| member.user.as_ref());
+        let Some(member) = member else {
+            return false;
+        };
+        if member.bot || member.id.get().to_string() == self.runtime.bot_id {
+            return false;
+        }
+        let Some(panel) = self.panels.iter().find(|p| p.id == parsed.panel_id) else {
+            // Parses, but names no live panel: the panel was removed.
+            return true;
+        };
+        let Some(message) = interaction.message.as_ref() else {
+            return false;
+        };
+        if message.channel_id.get().to_string() != panel.channel_id
+            || message
+                .guild_id
+                .is_some_and(|id| Some(id) != interaction.guild_id)
+        {
+            return false;
+        }
+        if message.id.get().to_string() != panel.message_id {
+            // Same panel and channel, new source message: the panel moved on.
+            return true;
+        }
+        match (panel.mode, data.component_type, parsed.option_key) {
+            (PanelMode::Button, ComponentType::Button, Some(option_key))
+                if data.values.is_empty() =>
+            {
+                !panel.options.iter().any(|o| o.key == option_key)
+            }
+            (PanelMode::Select, ComponentType::TextSelectMenu, None) => {
+                let unique: HashSet<_> = data.values.iter().collect();
+                unique.len() == data.values.len()
+                    && !(panel.exclusive && data.values.len() > 1)
+                    && data
+                        .values
+                        .iter()
+                        .any(|key| !panel.options.iter().any(|o| &o.key == key))
+            }
+            _ => false,
+        }
+    }
+
     /// Mint one delivery identity/order BEFORE detached gateway work. Reaction
     /// remove has no member; neither path trusts cached roles for authorization.
     pub fn reaction_input(
