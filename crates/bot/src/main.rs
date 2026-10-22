@@ -34,6 +34,8 @@ mod containment_runtime;
 mod containment_runtime_evidence_tests;
 #[cfg(test)]
 mod containment_runtime_tests;
+#[cfg(test)]
+mod custom_command_lookup_outage_acceptance_tests;
 mod database_roles_cli;
 mod db_log;
 #[cfg(test)]
