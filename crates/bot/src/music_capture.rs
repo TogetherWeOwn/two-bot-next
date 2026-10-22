@@ -727,6 +727,7 @@ mod tests {
             "entitlements": [],
             "type": 2,
             "token": "token",
+            "data": {"id": "3", "name": "kick", "type": 1},
         }))
         .unwrap();
         assert!(decorated.kick_vote(interaction).await);
@@ -738,6 +739,7 @@ mod tests {
             "entitlements": [],
             "type": 2,
             "token": "token",
+            "data": {"id": "3", "name": "kick", "type": 1},
         }))
         .unwrap();
         assert!(
