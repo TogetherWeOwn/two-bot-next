@@ -35,6 +35,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("feed-remove", "docs/parity.md §1 #29 caps"),
     ("schedule-list", "docs/parity.md §1 #19 page"),
     ("privacy", "docs/parity.md §1 privacy"),
+    ("command-list", "docs/parity.md §1 #16 page"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -377,6 +378,35 @@ pub fn expected_registry() -> Value {
                 "page",
                 "Page of the schedule list (1-based)",
                 two_bot_core::commands::CommandOptionType::Integer,
+            )
+            .min_value(1),
+        )
+        .expect("page option serializes");
+        command["options"] = json!([page]);
+    }
+    // Custom-command paging changes ONLY the formerly empty option list.
+    // Keep descriptions, permissions and every other legacy field pinned.
+    {
+        let _ = INTENTIONAL_DIFFERENCES
+            .iter()
+            .find(|(command, _)| *command == "command-list")
+            .expect("page has a documented command exception");
+        let command = commands
+            .iter_mut()
+            .find(|command| command["name"] == "command-list")
+            .expect("docs/parity.md §1 #16 page");
+        assert!(
+            command["options"]
+                .as_array()
+                .expect("command options array")
+                .is_empty(),
+            "legacy command-list has no options"
+        );
+        let page = serde_json::to_value(
+            CommandOption::new(
+                "page",
+                "Page of the custom-command list (1-based)",
+                CommandOptionType::Integer,
             )
             .min_value(1),
         )
