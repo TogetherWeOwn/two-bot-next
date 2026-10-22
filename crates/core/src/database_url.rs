@@ -86,15 +86,38 @@ enum TargetProof {
     },
 }
 
-/// Socket directories compare without trailing slashes: the driver builds the
-/// socket file as `{dir}/.s.PGSQL.{port}` (`fetch_socket`), so a trailing
-/// slash reaches the same file. TCP hostnames never reach this function.
+/// Socket directories compare by path components: the driver builds the socket
+/// file as `{dir}/.s.PGSQL.{port}` (`fetch_socket`) and the OS resolves
+/// redundant separators, `.` segments, and trailing slashes to the same file,
+/// so every spelling of one directory must compare equal. `..` segments pop
+/// lexically (over-folding only ever over-refuses a scratch target, never
+/// under-refuses a live one). TCP hostnames never reach this function.
 fn normalize_socket_dir(value: &str) -> String {
-    let trimmed = value.trim_end_matches('/');
-    if trimmed.is_empty() {
+    use std::path::{Component, Path};
+    let mut stack: Vec<String> = Vec::new();
+    let mut rooted = false;
+    for component in Path::new(value).components() {
+        match component {
+            Component::Prefix(prefix) => {
+                stack.push(prefix.as_os_str().to_string_lossy().into_owned());
+            }
+            Component::RootDir => rooted = true,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                stack.pop();
+            }
+            Component::Normal(part) => stack.push(part.to_string_lossy().into_owned()),
+        }
+    }
+    let mut normalized = String::new();
+    if rooted {
+        normalized.push('/');
+    }
+    normalized.push_str(&stack.join("/"));
+    if normalized.is_empty() {
         "/".to_owned()
     } else {
-        trimmed.to_owned()
+        normalized
     }
 }
 
@@ -123,8 +146,9 @@ fn default_port() -> u16 {
 ///   `?host=` spellings of one socket compare equal. A decoded socket path
 ///   (containing `/`) can never collide with a TCP hostname; DNS is
 ///   case-insensitive.
-/// - Socket directories compare without trailing slashes: the driver formats
-///   the socket file as `{dir}/.s.PGSQL.{port}` either way.
+/// - Socket directories compare by path components: redundant separators,
+///   `.` segments, and trailing slashes all reach the same socket file
+///   (`{dir}/.s.PGSQL.{port}`), so every spelling of one directory folds.
 /// - A missing port defaults from `PGPORT` exactly as the driver seeds it
 ///   (unparseable or unset means 5432), so a portless URL cannot evade a
 ///   live URL on the effective port.
@@ -628,21 +652,31 @@ mod tests {
     }
 
     #[test]
-    fn restore_folds_socket_trailing_slashes() {
-        // The driver formats the socket file as `{dir}/.s.PGSQL.{port}`, so
-        // a trailing slash reaches the same file (its own parser test uses
-        // the slashed spelling).
+    fn restore_folds_socket_directory_spellings() {
+        // The driver builds the socket file as `{dir}/.s.PGSQL.{port}` and
+        // the OS resolves redundant separators, `.` segments, and trailing
+        // slashes to the same file — so every spelling of one directory
+        // refuses when it is the live socket.
         let live = "postgres:///app?host=/var/run/postgresql";
-        let slashed = "postgres:///app?host=/var/run/postgresql/";
-        assert!(restore_target_is_live(slashed, Some(live)));
-        assert!(restore_target_is_live(live, Some(slashed)));
-        assert!(restore_target_is_live(
+        for candidate in [
+            "postgres:///app?host=/var/run/postgresql/",
+            "postgres:///app?host=/var//run/postgresql",
+            "postgres:///app?host=/var/run/./postgresql",
+            "postgres:///app?host=//var/run/postgresql",
+            "postgres:///app?host=/var/run/postgresql/../postgresql",
             "postgres://%2Fvar%2Frun%2Fpostgresql%2F/app",
-            Some(live)
-        ));
+            "postgres://%2Fvar%2F%2Frun%2Fpostgresql/app",
+        ] {
+            assert!(restore_target_is_live(candidate, Some(live)), "{candidate}");
+            assert!(restore_target_is_live(live, Some(candidate)), "{candidate}");
+        }
         // A different socket directory stays a different target.
         assert!(!restore_target_is_live(
             "postgres:///app?host=/other/socket/",
+            Some(live)
+        ));
+        assert!(!restore_target_is_live(
+            "postgres:///app?host=/var/run/other",
             Some(live)
         ));
     }

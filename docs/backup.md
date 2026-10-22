@@ -18,7 +18,8 @@ database (scheme alias, host case, ports defaulted from `PGPORT` exactly as
 the driver seeds them, and credential/query spellings folded away;
 `?host=`/`?hostaddr=`/`?dbname=`/`?port=` overrides honored; database
 derived exactly as the driver derives it, so `//prod` names `prod`;
-socket spellings — encoded authority, `?host=`, trailing slash — folded),
+socket spellings — encoded authority, `?host=`, redundant separators, `.`
+segments, trailing slash — folded component-wise),
 or whose database name is a production marker (`prod`, `production`,
 `two_prod`, `two_production`, `live`, `two_live`), is refused with a fixed
 message on stderr and exit 2 — even with `--force`, and without echoing
