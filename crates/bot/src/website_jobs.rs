@@ -350,6 +350,11 @@ pub async fn serve(
                 if let Some(member) = member {
                     registered.push(member_runtime::sweep_job(member, context.rest.clone()));
                 }
+                if let Some(job) = crate::birthday_jobs::register(context.clone(), &activation) {
+                    registered.push(job);
+                } else {
+                    parked.push(crate::birthday_jobs::NAME);
+                }
                 let registration = community_jobs::register(context.clone());
                 registered.extend(registration.jobs);
                 parked = registration.parked;
@@ -497,6 +502,7 @@ async fn registered_statuses(
         .chain(member_runtime::NAMES)
         .chain([RECOVERY_JOB_NAME])
         .chain([feed_jobs::NAME])
+        .chain([crate::birthday_jobs::NAME])
         .chain([crate::retention_jobs::NAME])
         .collect();
     if crate::automod_gateway::enabled() {

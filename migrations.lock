@@ -468,6 +468,10 @@
     "crates/cutover/migrations/0454_sticky_delivery_uncertainty.sql": {
       "sha256": "c813acffc8d44d4f3175acab3aadd9c81a2e611f7962fbba1725a828c3cee4fc",
       "justification": "Uncertain-delivery fence for sticky re-posts: one NOT NULL DEFAULT FALSE column delivery_uncertain on sticky_messages, armed by the atomic claim and disarmed only by confirmed record, proven no-send, confirmed orphan absence, or administrator reconfigure. Additive, IF NOT EXISTS; numbered 0454 because main owns 0452 (scheduled tombstone) and 0453 (store copy); global migration numbers remain unique across both chains; rollback drops the column."
+    },
+    "crates/cutover/migrations/0455_birthdays.sql": {
+      "sha256": "92a44f0174caae75aa106b0f3df1c6c69b79d4b11172def76f65f69645b8b1cf",
+      "justification": "Opt-in month/day-only birthdays, guild configuration, durable daily cheer fences and role cleanup intents. Additive cutover tables; preserve recovery records when disabling the feature. No production activation or existing schema changes."
     }
   }
 }

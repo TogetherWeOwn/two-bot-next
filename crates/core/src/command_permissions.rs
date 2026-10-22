@@ -76,9 +76,11 @@ use PolicyHook::{
 /// All 30 parity rows, including the three non-static-slash dispositions,
 /// plus the Next-only `/help` discovery command (parity row 31 — legacy has
 /// no help command) and the Next-only `/privacy` member self-serve
-/// (parity row 32).
+/// (parity row 32), plus announcement-gated birthday self-service (row 33).
 /// No Administrator-only exception: preserve the legacy resolved-bit check.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 32] = [
+pub const COMMAND_PERMISSIONS: [CommandPermission; 33] = [
+    // The config subcommand is additionally checked by route_birthday.
+    row(33, "birthday", BuiltinSlash, 0, None),
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),

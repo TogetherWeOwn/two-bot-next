@@ -21,6 +21,9 @@ mod backup_cli_pool_open_tests;
 mod backup_stable_error_codes_acceptance_tests;
 #[cfg(test)]
 mod birthday_acceptance_tests;
+mod birthday_command;
+mod birthday_jobs;
+mod birthday_store;
 // Pure burn math: no runtime caller yet, the offline pin test is the consumer.
 #[allow(dead_code)]
 mod burn_rate;

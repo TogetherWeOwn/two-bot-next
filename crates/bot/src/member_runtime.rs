@@ -107,6 +107,29 @@ pub struct MemberRuntime {
 }
 
 impl MemberRuntime {
+    /// Feature-off ticks compensate previously persisted grants without posting
+    /// or granting anything new. The supervisor still owns the identity fence.
+    pub async fn run_birthday_tick(
+        pool: &sqlx::PgPool,
+        rest: &ActionExecutor,
+        guild: &str,
+        now_ms: i64,
+        enabled: bool,
+    ) -> Result<(), ErrorClass> {
+        crate::birthday_jobs::tick(pool, rest, guild, now_ms, enabled).await
+    }
+
+    /// UTC birthday sweep with a caller-supplied clock for restart/day-boundary
+    /// verification. Its supervised caller owns the staging activation gate.
+    pub async fn run_birthday_sweep(
+        pool: &sqlx::PgPool,
+        rest: &ActionExecutor,
+        guild: &str,
+        now_ms: i64,
+    ) -> Result<(), ErrorClass> {
+        crate::birthday_jobs::sweep(pool, rest, guild, now_ms).await
+    }
+
     /// Compose the guild consumer, or park when moderation is off, invalidly
     /// configured, or aimed at a non-staging guild. Staging-only until soak:
     /// enabling is a deployment decision, and the default stays off.
