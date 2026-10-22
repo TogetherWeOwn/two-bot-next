@@ -106,8 +106,9 @@ pub const DUMP_TABLES: &[&str] = &[
     // definitions plus the draw-ticker lease, one row per entrant, and one
     // row per draw round carrying the replay inputs. Archived so a restore
     // keeps live giveaways and their published winners; see
-    // [`V12_ADDED_TABLES`]. No foreign keys, so order beside the other
-    // engagement tables is free.
+    // [`V12_ADDED_TABLES`]. The child tables carry composite foreign keys
+    // to `giveaways`, so this parent-before-child order is load-bearing
+    // for restore inserts.
     "giveaways",
     "giveaway_entries",
     "giveaway_draws",

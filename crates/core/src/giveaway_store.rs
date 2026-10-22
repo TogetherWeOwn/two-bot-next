@@ -245,7 +245,10 @@ pub async fn set_giveaway_status(
 }
 
 /// Hard-delete a giveaway with its entries and draws, atomically. Returns
-/// `false` when the giveaway is unknown (nothing is deleted then).
+/// `false` when the giveaway is unknown (nothing is deleted then). Children
+/// go first explicitly; the schema's composite foreign keys refuse a parent
+/// delete while live children exist, so an entry or draw racing the delete
+/// fails the whole transaction closed instead of being orphaned.
 pub async fn delete_giveaway(
     pool: &Pool<Postgres>,
     guild_id: &str,

@@ -6,7 +6,12 @@
 -- row per draw round; rerolls insert, never update). The draw seed is
 -- `sha256("{draw_nonce}:{draw_no}")` and `eligible_hash` commits to the
 -- sorted eligible list, so any member can replay the draw from the stored
--- row. Additive only: one feature's new tables, no writes to existing
+-- row. Both child tables carry a composite foreign key to `giveaways`
+-- (`guild_id`, `giveaway_id`), so entries and draws stay bound to a live
+-- definition: a parent delete with live children is refused instead of
+-- orphaning them, and removals delete children first (`delete_giveaway`,
+-- the erasure plan's creator branches, restore's parent-first order).
+-- Additive only: one feature's new tables, no writes to existing
 -- tables, `IF NOT EXISTS` throughout so cross-running the store and
 -- cutover chains against one schema stays safe in either order. No
 -- secondary indexes: a plain `CREATE INDEX` fails the squawk-strict lint
@@ -44,7 +49,8 @@ CREATE TABLE IF NOT EXISTS giveaway_entries (
   user_id     TEXT NOT NULL,
   weight      INTEGER NOT NULL DEFAULT 1 CHECK (weight >= 1),
   entered_at  TIMESTAMPTZ NOT NULL,
-  PRIMARY KEY (guild_id, giveaway_id, user_id)
+  PRIMARY KEY (guild_id, giveaway_id, user_id),
+  FOREIGN KEY (guild_id, giveaway_id) REFERENCES giveaways (guild_id, id)
 );
 
 CREATE TABLE IF NOT EXISTS giveaway_draws (
@@ -57,5 +63,6 @@ CREATE TABLE IF NOT EXISTS giveaway_draws (
   seed           TEXT NOT NULL,
   winner_ids     JSONB NOT NULL,
   reroll_kind    TEXT,
-  PRIMARY KEY (guild_id, giveaway_id, draw_no)
+  PRIMARY KEY (guild_id, giveaway_id, draw_no),
+  FOREIGN KEY (guild_id, giveaway_id) REFERENCES giveaways (guild_id, id)
 );

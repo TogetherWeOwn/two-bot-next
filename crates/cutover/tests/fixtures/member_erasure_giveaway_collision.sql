@@ -1,6 +1,8 @@
 -- Giveaway erasure collision seed: the same giveaway id in two guilds, with
--- distinct creator, entrant and winner members, an orphan entrant row with no
--- parent, and a reroll round naming its replaced winner only in reroll_kind.
+-- distinct creator, entrant and winner members, and a reroll round naming
+-- its replaced winner only in reroll_kind. Every child row has a live
+-- parent: the schema binds entries and draws to `giveaways` with composite
+-- foreign keys, so parentless orphan rows are impossible.
 -- Fixed fake snowflakes only. Never load this fixture into a runtime database.
 INSERT INTO giveaways
   (guild_id, id, prize, channel_id, message_id, created_by, winners_count, ends_at,
@@ -20,7 +22,6 @@ INSERT INTO giveaway_entries (guild_id, giveaway_id, user_id, weight, entered_at
 VALUES
   ('1545644954272137297', 'gw-collide', '123456789012345678', 1, '2026-10-01T00:00:00Z'),
   ('1545644954272137298', 'gw-collide', '123456789012345678', 1, '2026-10-01T00:00:00Z'),
-  ('1545644954272137297', 'gw-orphan', '123456789012345678', 1, '2026-10-01T00:00:00Z'),
   ('1545644954272137297', 'gw-u', '123456789012345679', 1, '2026-10-01T00:00:00Z'),
   ('1545644954272137297', 'gw-v', '123456789012345679', 1, '2026-10-01T00:00:00Z');
 INSERT INTO giveaway_draws

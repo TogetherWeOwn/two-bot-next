@@ -882,9 +882,12 @@ async fn member_snowflake_idempotency_key_is_erased_from_audit_but_retained_for_
 
 /// Giveaway ids repeat across guilds, so the child predicates must scope on
 /// the child row's own guild: erasing USER in GUILD deletes the colliding
-/// A rows, the orphan entrant row with no parent, the creator-owned rows,
-/// and the reroll round naming USER only in `reroll_kind`, while the same
-/// giveaway id in the other guild and unrelated members' rows survive.
+/// A rows, the creator-owned rows, and the reroll round naming USER only in
+/// `reroll_kind`, while the same giveaway id in the other guild and
+/// unrelated members' rows survive. (Composite foreign keys bind every
+/// child row to a live `giveaways` parent, so parentless orphans are
+/// impossible; the `user_id` predicate branch still matches each entrant
+/// row directly.)
 #[tokio::test]
 async fn giveaway_erasure_is_guild_scoped_and_covers_reroll_kind() {
     const OTHER_GUILD: &str = "1545644954272137298";
@@ -899,7 +902,7 @@ async fn giveaway_erasure_is_guild_scoped_and_covers_reroll_kind() {
         .await
         .unwrap();
     let rows = |table: &str| dry.iter().find(|row| row.table == table).unwrap().rows;
-    assert_eq!(rows("giveaway_entries"), 3);
+    assert_eq!(rows("giveaway_entries"), 2);
     assert_eq!(rows("giveaway_draws"), 3);
     assert_eq!(rows("giveaways"), 1);
     assert!(

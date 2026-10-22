@@ -14,8 +14,10 @@
 //! idempotency through the store API, the claim-lease lifecycle (contention
 //! yields exactly one winner, expired leases reclaim, only the holder
 //! completes or releases), atomic draw completion (a failed guard rolls the
-//! insert back), the drawn-once announcement guard, and raced draw inserts
-//! leaving one row.
+//! insert back), the drawn-once announcement guard, raced draw inserts
+//! leaving one row, and composite foreign keys binding entries and draws
+//! to a live giveaway (missing parents fail, live children refuse a
+//! parent delete, the child-first store delete still succeeds).
 
 use sqlx::types::time::OffsetDateTime;
 use two_bot_core::giveaway_store as store;
@@ -556,6 +558,56 @@ async fn non_open_giveaways_are_never_due() -> Result<(), sqlx::Error> {
             .map(|row| row.id),
         None
     );
+    fixture.close().await.expect("drop test database");
+    Ok(())
+}
+
+#[tokio::test]
+async fn child_rows_stay_bound_to_their_giveaway() -> Result<(), sqlx::Error> {
+    let Some(fixture) = connect("child_rows_stay_bound_to_their_giveaway").await else {
+        return Ok(());
+    };
+    let pool = fixture.pool().clone();
+    // Entries and draws for a missing giveaway fail with a foreign-key
+    // violation instead of leaving orphan rows behind.
+    let missing_entry =
+        store::upsert_entry(&pool, GUILD, "gw-missing", "100000000000000001", at(1))
+            .await
+            .expect_err("entry without a giveaway must fail");
+    assert_sqlstate(&missing_entry, "23503");
+    let missing_draw = store::insert_draw(&pool, &new_draw("gw-missing", 0, None, SEED_0))
+        .await
+        .expect_err("draw without a giveaway must fail");
+    assert_sqlstate(&missing_draw, "23503");
+    // Deleting a giveaway with live children is refused: the foreign key
+    // fails closed instead of orphaning rows, and `delete_giveaway` (which
+    // removes children first) still succeeds.
+    store::create_giveaway(&pool, &new_giveaway("gw01h455k", at(900))).await?;
+    assert!(store::upsert_entry(&pool, GUILD, "gw01h455k", "100000000000000001", at(1)).await?);
+    store::insert_draw(&pool, &new_draw("gw01h455k", 0, None, SEED_0)).await?;
+    let refused = sqlx::query("DELETE FROM giveaways WHERE guild_id = $1 AND id = $2")
+        .bind(GUILD)
+        .bind("gw01h455k")
+        .execute(&pool)
+        .await
+        .expect_err("parent delete with live children must fail");
+    assert_sqlstate(&refused, "23503");
+    assert!(store::delete_giveaway(&pool, GUILD, "gw01h455k").await?);
+    let entries: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM giveaway_entries WHERE guild_id = $1 AND giveaway_id = $2",
+    )
+    .bind(GUILD)
+    .bind("gw01h455k")
+    .fetch_one(&pool)
+    .await?;
+    let draws: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM giveaway_draws WHERE guild_id = $1 AND giveaway_id = $2",
+    )
+    .bind(GUILD)
+    .bind("gw01h455k")
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!((entries, draws), (0, 0), "explicit delete removes all rows");
     fixture.close().await.expect("drop test database");
     Ok(())
 }
