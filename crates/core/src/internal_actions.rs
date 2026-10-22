@@ -2843,7 +2843,7 @@ mod tests {
         // shifting one entry between those classes. The stored invite-code
         // slice adds one hot key (TWO_GUILD_INVITE_CODE).
         for (class, expected) in [
-            (SettingClass::Hot, 44),
+            (SettingClass::Hot, 46),
             (SettingClass::Cold, 26),
             (SettingClass::EnvOnly, 64),
         ] {

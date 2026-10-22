@@ -94,6 +94,8 @@
   "TWO_MODERATION_AUDIT_SECRET": "Authentication secret for moderation audit handoff; never rendered.",
   "TWO_MODERATION_PROTECTED_ROLE_IDS": "Roles moderation may not target; strict comma-separated 17-20 digit snowflakes with no spaces or empty segments (empty segments and leading/trailing commas refused, padding refused); missing or empty means no roles.",
   "TWO_ONBOARDING_DRY_RUN": "Suppress onboarding role writes, legacy/anchor welcomes and session goodbyes. A stored non-0/1 rendering is ignored (deployment wins).",
+  "TWO_ONBOARDING_JOIN_ROLES": "Auto-role list: deployment comma-separated canonical nonzero role ids, stored JSON array of at most 10 distinct strings; never everyone. Stored overrides refresh per join, corrupt values disable grants. Session/dry-run suppress grants.",
+  "TWO_ONBOARDING_MEMBER_ROLE": "Member role granted by the Verify button: canonical nonzero role-id string, never everyone. Stored overrides refresh per press; corrupt values disable verification. Session/dry-run suppress grants.",
   "TWO_ONBOARDING_MODE": "Onboarding selector: legacy, session or anchor; session suppresses role writes.",
   "TWO_ONBOARDING_ROTA_MEASUREMENT": "Dropped staging rota measurement gate; env-only refusal is retained.",
   "TWO_ONBOARDING_ROTA_NOTICE": "Dropped staging rota notice gate; env-only refusal is retained.",

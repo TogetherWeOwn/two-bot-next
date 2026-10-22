@@ -33,6 +33,7 @@ pub enum AuditKind {
     VoiceLeave,
     VoiceMove,
     ModerationAction,
+    OnboardingRoleGrant,
 }
 
 impl AuditKind {
@@ -47,6 +48,7 @@ impl AuditKind {
             Self::VoiceLeave => "voice_leave",
             Self::VoiceMove => "voice_move",
             Self::ModerationAction => "moderation_action",
+            Self::OnboardingRoleGrant => "onboarding_role_grant",
         }
     }
 }

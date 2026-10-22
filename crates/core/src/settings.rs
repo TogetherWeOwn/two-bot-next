@@ -255,6 +255,8 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     ("TWO_COMMUNITY_TEST_ACTOR_IDS", SettingClass::Hot),
     ("TWO_COMMUNITY_WELCOME_CHANNEL_IDS", SettingClass::Hot),
     ("TWO_ONBOARDING_DRY_RUN", SettingClass::Hot),
+    ("TWO_ONBOARDING_JOIN_ROLES", SettingClass::Hot),
+    ("TWO_ONBOARDING_MEMBER_ROLE", SettingClass::Hot),
     ("TWO_SELF_ROLE_DRY_RUN", SettingClass::Hot),
     ("TWO_REDIRECT_FALLBACK_CODE", SettingClass::Hot),
     ("TWO_FEED_POLL_SECONDS", SettingClass::Hot),
@@ -987,6 +989,8 @@ pub enum WriteRefusal {
     NullCharacter,
     #[error("refused: {0} accepts only a boolean, 0 or 1")]
     InvalidGateValue(String),
+    #[error("refused: {0} requires canonical nonzero role ids, never everyone; join roles must be a distinct list of at most 10")]
+    InvalidRoleValue(String),
 }
 
 /// Dry-run gates the env parsers accept only as `0` or `1`; a stored value
@@ -1044,6 +1048,12 @@ pub fn validate_write(
             .is_some_and(|rendered| rendered != "0" && rendered != "1")
     {
         return Err(WriteRefusal::InvalidGateValue(key.to_owned()));
+    }
+    if value
+        .as_ref()
+        .is_some_and(|value| !crate::onboarding_roles::valid_setting(guild_id, key, value))
+    {
+        return Err(WriteRefusal::InvalidRoleValue(key.to_owned()));
     }
     Ok(ValidatedWrite {
         guild_id: guild_id.to_owned(),
@@ -1105,6 +1115,8 @@ mod tests {
         "TWO_JOIN_RISK_THRESHOLD",
         "TWO_JOIN_RISK_WINDOW_SECONDS",
         "TWO_ONBOARDING_DRY_RUN",
+        "TWO_ONBOARDING_JOIN_ROLES",
+        "TWO_ONBOARDING_MEMBER_ROLE",
         "TWO_RAID_JOIN_THRESHOLD",
         "TWO_RAID_WINDOW_SECONDS",
         "TWO_REDIRECT_FALLBACK_CODE",
@@ -1222,7 +1234,7 @@ mod tests {
             assert_eq!(classify_key(key), Some(SettingClass::EnvOnly), "{key}");
         }
         let expected_total = EXPECTED_HOT.len() + EXPECTED_COLD.len() + EXPECTED_ENV_ONLY.len();
-        assert_eq!(expected_total, 134, "tripwire lists must stay complete");
+        assert_eq!(expected_total, 136, "tripwire lists must stay complete");
         assert_eq!(
             SETTING_CLASSES.len(),
             expected_total,

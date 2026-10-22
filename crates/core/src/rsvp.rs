@@ -939,7 +939,7 @@ mod tests {
         let merged = merge_commands(&[feature_commands(), moderation_commands()], &[])
             .expect("slices merge cleanly");
         // 4 core + 16 feature + 9 moderation: nothing deduped away.
-        assert_eq!(merged.len(), 29);
+        assert_eq!(merged.len(), 30);
         let names: Vec<_> = merged.iter().map(|d| d.name.as_str()).collect();
         for name in ["attendance", "rsvp", "rsvp-attendance"] {
             assert_eq!(

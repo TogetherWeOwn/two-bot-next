@@ -172,6 +172,16 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             ],
         ),
         row(
+            "onboarding",
+            33,
+            E2eGate::Always,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "Onboarding",
+            "Deferred ephemeral admin configuration confirmation; fresh Manage Server check, safe bounded join/member role settings, or a Verify panel in the current visible text channel.",
+            &["Perm:ManageServerRequired", "Policy:LiveManageServer", "Valid:join-roles:max10,distinct,canonical,safe-role"],
+        ),
+        row(
             "attendance",
             12,
             E2eGate::Scorecard,

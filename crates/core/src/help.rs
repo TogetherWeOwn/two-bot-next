@@ -49,6 +49,12 @@ const HELP_GROUPS: &[HelpGroup] = &[
         anchor: None,
     },
     HelpGroup {
+        title: "Onboarding",
+        requires: Some("Manage Server"),
+        commands: &["onboarding"],
+        anchor: None,
+    },
+    HelpGroup {
         title: "Privacy",
         requires: None,
         commands: &["privacy"],
@@ -274,7 +280,7 @@ mod tests {
         // to moderation `/kick`; `/templateassistant` stays unpublished
         // until its slice lands): matches the regenerated `docs/commands.md`
         // total.
-        assert!(text.contains("**Server commands** (50 live)"));
+        assert!(text.contains("**Server commands** (51 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"
@@ -326,7 +332,7 @@ mod tests {
         });
         let defs = off.publish_set(&[]).expect("core-only set");
         let text = help_text(&defs);
-        assert!(text.contains("**Server commands** (4 live)"));
+        assert!(text.contains("**Server commands** (5 live)"));
         assert!(text.contains("/rank"));
         assert!(text.contains("/help"));
         assert!(!text.contains("Automations"));
@@ -398,7 +404,7 @@ mod tests {
         // Next-only privacy command, then the 21 voice names (voice `kick`
         // shares the Kick group). `/templateassistant` stays out until its
         // slice lands.
-        assert_eq!(grouped.len(), 50);
+        assert_eq!(grouped.len(), 51);
         for name in [
             "rank",
             "leaderboard",

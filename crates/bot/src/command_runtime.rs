@@ -1401,6 +1401,7 @@ impl CommandRuntime {
         // first, so an owner-map entry could never execute.
         let owner = match name.as_str() {
             "privacy" => Some(HandlerId::Privacy),
+            "onboarding" => Some(HandlerId::Onboarding),
             "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list" => {
                 Some(HandlerId::AutomationAdmin)
             }
@@ -1430,6 +1431,22 @@ impl CommandRuntime {
             return;
         }
         match name.as_str() {
+            "onboarding" => {
+                if crate::onboarding::admin_command(
+                    &self.pool,
+                    &self.executor,
+                    self.guild_id,
+                    interaction,
+                )
+                .await
+                .is_err()
+                {
+                    let _ = self.executor.edit_interaction_response_with_blocked_retry(
+                        interaction.application_id.get(), &interaction.token,
+                        "I couldn't confirm the onboarding change. Check the configuration before trying again.",
+                    ).await;
+                }
+            }
             "privacy" => {
                 crate::privacy_command::privacy_command(&self.pool, &self.executor, interaction)
                     .await;
@@ -2432,6 +2449,7 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     // `/privacy` member self-serve is never activation-fenced either: every
     // member may opt out of analytics in any guild.
     router.register(Box::new(SliceHandler(HandlerId::Privacy)));
+    router.register(Box::new(SliceHandler(HandlerId::Onboarding)));
     router
 }
 

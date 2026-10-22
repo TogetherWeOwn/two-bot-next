@@ -683,6 +683,7 @@ const KINDS: &[&str] = &[
     "voice_leave",
     "voice_move",
     "moderation_action",
+    "onboarding_role_grant",
 ];
 
 fn stored(row: &PgRow) -> Result<StoredAudit, AuditStoreError> {
@@ -694,6 +695,7 @@ fn stored(row: &PgRow) -> Result<StoredAudit, AuditStoreError> {
         "voice_leave" => AuditKind::VoiceLeave,
         "voice_move" => AuditKind::VoiceMove,
         "moderation_action" => AuditKind::ModerationAction,
+        "onboarding_role_grant" => AuditKind::OnboardingRoleGrant,
         _ => return Err(AuditStoreError::Invalid("operational kind")),
     };
     Ok(StoredAudit {
