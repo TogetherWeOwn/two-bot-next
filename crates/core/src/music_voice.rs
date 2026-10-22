@@ -154,6 +154,15 @@ impl VoicePairing {
         self.by_guild.remove(&guild_id);
     }
 
+    /// Whether `guild_id` holds a live entry (pending or complete).
+    ///
+    /// Callers use this to tell a leave that drops a real handshake from
+    /// a leave (or a redelivered leave) that clears nothing.
+    #[must_use]
+    pub fn contains(&self, guild_id: Snowflake) -> bool {
+        self.by_guild.contains_key(&guild_id)
+    }
+
     /// The complete handshake for `guild_id`, if both halves arrived.
     #[must_use]
     pub fn complete(&self, guild_id: Snowflake) -> Option<PlayerVoiceUpdate> {
@@ -236,6 +245,16 @@ mod tests {
             );
         }
         assert!(!MusicGates::from_map(&HashMap::new()).enabled);
+    }
+
+    #[test]
+    fn contains_tracks_live_guild_entries() {
+        let mut pairing = VoicePairing::new();
+        assert!(!pairing.contains(10), "empty cache holds no guild");
+        pairing.observe_server(10, "token", "endpoint");
+        assert!(pairing.contains(10), "a pending half is a live entry");
+        pairing.observe_state(10, "session", None);
+        assert!(!pairing.contains(10), "leave drops the guild entry");
     }
 
     #[test]

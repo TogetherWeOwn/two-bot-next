@@ -45,6 +45,8 @@ mod db_log;
 mod discord_test_common;
 mod dispatch;
 #[cfg(test)]
+mod drop_poison_test_serial;
+#[cfg(test)]
 mod duplicate_pool_registration_acceptance_tests;
 mod erasure_cli;
 mod event_cli;
@@ -92,6 +94,7 @@ mod member_runtime;
 mod metrics_http;
 mod moderation_cli;
 mod moderation_release_cli;
+mod music_capture;
 #[cfg(test)]
 mod observability_event_conformance_tests;
 mod onboarding;
@@ -122,6 +125,8 @@ mod schedule_runtime;
 mod scheduled_jobs;
 mod server;
 mod settings_jobs;
+#[cfg(test)]
+mod stale_control_expired_reply_acceptance_tests;
 // TOG-10292: boot composes the gated service below; fixture-only seams keep
 // the module-level allowance.
 #[allow(dead_code)]
@@ -823,6 +828,11 @@ async fn run(cli_args: &[String]) {
                             Box::pin(async move { voice.kick_vote(interaction).await })
                         }));
                     }
+                    // Staging-only music voice-update capture (dry-run): wraps
+                    // the voice sink so VoiceServerUpdate/self VoiceStateUpdate
+                    // feed the Lavalink pairing without touching rooms. Inert
+                    // unless TWO_MUSIC=1; the tap refuses non-staging guilds.
+                    let voice = music_capture::MusicVoiceTap::wrap(voice, Some(guild_id));
 
                     let intents = intents_from_env(&activation);
                     // Voice-room game names need GUILD_PRESENCES; record

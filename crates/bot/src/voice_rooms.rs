@@ -7424,7 +7424,17 @@ pub trait VoiceEventSink: Send + Sync {
     fn presence(&self, update: &twilight_model::gateway::payload::incoming::PresenceUpdate);
     /// Invalidate occupancy immediately on connection loss, including while an
     /// actor is awaiting SQL, HTTP or token-global rate-limit backoff.
+    /// Live path: panics on a poisoned registry (fail loud).
     fn disconnect(&self);
+    /// Drop-only `disconnect` for `VoiceConnectionGuard::drop`: recovers a
+    /// poisoned registry with one counted `voice_connection_guard`
+    /// increment instead of panicking (which would abort the process when
+    /// the drop runs during unwinding). Every production sink overrides
+    /// this; the default forwards to loud `disconnect` for lock-free test
+    /// doubles only.
+    fn disconnect_from_drop(&self) {
+        self.disconnect();
+    }
     /// A cold RESUME has replayed durably but cannot populate a fresh cache.
     /// The supervisor must IDENTIFY after committing RESUMED, not before replay.
     fn needs_bootstrap(&self, cache: &DefaultInMemoryCache) -> bool;
@@ -8622,17 +8632,32 @@ where
         // Clear before invalidating the views so a concurrent dispatch
         // cannot heal a view this transport loss is about to invalidate.
         self.gateway_connected.store(false, Ordering::Release);
-        // Drop-reachable (`VoiceConnectionGuard::drop` via `VoiceEventSink`)
-        // and shared with live disconnects: recover silently so a poisoned
-        // registry still invalidates its views instead of panicking during
-        // unwinding. No counter: non-drop callers must never be miscounted
-        // as drop poison.
-        for actor in self
-            .actors
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .values()
-        {
+        // Live path (transport loss): fail loud on a poisoned registry.
+        // `VoiceConnectionGuard::drop` must never call this; it calls
+        // `disconnect_from_drop` through the sink instead.
+        let actors = self.actors.lock().expect("voice runtime lock");
+        self.disconnect_locked(&actors);
+    }
+
+    /// Drop-only `disconnect`: panicking inside `drop` aborts the process
+    /// when the drop runs during unwinding, so a poisoned registry is
+    /// recovered with one counted `voice_connection_guard` increment
+    /// instead. Called only from `VoiceConnectionGuard::drop` (through
+    /// `VoiceEventSink::disconnect_from_drop`); live callers use loud
+    /// `disconnect`.
+    pub fn disconnect_from_drop(&self) {
+        // Clear before invalidating the views so a concurrent dispatch
+        // cannot heal a view this transport loss is about to invalidate.
+        self.gateway_connected.store(false, Ordering::Release);
+        let actors = two_bot_core::metrics::recover_drop_poison(
+            self.actors.lock(),
+            "voice_connection_guard",
+        );
+        self.disconnect_locked(&actors);
+    }
+
+    fn disconnect_locked(&self, actors: &HashMap<Snowflake, GuildActor>) {
+        for actor in actors.values() {
             actor.live.transport_lost();
         }
         // Game-activity wiring: transport loss invalidates live voice state,
@@ -8930,6 +8955,10 @@ where
 
     fn disconnect(&self) {
         VoiceRuntime::disconnect(self);
+    }
+
+    fn disconnect_from_drop(&self) {
+        VoiceRuntime::disconnect_from_drop(self);
     }
 
     fn needs_bootstrap(&self, cache: &DefaultInMemoryCache) -> bool {
@@ -10293,8 +10322,8 @@ pub fn decide_create_channel(request: CreateChannelRequest) -> CreateChannelPlan
 }
 
 /// `/textchannels` input after parsing. Unset options keep the stored value;
-/// `enabled` defaults to on, so naming a channel or role also switches the
-/// companions on.
+/// an absent `enabled` never switches the companions on, so naming a
+/// channel or role alone leaves the toggle untouched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextChannelsRequest {
     pub enabled: Option<bool>,
@@ -10323,7 +10352,9 @@ pub fn decide_text_channels(
     let Some(mut creator) = creator else {
         return refuse("That channel is not a voice-room creator. Pick one made with /create.");
     };
-    creator.text_channels = request.enabled.unwrap_or(true);
+    if let Some(enabled) = request.enabled {
+        creator.text_channels = enabled;
+    }
     if let Some(name) = &request.name {
         if !is_usable_channel_name(name) {
             return TextChannelsPlan::Refuse {
@@ -10391,7 +10422,8 @@ pub fn decide_position(creator: Option<CreatorChannel>, request: &PositionReques
     PositionPlan::Update(creator)
 }
 
-/// `/group` input after parsing. An omitted toggle turns grouping on.
+/// `/group` input after parsing. An omitted toggle refuses: the request
+/// carries nothing else, so there is nothing to apply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupRequest {
     pub enabled: Option<bool>,
@@ -10413,7 +10445,10 @@ pub fn decide_group(creator: Option<CreatorChannel>, request: &GroupRequest) -> 
     let Some(mut creator) = creator else {
         return refuse("That channel is not a voice-room creator. Pick one made with /create.");
     };
-    creator.group_by_category = request.enabled.unwrap_or(true);
+    let Some(enabled) = request.enabled else {
+        return refuse("Choose whether to group rooms by category, then try again.");
+    };
+    creator.group_by_category = enabled;
     if creator.validate().is_err() {
         return refuse("Those grouping settings are not valid. Try again.");
     }
@@ -10627,7 +10662,8 @@ pub fn decide_default_limit(
     DefaultLimitPlan::Update(creator)
 }
 
-/// `/alwaysprivate` input after parsing. An omitted toggle turns it on.
+/// `/alwaysprivate` input after parsing. An omitted toggle refuses: the
+/// request carries nothing else, so there is nothing to apply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlwaysPrivateRequest {
     pub enabled: Option<bool>,
@@ -10652,7 +10688,10 @@ pub fn decide_always_private(
     let Some(mut creator) = creator else {
         return refuse("That channel is not a voice-room creator. Pick one made with /create.");
     };
-    creator.private_default = request.enabled.unwrap_or(true);
+    let Some(enabled) = request.enabled else {
+        return refuse("Choose whether new rooms start private, then try again.");
+    };
+    creator.private_default = enabled;
     if creator.validate().is_err() {
         return refuse("Those privacy settings are not valid. Try again.");
     }
@@ -11846,6 +11885,33 @@ fn parse_vote_button(custom_id: &str) -> Option<VoiceCommand> {
         _ => return None,
     };
     Some(VoiceCommand::Ballot { vote_id, ballot })
+}
+
+/// Whether the voice sink claims this component/modal id, so the shared
+/// stale-control path must stay silent instead of answering expired. Covers the
+/// same shapes the sink parses: bare `two:voice:` ids, runtime join buttons
+/// with the 32-hex worker-epoch suffix (via `split_runtime_join_id`, shared
+/// with `join_component_action`), and `votekick:` ballots (via
+/// `parse_vote_button`). A prefix alone never claims ownership.
+#[must_use]
+pub fn voice_claims_custom_id(custom_id: &str) -> bool {
+    if parse_voice_custom_id(custom_id).is_some() {
+        return true;
+    }
+    if split_runtime_join_id(custom_id).is_some_and(|(core, epoch)| {
+        epoch.is_some()
+            && matches!(
+                parse_voice_custom_id(core),
+                Some(
+                    VoiceAction::JoinApprove { .. }
+                        | VoiceAction::JoinDeny { .. }
+                        | VoiceAction::JoinBlock { .. }
+                )
+            )
+    }) {
+        return true;
+    }
+    parse_vote_button(custom_id).is_some()
 }
 
 /// Button custom ID for one ballot. Inverse of [`parse_vote_button`].
@@ -13910,6 +13976,10 @@ where
         self.runtime.disconnect();
     }
 
+    fn disconnect_from_drop(&self) {
+        self.runtime.disconnect_from_drop();
+    }
+
     fn needs_bootstrap(&self, cache: &DefaultInMemoryCache) -> bool {
         self.runtime.needs_bootstrap(cache)
     }
@@ -13938,7 +14008,8 @@ pub use private_runtime::PrivacyCommand;
 
 mod join_requests;
 use join_requests::{
-    handle_join_interaction, join_component_action, JoinDecisionCommand, JoinReply,
+    handle_join_interaction, join_component_action, split_runtime_join_id, JoinDecisionCommand,
+    JoinReply,
 };
 
 #[cfg(test)]

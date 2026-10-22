@@ -473,9 +473,18 @@
       "sha256": "48ba8d98eb8ee340cf97e8bacd4b6e61a70658de6c68fa04ba97b46e7c2fd8d8",
       "justification": "Bump reminders: new table bump_reminders(guild_id, channel_id, fires_at TIMESTAMPTZ, fired BOOLEAN; PK(guild_id)) holding one pending reminder per guild; fresh bumps upsert-replace, expiry claims atomically. Additive, IF NOT EXISTS, inline PK with no secondary index; numbered 0455 as the next free global migration; rollback drops the table."
     },
-    "crates/store/migrations/0456_bump_reminders.sql": {
-      "sha256": "bcdb624806a70bc99f4fb2523f09e078207ffa946bdd605b8248f97094c97078",
-      "justification": "Store-chain copy of the bump_reminders pending layer (cutover 0455): one new table, IF NOT EXISTS, no writes to existing tables. Numbered 0456 because cutover owns 0455; global migration numbers remain unique across both chains."
+    "crates/cutover/migrations/0456_admin_api_tokens.sql": {
+      "sha256": "3452a9adac7ee312a3f10f4150d34effff441e3fac32931a1e8bc08860ac4be2",
+      "justification": "Admin API scoped-token registry (slice 0): new table with shaped token id, 64-lowercase-hex secret_hash CHECK, closed-set scopes, non-empty guild_ids with NULL elements refused, ordered issued/expires bounds and nullable revoked/last_used; live-lookup index on (revoked_at, expires_at). Hardened before first merge; additive IF NOT EXISTS, no binary reads it yet; rollback drops the table. Numbered 0456 after main claimed 0452/0453 for tombstones and 0454 for sticky uncertainty during review; never merged or deployed under the old numbers. SQL body unchanged."
+    },
+    "crates/store/migrations/0457_admin_api_tokens.sql": {
+      "sha256": "622bcbc5cfc2561432290c293e15d30d89997435970088c6e4c01f37e20f962d",
+      "justification": "Store-chain mirror of cutover 0456, including the pre-merge 64-lowercase-hex secret_hash CHECK and refusal of NULL guild elements: identical table and index, IF NOT EXISTS, no writes to existing tables. Numbered 0457 because cutover owns 0456; global migration numbers remain unique across both chains. Renumbered before first merge after main claimed 0454; SQL body unchanged."
+    },
+    "crates/store/migrations/0458_bump_reminders.sql": {
+      "sha256": "d0b4c5a87e841aa163eedfa9674b9193d77dba9eed70d970ce264516d5da6521",
+      "justification": "Store-chain copy of the bump_reminders pending layer (cutover 0455): one new table, IF NOT EXISTS, no writes to existing tables. Renumbered from 0456 to 0458 before first merge because main owns admin-token migrations 0456/0457; SQL body unchanged and global migration numbers remain unique across both chains."
+
     }
   }
 }

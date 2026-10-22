@@ -662,7 +662,7 @@ struct VoiceConnectionGuard(Option<Arc<dyn VoiceEventSink>>);
 impl Drop for VoiceConnectionGuard {
     fn drop(&mut self) {
         if let Some(voice) = &self.0 {
-            voice.disconnect();
+            voice.disconnect_from_drop();
         }
     }
 }
@@ -889,7 +889,7 @@ fn apply_dispatch<I: InviteSource>(
             (None, Some(dispatch)) => (
                 two_bot_discord::automod::event_to_automod(
                     &dispatch.event,
-                    crate::automod_gateway::receipt_ms(&dispatch.observed_at),
+                    crate::automod_gateway::received_at_ms(&dispatch.observed_at)?,
                 )?,
                 dispatch.observed_at.clone(),
             ),
@@ -1440,7 +1440,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         // A partial MESSAGE_UPDATE omits fields a full Twilight
                         // Message needs: decode its raw IDs before parsing.
                         let edit = if automod_enabled {
-                            crate::automod_gateway::partial_edit(&text, crate::automod_gateway::receipt_ms(&observed_at))
+                            crate::automod_gateway::partial_edit_received(&text, &observed_at)
                                 .map(|delivery| Box::new((delivery, observed_at.clone())))
                         } else {
                             None
@@ -2144,6 +2144,10 @@ pub async fn build_voice_runtime(
 #[cfg(test)]
 #[path = "gateway_drop_poison_acceptance_tests.rs"]
 mod drop_poison_acceptance_tests;
+
+#[cfg(test)]
+#[path = "gateway_drop_poison_counter_acceptance_tests.rs"]
+mod drop_poison_counter_acceptance_tests;
 
 #[cfg(test)]
 mod tests {
