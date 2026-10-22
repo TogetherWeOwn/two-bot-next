@@ -142,7 +142,9 @@ WORKER_PREFIX = "wrangler/"
 # smoke-surface-inventory for the same family of smoke content reads),
 # privacy/database-roles/rollback-delta/backup by the voice owner-grant
 # journal documentation regression
-# (crates/core/tests/voice_owner_grants_docs.rs).
+# (crates/core/tests/voice_owner_grants_docs.rs), tickets by the ticket
+# component admission acceptance suite (include_str! in
+# crates/bot/src/ticket_component_admission_acceptance_tests.rs).
 # parity.md and the baseline also gate parity-docs. Existence-only docs
 # (staging-soak/preflight: the preconditions binary checks is_file,
 # never content) and runbook/container-readiness (worker tests only) fall
@@ -165,6 +167,7 @@ RUST_DOCS = frozenset({
     "docs/database-roles.md",
     "docs/rollback-delta.md",
     "docs/backup.md",
+    "docs/tickets.md",
 })
 PARITY_DOCS = frozenset({
     "docs/parity.md",
