@@ -5,7 +5,8 @@ use two_bot_core::command_permissions::{
     command_permission, CommandSurface, PolicyHook, COMMAND_PERMISSIONS,
 };
 use two_bot_core::{
-    CustomCommand, InteractionRouter, ModerationAction, RouterGates, SlashContext, SlashOutcome,
+    CustomCommand, HandlerId, InteractionRouter, ModerationAction, RouterGates, SlashContext,
+    SlashOutcome,
 };
 
 const GUILD: u64 = 2222;
@@ -198,6 +199,55 @@ fn every_retained_command_rechecks_resolved_permissions_before_returning_a_handl
             );
         }
     }
+}
+
+#[test]
+fn every_routed_builtin_name_has_a_permission_row() {
+    let router = InteractionRouter::new(all_on());
+    let published = router.publish_set(&[]).unwrap();
+    let mut universe: HashSet<&str> = published
+        .iter()
+        .map(|definition| definition.name.as_str())
+        .collect();
+    universe.extend(
+        COMMAND_PERMISSIONS
+            .iter()
+            .filter(|row| row.surface == CommandSurface::BuiltinSlash)
+            .map(|row| row.command),
+    );
+    universe.extend(
+        ModerationAction::ALL
+            .iter()
+            .map(|action| action.command_name()),
+    );
+    // The router safety argument, pinned: `permission_allowed` unwraps the
+    // permission row for every name `route_builtin` matches, so each one must
+    // resolve. Probing through `route_slash` with no custom row keeps an
+    // unrouted name visible as `Unknown` instead of the custom fallthrough.
+    let mut routed = 0;
+    for name in universe {
+        match router.route_slash(&SlashContext {
+            name,
+            guild_id: Some(GUILD),
+            actor_permissions: Some(u64::MAX),
+            custom_row: None,
+        }) {
+            SlashOutcome::Handled { handler } => {
+                assert_ne!(
+                    handler,
+                    HandlerId::AutomationCustom,
+                    "{name} fell through to the custom path"
+                );
+                assert!(
+                    command_permission(name).is_some(),
+                    "{name} routes as a builtin but has no permission row"
+                );
+                routed += 1;
+            }
+            other => panic!("{name} is published or retained but does not route: {other:?}"),
+        }
+    }
+    assert_eq!(routed, 29, "every retained builtin routes");
 }
 
 #[test]

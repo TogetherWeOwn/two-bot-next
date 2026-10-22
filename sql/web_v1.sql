@@ -149,6 +149,17 @@ LEFT JOIN LATERAL (
 ORDER BY l.rank_order;
 
 -- ---------------------------------------------------------------------------
+-- rank_ladder - one row per rung, the Discord role id behind each rank
+-- ---------------------------------------------------------------------------
+--
+-- Thin on purpose: rank_counts carries the aggregates, this carries the rung's
+-- role id so rank cards can point at the Discord role. role_id stays NULL
+-- until the rank collector matches the rung to a guild role; a NULL is an
+-- unmatched rung, never a missing one.
+CREATE OR REPLACE VIEW web_v1.rank_ladder AS
+SELECT rank_key, role_id FROM rank_ladder;
+
+-- ---------------------------------------------------------------------------
 -- members - one row per human member, for profile pages
 -- ---------------------------------------------------------------------------
 --

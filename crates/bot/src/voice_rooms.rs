@@ -3021,6 +3021,7 @@ pub struct GuildRoomWorker<S, H> {
     /// button carries only that ID; guild, room and target come from here, never
     /// from the payload.
     vote_refs: HashMap<Snowflake, VoteKickRef>,
+    kick_ballots: HashMap<Snowflake, kick_ballots::KickBallot>,
     active_votes: Vec<VoteKickRef>,
     /// Who started each vote this session, by vote ID. The vote core binds the
     /// target but not the initiator, and every audit row names both.
@@ -3329,6 +3330,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             halted_by_discord: false,
             votes: VoteKickCore::new(),
             vote_refs: HashMap::new(),
+            kick_ballots: HashMap::new(),
             active_votes: Vec::new(),
             vote_initiators: HashMap::new(),
             fenced_initiators: HashSet::new(),
@@ -4571,6 +4573,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// result once, and queue the room-scoped enforcement exactly once (the
     /// core emits the decision only on the first transition to passed).
     fn settle_vote(&mut self, update: VoteKickUpdate) -> VoteKickUpdate {
+        self.kick_ballots
+            .entry(update.vote.id)
+            .or_insert_with(|| kick_ballots::KickBallot::new(update))
+            .update = update;
         if update.status != VoteKickStatus::Active {
             // A finished vote answers later ballots with its terminal status;
             // only the pass that still held it active records the result.
@@ -4625,10 +4631,15 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         self.vote_refs.remove(&vote_id);
         if self.queue.has_queued_kick(vote_id)
             || self.active_votes.iter().any(|vote| vote.id == vote_id)
+            || self
+                .kick_ballots
+                .get(&vote_id)
+                .is_some_and(kick_ballots::KickBallot::pending)
         {
             self.fenced_initiators.insert(vote_id);
         } else {
             self.vote_initiators.remove(&vote_id);
+            self.kick_ballots.remove(&vote_id);
         }
     }
 
@@ -4647,11 +4658,16 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .filter(|vote_id| {
                 !self.queue.has_queued_kick(*vote_id)
                     && !self.active_votes.iter().any(|vote| vote.id == *vote_id)
+                    && !self
+                        .kick_ballots
+                        .get(vote_id)
+                        .is_some_and(kick_ballots::KickBallot::pending)
             })
             .collect();
         for vote_id in released {
             self.fenced_initiators.remove(&vote_id);
             self.vote_initiators.remove(&vote_id);
+            self.kick_ballots.remove(&vote_id);
         }
         for evicted in self.votes.drain_evicted() {
             self.forget_vote_maps(evicted);
@@ -4694,6 +4710,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             None,
         ));
         metrics::global().voice_vote_kick(outcome.as_str());
+        self.correct_kick_ballot(vote_id, outcome);
     }
 
     /// Append buffered audit rows, one batch per call. Driven by the actor's
@@ -4921,6 +4938,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             };
             let update = self.settle_vote(update);
             if update.status != VoteKickStatus::Active {
+                self.enqueue_kick_ballot(update);
                 finished.push(update);
             }
         }
@@ -5502,6 +5520,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             // write is due and the guild is not rate limited.
             if self.queue.backed_off(self.live.guild_id, now_ms) {
                 return false;
+            }
+            if self.dispatch_kick_ballot(now_ms).await {
+                return true;
             }
             return self.dispatch_voice_status(now_ms).await;
         };
@@ -7324,7 +7345,12 @@ enum ActorCommand {
         vote_id: Snowflake,
         voter_id: Snowflake,
         ballot: VoteBallot,
-        reply: oneshot::Sender<KickReply>,
+        reply: oneshot::Sender<Result<InteractionResponse, KickRefusal>>,
+    },
+    /// Bind the public callback message after its send, retaining no token.
+    KickMessage {
+        vote_id: Snowflake,
+        message: MessageRef,
     },
     /// V4: resolve the tracked room a member is currently in, if any. The
     /// shared router uses this to tell vote-kick targets (voice owns the
@@ -8094,7 +8120,7 @@ where
         vote_id: Snowflake,
         voter_id: Snowflake,
         ballot: VoteBallot,
-    ) -> Option<KickReply> {
+    ) -> Option<Result<InteractionResponse, KickRefusal>> {
         let actor = self.live_actor(guild)?;
         let (reply, inbox) = oneshot::channel();
         actor
@@ -8107,6 +8133,23 @@ where
             })
             .ok()?;
         inbox.await.ok()
+    }
+
+    fn kick_message(&self, guild: Snowflake, vote_id: Snowflake, message: MessageRef) -> bool {
+        let queued = self.live_actor(guild).is_some_and(|actor| {
+            actor
+                .tx
+                .send(ActorCommand::KickMessage { vote_id, message })
+                .is_ok()
+        });
+        if !queued {
+            warn!(
+                guild = guild.to_string(),
+                vote_id = vote_id.to_string(),
+                "voice ballot reference not queued: actor unavailable"
+            );
+        }
+        queued
     }
 
     /// Resolve the tracked room a member is currently in, if any. `None`
@@ -9473,7 +9516,13 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             ballot,
             reply,
         } => {
-            let _ = reply.send(worker.kick_cast(vote_id, voter_id, ballot, now_ms));
+            let response = worker
+                .kick_cast(vote_id, voter_id, ballot, now_ms)
+                .map(|update| worker.kick_ballot_response(&update));
+            let _ = reply.send(response);
+        }
+        ActorCommand::KickMessage { vote_id, message } => {
+            worker.bind_kick_message(vote_id, message);
         }
         ActorCommand::KickRoomOf { member, reply } => {
             let _ = reply.send(worker.kick_room_of(member));
@@ -12283,8 +12332,8 @@ where
                     ))
                     .await;
                 }
-                Some(Ok(update)) => {
-                    reply(vote_update_message(&update)).await;
+                Some(Ok(response)) => {
+                    reply(response).await;
                 }
                 Some(Err(refusal)) => {
                     reply(ephemeral_response(kick_refusal_text(&refusal))).await;
@@ -13083,9 +13132,27 @@ pub trait InteractionReplies: Send + Sync {
         interaction: &Interaction,
         response: InteractionResponse,
     ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
+    /// Read the public initial response after its callback, retaining only its
+    /// channel/message IDs. Writers without this capability leave no binding.
+    fn original_message(
+        &self,
+        interaction: &Interaction,
+    ) -> impl Future<Output = Result<Option<MessageRef>, RoomHttpError>> + Send {
+        let _ = interaction;
+        async { Ok(None) }
+    }
 }
 
 impl InteractionReplies for RoomHttp {
+    async fn original_message(
+        &self,
+        interaction: &Interaction,
+    ) -> Result<Option<MessageRef>, RoomHttpError> {
+        self.interaction_message(interaction.application_id, &interaction.token)
+            .await
+            .map(Some)
+    }
+
     async fn defer(&self, interaction: &Interaction) -> Result<(), RoomHttpError> {
         let response = InteractionResponse {
             kind: InteractionResponseType::DeferredChannelMessageWithSource,
@@ -13296,9 +13363,30 @@ where
             let response =
                 Self::capture_response(runtime, interaction, invite_code, inventory.as_ref()).await;
             if let Some(response) = response {
+                let updated = response.kind == InteractionResponseType::UpdateMessage;
                 if let Err(error) = replies.respond(interaction, response).await {
                     warn!(interaction_id = interaction.id.get().to_string(), %error,
                         "voice ballot response failed; not retried");
+                }
+                if updated {
+                    if let (
+                        Some(VoiceCommand::Ballot { vote_id, .. }),
+                        Some(guild),
+                        Some(message),
+                    ) = (
+                        runtime.parse_voice_command(interaction),
+                        interaction_guild(interaction),
+                        interaction.message.as_ref(),
+                    ) {
+                        runtime.kick_message(
+                            guild,
+                            vote_id,
+                            MessageRef {
+                                channel_id: message.channel_id.get(),
+                                message_id: message.id.get(),
+                            },
+                        );
+                    }
                 }
             }
             return;
@@ -13385,9 +13473,26 @@ where
         let Some(response) = Self::capture_response(runtime, interaction, None, None).await else {
             return false;
         };
+        let public_ballot = response.kind == InteractionResponseType::ChannelMessageWithSource
+            && response
+                .data
+                .as_ref()
+                .is_some_and(|data| data.components.is_some());
         if let Err(error) = replies.respond(interaction, response).await {
             warn!(interaction_id = interaction.id.get().to_string(), %error,
                 "voice vote response failed; not retried");
+        }
+        if public_ballot {
+            // Even an ambiguous callback may have posted the ballot. This GET
+            // cannot create a duplicate and tokens never enter worker state.
+            match replies.original_message(interaction).await {
+                Ok(Some(message)) => {
+                    runtime.kick_message(guild, interaction.id.get(), message);
+                }
+                Ok(None) => {}
+                Err(error) => warn!(interaction_id = interaction.id.get().to_string(), %error,
+                    "voice ballot reference unavailable; not retried"),
+            }
         }
         true
     }
@@ -13527,6 +13632,7 @@ where
 /// Public so the binary's voice boot can spawn [`flush_loop`](game_activity::flush_loop);
 /// the aggregates stay guild-level-only (never a per-member row, reader or view).
 pub mod game_activity;
+mod kick_ballots;
 #[path = "voice_rooms_limit.rs"]
 mod limit;
 mod presence;

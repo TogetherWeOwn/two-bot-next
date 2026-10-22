@@ -84,17 +84,39 @@ class TrackerUnitTests(unittest.TestCase):
             self.assertNotIn(secret, body)
         self.assertIn(tracker.RUNBOOK_URL, body)
 
-    def test_unconfigured_exits_zero_with_warning(self):
-        evidence = str(self.dir / "evidence.json")
-        with mock.patch("sys.stdout") as stdout:
-            code = tracker.main(
-                ["--evidence-out", evidence, "--exposition-out",
-                 str(self.dir / "expo.prom")],
-                base_env({"STAGING_WORKER_URL": "", "METRICS_SCRAPE_TOKEN": ""}))
-        self.assertEqual(code, 0)
-        self.assertIn("warning", stdout.write.call_args_list[0].args[0])
-        stored = json.loads(Path(evidence).read_text())
-        self.assertEqual(stored["verdict"], "unconfigured")
+    def test_unconfigured_fails_closed_naming_the_unset_binding(self):
+        cases = (
+            ({"STAGING_WORKER_URL": "", "METRICS_SCRAPE_TOKEN": ""},
+             ("STAGING_WORKER_URL", "METRICS_SCRAPE_TOKEN")),
+            ({"STAGING_WORKER_URL": "https://staging.example",
+              "METRICS_SCRAPE_TOKEN": ""}, ("METRICS_SCRAPE_TOKEN",)),
+            ({"STAGING_WORKER_URL": "",
+              "METRICS_SCRAPE_TOKEN": "token"}, ("STAGING_WORKER_URL",)),
+        )
+        for extra, missing in cases:
+            with self.subTest(missing=missing):
+                evidence = str(self.dir / "evidence.json")
+                with mock.patch("sys.stdout") as stdout:
+                    with mock.patch.object(
+                            tracker.urllib.request, "build_opener",
+                            side_effect=AssertionError("must not scrape")):
+                        with mock.patch(
+                                "subprocess.run",
+                                side_effect=AssertionError("gh must not run")):
+                            code = tracker.main(
+                                ["--evidence-out", evidence, "--exposition-out",
+                                 str(self.dir / "expo.prom")],
+                                base_env(extra))
+                self.assertEqual(code, 1)
+                out = stdout.write.call_args_list[0].args[0]
+                self.assertIn("::error::", out)
+                for name in missing:
+                    self.assertIn(name, out)
+                for name in set(extra) - set(missing):
+                    self.assertNotIn(name, out)
+                stored = json.loads(Path(evidence).read_text())
+                self.assertEqual(stored["verdict"], "unconfigured")
+                self.assertEqual(stored["action"], "none")
 
     def test_scrape_failure_never_reconciles(self):
         evidence = str(self.dir / "evidence.json")

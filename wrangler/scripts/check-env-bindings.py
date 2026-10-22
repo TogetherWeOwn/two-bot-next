@@ -99,6 +99,13 @@ VOICE_GATE_ENVS = {"staging"}
 # Operator-set Worker binding after the app's Presence Intent is on.
 VOICE_PRESENCE_VAR = "TWO_VOICE_PRESENCE"
 VOICE_PRESENCE_ENVS = {"staging"}
+# The music voice-node spike gate attaches the Lavalink voice-update
+# forwarder (docs/music-voice-node-spike.md). Staging-only like the voice
+# gate: a top-level var would be required in every environment, so it is
+# denied there too; production music is an explicit follow-up decision,
+# never a committed var.
+MUSIC_GATE_VAR = "TWO_MUSIC"
+MUSIC_GATE_ENVS = {"staging"}
 # TOG-22862 (CISO AC4): the mutating admin controls (PUT /ops/config,
 # POST /ops/kill-switch) stay dark unless the environment opts in with these
 # exact-"1" switches. A top-level var would be required in every environment,
@@ -220,6 +227,13 @@ def _collect_errors(cfg: dict) -> list[str]:
             )
         if variables.get(VOICE_PRESENCE_VAR, "1") != "1":
             errors.append(f'{prefix}: {VOICE_PRESENCE_VAR} must be exactly "1" or absent')
+        if MUSIC_GATE_VAR in variables and env_name not in MUSIC_GATE_ENVS:
+            errors.append(
+                f"{prefix}: {MUSIC_GATE_VAR} is staging-only "
+                "(top-level vars are required in every env; production music is a follow-up, never a committed var)"
+            )
+        if variables.get(MUSIC_GATE_VAR, "1") != "1":
+            errors.append(f'{prefix}: {MUSIC_GATE_VAR} must be exactly "1" or absent')
         if OPS_CONFIG_WRITES_VAR in variables and env_name not in OPS_CONFIG_WRITES_ENVS:
             errors.append(
                 f"{prefix}: {OPS_CONFIG_WRITES_VAR} is staging-only "

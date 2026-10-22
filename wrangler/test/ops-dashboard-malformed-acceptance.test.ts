@@ -140,6 +140,9 @@ function runPageScript(script: string, queue: QueuedResponse[]) {
     fetch: fetchImpl,
     setInterval: () => 0,
     clearInterval: () => {},
+    setTimeout: (fn: () => void, ms: number) => setTimeout(fn, ms).unref(),
+    clearTimeout,
+    AbortController,
     console,
   };
   vm.createContext(sandbox);

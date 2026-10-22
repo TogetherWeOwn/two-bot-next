@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 use twilight_model::id::Id;
-use two_bot_cutover::cli::{now_iso, open_db, Args};
+use two_bot_cutover::cli::{now_iso, open_db, parse_env_guild, Args, DB_POOL_HELP};
 use two_bot_cutover::rest::RestError;
 use two_bot_cutover::{
     attribute_joins, invite_growth, mark_bot, record_event, FunnelWrite, InviteState, RestClient,
@@ -31,13 +31,26 @@ fn vanity_presence(code: Result<Option<String>, RestError>) -> Result<bool, Rest
 async fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let args = Args::parse(&argv);
+    if args.has("help") {
+        println!(
+            "Usage: capture [--dry-run] [--discord-base <url>] [--allow-live-guild]\n\
+             Env: DISCORD_TOKEN (or DISCORD_BOT_TOKEN), DISCORD_GUILD_ID, TWO_DATABASE_URL.\n\
+             {DB_POOL_HELP}"
+        );
+        return;
+    }
     let dry_run = args.has("dry-run");
 
     let token = std::env::var("DISCORD_TOKEN")
         .or_else(|_| std::env::var("DISCORD_BOT_TOKEN"))
         .unwrap_or_default();
     let guild_id = std::env::var("DISCORD_GUILD_ID").unwrap_or_default();
-    if token.is_empty() || guild_id.is_empty() {
+    let guild: Id<twilight_model::id::marker::GuildMarker> =
+        Id::new(parse_env_guild(&guild_id).unwrap_or_else(|error| {
+            eprintln!("input error: {error}");
+            std::process::exit(2);
+        }));
+    if token.is_empty() {
         eprintln!("Missing DISCORD_BOT_TOKEN or DISCORD_GUILD_ID.");
         std::process::exit(2);
     }
@@ -69,7 +82,6 @@ async fn main() {
             std::process::exit(1);
         });
     let db = open_db(&args, false).await;
-    let guild: Id<twilight_model::id::marker::GuildMarker> = Id::new(guild_id.parse().unwrap_or(0));
 
     println!(
         "\nTWO capture{}",
