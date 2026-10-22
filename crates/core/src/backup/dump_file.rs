@@ -2510,7 +2510,7 @@ mod tests {
         future[0]["version"] = serde_json::json!(DUMP_VERSION + 1);
         let message = inspect_bytes(&gzip_lines(&future)).unwrap_err().to_string();
         assert!(
-            message.contains(&format!("reads 3, 4, 5, 6, 7, 8, 9 and {DUMP_VERSION}")),
+            message.contains(&format!("reads 3, 4, 5, 6, 7, 8, 9, 10 and {DUMP_VERSION}")),
             "unknown versions are refused with the readable list: {message}"
         );
     }
