@@ -5,16 +5,23 @@
   "protected_files": [
     {
       "path": "crates/discord/tests/lfg_lifecycle_acceptance.rs",
-      "sha256": "c91ea2107848586df07d988ecb3c83d337ac60580c0469c767cb3a13255d3c17"
+      "sha256": "dd3315ae6059d2d13f39c9b6610869a1d1d474781ec0af4da24d34db374eff1b"
+    },
+    {
+      "path": "crates/bot/src/lfg_lifecycle_jobs_acceptance.rs",
+      "sha256": "dac9b87f18eeaf2e7d7a34f0c0c46864ae7737d8063c239440daac97ea5f8"
     }
   ],
   "ownership": "Test Author owns corrections. Builder must not edit the protected corpus or this manifest; consume the immutable acceptance head and make the combined change green.",
   "test_target": "lfg_lifecycle_acceptance",
+  "supervisor_target": "two-bot bin unit lfg_lifecycle_jobs_acceptance",
   "new_acceptance_tests": 16,
-  "registration": "The existing workspace --test '*' integration lane runs this non-ignored db-feature target with TWO_TEST_DATABASE_URL. The included production jobs module also brings its existing scheduler unit controls into this binary.",
+  "registration": "The existing workspace --test '*' integration lane runs the non-ignored db-feature discord target (15 cases) with TWO_TEST_DATABASE_URL. The supervised-job case lives in the bot crate (registered via #[cfg(test)] mod in main.rs, the backfill-acceptance precedent) and runs in the workspace lib/bins unit lane with the same disposable-DB env. A source-path include of the binary's jobs.rs cannot compile: its #[cfg(test)] jobs_tests module resolves crate:: paths against the including test crate.",
   "commands": {
     "controller": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test lfg_lifecycle_acceptance -- --test-threads=1 --nocapture",
     "hosted_ci": "cargo test -p two-bot-discord --features db --locked --test lfg_lifecycle_acceptance -- --test-threads=1 --nocapture",
+    "controller_supervisor": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot -- lfg_lifecycle_jobs_acceptance --test-threads=1 --nocapture",
+    "hosted_ci_supervisor": "cargo test -p two-bot --locked --bin two-bot -- lfg_lifecycle_jobs_acceptance --test-threads=1 --nocapture",
     "offline": [
       "cargo fmt --all -- --check",
       "python3 scripts/ci/check-floor-guard.py --base-ref origin/main",
@@ -67,7 +74,7 @@
     "Choose the visible post identifier alternative of the spec (rendered member-visible text), not message-link parsing. The test never treats hidden component custom_id as discoverability.",
     "Use the bounded job name lfg_sweep so its success/failure counters do not silently enter other.",
     "Grace and orphan-age policy values remain builder-owned and must be documented. Fixtures deliberately use unequivocally old rows and just-created/future rows rather than invent an unspecified minute threshold.",
-    "The supervisor test executes the real production jobs module and real LFG action against a disposable database. It proves the scheduling seam's behavior; it does not prove production boot registration or exclude a second ad-hoc scheduler. Builder must include boot-wiring evidence and keep the existing jobs seam as the only production scheduler.",
+    "The supervisor test is a bot-crate unit test executing the real crate::jobs supervisor and real LFG action against a disposable database. It proves the scheduling seam's behavior; it does not prove production boot registration or exclude a second ad-hoc scheduler. Builder must include boot-wiring evidence and keep the existing jobs seam as the only production scheduler.",
     "No GREEN prototype, production source change, whole-workspace test run, runtime activation or deployment is part of this Test Author handoff."
   ]
 }
