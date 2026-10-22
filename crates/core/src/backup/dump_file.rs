@@ -2043,6 +2043,7 @@ mod tests {
                     && !V10_ADDED_TABLES.contains(name)
                     && !V11_ADDED_TABLES.contains(name)
                     && !V12_ADDED_TABLES.contains(name)
+                    && !V13_ADDED_TABLES.contains(name)
             })
             .collect();
         assert_eq!(names, expected);
@@ -2107,7 +2108,7 @@ mod tests {
         assert_eq!(contents.manifest.missing_tables(), ["event_store"]);
         // The same inventory at the current version refuses: new archives must
         // cover the event store.
-        assert_eq!(DUMP_VERSION, 12);
+        assert_eq!(DUMP_VERSION, 13);
         let mut current = v5;
         current["version"] = serde_json::json!(DUMP_VERSION);
         assert!(validate_manifest(&current)
@@ -2193,7 +2194,7 @@ mod tests {
             .contains("event_store"));
         let mut current = v5;
         current["version"] = serde_json::json!(DUMP_VERSION);
-        assert_eq!(DUMP_VERSION, 12, "frozen v5 test pins the v12 bump");
+        assert_eq!(DUMP_VERSION, 13, "frozen v5 test pins the v13 writer");
         assert!(validate_manifest(&current)
             .unwrap_err()
             .to_string()
@@ -2244,7 +2245,7 @@ mod tests {
             "member_season_xp",
         ));
         assert_eq!(v7_gap["version"], serde_json::json!(DUMP_VERSION));
-        assert_eq!(DUMP_VERSION, 12, "frozen v6 test pins the v12 bump");
+        assert_eq!(DUMP_VERSION, 13, "frozen v6 test pins the v13 writer");
         assert!(validate_manifest(&v7_gap)
             .unwrap_err()
             .to_string()
@@ -2311,8 +2312,8 @@ mod tests {
         let mut v7_gap = v6.clone();
         v7_gap["version"] = serde_json::json!(DUMP_VERSION);
         assert_eq!(
-            DUMP_VERSION, 12,
-            "frozen pre-retention test pins the v12 bump"
+            DUMP_VERSION, 13,
+            "frozen pre-retention test pins the v13 writer"
         );
         let err = validate_manifest(&v7_gap).unwrap_err().to_string();
         assert!(err.contains("retention_guild_purge_queue"), "{err}");
@@ -2364,7 +2365,7 @@ mod tests {
             "stream_live_claims",
         ));
         assert_eq!(v8_gap["version"], serde_json::json!(DUMP_VERSION));
-        assert_eq!(DUMP_VERSION, 12, "frozen v7 test pins the v12 bump");
+        assert_eq!(DUMP_VERSION, 13, "frozen v7 test pins the v13 writer");
         assert!(validate_manifest(&v8_gap)
             .unwrap_err()
             .to_string()
@@ -2405,7 +2406,7 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 12, "new dumps require both guild counters");
+        assert_eq!(DUMP_VERSION, 13, "new dumps require both guild counters");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
@@ -2459,7 +2460,7 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 12, "new dumps require the epoch-claim guard");
+        assert_eq!(DUMP_VERSION, 13, "new dumps require the epoch-claim guard");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
@@ -2514,7 +2515,7 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 12, "new dumps require the delete tombstones");
+        assert_eq!(DUMP_VERSION, 13, "new dumps require the delete tombstones");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
@@ -2536,12 +2537,59 @@ mod tests {
     }
 
     #[test]
+    fn v12_archives_read_without_afk_but_v13_requires_it() {
+        // Literal name, not the version waiver: this reproduces the pre-AFK
+        // inventory even if the waiver is accidentally removed. The historical
+        // v12 writer already covered admin_api_tokens, but not afk_status.
+        let tables = complete_tables(&BTreeMap::new())
+            .into_iter()
+            .filter(|table| table["name"] != "afk_status")
+            .collect();
+        let mut old = manifest(tables);
+        for version in 4..=12 {
+            old["version"] = serde_json::json!(version);
+            let contents = inspect_bytes(&gzip_lines(&[
+                old.clone(),
+                serde_json::json!({"kind":"end","rows":0}),
+            ]))
+            .expect("old archives without the v13 AFK status table stay readable");
+            assert_eq!(contents.manifest.version, version);
+            assert_eq!(contents.manifest.missing_tables(), ["afk_status"]);
+            let mut gap = old.clone();
+            gap["tables"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|table| table["name"] != "events");
+            assert!(validate_manifest(&gap)
+                .unwrap_err()
+                .to_string()
+                .contains("missing tables: events"));
+        }
+        assert_eq!(DUMP_VERSION, 13, "new dumps require the AFK status table");
+        let current = manifest(complete_tables(&BTreeMap::new()));
+        inspect_bytes(&gzip_lines(&[
+            current.clone(),
+            serde_json::json!({"kind":"end","rows":0}),
+        ]))
+        .expect("complete current-version archive inspects");
+        let mut gap = current.clone();
+        gap["tables"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|table| table["name"] != "afk_status");
+        let error = inspect_bytes(&gzip_lines(&[
+            gap,
+            serde_json::json!({"kind":"end","rows":0}),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("afk_status"), "{error}");
+    }
+
+    #[test]
     fn v11_archives_read_without_registry_but_v12_requires_it() {
-        // Literal name, not V12_ADDED_TABLES: this reproduces the pre-change
-        // inventory even if the version waiver is accidentally removed. This
-        // is the frozen tombstone-only v11 shape written by the merged v11
-        // writer: the delete tombstones are present, the token registry is
-        // absent.
+        // Preserve the token-registry regression introduced by the v12 writer.
+        // Only its current-writer pin advances when AFK introduces v13.
         let tables = complete_tables(&BTreeMap::new())
             .into_iter()
             .filter(|table| table["name"] != "admin_api_tokens")
@@ -2566,13 +2614,13 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 12, "new dumps require the token registry");
+        assert_eq!(DUMP_VERSION, 13, "new dumps require the token registry");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v12 archive inspects");
+        .expect("complete v13 archive inspects");
         let mut gap = current.clone();
         gap["tables"]
             .as_array_mut()
@@ -2588,54 +2636,57 @@ mod tests {
     }
 
     #[test]
-    fn v11_archives_read_without_afk_but_v12_requires_it() {
-        // Literal name, not V12_ADDED_TABLES: this reproduces the pre-change
-        // inventory even if the version waiver is accidentally removed. This
-        // is the frozen pre-AFK v11 shape: every v11 table present, the AFK
-        // status table absent.
-        let tables = complete_tables(&BTreeMap::new())
+    fn historical_v12_with_registry_reports_only_afk_missing() {
+        // An explicit token-registry descriptor prevents a removed inventory
+        // entry from silently turning this into an unrelated older fixture.
+        let mut tables: Vec<_> = complete_tables(&BTreeMap::new())
             .into_iter()
-            .filter(|table| table["name"] != "afk_status")
+            .filter(|table| table["name"] != "afk_status" && table["name"] != "admin_api_tokens")
             .collect();
-        let mut old = manifest(tables);
-        for version in 4..=11 {
-            old["version"] = serde_json::json!(version);
-            let contents = inspect_bytes(&gzip_lines(&[
-                old.clone(),
-                serde_json::json!({"kind":"end","rows":0}),
-            ]))
-            .expect("old archives without the v12 AFK status table stay readable");
-            assert_eq!(contents.manifest.version, version);
-            assert_eq!(contents.manifest.missing_tables(), ["afk_status"]);
-            let mut gap = old.clone();
-            gap["tables"]
-                .as_array_mut()
-                .unwrap()
-                .retain(|table| table["name"] != "events");
-            assert!(validate_manifest(&gap)
-                .unwrap_err()
-                .to_string()
-                .contains("missing tables: events"));
-        }
-        assert_eq!(DUMP_VERSION, 12, "new dumps require the AFK status table");
-        let current = manifest(complete_tables(&BTreeMap::new()));
-        inspect_bytes(&gzip_lines(&[
-            current.clone(),
+        tables.push(serde_json::json!({
+            "name": "admin_api_tokens",
+            "columns": [],
+            "column_types": [],
+            "count": 0
+        }));
+        let mut v12 = manifest(tables);
+        v12["version"] = serde_json::json!(12);
+        let contents = inspect_bytes(&gzip_lines(&[
+            v12.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete current-version archive inspects");
-        let mut gap = current.clone();
-        gap["tables"]
+        .expect("historical v12 with the token registry but no AFK table reads");
+        assert_eq!(contents.manifest.version, 12);
+        assert_eq!(contents.rows, 0);
+        assert_eq!(contents.manifest.missing_tables(), ["afk_status"]);
+        assert_eq!(V12_ADDED_TABLES, ["admin_api_tokens"]);
+
+        let mut without_registry = v12.clone();
+        without_registry["tables"]
             .as_array_mut()
             .unwrap()
-            .retain(|table| table["name"] != "afk_status");
+            .retain(|table| table["name"] != "admin_api_tokens");
+        let error = validate_manifest(&without_registry)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("admin_api_tokens"),
+            "v12 still requires its registry: {error}"
+        );
+        assert!(
+            !error.contains("afk_status"),
+            "v12 waives only the later AFK addition: {error}"
+        );
+
+        // Relabelling the same historical inventory as v13 must not waive AFK.
+        v12["version"] = serde_json::json!(13);
         let error = inspect_bytes(&gzip_lines(&[
-            gap,
+            v12,
             serde_json::json!({"kind":"end","rows":0}),
         ]))
         .unwrap_err()
         .to_string();
-        assert!(error.contains("afk_status"), "{error}");
+        assert!(error.contains("afk_status"), "v13 requires AFK: {error}");
     }
 
     #[test]
@@ -2700,9 +2751,7 @@ mod tests {
         future[0]["version"] = serde_json::json!(DUMP_VERSION + 1);
         let message = inspect_bytes(&gzip_lines(&future)).unwrap_err().to_string();
         assert!(
-            message.contains(&format!(
-                "reads 3, 4, 5, 6, 7, 8, 9, 10, 11 and {DUMP_VERSION}"
-            )),
+            message.contains("reads 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 and 13"),
             "unknown versions are refused with the readable list: {message}"
         );
     }

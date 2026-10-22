@@ -27,6 +27,8 @@ mod sticky_uncertain_acceptance_tests;
 #[path = "custom_command_list_pages_acceptance.rs"]
 mod custom_command_list_pages_acceptance;
 
+#[path = "afk_input_capacity_acceptance.rs"]
+mod afk_input_capacity_acceptance;
 #[path = "afk_status_acceptance.rs"]
 mod afk_status_acceptance;
 
@@ -1291,6 +1293,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "leaderboard"
                         | "help"
                         | "privacy"
+                        | "afk"
                 )
             })
             .collect();
@@ -1298,6 +1301,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
         assert!(!unwired.contains(&"leaderboard"));
         assert!(!unwired.contains(&"help"));
         assert!(!unwired.contains(&"privacy"));
+        assert!(!unwired.contains(&"afk"));
         if router_gates.announcements {
             assert!(unwired.contains(&"rsvp"), "enabled unwired announcement");
         }

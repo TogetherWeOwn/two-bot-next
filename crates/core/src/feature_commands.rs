@@ -703,15 +703,26 @@ mod tests {
     #[test]
     fn feature_commands_serialize_to_wire_shape() {
         let json = serde_json::to_value(feature_commands()).expect("serializes");
+        let commands = json.as_array().expect("command array");
+        let named = |name: &str| {
+            let matching: Vec<_> = commands
+                .iter()
+                .filter(|command| command["name"] == name)
+                .collect();
+            assert_eq!(matching.len(), 1, "{name} is published exactly once");
+            matching[0]
+        };
         // Scorecard attendance keeps ManageEvents bits as a decimal string,
-        // RSVP-totals carries the namespaced name.
-        assert_eq!(json[0]["name"], "attendance");
-        assert_eq!(json[0]["default_member_permissions"], "8589934592");
-        assert_eq!(json[0]["options"][0]["name"], "event-occurrence");
-        assert_eq!(json[0]["options"][0]["max_length"], 128);
-        assert_eq!(json[10]["name"], "rsvp-attendance");
-        assert!(json[10].get("default_member_permissions").is_none());
-        assert_eq!(json[10]["options"][0]["name"], "event-id");
+        // RSVP-totals carries the namespaced name, regardless of registry order.
+        let attendance = named("attendance");
+        assert_eq!(attendance["name"], "attendance");
+        assert_eq!(attendance["default_member_permissions"], "8589934592");
+        assert_eq!(attendance["options"][0]["name"], "event-occurrence");
+        assert_eq!(attendance["options"][0]["max_length"], 128);
+        let rsvp_attendance = named("rsvp-attendance");
+        assert_eq!(rsvp_attendance["name"], "rsvp-attendance");
+        assert!(rsvp_attendance.get("default_member_permissions").is_none());
+        assert_eq!(rsvp_attendance["options"][0]["name"], "event-id");
     }
 
     #[test]

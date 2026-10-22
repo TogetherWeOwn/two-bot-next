@@ -131,7 +131,7 @@ fn help_lists_only_handled_commands() {
     );
 }
 
-/// CONTROL (green before and after): the 29 parity builtins route to their
+/// CONTROL (green before and after): the 30 parity builtins route to their
 /// handlers. Unaffected by the templateassistant unpublish.
 #[test]
 fn parity_builtins_route_to_their_handlers() {
@@ -172,8 +172,9 @@ fn parity_builtins_route_to_their_handlers() {
         ("feed-add", HandlerId::FeedAdd),
         ("feed-remove", HandlerId::FeedRemove),
         ("feed-list", HandlerId::FeedList),
+        ("afk", HandlerId::Afk),
     ];
-    assert_eq!(cases.len(), 29, "all 29 parity builtins covered");
+    assert_eq!(cases.len(), 30, "all 30 parity builtins covered");
     for (name, handler) in cases {
         assert_eq!(
             router.route_slash(&ctx(name)),
