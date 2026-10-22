@@ -1269,6 +1269,10 @@ mod cursor_budget_interaction_tests;
 mod creation_receipt_acceptance_tests;
 
 #[cfg(test)]
+#[path = "ticket_destination_move_tests.rs"]
+mod destination_move_tests;
+
+#[cfg(test)]
 #[path = "ticket_capture_cap_acceptance_tests.rs"]
 mod capture_cap_acceptance_tests;
 
