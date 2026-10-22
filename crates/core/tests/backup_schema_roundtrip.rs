@@ -1461,10 +1461,10 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v10-source.ndjson.gz");
+    let current_path = directory.path("v11-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 10);
+    assert_eq!(old.manifest.version, 11);
     for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -1510,10 +1510,10 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v10-source.ndjson.gz");
+    let current_path = directory.path("v11-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 10);
+    assert_eq!(old.manifest.version, 11);
     let rows = old.buffers.remove("scheduled_events_claim").unwrap();
     assert!(
         !rows.is_empty(),

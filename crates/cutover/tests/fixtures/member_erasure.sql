@@ -167,7 +167,8 @@ BEGIN
       -- Starboard starrers are BIGINT snowflakes (one row per guild/message/user
       -- here, like every other member table): four rows total, one matching the
       -- erasure target, three survivors. The erasure predicate is
-      -- guild_id::text = $1 AND user_id::text = $2; config.updated_by stays a
+      -- guild_id = $1::bigint AND user_id = $2::bigint (cast the retained text
+      -- binds, never the indexed columns); config.updated_by stays a
       -- retained-attribution allowlist and posts carry no member column.
       INSERT INTO starboard_starrers
         (guild_id, source_channel_id, source_message_id, user_id)
