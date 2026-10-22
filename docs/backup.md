@@ -14,15 +14,18 @@ against scratch Postgres only (tests: agent-testdb `two_next_backup_test` /
 (`TWO_RESTORE_URL`, never `TWO_DATABASE_URL`) and real restores additionally
 require `--force`. This confirmation is not authorization to target production.
 `restore` enforces the rule by value: a target that normalizes to the live
-database (scheme alias, host case, default ports and credential/query
-spellings folded away; `?host=`/`?dbname=`/`?port=` overrides honored;
-database derived exactly as the driver derives it, so `//prod` names
-`prod`), or whose database name is a production marker (`prod`,
-`production`, `two_prod`, `two_production`, `live`, `two_live`), is refused
-with a fixed message on stderr and exit 2 — even with `--force`, and
-without echoing either URL. A target whose effective database cannot be
-proven — omitted database, or an empty `?host=`/`?hostaddr=`/`?dbname=`
-override — is refused the same way: name the scratch database explicitly.
+database (scheme alias, host case, ports defaulted from `PGPORT` exactly as
+the driver seeds them, and credential/query spellings folded away;
+`?host=`/`?hostaddr=`/`?dbname=`/`?port=` overrides honored; database
+derived exactly as the driver derives it, so `//prod` names `prod`;
+socket spellings — encoded authority, `?host=`, trailing slash — folded),
+or whose database name is a production marker (`prod`, `production`,
+`two_prod`, `two_production`, `live`, `two_live`), is refused with a fixed
+message on stderr and exit 2 — even with `--force`, and without echoing
+either URL. A target whose effective target cannot be proven — omitted
+database, an empty `?host=`/`?hostaddr=`/`?dbname=` override, or a socket
+directory mixed with a plain host (the driver's socket slot is sticky) —
+is refused the same way: name the scratch database explicitly.
 `--dry-run` still previews without that comparison.
 
 ## Stable failure codes
@@ -62,8 +65,8 @@ code and are byte-identical.
 
 - `restore_live_target_refused` — `TWO_RESTORE_URL` normalizes to the live
   database, names a production database, or cannot be proven different
-  (omitted database, empty overrides); fixed refusal, exit 2, even with
-  `--force`. `--dry-run` still previews.
+  (omitted database, empty overrides, socket/host mixes); fixed refusal,
+  exit 2, even with `--force`. `--dry-run` still previews.
 
 `two-bot guild-config-snapshot`:
 

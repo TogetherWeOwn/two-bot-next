@@ -86,6 +86,32 @@ enum TargetProof {
     },
 }
 
+/// Socket directories compare without trailing slashes: the driver builds the
+/// socket file as `{dir}/.s.PGSQL.{port}` (`fetch_socket`), so a trailing
+/// slash reaches the same file. TCP hostnames never reach this function.
+fn normalize_socket_dir(value: &str) -> String {
+    let trimmed = value.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+/// Default port exactly as the driver seeds it: `PGPORT` when it parses as a
+/// port, else 5432 (sqlx-postgres `options/mod.rs::new_without_pgpass`).
+/// Split from the environment read so tests pin the fallback without
+/// mutating process env (which would race parallel tests).
+fn default_port_from_env(pgport: Option<&str>) -> u16 {
+    pgport.and_then(|v| v.parse().ok()).unwrap_or(5432)
+}
+
+/// The restore process's own effective default port: it is the process that
+/// connects, so its `PGPORT` is the one that steers a portless URL.
+fn default_port() -> u16 {
+    default_port_from_env(std::env::var("PGPORT").ok().as_deref())
+}
+
 /// Live-target identity for the restore refusal: the (host, port, database)
 /// a URL actually connects to, with every spelling variation folded away —
 /// or proof that the target cannot be named exactly and must be refused.
@@ -97,13 +123,21 @@ enum TargetProof {
 ///   `?host=` spellings of one socket compare equal. A decoded socket path
 ///   (containing `/`) can never collide with a TCP hostname; DNS is
 ///   case-insensitive.
-/// - Missing port means 5432, so `:5432` cannot evade an unported live URL.
+/// - Socket directories compare without trailing slashes: the driver formats
+///   the socket file as `{dir}/.s.PGSQL.{port}` either way.
+/// - A missing port defaults from `PGPORT` exactly as the driver seeds it
+///   (unparseable or unset means 5432), so a portless URL cannot evade a
+///   live URL on the effective port.
 /// - `?host=` / `?hostaddr=`, `?port=`, `?dbname=` folded in (libpq/sqlx let
 ///   query keys override the authority/path); last value wins, matching
-///   option-map collection. An *empty* `?host=`/`?hostaddr=`/`?dbname=`
-///   override is unprovable: sqlx applies it unconditionally (empty host =
-///   local socket, empty dbname = the server falls back to the username),
-///   so the URL no longer names the target the guard compared.
+///   option-map collection — except a socket directory (leading `/`) and a
+///   plain host never merge: the driver's socket slot is sticky (`host()`
+///   never clears `socket()`, `fetch_socket()` prefers it), so a URL naming
+///   both spellings is unprovable. Either spelling alone stays comparable.
+///   An *empty* `?host=`/`?hostaddr=`/`?dbname=` override is unprovable:
+///   sqlx applies it unconditionally (empty host = local socket, empty
+///   dbname = the server falls back to the username), so the URL no longer
+///   names the target the guard compared.
 /// - Userinfo and every other query key ignored, so a different password or
 ///   `sslmode` cannot evade the comparison.
 /// - A missing host (unix-socket URLs such as `postgres:///db?host=...`)
@@ -123,6 +157,12 @@ enum TargetProof {
 ///   effective target cannot be named exactly yields `Unprovable`: refusing
 ///   an unnameable restore target is the fail-closed contract.
 fn target_identity(raw: &str) -> TargetProof {
+    target_identity_with_default_port(raw, default_port())
+}
+
+/// [`target_identity`] with an explicit default port, so tests pin `PGPORT`
+/// behavior without touching process env.
+fn target_identity_with_default_port(raw: &str, default_port: u16) -> TargetProof {
     let url = match url::Url::parse(raw.trim()) {
         Ok(url) => url,
         Err(_) => return TargetProof::Unparsed,
@@ -130,10 +170,17 @@ fn target_identity(raw: &str) -> TargetProof {
     if url.scheme() != "postgres" && url.scheme() != "postgresql" {
         return TargetProof::Unparsed;
     }
-    let mut host = percent_encoding::percent_decode_str(url.host_str().unwrap_or_default())
+    let authority = percent_encoding::percent_decode_str(url.host_str().unwrap_or_default())
         .decode_utf8_lossy()
         .to_lowercase();
-    let mut port = url.port().unwrap_or(5432);
+    let mut socket_seen = authority.starts_with('/');
+    let mut plain_seen = !socket_seen && !authority.is_empty();
+    let mut host = if socket_seen {
+        normalize_socket_dir(&authority)
+    } else {
+        authority
+    };
+    let mut port = url.port().unwrap_or(default_port);
     let mut dbname = percent_encoding::percent_decode_str(url.path().trim_start_matches('/'))
         .decode_utf8_lossy()
         .into_owned();
@@ -144,7 +191,14 @@ fn target_identity(raw: &str) -> TargetProof {
                 unprovable = true;
             }
             "host" | "hostaddr" => {
-                host = value.to_lowercase();
+                let value = value.to_lowercase();
+                if value.starts_with('/') {
+                    socket_seen = true;
+                    host = normalize_socket_dir(&value);
+                } else {
+                    plain_seen = true;
+                    host = value;
+                }
             }
             "port" => {
                 if let Ok(overridden) = value.parse::<u16>() {
@@ -157,7 +211,7 @@ fn target_identity(raw: &str) -> TargetProof {
             _ => {}
         }
     }
-    if unprovable || dbname.is_empty() {
+    if unprovable || (socket_seen && plain_seen) || dbname.is_empty() {
         return TargetProof::Unprovable;
     }
     TargetProof::Known { host, port, dbname }
@@ -166,7 +220,8 @@ fn target_identity(raw: &str) -> TargetProof {
 /// True when `candidate` must be refused as a restore target: it normalizes
 /// to the live database, its database name is a production marker, or its
 /// effective target cannot be proven different from live (omitted database,
-/// empty overrides — see `target_identity`). `live` is `TWO_DATABASE_URL`
+/// empty overrides, socket/host mixes — see `target_identity`). `live` is
+/// `TWO_DATABASE_URL`
 /// when set; with no live URL only the marker list applies. A live URL that
 /// is itself unprovable also refuses: it cannot be proven different from the
 /// candidate. Never echoes either input (returns `bool`, not a message).
@@ -538,6 +593,93 @@ mod tests {
             "postgres://u:p@db-host/scratch_db",
             Some("postgres://u:p@db-host/scratch_db?dbname=")
         ));
+    }
+
+    #[test]
+    fn restore_refuses_socket_urls_mixed_with_plain_host_overrides() {
+        // The driver's socket slot is sticky: `?host=` with a leading `/`
+        // (or a socket authority) calls `socket()`, while a later plain
+        // `?host=`/`?hostaddr=` only calls `host()` — and `fetch_socket()`
+        // still prefers the slot. A last-wins string cannot name that
+        // target, so any socket/plain mix is unprovable.
+        let live = "postgres:///app?host=/var/run/postgresql";
+        for candidate in [
+            // `?host=<socket>` then a plain hostaddr: driver stays on socket.
+            "postgres://u:p@localhost/app?host=/var/run/postgresql&hostaddr=127.0.0.1",
+            // Socket authority then a plain `?host=`: the slot survives.
+            "postgres://%2Fvar%2Frun%2Fpostgresql/app?host=localhost",
+            // Socket `?host=` then a plain `?host=`: same sticky slot.
+            "postgres:///app?host=/var/run/postgresql&host=localhost",
+            // Order-independent: plain first, socket second is still a mix.
+            "postgres:///app?host=localhost&host=/var/run/postgresql",
+            // A TCP authority with a socket override is a mix too.
+            "postgres://u:p@db-host/app?host=/var/run/postgresql",
+        ] {
+            assert!(restore_target_is_live(candidate, Some(live)), "{candidate}");
+            // Unprovable refuses even with no live URL to compare against.
+            assert!(restore_target_is_live(candidate, None), "{candidate}");
+        }
+        // One spelling alone stays comparable: the same socket twice still
+        // names the live target.
+        assert!(restore_target_is_live(
+            "postgres://%2Fvar%2Frun%2Fpostgresql/app?host=/var/run/postgresql",
+            Some(live)
+        ));
+    }
+
+    #[test]
+    fn restore_folds_socket_trailing_slashes() {
+        // The driver formats the socket file as `{dir}/.s.PGSQL.{port}`, so
+        // a trailing slash reaches the same file (its own parser test uses
+        // the slashed spelling).
+        let live = "postgres:///app?host=/var/run/postgresql";
+        let slashed = "postgres:///app?host=/var/run/postgresql/";
+        assert!(restore_target_is_live(slashed, Some(live)));
+        assert!(restore_target_is_live(live, Some(slashed)));
+        assert!(restore_target_is_live(
+            "postgres://%2Fvar%2Frun%2Fpostgresql%2F/app",
+            Some(live)
+        ));
+        // A different socket directory stays a different target.
+        assert!(!restore_target_is_live(
+            "postgres:///app?host=/other/socket/",
+            Some(live)
+        ));
+    }
+
+    #[test]
+    fn restore_defaults_portless_urls_from_pgport_like_the_driver() {
+        // The driver seeds the port from PGPORT before URL fields override it
+        // (`new_without_pgpass`); the guard takes the same default so a
+        // portless URL cannot evade a live URL on the effective port.
+        let portless = "postgres://u:p@db-host/app";
+        let on_5433 = "postgres://u:p@db-host:5433/app";
+        let on_5432 = "postgres://u:p@db-host:5432/app";
+        assert_eq!(
+            target_identity_with_default_port(portless, 5433),
+            target_identity_with_default_port(on_5433, 5433)
+        );
+        assert_ne!(
+            target_identity_with_default_port(portless, 5433),
+            target_identity_with_default_port(on_5432, 5433)
+        );
+        // Explicit ports ignore the default on both sides.
+        assert_ne!(
+            target_identity_with_default_port(on_5432, 5433),
+            target_identity_with_default_port(on_5433, 5433)
+        );
+        // A `?port=` override still wins over the default.
+        assert_ne!(
+            target_identity_with_default_port("postgres://u:p@db-host/app?port=5432", 5433),
+            target_identity_with_default_port(on_5433, 5433)
+        );
+        // The default itself mirrors the driver's seed exactly: PGPORT when
+        // it parses as a port, else 5432.
+        assert_eq!(default_port_from_env(None), 5432);
+        assert_eq!(default_port_from_env(Some("5433")), 5433);
+        for pgport in ["", "not-a-port", "99999", "-1", "5432x"] {
+            assert_eq!(default_port_from_env(Some(pgport)), 5432, "{pgport}");
+        }
     }
 
     #[test]
