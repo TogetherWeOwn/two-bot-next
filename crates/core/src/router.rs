@@ -119,6 +119,7 @@ pub const SCORECARD_DISABLED_REPLY: &str = "Attendance capture is not enabled on
 pub enum HandlerId {
     Rank,
     Leaderboard,
+    Invites,
     Help,
     Privacy,
     ScorecardAttendance,
@@ -413,6 +414,7 @@ impl InteractionRouter {
         for id in [
             HandlerId::Rank,
             HandlerId::Leaderboard,
+            HandlerId::Invites,
             HandlerId::Help,
             HandlerId::Privacy,
         ] {
@@ -616,6 +618,11 @@ impl InteractionRouter {
             },
             "leaderboard" => Row {
                 handler: HandlerId::Leaderboard,
+                gate: RowGate::Always,
+                permission_refusal: None,
+            },
+            "invites" => Row {
+                handler: HandlerId::Invites,
                 gate: RowGate::Always,
                 permission_refusal: None,
             },

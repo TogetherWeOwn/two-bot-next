@@ -314,6 +314,15 @@ pub fn core_commands() -> Vec<CommandDefinition> {
                 .max_length(128),
             ]),
         ]),
+        CommandDefinition::new(
+            "invites",
+            "Show attributed invites and the server's top inviters.",
+        )
+        .options(vec![CommandOption::new(
+            "member",
+            "Show another member.",
+            CommandOptionType::User,
+        )]),
     ]
 }
 

@@ -43,6 +43,12 @@ const HELP_GROUPS: &[HelpGroup] = &[
         anchor: None,
     },
     HelpGroup {
+        title: "Invites",
+        requires: None,
+        commands: &["invites"],
+        anchor: None,
+    },
+    HelpGroup {
         title: "Discovery",
         requires: None,
         commands: &["help"],

@@ -1387,6 +1387,11 @@ impl CommandRuntime {
             }
             return;
         }
+        if handler == HandlerId::Invites {
+            crate::invites_command::respond(&self.pool, &self.executor, self.guild_id, interaction)
+                .await;
+            return;
+        }
         if handler == HandlerId::Help {
             // Read the actual confirmed publication, including DB-backed
             // custom rows and successful add/remove refreshes. No store wait.
@@ -2423,7 +2428,7 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     }
     // Leveling is not an activation-fenced capability: the core rank and
     // leaderboard commands stay available to every permitted identity.
-    for id in [HandlerId::Rank, HandlerId::Leaderboard] {
+    for id in [HandlerId::Rank, HandlerId::Leaderboard, HandlerId::Invites] {
         router.register(Box::new(SliceHandler(id)));
     }
     // `/help` discovery is never activation-fenced either: it renders from
