@@ -337,3 +337,29 @@ fn failure_and_unknown_semantics_are_documented() {
         "docs/custom-commands.md states the uncertain-completion rule"
     );
 }
+
+#[tokio::test]
+async fn slow_availability_callback_still_meets_receipt_deadline() {
+    let (pool, stub) = stalling_pool().await;
+    let mock = MockRest::start(
+        vec![ScriptedResponse::status(204).delayed(Duration::from_secs(4))],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(pool.clone(), &mock, true);
+    let started = tokio::time::Instant::now();
+    let outcome = runtime
+        .handle_interaction(&slash(331, "faq", 0), Some("Test guild"))
+        .await;
+    let elapsed = started.elapsed();
+    match outcome {
+        Ok(true) => {}
+        other => panic!("slow-callback outage is owned with a reply, got {other:?}"),
+    }
+    assert_within_receipt_budget(elapsed);
+    // The timed-out 204 never lands, but the callback request assertions hold.
+    assert_availability_reply(&mock);
+    stub.abort();
+    mock.shutdown().await;
+    pool.close().await;
+}

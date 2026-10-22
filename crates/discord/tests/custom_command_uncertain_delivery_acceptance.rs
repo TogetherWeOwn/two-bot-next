@@ -513,3 +513,30 @@ async fn completion_audit_rows_carry_no_template_or_rendered_content() {
     }
     pool.close().await;
 }
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+async fn uncertain_completion_render_failed_still_audits_failed_run() {
+    let pool = test_pool().await;
+    seed_faq(&pool, "hello").await;
+    let mock = MockRest::start(
+        vec![ScriptedResponse::status(204), ScriptedResponse::status(500)],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(pool.clone(), &mock);
+    // `None` guild name fails rendering (`rendered == None`, reason
+    // `render_failed`), but the uncertain completion still audits.
+    match runtime.handle_interaction(&slash(411, "faq"), None).await {
+        Err(CustomCommandError::DeliveryUnknown) => {}
+        other => panic!("render-failed uncertain completion is DeliveryUnknown, got {other:?}"),
+    }
+    assert_eq!(patch_bodies(&mock).len(), 1);
+    assert_eq!(
+        run_fact(&pool, 411).await,
+        Some(("failed".to_owned(), Some("render_failed".to_owned()))),
+        "render failure still audits its failed run"
+    );
+    mock.shutdown().await;
+    pool.close().await;
+}
