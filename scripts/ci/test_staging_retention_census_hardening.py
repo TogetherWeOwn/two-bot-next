@@ -64,8 +64,12 @@ class HugeNumericTests(unittest.TestCase):
                 f"{HUGE},{digest},{minute},2026-10-20 20:10:00+00\n", True),
             "cohort count (no digest)": lambda: census.parse_cohort(
                 f"{HUGE},{minute},2026-10-20 20:10:00+00\n", False),
-            "family counts": lambda: census.parse_counts(
+            "family counts (eligible)": lambda: census.parse_counts(
                 f"PRESENCE_UPDATE,{HUGE},900,907\n"),
+            "family counts (fresh)": lambda: census.parse_counts(
+                f"PRESENCE_UPDATE,1,{HUGE},907\n"),
+            "family counts (total)": lambda: census.parse_counts(
+                f"PRESENCE_UPDATE,1,900,{HUGE}\n"),
             "anchor": lambda: census.parse_anchor(f"{HUGE}\n"),
         }
         for label, call in cases.items():
