@@ -79,6 +79,13 @@ per-guild epoch row through the app pool inside its snapshot-swap
 transaction. The table carries no member column, so there is nothing to
 erase and no reader grant beyond the app pool.
 
+The scheduled-event delete-tombstone table (`scheduled_events_tombstone`) is
+ordinary `table` kind for the same reason: `replace_events` writes one row
+per DELETE-removed id through the app pool inside its snapshot-swap
+transaction, and reads the guild high-water back through it before touching
+the mirror. The table carries no member column, so there is nothing to
+erase and no reader grant beyond the app pool.
+
 The reader cannot read bot base tables, including through inherited/public or
 column-level grants. Normal PostgreSQL views deliberately run with their owner's
 base-table privileges: only the reviewed `web_v1` projection is exposed. Do not
@@ -168,10 +175,9 @@ never returns PASS. Verification checks missing groups/objects, group attributes
 and memberships, database/schema privileges, ownership/object kinds, effective
 table/column/sequence/function privileges (including PUBLIC), grant options, parsed
 boolean view invoker settings and unsafe future grants. Explicit grants cover the
-current migrations' 89 ordinary bot tables plus two restricted admission lanes,
-SQLx ledger, two migrator-only tables, twelve sequences,
-nine web views and six functions (three trigger helpers plus three `web_v1`
-helpers). The read-only migrator group additionally reads the ordinary tables,
+reviewed matrix's ordinary bot tables, restricted admission lanes, migration
+ledgers, migrator-only tables, sequences, web views and functions (trigger helpers
+and `web_v1` helpers). The read-only migrator group additionally reads the ordinary tables,
 the admission lanes and the ledger; it reads no migrator-only table, sequence,
 view or function. This includes
 `gateway_onboarding_jobs` and its sequence: the DML-only gateway must recover and

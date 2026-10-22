@@ -61,6 +61,71 @@ MAX_RESPONSE_BYTES = 1 << 20
 class HistoryError(Exception):
     """A safe-to-report failure reading probe history."""
 
+    code = "history_unknown"
+    next_action = "inspect_workflow_history"
+
+
+def _refuse_history():
+    # Never include a remote field, parser detail or URL in this diagnostic.
+    raise HistoryError("synthetic workflow history is malformed or ambiguous; "
+                       "incident state is unknown")
+
+
+def _positive_integer(value):
+    # bool is an int subclass; floats (including nonfinite ones) are not IDs.
+    return type(value) is int and 0 < value <= (1 << 63) - 1
+
+
+def _collection(body, key, limit=None, complete=False):
+    if not isinstance(body, dict) or not isinstance(body.get(key), list):
+        _refuse_history()
+    rows = body[key]
+    if (limit is not None and len(rows) > limit
+            or any(not isinstance(row, dict) for row in rows)):
+        _refuse_history()
+    # Older fixture/record shapes omit counts. If supplied, a count is a
+    # claim we must validate, never a permissive pagination hint. Jobs are
+    # deliberately one bounded page: an incomplete page cannot prove uniqueness.
+    if "total_count" in body:
+        count = body["total_count"]
+        if (type(count) is not int or not 0 <= count <= (1 << 63) - 1
+                or count < len(rows) or (complete and count != len(rows))):
+            _refuse_history()
+    return rows
+
+
+CONCLUSIONS = (None, "success", "failure", "neutral", "cancelled", "skipped",
+               "timed_out", "action_required", "stale", "startup_failure")
+
+
+def _completed_record(record):
+    # Missing optional fields keep pre-decide history readable, but cannot
+    # manufacture a decided-none checkpoint. Present fields must be supported.
+    if ("status" in record and record["status"] != "completed"
+            or record.get("conclusion") not in CONCLUSIONS):
+        _refuse_history()
+
+
+def _run_record(run):
+    if (not isinstance(run, dict) or not _positive_integer(run.get("id"))
+            or not _positive_integer(run.get("run_number"))
+            or not isinstance(run.get("event"), str) or not run["event"]):
+        _refuse_history()
+    _completed_record(run)
+
+
+def _named_record(record):
+    if not isinstance(record.get("name"), str) or not record["name"]:
+        _refuse_history()
+    _completed_record(record)
+
+
+def _unique_match(records, name):
+    matches = [record for record in records if record["name"] == name]
+    if len(matches) > 1:
+        _refuse_history()
+    return matches[0] if matches else None
+
 
 class DuplicateKeyError(ValueError):
     """A JSON object repeats a key; the message never carries key/value data."""
@@ -235,18 +300,31 @@ def _get(path, token):
 
 
 def _run_outcome(repo, run, environment, token):
-    jobs = _get(f"/repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100", token)
-    job = next((item for item in jobs.get("jobs", [])
-                if item.get("name") == JOB_NAMES[environment]), None)
-    if not job:
+    _run_record(run)
+    body = _get(f"/repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100", token)
+    jobs = _collection(body, "jobs", 100, complete=True)
+    job_ids = set()
+    for item in jobs:
+        _named_record(item)
+        if "id" in item:
+            if not _positive_integer(item["id"]) or item["id"] in job_ids:
+                _refuse_history()
+            job_ids.add(item["id"])
+        steps = _collection(item, "steps")
+        numbers = set()
+        for step in steps:
+            _named_record(step)
+            if "number" in step:
+                if not _positive_integer(step["number"]) or step["number"] in numbers:
+                    _refuse_history()
+                numbers.add(step["number"])
+    job = _unique_match(jobs, JOB_NAMES[environment])
+    if job is None:
         return None
-    steps = job.get("steps", [])
-    probe = next((step for step in steps
-                  if step.get("name") == PROBE_STEPS[environment]), None)
-    alert = next((step for step in steps
-                  if step.get("name") == ALERT_STEPS[environment]), None)
-    decide = next((step for step in steps
-                   if step.get("name") == DECIDE_STEPS[environment]), None)
+    steps = job["steps"]
+    probe = _unique_match(steps, PROBE_STEPS[environment])
+    alert = _unique_match(steps, ALERT_STEPS[environment])
+    decide = _unique_match(steps, DECIDE_STEPS[environment])
     outcome = probe.get("conclusion") if probe else None
     if outcome in ("success", "failure"):
         delivery = alert.get("conclusion") if alert else None
@@ -302,25 +380,43 @@ def previous_probe_outcomes(env, environment):
     repo = urllib.parse.quote(repository, safe="/")
     outcomes = []
     seen = set()
+    seen_numbers = set()
+    oldest_number = None
     scanned = 0
     confirmed = False
     page = 1
-    while scanned < MAX_HISTORY_RUNS:
+    # Filtered rows must not turn a bounded reconstruction into unbounded
+    # pagination. Allow one extra page for the current run being excluded.
+    max_pages = (MAX_HISTORY_RUNS + RUNS_PAGE_SIZE - 1) // RUNS_PAGE_SIZE + 1
+    while scanned < MAX_HISTORY_RUNS and page <= max_pages:
         query = urllib.parse.urlencode(
             {"branch": "main", "event": "schedule", "status": "completed",
              "per_page": RUNS_PAGE_SIZE, "page": page})
         runs = _get(f"/repos/{repo}/actions/workflows/{WORKFLOW}/runs?{query}", token)
-        page_runs = runs.get("workflow_runs", [])
+        page_runs = _collection(runs, "workflow_runs", RUNS_PAGE_SIZE)
+        # Admit the entire page, including filtered rows, before sorting or
+        # reading a job. A plausible checkpoint must not hide malformed peers.
+        for run in page_runs:
+            _run_record(run)
+            if (run["id"] in seen or run["run_number"] in seen_numbers
+                    or oldest_number is not None and run["run_number"] >= oldest_number):
+                _refuse_history()
+            seen.add(run["id"])
+            seen_numbers.add(run["run_number"])
+        total = runs.get("total_count")
+        returned = (page - 1) * RUNS_PAGE_SIZE + len(page_runs)
+        if total is not None and (total < returned
+                or len(page_runs) < RUNS_PAGE_SIZE and total != returned):
+            _refuse_history()
+        if page_runs:
+            oldest_number = min(run["run_number"] for run in page_runs)
         prior = sorted(
             (run for run in page_runs
-             if str(run.get("id")) != str(run_id) and run.get("event") == "schedule"),
-            key=lambda run: run.get("run_number", 0), reverse=True,
+             if str(run["id"]) != str(run_id) and run["event"] == "schedule"),
+            key=lambda run: run["run_number"], reverse=True,
         )
         bound_hit = False
         for run in prior:
-            if run.get("id") in seen:
-                continue
-            seen.add(run.get("id"))
             if scanned >= MAX_HISTORY_RUNS:
                 bound_hit = True
                 break
@@ -343,8 +439,9 @@ def previous_probe_outcomes(env, environment):
         if isinstance(total, int) and page * RUNS_PAGE_SIZE >= total:
             return outcomes
         page += 1
-    if outcomes and all(outcome == "success" and delivery in ("skipped", "closed")
-                         for outcome, delivery in outcomes):
+    if scanned >= MAX_HISTORY_RUNS and outcomes and all(
+            outcome == "success" and delivery in ("skipped", "closed")
+            for outcome, delivery in outcomes):
         # Bound reached over an all-healthy suffix in which no post step
         # ever ran (conclusion exactly skipped, or the closed checkpoint):
         # settle closed (the same replay-from-closed the exhausted-history

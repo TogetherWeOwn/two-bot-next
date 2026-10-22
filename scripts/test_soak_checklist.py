@@ -556,7 +556,7 @@ class ScriptReferenceTests(unittest.TestCase):
         cls.checklist = json.loads((ROOT / "docs/soak-checklist.json").read_text())
 
     def test_live_script_citation_resolves(self):
-        check_script_refs({"id": "fixture", "action": "Read `.github/scripts/release-on-promote.cjs`."})
+        check_script_refs({"id": "fixture", "action": "Read `.github/scripts/daily-digest.cjs`."})
 
     def test_missing_live_script_fails(self):
         for path in ("scripts/missing-check.cjs", "./scripts/missing-check.sh",
@@ -584,12 +584,12 @@ class ScriptReferenceTests(unittest.TestCase):
 
     def test_historical_exemption_needs_reason_and_a_missing_citation(self):
         cited = "Historical only: `scripts/missing-check.cjs`."
-        live = "Read `.github/scripts/release-on-promote.cjs`."
+        live = "Read `.github/scripts/daily-digest.cjs`."
         for action, historical, error in (
             (cited, [{"path": "scripts/missing-check.cjs", "reason": " "}], "requires path and reason"),
             (cited, [{"path": "scripts/missing-check.cjs"}], "requires path and reason"),
             ("No citation.", [{"path": "scripts/missing-check.cjs", "reason": "Removed."}], "stale historical exemption"),
-            (live, [{"path": ".github/scripts/release-on-promote.cjs", "reason": "Live."}], "stale historical exemption"),
+            (live, [{"path": ".github/scripts/daily-digest.cjs", "reason": "Live."}], "stale historical exemption"),
         ):
             with self.subTest(action=action, historical=historical):
                 with self.assertRaisesRegex(ValueError, error):
