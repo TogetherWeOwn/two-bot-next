@@ -27,6 +27,9 @@ mod sticky_uncertain_acceptance_tests;
 #[path = "custom_command_list_pages_acceptance.rs"]
 mod custom_command_list_pages_acceptance;
 
+#[path = "remind_acceptance_tests.rs"]
+mod remind_acceptance;
+
 use std::collections::VecDeque;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
