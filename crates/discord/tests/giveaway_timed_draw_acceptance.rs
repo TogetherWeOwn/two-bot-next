@@ -932,7 +932,6 @@ async fn deadline_tick_draws_and_announces() {
     enter(fixture.pool(), &mock, 612, BOB, &gid2).await;
     enter(fixture.pool(), &mock, 613, CAROL, &gid2).await;
     age_past(fixture.pool(), &gid2).await;
-    let before = mock.requests().len();
     tick(fixture.pool(), &mock, "multi-winner tick").await;
     let draws2 = draw_rows(fixture.pool(), &gid2).await;
     assert_eq!(draws2.len(), 1);
@@ -1406,16 +1405,20 @@ async fn concurrent_ticks_yield_one_draw_row() {
         assert!(body.contains(&format!("<@{champ}>")));
     }
     // The draw primary key holds under directly raced inserts too.
-    let insert = |pool: &Pool<Postgres>, giveaway: &str| {
+    async fn insert(
+        pool: &Pool<Postgres>,
+        giveaway: &str,
+    ) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
         sqlx::query(
             "INSERT INTO giveaway_draws (guild_id, giveaway_id, draw_no, drawn_at, \
                     eligible_count, eligible_hash, seed, winner_ids, reroll_kind) \
              VALUES ($1, $2, 7, now(), 1, 'aa', 'bb', '[]', NULL)",
         )
         .bind(GUILD)
-        .bind(giveaway.to_owned())
+        .bind(giveaway)
         .execute(pool)
-    };
+        .await
+    }
     let (one, two) = tokio::join!(insert(fixture.pool(), &gid), insert(fixture.pool(), &gid));
     assert!(
         one.is_ok() ^ two.is_ok(),
