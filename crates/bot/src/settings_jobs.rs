@@ -179,9 +179,12 @@ async fn poll_once(pool: &PgPool, writer: &Mutex<LiveSettingsWriter>) -> Result<
 ///
 /// Test note: the URL is process-global per tick, so only one test in the
 /// suite may set it (the protected ops acceptance test — do not add
-/// another, concurrent tickers would share its mock). The runners isolate
-/// that test: nextest runs each test in its own process, and nightly runs
-/// single-threaded.
+/// another). `cargo test` threads share the variable, so a concurrent
+/// ticker can observe the acceptance mock; in practice the serialized
+/// fixture setup separates the two DB tests' tick windows, while nextest
+/// (per-test processes) and nightly (single-threaded) isolate them fully.
+/// If the supervised no-republish assertion ever flakes, serialize those
+/// two tests instead of touching the poll.
 async fn poll_ops_record(
 ) -> Option<Result<two_bot_core::settings::OpsRecord, two_bot_core::ops_fetch::OpsFetchError>> {
     let Some(url) = two_bot_core::ops_fetch::ops_url_from_env() else {
