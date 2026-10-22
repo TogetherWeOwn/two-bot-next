@@ -763,6 +763,7 @@ class VoiceSelectionTest(unittest.TestCase):
             "scripts/staging_voice_synthetic.py",
             "scripts/test_staging_voice_synthetic_dry_run_acceptance.py",
             "scripts/test_staging_voice_synthetic_gateway_intake_acceptance.py",
+            "scripts/test_staging_voice_synthetic_owned_room_acceptance.py",
             ".github/workflows/voice-synthetic.yml",
             "./crates/bot/src/voice_room_plan.rs",
         ):
