@@ -87,6 +87,10 @@ pub const TABLE_SPECS: &[TableSpec] = &[
         measure: TableMeasure::Unmeasurable("sent_at records message time, not when catch-up inserted the row", DISPOSITION_MANUAL_RECONCILE_REQUIRED),
     },
     TableSpec { table: "backfill_history_counts", measure: TableMeasure::Columns(&["updated_at"]) },
+    TableSpec {
+        table: "bump_reminders",
+        measure: TableMeasure::Unmeasurable("no write timestamp; fires_at is a delivery deadline and fired changes without a timestamp; transient reminder state is excluded from backups to avoid replay, and the next successful bump re-arms it", DISPOSITION_ACCEPT_WITH_REASON),
+    },
     TableSpec { table: "community_facts", measure: TableMeasure::Columns(&["recorded_at"]) },
     TableSpec { table: "community_scorecard_alerts", measure: TableMeasure::Columns(&["created_at"]) },
     // Retry reservation (TOG-11145): next_attempt_at is a BIGINT epoch-ms

@@ -83,6 +83,7 @@ from this map, and the acceptance battery pins the JSON encoding):
 | Table | Disposition | Why |
 |---|---|---|
 | `backfill_history_messages` | `manual-reconcile-required` | Catch-up inserts are invisible after the fact; no alternate measured evidence is named for the window |
+| `bump_reminders` | `accept-with-reason` | No write timestamp: `fires_at` is a delivery deadline, and claiming changes `fired` without a timestamp. Transient reminder state is excluded from backups and rollback export to avoid replaying stale pings; the next successful bump re-arms it |
 | `community_scorecard_attempts` | `accept-with-reason` | A completed week is visible via `community_scorecard_runs.generated_at` |
 | `gateway_onboarding_jobs` | `accept-with-reason` | Transient restart-recovery queue; rows hold no durable member state |
 | `guild_settings_revision` | `accept-with-reason` | Changes are visible via `guild_settings.updated_at` |
