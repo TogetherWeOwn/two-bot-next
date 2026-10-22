@@ -7192,7 +7192,9 @@ struct GuildActor {
 /// evicts) and counts the drop; the actor loop releases one permit per
 /// received bufferable command, so a draining actor never wedges.
 /// Reply-bearing commands bypass the gate: dropping a reply would hang its
-/// caller, while fire-and-forget state reconverges on the next frame.
+/// caller, while fire-and-forget state reconverges on the next frame, with
+/// one exception: a refused ticketed `Join` drops its ticket, and only a
+/// fresh channel transition re-tickets, so the member rejoins to get a room.
 const VOICE_ACTOR_INBOX_CAP: usize = 256;
 
 /// Backpressure ledger for one guild actor's inbox

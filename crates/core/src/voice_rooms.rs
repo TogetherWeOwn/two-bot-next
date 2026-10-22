@@ -53,9 +53,11 @@ pub const MAX_FAILED_ACTIONS: usize = 100;
 /// Cap on one guild's total pending actions (urgent + deferred) admitted
 /// through [`ActionQueue::try_enqueue`]. Past the cap new work is refused
 /// (never evicted: the oldest admitted action still pops first) and counted
-/// by [`ActionQueue::overflow_dropped`]. Production intake is bounded
-/// upstream at the per-guild actor inbox; must-admit producers (accepted
-/// user commands, room lifecycle writes) keep [`ActionQueue::enqueue`].
+/// by [`ActionQueue::overflow_dropped`]. The inbox gate bounds the inbound
+/// burst feeding the queue, not cumulative production under a stalled drain:
+/// must-admit producers (accepted user commands, room lifecycle writes) keep
+/// [`ActionQueue::enqueue`]; wiring sheddable producers to the bounded
+/// intake is follow-up work.
 pub const MAX_QUEUE_PENDING_PER_GUILD: usize = 1024;
 
 // --- creator channels -------------------------------------------------------
