@@ -5,7 +5,7 @@
 //! written, stop and escalate instead of changing the tests.
 //!
 //! Spec: the Admin MCP + REST API design, section 8 slice 0 (token registry
-//! + container authorize), sections 4.1 (admin_api_tokens), 4.2 (scope map
+//! and container authorize), sections 4.1 (admin_api_tokens), 4.2 (scope map
 //! v0), 4.3 (guild allowlist), 5.1 (hash-only storage) and 5.2 (two-layer
 //! enforcement). Owner-approved round-1 decisions apply: operator-issued
 //! tokens to named holders including named AI-agent clients (one token
