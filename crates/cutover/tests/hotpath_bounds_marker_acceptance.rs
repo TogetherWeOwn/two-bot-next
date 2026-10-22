@@ -395,7 +395,7 @@ fn funnel_store(db: &TestDatabase) -> PgFunnelStore {
     PgFunnelStore::new(db.pool().clone())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn member_page_marks_truncated_over_cap() {
     let Some(bootstrap) = bootstrap_url("funnel page cap") else {
         return;
@@ -414,7 +414,7 @@ async fn member_page_marks_truncated_over_cap() {
     db.close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn member_page_unmarked_within_cap() {
     let Some(bootstrap) = bootstrap_url("funnel page within cap") else {
         return;
@@ -441,7 +441,7 @@ async fn member_page_unmarked_within_cap() {
     db.close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn member_page_unknown_member_is_none() {
     let Some(bootstrap) = bootstrap_url("funnel page unknown") else {
         return;
