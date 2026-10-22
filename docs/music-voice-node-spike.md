@@ -110,6 +110,8 @@ handshake logs one structured line (guild, channel, `has_token` — never
 token/endpoint values) and is dropped; a self leave with a live pairing
 logs the clear. Redelivered identical halves (mute toggles, duplicate
 dispatches) do not re-log; a changed half logs again as a new handshake.
+A gateway disconnect silently drops pending/complete pairing and dedup state,
+so both fresh halves are required after reconnect, in either arrival order.
 No HTTP, no PATCH, no gateway send in the capture slice.
 
 Still to come (follow-up cards): the REST/WS client, the

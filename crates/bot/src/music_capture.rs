@@ -251,6 +251,16 @@ impl VoiceEventSink for MusicVoiceTap {
         if let Some(inner) = self.inner.as_ref() {
             inner.disconnect();
         }
+        if let Some(guild_id) = self.staging_guild {
+            self.pairing
+                .lock()
+                .expect("music pairing lock")
+                .reset(guild_id);
+            self.last_logged
+                .lock()
+                .expect("music pairing lock")
+                .remove(&guild_id);
+        }
     }
 
     fn needs_bootstrap(&self, cache: &DefaultInMemoryCache) -> bool {
@@ -512,6 +522,10 @@ mod tests {
         );
         assert_eq!(tap.dry_runs(), 0, "other guilds never pair");
         assert_eq!(tap.complete(OTHER_GUILD), None);
+        assert!(
+            !tap.pairing.lock().unwrap().contains(OTHER_GUILD),
+            "neither half may create a pending entry outside staging"
+        );
     }
 
     #[test]
@@ -524,6 +538,10 @@ mod tests {
         );
         assert_eq!(tap.dry_runs(), 0, "prod (no staging var) must never pair");
         assert_eq!(tap.complete(STAGING), None);
+        assert!(
+            !tap.pairing.lock().unwrap().contains(STAGING),
+            "neither half may create a pending entry without a staging guild"
+        );
     }
 
     #[test]
@@ -708,6 +726,79 @@ mod tests {
         assert_eq!(inner.presences.load(Ordering::Relaxed), 1);
         assert_eq!(inner.disconnects.load(Ordering::Relaxed), 1);
         assert_eq!(inner.identities.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn bootstrap_request_from_inner_is_preserved() {
+        let inner: Arc<dyn VoiceEventSink> = Arc::new(CountingSink {
+            bootstrap: true,
+            ..CountingSink::new()
+        });
+        let sink = MusicVoiceTap::wrap_with_vars(Some(inner), Some(STAGING), &vars_with("1"))
+            .expect("gate on attaches the tap");
+        assert!(
+            sink.needs_bootstrap(&DefaultInMemoryCache::new()),
+            "a cold-resume bootstrap request must pass through the music tap"
+        );
+    }
+
+    #[test]
+    fn disconnect_requires_fresh_halves_and_resets_dedup() {
+        for with_inner in [false, true] {
+            for (had_server, had_state) in [(true, false), (false, true), (true, true)] {
+                for server_first in [false, true] {
+                    let inner = Arc::new(CountingSink::new());
+                    let tap = MusicVoiceTap::new(
+                        with_inner.then(|| Arc::clone(&inner) as Arc<dyn VoiceEventSink>),
+                        Some(STAGING),
+                    );
+                    let cache = seeded_cache(BOT);
+                    let server = server_event(STAGING, "token", Some("endpoint"));
+                    let state = state_event(STAGING, BOT, "session", Some(CHANNEL));
+                    if had_server {
+                        tap.handle(&server, &cache);
+                    }
+                    if had_state {
+                        tap.handle(&state, &cache);
+                    }
+                    let before = u64::from(had_server && had_state);
+                    assert_eq!(tap.dry_runs(), before);
+
+                    tap.disconnect();
+                    assert_eq!(
+                        inner.disconnects.load(Ordering::Relaxed),
+                        u64::from(with_inner)
+                    );
+                    assert!(
+                        !tap.pairing.lock().unwrap().contains(STAGING),
+                        "disconnect drops both complete and pending handshakes"
+                    );
+                    assert_eq!(tap.complete(STAGING), None);
+                    assert_eq!(tap.dry_runs(), before, "disconnect never logs a completion");
+                    assert_eq!(tap.clears(), 0, "disconnect is not a self leave");
+
+                    let (first, second) = if server_first {
+                        (&server, &state)
+                    } else {
+                        (&state, &server)
+                    };
+                    tap.handle(first, &cache);
+                    assert_eq!(
+                        tap.complete(STAGING),
+                        None,
+                        "one fresh half cannot pair with stale data"
+                    );
+                    assert_eq!(tap.dry_runs(), before);
+                    tap.handle(second, &cache);
+                    assert!(tap.complete(STAGING).is_some());
+                    assert_eq!(
+                        tap.dry_runs(),
+                        before + 1,
+                        "even an identical handshake logs again after disconnect"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
