@@ -113,6 +113,11 @@ VALUES ('100000000000000001', '100000000000000003', E'Backup sticky | NULL\n雪 
         17, FALSE, '100000000000000006', '2026-08-01T10:00:00.123456Z',
         '100000000000000002', '2026-08-01T09:00:00Z', '100000000000000004',
         '2026-08-01T10:00:00Z', 'backup-sticky-claim', '2026-08-01T10:00:01Z');
+-- AFK member status (0455): one away member with a note plus one noteless
+-- row, covering both note shapes through dump and restore.
+INSERT INTO afk_status (guild_id, user_id, note, set_at)
+VALUES ('100000000000000001', '100000000000000002', E'Backup away | NULL\n雪 "quote"', '2026-08-01T10:00:00Z'),
+       ('100000000000000001', '100000000000000004', NULL, '2026-08-01T10:01:00Z');
 INSERT INTO automation_commands
     (guild_id, name, description, template, text_trigger, enabled,
      created_by, created_at, updated_by, updated_at)

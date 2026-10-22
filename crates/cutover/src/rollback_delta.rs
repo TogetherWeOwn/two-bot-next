@@ -69,6 +69,10 @@ pub struct TableSpec {
 /// here, and on any entry here that appears in neither list (outside the two
 /// documented feed tables).
 pub const TABLE_SPECS: &[TableSpec] = &[
+    // AFK member status (0455): every set and update rewrites set_at, so its
+    // maximum is the row's last write (a clear deletes the row, so only live
+    // away states are measurable).
+    TableSpec { table: "afk_status", measure: TableMeasure::Columns(&["set_at"]) },
     TableSpec { table: "announcements_audit_log", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec { table: "assistant_monthly_builds", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "audit_kill_switch", measure: TableMeasure::Columns(&["engaged_at"]) },

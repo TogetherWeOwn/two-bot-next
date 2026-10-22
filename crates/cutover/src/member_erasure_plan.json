@@ -259,6 +259,11 @@
       "table": "retention_deletion_requests",
       "columns": ["user_id"],
       "predicate": "guild_id = $1 AND user_id = $2"
+    },
+    {
+      "table": "afk_status",
+      "columns": ["user_id"],
+      "predicate": "guild_id = $1 AND user_id = $2"
     }
   ],
   "allowlist": [

@@ -468,6 +468,10 @@
     "crates/cutover/migrations/0454_sticky_delivery_uncertainty.sql": {
       "sha256": "c813acffc8d44d4f3175acab3aadd9c81a2e611f7962fbba1725a828c3cee4fc",
       "justification": "Uncertain-delivery fence for sticky re-posts: one NOT NULL DEFAULT FALSE column delivery_uncertain on sticky_messages, armed by the atomic claim and disarmed only by confirmed record, proven no-send, confirmed orphan absence, or administrator reconfigure. Additive, IF NOT EXISTS; numbered 0454 because main owns 0452 (scheduled tombstone) and 0453 (store copy); global migration numbers remain unique across both chains; rollback drops the column."
+    },
+    "crates/cutover/migrations/0455_afk_status.sql": {
+      "sha256": "89a4a99e6e368c123bac636da010c5a0193f9cdeddf6c3515b95ee931ae95491",
+      "justification": "AFK status store for /afk with mention replies: new table afk_status(guild_id, user_id, note NULL, set_at TIMESTAMPTZ; PK(guild_id, user_id)), no sequences or secondary indexes. Additive, IF NOT EXISTS, cutover chain only (bot-runtime state like sticky); numbered 0455 as the next free global migration; rollback drops the table."
     }
   }
 }

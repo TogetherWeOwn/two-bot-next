@@ -42,12 +42,14 @@
 //! is deferred when automations enable dynamic commands.
 
 use std::{
+    collections::HashMap,
     future::Future,
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, PoisonError, RwLock,
     },
+    time::{Duration, Instant},
 };
 
 use crate::member_runtime::MemberRuntime;
@@ -62,6 +64,7 @@ use twilight_model::{
     http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
 };
 use two_bot_core::{
+    afk::store as afk_store,
     automod_runtime::FunnelDisposition,
     commands::PERM_MANAGE_GUILD,
     feeds::{
@@ -70,16 +73,19 @@ use two_bot_core::{
     },
     feeds_store::{add_feed, list_feeds, remove_feed, write_audit, FeedAudit, FeedRemoval},
     funnel::now_millis_for_test,
+    mention_reply,
     moderation::ModerationAction,
+    render_elapsed, set_confirmation,
     sticky::{
         activity_eligible, decide_activity, normalize_debounce, sticky_removed_reply,
         sticky_set_reply, store, validate_body, ActivityDecision, ActivityOutcome, PutSticky,
         RemoveOutcome, StickyAudit, StickyAuditAction, StickyAuditOutcome,
     },
     tickets::TicketAction,
-    ChannelModerationStore, ComponentHandler, ComponentOutcome, FeatureGates, HandlerId,
-    InteractionHandler, InteractionRouter, ModerationGates, RouterGates, RouterRefusal,
-    SlashOutcome, SurfaceFlags,
+    validate_note, ChannelModerationStore, ComponentHandler, ComponentOutcome, FeatureGates,
+    HandlerId, InteractionHandler, InteractionRouter, ModerationGates, RouterGates, RouterRefusal,
+    SlashOutcome, SurfaceFlags, AFK_CLEARED_REPLY, AFK_GUILD_CAP_REPLY, AFK_GUILD_ROW_CAP,
+    AFK_MENTION_COOLDOWN_SECS, AFK_STORE_UNAVAILABLE_REPLY,
 };
 use two_bot_discord::{
     help_response, publish_commands, register_channel_handlers, response_for_slash,
@@ -288,6 +294,9 @@ pub struct CommandRuntime {
     /// answerer of `/kick`: moderation first, then this delegate for room
     /// occupants the moderation path refused.
     voice_kick_vote: Mutex<Option<VoiceKickVote>>,
+    /// Last AFK mention reply per (AFK member, mentioner). Pruned on write;
+    /// never held across an await.
+    afk_mention_cooldown: Mutex<HashMap<(u64, u64), Instant>>,
 }
 
 // Each in-flight LFG execution holds up to two connections of the shared pool;
@@ -368,6 +377,7 @@ impl CommandRuntime {
             registry_synced: tokio::sync::Mutex::new(false),
             attempts: AtomicU64::new(now_millis_for_test().max(0) as u64),
             voice_kick_vote: Mutex::new(None),
+            afk_mention_cooldown: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1396,8 +1406,14 @@ impl CommandRuntime {
             self.answer(interaction, response).await;
             return;
         }
-        // No `"help"` entry: the help arm above owns `/help` and returns
-        // first, so an owner-map entry could never execute.
+        if handler == HandlerId::Afk {
+            // AFK owns its immediate set/update/refusal callback. Never send
+            // the generic ephemeral defer as well.
+            self.afk_set(interaction).await;
+            return;
+        }
+        // No `"help"`/`"afk"` entry: the arms above own `/help` and `/afk`
+        // and return first, so an owner-map entry could never execute.
         let owner = match name.as_str() {
             "privacy" => Some(HandlerId::Privacy),
             "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list" => {
@@ -1552,6 +1568,174 @@ impl CommandRuntime {
         }
     }
 
+    /// `/afk [message]`: one immediate ephemeral callback — set/update
+    /// confirmation or an owned refusal. Never defers. Note contents never
+    /// reach the logs.
+    async fn afk_set(&self, interaction: &Interaction) {
+        let guild_id = self.guild_id.to_string();
+        let user_id = actor_id(interaction);
+        if user_id.is_empty() {
+            self.answer(interaction, ephemeral(AFK_STORE_UNAVAILABLE_REPLY))
+                .await;
+            return;
+        }
+        let note = afk_message_option(interaction);
+        if let Some(note) = &note {
+            if let Err(err) = validate_note(note) {
+                self.answer(interaction, ephemeral(err.to_string())).await;
+                return;
+            }
+        }
+        match afk_store::set_afk(
+            &self.pool,
+            &guild_id,
+            &user_id,
+            note.as_deref(),
+            now_millis_for_test(),
+            AFK_GUILD_ROW_CAP,
+        )
+        .await
+        {
+            Ok(Some(created)) => {
+                self.answer(
+                    interaction,
+                    ephemeral(set_confirmation(note.as_deref(), !created)),
+                )
+                .await;
+            }
+            Ok(None) => {
+                self.answer(interaction, ephemeral(AFK_GUILD_CAP_REPLY))
+                    .await;
+            }
+            Err(err) => {
+                warn!(
+                    interaction_id = %interaction.id.get(),
+                    guild_id = %guild_id,
+                    reason = db_class(&err),
+                    "afk set failed; no state written"
+                );
+                self.answer(interaction, ephemeral(AFK_STORE_UNAVAILABLE_REPLY))
+                    .await;
+            }
+        }
+    }
+
+    /// AFK half of the message lane: the author's own message clears their
+    /// status with one quiet confirmation and never triggers an auto-reply;
+    /// mentions of AFK members answer once each, rate-limited per
+    /// mentioner. Bot authors and foreign guilds never reach here (the
+    /// `on_message` gate). Store failures fail closed: warn and skip both
+    /// halves for this message, never post on unknown state.
+    async fn afk_on_message(&self, message: &Message) {
+        let guild_id = self.guild_id.to_string();
+        let author_id = message.author.id.get();
+        match afk_store::clear_afk(&self.pool, &guild_id, &author_id.to_string()).await {
+            Ok(true) => {
+                let channel_id = message.channel_id.get().to_string();
+                if let Err(err) = self
+                    .executor
+                    .post_message(&channel_id, AFK_CLEARED_REPLY, None)
+                    .await
+                {
+                    warn!(
+                        guild_id = %guild_id,
+                        channel_id = %channel_id,
+                        reason = discord_class(&err),
+                        "afk clear confirmation failed"
+                    );
+                }
+                return;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                warn!(
+                    guild_id = %guild_id,
+                    reason = db_class(&err),
+                    "afk clear lookup failed; skipping mentions"
+                );
+                return;
+            }
+        }
+        // Mention targets are server truth (`Message.mentions`), deduped.
+        // The author's own id and bot users never trigger.
+        let mut targets: Vec<(u64, String)> = Vec::new();
+        for mention in &message.mentions {
+            if mention.bot {
+                continue;
+            }
+            let id = mention.id.get();
+            if id == author_id || targets.iter().any(|(seen, _)| *seen == id) {
+                continue;
+            }
+            targets.push((id, mention.name.clone()));
+        }
+        if targets.is_empty() {
+            return;
+        }
+        let ids: Vec<String> = targets.iter().map(|(id, _)| id.to_string()).collect();
+        let statuses = match afk_store::get_afk_for(&self.pool, &guild_id, &ids).await {
+            Ok(statuses) => statuses,
+            Err(err) => {
+                warn!(
+                    guild_id = %guild_id,
+                    reason = db_class(&err),
+                    "afk mention lookup failed"
+                );
+                return;
+            }
+        };
+        if statuses.is_empty() {
+            return;
+        }
+        let channel_id = message.channel_id.get().to_string();
+        let now = Instant::now();
+        let now_ms = now_millis_for_test();
+        for (afk_id, name) in &targets {
+            let id = afk_id.to_string();
+            let Some(status) = statuses.iter().find(|status| status.user_id == id) else {
+                continue;
+            };
+            if !self.afk_cooldown_admit(*afk_id, author_id, now) {
+                continue;
+            }
+            let reply = mention_reply(
+                name,
+                status.note.as_deref(),
+                &render_elapsed(status.set_at_ms, now_ms),
+            );
+            if let Err(err) = self.executor.post_message(&channel_id, &reply, None).await {
+                self.afk_cooldown_release(*afk_id, author_id, now);
+                warn!(
+                    guild_id = %guild_id,
+                    channel_id = %channel_id,
+                    reason = discord_class(&err),
+                    "afk mention reply failed"
+                );
+            }
+        }
+    }
+
+    /// Admit one mention reply per (AFK member, mentioner) cooldown window.
+    /// Admits pre-mark the pair so concurrent messages cannot double-post;
+    /// a failed post releases the mark.
+    fn afk_cooldown_admit(&self, afk_id: u64, mentioner: u64, now: Instant) -> bool {
+        let mut cooldowns = self.afk_mention_cooldown.lock().expect("afk cooldown lock");
+        let window = Duration::from_secs(AFK_MENTION_COOLDOWN_SECS);
+        cooldowns.retain(|_, admitted_at| now.duration_since(*admitted_at) < window);
+        if cooldowns.contains_key(&(afk_id, mentioner)) {
+            return false;
+        }
+        cooldowns.insert((afk_id, mentioner), now);
+        true
+    }
+
+    fn afk_cooldown_release(&self, afk_id: u64, mentioner: u64, admitted_at: Instant) {
+        let mut cooldowns = self.afk_mention_cooldown.lock().expect("afk cooldown lock");
+        if cooldowns.get(&(afk_id, mentioner)) == Some(&admitted_at) {
+            cooldowns.remove(&(afk_id, mentioner));
+        }
+    }
+
     /// Gateway accepted-message path (legacy `automationMessageAccepted`
     /// sticky half). The pure decision is only a precheck — the store's
     /// atomic claim is what coalesces a burst to one re-post.
@@ -1560,6 +1744,7 @@ impl CommandRuntime {
         if !self.automations || !activity_eligible(message.author.bot, guild_matches, true) {
             return ActivityOutcome::None;
         }
+        self.afk_on_message(message).await;
         let guild_id = self.guild_id.to_string();
         let channel_id = message.channel_id.get().to_string();
         let now = now_millis_for_test();
@@ -2357,6 +2542,10 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     }
     if gates.automations {
         router.register(Box::new(StickyHandler));
+        // AFK status is a message automation (mention replies and the
+        // auto-clear run in the message lane), so it registers with the
+        // automations surface even though every member may set their own.
+        router.register(Box::new(SliceHandler(HandlerId::Afk)));
         // Custom commands are an automations capability: a refused identity
         // must not even resolve their handlers (4014 isolation depends on the
         // narrowed intent too). Dispatch refuses and publish withholds when
@@ -2439,6 +2628,24 @@ pub(crate) fn sticky_options(interaction: &Interaction) -> (Option<String>, Opti
         }
     }
     (body, debounce)
+}
+
+/// Extract `/afk`'s `message` option (optional string). A missing or blank
+/// note becomes `None`: the status sets without a note.
+pub(crate) fn afk_message_option(interaction: &Interaction) -> Option<String> {
+    let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
+        &interaction.data
+    else {
+        return None;
+    };
+    data.options
+        .iter()
+        .find_map(|option| match (option.name.as_str(), &option.value) {
+            ("message", CommandOptionValue::String(value)) => Some(value.clone()),
+            _ => None,
+        })
+        .map(|note| note.trim().to_owned())
+        .filter(|note| !note.is_empty())
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 {
   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
-  "count": 29,
+  "count": 30,
   "dm_permission_all_false": true,
   "commands": [
     {
@@ -412,6 +412,29 @@
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Channel-state mutation; excluded from the read-only smoke."
+    },
+    {
+      "name": "afk",
+      "description": "Mark yourself away; mentions answer while you're gone",
+      "family": "automations",
+      "gate": "automations",
+      "default_member_permissions": null,
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "message",
+          "description": "Away note shown to members who mention you",
+          "type": "string",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 200,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Member-state mutation with message-lane replies; excluded from the read-only smoke."
     },
     {
       "name": "rsvp",

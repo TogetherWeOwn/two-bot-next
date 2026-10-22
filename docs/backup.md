@@ -150,29 +150,32 @@ versioned additions introduced later:
 
 | Version | Tables it may omit |
 | --- | --- |
-| v4 | `V5_ADDED_TABLES` (reservations and privacy controls), `V6_ADDED_TABLES` (event store), `V7_ADDED_TABLES` (seasonal XP and retention queues), `V8_ADDED_TABLES` (stream ledger), `V9_ADDED_TABLES` (guild counters), `V10_ADDED_TABLES` (epoch-claim guard), `V11_ADDED_TABLES` (delete tombstones) |
-| v5 | `V6_ADDED_TABLES`, `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES` |
-| v6 | `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES` |
-| v7 | `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES` |
-| v8 | `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES` |
-| v9 | `V10_ADDED_TABLES`, `V11_ADDED_TABLES`: `scheduled_events_claim`, `scheduled_events_tombstone` |
-| v10 | `V11_ADDED_TABLES`: `scheduled_events_tombstone` |
-| v11 | None: the full current inventory is required |
+| v4 | `V5_ADDED_TABLES` (reservations and privacy controls), `V6_ADDED_TABLES` (event store), `V7_ADDED_TABLES` (seasonal XP and retention queues), `V8_ADDED_TABLES` (stream ledger), `V9_ADDED_TABLES` (guild counters), `V10_ADDED_TABLES` (epoch-claim guard), `V11_ADDED_TABLES` (delete tombstones), `V12_ADDED_TABLES` (AFK status) |
+| v5 | `V6_ADDED_TABLES`, `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES` |
+| v6 | `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES` |
+| v7 | `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES` |
+| v8 | `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES` |
+| v9 | `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`: `scheduled_events_claim`, `scheduled_events_tombstone`, `afk_status` |
+| v10 | `V11_ADDED_TABLES`, `V12_ADDED_TABLES`: `scheduled_events_tombstone`, `afk_status` |
+| v11 | `V12_ADDED_TABLES`: `afk_status` |
+| v12 | None: the full current inventory is required |
 
 These are narrow waivers, not permission to omit arbitrary tables. An
 incomplete new archive refuses at inspection. The frozen 85-table v4 fixture
-is unchanged from before these additions; older v4–v10 archives need not
-invent entries for the v9 guild counters, the v10 epoch-claim guard or the
-v11 delete tombstones.
+is unchanged from before these additions; older v4–v11 archives need not
+invent entries for the v9 guild counters, the v10 epoch-claim guard, the
+v11 delete tombstones or the v12 AFK status table.
 Restoring an older archive clears
 destination rows for every omitted later table instead of retaining unrelated
 target state. In particular, restoring v8 without guild counters clears both
 counters; it cannot recover assistant usage that predates its persistence.
 Restoring v9 without the claim guard clears the guard and the tombstones; the
 mirror re-fences on the next winning fetch. Restoring a claim-only v10 clears
-the tombstones while keeping the epoch fence. Use a v11 recovery point to
-preserve the monthly cap and both mirror fences. Current v11 archives must
-include the monthly cap and both mirror-fence tables, so routine restores
+the tombstones while keeping the epoch fence. Restoring v11 without the AFK
+table clears live away states; members re-set with `/afk`. Use a v12
+recovery point to preserve the monthly cap, both mirror fences and away
+states. Current v12 archives must include the monthly cap, both
+mirror-fence tables and the AFK status table, so routine restores
 retain their archived state. Tombstone `deleted_at` cells must be real dates in
 exact `YYYY-MM-DDTHH:MM:SS.sssZ` form: inspection refuses missing, null,
 non-string or noncanonical values before restore opens a write transaction.

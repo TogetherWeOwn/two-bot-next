@@ -34,6 +34,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use super::afk::AFK_NOTE_MAX_CHARS;
 use super::commands::{
     CommandChoice, CommandDefinition, CommandOption, CommandOptionType, MAX_RESOURCE_ID_CHARS,
     OCCURRENCE_ID_MAX_CHARS, PERM_MANAGE_EVENTS, PERM_MANAGE_GUILD,
@@ -71,9 +72,13 @@ pub fn scorecard_attendance_command() -> CommandDefinition {
     ])
 }
 
+/// Next-only AFK status description, shared by the registry fixtures.
+pub const AFK_DESCRIPTION: &str = "Mark yourself away; mentions answer while you're gone";
+
 /// Automation admin commands (parity #14–#21): custom-command builder,
 /// scheduled messages, stickies. All `ManageGuild`-gated in legacy
-/// (`setDefaultMemberPermissions`), guild-only.
+/// (`setDefaultMemberPermissions`), guild-only — except the Next-only
+/// `/afk` status command, which every member may use on themselves.
 #[must_use]
 pub fn automation_commands() -> Vec<CommandDefinition> {
     vec![
@@ -175,6 +180,15 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
             ]),
         CommandDefinition::new("sticky-remove", "Remove this channel's sticky message")
             .permissions(PERM_MANAGE_GUILD),
+        // Next-only AFK status (parity row 33): open to everyone, so no
+        // `permissions(...)` picker default. The handler re-checks the note
+        // bound and refuses mention syntax.
+        CommandDefinition::new("afk", AFK_DESCRIPTION).options(vec![CommandOption::new(
+            "message",
+            "Away note shown to members who mention you",
+            CommandOptionType::String,
+        )
+        .max_length(AFK_NOTE_MAX_CHARS as u32)]),
     ]
 }
 
@@ -420,6 +434,7 @@ mod tests {
                 "schedule-list",
                 "sticky",
                 "sticky-remove",
+                "afk",
                 "rsvp",
                 "rsvp-attendance",
                 "lfg",
@@ -434,8 +449,8 @@ mod tests {
     #[test]
     fn no_collision_with_leveling_core_or_within_slice() {
         let merged = merge_commands(&[feature_commands()], &[]).expect("slice 2 merges cleanly");
-        // 4 core + 1 scorecard + 8 automation + 7 announcement.
-        assert_eq!(merged.len(), 20);
+        // 4 core + 1 scorecard + 9 automation + 7 announcement.
+        assert_eq!(merged.len(), 21);
         assert_eq!(
             &names(&merged)[..5],
             ["rank", "leaderboard", "help", "privacy", "attendance"]
@@ -476,6 +491,7 @@ mod tests {
         // Open to everyone: no permission gate.
         assert_eq!(is(&ann, "rsvp"), None);
         assert_eq!(is(&ann, "rsvp-attendance"), None);
+        assert_eq!(is(&auto, "afk"), None);
         assert_eq!(
             is(&[scorecard_attendance_command()], "attendance"),
             manage_events
@@ -499,6 +515,7 @@ mod tests {
             ("schedule", 0, 2000),
             ("schedule-remove", 0, 128),
             ("sticky", 0, 2000),
+            ("afk", 0, 200),
         ] {
             assert_eq!(
                 get(&auto, command).options[option].max_length,

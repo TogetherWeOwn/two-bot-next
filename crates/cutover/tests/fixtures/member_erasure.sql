@@ -70,6 +70,8 @@ BEGIN
       INSERT INTO sticky_messages
         (guild_id, channel_id, body, created_by, created_at, updated_by, updated_at)
         VALUES (g, u, 'fixture', u, now(), u, now());
+      INSERT INTO afk_status (guild_id, user_id, note, set_at)
+        VALUES (g, u, 'fixture', now());
       INSERT INTO automation_commands
         (guild_id, name, description, template, text_trigger, enabled, created_by, created_at, updated_by, updated_at)
         VALUES (g, 'fixture-' || u, 'fixture', 'fixture', NULL, TRUE, u, now(), u, now());
