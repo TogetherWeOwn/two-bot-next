@@ -13,10 +13,26 @@ against scratch Postgres only (tests: agent-testdb `two_next_backup_test` /
 `two_next_restore_drill`). The restore target is a different variable
 (`TWO_RESTORE_URL`, never `TWO_DATABASE_URL`) and real restores additionally
 require `--force`. This confirmation is not authorization to target production.
+`restore` enforces the rule by value: a target that normalizes to the live
+database (scheme alias, host case, ports defaulted from `PGPORT` exactly as
+the driver seeds them, and credential/query spellings folded away;
+`?host=`/`?hostaddr=`/`?dbname=`/`?port=` overrides honored; database
+derived exactly as the driver derives it, so `//prod` names `prod`;
+socket spellings — encoded authority, `?host=`, redundant separators, `.`
+segments, trailing slash — folded component-wise),
+or whose database name is a production marker (`prod`, `production`,
+`two_prod`, `two_production`, `live`, `two_live`), is refused with a fixed
+message on stderr and exit 2 — even with `--force`, and without echoing
+either URL. A target whose effective target cannot be proven — omitted
+database, an empty `?host=`/`?hostaddr=`/`?dbname=` override, or a socket
+directory mixed with a plain host (the driver's socket slot is sticky) —
+is refused the same way: name the scratch database explicitly.
+`--dry-run` still previews without that comparison.
 
 ## Stable failure codes
 
-Every `backup`, `backup-upload` and `guild-config-snapshot` failure line
+Every `backup`, `restore`, `backup-upload`, `guild-config-snapshot` and
+`guild-config-restore` failure line
 ends with a stable `code=<snake>` token so agents can match failure classes
 without substring-matching English. The human-readable text is unchanged;
 the code is additive. Success lines (`backup: done`, `RESTORE VERIFIED`,
@@ -47,6 +63,13 @@ code and are byte-identical.
 - `backup_upload_put_status` — PUT returned a non-2xx status.
 - `backup_upload_put_failed` — the PUT request failed.
 
+`two-bot restore <dump> --force`:
+
+- `restore_live_target_refused` — `TWO_RESTORE_URL` normalizes to the live
+  database, names a production database, or cannot be proven different
+  (omitted database, empty overrides, socket/host mixes); fixed refusal,
+  exit 2, even with `--force`. `--dry-run` still previews.
+
 `two-bot guild-config-snapshot`:
 
 - `snapshot_usage` — unexpected extra argument (usage refusal, exit 2).
@@ -61,6 +84,12 @@ code and are byte-identical.
 - `snapshot_hash_changed` — snapshot hash changed after the write.
 - `snapshot_seal_missing` — written snapshot lacks its integrity seal.
 - `snapshot_local_only_refused` — no upload command; local-only refused.
+
+`two-bot guild-config-restore --apply`:
+
+- `guild_restore_apply_failed` — a mid-apply failure; the report names
+  landed vs pending operations (labels only). Exit 1. Completion prints
+  `DID <op>` per operation only as each operation lands.
 
 Bounded upload helper (`backup` and `guild-config-snapshot`: external
 upload command; argv and child output never echoed):

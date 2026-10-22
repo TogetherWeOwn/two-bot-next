@@ -64,11 +64,12 @@ async fn exactly_thousand_messages_completes_without_marker() {
         .collect();
     script.push(ScriptedResponse::json(200, json!([])));
     let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
-    let snapshot = runtime(&mock)
+    let (snapshot, truncated) = runtime(&mock)
         .capture_history("600")
         .await
         .ok()
         .expect("exactly-1000 capture completes");
+    assert!(!truncated, "exactly-1000 capture must report not truncated");
     assert_eq!(snapshot.message_count, 1000);
     assert!(
         !snapshot.content.to_lowercase().contains("truncat"),
@@ -93,11 +94,12 @@ async fn ten_full_pages_plus_one_message_marks_capped() {
         .collect();
     script.push(ScriptedResponse::json(200, json!([message(201)])));
     let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
-    let snapshot = runtime(&mock)
+    let (snapshot, truncated) = runtime(&mock)
         .capture_history("600")
         .await
         .ok()
         .expect("1001-message capture completes");
+    assert!(truncated, "1001-message capture must report truncated");
     assert_eq!(snapshot.message_count, 1000);
     assert!(
         snapshot.content.to_lowercase().contains("truncat"),
@@ -117,11 +119,12 @@ async fn deep_channel_stores_newest_thousand_with_marker() {
         .map(|index| ScriptedResponse::json(200, json!(full_page(index))))
         .collect();
     let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
-    let snapshot = runtime(&mock)
+    let (snapshot, truncated) = runtime(&mock)
         .capture_history("600")
         .await
         .ok()
         .expect("deep capture completes");
+    assert!(truncated, "deep capture must report truncated");
     assert_eq!(
         snapshot.message_count, 1000,
         "deep close stores exactly the newest 1000"

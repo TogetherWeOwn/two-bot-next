@@ -188,7 +188,7 @@ static REFUSAL_WARN_SAMPLE: AtomicU64 = AtomicU64::new(0);
 const REFUSAL_WARN_SAMPLE_EVERY: u64 = 64;
 
 fn sample_every_n(counter: u64) -> bool {
-    counter % REFUSAL_WARN_SAMPLE_EVERY == 0
+    counter.is_multiple_of(REFUSAL_WARN_SAMPLE_EVERY)
 }
 
 fn sampled_refusal_warn_emits() -> bool {
