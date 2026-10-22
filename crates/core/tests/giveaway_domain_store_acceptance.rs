@@ -111,7 +111,7 @@ const WINNERS_MIN: i64 = 1;
 const WINNERS_MAX: i64 = 100;
 
 /// Fixed 128-bit draw nonce (hex) for the reference vectors.
-const VECTOR_NONCE: &str = "9f2c4a7e1b5d8f03a6c9e2b4d7f1a83c5";
+const VECTOR_NONCE: &str = "9f2c4a7e1b5d8f03a6c9e2b4d7f1a83c";
 /// Ten fixed eligible member ids for the reference vectors.
 const VECTOR_ELIGIBLE: [&str; 10] = [
     "100000000000000001",
@@ -126,14 +126,14 @@ const VECTOR_ELIGIBLE: [&str; 10] = [
     "100000000000000010",
 ];
 /// `reference_seed(VECTOR_NONCE, 0)`.
-const VECTOR_SEED_0: &str = "85d008e0abe062a3aa45760c0e55a36f7a32cc5702c1dd42b032df02c822313d";
+const VECTOR_SEED_0: &str = "fdab72cb4823dbf292f0ed3fea3abef20dc268169a90f6aea0a1cd4c1a8c15ab";
 /// `reference_seed(VECTOR_NONCE, 1)` — the full-reroll seed.
-const VECTOR_SEED_1: &str = "51da7ad65a3d1311cfcd21a354736d2a9ff8c2dc0995fa276d2baa73717cb2d3";
+const VECTOR_SEED_1: &str = "16688231019cd5f768dcb0e2a604881b365c0ba7b242433b3e7ff96bde0bdf88";
 /// `reference_eligible_hash(VECTOR_ELIGIBLE)`.
 const VECTOR_ELIGIBLE_HASH: &str =
     "deebe3bffe4ba1543bd568b42a31508a96ef5c0ba98464a3f1e572286ead0299";
 /// `reference_draw(VECTOR_ELIGIBLE, VECTOR_SEED_0, 2)`.
-const VECTOR_WINNERS_10_OF_2: [&str; 2] = ["100000000000000008", "100000000000000001"];
+const VECTOR_WINNERS_10_OF_2: [&str; 2] = ["100000000000000009", "100000000000000002"];
 /// `reference_draw(first 3 of VECTOR_ELIGIBLE, VECTOR_SEED_0, 5)` — fewer
 /// entrants than winners draws everybody, in draw order.
 const VECTOR_WINNERS_3_OF_5: [&str; 3] = [
@@ -142,7 +142,7 @@ const VECTOR_WINNERS_3_OF_5: [&str; 3] = [
     "100000000000000002",
 ];
 /// `reference_draw(VECTOR_ELIGIBLE, VECTOR_SEED_1, 2)` — the full reroll.
-const VECTOR_REROLL_WINNERS: [&str; 2] = ["100000000000000004", "100000000000000008"];
+const VECTOR_REROLL_WINNERS: [&str; 2] = ["100000000000000005", "100000000000000002"];
 
 const GUILD: &str = "1545644954272137297";
 const GIVEAWAY: &str = "gw01h455k";
@@ -183,7 +183,7 @@ fn reference_seed(draw_nonce_hex: &str, draw_no: i64) -> String {
         draw_nonce_hex.bytes().all(|b| b.is_ascii_hexdigit()),
         "draw nonces are 128-bit hex, got {draw_nonce_hex:?}"
     );
-    sha256_hex(&format!("{draw_nonce_hex}:{draw_no}"))
+    sha256_hex(format!("{draw_nonce_hex}:{draw_no}"))
 }
 
 /// Reference eligible-hash: `sha256` over the ASCII comma-join of the
@@ -192,7 +192,7 @@ fn reference_seed(draw_nonce_hex: &str, draw_no: i64) -> String {
 fn reference_eligible_hash(eligible_user_ids: &[String]) -> String {
     let mut sorted = eligible_user_ids.to_vec();
     sorted.sort();
-    sha256_hex(&sorted.join(","))
+    sha256_hex(sorted.join(","))
 }
 
 /// Reference draw: partial Fisher–Yates over the lexicographically sorted
@@ -338,7 +338,7 @@ fn giveaway_migrations(chain_dir: &str) -> Vec<(String, String)> {
                 .into_owned();
             let sql = std::fs::read_to_string(path).expect("read migration");
             let body = normalize_sql(&strip_sql_comments(&sql));
-            (body.contains("giveaway_draws") || name.contains("giveaway")).then(|| (name, sql))
+            (body.contains("giveaway_draws") || name.contains("giveaway")).then_some((name, sql))
         })
         .collect()
 }
@@ -1087,7 +1087,7 @@ async fn giveaway_draw_pk_forbids_double_draw_of_same_round() -> Result<(), sqlx
         serde_json::from_str(&stored.2).expect("stored winners parse as JSON");
     assert_eq!(
         stored_winners,
-        serde_json::to_value(&VECTOR_WINNERS_10_OF_2).expect("winners value")
+        serde_json::to_value(VECTOR_WINNERS_10_OF_2).expect("winners value")
     );
     fixture.close().await.expect("drop test database");
     Ok(())
