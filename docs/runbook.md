@@ -38,6 +38,9 @@ it runs the gateway/HTTP service; there is **no `serve` or `restart` subcommand*
 Use the top-level help above: backup subcommands do not implement per-command
 `--help`, despite the old comment in `backup_cli.rs`.
 
+For read-only admin change history, see the compact [ops audit contract](ops-control.md)
+(response allowlist, byte/row bounds, refusal actions and offline checks).
+
 ## Is it alive?
 
 ```bash
@@ -67,7 +70,12 @@ green without the flag. Each probe line cites the code path it checks. The five
 probes cover liveness, the readyz breakdown shape, gateway truthfulness, the
 jobs map (freshness-graded when ready or with --expect-ready, otherwise
 informational), and that the body is the container's breakdown rather
-than an ownership-fence refusal.
+than an ownership-fence refusal. Pass `--json` for one machine-readable
+verdict object with stable per-check ids, codes and next actions.
+Malformed origins and remote fields fail as bounded fixed-vocabulary
+verdicts that echo nothing; failures never write `--evidence`, which stays
+a success-only attestation. If the checks pass but the receipt write itself
+fails, `--json` reports FAIL with an `evidence` row instead of PASS.
 
 The container listens on `LISTEN_ADDR` (default `0.0.0.0:8080`). The Worker
 sets it from `BOT_PORT` (default 8080). Both routes use this listener; there is
@@ -404,6 +412,120 @@ should have cleared, when invalid requests keep arriving with no suspect
 deploy (a caller may be minting bad requests in a loop), or when the ticket
 coincides with missed gateway events or 5xx alerts suggesting a wider Discord
 or network incident.
+
+#### Alert: REST token invalid
+
+The bot-token latch read `1` (`two_bot_rest_guard_token_invalid`). A
+bot-authenticated 401 permanently latched `token_invalid` for this process:
+every new REST attempt, including essential interaction acknowledgements,
+refuses locally, and `/readyz` reports 503 until a restart with a corrected
+token. This pages on the first valid latched sample with no streak bound: the
+latch defaults to `0` at boot and is set only by a bot 401, so a `1` is never
+a boot artifact. A 401 on an interaction callback or original-response webhook
+edit counts as invalid but does not condemn the bot token (short-lived
+interaction token), so this page always means the bot credential itself. A
+valid `0` resolves (only a new process without the latch reads `0`); missing,
+malformed or failed scrapes hold the page without manufacturing recovery.
+
+First response: stop retries at once — every retry refuses and burns no
+budget, but it pages the same incident. Read the `discord_token_invalid` log
+line and confirm `/readyz` shows `token_invalid` down via the keepalive
+breakdown. Then follow the [fatal-token
+procedure](rest-guard.md#fatal-bot-token-and-readiness): the authorized
+credential operator verifies provisioning/token validity under the normal
+credential approval procedure, then restarts with the corrected configuration.
+Never log, swap in an unrelated credential, or automatically rotate a token.
+Expect [REST refusal surge](#alert-rest-refusal-surge) alongside: token-driven
+refusals grow that counter too, so treat the token page as the cause and the
+surge as its echo.
+
+Escalate when the latch re-arms right after a corrected restart (provisioning
+disagrees with the running configuration), or when the page coincides with a
+wider identity incident — the fix belongs to the credential owner, not another
+redeploy.
+
+#### Alert: REST refusal surge
+
+Combined guard invalid observations (401, 403 and 429 at response headers)
+plus local refusals (breaker, global-pause and token refusals, pre-wire)
+grew by 10 or more between two keepalive samples
+(`two_bot_rest_guard_invalid_requests_total` plus
+`two_bot_rest_guard_rejected_requests_total`). Healthy windows sit at zero,
+so 10 in one window is a loop, a bad deploy, or a Discord-side storm — never
+one operator mistake. Either family can surge alone: a 403 permission loop or
+a Discord 429 storm grows invalid, while a global pause or an open breaker
+grows rejected. Both burn the same IP-invalid budget toward the 5,000/600 s
+breaker trip and Discord's 10,000-invalid-requests/10-minute IP ban, so this
+pages while the budget still has headroom. The first valid sample only stores
+a baseline; a backwards counter re-baselines only that family to the new
+value and contributes no growth for the window, while the other family's
+growth is still judged — the invalid counter steps back by one when a 429
+tally is retracted for body-learned shared scope, which is not a restart. A
+full reset (both counters back) re-baselines both quietly rather than
+firing; a below-threshold window resolves. Missing, malformed or failed
+scrapes hold a firing page.
+
+First response: scope the surge before touching the bot. Read both counters
+plus `two_bot_rest_guard_invalid_requests_in_window` via the authorized
+`/ops/metrics` scrape: invalid-heavy means the bot's requests are being
+rejected at headers (check the hot route on
+`two_bot_rest_requests_total{route,result}` and correlate with
+[REST 429](#alert-rest-429)/[REST 5xx](#alert-rest-5xx) — a 429-heavy surge
+with a firing 429 rule is a Discord-side storm, while a 403-heavy surge with
+no 429 page is a permission loop or a bad request shape from a fresh deploy);
+rejected-heavy means local refusals (correlate with the [breaker
+ticket](#alert-rest-admission-breaker-open) and the [token
+page](#alert-rest-token-invalid) — a surge beside a firing token page is
+token-driven and follows the token procedure; a surge during a Discord
+global pause is pause-driven backpressure, see the global-pause notes in the
+breaker section). Confirm no deploy is in
+progress; a fresh deploy shipping a bad token or a hot invalid route fills the
+window fast. Contain through the actual writer's verified control
+([containment](#containment-kill-switches-and-feature-flags)): stop the
+offending workload and fix the missing permission or caller bug rather than
+repeatedly restarting to erase the budget. Do not hammer Discord, replay
+uncertain writes, or invent a breaker-reset command — there is no manual
+reset.
+
+Escalate when the surge repeats across windows after containment, when invalid
+requests keep arriving with no suspect deploy (a caller may be minting bad
+requests in a loop, or an abuse pattern is driving the bot's sends), or when
+the surge coincides with missed gateway events or 5xx alerts suggesting a
+wider Discord or network incident.
+
+#### Alert: REST global responses stuck
+
+Global-pause response bodies stayed unresolved
+(`two_bot_rest_guard_pending_global_responses` nonzero) for three consecutive
+valid keepalive samples. A pending global body still blocks admission when its
+provisional remaining time is zero, so three stuck samples mean REST sends
+have been refused for minutes while no deadline elapses to release them. Body
+reads carry a 5-second deadline and expiry drops their accounting, so this is
+24-36x past the expected drain: the bodies are stuck, not slow. A valid zero
+sample proves the bodies drained and resolves; missing, malformed or failed
+samples break the streak but hold a firing page.
+
+The paused/remaining gauges deliberately have no rule of their own: a live
+global deadline is healthy Discord backpressure — pausing sends during a
+Discord global cooldown is the guard working as designed, not a fault — and
+the remaining countdown derives from a monotonic deadline that decreases
+every scrape and cannot wedge high, so no threshold on it could distinguish a
+long Discord cooldown from a fault. Only the pathological case, bodies that
+never resolve, pages here.
+
+First response: confirm the stall via the authorized `/ops/metrics` scrape —
+pending nonzero across samples while the pause countdown drains or sits at
+zero — then read the container logs for `discord_global_pause` lines and
+global-body expiry errors around the first stuck sample. Let any live Discord
+deadline elapse; do not bypass the guard or resubmit concurrent copies of the
+same action. Do not restart the container to "clear" the counter: a
+replacement resets the baseline without proving the bodies resolved, and the
+rule re-fires on three fresh stuck samples if the fault survives.
+
+Escalate when the stall survives a live-deadline expiry, when it coincides
+with missed gateway events or 5xx alerts, or when pending keeps climbing with
+no `discord_global_pause` line in the logs — the cause is then unexplained
+and the fix belongs to the on-call engineer, not another redeploy.
 
 #### Alert: DB pool
 
@@ -2416,8 +2538,11 @@ Pooler hosts/ports and production-like or empty pins refuse with fixed,
 secret-free messages. When the three variables are unset the gate fails
 closed, so set and verify them in the environment before relying on deploys.
 
-Outcomes: `pending_before` and `pending_store_before` both empty prints
-`schema gate clean` and the deploy proceeds; either non-empty exits 1 with
+The gate first binds the returned read-only report to the requested SHA and
+verified identity (the [evidence contract](#schema-gate-evidence-and-terminal-results)
+below applies to both targets). Only then do `pending_before` and
+`pending_store_before` both empty print `schema gate clean` and allow the
+deploy; either non-empty exits 1 with
 `schema drift: staging database is behind source <sha>: pending versions [...]`
 — fix it with the manual `staging-migrate` apply dispatch for that source
 (reviewed plan, exact `expected_pending` plus `expected_store_pending` when
@@ -2435,6 +2560,52 @@ never fails — when usage is strictly above 80% of the non-superuser ceiling
 `superuser_reserved_connections`, else raw `max_connections` for older
 manifests, labelled as such). A saturated staging database (logins refused)
 therefore shows in the gate log before the deploy hits it.
+
+#### Schema-gate evidence and terminal results
+
+Both schema gates require a canonical lowercase 40-hex `--source-sha` before
+running a plan or writing evidence. The existing report must have strict integer
+`runner_version=1`, `mode=plan`, the exact `migration_target` (`staging` or
+`production`), the exact requested `source_sha`, `role=two_bot_migrator_ro`,
+and strict integer zero `applied_count` and `applied_store_count`. No new
+schema-version field is used. `target` must contain string `host`, `database`
+and `branch_id` fields matching the independently verified, trimmed environment
+pins: host and branch case-insensitively, database exactly. The manifest cannot
+choose replacement pins. Missing/minimal/contradictory reports refuse.
+
+Both pending arrays are required, strictly increasing, unique positive i64
+integers (no booleans, floats or strings). Duplicate JSON fields, non-JSON,
+nonfinite numbers and malformed shapes refuse **before** publishing any plan.
+Validated clean and drift reports are saved atomically in `--manifest-out`;
+refused/error runs publish no new manifest. An output failure leaves prior
+evidence untouched; do not consume a pre-existing file as evidence of this run.
+The production script's existing guard-validated rollback/live-SHA exemptions
+still record `waived` evidence without reading the database; these are not clean
+plan attestations or new waiver authority. Valid connection-usage warnings stay
+advisory and do not change the verdict.
+
+The **last nonempty stdout line** is a single-line JSON object with `verdict`,
+`code` and `next_action`. Earlier human-readable drift/warning lines remain;
+parse the terminal object, not those lines. Codes/actions are fixed tokens:
+
+| Code | Verdict / exit | `next_action` | Meaning |
+| --- | --- | --- | --- |
+| `schema_clean` | `clean` / 0 | `proceed_with_deploy` | Bound read-only report; both chains clean. |
+| `schema_drift` | `drift` / 1 | `run_reviewed_migration_then_retry` | Follow the target's reviewed manual migration and role-restore procedure above. |
+| `recovery_waived` | `waived` / 0 | `continue_guard_validated_recovery` | Existing production recovery exemption only. |
+| `arguments_invalid` | `refused` / 2 | `correct_gate_arguments` | Repair the CLI invocation. |
+| `source_sha_invalid` | `refused` / 2 | `supply_canonical_source_sha` | Supply the resolved lowercase full commit SHA. |
+| `binding_refused` | `refused` / 2 | `repair_plan_binding_and_pins` | Operator verifies the existing direct read-only binding and independent pins. |
+| `manifest_invalid` | `refused` / 2 | `rebuild_reviewed_plan_runner_and_retry` | Runner output is malformed, unsupported or not this read-only request. |
+| `plan_process_failed` | `error` / 3 | `inspect_plan_runner_failure_and_retry` | Plan subprocess exited nonzero. |
+| `plan_execution_failed` | `error` / 3 | `repair_plan_runner_execution_and_retry` | Plan subprocess could not execute. |
+| `plan_timeout` | `error` / 3 | `investigate_plan_timeout_and_retry` | Plan exceeded its 600-second limit. |
+| `manifest_write_failed` | `error` / 3 | `repair_evidence_output_and_retry` | Evidence serialization/output publication failed. |
+| `gate_internal_error` | `error` / 3 | `inspect_gate_implementation_before_retry` | Unexpected gate fault; no deploy authorization. |
+
+Failures never relay raw child stdout/stderr, rejected values, filesystem paths,
+exception text or tracebacks. Investigate within the existing authorized runner
+and credential boundaries; do not bypass the gate or retry with another binding.
 
 ### Production migration runner
 
@@ -2768,6 +2939,33 @@ Source: [`automation_quota.rs`](../crates/core/src/automation_quota.rs),
 [`scheduled_store.rs`](../crates/core/src/scheduled_store.rs),
 [`feeds_store.rs`](../crates/core/src/feeds_store.rs),
 [`lfg_store.rs`](../crates/core/src/lfg_store.rs).
+
+### Scheduled delivery uncertainty
+
+Before a scheduled POST, the store arms `delivery_uncertain` under the current
+claim token. Timeout/transport loss, an unusable receipt, or failed completion
+with unconfirmed cleanup retains that fence and occurrence nonce. Restart and
+lease expiry never authorize another POST or advance a one-shot/recurring run.
+Only proven no-effect refusal or confirmed cleanup permits retry. Admission
+completion must be confirmed too; an accepted DELETE or missing id is not proof
+of cleanup.
+
+Diagnostic: `scheduled_delivery_uncertain`; safe next action:
+`inspect_channel_before_cancel_or_replace`. The attempt audit uses
+`delivery_uncertain` or `persistence_failed_uncertain`, never clean success.
+Inspect the target channel and the schedule's audit first. An already-authorized
+administrator may then cancel with `/schedule-remove`, or intentionally replace
+the definition through the existing schedule workflow. Replacement is a **new
+send** and can duplicate a surviving old message. Do not clear the fence, force
+retry, or infer absence from missing/unreadable/bounded channel history. This
+slice performs no automatic history scan, even for a positive receipt.
+
+Migration 0142 is additive and conservatively fences existing nonce/claim rows;
+NULL fences fail closed. Restoring a pre-0142 archive re-fences its pending
+nonce/claim rows the same way; current archives restore the recorded fence
+faithfully. Rollout must stop old blind-replay writers first. Do
+not downgrade to a binary that ignores the fence; retain it when reverting code.
+This is source behavior, not evidence of a migration or live release.
 
 ## Backup, restore and drill commands
 

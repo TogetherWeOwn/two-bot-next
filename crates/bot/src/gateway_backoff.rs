@@ -1,40 +1,25 @@
-//! Bounded gateway reconnect backoff: the gateway retry contract.
+//! Bounded supervised reconnect schedule and Twilight reconnect spread.
 //!
 //! A dead gateway process exits and the container supervisor restarts it, but
 //! a restart hot loop is unbounded work (the October crash-loop week). The
-//! paired build card supervises reconnects in-process instead: retries wait on
-//! this schedule, readyz reports [`GatewayState::Armed`] (`starting`) while a
-//! retry is pending, and the runner gives up after [`ReconnectPolicy`]
-//! attempts instead of spinning forever.
+//! supervised runner paces retries on this schedule and gives up the episode
+//! after [`ReconnectPolicy`] attempts. Twilight owns its separate receive-loop
+//! reconnect backoff; [`wait_reconnect_spread`] adds only a non-growing spread.
 //!
-//! The acceptance tests (`gateway_tests::supervised_reconnect`) pin this
-//! module's contract: the schedule and [`run_supervised`]'s retry loop.
-//! Test-only until the gateway loop adopts it: no runtime caller yet, so the
-//! module is gated to test builds and ships no code to the container.
+//! Growth is `base_delay * 2^attempt`, saturated and capped at `max_delay`,
+//! with equal jitter: each wait lies in `[capped/2, capped]`, drawn
+//! deterministically from `(seed, attempt)`. Equal jitter (not full jitter)
+//! keeps a floor under each wait so a herd of restarting shards cannot
+//! collapse onto near-zero synchronized retries, while still decorrelating
+//! them. Attempt indices at or past `max_attempts` yield no delay: the type
+//! itself carries "no unbounded retry".
 //!
-//! The loop (keep the polling exact so paused-time tests observe it):
-//!
-//! ```text
-//! for attempt in 0..policy.max_attempts:
-//!     match connect(attempt).await:
-//!         Connected => publish Connected, return Reconnected
-//!         Retryable => publish Armed, sleep reconnect_delay(policy, attempt)
-//!                      (skipped after the final budgeted attempt)
-//! publish Draining, return BudgetExhausted
-//! ```
-//!
-//! The sleep must be `tokio::time::sleep` (not a wall-clock wait) so the
-//! attempt timestamps the tests record advance by exactly the scheduled delay
-//! under paused time. Never hold the state lock across `connect` or the
-//! sleep; the connector reads the state to record what readyz served.
+//! The binary's supervised runner (which publishes gateway state around this
+//! schedule) keeps its own contract tests in
+//! `gateway_tests::supervised_reconnect`; the seeded ranges are pinned here
+//! and in `tests/jitter_backoff_acceptance.rs`.
 
-use std::future::Future;
-use std::sync::Arc;
 use std::time::Duration;
-
-use tokio::sync::RwLock;
-
-use super::gateway::GatewayState;
 
 /// First retry waits this long; each later attempt doubles, capped below.
 pub const DEFAULT_BASE_DELAY: Duration = Duration::from_secs(1);
@@ -72,39 +57,29 @@ impl Default for ReconnectPolicy {
     }
 }
 
-/// Outcome of one connect attempt, as reported by the injected connector.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AttemptOutcome {
-    /// The gateway is back; publish [`GatewayState::Connected`].
-    Connected,
-    /// The attempt failed transiently; back off and retry within budget.
-    Retryable,
-}
-
-/// How a supervised reconnect episode ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SupervisedExit {
-    /// A retry connected; the gateway is serving again.
-    Reconnected,
-    /// Every attempt failed; the runner published [`GatewayState::Draining`]
-    /// so readyz fails closed and the container supervisor takes over.
-    BudgetExhausted,
-    /// A shutdown request arrived, or draining began, before or during the
-    /// episode. [`GatewayState::Draining`] is sticky: once observed the
-    /// runner never overwrites it and makes no further attempts.
-    ShutdownRequested,
-}
-
 /// Deterministic 64-bit mixer (splitmix64) for jitter without a global RNG.
 ///
 /// Pure integer arithmetic: the same `(seed, attempt)` pair always yields the
 /// same stream, on every platform, with no clock and no `rand` dependency.
-fn jitter_stream(seed: u64, attempt: u32) -> u64 {
+/// Shared by the reconnect schedule and the voice-actor load backoff.
+pub(crate) fn jitter_stream(seed: u64, attempt: u32) -> u64 {
     let mixed = seed.wrapping_add(u64::from(attempt).wrapping_mul(0x9E3779B97F4A7C15));
     let mut z = mixed.wrapping_add(0x9E3779B97F4A7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
     z ^ (z >> 31)
+}
+
+/// Await a non-growing 500 ms–1 s spread before polling Twilight again.
+///
+/// Twilight already backs off its connection attempts. The attempt index only
+/// varies the deterministic draw: it never grows the delay or exhausts a budget.
+/// Returns the requested wait after the timer completes, for bounded logging.
+pub async fn wait_reconnect_spread(seed: u64, attempt: u32) -> Duration {
+    let delay = Duration::from_millis(500)
+        + Duration::from_nanos(jitter_stream(seed, attempt) % 500_000_001);
+    tokio::time::sleep(delay).await;
+    delay
 }
 
 /// Wait before retrying `attempt` (0-based), or `None` past the budget.
@@ -131,108 +106,53 @@ pub fn reconnect_delay(policy: &ReconnectPolicy, attempt: u32) -> Option<Duratio
     Some(half + Duration::from_nanos(jitter_stream(policy.seed, attempt) % span))
 }
 
-/// Run one supervised reconnect episode against an injected connector.
-///
-/// `connect` performs attempt `n` and reports its outcome; `shutdown`
-/// resolves when the process must stop. The connector may read `state` (to
-/// record what readyz served) but the runner never holds the state lock
-/// across `connect` or a backoff sleep.
-///
-/// The connector returns a boxed attempt future; the runner converts that
-/// box into a `Pin<Box<dyn Future>>` before polling (never `Box::pin` on the
-/// box — a second box still needs the `dyn` future to be `Unpin`), so callers
-/// never have to name the exact future type. Retryable
-/// outcomes publish [`GatewayState::Armed`] (readyz serves `starting`) and
-/// wait exactly [`reconnect_delay`] before the next attempt, except after the
-/// final budgeted attempt, where there is no next attempt to wait for.
-/// Exhausting the budget publishes [`GatewayState::Draining`] so readyz fails
-/// closed. Shutdown wins immediately: it is checked at the top of each
-/// iteration and raced (biased, shutdown first) against every `connect` and
-/// backoff sleep, so a SIGTERM during a sleep or a hanging connect ends the
-/// episode without waiting out the delay — the same "SIGTERM never waits"
-/// shape as `publish_gateway_failure` in `main.rs`. Draining is sticky, as at
-/// every other publish site: if an outside owner publishes
-/// [`GatewayState::Draining`] during the unlocked `connect` or backoff sleep,
-/// neither publish overwrites it (readyz is never resurrected to ready or
-/// starting after draining begins) and the episode ends with
-/// [`SupervisedExit::ShutdownRequested`] instead of retrying into the drain.
-pub async fn run_supervised<C, S>(
-    state: Arc<RwLock<GatewayState>>,
-    policy: ReconnectPolicy,
-    mut connect: C,
-    shutdown: S,
-) -> SupervisedExit
-where
-    C: FnMut(u32) -> Box<dyn Future<Output = AttemptOutcome> + Send>,
-    S: Future<Output = ()>,
-{
-    tokio::pin!(shutdown);
-    for attempt in 0..policy.max_attempts {
-        // A shutdown that is already pending wins before any attempt. The
-        // `connect` and backoff sleep below are also raced against shutdown
-        // (biased, shutdown first): the recorded attempt timestamps still
-        // advance by exactly the scheduled delay when shutdown never fires.
-        tokio::select! {
-            biased;
-            () = &mut shutdown => return SupervisedExit::ShutdownRequested,
-            () = std::future::ready(()) => {}
-        }
-        // Draining published during the previous backoff sleep (or before
-        // the episode started) is terminal: make no further attempts.
-        if *state.read().await == GatewayState::Draining {
-            return SupervisedExit::ShutdownRequested;
-        }
-        // The connect future is built lazily inside the raced branch: calling
-        // `connect(attempt)` while building the `select!` futures would
-        // construct (and drop unpolled) an attempt even when shutdown wins
-        // the race. Deferring the call into the branch means a shutdown that
-        // is already ready never starts an attempt.
-        let outcome = tokio::select! {
-            biased;
-            () = &mut shutdown => return SupervisedExit::ShutdownRequested,
-            outcome = async {
-                Box::into_pin(connect(attempt)).await
-            } => outcome,
-        };
-        match outcome {
-            AttemptOutcome::Connected => {
-                // Guard Draining set during the unlocked connect await, the
-                // same stickiness every other Connected publish keeps.
-                let mut guard = state.write().await;
-                if *guard == GatewayState::Draining {
-                    return SupervisedExit::ShutdownRequested;
-                }
-                *guard = GatewayState::Connected;
-                return SupervisedExit::Reconnected;
+#[cfg(test)]
+mod schedule_tests {
+    use std::time::Duration;
+
+    use super::{
+        reconnect_delay, ReconnectPolicy, DEFAULT_BASE_DELAY, DEFAULT_MAX_ATTEMPTS,
+        DEFAULT_MAX_DELAY, DEFAULT_SEED,
+    };
+
+    #[test]
+    fn defaults_carry_the_storm_contract() {
+        assert_eq!(DEFAULT_BASE_DELAY, Duration::from_secs(1));
+        assert_eq!(DEFAULT_MAX_DELAY, Duration::from_secs(30));
+        assert_eq!(DEFAULT_MAX_ATTEMPTS, 10);
+        assert_eq!(
+            ReconnectPolicy::default(),
+            ReconnectPolicy {
+                base_delay: Duration::from_secs(1),
+                max_delay: Duration::from_secs(30),
+                max_attempts: 10,
+                seed: DEFAULT_SEED,
             }
-            AttemptOutcome::Retryable => {
-                // Check Draining before either publishing Armed or exhausting
-                // the budget. The final attempt still has to honor a drain
-                // that arrived during its unlocked connect await.
-                let mut guard = state.write().await;
-                if *guard == GatewayState::Draining {
-                    return SupervisedExit::ShutdownRequested;
-                }
-                if attempt + 1 >= policy.max_attempts {
-                    *guard = GatewayState::Draining;
-                    return SupervisedExit::BudgetExhausted;
-                }
-                *guard = GatewayState::Armed;
-                drop(guard);
-                // `attempt` is within budget (checked above), so the delay
-                // exists; fall back to no wait rather than panic if a future
-                // policy rule ever disagrees. Race the sleep against
-                // shutdown so a SIGTERM during backoff ends the episode
-                // without waiting out the delay.
-                let delay = reconnect_delay(&policy, attempt).unwrap_or(Duration::ZERO);
-                tokio::select! {
-                    biased;
-                    () = &mut shutdown => return SupervisedExit::ShutdownRequested,
-                    () = tokio::time::sleep(delay) => {}
-                }
-            }
-        }
+        );
     }
-    *state.write().await = GatewayState::Draining;
-    SupervisedExit::BudgetExhausted
+
+    #[test]
+    fn schedule_is_jittered_within_cap_and_ends_at_budget() {
+        let policy = ReconnectPolicy::default();
+        for attempt in 0..DEFAULT_MAX_ATTEMPTS {
+            let grown = DEFAULT_BASE_DELAY.saturating_mul(1u32 << attempt.min(31));
+            let capped = grown.min(DEFAULT_MAX_DELAY);
+            let sample = reconnect_delay(&policy, attempt).expect("within budget");
+            assert!(
+                sample >= capped / 2 && sample <= capped,
+                "attempt {attempt}: {sample:?} outside [{:?}, {capped:?}]",
+                capped / 2,
+            );
+        }
+        assert!(reconnect_delay(&policy, DEFAULT_MAX_ATTEMPTS).is_none());
+        let replay: Vec<_> = (0..3)
+            .map(|attempt| reconnect_delay(&policy, attempt))
+            .collect();
+        assert_eq!(
+            replay,
+            (0..3)
+                .map(|attempt| reconnect_delay(&policy, attempt))
+                .collect::<Vec<_>>()
+        );
+    }
 }

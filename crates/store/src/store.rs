@@ -168,9 +168,9 @@ async fn record_async(
         return Ok(outcome);
     };
     project_event(&mut tx, event, &guild_id).await?;
-    // First rollback-journal writer, `PgFunnelStore` seam only (not yet the
-    // production gateway batch writer in `cutover::gateway_session`, which
-    // needs its own slice): each `PgFunnelStore` funnel append leaves one
+    // Rollback-journal writer for the `PgFunnelStore` seam (the production
+    // gateway batch writer in `cutover::gateway_session` journals its own
+    // appends the same way): each `PgFunnelStore` funnel append leaves one
     // `events` insert entry naming the inserted row, journaled inside the
     // primary transaction under a savepoint so the row and its evidence
     // commit atomically — no crash window between a primary commit and a

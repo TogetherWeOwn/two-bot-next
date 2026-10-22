@@ -1,7 +1,11 @@
 //! Bounded chronological transcript capture from newest-first Discord history.
-//! Pagination must continue after truncation: every message still needs validation
-//! and contributes to the count. The caller sorts each page by numeric ID DESC
-//! and checks strict cursor progress; no history-sized ID set is needed here.
+//! Transcript-budget truncation keeps counting: every pushed message still
+//! needs validation and contributes to the count. The caller additionally
+//! caps fetching at 10 pages (100 messages each) plus one boundary probe,
+//! so a deep channel stores the newest 1000 with the truncation marker and
+//! `message_count` covers stored messages only. The caller sorts each page
+//! by numeric ID DESC and checks strict cursor progress; no history-sized ID
+//! set is needed here.
 
 use std::collections::VecDeque;
 
@@ -145,6 +149,13 @@ impl HistoryCapture {
                 }
             }
         }
+    }
+
+    /// Mark the capture as page-capped: the channel ran deeper than the fetch
+    /// cap, so `finish` carries the shared truncation marker even when the
+    /// retained text fits the transcript budget.
+    pub(super) fn mark_page_capped(&mut self) {
+        self.truncated = true;
     }
 
     pub(super) fn finish(self) -> TranscriptSnapshot {
