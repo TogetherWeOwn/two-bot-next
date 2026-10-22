@@ -684,7 +684,11 @@ mod tests {
         let url = match std::env::var("TWO_TEST_DATABASE_URL") {
             Ok(url) => url,
             Err(std::env::VarError::NotPresent) => return Ok(None),
-            Err(_) => panic!("TWO_TEST_DATABASE_URL must be Unicode"),
+            Err(_) => {
+                return Err(sqlx::Error::Configuration(
+                    "TWO_TEST_DATABASE_URL must be Unicode".into(),
+                ))
+            }
         };
         let options: PgConnectOptions = url.parse()?;
         // No DATABASE_URL or inherited credentials: tests accept only the
