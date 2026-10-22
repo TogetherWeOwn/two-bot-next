@@ -18,7 +18,7 @@ print one JSON evidence object on stdout. Exit 0 on a completed run;\n\
 exit 1 only on fatal errors (unresolvable echo, socket failure).\n\
   --echo <host:port>   echo target (or ECHO_HOST)\n\
   --duration-s <n>     RTT send window in seconds [300] (or DURATION_S)\n\
-  --rate-s <n>         RTT packets per second [10] (or RATE_S)\n\
+  --rate-s <n>         RTT packets per second [10] (or RATE_S, 1-1000)\n\
   --ssrc <n>           discovery SSRC [default]\n\
 \n\
 Echo: serve discovery replies plus verbatim echo until stopped.\n\
@@ -31,6 +31,11 @@ Short-lived probe runs only; never public in production.\n\
 /// Default echo bind: all interfaces, probe port 9001.
 pub const DEFAULT_ECHO_BIND: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9001);
+
+/// Highest accepted send rate: 100x the default, 20x RTP. Past this the
+/// 1 s tick truncates toward zero (past 1e9 it panics the interval), and
+/// the receipt ledger outgrows a short-lived probe run.
+pub const MAX_RATE_S: u32 = 1000;
 
 /// Parsed probe invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,8 +133,8 @@ fn parse_probe(
         return Err("--duration-s must be at least 1".to_owned());
     }
     let rate_s: u32 = number(flags.get("rate-s"), env("RATE_S"), "--rate-s", 10)?;
-    if rate_s < 1 {
-        return Err("--rate-s must be at least 1".to_owned());
+    if !(1..=MAX_RATE_S).contains(&rate_s) {
+        return Err(format!("--rate-s must be between 1 and {MAX_RATE_S}"));
     }
     let ssrc: u32 = number(flags.get("ssrc"), None, "--ssrc", DEFAULT_SSRC)?;
     Ok(Command::Probe(ProbeArgs {
@@ -329,15 +334,35 @@ mod tests {
             words.extend([flag, "abc"]);
             assert!(parse(&args(&words), &empty_env()).is_err(), "{flag} abc");
         }
-        for flag in ["--duration-s", "--rate-s"] {
-            let mut words = base.to_vec();
-            words.extend([flag, "0"]);
-            let error = parse(&args(&words), &empty_env()).unwrap_err();
-            assert!(error.contains("at least 1"), "{flag} 0 was: {error}");
-        }
+        let mut words = base.to_vec();
+        words.extend(["--duration-s", "0"]);
+        let error = parse(&args(&words), &empty_env()).unwrap_err();
+        assert!(error.contains("at least 1"), "was: {error}");
         let mut words = base.to_vec();
         words.extend(["--ssrc", "99999999999"]);
         assert!(parse(&args(&words), &empty_env()).is_err());
+    }
+
+    #[test]
+    fn probe_bounds_rate() {
+        let base = ["--echo", "echo.example:9001"];
+        // Absurd rates truncate the send tick to zero and panic; the parser
+        // refuses them instead of letting the runner die at runtime.
+        for bad in ["0", "1001", "2000000000"] {
+            let mut words = base.to_vec();
+            words.extend(["--rate-s", bad]);
+            let error = parse(&args(&words), &empty_env()).unwrap_err();
+            assert!(
+                error.contains("between 1 and 1000"),
+                "--rate-s {bad} was: {error}"
+            );
+        }
+        let mut words = base.to_vec();
+        words.extend(["--rate-s", "1000"]);
+        assert!(matches!(
+            parse(&args(&words), &empty_env()),
+            Ok(Command::Probe(ProbeArgs { rate_s: 1000, .. }))
+        ));
     }
 
     #[test]
