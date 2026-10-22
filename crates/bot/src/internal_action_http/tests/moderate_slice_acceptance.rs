@@ -30,6 +30,12 @@
 //!   prove-out for this slice (criterion 3): dry-run plans with zero side
 //!   effects, then the direct execute audits. Warn takes no confirm: the
 //!   "confirm" in the staging criterion is the execute step itself.
+//! - Flag gates: the suite sets only the existing classified moderation pair
+//!   (`TWO_INTERNAL_ALLOW_MODERATION=1` + `TWO_MODERATION=1`, via the shared
+//!   `set_moderation_flags` helper). The builder MUST NOT require any other
+//!   flag for these paths: `role.assign` is an unconditional Phase 1 verb,
+//!   and the moderate verbs ride the moderation gate. The role test runs with
+//!   the pair ON, so its differential proves scope, not flag state.
 //!
 //! Pinned wire choices (slice 1 + 3 builders: these names are the contract):
 //!
@@ -59,12 +65,6 @@
 //!   from "forbidden".
 //! - The `result.plan` shape (slice 3 carves it) and the refused-confirm
 //!   status for a spent confirm (403 or 409 both satisfy "refused").
-//! - `TWO_INTERNAL_ALLOW_ADMIN_ROLES=1` and `TWO_INTERNAL_ALLOW_ADMIN=1` are
-//!   set by the role test and `TWO_INTERNAL_ALLOW_MESSAGE_DELETE=1` by the
-//!   delete test: the builder MUST NOT require any other flag for these
-//!   paths, and moderate verbs MUST NOT require admin flags. Unknown vars
-//!   are ignored, so these pins are forward-compatible with a builder that
-//!   needs fewer of them.
 //!
 //! Out of scope: `event.cancel` confirm-gating (slice 6 owns `event.*`),
 //! token registry/expiry/revocation mechanics (slice 0), the Worker `/admin`
@@ -92,26 +92,6 @@ const FOREIGN_GUILD: &str = "222222222222222222";
 /// boundary on the admin path).
 const DELETE_CHANNEL_ID: &str = "333333333333333333";
 const DELETE_MESSAGE_ID: &str = "444444444444444444";
-
-/// Serializes the tests that set the admin-scope fixture flags below.
-/// Leaf under the moderation / add-member locks: acquire those first.
-static ADMIN_SCOPE_FLAG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// Pinned admin-path flags (see module docs). Unknown vars are ignored, so
-/// setting these is harmless if the builder needs fewer of them.
-fn set_admin_scope_flags(on: bool) {
-    for var in [
-        "TWO_INTERNAL_ALLOW_ADMIN",
-        "TWO_INTERNAL_ALLOW_ADMIN_ROLES",
-        "TWO_INTERNAL_ALLOW_MESSAGE_DELETE",
-    ] {
-        if on {
-            std::env::set_var(var, "1");
-        } else {
-            std::env::remove_var(var);
-        }
-    }
-}
 
 /// A scope-claimed signed request: the v1 envelope plus the three claim
 /// headers, with the MAC covering the extended canonical string.
@@ -648,9 +628,7 @@ async fn moderate_purge_requires_confirm_then_executes_exactly_once() {
 async fn moderate_message_delete_requires_confirm_then_executes_exactly_once() {
     let Some(db) = database().await else { return };
     let _flags = MODERATION_FLAG_LOCK.lock().await;
-    let _admin = ADMIN_SCOPE_FLAG_LOCK.lock().await;
     set_moderation_flags(true);
-    set_admin_scope_flags(true);
     let app = moderate_app(
         db.pool().clone(),
         Arc::new(MockEffect::new(MockOutcome::Success)),
@@ -718,7 +696,6 @@ async fn moderate_message_delete_requires_confirm_then_executes_exactly_once() {
         ),
     )
     .await;
-    set_admin_scope_flags(false);
     set_moderation_flags(false);
     assert_eq!(status, StatusCode::OK, "confirmed delete executes");
     assert_eq!(body["result"]["outcome"], "deleted");
@@ -771,8 +748,8 @@ async fn moderate_message_delete_requires_confirm_then_executes_exactly_once() {
 #[tokio::test]
 async fn moderate_scope_refuses_role_assign_while_admin_scope_allows() {
     let Some(db) = database().await else { return };
-    let _admin = ADMIN_SCOPE_FLAG_LOCK.lock().await;
-    set_admin_scope_flags(true);
+    let _flags = MODERATION_FLAG_LOCK.lock().await;
+    set_moderation_flags(true);
     let member = Arc::new(MockEffect::new(MockOutcome::Success));
     let app = moderate_app(
         db.pool().clone(),
@@ -830,7 +807,7 @@ async fn moderate_scope_refuses_role_assign_while_admin_scope_allows() {
         ),
     )
     .await;
-    set_admin_scope_flags(false);
+    set_moderation_flags(false);
     assert_eq!(
         status,
         StatusCode::OK,
