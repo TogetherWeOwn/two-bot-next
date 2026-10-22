@@ -2,7 +2,7 @@
 //!
 //! [`run_probe`] binds an ephemeral socket, runs the discovery exchange,
 //! then sends timestamped RTT packets for the configured window while
-//! receiving replies, and returns the [`Evidence`](crate::evidence::Evidence).
+//! receiving replies, and returns the [`Evidence`].
 //! Discovery failure and packet loss are evidence, not errors: only an
 //! unresolvable echo target or a socket failure fails the run.
 //!
