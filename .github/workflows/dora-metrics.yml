@@ -46,7 +46,7 @@ jobs:
   metrics:
     name: weekly DORA metrics
     permissions:
-      contents: write # Commit the weekly JSON and summary to main.
+      contents: write # Commit the weekly JSON and summary to the automation branch.
       deployments: read # Read 30 days of production Deployments.
       actions: read # Verify the Actions run behind each recorded deploy.
     if: github.ref == 'refs/heads/main' || inputs.dry_run == true
@@ -74,25 +74,32 @@ jobs:
           branch=automation/dora-metrics
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Tokenless checkout: authenticate network commands only, per
+          # command, so the bearer never lands in .git/config.
+          auth=(-c "http.https://github.com/.extraheader=AUTHORIZATION: bearer ${GH_TOKEN}")
+          git "${auth[@]}" fetch origin
+          base=HEAD
+          if git rev-parse --verify -q "origin/${branch}" >/dev/null; then
+            base="origin/${branch}"
+          fi
+          # Compute with the checked-out code, but publish on the branch's
+          # existing tree so a same-week rerun modifies rather than adds files.
+          # Keep the original outputs intact for the always-uploaded artifact.
+          publish_dir=$(mktemp -d "${RUNNER_TEMP}/dora-metrics.XXXXXX")
+          git worktree add --detach "$publish_dir" "$base"
+          mkdir -p "$publish_dir/ops/metrics"
+          cp "ops/metrics/dora-${WEEK}.json" "ops/metrics/dora-${WEEK}.md" "$publish_dir/ops/metrics/"
+          cd "$publish_dir"
           git add "ops/metrics/dora-${WEEK}.json" "ops/metrics/dora-${WEEK}.md"
           if git diff --cached --quiet; then
             echo "no DORA changes to commit"
             exit 0
           fi
-          # Tokenless checkout: authenticate network commands only, per
-          # command, so the bearer never lands in .git/config.
-          auth=(-c "http.https://github.com/.extraheader=AUTHORIZATION: bearer ${GH_TOKEN}")
-          git "${auth[@]}" fetch origin
           git commit -m "chore(metrics): weekly DORA metrics for ${WEEK}"
-          # First run creates the branch; later runs replay onto its tip.
-          if git rev-parse --verify -q "origin/${branch}" >/dev/null; then
-            git rebase "origin/${branch}" || {
-              git rebase --abort
-              echo "::error::DORA commit conflicts with ${branch}; refusing to push"
-              exit 1
-            }
-          fi
-          git "${auth[@]}" push origin "HEAD:${branch}"
+          git "${auth[@]}" push origin "HEAD:refs/heads/${branch}" || {
+            echo "::error::DORA publication to ${branch} was refused; evidence preserved"
+            exit 1
+          }
       - name: Upload the DORA evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

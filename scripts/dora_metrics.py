@@ -106,9 +106,9 @@ def gh_api_get(path, **fields):
 def list_production_deployments(repo, start):
     """Deploy-ID production rows at or after `start`, newest first.
 
-    Stops at the first row older than the window (the API returns newest
-    first) and keeps that boundary row when it carries a deploy ID, so the
-    earliest in-window deploy still has a predecessor for commits-per-deploy.
+    Stops at the first deploy-ID row older than the window (the API returns
+    newest first), skipping automatic rows to find the boundary predecessor.
+    The caller must verify its success before using it for commits-per-deploy.
     Automatic `environment:` rows (no deploy ID) are counted, never scored.
     """
     rows, automatic, boundary = [], 0, None
@@ -126,9 +126,9 @@ def list_production_deployments(repo, start):
             except DoraError:
                 raise DoraError("production deployments unreadable") from None
             if created < start:
-                if boundary is None and build_identity.is_deploy_id_shape(row.get("description")):
-                    boundary = row
-                return rows, automatic, boundary
+                if build_identity.is_deploy_id_shape(row.get("description")):
+                    return rows, automatic, row
+                continue
             if build_identity.is_deploy_id_shape(row.get("description")):
                 rows.append(row)
             else:
@@ -148,8 +148,10 @@ def latest_status(repo, deployment_id):
     statuses = gh_api_get(f"repos/{repo}/deployments/{deployment_id}/statuses", per_page=1)
     if not isinstance(statuses, list):
         raise DoraError("deployment statuses unreadable")
-    if not statuses or not isinstance(statuses[0], dict):
+    if not statuses:
         return None
+    if not isinstance(statuses[0], dict):
+        raise DoraError("deployment statuses unreadable")
     first = statuses[0]
     state = first.get("state")
     if not isinstance(state, str) or not state:
@@ -514,7 +516,12 @@ def main(argv=None):
 
         rows, automatic, boundary = list_production_deployments(repo, start)
         records = resolve_deployments(repo, rows)
-        boundary_sha = boundary.get("sha") if isinstance(boundary, dict) else None
+        boundary_sha = None
+        if isinstance(boundary, dict):
+            boundary_status = latest_status(repo, boundary.get("id"))
+            sha = boundary.get("sha")
+            if boundary_status and boundary_status[0] == "success" and isinstance(sha, str) and sha:
+                boundary_sha = sha
         throughput_unresolved = score_throughput(repo, records, boundary_sha)
         incidents, unrecovered, unverified = score_recovery(repo, records)
 

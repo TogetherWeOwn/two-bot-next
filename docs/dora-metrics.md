@@ -40,6 +40,12 @@ Every input ID (deployment IDs, SHAs, run IDs, verdicts) lands in the JSON
   failure rate and is counted beside it.
 - An unreadable commit date or compare count becomes a null field plus an
   `unresolved_*` count; percentiles cover only resolved values.
+- The first success in the window compares against the first canonical
+  deploy-ID row before the window only when that predecessor's latest status
+  is success and its SHA is present. Older automatic environment rows are
+  skipped when finding that predecessor. A failed, statusless or in-flight
+  predecessor leaves the first compare unresolved rather than scoring a
+  build that never served; the scan remains subject to the page cap.
 - An empty window reports nulls, never zeros.
 
 ## Operating the job
@@ -49,9 +55,12 @@ Every input ID (deployment IDs, SHAs, run IDs, verdicts) lands in the JSON
 - A live dispatch (or the Monday schedule) on `main` commits straight to
   the `automation/dora-metrics` branch with the job token: `main` only
   accepts pull requests, and the automation branch carries no rulesets. The
-  checkout stays credentialless and the push authenticates per command. A
-  refused or conflicting push fails the run closed; the artifact still
-  preserves that week's numbers.
+  checkout stays credentialless and the push authenticates per command. The
+  checked-out code computes the report; a separate temporary worktree publishes
+  only its JSON and Markdown on the automation branch's existing tree (the
+  current checkout is the first-run fallback). Same-week reruns replace that
+  week's report while preserving older weeks. A refused or conflicting push
+  fails the run closed; the original outputs remain available for the artifact.
 - The weekly side-branch push triggers no deploys; `ops/**` is also in
   `deploy-staging`'s push ignore list, so any future main-side delivery
   evidence restarts and promotes nothing.
