@@ -200,6 +200,7 @@ fn ev_age_values(schema: &EvSchema, value_sql: &str) -> String {
         .join(", ")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn ev_seed_channel_row(
     pool: &PgPool,
     schema: &EvSchema,
@@ -462,7 +463,11 @@ async fn ev_reconcile_channels(pool: &PgPool, schema: &EvSchema, discord: &FakeC
                 .await;
                 discord.retry_get(channel);
             }
-            ChannelOutcome::Exists { .. } => {}
+            ChannelOutcome::Exists { occupied } => {
+                // Card-1 reconcile never deletes: occupied rooms are kept, and
+                // this procedure contains no DELETE for empty rooms either.
+                let _ = occupied;
+            }
         }
     }
 }
