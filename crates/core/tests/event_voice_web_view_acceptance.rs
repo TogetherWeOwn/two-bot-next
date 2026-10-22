@@ -705,7 +705,10 @@ mod db_tests {
             columns.join(", "),
             values.join(", ")
         );
-        let mut query = sqlx::query(&sql);
+        // Audit: column identifiers above are restricted to [a-z0-9_] and
+        // double-quoted; all values go through bind parameters, so the
+        // assembled statement cannot carry injected SQL.
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
         for (_, _, text, flag) in &cells {
             if text.is_some() || flag.is_none() {
                 query = query.bind(text.clone());
