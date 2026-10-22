@@ -29,7 +29,7 @@ path before the 5-minute run.
 |--------------|---------|---------------------------------------------|
 | `ECHO_HOST`  | —       | Echo target `host:port` (required in probe mode) |
 | `DURATION_S` | `300`   | RTT send window, seconds (min 1)            |
-| `RATE_S`     | `10`    | RTT packets per second (min 1)              |
+| `RATE_S`     | `10`    | RTT packets per second (1-1000)             |
 
 ## Evidence object
 

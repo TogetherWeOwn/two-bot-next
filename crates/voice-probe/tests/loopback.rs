@@ -167,3 +167,26 @@ async fn discovery_response_carries_the_echo_observed_source() {
     let response = decode_response(&buf[..n], 0x000D_15C0).unwrap();
     assert_eq!(response.source.ip(), IpAddr::from(Ipv4Addr::LOCALHOST));
 }
+
+#[tokio::test]
+async fn ipv6_loopback_probe_succeeds() {
+    let socket = UdpSocket::bind("[::1]:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let echo = tokio::spawn(async move {
+        run_echo_on(socket, async move {
+            shutdown_rx.await.ok();
+        })
+        .await
+        .unwrap()
+    });
+
+    let evidence = run_probe(&short_probe(addr)).await.unwrap();
+
+    shutdown_tx.send(()).ok();
+    echo.await.unwrap();
+    assert!(evidence.discovery_ok);
+    let egress = evidence.observed_egress.unwrap();
+    assert!(egress.starts_with("[::1]:"), "egress was {egress}");
+    assert_eq!(evidence.loss_pct, 0.0);
+}

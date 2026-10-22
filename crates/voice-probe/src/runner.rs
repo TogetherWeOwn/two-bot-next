@@ -12,7 +12,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::future::Future;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use time::format_description::well_known::Rfc3339;
@@ -72,7 +72,9 @@ impl std::error::Error for ProbeError {
 pub struct ProbeConfig {
     /// Echo target as given (`host:port`); echoed into the evidence.
     pub echo_host: String,
-    /// Local bind address; ephemeral by default.
+    /// Local bind address; ephemeral by default. An unspecified IP follows
+    /// the echo's family (a v4-bound socket cannot reach a v6 echo); an
+    /// explicit IP is honored as given.
     pub bind: SocketAddr,
     /// RTT send window.
     pub duration: Duration,
@@ -156,9 +158,12 @@ pub fn decode_rtt(buf: &[u8]) -> Option<(u32, u64)> {
 pub async fn run_probe(config: &ProbeConfig) -> Result<Evidence, ProbeError> {
     let started_at = now_rfc3339();
     let echo = resolve_echo(&config.echo_host)?;
-    let socket = UdpSocket::bind(config.bind)
-        .await
-        .map_err(ProbeError::Socket)?;
+    let bind = if config.bind.ip().is_unspecified() {
+        probe_bind_addr(echo, config.bind.port())
+    } else {
+        config.bind
+    };
+    let socket = UdpSocket::bind(bind).await.map_err(ProbeError::Socket)?;
     let (discovery_ok, observed) = run_discovery(&socket, echo, config).await?;
     let phase = run_rtt(&socket, echo, config).await?;
     Ok(Evidence {
@@ -214,6 +219,18 @@ pub async fn run_echo_on(
         }
     }
     Ok(stats)
+}
+
+/// Local bind for `echo`: the unspecified address of the echo's family on
+/// `port`. A v4-bound socket cannot send to a v6 echo, so the default bind
+/// follows the resolved target instead of assuming IPv4.
+fn probe_bind_addr(echo: SocketAddr, port: u16) -> SocketAddr {
+    let ip = if echo.is_ipv4() {
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+    } else {
+        IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+    };
+    SocketAddr::new(ip, port)
 }
 
 /// Resolve the echo target to one address (DNS or literal).
@@ -374,6 +391,22 @@ mod tests {
             rate_per_sec: 10,
             ..ProbeConfig::new(echo.to_string())
         }
+    }
+
+    #[test]
+    fn probe_bind_follows_echo_family() {
+        let v4: SocketAddr = "192.0.2.1:9001".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::1]:9001".parse().unwrap();
+
+        assert_eq!(
+            probe_bind_addr(v4, 0),
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+        );
+        assert_eq!(
+            probe_bind_addr(v6, 0),
+            SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))
+        );
+        assert_eq!(probe_bind_addr(v6, 45231).port(), 45231);
     }
 
     #[test]
