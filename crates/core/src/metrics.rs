@@ -2981,6 +2981,18 @@ mod tests {
     }
 
     #[test]
+    fn containment_store_errors_stay_bounded() {
+        let metrics = Metrics::default();
+        metrics.containment_store_error("complete_incident");
+        metrics.containment_store_error("hostile\"\\\nlabel");
+        let text = metrics.render(None);
+        assert!(
+            text.contains("two_bot_containment_store_errors_total{op=\"complete_incident\"} 1\n")
+        );
+        assert!(text.contains("two_bot_containment_store_errors_total{op=\"other\"} 1\n"));
+    }
+
+    #[test]
     fn prefix_trigger_refusals_stay_bounded_and_saturate() {
         // TOG-19932: verdict refusals count separately from unmatched content.
         let metrics = Metrics::default();
