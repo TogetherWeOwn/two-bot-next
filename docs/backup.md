@@ -136,37 +136,43 @@ message/reaction capture, 0431 stage/interaction-observe/audit-log capture
 plus 0432 member-capture deltas plus 0439 invite/scheduled-event capture)
 the stream go-live ledger (`stream_live_claims`: 0440/0443), guild game-activity
 aggregates (`game_activity_guild_aggregates`: 0441/0442), the assistant
-monthly-cap ledger (`assistant_monthly_builds`: 0446/0447) and the
-scheduled-event epoch-claim guard (`scheduled_events_claim`: 0450/0451).
+monthly-cap ledger (`assistant_monthly_builds`: 0446/0447), the
+scheduled-event epoch-claim guard (`scheduled_events_claim`: 0450/0451) and the
+event voice pair (`event_voice_channels`, `event_voice_presence`: 0452).
 `OPTIONAL_LEGACY_TABLES` is empty: the coverage
 test fails if a covered table is not migrated. A dump from a fresh Rust schema
-has 97 table entries. A missing current table refuses a dump/restore: migrate
+has 99 table entries. A missing current table refuses a dump/restore: migrate
 the target first.
 Each readable version requires its historical inventory and waives only
 versioned additions introduced later:
 
 | Version | Tables it may omit |
 | --- | --- |
-| v4 | `V5_ADDED_TABLES` (reservations and privacy controls), `V6_ADDED_TABLES` (event store), `V7_ADDED_TABLES` (seasonal XP and retention queues), `V8_ADDED_TABLES` (stream ledger), `V9_ADDED_TABLES` (guild counters), `V10_ADDED_TABLES` (epoch-claim guard) |
-| v5 | `V6_ADDED_TABLES`, `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES` |
-| v6 | `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES` |
-| v7 | `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES` |
-| v8 | `V9_ADDED_TABLES`, `V10_ADDED_TABLES` |
-| v9 | `V10_ADDED_TABLES`: `scheduled_events_claim` |
-| v10 | None: the full current inventory is required |
+| v4 | `V5_ADDED_TABLES` (reservations and privacy controls), `V6_ADDED_TABLES` (event store), `V7_ADDED_TABLES` (seasonal XP and retention queues), `V8_ADDED_TABLES` (stream ledger), `V9_ADDED_TABLES` (guild counters), `V10_ADDED_TABLES` (epoch-claim guard), `V11_ADDED_TABLES` (event voice pair) |
+| v5 | `V6_ADDED_TABLES`, `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES` |
+| v6 | `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES` |
+| v7 | `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES` |
+| v8 | `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES` |
+| v9 | `V10_ADDED_TABLES`, `V11_ADDED_TABLES` |
+| v10 | `V11_ADDED_TABLES`: `event_voice_channels`, `event_voice_presence` |
+| v11 | None: the full current inventory is required |
 
 These are narrow waivers, not permission to omit arbitrary tables. An
 incomplete new archive refuses at inspection. The frozen 85-table v4 fixture
-is unchanged from before these additions; older v4–v9 archives need not
-invent entries for the v9 guild counters or the v10 epoch-claim guard.
+is unchanged from before these additions; older v4–v10 archives need not
+invent entries for the v9 guild counters, the v10 epoch-claim guard or the
+v11 event voice pair.
 Restoring an older archive clears
 destination rows for every omitted later table instead of retaining unrelated
 target state. In particular, restoring v8 without guild counters clears both
 counters; it cannot recover assistant usage that predates its persistence.
 Restoring v9 without the claim guard clears the guard; the mirror re-fences
 on the next winning fetch. Use a v10 recovery point to preserve the monthly
-cap and the mirror fence. Current v10 archives must
-include both tables, so routine restores retain their archived state.
+cap and the mirror fence. Restoring v10 without the event voice pair clears
+both tables; the next tick re-claims open instances, but archived presence
+spans are lost. Use a v11 recovery point to preserve claims and spans.
+Current v11 archives must include every table, so routine restores retain
+their archived state.
 An optional legacy table may be absent only when there are no archived rows for
 it. Nonempty legacy data without a matching target table refuses **before any
 truncate**, rather than silently discarding it.

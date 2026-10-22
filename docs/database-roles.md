@@ -79,6 +79,12 @@ per-guild epoch row through the app pool inside its snapshot-swap
 transaction. The table carries no member column, so there is nothing to
 erase and no reader grant beyond the app pool.
 
+The event voice pair (`event_voice_channels`, `event_voice_presence`) is
+ordinary `table` kind for the same reason: the claim path, the presence
+transition hook and the reconcile passes read and write both tables through
+the app pool. The presence spans carry a member column (`user_id`, erased
+via the scheduled-event mirror); the channel row carries no member identity.
+
 The reader cannot read bot base tables, including through inherited/public or
 column-level grants. Normal PostgreSQL views deliberately run with their owner's
 base-table privileges: only the reviewed `web_v1` projection is exposed. Do not
