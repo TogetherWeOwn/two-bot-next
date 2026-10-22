@@ -4245,6 +4245,7 @@ class WorkflowTests(unittest.TestCase):
             "raid_list_db",
             "reengagement_list_db",
             "member_moderation_db",
+            "invite_uses_saturation_acceptance",
         ):
             with self.subTest(target=target):
                 self.assertIn(target, step["run"])
@@ -4368,6 +4369,21 @@ class WorkflowTests(unittest.TestCase):
             "--skip seeded_aggregates_render_exactly_guild_scoped_and_read_only",
             main_sweep,
         )
+        # Invite saturation fixtures race the parallel sweep (nanos+pid
+        # schema nonce); they run only in the serial re-run below, never in
+        # the main sweep. Enumerate from the Rust source so a future sixth
+        # fixture cannot silently rejoin.
+        saturation_source = (
+            ROOT / "crates/store/tests/invite_uses_saturation_acceptance.rs"
+        ).read_text()
+        saturation_names = set(
+            re.findall(r"#\[tokio::test[^\]]*\]\s*async fn (\w+)\(", saturation_source)
+        )
+        self.assertTrue(saturation_names, "saturation fixtures must be discovered")
+        main_skips = set(re.findall(r"--skip (\S+)", main_sweep))
+        for name in sorted(saturation_names):
+            with self.subTest(saturation_skip=name):
+                self.assertIn(name, main_skips)
         # Staging fixtures accept only the exact agent_test URL; they run in
         # the dedicated staging_migrate_db re-run below, never in this
         # two_bot_test_ci sweep. Enumerate from the Rust source so a future
@@ -4400,7 +4416,7 @@ class WorkflowTests(unittest.TestCase):
             ignored_sweep,
         )
         guarded = [run for run in cov_runs if "llvm-cov --no-report -p " in run]
-        self.assertEqual(len(guarded), 14)
+        self.assertEqual(len(guarded), 15)
         for run in guarded:
             with self.subTest(guarded=run):
                 self.assertIn("--test-threads=1", run)
@@ -4409,7 +4425,8 @@ class WorkflowTests(unittest.TestCase):
                 # Deliberate: a guard panic in a guarded suite fails the step.
                 self.assertNotIn("--ignore-run-fail", run)
         # needle -> carries `--features db` (core/discord suites need the db
-        # feature to build their guarded targets; cutover suites do not).
+        # feature to build their guarded targets; cutover and store suites
+        # do not).
         guarded_needles = {
             "--test stream_live_store": True,
             "--test mutation_429_proves_no_effect_channel": True,
@@ -4425,6 +4442,7 @@ class WorkflowTests(unittest.TestCase):
             "--test reengagement_list_db": False,
             "--test game_activity_report_db": False,
             "--test member_moderation_db": True,
+            "--test invite_uses_saturation_acceptance": False,
         }
         for needle, wants_db_feature in guarded_needles.items():
             with self.subTest(needle=needle):
