@@ -138,14 +138,6 @@ impl Fixture {
             .expect("retained row")
     }
 
-    async fn sweep(&self, limit: usize) -> Result<usize, LfgError> {
-        // Keep the compatibility trait live after an inherent method is added.
-        let _baseline_entrypoint = <LfgInteractions as MissingLifecycleSweep>::sweep_lifecycle;
-        self.service
-            .sweep_lifecycle(&self.executor, GUILD, BOT, clock(), limit)
-            .await
-    }
-
     async fn finish(self) -> Vec<RestRequest> {
         let requests = self.rest.requests();
         self.rest.shutdown().await;
@@ -158,6 +150,8 @@ impl Fixture {
 
 #[tokio::test]
 async fn lifecycle_work_runs_under_the_existing_supervised_job_seam() {
+    // Keep the compatibility trait live after an inherent method is added.
+    let _baseline_entrypoint = <LfgInteractions as MissingLifecycleSweep>::sweep_lifecycle;
     let f = Fixture::new(ok_rest).await;
     f.seed(&post("lfg-job", OLD, Some("5001"), OLD)).await;
     let action: jobs::JobAction = {

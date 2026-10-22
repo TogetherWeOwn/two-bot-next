@@ -9,7 +9,7 @@
     },
     {
       "path": "crates/bot/src/lfg_lifecycle_jobs_acceptance.rs",
-      "sha256": "dac9b87f18eeaf2e7d7a34f0c0c46864ae7737d8063c239440daac97ea5f8"
+      "sha256": "f6c868b6ad94933df15c7d5bf3a1745101481164386dd58f78de864dbec43e42"
     }
   ],
   "ownership": "Test Author owns corrections. Builder must not edit the protected corpus or this manifest; consume the immutable acceptance head and make the combined change green.",
