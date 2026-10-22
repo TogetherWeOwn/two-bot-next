@@ -200,22 +200,29 @@ fn ev_age_values(schema: &EvSchema, value_sql: &str) -> String {
         .join(", ")
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn ev_seed_channel_row(
-    pool: &PgPool,
-    schema: &EvSchema,
-    event_id: &str,
-    instance: &str,
-    lifecycle_value: &str,
-    lease: Option<&str>,
+/// Seed parameters for one `event_voice_channels` row.
+struct EvSeed<'a> {
+    event_id: &'a str,
+    instance: &'a str,
+    lifecycle_value: &'a str,
+    lease: Option<&'a str>,
     channel: Option<u64>,
-    age_sql: &str,
-) {
-    let lease_sql = lease.map_or_else(|| "NULL".to_owned(), |value| format!("'{value}'"));
-    let channel_sql = channel.map_or_else(|| "NULL".to_owned(), |id| format!("'{id}'"));
+    age_sql: &'a str,
+}
+
+async fn ev_seed_channel_row(pool: &PgPool, schema: &EvSchema, seed: &EvSeed<'_>) {
+    let lease_sql = seed
+        .lease
+        .map_or_else(|| "NULL".to_owned(), |value| format!("'{value}'"));
+    let channel_sql = seed
+        .channel
+        .map_or_else(|| "NULL".to_owned(), |id| format!("'{id}'"));
     let age_columns = ev_age_columns(schema);
-    let age_values = ev_age_values(schema, age_sql);
+    let age_values = ev_age_values(schema, seed.age_sql);
     let lifecycle = schema.lifecycle.as_str();
+    let event_id = seed.event_id;
+    let instance = seed.instance;
+    let lifecycle_value = seed.lifecycle_value;
     ev_exec(
         pool,
         format!(
@@ -803,12 +810,14 @@ async fn event_voice_presence_join_leave_rejoin_flows_through_sink() {
     ev_seed_channel_row(
         pool,
         &schema,
-        EVENT_ID,
-        INSTANCE,
-        "creating",
-        Some("seed-1"),
-        Some(EVENT_CHANNEL),
-        "NOW()",
+        &EvSeed {
+            event_id: EVENT_ID,
+            instance: INSTANCE,
+            lifecycle_value: "creating",
+            lease: Some("seed-1"),
+            channel: Some(EVENT_CHANNEL),
+            age_sql: "NOW()",
+        },
     )
     .await;
 
@@ -922,34 +931,40 @@ async fn event_voice_stale_creating_reconciles_via_get() {
     ev_seed_channel_row(
         pool,
         &schema,
-        EVENT_ID,
-        INSTANCE,
-        "creating",
-        Some("tick-stale"),
-        None,
-        "NOW() - INTERVAL '6 minutes'",
+        &EvSeed {
+            event_id: EVENT_ID,
+            instance: INSTANCE,
+            lifecycle_value: "creating",
+            lease: Some("tick-stale"),
+            channel: None,
+            age_sql: "NOW() - INTERVAL '6 minutes'",
+        },
     )
     .await;
     ev_seed_channel_row(
         pool,
         &schema,
-        EVENT_ID_B,
-        INSTANCE,
-        "creating",
-        Some("tick-stale-b"),
-        None,
-        "NOW() - INTERVAL '6 minutes'",
+        &EvSeed {
+            event_id: EVENT_ID_B,
+            instance: INSTANCE,
+            lifecycle_value: "creating",
+            lease: Some("tick-stale-b"),
+            channel: None,
+            age_sql: "NOW() - INTERVAL '6 minutes'",
+        },
     )
     .await;
     ev_seed_channel_row(
         pool,
         &schema,
-        "9003",
-        INSTANCE,
-        "creating",
-        Some("tick-fresh"),
-        None,
-        "NOW()",
+        &EvSeed {
+            event_id: "9003",
+            instance: INSTANCE,
+            lifecycle_value: "creating",
+            lease: Some("tick-fresh"),
+            channel: None,
+            age_sql: "NOW()",
+        },
     )
     .await;
 
@@ -1016,34 +1031,40 @@ async fn event_voice_missing_channel_marks_orphaned_with_single_retry_and_never_
     ev_seed_channel_row(
         pool,
         &schema,
-        EVENT_ID,
-        INSTANCE,
-        "creating",
-        Some("tick-a"),
-        Some(9701),
-        "NOW()",
+        &EvSeed {
+            event_id: EVENT_ID,
+            instance: INSTANCE,
+            lifecycle_value: "creating",
+            lease: Some("tick-a"),
+            channel: Some(9701),
+            age_sql: "NOW()",
+        },
     )
     .await;
     ev_seed_channel_row(
         pool,
         &schema,
-        EVENT_ID_B,
-        INSTANCE,
-        "creating",
-        Some("tick-b"),
-        Some(9702),
-        "NOW()",
+        &EvSeed {
+            event_id: EVENT_ID_B,
+            instance: INSTANCE,
+            lifecycle_value: "creating",
+            lease: Some("tick-b"),
+            channel: Some(9702),
+            age_sql: "NOW()",
+        },
     )
     .await;
     ev_seed_channel_row(
         pool,
         &schema,
-        "9003",
-        INSTANCE,
-        "creating",
-        Some("tick-c"),
-        Some(9703),
-        "NOW()",
+        &EvSeed {
+            event_id: "9003",
+            instance: INSTANCE,
+            lifecycle_value: "creating",
+            lease: Some("tick-c"),
+            channel: Some(9703),
+            age_sql: "NOW()",
+        },
     )
     .await;
 
