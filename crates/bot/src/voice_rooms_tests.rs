@@ -7257,6 +7257,71 @@ async fn access_changed_refreshes_a_loaded_worker() {
     }
 }
 
+#[test]
+fn lossless_inbox_receives_do_not_release_gated_capacity() {
+    let (live, _, _, _) = fixture();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let actor = GuildActor {
+        live,
+        tx,
+        backpressure: ActorInboxBackpressure::default(),
+    };
+    // Queue control-plane traffic first, then fill all remaining capacity.
+    // Receiving the control messages must not free the gated tail's slots.
+    for _ in 0..3 {
+        assert!(actor.send_command_lossless(ActorCommand::AccessChanged(AccessControls::default())));
+    }
+    let mut admitted = 0;
+    while actor.try_send_command(ActorCommand::Reconcile) {
+        admitted += 1;
+    }
+    for _ in 0..3 {
+        let command = rx.try_recv().unwrap();
+        assert!(matches!(command, ActorCommand::AccessChanged(_)));
+        actor.backpressure.release_for(&command);
+    }
+    assert_eq!(actor.inbox_depth(), admitted);
+    for _ in admitted..VOICE_ACTOR_INBOX_CAP {
+        assert!(actor.try_send_command(ActorCommand::Reconcile));
+    }
+    assert!(!actor.try_send_command(ActorCommand::Reconcile));
+    assert_eq!(actor.inbox_depth(), VOICE_ACTOR_INBOX_CAP);
+    assert_eq!(actor.inbox_overflow_dropped(), 2);
+    while let Ok(command) = rx.try_recv() {
+        actor.backpressure.release_for(&command);
+    }
+    assert_eq!(actor.inbox_depth(), 0);
+}
+
+#[test]
+fn lossless_inbox_accounting_handles_full_closed_and_reply_sends() {
+    let (live, _, _, _) = fixture();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let actor = GuildActor {
+        live,
+        tx,
+        backpressure: ActorInboxBackpressure::default(),
+    };
+    for _ in 0..VOICE_ACTOR_INBOX_CAP {
+        assert!(actor.try_send_command(ActorCommand::Reconcile));
+    }
+    assert!(actor.send_command_lossless(ActorCommand::DisplaySeed(vec![])));
+    assert_eq!(actor.inbox_depth(), VOICE_ACTOR_INBOX_CAP + 1);
+    let (reply, _) = oneshot::channel();
+    assert!(actor.send_command_lossless(ActorCommand::Status(reply)));
+    assert_eq!(actor.inbox_depth(), VOICE_ACTOR_INBOX_CAP + 1);
+    while let Ok(command) = rx.try_recv() {
+        actor.backpressure.release_for(&command);
+    }
+    assert_eq!(actor.inbox_depth(), 0);
+    drop(rx);
+    assert!(!actor.send_command_lossless(ActorCommand::DisplaySeed(vec![])));
+    let (reply, _) = oneshot::channel();
+    assert!(!actor.send_command_lossless(ActorCommand::Status(reply)));
+    assert_eq!(actor.inbox_depth(), 0);
+    assert_eq!(actor.inbox_overflow_dropped(), 0);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn access_changed_delivers_past_a_full_inbox() {
     // Control-plane exception to the inbox gate: the store write already

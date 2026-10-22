@@ -110,8 +110,10 @@ remaining gateway/accepted-prefix work:
    or the compiled-only commands CLI.
 5. Dynamic slash dispatch uses `adjudicate_run`; a known row while automations
    are off gets `AUTOMATIONS_DISABLED_REPLY`. Render inside the delivery/audit
-   outcome path so both oversize output and REST failure leave a failed
-   `command.run` fact. Emit all output with empty allowed-mention parsing.
+   outcome path so both oversize output and proven REST rejection leave a failed
+   `command.run` fact. An uncertain completion leaves no definitive failed fact;
+   see [completion rules](#lookup-outages-and-uncertain-completion).
+   Emit all output with empty allowed-mention parsing.
 6. Only after the automod-accepted guild/channel message hook, call
    `accepted_text_trigger`. Both automation/text flags must be on, bot authors
    and builtin tokens are excluded, and only the first token is examined.

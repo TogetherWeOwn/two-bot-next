@@ -101,7 +101,7 @@ pub(super) async fn connect(
     connect_with_shutdown(db, rest, None).await
 }
 
-async fn connect_with_shutdown(
+pub(super) async fn connect_with_shutdown(
     db: &TestDb,
     rest: &MockRest,
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,

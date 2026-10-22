@@ -7278,15 +7278,12 @@ struct GuildActor {
 const VOICE_ACTOR_INBOX_CAP: usize = 256;
 
 /// Backpressure ledger for one guild actor's inbox
-/// ([`VOICE_ACTOR_INBOX_CAP`]). Cloned into the actor task: every gated
-/// send consumes one permit and every receive of a bufferable command
-/// releases one, so the in-flight count is the live inbox depth.
-/// Reply-bearing traffic never touches the ledger (see
-/// [`ActorCommand::is_bufferable`]), which keeps the acquire/release
-/// pairing exact for gated traffic: every gated bufferable send goes through
-/// [`GuildActor::try_send_command`], while the rare lossless control-plane
-/// sends skip acquisition and skew the count by at most one slot each (see
-/// [`GuildActor::send_command_lossless`]).
+/// ([`VOICE_ACTOR_INBOX_CAP`]). Cloned into the actor task: every bufferable
+/// send consumes one permit and every receive releases one, so the in-flight
+/// count is the live bufferable inbox depth. Lossless control-plane sends
+/// acquire past the cap but remain counted until received; they cannot release
+/// permits belonging to gated traffic. Reply-bearing traffic never touches
+/// the ledger (see [`ActorCommand::is_bufferable`]).
 #[derive(Debug, Clone, Default)]
 struct ActorInboxBackpressure {
     in_flight: Arc<AtomicUsize>,
@@ -7310,8 +7307,8 @@ impl ActorInboxBackpressure {
     /// commands consume permits, so only they release: reply-bearing
     /// receives must not inflate capacity. Saturating: a receive must
     /// never drive the count negative (which would wedge the gate shut);
-    /// gated production sends always acquire first, so saturation only
-    /// engages for lossless control-plane sends and test-only direct sends.
+    /// production bufferable sends always acquire first, so saturation only
+    /// engages for test-only direct sends.
     fn release_for(&self, command: &ActorCommand) {
         if command.is_bufferable() {
             let _ = self
@@ -7328,7 +7325,7 @@ impl ActorInboxBackpressure {
         self.in_flight.fetch_sub(1, Ordering::AcqRel);
     }
 
-    /// Outstanding gated entries: the live inbox depth.
+    /// Outstanding bufferable entries, including lossless control traffic.
     fn depth(&self) -> usize {
         self.in_flight.load(Ordering::Acquire)
     }
@@ -7369,11 +7366,21 @@ impl GuildActor {
     /// "Saved", and a refused `NameSettingsChanged` would likewise keep the
     /// previous settings and skip the prompt reload. The startup
     /// display-name seed travels as one batch here for the same reason.
-    /// Reception still releases the entry's bufferable ledger slot, so each
-    /// concurrent lossless send skews the gate by at most one slot;
-    /// administrator saves are rare enough that the bound stays effective.
+    /// Bufferable entries still acquire a ledger slot, even past the cap,
+    /// so reception releases their own capacity rather than a gated entry's.
     fn send_command_lossless(&self, command: ActorCommand) -> bool {
-        self.tx.send(command).is_ok()
+        let bufferable = command.is_bufferable();
+        if bufferable {
+            self.backpressure.in_flight.fetch_add(1, Ordering::AcqRel);
+        }
+        if self.tx.send(command).is_ok() {
+            true
+        } else {
+            if bufferable {
+                self.backpressure.rollback();
+            }
+            false
+        }
     }
 
     /// Fire-and-forget sends refused past the inbox cap. Monotonic per actor.
@@ -7385,7 +7392,7 @@ impl GuildActor {
         self.backpressure.dropped()
     }
 
-    /// Outstanding gated inbox entries: the live inbox depth. Test-only,
+    /// Outstanding bufferable inbox entries: the live inbox depth. Test-only,
     /// like [`Self::inbox_overflow_dropped`]; production reads the depth
     /// through `WorkerStatus::inbox_pending`.
     #[cfg(test)]
@@ -8540,8 +8547,8 @@ where
         // One lossless batch, not one gated send per member: a guild with
         // more cached members than inbox slots would otherwise refuse the
         // tail (room-owner names included), and the periodic settings reload
-        // never repopulates the directory. The batch skews the gate by at
-        // most one slot (see `send_command_lossless`).
+        // never repopulates the directory. The batch acquires its own ledger
+        // slot past the cap (see `send_command_lossless`).
         let seed = cached_display_names(cache, guild_id);
         if !seed.is_empty() {
             let _ = actor.send_command_lossless(ActorCommand::DisplaySeed(seed));

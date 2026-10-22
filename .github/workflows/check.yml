@@ -3195,7 +3195,12 @@ jobs:
         run: node ../scripts/test-daily-digest.cjs
       - name: Verify the production digest resolver (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_digest_resolve.py -v
+      - name: Install pinned digest fixture dependency
+        run: |
+          python3 -m pip --isolated --disable-pip-version-check --no-cache-dir install --only-binary=:all: --no-deps --target "$RUNNER_TEMP/digest-fixture-python" 'PyYAML==6.0.3'
       - name: Verify digest failure, repair and SBOM replay (offline fixtures)
+        env:
+          PYTHONPATH: ${{ runner.temp }}/digest-fixture-python
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_daily_digest_execution.py -v
       - name: Verify the missing-digest alert (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_digest_alert.py -v
