@@ -10322,8 +10322,8 @@ pub fn decide_create_channel(request: CreateChannelRequest) -> CreateChannelPlan
 }
 
 /// `/textchannels` input after parsing. Unset options keep the stored value;
-/// `enabled` defaults to on, so naming a channel or role also switches the
-/// companions on.
+/// an absent `enabled` never switches the companions on, so naming a
+/// channel or role alone leaves the toggle untouched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextChannelsRequest {
     pub enabled: Option<bool>,
@@ -10352,7 +10352,9 @@ pub fn decide_text_channels(
     let Some(mut creator) = creator else {
         return refuse("That channel is not a voice-room creator. Pick one made with /create.");
     };
-    creator.text_channels = request.enabled.unwrap_or(true);
+    if let Some(enabled) = request.enabled {
+        creator.text_channels = enabled;
+    }
     if let Some(name) = &request.name {
         if !is_usable_channel_name(name) {
             return TextChannelsPlan::Refuse {
@@ -10420,7 +10422,8 @@ pub fn decide_position(creator: Option<CreatorChannel>, request: &PositionReques
     PositionPlan::Update(creator)
 }
 
-/// `/group` input after parsing. An omitted toggle turns grouping on.
+/// `/group` input after parsing. An omitted toggle refuses: the request
+/// carries nothing else, so there is nothing to apply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupRequest {
     pub enabled: Option<bool>,
@@ -10442,7 +10445,10 @@ pub fn decide_group(creator: Option<CreatorChannel>, request: &GroupRequest) -> 
     let Some(mut creator) = creator else {
         return refuse("That channel is not a voice-room creator. Pick one made with /create.");
     };
-    creator.group_by_category = request.enabled.unwrap_or(true);
+    let Some(enabled) = request.enabled else {
+        return refuse("Choose whether to group rooms by category, then try again.");
+    };
+    creator.group_by_category = enabled;
     if creator.validate().is_err() {
         return refuse("Those grouping settings are not valid. Try again.");
     }
@@ -10656,7 +10662,8 @@ pub fn decide_default_limit(
     DefaultLimitPlan::Update(creator)
 }
 
-/// `/alwaysprivate` input after parsing. An omitted toggle turns it on.
+/// `/alwaysprivate` input after parsing. An omitted toggle refuses: the
+/// request carries nothing else, so there is nothing to apply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlwaysPrivateRequest {
     pub enabled: Option<bool>,
@@ -10681,7 +10688,10 @@ pub fn decide_always_private(
     let Some(mut creator) = creator else {
         return refuse("That channel is not a voice-room creator. Pick one made with /create.");
     };
-    creator.private_default = request.enabled.unwrap_or(true);
+    let Some(enabled) = request.enabled else {
+        return refuse("Choose whether new rooms start private, then try again.");
+    };
+    creator.private_default = enabled;
     if creator.validate().is_err() {
         return refuse("Those privacy settings are not valid. Try again.");
     }

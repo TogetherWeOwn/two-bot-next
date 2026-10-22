@@ -7558,16 +7558,23 @@ fn plan_creator(plan: TextChannelsPlan) -> CreatorChannel {
 }
 
 #[test]
-fn decide_text_channels_defaults_to_on_and_keeps_unset_fields() {
+fn decide_text_channels_absent_toggle_keeps_the_stored_value() {
     let base = CreatorChannel::new(GUILD, CREATOR);
     let creator = plan_creator(decide_text_channels(
         Some(base.clone()),
         &request(None, None, None),
     ));
-    assert!(creator.text_channels, "omitted toggle turns companions on");
+    assert!(
+        !creator.text_channels,
+        "absent toggle preserves stored off, never enables"
+    );
     assert_eq!(creator.text_channel_name, None);
     assert_eq!(creator.text_viewer_role_id, None);
     assert_eq!(creator.name_template, base.name_template);
+    let mut on = CreatorChannel::new(GUILD, CREATOR);
+    on.text_channels = true;
+    let kept = plan_creator(decide_text_channels(Some(on), &request(None, None, None)));
+    assert!(kept.text_channels, "absent toggle preserves stored on");
 }
 
 #[test]
@@ -7690,9 +7697,20 @@ async fn handle_textchannels_refuses_without_manage_channels() {
 }
 
 #[tokio::test]
-async fn handle_textchannels_saves_settings_for_a_creator_channel() {
+async fn handle_textchannels_preserves_stored_toggle_on_rename_only() {
     let trace = Trace::default();
-    let runtime = test_runtime(trace.clone());
+    let runtime = VoiceRuntime::new(
+        {
+            let trace = trace.clone();
+            move || {
+                let store = Store::new(trace.clone());
+                store.creators.lock().unwrap()[0].text_channels = true;
+                (store, Http::new(trace.clone()))
+            }
+        },
+        Duration::from_millis(10),
+        true,
+    );
     let interaction = textchannels_interaction(
         vec![
             typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
@@ -7951,15 +7969,14 @@ fn decide_position_refuses_empty_and_bad_numbers() {
 }
 
 #[test]
-fn decide_group_defaults_to_on() {
-    let on = match decide_group(
+fn decide_group_refuses_without_a_toggle() {
+    let GroupPlan::Refuse { message } = decide_group(
         Some(CreatorChannel::new(GUILD, CREATOR)),
         &GroupRequest { enabled: None },
-    ) {
-        GroupPlan::Update(creator) => creator,
-        GroupPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    ) else {
+        panic!("absent toggle refuses, never enables by default");
     };
-    assert!(on.group_by_category);
+    assert!(message.contains("group"), "{message}");
     let off = match decide_group(
         Some(CreatorChannel::new(GUILD, CREATOR)),
         &GroupRequest {
@@ -8129,15 +8146,14 @@ fn decide_default_limit_sets_and_clears() {
 }
 
 #[test]
-fn decide_always_private_defaults_to_on() {
-    let on = match decide_always_private(
+fn decide_always_private_refuses_without_a_toggle() {
+    let AlwaysPrivatePlan::Refuse { message } = decide_always_private(
         Some(CreatorChannel::new(GUILD, CREATOR)),
         &AlwaysPrivateRequest { enabled: None },
-    ) {
-        AlwaysPrivatePlan::Update(creator) => creator,
-        AlwaysPrivatePlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    ) else {
+        panic!("absent toggle refuses, never enables by default");
     };
-    assert!(on.private_default);
+    assert!(message.contains("private"), "{message}");
     let off = match decide_always_private(
         Some(CreatorChannel::new(GUILD, CREATOR)),
         &AlwaysPrivateRequest {
@@ -8378,7 +8394,7 @@ async fn handle_defaultlimit_saves_the_limit() {
 }
 
 #[tokio::test]
-async fn handle_alwaysprivate_saves_the_default() {
+async fn handle_alwaysprivate_refuses_without_enabled() {
     let trace = Trace::default();
     let runtime = test_runtime(trace.clone());
     let interaction = v8_interaction(
@@ -8391,13 +8407,18 @@ async fn handle_alwaysprivate_saves_the_default() {
     let (owned, response) = handle_capture(&runtime, &interaction).await;
     assert!(owned);
     assert!(
-        response_text(response.as_ref().expect("reply")).contains("private"),
-        "alwaysprivate defaults on and reports it"
+        response_text(response.as_ref().expect("reply"))
+            .contains("Choose whether new rooms start private, then try again."),
+        "alwaysprivate refuses an absent toggle instead of defaulting on"
     );
-    assert!(trace
-        .lock()
-        .unwrap()
-        .contains(&format!("add_creator:{CREATOR}")));
+    assert!(
+        !trace
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.starts_with("add_creator")),
+        "a refused toggle writes nothing"
+    );
 }
 
 #[test]

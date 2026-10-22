@@ -211,6 +211,11 @@ pub const VOICE_DEAD_ACTIONS: &[&str] = &[
 /// (admit/extend/complete). Every other store reports `other` until its op
 /// joins this allowlist.
 pub const DB_ERROR_OPS: &[&str] = &["admission", "other"];
+/// Containment-store operations for
+/// `two_bot_containment_store_errors_total{op}`: a failed completion also
+/// surfaces as outcome-unknown in the staff alert, so the alert and the
+/// durable record never silently disagree. Unknown ops collapse to `other`.
+pub const CONTAINMENT_STORE_OPS: &[&str] = &["complete_incident", "other"];
 /// Terminal outcomes of one send-admission `admit()` decision:
 /// `admitted` on Ok, `blocked` on lane/cooldown refusal, `storage_error`
 /// when the admission SQL itself failed (also counted in
@@ -681,6 +686,7 @@ struct Values {
     moderation_enforcements: [[u64; MODERATION_ENFORCEMENT_OUTCOMES.len()]; MODERATION_VERBS.len()],
     voice_names: [u64; VOICE_NAME_OUTCOMES.len()],
     db_errors: [u64; DB_ERROR_OPS.len()],
+    containment_store_errors: [u64; CONTAINMENT_STORE_OPS.len()],
     send_admissions: [u64; SEND_ADMISSION_OUTCOMES.len()],
     prefix_trigger_refused: [u64; PREFIX_TRIGGER_REFUSED_REASONS.len()],
     dispatch_drops: [u64; DISPATCH_LANES.len()],
@@ -1398,6 +1404,18 @@ impl Metrics {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let counter = &mut values.db_errors[bounded_index(op, DB_ERROR_OPS)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One containment-store failure. Unknown `op` values collapse
+    /// to `other`; no error text, query or identifier is retained.
+    pub fn containment_store_error(&self, op: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter =
+            &mut values.containment_store_errors[bounded_index(op, CONTAINMENT_STORE_OPS)];
         *counter = counter.saturating_add(1);
     }
 
@@ -2151,6 +2169,22 @@ impl Metrics {
         );
         for (op, count) in DB_ERROR_OPS.iter().zip(values.db_errors) {
             writeln!(out, "two_bot_db_errors_total{{op=\"{op}\"}} {count}").unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_containment_store_errors_total",
+            "counter",
+            "Containment-store failures by bounded operation; a failed completion also surfaces as outcome-unknown in the staff alert.",
+        );
+        for (op, count) in CONTAINMENT_STORE_OPS
+            .iter()
+            .zip(values.containment_store_errors)
+        {
+            writeln!(
+                out,
+                "two_bot_containment_store_errors_total{{op=\"{op}\"}} {count}"
+            )
+            .unwrap();
         }
         header(
             &mut out,
@@ -3024,6 +3058,18 @@ mod tests {
             assert!(series.insert(key), "duplicate series: {key}");
             assert!(value.parse::<f64>().is_ok(), "bad sample: {line}");
         }
+    }
+
+    #[test]
+    fn containment_store_errors_stay_bounded() {
+        let metrics = Metrics::default();
+        metrics.containment_store_error("complete_incident");
+        metrics.containment_store_error("hostile\"\\\nlabel");
+        let text = metrics.render(None);
+        assert!(
+            text.contains("two_bot_containment_store_errors_total{op=\"complete_incident\"} 1\n")
+        );
+        assert!(text.contains("two_bot_containment_store_errors_total{op=\"other\"} 1\n"));
     }
 
     #[test]

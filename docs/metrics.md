@@ -44,6 +44,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_db_pool_idle_connections` | Current idle connections |
 | `two_bot_db_pool_max_connections` | Configured maximum |
 | `two_bot_db_errors_total{op}` | Recorded storage-layer failures: send-admission SQL uses `op="admission"`, voice actor load uses `op="other"`; unknown instrumented operations also collapse to `other`. Not a database-wide total |
+| `two_bot_containment_store_errors_total{op}` | Containment-store failures; `op` is `complete_incident` or `other`. A failed completion increments `complete_incident` once and marks the staff alert outcome-unknown because the terminal outcome could not be durably recorded. Fixed two series from process start; no guild, actor, incident or error text labels |
 | `two_bot_send_admissions_total{outcome}` | Send-admission `admit()` decisions; `outcome` is `admitted`, `blocked`, `storage_error` (also counted in `two_bot_db_errors_total{op="admission"}`) or `other` |
 | `two_bot_gateway_prefix_trigger_refused_total{reason}` | In-scope prefix candidates refused by the automod verdict before any trigger lookup; `reason` is `verdict` (contained, timed-out, uninspected, unrecorded or missing verdict) or `other`. The worker records candidates even when its capture-only gate prevents detached dispatch. Unmatched content (no trigger), scope mismatches, bot/webhook messages and disabled text-command gates never increment this family |
 | `two_bot_job_runs_total{job,outcome}` | Completed attempts; outcome is `success` or `failure` (including returned errors, timeouts and isolated panics) |
@@ -335,6 +336,11 @@ as dynamic labels.
   by `Metrics::db_error`; send-admission SQL (admit/extend/complete storage
   failures) reports as `admission`, and failed voice actor store loads
   report as `other`.
+- `two_bot_containment_store_errors_total{op}` — `op` is `complete_incident`
+  or `other` (`CONTAINMENT_STORE_OPS`). Recorded by
+  `Metrics::containment_store_error`; a failed containment completion counts
+  once and marks the staff alert outcome-unknown, without retrying the write.
+  Unknown operations collapse to `other`; no error text becomes a label.
 - `two_bot_send_admissions_total{outcome}` — `outcome` is `admitted`,
   `blocked`, `storage_error` or `other`. Recorded once per `admit()`
   decision by the Postgres admission gate; failed `complete()`/`extend()`
@@ -403,8 +409,22 @@ as dynamic labels.
   `InternalMemberExecutor`), including definitive preflight refusals (slash:
   unknown roles and non-member target; website: resolver `ActionNotAllowed`
   such as non-member target, actor not member, or actor forbidden, recorded
-  by the website effect before the executor runs); actor cooldowns, Discord
-  snapshot failures and other indeterminate reads are not outcomes.
+  by the website effect before the executor runs). Slash member authority
+  refresh failures also count once as `refused`, before any mutation; actor
+  cooldowns are not outcomes. Website resolver snapshot failures and other
+  indeterminate reads before terminal execution are not outcomes.
+  Slash member authority diagnostics use `warn!` with the fixed message
+  `member authority unavailable`, `verb`, and a bounded `cause`: `discord_403`
+  (confirmed 403 on guild/member reads), `transport` (timeout, unavailable,
+  rate-limit, guard or other HTTP refusal on those reads), `malformed_roles`
+  (invalid JSON, incomplete/malformed guild or member evidence, or unknown held
+  roles), `unknown_bot` (any failed bot-identity lookup, including HTTP failures,
+  or absent/non-bot bot membership), or `guild_mismatch` (interaction or fetched guild
+  identity differs from the configured guild). No provider text or payload is
+  logged. Only the first refusal per cause per 60 seconds per member runtime is
+  warned: five fixed sampling slots, no member-keyed state. Suppression never
+  changes the enforcement counter, denial audit, or generic member reply;
+  causes are log fields, not new metric labels or enforcement outcomes.
   Recorded once per terminal channel enforcement (slash
   `ChannelModerationRuntime`, website `ChannelModerationExecutor` plus
   `InternalChannelExecutor`), with the same boundary: website resolver
