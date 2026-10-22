@@ -1,0 +1,50 @@
+-- 0460_admin_api_token_authority: named holders and bounded credential authority.
+-- 0458/0459 remain reserved for the audit/confirmation slice. Never rewrite
+-- shipped 0456/0457. Mirrored in store 0461; both chains may run on one schema.
+-- SQLx runs this entire file in one transaction. Existing rows have no named
+-- holder: SET NOT NULL must abort the upgrade, leaving data and DDL untouched.
+-- No invented holder/default, deletion, expiry truncation or token issuance.
+-- An operator must reconcile incompatible rows before retrying; this migration
+-- does not authorize that action. Backout is binary-only: keep these constraints.
+
+ALTER TABLE admin_api_tokens ADD COLUMN IF NOT EXISTS holder_id TEXT;
+ALTER TABLE admin_api_tokens ADD COLUMN IF NOT EXISTS holder_kind TEXT;
+ALTER TABLE admin_api_tokens ALTER COLUMN holder_id SET NOT NULL;
+ALTER TABLE admin_api_tokens ALTER COLUMN holder_kind SET NOT NULL;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                 WHERE conrelid = 'admin_api_tokens'::regclass
+                   AND conname = 'admin_api_tokens_holder_named') THEN
+    ALTER TABLE admin_api_tokens ADD CONSTRAINT admin_api_tokens_holder_named
+      CHECK (holder_id ~ '[^[:space:]]') NOT VALID;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                 WHERE conrelid = 'admin_api_tokens'::regclass
+                   AND conname = 'admin_api_tokens_holder_kind_closed') THEN
+    ALTER TABLE admin_api_tokens ADD CONSTRAINT admin_api_tokens_holder_kind_closed
+      CHECK (holder_kind IN ('human', 'ai_agent')) NOT VALID;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                 WHERE conrelid = 'admin_api_tokens'::regclass
+                   AND conname = 'admin_api_tokens_admin_human') THEN
+    ALTER TABLE admin_api_tokens ADD CONSTRAINT admin_api_tokens_admin_human
+      CHECK (holder_kind = 'human' OR NOT ('admin' = ANY(scopes))) NOT VALID;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                 WHERE conrelid = 'admin_api_tokens'::regclass
+                   AND conname = 'admin_api_tokens_lifetime_bounded') THEN
+    -- Epoch subtraction uses numeric seconds, not timezone-dependent calendar
+    -- days or timestamp arithmetic that can overflow at the finite endpoints.
+    ALTER TABLE admin_api_tokens ADD CONSTRAINT admin_api_tokens_lifetime_bounded
+      CHECK (isfinite(issued_at) AND isfinite(expires_at)
+             AND expires_at > issued_at
+             AND EXTRACT(EPOCH FROM expires_at) - EXTRACT(EPOCH FROM issued_at) <= 7776000) NOT VALID;
+  END IF;
+END $$;
+
+ALTER TABLE admin_api_tokens VALIDATE CONSTRAINT admin_api_tokens_holder_named;
+ALTER TABLE admin_api_tokens VALIDATE CONSTRAINT admin_api_tokens_holder_kind_closed;
+ALTER TABLE admin_api_tokens VALIDATE CONSTRAINT admin_api_tokens_admin_human;
+ALTER TABLE admin_api_tokens VALIDATE CONSTRAINT admin_api_tokens_lifetime_bounded;

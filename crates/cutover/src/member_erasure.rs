@@ -86,6 +86,7 @@ pub fn is_identity_column(column: &str) -> bool {
                 | "assignee_id"
                 | "opener_id"
                 | "requester_id"
+                | "holder_id"
         )
 }
 
