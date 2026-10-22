@@ -15,11 +15,14 @@
 //! Deliberately out of scope: fetching `/guilds/{id}/scheduled-events` (the
 //! S4 REST executor slice owns that when it lands), running the timer, and
 //! SQL. The sqlx swap lives in [`crate::website_store::replace_events`]; the
-//! tick recipe is: acquire [`crate::community_snapshots::JobGate`] → fetch via
-//! REST → [`normalize_events`] (`None` = [`ScheduledEventsSkip::InvalidResponse`],
-//! fetch failure = `DiscordReadFailed`) → swap via the store (`Some(StaleSnapshot)`
-//! = a newer tick already swapped; the tick logs the skip and keeps the newer
-//! snapshot) → drop the guard.
+//! tick recipe is: try to acquire [`crate::community_snapshots::JobGate`] (a
+//! held gate skips the tick outright: no fetch, no publish, no queue, no
+//! error) → fetch via REST → [`normalize_events`] (`None` =
+//! [`ScheduledEventsSkip::InvalidResponse`], fetch failure =
+//! `DiscordReadFailed`) → swap via the store (`Some(StaleSnapshot)` = a newer
+//! tick already swapped; the tick logs the skip and keeps the newer snapshot)
+//! → drop the guard. The scheduler's Events tick holds that guard across the
+//! whole tick, so overlapping ticks cannot both run.
 //! A failed or malformed read leaves the last good snapshot in place rather
 //! than publishing "no events" as a transport error — including leaving it at
 //! zero rows. A successful empty response *does* delete the last event.
@@ -125,9 +128,10 @@ pub trait ScheduledEventMirror: Send + Sync {
 pub enum ScheduledEventsSkip {
     DiscordReadFailed,
     InvalidResponse,
-    /// The fetch's `observed_at` predates the guild's committed epoch: a newer
-    /// tick already swapped, so this tick's whole transaction rolled back and
-    /// wrote nothing. The mirror keeps the newer snapshot.
+    /// The observation exceeds the tick's five-minute age bound, or its
+    /// `observed_at` predates the guild's committed epoch. The tick skips before
+    /// storage in the first case; the store rolls back the whole transaction
+    /// in the second. Neither path changes the last good snapshot.
     StaleSnapshot,
 }
 
