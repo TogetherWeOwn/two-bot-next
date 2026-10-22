@@ -109,6 +109,14 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     // per row; the maximum across both is the row's last write.
     TableSpec { table: "event_store", measure: TableMeasure::Columns(&["event_time", "received_at"]) },
     TableSpec { table: "events", measure: TableMeasure::Columns(&["recorded_at"]) },
+    // Event voice idempotency rows (0452): the claim stamps created_at once;
+    // bind/clear/orphan transitions rewrite updated_at without touching
+    // created_at, so the maximum across both is the row's last write.
+    TableSpec { table: "event_voice_channels", measure: TableMeasure::Columns(&["created_at", "updated_at"]) },
+    // Event voice presence spans (0452): the join stamps joined_at once; the
+    // leave rewrites left_at from NULL without touching joined_at, so the
+    // maximum across both is the row's last write (same shape as tickets).
+    TableSpec { table: "event_voice_presence", measure: TableMeasure::Columns(&["joined_at", "left_at"]) },
     TableSpec { table: "feed_deliveries", measure: TableMeasure::Columns(&["first_seen_at"]) },
     TableSpec { table: "feed_relays", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "game_activity_guild_aggregates", measure: TableMeasure::Columns(&["updated_at"]) },

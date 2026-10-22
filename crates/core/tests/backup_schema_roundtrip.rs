@@ -1556,6 +1556,55 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
 }
 
 #[tokio::test]
+async fn v10_archive_restores_and_clears_newer_event_voice() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    seed(pool).await;
+    let directory = ArchiveDirectory::new();
+    let current_path = directory.path("v11-source.ndjson.gz");
+    dump(pool, &current_path).await.unwrap();
+    let mut old = inspect(&current_path).unwrap();
+    assert_eq!(old.manifest.version, 11);
+    for table in ["event_voice_channels", "event_voice_presence"] {
+        let rows = old.buffers.remove(table).unwrap();
+        assert!(!rows.is_empty(), "fixture must populate newer {table}");
+        old.manifest.tables.retain(|info| info.name != table);
+    }
+    old.manifest.version = 10;
+    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
+    let old_path = directory.path("pre-event-voice-v10.ndjson.gz");
+    write_archive(&old_path, &old);
+    let inspected = inspect(&old_path).expect("pre-change v10 archive remains readable");
+    assert_eq!(inspected.manifest.version, 10);
+    assert_eq!(
+        inspected.manifest.missing_tables(),
+        ["event_voice_channels", "event_voice_presence"]
+    );
+    // This test deliberately replaces a reused isolated rehearsal target.
+    forget_moderation_history(pool).await;
+    let report = restore(pool, &old_path).await.unwrap();
+    assert!(report.ok);
+    for table in ["event_voice_channels", "event_voice_presence"] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(table)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "v10 restore clears newer {table} target rows");
+    }
+    let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(members > 0, "older covered data is restored, not discarded");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn v3_prefix_restores_into_migrated_schema_without_retaining_newer_target_data() {
     let Some(db) = database().await else {
         return;
