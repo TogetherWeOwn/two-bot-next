@@ -1085,7 +1085,10 @@ where
                 self.audit_refused(exec, "policy").await?;
                 return Err(err);
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                self.audit_refused(exec, "validation").await?;
+                return Err(err);
+            }
         };
         let hash = request_hash(
             validated.action,
@@ -1146,6 +1149,37 @@ where
             })
             .await?;
         Ok(())
+    }
+
+    // Failure audits are best effort: losing this write must never change the
+    // original error, release an uncertain claim or repeat an accepted effect.
+    async fn audit_failed(&self, exec: &MemberExecution, outcome: &'static str, stage: &str) {
+        if self
+            .store
+            .record_audit(&AuditRow {
+                request_id: format!("{}:{outcome}", exec.request_id),
+                guild_id: exec.guild_id.clone(),
+                actor_id: exec.actor.user_id.clone(),
+                action: exec.action.action_name(),
+                target_id: exec.target.as_ref().map(|target| target.user_id.clone()),
+                reason: "Member moderation did not complete".to_owned(),
+                outcome,
+                idempotency_key: exec.idempotency_key.clone(),
+                metadata_json: serde_json::json!({
+                    "stage": stage,
+                    "request_id": exec.request_id,
+                })
+                .to_string(),
+            })
+            .await
+            .is_err()
+        {
+            tracing::error!(
+                action = exec.action.action_name(),
+                stage,
+                "moderation_failure_audit_failed"
+            );
+        }
     }
 
     /// Fire at most 25 due expiries for the owning guild. Claim immediately
@@ -1238,7 +1272,7 @@ where
         hash: &str,
     ) -> Result<MemberResult, MemberError> {
         let now = format_iso_millis((self.now)());
-        match self
+        let claim = match self
             .store
             .claim(
                 &exec.guild_id,
@@ -1247,11 +1281,24 @@ where
                 hash,
                 &now,
             )
-            .await?
+            .await
         {
+            Ok(claim) => claim,
+            Err(err) => {
+                self.audit_failed(exec, "in_progress", "claim").await;
+                return Err(err.into());
+            }
+        };
+        match claim {
             ClaimState::Replayed { outcome } => return replayed_result(&outcome),
-            ClaimState::InFlight => return Err(MemberError::InFlight),
-            ClaimState::Mismatch => return Err(MemberError::KeyMismatch),
+            ClaimState::InFlight => {
+                self.audit_failed(exec, "in_progress", "claim").await;
+                return Err(MemberError::InFlight);
+            }
+            ClaimState::Mismatch => {
+                self.audit_refused(exec, "claim").await?;
+                return Err(MemberError::KeyMismatch);
+            }
             ClaimState::Claimed => {}
         }
 
@@ -1269,6 +1316,7 @@ where
                     MemberError::Store(s) if s.is_safe_pre_mutation() => Some("store_rolled_back"),
                     _ => None,
                 };
+                let mut audit_outcome = "in_progress";
                 if let Some(cause) = release_cause {
                     // A real second attempt, not a cached error. A failed
                     // release is never retried and never replaces `err`: the
@@ -1287,8 +1335,16 @@ where
                             cause,
                             "moderation_idempotency_release_failed"
                         );
+                    } else {
+                        audit_outcome = "failed";
                     }
                 }
+                let stage = if matches!(err, MemberError::Discord(_)) {
+                    "discord"
+                } else {
+                    "store"
+                };
+                self.audit_failed(exec, audit_outcome, stage).await;
                 return Err(err);
             }
         };
@@ -1302,7 +1358,8 @@ where
         ) {
             self.audit_accepted(exec, validated, outcome, None).await;
         }
-        self.store
+        if let Err(err) = self
+            .store
             .complete(
                 &exec.guild_id,
                 &exec.idempotency_key,
@@ -1310,7 +1367,11 @@ where
                 &serde_json::json!({ "outcome": outcome.as_str() }).to_string(),
                 &format_iso_millis((self.now)()),
             )
-            .await?;
+            .await
+        {
+            self.audit_failed(exec, "in_progress", "store").await;
+            return Err(err.into());
+        }
         Ok(MemberResult {
             outcome,
             replayed: false,
@@ -1957,7 +2018,15 @@ impl MemberModerationStore for MemMemberStore {
 
     async fn record_audit(&self, row: &AuditRow) -> Result<(), StoreError> {
         let mut inner = self.lock();
-        if !inner.audits.iter().any(|r| r.request_id == row.request_id) {
+        // A known accepted effect is stronger evidence than a later stuck
+        // completion/claim. Keep its byte-identical row, not a redundant one.
+        let accepted_id = (row.outcome == "in_progress")
+            .then(|| row.request_id.strip_suffix(":in_progress"))
+            .flatten();
+        if !inner.audits.iter().any(|r| {
+            r.request_id == row.request_id
+                || (r.guild_id == row.guild_id && Some(r.request_id.as_str()) == accepted_id)
+        }) {
             inner.audits.push(row.clone());
         }
         Ok(())
@@ -2661,6 +2730,28 @@ mod tests {
     }
 
     const NOW: &str = "2023-11-14T22:13:20.000Z";
+
+    /// Pin a failure/incomplete audit row: bound to the actor, guild, target,
+    /// action and idempotency key, under the `:<outcome>` suffixed request id
+    /// that keeps it from masking the accepted row of a later retry.
+    fn assert_bound_failure_audit(
+        row: &AuditRow,
+        exec: &MemberExecution,
+        outcome: &str,
+        stage: &str,
+    ) {
+        assert_eq!(row.request_id, format!("{}:{outcome}", exec.request_id));
+        assert_eq!(row.outcome, outcome);
+        assert_eq!(row.action, exec.action.action_name());
+        assert_eq!(row.guild_id, GUILD);
+        assert_eq!(row.actor_id, ACTOR_ID);
+        assert_eq!(row.target_id.as_deref(), Some(TARGET_ID));
+        assert_eq!(row.idempotency_key, exec.idempotency_key);
+        let metadata: serde_json::Value =
+            serde_json::from_str(&row.metadata_json).expect("metadata is JSON");
+        assert_eq!(metadata["stage"], stage);
+        assert_eq!(metadata["request_id"], exec.request_id);
+    }
 
     // Imported ownership may contain an older uncertain PUT plus a later
     // accepted one, a state ordinary staging deliberately cannot create.
@@ -3389,8 +3480,12 @@ mod tests {
             err,
             MemberError::Discord(DiscordError::Rejected(_))
         ));
-        // No audit row for a mutation that provably never happened.
-        assert!(svc.store.audits().is_empty());
+        // The rejected attempt is audited as a bound `failed` row under a
+        // suffixed request id, so it can never mask the accepted retry's row.
+        let exec = execution(ModerationAction::Kick);
+        let audits = svc.store.audits();
+        assert_eq!(audits.len(), 1);
+        assert_bound_failure_audit(&audits[0], &exec, "failed", "discord");
 
         // Retry is a real second attempt, not a cached error.
         svc.discord.clear_failure("kick");
@@ -3400,7 +3495,111 @@ mod tests {
             .expect("retry");
         assert!(!res.replayed);
         assert_eq!(svc.discord.call_count("kick"), 2);
-        assert_eq!(svc.store.audits().len(), 1);
+        // The failed row survives the retry untouched and the accepted retry
+        // adds its own plain-request-id success row.
+        let audits = svc.store.audits();
+        assert_eq!(audits.len(), 2);
+        assert_bound_failure_audit(&audits[0], &exec, "failed", "discord");
+        assert_eq!(audits[1].request_id, exec.request_id);
+        assert_eq!(audits[1].outcome, "kicked");
+        assert_eq!(audits[1].action, "moderation.kick");
+        assert_eq!(audits[1].guild_id, GUILD);
+        assert_eq!(audits[1].actor_id, ACTOR_ID);
+        assert_eq!(audits[1].target_id.as_deref(), Some(TARGET_ID));
+        assert_eq!(audits[1].idempotency_key, exec.idempotency_key);
+        assert_eq!(audits[1].reason, exec.reason);
+    }
+
+    /// A definitive Discord rejection that leaves the key unreleasable is an
+    /// uncertain claim, not a retryable failure: it audits as `in_progress`.
+    #[tokio::test]
+    async fn rejected_discord_call_with_failed_release_audits_in_progress() {
+        let discord = MockMemberDiscord::new();
+        let store = FaultyStore::wrap(MemMemberStore::new());
+        let svc = MemberModerationService::new(discord.clone(), store.clone(), policy(), || {
+            1_700_000_000_000
+        });
+
+        discord.fail_with("kick", DiscordError::Rejected("unknown member".to_owned()));
+        store.arm_release();
+        let exec = execution(ModerationAction::Kick);
+        let err = svc.execute(&exec).await.expect_err("must fail");
+        assert!(matches!(
+            err,
+            MemberError::Discord(DiscordError::Rejected(_))
+        ));
+        let audits = store.inner.audits();
+        assert_eq!(audits.len(), 1);
+        assert_bound_failure_audit(&audits[0], &exec, "in_progress", "discord");
+
+        // The claim stayed in flight: no second Discord call, no new row.
+        discord.clear_failure("kick");
+        assert_eq!(svc.execute(&exec).await, Err(MemberError::InFlight));
+        assert_eq!(discord.call_count("kick"), 1);
+        assert_eq!(store.inner.audits(), audits);
+    }
+
+    /// A failed-audit write must never change the original error, and must
+    /// still release the key so the retry is a real attempt.
+    #[tokio::test]
+    async fn failure_audit_write_loss_keeps_error_and_release() {
+        let discord = MockMemberDiscord::new();
+        let store = FaultyStore::wrap(MemMemberStore::new());
+        let svc = MemberModerationService::new(discord.clone(), store.clone(), policy(), || {
+            1_700_000_000_000
+        });
+
+        discord.fail_with("kick", DiscordError::Rejected("unknown member".to_owned()));
+        store.arm_audit();
+        let exec = execution(ModerationAction::Kick);
+        let err = svc.execute(&exec).await.expect_err("must fail");
+        assert!(matches!(
+            err,
+            MemberError::Discord(DiscordError::Rejected(_))
+        ));
+        assert!(store.inner.audits().is_empty(), "the audit write was lost");
+
+        discord.clear_failure("kick");
+        let res = svc.execute(&exec).await.expect("retry");
+        assert!(!res.replayed);
+        assert_eq!(discord.call_count("kick"), 2);
+        let audits = store.inner.audits();
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].request_id, exec.request_id);
+        assert_eq!(audits[0].outcome, "kicked");
+    }
+
+    /// An in-flight refusal is audited under the suffixed id, makes no
+    /// Discord call and adds nothing on redelivery.
+    #[tokio::test]
+    async fn in_flight_refusal_is_audited_once_without_effect() {
+        let svc = service(MockMemberDiscord::new(), MemMemberStore::new());
+        let exec = execution(ModerationAction::Ban);
+        let hash = request_hash(
+            exec.action,
+            &exec.guild_id,
+            Some(TARGET_ID),
+            "spam in #general",
+            None,
+        );
+        svc.store
+            .claim(
+                &exec.guild_id,
+                &exec.idempotency_key,
+                "moderation.ban",
+                &hash,
+                "x",
+            )
+            .await
+            .expect("claim");
+
+        for _ in 0..2 {
+            assert_eq!(svc.execute(&exec).await, Err(MemberError::InFlight));
+        }
+        assert_eq!(svc.discord.call_count("ban"), 0);
+        let audits = svc.store.audits();
+        assert_eq!(audits.len(), 1, "redelivery deduplicates the row");
+        assert_bound_failure_audit(&audits[0], &exec, "in_progress", "claim");
     }
 
     #[tokio::test]
@@ -3709,7 +3908,10 @@ mod tests {
             svc.store.unban_state("req-tempban"),
             Some("cancelled".to_owned())
         );
-        assert!(svc.store.audits().is_empty());
+        let exec = execution(ModerationAction::TempBan);
+        let audits = svc.store.audits();
+        assert_eq!(audits.len(), 1);
+        assert_bound_failure_audit(&audits[0], &exec, "failed", "discord");
         svc.discord.clear_failure("ban");
         let res = svc
             .execute(&execution(ModerationAction::TempBan))
@@ -3720,6 +3922,13 @@ mod tests {
             svc.store.unban_state("req-tempban"),
             Some("pending".to_owned())
         );
+        // The failed row is kept; the accepted retry adds a plain success row.
+        let audits = svc.store.audits();
+        assert_eq!(audits.len(), 2);
+        assert_bound_failure_audit(&audits[0], &exec, "failed", "discord");
+        assert_eq!(audits[1].request_id, exec.request_id);
+        assert_eq!(audits[1].outcome, "temporarily_banned");
+        assert_eq!(audits[1].action, "moderation.tempban");
     }
 
     #[tokio::test]
@@ -4210,12 +4419,14 @@ mod tests {
     #[derive(Clone)]
     struct FaultyStore {
         inner: MemMemberStore,
+        fail_claim_once: Arc<std::sync::atomic::AtomicBool>,
         fail_complete_once: Arc<std::sync::atomic::AtomicBool>,
         fail_stage_once: Arc<std::sync::atomic::AtomicBool>,
         fail_warning_ack_once: Arc<std::sync::atomic::AtomicBool>,
         fail_audit_once: Arc<std::sync::atomic::AtomicBool>,
         fail_complete_unban_once: Arc<std::sync::atomic::AtomicBool>,
         fail_release_once: Arc<std::sync::atomic::AtomicBool>,
+        audit_attempts: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl FaultyStore {
@@ -4223,12 +4434,14 @@ mod tests {
             use std::sync::atomic::AtomicBool;
             Self {
                 inner,
+                fail_claim_once: Arc::new(AtomicBool::new(false)),
                 fail_complete_once: Arc::new(AtomicBool::new(false)),
                 fail_stage_once: Arc::new(AtomicBool::new(false)),
                 fail_warning_ack_once: Arc::new(AtomicBool::new(false)),
                 fail_audit_once: Arc::new(AtomicBool::new(false)),
                 fail_complete_unban_once: Arc::new(AtomicBool::new(false)),
                 fail_release_once: Arc::new(AtomicBool::new(false)),
+                audit_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
         }
 
@@ -4236,9 +4449,22 @@ mod tests {
             flag.swap(false, std::sync::atomic::Ordering::SeqCst)
         }
 
+        fn arm_claim(&self) {
+            self.fail_claim_once
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
         fn arm_complete(&self) {
             self.fail_complete_once
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// Every `record_audit` call, including writes the inner store
+        /// suppresses (accepted-effect precedence) or fails: deleting an
+        /// audit call changes this count even when the ledger does not.
+        fn audit_attempts(&self) -> usize {
+            self.audit_attempts
+                .load(std::sync::atomic::Ordering::SeqCst)
         }
 
         fn arm_stage(&self) {
@@ -4279,6 +4505,9 @@ mod tests {
             request_hash: &str,
             claimed_at: &str,
         ) -> Result<ClaimState, StoreError> {
+            if Self::fail_once(&self.fail_claim_once) {
+                return Err(StoreError::new("injected claim failure"));
+            }
             self.inner
                 .claim(guild_id, idempotency_key, action, request_hash, claimed_at)
                 .await
@@ -4325,6 +4554,8 @@ mod tests {
         }
 
         async fn record_audit(&self, row: &AuditRow) -> Result<(), StoreError> {
+            self.audit_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if Self::fail_once(&self.fail_audit_once) {
                 return Err(StoreError::new("injected audit failure"));
             }
@@ -4553,6 +4784,56 @@ mod tests {
         );
         assert_eq!(discord.call_count("kick"), 1);
         assert_eq!(store.inner.audits().len(), 1);
+    }
+
+    // A claim-store failure surfaces the original error and still leaves its
+    // bound `in_progress` audit row: the failure audit must not depend on the
+    // claim it reports on.
+    #[tokio::test]
+    async fn claim_store_error_returns_original_error_and_audits_in_progress() {
+        let discord = MockMemberDiscord::new();
+        let store = FaultyStore::wrap(MemMemberStore::new());
+        let svc = MemberModerationService::new(discord.clone(), store.clone(), policy(), || {
+            1_700_000_000_000
+        });
+
+        store.arm_claim();
+        let exec = execution(ModerationAction::Kick);
+        let err = svc.execute(&exec).await.expect_err("claim fails");
+        assert!(
+            matches!(err, MemberError::Store(ref store) if store.message == "injected claim failure"),
+            "original store error surfaces, got {err:?}"
+        );
+        assert_eq!(discord.call_count("kick"), 0);
+        assert_eq!(store.audit_attempts(), 1);
+        let audits = store.inner.audits();
+        assert_eq!(audits.len(), 1);
+        assert_bound_failure_audit(&audits[0], &exec, "in_progress", "claim");
+    }
+
+    // A completion-store failure after an accepted effect still attempts the
+    // `in_progress` audit write even though accepted-effect suppression drops
+    // the row: deleting the call turns the attempt count red.
+    #[tokio::test]
+    async fn complete_store_error_attempts_suppressed_in_progress_audit() {
+        let discord = MockMemberDiscord::new();
+        let store = FaultyStore::wrap(MemMemberStore::new());
+        let svc = MemberModerationService::new(discord.clone(), store.clone(), policy(), || {
+            1_700_000_000_000
+        });
+
+        store.arm_complete();
+        let err = svc
+            .execute(&execution(ModerationAction::Kick))
+            .await
+            .expect_err("completion fails");
+        assert!(matches!(err, MemberError::Store(_)));
+        assert_eq!(discord.call_count("kick"), 1);
+        // One accepted row plus the suppressed `in_progress` attempt.
+        assert_eq!(store.audit_attempts(), 2);
+        let audits = store.inner.audits();
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].outcome, "kicked");
     }
 
     // F3 (scheduled effect): a completion failure after the dispatched

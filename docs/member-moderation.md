@@ -274,6 +274,33 @@ store error. Such a line means one caller-supplied key will keep answering
 `in_progress`; the signal does
 not name it, and no code expires or takes over the row.
 
+### Refused and incomplete request audits
+
+All five member verbs audit reason/duration validation refusals as `denied`
+with `stage: validation`; key mismatches use `stage: claim`. Denials retain
+only fixed reason copy, not rejected input. Their `:denied` request identity
+keeps a corrected retry's plain success row available.
+
+Discord failures and store errors attempt a best-effort audit with the original
+request ID in metadata and the original idempotency key in its dedicated field.
+A proven no-effect failure whose key was released writes `:failed` / `failed`;
+an uncertain effect, claim or failed release writes `:in_progress` /
+`in_progress`. The stage distinguishes `discord`, `store` and `claim`. An
+in-flight redelivery uses the same suffix and does not duplicate that row. If
+the plain accepted-effect row already exists, it remains the authoritative
+observation and no redundant in-progress row is inserted. A completed replay
+writes no audit. Audit loss cannot change release/fence decisions or the
+original effect error; no failure adds an automatic retry.
+
+Channel moderation's four verbs attempt a best-effort missing-context refusal
+row before replying. Known interaction IDs are preserved; unavailable guild or
+actor IDs are empty text and an unavailable channel is null, with
+`stage: validation` / `cause: missing_context` metadata. No principal is
+inferred and no claim or Discord write occurs. Held channel claims write a
+separate `:in_progress` row with `stage: claim`, preserving both the original
+uncertain dispatch row and its key. Further redelivery deduplicates that row;
+completed channel replays still write none. Successful rows are unchanged.
+
 ## Verification
 
 On the persistent controller, use the bounded cache wrapper from this isolated

@@ -1,4 +1,4 @@
--- 0454_bump_reminders: one durable pending bump reminder per guild.
+-- 0455_bump_reminders: one durable pending bump reminder per guild.
 --
 -- The bot upserts the guild row on each bumper-bot success embed (a fresh
 -- bump replaces the pending reminder instead of stacking), and lazily claims

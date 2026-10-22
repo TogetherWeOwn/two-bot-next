@@ -287,7 +287,13 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
             .required()
             .max_length(MAX_RESOURCE_ID_CHARS as u32)]),
         CommandDefinition::new("feed-list", "List this server's feed relays")
-            .permissions(PERM_MANAGE_GUILD),
+            .permissions(PERM_MANAGE_GUILD)
+            .options(vec![CommandOption::new(
+                "page",
+                "Page of the feed relay list (1-based)",
+                CommandOptionType::Integer,
+            )
+            .min_value(1)]),
     ]
 }
 
