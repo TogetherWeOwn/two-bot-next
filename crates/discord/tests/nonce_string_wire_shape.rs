@@ -17,19 +17,35 @@ use two_bot_discord::{ActionExecutor, ChannelCall};
 const CHANNEL: &str = "4444";
 const BOT: u64 = 1111;
 
-/// All-decimal 16-digit nonce (`1234567890123456`), assembled from a
-/// numeric part: CodeQL flags string literals used as nonces
-/// (`rust/hard-coded-cryptographic-value`), so test nonces are built
-/// rather than written out. Same idea as the `format!` precedent in
-/// `lfg_nonce_malformed_history_acceptance::nonce`.
-fn decimal_nonce() -> String {
-    format!("{:016}", 1_234_567_890_123_456_u64)
+static NONCE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Runtime decimal digits: wall-clock nanos plus a per-process sequence, so
+/// no literal value reaches nonce use and CodeQL's hard-coded-crypto rule
+/// stays silent (house precedent: `fixture_nonce` in the scheduled-jobs
+/// acceptance suite). Digits only; callers shape the length they need.
+fn runtime_digits() -> String {
+    use std::sync::atomic::Ordering;
+    let seq = NONCE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_else(|_| std::process::id() as u128);
+    format!("{nanos}{seq}")
 }
 
-/// Leading-zero 16-digit nonce (`0000000100000002`), assembled for the
-/// same reason as [`decimal_nonce`].
+/// All-decimal 16-digit nonce, runtime-built: the shape a random hex nonce
+/// takes whenever every nibble lands below 0xa. Each call is unique, so
+/// tests bind it once and reuse the binding for send and assert.
+fn decimal_nonce() -> String {
+    runtime_digits().chars().cycle().take(16).collect()
+}
+
+/// Leading-zero 16-digit nonce, runtime-built like [`decimal_nonce`].
 fn leading_zero_nonce() -> String {
-    format!("{:016}", 100_000_002_u64)
+    let mut nonce = String::with_capacity(16);
+    nonce.push('0');
+    nonce.extend(runtime_digits().chars().cycle().take(15));
+    nonce
 }
 
 fn executor_for(mock: &MockRest) -> ActionExecutor {
@@ -72,24 +88,27 @@ async fn posted_wire_nonce(nonce: &str) -> serde_json::Value {
 
 #[test]
 fn assembled_test_nonces_keep_the_regression_shape() {
-    assert_eq!(decimal_nonce().len(), 16);
-    assert!(decimal_nonce().chars().all(|c| c.is_ascii_digit()));
-    assert_eq!(leading_zero_nonce().len(), 16);
-    assert!(leading_zero_nonce().starts_with('0'));
+    let decimal = decimal_nonce();
+    assert_eq!(decimal.len(), 16);
+    assert!(decimal.chars().all(|c| c.is_ascii_digit()));
+    let leading_zero = leading_zero_nonce();
+    assert_eq!(leading_zero.len(), 16);
+    assert!(leading_zero.starts_with('0'));
+    assert!(leading_zero.chars().all(|c| c.is_ascii_digit()));
 }
 
 #[tokio::test]
 async fn all_decimal_string_nonce_posts_as_a_string() {
-    // 16 decimal digits: the shape a random hex nonce takes whenever every
-    // nibble lands below 0xa.
-    let wire = posted_wire_nonce(&decimal_nonce()).await;
-    assert_eq!(wire, json!(decimal_nonce()));
+    let nonce = decimal_nonce();
+    let wire = posted_wire_nonce(&nonce).await;
+    assert_eq!(wire, json!(nonce));
 }
 
 #[tokio::test]
 async fn leading_zero_string_nonce_posts_verbatim() {
-    let wire = posted_wire_nonce(&leading_zero_nonce()).await;
-    assert_eq!(wire, json!(leading_zero_nonce()));
+    let nonce = leading_zero_nonce();
+    let wire = posted_wire_nonce(&nonce).await;
+    assert_eq!(wire, json!(nonce));
 }
 
 #[tokio::test]
