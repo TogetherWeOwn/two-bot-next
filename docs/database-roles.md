@@ -250,7 +250,11 @@ their login status or silently removing memberships. It contains no passwords.
    to a member login; (c) the provisioning identity reapplies the reviewed full
    plan after migrations and view updates, then `verify` reads 0 findings.
    `sql/web_v1.sql` is applied with `public` as the bot-table search
-   path before the bootstrap phase; functions stay strict in both phases.
+   path before the bootstrap phase; its functions stay strict in both phases.
+   The two voice-audit trigger functions from migration 0455 may be absent only
+   while `voice_settings_audit` is absent. Once that table exists, either missing
+   function fails closed. The full plan requires the audit table before reaching
+   those functions, so an unapplied migration cannot pass full provisioning.
 2. Review and apply the rendered role plan with the authorized provisioning
    identity. It transfers only allowlisted objects to `two_bot_migrator`; unrelated
    tables are not transferred or granted to the runtime.
