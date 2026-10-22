@@ -116,7 +116,13 @@ fn role(id: &str, position: i64, managed: bool) -> Value {
     json!({
         "id": id,
         "name": format!("role-{id}"),
-        "permissions": if id == GUILD { "1051648" } else { "0" },
+        "permissions": if id == GUILD {
+            "1051648"
+        } else if id == BOT_TOP {
+            "268435456"
+        } else {
+            "0"
+        },
         "position": position,
         "managed": managed,
     })
@@ -165,6 +171,11 @@ async fn discord(state: Arc<Mutex<DiscordState>>) -> MockRest {
             ("GET", "/guilds/22/members/45") => ScriptedResponse::json(
                 200,
                 json!({"user": {"id": "45", "username": "joiner-bot", "discriminator": "0", "bot": true},
+                       "roles": []}),
+            ),
+            ("GET", "/guilds/22/members/46") => ScriptedResponse::json(
+                200,
+                json!({"user": {"id": "46", "username": "override-member", "discriminator": "0"},
                        "roles": []}),
             ),
             ("GET", "/guilds/22/members/999") => ScriptedResponse::json(
