@@ -81,8 +81,12 @@ const PRODUCTION_DATABASE_NAMES: [&str; 6] = [
 ///   option-map collection.
 /// - Userinfo and every other query key ignored, so a different password or
 ///   `sslmode` cannot evade the comparison.
-/// - Database is the first path segment; an empty path and `/` both mean the
-///   driver's default database and compare equal (fail-closed: name the
+/// - A missing host (unix-socket URLs such as `postgres:///db?host=...`)
+///   compares as the empty string instead of failing open, so query
+///   overrides still apply and identical socket targets refuse.
+/// - Database is the first path segment, percent-decoded exactly as the
+///   driver decodes it before connecting; an empty path and `/` both mean
+///   the driver's default database and compare equal (fail-closed: name the
 ///   database explicitly to restore). Case preserved (Postgres names are
 ///   case-sensitive).
 /// - Unparsable input or a non-Postgres scheme yields `None`: the caller falls
@@ -93,13 +97,17 @@ fn target_identity(raw: &str) -> Option<(String, u16, String)> {
     if url.scheme() != "postgres" && url.scheme() != "postgresql" {
         return None;
     }
-    let mut host = url.host_str()?.to_lowercase();
+    let mut host = url.host_str().unwrap_or_default().to_lowercase();
     let mut port = url.port().unwrap_or(5432);
     let mut dbname = url
         .path_segments()
         .and_then(|mut segments| segments.next())
-        .unwrap_or_default()
-        .to_owned();
+        .map(|segment| {
+            percent_encoding::percent_decode_str(segment)
+                .decode_utf8_lossy()
+                .into_owned()
+        })
+        .unwrap_or_default();
     for (key, value) in url.query_pairs() {
         match key.as_ref() {
             "host" | "hostaddr" if !value.is_empty() => {
@@ -374,6 +382,33 @@ mod tests {
             "postgres://u:p@db-host:9999/app?port=not-a-port",
             Some("postgres://u:p@db-host/app")
         ));
+    }
+
+    #[test]
+    fn restore_covers_hostless_socket_urls_and_encoded_names() {
+        // Hostless unix-socket URLs must not fail open: the `?host=`
+        // override still applies and identical socket targets refuse.
+        let live = "postgres:///app?host=/var/run/postgresql";
+        assert!(restore_target_is_live(
+            "postgres:///app?host=/var/run/postgresql",
+            Some(live)
+        ));
+        assert!(!restore_target_is_live(
+            "postgres:///app?host=/other/socket",
+            Some(live)
+        ));
+        // Markers fire on hostless candidates too.
+        assert!(restore_target_is_live(
+            "postgres:///two_prod?host=/var/run/postgresql",
+            None
+        ));
+        // The path segment is percent-decoded before comparison, matching
+        // the `?dbname=` override and the driver's own decoding.
+        assert!(restore_target_is_live(
+            "postgres://u:p@db-host/two%5Fprod",
+            Some("postgres://u:p@db-host/two_prod")
+        ));
+        assert!(restore_target_is_live("postgres://u:p@h/pr%6Fd", None));
     }
 
     #[test]

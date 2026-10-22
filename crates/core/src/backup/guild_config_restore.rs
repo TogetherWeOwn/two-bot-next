@@ -1521,8 +1521,7 @@ pub async fn apply_restore_plan_with_progress(
     let mut roles = plan.known_ids.roles.clone();
     let mut channels = plan.known_ids.channels.clone();
     let mut emojis = plan.known_ids.emojis.clone();
-    let mut landed = 0usize;
-    for op in &plan.operations {
+    for (landed, op) in plan.operations.iter().enumerate() {
         let path = resolve_path(&op.path, &channels).map_err(|err| (err, landed))?;
         let body = resolve_value(&op.body, &roles, &channels).map_err(|err| (err, landed))?;
         let result = api
@@ -1552,7 +1551,6 @@ pub async fn apply_restore_plan_with_progress(
                 }
             }
         }
-        landed += 1;
         on_landed(op);
     }
     Ok(RestoreIdMaps {

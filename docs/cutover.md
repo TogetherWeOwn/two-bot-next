@@ -167,8 +167,8 @@ before invoking tools. `two-bot` with no subcommand starts the server;
 `two-bot guild-config-snapshot --help`, and `--help` after any subcommand print
 usage and exit 0 before any env, DB or network read, so `--help` never dumps,
 prunes or uploads
-([help routing](../crates/bot/src/backup_cli.rs#L228), [dispatch](../crates/bot/src/backup_cli.rs#L263)).
-A trailing argument that is not `--help` is refused with exit 2 (`:243-248`).
+([help routing](../crates/bot/src/backup_cli.rs#L233), [dispatch](../crates/bot/src/backup_cli.rs#L268)).
+A trailing argument that is not `--help` is refused with exit 2 (`:248-253`).
 Other binaries or future subcommand help paths still require source/fixture
 verification before approval; a `--help` suffix is not a universal read-only
 safety boundary.
