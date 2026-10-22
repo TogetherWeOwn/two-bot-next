@@ -3206,12 +3206,12 @@ impl ActionExecutor {
             } => {
                 // `audit::delivery_nonce` mints `oa_...` strings that can never
                 // parse as u64 — carry them as string nonces with enforcement
-                // instead of rejecting them (finding 5). Numeric strings keep
-                // the numeric wire shape.
-                let value = nonce.as_deref().map(|s| match s.parse::<u64>() {
-                    Ok(n) => serde_json::Value::from(n),
-                    Err(_) => serde_json::Value::from(s),
-                });
+                // instead of rejecting them (finding 5). Every string nonce
+                // keeps its exact string identity on the wire, even when all
+                // its chars are decimal digits: recovery compares the echoed
+                // nonce as a string, and parsing it as a number would also
+                // drop leading zeroes. Never infer a numeric wire identity.
+                let value = nonce.as_deref().map(serde_json::Value::from);
                 Ok(ChannelCallOutcome::Posted {
                     message_id: self.send_message(channel_id, content, value, false).await?,
                 })
