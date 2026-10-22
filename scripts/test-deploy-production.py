@@ -349,25 +349,24 @@ class StaticGuardTests(unittest.TestCase):
             self.assertIn("          environment: production", step)
 
     def test_concurrency_queues_instead_of_cancelling(self):
-        # Job-level concurrency on production and release only: the guard,
-        # gates, soak and recheck run outside the lane, so an automatic run
-        # can never delay an operator rollback behind a sleeping promotion.
-        # The lane keeps the default single pending slot (a third arrival
-        # cancels the queued run), so the recheck skips an automatic run while
-        # an operator dispatch is active instead of entering the lane behind
-        # it. Running jobs are never cancelled (cancel-in-progress is false).
+        # Job-level concurrency on production only: the guard, gates, soak
+        # and recheck run outside the lane, so an automatic run can never
+        # delay an operator rollback behind a sleeping promotion. The lane
+        # keeps the default single pending slot (a third arrival cancels the
+        # queued run), so the recheck skips an automatic run while an operator
+        # dispatch is active instead of entering the lane behind it. Running
+        # jobs are never cancelled (cancel-in-progress is false).
         self.assertNotIn("concurrency", TOP)
-        for job in ("production", "release"):
-            conc = children(JOBS[job][1:], 4).get("concurrency", [])
-            self.assertIn("group: deploy-production", "\n".join(conc))
-            self.assertIn("cancel-in-progress: false", "\n".join(conc))
+        conc = children(JOBS["production"][1:], 4).get("concurrency", [])
+        self.assertIn("group: deploy-production", "\n".join(conc))
+        self.assertIn("cancel-in-progress: false", "\n".join(conc))
         for job in ("guard", "schema-gate", "roles-gate", "soak", "recheck"):
             self.assertNotIn("concurrency", children(JOBS[job][1:], 4))
 
     def test_every_job_uses_the_shared_runner_routing(self):
         # scripts/test-runner-routing.py pins the full expression (TOG-12339).
         self.assertEqual(list(JOBS), ["guard", "schema-gate", "roles-gate", "soak", "recheck",
-                                      "production", "release"])
+                                      "production"])
         for name, job in JOBS.items():
             runs_on = value(children(job[1:], 4)["runs-on"])
             self.assertTrue(runs_on.startswith("${{ fromJSON((!github.event.repository.private && "), name)
@@ -381,17 +380,6 @@ class StaticGuardTests(unittest.TestCase):
                 for key, block in children(children(job[1:], 4)["permissions"][1:], 6).items()
             }
             self.assertTrue(granted, name)
-            if name == "release":
-                # Only dispatches release.yml: the tag + SBOM chain runs outside this run's
-                # deploy-production group, so a rollback never queues behind it.
-                self.assertEqual(granted, {"actions": "write"})
-                release = "\n".join(JOBS["release"])
-                self.assertIn("needs: [guard, production]", release)
-                self.assertIn("if: needs.guard.outputs.mode == 'deploy'", release)
-                self.assertIn('run: gh workflow run release.yml --ref main -f sha="$SHA"', release)
-                self.assertIn("SHA: ${{ needs.guard.outputs.sha }}", release)
-                self.assertNotIn("uses:", release)
-                continue
             if name == "production":
                 # Checkout plus the deploy-ID lifecycle: count today's
                 # production Deployments for N, then record this one.
@@ -593,8 +581,6 @@ class StaticGuardTests(unittest.TestCase):
             self.assertIn("needs.guard.outputs.skip == ''", condition)
         production_if = value(children(JOBS["production"][1:], 4)["if"])
         self.assertIn("needs.guard.outputs.skip == ''", production_if)
-        release_if = value(children(JOBS["release"][1:], 4)["if"])
-        self.assertEqual(release_if, "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.skip == ''")
 
     def test_soak_runs_outside_the_production_lane_and_recomputes_the_remainder(self):
         # The soak sleeps in its own job with no concurrency group, so a

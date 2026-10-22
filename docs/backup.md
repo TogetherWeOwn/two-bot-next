@@ -343,6 +343,64 @@ sudo systemctl start two-bot-next-backup      # run one now
 journalctl -u two-bot-next-backup -n 30       # what it did
 ```
 
+## Unit bounds and failure signal
+
+Every `deploy/*.service` is bounded and loud. These are templates; shipping the
+directives installs nothing and starts no timer (host installation stays with the
+Operator). `scripts/test_deploy_units.py` lints every unit, so a new or edited
+unit that drops a directive fails CI naming the file. The lint also pins
+`Type=oneshot` (the start bound only applies to oneshot units) and refuses
+`TimeoutSec=` and `SuccessExitStatus=`/`RestartForceExitStatus=` overrides,
+which would silently drop the bound or the failure hook.
+
+| Unit | `TimeoutStartSec` | Why this long |
+|---|---|---|
+| `two-bot-next-backup.service` | 2 h | dump plus the 30-minute upload deadline |
+| `two-bot-next-guild-config-backup.service` | 2 h | Discord REST reads plus two sequential uploads (snapshot and drift report, 30 min each) |
+| `two-bot-next-restore-drill.service` | 2 h | scratch provision, migrate and restore |
+| `two-bot-next-failure@.service` | 30 s | the handler only writes one log line |
+
+Without a bound, a hung oneshot stays "activating" forever and its timer skips
+every later run. On expiry systemd kills the run and the unit goes `failed`.
+
+**Consuming the signal.** Each of the three units sets
+`OnFailure=two-bot-next-failure@%n.service`. A failed, timed-out or refused run
+starts that template, which writes one `crit`-priority journal line tagged
+`two-bot-next-unit-failed`: `unit failed: <unit> - inspect with journalctl -u <unit>`.
+Alert on that tag (any journal shipper that filters on priority or tag) or on
+`systemctl --failed` / the unit's `failed` state. The handler reads no
+credential, touches no database and sends nothing off the host; delivery to a
+person is the alerting layer's job. Install it next to the other units:
+
+```bash
+sudo cp deploy/two-bot-next-failure@.service /etc/systemd/system/
+journalctl -t two-bot-next-unit-failed --since -2d    # recent failures
+```
+
+**Drill archive age.** The drill refuses to restore an archive older than
+`TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S` (unit default `172800`, 48 h: one missed
+nightly run), measured from the newest `two-funnel-*.ndjson.gz` file's mtime. The
+check runs in the unit's shell script before `restore-drill` allocates any
+database, so a stopped nightly backup cannot pass against an old file. It prints
+one JSON line and, on refusal, the next action on stderr, then exits 1 (which
+fires `OnFailure=`):
+
+```json
+{"verdict":"refuse","code":"archive_stale","archive_age_s":9000000}
+```
+
+| `code` | Verdict | Next action |
+|---|---|---|
+| `archive_fresh` | pass | none; the restore proceeds |
+| `archive_stale` | refuse | the nightly backup stopped: `journalctl -u two-bot-next-backup`, fix it, take a fresh backup, rerun the drill |
+| `archive_missing` | refuse | no archive exists (`archive_age_s` is `null`): run the backup service first |
+| `archive_unreadable` | refuse | the archive cannot be inspected or opened for reading: check backup directory permissions and file ownership |
+| `archive_from_future` | refuse | the file is dated ahead of the host clock: check the clock |
+| `max_age_invalid` | refuse | set the variable to a positive whole number of seconds (no leading zero, at most 9 digits) |
+
+The check is read-only and repeatable, and prints no archive name, path or secret.
+Never `touch` an archive to make the drill pass: the age is the point.
+
 ## Off-box destination
 
 `two-bot backup-upload <file>` PUTs one dump via SigV4 single-PUT. Canonical
