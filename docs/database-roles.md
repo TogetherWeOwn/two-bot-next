@@ -13,7 +13,7 @@ holds no membership path into the migrator group.
 | --- | --- | --- | --- | --- | --- |
 | `two_bot_migrator` | CONNECT, CREATE; no TEMP | Owner (DDL) | Owner | Owner | Owner |
 | `two_bot_runtime` | CONNECT; no CREATE/TEMP | USAGE, no CREATE | Ordinary tables: SELECT, INSERT, UPDATE, DELETE; admission lanes: SELECT, INSERT, UPDATE only | USAGE, SELECT; no UPDATE | No access |
-| `two_web_reader` | CONNECT; no CREATE/TEMP | No access | No access | No access | USAGE; SELECT on nine reviewed views |
+| `two_web_reader` | CONNECT; no CREATE/TEMP | No access | No access | No access | USAGE; SELECT on ten reviewed views |
 | `two_bot_migrator_ro` | CONNECT; no CREATE/TEMP | USAGE, no CREATE | SELECT on bot tables, admission lanes and SQLx ledger; no DML | No access | USAGE; no view or function access |
 
 The owner-grant journal (`voice_owner_grants`) is an ordinary `table`-kind
@@ -77,6 +77,13 @@ The scheduled-event epoch-claim table (`scheduled_events_claim`) is ordinary
 `table` kind for the same reason: `replace_events` conditionally upserts the
 per-guild epoch row through the app pool inside its snapshot-swap
 transaction. The table carries no member column, so there is nothing to
+erase and no reader grant beyond the app pool.
+
+The scheduled-event delete-tombstone table (`scheduled_events_tombstone`) is
+ordinary `table` kind for the same reason: `replace_events` writes one row
+per DELETE-removed id through the app pool inside its snapshot-swap
+transaction, and reads the guild high-water back through it before touching
+the mirror. The table carries no member column, so there is nothing to
 erase and no reader grant beyond the app pool.
 
 The reader cannot read bot base tables, including through inherited/public or
@@ -168,10 +175,9 @@ never returns PASS. Verification checks missing groups/objects, group attributes
 and memberships, database/schema privileges, ownership/object kinds, effective
 table/column/sequence/function privileges (including PUBLIC), grant options, parsed
 boolean view invoker settings and unsafe future grants. Explicit grants cover the
-current migrations' 89 ordinary bot tables plus two restricted admission lanes,
-SQLx ledger, two migrator-only tables, twelve sequences,
-nine web views and six functions (three trigger helpers plus three `web_v1`
-helpers). The read-only migrator group additionally reads the ordinary tables,
+reviewed matrix's ordinary bot tables, restricted admission lanes, migration
+ledgers, migrator-only tables, sequences, web views and functions (trigger helpers
+and `web_v1` helpers). The read-only migrator group additionally reads the ordinary tables,
 the admission lanes and the ledger; it reads no migrator-only table, sequence,
 view or function. This includes
 `gateway_onboarding_jobs` and its sequence: the DML-only gateway must recover and

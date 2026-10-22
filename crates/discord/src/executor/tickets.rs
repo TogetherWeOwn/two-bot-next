@@ -40,6 +40,7 @@ pub struct TicketChannelRequest<'a> {
 pub enum TicketMessage<'a> {
     Panel,
     Controls { opener_id: &'a str },
+    Claimed { staff_id: &'a str },
 }
 
 impl ActionExecutor {
@@ -323,8 +324,22 @@ impl ActionExecutor {
                     Some(opener_id),
                 )
             }
+            TicketMessage::Claimed { staff_id } => {
+                snowflake::<UserMarker>(staff_id)?;
+                (
+                    format!("<@{staff_id}> claimed this ticket."),
+                    json!([]),
+                    None,
+                )
+            }
         };
-        let mut body = json!({"content":content,"components":[{"type":1,"components":buttons}]});
+        let mut body = json!({"content":content});
+        if buttons
+            .as_array()
+            .is_some_and(|buttons| !buttons.is_empty())
+        {
+            body["components"] = json!([{"type":1,"components":buttons}]);
+        }
         crate::message_safety::sanitize_message(&mut body);
         // The ONLY notification opt-in: a validated opener id in a fixed template.
         // No caller-supplied content or parse/role policy crosses this boundary.

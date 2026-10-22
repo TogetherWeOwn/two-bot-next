@@ -421,7 +421,7 @@ async fn scorecard_stop_cancels_future_retry_ticks() {
     }
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
     stop.send(true).unwrap();
-    task.await.unwrap();
+    task.await.unwrap().unwrap();
     clock.store(monday + RETRY_DELAY_MS, Ordering::SeqCst);
     tokio::time::advance(Duration::from_secs(300)).await;
     assert_eq!(attempts.load(Ordering::SeqCst), 1);

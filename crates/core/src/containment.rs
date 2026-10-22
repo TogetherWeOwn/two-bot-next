@@ -685,6 +685,10 @@ pub enum QuarantineFailure {
     Unavailable,
     Timeout,
     Other,
+    /// The service shutdown latch interrupted planning before the outcome was
+    /// decided. Like a timeout, this is never a definitive rejection: the end
+    /// state is unknown, so the incident stays uncertain (held, not released).
+    Shutdown,
 }
 
 /// Interpret one role-removal response, without transport or retry machinery.
@@ -708,7 +712,8 @@ pub fn quarantine_outcome(
         Some(
             QuarantineFailure::RateLimited
             | QuarantineFailure::Unavailable
-            | QuarantineFailure::Timeout,
+            | QuarantineFailure::Timeout
+            | QuarantineFailure::Shutdown,
         ) => ContainmentIncidentState::Uncertain,
         Some(_) if !removed_role_ids.is_empty() => ContainmentIncidentState::Uncertain,
         Some(_) => ContainmentIncidentState::Refused,
@@ -1298,6 +1303,7 @@ mod tests {
                 QuarantineFailure::RateLimited,
                 QuarantineFailure::Unavailable,
                 QuarantineFailure::Timeout,
+                QuarantineFailure::Shutdown,
             ] {
                 assert_eq!(
                     quarantine_outcome(&removed, Some(error)),

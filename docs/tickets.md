@@ -45,6 +45,18 @@ and the open-path controls-post rollback reach their terminal states
 without emitting. The series, labels and causes are listed in
 [ticket-lifecycle-observability.md](ticket-lifecycle-observability.md).
 
+## Component admission and overload
+
+Ticket button presses never enter the shared user-slot/lane admission, so the ticket runtime admits them itself, synchronously, before spawning any handler task:
+
+- At most `MAX_TICKET_COMPONENT_IN_FLIGHT` (16) component executions run per runtime, and one member holds at most the shared per-member budget (3). Both checks and the spawn are atomic: beyond either bound the dispatch refuses immediately and queues no waiter.
+- A refused but otherwise valid component gets exactly one ephemeral busy acknowledgement (immediate type-4 reply: the bot is busy, try again) on the shared busy lane (capacity 8). When the busy lane is also full the refusal stays silent. Refused work creates no ticket row, sends no other Discord effect, defers nothing, and promises no recovery or automatic retry.
+- Admission is held until the handler actually settles: the permit releases on success, failure, cancellation and shutdown, so later work and other members keep making progress. Authorization, guild fencing, durable close/recovery semantics and the existing button deadlines (10-second lane wait, 120-second total) are unchanged.
+
+Overload evidence is machine-identifiable and label-free: every refusal increments `two_bot_ticket_component_drops_total` (no member, token or interaction labels), and the log samples `ticket_component_admission_saturated` at most once per 60 seconds per runtime with the interaction id only.
+
+**Next action:** when `ticket_component_admission_saturated` appears or the drops counter climbs, the runtime is shedding ticket bursts as designed — no restart or config change is needed. If saturation persists outside bursts, look for stuck handlers holding admission (deferred components awaiting slow Discord or store calls) before considering bound changes; do not retune lane sizes outside tickets from this signal.
+
 ## Verification
 
 ```sh

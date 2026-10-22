@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     future::Future,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex as TaskMutex,
     },
     time::Duration,
@@ -26,6 +26,7 @@ use two_bot_discord::{
     ActionExecutor, DiscordError,
 };
 
+use crate::interaction_admission::{UserSlot, UserSlots, PER_USER_IN_FLIGHT};
 use crate::jobs::{ErrorClass, JobAction};
 
 const RECOVERY_CADENCE: Duration = Duration::from_secs(RECOVERY_INTERVAL_SECONDS);
@@ -38,6 +39,28 @@ const RECOVERY_ITEM_TIMEOUT: Duration = Duration::from_secs(20);
 const RECOVERY_ROWS_BUDGET: Duration = Duration::from_secs(180);
 const IDENTITY_TIMEOUT: Duration = Duration::from_secs(6);
 const PANEL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Concurrently admitted ticket component executions per runtime. Admission
+/// is non-waiting and happens before spawning: beyond this bound (or the
+/// per-member cap) dispatch refuses synchronously with one ephemeral busy
+/// acknowledgement on the shared busy lane instead of queueing a waiter.
+/// Ticket work is at least as heavy as shared interactions, so the bound
+/// matches the shared interaction lane rather than exceeding it.
+pub(crate) const MAX_TICKET_COMPONENT_IN_FLIGHT: usize = 16;
+
+/// Seconds between saturation `warn!` lines per runtime. The drops counter
+/// increments on every refusal; the log samples the first refusal in each
+/// window so a burst is O(1) lines.
+const COMPONENT_SATURATION_LOG_WINDOW_SECS: u64 = 60;
+
+// Ticket fairness rides the shared per-member budget: one member holds at
+// most PER_USER_IN_FLIGHT executions, strictly below the global cap, so a
+// single-member burst can never fill the runtime and another member at
+// available capacity still makes progress.
+const _: () = assert!(
+    PER_USER_IN_FLIGHT < MAX_TICKET_COMPONENT_IN_FLIGHT,
+    "per-member ticket budget must leave room for other members"
+);
 
 #[path = "ticket_history.rs"]
 mod history;
@@ -376,6 +399,20 @@ pub(crate) struct TicketRuntime {
     started: AtomicBool,
     stopping: AtomicBool,
     tasks: TaskMutex<JoinSet<()>>,
+    /// Ticket component executions admitted per member; see
+    /// [`crate::interaction_admission`]. Held inside the spawned handler
+    /// until it settles, so the slot releases on success, failure,
+    /// cancellation and shutdown.
+    component_slots: UserSlots,
+    /// Admitted ticket component executions currently in flight: the global
+    /// half of admission, counted separately from `tasks` so generic ticket
+    /// work sharing the scope (e.g. RESUMED readiness) never consumes
+    /// component budget. Each permit holds a clone and releases on drop, so
+    /// the count is exact without waiting for the next prune.
+    component_in_flight: Arc<AtomicUsize>,
+    /// Last sampled saturation `warn!`; the drops counter increments
+    /// un-sampled on every refusal.
+    last_component_drop_log: TaskMutex<Option<std::time::Instant>>,
 }
 
 pub(crate) enum Failure {
@@ -385,6 +422,8 @@ pub(crate) enum Failure {
     Timeout,
     LaneBusy,
     NoTicket,
+    TicketClaimedBy(String),
+    TicketNotOpen,
 }
 
 impl From<StoreError> for Failure {
@@ -414,6 +453,15 @@ impl Failure {
             // operation: name the refusal specifically without promising
             // recovery or exposing storage details.
             Self::NoTicket => "This channel is not a ticket.".into(),
+            // A lost claim race names the durable winner. The id is
+            // Discord-owned, never a user-controlled name, and the shared
+            // router suppresses the mention, so this cannot ping.
+            Self::TicketClaimedBy(winner) => {
+                format!("This ticket is already claimed by <@{winner}>.")
+            }
+            // Claiming a closing or otherwise non-open ticket is a lifecycle
+            // refusal, never an ownership conflict or a recovery promise.
+            Self::TicketNotOpen => "This ticket is not open.".into(),
             _ => {
                 "Ticket action failed; recovery will retry unfinished work. Try again later.".into()
             }
@@ -425,7 +473,11 @@ impl Failure {
             Self::Timeout | Self::LaneBusy | Self::Rest(DiscordError::Timeout) => {
                 ErrorClass::Timeout
             }
-            Self::Rest(_) | Self::InvalidEvidence | Self::NoTicket => ErrorClass::Rest,
+            Self::Rest(_)
+            | Self::InvalidEvidence
+            | Self::NoTicket
+            | Self::TicketClaimedBy(_)
+            | Self::TicketNotOpen => ErrorClass::Rest,
         }
     }
     /// True only for SQL storage failures (pool, connection or query), never
@@ -449,6 +501,29 @@ type Result<T> = std::result::Result<T, Failure>;
 /// byte-identical, and `message_count` covers stored messages only.
 const MAX_HISTORY_PAGES: usize = 10;
 
+/// An admitted ticket component execution. Both slots release on drop —
+/// including when the handler is aborted — so admission is held exactly until
+/// the handler settles.
+pub(crate) struct TicketComponentPermit {
+    _member: Option<UserSlot>,
+    _components: Arc<AtomicUsize>,
+}
+
+impl Drop for TicketComponentPermit {
+    fn drop(&mut self) {
+        self._components.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Reap finished tasks; an abnormal end keeps its durable state for recovery.
+fn prune_finished(tasks: &mut JoinSet<()>) {
+    while let Some(result) = tasks.try_join_next() {
+        if result.is_err() {
+            tracing::warn!("ticket task stopped; durable state retained");
+        }
+    }
+}
+
 impl TicketRuntime {
     pub fn new(
         pool: PgPool,
@@ -470,6 +545,9 @@ impl TicketRuntime {
             started: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             tasks: TaskMutex::new(JoinSet::new()),
+            component_slots: UserSlots::default(),
+            component_in_flight: Arc::new(AtomicUsize::new(0)),
+            last_component_drop_log: TaskMutex::new(None),
         })
     }
 
@@ -526,12 +604,73 @@ impl TicketRuntime {
         if self.stopping.load(Ordering::Acquire) {
             return;
         }
-        while let Some(result) = tasks.try_join_next() {
-            if result.is_err() {
-                tracing::warn!("ticket task stopped; durable state retained");
-            }
-        }
+        prune_finished(&mut tasks);
         tasks.spawn(task);
+    }
+
+    /// Admit one ticket component execution and spawn its handler, or refuse
+    /// synchronously without spawning when the runtime holds
+    /// [`MAX_TICKET_COMPONENT_IN_FLIGHT`] executions or the member holds the
+    /// per-member cap. The bound check, the member-slot claim and the spawn
+    /// are atomic under the task scope, so concurrent dispatches cannot
+    /// over-admit; refused work queues no waiter. The permit moves into the
+    /// spawned handler and releases when it settles — on success, failure,
+    /// cancellation and shutdown — while the global slot rides the permit's
+    /// counter, so generic ticket tasks sharing the scope never consume
+    /// component budget.
+    pub fn try_spawn_component<Fut>(
+        &self,
+        user: Option<u64>,
+        spawn: impl FnOnce(TicketComponentPermit) -> Fut,
+    ) -> bool
+    where
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let mut tasks = self.tasks.lock().expect("ticket task scope");
+        if self.stopping.load(Ordering::Acquire) {
+            return false;
+        }
+        prune_finished(&mut tasks);
+        if self.component_in_flight.load(Ordering::Acquire) >= MAX_TICKET_COMPONENT_IN_FLIGHT {
+            return false;
+        }
+        let member = match user {
+            Some(user) => match self.component_slots.acquire(user) {
+                Some(slot) => Some(slot),
+                None => return false,
+            },
+            None => None,
+        };
+        self.component_in_flight.fetch_add(1, Ordering::AcqRel);
+        let permit = TicketComponentPermit {
+            _member: member,
+            _components: Arc::clone(&self.component_in_flight),
+        };
+        tasks.spawn(spawn(permit));
+        true
+    }
+
+    /// Record one refused ticket component: the label-free saturation counter
+    /// increments on every refusal and the log samples the first refusal per
+    /// 60 s per runtime, so a burst is O(1) lines with N counter increments.
+    /// Carries the interaction id only — no member or token labels.
+    pub fn record_component_saturation(&self, interaction_id: u64) {
+        two_bot_core::metrics::global().ticket_component_drop();
+        let mut last = self
+            .last_component_drop_log
+            .lock()
+            .expect("ticket saturation log");
+        let now = std::time::Instant::now();
+        let due = last.is_none_or(|at| {
+            now.duration_since(at).as_secs() >= COMPONENT_SATURATION_LOG_WINDOW_SECS
+        });
+        if due {
+            *last = Some(now);
+            tracing::warn!(
+                interaction_id = interaction_id.to_string(),
+                "ticket component admission saturated (ticket_component_admission_saturated; sampled; see two_bot_ticket_component_drops_total)"
+            );
+        }
     }
 
     fn stop_tasks(&self) {
@@ -698,17 +837,28 @@ impl TicketRuntime {
                     .await?
                     .ok_or(Failure::NoTicket)?;
                 match action {
-                    TicketAction::Claim => {
-                        let prior = ticket.status.as_str();
-                        self.store.claim(&ticket.id, &actor).await?;
-                        emit_lifecycle("claim", "claimed", &ticket.id, prior, "staff_claim");
-                        Ok("Ticket claimed.".into())
-                    }
+                    TicketAction::Claim => match self.store.claim(&ticket.id, &actor).await {
+                        Ok(_) => {
+                            let prior = ticket.status.as_str();
+                            self.post_claim_marker(&channel, &actor).await;
+                            emit_lifecycle("claim", "claimed", &ticket.id, prior, "staff_claim");
+                            Ok("Ticket claimed.".into())
+                        }
+                        Err(StoreError::Domain(TicketError::AlreadyClaimed)) => {
+                            Err(self.claim_refusal(&ticket.id).await)
+                        }
+                        Err(error) => Err(error.into()),
+                    },
                     TicketAction::Close => {
                         let prior = ticket.status.as_str();
-                        self.close(&ticket).await?;
+                        let truncated = self.close(&ticket).await?;
                         emit_lifecycle("close", "closed", &ticket.id, prior, "staff_close");
-                        Ok("Ticket closed; transcript saved for up to 90 days.".into())
+                        Ok(if truncated {
+                            "Ticket closed; transcript was truncated, saved for up to 90 days."
+                                .into()
+                        } else {
+                            "Ticket closed; transcript saved for up to 90 days.".into()
+                        })
                     }
                     TicketAction::Open => unreachable!(),
                 }
@@ -801,7 +951,37 @@ impl TicketRuntime {
         Ok(format!("Your ticket is ready: <#{channel}>."))
     }
 
-    async fn close(&self, ticket: &Ticket) -> Result<()> {
+    /// Best-effort visibility for a committed claim: the store row is truth,
+    /// so a rejected post is counted once and never un-claims or retries.
+    /// The remote response body is never logged.
+    async fn post_claim_marker(&self, channel: &str, staff_id: &str) {
+        if self
+            .executor
+            .post_ticket_message(channel, TicketMessage::Claimed { staff_id })
+            .await
+            .is_err()
+        {
+            let failed = 1;
+            tracing::warn!(failed, "ticket claim marker failed");
+        }
+    }
+
+    /// A lost claim names its reason from a fresh read: lifecycle state wins
+    /// over ownership, and an unknown row keeps the domain refusal.
+    async fn claim_refusal(&self, ticket_id: &str) -> Failure {
+        match self.store.get(ticket_id).await {
+            Ok(Some(current)) if current.status != TicketStatus::Open => Failure::TicketNotOpen,
+            Ok(Some(current)) => match current.claimed_by {
+                Some(winner) => Failure::TicketClaimedBy(winner),
+                None => Failure::Store(StoreError::Domain(TicketError::AlreadyClaimed)),
+            },
+            _ => Failure::Store(StoreError::Domain(TicketError::AlreadyClaimed)),
+        }
+    }
+
+    /// Runs the full close workflow. Returns whether the saved transcript was
+    /// truncated, so the member-visible reply can say so.
+    async fn close(&self, ticket: &Ticket) -> Result<bool> {
         // State first: a repeat Close on a non-Open ticket (or a ticket with
         // no channel) must fail with the state error before any Discord I/O,
         // preserving the pre-gate behavior (no GET, InvalidTransition copy).
@@ -845,12 +1025,13 @@ impl TicketRuntime {
             .ok_or(Failure::InvalidEvidence)?;
         self.set_writes(&doc, channel, &ticket.opener_id, false)
             .await?;
-        let snapshot = self.capture_history(channel).await?;
+        let (snapshot, truncated) = self.capture_history(channel).await?;
         self.store
             .save_transcript(&ticket.id, started_at, now_millis_for_test(), snapshot)
             .await?;
         // The store call above returns only after INSERT + cleanup state COMMIT.
-        self.cleanup(&ticket.id, channel).await
+        self.cleanup(&ticket.id, channel).await?;
+        Ok(truncated)
     }
 
     async fn channel_document(&self, channel: &str) -> Result<Value> {
@@ -897,7 +1078,10 @@ impl TicketRuntime {
         Ok(())
     }
 
-    pub(crate) async fn capture_history(&self, channel: &str) -> Result<TranscriptSnapshot> {
+    pub(crate) async fn capture_history(
+        &self,
+        channel: &str,
+    ) -> Result<(TranscriptSnapshot, bool)> {
         let mut before: Option<String> = None;
         let mut capture = history::HistoryCapture::default();
         let mut pages = 0;
@@ -1366,6 +1550,10 @@ mod panels_isolation_tests;
 #[cfg(test)]
 #[path = "ticket_no_work_acceptance_tests.rs"]
 mod no_work_acceptance_tests;
+
+#[cfg(test)]
+#[path = "ticket_claim_close_truth_acceptance_tests.rs"]
+mod claim_close_truth_acceptance_tests;
 
 #[cfg(test)]
 #[path = "ticket_failure_class_tests.rs"]

@@ -27,13 +27,15 @@ use two_bot_core::{
         AuditRecord, AutomationMessageAcceptance, PutCommandInput, StoredCommand, TemplateContext,
         INVALID_COMMAND_LIST_PAGE,
     },
-    router::InteractionHandler,
+    router::{replies::InteractionReply, InteractionHandler},
     HandlerId, InteractionRouter, SlashOutcome,
 };
 
 use crate::{
     automation_admission::ActorCooldowns,
-    interactions::{publish_commands, refusal_response, route_interaction, RoutedInteraction},
+    interactions::{
+        publish_commands, refusal_response, route_interaction, text_response, RoutedInteraction,
+    },
     ActionExecutor,
 };
 
@@ -78,6 +80,14 @@ impl InteractionHandler for Registration {
 }
 
 type PublishedCommands = Option<Arc<[two_bot_core::CommandDefinition]>>;
+
+/// Fixed availability copy for a failed definition lookup: generic fixed
+/// text, no command name, error, or transport detail. Pinned by the lookup
+/// outage acceptance suites in both crates and quoted in
+/// `docs/custom-commands.md`; keep every copy identical — a different copy
+/// needs a Test Author correction.
+const LOOKUP_OUTAGE_REPLY: &str =
+    "Custom commands are temporarily unavailable. Please try again shortly.";
 
 #[derive(Clone)]
 pub struct CustomCommandRuntime {
@@ -166,6 +176,9 @@ impl CustomCommandRuntime {
     /// Returns false for another feature's interaction. Guild/application fences
     /// precede every lookup, and builtin names never fall through to DB rows.
     /// The guild name comes from the shared cache, never from a synthetic ID.
+    /// A failed definition lookup is not a definitive miss: when the surface
+    /// is in scope the runtime owns the interaction with one fixed ephemeral
+    /// availability reply instead of executing a cached or guessed definition.
     pub async fn handle_interaction(
         &self,
         interaction: &Interaction,
@@ -198,13 +211,22 @@ impl CustomCommandRuntime {
         let row = if management {
             None
         } else {
-            tokio::time::timeout(
+            match tokio::time::timeout(
                 Duration::from_millis(750),
                 store::get_command(&self.pool, &guild, &data.name),
             )
             .await
-            .map_err(|_| CustomCommandError::Storage)?
-            .map_err(|_| CustomCommandError::Storage)?
+            {
+                Ok(Ok(row)) => row,
+                // A lookup outage is not a definitive miss: unknown commands
+                // must stay silent, but a failed lookup cannot prove absence.
+                // Answer once with the fixed availability copy when the
+                // surface is in scope, instead of executing a cached or
+                // guessed definition.
+                Ok(Err(_)) | Err(_) => {
+                    return self.answer_lookup_outage(interaction, received).await;
+                }
+            }
         };
         let RoutedInteraction::Slash { outcome, .. } = route_interaction(
             &self.router,
@@ -295,6 +317,14 @@ impl CustomCommandRuntime {
                         Some("render_failed"),
                     ),
                 };
+                // An uncertain completion proves nothing about the run, so it
+                // stays unaudited (like an ambiguous defer): no definitive
+                // `delivery_failed` fact, and a later explicit retry of the
+                // same interaction records only its own outcome. A render or
+                // context failure is definitive and local, so it still audits.
+                if matches!(result, Err(CustomCommandError::DeliveryUnknown)) && reason.is_none() {
+                    return Err(CustomCommandError::DeliveryUnknown);
+                }
                 let ok = result.is_ok() && reason.is_none();
                 let record = AuditRecord::run(
                     &guild,
@@ -455,6 +485,47 @@ impl CustomCommandRuntime {
         Ok(TextCommandOutcome::Delivered)
     }
 
+    /// One bounded fixed-text ephemeral reply for a failed definition lookup.
+    /// Builtin names (which carry refusals) and foreign/gated inputs never
+    /// reach the lookup, so the error path only sees `Unknown` or silence: a
+    /// disabled surface, a voice-owned name, or anything else stays unowned
+    /// with no I/O. The reply lands inside the existing receipt budget,
+    /// leaving margin below Discord's three-second acknowledgement deadline.
+    /// The interaction stays owned after the single attempt whatever the wire
+    /// outcome: the lookup already failed, so no fallback handler may execute
+    /// a cached or guessed definition or send a second reply.
+    async fn answer_lookup_outage(
+        &self,
+        interaction: &Interaction,
+        received: tokio::time::Instant,
+    ) -> Result<bool, CustomCommandError> {
+        let RoutedInteraction::Slash { outcome, .. } =
+            route_interaction(&self.router, interaction, None)
+        else {
+            return Ok(false);
+        };
+        match outcome {
+            SlashOutcome::Unknown if self.router.gates().automations => {
+                let response = text_response(InteractionReply::new(LOOKUP_OUTAGE_REPLY, true));
+                // One attempt only, inside the receipt budget. The attempt's
+                // wire outcome (provably pre-wire or uncertain alike) is
+                // spent, never retried, and never propagated: ownership is
+                // decided by the failed lookup, not by the reply landing.
+                let _attempted = tokio::time::timeout_at(
+                    received + Duration::from_millis(crate::executor::RECEIPT_ADMISSION_BUDGET_MS),
+                    self.executor.answer_interaction_with_blocked_retry(
+                        interaction.id.get(),
+                        &interaction.token,
+                        &response,
+                    ),
+                )
+                .await;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     async fn defer(
         &self,
         interaction: &Interaction,
@@ -487,13 +558,7 @@ impl CustomCommandRuntime {
         )
         .await
         .map_err(|_| CustomCommandError::DeliveryUnknown)?
-        .map_err(|error| {
-            if error.is_safe_pre_mutation() {
-                CustomCommandError::Delivery
-            } else {
-                CustomCommandError::DeliveryUnknown
-            }
-        })
+        .map_err(delivery_error)
     }
 
     async fn complete(
@@ -505,6 +570,11 @@ impl CustomCommandRuntime {
         // deferred completion carries no three-second deadline, but a Blocked
         // attempt never reached the wire, so retrying it cannot repeat an
         // accepted edit. Uncertain sends are never retried.
+        //
+        // A proven rejection maps to `Delivery`; an ambiguous transport
+        // outcome (timeout, transport failure, 5xx, 429 — including an
+        // accepted edit whose response is lost) maps to `DeliveryUnknown`,
+        // like the defer and prefix paths.
         self.executor
             .edit_interaction_response_with_blocked_retry(
                 self.application_id,
@@ -512,7 +582,7 @@ impl CustomCommandRuntime {
                 content,
             )
             .await
-            .map_err(|_| CustomCommandError::Delivery)
+            .map_err(delivery_error)
     }
 
     // Explicit re-entry still attempts Discord delivery and returns that
@@ -638,6 +708,18 @@ impl CustomCommandRuntime {
             ));
         }
         Ok(reply)
+    }
+}
+
+/// Proven pre-wire refusals and guard failures map to `Delivery`; anything
+/// else (timeout, transport failure, 5xx, 429) is `DeliveryUnknown`: the send
+/// may have landed, so it must never be resent or audited as definitively
+/// failed.
+fn delivery_error(error: crate::DiscordError) -> CustomCommandError {
+    if error.is_safe_pre_mutation() {
+        CustomCommandError::Delivery
+    } else {
+        CustomCommandError::DeliveryUnknown
     }
 }
 

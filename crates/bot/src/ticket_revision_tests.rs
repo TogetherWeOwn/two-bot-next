@@ -259,7 +259,8 @@ async fn equal_timestamp_history_uses_snowflake_order_across_page_boundary() {
         ScriptedResponse::status(500),
     )
     .await;
-    let snapshot = runtime(&mock).capture_history("600").await.ok().unwrap();
+    let (snapshot, truncated) = runtime(&mock).capture_history("600").await.ok().unwrap();
+    assert!(!truncated);
     assert_eq!(snapshot.message_count, 102);
     let lines: Vec<_> = snapshot.content.lines().collect();
     for (index, line) in lines.iter().enumerate() {
