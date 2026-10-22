@@ -73,7 +73,7 @@ impl TicketSupervisor {
 
 impl Drop for TicketSupervisor {
     fn drop(&mut self) {
-        self.runtime.stop_tasks();
+        self.runtime.stop_tasks_from_drop();
         self.shutdown.send_replace(true);
         self.task.abort();
     }
@@ -457,14 +457,22 @@ impl TicketRuntime {
     }
 
     fn stop_tasks(&self) {
-        // Drop-reachable (`TicketSupervisor::drop`) and shared with async
-        // shutdown: recover silently so a poisoned scope still aborts its
-        // tasks instead of panicking during unwinding. No counter: non-drop
-        // callers must never be miscounted as drop poison.
-        let mut tasks = self
-            .tasks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Live path (async `shutdown`): fail loud on a poisoned scope. The
+        // lock acquisition panics before any mutation, so a poisoned live
+        // call fences nothing, aborts nothing and counts nothing. `Drop`
+        // must never call this; it calls `stop_tasks_from_drop` instead.
+        let mut tasks = self.tasks.lock().expect("ticket task scope");
+        self.stopping.store(true, Ordering::Release);
+        tasks.abort_all();
+    }
+
+    /// Drop-only `stop_tasks`: panicking inside `drop` aborts the process
+    /// when the drop runs during unwinding, so a poisoned scope is recovered
+    /// with one counted `ticket_supervisor` increment instead. Called only
+    /// from `TicketSupervisor::drop`; live callers use loud `stop_tasks`.
+    fn stop_tasks_from_drop(&self) {
+        let mut tasks =
+            two_bot_core::metrics::recover_drop_poison(self.tasks.lock(), "ticket_supervisor");
         self.stopping.store(true, Ordering::Release);
         tasks.abort_all();
     }

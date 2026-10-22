@@ -258,13 +258,13 @@ Labelled counter recorded by `recover_drop_poison` in
 poisoned drop counts once under its guard and logs one `drop guard recovered
 a poisoned lock` warn carrying the guard name; the drop still releases its
 state from the recovered guard. Unknown guards collapse to the trailing
-`in_flight_guard` slot, and no panic payload, ID, token or body content ever
+`voice_connection_guard` slot, and no panic payload, ID, token or body content ever
 becomes a label. Manual check, not an alert input: consumed by no alert rule.
 Full semantics live in `docs/metrics.md`.
 
 | Series | Meaning |
 | --- | --- |
-| `two_bot_drop_poison_total{guard}` | Poisoned locks recovered by drop guards instead of panicking inside `drop`; `guard` is `command_dispatch_guard`, `schedule_run`, `user_slot` or `in_flight_guard`. Any increase is a fault worth a look in the container logs |
+| `two_bot_drop_poison_total{guard}` | Poisoned locks recovered by drop guards instead of panicking inside `drop`; `guard` is `command_dispatch_guard`, `schedule_run`, `user_slot`, `in_flight_guard`, `ticket_supervisor`, `response_accounting` or `voice_connection_guard`. Any increase is a fault worth a look in the container logs |
 
 ## Scheduled job labels
 

@@ -646,7 +646,7 @@ struct VoiceConnectionGuard(Option<Arc<dyn VoiceEventSink>>);
 impl Drop for VoiceConnectionGuard {
     fn drop(&mut self) {
         if let Some(voice) = &self.0 {
-            voice.disconnect();
+            voice.disconnect_from_drop();
         }
     }
 }
