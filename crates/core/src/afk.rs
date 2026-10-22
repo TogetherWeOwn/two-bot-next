@@ -14,8 +14,6 @@
 //! (AFK member, mentioner) pair by the bot crate
 //! ([`AFK_MENTION_COOLDOWN_SECS`]). Nothing here logs note contents.
 
-use std::fmt::Write as _;
-
 /// Longest AFK note, in characters. The publish definition declares the
 /// same bound via `max_length`, and the handler re-checks it: Discord
 /// picker hiding is not authorization.
