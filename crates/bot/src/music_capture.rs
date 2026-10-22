@@ -80,12 +80,14 @@ impl MusicVoiceTap {
     }
 
     /// Completed handshakes logged and dropped (dry-run observability).
+    #[cfg(test)]
     #[must_use]
     pub fn dry_runs(&self) -> u64 {
         self.dry_runs.load(Ordering::Relaxed)
     }
 
     /// Pairings cleared by a self leave (dry-run observability).
+    #[cfg(test)]
     #[must_use]
     pub fn clears(&self) -> u64 {
         self.clears.load(Ordering::Relaxed)
@@ -94,7 +96,8 @@ impl MusicVoiceTap {
     /// The complete handshake for `guild_id`, if both halves arrived.
     ///
     /// The dry-run slice only logs completions; the follow-up client card
-    /// PATCHes from this same accessor.
+    /// removes the test gate and PATCHes from this same accessor.
+    #[cfg(test)]
     #[must_use]
     pub fn complete(&self, guild_id: Snowflake) -> Option<PlayerVoiceUpdate> {
         self.pairing
@@ -713,7 +716,7 @@ mod tests {
             kick_answer: true,
             ..CountingSink::new()
         });
-        let tap = MusicVoiceTap::new(
+        let decorated = MusicVoiceTap::new(
             Some(Arc::clone(&inner) as Arc<dyn VoiceEventSink>),
             Some(STAGING),
         );
@@ -726,7 +729,7 @@ mod tests {
             "token": "token",
         }))
         .unwrap();
-        assert!(tap.kick_vote(interaction).await);
+        assert!(decorated.kick_vote(interaction).await);
         let music_only = tap(None);
         let interaction: Interaction = serde_json::from_value(serde_json::json!({
             "id": "1",
