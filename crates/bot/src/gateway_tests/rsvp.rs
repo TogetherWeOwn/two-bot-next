@@ -12,7 +12,7 @@ use crate::discord_test_common::{MockRest, ScriptedResponse};
 
 const EVENT: &str = "1546451670500642999";
 
-fn interaction(sequence: u64, status: &str) -> Value {
+pub(super) fn interaction(sequence: u64, status: &str) -> Value {
     json!({"op":0,"s":sequence,"t":"INTERACTION_CREATE","d":{
         "application_id":"1111", "authorizing_integration_owners":{"0":GUILD},
         "id":sequence.to_string(), "token":format!("mock-rsvp-{sequence}"),
@@ -91,7 +91,7 @@ async fn spawn_with_shutdown(
     ))
 }
 
-async fn connect(
+pub(super) async fn connect(
     db: &TestDb,
     rest: &MockRest,
 ) -> (
@@ -241,7 +241,7 @@ async fn connect_governed(
 /// lane stays occupied until the hold elapses. Sets `seen` the moment the held
 /// read arrives, so the test can send the next command into certain occupancy.
 /// Later reads pass through immediately.
-async fn lane_holding_rest(seen: Arc<AtomicBool>, hold: Duration) -> MockRest {
+pub(super) async fn lane_holding_rest(seen: Arc<AtomicBool>, hold: Duration) -> MockRest {
     let held = Arc::new(AtomicBool::new(false));
     MockRest::with_responder(move |request| {
         // RA-01 live-membership gate precedes the live-event read: echo the
@@ -315,7 +315,7 @@ enum CheckpointFailure {
 /// Read one counter series from the process-global metrics exposition.
 /// Global counters are monotonic and shared with parallel tests, so callers
 /// assert `after >= before + expected`, never an exact value.
-fn global_series(prefix: &str) -> u64 {
+pub(super) fn global_series(prefix: &str) -> u64 {
     two_bot_core::metrics::global()
         .render(None)
         .lines()

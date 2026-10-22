@@ -132,6 +132,7 @@ Scalar gateway series pair with the labels above:
 | `two_bot_gateway_resumes_total` | Received RESUMED dispatches |
 | `two_bot_gateway_disconnects_total` | Transport losses through the shard supervisor; each must pair with a later RESUME or fresh READY |
 | `two_bot_gateway_missed_events_total` | Sequence gaps inside one session; any nonzero increase fails the zero-missed-events acceptance |
+| `two_bot_gateway_rsvp_refused_total` | RSVP interactions refused at reception because the in-flight RSVP bound (32) was exhausted: no prepare task spawned and nothing entered the serial drain. Non-RSVP interactions bypass admission and never increment it |
 | `two_bot_gateway_latency_seconds` | Last heartbeat ACK round-trip; `NaN` until measured |
 | `two_bot_gateway_prefix_trigger_refused_total{reason="verdict"}` | In-scope prefix candidates refused by the automod verdict; the worker records candidates even when its capture-only gate prevents detached dispatch. Unmatched content, scope mismatches, bot/webhook messages and disabled text-command gates never increment it |
 | `two_bot_presence_capture_total{outcome}` | Presence-update capture decisions on the hot path; `outcome` is `inserted` (first delivery stored a row), `duplicate` (same-key retry absorbed by the dedup key) or `rejected` (refused before the insert) |

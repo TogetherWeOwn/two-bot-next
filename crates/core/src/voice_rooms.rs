@@ -50,6 +50,15 @@ pub const QUEUE_MAX_ATTEMPTS: u32 = 10;
 /// [`ActionQueue::failed_dropped`]. Bounds `/setup` recent-failures memory
 /// when a guild-wide outage dead-letters every write.
 pub const MAX_FAILED_ACTIONS: usize = 100;
+/// Cap on one guild's total pending actions (urgent + deferred) admitted
+/// through [`ActionQueue::try_enqueue`]. Past the cap new work is refused
+/// (never evicted: the oldest admitted action still pops first) and counted
+/// by [`ActionQueue::overflow_dropped`]. The inbox gate bounds the inbound
+/// burst feeding the queue, not cumulative production under a stalled drain:
+/// must-admit producers (accepted user commands, room lifecycle writes) keep
+/// [`ActionQueue::enqueue`]; wiring sheddable producers to the bounded
+/// intake is follow-up work.
+pub const MAX_QUEUE_PENDING_PER_GUILD: usize = 1024;
 
 // --- creator channels -------------------------------------------------------
 
@@ -1009,6 +1018,9 @@ struct QueueInner {
     /// Dead letters evicted by the [`MAX_FAILED_ACTIONS`] cap (oldest first).
     /// Monotonic; `clear_failed` leaves it set.
     failed_dropped: u64,
+    /// Refused [`ActionQueue::try_enqueue`] calls. Monotonic; coalescing
+    /// overwrites are not refusals and never touch this.
+    overflow_dropped: u64,
     /// First-enqueue time by action id, for the oldest-pending-age gauge.
     /// Entries survive dispatch and requeue (age spans retries) and are
     /// removed at terminal completion or channel drain.
@@ -1054,22 +1066,70 @@ impl ActionQueue {
         Self::default()
     }
 
-    /// Enqueue a write; returns its id.
+    /// Enqueue a write; returns its id. Always admits: must-admit producers
+    /// (accepted user commands, room lifecycle writes) use this, while
+    /// sheddable producers use [`Self::try_enqueue`].
     pub fn enqueue(&self, guild_id: Snowflake, action: RoomAction) -> u64 {
         let mut inner = self.inner.lock().expect("queue lock");
-        if let RoomAction::RenameRoom { channel_id, .. } = &action {
+        if let Some(id) = Self::coalesce_pending(&mut inner, guild_id, &action) {
+            return id;
+        }
+        Self::insert_pending(&mut inner, guild_id, action)
+    }
+
+    /// Enqueue a write unless the guild already holds
+    /// [`MAX_QUEUE_PENDING_PER_GUILD`] pending actions, in which case the
+    /// work is refused (`None`) and counted by [`Self::overflow_dropped`].
+    /// A refusal allocates no id, touches no `enqueued_at` entry and leaves
+    /// both lanes byte-identical; the oldest admitted work still pops first.
+    /// Coalescing overwrites (`RenameRoom` / `RespaceChannels` over a
+    /// pending entry) are not refusals: they return the existing id without
+    /// touching the counter, even past the cap.
+    pub fn try_enqueue(&self, guild_id: Snowflake, action: RoomAction) -> Option<u64> {
+        let mut inner = self.inner.lock().expect("queue lock");
+        if let Some(id) = Self::coalesce_pending(&mut inner, guild_id, &action) {
+            return Some(id);
+        }
+        let pending = inner.urgent.get(&guild_id).map_or(0, VecDeque::len)
+            + inner.deferred.get(&guild_id).map_or(0, VecDeque::len);
+        if pending >= MAX_QUEUE_PENDING_PER_GUILD {
+            inner.overflow_dropped = inner.overflow_dropped.saturating_add(1);
+            return None;
+        }
+        Some(Self::insert_pending(&mut inner, guild_id, action))
+    }
+
+    /// Refused [`Self::try_enqueue`] calls since queue creation. Monotonic;
+    /// coalescing overwrites are not refusals.
+    #[must_use]
+    pub fn overflow_dropped(&self) -> u64 {
+        self.inner.lock().expect("queue lock").overflow_dropped
+    }
+
+    /// Overwrite a still-queued entry the new action supersedes, returning
+    /// its id. `None` when nothing coalesces and the action needs a slot.
+    fn coalesce_pending(
+        inner: &mut QueueInner,
+        guild_id: Snowflake,
+        action: &RoomAction,
+    ) -> Option<u64> {
+        if let RoomAction::RenameRoom { channel_id, .. } = action {
             if let Some(pending) = inner.deferred.get_mut(&guild_id).and_then(|queue| {
-                queue
-                    .iter_mut()
-                    .find(|queued| queued.action.channel_id() == Some(*channel_id))
+                queue.iter_mut().find(|queued| {
+                    matches!(
+                        &queued.action,
+                        RoomAction::RenameRoom { channel_id: id, .. }
+                        if *id == *channel_id
+                    )
+                })
             }) {
-                pending.action = action;
-                return pending.id;
+                pending.action = action.clone();
+                return Some(pending.id);
             }
         }
         // The dispatch recomputes the positions fresh, so a newer respace
         // for the same room supersedes a still-queued one.
-        if let RoomAction::RespaceChannels { room_channel_id } = &action {
+        if let RoomAction::RespaceChannels { room_channel_id } = action {
             if let Some(pending) = inner.deferred.get_mut(&guild_id).and_then(|queue| {
                 queue.iter_mut().find(|queued| {
                     matches!(
@@ -1079,10 +1139,16 @@ impl ActionQueue {
                     )
                 })
             }) {
-                pending.action = action;
-                return pending.id;
+                pending.action = action.clone();
+                return Some(pending.id);
             }
         }
+        None
+    }
+
+    /// Admit one new action: allocate its id, stamp `enqueued_at` and insert
+    /// it into its lane. Callers check the cap first; this always admits.
+    fn insert_pending(inner: &mut QueueInner, guild_id: Snowflake, action: RoomAction) -> u64 {
         inner.next_id += 1;
         let enqueued_id = inner.next_id;
         inner
@@ -2337,6 +2403,36 @@ mod tests {
         // A forgotten room drops its pending respace with everything else.
         assert_eq!(q.drop_for_channel(GUILD, 501), 1);
         assert_eq!(q.pending_counts(GUILD), (0, 1));
+    }
+
+    #[test]
+    fn rename_enqueue_never_swallows_a_pending_respace() {
+        let q = ActionQueue::new();
+        q.enqueue(
+            GUILD,
+            RoomAction::RespaceChannels {
+                room_channel_id: 500,
+            },
+        );
+        // A rename for the same room is new work, not a coalescing
+        // overwrite: the pending respace must still dispatch.
+        let renamed = q
+            .try_enqueue(
+                GUILD,
+                RoomAction::RenameRoom {
+                    channel_id: 500,
+                    name: "new name".to_owned(),
+                },
+            )
+            .expect("rename under the cap must admit");
+        assert_eq!(q.pending_counts(GUILD), (0, 2));
+        assert_eq!(q.overflow_dropped(), 0);
+        let first = q.pop_due(GUILD, 0).expect("respace due first");
+        assert!(matches!(first.action, RoomAction::RespaceChannels { .. }));
+        assert!(q.mark_succeeded(&first));
+        let second = q.pop_due(GUILD, 0).expect("rename due second");
+        assert_eq!(second.id, renamed);
+        assert!(matches!(second.action, RoomAction::RenameRoom { .. }));
     }
 
     #[test]

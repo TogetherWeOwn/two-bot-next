@@ -603,6 +603,7 @@ struct Values {
     resumes: u64,
     disconnects: u64,
     missed_events: u64,
+    rsvp_refused: u64,
     latency_micros: Option<u64>,
     handler: Histogram,
     voice_join_to_move: Histogram,
@@ -896,6 +897,18 @@ impl Metrics {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         values.missed_events = values.missed_events.saturating_add(count);
+    }
+
+    /// One RSVP interaction refused at reception: the in-flight RSVP bound
+    /// (`RSVP_IN_FLIGHT_LIMIT`) was exhausted, so no prepare task spawned
+    /// and nothing entered the serial drain. The dispatch advances without
+    /// an RSVP completion instead of wedging the funnel or checkpoint.
+    pub fn gateway_rsvp_refused(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.rsvp_refused = values.rsvp_refused.saturating_add(1);
     }
 
     pub fn gateway_latency(&self, latency: Duration) {
@@ -1653,6 +1666,12 @@ impl Metrics {
             "two_bot_gateway_missed_events_total",
             "counter",
             values.missed_events,
+        );
+        scalar(
+            &mut out,
+            "two_bot_gateway_rsvp_refused_total",
+            "counter",
+            values.rsvp_refused,
         );
         header(
             &mut out,
@@ -3680,23 +3699,32 @@ mod tests {
         let text = metrics.render(None);
         assert!(text.contains("two_bot_gateway_disconnects_total 0\n"));
         assert!(text.contains("two_bot_gateway_missed_events_total 0\n"));
+        assert!(text.contains("two_bot_gateway_rsvp_refused_total 0\n"));
         metrics.gateway_disconnect();
         metrics.gateway_missed_events(0);
         metrics.gateway_missed_events(3);
+        metrics.gateway_rsvp_refused();
         let text = metrics.render(None);
         assert!(text.contains("two_bot_gateway_disconnects_total 1\n"));
         assert!(text.contains("two_bot_gateway_missed_events_total 3\n"));
+        assert!(text.contains("two_bot_gateway_rsvp_refused_total 1\n"));
         {
             let mut values = metrics.0.lock().unwrap();
             values.disconnects = u64::MAX;
             values.missed_events = u64::MAX;
+            values.rsvp_refused = u64::MAX;
         }
         metrics.gateway_disconnect();
         metrics.gateway_missed_events(9);
+        metrics.gateway_rsvp_refused();
         let text = metrics.render(None);
         assert!(text.contains(&format!("two_bot_gateway_disconnects_total {}\n", u64::MAX)));
         assert!(text.contains(&format!(
             "two_bot_gateway_missed_events_total {}\n",
+            u64::MAX
+        )));
+        assert!(text.contains(&format!(
+            "two_bot_gateway_rsvp_refused_total {}\n",
             u64::MAX
         )));
     }
