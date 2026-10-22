@@ -288,6 +288,19 @@ write verb; bind that job to a capability in `BootActivation` before it ships.
   ```
 
   A staging apply-check stays a rollout step, not a test gate.
+- The production-call-site regressions in `community_live_tick_tests.rs`
+  additionally require the disposable test database. Each uses a child process
+  to register the real settings poll, publish committed overrides and run the
+  production tick without leaking the process-wide reader into other tests.
+  Presence and scorecard must skip all work on stored `0` and resume after
+  deletion; inactivity must persist flags using the stored horizon and restore
+  the boot horizon after deletion. Only Discord REST is doubled.
+
+  ```sh
+  TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local \
+    python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot community_jobs::live_tick_tests:: -- --test-threads=1
+  ```
+
 - Run `cargo test -p two-bot-core --features db --locked --lib <filter>`
   separately for `community::tests`, `presence::tests`, `inactivity::tests`,
   `funnel::tests`, `community_store`, `presence_store`, and `inactivity_store`,

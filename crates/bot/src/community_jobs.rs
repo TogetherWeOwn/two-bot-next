@@ -63,6 +63,10 @@ mod tests;
 #[path = "community_scorecard_bounds_tests.rs"]
 mod bounds_tests;
 
+#[cfg(test)]
+#[path = "community_live_tick_tests.rs"]
+mod live_tick_tests;
+
 #[derive(Clone, Copy)]
 pub(crate) enum Kind {
     PresenceProbe,
