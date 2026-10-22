@@ -19,7 +19,7 @@ registration and unrelated tests when consuming a correction; do not replace
 the large parent file wholesale.
 
 The combined change includes migration
-`crates/cutover/migrations/0452_sticky_delivery_uncertainty.sql` and its
+`crates/cutover/migrations/0454_sticky_delivery_uncertainty.sql` and its
 `crates/cutover/tests/sticky_delivery_uncertainty_migration.rs` coverage. The
 migration suite checks the file contract and exercises rollback/re-application
 in an owned disposable database. It demonstrates row preservation, fence-column
