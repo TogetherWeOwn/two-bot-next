@@ -95,6 +95,37 @@ async fn concurrent_claims_yield_a_single_winner() {
 }
 
 #[tokio::test]
+async fn concurrent_releases_yield_a_single_winner() {
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    let at = instance(2);
+    assert!(claim(pool, "ev-2r", at, "tick-old").await);
+    assert!(
+        clear_event_voice_lease(pool, "ev-2r", at, "tick-old")
+            .await
+            .expect("clear runs"),
+        "the row starts pre-cleared with a NULL lease"
+    );
+    // Two ticks race the re-lease UPDATE on the pre-cleared row: the CASE
+    // reads the latest committed lease under the row lock, so exactly one
+    // takes the NULL lease (the fresh-insert race above never exercises
+    // this conflict path).
+    let (won_a, won_b) = tokio::join!(
+        claim_event_voice_channel(pool, "ev-2r", at, at, None, "tick-a"),
+        claim_event_voice_channel(pool, "ev-2r", at, at, None, "tick-b"),
+    );
+    let (won_a, won_b) = (won_a.expect("claim runs"), won_b.expect("claim runs"));
+    assert!(won_a ^ won_b, "exactly one concurrent re-lease wins");
+    let winner = if won_a { "tick-a" } else { "tick-b" };
+    assert_eq!(
+        lease_of(pool, "ev-2r").await.as_deref(),
+        Some(winner),
+        "the winner holds the re-leased row"
+    );
+    db.close().await.expect("fixture teardown");
+}
+
+#[tokio::test]
 async fn claims_are_isolated_per_instance() {
     let Some(db) = database().await else { return };
     let pool = db.pool();
@@ -470,6 +501,16 @@ async fn reclaim_with_shifted_schedule_updates_the_row_but_keeps_the_lease() {
             .await
             .expect("claim runs")
     );
+    // Freeze the lease age before the losing re-claim: a losing claim must
+    // never move `updated_at`, or dead leases stay fresh forever and the
+    // stale pass never clears them.
+    backdate_updated(pool, "ev-shift", 6).await;
+    let age_before: OffsetDateTime = sqlx::query_scalar(
+        "SELECT updated_at FROM event_voice_channels WHERE event_id = 'ev-shift'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("lease age reads");
     // The Discord event is rescheduled under the same instance key: the
     // re-claim loses (tick-a still holds the lease) but the shifted schedule
     // lands on the row while lease, status and binding stand.
@@ -501,6 +542,16 @@ async fn reclaim_with_shifted_schedule_updates_the_row_but_keeps_the_lease() {
     assert_eq!(row.2.as_deref(), Some("tick-a"), "the lease is untouched");
     assert_eq!(row.3, "creating", "the status is untouched");
     assert_eq!(row.4, None, "the binding is untouched");
+    let age_after: OffsetDateTime = sqlx::query_scalar(
+        "SELECT updated_at FROM event_voice_channels WHERE event_id = 'ev-shift'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("lease age reads");
+    assert_eq!(
+        age_before, age_after,
+        "a losing re-claim never moves lease age"
+    );
     db.close().await.expect("fixture teardown");
 }
 

@@ -237,6 +237,9 @@ struct Store {
     /// V4 audit rows appended so far, in append order.
     kick_audit: Mutex<Vec<KickAuditRow>>,
     kick_audit_errors: Mutex<VecDeque<StoreError>>,
+    /// Scripted live event-voice bindings for the guild repair; empty by
+    /// default, so the repair is a no-op unless the test seeds a binding.
+    ev_bindings: Mutex<Vec<EventVoiceBinding>>,
 }
 
 impl Store {
@@ -293,6 +296,7 @@ impl Store {
             save_custom_name_errors: Mutex::new(VecDeque::new()),
             kick_audit: Mutex::new(Vec::new()),
             kick_audit_errors: Mutex::new(VecDeque::new()),
+            ev_bindings: Mutex::new(Vec::new()),
         }
     }
 }
@@ -520,6 +524,36 @@ impl RoomPersistence for Store {
             .unwrap()
             .push(format!("evleave:{channel}:{member}"));
         Ok(())
+    }
+    async fn event_voice_guild_bindings(
+        &self,
+        _: u64,
+    ) -> Result<Vec<EventVoiceBinding>, StoreError> {
+        Ok(self.ev_bindings.lock().unwrap().clone())
+    }
+    async fn flush_event_voice_presence(
+        &self,
+        event_id: &str,
+        _: OffsetDateTime,
+        occupants: &[u64],
+    ) -> Result<u64, StoreError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("evrepair_flush:{event_id}:{}", occupants.len()));
+        Ok(0)
+    }
+    async fn close_event_voice_spans_absent(
+        &self,
+        event_id: &str,
+        _: OffsetDateTime,
+        present: &[u64],
+    ) -> Result<u64, StoreError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("evrepair_close:{event_id}:{}", present.len()));
+        Ok(0)
     }
     async fn claim_create(
         &self,
