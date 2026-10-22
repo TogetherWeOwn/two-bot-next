@@ -590,7 +590,14 @@ fn voice_rooms_shadow_drops_contain_no_lock_expects() {
             .map(|offset| impl_at + offset);
         assert!(drop_pos.is_some(), "{drop_impl} must declare fn drop");
         let drop_at = drop_pos.unwrap_or(impl_at);
-        let body: String = lines[drop_at..lines.len().min(drop_at + 15)].join("\n");
+        // Bound the body at the end of this `fn drop`, not a fixed line
+        // window: the slice must never reach the next item (`load`, docs),
+        // or a future expect/unwrap there fails this pin while Drop is valid.
+        let drop_end = lines[drop_at..]
+            .iter()
+            .position(|line| *line == "    }")
+            .map_or(lines.len(), |offset| drop_at + offset + 1);
+        let body: String = lines[drop_at..drop_end].join("\n");
         assert!(
             !body.contains(".lock().expect(") && !body.contains(".lock().unwrap("),
             "{drop_impl} body must not abort on a poisoned lock, saw:\n{body}"

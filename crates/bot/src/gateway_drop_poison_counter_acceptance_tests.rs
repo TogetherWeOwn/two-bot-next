@@ -7,7 +7,8 @@
 //! by `voice_disconnect_poison_acceptance_tests.rs` on the shared disconnect
 //! logic, which the drop-only variant preserves) — and additionally emits
 //! exactly one `two_bot_drop_poison_total{guard="voice_connection_guard"}`.
-//! A healthy drop leaves zero delta.
+//! A healthy drop leaves zero delta. A poisoned drop through the production
+//! `VoiceResponder` sink pins that sink's own drop-only override the same way.
 //!
 //! RED on main (silent `into_inner`, no counter series): counter assertions
 //! fail (series missing). GREEN after Builder (guard drop calls only the
@@ -25,12 +26,34 @@ use std::sync::{
     Arc,
 };
 use std::time::Duration;
-use two_bot::voice_rooms::{BotAccess, GuildSnapshot, VoiceRuntime};
+use twilight_model::application::interaction::Interaction;
+use twilight_model::http::interaction::InteractionResponse;
+use two_bot::voice_rooms::{
+    BotAccess, GuildSnapshot, InteractionReplies, VoiceResponder, VoiceRuntime,
+};
 use two_bot_core::game_activity::{ActivitySnapshot, ActivityType, PresenceDelta};
 use two_bot_cutover::voice_rooms::PgRoomStore;
-use two_bot_discord::voice_rooms::RoomHttp;
+use two_bot_discord::voice_rooms::{RoomHttp, RoomHttpError};
 
 const GUARD: &str = "voice_connection_guard";
+
+/// Reply seam for the responder-wrapped drop fixture. The disconnect path
+/// never answers an interaction, so every method is an inert stub.
+struct DropOnlyReplies;
+
+impl InteractionReplies for DropOnlyReplies {
+    async fn defer(&self, _: &Interaction) -> Result<(), RoomHttpError> {
+        Ok(())
+    }
+
+    async fn complete(&self, _: &Interaction, _: InteractionResponse) -> Result<(), RoomHttpError> {
+        Ok(())
+    }
+
+    async fn respond(&self, _: &Interaction, _: InteractionResponse) -> Result<(), RoomHttpError> {
+        Ok(())
+    }
+}
 
 fn drop_poison_count(guard: &str) -> Option<u64> {
     let rendered = two_bot_core::metrics::global().render(None);
@@ -43,7 +66,11 @@ fn drop_poison_count(guard: &str) -> Option<u64> {
     })
 }
 
-fn connection_guard_drop_with_counter(poisoned: bool, expected_delta: u64) {
+fn connection_guard_drop_with_counter(
+    poisoned: bool,
+    expected_delta: u64,
+    through_responder: bool,
+) {
     let holder_entered = Arc::new(AtomicBool::new(false));
     let runtime = Arc::new(
         VoiceRuntime::<PgRoomStore, RoomHttp>::new(
@@ -106,7 +133,17 @@ fn connection_guard_drop_with_counter(poisoned: bool, expected_delta: u64) {
         },
     );
     collector.observe_join(100, 300, joined_at);
-    let sink: Arc<dyn VoiceEventSink> = runtime.clone();
+    // The responder variant pins the production sink's own
+    // `disconnect_from_drop` override: without it the trait default forwards
+    // to loud `disconnect`, which panics on the poisoned registry above.
+    let sink: Arc<dyn VoiceEventSink> = if through_responder {
+        Arc::new(VoiceResponder::new(
+            Arc::clone(&runtime),
+            Arc::new(DropOnlyReplies),
+        ))
+    } else {
+        runtime.clone()
+    };
     let guard = VoiceConnectionGuard(Some(sink));
 
     let (outcome, before_count, after_count) = {
@@ -153,10 +190,15 @@ fn connection_guard_drop_with_counter(poisoned: bool, expected_delta: u64) {
 
 #[test]
 fn healthy_voice_connection_guard_drop_leaves_counter_at_zero_delta() {
-    connection_guard_drop_with_counter(false, 0);
+    connection_guard_drop_with_counter(false, 0, false);
 }
 
 #[test]
 fn poisoned_voice_connection_guard_drop_counts_exactly_one() {
-    connection_guard_drop_with_counter(true, 1);
+    connection_guard_drop_with_counter(true, 1, false);
+}
+
+#[test]
+fn poisoned_voice_connection_guard_drop_through_responder_counts_exactly_one() {
+    connection_guard_drop_with_counter(true, 1, true);
 }
