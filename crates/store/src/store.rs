@@ -28,7 +28,8 @@ use two_bot_core::{
         advance_observation, is_membership, project, set_observation, valid_observation,
         Membership, MembershipStore,
     },
-    EventType, FunnelEvent, FunnelStore, RecordOutcome, Snowflake, StoredRow, MESSAGE_RUNGS,
+    metrics, EventType, FunnelEvent, FunnelStore, RecordOutcome, Snowflake, StoredRow,
+    MESSAGE_RUNGS,
 };
 
 /// Postgres-backed [`FunnelStore`].
@@ -77,14 +78,6 @@ impl PgFunnelStore {
         observed_at: Option<&str>,
     ) -> Result<RecordOutcome, sqlx::Error> {
         record_async(&self.pool, event, observed_at).await
-    }
-
-    /// Run an async query from the sync trait methods.
-    fn block_on<F, T>(&self, fut: F) -> T
-    where
-        F: std::future::Future<Output = T>,
-    {
-        tokio::task::block_in_place(|| self.handle.block_on(fut))
     }
 }
 
@@ -175,9 +168,9 @@ async fn record_async(
         return Ok(outcome);
     };
     project_event(&mut tx, event, &guild_id).await?;
-    // First rollback-journal writer, `PgFunnelStore` seam only (not yet the
-    // production gateway batch writer in `cutover::gateway_session`, which
-    // needs its own slice): each `PgFunnelStore` funnel append leaves one
+    // Rollback-journal writer for the `PgFunnelStore` seam (the production
+    // gateway batch writer in `cutover::gateway_session` journals its own
+    // appends the same way): each `PgFunnelStore` funnel append leaves one
     // `events` insert entry naming the inserted row, journaled inside the
     // primary transaction under a savepoint so the row and its evidence
     // commit atomically — no crash window between a primary commit and a
@@ -455,7 +448,7 @@ async fn advance_activity(
 
 impl FunnelStore for PgFunnelStore {
     fn mark_bot(&self, guild_id: Snowflake, member_id: Snowflake) {
-        self.block_on(async {
+        crate::retry::block_on_retry(&self.handle, || async {
             // Suppressed pairs stay unwritten: the flag would create a
             // per-user `members` row for a member who opted out. The gate
             // runs inside the write transaction under the shared table lock
@@ -493,12 +486,16 @@ impl FunnelStore for PgFunnelStore {
     ///
     /// # Panics
     ///
-    /// Propagates a database failure as a panic: the sync [`FunnelStore`]
-    /// seam has no fallible channel. A write failure must stop the pipeline
-    /// rather than silently drop data; the release profile aborts the process
-    /// so the container can restart without partially advanced in-memory state.
+    /// Propagates a database failure as a panic after bounded retries are
+    /// exhausted: the sync [`FunnelStore`] seam has no fallible channel, and
+    /// a write failure must stop the pipeline rather than silently drop data.
+    /// The release profile unwinds (`panic = "unwind"` in the workspace
+    /// `Cargo.toml`), so the panic kills only the task that made the call —
+    /// never the supervisor — but it poisons any mutex that task holds
+    /// across the call; holders must recover from poisoning instead of
+    /// `expect`ing the lock.
     fn record(&self, event: FunnelEvent) -> RecordOutcome {
-        self.block_on(record_async(&self.pool, &event, None))
+        crate::retry::block_on_retry(&self.handle, || record_async(&self.pool, &event, None))
             .expect("funnel record failed")
     }
 
@@ -516,7 +513,7 @@ impl FunnelStore for PgFunnelStore {
         let guild_id = snowflake_text(guild_id);
         let member_id = snowflake_text(member_id);
         let at = at.to_owned();
-        self.block_on(async {
+        crate::retry::block_on_retry(&self.handle, || async {
             // Suppressed pairs stay untouched: the bump would create or
             // refresh a per-user `members` row for a member who opted out.
             // Like `mark_bot`, the gate runs under the shared table lock so
@@ -552,7 +549,8 @@ impl FunnelStore for PgFunnelStore {
     /// Lowest empty message rung for a message arriving at `at`, or `None`
     /// when the ladder is full — including the redelivery guard (a rung is
     /// filled only strictly after the rung below). Mirrors [`MemStore`]
-    /// exactly; failures panic — see [`FunnelStore::record`].
+    /// exactly on the healthy path; on a persistent DB error degrades to
+    /// `None` with an error metric after bounded retries, never panicking.
     ///
     /// [`MemStore`]: two_bot_core::MemStore
     fn next_message_rung(
@@ -564,8 +562,9 @@ impl FunnelStore for PgFunnelStore {
         let guild_id = snowflake_text(guild_id);
         let member_id = snowflake_text(member_id);
         let at = at.to_owned();
-        let rows: Vec<(String, String)> = self
-            .block_on(async {
+        let rows: Vec<(String, String)> = match crate::retry::block_on_retry(
+            &self.handle,
+            || async {
                 sqlx::query_as(
                     "SELECT event_type, to_char(occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
                      FROM events WHERE guild_id = $1 AND member_id = $2
@@ -575,8 +574,24 @@ impl FunnelStore for PgFunnelStore {
                 .bind(&member_id)
                 .fetch_all(&self.pool)
                 .await
-            })
-            .expect("funnel next_message_rung failed");
+            },
+        ) {
+            Ok(rows) => rows,
+            Err(error) => {
+                metrics::global().db_error("other");
+                tracing::warn!(
+                    error = %error,
+                    "funnel next_message_rung degraded to None after retries"
+                );
+                // Fail closed as ladder-full: `None` fills no rung this
+                // window, so an outage under-counts instead of inventing
+                // milestones. This is the opposite of the empty-ladder
+                // answer (`Some(FirstMessage)`): every message during the
+                // outage fills nothing, and the next healthy message
+                // re-reads the true ladder — no stuck state.
+                return None;
+            }
+        };
         // ISO-8601 UTC compares lexicographically (legacy string compare).
         let mut filled: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
         for (event_type, stamp) in &rows {
@@ -597,13 +612,14 @@ impl FunnelStore for PgFunnelStore {
         None
     }
 
-    /// Whether the member already has a row of this type. Failures panic —
-    /// see [`FunnelStore::record`].
+    /// Whether the member already has a row of this type. On a persistent DB
+    /// error degrades to `false` with an error metric after bounded retries,
+    /// never panicking.
     fn has_event(&self, guild_id: Snowflake, member_id: Snowflake, event_type: EventType) -> bool {
         let guild_id = snowflake_text(guild_id);
         let member_id = snowflake_text(member_id);
         let event_type = event_type.as_str();
-        self.block_on(async {
+        match crate::retry::block_on_retry(&self.handle, || async {
             sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS (SELECT 1 FROM events WHERE guild_id = $1 AND member_id = $2 AND event_type = $3)",
             )
@@ -612,8 +628,23 @@ impl FunnelStore for PgFunnelStore {
             .bind(event_type)
             .fetch_one(&self.pool)
             .await
-        })
-        .expect("funnel has_event failed")
+        }) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                metrics::global().db_error("other");
+                tracing::warn!(
+                    error = %error,
+                    "funnel has_event degraded to false after retries"
+                );
+                // Fail closed as unseen: `false` re-runs the follow-up write,
+                // which is idempotent (insert-first arbitration dedupes),
+                // rather than skipping a genuinely new event. Concurrent
+                // callers already race this way on the healthy path, so
+                // downstream tolerates the duplicate claim; the store itself
+                // stays exact.
+                false
+            }
+        }
     }
 }
 
@@ -621,26 +652,58 @@ impl FunnelStore for PgFunnelStore {
 /// projection derives from persisted event rows (not arrival-ordered
 /// `members` columns), so historical joins and any-order replays converge
 /// exactly like memory. Duplicate reconfirmations advance only the stored
-/// observation maximum. Failures panic — see [`FunnelStore::record`].
+/// observation maximum. Reads degrade fail-closed with an error metric after
+/// bounded retries, never panicking; writes panic — see
+/// [`FunnelStore::record`].
 impl MembershipStore for PgFunnelStore {
     fn membership(&self, guild_id: Snowflake, member_id: Snowflake) -> Option<Membership> {
-        let rows = self
-            .block_on(fetch_member_rows(&self.pool, guild_id, member_id))
-            .expect("funnel membership failed");
+        let rows = match crate::retry::block_on_retry(&self.handle, || {
+            fetch_member_rows(&self.pool, guild_id, member_id)
+        }) {
+            Ok(rows) => rows,
+            Err(error) => {
+                metrics::global().db_error("other");
+                tracing::warn!(
+                    error = %error,
+                    "funnel membership degraded to None after retries"
+                );
+                // Fail closed as unknown: `None` is what a never-seen member
+                // reads (`project` over zero rows), so consumers take the
+                // new-member path instead of acting on a fabricated
+                // membership.
+                return None;
+            }
+        };
         project(rows.iter())
     }
 
     fn membership_rows(&self, guild_id: Snowflake, member_id: Snowflake) -> Vec<StoredRow> {
-        self.block_on(fetch_member_rows(&self.pool, guild_id, member_id))
-            .expect("funnel membership rows failed")
+        match crate::retry::block_on_retry(&self.handle, || {
+            fetch_member_rows(&self.pool, guild_id, member_id)
+        }) {
+            Ok(rows) => rows,
+            Err(error) => {
+                metrics::global().db_error("other");
+                tracing::warn!(
+                    error = %error,
+                    "funnel membership_rows degraded to empty after retries"
+                );
+                // Fail closed as no rows: projecting zero rows yields `None`,
+                // the same unknown-member answer as a never-seen member —
+                // never a fabricated row.
+                Vec::new()
+            }
+        }
     }
 
     /// Insert or reconfirm a membership event. Invalid/non-membership hints
     /// are ignored; an existing row's occurrence/source/other metadata stay
     /// put. Failures panic — see [`FunnelStore::record`].
     fn record_observed(&self, event: FunnelEvent, observed_at: Option<&str>) -> RecordOutcome {
-        self.block_on(record_async(&self.pool, &event, observed_at))
-            .expect("funnel record_observed failed")
+        crate::retry::block_on_retry(&self.handle, || {
+            record_async(&self.pool, &event, observed_at)
+        })
+        .expect("funnel record_observed failed")
     }
 }
 

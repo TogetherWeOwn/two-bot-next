@@ -60,23 +60,13 @@ _ALERT_INPUT_REASON = (
 # Every emitted family absent from the catalog, with why it stays out.
 # A name here that gains a catalog row fails until its exemption is removed.
 EXEMPT_SERIES = {
-    "two_bot_rest_guard_invalid_requests_total": _GUARD_REASON,
-    "two_bot_rest_guard_rejected_requests_total": _GUARD_REASON,
-    "two_bot_rest_guard_breaker_opens_total": _GUARD_REASON,
-    "two_bot_rest_guard_breaker_closes_total": _GUARD_REASON,
-    "two_bot_rest_guard_global_pauses_total": _GUARD_REASON,
     "two_bot_rest_guard_invalid_requests_in_window": _GUARD_REASON,
-    "two_bot_rest_guard_token_invalid": _GUARD_REASON,
-    "two_bot_rest_guard_pending_global_responses": _GUARD_REASON,
     "two_bot_rest_guard_global_paused": _GUARD_REASON,
     "two_bot_rest_guard_global_pause_remaining_seconds": _GUARD_REASON,
     "two_bot_db_pool_configured": _POOL_REASON,
     "two_bot_db_pool_connections": _POOL_REASON,
     "two_bot_db_pool_idle_connections": _POOL_REASON,
     "two_bot_db_pool_max_connections": _POOL_REASON,
-    "two_bot_handler_duration_seconds": (
-        "latency histogram documented in docs/metrics.md; consumed by no alert rule"
-    ),
     "two_bot_voice_operations_total": _VOICE_SERIES_REASON + "; alert input for voice_failures",
     "two_bot_voice_dead_letters_total": _VOICE_SERIES_REASON + "; alert input for voice_failures",
     "two_bot_voice_orphans_total": _VOICE_SERIES_REASON + "; alert input for voice_failures",
@@ -110,6 +100,15 @@ EXEMPT_SERIES = {
         "two_bot_voice_join_to_move_seconds family; alert input for "
         "voice_join_fast_burn and voice_join_slow_burn (cumulative le=\"5\" "
         "count); documented in docs/metrics.md and the catalog alert-rule rows"
+    ),
+    # Same `_bucket`-child spelling rule as the voice join family above: the
+    # base two_bot_handler_duration_seconds family stays exempt while the
+    # raw alert-input name needs its own exemption.
+    "two_bot_handler_duration_seconds_bucket": (
+        "histogram _bucket child of the exempt "
+        "two_bot_handler_duration_seconds family; alert input for "
+        "handler_duration_saturated (per-le deltas with the p99 bound); "
+        "documented in docs/metrics.md and the catalog alert-rule rows"
     ),
 }
 

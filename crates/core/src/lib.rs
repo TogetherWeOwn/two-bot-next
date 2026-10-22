@@ -180,11 +180,11 @@ pub mod voice_vote_kick_audit;
 pub mod website_store;
 
 pub use action_outcomes::{
-    backoff_ms, classify_kick_status, clear_send_bit, lockdown_overwrite, pace_wait_ms,
-    parse_retry_after_secs, retry_after_ms, retry_after_ms_unclamped, set_send_bit,
-    unlock_overwrite, ActionOutcome, KickOutcome, KickResult, KickStatus, ModerationExecution,
-    BACKOFF_BASE_MS, MAX_BACKFILL_RETRY_AFTER_MS, MAX_HTTP_TRIES, MAX_RETRY_AFTER_MS,
-    RETRY_AFTER_PADDING_MS,
+    backoff_ms, backoff_ms_jittered, classify_kick_status, clear_send_bit, jitter_seed,
+    lockdown_overwrite, pace_wait_ms, parse_retry_after_secs, retry_after_ms,
+    retry_after_ms_unclamped, set_send_bit, unlock_overwrite, ActionOutcome, KickOutcome,
+    KickResult, KickStatus, ModerationExecution, BACKOFF_BASE_MS, MAX_BACKFILL_RETRY_AFTER_MS,
+    MAX_HTTP_TRIES, MAX_RETRY_AFTER_MS, RETRY_AFTER_PADDING_MS,
 };
 pub use automation_transfer::{
     diff_import, export_document, max_import_entries, parse_import_document, ExportDocument,
@@ -299,9 +299,10 @@ pub use internal_actions::{
 };
 pub use invites::{
     attribute_joins, attribution_category, count_downtime_unknown_joins, invite_growth,
-    is_snapshot_stale, referral_counts, summarize_attribution_split, AttributionCategory,
-    AttributionSplit, DowntimeWindow, DowntimeWindowCount, InviteSnapshotStore, InviteState,
-    InviteTracker, JoinAttribution, MemSnapshots, INVITE_SNAPSHOT_STALENESS_BOUND_MS,
+    is_snapshot_stale, referral_counts, saturate_invite_uses, summarize_attribution_split,
+    AttributionCategory, AttributionSplit, DowntimeWindow, DowntimeWindowCount,
+    InviteSnapshotStore, InviteState, InviteTracker, JoinAttribution, MemSnapshots,
+    INVITE_SNAPSHOT_STALENESS_BOUND_MS, MAX_INVITE_USES,
 };
 #[cfg(feature = "db")]
 pub use leveling_store::{
