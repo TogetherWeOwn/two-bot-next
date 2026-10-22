@@ -483,7 +483,7 @@ def parse_migrations(output):
     for raw in csv_rows(output):
         if len(raw) != 3 or not COUNT_RE.fullmatch(raw[0]) or raw[2] not in ("t", "f"):
             raise ReadFailed("a row had an unexpected shape; nothing was reported")
-        version = int(raw[0])
+        version = parse_count(raw[0])
         if version not in MIGRATION_VERSIONS or version in found:
             raise ReadFailed("a row had an unexpected shape; nothing was reported")
         found[version] = (parse_timestamp(raw[1]), raw[2] == "t")
@@ -767,12 +767,12 @@ def main(argv=None, env=None, clock=None, psql=None, sleep_fn=None):
         return 0
     except Refused as error:
         result = failure_result("refused")
-        # Preserve this useful legacy diagnostic, only on an exact fixed match.
-        if str(error) == f"refusing: no database login bound (${URL_ENV})":
-            legacy_error = (f"refusing: no database login bound (${URL_ENV})\n"
-                            + render_text(result))
-    except ReadFailed:
+        # Refused messages are fixed vocabulary; text mode keeps the cause.
+        legacy_error = f"{error}\n" + render_text(result)
+    except ReadFailed as error:
         result = failure_result("read_failed")
+        # ReadFailed messages are fixed vocabulary, never psql output.
+        legacy_error = f"failed: {error}\n" + render_text(result)
     except Exception as error:  # a traceback or OS message could quote the login
         result = failure_result("publication_failed" if publishing else "read_failed")
         if not publishing and type(error) is ValueError:

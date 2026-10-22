@@ -224,7 +224,8 @@ Capture clocks retain millisecond RFC3339. SQL and the frozen window are unchang
 
 `observed` exits 0, including limitations. `refused` exits 2; `read_failed` and
 `publication_failed` exit 1. Failed JSON documents contain no observations and
-an error with only `code`, boolean `retryable` and fixed `next_action`. Summary
+an error with only `code`, boolean `retryable` and fixed `next_action`. Text-mode
+failures prefix the structured line with the fixed refusal or read cause. Summary
 write failures are protected too: no raw OS/exception text, traceback or success
 marker. On success `GITHUB_STEP_SUMMARY` receives the same text projection even
 in JSON mode; read/refusal failures do not append a partial census.
