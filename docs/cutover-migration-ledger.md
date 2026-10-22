@@ -142,6 +142,7 @@ All migrations are up-only; there are no down files. The `direction` column is
 | 0450_scheduled_events_claim | up | scheduled_events_claim | backout-script | Guarded `CREATE TABLE IF NOT EXISTS`. Backout: deploy the previous binary, then drop the table; dropping it under the claim-aware binary fails every events swap. The mirror itself stays readable. No member PII in the table. |
 | 0452_scheduled_events_tombstone | up | scheduled_events_tombstone | backout-script | Guarded `CREATE TABLE IF NOT EXISTS`. Backout: deploy the previous binary, then drop the table; dropping it under the tombstone-aware binary fails every events swap. The mirror itself stays readable. No member PII in the table. |
 | 0455_audit_reconcile_cursor | up | operational_audit_log | re-runnable | Guarded nullable `delivery_reconcile_before` column holds only a verified recovery floor, never message content. Backout: deploy the previous binary with the additive column retained; do not discard cursor or acceptance evidence. |
+| 0456_admin_api_tokens | up | admin_api_tokens | re-runnable | Guarded `CREATE TABLE IF NOT EXISTS` plus a guarded live-lookup index. Backout: drop the table; no binary reads it yet, so nothing breaks (later slices wire the container authorizer to it; issued tokens would need re-issuance after a drop). Hash-only secret storage; `issued_by` is operator attribution retained by the erasure allowlist, no member PII in the table. |
 
 ## Notes
 
