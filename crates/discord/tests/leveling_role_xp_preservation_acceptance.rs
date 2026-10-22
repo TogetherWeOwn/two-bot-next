@@ -38,7 +38,7 @@
 #[allow(dead_code)]
 mod common;
 
-use common::{MockRest, ScriptedResponse};
+use common::{MockRest, RestRequest, ScriptedResponse};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -165,6 +165,43 @@ fn decode_reason(header: &str) -> String {
     String::from_utf8(bytes).unwrap()
 }
 
+// Role failures must not suppress celebrations, announce an uncommitted level,
+// move the post to another channel, or enable member/reply notifications.
+fn assert_celebration(request: &RestRequest, level: u64) {
+    assert_eq!(request.method, "POST");
+    assert_eq!(
+        request.path,
+        format!("/api/v10/channels/{CHANNEL}/messages")
+    );
+    let body: Value = serde_json::from_slice(&request.body).unwrap();
+    let content = body["content"].as_str().expect("celebration text");
+    let lower = content.to_ascii_lowercase();
+    let announced_level = lower
+        .split_once("level ")
+        .expect("celebration names the committed level")
+        .1
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .unwrap()
+        .parse::<u64>()
+        .expect("numeric celebration level");
+    assert_eq!(announced_level, level);
+    assert!(content.chars().count() <= 200);
+    assert!(!content.contains("@everyone") && !content.contains("@here"));
+    // A displayed member tag is inert only when parsing and explicit user/role
+    // allowlists are disabled; checking the copy alone would miss notifications.
+    let mentions = &body["allowed_mentions"];
+    assert_eq!(mentions["parse"], json!([]));
+    for key in ["users", "roles"] {
+        assert!(
+            mentions[key].is_null() || mentions[key] == json!([]),
+            "no explicit notification allowlist: {key}"
+        );
+    }
+    assert!(mentions["replied_user"].is_null() || mentions["replied_user"] == json!(false));
+    assert!(body["message_reference"].is_null(), "not a member reply");
+}
+
 #[tokio::test]
 async fn grant_refusal_preserves_committed_xp_and_level_up() {
     let Some(url) = test_database_url() else {
@@ -189,6 +226,7 @@ async fn grant_refusal_preserves_committed_xp_and_level_up() {
             ScriptedResponse::json(200, json!({"roles":[]})),
             ScriptedResponse::status(204),
             ScriptedResponse::status(403),
+            ScriptedResponse::json(200, json!({"id":"900000000000000001"})),
         ],
         ScriptedResponse::status(500),
     )
@@ -239,14 +277,20 @@ async fn grant_refusal_preserves_committed_xp_and_level_up() {
 
     // Fail-fast end to end: held-roles read, one applied PUT, one refused PUT,
     // and the third role never attempted. Both PUTs carry the grant reason.
+    // The committed level still earns exactly one celebration after the refusal.
     let requests = mock.requests();
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 4);
     assert_eq!(requests[0].method, "GET");
+    assert_eq!(
+        requests[0].path,
+        format!("/api/v10/guilds/{GUILD}/members/{MEMBER}")
+    );
     assert_eq!(requests[1].method, "PUT");
     assert!(requests[1].path.ends_with("/roles/400000000000000001"));
     assert_eq!(requests[2].method, "PUT");
     assert!(requests[2].path.ends_with("/roles/400000000000000002"));
-    for request in &requests[1..] {
+    assert_celebration(&requests[3], 3);
+    for request in &requests[1..3] {
         let reason = decode_reason(request.header("x-audit-log-reason").unwrap_or_default());
         assert!(
             reason.contains("reached level 3"),
@@ -275,7 +319,10 @@ async fn over_cap_ladder_preserves_committed_xp_and_reports_the_cap() {
         .collect();
     db.seed(5770, &ladder).await;
     let mock = MockRest::start(
-        vec![ScriptedResponse::json(200, json!({"roles":[]}))],
+        vec![
+            ScriptedResponse::json(200, json!({"roles":[]})),
+            ScriptedResponse::json(200, json!({"id":"900000000000000001"})),
+        ],
         ScriptedResponse::status(500),
     )
     .await;
@@ -319,13 +366,22 @@ async fn over_cap_ladder_preserves_committed_xp_and_reports_the_cap() {
     );
     assert_eq!(award_count(&db.pool).await, 1);
 
-    // Zero role writes: only the held-roles read may run.
+    // Zero role writes: one held-roles read, then only the celebration POST.
     let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].method, "GET");
+    assert_eq!(
+        requests[0].path,
+        format!("/api/v10/guilds/{GUILD}/members/{MEMBER}")
+    );
     assert!(
-        requests.iter().all(|r| r.method == "GET"),
+        requests
+            .iter()
+            .all(|r| r.method != "PUT" && r.method != "DELETE"),
         "an over-cap ladder performs no PUT or DELETE: {}",
         requests.len()
     );
+    assert_celebration(&requests[1], 11);
     mock.shutdown().await;
     db.close().await;
 }
@@ -342,6 +398,7 @@ async fn successful_grants_apply_and_report_the_level_up() {
         vec![
             ScriptedResponse::json(200, json!({"roles":[]})),
             ScriptedResponse::status(204),
+            ScriptedResponse::json(200, json!({"id":"900000000000000001"})),
         ],
         ScriptedResponse::status(500),
     )
@@ -363,9 +420,15 @@ async fn successful_grants_apply_and_report_the_level_up() {
         }]
     );
     let requests = mock.requests();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].method, "GET");
+    assert_eq!(
+        requests[0].path,
+        format!("/api/v10/guilds/{GUILD}/members/{MEMBER}")
+    );
     assert_eq!(requests[1].method, "PUT");
     assert!(requests[1].path.ends_with("/roles/400000000000000001"));
+    assert_celebration(&requests[2], 1);
     let reason = decode_reason(requests[1].header("x-audit-log-reason").unwrap_or_default());
     assert!(
         reason.contains("reached level 1"),
