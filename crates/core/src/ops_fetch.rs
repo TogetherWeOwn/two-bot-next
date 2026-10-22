@@ -53,7 +53,7 @@ pub enum OpsFetchError {
     /// The endpoint answered a non-success status (the code, for the log).
     #[error("ops endpoint returned status {0}")]
     Status(u16),
-    /// The response exceeded [`MAX_OPS_BODY_BYTES`] (or the body stream
+    /// The response exceeded `MAX_OPS_BODY_BYTES` (or the body stream
     /// broke mid-read, which surfaces through the same cap).
     #[error("ops response exceeded the body cap")]
     BodyTooLarge,
@@ -106,7 +106,7 @@ fn parse_ops_url(raw: &str) -> Option<Uri> {
 /// A fresh client per call (feeds_connector precedent): the 15 s cadence
 /// makes pool reuse worthless and keeps test-global clients out of the
 /// picture. Plain HTTP and HTTPS both dial; anything else never reaches
-/// here ([`parse_ops_url`] refuses it first).
+/// here (`parse_ops_url` refuses it first).
 pub async fn fetch_ops_record(
     url: &Uri,
     token: Option<&str>,
