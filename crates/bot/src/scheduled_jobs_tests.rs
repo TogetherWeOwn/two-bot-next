@@ -1,3 +1,5 @@
+#[path = "event_reminder_acceptance_tests.rs"]
+mod event_reminder_acceptance;
 #[path = "scheduled_uncertainty_acceptance_tests.rs"]
 mod uncertainty_acceptance;
 
