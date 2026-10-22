@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Acceptance tests: required event-voice category config + per-tick
 //! fail-closed preflight (host decision D4, accepted changes R12/R13).
 //!

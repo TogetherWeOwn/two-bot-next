@@ -96,6 +96,10 @@ export const FORWARDED_FLAGS = [
   // Staging-only synthetic voice test identities (docs/voice-synthetic.md).
   "TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS",
   "TWO_TEMP_VOICE_SWEEP_SECONDS",
+  // Event voice channels (per-event create + after-party handoff): required
+  // category id. Non-secret runtime flag; the bot fails closed (inactive,
+  // TBD `no_category`) until a usable category exists.
+  "TWO_EVENT_VOICE_CATEGORY_ID",
   // Template assistant (V12): non-secret endpoint URL + model name; the
   // endpoint credential (if any) travels as its own Container secret, never
   // through this flag allowlist.
