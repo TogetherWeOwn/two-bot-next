@@ -98,7 +98,7 @@ fn assert_debug_clean(value: &AssistantConfig, sentinels: &[&str]) {
         again: vec![value.clone()],
     };
     assert_eq!(nested.again.len(), 1);
-    assert!(!format!("{:?}", &nested.config).is_empty());
+    assert!(!format!("{:?}", nested.config).is_empty());
 
     let renderings = [
         format!("{value:?}"),
