@@ -2282,6 +2282,7 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
+ "percent-encoding",
  "proptest",
  "rand",
  "regex",
@@ -2388,6 +2389,16 @@ dependencies = [
  "sqlx",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "two-bot-voice-probe"
+version = "0.4.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
 ]
 
 [[package]]

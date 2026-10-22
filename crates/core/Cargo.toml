@@ -32,6 +32,7 @@ tracing = { workspace = true }
 unicode-normalization = { workspace = true }
 regex = { workspace = true }
 url = { workspace = true }
+percent-encoding = { workspace = true }
 # Row-by-row dump streaming only (TryStreamExt::try_next); same locked
 # version the bot and discord crates already use.
 futures-util = { workspace = true }

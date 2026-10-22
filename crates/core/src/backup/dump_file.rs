@@ -102,7 +102,7 @@ pub const DUMP_TABLES: &[&str] = &[
     "lfg_posts",
     "lfg_roles",
     "lfg_signups",
-    // Timed-entry giveaways with verifiable draws (0454/0455, v12):
+    // Timed-entry giveaways with verifiable draws (0455/0456, v12):
     // definitions plus the draw-ticker lease, one row per entrant, and one
     // row per draw round carrying the replay inputs. Archived so a restore
     // keeps live giveaways and their published winners; see
@@ -271,7 +271,7 @@ pub const V10_ADDED_TABLES: &[&str] = &["scheduled_events_claim"];
 pub const V11_ADDED_TABLES: &[&str] = &["scheduled_events_tombstone"];
 
 /// Tables first covered by v12 (timed-entry giveaways, migrations
-/// 0454/0455). Older archives may omit the giveaway tables; restore clears
+/// 0455/0456). Older archives may omit the giveaway tables; restore clears
 /// the destination rows, as for every versioned addition. New archives must
 /// contain them so a restore keeps live giveaways, their entries and the
 /// published draw rounds. v11 is a readable legacy shape: tombstone-carrying
@@ -1199,7 +1199,7 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
     // only tables first covered by a later version. New v12 archives require
     // the full inventory, including both guild counters (0441/0442/0446/0447),
     // the epoch-claim guard (0450/0451), the delete tombstones (0452/0453)
-    // and the giveaway tables (0454/0455).
+    // and the giveaway tables (0455/0456).
     let version = obj.get("version").and_then(Value::as_u64);
     let missing: Vec<&str> = DUMP_TABLES
         .iter()

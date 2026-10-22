@@ -309,6 +309,7 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_GUILD_CONFIG_UPLOAD_CMD: BACKUP,
   TWO_RESTORE_DRILL_BOOTSTRAP_URL: BACKUP,
   TWO_RESTORE_DRILL_EVIDENCE_DIR: BACKUP,
+  TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S: BACKUP,
   TWO_ANTI_NUKE_SNAPSHOT_PATH: "filesystem write path; Container disk is ephemeral",
   TWO_HEALTH_BIND_HOST: BIND,
   TWO_HEALTH_PORT: BIND,
@@ -373,6 +374,13 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   // settings snapshot, never from the process environment, so there is
   // nothing to forward.
   TWO_GUILD_INVITE_CODE: "store-only guild setting; read from the live settings snapshot, never from the process environment",
+  // /ops override enforcement (Slice 0a): the Rust settings poll GETs this
+  // URL on every tick for the DO ops record. URL-shaped values are never
+  // flags (the allowlist test rejects `_URL`), so it travels only here.
+  TWO_OPS_CONFIG_URL: "ops-record fetch URL; reaches the Container only through an explicit containerEnvVars line when the Operator sets it, never this flag allowlist",
+  // Bearer the container sends on that fetch: the ops control token's value,
+  // forwarded only while the fetch URL is set, on its own secret line.
+  TWO_OPS_CONFIG_TOKEN: SECRET,
 };
 
 /**

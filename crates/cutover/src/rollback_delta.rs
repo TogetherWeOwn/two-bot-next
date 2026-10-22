@@ -118,7 +118,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
         measure: TableMeasure::Unmeasurable("transient restart-recovery queue with no timestamp column (occurred_at_ms is a gateway event time); rows hold no durable member state", DISPOSITION_ACCEPT_WITH_REASON),
     },
     TableSpec { table: "gateway_sessions", measure: TableMeasure::Columns(&["updated_at"]) },
-    // Timed-entry giveaways (0454/0455): every definition mutation stamps
+    // Timed-entry giveaways (0455/0456): every definition mutation stamps
     // updated_at (create, claim, release, status, draw, announce), so its
     // maximum is the row's last write. Entries and draws are insert-only;
     // their insert stamps are the last write.
