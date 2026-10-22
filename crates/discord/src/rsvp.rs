@@ -573,9 +573,10 @@ async fn execute(
             // `record_checkin_with_audit` transaction only bounds the
             // occurrence count — it cannot see Discord-side removal — so
             // re-read the same live evidence here; on loss or lookup failure
-            // compensate (delete exactly this attempt's fact and audit row)
-            // and refuse. Duplicates return above without revalidation: they
-            // wrote nothing.
+            // compensate (delete exactly this attempt's fact, plus its audit
+            // row only when this attempt inserted it — a deduped audit id
+            // belongs to the earlier attempt) and refuse. Duplicates return
+            // above without revalidation: they wrote nothing.
             if let Err(refusal) = revalidate_attendance(
                 executor,
                 &guild_id,
@@ -587,7 +588,7 @@ async fn execute(
                 if compensate_checkin_write(
                     pool,
                     &checkin_idempotency_key(&resolved.canonical_id, &member_id_str),
-                    &audit_id,
+                    audit_inserted.then_some(audit_id.as_str()),
                 )
                 .await
                 .is_err()

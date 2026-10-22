@@ -21,7 +21,7 @@ use sqlx::{Pool, Postgres};
 use super::rsvp::{
     checkin_idempotency_key, checkin_metadata_json, checkin_source, checkin_source_event_id,
     AttendanceProof, RsvpAudit, RsvpRecord, RsvpStatus, RsvpTransition, ATTENDANCE_EVENT_TYPE,
-    AUDIT_RETENTION_DAYS, MAX_CHECKINS_PER_OCCURRENCE, MAX_RSVPS_PER_EVENT,
+    AUDIT_RETENTION_DAYS, CHECKIN_AUDIT_ACTION, MAX_CHECKINS_PER_OCCURRENCE, MAX_RSVPS_PER_EVENT,
     MAX_RSVP_WRITES_PER_USER_PER_MINUTE, RSVP_AUDIT_ACTION,
 };
 
@@ -507,34 +507,39 @@ pub async fn compensate_rsvp_write(
 
 /// RA-03 compensation (TOG-19773): remove the attendance fact one attempt
 /// inserted when post-write revalidation finds a membership gone, plus the
-/// audit row that attempt wrote. The fact delete keys on the exact
-/// idempotency key, so only this identity's fact can match; the audit delete
-/// keys on this attempt's id, so a refused attempt leaves neither row — like
-/// [`compensate_rsvp_write`], which always removes its attempt's audit row
-/// too. The fact delete runs first: if it fails, both rows remain and the
-/// caller reports the `compensation_failed` diagnostic.
+/// audit row that attempt wrote — both deletes in one transaction, so either
+/// both rows go or neither does. The fact delete keys on the exact
+/// idempotency key, so only this identity's fact can match; `audit_id` is
+/// `Some` only when this attempt inserted its audit row (a deduped audit id
+/// belongs to the earlier attempt and must survive), so a refused attempt
+/// leaves neither row it owns — like [`compensate_rsvp_write`], which always
+/// removes its attempt's audit row too.
 pub async fn compensate_checkin_write(
     pool: &Pool<Postgres>,
     idempotency_key: &str,
-    audit_id: &str,
+    audit_id: Option<&str>,
 ) -> Result<(), RsvpStoreError> {
+    let mut tx = pool.begin().await?;
     sqlx::query("DELETE FROM community_facts WHERE idempotency_key = $1")
         .bind(idempotency_key)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
-    sqlx::query("DELETE FROM announcements_audit_log WHERE id = $1")
-        .bind(audit_id)
-        .execute(pool)
-        .await?;
+    if let Some(audit_id) = audit_id {
+        sqlx::query("DELETE FROM announcements_audit_log WHERE id = $1")
+            .bind(audit_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
 /// RA-03 retention (TOG-19773): delete RSVP rows and this slice's own audit
 /// rows strictly older than `cutoff_iso`, returning
 /// `(rsvps_deleted, audits_deleted)`. The audit delete is scoped to
-/// [`RSVP_AUDIT_ACTION`] rows: the log table is shared with feed, LFG and
-/// recovery writers, and their evidence must survive an RSVP purge. The
-/// cutoff must be older than the audit retention floor
+/// [`RSVP_AUDIT_ACTION`] and [`CHECKIN_AUDIT_ACTION`] rows: the log table is
+/// shared with feed, LFG and recovery writers, and their evidence must
+/// survive an RSVP purge. The cutoff must be older than the audit retention floor
 /// ([`AUDIT_RETENTION_DAYS`], the stricter horizon, which also covers the
 /// RSVP floor); a newer cutoff is refused with
 /// [`RsvpStoreError::CutoffTooRecent`] before any delete, so required
@@ -560,10 +565,11 @@ pub async fn prune_rsvp_history(
         .rows_affected();
     let audits = sqlx::query(
         "DELETE FROM announcements_audit_log
-         WHERE action = $2 AND created_at < $1::timestamptz",
+         WHERE action IN ($2, $3) AND created_at < $1::timestamptz",
     )
     .bind(cutoff_iso)
     .bind(RSVP_AUDIT_ACTION)
+    .bind(CHECKIN_AUDIT_ACTION)
     .execute(pool)
     .await?
     .rows_affected();
@@ -1330,6 +1336,20 @@ mod tests {
         write_audit(&pool, &RsvpAudit::for_rsvp("audit-old", &old))
             .await
             .expect("old audit");
+        // This slice's check-in audit rows purge with RSVP history.
+        write_audit(
+            &pool,
+            &RsvpAudit::for_checkin(
+                "audit-checkin-old",
+                "1545644954272137297",
+                "host-1",
+                "occ-old",
+                "old-member",
+                "2020-01-01T00:00:00.000Z",
+            ),
+        )
+        .await
+        .expect("old check-in audit");
         let fresh = rsvp(RsvpStatus::Interested, "new-user", &recent);
         put_rsvp(&pool, &fresh).await.expect("recent write");
         write_audit(&pool, &RsvpAudit::for_rsvp("audit-new", &fresh))
@@ -1355,7 +1375,7 @@ mod tests {
         let pruned = prune_rsvp_history(&pool, "2021-06-01T00:00:00.000Z")
             .await
             .expect("history purge");
-        assert_eq!(pruned, (1, 1));
+        assert_eq!(pruned, (1, 2));
         let rows = list_rsvps(&pool, "1545644954272137297", "1546451670500642999")
             .await
             .expect("list");
@@ -1367,6 +1387,10 @@ mod tests {
                 .await
                 .expect("audit ids");
         assert_eq!(audits, ["audit-foreign".to_owned(), "audit-new".to_owned()]);
+        assert!(
+            !audits.iter().any(|id| id == "audit-checkin-old"),
+            "old check-in audit row purges with RSVP history"
+        );
         assert_eq!(
             prune_rsvp_history(&pool, "2021-06-01T00:00:00.000Z")
                 .await
@@ -1471,7 +1495,7 @@ mod tests {
         compensate_checkin_write(
             &pool,
             &checkin_idempotency_key("occ-comp", "m1"),
-            "audit-missing",
+            Some("audit-missing"),
         )
         .await
         .expect("compensate m1");
@@ -1480,6 +1504,84 @@ mod tests {
             .await
             .expect("keys");
         assert_eq!(keys, [checkin_idempotency_key("occ-comp", "m2")]);
+        drop_schema(&pool, &schema).await;
+    }
+
+    /// RA-03 compensation ownership: when this attempt's audit id deduped, it
+    /// owns no audit row, so compensation removes the fact but keeps the
+    /// earlier attempt's row (`None` deletes no audit row); when the attempt
+    /// inserted its row, compensation removes both rows together.
+    #[tokio::test]
+    async fn compensation_keeps_unowned_audit_row() {
+        let Some((pool, schema)) = test_pool("checkin_comp_own")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping rsvp_store test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        // Earlier attempt's audit row, still owned by that attempt.
+        let prior = RsvpAudit::for_checkin(
+            "checkin:prior",
+            "1545644954272137297",
+            "host-1",
+            "occ-own",
+            "m1",
+            "2026-09-02T10:00:00.000Z",
+        );
+        write_audit(&pool, &prior).await.expect("prior audit");
+        // This attempt records its fact while the audit id dedupes.
+        let (inserted, audit_inserted) = record_checkin_with_audit(
+            &pool,
+            &checkin("occ-own", "m1", "2026-09-02T10:00:00.000Z"),
+            &prior,
+        )
+        .await
+        .expect("deduped write");
+        assert!(inserted, "fact records");
+        assert!(!audit_inserted, "retried audit id dedupes");
+        // Refusal compensates with no owned audit row.
+        compensate_checkin_write(&pool, &checkin_idempotency_key("occ-own", "m1"), None)
+            .await
+            .expect("compensate unowned");
+        // Owned audit row: compensation removes both rows together.
+        let owned = RsvpAudit::for_checkin(
+            "checkin:owned",
+            "1545644954272137297",
+            "host-1",
+            "occ-own",
+            "m2",
+            "2026-09-02T10:00:00.000Z",
+        );
+        let (inserted, audit_inserted) = record_checkin_with_audit(
+            &pool,
+            &checkin("occ-own", "m2", "2026-09-02T10:00:00.000Z"),
+            &owned,
+        )
+        .await
+        .expect("owned write");
+        assert!(inserted && audit_inserted, "fact and audit record");
+        compensate_checkin_write(
+            &pool,
+            &checkin_idempotency_key("occ-own", "m2"),
+            Some("checkin:owned"),
+        )
+        .await
+        .expect("compensate owned");
+        let facts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM community_facts")
+            .fetch_one(&pool)
+            .await
+            .expect("facts");
+        assert_eq!(facts, 0, "refused facts are removed");
+        let audits: Vec<String> = sqlx::query_scalar("SELECT id FROM announcements_audit_log")
+            .fetch_all(&pool)
+            .await
+            .expect("audit ids");
+        assert_eq!(
+            audits,
+            ["checkin:prior".to_owned()],
+            "earlier attempt's audit row survives"
+        );
         drop_schema(&pool, &schema).await;
     }
 
