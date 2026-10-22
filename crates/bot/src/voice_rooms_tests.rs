@@ -33,6 +33,8 @@ mod join_grant_witness_acceptance;
 mod join_still_waiting_acceptance;
 #[path = "voice_kick_tests.rs"]
 mod kick;
+#[path = "voice_kick_ballot_delivery_tests.rs"]
+mod kick_ballot_delivery;
 #[path = "voice_rooms_limit_tests.rs"]
 mod limit_command;
 #[path = "voice_name_tests.rs"]
@@ -41,6 +43,8 @@ mod name;
 mod name_filter_acceptance;
 #[path = "voice_name_rerender_tests.rs"]
 mod name_rerender;
+#[path = "voice_ownership_receipt_acceptance_tests.rs"]
+mod ownership_receipt_acceptance;
 #[path = "voice_private_runtime_tests.rs"]
 mod private;
 #[path = "voice_responder_admission_acceptance_tests.rs"]
@@ -51,6 +55,10 @@ mod sink;
 mod snapshot_fence_acceptance;
 #[path = "../../core/tests/support/tracing_capture.rs"]
 mod tracing_capture;
+#[path = "voice_votekick_ballot_truth_acceptance_tests.rs"]
+mod votekick_ballot_truth_acceptance;
+#[path = "voice_worker_reply_acceptance_tests.rs"]
+mod worker_reply_acceptance;
 
 const GUILD: u64 = 100;
 const CREATOR: u64 = 200;
@@ -170,6 +178,10 @@ struct Store {
     owner_revision: AtomicU64,
     prepare_errors: Mutex<VecDeque<StoreError>>,
     ownership_errors: Mutex<VecDeque<StoreError>>,
+    /// Times `update_ownership` yields before writing, consumed when the
+    /// write starts, so a test can prove an expired reply budget never
+    /// cancels an in-flight commit nobody is listening on.
+    update_ownership_yields: AtomicUsize,
     companions: Mutex<HashMap<(u64, u64), TextCompanion>>,
     persist_error: Option<StoreError>,
     access: Arc<Mutex<AccessControls>>,
@@ -249,6 +261,7 @@ impl Store {
             owner_revision: AtomicU64::new(0),
             prepare_errors: Mutex::new(VecDeque::new()),
             ownership_errors: Mutex::new(VecDeque::new()),
+            update_ownership_yields: AtomicUsize::new(0),
             companions: Mutex::new(HashMap::new()),
             persist_error: None,
             access: Arc::new(Mutex::new(AccessControls::default())),
@@ -429,6 +442,10 @@ impl RoomPersistence for Store {
         Ok(intent.clone())
     }
     async fn update_ownership(&self, room: &VoiceRoom, revision: &str) -> Result<bool, StoreError> {
+        if self.update_ownership_yields.load(Ordering::Relaxed) > 0 {
+            self.update_ownership_yields.fetch_sub(1, Ordering::Relaxed);
+            tokio::task::yield_now().await;
+        }
         self.trace.lock().unwrap().push(format!(
             "update_ownership:{}:{}",
             room.channel_id, room.owner_id
@@ -822,6 +839,8 @@ struct Http {
     /// errors (one per attempt) the next sends fail with.
     prompts: Mutex<Vec<SentPrompt>>,
     prompt_errors: Mutex<VecDeque<RoomHttpError>>,
+    component_edits: Mutex<Vec<SentPrompt>>,
+    component_edit_errors: Mutex<VecDeque<RoomHttpError>>,
     next_message: Mutex<u64>,
     created_attributes: Mutex<Vec<RoomChannelAttributes>>,
     created_names: Mutex<Vec<String>>,
@@ -885,6 +904,8 @@ impl Http {
             rate_limited_notices: Mutex::new(Vec::new()),
             prompts: Mutex::new(Vec::new()),
             prompt_errors: Mutex::new(VecDeque::new()),
+            component_edits: Mutex::new(Vec::new()),
+            component_edit_errors: Mutex::new(VecDeque::new()),
             next_message: Mutex::new(9_000),
             created_attributes: Mutex::new(Vec::new()),
             created_names: Mutex::new(Vec::new()),
@@ -1337,7 +1358,18 @@ impl RoomWrites for Http {
             content,
             components.len()
         ));
-        Ok(())
+        self.component_edits.lock().unwrap().push(SentPrompt {
+            channel: message.channel_id,
+            content: content.to_owned(),
+            mention: None,
+            components: components.to_vec(),
+            message,
+        });
+        self.component_edit_errors
+            .lock()
+            .unwrap()
+            .pop_front()
+            .map_or(Ok(()), Err)
     }
     async fn send_notice(
         &self,
@@ -2629,6 +2661,131 @@ async fn transfer_hands_room_to_occupant_and_remembers_creator() {
         .lock()
         .unwrap()
         .contains(&"update_ownership:500:301".to_owned()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn suspended_room_transfer_reports_finalizing_and_keeps_the_handoff_queued() {
+    let (live, store, http, _) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // Suspend the room so the queued handoff is never due: the staged reply
+    // must answer from the pump deadline, not hang on the queue.
+    assert!(worker.queue.suspend(GUILD, 500));
+    let (reply, inbox) = oneshot::channel();
+    apply_command(
+        &mut worker,
+        ActorCommand::Ownership {
+            actor_id: MEMBER,
+            is_admin: false,
+            command: OwnershipCommand::Transfer { target_id: 301 },
+            reply,
+        },
+        0,
+    );
+    worker.drive_staged_ownership(0).await;
+    assert_eq!(inbox.await.unwrap(), OWNERSHIP_FINALIZING);
+    assert!(
+        worker.ownership_queued.contains(&500),
+        "an unconfirmed handoff stays queued for retry"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn held_owner_grant_reports_finalizing_before_the_write_finishes() {
+    let (live, store, mut http, trace) = owned_room();
+    let gate = Arc::new(OverwriteGate::default());
+    http.overwrites_gate = Some(gate.clone());
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let (reply, inbox) = oneshot::channel();
+    apply_command(
+        &mut worker,
+        ActorCommand::Ownership {
+            actor_id: MEMBER,
+            is_admin: false,
+            command: OwnershipCommand::Transfer { target_id: 301 },
+            reply,
+        },
+        0,
+    );
+    let observe = async {
+        gate.sent.notified().await;
+        let response = tokio::time::timeout(Duration::from_millis(2_000), inbox).await;
+        // Release even on failure so the queued action can finish, rather
+        // than hiding a dropped in-flight dispatch behind test shutdown.
+        gate.release.notify_one();
+        let text = response
+            .expect("reply before the held grant finishes")
+            .unwrap();
+        assert!(
+            text.contains("Recorded") && text.contains("finalized"),
+            "{text}"
+        );
+        assert!(!text.contains("Transferred"), "{text}");
+        assert!(
+            !trace
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call.starts_with("update_ownership:")),
+            "the reply must precede the held grant's durable completion"
+        );
+    };
+    tokio::join!(worker.drive_staged_ownership(0), observe);
+    assert!(
+        trace
+            .lock()
+            .unwrap()
+            .contains(&"update_ownership:500:301".to_owned()),
+        "the in-flight handoff must finish after its reply, not be cancelled"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn held_owner_grant_with_slow_store_still_commits_after_finalizing() {
+    let (live, store, mut http, trace) = owned_room();
+    let gate = Arc::new(OverwriteGate::default());
+    http.overwrites_gate = Some(gate.clone());
+    // A real Postgres write pends on its first poll: the expired reply
+    // budget must not cancel the in-flight commit once nobody listens.
+    store.update_ownership_yields.store(1, Ordering::Relaxed);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let (reply, inbox) = oneshot::channel();
+    apply_command(
+        &mut worker,
+        ActorCommand::Ownership {
+            actor_id: MEMBER,
+            is_admin: false,
+            command: OwnershipCommand::Transfer { target_id: 301 },
+            reply,
+        },
+        0,
+    );
+    let observe = async {
+        gate.sent.notified().await;
+        let response = tokio::time::timeout(Duration::from_millis(2_000), inbox).await;
+        // Release even on failure so the queued action can finish, rather
+        // than hiding a dropped in-flight dispatch behind test shutdown.
+        gate.release.notify_one();
+        let text = response
+            .expect("reply before the held grant finishes")
+            .unwrap();
+        assert!(
+            text.contains("Recorded") && text.contains("finalized"),
+            "{text}"
+        );
+        assert!(!text.contains("Transferred"), "{text}");
+    };
+    tokio::join!(worker.drive_staged_ownership(0), observe);
+    assert!(
+        trace
+            .lock()
+            .unwrap()
+            .contains(&"update_ownership:500:301".to_owned()),
+        "a Pending-first store write must run to completion after its reply, not be cancelled by the expired budget"
+    );
+    assert!(
+        !worker.ownership_queued.contains(&500),
+        "the committed handoff leaves the retry queue instead of failing back into it"
+    );
 }
 
 fn owner_overwrite(member: u64) -> PermissionOverwrite {
@@ -8562,6 +8719,86 @@ async fn runtime_worker_status_reports_live_actor() {
         .expect("live actor");
     assert_eq!(status.tracked_rooms, 0);
     assert!(!status.halted);
+}
+
+/// Two-second ceiling shared by the sibling worker-wait regression tests
+/// (`/name`, join-request decisions, `/setup` status): mirrors the protected
+/// worker-reply suite's guard so an unbounded production future fails fast
+/// instead of hanging the test.
+const SIBLING_ACK_BOUND: Duration = Duration::from_millis(2_000);
+const SIBLING_TEST_GUARD: Duration = Duration::from_millis(2_100);
+
+/// A runtime whose guild actor never answers: the test holds the inbox
+/// receiver without polling it, so every worker wait must time out.
+fn stalled_worker_runtime() -> (
+    VoiceRuntime<Store, Http>,
+    mpsc::UnboundedReceiver<ActorCommand>,
+) {
+    let runtime = test_runtime(Trace::default());
+    let live = LiveGuild::new(GUILD);
+    live.publish(command_snapshot());
+    let (tx, rx) = mpsc::unbounded_channel();
+    runtime
+        .actors
+        .lock()
+        .unwrap()
+        .insert(GUILD, GuildActor { live, tx });
+    (runtime, rx)
+}
+
+async fn bounded_sibling_wait<T>(future: impl Future<Output = T>) -> T {
+    let start = tokio::time::Instant::now();
+    let result = tokio::time::timeout(SIBLING_TEST_GUARD, future)
+        .await
+        .expect("sibling worker wait must return within the two-second /limit budget");
+    assert!(
+        start.elapsed() <= SIBLING_ACK_BOUND,
+        "sibling worker wait exceeded its documented bound"
+    );
+    result
+}
+
+fn assert_sibling_worker_lost_reply(response: &InteractionResponse) {
+    let text = response_text(response);
+    let lower = text.to_lowercase();
+    assert!(
+        !lower.contains("warm") && !lower.contains("syncing"),
+        "a known worker lost its reply, not its cache: {text}"
+    );
+    assert!(
+        [
+            "timed out",
+            "unavailable",
+            "not responding",
+            "couldn't",
+            "stopped"
+        ]
+        .iter()
+        .any(|reason| lower.contains(reason)),
+        "state the worker failure honestly: {text}"
+    );
+    assert!(
+        ["try again", "retry", "check", "wait"]
+            .iter()
+            .any(|next| lower.contains(next)),
+        "worker failure needs a next action: {text}"
+    );
+    assert_eq!(
+        response.kind,
+        InteractionResponseType::ChannelMessageWithSource
+    );
+    assert_eq!(
+        response.data.as_ref().and_then(|data| data.flags),
+        Some(MessageFlags::EPHEMERAL)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn status_wait_is_bounded_with_a_live_unanswered_inbox() {
+    let (runtime, _rx) = stalled_worker_runtime();
+    assert!(bounded_sibling_wait(runtime.worker_status(GUILD))
+        .await
+        .is_none());
 }
 
 struct Replies {

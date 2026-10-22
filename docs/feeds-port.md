@@ -50,7 +50,7 @@ Read-only specification: TogetherWeOwn/two-bot `src/announcements/service.ts`,
   item URLs over their feed kind's message budget are filtered during XML parsing
   rather than retried as poll failures. The kind-agnostic XML parser uses the
   widest feed URL budget; the managed poller passes the feed kind explicitly.
-  `/feed-list` caps each source at 128 units and shrinks sources adaptively at capacity (scheme-stripped head…tail) so every relay id stays discoverable and same-host sources stay distinguishable within the 2,000-unit message cap.
+  `/feed-list` caps each source at 128 units and pages whole relay rows through an optional 1-based `page` option, so every exact removal id stays reachable exactly once with its source context distinguishable within the 2,000-unit message cap; short lists keep their exact single reply.
 - SHA-256 item-key fallback and 24-hex nonce are byte-compatible with legacy.
   Feed titles neutralize mass mentions before escaping punctuation and flattening
   CR/LF, so the shared REST sanitizer does not expand them past the message limit.

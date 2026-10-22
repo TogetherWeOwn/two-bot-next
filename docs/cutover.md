@@ -167,8 +167,8 @@ before invoking tools. `two-bot` with no subcommand starts the server;
 `two-bot guild-config-snapshot --help`, and `--help` after any subcommand print
 usage and exit 0 before any env, DB or network read, so `--help` never dumps,
 prunes or uploads
-([help routing](../crates/bot/src/backup_cli.rs#L263), [dispatch](../crates/bot/src/backup_cli.rs#L298)).
-A trailing argument that is not `--help` is refused with exit 2 (`:278-292`).
+([help routing](../crates/bot/src/backup_cli.rs#L269), [dispatch](../crates/bot/src/backup_cli.rs#L304)).
+A trailing argument that is not `--help` is refused with exit 2 (`:284-298`).
 Other binaries or future subcommand help paths still require source/fixture
 verification before approval; a `--help` suffix is not a universal read-only
 safety boundary.
@@ -183,7 +183,7 @@ safety boundary.
 | `two-bot guild-config-snapshot` / `two-bot guild-config-restore --snapshot FILE` | Pinned **staging-only** guild structure recovery. Does **not** snapshot application commands; never use as production registry rollback |
 
 Reference: [backup CLI commands/bindings](../crates/bot/src/backup_cli.rs#L183),
-[restore implementation](../crates/bot/src/backup_cli.rs#L548) and
+[restore implementation](../crates/bot/src/backup_cli.rs#L554) and
 [backup runbook](backup.md). `restore --dry-run` optionally reads a target when
 `TWO_RESTORE_URL` is set; do not mistake it for automatically offline operation.
 For local fixture/artifact inspection **without any DB connection**:
@@ -214,6 +214,28 @@ previews run migrations on connect; they are not production preflight tools.
 Do not use `dedupe-events` during cutover: it defaults to deletion and has no
 guild fence. Their exact behavior is in the
 [cutover CLI sources](../crates/cutover/src/bin) and is outside this procedure.
+
+#### Cutover CLI input preflight
+
+`capture` and `backfill-messages` validate `DISCORD_GUILD_ID` as a canonical
+Discord snowflake before the live-guild fence, admission or database bootstrap.
+Signed and zero-padded IDs refuse even with `--allow-live-guild`; the existing
+canonical live-guild opt-in is unchanged.
+
+Both scan tools accept `--max-pages` in `1..=10000`, defaulting to 25 for
+`backfill` and 60 for `backfill-messages`. Re-run hints use saturating arithmetic
+and never exceed that cap. At the cap, review scan scope rather than expecting a
+larger page budget. A supplied `backfill-messages --since` must be RFC3339;
+omitting it still selects unbounded history.
+
+All shared cutover CLI consumers preflight `TWO_DB_POOL_MAX` in `1..=32`
+(default 5) before I/O. This includes `rollback-delta import` in both modes,
+before file reads or plan output; valid dry-run imports still stay offline.
+These input refusals exit 2 with empty stdout and a fixed `input error: `
+diagnostic containing `code=` and `next_action=`, never the rejected value.
+The four tools' `--help` (including `rollback-delta import --help`) is
+credential-free and documents the ranges. Input validation grants no new live
+access, deployment or rollback authority.
 
 ### Merged copy, registry and preflight tools
 

@@ -40,8 +40,8 @@ const GATEWAY_RS_EVENTS: [&str; 20] = [
     "retention purge skipped; schema gap, operator replay required",
 ];
 
-/// `crates/bot/src/main.rs`: the nine cataloged `tracing` messages.
-const MAIN_RS_TRACED_EVENTS: [&str; 9] = [
+/// `crates/bot/src/main.rs`: the eleven cataloged `tracing` messages.
+const MAIN_RS_TRACED_EVENTS: [&str; 11] = [
     "gateway intents resolved",
     "durable gateway initialized; shard connecting",
     "gateway prerequisites missing; gateway parked, /readyz reports down",
@@ -51,6 +51,8 @@ const MAIN_RS_TRACED_EVENTS: [&str; 9] = [
     "shutdown_deadline_exceeded: abandoning in-flight work",
     "feature gates invalid; ordered interaction surface parked",
     "moderation gates invalid; ordered interaction surface parked",
+    "worker supervisor ended abnormally during shutdown join",
+    "worker supervisor did not finish within the remaining shutdown deadline; aborting it, so its worker drain is cut short",
 ];
 
 /// `crates/bot/src/main.rs`: cataloged drain outcomes that surface as
@@ -197,8 +199,9 @@ const MAIN_RS_ADJACENT: [&str; 14] = [
 
 // `crates/bot/src/voice_rooms.rs`: per-command voice UX receipts, not gateway
 // session events.
-const VOICE_RS_ADJACENT: [&str; 23] = [
+const VOICE_RS_ADJACENT: [&str; 26] = [
     "voice succession refused",
+    "voice succession handed the room to the longest-present member",
     "voice actor load failed; retrying with capped backoff",
     "voice actor load failed; credential refused, not retrying",
     "voice notice settings unreadable",
@@ -208,6 +211,8 @@ const VOICE_RS_ADJACENT: [&str; 23] = [
     "import preview planned an apply; refusing without writing",
     "voice vote response failed; not retried",
     "voice ballot response failed; not retried",
+    "voice ballot reference not queued: actor unavailable",
+    "voice ballot reference unavailable; not retried",
     "voice name modal response failed; not retried",
     "voice acknowledgement failed; command not executed",
     "voice responder saturated; interaction dropped without acknowledgement (sampled)",

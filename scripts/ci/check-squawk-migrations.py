@@ -30,6 +30,13 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_GLOB = "crates/*/migrations/*.sql"
 
+# Bounded-subprocess policy (docs/bounded-subprocess-checks.md): every child
+# wait is finite so a stalled child fails closed here instead of hanging
+# until the external CI ceiling. Local Git reads answer in well under a
+# second; 30s bounds the stall without touching valid runs. Both Git calls
+# below share this one value.
+GIT_TIMEOUT_SECONDS = 30
+
 RULES = (
     "adding-required-field",
     "creating-index",
@@ -460,22 +467,50 @@ def discover_all(root, globs, excludes):
 
 
 def git(root, *args):
-    result = subprocess.run(
-        ["git", "-C", str(root), *args], capture_output=True
-    )
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), *args], capture_output=True,
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise SquawkError(
+            f"cannot read Git baseline: git {' '.join(args)} timeout after "
+            f"{GIT_TIMEOUT_SECONDS}s; next: re-run the gate; if the stall "
+            "repeats, inspect the git invocation and runner state") from error
+    except OSError as error:
+        raise SquawkError(
+            "cannot read Git baseline: git spawn failed "
+            f"({error}); next: re-run the gate on a runner with git "
+            "installed") from error
     if result.returncode:
-        detail = result.stderr.decode(errors="replace").strip()
-        raise SquawkError(f"cannot read Git baseline: {detail}")
+        raise SquawkError(
+            f"cannot read Git baseline: git {' '.join(args)} failed with "
+            f"exit status {result.returncode}; next: verify the baseline "
+            "ref exists and is fetchable, then re-run the gate")
     return result.stdout.decode().split("\0")
 
 
 def changed_paths(root, base_ref):
-    resolved = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "--verify", "--end-of-options", f"{base_ref}^{{commit}}"],
-        capture_output=True,
-    )
+    try:
+        resolved = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--verify", "--end-of-options", f"{base_ref}^{{commit}}"],
+            capture_output=True, timeout=GIT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise SquawkError(
+            f"cannot resolve Git baseline {base_ref!r}: rev-parse timeout "
+            f"after {GIT_TIMEOUT_SECONDS}s; next: re-run the gate; if the "
+            "stall repeats, inspect the git invocation and runner "
+            "state") from error
+    except OSError as error:
+        raise SquawkError(
+            f"cannot resolve Git baseline {base_ref!r}: rev-parse spawn "
+            f"failed ({error}); next: re-run the gate on a runner with git "
+            "installed") from error
     if resolved.returncode:
-        raise SquawkError(f"unresolvable Git baseline {base_ref!r}")
+        raise SquawkError(
+            f"unresolvable Git baseline {base_ref!r}; next: verify the "
+            "baseline ref exists and is fetchable, then re-run the gate")
     records = git(root, "diff", "--name-only", "-z", f"{base_ref}...HEAD", "--")
     return [record for record in records if record]
 
