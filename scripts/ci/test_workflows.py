@@ -4171,6 +4171,46 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("'max_wal_size': '512MB'", verify["run"])
         self.assertIn("'min_wal_size': '64MB'", verify["run"])
 
+    def test_ops_acceptance_env_is_isolated_from_parallel_sweeps(self):
+        suite = "settings_jobs::tests::ops_overrides_acceptance_tests::"
+        for job_name in ("rust-tests", "patch-coverage"):
+            with self.subTest(job=job_name):
+                steps = self.workflows["check.yml"]["jobs"][job_name]["steps"]
+                runs = [
+                    (step, line)
+                    for step in steps
+                    for line in shell_logical_lines(step.get("run", ""))
+                ]
+                broad = [
+                    line for _, line in runs
+                    if "--workspace --lib --bins" in line
+                    and "--ignored" not in line and "property_" not in line
+                ]
+                self.assertEqual(len(broad), 1)
+                self.assertIn(f"--skip {suite}", broad[0])
+                isolated = [
+                    (step, line) for step, line in runs
+                    if suite in line and f"--skip {suite}" not in line
+                ]
+                self.assertEqual(len(isolated), 1)
+                step, command = isolated[0]
+                self.assertIn("-p two-bot --bin two-bot", command)
+                self.assertIn("--features two-bot-core/db", command)
+                self.assertIn("--locked", command)
+                self.assertIn("--test-threads=1", command)
+                self.assertNotIn("--ignore-run-fail", command)
+                self.assertNotIn("--ignored", command)
+                self.assertEqual(
+                    step["env"]["TWO_TEST_DATABASE_URL"],
+                    "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
+                )
+                if job_name == "patch-coverage":
+                    self.assertIn("--no-report", command)
+                    self.assertLess(
+                        step["run"].index(command),
+                        step["run"].index("export TWO_TEST_DATABASE_URL="),
+                    )
+
     def test_patch_coverage_runs_with_db_and_includes_ignored_tests(self):
         job = self.workflows["check.yml"]["jobs"]["patch-coverage"]
         step = next(
@@ -4416,7 +4456,7 @@ class WorkflowTests(unittest.TestCase):
             ignored_sweep,
         )
         guarded = [run for run in cov_runs if "llvm-cov --no-report -p " in run]
-        self.assertEqual(len(guarded), 15)
+        self.assertEqual(len(guarded), 16)
         for run in guarded:
             with self.subTest(guarded=run):
                 self.assertIn("--test-threads=1", run)

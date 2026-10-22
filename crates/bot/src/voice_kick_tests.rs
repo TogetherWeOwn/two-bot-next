@@ -918,7 +918,7 @@ async fn actor_kick_room_of_answers_through_the_inbox() {
         tokio::time::timeout(Duration::from_secs(5), runtime.kick_room_of(GUILD, TARGET),)
             .await
             .expect("claim reply"),
-        None
+        Some(None)
     );
 }
 

@@ -19,7 +19,7 @@ The Container registers a `guild_settings` poll job
 (`crates/bot/src/settings_jobs.rs:146-160`), exposed through `settings_jobs::live`
 (`crates/bot/src/settings_jobs.rs:53`). Every consumer reads store-first:
 a stored row wins and an absent row falls back to the boot value, except
-the invite responder, which falls back to the live vanity code; a malformed
+the invite responder, which falls back to the live vanity code; a live /ops override wins over the stored row while the container polls an ops record, falling back to the row on clear or expiry; a malformed
 row falls back to a safe value, refuses, or filters entries depending on
 the runtime (see below), and `None` while parked or pre-first-poll layers
 nothing. Gateway
@@ -98,7 +98,7 @@ remain: the voice room-name policy is
 built once at boot from the process environment
 (`crates/bot/src/gateway.rs:2080`); and gateway intents plus ticket command
 publication read the ticket destination keys once at boot
-(`crates/bot/src/gateway.rs:150`, `crates/bot/src/command_runtime.rs:431`), so a stored ticket
+(`crates/bot/src/gateway.rs:150`, `crates/bot/src/command_runtime.rs:435`), so a stored ticket
 destination reaches already-published commands only through the per-operation
 refresh above. Every other
 storable row's stored value is unwired.

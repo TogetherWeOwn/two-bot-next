@@ -135,6 +135,18 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
 ```
 
+The ops-override DB acceptance test mutates process environment. With the test
+DB configured, run it separately from parallel workspace tests (CI does this in
+both the unit-test and coverage lanes):
+
+```sh
+cargo test --workspace --features two-bot-core/db --locked -- --skip settings_jobs::tests::ops_overrides_acceptance_tests::
+cargo test -p two-bot --bin two-bot --features two-bot-core/db --locked settings_jobs::tests::ops_overrides_acceptance_tests:: -- --test-threads=1
+```
+
+Nextest already isolates each test in its own process. On the controller, use the
+bounded cache wrapper for both compiling commands, as required by `AGENTS.md`.
+
 ### Pre-push checklist
 
 Run this before every push. It mirrors the CI `check` job's fail-fast order:

@@ -8,6 +8,12 @@ use two_bot_testsupport::TestDatabase;
 
 use super::*;
 
+// Protected acceptance wiring (TOG-36209; builder TOG-36216 must not edit
+// this line or the module it loads): the /ops override merge pins live in a
+// dedicated child module so the implementation cannot silently narrow them.
+#[path = "ops_overrides_acceptance_tests.rs"]
+mod ops_overrides_acceptance_tests;
+
 fn row(guild: &str, key: &str, value: serde_json::Value) -> SettingRow {
     SettingRow {
         guild_id: guild.to_owned(),
