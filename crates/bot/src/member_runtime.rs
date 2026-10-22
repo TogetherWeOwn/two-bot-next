@@ -65,9 +65,102 @@ const NO_MEMBER_REPLY: &str = "That member is not in this server.";
 /// Reply when Discord left the outcome unknowable: the claim stays fenced,
 /// so a blind retry could double-moderate. Reconciliation owns the next step.
 const UNCERTAIN_REPLY: &str = "Discord did not confirm the action. It may still land; ask an operator to reconcile before retrying.";
+/// Fixed reply when Discord refuses the request: identical for every detail,
+/// naming Discord with a next action. The full detail goes to the server log
+/// with the interaction/request ids, never to the reply.
+const REJECTED_REPLY: &str =
+    "Discord refused the request; nothing was applied. Check the bot's permissions or ask an operator.";
 const ACTOR_COOLDOWN: Duration = Duration::from_secs(5);
 const ACTOR_COOLDOWN_CAPACITY: usize = 1024;
 const COOLDOWN_REPLY: &str = "Wait 5 seconds before using another member moderation command.";
+
+/// Fixed diagnostic vocabulary only: never carry Discord bodies, parser errors,
+/// transport details or member-supplied strings into refusal logs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthorityCause {
+    Discord403,
+    Transport,
+    MalformedRoles,
+    UnknownBot,
+    GuildMismatch,
+}
+
+impl AuthorityCause {
+    fn token(self) -> &'static str {
+        match self {
+            Self::Discord403 => "discord_403",
+            Self::Transport => "transport",
+            Self::MalformedRoles => "malformed_roles",
+            Self::UnknownBot => "unknown_bot",
+            Self::GuildMismatch => "guild_mismatch",
+        }
+    }
+
+    fn from_read(error: &two_bot_discord::DiscordError) -> Self {
+        use two_bot_discord::DiscordError;
+        // These are executor-owned constants, not provider response text:
+        // throw_for_status and get_json_strict deliberately discard the body.
+        match error {
+            DiscordError::Rejected(detail) if detail == "Discord refused the request with 403" => {
+                Self::Discord403
+            }
+            DiscordError::Unavailable(detail) if detail == "invalid JSON response" => {
+                Self::MalformedRoles
+            }
+            _ => Self::Transport,
+        }
+    }
+}
+
+/// Preserve the domain's error/audit contract while carrying runtime diagnostics
+/// across its one-shot authority callback. Non-authority errors pass unchanged.
+enum AuthorityError {
+    Unavailable(AuthorityCause),
+    Member(MemberError),
+}
+
+impl From<AuthorityCause> for AuthorityError {
+    fn from(cause: AuthorityCause) -> Self {
+        Self::Unavailable(cause)
+    }
+}
+
+impl AuthorityError {
+    fn into_member_error(self, cause: &mut Option<AuthorityCause>) -> MemberError {
+        match self {
+            Self::Unavailable(value) => {
+                *cause = Some(value);
+                MemberError::AuthorityUnavailable
+            }
+            Self::Member(error) => error,
+        }
+    }
+}
+
+/// First refusal per cause per 60 s is warned. Five fixed slots per runtime,
+/// never per-member state; the enforcement counter still records every refusal.
+#[derive(Default)]
+struct AuthorityWarnings {
+    last: [Option<Instant>; 5],
+}
+
+impl AuthorityWarnings {
+    fn admit(&mut self, cause: AuthorityCause, now: Instant) -> bool {
+        let index = match cause {
+            AuthorityCause::Discord403 => 0,
+            AuthorityCause::Transport => 1,
+            AuthorityCause::MalformedRoles => 2,
+            AuthorityCause::UnknownBot => 3,
+            AuthorityCause::GuildMismatch => 4,
+        };
+        let last = &mut self.last[index];
+        if last.is_some_and(|at| now.saturating_duration_since(at) < Duration::from_secs(60)) {
+            return false;
+        }
+        *last = Some(now);
+        true
+    }
+}
 
 #[derive(Default)]
 struct ActorCooldowns {
@@ -99,6 +192,7 @@ pub struct MemberRuntime {
     guild_id: String,
     bot_id: OnceCell<String>,
     actor_cooldowns: Mutex<ActorCooldowns>,
+    authority_warnings: Mutex<AuthorityWarnings>,
 }
 
 impl MemberRuntime {
@@ -131,6 +225,7 @@ impl MemberRuntime {
             guild_id,
             bot_id: OnceCell::new(),
             actor_cooldowns: Mutex::new(ActorCooldowns::default()),
+            authority_warnings: Mutex::new(AuthorityWarnings::default()),
         }))
     }
 
@@ -150,6 +245,7 @@ impl MemberRuntime {
             guild_id: guild_id.to_owned(),
             bot_id: OnceCell::new(),
             actor_cooldowns: Mutex::new(ActorCooldowns::default()),
+            authority_warnings: Mutex::new(AuthorityWarnings::default()),
         })
     }
 
@@ -169,17 +265,75 @@ impl MemberRuntime {
 
     /// Bot user id, resolved once over REST and cached. A failed lookup fails
     /// the caller: hierarchy checks must not run against an unknown bot.
-    async fn bot_id(&self, executor: &ActionExecutor) -> Result<&str, ()> {
+    async fn bot_id(&self, executor: &ActionExecutor) -> Result<&str, AuthorityCause> {
         self.bot_id
             .get_or_try_init(|| async {
                 executor
                     .current_bot_user_id()
                     .await
                     .map(|id| id.to_string())
-                    .map_err(|_| ())
+                    // Any identity lookup failure leaves hierarchy without a
+                    // known bot; preserve this stage-specific cause even on 5xx.
+                    .map_err(|_| AuthorityCause::UnknownBot)
             })
             .await
             .map(String::as_str)
+    }
+
+    fn warn_authority_unavailable(&self, cause: AuthorityCause, action: ModerationAction) {
+        let admitted = self
+            .authority_warnings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .admit(cause, Instant::now());
+        if admitted {
+            tracing::warn!(
+                cause = cause.token(),
+                verb = action.command_name(),
+                "member authority unavailable"
+            );
+        }
+    }
+
+    /// User-facing error copy with server-side truth: a Discord failure logs
+    /// its full detail at WARN with the interaction and request ids on the
+    /// same event, then returns exactly [`error_text`]. The `?` sigil keeps
+    /// multi-line detail on one log line. Non-Discord arms carry no hidden
+    /// detail, so they log nothing.
+    pub(crate) fn error_text_with_log(
+        err: MemberError,
+        interaction_id: u64,
+        request_id: &str,
+    ) -> String {
+        if let MemberError::Discord(discord_err) = &err {
+            tracing::warn!(
+                interaction_id,
+                request_id,
+                detail = ?discord_err,
+                "member moderation discord failure"
+            );
+        }
+        error_text(err)
+    }
+
+    /// Success reply naming the sanitized target: the verb base first, the
+    /// [`sanitize_target_display`] slot next, and exactly ` Already applied.`
+    /// last on replay.
+    pub(crate) fn outcome_text_with_target(result: &MemberResult, target_display: &str) -> String {
+        let base = match result.outcome {
+            MemberOutcome::Banned => "Banned",
+            MemberOutcome::TemporarilyBanned => "Temporarily banned",
+            MemberOutcome::Kicked => "Kicked",
+            MemberOutcome::TimedOut => "Timed out",
+            MemberOutcome::Warned => "Warned",
+            MemberOutcome::Unbanned => "Unbanned",
+        };
+        let target = sanitize_target_display(target_display);
+        if result.replayed {
+            format!("{base} {target}. Already applied.")
+        } else {
+            format!("{base} {target}.")
+        }
     }
 }
 
@@ -207,42 +361,47 @@ fn text(value: &serde_json::Value, key: &str) -> Option<String> {
 /// One `GET /guilds/{id}`: owner id plus every role position. Any malformed
 /// or missing piece fails the command — hierarchy never runs on a partial
 /// snapshot.
-async fn guild_facts(executor: &ActionExecutor, guild_id: &str) -> Result<GuildFacts, ()> {
+async fn guild_facts(
+    executor: &ActionExecutor,
+    guild_id: &str,
+) -> Result<GuildFacts, AuthorityCause> {
     let guild = executor
         .get_json_strict(&format!("/guilds/{guild_id}"))
         .await
-        .map_err(|_| ())?
-        .ok_or(())?;
+        .map_err(|error| AuthorityCause::from_read(&error))?
+        .ok_or(AuthorityCause::MalformedRoles)?;
     if text(&guild, "id").as_deref() != Some(guild_id) {
-        return Err(());
+        return Err(AuthorityCause::GuildMismatch);
     }
     let owner_id = text(&guild, "owner_id")
         .filter(|id| valid_id(id))
-        .ok_or(())?;
+        .ok_or(AuthorityCause::MalformedRoles)?;
     let mut positions = HashMap::new();
     let mut permissions = HashMap::new();
     for role in guild
         .get("roles")
         .and_then(serde_json::Value::as_array)
-        .ok_or(())?
+        .ok_or(AuthorityCause::MalformedRoles)?
     {
-        let id = text(role, "id").filter(|id| valid_id(id)).ok_or(())?;
+        let id = text(role, "id")
+            .filter(|id| valid_id(id))
+            .ok_or(AuthorityCause::MalformedRoles)?;
         let position = role
             .get("position")
             .and_then(serde_json::Value::as_i64)
             .filter(|position| *position >= 0)
-            .ok_or(())?;
+            .ok_or(AuthorityCause::MalformedRoles)?;
         let bits = text(role, "permissions")
-            .ok_or(())?
+            .ok_or(AuthorityCause::MalformedRoles)?
             .parse::<u64>()
-            .map_err(|_| ())?;
+            .map_err(|_| AuthorityCause::MalformedRoles)?;
         if positions.insert(id.clone(), position).is_some() {
-            return Err(());
+            return Err(AuthorityCause::MalformedRoles);
         }
         permissions.insert(id, bits);
     }
     if !positions.contains_key(guild_id) {
-        return Err(());
+        return Err(AuthorityCause::MalformedRoles);
     }
     Ok(GuildFacts {
         guild_id: guild_id.to_owned(),
@@ -327,11 +486,11 @@ async fn fetched_member(
     executor: &ActionExecutor,
     guild_id: &str,
     target: &str,
-) -> Result<Option<(Vec<String>, bool)>, ()> {
+) -> Result<Option<(Vec<String>, bool)>, AuthorityCause> {
     let member = match executor
         .get_json_strict(&format!("/guilds/{guild_id}/members/{target}"))
         .await
-        .map_err(|_| ())?
+        .map_err(|error| AuthorityCause::from_read(&error))?
     {
         Some(member) => member,
         None => return Ok(None),
@@ -339,21 +498,28 @@ async fn fetched_member(
     parse_member(&member, target).map(Some)
 }
 
-fn parse_member(member: &serde_json::Value, target: &str) -> Result<(Vec<String>, bool), ()> {
-    let user = member.get("user").ok_or(())?;
+fn parse_member(
+    member: &serde_json::Value,
+    target: &str,
+) -> Result<(Vec<String>, bool), AuthorityCause> {
+    let user = member.get("user").ok_or(AuthorityCause::MalformedRoles)?;
     if text(user, "id").as_deref() != Some(target) {
-        return Err(());
+        return Err(AuthorityCause::MalformedRoles);
     }
     let mut roles = Vec::new();
     for role in member
         .get("roles")
         .and_then(serde_json::Value::as_array)
-        .ok_or(())?
+        .ok_or(AuthorityCause::MalformedRoles)?
     {
-        roles.push(role.as_str().ok_or(())?.to_owned());
+        roles.push(
+            role.as_str()
+                .ok_or(AuthorityCause::MalformedRoles)?
+                .to_owned(),
+        );
     }
     if !roles.iter().all(|role| valid_id(role)) {
-        return Err(());
+        return Err(AuthorityCause::MalformedRoles);
     }
     Ok((
         roles,
@@ -361,7 +527,7 @@ fn parse_member(member: &serde_json::Value, target: &str) -> Result<(Vec<String>
         // malformed value is not a valid negative bot assertion.
         match user.get("bot") {
             None => false,
-            Some(value) => value.as_bool().ok_or(())?,
+            Some(value) => value.as_bool().ok_or(AuthorityCause::MalformedRoles)?,
         },
     ))
 }
@@ -375,7 +541,10 @@ pub(crate) async fn handle_command(
     action: ModerationAction,
 ) {
     let reply = match execute(member, executor, interaction, action).await {
-        Ok(result) => outcome_text(&result),
+        Ok(result) => {
+            let target = target_display(interaction);
+            MemberRuntime::outcome_text_with_target(&result, &target)
+        }
         Err(reply) => reply,
     };
     if let Err(err) = executor
@@ -386,20 +555,35 @@ pub(crate) async fn handle_command(
     }
 }
 
-fn outcome_text(result: &MemberResult) -> String {
-    let base = match result.outcome {
-        MemberOutcome::Banned => "Banned.",
-        MemberOutcome::TemporarilyBanned => "Temporarily banned.",
-        MemberOutcome::Kicked => "Kicked.",
-        MemberOutcome::TimedOut => "Timed out.",
-        MemberOutcome::Warned => "Warned.",
-        MemberOutcome::Unbanned => "Unbanned.",
-    };
-    if result.replayed {
-        format!("{base} Already applied.")
-    } else {
-        base.to_owned()
+/// Moderator-visible target slot: the resolved interaction user's display
+/// name when Discord sent it, else the raw target user id. The reply
+/// sanitizer neutralizes anything hostile in either.
+fn target_display(interaction: &Interaction) -> String {
+    let target = command_options(interaction).0;
+    if let (Some(id), Some(InteractionData::ApplicationCommand(data))) =
+        (target, interaction.data.as_ref())
+    {
+        if let Some(user) = data.resolved.as_ref().and_then(|r| r.users.get(&id)) {
+            return user.global_name.as_deref().unwrap_or(&user.name).to_owned();
+        }
+        return id.get().to_string();
     }
+    String::new()
+}
+
+/// Ephemeral-reply sanitizer for a moderator-visible display name: fold
+/// newlines to one space, neutralize mass mentions through the shared
+/// helper, split mention pills so they render literally, then cap the slot
+/// at 512 chars on char boundaries. Markdown-escaping is NOT applied here.
+fn sanitize_target_display(display: &str) -> String {
+    let folded = display.replace("\r\n", " ").replace(['\r', '\n'], " ");
+    let neutralized = two_bot_core::message_safety::neutralize_mentions(&folded);
+    let split = neutralized
+        .replace("<@", "<\u{200b}@")
+        .replace("<#", "<\u{200b}#")
+        .replace("<:", "<\u{200b}:")
+        .replace("<a:", "<\u{200b}a:");
+    split.chars().take(512).collect()
 }
 
 fn error_text(err: MemberError) -> String {
@@ -413,9 +597,7 @@ fn error_text(err: MemberError) -> String {
         MemberError::KeyMismatch => {
             "This moderation request was already submitted with different details.".to_owned()
         }
-        MemberError::Discord(MemberDiscordError::Rejected(detail)) => {
-            format!("Discord refused the request: {detail}")
-        }
+        MemberError::Discord(MemberDiscordError::Rejected(_)) => REJECTED_REPLY.to_owned(),
         MemberError::Discord(MemberDiscordError::RateLimited) => {
             "Discord rate-limited the request; nothing was applied. Try again shortly.".to_owned()
         }
@@ -474,21 +656,24 @@ async fn execute(
         request_id: new_id(),
         idempotency_key: interaction.id.get().to_string(),
     };
-    let bot_id = member.bot_id(executor).await.ok();
-    let policy = bot_id.map_or_else(|| member.policy.clone(), |id| member.policy(id));
+    let bot_id = member.bot_id(executor).await;
+    let policy = bot_id.map_or_else(|_| member.policy.clone(), |id| member.policy(id));
     let service =
         MemberModerationService::new(executor.clone(), member.store(), policy, now_millis_i64);
+    let mut refusal_cause = None;
     let result = service
         .execute_with_authority(&execution, || async {
-            if interaction.guild_id.map(|id| id.to_string()).as_deref() != Some(&member.guild_id) {
-                return Err(MemberError::AuthorityUnavailable);
-            }
-            current_authority(
-                executor,
-                &execution,
-                bot_id.ok_or(MemberError::AuthorityUnavailable)?,
-            )
-            .await
+            let authority = if interaction.guild_id.map(|id| id.to_string()).as_deref()
+                != Some(&member.guild_id)
+            {
+                Err(AuthorityCause::GuildMismatch.into())
+            } else {
+                match bot_id {
+                    Ok(id) => current_authority(executor, &execution, id).await,
+                    Err(cause) => Err(cause.into()),
+                }
+            };
+            authority.map_err(|error: AuthorityError| error.into_member_error(&mut refusal_cause))
         })
         .await;
     match result {
@@ -500,7 +685,20 @@ async fn execute(
         Err(err) => {
             two_bot_core::metrics::global()
                 .moderation_enforcement(action.command_name(), err.enforcement_outcome());
-            Err(error_text(err))
+            if matches!(&err, MemberError::AuthorityUnavailable) {
+                // A successful resolver with mismatched subject identities is
+                // also rejected by core; it is malformed evidence, not a new
+                // outcome or a reason to expose provider detail.
+                member.warn_authority_unavailable(
+                    refusal_cause.unwrap_or(AuthorityCause::MalformedRoles),
+                    action,
+                );
+            }
+            Err(MemberRuntime::error_text_with_log(
+                err,
+                interaction.id.get(),
+                &execution.request_id,
+            ))
         }
     }
 }
@@ -519,42 +717,37 @@ async fn current_authority(
     executor: &ActionExecutor,
     exec: &MemberExecution,
     bot_id: &str,
-) -> Result<MemberAuthority, MemberError> {
-    let unavailable = || MemberError::AuthorityUnavailable;
-    let facts = guild_facts(executor, &exec.guild_id)
-        .await
-        .map_err(|_| unavailable())?;
+) -> Result<MemberAuthority, AuthorityError> {
+    let facts = guild_facts(executor, &exec.guild_id).await?;
     let (actor_roles, _) = fetched_member(executor, &exec.guild_id, &exec.actor.user_id)
-        .await
-        .map_err(|_| unavailable())?
-        .ok_or_else(unavailable)?;
-    let actor =
-        actor_authority(&exec.actor.user_id, actor_roles, &facts).ok_or_else(unavailable)?;
-    let target = exec
-        .target
-        .as_ref()
-        .ok_or(two_bot_core::moderation::PolicyError::MissingTarget)?;
+        .await?
+        .ok_or(AuthorityCause::MalformedRoles)?;
+    let actor = actor_authority(&exec.actor.user_id, actor_roles, &facts)
+        .ok_or(AuthorityCause::MalformedRoles)?;
+    let target = exec.target.as_ref().ok_or_else(|| {
+        AuthorityError::Member(two_bot_core::moderation::PolicyError::MissingTarget.into())
+    })?;
     let (target_roles, is_bot) = target_membership(
         exec.action,
-        fetched_member(executor, &exec.guild_id, &target.user_id)
-            .await
-            .map_err(|_| unavailable())?,
-    )?;
+        fetched_member(executor, &exec.guild_id, &target.user_id).await?,
+    )
+    .map_err(AuthorityError::Member)?;
     let target = ModerationTarget {
         user_id: target.user_id.clone(),
-        highest_role_position: top_position(&target_roles, &facts).ok_or_else(unavailable)?,
+        highest_role_position: top_position(&target_roles, &facts)
+            .ok_or(AuthorityCause::MalformedRoles)?,
         role_ids: with_everyone(target_roles, &exec.guild_id),
         is_bot,
         is_guild_owner: target.user_id == facts.owner_id,
     };
     let (bot_roles, is_bot) = fetched_member(executor, &exec.guild_id, bot_id)
-        .await
-        .map_err(|_| unavailable())?
-        .ok_or_else(unavailable)?;
+        .await?
+        .ok_or(AuthorityCause::UnknownBot)?;
     if !is_bot {
-        return Err(unavailable());
+        return Err(AuthorityCause::UnknownBot.into());
     }
-    let bot_highest_role_position = top_position(&bot_roles, &facts).ok_or_else(unavailable)?;
+    let bot_highest_role_position =
+        top_position(&bot_roles, &facts).ok_or(AuthorityCause::MalformedRoles)?;
     Ok(MemberAuthority {
         actor,
         target: Some(target),
@@ -581,8 +774,9 @@ fn target_membership(
 
 /// The supervised unban sweep for the configured guild: claim one due job
 /// immediately before each dispatch (at most 25 per tick, enforced inside
-/// `run_due_unbans`), stop on failure. Definite refusals requeue for the
-/// next tick; uncertain dispatches stay fenced for reconciliation.
+/// `run_due_unbans_summary`), recording per-job failures and continuing.
+/// Definite refusals requeue for the next tick; uncertain dispatches stay
+/// fenced for reconciliation.
 pub(crate) fn sweep_job(member: Arc<MemberRuntime>, rest: ActionExecutor) -> Job {
     let cadence = Duration::from_secs(UNBAN_SWEEP_INTERVAL_SECONDS);
     Job {
@@ -601,25 +795,38 @@ pub(crate) fn sweep_job(member: Arc<MemberRuntime>, rest: ActionExecutor) -> Job
 
 async fn tick(member: &MemberRuntime, rest: &ActionExecutor) -> Result<(), ErrorClass> {
     // Scheduled unbans are attributed to the bot, so no identity means no sweep.
-    let bot_id = member.bot_id(rest).await.map_err(|()| ErrorClass::Rest)?;
+    let bot_id = member.bot_id(rest).await.map_err(|_| ErrorClass::Rest)?;
     let service = MemberModerationService::new(
         rest.clone(),
         member.store(),
         member.policy(bot_id),
         now_millis_i64,
     );
-    match service.run_due_unbans(&member.guild_id).await {
-        Ok(completed) => {
-            if completed > 0 {
-                tracing::info!(completed, guild = %member.guild_id, "member unban sweep completed jobs");
+    match service.run_due_unbans_summary(&member.guild_id).await {
+        Ok((completed, failed)) => {
+            if completed > 0 || failed > 0 {
+                tracing::info!(completed, failed, guild = %member.guild_id, "member unban sweep completed jobs");
             }
-            Ok(())
+            // A failed job is a failed sweep: Ok here would reset the
+            // `member_unban_sweep` consecutive-failure streak (and its
+            // failure-only alert) while expired tempbans never lift.
+            // Per-job requeue and fencing already happened inside the
+            // summary; this only reports the tick outcome.
+            if failed > 0 {
+                Err(ErrorClass::Rest)
+            } else {
+                Ok(())
+            }
         }
         Err(MemberError::Store(_)) => Err(ErrorClass::Database),
         Err(MemberError::Discord(_)) => Err(ErrorClass::Rest),
         Err(_) => Err(ErrorClass::Configuration),
     }
 }
+
+#[cfg(test)]
+#[path = "member_runtime_diagnostics_tests.rs"]
+mod diagnostics_tests;
 
 #[cfg(test)]
 mod tests {
@@ -846,13 +1053,19 @@ mod tests {
     }
 
     #[test]
-    fn rejected_detail_passthrough_is_pinned() {
-        // Representative fixed detail: a Discord 4xx refusal names its cause.
+    fn rejected_detail_renders_fixed_actionable_copy() {
+        // Rejections never paste the provider detail: every detail renders
+        // the same fixed copy naming Discord with a next action.
+        let first = error_text(MemberError::Discord(MemberDiscordError::Rejected(
+            "missing permissions".to_owned(),
+        )));
+        let second = error_text(MemberError::Discord(MemberDiscordError::Rejected(
+            "totally different 50013 @everyone".to_owned(),
+        )));
+        assert_eq!(first, second);
         assert_eq!(
-            error_text(MemberError::Discord(MemberDiscordError::Rejected(
-                "missing permissions".to_owned()
-            ))),
-            "Discord refused the request: missing permissions"
+            first,
+            "Discord refused the request; nothing was applied. Check the bot's permissions or ask an operator."
         );
     }
 
@@ -872,144 +1085,193 @@ mod tests {
 
     #[test]
     fn ban_success_confirmation_copy_is_pinned() {
-        // Reply layer only: `MemberResult` carries no member data, so the
-        // pinned copy cannot paste any.
+        // Reply layer only: `handle_command` renders through
+        // `outcome_text_with_target`, so this pins the exact `/ban` success
+        // copy with its sanitized target slot.
         assert_eq!(
-            outcome_text(&MemberResult {
-                outcome: MemberOutcome::Banned,
-                replayed: false,
-            }),
-            "Banned."
+            MemberRuntime::outcome_text_with_target(
+                &MemberResult {
+                    outcome: MemberOutcome::Banned,
+                    replayed: false,
+                },
+                "dave"
+            ),
+            "Banned dave."
         );
         assert_eq!(
-            outcome_text(&MemberResult {
-                outcome: MemberOutcome::Banned,
-                replayed: true,
-            }),
-            "Banned. Already applied."
+            MemberRuntime::outcome_text_with_target(
+                &MemberResult {
+                    outcome: MemberOutcome::Banned,
+                    replayed: true,
+                },
+                "dave"
+            ),
+            "Banned dave. Already applied."
         );
     }
 
     #[test]
     fn tempban_success_confirmation_copy_is_pinned() {
         // Same reply layer as `/ban`: `handle_command` renders through
-        // `outcome_text`, so this pins the exact `/tempban` success copy.
+        // `outcome_text_with_target`, so this pins the exact `/tempban`
+        // success copy.
         assert_eq!(
-            outcome_text(&MemberResult {
-                outcome: MemberOutcome::TemporarilyBanned,
-                replayed: false,
-            }),
-            "Temporarily banned."
+            MemberRuntime::outcome_text_with_target(
+                &MemberResult {
+                    outcome: MemberOutcome::TemporarilyBanned,
+                    replayed: false,
+                },
+                "dave"
+            ),
+            "Temporarily banned dave."
         );
         assert_eq!(
-            outcome_text(&MemberResult {
-                outcome: MemberOutcome::TemporarilyBanned,
-                replayed: true,
-            }),
-            "Temporarily banned. Already applied."
+            MemberRuntime::outcome_text_with_target(
+                &MemberResult {
+                    outcome: MemberOutcome::TemporarilyBanned,
+                    replayed: true,
+                },
+                "dave"
+            ),
+            "Temporarily banned dave. Already applied."
         );
     }
 
     #[test]
     fn kick_success_confirmation_copy_is_pinned() {
         // Same reply layer as `/ban`: `handle_command` renders through
-        // `outcome_text`, so this pins the exact `/kick` success copy.
+        // `outcome_text_with_target`, so this pins the exact `/kick` success
+        // copy.
         assert_eq!(
-            outcome_text(&MemberResult {
-                outcome: MemberOutcome::Kicked,
-                replayed: false,
-            }),
-            "Kicked."
+            MemberRuntime::outcome_text_with_target(
+                &MemberResult {
+                    outcome: MemberOutcome::Kicked,
+                    replayed: false,
+                },
+                "dave"
+            ),
+            "Kicked dave."
         );
         assert_eq!(
-            outcome_text(&MemberResult {
-                outcome: MemberOutcome::Kicked,
-                replayed: true,
-            }),
-            "Kicked. Already applied."
+            MemberRuntime::outcome_text_with_target(
+                &MemberResult {
+                    outcome: MemberOutcome::Kicked,
+                    replayed: true,
+                },
+                "dave"
+            ),
+            "Kicked dave. Already applied."
         );
     }
 
     #[test]
     fn timeout_success_confirmation_copy_is_pinned() {
         // Same reply layer as `/ban`: `handle_command` renders through
-        // `outcome_text`, so this pins the exact `/timeout` success copy.
+        // `outcome_text_with_target`, so this pins the exact `/timeout`
+        // success copy.
         assert_eq!(
-            outcome_text(&MemberResult {
-                outcome: MemberOutcome::TimedOut,
-                replayed: false,
-            }),
-            "Timed out."
+            MemberRuntime::outcome_text_with_target(
+                &MemberResult {
+                    outcome: MemberOutcome::TimedOut,
+                    replayed: false,
+                },
+                "dave"
+            ),
+            "Timed out dave."
         );
         assert_eq!(
-            outcome_text(&MemberResult {
-                outcome: MemberOutcome::TimedOut,
-                replayed: true,
-            }),
-            "Timed out. Already applied."
+            MemberRuntime::outcome_text_with_target(
+                &MemberResult {
+                    outcome: MemberOutcome::TimedOut,
+                    replayed: true,
+                },
+                "dave"
+            ),
+            "Timed out dave. Already applied."
         );
     }
 
     #[test]
     fn warn_success_confirmation_copy_is_pinned() {
         // Same reply layer as `/ban`: `handle_command` renders through
-        // `outcome_text`, so this pins the exact `/warn` success copy.
+        // `outcome_text_with_target`, so this pins the exact `/warn` success
+        // copy.
         assert_eq!(
-            outcome_text(&MemberResult {
-                outcome: MemberOutcome::Warned,
-                replayed: false,
-            }),
-            "Warned."
+            MemberRuntime::outcome_text_with_target(
+                &MemberResult {
+                    outcome: MemberOutcome::Warned,
+                    replayed: false,
+                },
+                "dave"
+            ),
+            "Warned dave."
         );
         assert_eq!(
-            outcome_text(&MemberResult {
-                outcome: MemberOutcome::Warned,
-                replayed: true,
-            }),
-            "Warned. Already applied."
+            MemberRuntime::outcome_text_with_target(
+                &MemberResult {
+                    outcome: MemberOutcome::Warned,
+                    replayed: true,
+                },
+                "dave"
+            ),
+            "Warned dave. Already applied."
         );
     }
 
     #[test]
     fn unban_success_confirmation_copy_is_pinned() {
         // Same reply layer as `/ban`: `handle_command` renders through
-        // `outcome_text`, so this pins the exact unban-sweep success copy.
+        // `outcome_text_with_target`, so this pins the exact unban success
+        // copy.
         assert_eq!(
-            outcome_text(&MemberResult {
-                outcome: MemberOutcome::Unbanned,
-                replayed: false,
-            }),
-            "Unbanned."
+            MemberRuntime::outcome_text_with_target(
+                &MemberResult {
+                    outcome: MemberOutcome::Unbanned,
+                    replayed: false,
+                },
+                "dave"
+            ),
+            "Unbanned dave."
         );
         assert_eq!(
-            outcome_text(&MemberResult {
-                outcome: MemberOutcome::Unbanned,
-                replayed: true,
-            }),
-            "Unbanned. Already applied."
+            MemberRuntime::outcome_text_with_target(
+                &MemberResult {
+                    outcome: MemberOutcome::Unbanned,
+                    replayed: true,
+                },
+                "dave"
+            ),
+            "Unbanned dave. Already applied."
         );
     }
 
     #[test]
     fn replay_suffix_confirmation_copy_is_pinned() {
         // The replay suffix is one uniform arm: every outcome replays by
-        // appending exactly ` Already applied.` to its fresh copy.
+        // appending exactly ` Already applied.` after its named target.
         let fresh = [
-            (MemberOutcome::Banned, "Banned."),
-            (MemberOutcome::TemporarilyBanned, "Temporarily banned."),
-            (MemberOutcome::Kicked, "Kicked."),
-            (MemberOutcome::TimedOut, "Timed out."),
-            (MemberOutcome::Warned, "Warned."),
-            (MemberOutcome::Unbanned, "Unbanned."),
+            (MemberOutcome::Banned, "Banned"),
+            (MemberOutcome::TemporarilyBanned, "Temporarily banned"),
+            (MemberOutcome::Kicked, "Kicked"),
+            (MemberOutcome::TimedOut, "Timed out"),
+            (MemberOutcome::Warned, "Warned"),
+            (MemberOutcome::Unbanned, "Unbanned"),
         ];
         for (outcome, base) in fresh {
             assert_eq!(
-                outcome_text(&MemberResult {
-                    outcome,
-                    replayed: true,
-                }),
-                format!("{base} Already applied.")
+                MemberRuntime::outcome_text_with_target(
+                    &MemberResult {
+                        outcome,
+                        replayed: true,
+                    },
+                    "dave"
+                ),
+                format!("{base} dave. Already applied.")
             );
         }
     }
 }
+
+#[cfg(test)]
+#[path = "member_moderation_truthful_replies_acceptance_tests.rs"]
+mod truthful_replies_acceptance_tests;

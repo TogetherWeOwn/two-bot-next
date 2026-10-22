@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/discord", "crates/bot", "crates/cutover", "crates/store", "crates/testsupport"]
+members = ["crates/core", "crates/discord", "crates/bot", "crates/cutover", "crates/store", "crates/testsupport", "crates/voice-probe"]
 exclude = ["fuzz"]
 default-members = [".", "crates/core", "crates/discord", "crates/bot", "crates/cutover", "crates/store"]
 
@@ -88,6 +88,9 @@ sqlx = { version = "0.9", default-features = false, features = [
 # Unicode link patterns and WHATWG host parsing preserve legacy automod semantics.
 regex = "1"
 url = "2"
+# Path-segment decoding for the restore-target guard (`url` does not re-export
+# it). Already in the locked tree via `url`, so this adds no new crates.
+percent-encoding = "2"
 # NFKC normalization for the automod bad-word matcher.
 unicode-normalization = "0.1"
 thiserror = "2"

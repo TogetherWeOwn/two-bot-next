@@ -270,6 +270,7 @@ async fn ordered_gateway_concurrent_sources_award_once_and_read_back_rewards() {
         true,
         false
     )
+    .unwrap()
     .grant
     .is_empty());
     mock.shutdown().await;
@@ -443,7 +444,14 @@ async fn gateway_reward_and_interaction_executor_errors_propagate() {
         .handle_at(&message(0), &at(0), MessageEligibility::default())
         .await
         .unwrap_err();
-    assert_eq!(error.to_string(), "leveling Discord operation failed");
+    // The held-roles read fails after the award committed: the error says so
+    // and carries the committed award.
+    assert_eq!(
+        error.to_string(),
+        "leveling role application failed after the XP award committed: role application Discord operation failed"
+    );
+    assert_eq!(error.committed_awards().len(), 1);
+    assert!(error.committed_awards()[0].leveled_up);
     let runtime = runtime(db.pool.clone(), &mock, OnboardingMode::Legacy);
     assert!(runtime
         .handle_interaction(&interaction("rank", false), HandlerId::Rank)
