@@ -4194,6 +4194,7 @@ class WorkflowTests(unittest.TestCase):
             "--test member_moderation_db": True,
             "--test starboard_store": False,
             "--test starboard_api": False,
+            "--test starboard_config_updated_at": False,
         }
         for needle, wants_db_feature in guarded_needles.items():
             with self.subTest(needle=needle):

@@ -140,8 +140,10 @@ fn event_to_core_inner(event: &Event, delivery: Option<&ReactionDelivery>) -> Op
 mod tests {
     use super::*;
     use twilight_model::{
-        gateway::payload::incoming::{MemberRemove, VoiceStateUpdate},
-        guild::Member,
+        gateway::payload::incoming::{
+            MemberRemove, MessageDelete, ReactionAdd, ReactionRemove, VoiceStateUpdate,
+        },
+        guild::{Member, MemberFlags},
         id::Id,
         user::User,
         voice::VoiceState,
@@ -277,6 +279,171 @@ mod tests {
             local_a.starboard_delivery_key(),
             local_b.starboard_delivery_key(),
             "local fallback never reuses an identity"
+        );
+    }
+
+    fn member(user_id: u64, bot: bool) -> Member {
+        let mut member_user = user(user_id);
+        member_user.bot = bot;
+        Member {
+            avatar: None,
+            avatar_decoration_data: None,
+            banner: None,
+            communication_disabled_until: None,
+            deaf: false,
+            flags: MemberFlags::empty(),
+            joined_at: None,
+            mute: false,
+            nick: None,
+            pending: false,
+            premium_since: None,
+            roles: vec![],
+            user: member_user,
+        }
+    }
+
+    fn custom_burst_reaction() -> GatewayReaction {
+        // Every id is distinct, so any field swap fails the exact match.
+        GatewayReaction {
+            burst: true,
+            burst_colors: Vec::new(),
+            channel_id: Id::new(12),
+            emoji: EmojiReactionType::Custom {
+                animated: true,
+                id: Id::new(16),
+                name: Some("star".to_owned()),
+            },
+            guild_id: Some(Id::new(11)),
+            member: Some(member(14, true)),
+            message_author_id: Some(Id::new(15)),
+            message_id: Id::new(13),
+            user_id: Id::new(14),
+        }
+    }
+
+    fn unicode_reaction() -> GatewayReaction {
+        GatewayReaction {
+            burst: false,
+            burst_colors: Vec::new(),
+            channel_id: Id::new(22),
+            emoji: EmojiReactionType::Unicode {
+                name: "⭐".to_owned(),
+            },
+            guild_id: Some(Id::new(21)),
+            member: Some(member(24, false)),
+            message_author_id: Some(Id::new(25)),
+            message_id: Id::new(23),
+            user_id: Id::new(24),
+        }
+    }
+
+    fn bare_reaction() -> GatewayReaction {
+        // No member and no author: pins the None arms of both mappings.
+        GatewayReaction {
+            burst: false,
+            burst_colors: Vec::new(),
+            channel_id: Id::new(32),
+            emoji: EmojiReactionType::Unicode {
+                name: "⭐".to_owned(),
+            },
+            guild_id: Some(Id::new(31)),
+            member: None,
+            message_author_id: None,
+            message_id: Id::new(33),
+            user_id: Id::new(34),
+        }
+    }
+
+    #[test]
+    fn reaction_add_and_remove_pin_exact_variant_and_fields() {
+        // Builder pin (the acceptance target only asserts modelled + guild +
+        // non-empty delivery key): exact CoreEvent equality, so an add/remove
+        // arm swap, a channel/message swap, or a custom-emoji off-by-one turns
+        // this suite red. The runtime card counts stars from these fields.
+        let delivery = reaction_delivery("session-a", 9);
+        for (make, emoji, burst, member_is_bot, author, ids) in [
+            (
+                custom_burst_reaction as fn() -> GatewayReaction,
+                ReactionEmoji::Custom(16),
+                true,
+                Some(true),
+                Some(15),
+                (11, 12, 13, 14),
+            ),
+            (
+                unicode_reaction as fn() -> GatewayReaction,
+                ReactionEmoji::Unicode("⭐".to_owned()),
+                false,
+                Some(false),
+                Some(25),
+                (21, 22, 23, 24),
+            ),
+            (
+                bare_reaction as fn() -> GatewayReaction,
+                ReactionEmoji::Unicode("⭐".to_owned()),
+                false,
+                None,
+                None,
+                (31, 32, 33, 34),
+            ),
+        ] {
+            let (guild, channel, message, user) = ids;
+            let expected = ReactionEvent {
+                guild_id: Some(guild),
+                channel_id: channel,
+                message_id: message,
+                user_id: user,
+                message_author_id: author,
+                member_is_bot,
+                emoji,
+                burst,
+                delivery: delivery.clone(),
+            };
+            let add = Event::ReactionAdd(Box::new(ReactionAdd(make())));
+            assert_eq!(
+                event_to_core_with_delivery(&add, &delivery),
+                Some(CoreEvent::ReactionAdded(expected.clone())),
+                "ReactionAdd maps every field exactly"
+            );
+            let remove = Event::ReactionRemove(Box::new(ReactionRemove(make())));
+            assert_eq!(
+                event_to_core_with_delivery(&remove, &delivery),
+                Some(CoreEvent::ReactionRemoved(expected)),
+                "ReactionRemove maps every field exactly"
+            );
+        }
+    }
+
+    #[test]
+    fn reaction_delivery_hashes_session_id() {
+        // The D1 claim is that the session is hashed, not copied: the raw
+        // gateway session id must appear in neither delivery part.
+        let delivery = reaction_delivery("session-a", 9);
+        assert!(
+            !delivery.event_id.contains("session-a"),
+            "event_id carries the hash, not the raw session"
+        );
+        assert!(
+            !delivery.event_order.contains("session-a"),
+            "event_order carries the hash, not the raw session"
+        );
+    }
+
+    #[test]
+    fn message_delete_pins_exact_ids() {
+        // Exact match with distinct ids, so a channel/message swap turns red.
+        let event = Event::MessageDelete(MessageDelete {
+            channel_id: Id::new(42),
+            guild_id: Some(Id::new(41)),
+            id: Id::new(43),
+        });
+        assert_eq!(
+            event_to_core(&event),
+            Some(CoreEvent::MessageDeleted {
+                guild_id: Some(41),
+                channel_id: 42,
+                message_id: 43,
+            })
         );
     }
 }

@@ -1461,10 +1461,10 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v11-source.ndjson.gz");
+    let current_path = directory.path("v12-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 11);
+    assert_eq!(old.manifest.version, 12);
     for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -1510,10 +1510,10 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v11-source.ndjson.gz");
+    let current_path = directory.path("v12-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 11);
+    assert_eq!(old.manifest.version, 12);
     for name in [
         "scheduled_events_claim",
         "scheduled_events_tombstone",
@@ -1577,10 +1577,10 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v11-source.ndjson.gz");
+    let current_path = directory.path("v12-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 11);
+    assert_eq!(old.manifest.version, 12);
     // Frozen claim-only v10 shape: the merged v10 writer carried the
     // epoch-claim guard but predates the delete tombstones and the three
     // starboard tables.
@@ -1635,6 +1635,65 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
     assert!(
         claims > 0,
         "the v10 epoch-claim guard is restored, not discarded"
+    );
+    let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(members > 0, "older covered data is restored, not discarded");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v11_archive_restores_and_clears_newer_starboard() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    seed(pool).await;
+    let directory = ArchiveDirectory::new();
+    let current_path = directory.path("v12-source.ndjson.gz");
+    dump(pool, &current_path).await.unwrap();
+    let mut old = inspect(&current_path).unwrap();
+    assert_eq!(old.manifest.version, 12);
+    // Frozen tombstone-only v11 shape: the merged v11 writer carried the
+    // delete tombstones but predates the three starboard tables.
+    for name in ["starboard_config", "starboard_starrers", "starboard_posts"] {
+        let rows = old.buffers.remove(name).unwrap();
+        assert!(!rows.is_empty(), "fixture must populate newer {name}");
+        old.manifest.tables.retain(|table| table.name != name);
+    }
+    old.manifest.version = 11;
+    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
+    let old_path = directory.path("pre-starboard-v11.ndjson.gz");
+    write_archive(&old_path, &old);
+    let inspected = inspect(&old_path).expect("pre-change v11 archive remains readable");
+    assert_eq!(inspected.manifest.version, 11);
+    assert_eq!(
+        inspected.manifest.missing_tables(),
+        ["starboard_config", "starboard_starrers", "starboard_posts"]
+    );
+    // This test deliberately replaces a reused isolated rehearsal target.
+    forget_moderation_history(pool).await;
+    let report = restore(pool, &old_path).await.unwrap();
+    assert!(report.ok);
+    for name in ["starboard_config", "starboard_starrers", "starboard_posts"] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(name)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "v11 restore clears newer {name} target rows");
+    }
+    let tombstones: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scheduled_events_tombstone")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(
+        tombstones > 0,
+        "the v11 delete tombstones are restored, not discarded"
     );
     let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
         .fetch_one(pool)
