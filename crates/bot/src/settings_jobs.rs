@@ -228,3 +228,7 @@ fn log_applied(report: &RefreshReport) {
 #[cfg(test)]
 #[path = "settings_jobs_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "settings_community_live_log_acceptance_tests.rs"]
+mod community_live_log_acceptance_tests;
