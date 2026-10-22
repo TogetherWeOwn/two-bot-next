@@ -29,6 +29,8 @@ mod custom_command_list_pages_acceptance;
 
 #[path = "remind_acceptance_tests.rs"]
 mod remind_acceptance;
+#[path = "remind_safety_acceptance_tests.rs"]
+mod remind_safety_acceptance;
 
 use std::collections::VecDeque;
 use std::str::FromStr;
@@ -640,6 +642,7 @@ async fn activation_boot_publishes_only_permitted_capabilities() {
             .collect();
         for definition in automation_commands()
             .into_iter()
+            .chain(std::iter::once(two_bot_core::remind::command()))
             .chain(announcement_commands())
             .chain(moderation_commands())
         {
@@ -652,6 +655,7 @@ async fn activation_boot_publishes_only_permitted_capabilities() {
         }
         for handler in [
             HandlerId::AutomationAdmin,
+            HandlerId::Remind,
             HandlerId::FeedAdd,
             HandlerId::FeedRemove,
             HandlerId::FeedList,
@@ -1291,6 +1295,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "leaderboard"
                         | "help"
                         | "privacy"
+                        | "remind"
                 )
             })
             .collect();
@@ -1298,6 +1303,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
         assert!(!unwired.contains(&"leaderboard"));
         assert!(!unwired.contains(&"help"));
         assert!(!unwired.contains(&"privacy"));
+        assert!(!unwired.contains(&"remind"));
         if router_gates.announcements {
             assert!(unwired.contains(&"rsvp"), "enabled unwired announcement");
         }
@@ -3397,6 +3403,7 @@ fn production_router_matches_composed_production_wiring() {
             HandlerId::ScorecardAttendance,
             HandlerId::AutomationAdmin,
             HandlerId::AutomationCustom,
+            HandlerId::Remind,
             HandlerId::Rsvp,
             HandlerId::RsvpAttendance,
             HandlerId::Lfg,

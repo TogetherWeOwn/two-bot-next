@@ -610,18 +610,20 @@ mod tests {
     fn full_registry_merges_without_collision() {
         let merged = merge_commands(&[feature_commands(), moderation_commands()], &[])
             .expect("slices 1-3 merge cleanly");
-        // 4 core + 16 slice-2 + 9 moderation.
-        assert_eq!(merged.len(), 29);
+        // 4 core + 17 feature (incl. automation-gated remind) + 9 moderation.
+        assert_eq!(merged.len(), 30);
         let names: Vec<_> = merged.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(
             &names[..5],
             ["rank", "leaderboard", "help", "privacy", "attendance"]
         );
+        // Remind rides the automation gate at index 13, ahead of moderation.
+        assert_eq!(names[13], "remind");
         assert_eq!(
-            &names[20..25],
+            &names[21..26],
             ["ban", "tempban", "kick", "timeout", "warn"]
         );
-        assert_eq!(&names[25..], ["purge", "slowmode", "lockdown", "unlock"]);
+        assert_eq!(&names[26..], ["purge", "slowmode", "lockdown", "unlock"]);
         assert!(merged.iter().all(|d| !d.dm_permission));
     }
 

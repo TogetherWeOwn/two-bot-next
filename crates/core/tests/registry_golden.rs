@@ -90,6 +90,24 @@ fn diff_detects_each_kind_of_unlisted_drift_including_exception_bodies() {
         ("feed-remove", "/options/0/max_length", json!(127)),
         ("rsvp-attendance", "/options/0/name", json!("event")),
         ("rsvp-attendance", "/name", json!("attendance")),
+        ("remind", "/description", json!("Changed copy")),
+        ("remind", "/default_member_permissions", json!("32")),
+        ("remind", "/dm_permission", json!(true)),
+        ("remind", "/type", json!(2)),
+        ("remind", "/options/0/name", json!("you")),
+        ("remind", "/options/0/type", json!(3)),
+        ("remind", "/options/0/options/0/name", json!("delay")),
+        ("remind", "/options/0/options/0/type", json!(3)),
+        ("remind", "/options/0/options/0/required", json!(false)),
+        ("remind", "/options/0/options/1/type", json!(4)),
+        ("remind", "/options/0/options/1/required", json!(false)),
+        ("remind", "/options/2/options/0/required", json!(false)),
+        ("remind", "/options/0/options/0/min_value", json!(2)),
+        ("remind", "/options/0/options/0/max_value", json!(525601)),
+        ("remind", "/options/0/options/1/max_length", json!(241)),
+        ("remind", "/options/1/name", json!("listed")),
+        ("remind", "/options/2/options/0/name", json!("id")),
+        ("remind", "/options/2/options/0/max_length", json!(241)),
         ("leaderboard", "/description", json!("Changed copy")),
         ("leaderboard", "/dm_permission", json!(true)),
         ("leaderboard", "/type", json!(2)),
@@ -102,8 +120,10 @@ fn diff_detects_each_kind_of_unlisted_drift_including_exception_bodies() {
             .iter_mut()
             .find(|command| command["name"] == name)
             .unwrap();
-        if pointer == "/dm_permission" {
-            command["dm_permission"] = replacement;
+        if matches!(pointer, "/dm_permission" | "/default_member_permissions") {
+            // Canonical defaults may omit these fields; adding a non-default
+            // permission or DM policy must still be detected as drift.
+            command[pointer.trim_start_matches('/')] = replacement;
         } else {
             *command.pointer_mut(pointer).expect("mutation field exists") = replacement;
         }

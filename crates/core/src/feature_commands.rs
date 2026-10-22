@@ -427,6 +427,7 @@ mod tests {
                 "schedule-list",
                 "sticky",
                 "sticky-remove",
+                "remind",
                 "rsvp",
                 "rsvp-attendance",
                 "lfg",
@@ -436,17 +437,29 @@ mod tests {
                 "feed-list",
             ]
         );
+        // Personal reminders ride the automation gate, right after the admin
+        // shapes and before the announcement slice.
+        assert_eq!(names(&feature_commands())[9], "remind");
     }
 
     #[test]
     fn no_collision_with_leveling_core_or_within_slice() {
         let merged = merge_commands(&[feature_commands()], &[]).expect("slice 2 merges cleanly");
-        // 4 core + 1 scorecard + 8 automation + 7 announcement.
-        assert_eq!(merged.len(), 20);
+        // 4 core + 1 scorecard + 8 automation + 1 remind + 7 announcement.
+        assert_eq!(merged.len(), 21);
         assert_eq!(
             &names(&merged)[..5],
             ["rank", "leaderboard", "help", "privacy", "attendance"]
         );
+        // Remind publishes at merged index 13 (4 core + 9 feature rows ahead
+        // of it), open to everyone: no permission gate, never a DM command.
+        assert_eq!(names(&merged)[13], "remind");
+        let remind = merged
+            .iter()
+            .find(|d| d.name == "remind")
+            .expect("remind publishes");
+        assert!(remind.default_member_permissions.is_none());
+        assert!(!remind.dm_permission);
         assert!(!merged.iter().any(|d| d.dm_permission));
     }
 
@@ -693,9 +706,14 @@ mod tests {
         assert_eq!(json[0]["default_member_permissions"], "8589934592");
         assert_eq!(json[0]["options"][0]["name"], "event-occurrence");
         assert_eq!(json[0]["options"][0]["max_length"], 128);
-        assert_eq!(json[10]["name"], "rsvp-attendance");
-        assert!(json[10].get("default_member_permissions").is_none());
-        assert_eq!(json[10]["options"][0]["name"], "event-id");
+        // Personal reminders ride the automation gate at wire index 9: open to
+        // everyone, subcommand-shaped (`me` / `list` / `cancel`).
+        assert_eq!(json[9]["name"], "remind");
+        assert!(json[9].get("default_member_permissions").is_none());
+        assert_eq!(json[9]["options"][0]["name"], "me");
+        assert_eq!(json[11]["name"], "rsvp-attendance");
+        assert!(json[11].get("default_member_permissions").is_none());
+        assert_eq!(json[11]["options"][0]["name"], "event-id");
     }
 
     #[test]
