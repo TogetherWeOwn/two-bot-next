@@ -39,7 +39,8 @@ and [`discord.ts`](https://github.com/TogetherWeOwn/two-bot/blob/d5d11793/src/le
   itself carries ` — partial: early-season XP not counted` until a backfill
   lands or the quarter rolls over.
 - Legacy level-up processing grants earned roles but posts **no channel
-  announcement**. The reply/effect types intentionally do not add one.
+  announcement**. Next intentionally adds a concise, mention-suppressed
+  celebration for message-XP level-ups, with a pointer to `/rank`.
 - Reward grants skip already-held roles. Session onboarding suppresses all
   reward-role writes. Re-planning after applying a plan yields no new grants.
 - Revocation is separate from an ordinary level-up. The later legacy
@@ -99,7 +100,16 @@ both suppress reward writes without suppressing XP.
 
 On an actual level-up, the runtime reads the current ladder and member roles,
 plans grants with `staging_revoke_allowed = false`, and sends idempotent role PUTs
-through the shared executor. It sends no channel announcement. Ordinary runtime
+through the shared executor. After draining awards, message-XP crossings collapse
+per member to one celebration naming the highest crossing in its source channel.
+Voice, seasonal decay, revocation and role reconciliation never announce. Session
+mode and dry-run suppress celebrations as well as role writes, without suppressing
+XP. The shared sender serializes `allowed_mentions.parse = []`; the member mention
+renders without notifying. Delivery makes one bounded attempt after XP commits;
+failures log only a fixed cause, with no member data, and do not change the award
+or mask role-application errors. Store cooldowns fence replayed earning events.
+There is no durable announcement outbox, retry or exactly-once remote delivery
+claim across crashes or ambiguous HTTP outcomes. Ordinary runtime
 never constructs a revoke fence. Separately authorized callers must supply
 `StagingRevokeFence` whose staging/production identities match the existing
 pinned TWO identities in `backup::guild_config`; callers cannot relabel production
@@ -121,6 +131,7 @@ export TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_te
 cargo fmt --all -- --check
 python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --test leveling_store
 python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test leveling_roles
+python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test leveling_announcements -- --test-threads=1
 python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test leveling_runtime -- --ignored --test-threads=1
 python3 scripts/cargo_cache.py run -- test -p two-bot --locked command_runtime_tests::shared_runtime_routes_leveling -- --ignored
 ```
