@@ -454,7 +454,7 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
             target_tables.push(*name);
         }
     }
-    // Lock before changing guards. Only two named application triggers are
+    // Lock before changing guards. Only the three named application triggers are
     // suspended, never FK/check constraints or session_replication_role. ALTER
     // TABLE is transactional: error/cancellation rolls back data AND guards.
     // trg_guild_settings_version stays enabled: it allocates fresh CAS tokens.
@@ -485,6 +485,15 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
             "destination moderation history exists; restore into a fresh migrated target, preserve the destination and reconcile both histories before enabling moderation".into(),
         ));
     }
+    let voice_history: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM voice_settings_audit)")
+            .fetch_one(&mut *tx)
+            .await?;
+    if voice_history {
+        return Err(DbDumpError::Refused(
+            "destination voice configuration history exists; preserve it and restore into a fresh migrated target".into(),
+        ));
+    }
     let mut suspended = Vec::new();
     for (table, trigger) in [
         ("guild_settings", "trg_guild_settings_revision"),
@@ -492,6 +501,7 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
             "guild_settings_audit",
             "trg_guild_settings_audit_append_only",
         ),
+        ("voice_settings_audit", "voice_settings_audit_append_only"),
     ] {
         let enabled: Option<(String,)> = sqlx::query_as(
             "SELECT tgenabled::text FROM pg_trigger \

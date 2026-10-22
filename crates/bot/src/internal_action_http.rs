@@ -91,6 +91,8 @@ use two_bot_discord::internal_member_moderation::{
 };
 use two_bot_discord::{ActionExecutor, DiscordError, EventActionError, EventCall};
 
+mod voice_config_actions;
+
 const MAX_HEADER_BYTES: usize = 8192;
 const MAX_HEADERS: usize = 64;
 const MAX_REQUESTS: usize = 32;
@@ -1561,6 +1563,21 @@ async fn receive(
             Ok(response) => response,
             Err(_) => state.reject(Failure::reconciliation(), key, action, id),
         };
+    }
+    if matches!(
+        decision.action.as_str(),
+        "voice.config.get" | "voice.config.set"
+    ) {
+        return voice_config_actions::handle(
+            state,
+            &decision,
+            headers.idempotency,
+            &raw,
+            id,
+            key,
+            action,
+        )
+        .await;
     }
     if decision.action == "settings.get" {
         return read_setting(state, &decision, id, key, action).await;

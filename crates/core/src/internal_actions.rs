@@ -671,7 +671,7 @@ pub fn auth_failure(log_reason: impl Into<String>) -> ActionError {
 /// (TOG-5510). Adding a verb here without deciding which side of
 /// [`NEEDS_IDEMPOTENCY_KEY`] it falls on is the mistake that set exists to
 /// prevent.
-pub const IMPLEMENTED_ACTIONS: [&str; 19] = [
+pub const IMPLEMENTED_ACTIONS: [&str; 21] = [
     "role.assign",
     "guild.add_member",
     "announcement.post",
@@ -682,6 +682,8 @@ pub const IMPLEMENTED_ACTIONS: [&str; 19] = [
     "automations.export",
     "settings.get",
     "settings.set",
+    "voice.config.get",
+    "voice.config.set",
     "moderation.ban",
     "moderation.tempban",
     "moderation.kick",
@@ -698,12 +700,13 @@ pub const IMPLEMENTED_ACTIONS: [&str; 19] = [
 /// sits here because two deliveries of the same save are two audit rows and
 /// two version bumps — and a concurrent save landing in between would be
 /// silently reverted by the second delivery.
-pub const NEEDS_IDEMPOTENCY_KEY: [&str; 14] = [
+pub const NEEDS_IDEMPOTENCY_KEY: [&str; 15] = [
     "announcement.post",
     "event.upsert",
     "event.cancel",
     "automations.import",
     "settings.set",
+    "voice.config.set",
     "moderation.ban",
     "moderation.tempban",
     "moderation.kick",
@@ -717,7 +720,12 @@ pub const NEEDS_IDEMPOTENCY_KEY: [&str; 14] = [
 
 /// Actions that cannot run without the config store wired in. Configured-on
 /// with nothing behind it is a typed refusal, never a 500.
-pub const NEEDS_SETTINGS_STORE: [&str; 2] = ["settings.get", "settings.set"];
+pub const NEEDS_SETTINGS_STORE: [&str; 4] = [
+    "settings.get",
+    "settings.set",
+    "voice.config.get",
+    "voice.config.set",
+];
 
 /// The nine moderation verbs, in legacy publish order (mirrors
 /// `MODERATION_ACTIONS`; [`ModerationAction::action_name`] is the same list).
@@ -846,6 +854,10 @@ impl InternalFlags {
         if flag("TWO_INTERNAL_ALLOW_SETTINGS") {
             enabled.insert("settings.get".to_owned());
             enabled.insert("settings.set".to_owned());
+        }
+        if flag("TWO_INTERNAL_ALLOW_VOICE_CONFIG") {
+            enabled.insert("voice.config.get".to_owned());
+            enabled.insert("voice.config.set".to_owned());
         }
         if flag("TWO_INTERNAL_ALLOW_MODERATION") && flag("TWO_MODERATION") {
             enabled.extend(MODERATION_ACTIONS.iter().map(|s| (*s).to_owned()));

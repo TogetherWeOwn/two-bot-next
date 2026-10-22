@@ -996,7 +996,7 @@ const ZERO_ONE_GATE_KEYS: &[&str] = &["TWO_ONBOARDING_DRY_RUN", "TWO_SELF_ROLE_D
 /// Postgres JSONB cannot represent decoded NUL in strings or object keys.
 /// Inspect the domain value, not its encoding (literal `\\u0000` is valid).
 #[must_use]
-pub(crate) fn contains_json_nul(value: &Value) -> bool {
+pub fn contains_json_nul(value: &Value) -> bool {
     match value {
         Value::String(value) => value.contains('\0'),
         Value::Array(values) => values.iter().any(contains_json_nul),
