@@ -764,7 +764,8 @@ async fn host_checkin_authorized_self_and_on_behalf_retain_host_checkin_proof() 
         &attendance(402, MANAGE_EVENTS, OTHER, &occ),
     )
     .await;
-    assert_eq!(counts(fixture.pool()).await, (0, 0, 2));
+    // Two recorded check-ins: two facts, two audit rows; the duplicate wrote neither.
+    assert_eq!(counts(fixture.pool()).await, (0, 2, 2));
     let rows: Vec<(String, String, String, String, String, String, String)> = sqlx::query_as(
         "SELECT event_type, source_event_id, actor_id, source, classification, metadata, idempotency_key FROM community_facts ORDER BY id")
         .fetch_all(fixture.pool()).await.unwrap();
@@ -832,7 +833,8 @@ async fn host_checkin_authorized_self_and_on_behalf_retain_host_checkin_proof() 
     assert_eq!(gets[12].path, guild_member_path(USER));
     assert_eq!(gets[13].path, scheduled_event_path(EVENT));
     assert_eq!(gets[14].path, guild_member_path(USER));
-    assert_eq!(counts(fixture.pool()).await, (0, 0, 3));
+    // The labeled repeat is a third recorded check-in: three facts, three audit rows.
+    assert_eq!(counts(fixture.pool()).await, (0, 3, 3));
     fixture.close().await;
     mock.shutdown().await;
 }
@@ -1237,7 +1239,8 @@ async fn failed_final_reply_does_not_retry_committed_effects() {
         .handle(&attendance(601, MANAGE_EVENTS, USER, &occ))
         .await
         .is_err());
-    assert_eq!(counts(fixture.pool()).await, (1, 1, 1));
+    // The committed check-in leaves its fact and its audit row behind the failed edit.
+    assert_eq!(counts(fixture.pool()).await, (1, 2, 1));
     assert_eq!(mock.requests().len(), 13);
     assert!(runtime
         .handle(&attendance(602, MANAGE_EVENTS, USER, &occ))
@@ -1248,7 +1251,8 @@ async fn failed_final_reply_does_not_retry_committed_effects() {
         &two_bot_core::checkin_duplicate_text(USER, &occ),
         true,
     );
-    assert_eq!(counts(fixture.pool()).await, (1, 1, 1));
+    // The duplicate adds no fact and no audit row.
+    assert_eq!(counts(fixture.pool()).await, (1, 2, 1));
     fixture.close().await;
     mock.shutdown().await;
 }
@@ -1430,6 +1434,74 @@ async fn checkin_mid_write_target_departure_is_compensated_and_refused() {
     fixture.close().await;
 }
 
+/// RA-03 ownership: when this attempt's audit id dedupes, the audit row
+/// belongs to the earlier attempt, so mid-write compensation removes the
+/// fact but keeps the pre-existing row. An unconditional audit delete fails
+/// here: the survivor count drops to zero.
+#[tokio::test]
+async fn checkin_deduped_audit_row_survives_mid_write_compensation() {
+    let _window = DIAGNOSTIC_WINDOW.lock().await;
+    let mark = log_mark();
+    let Some(fixture) = pool().await else {
+        return;
+    };
+    let occ = anchored("2026-09-30");
+    // A prior delivery of interaction 822 already wrote its audit row: the
+    // acting host is the actor, the on-behalf target in the target key.
+    sqlx::query(
+        "INSERT INTO announcements_audit_log \
+         (id, guild_id, actor_id, action, target_key, outcome, created_at) \
+         VALUES ('checkin:822', $1, $2, 'event.checkin', $3, 'recorded', now())",
+    )
+    .bind(GUILD)
+    .bind(USER)
+    .bind(format!("{occ}:{OTHER}"))
+    .execute(fixture.pool())
+    .await
+    .unwrap();
+    assert_eq!(counts(fixture.pool()).await, (0, 1, 0));
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            event(1),
+            member(USER),
+            member_get(OTHER, None),
+            // Post-write fence: the anchor is still live, the target now gone.
+            event(1),
+            ScriptedResponse::status(404),
+            ScriptedResponse::json(200, json!({"id": "99"})),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    run(
+        fixture.pool(),
+        &mock,
+        &attendance(822, MANAGE_EVENTS, OTHER, &occ),
+    )
+    .await;
+    assert_reply(&mock, "That member is no longer in this server.", true);
+    assert_eq!(mock.requests().len(), 7);
+    // The refused fact is gone; the earlier attempt's audit row survives.
+    assert_eq!(counts(fixture.pool()).await, (0, 1, 0));
+    let audits: Vec<(String, Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT id, actor_id, target_key FROM announcements_audit_log")
+            .fetch_all(fixture.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        audits,
+        [(
+            "checkin:822".to_owned(),
+            Some(USER.to_owned()),
+            Some(format!("{occ}:{OTHER}")),
+        )]
+    );
+    assert!(compensation_failures_since(mark).is_empty());
+    mock.shutdown().await;
+    fixture.close().await;
+}
+
 /// RA-03 compensation failure: when the compensating delete itself fails, the
 /// user still gets only the refusal, the attempt's rows remain, and exactly one
 /// bounded diagnostic names the failed write. The fault is a trigger that
@@ -1514,11 +1586,59 @@ async fn failed_compensation_keeps_refusal_and_emits_one_diagnostic() {
     .await;
     assert_reply(&mock, "That member is no longer in this server.", true);
     assert_eq!(mock.requests().len(), 7);
-    // The failed compensation kept this attempt's attendance fact.
-    assert_eq!(counts(checkin_db.pool()).await, (0, 0, 1));
+    // The failed compensation kept this attempt's attendance fact and its audit row.
+    assert_eq!(counts(checkin_db.pool()).await, (0, 1, 1));
     assert_single_failure(compensation_failures_since(mark), "checkin");
     mock.shutdown().await;
     checkin_db.close().await;
+}
+
+/// RA-03 compensation atomicity: when the audit delete fails, the fact
+/// delete rolls back with it — both rows remain and the refusal still
+/// carries exactly one diagnostic. A non-transactional compensation fails
+/// here: the fact is gone while its audit row stays.
+#[tokio::test]
+async fn failed_audit_delete_rolls_back_checkin_compensation() {
+    let _window = DIAGNOSTIC_WINDOW.lock().await;
+    let Some(fixture) = pool().await else {
+        return;
+    };
+    sqlx::query("CREATE FUNCTION injected_compensation_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected compensation fault'; END $$")
+        .execute(fixture.pool())
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER fault_checkin_audit_delete BEFORE DELETE ON announcements_audit_log FOR EACH STATEMENT EXECUTE FUNCTION injected_compensation_fault()")
+        .execute(fixture.pool())
+        .await
+        .unwrap();
+    let occ = anchored("2026-09-30");
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            event(1),
+            member(USER),
+            member_get(OTHER, None),
+            event(1),
+            ScriptedResponse::status(404),
+            ScriptedResponse::json(200, json!({"id": "99"})),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let mark = log_mark();
+    run(
+        fixture.pool(),
+        &mock,
+        &attendance(823, MANAGE_EVENTS, OTHER, &occ),
+    )
+    .await;
+    assert_reply(&mock, "That member is no longer in this server.", true);
+    assert_eq!(mock.requests().len(), 7);
+    // The failed compensation kept this attempt's attendance fact and its audit row.
+    assert_eq!(counts(fixture.pool()).await, (0, 1, 1));
+    assert_single_failure(compensation_failures_since(mark), "checkin");
+    mock.shutdown().await;
+    fixture.close().await;
 }
 
 /// RA-03: store failures fail closed — a refused commit is reported as a
