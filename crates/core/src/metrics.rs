@@ -2558,7 +2558,9 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
         assert!(text.contains("two_bot_gateway_events_total{event=\"other\"} 10000\n"));
         assert!(
             text.contains("two_bot_rest_requests_total{route=\"other\",result=\"429\"} 10000\n")
@@ -2828,7 +2830,9 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
     }
 
     #[test]
@@ -2936,7 +2940,9 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
     }
 
     #[test]
@@ -3055,7 +3061,9 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
         assert!(text.contains("two_bot_gateway_checkpoint_failures_total{stage=\"commit\"} 100\n"));
     }
 
@@ -3147,7 +3155,9 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
         assert!(text.contains("two_bot_drop_poison_total{guard=\"in_flight_guard\"} 100\n"));
     }
 
@@ -3222,7 +3232,9 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
     }
 
     #[test]
@@ -3265,7 +3277,9 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
     }
 
     #[test]
@@ -3299,7 +3313,9 @@ mod tests {
         assert!(
             text.contains("two_bot_community_facts_drain_failures_total{reason=\"other\"} 100\n")
         );
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
     }
 
     #[test]
@@ -3610,7 +3626,9 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
         assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"failed\"} 100\n"));
         assert!(text.contains("two_bot_eventsub_reconcile_actions_total{action=\"delete\"} 100\n"));
         assert!(
@@ -3757,7 +3775,9 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
         assert!(text.contains("two_bot_feed_fetches_total{outcome=\"failure\"} 100\n"));
         assert!(text.contains("two_bot_feed_fetch_errors_total{error_class=\"other\"} 100\n"));
     }
@@ -3833,7 +3853,9 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
         assert!(
             text.contains("two_bot_automod_decisions_total{outcome=\"sanction_refused\"} 100\n")
         );
