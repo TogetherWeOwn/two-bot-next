@@ -142,7 +142,9 @@ Staging target (follow-up): `workers-oauth-provider` in resource-server
 mode with dynamic client registration, PKCE, and scopes. Phase-1 scope is
 `mcp:read` (all five tools). Control tools are deferred behind a step-up
 scope plus a control token plus an audit write, and no control tool is
-registered until that lands.
+registered until that lands. The [closed admin gateway and bearer-binding
+contract](admin-api.md) reserves the request-local control seam; it does not
+register tools or turn this phase-1 bearer into control authority.
 
 ## Staging prove-out
 
