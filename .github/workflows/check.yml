@@ -1560,6 +1560,7 @@ jobs:
           name: coverage-shard-${{ matrix.shard_index }}
           path: lcov-shard-${{ matrix.shard_index }}.info
           if-no-files-found: error
+          overwrite: true
           retention-days: 14
 
       - name: sccache stats (advisory speed evidence)
@@ -1619,8 +1620,11 @@ jobs:
             count=$((count + 1))
           done
           echo "merging $count shard reports (expecting $EXPECTED_SHARDS)"
+          # Shards produce absolute SF paths inside the job container; this
+          # host-only job has a different checkout root. Relativize at merge.
           python3 scripts/ci/merge-coverage-shards.py "${args[@]}" \
             --expected-shards "$EXPECTED_SHARDS" \
+            --source-root /__w/two-bot-next/two-bot-next \
             --out "$GITHUB_WORKSPACE/lcov.info"
 
       - name: Patch coverage (HARD, 80% of added lines)

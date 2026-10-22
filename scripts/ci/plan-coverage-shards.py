@@ -2,8 +2,8 @@
 """Plan coverage shards from changed files (two-bot-next CI sharding).
 
 Emits the coverage leg matrix: which of the 16 patch-coverage legs to run
-(2 workspace sweeps + 14 dedicated ignored/DB legs, pinned to the
-pre-shard check.yml at 817707990) and how to partition them into N shards.
+(2 workspace sweeps + 14 dedicated ignored/DB legs, matching the
+coverage-shard job in check.yml) and how to partition them into N shards.
 
 Fail-closed: any planning error (unreadable diff, malformed metadata,
 unknown paths) widens to the full set with ``widened: true``. ``main``
@@ -28,15 +28,16 @@ ALL_CRATES = [
     "two-bot-next",
 ]
 
-# Pinned to .github/workflows/check.yml at 817707990 (pre-shard
-# patch-coverage job): 2 workspace sweeps + 14 dedicated cov legs.
+# Match .github/workflows/check.yml's coverage-shard commands, including
+# sweep skip lists: 2 workspace sweeps + 14 dedicated cov legs.
 FULL_LEGS = [
     {
         "id": "sweep-nonignored",
         "command": (
             "cargo llvm-cov --workspace --lib --bins --tests "
-            "--features two-bot-core/db --locked --ignore-run-fail "
-            "--no-report -- --skip regenerate_reference_docs"
+            "--features two-bot-core/db --locked --ignore-run-fail --no-report -- "
+            "--skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump "
+            "--skip seeded_aggregates_render_exactly_guild_scoped_and_read_only"
         ),
         "crates": list(ALL_CRATES),
     },
@@ -45,8 +46,51 @@ FULL_LEGS = [
         "command": (
             "cargo llvm-cov --workspace --lib --bins --tests "
             "--features two-bot-core/db --locked --ignore-run-fail "
-            "--no-report -- --ignored --test-threads=1 "
-            "--skip regenerate_reference_docs"
+            "--no-report -- --ignored --test-threads=1 --skip regenerate_reference_docs "
+            "--skip flags_are_guild_scoped_half_open_deduplicated_and_activity_protected "
+            "--skip list_is_guild_scoped_selector_shaped_and_read_only "
+            "--skip claim_is_owned_once_then_in_flight "
+            "--skip failed_send_releases_the_claim_for_the_retry "
+            "--skip delivered_rows_are_never_reclaimed "
+            "--skip delivered_rows_expire_only_past_the_horizon_with_the_fence_intact "
+            "--skip fresh_claim_cannot_be_reclaimed "
+            "--skip stale_unposted_claim_is_taken_over_atomically "
+            "--skip started_claim_is_never_reclaimed_even_when_stale "
+            "--skip started_send_that_provably_failed_releases_for_the_retry "
+            "--skip reclaiming_a_missing_key_claims_it_fresh "
+            "--skip database::actions_persist_rows_and_preserve_other_events_and_guilds "
+            "--skip parity_mismatch_cursor_and_read_only_acceptance "
+            "--skip legacy_verify_policy_gates_the_real_test_endpoints "
+            "--skip real_sqlx_runner_cases "
+            "--skip post_failure_unreadable_ledger_is_unknown_not_empty "
+            "--skip post_failure_readable_ledger_keeps_array_output "
+            "--skip post_apply_unreadable_ledger_is_unknown_not_empty "
+            "--skip store_failure_keeps_committed_cutover_evidence "
+            "--skip connection_count_sees_other_roles_from_plan_login "
+            "--skip single_delete_429_releases_attempt_for_same_key_retry "
+            "--skip bulk_delete_429_releases_attempt_for_same_key_retry "
+            "--skip channel_overwrite_429_releases_attempt_and_retires_only_its_seed "
+            "--skip slowmode_429_releases_attempt_for_same_and_distinct_keys "
+            "--skip unlock_429_releases_lane_but_preserves_recovery_seed "
+            "--skip lockdown_429_preserves_prior_seed_while_releasing_the_lane "
+            "--skip slowmode_5xx_and_unexpected_statuses_stay_fenced "
+            "--skip slowmode_timeout_stays_fenced "
+            "--skip cancelled_lockdown_stays_fenced_with_seed_retained "
+            "--skip audit_log_pagination_limit_1_to_100_before_after_covers_45d_window "
+            "--skip audit_log_requests_ride_rate_limit_client_never_direct_rest "
+            "--skip audit_cursor_persists_per_window_and_resumes_mid_window "
+            "--skip audit_rows_hold_ids_timestamps_enums_only "
+            "--skip audit_429_retry_after_pauses_without_losing_place "
+            "--skip bans_fetch_applies_blocklist_and_counts_everyone "
+            "--skip invite_rows_hold_metadata_only "
+            "--skip onboarding_rows_hold_ids_enums_metadata_only "
+            "--skip bans_invites_onboarding_resume_continues_from_persisted_cursors "
+            "--skip event_users_paginate_through_rate_limit_client_with_max_100 "
+            "--skip reaction_users_paginate_through_rate_limit_client "
+            "--skip pins_list_through_rate_limit_client_persists_metadata_only "
+            "--skip blocklisted_users_skipped_for_per_user_rows_while_aggregates_keep_counting "
+            "--skip persisted_rows_hold_ids_timestamps_enums_only "
+            "--skip resume_continues_from_persisted_cursors_per_family"
         ),
         "crates": list(ALL_CRATES),
     },

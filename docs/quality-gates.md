@@ -32,7 +32,13 @@ lint-only `check` lane.
   sharded jobs so the unit-test signal and the coverage verdict fail
   independently, each legs step uses `always()` so a failure never suppresses
   coverage output, and the merge refuses anything but exactly N-of-N valid
-  shard reports. Measurement also uses
+  shard reports. The merge converts absolute container `SF:` paths to
+  repository-relative paths with `--source-root /__w/two-bot-next/two-bot-next`;
+  its own checkout root and already-relative paths are also accepted. Unknown
+  absolute roots and parent traversal fail closed, rather than silently
+  producing an uncovered verdict on the host runner's different checkout root.
+  Shard uploads overwrite the same shard's earlier artifact on a failed-job
+  re-run. Measurement also uses
   `--ignore-run-fail` to preserve LCOV output when tests invoked by llvm-cov fail.
   A build or report-generation failure fails this gate.
 - Dependency advisories (HARD): the `cargo-deny` step (`check all`, which
