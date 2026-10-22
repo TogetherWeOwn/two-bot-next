@@ -6,12 +6,12 @@
 //! snapshot without waiting for database work or cache construction and never
 //! see a half-rebuilt cache.
 //!
-//! Each tick is the cheap marks query first; only a moved revision or row
-//! count pays for the consistent snapshot load. A malformed snapshot (empty
-//! `guild_id`/`key`, duplicate `(guild_id, key)` — impossible under the table
-//! PK but not under a hand-edited or restored row set) is refused whole: the
-//! previous snapshot stays published and the tick fails as
-//! [`ErrorClass::Configuration`].
+//! Each tick GETs the /ops record first, then the cheap marks query; only a
+//! moved revision or row count pays for the consistent snapshot load. A
+//! malformed snapshot (empty `guild_id`/`key`, duplicate `(guild_id, key)` —
+//! impossible under the table PK but not under a hand-edited or restored row
+//! set) is refused whole: the previous snapshot stays published and the tick
+//! fails as [`ErrorClass::Configuration`].
 //!
 //! Applied swaps log `settings_applied {version, keys}` — key names only —
 //! plus one `setting_changed` per hot key with from/to, one
@@ -139,27 +139,92 @@ impl Poll {
 }
 
 async fn poll_once(pool: &PgPool, writer: &Mutex<LiveSettingsWriter>) -> Result<(), ErrorClass> {
+    // The /ops override layer polls first and always: the incident lever
+    // must land during a Postgres outage too, and a guild early-return must
+    // never skip the ops read (an ops-only change takes effect next tick).
+    // The heavy paths use fully-qualified core items so this file's header
+    // line numbers (cited by the configuration reference) never shift.
+    let ops_outcome = poll_ops_record().await;
+    if let Some(fetched) = ops_outcome {
+        let mut writer = writer.lock().await;
+        let outcome = writer.apply_ops(fetched.as_ref().ok(), std::time::Instant::now());
+        log_ops(&outcome, fetched.as_ref().err());
+    }
     let store = SettingsStore::new(pool);
     let (revision, rows) = store.poll_marks().await.map_err(|_| ErrorClass::Database)?;
-    {
-        let writer = writer.lock().await;
-        if !writer.needs_refresh(revision, rows) {
-            return Ok(());
+    let guild_moved = writer.lock().await.needs_refresh(revision, rows);
+    let snapshot = if guild_moved {
+        let snapshot = store
+            .load_snapshot()
+            .await
+            .map_err(|_| ErrorClass::Database)?;
+        if let Err(reason) = validate_snapshot(&snapshot) {
+            // Refuse the whole snapshot: a partial apply could pair a new value
+            // with a stale neighbouring row.
+            tracing::error!(reason, "settings_snapshot_rejected");
+            return Err(ErrorClass::Configuration);
+        }
+        Some(snapshot)
+    } else {
+        None
+    };
+    if let Some(snapshot) = &snapshot {
+        let report = writer.lock().await.publish(snapshot);
+        log_applied(&report);
+    }
+    Ok(())
+}
+
+/// Fetch one /ops record, or `None` when the layer is disabled (no URL).
+/// Fetch failures resolve to `Some(Err(..))` so the writer can age the last
+/// good record toward expiry; only a missing URL skips the apply.
+async fn poll_ops_record(
+) -> Option<Result<two_bot_core::settings::OpsRecord, two_bot_core::ops_fetch::OpsFetchError>> {
+    let Some(url) = two_bot_core::ops_fetch::ops_url_from_env() else {
+        if std::env::var(two_bot_core::ops_fetch::OPS_CONFIG_URL_ENV).is_ok() {
+            // Set but off-shape: loud, so a paste error surfaces instead of
+            // silently disabling the incident lever.
+            tracing::warn!("ops_config_url_invalid");
+        }
+        return None;
+    };
+    let token = two_bot_core::ops_fetch::ops_token_from_env();
+    Some(
+        two_bot_core::ops_fetch::fetch_ops_record(
+            &url,
+            token.as_deref(),
+            two_bot_core::ops_fetch::OPS_FETCH_TIMEOUT,
+        )
+        .await,
+    )
+}
+
+/// Spec-named ops lines (Slice 0a): `ops_overrides_applied` per applied
+/// epoch with key names only, plus the stale/expiry/fetch-failure lines.
+/// Heartbeats and transparent reads stay silent. Values never render.
+fn log_ops(
+    outcome: &two_bot_core::settings::OpsApplyOutcome,
+    fetch_error: Option<&two_bot_core::ops_fetch::OpsFetchError>,
+) {
+    use two_bot_core::settings::OpsApplyOutcome as Outcome;
+    match outcome {
+        Outcome::Applied { epoch, keys } => {
+            tracing::info!(epoch, keys = ?keys, "ops_overrides_applied");
+        }
+        Outcome::Heartbeat { .. } | Outcome::Transparent => {}
+        Outcome::StaleIgnored { epoch, current } => {
+            tracing::warn!(epoch, current, "ops_overrides_stale_epoch");
+        }
+        Outcome::FetchFailedKeptGood => {
+            if let Some(error) = fetch_error {
+                // Kind-only: the error carries no URL, token, or values.
+                tracing::warn!(error = %error, "ops_overrides_fetch_failed");
+            }
+        }
+        Outcome::Expired => {
+            tracing::warn!("ops_overrides_expired");
         }
     }
-    let snapshot = store
-        .load_snapshot()
-        .await
-        .map_err(|_| ErrorClass::Database)?;
-    if let Err(reason) = validate_snapshot(&snapshot) {
-        // Refuse the whole snapshot: a partial apply could pair a new value
-        // with a stale neighbouring row.
-        tracing::error!(reason, "settings_snapshot_rejected");
-        return Err(ErrorClass::Configuration);
-    }
-    let report = writer.lock().await.publish(&snapshot);
-    log_applied(&report);
-    Ok(())
 }
 
 /// The PK makes duplicates impossible and NOT NULL keeps the columns
@@ -228,3 +293,38 @@ fn log_applied(report: &RefreshReport) {
 #[cfg(test)]
 #[path = "settings_jobs_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod ops_log_tests {
+    use super::*;
+
+    /// Covers every `log_ops` arm without touching the process environment
+    /// or a database (the apply-side semantics are pinned in core and the
+    /// tick-level behavior in the protected acceptance module). Log text is
+    /// intentionally unpinned; the match only ever renders epochs, key
+    /// names, and the kind-only fetch error.
+    #[test]
+    fn ops_log_lines_cover_every_outcome() {
+        use two_bot_core::settings::OpsApplyOutcome as Outcome;
+        for outcome in [
+            Outcome::Applied {
+                epoch: 1,
+                keys: vec!["TWO_AUTOMOD_MENTION_LIMIT".to_owned()],
+            },
+            Outcome::Heartbeat { epoch: 1 },
+            Outcome::Transparent,
+            Outcome::StaleIgnored {
+                epoch: 3,
+                current: 5,
+            },
+            Outcome::FetchFailedKeptGood,
+            Outcome::Expired,
+        ] {
+            log_ops(&outcome, None);
+        }
+        log_ops(
+            &Outcome::FetchFailedKeptGood,
+            Some(&two_bot_core::ops_fetch::OpsFetchError::Timeout),
+        );
+    }
+}
