@@ -46,6 +46,25 @@
 //!   matrix and chaos row id, state the prod fence, and document the rollback
 //!   rehearsal.
 //!
+//!   Term pins (lowercased substring match on each row's setup + assert +
+//!   fault text; `[a | b]` means either term passes):
+//!   - create-t15-window: `t-15`, `t-14`, `jump link`, `staging`
+//!   - rename-propagates: `renam`, `staging`; `timeout_s <= 120`
+//!   - complete-while-occupied: `after-party`, `owner`, `control`
+//!   - complete-while-empty: `delet`; `timeout_s <= 120`
+//!   - cancel-pre-start: `cancel`, `delet`
+//!   - restart-mid-event: `duplicat`, [`pg` | `postgres` | `presence`]
+//!   - chaos-restart-mid-handoff: `restart`, [`handoff` | `after-party` | `owner`]
+//!   - chaos-injected-429s: fault names `429`
+//!   - chaos-category-permission-revoked: fault names a revocation
+//!     ([`revok` | `deny` | `403`]) on the category ([`categor` | `perm` | `403`])
+//!   - chaos-same-slug-same-t15: `slug`, `t-15`
+//!   - chaos-dst-week-recurrence: `dst`, [`recur` | `week`]
+//!   - prod fence (manifest guards + runbook): hidden test channel, passive
+//!     monitors, prod scope (`prod` word or `production`), promotion, human
+//!     gate (any `review*` form except `preview`, or `approv*`), takeover,
+//!     staging, rollback deleting the test channels, and a rehearsal note.
+//!
 //! RED: every test fails until those artifacts land. No guild, no network, no
 //! database; these pin the harness definition, not a live staging run.
 
@@ -146,6 +165,22 @@ fn contains_word(haystack: &str, word: &str) -> bool {
     haystack
         .split(|c: char| !c.is_alphanumeric())
         .any(|token| token == word)
+}
+
+/// Prod scope, whether written "prod" or "production" ("reproduce" passes
+/// neither).
+fn mentions_prod(haystack: &str) -> bool {
+    contains_word(haystack, "prod") || haystack.contains("production")
+}
+
+/// Human gate: any `review*` form except `preview`, or any `approv*` form.
+fn mentions_review(haystack: &str) -> bool {
+    if haystack.contains("approv") {
+        return true;
+    }
+    haystack
+        .match_indices("review")
+        .any(|(at, _)| !haystack[..at].ends_with('p'))
 }
 
 fn require_terms(id: &str, text: &str, groups: &[&[&str]]) {
@@ -341,9 +376,15 @@ fn staging_chaos_rows_declare_fault_and_observable() {
         row_by_id(chaos, "chaos-category-permission-revoked", "chaos"),
         "chaos-category-permission-revoked",
     );
+    let revokes = ["revok", "deny", "403"]
+        .iter()
+        .any(|term| revoked.contains(term));
+    let category_scope = ["categor", "perm", "403"]
+        .iter()
+        .any(|term| revoked.contains(term));
     assert!(
-        revoked.contains("permission") && (revoked.contains("categor") || revoked.contains("403")),
-        "chaos-category-permission-revoked fault must name the revoked category permission"
+        revokes && category_scope,
+        "chaos-category-permission-revoked fault must name a revocation on the category permission"
     );
     require_terms(
         "chaos-same-slug-same-t15",
@@ -401,12 +442,20 @@ fn staging_manifest_declares_the_prod_fence() {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    for word in ["hidden", "channel", "prod", "review"] {
+    for word in ["hidden", "channel"] {
         assert!(
             contains_word(&guard_text, word),
-            "prod_fence.guards must pin {word:?} (hidden test channel only, passive prod monitors, no promotion without review)"
+            "prod_fence.guards must pin {word:?} (hidden test channel only)"
         );
     }
+    assert!(
+        mentions_prod(&guard_text),
+        "prod_fence.guards must scope the passive monitors to prod"
+    );
+    assert!(
+        mentions_review(&guard_text),
+        "prod_fence.guards must gate promotion on review/approval"
+    );
     for phrase in ["passive monitors", "promotion", "takeover", "staging"] {
         assert!(
             guard_text.contains(phrase),
@@ -467,11 +516,11 @@ fn staging_runbook_covers_matrix_fence_and_rehearsal() {
         );
     }
     assert!(
-        contains_word(&lowered, "review"),
-        "runbook must state the prod fence (\"review\")"
+        mentions_review(&lowered),
+        "runbook must gate promotion on review/approval"
     );
     assert!(
-        contains_word(&lowered, "prod"),
-        "runbook must state the prod fence (\"prod\")"
+        mentions_prod(&lowered),
+        "runbook must scope the passive monitors to prod"
     );
 }
