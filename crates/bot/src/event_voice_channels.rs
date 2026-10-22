@@ -22,7 +22,7 @@ use two_bot_cutover::event_voice::{
 
 /// Record one voice-channel transition (join, leave or move) as presence
 /// spans. Called by the guild actor loop before room handling; each write
-/// is bounded by [`REVALIDATE_TIMEOUT_MS`] (the same inbox-protection
+/// is bounded by `REVALIDATE_TIMEOUT_MS` (the same inbox-protection
 /// bound as creator revalidation) so a slow statement cannot hold room
 /// handling. Failures and timeouts are debug-logged (no member or channel
 /// ids on this warm path) and the 60s flush backstop repairs the open
