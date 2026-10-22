@@ -399,3 +399,7 @@ impl PendingCompletedPatch {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "event_voice_category_regression_tests.rs"]
+mod regression_tests;
