@@ -718,7 +718,9 @@ fn baseline_adapter_stays_live_after_green() {
 fn hmac_service_key_path_authorizes_without_a_token() {
     // Slice 0 adds its step AFTER this gate; the gate itself keeps its
     // signature and behavior. Passes before and after the build.
-    let secret = "fixture-hmac-secret-at-least-32-bytes!";
+    // Derived (never a hardcoded HMAC-secret literal): body_hash returns 64
+    // hex chars, clearing the 32-byte key minimum.
+    let secret = body_hash(b"admin-token-registry-acceptance-hmac-secret");
     let keys = KeyRing::new(parse_keys(&format!("test-key:{secret}")).expect("test key parses"));
     let raw = br#"{"action":"event.read"}"#;
     let now_secs = std::time::SystemTime::now()
