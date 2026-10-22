@@ -256,16 +256,16 @@ const BASE_MIGRATIONS: [&str; 7] = [
 static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
 
 /// Disposable schema name: process id, a process-wide monotonic counter, and
-/// a clock nonce. The counter (not the clock) is the uniqueness guarantee
+/// a clock sample. The counter (not the clock) is the uniqueness guarantee
 /// under parallel execution: tests in one process share the pid and can sample
 /// the same nanos tick, which used to collide on `CREATE SCHEMA` (`23505` on
 /// `pg_namespace_nspname_index`).
-fn schema_name(nonce: u128) -> String {
+fn schema_name(clock_sample: u128) -> String {
     format!(
         "self_role_ack_{}_{}_{}",
         std::process::id(),
         NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed),
-        nonce
+        clock_sample
     )
 }
 
@@ -290,11 +290,11 @@ where
         .max_connections(1)
         .connect_with(options.clone())
         .await?;
-    let nonce = std::time::SystemTime::now()
+    let now_nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_nanos();
     // Fixed prefix plus numeric PID/counter/timestamp; no caller-supplied identifiers.
-    let schema = schema_name(nonce);
+    let schema = schema_name(now_nanos);
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
         .execute(&admin)
         .await?;
