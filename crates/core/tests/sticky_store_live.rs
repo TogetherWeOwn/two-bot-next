@@ -12,7 +12,7 @@
 //! its own scratch schema and drops it at the end.
 //!
 //! Applies the real `0150_sticky_messages.sql` migration plus the
-//! `0452_sticky_delivery_uncertainty.sql` fence column (single-statement
+//! `0454_sticky_delivery_uncertainty.sql` fence column (single-statement
 //! `raw_sql`, so the checked-in files are what gets verified), then drives
 //! the card acceptance end to end: bursts coalesce to one re-post, remove
 //! clears state, updates preserve the live post columns, and an uncertain
@@ -42,7 +42,7 @@ fn now_ms() -> i64 {
 const TEST_URL: &str = "postgres://agent_test:@agent-testdb:5432/agent_test";
 const DDL: &str = include_str!("../../cutover/migrations/0150_sticky_messages.sql");
 const DDL_UNCERTAINTY: &str =
-    include_str!("../../cutover/migrations/0452_sticky_delivery_uncertainty.sql");
+    include_str!("../../cutover/migrations/0454_sticky_delivery_uncertainty.sql");
 
 fn test_options(url: &str) -> Result<PgConnectOptions, &'static str> {
     // sqlx applies query-string overrides (host, hostaddr, user, dbname,
@@ -149,7 +149,7 @@ async fn sticky_live_round_trip() {
     sqlx::raw_sql(DDL_UNCERTAINTY)
         .execute(&pool)
         .await
-        .expect("0452 fence migration applies cleanly");
+        .expect("0454 fence migration applies cleanly");
 
     let now = now_ms();
     let (guild, held, burst, gone) = ("g-live", "c-held", "c-burst", "c-remove");
@@ -496,7 +496,7 @@ async fn sticky_live_uncertainty_fence() {
     sqlx::raw_sql(DDL_UNCERTAINTY)
         .execute(&pool)
         .await
-        .expect("0452 fence migration applies cleanly");
+        .expect("0454 fence migration applies cleanly");
 
     let now = now_ms();
     let (guild, channel) = ("g-fence", "c-fence");

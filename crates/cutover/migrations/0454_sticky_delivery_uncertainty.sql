@@ -1,4 +1,4 @@
--- 0452_sticky_delivery_uncertainty: fence ambiguous sticky re-posts.
+-- 0454_sticky_delivery_uncertainty: fence ambiguous sticky re-posts.
 --
 -- `claim_sticky_post` (0150) expires after 60 seconds, so a POST accepted by
 -- Discord with a lost response, a 2xx with an unusable id, or a record

@@ -1,6 +1,6 @@
 //! Forward/rollback compatibility for the sticky uncertain-delivery fence.
 //!
-//! The `0452_sticky_delivery_uncertainty.sql` migration adds one
+//! The `0454_sticky_delivery_uncertainty.sql` migration adds one
 //! `delivery_uncertain` flag to `sticky_messages`: additive, `IF NOT EXISTS`,
 //! pre-existing rows read back certain. Applying the full chain on a fresh
 //! database does not prove the rollback half, so the disposable-database test
@@ -16,7 +16,7 @@
 use sqlx::PgPool;
 use two_bot_testsupport::TestDatabase;
 
-const MIGRATION_FILE: &str = "0452_sticky_delivery_uncertainty.sql";
+const MIGRATION_FILE: &str = "0454_sticky_delivery_uncertainty.sql";
 
 fn migration_path() -> String {
     format!("{}/migrations/{MIGRATION_FILE}", env!("CARGO_MANIFEST_DIR"))

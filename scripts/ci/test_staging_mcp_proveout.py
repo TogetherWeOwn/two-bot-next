@@ -26,6 +26,12 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import staging_mcp_proveout as proveout
 
 
+def shipped_tools():
+    """Fresh tools/list fixture from wrangler/src/mcp.ts toolEntries()."""
+    fixture = ROOT / "scripts/ci/fixtures/staging_mcp_shipped_contract.json"
+    return json.loads(fixture.read_text())["tools_result"]["tools"]
+
+
 class _Target(BaseHTTPRequestHandler):
     hits = []
 
@@ -167,7 +173,7 @@ class AuditContractTests(unittest.TestCase):
             if payload["method"] == "initialize":
                 envelope["result"] = {"protocolVersion": "2025-06-18"}
             elif payload["method"] == "tools/list":
-                envelope["result"] = {"tools": [{"name": t} for t in proveout.EXPECTED_TOOLS]}
+                envelope["result"] = {"tools": shipped_tools()}
             else:
                 tool = payload["params"]["name"]
                 if tool == "get_audit":
@@ -326,8 +332,7 @@ class HostileBodyTests(unittest.TestCase):
         responses = [
             (200, {}, json.dumps({"jsonrpc": "2.0", "id": 1, "result": {
                 "protocolVersion": "2025-06-18"}})),
-            (200, {}, json.dumps({"jsonrpc": "2.0", "id": 2, "result": {"tools": [
-                {"name": tool} for tool in proveout.EXPECTED_TOOLS]}})),
+            (200, {}, json.dumps({"jsonrpc": "2.0", "id": 2, "result": {"tools": shipped_tools()}})),
         ] + [(200, {}, json.dumps({"jsonrpc": "2.0", "id": 3 + offset, "result": {
             "content": [], "structuredContent": {
                 "available": True, "rows": [], "truncated": False}}}))
@@ -617,8 +622,7 @@ class OutputSafetyTests(unittest.TestCase):
         cases = [
             (0, {"jsonrpc": "2.0", "id": 1, "result": {
                 "protocolVersion": "2025-06-18", "pad": padding}}),
-            (1, {"jsonrpc": "2.0", "id": 2, "result": {"tools": [
-                {"name": tool} for tool in proveout.EXPECTED_TOOLS], "pad": padding}}),
+            (1, {"jsonrpc": "2.0", "id": 2, "result": {"tools": shipped_tools(), "pad": padding}}),
         ] + [(index, {"jsonrpc": "2.0", "id": index + 1, "result": {
             "content": [{"type": "text", "text": padding}],
             "structuredContent": {"available": True, "rows": [], "truncated": False},

@@ -226,7 +226,10 @@ pub(crate) struct CommandDispatchGuard(Arc<CommandRuntime>);
 
 impl Drop for CommandDispatchGuard {
     fn drop(&mut self) {
-        let mut tasks = self.0.tasks.lock().expect("command task scope");
+        let mut tasks = two_bot_core::metrics::recover_drop_poison(
+            self.0.tasks.lock(),
+            "command_dispatch_guard",
+        );
         tasks.stopped = true;
         for lane in &mut tasks.lanes {
             for handle in lane.drain(..) {
@@ -2141,7 +2144,7 @@ impl CommandRuntime {
     ) -> Result<bool, DiscordError> {
         let outcome = self
             .executor
-            .delete_message_confirmed(channel_id, message_id, ORPHAN_REASON)
+            .delete_message_with_absence_receipt(channel_id, message_id, ORPHAN_REASON)
             .await;
         if let Err(err) = &outcome {
             warn!(
@@ -2430,3 +2433,7 @@ pub(crate) fn publication_definitions(
         .map(Some)
         .map_err(|_| RegistrySyncError::Invalid)
 }
+
+#[cfg(test)]
+#[path = "command_runtime_poison_acceptance.rs"]
+mod dispatch_guard_poison_acceptance;

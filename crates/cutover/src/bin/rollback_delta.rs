@@ -4,8 +4,10 @@
 use two_bot_cutover::{
     cli::{open_db, Args},
     legacy_copy::options::guarded_target,
+    over_cap_message, read_string_capped,
     rollback_delta::{export_delta, file_writer, parse_since, report},
     rollback_import::{apply_import, import_plan, parse_import},
+    IntakeReadError,
 };
 
 const IMPORT_HELP: &str =
@@ -28,7 +30,9 @@ divergent: the first run that drops updates is reported with its table:key
 entries and exits 3 unless `--acknowledge-divergent` is passed. The check is
 primary-keyed inside a UTC-pinned transaction. A failed insert names its
 table and constraint for integrity violations; other server errors stay
-redacted. No migrations are applied.";
+redacted. No migrations are applied. Intake caps: the file must not exceed
+8 MiB and no single line may exceed 1 MiB (both refuse with exit 2 before
+any parse).";
 
 #[tokio::main]
 async fn main() {
@@ -128,9 +132,16 @@ async fn run_import(args: Args) -> i32 {
             return 2;
         }
     };
-    let contents = match std::fs::read_to_string(&file) {
+    let contents = match read_string_capped(&file) {
         Ok(contents) => contents,
-        Err(_) => {
+        Err(IntakeReadError::OverCap) => {
+            eprintln!(
+                "rollback-delta import: {}",
+                over_cap_message("rollback delta import file")
+            );
+            return 2;
+        }
+        Err(IntakeReadError::Unreadable(_)) => {
             eprintln!("rollback-delta import: cannot read import file '{file}'");
             return 2;
         }
@@ -333,6 +344,24 @@ mod tests {
             run_import(args(&["import", "--file", missing.as_str()])).await,
             2
         );
+    }
+
+    #[tokio::test]
+    async fn over_cap_file_refuses_before_parsing() {
+        // One byte past the cap, otherwise shaped to sail through every
+        // later check, so only the size enforcement can refuse it.
+        let line = "{\"table\":\"events\",\"row\":{\"id\":1}}\n";
+        let repeats = two_bot_cutover::INTAKE_CAP_BYTES / line.len() + 1;
+        let contents = line.repeat(repeats);
+        assert!(contents.len() > two_bot_cutover::INTAKE_CAP_BYTES);
+        let file = scratch_path("over-cap");
+        std::fs::write(&file, &contents).unwrap();
+        let path = file.to_string_lossy().into_owned();
+        assert_eq!(
+            run_import(args(&["import", "--file", path.as_str()])).await,
+            2
+        );
+        let _ = std::fs::remove_file(&file);
     }
 
     #[tokio::test]

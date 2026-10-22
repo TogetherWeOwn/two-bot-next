@@ -1,0 +1,46 @@
+{
+  "purpose": "Protected, tests-only schema-gate plan-binding acceptance handoff; not a standalone merge candidate",
+  "base_sha": "1f939869073cb0ced2e5d03b85e1177a8c85175d",
+  "public_branch": "test/schema-gate-plan-binding-acceptance",
+  "protected_files": [
+    {
+      "path": "scripts/ci/test_schema_gate_plan_binding_acceptance.py",
+      "sha256": "22d1e417b27646bf9dc42b013f416ad9ecf6a80f5b91884b7d1084e17b5ea095"
+    }
+  ],
+  "focused_command": "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_schema_gate_plan_binding_acceptance.py' -v",
+  "existing_suite_commands": [
+    "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_staging_schema_gate.py' -v",
+    "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_production_schema_gate.py' -v"
+  ],
+  "registration": "Existing check.yml unittest discovery of scripts/ci/test_*.py; no workflow changes",
+  "boundary": "Real gate __main__ entry points via runpy, isolated environment, real temporary artifact I/O; only subprocess.run is mocked",
+  "terminal_contract": {
+    "location": "last nonempty stdout line",
+    "encoding": "single-line JSON object",
+    "required_fields": ["verdict", "code", "next_action"],
+    "verdicts": ["clean", "drift", "refused", "error"],
+    "code": "stable lower_snake_case token; exact vocabulary chosen and documented by Builder",
+    "next_action": "nonempty stable remediation, independent of rejected values and exception text",
+    "failure_classes": ["nonzero_subprocess", "subprocess_execution", "malformed_output", "artifact_io"],
+    "refusal_artifacts": "absent or valid JSON with explicit failed/refused/error verdict or status; never a raw apparently clean report"
+  },
+  "observed_baseline": {
+    "focused_exit": 1,
+    "test_methods": 19,
+    "passing_control_methods": 6,
+    "failing_subtests": 164,
+    "test_runner_errors": 0,
+    "staging_existing_tests": "35/35 passed",
+    "production_existing_tests": "49/49 passed",
+    "cause": "Behavioral assertions: unbound reports accepted, invalid artifacts saved, missing terminal machine results, raw stderr/exception disclosure; not compile/cache/infrastructure refusal"
+  },
+  "builder_contract": [
+    "Consume the published immutable handoff commit; preserve protected test bytes. Acceptance fixes remain with the test author.",
+    "Implement only the existing read-only evidence validation; preserve runner_version=1 and the Rust report shape. No new schema-version field, apply authority, bypass or waiver.",
+    "Update the pre-existing minimal-success gate fixtures to complete producer-shaped reports; retain both migration-chain checks, connection warnings and existing recovery exemptions.",
+    "Update concise gate contracts in docs/runbook.md and docs/production-deploy.md, including the terminal code vocabulary and remediation.",
+    "Own the combined passing PR, exact-head required CI, independent review and auto-merge. Do not merge the RED tests-only head."
+  ],
+  "not_run": ["Cargo compilation or workspace tests", "network or database checks", "live dispatch/deploy/apply", "required GitHub CI or independent review on the intentionally RED tests-only branch"]
+}

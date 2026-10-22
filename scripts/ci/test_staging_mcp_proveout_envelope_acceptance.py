@@ -72,6 +72,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import staging_mcp_proveout as proveout
+from scripts.ci.test_staging_mcp_proveout import shipped_tools
 
 BEARER = "test-bearer-envelope-acceptance-0000"
 EXPECT_FENCE_ENV = "STAGING_MCP_EXPECT_FENCE"
@@ -104,7 +105,7 @@ def valid_envelope(kind, rpc_id):
     if kind == "tools/list":
         return 200, headers, json.dumps({
             "jsonrpc": "2.0", "id": rpc_id,
-            "result": {"tools": [{"name": n} for n in proveout.EXPECTED_TOOLS]},
+            "result": {"tools": shipped_tools()},
         })
     if kind.startswith("tools/call "):
         tool = kind.split(" ", 1)[1]
@@ -312,7 +313,7 @@ class EnvelopeFramingTests(ProofContractHelpers):
                 elif index == 1:
                     envelope = {
                         "jsonrpc": "2.0", "id": rpc_id,
-                        "result": {"tools": [{"name": n} for n in proveout.EXPECTED_TOOLS]},
+                        "result": {"tools": shipped_tools()},
                         "error": {"code": -32603, "message": "x"},
                     }
                 else:
