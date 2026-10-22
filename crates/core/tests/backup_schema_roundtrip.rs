@@ -1461,10 +1461,10 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v11-source.ndjson.gz");
+    let current_path = directory.path("v12-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 11);
+    assert_eq!(old.manifest.version, 12);
     for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -1510,18 +1510,20 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v11-source.ndjson.gz");
+    let current_path = directory.path("v12-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 11);
-    let rows = old.buffers.remove("scheduled_events_claim").unwrap();
-    assert!(
-        !rows.is_empty(),
-        "fixture must populate newer scheduled_events_claim"
-    );
-    old.manifest
-        .tables
-        .retain(|table| table.name != "scheduled_events_claim");
+    assert_eq!(old.manifest.version, 12);
+    for name in [
+        "scheduled_events_claim",
+        "scheduled_events_tombstone",
+        "event_voice_channels",
+        "event_voice_presence",
+    ] {
+        let rows = old.buffers.remove(name).unwrap();
+        assert!(!rows.is_empty(), "fixture must populate newer {name}");
+        old.manifest.tables.retain(|table| table.name != name);
+    }
     old.manifest.version = 9;
     old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
     let old_path = directory.path("pre-epoch-claim-v9.ndjson.gz");
@@ -1530,22 +1532,103 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     assert_eq!(inspected.manifest.version, 9);
     assert_eq!(
         inspected.manifest.missing_tables(),
-        ["scheduled_events_claim"]
+        [
+            "scheduled_events_claim",
+            "scheduled_events_tombstone",
+            "event_voice_channels",
+            "event_voice_presence"
+        ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
     forget_moderation_history(pool).await;
     let report = restore(pool, &old_path).await.unwrap();
     assert!(report.ok);
-    let count: i64 = sqlx::query_scalar(audited(format!(
-        "SELECT COUNT(*) FROM {}",
-        identifier("scheduled_events_claim")
-    )))
-    .fetch_one(pool)
-    .await
-    .unwrap();
+    for name in [
+        "scheduled_events_claim",
+        "scheduled_events_tombstone",
+        "event_voice_channels",
+        "event_voice_presence",
+    ] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(name)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "v9 restore clears newer {name} target rows");
+    }
+    let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(members > 0, "older covered data is restored, not discarded");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v10_archive_restores_and_clears_newer_tombstone() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    seed(pool).await;
+    let directory = ArchiveDirectory::new();
+    let current_path = directory.path("v12-source.ndjson.gz");
+    dump(pool, &current_path).await.unwrap();
+    let mut old = inspect(&current_path).unwrap();
+    assert_eq!(old.manifest.version, 12);
+    // Frozen claim-only v10 shape: the merged v10 writer carried the
+    // epoch-claim guard but predates the delete tombstones and the v12
+    // event voice pair.
+    for name in [
+        "scheduled_events_tombstone",
+        "event_voice_channels",
+        "event_voice_presence",
+    ] {
+        let rows = old.buffers.remove(name).unwrap();
+        assert!(!rows.is_empty(), "fixture must populate newer {name}");
+        old.manifest.tables.retain(|table| table.name != name);
+    }
+    old.manifest.version = 10;
+    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
+    let old_path = directory.path("pre-tombstone-v10.ndjson.gz");
+    write_archive(&old_path, &old);
+    let inspected = inspect(&old_path).expect("pre-change v10 archive remains readable");
+    assert_eq!(inspected.manifest.version, 10);
     assert_eq!(
-        count, 0,
-        "v9 restore clears newer scheduled_events_claim target rows"
+        inspected.manifest.missing_tables(),
+        [
+            "scheduled_events_tombstone",
+            "event_voice_channels",
+            "event_voice_presence"
+        ]
+    );
+    // This test deliberately replaces a reused isolated rehearsal target.
+    forget_moderation_history(pool).await;
+    let report = restore(pool, &old_path).await.unwrap();
+    assert!(report.ok);
+    for name in [
+        "scheduled_events_tombstone",
+        "event_voice_channels",
+        "event_voice_presence",
+    ] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(name)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "v10 restore clears newer {name} target rows");
+    }
+    let claims: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scheduled_events_claim")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(
+        claims > 0,
+        "the v10 epoch-claim guard is restored, not discarded"
     );
     let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
         .fetch_one(pool)
@@ -1556,28 +1639,28 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
 }
 
 #[tokio::test]
-async fn v10_archive_restores_and_clears_newer_event_voice() {
+async fn v11_archive_restores_and_clears_newer_event_voice() {
     let Some(db) = database().await else {
         return;
     };
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v11-source.ndjson.gz");
+    let current_path = directory.path("v12-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 11);
+    assert_eq!(old.manifest.version, 12);
     for table in ["event_voice_channels", "event_voice_presence"] {
         let rows = old.buffers.remove(table).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {table}");
         old.manifest.tables.retain(|info| info.name != table);
     }
-    old.manifest.version = 10;
+    old.manifest.version = 11;
     old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
-    let old_path = directory.path("pre-event-voice-v10.ndjson.gz");
+    let old_path = directory.path("pre-event-voice-v11.ndjson.gz");
     write_archive(&old_path, &old);
-    let inspected = inspect(&old_path).expect("pre-change v10 archive remains readable");
-    assert_eq!(inspected.manifest.version, 10);
+    let inspected = inspect(&old_path).expect("pre-change v11 archive remains readable");
+    assert_eq!(inspected.manifest.version, 11);
     assert_eq!(
         inspected.manifest.missing_tables(),
         ["event_voice_channels", "event_voice_presence"]
@@ -1594,7 +1677,7 @@ async fn v10_archive_restores_and_clears_newer_event_voice() {
         .fetch_one(pool)
         .await
         .unwrap();
-        assert_eq!(count, 0, "v10 restore clears newer {table} target rows");
+        assert_eq!(count, 0, "v11 restore clears newer {table} target rows");
     }
     let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
         .fetch_one(pool)

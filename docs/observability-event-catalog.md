@@ -251,6 +251,21 @@ re-baseline, missing family is no window). Full semantics live in
 | --- | --- |
 | `two_bot_retention_replay_needed_total` | Skipped retention purges needing Operator replay: one per real guild removal whose purge-queue write hit the schema gap; successful queue writes and rejoin-cancel skips never increment it |
 
+## Drop-guard poison recovery series
+
+Labelled counter recorded by `recover_drop_poison` in
+`crates/core/src/metrics.rs` and rendered by `render` in the same file. Each
+poisoned drop counts once under its guard and logs one `drop guard recovered
+a poisoned lock` warn carrying the guard name; the drop still releases its
+state from the recovered guard. Unknown guards collapse to the trailing
+`in_flight_guard` slot, and no panic payload, ID, token or body content ever
+becomes a label. Manual check, not an alert input: consumed by no alert rule.
+Full semantics live in `docs/metrics.md`.
+
+| Series | Meaning |
+| --- | --- |
+| `two_bot_drop_poison_total{guard}` | Poisoned locks recovered by drop guards instead of panicking inside `drop`; `guard` is `command_dispatch_guard`, `schedule_run`, `user_slot` or `in_flight_guard`. Any increase is a fault worth a look in the container logs |
+
 ## Scheduled job labels
 
 Each label owns independent `two_bot_job_runs_total{job,outcome}`,
@@ -309,6 +324,9 @@ is the single shared spelling also pinned in `evidence.rs`
 | `gateway_reconnect_flapping` | `two_bot_gateway_reconnects_total` (required scrape input) | Pages when successful transport reconnections rise in 3 consecutive samples; single blips stay log-only, a flat window or counter reset clears, the first sample is baseline-only, missing/invalid samples hold a firing page |
 | `handler_duration_saturated` | `two_bot_handler_duration_seconds_bucket{le}` (required scrape input; `_sum`/`_count` stay unconsumed passthrough) | Ticket, not page: window p99 past 1 s (past-bound share above 1% with at least 10 completions and 2 slow) in 3 consecutive windows; a judged-quiet window or counter reset clears, the first sample is baseline-only, missing/invalid samples drop the baseline and hold a firing ticket; routine quantile movement stays log-only in the query pack |
 | `job_failure_share` | `two_bot_job_runs_total{job,outcome}` for the fixed `JOBS` labels and `success`/`failure` outcomes (required scrape input) | Ticket, not page: per-job failures exceed 10% of recent runs with at least 10 runs and 2 failures in the judged window (sub-floor windows accumulate across consecutive valid samples); only a judged window at or below the line resolves, flat/sub-floor windows and missing/invalid samples hold, restarts rebaseline; co-firing with `job_consecutive_failures` means continuous outage, this ticket alone means intermittent sickness |
+| `rest_token_invalid` | `two_bot_rest_guard_token_invalid` | Pages on any valid sample reading 1: the bot-token latch is set only by a bot-authenticated 401 and defaults to 0 at boot, so a 1 is never a boot artifact and the first valid sample may fire; a valid 0 (only a new process without the latch) resolves, missing/invalid samples hold the page; the latch is an optional scrape input, so older containers hold the previous state |
+| `rest_refusal_surge` | `two_bot_rest_guard_invalid_requests_total` plus `two_bot_rest_guard_rejected_requests_total` | Pages when the combined invalid-observation and local-refusal growth reaches 10+ between two consecutive valid samples; either family can surge alone and both burn the same IP-invalid budget toward the breaker trip; the first valid sample only stores a baseline, a backwards counter re-baselines only that family and contributes no growth for the window while the other family's growth is still judged (a one-step drop on invalid is a 429 scope retraction, not a restart), below-threshold windows resolve, and missing/invalid samples keep the baseline and hold a firing page; both counters are optional scrape inputs, so older containers hold the previous state |
+| `rest_global_responses_stuck` | `two_bot_rest_guard_pending_global_responses` | Pages when the pending global-body count stays nonzero for 3 consecutive valid samples (a pending body holds admission even at zero remaining, and the 5 s body deadline makes three stuck samples 24-36x past the expected drain); a valid zero resolves, missing/invalid samples and failed scrapes break the streak but preserve a firing page; the gauge is an optional scrape input, so older containers reset the streak while retaining a firing page; the paused/remaining gauges stay out of this rule by design (a live deadline is healthy backpressure and the countdown cannot wedge) |
 
 Deliberately unwatched: `two_bot_rest_guard_breaker_closes_total`. A close is
 the 600 s invalid-request window cooling below threshold after a trip — pure

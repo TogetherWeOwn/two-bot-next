@@ -65,7 +65,8 @@ pub(crate) struct UserSlot {
 
 impl Drop for UserSlot {
     fn drop(&mut self) {
-        let mut counts = self.counts.lock().expect("user slot counts");
+        let mut counts =
+            two_bot_core::metrics::recover_drop_poison(self.counts.lock(), "user_slot");
         if let Some(held) = counts.get_mut(&self.user) {
             *held -= 1;
             if *held == 0 {
@@ -318,3 +319,7 @@ mod tests {
         assert_eq!(slots.tracked_users(), 0, "counts never grow unbounded");
     }
 }
+
+#[cfg(test)]
+#[path = "interaction_admission_poison_acceptance.rs"]
+mod slot_poison_acceptance;

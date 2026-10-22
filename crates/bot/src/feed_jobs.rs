@@ -168,7 +168,7 @@ fn parse_fetched(
 struct ScheduleRun(Arc<Mutex<FeedPollSchedule>>);
 impl Drop for ScheduleRun {
     fn drop(&mut self) {
-        self.0.lock().expect("feed schedule").finish();
+        two_bot_core::metrics::recover_drop_poison(self.0.lock(), "schedule_run").finish();
     }
 }
 
@@ -705,3 +705,7 @@ async fn audit(
 #[cfg(test)]
 #[path = "feed_jobs_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "feed_jobs_poison_acceptance.rs"]
+mod schedule_poison_acceptance;
