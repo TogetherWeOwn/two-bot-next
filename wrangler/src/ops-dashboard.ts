@@ -139,15 +139,27 @@ All changes go through their own API routes.</p>
 </section>
 <section id="summary"><p class="muted">No data yet.</p></section>
 <script>
+const POLL_MS = 15000;
+const POLL_DEADLINE_MS = 10000;
+const FRESH_MS = 30000;
 let timer = null;
-// Connection-generation + request-order guard: every poll captures its
-// generation and sequence number, and a completion that is obsolete (a
-// Disconnect or reconnect moved the generation on) or older than an
-// already-applied result in the same generation never touches the DOM.
-// Bounded O(1) counters only; no credential is stored, logged or rendered.
+let freshnessTimer = null;
+let activePoll = null;
+let lastObserved = null;
+// Generation/order fences remain authoritative even if a transport ignores
+// abort. One active attempt owns one deadline across both headers and body.
 let connectGen = 0;
 let pollSeq = 0;
 let lastAppliedSeq = 0;
+function clearFreshness() {
+  if (freshnessTimer !== null) clearTimeout(freshnessTimer);
+  freshnessTimer = null;
+}
+function unavailable(message) {
+  clearFreshness();
+  document.getElementById("summary").innerHTML = '<p class="bad">' + esc(message) + '</p>'
+    + '<p class="muted">' + (lastObserved ? 'Last observed ' + esc(lastObserved) + '.' : 'No observation yet.') + '</p>';
+}
 function creds() {
   return {
     id: document.getElementById("clientId").value,
@@ -155,65 +167,93 @@ function creds() {
   };
 }
 async function poll() {
+  if (activePoll) activePoll.cancel();
   const gen = connectGen;
   const seq = ++pollSeq;
-  const { id, secret } = creds();
-  const el = document.getElementById("summary");
-  const status = document.getElementById("status");
-  // A stale completion leaves the DOM untouched, however it finishes.
+  const controller = new AbortController();
+  let release;
+  const cancelled = new Promise((resolve) => { release = resolve; });
+  const attempt = {
+    retired: false,
+    cancel() {
+      attempt.retired = true;
+      clearTimeout(deadline);
+      controller.abort();
+      release(null);
+      if (activePoll === attempt) activePoll = null;
+    },
+  };
   function obsolete() {
-    return gen !== connectGen || seq <= lastAppliedSeq;
+    return attempt.retired || gen !== connectGen || seq <= lastAppliedSeq;
   }
-  let res;
+  const status = document.getElementById("status");
+  const deadline = setTimeout(() => {
+    if (!obsolete()) {
+      lastAppliedSeq = seq;
+      status.textContent = "summary timed out";
+      unavailable("Summary unavailable: request timed out. Wait for automatic retry or reconnect.");
+    }
+    attempt.cancel();
+  }, POLL_DEADLINE_MS);
+  activePoll = attempt;
+  // Race the entire read, not just fetch(). Cancellation releases the poll
+  // even when a non-cooperative promise never settles; the race observes any
+  // eventual rejection and the retired fence prevents late DOM writes.
+  async function read() {
+    const { id, secret } = creds();
+    let res;
+    try {
+      res = await fetch("/ops/summary", {
+        headers: { "cf-access-client-id": id, "cf-access-client-secret": secret },
+        signal: controller.signal,
+      });
+    } catch (e) {
+      return { failure: "fetch failed", message: "summary unavailable: fetch failed" };
+    }
+    if (obsolete()) return null;
+    const contentType = res.headers.get("content-type") || "";
+    const isReadinessJson = contentType.indexOf("application/json") !== -1
+      && (res.status === 200 || res.status === 503);
+    if (!isReadinessJson) {
+      return { failure: "summary " + res.status, message: "summary request failed: " + res.status };
+    }
+    try {
+      return { data: await res.json(), status: res.status };
+    } catch (e) {
+      return { failure: "summary " + res.status, message: "summary request failed: " + res.status };
+    }
+  }
   try {
-    res = await fetch("/ops/summary", {
-      headers: { "cf-access-client-id": id, "cf-access-client-secret": secret },
-    });
-  } catch (e) {
-    if (obsolete()) return;
+    const result = await Promise.race([read(), cancelled]);
+    if (!result || obsolete()) return;
+    if (result.failure) {
+      lastAppliedSeq = seq;
+      status.textContent = result.failure;
+      unavailable(result.message + ". Wait for automatic retry or check access credentials and reconnect.");
+      return;
+    }
+    let html;
+    try {
+      html = render(result.data, result.status);
+    } catch (e) {
+      lastAppliedSeq = seq;
+      status.textContent = "summary " + result.status;
+      unavailable("summary report invalid: " + result.status + ". Wait for retry or check the bot report.");
+      return;
+    }
     lastAppliedSeq = seq;
-    status.textContent = "fetch failed";
-    el.innerHTML = '<p class="bad">summary unavailable: fetch failed</p>';
-    return;
+    lastObserved = new Date().toISOString();
+    status.textContent = "updated " + lastObserved;
+    document.getElementById("summary").innerHTML = html;
+    clearFreshness();
+    freshnessTimer = setTimeout(() => {
+      if (gen !== connectGen || seq !== lastAppliedSeq) return;
+      status.textContent = "summary stale";
+      unavailable("Summary stale: observation expired. Wait for automatic retry or reconnect.");
+    }, FRESH_MS);
+  } finally {
+    attempt.cancel();
   }
-  const contentType = res.headers.get("content-type") || "";
-  const isReadinessJson = contentType.indexOf("application/json") !== -1
-    && (res.status === 200 || res.status === 503);
-  if (!isReadinessJson) {
-    if (obsolete()) return;
-    lastAppliedSeq = seq;
-    status.textContent = "summary " + res.status;
-    el.innerHTML = '<p class="bad">summary request failed: ' + res.status + '</p>';
-    return;
-  }
-  let data;
-  try {
-    data = await res.json();
-  } catch (e) {
-    if (obsolete()) return;
-    lastAppliedSeq = seq;
-    status.textContent = "summary " + res.status;
-    el.innerHTML = '<p class="bad">summary request failed: ' + res.status + '</p>';
-    return;
-  }
-  // Re-check after the second await: the body may arrive after Disconnect,
-  // reconnect, or a newer poll that already rendered.
-  if (obsolete()) return;
-  // Validate and render before stamping: a malformed report must replace the
-  // previous readiness with an explicit failure state instead of leaving a
-  // stale READY on screen as current. render throws on malformed shapes.
-  let html;
-  try {
-    html = render(data, res.status);
-  } catch (e) {
-    lastAppliedSeq = seq;
-    status.textContent = "summary " + res.status;
-    el.innerHTML = '<p class="bad">summary report invalid: ' + res.status + '</p>';
-    return;
-  }
-  lastAppliedSeq = seq;
-  status.textContent = "updated " + new Date().toISOString();
-  el.innerHTML = html;
 }
 function esc(s) {
   return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -276,23 +316,23 @@ function render(data, status) {
   return html;
 }
 document.getElementById("connect").addEventListener("click", () => {
-  if (timer) clearInterval(timer);
-  // A (re)connect opens a new generation with fresh ordering: pending
-  // polls from any previous generation can no longer write the DOM, and
-  // exactly one interval keeps polling.
+  if (timer !== null) clearInterval(timer);
   connectGen++;
   lastAppliedSeq = 0;
+  if (activePoll) activePoll.cancel();
+  document.getElementById("status").textContent = "connecting";
+  unavailable("Summary unavailable: connecting; prior observation is stale. Wait for a fresh report.");
   poll();
-  timer = setInterval(poll, 15000);
+  timer = setInterval(poll, POLL_MS);
 });
 document.getElementById("disconnect").addEventListener("click", () => {
-  if (timer) { clearInterval(timer); timer = null; }
-  // Invalidate pending polls so their late completions cannot overwrite
-  // the disconnected status; the status line below stays authoritative.
+  if (timer !== null) { clearInterval(timer); timer = null; }
   connectGen++;
+  if (activePoll) activePoll.cancel();
   document.getElementById("clientId").value = "";
   document.getElementById("clientSecret").value = "";
   document.getElementById("status").textContent = "disconnected";
+  unavailable("Summary disconnected: prior observation is stale. Enter credentials and Connect to refresh.");
 });
 </script>
 </body>
@@ -307,7 +347,7 @@ const DASHBOARD_CSP = [
   "base-uri 'none'",
   "form-action 'none'",
   "frame-ancestors 'none'",
-  "script-src 'sha256-sbPuAjAIyFmK05CEmJH0aG8J07NSV0pLMxptYsiWXQI='",
+  "script-src 'sha256-D3Mj7MW5UP9M3/Y0JBDkauGJcAjNdmVv3UbplE0tXLY='",
   "style-src 'sha256-XfBF+coe4Stt3RC6YIku87CPj/YAhk41yequAyR3nkA='",
 ].join("; ");
 

@@ -54,8 +54,9 @@ claim. Staging deploys from `main`; production deploys through the manual
 - [Configuration](docs/configuration.md): all catalog keys/classes, known parsed
   defaults and descriptions. Classes are legacy-catalog labels only: gateway
   boot reads a fixed set of process-environment keys, and the Container's
-  `guild_settings` poll (`crates/bot/src/website_jobs.rs:207`) publishes a
-  snapshot every 15 s through `settings_jobs::live`
+  `guild_settings` job (`crates/bot/src/website_jobs.rs:207`) polls every 15 s
+  and publishes a snapshot only when the revision or row count changes
+  (`crates/bot/src/settings_jobs.rs:146-160`), exposed through `settings_jobs::live`
   (`crates/bot/src/settings_jobs.rs:53`); the live-snapshot consumer table in
   the reference names every reader — automod, feed, audit, ticket, gateway
   classifier and voice — alongside the per-runtime store and per-event

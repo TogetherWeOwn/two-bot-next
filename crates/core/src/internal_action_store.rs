@@ -19,6 +19,11 @@ use crate::internal_actions::{
 /// process-local wall clock, so the durable mark lives in its own domain row.
 pub const NONCE_DB_CLOCK_DOMAIN: &str = "internal_nonce_db";
 
+// Operator `--list` page: the default rows per listing and the ceiling an
+// explicit `--limit` clamps to. The reconcile-event CLI documents both.
+pub const OPERATOR_LIST_DEFAULT_LIMIT: i64 = 25;
+pub const OPERATOR_LIST_MAX_LIMIT: i64 = 100;
+
 /// Public errors deliberately omit SQLx sources and all request/provider details.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum InternalStoreError {
@@ -715,6 +720,14 @@ impl InternalActionStore {
         Ok(())
     }
 
+    fn unknown_event_intent(row: &sqlx::postgres::PgRow) -> UnknownEventIntent {
+        UnknownEventIntent {
+            intent_id: row.try_get("intent_id").unwrap_or_default(),
+            action: row.try_get("action").unwrap_or_default(),
+            created_at_utc: row.try_get("created_at_utc").unwrap_or_default(),
+        }
+    }
+
     /// Read-only listing of `unknown` event intents for one guild, oldest
     /// first. Never migrates, never writes, never contacts Discord.
     pub async fn list_unknown_event_intents(
@@ -735,12 +748,51 @@ impl InternalActionStore {
         .fetch_all(&self.pool)
         .await?
         .into_iter()
-        .map(|row| UnknownEventIntent {
-            intent_id: row.try_get("intent_id").unwrap_or_default(),
-            action: row.try_get("action").unwrap_or_default(),
-            created_at_utc: row.try_get("created_at_utc").unwrap_or_default(),
-        })
+        .map(|row| Self::unknown_event_intent(&row))
         .collect())
+    }
+
+    /// Bounded operator page over the same unknown event intents
+    /// `list_unknown_event_intents` reports, oldest first: at most `limit`
+    /// rows plus the total fenced count so `--list` can print its truncation
+    /// receipt. The limit clamps to `OPERATOR_LIST_MAX_LIMIT`. Never migrates,
+    /// never writes, never contacts Discord.
+    pub async fn list_unknown_event_intents_limited(
+        &self,
+        guild_id: &str,
+        limit: i64,
+    ) -> Result<(Vec<UnknownEventIntent>, i64), InternalStoreError> {
+        if !is_snowflake(guild_id) {
+            return Err(InternalStoreError::InvalidInput);
+        }
+        // Page before counting, against the same WHERE clause: a row arriving
+        // between the two reads then prints a (converging) receipt instead of
+        // hiding behind a stale count, while a row resolved between them only
+        // stales already-shown rows — and the resolution re-checks its exact
+        // row under lock before writing.
+        let rows: Vec<UnknownEventIntent> = sqlx::query(
+            "SELECT intent_id, action, \
+             to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at_utc \
+             FROM internal_idempotency \
+             WHERE state = 'unknown' AND action IN ('event.upsert', 'event.cancel') \
+             AND guild_id = $1 ORDER BY intent_id LIMIT $2",
+        )
+        .bind(guild_id)
+        .bind(limit.clamp(0, OPERATOR_LIST_MAX_LIMIT))
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| Self::unknown_event_intent(&row))
+        .collect();
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM internal_idempotency \
+             WHERE state = 'unknown' AND action IN ('event.upsert', 'event.cancel') \
+             AND guild_id = $1",
+        )
+        .bind(guild_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((rows, total))
     }
 
     /// Operator resolution of one exact unknown event intent, in a single

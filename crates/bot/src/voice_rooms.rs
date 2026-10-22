@@ -872,6 +872,62 @@ mod voice_actor_load_backoff_tests {
     }
 }
 
+/// Delay before retrying actor initialization after `failed_attempts`
+/// consecutive failures (1-based) with full jitter: a deterministic draw in
+/// `[1 ms, voice_actor_load_backoff(failed_attempts)]`, so guild actors
+/// retrying the same store outage spread instead of waking in lockstep. The
+/// deterministic helper stays as the bound (the 1 s → 60 s progression and
+/// its cap hold by construction); the same `seed` replays the same sample,
+/// so tests pin ranges without a clock or RNG. Production seeds by guild id:
+/// stable per guild, spread across guilds.
+#[must_use]
+pub fn voice_actor_load_backoff_jittered(failed_attempts: u32, seed: u64) -> Duration {
+    let base_ms = voice_actor_load_backoff(failed_attempts)
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    Duration::from_millis(
+        1 + (crate::gateway_backoff::jitter_stream(seed, failed_attempts) % base_ms),
+    )
+}
+
+#[cfg(test)]
+mod voice_actor_load_backoff_jittered_tests {
+    use super::{voice_actor_load_backoff, voice_actor_load_backoff_jittered, Duration};
+
+    #[test]
+    fn jittered_backoff_stays_within_the_deterministic_progression() {
+        for failed_attempts in 1..=6u32 {
+            let base = voice_actor_load_backoff(failed_attempts);
+            for seed in 0..8u64 {
+                let sample = voice_actor_load_backoff_jittered(failed_attempts, seed);
+                assert!(
+                    sample >= Duration::from_millis(1) && sample <= base,
+                    "failures {failed_attempts} seed {seed}: {sample:?} outside [1 ms, {base:?}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn jittered_backoff_spreads_guild_retries_and_replays_per_seed() {
+        use std::collections::HashSet;
+        // Three consecutive failures have a 4 s base: after a store outage
+        // every guild actor retries in lockstep today.
+        let distinct: HashSet<Duration> = (0..32u64)
+            .map(|seed| voice_actor_load_backoff_jittered(3, seed))
+            .collect();
+        assert!(
+            distinct.len() >= 8,
+            "only {} distinct delays across 32 seeds",
+            distinct.len()
+        );
+        assert_eq!(
+            voice_actor_load_backoff_jittered(3, 42),
+            voice_actor_load_backoff_jittered(3, 42)
+        );
+    }
+}
+
 /// A failed `GuildRoomWorker::load` must not silently drop the guild actor:
 /// count it and warn (throttled). Transient failures retry in place with
 /// capped backoff (see [`voice_actor_load_backoff`]); a credential refusal
@@ -1953,10 +2009,7 @@ impl LiveGuild {
     #[must_use]
     pub fn not_ready_secs(&self, now: tokio::time::Instant) -> u64 {
         let live = self.read_state();
-        match live.not_ready_since {
-            Some(since) if !live.ready => now.saturating_duration_since(since).as_secs(),
-            _ => 0,
-        }
+        snapshot_not_ready_age_secs(live.not_ready_since, live.ready, now)
     }
 
     /// V10 health check: the bot's missing Manage Channels, Move Members,
@@ -2968,6 +3021,7 @@ pub struct GuildRoomWorker<S, H> {
     /// button carries only that ID; guild, room and target come from here, never
     /// from the payload.
     vote_refs: HashMap<Snowflake, VoteKickRef>,
+    kick_ballots: HashMap<Snowflake, kick_ballots::KickBallot>,
     active_votes: Vec<VoteKickRef>,
     /// Who started each vote this session, by vote ID. The vote core binds the
     /// target but not the initiator, and every audit row names both.
@@ -3276,6 +3330,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             halted_by_discord: false,
             votes: VoteKickCore::new(),
             vote_refs: HashMap::new(),
+            kick_ballots: HashMap::new(),
             active_votes: Vec::new(),
             vote_initiators: HashMap::new(),
             fenced_initiators: HashSet::new(),
@@ -4518,6 +4573,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// result once, and queue the room-scoped enforcement exactly once (the
     /// core emits the decision only on the first transition to passed).
     fn settle_vote(&mut self, update: VoteKickUpdate) -> VoteKickUpdate {
+        self.kick_ballots
+            .entry(update.vote.id)
+            .or_insert_with(|| kick_ballots::KickBallot::new(update))
+            .update = update;
         if update.status != VoteKickStatus::Active {
             // A finished vote answers later ballots with its terminal status;
             // only the pass that still held it active records the result.
@@ -4572,10 +4631,15 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         self.vote_refs.remove(&vote_id);
         if self.queue.has_queued_kick(vote_id)
             || self.active_votes.iter().any(|vote| vote.id == vote_id)
+            || self
+                .kick_ballots
+                .get(&vote_id)
+                .is_some_and(kick_ballots::KickBallot::pending)
         {
             self.fenced_initiators.insert(vote_id);
         } else {
             self.vote_initiators.remove(&vote_id);
+            self.kick_ballots.remove(&vote_id);
         }
     }
 
@@ -4594,11 +4658,16 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .filter(|vote_id| {
                 !self.queue.has_queued_kick(*vote_id)
                     && !self.active_votes.iter().any(|vote| vote.id == *vote_id)
+                    && !self
+                        .kick_ballots
+                        .get(vote_id)
+                        .is_some_and(kick_ballots::KickBallot::pending)
             })
             .collect();
         for vote_id in released {
             self.fenced_initiators.remove(&vote_id);
             self.vote_initiators.remove(&vote_id);
+            self.kick_ballots.remove(&vote_id);
         }
         for evicted in self.votes.drain_evicted() {
             self.forget_vote_maps(evicted);
@@ -4641,6 +4710,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             None,
         ));
         metrics::global().voice_vote_kick(outcome.as_str());
+        self.correct_kick_ballot(vote_id, outcome);
     }
 
     /// Append buffered audit rows, one batch per call. Driven by the actor's
@@ -4868,6 +4938,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             };
             let update = self.settle_vote(update);
             if update.status != VoteKickStatus::Active {
+                self.enqueue_kick_ballot(update);
                 finished.push(update);
             }
         }
@@ -5449,6 +5520,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             // write is due and the guild is not rate limited.
             if self.queue.backed_off(self.live.guild_id, now_ms) {
                 return false;
+            }
+            if self.dispatch_kick_ballot(now_ms).await {
+                return true;
             }
             return self.dispatch_voice_status(now_ms).await;
         };
@@ -7271,7 +7345,12 @@ enum ActorCommand {
         vote_id: Snowflake,
         voter_id: Snowflake,
         ballot: VoteBallot,
-        reply: oneshot::Sender<KickReply>,
+        reply: oneshot::Sender<Result<InteractionResponse, KickRefusal>>,
+    },
+    /// Bind the public callback message after its send, retaining no token.
+    KickMessage {
+        vote_id: Snowflake,
+        message: MessageRef,
     },
     /// V4: resolve the tracked room a member is currently in, if any. The
     /// shared router uses this to tell vote-kick targets (voice owns the
@@ -8041,7 +8120,7 @@ where
         vote_id: Snowflake,
         voter_id: Snowflake,
         ballot: VoteBallot,
-    ) -> Option<KickReply> {
+    ) -> Option<Result<InteractionResponse, KickRefusal>> {
         let actor = self.live_actor(guild)?;
         let (reply, inbox) = oneshot::channel();
         actor
@@ -8054,6 +8133,23 @@ where
             })
             .ok()?;
         inbox.await.ok()
+    }
+
+    fn kick_message(&self, guild: Snowflake, vote_id: Snowflake, message: MessageRef) -> bool {
+        let queued = self.live_actor(guild).is_some_and(|actor| {
+            actor
+                .tx
+                .send(ActorCommand::KickMessage { vote_id, message })
+                .is_ok()
+        });
+        if !queued {
+            warn!(
+                guild = guild.to_string(),
+                vote_id = vote_id.to_string(),
+                "voice ballot reference not queued: actor unavailable"
+            );
+        }
+        queued
     }
 
     /// Resolve the tracked room a member is currently in, if any. `None`
@@ -8272,7 +8368,17 @@ where
         // Clear before invalidating the views so a concurrent dispatch
         // cannot heal a view this transport loss is about to invalidate.
         self.gateway_connected.store(false, Ordering::Release);
-        for actor in self.actors.lock().expect("voice runtime lock").values() {
+        // Drop-reachable (`VoiceConnectionGuard::drop` via `VoiceEventSink`)
+        // and shared with live disconnects: recover silently so a poisoned
+        // registry still invalidates its views instead of panicking during
+        // unwinding. No counter: non-drop callers must never be miscounted
+        // as drop poison.
+        for actor in self
+            .actors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+        {
             actor.live.transport_lost();
         }
         // Game-activity wiring: transport loss invalidates live voice state,
@@ -8581,8 +8687,8 @@ where
 /// brief database outage during `GuildCreate` no longer leaves the guild
 /// actorless until the next snapshot. Bounds: each attempt is abandoned
 /// after [`VOICE_ACTOR_LOAD_ATTEMPT_TIMEOUT`] (the load is reads only, so
-/// abandoning it replays nothing), consecutive failures wait
-/// [`voice_actor_load_backoff`] between attempts, and the same single
+/// abandoning it replays nothing), consecutive failures wait the guild-seeded
+/// [`voice_actor_load_backoff_jittered`] between attempts, and the same single
 /// spawned task owns every attempt — retries never spawn a second actor.
 ///
 /// While a load attempt is in flight, every inbox command waits in order
@@ -8661,7 +8767,9 @@ async fn load_actor_worker<S: RoomPersistence, H: RoomWrites>(
         // instead of hanging across the backoff window. State stays queued.
         purge_unanswerable_buffered(&mut buffered);
         failed_attempts = failed_attempts.saturating_add(1);
-        let wait = tokio::time::sleep(voice_actor_load_backoff(failed_attempts));
+        // Jittered by guild id: after a store outage every guild actor
+        // wakes from the same deterministic backoff in lockstep.
+        let wait = tokio::time::sleep(voice_actor_load_backoff_jittered(failed_attempts, guild_id));
         tokio::pin!(wait);
         loop {
             tokio::select! {
@@ -8674,6 +8782,18 @@ async fn load_actor_worker<S: RoomPersistence, H: RoomWrites>(
         }
     }
 }
+
+/// Fair-scheduling bound for the per-guild actor loop: at most this many
+/// consecutive inbox turns before a ready dispatch, timer or maintenance
+/// branch runs. The inbox branch is parked once the count is reached, so
+/// sustained benign churn cannot starve already-ready dispatch or due
+/// maintenance; the count resets on any timer or maintenance turn, or on
+/// a dispatch turn that neither progresses nor leaves maintenance due,
+/// while a progressing dispatch keeps the inbox parked so a create runs
+/// with its priority move. Exposed as the
+/// `two_bot_voice_actor_inbox_turn_bound` gauge; the inbox/dispatch turn
+/// counters beside it tell inbox activity apart from dispatch progress.
+const VOICE_ACTOR_MAX_CONSECUTIVE_INBOX_TURNS: u8 = 32;
 
 #[cfg(test)]
 async fn run_actor<S: RoomPersistence, H: RoomWrites + 'static>(
@@ -8743,6 +8863,35 @@ fn watchdog_due(
 /// keep climbing between merges instead of freezing at the merge-time zero.
 fn creator_map_age_secs(creators_merged_ms: Option<u64>, now_ms: u64) -> u64 {
     creators_merged_ms.map_or(0, |last| now_ms.saturating_sub(last) / 1000)
+}
+
+/// Queue age on the sibling's own clock: seconds since the snapshot's
+/// oldest first-enqueue stamp; 0 when the snapshot queue was empty. Pure,
+/// unit-tested: a frozen snapshot (hung dispatch) still yields a climbing
+/// age instead of the snapshot-time value.
+fn snapshot_queue_age_secs(
+    oldest_enqueued_at: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> u64 {
+    oldest_enqueued_at.map_or(0, |at| now.saturating_duration_since(at).as_secs())
+}
+
+/// Live-not-ready age on the sibling's own clock: seconds since the
+/// live view's not-ready-since stamp; 0 when the view is ready or the
+/// transport was down. Pure, unit-tested: the watchdog sibling reads the
+/// shared live view directly (the gateway mutates it off the actor task),
+/// so a hung dispatch still yields a climbing age.
+/// [`LiveGuild::not_ready_secs`] delegates here so the sibling can never
+/// drift from main-task semantics.
+fn snapshot_not_ready_age_secs(
+    not_ready_since: Option<tokio::time::Instant>,
+    ready: bool,
+    now: tokio::time::Instant,
+) -> u64 {
+    match not_ready_since {
+        Some(since) if !ready => now.saturating_duration_since(since).as_secs(),
+        _ => 0,
+    }
 }
 
 /// Process-wide guild-actor incarnation counter for the per-actor stall
@@ -8826,8 +8975,9 @@ fn publish_voice_gauges<S: RoomPersistence, H: RoomWrites>(
 
 /// Stall posture shared between the guild actor loop and its watchdog
 /// sibling. The main task owns `&mut worker` and refreshes the snapshot; the
-/// sibling only reads it, so the watchdog and the gauge publish keep running
-/// while a dispatch is hung inside an unbounded await. A hung dispatch still
+/// sibling only reads it (plus the shared live view), so the watchdog and
+/// the gauge publish keep running while a dispatch is hung inside an
+/// unbounded await. A hung dispatch still
 /// cannot answer inbox commands (the inbox consumer is the hung task) and
 /// still cannot recover the halt latch mid-hang: the sibling detects, the
 /// main task recovers once the write returns.
@@ -8841,6 +8991,13 @@ struct StallShared<H> {
     /// so no sibling publish can follow the contribution's removal.
     retired: AtomicBool,
     http: Arc<H>,
+    /// The actor's shared live view. The sibling reads readiness from this
+    /// directly instead of a snapshot copy, because the gateway mutates it
+    /// off the actor task (`publish` on GUILD_CREATE, `gateway_connected`
+    /// on READY/RESUMED) while a dispatch is hung: a copy would go stale
+    /// in both directions (false page after a republish, missed page after
+    /// a reconnect stamps a new not-ready clock).
+    live: LiveGuild,
     /// Actor start instant: the sibling computes the creator-map age from
     /// the stored merge stamp on this clock, so the age keeps climbing
     /// while the main task (and its snapshots) are hung in a dispatch.
@@ -8853,7 +9010,11 @@ struct StallState {
     last_progress: tokio::time::Instant,
     urgent: usize,
     deferred: usize,
-    oldest_age_secs: u64,
+    /// First-enqueue stamp (std clock, as the queue records it) of the
+    /// oldest action still queued at snapshot time; `None` when the queue
+    /// was empty. The sibling recomputes the age on its own clock, so a
+    /// frozen snapshot still yields a climbing age.
+    oldest_enqueued_at: Option<std::time::Instant>,
     halted: bool,
     creators_generation: u64,
     creators_merged_ms: Option<u64>,
@@ -8867,15 +9028,12 @@ impl<H: RoomWrites> StallShared<H> {
     ) {
         let guild = worker.live.guild_id;
         let (urgent, deferred) = worker.queue.pending_counts(guild);
-        let oldest_age_secs = worker
-            .queue
-            .oldest_pending_age(guild)
-            .map_or(0, |age| age.as_secs());
+        let oldest_enqueued_at = worker.queue.oldest_pending_at(guild);
         *self.state.lock().expect("stall snapshot lock") = StallState {
             last_progress,
             urgent,
             deferred,
-            oldest_age_secs,
+            oldest_enqueued_at,
             halted: worker.halted(),
             creators_generation: worker.creators_generation,
             creators_merged_ms: worker.creators_merged_ms,
@@ -8889,9 +9047,23 @@ impl<H: RoomWrites> StallShared<H> {
         creator_map_age_secs(snap.creators_merged_ms, now_ms)
     }
 
-    /// Watchdog + gauge publish from the shared snapshot. Reads only: safe
-    /// to run on the sibling task while the main task is hung in dispatch.
+    /// Watchdog + gauge publish from the shared snapshot and live view.
+    /// Reads only: safe to run on the sibling task while the main task is
+    /// hung in dispatch.
     fn observe(&self, stuck_after: Duration, last_fire: &mut Option<tokio::time::Instant>) {
+        // The queue age derives from the snapshot's first-enqueue stamp on
+        // this task's own clock, so a frozen snapshot (hung dispatch) still
+        // yields a climbing age. Readiness comes from the live view instead:
+        // the gateway mutates it off the actor task, so a snapshot copy
+        // would go stale in both directions (false page after a republish,
+        // missed page after a reconnect stamps a new not-ready clock). Read
+        // the live view before the snapshot lock.
+        let now = tokio::time::Instant::now();
+        let queue_now = std::time::Instant::now();
+        let (live_ready, not_ready_since) = {
+            let live = self.live.read_state();
+            (live.ready, live.not_ready_since)
+        };
         // Publish under the snapshot lock: the metric guard sets `retired`
         // under the same lock before removing this actor's contribution,
         // so a publish either lands before that removal or not at all.
@@ -8912,7 +9084,12 @@ impl<H: RoomWrites> StallShared<H> {
                 self.generation,
                 u64::try_from(snap.urgent).unwrap_or(u64::MAX),
                 u64::try_from(snap.deferred).unwrap_or(u64::MAX),
-                snap.oldest_age_secs,
+                snapshot_queue_age_secs(snap.oldest_enqueued_at, queue_now),
+            );
+            gauges.set_voice_actor_live_not_ready(
+                self.guild,
+                self.generation,
+                snapshot_not_ready_age_secs(not_ready_since, live_ready, now),
             );
             gauges.set_voice_creator_map(
                 snap.creators_generation,
@@ -8923,7 +9100,6 @@ impl<H: RoomWrites> StallShared<H> {
         // Stuck-worker watchdog: queued work with no completed turn for the
         // full window. Log + metric only; the queue keeps its retries so a
         // transient outage still drains on recovery.
-        let now = tokio::time::Instant::now();
         let fire_cooled =
             last_fire.is_none_or(|fired| now.saturating_duration_since(fired) >= stuck_after);
         if fire_cooled
@@ -8940,7 +9116,8 @@ impl<H: RoomWrites> StallShared<H> {
                 guild = self.guild.to_string(),
                 urgent = snap.urgent,
                 deferred = snap.deferred,
-                oldest_pending_age_secs = snap.oldest_age_secs,
+                oldest_pending_age_secs =
+                    snapshot_queue_age_secs(snap.oldest_enqueued_at, queue_now),
                 halted = snap.halted,
                 "voice worker stuck: queued actions with no progress"
             );
@@ -8972,6 +9149,7 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
     let mut dispatch_ready = false;
     let mut maintenance_ready = false;
     let mut dispatch_budget = 8u8;
+    let mut consecutive_inbox_turns = 0u8;
     let mut complete_join_pair = false;
     let mut last_progress = tokio::time::Instant::now();
     let mut last_halt_probe = tokio::time::Instant::now();
@@ -8983,18 +9161,21 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
         generation,
         retired: AtomicBool::new(false),
         http: Arc::clone(&worker.http),
+        live: worker.live.clone(),
         start,
         state: Mutex::new(StallState {
             last_progress,
             urgent: 0,
             deferred: 0,
-            oldest_age_secs: 0,
+            oldest_enqueued_at: None,
             halted: false,
             creators_generation: 0,
             creators_merged_ms: None,
         }),
     });
     stall.snapshot(worker, last_progress);
+    metrics::global()
+        .set_voice_actor_inbox_turn_bound(u64::from(VOICE_ACTOR_MAX_CONSECUTIVE_INBOX_TURNS));
     // Retires this incarnation's stall contribution on every exit path
     // (inbox close or panic unwind). Declared after `stall`, so it drops
     // while the strong ref is still alive and its retire fence can engage.
@@ -9036,6 +9217,7 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
             worker.revalidate_creator(ticket.creator_id).await;
         }
         let accepted = apply_command(worker, command, now_ms);
+        metrics::global().voice_actor_inbox_turn();
         if accepted {
             last_progress = tokio::time::Instant::now();
         }
@@ -9045,7 +9227,12 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
     loop {
         tokio::select! {
             biased;
-            command = inbox.recv() => {
+            // Fair scheduling: park the inbox once the consecutive-turn
+            // bound is reached so a ready dispatch, timer or maintenance
+            // branch runs instead. The count resets on any timer or
+            // maintenance turn, or on a no-op dispatch with none due; a
+            // progressing dispatch keeps the park (see below).
+            command = inbox.recv(), if consecutive_inbox_turns < VOICE_ACTOR_MAX_CONSECUTIVE_INBOX_TURNS => {
                 let Some(command) = command else { break };
                 let now_ms = start
                     .elapsed()
@@ -9058,6 +9245,8 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                     worker.revalidate_creator(ticket.creator_id).await;
                 }
                 let accepted = apply_command(worker, command, now_ms);
+                consecutive_inbox_turns = consecutive_inbox_turns.saturating_add(1);
+                metrics::global().voice_actor_inbox_turn();
                 if accepted {
                     last_progress = tokio::time::Instant::now();
                 }
@@ -9092,6 +9281,14 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                 dispatch_ready = progressed;
                 complete_join_pair = worker.moves.len() > pending_moves;
                 dispatch_budget = dispatch_budget.saturating_sub(1);
+                metrics::global().voice_actor_dispatch_turn();
+                // A progressing dispatch keeps the inbox parked so the drain
+                // finishes (a create runs with its priority move); a no-op
+                // turn yields back to the inbox unless maintenance is already
+                // due, in which case it runs next.
+                if !progressed && !maintenance_ready {
+                    consecutive_inbox_turns = 0;
+                }
             }
             _ = timer.tick() => {
                 let now_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
@@ -9162,6 +9359,7 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                 stall.snapshot(worker, last_progress);
                 dispatch_ready = true;
                 maintenance_ready = true;
+                consecutive_inbox_turns = 0;
             }
             // Never interpose maintenance SQL/notices between create and move.
             _ = std::future::ready(()), if maintenance_ready => {
@@ -9178,10 +9376,14 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                 worker.send_notices(now_ms).await;
                 worker.flush_kick_audit(now_ms).await;
                 dispatch_budget = 8;
+                consecutive_inbox_turns = 0;
             }
             // Yield after a bounded turn even when the next timer is not due.
             // A persisted creator move is allowed to finish the current pair.
             _ = tokio::task::yield_now(), if dispatch_ready => {
+                // Budget refill only, not a fairness turn: the inbox stays
+                // parked so the refilled dispatch runs next instead of
+                // starving behind new churn.
                 dispatch_budget = 8;
             }
         }
@@ -9314,7 +9516,13 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             ballot,
             reply,
         } => {
-            let _ = reply.send(worker.kick_cast(vote_id, voter_id, ballot, now_ms));
+            let response = worker
+                .kick_cast(vote_id, voter_id, ballot, now_ms)
+                .map(|update| worker.kick_ballot_response(&update));
+            let _ = reply.send(response);
+        }
+        ActorCommand::KickMessage { vote_id, message } => {
+            worker.bind_kick_message(vote_id, message);
         }
         ActorCommand::KickRoomOf { member, reply } => {
             let _ = reply.send(worker.kick_room_of(member));
@@ -12114,8 +12322,8 @@ where
                     ))
                     .await;
                 }
-                Some(Ok(update)) => {
-                    reply(vote_update_message(&update)).await;
+                Some(Ok(response)) => {
+                    reply(response).await;
                 }
                 Some(Err(refusal)) => {
                     reply(ephemeral_response(kick_refusal_text(&refusal))).await;
@@ -12914,9 +13122,27 @@ pub trait InteractionReplies: Send + Sync {
         interaction: &Interaction,
         response: InteractionResponse,
     ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
+    /// Read the public initial response after its callback, retaining only its
+    /// channel/message IDs. Writers without this capability leave no binding.
+    fn original_message(
+        &self,
+        interaction: &Interaction,
+    ) -> impl Future<Output = Result<Option<MessageRef>, RoomHttpError>> + Send {
+        let _ = interaction;
+        async { Ok(None) }
+    }
 }
 
 impl InteractionReplies for RoomHttp {
+    async fn original_message(
+        &self,
+        interaction: &Interaction,
+    ) -> Result<Option<MessageRef>, RoomHttpError> {
+        self.interaction_message(interaction.application_id, &interaction.token)
+            .await
+            .map(Some)
+    }
+
     async fn defer(&self, interaction: &Interaction) -> Result<(), RoomHttpError> {
         let response = InteractionResponse {
             kind: InteractionResponseType::DeferredChannelMessageWithSource,
@@ -13127,9 +13353,30 @@ where
             let response =
                 Self::capture_response(runtime, interaction, invite_code, inventory.as_ref()).await;
             if let Some(response) = response {
+                let updated = response.kind == InteractionResponseType::UpdateMessage;
                 if let Err(error) = replies.respond(interaction, response).await {
                     warn!(interaction_id = interaction.id.get().to_string(), %error,
                         "voice ballot response failed; not retried");
+                }
+                if updated {
+                    if let (
+                        Some(VoiceCommand::Ballot { vote_id, .. }),
+                        Some(guild),
+                        Some(message),
+                    ) = (
+                        runtime.parse_voice_command(interaction),
+                        interaction_guild(interaction),
+                        interaction.message.as_ref(),
+                    ) {
+                        runtime.kick_message(
+                            guild,
+                            vote_id,
+                            MessageRef {
+                                channel_id: message.channel_id.get(),
+                                message_id: message.id.get(),
+                            },
+                        );
+                    }
                 }
             }
             return;
@@ -13216,9 +13463,26 @@ where
         let Some(response) = Self::capture_response(runtime, interaction, None, None).await else {
             return false;
         };
+        let public_ballot = response.kind == InteractionResponseType::ChannelMessageWithSource
+            && response
+                .data
+                .as_ref()
+                .is_some_and(|data| data.components.is_some());
         if let Err(error) = replies.respond(interaction, response).await {
             warn!(interaction_id = interaction.id.get().to_string(), %error,
                 "voice vote response failed; not retried");
+        }
+        if public_ballot {
+            // Even an ambiguous callback may have posted the ballot. This GET
+            // cannot create a duplicate and tokens never enter worker state.
+            match replies.original_message(interaction).await {
+                Ok(Some(message)) => {
+                    runtime.kick_message(guild, interaction.id.get(), message);
+                }
+                Ok(None) => {}
+                Err(error) => warn!(interaction_id = interaction.id.get().to_string(), %error,
+                    "voice ballot reference unavailable; not retried"),
+            }
         }
         true
     }
@@ -13358,6 +13622,7 @@ where
 /// Public so the binary's voice boot can spawn [`flush_loop`](game_activity::flush_loop);
 /// the aggregates stay guild-level-only (never a per-member row, reader or view).
 pub mod game_activity;
+mod kick_ballots;
 #[path = "voice_rooms_limit.rs"]
 mod limit;
 mod presence;

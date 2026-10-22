@@ -509,15 +509,36 @@ class SyntheticAlertTests(unittest.TestCase):
         self.assertIn("not set", err.getvalue())
 
     def test_missing_probe_sample_and_non_transition_do_not_post(self):
-        for outcome, previous in (("skipped", []), ("failure", [])):
+        # A skipped probe is zero samples: fail closed (exit 1) with no post,
+        # distinct from a healthy pass. A lone failure below the two-failure
+        # threshold still decides no transition and stays green.
+        for outcome, previous, expected_code in (("skipped", [], 1), ("failure", [], 0)):
             env = {**self.base_env(), "PROBE_OUTCOME": outcome, "FORCE_FAIL": "false"}
             with self.subTest(outcome=outcome), mock.patch.dict(os.environ, env, clear=True), \
                     redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()), \
                     mock.patch.object(alert, "previous_probe_outcomes", return_value=previous), \
                     mock.patch.object(alert, "post") as post:
                 code = alert.main(["--env", "staging", "--evidence", self.evidence])
-            self.assertEqual(code, 0)
+            self.assertEqual(code, expected_code)
             post.assert_not_called()
+        # The live decide-step path fails the same way on zero samples while
+        # still writing the empty event that keeps the post step skipped, and
+        # without spending a history read on a non-sample.
+        with tempfile.NamedTemporaryFile(mode="w+", delete=False) as output:
+            output_path = output.name
+        try:
+            env = {**self.base_env(), "PROBE_OUTCOME": "skipped",
+                   "FORCE_FAIL": "false", "GITHUB_OUTPUT": output_path}
+            with mock.patch.dict(os.environ, env, clear=True), \
+                    redirect_stderr(io.StringIO()), \
+                    mock.patch.object(alert, "previous_probe_outcomes",
+                                      side_effect=AssertionError("no sample must not read history")):
+                code = alert.main(["--env", "staging", "--evidence", self.evidence,
+                                   "--decide-only"])
+            self.assertEqual(code, 1)
+            self.assertEqual(Path(output_path).read_text(), "event=\n")
+        finally:
+            Path(output_path).unlink(missing_ok=True)
 
     def test_history_error_does_not_suppress_failure_alert(self):
         out, err = io.StringIO(), io.StringIO()
@@ -641,6 +662,442 @@ class SyntheticAlertTests(unittest.TestCase):
         post.assert_called_once()
         self.assertIn("unknown", post.call_args.args[1])
         self.assertNotIn("Traceback", out.getvalue() + err.getvalue())
+
+
+class MalformedHistoryAcceptanceTests(unittest.TestCase):
+    """Protected, offline history-admission and decision contract.
+
+    Check: python3 -m unittest discover -s scripts -p test_synthetic_alert.py -v
+    Admission failures are HistoryError(code="history_unknown",
+    next_action="inspect_workflow_history"); diagnostics never echo remote data.
+    Optional --decide-only --json emits one bounded JSON object on stdout:
+    schema_version=1, check_id=synthetic-user-flow:<env>, run_id=<current run>,
+    event=alert|recovery|null, history_known=bool, code=history_unknown|decision_ready,
+    next_action=inspect_workflow_history|none. GITHUB_OUTPUT remains event=<value>.
+    No JSON opt-in changes posting, debounce, history bounds or checkpoint policy.
+    """
+
+    SENTINEL = "REMOTE_SECRET_SENTINEL_" + "untrusted-" * 512
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_SCRATCH_DIR"))
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        self.output = self.dir / "github-output"
+        for obj, name in ((urllib.request, "urlopen"),
+                          (urllib.request, "build_opener"), (alert, "post")):
+            guard = mock.patch.object(obj, name, side_effect=AssertionError(
+                "external transport or posting is forbidden in decide-only fixtures"))
+            guard.start()
+            self.addCleanup(guard.stop)
+
+    def env(self, current="failure"):
+        # No webhook or real credential is needed to decide an event.
+        return {"GITHUB_TOKEN": "offline-test-value", "GITHUB_REPOSITORY": "owner/repo",
+                "GITHUB_RUN_ID": "999", "RUN_ID": "999", "FORCE_FAIL": "false",
+                "PROBE_OUTCOME": current, "GITHUB_OUTPUT": str(self.output)}
+
+    def run_row(self, run_id=100, number=99):
+        return {"id": run_id, "run_number": number, "event": "schedule",
+                "status": "completed", "conclusion": "success"}
+
+    def run_page(self):
+        return {"total_count": 2, "workflow_runs": [self.run_row(999, 100), self.run_row()]}
+
+    def jobs_page(self, environment="staging", probe="success", delivery="skipped",
+                  decide="success", job=None):
+        return {"total_count": 1, "jobs": [{
+            "id": 200, "name": history.JOB_NAMES[environment], "status": "completed",
+            "conclusion": job or probe, "steps": [
+                {"number": 1, "name": history.PROBE_STEPS[environment],
+                 "status": "completed", "conclusion": probe},
+                {"number": 2, "name": history.DECIDE_STEPS[environment],
+                 "status": "completed", "conclusion": decide},
+                {"number": 3, "name": history.ALERT_STEPS[environment],
+                 "status": "completed", "conclusion": delivery},
+            ]}]}
+
+    def malformed_cases(self, environment="staging"):
+        """Independent one-field mutations of complete Actions-shaped controls."""
+        import copy
+
+        cases = []
+        for label, value in (("null", None), ("array", []), ("text", self.SENTINEL),
+                             ("boolean", True), ("integer", 7)):
+            cases.extend((("runs-root-" + label, value, self.jobs_page(environment)),
+                          ("jobs-root-" + label, self.run_page(), value)))
+        for label, value in (("missing", {}), ("null", None),
+                             ("object", {"poison": self.SENTINEL}),
+                             ("text", self.SENTINEL), ("member", [None])):
+            runs, jobs = self.run_page(), self.jobs_page(environment)
+            if label == "missing":
+                del runs["workflow_runs"]
+                del jobs["jobs"]
+            else:
+                runs["workflow_runs"], jobs["jobs"] = value, value
+            cases.extend((("runs-collection-" + label, runs, self.jobs_page(environment)),
+                          ("jobs-collection-" + label, self.run_page(), jobs)))
+        bad_numbers = (None, True, False, 0, -1, 1.5, 100.0, float("nan"),
+                       float("inf"), "100", self.SENTINEL, [], {})
+        for field in ("id", "run_number"):
+            for index, value in enumerate(bad_numbers):
+                runs = self.run_page()
+                runs["workflow_runs"][1][field] = value
+                cases.append((f"run-{field}-{index}", runs, self.jobs_page(environment)))
+            runs = self.run_page()
+            del runs["workflow_runs"][1][field]
+            cases.append(("run-missing-" + field, runs, self.jobs_page(environment)))
+        for root in ("runs", "jobs"):
+            for index, value in enumerate((None, True, -1, 1.5, "2", self.SENTINEL, [], {})):
+                runs, jobs = self.run_page(), self.jobs_page(environment)
+                (runs if root == "runs" else jobs)["total_count"] = value
+                cases.append((f"{root}-count-{index}", runs, jobs))
+            runs, jobs = self.run_page(), self.jobs_page(environment)
+            (runs if root == "runs" else jobs)["total_count"] = 0
+            cases.append((root + "-count-less-than-returned", runs, jobs))
+        for root, member in (("runs", "workflow_runs"), ("jobs", "jobs")):
+            for index, value in enumerate((None, self.SENTINEL, True, [])):
+                runs, jobs = self.run_page(), self.jobs_page(environment)
+                body = runs if root == "runs" else jobs
+                body[member].append(value)
+                body["total_count"] += 1
+                cases.append((f"{root}-mixed-member-{index}", runs, jobs))
+        for index, value in enumerate((None, True, 3, [], {})):
+            runs = self.run_page()
+            runs["workflow_runs"][1]["event"] = value
+            cases.append((f"run-event-{index}", runs, self.jobs_page(environment)))
+        jobs = self.jobs_page(environment)
+        jobs["total_count"] = 2
+        cases.append(("jobs-incomplete-count", self.run_page(), jobs))
+        runs = self.run_page()
+        runs["workflow_runs"].append(copy.deepcopy(runs["workflow_runs"][1]))
+        runs["total_count"] = 3
+        cases.append(("duplicate-run-id", runs, self.jobs_page(environment)))
+        runs = self.run_page()
+        runs["workflow_runs"].append(self.run_row(101, 99))
+        runs["total_count"] = 3
+        cases.append(("ambiguous-run-order", runs, self.jobs_page(environment)))
+        for label, value in (("null", None), ("text", self.SENTINEL),
+                             ("object", {}), ("boolean", False)):
+            jobs = self.jobs_page(environment)
+            jobs["jobs"][0]["steps"] = value
+            cases.append(("steps-collection-" + label, self.run_page(), jobs))
+        for label, value in (("null", None), ("text", self.SENTINEL), ("array", [])):
+            jobs = self.jobs_page(environment)
+            jobs["jobs"][0]["steps"].append(value)
+            cases.append(("step-member-" + label, self.run_page(), jobs))
+        for location in ("job", "probe", "decide", "alert"):
+            for index, value in enumerate((self.SENTINEL, True, 3, [], {})):
+                jobs = self.jobs_page(environment)
+                target = jobs["jobs"][0]
+                if location != "job":
+                    target = target["steps"][("probe", "decide", "alert").index(location)]
+                target["conclusion"] = value
+                cases.append((f"{location}-unsupported-conclusion-{index}", self.run_page(), jobs))
+            for index, value in enumerate((None, [], {}, 3)):
+                jobs = self.jobs_page(environment)
+                target = jobs["jobs"][0]
+                if location != "job":
+                    target = target["steps"][("probe", "decide", "alert").index(location)]
+                target["name"] = value
+                cases.append((f"{location}-malformed-name-{index}", self.run_page(), jobs))
+        # Identical duplicates are still ambiguous; a conflicting second match
+        # must not be ignored just because a plausible first match was found.
+        for location in ("job", "probe", "decide", "alert"):
+            for conflicting in (False, True):
+                for reverse in (False, True):
+                    jobs = self.jobs_page(environment)
+                    items = jobs["jobs"] if location == "job" else jobs["jobs"][0]["steps"]
+                    index = 0 if location == "job" else ("probe", "decide", "alert").index(location)
+                    duplicate = copy.deepcopy(items[index])
+                    if conflicting:
+                        duplicate["conclusion"] = "failure"
+                    items.append(duplicate)
+                    if location == "job":
+                        jobs["total_count"] = 2
+                    if reverse:
+                        items.reverse()
+                    cases.append((f"duplicate-{location}-{conflicting}-{reverse}",
+                                  self.run_page(), jobs))
+        return cases
+
+    def reader(self, runs, jobs):
+        import copy
+        import re
+        from urllib.parse import urlparse, parse_qs
+
+        calls = []
+
+        def get(path, _token):
+            calls.append(path)
+            if "/actions/workflows/" in path:
+                # A malformed full first page must not be silently skipped.
+                page = int(parse_qs(urlparse(path).query).get("page", ["1"])[0])
+                return copy.deepcopy(runs if page == 1 else {"total_count": 2, "workflow_runs": []})
+            if not re.search(r"/actions/runs/(100|99)/jobs\?", path):
+                raise AssertionError("history constructed a jobs URL from an unadmitted ID")
+            return copy.deepcopy(jobs)
+
+        return get, calls
+
+    def assert_safe_history_error(self, operation):
+        try:
+            operation()
+        except history.HistoryError as error:
+            self.assertEqual(getattr(error, "code", None), "history_unknown")
+            self.assertEqual(getattr(error, "next_action", None), "inspect_workflow_history")
+            self.assertLessEqual(len(str(error)), 240)
+            self.assertIn("history", str(error).lower())
+            self.assertNotIn("REMOTE_SECRET_SENTINEL", str(error))
+            self.assertNotIn("untrusted-", str(error))
+            self.assertNotIn("Traceback", str(error))
+        except Exception as error:
+            self.fail(f"{type(error).__name__} escaped instead of a safe HistoryError")
+        else:
+            self.fail("malformed or ambiguous history was accepted as known history")
+
+    def invoke(self, get, current, environment="staging", json_mode=False):
+        self.output.unlink(missing_ok=True)
+        out, err = io.StringIO(), io.StringIO()
+        args = ["--env", environment, "--evidence", str(self.dir / "absent-evidence.json"),
+                "--decide-only"] + (["--json"] if json_mode else [])
+        with mock.patch.dict(os.environ, self.env(current), clear=True), \
+                mock.patch.object(history, "_get", side_effect=get), \
+                redirect_stdout(out), redirect_stderr(err):
+            try:
+                code = alert.main(args)
+            except (Exception, SystemExit) as error:
+                self.fail(f"decide-only escaped {type(error).__name__} instead of returning a decision")
+        stdout, stderr = out.getvalue(), err.getvalue()
+        for text in (stdout, stderr):
+            self.assertNotIn("REMOTE_SECRET_SENTINEL", text)
+            self.assertNotIn("untrusted-", text)
+            self.assertNotIn("offline-test-value", text)
+            self.assertNotIn("Traceback", text)
+            self.assertLessEqual(len(text.encode("utf-8")), 2048)
+        self.assertTrue(self.output.exists(), "decide-only lost its GITHUB_OUTPUT record")
+        return code, stdout, stderr, self.output.read_text()
+
+    def test_malformed_runs_are_refused_before_jobs_url_or_checkpoint(self):
+        for label, runs, jobs in self.malformed_cases():
+            if not label.startswith(("run", "duplicate-run", "ambiguous-run")):
+                continue
+            with self.subTest(case=label):
+                get, calls = self.reader(runs, jobs)
+                with mock.patch.object(history, "_get", side_effect=get):
+                    self.assert_safe_history_error(lambda: history.previous_probe_outcomes(
+                        self.env(), "staging"))
+                self.assertFalse(any("/jobs?" in path for path in calls),
+                                 "run-page admission must precede jobs fetches")
+
+    def test_malformed_jobs_and_ambiguous_steps_are_safe_history_errors(self):
+        for label, runs, jobs in self.malformed_cases():
+            if label.startswith(("run", "duplicate-run", "ambiguous-run")):
+                continue
+            with self.subTest(case=label):
+                get, _ = self.reader(runs, jobs)
+                with mock.patch.object(history, "_get", side_effect=get):
+                    self.assert_safe_history_error(lambda: history._run_outcome(
+                        "owner/repo", self.run_row(), "staging", "offline-test-value"))
+
+    def test_every_malformed_case_preserves_failed_and_healthy_decide_policy(self):
+        # Running the actual entry point catches raw exceptions that bypass the
+        # HistoryError policy, not merely parsers that reject a fixture in isolation.
+        for environment in ("staging", "prod"):
+            for label, runs, jobs in self.malformed_cases(environment):
+                for current, want_code, want_event in (("failure", 0, "event=alert\n"),
+                                                       ("success", 1, "event=\n")):
+                    with self.subTest(env=environment, case=label, current=current):
+                        get, _ = self.reader(runs, jobs)
+                        code, stdout, stderr, output = self.invoke(get, current, environment)
+                        self.assertEqual(code, want_code)
+                        self.assertEqual(output, want_event)
+                        self.assertEqual(stdout, "", "text-mode decision must stay stdout-compatible")
+                        self.assertIn("synthetic_alert:", stderr)
+
+    def test_invalid_filtered_row_cannot_hide_behind_a_valid_checkpoint(self):
+        for event, run_id in (("workflow_dispatch", 101), ("schedule", 1000)):
+            runs = self.run_page()
+            runs["workflow_runs"].append({"id": run_id, "event": event,
+                                           "run_number": self.SENTINEL})
+            runs["total_count"] = 3
+            get, calls = self.reader(runs, self.jobs_page())
+            with self.subTest(event=event), mock.patch.object(history, "_get", side_effect=get):
+                self.assert_safe_history_error(lambda: history.previous_probe_outcomes(
+                    self.env(), "staging"))
+                self.assertEqual(len(calls), 1)
+
+    def test_duplicate_ids_or_order_on_later_pages_are_not_replayed_twice(self):
+        from urllib.parse import urlparse, parse_qs
+
+        for duplicate in (self.run_row(100, 98), self.run_row(99, 99)):
+            calls = []
+
+            def get(path, _token):
+                calls.append(path)
+                if "/actions/workflows/" in path:
+                    page = int(parse_qs(urlparse(path).query).get("page", ["1"])[0])
+                    rows = {1: [self.run_row(999, 100), self.run_row()],
+                            2: [duplicate, self.run_row(98, 97)]}.get(page, [])
+                    return {"total_count": 4, "workflow_runs": rows}
+                return self.jobs_page(probe="failure", delivery="skipped", decide="failure")
+
+            with self.subTest(id=duplicate["id"], number=duplicate["run_number"]), \
+                    mock.patch.object(history, "RUNS_PAGE_SIZE", 2), \
+                    mock.patch.object(history, "_get", side_effect=get):
+                self.assert_safe_history_error(lambda: history.previous_probe_outcomes(
+                    self.env(), "staging"))
+                self.assertLessEqual(sum("/jobs?" in path for path in calls), 1,
+                                     "second-page admission must precede replay")
+
+    def test_json_option_is_discoverable_without_touching_history(self):
+        out = io.StringIO()
+        with redirect_stdout(out), self.assertRaises(SystemExit) as exit_info:
+            alert.main(["--help"])
+        self.assertEqual(exit_info.exception.code, 0)
+        self.assertIn("--json", out.getvalue())
+
+    def test_json_unknown_history_is_bounded_identified_and_keeps_event_output(self):
+        for environment in ("staging", "prod"):
+            for current, want_code, want_event in (("failure", 0, "alert"), ("success", 1, None)):
+                get, _ = self.reader(self.run_page(), {"jobs": [None]})
+                with self.subTest(env=environment, current=current):
+                    code, stdout, _, output = self.invoke(get, current, environment, json_mode=True)
+                    self.assertEqual(code, want_code)
+                    self.assertEqual(output, f"event={want_event or ''}\n")
+                    receipt = json.loads(stdout)
+                    self.assertEqual(receipt["schema_version"], 1)
+                    self.assertEqual(receipt["check_id"], f"synthetic-user-flow:{environment}")
+                    self.assertEqual(receipt["run_id"], "999")
+                    self.assertEqual(receipt["event"], want_event)
+                    self.assertIs(receipt["history_known"], False)
+                    self.assertEqual(receipt["code"], "history_unknown")
+                    self.assertEqual(receipt["next_action"], "inspect_workflow_history")
+
+    def test_json_valid_history_uses_the_same_transition_as_text_mode(self):
+        for current, probe, delivery, want_event in (
+                ("failure", "success", "skipped", None),
+                ("failure", "failure", "skipped", "alert"),
+                ("success", "failure", "success", "recovery")):
+            # Explicit failed decide prevents this one-sample failure fixture
+            # from pretending a suppressed alert was already delivered.
+            jobs = self.jobs_page(probe=probe, delivery=delivery, decide="failure")
+            with self.subTest(current=current, probe=probe, delivery=delivery):
+                runs = self.run_page()
+                runs["workflow_runs"].append(self.run_row(99, 98))
+                runs["total_count"] = 3
+                get, _ = self.reader(runs, jobs)
+                text_code, _, _, text_event = self.invoke(get, current)
+                self.assertEqual(text_code, 0)
+                self.assertEqual(text_event, f"event={want_event or ''}\n")
+                get, _ = self.reader(runs, jobs)
+                code, stdout, _, output = self.invoke(get, current, json_mode=True)
+                receipt = json.loads(stdout)
+                self.assertEqual(code, text_code)
+                self.assertEqual(output, text_event)
+                self.assertEqual(receipt["event"], want_event)
+                self.assertIs(receipt["history_known"], True)
+                self.assertEqual(receipt["code"], "decision_ready")
+                self.assertEqual(receipt["next_action"], "none")
+
+    def test_empty_and_unrelated_valid_history_keep_debounce_and_filtering(self):
+        for environment in ("staging", "prod"):
+            for current in ("success", "failure"):
+                with self.subTest(env=environment, current=current, history="empty"):
+                    get, calls = self.reader({"total_count": 0, "workflow_runs": []},
+                                             self.jobs_page(environment))
+                    code, _, _, output = self.invoke(get, current, environment)
+                    self.assertEqual((code, output), (0, "event=\n"))
+                    self.assertEqual(len(calls), 1)
+            runs, jobs = self.run_page(), self.jobs_page(environment)
+            ignored_run = self.run_row(102, 101)
+            ignored_run["event"] = "workflow_dispatch"
+            runs["workflow_runs"].insert(0, ignored_run)
+            runs["total_count"] = 3
+            jobs["jobs"].insert(0, {"id": 201, "name": "other validation job",
+                                      "status": "completed", "conclusion": "success", "steps": []})
+            jobs["total_count"] = 2
+            jobs["jobs"][1]["steps"].insert(0, {"number": 1, "name": "Set up job",
+                                                "status": "completed", "conclusion": "success"})
+            for number, step in enumerate(jobs["jobs"][1]["steps"], 1):
+                step["number"] = number
+            with self.subTest(env=environment, history="unrelated entries"):
+                get, _ = self.reader(runs, jobs)
+                code, _, _, output = self.invoke(get, "failure", environment)
+                self.assertEqual((code, output), (0, "event=\n"))
+
+    def test_zero_sample_still_fails_without_history_or_posting(self):
+        def forbidden_get(*_args):
+            self.fail("a skipped current probe must not read history")
+
+        code, _, _, output = self.invoke(forbidden_get, "skipped")
+        self.assertEqual(code, 1)
+        self.assertEqual(output, "event=\n")
+
+    def test_cancelled_timed_out_or_skipped_delivery_is_never_delivery_or_closure(self):
+        for delivery in ("cancelled", "timed_out", "skipped"):
+            for job in ("cancelled", "timed_out", "success"):
+                jobs = self.jobs_page(probe="success", delivery=delivery, job=job)
+                # A successful decide in a normal job plus skipped delivery is
+                # the existing closed checkpoint; it is not an undelivered recovery.
+                if job == "success" and delivery == "skipped":
+                    continue
+                with self.subTest(delivery=delivery, job=job):
+                    get, _ = self.reader(self.run_page(), jobs)
+                    with mock.patch.object(history, "_get", side_effect=get):
+                        try:
+                            sample = history._run_outcome("owner/repo", self.run_row(),
+                                                          "staging", "offline-test-value")
+                        except history.HistoryError:
+                            continue  # Refusal is safe; inventing a checkpoint is not.
+                    self.assertIsNotNone(sample)
+                    self.assertNotIn(sample[1], ("success", "closed", "decided_none"))
+
+    def timeline(self, samples, job_conclusions=None):
+        fake = SyntheticAlertTests.fake_history(self, samples, job_conclusions=job_conclusions)
+
+        def get(path, token):
+            body = fake(path, token)
+            if "workflow_runs" in body:
+                for run in body["workflow_runs"]:
+                    if run["id"] == 99999:
+                        run["id"] = 999
+            return body
+
+        return get, fake
+
+    def test_interrupted_delivery_keeps_alert_or_recovery_due_end_to_end(self):
+        for delivery in ("cancelled", "timed_out", "skipped"):
+            for interrupted_job in ("cancelled", "timed_out"):
+                with self.subTest(delivery=delivery, job=interrupted_job):
+                    samples = [("failure", delivery)] * 6
+                    get, _ = self.timeline(samples, {i: interrupted_job for i in range(6)})
+                    code, _, _, output = self.invoke(get, "failure")
+                    self.assertEqual((code, output), (0, "event=alert\n"))
+                    samples = [("failure", "skipped"), ("failure", "success"),
+                               ("success", delivery)]
+                    get, _ = self.timeline(samples, {2: interrupted_job})
+                    code, _, _, output = self.invoke(get, "success")
+                    self.assertIn((code, output), ((0, "event=recovery\n"), (1, "event=\n")),
+                                  "an interrupted recovery must not close a delivered incident")
+
+    def test_existing_quiet_and_long_outage_controls_reach_actual_decide_entry(self):
+        controls = (
+            ([("success", "skipped")] * 250, "failure", None),
+            ([("success", "skipped")] * 250, "success", None),
+            ([("success", "skipped"), ("failure", "skipped")], "failure", "alert"),
+            ([("failure", "skipped"), ("failure", "success")] +
+             [("failure", "skipped")] * 128, "failure", None),
+            ([("failure", "skipped"), ("failure", "success")] +
+             [("failure", "skipped")] * 128, "success", "recovery"),
+        )
+        for samples, current, want_event in controls:
+            with self.subTest(length=len(samples), current=current):
+                get, fake = self.timeline(samples)
+                code, _, _, output = self.invoke(get, current)
+                self.assertEqual(code, 0)
+                self.assertEqual(output, f"event={want_event or ''}\n")
+                self.assertLess(fake.jobs_calls, 10, "checkpoint regressed to unbounded replay")
 
 
 if __name__ == "__main__":

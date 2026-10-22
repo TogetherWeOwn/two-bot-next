@@ -2,13 +2,13 @@
 
 Deterministic CI gates (no reviewer needed). WARN reports without failing;
 HARD fails the PR. Gates run in their designated lanes in `check.yml` on the
-existing routed runner. Patch coverage runs in `rust-tests`, alongside the
-existing disposable Postgres service, rather than the lint-only `check` lane.
+existing routed runner. Patch coverage runs in `patch-coverage`, alongside its
+own disposable Postgres service, rather than the lint-only `check` lane.
 
 - Patch coverage (HARD): `cargo llvm-cov --workspace --lib --bins --tests
   --features two-bot-core/db -- --include-ignored` plus
   `scripts/ci/check-patch-coverage.py` requires 80% line coverage over the
-  lines the PR adds. Measurement uses the `rust-tests` lane's disposable
+  lines the PR adds. Measurement uses the `patch-coverage` lane's disposable
   Postgres service and test database so ignored database-backed tests can run.
   Non-ignored tests run at full parallelism; ignored tests run serially
   (`--test-threads=1`): the ignored stores share tables and locks, so
@@ -26,9 +26,10 @@ existing disposable Postgres service, rather than the lint-only `check` lane.
   C-quotes (non-ASCII or escaped file names) are decoded to the same
   repository-relative names the LCOV report uses, so they count like any
   other changed file; a diff header the parser cannot read fails closed
-  instead of dropping the file from the denominator. The step runs after the
-  ordinary rust-tests steps and uses `always()` so their failures do not suppress
-  coverage output or get hidden by a coverage shortfall. Measurement also uses
+  instead of dropping the file from the denominator. The step runs in its own
+  job so the unit-test signal and the coverage verdict fail independently,
+  and uses `always()` so a failure never suppresses coverage output.
+  Measurement also uses
   `--ignore-run-fail` to preserve LCOV output when tests invoked by llvm-cov fail.
   A build or report-generation failure fails this gate.
 - Dependency advisories (HARD): the `cargo-deny` step (`check all`, which

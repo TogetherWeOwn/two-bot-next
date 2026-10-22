@@ -227,6 +227,38 @@ pub fn backoff_ms(attempt: u32) -> u64 {
     BACKOFF_BASE_MS.saturating_mul(1u64 << attempt.min(20))
 }
 
+/// Deterministic 64-bit mixer (splitmix64) for seeded jitter without a
+/// global RNG: the same `(seed, attempt)` pair always yields the same draw,
+/// on every platform, with no clock and no `rand` dependency.
+fn jitter_draw(seed: u64, attempt: u32) -> u64 {
+    let mixed = seed.wrapping_add(u64::from(attempt).wrapping_mul(0x9E3779B97F4A7C15));
+    let mut z = mixed.wrapping_add(0x9E3779B97F4A7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+/// 5xx / transport backoff for failure `attempt` (0-based) with full jitter:
+/// a deterministic draw in `[1, backoff_ms(attempt)]` ms, so concurrent
+/// callers retrying the same outage spread instead of re-hammering in
+/// lockstep. The deterministic [`backoff_ms`] stays as the bound (caps and
+/// the [`MAX_HTTP_TRIES`] budget hold by construction); the same `seed`
+/// replays the same sample, so tests pin ranges without a clock or RNG.
+#[must_use]
+pub fn backoff_ms_jittered(attempt: u32, seed: u64) -> u64 {
+    let base = backoff_ms(attempt);
+    1 + (jitter_draw(seed, attempt) % base)
+}
+
+/// Fresh runtime seed for the jittered backoffs: one CSPRNG draw per call,
+/// so concurrent retry loops spread even when they share an attempt index.
+/// Tests pass explicit seeds to the jittered functions instead, keeping
+/// every pin deterministic without a global RNG.
+#[must_use]
+pub fn jitter_seed() -> u64 {
+    rand::random()
+}
+
 /// How long to wait before the next paced request: the gap between the
 /// minimum interval after the last request and now, or zero when the floor
 /// already passed (legacy `pace()` in `rest.ts` / `kick.ts`, made pure).
@@ -477,6 +509,37 @@ mod tests {
             [500, 1000, 2000, 4000, 8000]
         );
         assert_eq!(MAX_HTTP_TRIES, 5);
+    }
+
+    #[test]
+    fn jittered_backoff_stays_within_base_and_replays_per_seed() {
+        for attempt in 0..5u32 {
+            let base = backoff_ms(attempt);
+            for seed in 0..8u64 {
+                let sample = backoff_ms_jittered(attempt, seed);
+                assert!(
+                    (1..=base).contains(&sample),
+                    "attempt {attempt} seed {seed}: {sample} outside [1, {base}]"
+                );
+            }
+        }
+        assert_eq!(backoff_ms_jittered(3, 42), backoff_ms_jittered(3, 42));
+        assert_eq!(backoff_ms_jittered(0, 7), backoff_ms_jittered(0, 7));
+    }
+
+    #[test]
+    fn jittered_backoff_spreads_across_seeds() {
+        use std::collections::HashSet;
+        // Attempt 3 has a 4 s base: fleet-wide 5xx episodes must not retry
+        // in phase.
+        let distinct: HashSet<u64> = (0..32u64)
+            .map(|seed| backoff_ms_jittered(3, seed))
+            .collect();
+        assert!(
+            distinct.len() >= 8,
+            "only {} distinct delays across 32 seeds",
+            distinct.len()
+        );
     }
 
     #[test]

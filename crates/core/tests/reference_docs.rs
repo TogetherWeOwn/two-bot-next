@@ -45,8 +45,9 @@ a required value or an implemented consumer. Secret defaults are never rendered.
 - `env_only`: never dashboard-stored. Unknown names and `TWO_INTERNAL_*` fail closed.\n\
 - `cold` / `hot`: legacy-catalog storage classes, not application promises.\n\
   The Container registers a `guild_settings` poll job\n\
-  (`crates/bot/src/website_jobs.rs:207`) publishing a `SettingsCache`\n\
-  snapshot every 15 s through `settings_jobs::live`\n\
+  (`crates/bot/src/website_jobs.rs:207`) that polls every 15 s and publishes a\n\
+  `SettingsCache` snapshot only when the revision or row count changes\n\
+  (`crates/bot/src/settings_jobs.rs:146-160`), exposed through `settings_jobs::live`\n\
   (`crates/bot/src/settings_jobs.rs:53`). Every consumer reads store-first:\n\
   a stored row wins and an absent row falls back to the boot value, except\n\
   the invite responder, which falls back to the live vanity code; a malformed\n\
@@ -60,7 +61,8 @@ a required value or an implemented consumer. Secret defaults are never rendered.
   legacy `HOT_WIRED` are labeled “reload-report hot” (the `RefreshReport::hot`\n\
   partition in `settings.rs`); every other storable key reports cold.\n\n\
 Live snapshot consumers at `1643438` (canonical table; eight `live()` call\n\
-sites across five runtimes, plus voice through the gateway closure):\n\n\
+sites total: seven across the five non-voice rows below, plus the voice\n\
+gateway closure):\n\n\
 | Runtime | Call sites | Reads | When |\n\
 | --- | --- | --- | --- |\n\
 | automod | `automod_gateway.rs:211-223`, `:305` | 10 live lists, thresholds, enforce flag (`:116-127`) | every message delivery |\n\

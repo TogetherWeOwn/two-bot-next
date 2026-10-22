@@ -54,11 +54,28 @@ export const RUST_ALERT_AXES: Record<string, Record<string, string | readonly st
   two_bot_dispatch_drops_total: { lane: "DISPATCH_LANES" },
   two_bot_internal_actions_total: { family: "INTERNAL_ACTION_FAMILIES", outcome: "INTERNAL_ACTION_OUTCOMES" },
   two_bot_rest_guard_breaker_open: {},
+  two_bot_rest_guard_token_invalid: {},
+  two_bot_rest_guard_invalid_requests_total: {},
+  two_bot_rest_guard_rejected_requests_total: {},
+  two_bot_rest_guard_pending_global_responses: {},
   two_bot_community_facts_drain_failures_total: { reason: "COMMUNITY_FACTS_DRAIN_REASONS" },
   two_bot_eventsub_posts_total: { outcome: "EVENTSUB_POST_OUTCOMES" },
   two_bot_eventsub_reconcile_passes_total: { outcome: "EVENTSUB_RECONCILE_OUTCOMES" },
   two_bot_eventsub_classified_total: { kind: "EVENTSUB_DELIVERY_KINDS" },
   two_bot_event_store_consumer_lag_seconds: {},
+  two_bot_retention_replay_needed_total: {},
+  two_bot_voice_dispatch_timeouts_total: {},
+  two_bot_voice_watchdog_stucks_total: {},
+  two_bot_voice_halt_recoveries_total: {},
+  two_bot_rest_guard_breaker_opens_total: {},
+  two_bot_rest_guard_global_pauses_total: {},
+  two_bot_gateway_latency_seconds: {},
+  two_bot_gateway_reconnects_total: {},
+  // Handler buckets render from the private BUCKETS_MICROS (no pub label
+  // const like VOICE_JOIN_TO_MOVE_BUCKET_LE), so the wire `le` spellings are
+  // literal here, pinned against the validator and the rule below.
+  two_bot_handler_duration_seconds_bucket: { le: ["0.001", "0.005", "0.01", "0.05", "0.1", "0.5", "1", "5", "+Inf"] },
+  two_bot_job_runs_total: { job: "JOBS", outcome: "JOB_OUTCOMES" },
 };
 
 /** Complete consumed-input fixture generated from the Rust label contract, not the validator. */
@@ -80,5 +97,5 @@ export function metricsLines(rankFailures = 0): string[] {
 }
 
 export function metricsBody(rankFailures = 0): string {
-  return [...metricsLines(rankFailures), "two_bot_gateway_latency_seconds NaN", ""].join("\n");
+  return [...metricsLines(rankFailures), ""].join("\n");
 }
