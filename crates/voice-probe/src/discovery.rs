@@ -57,10 +57,9 @@ impl fmt::Display for DiscoveryError {
             Self::BadLengthField(got) => {
                 write!(f, "discovery length field must be 70, got {got}")
             }
-            Self::SsrcMismatch { expected, got } => write!(
-                f,
-                "discovery ssrc mismatch: expected {expected}, got {got}"
-            ),
+            Self::SsrcMismatch { expected, got } => {
+                write!(f, "discovery ssrc mismatch: expected {expected}, got {got}")
+            }
             Self::BadAddress => write!(
                 f,
                 "discovery address field is not a null-terminated IP string"
@@ -92,9 +91,9 @@ pub fn encode_request(ssrc: u32) -> [u8; DISCOVERY_LEN] {
 }
 
 /// Encode a discovery response echoing `ssrc` and reporting `source` as the
-/// observed sender. The IP renders via [`IpAddr::to_string`] and is
-/// null-padded to 64 bytes; the longest textual IP (IPv6, 45 chars) always
-/// leaves room for the terminator.
+/// observed sender. The IP renders as text and is null-padded to 64
+/// bytes; the longest textual IP (IPv6, 45 chars) always leaves room for
+/// the terminator.
 #[must_use]
 pub fn encode_response(ssrc: u32, source: SocketAddr) -> [u8; DISCOVERY_LEN] {
     let mut packet = [0u8; DISCOVERY_LEN];
@@ -149,7 +148,10 @@ pub fn decode_response(
         });
     }
     let field = &buf[ADDR_FIELD_START..ADDR_FIELD_START + ADDR_FIELD_LEN];
-    let end = field.iter().position(|byte| *byte == 0).ok_or(DiscoveryError::BadAddress)?;
+    let end = field
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or(DiscoveryError::BadAddress)?;
     let text = std::str::from_utf8(&field[..end]).map_err(|_| DiscoveryError::BadAddress)?;
     let ip: IpAddr = text.parse().map_err(|_| DiscoveryError::BadAddress)?;
     let port = u16::from_be_bytes([buf[PORT_FIELD_START], buf[PORT_FIELD_START + 1]]);
