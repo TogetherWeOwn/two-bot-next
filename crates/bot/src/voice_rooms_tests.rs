@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 use serde_json::json;
 use std::sync::atomic::AtomicUsize;
@@ -17,6 +19,8 @@ mod cold_authority;
 mod creation_receipt_acceptance;
 #[path = "voice_delete_guard_tests.rs"]
 mod delete_guards;
+#[path = "voice_disconnect_loud_acceptance_tests.rs"]
+mod disconnect_loud_acceptance_tests;
 #[path = "voice_disconnect_poison_acceptance_tests.rs"]
 mod drop_poison_acceptance_tests;
 #[path = "voice_empty_grace_override_tests.rs"]
@@ -16505,4 +16509,49 @@ async fn global_429_requeues_and_resumes_without_losing_the_move() {
     dispatch(&mut worker, 2_000).await;
     assert_eq!(worker.queue.pending_counts(GUILD), (0, 0));
     assert_eq!(worker.queue.oldest_pending_age(GUILD), None);
+}
+
+#[test]
+fn voice_claims_custom_id_matches_sink_shapes() {
+    use two_bot_core::voice_custom_id::{join_custom_id, name_modal_custom_id};
+    use two_bot_core::voice_private::JoinDecision;
+
+    let room = 777_000_111_222_333_444u64;
+    let request = 888_000_111_222_333_444u64;
+    let bare = join_custom_id(JoinDecision::Approve, room, request);
+    // Production runtime shape: codec core plus the 32-hex worker epoch.
+    let runtime = format!("{bare}:0123456789abcdef0123456789abcdef");
+    assert!(voice_claims_custom_id(&bare), "bare join button");
+    assert!(
+        voice_claims_custom_id(&runtime),
+        "epoch-suffixed join button"
+    );
+    assert!(
+        voice_claims_custom_id(&name_modal_custom_id(room)),
+        "name modal"
+    );
+    assert!(
+        voice_claims_custom_id("votekick:7000000111222333444:yes"),
+        "ballot yes"
+    );
+    assert!(
+        voice_claims_custom_id("votekick:7000000111222333444:no"),
+        "ballot no"
+    );
+    let short_epoch = format!("{bare}:0123456789abcdef0123456789abcde");
+    let upper_epoch = format!("{bare}:0123456789ABCDEF0123456789ABCDEF");
+    let nonhex_epoch = format!("{bare}:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz");
+    for unowned in [
+        "two:stale-widget:deadbeef",
+        "two:voice:join-approve:notanid:7",
+        "two:voice:join-approve:500",
+        short_epoch.as_str(),
+        upper_epoch.as_str(),
+        nonhex_epoch.as_str(),
+        "votekick:7000000111222333444:maybe",
+        "votekick:notanid:yes",
+        "votekick:7000000111222333444",
+    ] {
+        assert!(!voice_claims_custom_id(unowned), "unowned: {unowned}");
+    }
 }

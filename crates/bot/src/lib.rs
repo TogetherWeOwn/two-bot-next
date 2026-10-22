@@ -14,9 +14,16 @@ pub mod gateway_backoff;
 // Visibility widens (`pub(crate)` -> `pub`) with no logic change.
 pub mod containment_runtime;
 pub mod join_risk_runtime;
+pub mod lane_jitter;
 pub mod raid_runtime;
 
 // Shared by the raid/containment tuning test modules; declared once so the
 // file is not loaded as two modules (clippy::duplicate_mod).
 #[cfg(test)]
 mod tuning_test_support;
+
+// Shared serial lock for drop-poison counter tests; the binary declares the
+// same file so its counter tests share one lock per test binary (one module
+// per crate, so no clippy::duplicate_mod).
+#[cfg(test)]
+mod drop_poison_test_serial;

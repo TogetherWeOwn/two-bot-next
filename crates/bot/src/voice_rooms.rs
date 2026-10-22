@@ -7424,7 +7424,17 @@ pub trait VoiceEventSink: Send + Sync {
     fn presence(&self, update: &twilight_model::gateway::payload::incoming::PresenceUpdate);
     /// Invalidate occupancy immediately on connection loss, including while an
     /// actor is awaiting SQL, HTTP or token-global rate-limit backoff.
+    /// Live path: panics on a poisoned registry (fail loud).
     fn disconnect(&self);
+    /// Drop-only `disconnect` for `VoiceConnectionGuard::drop`: recovers a
+    /// poisoned registry with one counted `voice_connection_guard`
+    /// increment instead of panicking (which would abort the process when
+    /// the drop runs during unwinding). Every production sink overrides
+    /// this; the default forwards to loud `disconnect` for lock-free test
+    /// doubles only.
+    fn disconnect_from_drop(&self) {
+        self.disconnect();
+    }
     /// A cold RESUME has replayed durably but cannot populate a fresh cache.
     /// The supervisor must IDENTIFY after committing RESUMED, not before replay.
     fn needs_bootstrap(&self, cache: &DefaultInMemoryCache) -> bool;
@@ -8892,17 +8902,32 @@ where
         // Clear before invalidating the views so a concurrent dispatch
         // cannot heal a view this transport loss is about to invalidate.
         self.gateway_connected.store(false, Ordering::Release);
-        // Drop-reachable (`VoiceConnectionGuard::drop` via `VoiceEventSink`)
-        // and shared with live disconnects: recover silently so a poisoned
-        // registry still invalidates its views instead of panicking during
-        // unwinding. No counter: non-drop callers must never be miscounted
-        // as drop poison.
-        for actor in self
-            .actors
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .values()
-        {
+        // Live path (transport loss): fail loud on a poisoned registry.
+        // `VoiceConnectionGuard::drop` must never call this; it calls
+        // `disconnect_from_drop` through the sink instead.
+        let actors = self.actors.lock().expect("voice runtime lock");
+        self.disconnect_locked(&actors);
+    }
+
+    /// Drop-only `disconnect`: panicking inside `drop` aborts the process
+    /// when the drop runs during unwinding, so a poisoned registry is
+    /// recovered with one counted `voice_connection_guard` increment
+    /// instead. Called only from `VoiceConnectionGuard::drop` (through
+    /// `VoiceEventSink::disconnect_from_drop`); live callers use loud
+    /// `disconnect`.
+    pub fn disconnect_from_drop(&self) {
+        // Clear before invalidating the views so a concurrent dispatch
+        // cannot heal a view this transport loss is about to invalidate.
+        self.gateway_connected.store(false, Ordering::Release);
+        let actors = two_bot_core::metrics::recover_drop_poison(
+            self.actors.lock(),
+            "voice_connection_guard",
+        );
+        self.disconnect_locked(&actors);
+    }
+
+    fn disconnect_locked(&self, actors: &HashMap<Snowflake, GuildActor>) {
+        for actor in actors.values() {
             actor.live.transport_lost();
         }
         // Game-activity wiring: transport loss invalidates live voice state,
@@ -9200,6 +9225,10 @@ where
 
     fn disconnect(&self) {
         VoiceRuntime::disconnect(self);
+    }
+
+    fn disconnect_from_drop(&self) {
+        VoiceRuntime::disconnect_from_drop(self);
     }
 
     fn needs_bootstrap(&self, cache: &DefaultInMemoryCache) -> bool {
@@ -12149,6 +12178,33 @@ fn parse_vote_button(custom_id: &str) -> Option<VoiceCommand> {
     Some(VoiceCommand::Ballot { vote_id, ballot })
 }
 
+/// Whether the voice sink claims this component/modal id, so the shared
+/// stale-control path must stay silent instead of answering expired. Covers the
+/// same shapes the sink parses: bare `two:voice:` ids, runtime join buttons
+/// with the 32-hex worker-epoch suffix (via `split_runtime_join_id`, shared
+/// with `join_component_action`), and `votekick:` ballots (via
+/// `parse_vote_button`). A prefix alone never claims ownership.
+#[must_use]
+pub fn voice_claims_custom_id(custom_id: &str) -> bool {
+    if parse_voice_custom_id(custom_id).is_some() {
+        return true;
+    }
+    if split_runtime_join_id(custom_id).is_some_and(|(core, epoch)| {
+        epoch.is_some()
+            && matches!(
+                parse_voice_custom_id(core),
+                Some(
+                    VoiceAction::JoinApprove { .. }
+                        | VoiceAction::JoinDeny { .. }
+                        | VoiceAction::JoinBlock { .. }
+                )
+            )
+    }) {
+        return true;
+    }
+    parse_vote_button(custom_id).is_some()
+}
+
 /// Button custom ID for one ballot. Inverse of [`parse_vote_button`].
 fn vote_button_id(vote_id: Snowflake, ballot: VoteBallot) -> String {
     let vote = match ballot {
@@ -14216,6 +14272,10 @@ where
         self.runtime.disconnect();
     }
 
+    fn disconnect_from_drop(&self) {
+        self.runtime.disconnect_from_drop();
+    }
+
     fn needs_bootstrap(&self, cache: &DefaultInMemoryCache) -> bool {
         self.runtime.needs_bootstrap(cache)
     }
@@ -14244,7 +14304,8 @@ pub use private_runtime::PrivacyCommand;
 
 mod join_requests;
 use join_requests::{
-    handle_join_interaction, join_component_action, JoinDecisionCommand, JoinReply,
+    handle_join_interaction, join_component_action, split_runtime_join_id, JoinDecisionCommand,
+    JoinReply,
 };
 
 #[cfg(test)]
