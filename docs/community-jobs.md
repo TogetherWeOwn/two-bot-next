@@ -255,6 +255,16 @@ write verb; bind that job to a capability in `BootActivation` before it ships.
   audit-retry job, the scheduled-messages job, the self-role recovery job, the
   gated `feeds` job and the DB-only settings poll, each parked when its service
   is unregistered), even when announcements are off.
+- The five community keys (`TWO_COMMUNITY_SCORECARD`,
+  `TWO_COMMUNITY_RECOMMENDATIONS`, `TWO_COMMUNITY_CORRECTION_CYCLES`,
+  `TWO_PRESENCE_PROBE`, `TWO_INACTIVITY_DAYS`) are hot-wired: every tick
+  layers the poller-published snapshot over the boot gates store-first
+  (`bot::community_jobs::LIVE_KEYS`), so a dashboard write applies within
+  one 15 s poll. A stored `0` on either enable gate skips that tick; an
+  absent or unparsable stored count falls back to boot per key. Boot
+  registration is unchanged: a job parked at boot needs a restart to start
+  ticking, the facts sink arms once at boot, and the scorecard command
+  surface publishes at boot (see [configuration](configuration.md)).
 
 ## Verification
 
@@ -268,6 +278,16 @@ write verb; bind that job to a capability in `BootActivation` before it ships.
   Database cases require `TWO_TEST_DATABASE_URL` on agent-testdb/CI services;
   absent configuration skips locally and fails in CI. Existing hosted CI's
   unit/binary step runs them without changing the workflow.
+- The live-apply pins run fully offline (pure in-memory `live_channel`, no
+  `TWO_TEST_DATABASE_URL` needed):
+
+  ```sh
+  python3 scripts/cargo_cache.py run -- test -p two-bot-core --test community_presence_inactivity_live_keys_acceptance
+  python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot community_jobs::
+  python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot settings_jobs::community_live_log_acceptance_tests
+  ```
+
+  A staging apply-check stays a rollout step, not a test gate.
 - Run `cargo test -p two-bot-core --features db --locked --lib <filter>`
   separately for `community::tests`, `presence::tests`, `inactivity::tests`,
   `funnel::tests`, `community_store`, `presence_store`, and `inactivity_store`,

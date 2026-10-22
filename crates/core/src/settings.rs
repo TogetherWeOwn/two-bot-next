@@ -183,12 +183,7 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     ("TWO_TEMP_VOICE_DISABLED_CONTROLS", SettingClass::Cold),
     ("TWO_ANTI_NUKE", SettingClass::Cold),
     ("TWO_ANTI_NUKE_DRY_RUN", SettingClass::Cold),
-    ("TWO_COMMUNITY_SCORECARD", SettingClass::Cold),
-    ("TWO_COMMUNITY_RECOMMENDATIONS", SettingClass::Cold),
-    ("TWO_COMMUNITY_CORRECTION_CYCLES", SettingClass::Cold),
     ("TWO_SELF_ROLE_PANELS", SettingClass::Cold),
-    ("TWO_PRESENCE_PROBE", SettingClass::Cold),
-    ("TWO_INACTIVITY_DAYS", SettingClass::Cold),
     ("TWO_TICKET_COOLDOWN_SECONDS", SettingClass::Cold),
     ("LOG_LEVEL", SettingClass::Cold),
     // --- hot: channel/role ids, thresholds, lists, dry-runs ---
@@ -236,6 +231,14 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     ("TWO_COMMUNITY_STAGING_GUILD_IDS", SettingClass::Hot),
     ("TWO_COMMUNITY_TEST_ACTOR_IDS", SettingClass::Hot),
     ("TWO_COMMUNITY_WELCOME_CHANNEL_IDS", SettingClass::Hot),
+    // Community jobs go-live: the scorecard gates, the presence probe and the
+    // inactivity horizon reload per tick from the live snapshot (consumers in
+    // `bot::community_jobs` read them store-first with boot fallback).
+    ("TWO_COMMUNITY_SCORECARD", SettingClass::Hot),
+    ("TWO_COMMUNITY_RECOMMENDATIONS", SettingClass::Hot),
+    ("TWO_COMMUNITY_CORRECTION_CYCLES", SettingClass::Hot),
+    ("TWO_PRESENCE_PROBE", SettingClass::Hot),
+    ("TWO_INACTIVITY_DAYS", SettingClass::Hot),
     ("TWO_ONBOARDING_DRY_RUN", SettingClass::Hot),
     ("TWO_SELF_ROLE_DRY_RUN", SettingClass::Hot),
     ("TWO_REDIRECT_FALLBACK_CODE", SettingClass::Hot),
@@ -276,6 +279,11 @@ pub const HOT_WIRED: &[&str] = &[
     "TWO_COMMUNITY_WELCOME_CHANNEL_IDS",
     "TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS",
     "TWO_GUILD_INVITE_CODE",
+    "TWO_COMMUNITY_SCORECARD",
+    "TWO_COMMUNITY_RECOMMENDATIONS",
+    "TWO_COMMUNITY_CORRECTION_CYCLES",
+    "TWO_PRESENCE_PROBE",
+    "TWO_INACTIVITY_DAYS",
 ];
 
 /// The catalogue class for `key`, or `None` for a name this file has never
@@ -775,11 +783,29 @@ pub enum WriteRefusal {
     NullCharacter,
     #[error("refused: {0} accepts only a boolean, 0 or 1")]
     InvalidGateValue(String),
+    #[error(
+        "refused: {0} accepts only a non-negative integer correction count; \
+         store a plain count or delete the row to fall back to the boot value"
+    )]
+    InvalidCorrectionCycles(String),
+    #[error(
+        "refused: {0} accepts only a non-negative integer number of days; \
+         store a plain count or delete the row to fall back to the boot value"
+    )]
+    InvalidInactivityDays(String),
 }
 
 /// Dry-run gates the env parsers accept only as `0` or `1`; a stored value
-/// that renders to anything else would be refused at every hot refresh.
-const ZERO_ONE_GATE_KEYS: &[&str] = &["TWO_ONBOARDING_DRY_RUN", "TWO_SELF_ROLE_DRY_RUN"];
+/// that renders to anything else would be refused at every hot refresh. The
+/// three community boolean gates join the same check: their readers only
+/// distinguish `0` from `1`-shaped values.
+const ZERO_ONE_GATE_KEYS: &[&str] = &[
+    "TWO_ONBOARDING_DRY_RUN",
+    "TWO_SELF_ROLE_DRY_RUN",
+    "TWO_COMMUNITY_SCORECARD",
+    "TWO_COMMUNITY_RECOMMENDATIONS",
+    "TWO_PRESENCE_PROBE",
+];
 
 /// Postgres JSONB cannot represent decoded NUL in strings or object keys.
 /// Inspect the domain value, not its encoding (literal `\\u0000` is valid).
@@ -833,6 +859,28 @@ pub fn validate_write(
     {
         return Err(WriteRefusal::InvalidGateValue(key.to_owned()));
     }
+    // Correction cycles and inactivity days validate through their real
+    // readers: a stored value the tick cannot parse is refused before any
+    // SQL, so the live boot-fallback only ever fires on direct-SQL rows.
+    if key == "TWO_COMMUNITY_CORRECTION_CYCLES"
+        && value
+            .as_ref()
+            .and_then(to_env_string)
+            .is_some_and(|rendered| {
+                let probe = HashMap::from([(key.to_owned(), rendered)]);
+                crate::ScorecardGates::from_map(&probe).is_err()
+            })
+    {
+        return Err(WriteRefusal::InvalidCorrectionCycles(key.to_owned()));
+    }
+    if key == "TWO_INACTIVITY_DAYS"
+        && value
+            .as_ref()
+            .and_then(to_env_string)
+            .is_some_and(|rendered| crate::parse_inactivity_days(Some(&rendered)).is_err())
+    {
+        return Err(WriteRefusal::InvalidInactivityDays(key.to_owned()));
+    }
     Ok(ValidatedWrite {
         guild_id: guild_id.to_owned(),
         key: key.to_owned(),
@@ -884,15 +932,20 @@ mod tests {
         "TWO_BULK_JOIN_WINDOW_UNTIL",
         "TWO_COMMUNITY_AUTOMATION_ACTOR_IDS",
         "TWO_COMMUNITY_CLASSIFIER_VERSION",
+        "TWO_COMMUNITY_CORRECTION_CYCLES",
         "TWO_COMMUNITY_HUMAN_CHANNEL_IDS",
         "TWO_COMMUNITY_RAID_ACTOR_IDS",
+        "TWO_COMMUNITY_RECOMMENDATIONS",
+        "TWO_COMMUNITY_SCORECARD",
         "TWO_COMMUNITY_STAGING_ACTOR_IDS",
         "TWO_COMMUNITY_STAGING_GUILD_IDS",
         "TWO_COMMUNITY_TEST_ACTOR_IDS",
         "TWO_COMMUNITY_WELCOME_CHANNEL_IDS",
+        "TWO_INACTIVITY_DAYS",
         "TWO_JOIN_RISK_THRESHOLD",
         "TWO_JOIN_RISK_WINDOW_SECONDS",
         "TWO_ONBOARDING_DRY_RUN",
+        "TWO_PRESENCE_PROBE",
         "TWO_RAID_JOIN_THRESHOLD",
         "TWO_RAID_WINDOW_SECONDS",
         "TWO_REDIRECT_FALLBACK_CODE",
@@ -910,11 +963,6 @@ mod tests {
         "TWO_ANTI_NUKE_DRY_RUN",
         "TWO_AUTOMATIONS",
         "TWO_AUTOMOD",
-        "TWO_COMMUNITY_CORRECTION_CYCLES",
-        "TWO_COMMUNITY_RECOMMENDATIONS",
-        "TWO_COMMUNITY_SCORECARD",
-        "TWO_INACTIVITY_DAYS",
-        "TWO_PRESENCE_PROBE",
         "TWO_SELF_ROLE_PANELS",
         "TWO_TEMP_VOICE",
         "TWO_TEMP_VOICE_CATEGORY_ID",
@@ -1052,7 +1100,7 @@ mod tests {
 
     #[test]
     fn hot_wired_is_a_hot_subset() {
-        assert_eq!(HOT_WIRED.len(), 26);
+        assert_eq!(HOT_WIRED.len(), 31);
         for key in HOT_WIRED {
             assert_eq!(classify_key(key), Some(SettingClass::Hot), "{key}");
         }

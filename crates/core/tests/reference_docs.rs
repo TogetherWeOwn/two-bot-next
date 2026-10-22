@@ -60,8 +60,8 @@ a required value or an implemented consumer. Secret defaults are never rendered.
   Keys in\n\
   legacy `HOT_WIRED` are labeled “reload-report hot” (the `RefreshReport::hot`\n\
   partition in `settings.rs`); every other storable key reports cold.\n\n\
-Live snapshot consumers at `1643438` (canonical table; eight `live()` call\n\
-sites total: seven across the five non-voice rows below, plus the voice\n\
+Live snapshot consumers at `1643438` (canonical table; nine `live()` call\n\
+sites total: eight across the six non-voice rows below, plus the voice\n\
 gateway closure):\n\n\
 | Runtime | Call sites | Reads | When |\n\
 | --- | --- | --- | --- |\n\
@@ -70,8 +70,9 @@ gateway closure):\n\n\
 | audit | `audit_runtime.rs:308`, `:438` | 3 mirror destinations (`:60-63`) | every record (`:483`) and sweep (`:497`), once installed |\n\
 | ticket | `ticket_runtime.rs:457`, `:981` | 3 ticket destinations (`:172-175`) | every execute/recovery and purge |\n\
 | gateway classifier | `gateway.rs:774-789`, `:918` | human/welcome channel sets (`:800-817`) | every guild message; classifier + facts sink swap together (`leveling_runtime.rs:766`) |\n\
+| community | `community_jobs.rs:181-183` | 5 scorecard/presence/inactivity keys (`:170-176`) | every tick: probe (`:396`), scorecard (`:548`), sweep (`:634`) |\n\
 | voice | `gateway.rs:2082` closure | empty grace (`voice_rooms.rs:9415`), invite code (`:9460`) | spawn (`:7753-7757`), maintenance (`:3319`), `/invite` (`:13306-13307`) |\n\n\
-The thirty-six keys in `STORE_READ_KEYS`\n\
+The forty-one keys in `STORE_READ_KEYS`\n\
 (`crates/core/tests/reference_docs.rs`) say “applied live by runtime refresh”\n\
 instead of “stored unwired”: containment applies `TWO_ANTI_NUKE_WINDOW_SECONDS`,\n\
 `TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS`, `TWO_ANTI_NUKE_HEAT_THRESHOLD` and\n\
@@ -112,14 +113,19 @@ malformed row keeps the last good destinations like the audit mirror; the gatewa
 `TWO_COMMUNITY_HUMAN_CHANNEL_IDS` and `TWO_COMMUNITY_WELCOME_CHANNEL_IDS`\n\
 from the snapshot on every guild message, refreshing the channel classifier\n\
 and the community-facts sink together before the message's channel class is\n\
-stamped (`crates/bot/src/gateway.rs:774-789`, `:918`, `crates/discord/src/leveling_runtime.rs:766`), with malformed entries filtered silently so a wholly-malformed row applies as the empty set (`crates/core/src/community.rs:252-260`); the voice sweep applies `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` from the snapshot on spawn and every maintenance refresh, so a stored per-guild grace reaches the deletion sweep without a restart (`crates/bot/src/voice_rooms.rs:7753-7757`, `:3319`), and the invite responder applies `TWO_GUILD_INVITE_CODE` per `/invite` interaction (`crates/bot/src/voice_rooms.rs:13306-13307`), falling back to the live vanity code when the row is absent or invalid (`:9462-9467`). Two boot-only edges\n\
+stamped (`crates/bot/src/gateway.rs:774-789`, `:918`, `crates/discord/src/leveling_runtime.rs:766`), with malformed entries filtered silently so a wholly-malformed row applies as the empty set (`crates/core/src/community.rs:252-260`); the voice sweep applies `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` from the snapshot on spawn and every maintenance refresh, so a stored per-guild grace reaches the deletion sweep without a restart (`crates/bot/src/voice_rooms.rs:7753-7757`, `:3319`), and the invite responder applies `TWO_GUILD_INVITE_CODE` per `/invite` interaction (`crates/bot/src/voice_rooms.rs:13306-13307`), falling back to the live vanity code when the row is absent or invalid (`:9462-9467`); the community jobs apply `TWO_COMMUNITY_SCORECARD`, `TWO_COMMUNITY_RECOMMENDATIONS`, `TWO_COMMUNITY_CORRECTION_CYCLES`, `TWO_PRESENCE_PROBE` and `TWO_INACTIVITY_DAYS` from the snapshot on every tick, layering stored rows over the boot gates with boot fallback for absent or unparsable counts (`crates/bot/src/community_jobs.rs:170-268`), where a stored `0` on either enable gate skips that tick while the sweep re-reads its horizon per run. Five boot-only edges\n\
 remain: the voice room-name policy is\n\
 built once at boot from the process environment\n\
-(`crates/bot/src/gateway.rs:2080`); and gateway intents plus ticket command\n\
+(`crates/bot/src/gateway.rs:2080`); gateway intents plus ticket command\n\
 publication read the ticket destination keys once at boot\n\
 (`crates/bot/src/gateway.rs:150`, `crates/bot/src/command_runtime.rs:431`), so a stored ticket\n\
 destination reaches already-published commands only through the per-operation\n\
-refresh above. Every other\n\
+refresh above; the community-facts sink arms once at boot\n\
+(`crates/bot/src/main.rs:697-698`), so a live scorecard `0` stops scoring but\n\
+not capture; the scorecard command surface publishes at boot\n\
+(`crates/bot/src/main.rs:1004`, `crates/bot/src/command_runtime.rs:440`); and\n\
+a boot-parked community job needs a restart to start ticking, like the parked\n\
+audit runtime. Every other\n\
 storable row's stored value is unwired.\n\n\
 Gateway boot reads process environment only, through a fixed set of loaders:\n\
 `Config::from_env` (`DISCORD_TOKEN`, `DATABASE_URL`, `LISTEN_ADDR`, `GUILD_ID`),\n\
@@ -215,8 +221,9 @@ const BOOT_ENV: &[&str] = &[
 /// gateway closure (`gateway.rs:2082`), containment
 /// (`containment_runtime.rs:61-67`, `:278-286`), join-risk
 /// (`join_risk_runtime.rs:66-70`, `:239-249`), raid
-/// (`raid_runtime.rs:45-48`, `:194-202`) and onboarding's per-event
-/// `CONFIG_KEYS` merge (`onboarding.rs:21-30`, `:271`).
+/// (`raid_runtime.rs:45-48`, `:194-202`), onboarding's per-event
+/// `CONFIG_KEYS` merge (`onboarding.rs:21-30`, `:271`), and the community
+/// jobs' per-tick refresh (`community_jobs.rs:170-268`).
 /// These rows say “applied live by runtime refresh” in the table below;
 /// every other storable key keeps the legacy `HOT_WIRED`/boot-env labels.
 const STORE_READ_KEYS: &[&str] = &[
@@ -256,6 +263,11 @@ const STORE_READ_KEYS: &[&str] = &[
     "TWO_COMMUNITY_WELCOME_CHANNEL_IDS",
     "TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS",
     "TWO_GUILD_INVITE_CODE",
+    "TWO_COMMUNITY_SCORECARD",
+    "TWO_COMMUNITY_RECOMMENDATIONS",
+    "TWO_COMMUNITY_CORRECTION_CYCLES",
+    "TWO_PRESENCE_PROBE",
+    "TWO_INACTIVITY_DAYS",
 ];
 
 fn repository_root() -> PathBuf {
