@@ -1160,6 +1160,8 @@ mod tests {
                     Method::PUT,
                     "/api/v10/guilds/100/members/201/roles/555555555555555555".into()
                 ),
+                (Method::POST, "/api/v10/channels/300/messages".into()),
+                (Method::POST, "/api/v10/channels/300/messages".into()),
             ]
         );
     }
