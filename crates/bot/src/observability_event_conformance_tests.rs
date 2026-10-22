@@ -199,7 +199,7 @@ const MAIN_RS_ADJACENT: [&str; 14] = [
 
 // `crates/bot/src/voice_rooms.rs`: per-command voice UX receipts, not gateway
 // session events.
-const VOICE_RS_ADJACENT: [&str; 23] = [
+const VOICE_RS_ADJACENT: [&str; 25] = [
     "voice succession refused",
     "voice actor load failed; retrying with capped backoff",
     "voice actor load failed; credential refused, not retrying",
@@ -210,6 +210,8 @@ const VOICE_RS_ADJACENT: [&str; 23] = [
     "import preview planned an apply; refusing without writing",
     "voice vote response failed; not retried",
     "voice ballot response failed; not retried",
+    "voice ballot reference not queued: actor unavailable",
+    "voice ballot reference unavailable; not retried",
     "voice name modal response failed; not retried",
     "voice acknowledgement failed; command not executed",
     "voice responder saturated; interaction dropped without acknowledgement (sampled)",
