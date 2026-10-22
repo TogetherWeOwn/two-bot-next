@@ -800,42 +800,55 @@ pub async fn apply_seasonal_decay(
 ) -> Result<u64, LevelingStoreError> {
     let as_of_ms = validate_at(as_of_iso)?;
     let as_of_norm = format_iso_millis(as_of_ms);
-    let rows: Vec<(String, i64, i32, i64)> = sqlx::query_as(
-        "SELECT member_id, seasonal_xp, decayed_weeks,
-                FLOOR(EXTRACT(EPOCH FROM updated_at) * 1000)::bigint
-         FROM member_season_xp WHERE guild_id = $1 AND season_id = $2",
-    )
-    .bind(guild_id)
-    .bind(season_id)
-    .fetch_all(pool)
-    .await?;
     let mut tx = pool.begin().await?;
     let mut decayed = 0u64;
-    for (member_id, seasonal_xp, decayed_weeks, updated_ms) in rows {
-        let days_inactive = (as_of_ms - updated_ms).max(0) as u64 / 86_400_000;
-        let new_weeks = seasonal_decay_new_weeks(days_inactive, decayed_weeks.max(0) as u64);
-        if new_weeks == 0 {
-            continue;
-        }
-        let next = seasonal_xp_after_decay_weeks(seasonal_xp as u64, new_weeks);
-        let lost = (seasonal_xp as u64).saturating_sub(next);
-        if lost == 0 {
-            continue;
-        }
-        let total_weeks =
-            i32::try_from(decayed_weeks.max(0) as u64 + new_weeks).unwrap_or(i32::MAX);
-        sqlx::query(
-            "UPDATE member_season_xp SET seasonal_xp = $3, decayed_weeks = $4
-             WHERE guild_id = $1 AND season_id = $2 AND member_id = $5",
+    let mut after = None::<String>;
+    // TOP-25 keyset pages, at most 25 actual decays per call. Scan past
+    // unchanged/zero-XP rows so zero remains a truthful drain marker. Row
+    // locks serialize the read/modify/write with awards and other ticks.
+    while decayed < 25 {
+        let rows: Vec<(String, i64, i32, i64)> = sqlx::query_as(
+            "SELECT member_id, seasonal_xp, decayed_weeks,
+                    FLOOR(EXTRACT(EPOCH FROM updated_at) * 1000)::bigint
+             FROM member_season_xp WHERE guild_id = $1 AND season_id = $2
+               AND ($3::text IS NULL OR member_id > $3)
+             ORDER BY member_id LIMIT $4 FOR UPDATE",
         )
         .bind(guild_id)
         .bind(season_id)
-        .bind(next as i64)
-        .bind(total_weeks)
-        .bind(&member_id)
-        .execute(&mut *tx)
+        .bind(after.as_deref())
+        .bind((25 - decayed) as i64)
+        .fetch_all(&mut *tx)
         .await?;
-        sqlx::query(
+        if rows.is_empty() {
+            break;
+        }
+        for (member_id, seasonal_xp, decayed_weeks, updated_ms) in rows {
+            after = Some(member_id.clone());
+            let days_inactive = (as_of_ms - updated_ms).max(0) as u64 / 86_400_000;
+            let new_weeks = seasonal_decay_new_weeks(days_inactive, decayed_weeks.max(0) as u64);
+            if new_weeks == 0 {
+                continue;
+            }
+            let next = seasonal_xp_after_decay_weeks(seasonal_xp as u64, new_weeks);
+            let lost = (seasonal_xp as u64).saturating_sub(next);
+            if lost == 0 {
+                continue;
+            }
+            let total_weeks =
+                i32::try_from(decayed_weeks.max(0) as u64 + new_weeks).unwrap_or(i32::MAX);
+            sqlx::query(
+                "UPDATE member_season_xp SET seasonal_xp = $3, decayed_weeks = $4
+             WHERE guild_id = $1 AND season_id = $2 AND member_id = $5",
+            )
+            .bind(guild_id)
+            .bind(season_id)
+            .bind(next as i64)
+            .bind(total_weeks)
+            .bind(&member_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
             "INSERT INTO xp_awards (guild_id, member_id, source, xp, occurred_at, channel_id, decision)
              VALUES ($1, $2, 'decay', $3, $4::text::timestamptz, NULL, 'seasonal_decay')",
         )
@@ -845,7 +858,8 @@ pub async fn apply_seasonal_decay(
         .bind(&as_of_norm)
         .execute(&mut *tx)
         .await?;
-        decayed += 1;
+            decayed += 1;
+        }
     }
     tx.commit().await?;
     Ok(decayed)
