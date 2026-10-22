@@ -22,12 +22,10 @@
 #![cfg(test)]
 
 use super::*;
+use crate::drop_poison_test_serial::DROP_POISON_SERIAL;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::LazyLock;
 
 const GUARD: &str = "voice_connection_guard";
-
-static SERIAL: LazyLock<std::sync::Mutex<()>> = LazyLock::new(|| std::sync::Mutex::new(()));
 
 fn drop_poison_count(guard: &str) -> Option<u64> {
     let rendered = two_bot_core::metrics::global().render(None);
@@ -60,7 +58,7 @@ async fn live_disconnect(poisoned: bool, expect_panic: bool) {
     // Direct sink call, NOT through the guard's drop: the live path.
     let sink: Arc<dyn VoiceEventSink> = runtime.clone();
     let (outcome, before, after) = {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = DROP_POISON_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let before = drop_poison_count(GUARD).unwrap_or(0);
         let outcome = catch_unwind(AssertUnwindSafe(|| sink.disconnect()));
         let after = drop_poison_count(GUARD).unwrap_or(0);

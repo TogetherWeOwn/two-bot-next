@@ -42,6 +42,8 @@ mod db_log;
 mod discord_test_common;
 mod dispatch;
 #[cfg(test)]
+mod drop_poison_test_serial;
+#[cfg(test)]
 mod duplicate_pool_registration_acceptance_tests;
 mod erasure_cli;
 mod event_cli;

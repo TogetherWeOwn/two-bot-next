@@ -17,11 +17,12 @@
 #![cfg(test)]
 
 use super::{VoiceConnectionGuard, VoiceEventSink};
+use crate::drop_poison_test_serial::DROP_POISON_SERIAL;
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, LazyLock,
+    Arc,
 };
 use std::time::Duration;
 use two_bot::voice_rooms::{BotAccess, GuildSnapshot, VoiceRuntime};
@@ -30,8 +31,6 @@ use two_bot_cutover::voice_rooms::PgRoomStore;
 use two_bot_discord::voice_rooms::RoomHttp;
 
 const GUARD: &str = "voice_connection_guard";
-
-static SERIAL: LazyLock<std::sync::Mutex<()>> = LazyLock::new(|| std::sync::Mutex::new(()));
 
 fn drop_poison_count(guard: &str) -> Option<u64> {
     let rendered = two_bot_core::metrics::global().render(None);
@@ -111,7 +110,7 @@ fn connection_guard_drop_with_counter(poisoned: bool, expected_delta: u64) {
     let guard = VoiceConnectionGuard(Some(sink));
 
     let (outcome, before_count, after_count) = {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = DROP_POISON_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let before_count = drop_poison_count(GUARD);
         let outcome = catch_unwind(AssertUnwindSafe(|| drop(guard)));
         let after_count = drop_poison_count(GUARD);
