@@ -178,7 +178,6 @@ fn receipt_default() -> ScriptedResponse {
 }
 
 #[tokio::test]
-#[ignore = "requires approved agent-testdb or credential-free CI service"]
 async fn message_level_up_posts_exactly_one_mention_safe_announcement_in_source_channel() {
     assert_eq!(
         (total_xp_for_level(1), total_xp_for_level(2)),
@@ -219,7 +218,6 @@ async fn message_level_up_posts_exactly_one_mention_safe_announcement_in_source_
 }
 
 #[tokio::test]
-#[ignore = "requires approved agent-testdb or credential-free CI service"]
 async fn role_grant_reconciliation_adds_no_extra_message_and_rank_composes() {
     let db = TestDb::new().await;
     db.seed(90).await;
@@ -277,7 +275,6 @@ async fn role_grant_reconciliation_adds_no_extra_message_and_rank_composes() {
 }
 
 #[tokio::test]
-#[ignore = "requires approved agent-testdb or credential-free CI service"]
 async fn multi_level_burst_in_one_drain_collapses_to_single_highest_level_message() {
     let db = TestDb::new().await;
     db.seed(90).await;
@@ -348,7 +345,6 @@ async fn multi_level_burst_in_one_drain_collapses_to_single_highest_level_messag
 }
 
 #[tokio::test]
-#[ignore = "requires approved agent-testdb or credential-free CI service"]
 async fn announcement_post_failure_keeps_award() {
     let db = TestDb::new().await;
     db.seed(90).await;
@@ -389,7 +385,6 @@ async fn announcement_post_failure_keeps_award() {
 }
 
 #[tokio::test]
-#[ignore = "requires approved agent-testdb or credential-free CI service"]
 async fn award_without_crossing_posts_nothing() {
     let db = TestDb::new().await;
     let mock = MockRest::start(vec![], receipt_default()).await;
@@ -413,7 +408,6 @@ async fn award_without_crossing_posts_nothing() {
 }
 
 #[tokio::test]
-#[ignore = "requires approved agent-testdb or credential-free CI service"]
 async fn decay_revoke_and_bot_traffic_post_nothing() {
     let db = TestDb::new().await;
     let mock = MockRest::start(vec![], receipt_default()).await;
@@ -465,7 +459,8 @@ async fn decay_revoke_and_bot_traffic_post_nothing() {
         &[ROLE.into()],
         true,
         true,
-    );
+    )
+    .expect("one revoke stays within the role-write cap");
     assert_eq!(plan.revoke, vec![ROLE.to_owned()], "a revoke is planned");
     assert!(
         mock.requests().is_empty(),
@@ -487,7 +482,6 @@ async fn decay_revoke_and_bot_traffic_post_nothing() {
 }
 
 #[tokio::test]
-#[ignore = "requires approved agent-testdb or credential-free CI service"]
 async fn gates_and_voice_level_ups_stay_silent() {
     // Dry runs award but never write to Discord: no roles, no announcements.
     let db = TestDb::new().await;

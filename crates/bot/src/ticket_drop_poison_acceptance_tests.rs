@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::discord_test_common::{MockRest, ScriptedResponse};
+use crate::drop_poison_test_serial::DROP_POISON_SERIAL;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use tokio::sync::oneshot;
 
@@ -65,7 +66,12 @@ async fn supervisor_drop(poisoned: bool) {
         assert!(runtime.tasks.is_poisoned());
     }
 
-    let outcome = catch_unwind(AssertUnwindSafe(|| drop(supervisor)));
+    // The poison counter series is process-global: hold the shared lock so
+    // this drop cannot land inside a counter test's delta window.
+    let outcome = {
+        let _serial = DROP_POISON_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        catch_unwind(AssertUnwindSafe(|| drop(supervisor)))
+    };
     let stopping = runtime.stopping.load(Ordering::Acquire);
     let notified = *shutdown.borrow();
     // Unfixed code panics before aborting anything. Clean up only after saving
