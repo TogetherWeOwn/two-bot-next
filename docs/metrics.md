@@ -395,8 +395,22 @@ as dynamic labels.
   `InternalMemberExecutor`), including definitive preflight refusals (slash:
   unknown roles and non-member target; website: resolver `ActionNotAllowed`
   such as non-member target, actor not member, or actor forbidden, recorded
-  by the website effect before the executor runs); actor cooldowns, Discord
-  snapshot failures and other indeterminate reads are not outcomes.
+  by the website effect before the executor runs). Slash member authority
+  refresh failures also count once as `refused`, before any mutation; actor
+  cooldowns are not outcomes. Website resolver snapshot failures and other
+  indeterminate reads before terminal execution are not outcomes.
+  Slash member authority diagnostics use `warn!` with the fixed message
+  `member authority unavailable`, `verb`, and a bounded `cause`: `discord_403`
+  (confirmed 403 on guild/member reads), `transport` (timeout, unavailable,
+  rate-limit, guard or other HTTP refusal on those reads), `malformed_roles`
+  (invalid JSON, incomplete/malformed guild or member evidence, or unknown held
+  roles), `unknown_bot` (any failed bot-identity lookup, including HTTP failures,
+  or absent/non-bot bot membership), or `guild_mismatch` (interaction or fetched guild
+  identity differs from the configured guild). No provider text or payload is
+  logged. Only the first refusal per cause per 60 seconds per member runtime is
+  warned: five fixed sampling slots, no member-keyed state. Suppression never
+  changes the enforcement counter, denial audit, or generic member reply;
+  causes are log fields, not new metric labels or enforcement outcomes.
   Recorded once per terminal channel enforcement (slash
   `ChannelModerationRuntime`, website `ChannelModerationExecutor` plus
   `InternalChannelExecutor`), with the same boundary: website resolver
