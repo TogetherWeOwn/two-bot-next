@@ -736,15 +736,15 @@ fn forgery_burst_counts_in_counters_not_logs() {
         exposition.contains(&classified_series("bad_signature", BURST as u64)),
         "RED: the burst must count under kind=\"bad_signature\"; got:\n{exposition}"
     );
-    for secret in [
+    for probe in [
         test_secret_value(),
         "synthetic-delivery-burst-0000",
         timestamp.as_str(),
         zeros.as_str(),
     ] {
         assert!(
-            !exposition.contains(secret),
-            "per-request values must never reach exposition: {secret:?}"
+            !exposition.contains(probe),
+            "per-request values must never reach exposition: {probe:?}"
         );
     }
 }
