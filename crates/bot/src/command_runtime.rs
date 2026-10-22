@@ -1683,8 +1683,10 @@ impl CommandRuntime {
             Ok(_) => {
                 // A 2xx without a usable id is not a confirmed replacement
                 // (the executor normally rejects these before they arrive).
-                // Discord may have accepted the post, so the fence stays
-                // armed — the next message must hold, not resend.
+                // Discord may have accepted the post, so re-arm the fence
+                // claim-blind — an administrator reconfigure during the POST
+                // may have disarmed the claim's fence — then diagnose.
+                self.fence_uncertain(&guild_id, &channel_id).await;
                 self.diagnose_uncertain(&guild_id, &channel_id, "receipt_id_unusable")
                     .await;
                 ActivityOutcome::Held
@@ -1694,7 +1696,7 @@ impl CommandRuntime {
                 // rejection, rate limit, local guard, or a pre-wire
                 // admission refusal — none of them reached Discord as a
                 // mutation). Timeouts, transport losses and ambiguous
-                // statuses keep the fence: the post may be live.
+                // statuses re-arm the fence: the post may be live.
                 let admission_refused = err.is_admission_blocked()
                     || matches!(
                         discord_class(&err),
@@ -1714,6 +1716,10 @@ impl CommandRuntime {
                     )
                     .await;
                 } else {
+                    // Ambiguous outcome, possibly live: re-arm claim-blind
+                    // (an administrator reconfigure during the POST may have
+                    // disarmed the fence) before diagnosing.
+                    self.fence_uncertain(&guild_id, &channel_id).await;
                     self.diagnose_uncertain(&guild_id, &channel_id, discord_class(&err))
                         .await;
                 }
@@ -2161,11 +2167,12 @@ impl CommandRuntime {
         outcome
     }
 
-    /// Re-arm the delivery fence after an unconfirmed orphan cleanup
-    /// (obsolete completion or failed record); a no-op when the
-    /// administrator removed the row. A failed
-    /// write is logged — without a claim no further post is possible until
-    /// the store recovers, and the next attempt re-fences if needed.
+    /// Re-arm the delivery fence on any uncertain outcome — the claim's
+    /// own fence may have been disarmed by an administrator reconfigure
+    /// mid-flight; a no-op when the administrator removed the row. A
+    /// failed write is logged — without a claim no further post is
+    /// possible until the store recovers, and the next attempt re-fences
+    /// if needed.
     async fn fence_uncertain(&self, guild_id: &str, channel_id: &str) {
         if let Err(err) =
             store::mark_sticky_delivery_uncertain(&self.pool, guild_id, channel_id).await

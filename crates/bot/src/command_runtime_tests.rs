@@ -4858,6 +4858,235 @@ async fn failed_record_with_admin_update_during_cleanup_rearms_fence() {
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn ambiguous_post_error_with_admin_update_during_post_rearms_fence() {
+    let db = TestDb::new().await;
+    db.seed(Some("8000000000000000021"), 120_000, 5).await;
+    // Hold the ambiguous POST (500) open so the administrator update lands
+    // mid-flight: the claim's fence is disarmed at diagnose time with a
+    // possibly-live post, and only a claim-blind re-arm holds the window.
+    let (runtime, mock) = db_runtime_script(
+        &db,
+        vec![RestResponse {
+            status: 500,
+            body: None,
+            delay: Duration::from_millis(1000),
+        }],
+    )
+    .await;
+    let msg = message(40, CHANNEL, false, Some(GUILD));
+    let (outcome, _) = tokio::join!(runtime.on_message(&msg), async {
+        wait_for(
+            || {
+                mock.requests()
+                    .iter()
+                    .any(|r| r.method == "POST" && r.path.ends_with("/messages"))
+            },
+            "ambiguous POST entered",
+        )
+        .await;
+        // Independent administrator path: the upsert clears the claim and
+        // disarms the fence but preserves the live post columns.
+        let updated = store::put_sticky(
+            &db.pool,
+            &PutSticky {
+                guild_id: GUILD_S,
+                channel_id: CHANNEL_S,
+                body: "admin v4",
+                debounce_seconds: 5,
+                enabled: true,
+                actor_id: "admin-9",
+                now_ms: now_millis_for_test(),
+            },
+        )
+        .await
+        .expect("admin update");
+        assert!(!updated, "seed row already existed");
+    });
+    assert_eq!(
+        outcome,
+        ActivityOutcome::Held,
+        "ambiguous error reports held"
+    );
+
+    // The ambiguous attempt reached the wire exactly once; with no usable
+    // receipt there is no orphan cleanup to attempt.
+    assert_eq!(
+        mock.posts_to("/messages").await.len(),
+        1,
+        "failed attempt only"
+    );
+    assert!(mock.deletes().is_empty(), "no orphan id, no cleanup");
+
+    // Administrator state wins on the row, but the ambiguous outcome
+    // re-arms the fence: the claim stays cleared (the re-arm is
+    // claim-blind) while delivery_uncertain blocks the next window.
+    let (body, last_id, claim) = db.row().await.expect("row exists");
+    assert_eq!(body, "admin v4");
+    assert_eq!(
+        last_id.as_deref(),
+        Some("8000000000000000021"),
+        "ambiguous post records nothing",
+    );
+    assert_eq!(
+        claim, None,
+        "admin update cleared the claim; the re-arm adds none"
+    );
+    assert_eq!(
+        db.audits().await,
+        vec![("sticky.run".to_owned(), "post_failed".to_owned())],
+        "ambiguous outcome audits failure, never success"
+    );
+
+    // The re-armed fence outlives the 60s claim lease: a probe past expiry
+    // is held, and the next accepted message holds without posting a
+    // duplicate. (Deleting the ambiguous-error fence_uncertain call turns
+    // the probe red and lets the follow-up duplicate.)
+    assert!(
+        store::claim_sticky_post(
+            &db.pool,
+            GUILD_S,
+            CHANNEL_S,
+            "rearm-probe",
+            now_millis_for_test() + 120_000,
+        )
+        .await
+        .expect("lease probe")
+        .is_none(),
+        "ambiguous-error re-arm survives lease expiry"
+    );
+    mock.shutdown().await;
+    let (runtime, mock) = db_runtime(&db, vec![]).await;
+    assert_eq!(
+        runtime
+            .on_message(&message(41, CHANNEL, false, Some(GUILD)))
+            .await,
+        ActivityOutcome::Held
+    );
+    assert!(
+        mock.posts_to("/messages").await.is_empty(),
+        "fenced channel sends no duplicate"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn unusable_receipt_with_admin_update_during_post_rearms_fence() {
+    let db = TestDb::new().await;
+    db.seed(Some("8000000000000000022"), 120_000, 5).await;
+    // Plus-prefixed receipt the executor accepts but the runtime
+    // all-digits guard rejects, held open so the administrator update
+    // lands mid-flight: the post may be live but can be neither recorded
+    // nor deleted, and only a claim-blind re-arm holds the window.
+    let (runtime, mock) = db_runtime_script(
+        &db,
+        vec![RestResponse {
+            status: 200,
+            body: Some(r#"{"id":"+123"}"#.into()),
+            delay: Duration::from_millis(1000),
+        }],
+    )
+    .await;
+    let msg = message(42, CHANNEL, false, Some(GUILD));
+    let (outcome, _) = tokio::join!(runtime.on_message(&msg), async {
+        wait_for(
+            || {
+                mock.requests()
+                    .iter()
+                    .any(|r| r.method == "POST" && r.path.ends_with("/messages"))
+            },
+            "unusable-receipt POST entered",
+        )
+        .await;
+        // Independent administrator path: the upsert clears the claim and
+        // disarms the fence but preserves the live post columns.
+        let updated = store::put_sticky(
+            &db.pool,
+            &PutSticky {
+                guild_id: GUILD_S,
+                channel_id: CHANNEL_S,
+                body: "admin v5",
+                debounce_seconds: 5,
+                enabled: true,
+                actor_id: "admin-9",
+                now_ms: now_millis_for_test(),
+            },
+        )
+        .await
+        .expect("admin update");
+        assert!(!updated, "seed row already existed");
+    });
+    assert_eq!(
+        outcome,
+        ActivityOutcome::Held,
+        "unusable receipt reports held"
+    );
+
+    // The POST reached the wire before the receipt was judged unusable;
+    // the unusable id leaves no orphan cleanup to attempt.
+    assert_eq!(
+        mock.posts_to("/messages").await.len(),
+        1,
+        "the POST reaches the wire before the receipt is judged unusable"
+    );
+    assert!(mock.deletes().is_empty(), "no orphan id, no cleanup");
+
+    // Administrator state wins on the row, but the unusable receipt
+    // re-arms the fence: the claim stays cleared (the re-arm is
+    // claim-blind) while delivery_uncertain blocks the next window.
+    let (body, last_id, claim) = db.row().await.expect("row exists");
+    assert_eq!(body, "admin v5");
+    assert_eq!(
+        last_id.as_deref(),
+        Some("8000000000000000022"),
+        "unusable receipt records nothing",
+    );
+    assert_eq!(
+        claim, None,
+        "admin update cleared the claim; the re-arm adds none"
+    );
+    assert_eq!(
+        db.audits().await,
+        vec![("sticky.run".to_owned(), "post_failed".to_owned())],
+        "unusable receipt audits failure, never success"
+    );
+
+    // The re-armed fence outlives the 60s claim lease: a probe past expiry
+    // is held, and the next accepted message holds without posting a
+    // duplicate. (Deleting the unusable-receipt fence_uncertain call turns
+    // the probe red and lets the follow-up duplicate.)
+    assert!(
+        store::claim_sticky_post(
+            &db.pool,
+            GUILD_S,
+            CHANNEL_S,
+            "rearm-probe",
+            now_millis_for_test() + 120_000,
+        )
+        .await
+        .expect("lease probe")
+        .is_none(),
+        "unusable-receipt re-arm survives lease expiry"
+    );
+    mock.shutdown().await;
+    let (runtime, mock) = db_runtime(&db, vec![]).await;
+    assert_eq!(
+        runtime
+            .on_message(&message(43, CHANNEL, false, Some(GUILD)))
+            .await,
+        ActivityOutcome::Held
+    );
+    assert!(
+        mock.posts_to("/messages").await.is_empty(),
+        "fenced channel sends no duplicate"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn obsolete_post_after_admin_remove_preserves_absence() {
     let db = TestDb::new().await;
     db.seed(Some("8000000000000000011"), 120_000, 5).await;
