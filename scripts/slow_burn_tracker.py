@@ -499,13 +499,15 @@ def main(argv=None, env=None):
         origin = env.get("STAGING_WORKER_URL", "")
         token = env.get("METRICS_SCRAPE_TOKEN", "")
         if not origin or not token:
-            print("::warning::slow-burn tracker not configured yet "
-                  "(STAGING_WORKER_URL or METRICS_SCRAPE_TOKEN unset); "
+            missing = ", ".join(name for name, value in
+                                 (("STAGING_WORKER_URL", origin),
+                                  ("METRICS_SCRAPE_TOKEN", token)) if not value)
+            print(f"::error::slow-burn tracker misconfigured: {missing} unset; "
                   "see the slow-burn runbook section")
             evidence["verdict"] = "unconfigured"
             Path(args.evidence_out).write_text(json.dumps(evidence, indent=2) + "\n",
                                                encoding="utf-8")
-            return 0
+            return 1
         evidence["origin"] = origin
         try:
             exposition = scrape_metrics(origin, token)

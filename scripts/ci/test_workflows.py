@@ -18,6 +18,10 @@ _HISTORY_SPEC = importlib.util.spec_from_file_location(
     "synthetic_alert_history", ROOT / "scripts/synthetic_alert_history.py")
 _HISTORY_MODULE = importlib.util.module_from_spec(_HISTORY_SPEC)
 _HISTORY_SPEC.loader.exec_module(_HISTORY_MODULE)
+_TRACKER_SPEC = importlib.util.spec_from_file_location(
+    "slow_burn_tracker", ROOT / "scripts/slow_burn_tracker.py")
+_TRACKER_MODULE = importlib.util.module_from_spec(_TRACKER_SPEC)
+_TRACKER_SPEC.loader.exec_module(_TRACKER_MODULE)
 ALERT_STEPS = _HISTORY_MODULE.ALERT_STEPS
 DECIDE_STEPS = _HISTORY_MODULE.DECIDE_STEPS
 JOB_NAMES = _HISTORY_MODULE.JOB_NAMES
@@ -266,6 +270,105 @@ def skip_blocks_test(skip, name):
     when the module part would not match, which fails closed.
     """
     return skip.rsplit("::", 1)[-1] in name
+
+
+# Quarantined red backfill acceptance (TOG-34944): 15 ignored tests that run
+# in NO lane — skipped in the check.yml coverage sweep, the check.yml store
+# lane and the nightly sweep — because their builders have not landed yet.
+# Each entry maps the test fn to the build card tracking it. Shrink-only: a
+# builder PR removes the "quarantined red" marker (keeping the DB ignore),
+# un-skips its family in all three lanes AND ratchets this pin down in the
+# same PR. Growth fails closed; see backfill_quarantine_errors.
+BACKFILL_QUARANTINE = {
+    # Audit-log family: TOG-22948 lands the fetcher + backfill_audit_entries.
+    "audit_log_pagination_limit_1_to_100_before_after_covers_45d_window": "TOG-22948",
+    "audit_log_requests_ride_rate_limit_client_never_direct_rest": "TOG-22948",
+    "audit_cursor_persists_per_window_and_resumes_mid_window": "TOG-22948",
+    "audit_rows_hold_ids_timestamps_enums_only": "TOG-22948",
+    "audit_429_retry_after_pauses_without_losing_place": "TOG-22948",
+    # Event-users/reactions/pins family: TOG-22951 lands the three fetchers.
+    "event_users_paginate_through_rate_limit_client_with_max_100": "TOG-22951",
+    "reaction_users_paginate_through_rate_limit_client": "TOG-22951",
+    "pins_list_through_rate_limit_client_persists_metadata_only": "TOG-22951",
+    "blocklisted_users_skipped_for_per_user_rows_while_aggregates_keep_counting": "TOG-22951",
+    "persisted_rows_hold_ids_timestamps_enums_only": "TOG-22951",
+    "resume_continues_from_persisted_cursors_per_family": "TOG-22951",
+    # Bans/invites/onboarding family: TOG-22952 lands the family fetchers.
+    "bans_fetch_applies_blocklist_and_counts_everyone": "TOG-22952",
+    "invite_rows_hold_metadata_only": "TOG-22952",
+    "onboarding_rows_hold_ids_enums_metadata_only": "TOG-22952",
+    "bans_invites_onboarding_resume_continues_from_persisted_cursors": "TOG-22952",
+}
+BACKFILL_QUARANTINE_SUITES = (
+    "backfill_audit_log",
+    "backfill_bans_invites_onboarding",
+    "backfill_event_users_reactions_pins",
+)
+
+
+def ignored_test_reasons(suite):
+    """Map ignored test fns to their ignore-mark source line.
+
+    Same discovery as ignored_test_names, but keeps the `#[ignore ...]`
+    line so the quarantine tripwire can require a tracking ref in it.
+    Unsupported syntax fails closed exactly like ignored_test_names.
+    """
+    [path] = ROOT.glob(f"crates/*/tests/{suite}.rs")
+    text = path.read_text(encoding="utf-8")
+    marks = list(IGNORE_MARK.finditer(text))
+    reasons = {}
+    for mark in marks:
+        line_end = text.find("\n", mark.end())
+        if line_end == -1:
+            continue
+        name = _match_fn_name(text, _skip_trivia(text, line_end + 1))
+        if name is not None:
+            line_start = text.rfind("\n", 0, mark.start()) + 1
+            reasons[name] = text[line_start:line_end]
+    if len(reasons) != len(marks):
+        raise ValueError(
+            f"{path.name}: discovered {len(reasons)} of {len(marks)} ignored test functions; "
+            "extend the scanner for the unsupported declaration",
+        )
+    return reasons
+
+
+def backfill_quarantine_members(reasons):
+    """Select explicit quarantine markers, not passing tests' DB opt-ins."""
+    return {name: reason for name, reason in reasons.items() if "quarantined red" in reason}
+
+
+def backfill_quarantine_errors(pinned, current):
+    """Shrink-only tripwire for the quarantined red backfill tests.
+
+    `pinned` maps test fn -> tracking ref (BACKFILL_QUARANTINE); `current`
+    maps test fn -> ignore-mark line, derived from the suite sources.
+    Only reasons marked "quarantined red" are quarantine members. A fixed
+    test can retain its plain DB ignore while leaving quarantine.
+    Growth is blocked outright; shrinkage must ratchet the pin down in the
+    same PR; every surviving member must carry its tracking ref in its
+    ignore reason. Returns a list of error strings (empty when clean).
+    """
+    current = backfill_quarantine_members(current)
+    errors = []
+    for name in sorted(set(current) - set(pinned)):
+        errors.append(
+            f"{name}: quarantine grew; blocked: fix the test or quarantine it "
+            "with a tracking ref in BACKFILL_QUARANTINE",
+        )
+    removed = sorted(set(pinned) - set(current))
+    if removed:
+        errors.append(
+            "quarantine shrank (good): ratchet BACKFILL_QUARANTINE down to "
+            f"{sorted(set(pinned) & set(current))} in this PR "
+            f"(fixed: {', '.join(removed)})",
+        )
+    for name in sorted(set(pinned) & set(current)):
+        if pinned[name] not in current[name]:
+            errors.append(
+                f"{name}: ignore reason must carry tracking ref {pinned[name]}",
+            )
+    return errors
 
 
 # Staging deploy push filter. Each deploy restarts the bot container and drops the
@@ -2788,6 +2891,16 @@ def voice_synthetic_errors(workflow):
     return errors
 
 
+SYNTHETIC_MISSING_BINDING_RUN = {
+    "staging": ('echo "::error::Staging synthetic has zero probe samples because '
+                'STAGING_WORKER_URL is unset; refusing to report green"\n'
+                'exit 1\n'),
+    "prod-passive": ('echo "::error::Production synthetic has zero probe samples because '
+                     'PRODUCTION_WORKER_URL is unset; refusing to report green"\n'
+                     'exit 1\n'),
+}
+
+
 def synthetic_user_flow_errors(workflow):
     """Five-minute user-flow synthetic (docs/synthetic-user-flow.md).
 
@@ -2806,6 +2919,8 @@ def synthetic_user_flow_errors(workflow):
     """
     name = "synthetic-user-flow.yml"
     errors = []
+    if "defaults" in workflow:
+        errors.append(f"{name}: workflow-level defaults must stay absent (fail-closed shell)")
     if "env" in workflow:
         errors.append(f"{name}: workflow-level env must stay absent")
     on = workflow.get("on") or {}
@@ -2845,7 +2960,7 @@ def synthetic_user_flow_errors(workflow):
             errors.append(f"{name}:{job_id}: timeout must stay 10 minutes")
         if not runner_allowed(job_id, job.get("runs-on")):
             errors.append(f"{name}:{job_id}: must use the routed runner expression for job '{job_id}'")
-        for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
+        for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy", "defaults"):
             if key in job:
                 errors.append(f"{name}:{job_id}: must not set {key}")
         steps = job.get("steps") or []
@@ -2861,11 +2976,19 @@ def synthetic_user_flow_errors(workflow):
         expected_target = "STAGING_WORKER_URL" if job_id == "staging" else "PRODUCTION_WORKER_URL"
         if probe_step.get("id") != "probe" or expected_target not in str(probe_step.get("if", "")):
             errors.append(f"{name}:{job_id}: probe must be skipped when {expected_target} is unset")
-        expected_notice = expected_target + " is unset"
-        if expected_notice not in str(notice.get("run", "")) or "::error::" not in str(notice.get("run", "")):
-            errors.append(f"{name}:{job_id}: missing-binding skip must fail with an error naming the unset variable")
-        if "exit 1" not in str(notice.get("run", "")):
-            errors.append(f"{name}:{job_id}: missing-binding skip must fail the job, never warn and stay green")
+        if notice.get("run") != SYNTHETIC_MISSING_BINDING_RUN[job_id]:
+            errors.append(f"{name}:{job_id}: missing-binding notice must run exactly the "
+                          "reviewed error and exit 1 command (fail closed)")
+        if "shell" in notice:
+            errors.append(f"{name}:{job_id}: missing-binding notice must not override shell")
+        expected_notice_if = (
+            f"steps.probe.outcome == 'skipped' && vars.{expected_target} == ''"
+            + (" && !inputs.force_fail" if job_id == "staging" else ""))
+        if notice.get("if") != expected_notice_if:
+            errors.append(f"{name}:{job_id}: missing-binding notice must keep its probe-skipped gate")
+        if "continue-on-error" in notice:
+            errors.append(f"{name}:{job_id}: missing-binding notice must not set "
+                          "continue-on-error (fail closed)")
         if upload.get("if") != "always()":
             errors.append(f"{name}:{job_id}: upload must run with if: always() so failures keep their artifact")
         if not str(upload.get("uses", "")).startswith("actions/upload-artifact@"):
@@ -2984,6 +3107,8 @@ def slow_burn_tracker_errors(workflow):
     """
     name = "slow-burn-tracker.yml"
     errors = []
+    if "defaults" in workflow:
+        errors.append(f"{name}: workflow-level defaults must stay absent (fail-closed shell)")
     if "env" in workflow:
         errors.append(f"{name}: workflow-level env must stay absent")
     on = workflow.get("on") or {}
@@ -3028,7 +3153,7 @@ def slow_burn_tracker_errors(workflow):
             errors.append(f"{name}:{job_id}: timeout must stay 10 minutes")
         if not runner_allowed(job_id, job.get("runs-on")):
             errors.append(f"{name}:{job_id}: must use the routed runner expression for job '{job_id}'")
-        for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
+        for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy", "defaults"):
             if key in job:
                 errors.append(f"{name}:{job_id}: must not set {key}")
         text = str(job).lower().replace(" ", "")
@@ -3051,6 +3176,12 @@ def slow_burn_tracker_errors(workflow):
         if run_step.get("run") != command or "uses" in run_step:
             errors.append(f"{name}:{job_id}: run step must run exactly the reviewed tracker command, "
                           "with inputs passed via env only")
+        if "if" in run_step:
+            errors.append(f"{name}:{job_id}: run step must not set if (fail closed)")
+        if "shell" in run_step:
+            errors.append(f"{name}:{job_id}: run step must not override shell (fail closed)")
+        if "continue-on-error" in run_step:
+            errors.append(f"{name}:{job_id}: run step must not set continue-on-error (fail closed)")
         if upload.get("if") != "always()":
             errors.append(f"{name}:{job_id}: upload must run with if: always() so failures keep their artifact")
         if not str(upload.get("uses", "")).startswith("actions/upload-artifact@"):
@@ -3109,11 +3240,124 @@ def slow_burn_tracker_errors(workflow):
     return errors
 
 
+FIVE_MINUTE_SCHEDULERS = ("slow-burn-tracker.yml", "synthetic-user-flow.yml")
+
+
+def scheduled_binding_audit_errors(workflows):
+    """Five-minute watchers must fail closed on missing bindings.
+
+    Both `*/5` schedules exist to watch production health every five
+    minutes; an unconfigured watcher that warns and exits green reads as a
+    clean bill of health forever. The audit pins the `*/5` inventory (a new
+    five-minute watcher needs its fail-closed entry here) and each
+    watcher's fail-closed unconfigured path: slow-burn's tracker step
+    hands both bindings to scripts/slow_burn_tracker.py, which exits 1
+    with an ::error:: naming the unset binding (proved below against the
+    reviewed script, and pinned per binding in
+    scripts/test_slow_burn_tracker.py), and the handoff step itself
+    carries no if or continue-on-error; synthetic's missing-binding
+    notice keeps its probe-skipped gate and fails the job with an
+    ::error:: naming the unset target var, with no continue-on-error.
+    """
+    name = "scheduled-binding-audit"
+    errors = []
+    five_min = sorted(
+        path for path, workflow in workflows.items()
+        for slot in ((workflow.get("on") or {}).get("schedule") or [])
+        if isinstance(slot, dict) and slot.get("cron") == "*/5 * * * *")
+    if five_min != sorted(FIVE_MINUTE_SCHEDULERS):
+        errors.append(
+            f"{name}: */5 schedules must stay exactly "
+            f"{', '.join(sorted(FIVE_MINUTE_SCHEDULERS))} (a new five-minute "
+            "watcher needs its fail-closed audit entry)")
+        return errors
+    slow_burn_workflow = workflows.get("slow-burn-tracker.yml") or {}
+    if "defaults" in slow_burn_workflow:
+        errors.append(f"{name}: slow-burn-tracker.yml: workflow-level defaults must "
+                      "stay absent (fail-closed shell)")
+    tracker = (slow_burn_workflow.get("jobs") or {}).get("tracker") or {}
+    if "defaults" in tracker:
+        errors.append(f"{name}: slow-burn-tracker.yml:tracker: job-level defaults "
+                      "must stay absent (fail-closed shell)")
+    runs = [step for step in tracker.get("steps") or []
+            if "scripts/slow_burn_tracker.py" in str(step.get("run", ""))]
+    if len(runs) != 1:
+        errors.append(f"{name}: slow-burn-tracker.yml: tracker job must invoke "
+                      "scripts/slow_burn_tracker.py exactly once")
+    else:
+        handoff = runs[0].get("env") or {}
+        if "STAGING_WORKER_URL" not in handoff or "METRICS_SCRAPE_TOKEN" not in handoff:
+            errors.append(f"{name}: slow-burn-tracker.yml: tracker step must hand both "
+                          "bindings to the tracker script via env")
+        if "if" in runs[0]:
+            errors.append(f"{name}: slow-burn-tracker.yml: tracker step must not set "
+                          "if (fail closed)")
+        if "shell" in runs[0]:
+            errors.append(f"{name}: slow-burn-tracker.yml: tracker step must not "
+                          "override shell")
+        if "continue-on-error" in runs[0]:
+            errors.append(f"{name}: slow-burn-tracker.yml: tracker step must not set "
+                          "continue-on-error (fail closed)")
+    with tempfile.TemporaryDirectory() as tmp:
+        evidence = str(Path(tmp) / "evidence.json")
+        expo = str(Path(tmp) / "expo.prom")
+        with patch("sys.stdout") as stdout:
+            code = _TRACKER_MODULE.main(
+                ["--evidence-out", evidence, "--exposition-out", expo],
+                {"GITHUB_REPOSITORY": "TogetherWeOwn/two-bot-next",
+                 "GITHUB_RUN_ID": "0",
+                 "GITHUB_SERVER_URL": "https://github.com",
+                 "GH_TOKEN": "audit-token",
+                 "STAGING_WORKER_URL": "", "METRICS_SCRAPE_TOKEN": ""})
+        writes = stdout.write.call_args_list
+        out = writes[0].args[0] if writes else ""
+        if (code == 0 or "::error::" not in out
+                or "STAGING_WORKER_URL" not in out
+                or "METRICS_SCRAPE_TOKEN" not in out):
+            errors.append(f"{name}: slow-burn-tracker.yml: an unconfigured tracker run "
+                          "must exit non-zero with an ::error:: naming the unset bindings")
+    synthetic_workflow = workflows.get("synthetic-user-flow.yml") or {}
+    if "defaults" in synthetic_workflow:
+        errors.append(f"{name}: synthetic-user-flow.yml: workflow-level defaults must "
+                      "stay absent (fail-closed shell)")
+    synthetic = synthetic_workflow.get("jobs") or {}
+    targets = (("staging", "STAGING_WORKER_URL"),
+               ("prod-passive", "PRODUCTION_WORKER_URL"))
+    for job_id, target in targets:
+        job = synthetic.get(job_id) or {}
+        if "defaults" in job:
+            errors.append(f"{name}: synthetic-user-flow.yml:{job_id}: job-level defaults "
+                          "must stay absent (fail-closed shell)")
+        steps = job.get("steps") or []
+        notices = [step for step in steps
+                   if str(step.get("name", "")).startswith("Fail closed when the ")]
+        if len(notices) != 1:
+            errors.append(f"{name}: synthetic-user-flow.yml:{job_id}: must keep its "
+                          "missing-binding notice step")
+            continue
+        if notices[0].get("run") != SYNTHETIC_MISSING_BINDING_RUN[job_id]:
+            errors.append(f"{name}: synthetic-user-flow.yml:{job_id}: missing-binding "
+                          f"notice must run exactly the reviewed ::error:: naming {target} "
+                          "and exit 1 command")
+        if "shell" in notices[0]:
+            errors.append(f"{name}: synthetic-user-flow.yml:{job_id}: missing-binding "
+                          "notice must not override shell")
+        notice_if = str(notices[0].get("if", ""))
+        if "steps.probe.outcome" not in notice_if or target not in notice_if:
+            errors.append(f"{name}: synthetic-user-flow.yml:{job_id}: missing-binding "
+                          f"notice must keep its probe-skipped gate on {target}")
+        if "continue-on-error" in notices[0]:
+            errors.append(f"{name}: synthetic-user-flow.yml:{job_id}: missing-binding "
+                          "notice must not set continue-on-error (fail closed)")
+    return errors
+
+
 def workflow_policy_errors(workflows):
     errors = []
     errors.extend(staging_gateway_injection_errors(workflows))
     errors.extend(staging_error_rate_gate_errors(workflows))
     errors.extend(staging_fault_injection_errors(workflows))
+    errors.extend(scheduled_binding_audit_errors(workflows))
     # Fail closed on new workflows/jobs, including reusable-workflow alternatives.
     # An intentional addition needs an explicit policy change and independent review.
     if set(workflows) != set(JOB_INVENTORY):
@@ -4212,10 +4456,9 @@ class WorkflowTests(unittest.TestCase):
 
     def test_patch_coverage_ignored_sweep_skips_tests_that_cannot_pass_there(self):
         # The ignored sweep tolerates failures, but the flake ledger reads
-        # every FAILED line it prints as a flake. No ignored test in these
-        # suites can pass under its two_bot_test_ci URL, so the sweep skips
-        # each one. Names come from the sources: a new ignored test in one of
-        # these suites fails here until the sweep skips it too.
+        # every FAILED line it prints as a flake. Skip exact-URL opt-ins and
+        # explicitly quarantined red tests, not passing DB opt-ins in those
+        # backfill suites. Names and quarantine markers come from the sources.
         # Exact-URL suites: a fail-closed run elsewhere still executes them.
         # The stream go-live ledger suite shares the strict agent_test
         # guard; its dedicated replay below stays fail-closed.
@@ -4268,13 +4511,14 @@ class WorkflowTests(unittest.TestCase):
                     )
         [store_lane] = [line for line in runs if "--test backfill_audit_log" in line]
         store_skips = re.findall(r"--skip (\S+)", store_lane)
+        quarantined = set()
         for suite in red_suites:
-            names = ignored_test_names(suite)
-            self.assertTrue(names, suite)
-            expected.update(names)
-            for name in names:
-                with self.subTest(suite=suite, test=name):
-                    self.assertIn(name, store_skips)
+            quarantined.update(backfill_quarantine_members(ignored_test_reasons(suite)))
+        expected.update(quarantined)
+        self.assertEqual(
+            set(store_skips), quarantined,
+            "store skip set must match quarantine; un-skip graduated tests in the fail-closed lane",
+        )
         # The internal-events DB test is skipped by its module-qualified
         # path: the bare function name would also match a same-named test
         # in any other module swept here. The qualified pin in the
@@ -4283,6 +4527,170 @@ class WorkflowTests(unittest.TestCase):
         expected.add("database::actions_persist_rows_and_preserve_other_events_and_guilds")
         self.assertEqual(len(sweep_skips), len(set(sweep_skips)))
         self.assertEqual(set(sweep_skips) - {"regenerate_reference_docs"}, expected)
+
+    def test_backfill_quarantine_tripwire_reports_growth_shrinkage_and_untracked(self):
+        pinned = {"alpha": "TOG-1", "beta": "TOG-2"}
+        clean = {
+            "alpha": '#[ignore = "quarantined red, tracked by TOG-1"]',
+            "beta": '#[ignore = "quarantined red, tracked by TOG-2"]',
+        }
+        self.assertEqual(backfill_quarantine_errors(pinned, clean), [])
+        grown = dict(clean, gamma='#[ignore = "quarantined red, tracked by TOG-3"]')
+        [growth] = backfill_quarantine_errors(pinned, grown)
+        self.assertIn("gamma", growth)
+        self.assertIn("grew", growth)
+        [shrinkage] = backfill_quarantine_errors(
+            pinned, {"alpha": clean["alpha"]},
+        )
+        self.assertIn("shrank", shrinkage)
+        self.assertIn("BACKFILL_QUARANTINE", shrinkage)
+        self.assertIn("beta", shrinkage)
+        untracked = dict(clean, alpha='#[ignore = "quarantined red, requires authorized TEST_DATABASE_URL"]')
+        [missing] = backfill_quarantine_errors(pinned, untracked)
+        self.assertIn("alpha", missing)
+        self.assertIn("TOG-1", missing)
+
+    def test_fixed_backfill_test_can_keep_database_ignore_after_quarantine_ratchet(self):
+        reason = '#[ignore = "requires authorized TEST_DATABASE_URL"]'
+        [shrinkage] = backfill_quarantine_errors({"alpha": "TOG-1"}, {"alpha": reason})
+        self.assertIn("shrank", shrinkage)
+        self.assertIn("alpha", shrinkage)
+        self.assertEqual(backfill_quarantine_errors({}, {"alpha": reason}), [])
+
+    def test_fixed_backfill_family_can_leave_coverage_and_store_skip_sets(self):
+        reasons = ignored_test_reasons
+        for suite in BACKFILL_QUARANTINE_SUITES:
+            fixed = set(ignored_test_names(suite))
+            current = {}
+            for candidate in BACKFILL_QUARANTINE_SUITES:
+                current.update(reasons(candidate))
+            for name in fixed:
+                current[name] = '#[ignore = "requires authorized TEST_DATABASE_URL"]'
+            pinned = {name: ref for name, ref in BACKFILL_QUARANTINE.items() if name not in fixed}
+            mutated = deepcopy(self.workflows)
+            for workflow in ("check.yml", "nightly.yml"):
+                for job in mutated[workflow]["jobs"].values():
+                    for step in job.get("steps", []):
+                        if "run" in step:
+                            for name in fixed:
+                                step["run"] = step["run"].replace(f"--skip {name}", "")
+            store = next(
+                step for job in mutated["check.yml"]["jobs"].values()
+                for step in job.get("steps", [])
+                if "--test backfill_audit_log" in step.get("run", "")
+            )
+            nightly = next(
+                step for step in mutated["nightly.yml"]["jobs"]["sweep"]["steps"]
+                if step.get("name") == "Full workspace sweep including ignored tests"
+            )
+            with patch.object(self, "workflows", mutated), patch(
+                f"{__name__}.ignored_test_reasons",
+                side_effect=lambda candidate: (
+                    {name: current[name] for name in fixed}
+                    if candidate == suite else reasons(candidate)
+                ),
+            ), patch(f"{__name__}.BACKFILL_QUARANTINE", pinned):
+                # Proper graduation keeps the DB opt-in and un-skips all three sites.
+                with self.subTest(suite=suite, graduation="complete"):
+                    self.test_patch_coverage_ignored_sweep_skips_tests_that_cannot_pass_there()
+                    self._assert_backfill_quarantine_skip_sites(current)
+                    self.assertEqual(backfill_quarantine_errors(pinned, current), [])
+                name = sorted(fixed)[0]
+                for site, step in (("store", store), ("nightly", nightly)):
+                    original = step["run"]
+                    # Cargo also accepts substring and module-qualified skips.
+                    for token in (name, name[:-1], f"database::{name}"):
+                        with self.subTest(suite=suite, site=site, stale_skip=token):
+                            step["run"] = original.rstrip() + f" --skip {token}"
+                            try:
+                                message = (
+                                    "store skip set must match quarantine" if site == "store"
+                                    else "un-skip graduated backfill tests in the nightly sweep"
+                                )
+                                with self.assertRaisesRegex(AssertionError, message):
+                                    self._assert_backfill_quarantine_skip_sites(current)
+                                if site == "store":
+                                    with self.assertRaisesRegex(AssertionError, message):
+                                        self.test_patch_coverage_ignored_sweep_skips_tests_that_cannot_pass_there()
+                            finally:
+                                step["run"] = original
+
+    def _assert_backfill_quarantine_skip_sites(self, current):
+        # All three skip sites pin every quarantined test: the coverage sweep
+        # and the store lane (check.yml) plus the nightly sweep (nightly.yml).
+        check_jobs = self.workflows["check.yml"]["jobs"]
+        coverage_step = next(
+            step for step in check_jobs["patch-coverage"]["steps"]
+            if step.get("name") == "Patch coverage (HARD, 80% of added lines)"
+        )
+        [coverage_sweep] = [
+            line for line in shell_logical_lines(coverage_step["run"])
+            if line.startswith("cov_run ") and "--workspace --lib --bins --tests" in line
+            and "-- --ignored" in line
+        ]
+        coverage_skips = set(re.findall(r"--skip (\S+)", coverage_sweep))
+        [store_lane] = [
+            line
+            for job in check_jobs.values() for candidate in job.get("steps", [])
+            for line in shell_logical_lines(str(candidate.get("run", "")))
+            if "--test backfill_audit_log" in line
+        ]
+        store_skips = set(re.findall(r"--skip (\S+)", store_lane))
+        [nightly_sweep] = [
+            line
+            for candidate in self.workflows["nightly.yml"]["jobs"]["sweep"]["steps"]
+            if candidate.get("name") == "Full workspace sweep including ignored tests"
+            for line in shell_logical_lines(str(candidate.get("run", "")))
+        ]
+        nightly_skips = set(re.findall(r"--skip (\S+)", nightly_sweep))
+        self.assertEqual(
+            store_skips, set(BACKFILL_QUARANTINE),
+            "store skip set must match quarantine; un-skip graduated tests in the fail-closed lane",
+        )
+        graduated = set(current) - set(backfill_quarantine_members(current))
+        blocked = {}
+        for name in sorted(graduated):
+            # These backfill fns are top-level: unrelated module-only filters
+            # such as channel_moderation_store:: cannot block their bare paths.
+            matches = sorted(
+                skip for skip in nightly_skips
+                if skip.rsplit("::", 1)[-1] and skip_blocks_test(skip, name)
+            )
+            if matches:
+                blocked[name] = matches
+        self.assertEqual(blocked, {}, "un-skip graduated backfill tests in the nightly sweep")
+        for name in sorted(BACKFILL_QUARANTINE):
+            with self.subTest(quarantined=name):
+                self.assertIn(name, coverage_skips)
+                self.assertIn(name, store_skips)
+                self.assertIn(name, nightly_skips)
+
+    def test_backfill_quarantine_is_tracked_counted_and_shrink_only(self):
+        # TOG-34944: the 15 nowhere-run red backfill tests are quarantined,
+        # never silent. Tracked: each ignore reason carries its build card.
+        # Counted: the pin asserts 15. Shrink-only: growth fails, and a fix
+        # ratchets the pin down in the same PR.
+        self.assertEqual(len(BACKFILL_QUARANTINE), 15)
+        current = {}
+        for suite in BACKFILL_QUARANTINE_SUITES:
+            current.update(ignored_test_reasons(suite))
+        self.assertEqual(backfill_quarantine_errors(BACKFILL_QUARANTINE, current), [])
+        self._assert_backfill_quarantine_skip_sites(current)
+        # Both workflow comments restate the quarantine at test granularity
+        # with tracking refs: every name and every ref appears in a `#`
+        # comment line, so the prose cannot drift from the pin.
+        for workflow in ("check.yml", "nightly.yml"):
+            comments = "\n".join(
+                line
+                for line in (ROOT / ".github/workflows" / workflow).read_text().splitlines()
+                if line.strip().startswith("#")
+            )
+            for name in sorted(BACKFILL_QUARANTINE):
+                with self.subTest(workflow=workflow, comment=name):
+                    self.assertIn(name, comments)
+            for ref in sorted(set(BACKFILL_QUARANTINE.values())):
+                with self.subTest(workflow=workflow, comment=ref):
+                    self.assertIn(ref, comments)
 
     def test_fail_closed_gate_sees_qualified_skip_tokens(self):
         # Cargo matches --skip against the full test path, so a qualified
@@ -6109,6 +6517,16 @@ class WorkflowTests(unittest.TestCase):
             "pull_request_target trigger": lambda w: w["on"].update({"pull_request_target": None}),
             "workflow_run trigger": lambda w: w["on"].update({"workflow_run": {"workflows": ["check"]}}),
             "workflow-level secret": lambda w: w.update({"env": {"T": bearer}}),
+            "workflow-level shell default": lambda w: w.update(
+                {"defaults": {"run": {"shell": "echo {0}"}}}),
+            "live job shell default": lambda w: live_job(w).update(
+                {"defaults": {"run": {"shell": "echo {0}"}}}),
+            "fixture job shell default": lambda w: fixture_job(w).update(
+                {"defaults": {"run": {"shell": "echo {0}"}}}),
+            "live run step shell override": lambda w: live_job(w)["steps"][3].update(
+                {"shell": "echo {0}"}),
+            "fixture run step shell override": lambda w: fixture_job(w)["steps"][2].update(
+                {"shell": "echo {0}"}),
             "third job": lambda w: w["jobs"].update({"again": deepcopy(live_job(w))}),
             "fixture job dropped": lambda w: w["jobs"].pop("fixture"),
             # Live job: exactly the existing staging bearer, from main only.
@@ -6206,6 +6624,120 @@ class WorkflowTests(unittest.TestCase):
         del missing["slow-burn-tracker.yml"]
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
+
+    def test_synthetic_missing_binding_notices_cannot_hide_failure(self):
+        mutations = {
+            "dead branch": lambda run: run.replace(
+                "exit 1", "if false; then\nexit 1\nfi"),
+            "early success": lambda run: run.replace("exit 1", "exit 0\nexit 1"),
+            "uncalled function": lambda run: run.replace(
+                "exit 1", "unused() {\nexit 1\n}"),
+            "heredoc": lambda run: run.replace(
+                "exit 1", "cat <<'EOF'\nexit 1\nEOF"),
+        }
+        for job_id in ("staging", "prod-passive"):
+            original = self.workflows["synthetic-user-flow.yml"]["jobs"][job_id]["steps"][2]
+            baseline = subprocess.run(
+                ["bash", "--noprofile", "--norc", "-c", original["run"]],
+                env={"PATH": os.defpath}, capture_output=True, text=True, timeout=5)
+            self.assertEqual(baseline.returncode, 1)
+            self.assertIn("::error::", baseline.stdout)
+            for label, transform in mutations.items():
+                with self.subTest(job=job_id, mutation=label):
+                    changed = deepcopy(self.workflows)
+                    notice = changed["synthetic-user-flow.yml"]["jobs"][job_id]["steps"][2]
+                    notice["run"] = transform(notice["run"])
+                    result = subprocess.run(
+                        ["bash", "--noprofile", "--norc", "-c", notice["run"]],
+                        env={"PATH": os.defpath}, capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, 0)
+                    self.assertTrue(scheduled_binding_audit_errors(changed), label)
+                    self.assertTrue(synthetic_user_flow_errors(changed["synthetic-user-flow.yml"]), label)
+                    self.assertTrue(workflow_policy_errors(changed), label)
+            for scope in ("step", "job", "workflow"):
+                with self.subTest(job=job_id, mutation="shell override", scope=scope):
+                    changed = deepcopy(self.workflows)
+                    workflow = changed["synthetic-user-flow.yml"]
+                    job = workflow["jobs"][job_id]
+                    if scope == "step":
+                        job["steps"][2]["shell"] = "echo {0}"
+                    else:
+                        holder = job if scope == "job" else workflow
+                        holder["defaults"] = {"run": {"shell": "echo {0}"}}
+                    self.assertTrue(scheduled_binding_audit_errors(changed))
+                    self.assertTrue(synthetic_user_flow_errors(workflow))
+                    self.assertTrue(workflow_policy_errors(changed))
+
+    def test_five_minute_schedulers_fail_closed_on_missing_bindings(self):
+        workflows = self.workflows
+        self.assertEqual(scheduled_binding_audit_errors(workflows), [])
+
+        def tracker_run_step(copy):
+            steps = copy["slow-burn-tracker.yml"]["jobs"]["tracker"]["steps"]
+            return next(step for step in steps
+                        if "slow_burn_tracker.py" in step.get("run", ""))
+
+        def tracker_env(copy):
+            return tracker_run_step(copy)["env"]
+
+        def notice_step(copy, job_id):
+            steps = copy["synthetic-user-flow.yml"]["jobs"][job_id]["steps"]
+            return next(step for step in steps
+                        if str(step.get("name", "")).startswith("Fail closed when the "))
+
+        def notice_run(copy, job_id, transform):
+            notice_step(copy, job_id)["run"] = transform(notice_step(copy, job_id)["run"])
+
+        mutations = {
+            "slow-burn schedule coarsened": lambda w: w["slow-burn-tracker.yml"]["on"][
+                "schedule"].__setitem__(0, {"cron": "*/6 * * * *"}),
+            "nightly gains a five-minute schedule": lambda w: w["nightly.yml"]["on"][
+                "schedule"].__setitem__(0, {"cron": "*/5 * * * *"}),
+            "tracker drops the bearer handoff": lambda w: tracker_env(w).pop(
+                "METRICS_SCRAPE_TOKEN"),
+            "tracker drops the url handoff": lambda w: tracker_env(w).pop(
+                "STAGING_WORKER_URL"),
+            "tracker run step gated": lambda w: tracker_run_step(w).__setitem__(
+                "if", "false"),
+            "tracker run tolerates failure": lambda w: tracker_run_step(w).__setitem__(
+                "continue-on-error", True),
+            "tracker run step shell override": lambda w: tracker_run_step(w).__setitem__(
+                "shell", "echo {0}"),
+            "tracker job shell default": lambda w: w["slow-burn-tracker.yml"]["jobs"][
+                "tracker"].__setitem__("defaults", {"run": {"shell": "echo {0}"}}),
+            "slow-burn workflow shell default": lambda w: w["slow-burn-tracker.yml"].__setitem__(
+                "defaults", {"run": {"shell": "echo {0}"}}),
+            "staging notice gated off": lambda w: notice_step(w, "staging").__setitem__(
+                "if", "false"),
+            "staging notice tolerates failure": lambda w: notice_step(w, "staging").__setitem__(
+                "continue-on-error", True),
+            "staging notice neutralizes its exit": lambda w: notice_run(
+                w, "staging", lambda run: run.replace("exit 1", "exit 1 || true")),
+            "staging notice warns": lambda w: notice_run(
+                w, "staging", lambda run: run.replace("::error::", "::warning::")),
+            "staging notice loses its exit": lambda w: notice_run(
+                w, "staging", lambda run: run.replace("exit 1", "exit 0")),
+            "staging notice drops the binding name": lambda w: notice_run(
+                w, "staging", lambda run: run.replace("STAGING_WORKER_URL", "the target var")),
+            "staging notice renamed": lambda w: notice_step(w, "staging").update(
+                {"name": "Note"}),
+            "prod notice warns": lambda w: notice_run(
+                w, "prod-passive", lambda run: run.replace("::error::", "::warning::")),
+            "prod notice loses its exit": lambda w: notice_run(
+                w, "prod-passive", lambda run: run.replace("exit 1", "exit 0")),
+            "prod notice gated off": lambda w: notice_step(w, "prod-passive").__setitem__(
+                "if", "false"),
+            "prod notice tolerates failure": lambda w: notice_step(w, "prod-passive").__setitem__(
+                "continue-on-error", True),
+            "prod notice neutralizes its exit": lambda w: notice_run(
+                w, "prod-passive", lambda run: run.replace("exit 1", "exit 1 || true")),
+        }
+        for label, change in mutations.items():
+            with self.subTest(change=label):
+                changed = deepcopy(workflows)
+                change(changed)
+                self.assertTrue(scheduled_binding_audit_errors(changed), label)
+                self.assertTrue(workflow_policy_errors(changed), label)
 
     def test_gradual_promote_proof_shape_is_pinned(self):
         workflows = self.workflows
