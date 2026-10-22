@@ -202,3 +202,25 @@ async fn actor_inbox_healthy_path_admits_and_drains() {
     assert!(!status.halted);
     runtime.remove_guild(GUILD);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn actor_inbox_legacy_adapter_path_stays_available() {
+    // Control pinning the legacy adapter path: qualified calls bypass any
+    // inherent inbox gate by design, so this passes both before and after the
+    // Builder adds inherent `try_send_command` / `inbox_overflow_dropped`. It
+    // also keeps the adapter traits referenced once inherent methods shadow
+    // unqualified calls, avoiding never-used warnings under `-D warnings`.
+    let trace = Trace::default();
+    let runtime = spawned_runtime(trace);
+    let actor = runtime.ensure_actor(GUILD).expect("live actor");
+    assert!(
+        <GuildActor as ActorTrySend>::try_send_command(&actor, ActorCommand::Reconcile),
+        "legacy adapter path must admit on a fresh actor"
+    );
+    assert_eq!(
+        <GuildActor as ActorOverflowCount>::inbox_overflow_dropped(&actor),
+        0,
+        "legacy adapter reports zero overflow on a fresh actor"
+    );
+    runtime.remove_guild(GUILD);
+}

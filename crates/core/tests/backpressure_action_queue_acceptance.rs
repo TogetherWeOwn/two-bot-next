@@ -252,3 +252,23 @@ fn queue_healthy_mixed_burst_has_no_refusal_under_cap() {
         "no refusal may be counted when everything fits under the cap"
     );
 }
+
+#[test]
+fn queue_legacy_adapter_path_stays_available() {
+    // Control pinning the legacy adapter path: qualified calls bypass any
+    // inherent bound by design, so this passes both before and after the
+    // Builder adds inherent `try_enqueue` / `overflow_dropped`. It also keeps
+    // the adapter traits referenced once inherent methods shadow unqualified
+    // calls, avoiding never-used warnings under `-D warnings`.
+    let queue = ActionQueue::new();
+    let admitted = <ActionQueue as TryEnqueue>::try_enqueue(&queue, GUILD, delete(900_000));
+    assert!(
+        admitted.is_some(),
+        "legacy adapter path must admit on a fresh queue"
+    );
+    assert_eq!(
+        <ActionQueue as OverflowCount>::overflow_dropped(&queue),
+        0,
+        "legacy adapter reports zero overflow on a fresh queue"
+    );
+}
