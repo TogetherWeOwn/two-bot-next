@@ -490,6 +490,9 @@ impl CustomCommandRuntime {
     /// disabled surface, a voice-owned name, or anything else stays unowned
     /// with no I/O. The reply lands inside the existing receipt budget,
     /// leaving margin below Discord's three-second acknowledgement deadline.
+    /// The interaction stays owned after the single attempt whatever the wire
+    /// outcome: the lookup already failed, so no fallback handler may execute
+    /// a cached or guessed definition or send a second reply.
     async fn answer_lookup_outage(
         &self,
         interaction: &Interaction,
@@ -503,10 +506,11 @@ impl CustomCommandRuntime {
         match outcome {
             SlashOutcome::Unknown if self.router.gates().automations => {
                 let response = text_response(InteractionReply::new(LOOKUP_OUTAGE_REPLY, true));
-                // Initial acknowledgement, like the defer path: receipt-deadline
-                // expiry is ambiguous (the reply may have landed), so only
-                // provably pre-wire failures map to `Delivery`.
-                tokio::time::timeout_at(
+                // One attempt only, inside the receipt budget. The attempt's
+                // wire outcome (provably pre-wire or uncertain alike) is
+                // spent, never retried, and never propagated: ownership is
+                // decided by the failed lookup, not by the reply landing.
+                let _attempted = tokio::time::timeout_at(
                     received + Duration::from_millis(crate::executor::RECEIPT_ADMISSION_BUDGET_MS),
                     self.executor.answer_interaction_with_blocked_retry(
                         interaction.id.get(),
@@ -514,9 +518,7 @@ impl CustomCommandRuntime {
                         &response,
                     ),
                 )
-                .await
-                .map_err(|_| CustomCommandError::DeliveryUnknown)?
-                .map_err(delivery_error)?;
+                .await;
                 Ok(true)
             }
             _ => Ok(false),

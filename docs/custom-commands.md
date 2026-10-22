@@ -152,9 +152,9 @@ fact with reason `delivery_failed`. An uncertain completion — timeout,
 transport failure, 5xx, or 429, including an accepted edit whose response is
 lost — is `DeliveryUnknown`: exactly one PATCH, never an automatic resend,
 and no definitive failed fact, so a later explicit retry of the same
-interaction records only its own outcome. Success still records `(ok, None)`
-with the rendered template, and audit rows carry no template or rendered
-content. A render or context failure is definitive and local, so it still
+interaction records only its own outcome. A successful completion delivers
+the rendered template and records `(ok, None)`; audit rows carry no template
+or rendered content. A render or context failure is definitive and local, so it still
 audits even when the fallback completion is uncertain.
 
 ## Explicit prefix acceptance and replay safety

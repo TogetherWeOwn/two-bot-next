@@ -449,9 +449,18 @@ async fn absent_and_disabled_commands_stay_silent() {
     pool.close().await;
 }
 
+#[derive(sqlx::FromRow)]
+struct AuditRow {
+    guild_id: String,
+    actor_id: Option<String>,
+    action: String,
+    target_key: Option<String>,
+    outcome: String,
+    reason: Option<String>,
+}
+
 #[tokio::test]
 #[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
-#[allow(clippy::type_complexity)]
 async fn completion_audit_rows_carry_no_template_or_rendered_content() {
     let pool = test_pool().await;
     seed_faq(&pool, "audit marker xyzzy {user}").await;
@@ -475,14 +484,7 @@ async fn completion_audit_rows_carry_no_template_or_rendered_content() {
         .await
         .is_err());
     mock.shutdown().await;
-    let rows: Vec<(
-        String,
-        Option<String>,
-        String,
-        Option<String>,
-        String,
-        Option<String>,
-    )> = sqlx::query_as(
+    let rows: Vec<AuditRow> = sqlx::query_as(
         "SELECT guild_id, actor_id, action, target_key, outcome, reason \
              FROM automation_audit_log WHERE action = 'command.run' ORDER BY id",
     )
@@ -490,14 +492,14 @@ async fn completion_audit_rows_carry_no_template_or_rendered_content() {
     .await
     .expect("audit rows");
     assert_eq!(rows.len(), 2);
-    for (guild, actor, action, target, outcome, reason) in &rows {
+    for row in &rows {
         let joined = [
-            guild.as_str(),
-            actor.as_deref().unwrap_or_default(),
-            action.as_str(),
-            target.as_deref().unwrap_or_default(),
-            outcome.as_str(),
-            reason.as_deref().unwrap_or_default(),
+            row.guild_id.as_str(),
+            row.actor_id.as_deref().unwrap_or_default(),
+            row.action.as_str(),
+            row.target_key.as_deref().unwrap_or_default(),
+            row.outcome.as_str(),
+            row.reason.as_deref().unwrap_or_default(),
         ]
         .join(" ");
         assert!(
