@@ -54,6 +54,8 @@ pub mod database_url;
 pub mod disable_preflight;
 pub mod e2e_matrix;
 pub mod error_chain;
+#[cfg(feature = "db")]
+pub mod event_reminder_store;
 pub mod events;
 pub mod eventsub_delivery_config;
 pub mod eventsub_receiver_config;
