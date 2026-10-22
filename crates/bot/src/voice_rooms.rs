@@ -7193,8 +7193,10 @@ struct GuildActor {
 /// received bufferable command, so a draining actor never wedges.
 /// Reply-bearing commands bypass the gate: dropping a reply would hang its
 /// caller, while fire-and-forget state reconverges on the next frame, with
-/// one exception: a refused ticketed `Join` drops its ticket, and only a
-/// fresh channel transition re-tickets, so the member rejoins to get a room.
+/// two exceptions: a refused ticketed `Join` drops its ticket, and only a
+/// fresh channel transition re-tickets, so the member rejoins to get a room;
+/// and creation-policy updates bypass losslessly, so a saved switch never
+/// leaves the worker on the previous policy past the cap.
 const VOICE_ACTOR_INBOX_CAP: usize = 256;
 
 /// Backpressure ledger for one guild actor's inbox
@@ -7277,6 +7279,18 @@ impl GuildActor {
             self.backpressure.rollback();
             false
         }
+    }
+
+    /// Deliver a control-plane command past the inbox gate. The channel is
+    /// unbounded, so this only fails when the actor is gone; it never blocks
+    /// and never counts a refusal. Creation-policy updates use this: a refused
+    /// `AccessChanged` would leave the worker enforcing the previous policy
+    /// after the administrator already saw "Saved". Reception still releases
+    /// the entry's bufferable ledger slot, so each concurrent lossless send
+    /// skews the gate by at most one slot; administrator saves are rare
+    /// enough that the bound stays effective.
+    fn send_command_lossless(&self, command: ActorCommand) -> bool {
+        self.tx.send(command).is_ok()
     }
 
     /// Fire-and-forget sends refused past the inbox cap. Monotonic per actor.
@@ -8311,10 +8325,12 @@ where
     }
 
     /// Push freshly saved access controls to the live actor, so a creation
-    /// switch takes effect without a restart.
+    /// switch takes effect without a restart. Lossless: the store write
+    /// already succeeded and the administrator is told "Saved", so the
+    /// update must reach the worker even past the inbox cap.
     fn access_changed(&self, guild: Snowflake, controls: AccessControls) {
         if let Some(actor) = self.live_actor(guild) {
-            let _ = actor.try_send_command(ActorCommand::AccessChanged(controls));
+            let _ = actor.send_command_lossless(ActorCommand::AccessChanged(controls));
         }
     }
 

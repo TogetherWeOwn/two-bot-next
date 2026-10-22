@@ -7236,6 +7236,39 @@ async fn access_changed_refreshes_a_loaded_worker() {
     }
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn access_changed_delivers_past_a_full_inbox() {
+    // Control-plane exception to the inbox gate: the store write already
+    // succeeded and the administrator saw "Saved", so a creation-policy
+    // update must reach the worker even when fire-and-forget sends refuse.
+    let trace = Trace::default();
+    let runtime = test_runtime(trace);
+    assert!(
+        runtime.publish_snapshot(GUILD, snapshot(&[], vec![])),
+        "snapshot must spawn the guild actor on an empty inbox"
+    );
+    let actor = runtime.ensure_actor(GUILD).expect("live actor");
+    // Fill the gate synchronously (no yield): on the current-thread flavor
+    // the actor task cannot drain mid-burst, so the first refusal is exact.
+    let mut refused = false;
+    for member in 0..10_000u64 {
+        if !actor.try_send_command(ActorCommand::Display {
+            member_id: 900_000 + member,
+            display: "x".to_owned(),
+        }) {
+            refused = true;
+            break;
+        }
+    }
+    assert!(refused, "burst must fill the inbox gate to refusal");
+    assert!(
+        actor.send_command_lossless(ActorCommand::AccessChanged(AccessControls::default())),
+        "creation-policy update must bypass a full inbox"
+    );
+    runtime.access_changed(GUILD, AccessControls::default());
+    runtime.remove_guild(GUILD);
+}
+
 async fn wait_for_trace(trace: &Trace, entry: &str) -> bool {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {

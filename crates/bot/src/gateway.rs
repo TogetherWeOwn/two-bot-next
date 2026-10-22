@@ -1493,7 +1493,20 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         }
                         if let (Some(runtime), Some(sender), Some(dispatch)) = (interactions.as_ref(), rsvp_sender.as_ref(), dispatch.as_mut()) {
                             if let Event::InteractionCreate(interaction) = &dispatch.event {
-                                match RsvpPermit::try_acquire(&in_flight_rsvp) {
+                                // Only RSVP interactions reach RSVP admission:
+                                // a non-RSVP interaction would consume a permit
+                                // for a `prepare` that returns `ignored()`, and
+                                // a non-RSVP burst at capacity would starve RSVP
+                                // traffic while polluting the refusal counter.
+                                // Bypassed interactions advance with no RSVP
+                                // completion, like a refused one.
+                                let candidate = runtime.is_rsvp_candidate(&interaction.0);
+                                let admitted = if candidate {
+                                    RsvpPermit::try_acquire(&in_flight_rsvp)
+                                } else {
+                                    None
+                                };
+                                match admitted {
                                     Some(permit) => {
                                         let interaction = interaction.0.clone();
                                         let runtime = Arc::clone(runtime);
@@ -1513,12 +1526,15 @@ pub async fn run_shard<I: InviteSource + 'static>(
                                         dispatch.completion = Some(completion);
                                     }
                                     None => {
-                                        // At capacity: refuse without spawning or
-                                        // queueing. The dispatch advances with no
-                                        // RSVP completion (same as a non-interaction
-                                        // event) instead of wedging the funnel,
-                                        // checkpoint or dispatch worker.
-                                        two_bot_core::metrics::global().gateway_rsvp_refused();
+                                        // At capacity an RSVP interaction refuses
+                                        // without spawning or queueing. The dispatch
+                                        // advances with no RSVP completion (same as
+                                        // a non-interaction event) instead of wedging
+                                        // the funnel, checkpoint or dispatch worker.
+                                        // Bypassed non-RSVP interactions never count.
+                                        if candidate {
+                                            two_bot_core::metrics::global().gateway_rsvp_refused();
+                                        }
                                     }
                                 }
                             }

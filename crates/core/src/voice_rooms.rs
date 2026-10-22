@@ -1115,9 +1115,13 @@ impl ActionQueue {
     ) -> Option<u64> {
         if let RoomAction::RenameRoom { channel_id, .. } = action {
             if let Some(pending) = inner.deferred.get_mut(&guild_id).and_then(|queue| {
-                queue
-                    .iter_mut()
-                    .find(|queued| queued.action.channel_id() == Some(*channel_id))
+                queue.iter_mut().find(|queued| {
+                    matches!(
+                        &queued.action,
+                        RoomAction::RenameRoom { channel_id: id, .. }
+                        if *id == *channel_id
+                    )
+                })
             }) {
                 pending.action = action.clone();
                 return Some(pending.id);
@@ -2399,6 +2403,36 @@ mod tests {
         // A forgotten room drops its pending respace with everything else.
         assert_eq!(q.drop_for_channel(GUILD, 501), 1);
         assert_eq!(q.pending_counts(GUILD), (0, 1));
+    }
+
+    #[test]
+    fn rename_enqueue_never_swallows_a_pending_respace() {
+        let q = ActionQueue::new();
+        q.enqueue(
+            GUILD,
+            RoomAction::RespaceChannels {
+                room_channel_id: 500,
+            },
+        );
+        // A rename for the same room is new work, not a coalescing
+        // overwrite: the pending respace must still dispatch.
+        let renamed = q
+            .try_enqueue(
+                GUILD,
+                RoomAction::RenameRoom {
+                    channel_id: 500,
+                    name: "new name".to_owned(),
+                },
+            )
+            .expect("rename under the cap must admit");
+        assert_eq!(q.pending_counts(GUILD), (0, 2));
+        assert_eq!(q.overflow_dropped(), 0);
+        let first = q.pop_due(GUILD, 0).expect("respace due first");
+        assert!(matches!(first.action, RoomAction::RespaceChannels { .. }));
+        assert!(q.mark_succeeded(&first));
+        let second = q.pop_due(GUILD, 0).expect("rename due second");
+        assert_eq!(second.id, renamed);
+        assert!(matches!(second.action, RoomAction::RenameRoom { .. }));
     }
 
     #[test]

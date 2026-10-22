@@ -20,7 +20,7 @@ high-rate event without a cap row fails the suite.
   guild/member/channel ID, token, query string, body or message content ever
   becomes a label or a log field.
 
-## Cardinality budget: 718 samples
+## Cardinality budget: 719 samples
 
 `GET /metrics` renders this many non-comment samples from process start,
 before any traffic. Adding any series fails the pinned count until this
@@ -31,6 +31,7 @@ table and the test are updated together.
 | `two_bot_process_incarnation{part}` | 4 | process-lifetime identity as exact unsigned 32-bit numeric parts; only fixed labels `0`, `1`, `2`, `3`, never identity-valued labels |
 | `two_bot_gateway_events_total{event}` | 21 | `EVENTS` allowlist |
 | reconnects, resumes, disconnects, missed | 4 | scalar counters |
+| `two_bot_gateway_rsvp_refused_total` | 1 | label-free counter: RSVP interactions refused past the 32 in-flight bound |
 | `two_bot_gateway_latency_seconds` | 1 | gauge, `NaN` until measured |
 | `two_bot_handler_duration_seconds` | 11 | 8 buckets + `+Inf` + sum + count |
 | `two_bot_voice_join_to_move_seconds` | 11 | label-free; 8 buckets + `+Inf` + sum + count |
@@ -64,7 +65,7 @@ table and the test are updated together.
 | `two_bot_feed_fetches_total{outcome}` | 4 | `success`, `invalid_source`, `refused_redirect`, `failure`; per-outcome, never per-feed |
 | `two_bot_feed_fetch_errors_total{error_class}` | 12 | 11 named classes + `other` (`invalid_source`, `non_public_address`, `redirect_refused`, `too_large`, `invalid_encoding`, `unsupported_content_type`, `unsupported_encoding`, `resolve`, `transport`, `deadline`, `http_error`); successes record nothing here |
 | `two_bot_retention_replay_needed_total` | 1 | label-free counter: skipped retention purges needing Operator replay (one per real guild removal whose purge-queue write hit the schema gap); resets on process restart |
-| `# HELP` / `# TYPE` headers | 152 | 76 families x 2 |
+| `# HELP` / `# TYPE` headers | 154 | 77 families x 2 |
 
 ## Per-event caps (gateway metric labels)
 
