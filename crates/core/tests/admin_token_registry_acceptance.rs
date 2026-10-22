@@ -59,6 +59,14 @@
 //!    `docs/cutover-migration-ledger.md` gains the 0452 row, so the table
 //!    the tests prove is the table the runtime can read.
 //!
+//! Review pins (same protected file, no new suite): `secret_hash` must
+//! match `^[0-9a-f]{64}$` through a CHECK named
+//! `admin_api_tokens_hash_shape` in both chains; `guild_ids` refuses NULL
+//! elements (`array_position(guild_ids, NULL) IS NULL`); malformed
+//! `token_id` inserts fail 23514; and the store 0453 DDL equals the
+//! cutover 0452 DDL once comments are stripped, so a store-only
+//! constraint or index edit fails loudly.
+//!
 //! Secrets: hash-only storage is pinned here (database row scan plus the
 //! hashing vector below). Refusal values carry no secret material (bools
 //! and static strings only). Tracing-level redaction of the token bearer
@@ -852,6 +860,89 @@ fn cutover_ledger_records_the_migration() {
 }
 
 // ---------------------------------------------------------------------------
+// Review pins: filesystem half (offline, no database)
+// ---------------------------------------------------------------------------
+
+/// Strip `--` comment lines and blank lines, then collapse every whitespace
+/// run to one space: the two chains document the same table under different
+/// file headers, so only the normalized DDL must match.
+fn normalized_ddl(sql: &str) -> String {
+    sql.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("--"))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[test]
+fn both_migrations_name_the_hash_shape_check() {
+    // Review pin 1 (named CHECK, both chains): the database probes below pin
+    // the behavior; this pins the constraint name in each chain.
+    for file in [
+        format!("../cutover/migrations/{CUTOVER_MIGRATION}"),
+        format!("../store/migrations/{STORE_MIGRATION}"),
+    ] {
+        let ddl = normalized_ddl(&read_manifest_file(&file));
+        assert!(
+            ddl.contains("admin_api_tokens_hash_shape"),
+            "{file} must name the secret_hash shape CHECK"
+        );
+    }
+}
+
+#[test]
+fn both_migrations_reject_null_guild_elements() {
+    // Review pin 2 (predicate text, both chains): the guild CHECK carries
+    // exactly this predicate; the probes below pin the behavior.
+    for file in [
+        format!("../cutover/migrations/{CUTOVER_MIGRATION}"),
+        format!("../store/migrations/{STORE_MIGRATION}"),
+    ] {
+        let ddl = normalized_ddl(&read_manifest_file(&file));
+        assert!(
+            ddl.contains("array_position(guild_ids, NULL) IS NULL"),
+            "{file} must refuse NULL guild elements"
+        );
+    }
+}
+
+#[test]
+fn store_migration_matches_cutover_ddl() {
+    // Review pin 3 (store mirror): the store file is an independent copy, so
+    // a store-only constraint or index edit must fail loudly here even when
+    // every cutover-chain probe stays green.
+    let cutover = normalized_ddl(&read_manifest_file(&format!(
+        "../cutover/migrations/{CUTOVER_MIGRATION}"
+    )));
+    let store = normalized_ddl(&read_manifest_file(&format!(
+        "../store/migrations/{STORE_MIGRATION}"
+    )));
+    assert!(
+        !cutover.is_empty() && !store.is_empty(),
+        "normalized DDL must not be empty"
+    );
+    for pinned in [
+        "CREATE TABLE IF NOT EXISTS admin_api_tokens",
+        "admin_api_tokens_id_shape",
+        "admin_api_tokens_hash_shape",
+        "admin_api_tokens_scopes_closed",
+        "admin_api_tokens_guilds_nonempty",
+        "admin_api_tokens_expiry_ordered",
+        "idx_admin_api_tokens_live",
+    ] {
+        assert!(cutover.contains(pinned), "cutover DDL must pin {pinned}");
+        assert!(store.contains(pinned), "store DDL must pin {pinned}");
+    }
+    assert_eq!(
+        store, cutover,
+        "store 0453 must mirror cutover 0452 exactly (comments aside)"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Disposable-database pins (cutover chain, isolated database per test)
 // ---------------------------------------------------------------------------
 
@@ -1240,5 +1331,198 @@ mod registry_db {
             .expect("re-apply restores the table");
         assert!(table_exists(db.pool()).await, "re-apply must restore");
         insert_live_token(db.pool(), TEST_TOKEN).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Review pins: database half (disposable test database only)
+    // -----------------------------------------------------------------------
+
+    /// Malformed secret_hash fixtures (synthetic shape probes, never real
+    /// secret material): short, non-hex, and uppercase.
+    const BAD_HASH_SHORT: &str = "9f86d081";
+    const BAD_HASH_NON_HEX: &str =
+        "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg";
+    const BAD_HASH_UPPER: &str = "4BC7CB80AB331AF138344F0E0508EA18D0E367B15E785FF40FA529DCA6467A56";
+    /// Well-formed synthetic control: 64 lowercase hex chars.
+    const GOOD_HASH_SYNTHETIC: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// Literal INSERT shapes (sqlx 0.9 only accepts `&'static str`, so the two
+    /// NULL-guild array shapes are literals, never interpolated): every
+    /// timestamp bind carries `::timestamptz` like the rest of this module.
+    const INSERT_PLAIN: &str = "INSERT INTO admin_api_tokens
+             (token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
+             VALUES ($1, $2, '{read}', '{1}', 'h', 'o', $3::timestamptz, $4::timestamptz)";
+    const INSERT_NULL_GUILD: &str = "INSERT INTO admin_api_tokens
+             (token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
+             VALUES ($1, $2, '{read}', ARRAY[NULL]::bigint[], 'h', 'o', $3::timestamptz, $4::timestamptz)";
+    const INSERT_PARTIAL_NULL_GUILD: &str = "INSERT INTO admin_api_tokens
+             (token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
+             VALUES ($1, $2, '{read}', ARRAY[1,NULL]::bigint[], 'h', 'o', $3::timestamptz, $4::timestamptz)";
+
+    #[tokio::test]
+    async fn secret_hash_shape_rejects_malformed_hashes() {
+        let Some(db) = connect("hash-shape").await else {
+            return;
+        };
+        assert_eq!(BAD_HASH_SHORT.len(), 8, "short fixture shape");
+        assert_eq!(BAD_HASH_NON_HEX.len(), 64, "non-hex fixture shape");
+        assert_eq!(BAD_HASH_UPPER.len(), 64, "uppercase fixture shape");
+        assert!(
+            GOOD_HASH_SYNTHETIC.len() == 64
+                && GOOD_HASH_SYNTHETIC
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+            "positive control must be 64 lowercase hex"
+        );
+        for (token_id, hash) in [
+            ("adm_2300000000000000", BAD_HASH_SHORT),
+            ("adm_2300000000000001", BAD_HASH_NON_HEX),
+            ("adm_2300000000000002", BAD_HASH_UPPER),
+        ] {
+            let err = sqlx::query(INSERT_PLAIN)
+                .bind(token_id)
+                .bind(hash)
+                .bind(ISSUED)
+                .bind(EXPIRES)
+                .execute(db.pool())
+                .await
+                .expect_err("malformed secret_hash must be rejected");
+            assert_sqlstate(&err, "23514", "secret_hash CHECK");
+        }
+        sqlx::query(INSERT_PLAIN)
+            .bind("adm_2300000000000003")
+            .bind(GOOD_HASH_SYNTHETIC)
+            .bind(ISSUED)
+            .bind(EXPIRES)
+            .execute(db.pool())
+            .await
+            .expect("well-formed 64-lowercase-hex hash inserts");
+    }
+
+    #[tokio::test]
+    async fn guild_allowlist_rejects_null_elements() {
+        let Some(db) = connect("guild-nulls").await else {
+            return;
+        };
+        for (token_id, stmt) in [
+            ("adm_2400000000000000", INSERT_NULL_GUILD),
+            ("adm_2400000000000001", INSERT_PARTIAL_NULL_GUILD),
+        ] {
+            let err = sqlx::query(stmt)
+                .bind(token_id)
+                .bind(TEST_HASH)
+                .bind(ISSUED)
+                .bind(EXPIRES)
+                .execute(db.pool())
+                .await
+                .expect_err("NULL guild elements must be rejected");
+            assert_sqlstate(&err, "23514", "guild NULL-element CHECK");
+        }
+        insert_live_token(db.pool(), "adm_2400000000000002").await;
+    }
+
+    #[tokio::test]
+    async fn token_id_shape_rejects_malformed_ids() {
+        let Some(db) = connect("token-id-shape").await else {
+            return;
+        };
+        for token_id in [
+            "adm_0123456789ABCDEF",
+            "tok_0123456789abcdef",
+            "adm_0123456789abcde",
+        ] {
+            let err = sqlx::query(INSERT_PLAIN)
+                .bind(token_id)
+                .bind(TEST_HASH)
+                .bind(ISSUED)
+                .bind(EXPIRES)
+                .execute(db.pool())
+                .await
+                .expect_err("malformed token_id must be rejected");
+            assert_sqlstate(&err, "23514", "token_id CHECK");
+        }
+        insert_live_token(db.pool(), TEST_TOKEN).await;
+    }
+
+    #[tokio::test]
+    async fn store_migration_applies_standalone_with_same_guards() {
+        let Some(db) = connect("store-standalone").await else {
+            return;
+        };
+        // Drop the cutover-built table, then apply ONLY the store file: the
+        // store chain must guard the registry on its own.
+        sqlx::query("DROP TABLE admin_api_tokens")
+            .execute(db.pool())
+            .await
+            .expect("drop cutover-built table");
+        let path = format!(
+            "{}/../store/migrations/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            super::STORE_MIGRATION
+        );
+        let sql = std::fs::read_to_string(&path).expect("store migration readable");
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+            .execute(db.pool())
+            .await
+            .expect("store file applies standalone");
+        // Same probes as the cutover chain: every malformed row must fail
+        // 23514, each rejected by exactly one guard.
+        for (token_id, hash) in [
+            ("adm_2500000000000000", BAD_HASH_SHORT),
+            ("adm_2500000000000001", BAD_HASH_NON_HEX),
+            ("adm_2500000000000002", BAD_HASH_UPPER),
+            ("adm_0123456789ABCDEF", TEST_HASH),
+        ] {
+            let err = sqlx::query(INSERT_PLAIN)
+                .bind(token_id)
+                .bind(hash)
+                .bind(ISSUED)
+                .bind(EXPIRES)
+                .execute(db.pool())
+                .await
+                .expect_err("store build must reject the malformed row");
+            assert_sqlstate(&err, "23514", "store CHECK");
+        }
+        for (token_id, stmt) in [
+            ("adm_2500000000000003", INSERT_NULL_GUILD),
+            ("adm_2500000000000004", INSERT_PARTIAL_NULL_GUILD),
+        ] {
+            let err = sqlx::query(stmt)
+                .bind(token_id)
+                .bind(TEST_HASH)
+                .bind(ISSUED)
+                .bind(EXPIRES)
+                .execute(db.pool())
+                .await
+                .expect_err("store build must reject NULL guild elements");
+            assert_sqlstate(&err, "23514", "store guild CHECK");
+        }
+        sqlx::query(INSERT_PLAIN)
+            .bind("adm_2500000000000005")
+            .bind(GOOD_HASH_SYNTHETIC)
+            .bind(ISSUED)
+            .bind(EXPIRES)
+            .execute(db.pool())
+            .await
+            .expect("store build inserts a valid token");
+        // The live-lookup index survives the standalone apply.
+        let defs: Vec<String> = sqlx::query_scalar(
+            "SELECT indexdef FROM pg_indexes WHERE tablename = 'admin_api_tokens'",
+        )
+        .fetch_all(db.pool())
+        .await
+        .expect("read store-built indexes");
+        let ordered =
+            defs.iter().any(
+                |def| match (def.find("revoked_at"), def.find("expires_at")) {
+                    (Some(revoked), Some(expires)) => revoked < expires,
+                    _ => false,
+                },
+            );
+        assert!(
+            ordered,
+            "store build needs an index on (revoked_at, expires_at) in that order, found {defs:?}"
+        );
     }
 }
