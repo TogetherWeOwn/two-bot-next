@@ -1511,11 +1511,18 @@ impl CommandRuntime {
                 let action_token = ticket_action_token(action);
                 // Best-effort enrichment: when the failure is itself a SQL
                 // storage failure, skip the decorating lookup instead of
-                // spending a second pool acquisition on a sick store.
+                // spending a second pool acquisition on a sick store. The
+                // lookup is also time-boxed so a slow store cannot delay the
+                // user-visible error reply; expiry degrades to no context.
                 let context = if error.is_storage_failure() {
                     None
                 } else {
-                    tickets.warn_ticket_context(interaction, action).await
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        tickets.warn_ticket_context(interaction, action),
+                    )
+                    .await
+                    .unwrap_or(None)
                 };
                 match context {
                     Some((ticket_id, status)) => {

@@ -9,10 +9,12 @@ for the lifecycle itself.
 
 ## Counter
 
-`two_bot_ticket_lifecycle_total{event,outcome}` — 5 events x 18 outcomes,
-all rendered from process start. No member text, channel names, ticket ids
-or error strings ever become labels; the vocabulary is closed (no `other`
-row).
+`two_bot_ticket_lifecycle_total{event,outcome}` — 22 rendered series from
+process start: each event renders its success outcomes plus the `query`
+collapse trapdoor, and `purge` additionally renders the full `db_cause` set
+(the full 5 x 18 cross product would not fit the Worker scrape body cap).
+No member text, channel names, ticket ids or error strings ever become
+labels; the vocabulary is closed (no `other` row).
 
 | event | outcome | cause (log) | Meaning |
 | --- | --- | --- | --- |
@@ -51,11 +53,12 @@ text never appear in these lines.
 - `ticket action incomplete` keeps `error_class` and carries `action`, the
   button verb (`open`, `claim` or `close`). Claim/close failures cite the
   channel-bound `ticket_id` and `status` when the ticket still resolves;
-  failed opens and failures in channels with no tracked ticket carry the
-  `action` alone.
+  failed opens, failures in channels with no tracked ticket, and SQL
+  storage failures (the lookup is skipped) carry the `action` alone.
 
 ## Volume
 
 Lifecycle lines are steady-state (one per ticket event, one per hourly
 purge pass), not hot-path: they never fire per dispatch. The counter adds
-90 fixed series to the [log-volume guard](log-volume-guard.md) budget.
+22 fixed series (per-event subsets, not the full cross product) to the
+[log-volume guard](log-volume-guard.md) budget.

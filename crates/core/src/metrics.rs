@@ -552,6 +552,34 @@ fn bounded_index(value: &str, allowed: &[&str]) -> usize {
         .unwrap_or(allowed.len() - 1)
 }
 
+/// Lifecycle exposition renders per-event outcome subsets, not the full 5 x
+/// 18 cross product: 90 zero series would not fit the Worker scrape body cap
+/// (see `rest_guard_snapshot_is_fixed_size_label_free_and_finite`). Every
+/// event renders its success outcomes plus the `query` collapse trapdoor so
+/// collapsed traffic stays observable; purge additionally renders the full
+/// `db_cause` set because it is the only storage-failure emitter. Storage
+/// keeps the flat vocabulary, so every collapse still lands in-bounds;
+/// exposition just omits the pairs no emitter can produce. Every allowlisted
+/// value still renders at least once (pinned by
+/// `crates/core/tests/metrics_docs.rs`).
+fn lifecycle_series_rendered(event: &str, outcome: &str) -> bool {
+    // The `query` slot is the collapse trapdoor for unknown outcomes in
+    // every row; render it so collapse traffic stays observable.
+    if outcome == "query" {
+        return true;
+    }
+    match event {
+        "retire" => outcome == "retired",
+        "abandon" => matches!(outcome, "abandoned" | "already_gone"),
+        // Purge is the only storage-failure emitter: `deleted` plus the
+        // trailing `db_cause` classes (`TICKET_LIFECYCLE_OUTCOMES[6..]`).
+        "purge" => outcome == "deleted" || TICKET_LIFECYCLE_OUTCOMES[6..].contains(&outcome),
+        "claim" => outcome == "claimed",
+        "close" => outcome == "closed",
+        _ => false,
+    }
+}
+
 #[derive(Default)]
 struct Histogram {
     buckets: [u64; BUCKETS_MICROS.len()],
@@ -2317,6 +2345,9 @@ impl Metrics {
         );
         for (event, outcomes) in TICKET_LIFECYCLE_EVENTS.iter().zip(values.ticket_lifecycle) {
             for (outcome, count) in TICKET_LIFECYCLE_OUTCOMES.iter().zip(outcomes) {
+                if !lifecycle_series_rendered(event, outcome) {
+                    continue;
+                }
                 writeln!(
                     out,
                     "two_bot_ticket_lifecycle_total{{event=\"{event}\",outcome=\"{outcome}\"}} {count}"
@@ -3543,17 +3574,61 @@ mod tests {
         assert!(text.contains(
             "two_bot_ticket_lifecycle_total{event=\"purge\",outcome=\"pool_closed\"} 1\n"
         ));
-        // Fixed cardinality: 5 events x (6 success outcomes + 12 db_cause outcomes).
+        // Fixed cardinality: per-event render subsets (22 series), not the
+        // full 5 x 18 cross product, so exposition fits the Worker scrape
+        // body cap. Every event renders its success outcomes plus the
+        // `query` collapse trapdoor; purge adds the full `db_cause` set.
         let series: Vec<_> = text
             .lines()
             .filter(|line| line.starts_with("two_bot_ticket_lifecycle_total{"))
             .collect();
-        assert_eq!(
-            series.len(),
-            TICKET_LIFECYCLE_EVENTS.len() * TICKET_LIFECYCLE_OUTCOMES.len()
-        );
+        assert_eq!(series.len(), 22);
+        for (event, outcomes) in [
+            ("retire", vec!["retired", "query"]),
+            ("abandon", vec!["abandoned", "already_gone", "query"]),
+            (
+                "purge",
+                vec![
+                    "deleted",
+                    "unique_violation",
+                    "foreign_key_violation",
+                    "not_null_violation",
+                    "check_violation",
+                    "exclusion_violation",
+                    "database",
+                    "pool_timeout",
+                    "pool_closed",
+                    "worker_crashed",
+                    "connection",
+                    "row_not_found",
+                    "query",
+                ],
+            ),
+            ("claim", vec!["claimed", "query"]),
+            ("close", vec!["closed", "query"]),
+        ] {
+            let prefix = format!("two_bot_ticket_lifecycle_total{{event=\"{event}\",outcome=\"");
+            let rendered: Vec<_> = series
+                .iter()
+                .filter_map(|line| line.strip_prefix(prefix.as_str()))
+                .filter_map(|rest| rest.split_once('"').map(|(outcome, _)| outcome))
+                .collect();
+            assert_eq!(rendered, outcomes, "render subset for {event}");
+        }
         assert_eq!(TICKET_LIFECYCLE_EVENTS.len(), 5);
         assert_eq!(TICKET_LIFECYCLE_OUTCOMES.len(), 18);
+    }
+
+    #[test]
+    fn lifecycle_render_subsets_are_closed_world() {
+        // Unknown events never render, and known events render only their
+        // subset: a pair no emitter can produce stays out of exposition.
+        assert!(!lifecycle_series_rendered("evil", "retired"));
+        assert!(!lifecycle_series_rendered("retire", "evil"));
+        assert!(!lifecycle_series_rendered("retire", "deleted"));
+        assert!(!lifecycle_series_rendered("claim", "pool_closed"));
+        assert!(lifecycle_series_rendered("purge", "pool_closed"));
+        assert!(lifecycle_series_rendered("close", "query"));
     }
 
     #[test]

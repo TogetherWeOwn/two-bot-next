@@ -968,6 +968,10 @@ impl TicketRuntime {
         failed.map_or(Ok(()), Err)
     }
 
+    // Test-only shim over the traced recovery: the ticket acceptance suites
+    // drive recovery through the untraced API while production calls
+    // `recover_ticket_traced` directly.
+    #[cfg(test)]
     async fn recover_ticket(&self, ticket: &Ticket) -> Result<()> {
         self.recover_ticket_traced(ticket).await.0
     }
