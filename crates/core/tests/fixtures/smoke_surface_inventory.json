@@ -1,6 +1,6 @@
 {
   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
-  "count": 29,
+  "count": 30,
   "dm_permission_all_false": true,
   "commands": [
     {
@@ -146,6 +146,93 @@
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Next-only member self-serve with no legacy counterpart; the purge-plus-suppression-plus-receipt path is pinned by the gateway dispatch tests on a disposable database rather than the live smoke five."
+    },
+    {
+      "name": "onboarding",
+      "description": "Configure join roles and the member verification button.",
+      "family": "core",
+      "gate": "always",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "join-roles",
+          "description": "Replace the auto-role list (up to 10 role ids).",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [],
+          "options": [
+            {
+              "name": "roles",
+              "description": "Comma-separated role ids; no spaces or duplicates.",
+              "type": "string",
+              "required": true,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 209,
+              "choices": []
+            }
+          ]
+        },
+        {
+          "name": "member-role",
+          "description": "Set the role granted by the Verify button.",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [],
+          "options": [
+            {
+              "name": "role",
+              "description": "Member role to grant after verification.",
+              "type": "role",
+              "required": true,
+              "min_value": null,
+              "max_value": null,
+              "max_length": null,
+              "choices": []
+            }
+          ]
+        },
+        {
+          "name": "clear-join",
+          "description": "Clear the stored join-role override (deployment fallback applies).",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "clear-member",
+          "description": "Clear the stored member-role override (deployment fallback applies).",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "panel",
+          "description": "Post a Verify button in this channel.",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Next-only admin configuration and member-verification surface; publication and role-policy behavior are pinned by offline acceptance and disposable-database runtime tests, not an expansion of the live smoke five."
     },
     {
       "name": "attendance",

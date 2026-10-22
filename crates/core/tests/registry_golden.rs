@@ -57,6 +57,7 @@ fn fixture_and_exception_list_are_pinned_to_the_parity_matrix() {
 
 #[test]
 fn diff_detects_each_kind_of_unlisted_drift_including_exception_bodies() {
+    assert_registry_parity(next_registry());
     let mutations = [
         ("purge", "/options/0/min_value", json!(0)),
         ("purge", "/options/0/max_value", json!(101)),
@@ -93,6 +94,12 @@ fn diff_detects_each_kind_of_unlisted_drift_including_exception_bodies() {
         ("leaderboard", "/description", json!("Changed copy")),
         ("leaderboard", "/dm_permission", json!(true)),
         ("leaderboard", "/type", json!(2)),
+        ("onboarding", "/default_member_permissions", json!("0")),
+        ("onboarding", "/options/0/options/0/required", json!(false)),
+        ("onboarding", "/options/0/options/0/max_length", json!(210)),
+        ("onboarding", "/options/1/options/0/type", json!(3)),
+        ("onboarding", "/options/2/name", json!("clear-all")),
+        ("onboarding", "/description", json!("Unlisted copy drift")),
     ];
     for (name, pointer, replacement) in mutations {
         let mut actual = canonical_registry(next_registry());

@@ -71,7 +71,7 @@ gateway closure):\n\n\
 | ticket | `ticket_runtime.rs:457`, `:981` | 3 ticket destinations (`:172-175`) | every execute/recovery and purge |\n\
 | gateway classifier | `gateway.rs:774-789`, `:918` | human/welcome channel sets (`:800-817`) | every guild message; classifier + facts sink swap together (`leveling_runtime.rs:766`) |\n\
 | voice | `gateway.rs:2082` closure | empty grace (`voice_rooms.rs:9415`), invite code (`:9460`) | spawn (`:7753-7757`), maintenance (`:3319`), `/invite` (`:13306-13307`) |\n\n\
-The thirty-six keys in `STORE_READ_KEYS`\n\
+The thirty-eight keys in `STORE_READ_KEYS`\n\
 (`crates/core/tests/reference_docs.rs`) say “applied live by runtime refresh”\n\
 instead of “stored unwired”: containment applies `TWO_ANTI_NUKE_WINDOW_SECONDS`,\n\
 `TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS`, `TWO_ANTI_NUKE_HEAT_THRESHOLD` and\n\
@@ -229,6 +229,8 @@ const STORE_READ_KEYS: &[&str] = &[
     "TWO_RAID_JOIN_THRESHOLD",
     "TWO_RAID_WINDOW_SECONDS",
     "TWO_ONBOARDING_DRY_RUN",
+    "TWO_ONBOARDING_JOIN_ROLES",
+    "TWO_ONBOARDING_MEMBER_ROLE",
     "DISCORD_LANDING_CHANNEL_IDS",
     "DISCORD_GOODBYE_CHANNEL_IDS",
     "DISCORD_ANCHOR_WELCOME_CHANNEL_ID",
@@ -622,7 +624,14 @@ fn configuration_fixture_path_resolves_from_repo_root() {
 #[test]
 #[ignore = "explicitly regenerate committed docs; never update during normal tests"]
 fn regenerate_reference_docs() {
+    // Test-only export supports a reviewable handoff without editing docs from
+    // a test-author workspace; the default regeneration path is unchanged.
+    let root = std::env::var_os("ACCEPTANCE_EXPORT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(repository_root);
     for (path, generated) in generated_documents() {
-        std::fs::write(repository_root().join(path), generated).unwrap();
+        let output = root.join(path);
+        std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+        std::fs::write(output, generated).unwrap();
     }
 }

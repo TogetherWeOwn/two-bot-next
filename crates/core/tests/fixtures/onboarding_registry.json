@@ -1,0 +1,50 @@
+{
+  "name": "onboarding",
+  "description": "Configure join roles and the member verification button.",
+  "options": [
+    {
+      "name": "join-roles",
+      "description": "Replace the auto-role list (up to 10 role ids).",
+      "type": 1,
+      "options": [
+        {
+          "name": "roles",
+          "description": "Comma-separated role ids; no spaces or duplicates.",
+          "type": 3,
+          "required": true,
+          "max_length": 209
+        }
+      ]
+    },
+    {
+      "name": "member-role",
+      "description": "Set the role granted by the Verify button.",
+      "type": 1,
+      "options": [
+        {
+          "name": "role",
+          "description": "Member role to grant after verification.",
+          "type": 8,
+          "required": true
+        }
+      ]
+    },
+    {
+      "name": "clear-join",
+      "description": "Clear the stored join-role override (deployment fallback applies).",
+      "type": 1
+    },
+    {
+      "name": "clear-member",
+      "description": "Clear the stored member-role override (deployment fallback applies).",
+      "type": 1
+    },
+    {
+      "name": "panel",
+      "description": "Post a Verify button in this channel.",
+      "type": 1
+    }
+  ],
+  "default_member_permissions": "32",
+  "dm_permission": false
+}
