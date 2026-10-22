@@ -410,10 +410,9 @@ fn feed_list_page_row(feed: &FeedRelay, content_budget: usize) -> String {
     .encode_utf16()
     .count();
     if frame_units > content_budget {
-        // Defensive: unreachable at runtime (the composed reply reserves
-        // footer overhead from the 2,000-unit cap, leaving ~1,900 units
-        // against a ~430-unit worst frame), but a tiny caller budget must
-        // still keep the removal id reachable, never drop the row.
+        // Defensive: reachable for restored/legacy rows whose fixed frame
+        // (an overlong channel id) exceeds the page budget. A tiny caller
+        // budget must still keep the removal id reachable, never drop the row.
         return truncate_utf16(&format!("`{}`", feed.id), content_budget);
     }
     feed_list_row_distinguishing(feed, content_budget - frame_units)
@@ -439,9 +438,14 @@ pub fn feed_list_page(feeds: &[FeedRelay], page: i64) -> String {
         return feed_list_text(feeds);
     }
     // Converge on the page count: the footer length depends on the total,
-    // and the total depends on the reserved footer overhead. Packing is
-    // monotonic in the budget and bounded by one page per row, so this
-    // settles in one or two passes.
+    // and the total depends on the reserved footer overhead. Rows re-render
+    // per budget, so packing is NOT monotonic in the budget: a smaller
+    // budget can collapse frame-inflated rows to tiny id-only rows and
+    // shrink the page count. Accept fewer bodies than guessed instead of
+    // looping: the reserved overhead upper-bounds the actual footer (its
+    // length only grows with the total), and a single body packed under
+    // budget fits without one. The guess only ever increases and is bounded
+    // by one page per row, so this always terminates.
     let mut total_guess: usize = 1;
     loop {
         let overhead = if total_guess <= 1 {
@@ -454,7 +458,7 @@ pub fn feed_list_page(feeds: &[FeedRelay], page: i64) -> String {
         };
         let budget = DISCORD_MESSAGE_CONTENT_LIMIT.saturating_sub(overhead);
         let bodies = FeedRelay::list_pages(feeds, budget);
-        if bodies.len() == total_guess {
+        if bodies.len() <= total_guess {
             let total = bodies.len() as i64;
             if page > total {
                 return feed_list_page_out_of_range_text(page, total);
@@ -468,7 +472,8 @@ pub fn feed_list_page(feeds: &[FeedRelay], page: i64) -> String {
                 feed_list_page_footer(page, total)
             );
         }
-        total_guess = bodies.len().max(1);
+        // Bodies outnumber the guess, so the guess strictly increases.
+        total_guess = bodies.len();
     }
 }
 

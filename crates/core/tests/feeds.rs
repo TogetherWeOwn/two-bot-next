@@ -1535,3 +1535,38 @@ fn feed_list_page_frame_over_budget_keeps_id_reachable() {
         row = pages[0]
     );
 }
+
+#[test]
+fn feed_list_page_frame_inflated_rows_converge_with_ids_reachable() {
+    // Restored/legacy rows carry unbounded channel ids: a frame wider than
+    // the multi-page budget collapses to id-only rows, which must converge
+    // (not oscillate the page-count guess forever) with every id reachable.
+    let feeds: Vec<FeedRelay> = ["a", "b"]
+        .into_iter()
+        .map(|id| FeedRelay {
+            id: id.into(),
+            guild_id: "guild-1".into(),
+            channel_id: "7".repeat(1930),
+            kind: FeedKind::Rss,
+            source: "https://example.org/feed.xml".into(),
+            enabled: true,
+            last_checked_at: None,
+            created_by: "actor".into(),
+            created_at: 0,
+            updated_at: 0,
+        })
+        .collect();
+    let reply = feed_list_page(&feeds, 1);
+    assert!(
+        reply.encode_utf16().count() <= 2000,
+        "reply fits the limit: {reply}"
+    );
+    for id in ["`a`", "`b`"] {
+        assert!(reply.contains(id), "id {id} stays reachable: {reply}");
+    }
+    let refusal = feed_list_page(&feeds, 2);
+    assert!(
+        refusal.contains("1 to 1"),
+        "converged total is one page: {refusal}"
+    );
+}
