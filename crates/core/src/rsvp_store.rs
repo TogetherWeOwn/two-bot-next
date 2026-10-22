@@ -109,16 +109,33 @@ async fn upsert_rsvp_row(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     record: &RsvpRecord,
 ) -> Result<Option<(String, sqlx::types::time::OffsetDateTime)>, RsvpStoreError> {
-    // Coarser lock first, always in this order: the event lock serializes the
-    // admission count below across distinct members, and the identity lock
-    // then serializes the read-modify-write on this member's row. Arity
-    // differs (2 vs 3 elements), so the two keys never alias by construction.
+    // Coarser lock first, always in this order on every RSVP write path:
+    // event, then user budget, then identity. The event lock serializes the
+    // admission count below across distinct members. The user-budget lock
+    // serializes the per-user rate check plus its audit-consuming write
+    // across distinct events: the ledger below counts by (guild, user), so
+    // same-user writers on different events must meet here or a single
+    // remaining budget slot admits both. The identity lock then serializes
+    // the read-modify-write on this member's row. Independent users take
+    // distinct budget keys and never contend; per-event capacity still
+    // serializes on the event key. The budget key carries a literal tag so
+    // it can never alias the untagged 2- and 3-element keys (whose first
+    // element is always a numeric guild snowflake); a hash collision only
+    // causes extra contention, never an incorrect transition.
     sqlx::query(
         "SELECT pg_advisory_xact_lock(hashtextextended(
             jsonb_build_array($1::text, $2::text)::text, 0))",
     )
     .bind(&record.guild_id)
     .bind(&record.event_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended(
+            jsonb_build_array('rsvp-user-budget-v1', $1::text, $2::text)::text, 0))",
+    )
+    .bind(&record.guild_id)
+    .bind(&record.user_id)
     .execute(&mut **tx)
     .await?;
     // FOR UPDATE cannot lock an absent row. Serialize the complete identity
@@ -407,13 +424,25 @@ pub async fn record_checkin(
 /// A first response (`previous` is `None`) deletes the row this attempt
 /// wrote; a re-response restores the member's exact prior row (status plus
 /// timestamp) instead, so a refused rewrite never destroys the earlier
-/// response that was live before this attempt. Both paths are guarded by
-/// this attempt's `responded_at`: a newer concurrent rewrite of the same
-/// member's row survives (the newer attempt delivers its own reply), while
-/// this attempt's audit row — owned by its unique id — is always removed.
-/// Net effect on refusal when this call succeeds: the table looks as if this
-/// attempt never ran. A failed call can leave the attempt's rows; the caller
-/// reports that as a `compensation_failed` diagnostic.
+/// response that was live before this attempt.
+///
+/// The response cleanup is fenced to this attempt's write identity — its
+/// audit row's `(outcome, created_at)` plus insertion commit order — never
+/// `responded_at` alone and never timestamp order: a later-committed rewrite
+/// (including an identical same-millisecond status rewrite, or an earlier
+/// timestamp committed second) survives older compensation, while this
+/// attempt's audit row — owned by its unique id — is always removed. When
+/// the audit row is absent (idempotent retry or a write that never
+/// ledgered), the fence falls back to the `responded_at` guard so the
+/// exact-timestamp case still cleans up.
+///
+/// The response cleanup and the audit delete share one transaction under
+/// the same identity lock writers take, so a midway database failure
+/// rolls both back and a same-identity rewrite cannot land between the
+/// fence check and the cleanup. Net effect on refusal when this call
+/// succeeds: the table looks as if this attempt never ran. A failed call
+/// leaves both pre-cleanup rows intact; the caller reports that as a
+/// `compensation_failed` diagnostic.
 pub async fn compensate_rsvp_write(
     pool: &Pool<Postgres>,
     guild_id: &str,
@@ -423,38 +452,147 @@ pub async fn compensate_rsvp_write(
     audit_id: &str,
     previous: Option<(RsvpStatus, &str)>,
 ) -> Result<(), RsvpStoreError> {
-    if let Some((status, previous_responded_at)) = previous {
-        sqlx::query(
-            "UPDATE event_rsvps SET status = $4, responded_at = $5::timestamptz
-             WHERE guild_id = $1 AND event_id = $2 AND user_id = $3
-               AND responded_at = $6::timestamptz",
-        )
-        .bind(guild_id)
-        .bind(event_id)
-        .bind(user_id)
-        .bind(status.as_str())
-        .bind(previous_responded_at)
-        .bind(responded_at)
-        .execute(pool)
-        .await?;
-    } else {
-        sqlx::query(
-            "DELETE FROM event_rsvps
-             WHERE guild_id = $1 AND event_id = $2 AND user_id = $3
-               AND responded_at = $4::timestamptz",
-        )
-        .bind(guild_id)
-        .bind(event_id)
-        .bind(user_id)
-        .bind(responded_at)
-        .execute(pool)
-        .await?;
+    let mut tx = pool.begin().await?;
+    // Serialize with same-identity writers and compensations. Writers take
+    // event -> budget -> identity; taking only the identity key here cannot
+    // deadlock (this path never waits for event/budget while holding it)
+    // and still blocks a same-identity rewrite from landing mid-cleanup.
+    // Tuple encoding matches the writer identity key exactly.
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended(
+            jsonb_build_array($1::text, $2::text, $3::text)::text, 0))",
+    )
+    .bind(guild_id)
+    .bind(event_id)
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+    // This attempt's own audit row is the write-identity witness: its
+    // outcome/created_at names what the attempt wrote, and its insertion
+    // commit order decides which attempt is newer — timestamps never order
+    // attempts because mint order can differ from commit order.
+    let owned: Option<(String, sqlx::types::time::OffsetDateTime)> =
+        sqlx::query_as("SELECT outcome, created_at FROM announcements_audit_log WHERE id = $1")
+            .bind(audit_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let current: Option<(String, sqlx::types::time::OffsetDateTime)> = sqlx::query_as(
+        "SELECT status, responded_at FROM event_rsvps
+         WHERE guild_id = $1 AND event_id = $2 AND user_id = $3 FOR UPDATE",
+    )
+    .bind(guild_id)
+    .bind(event_id)
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let owned_response = match (&owned, &current) {
+        (Some((outcome, created)), Some((status, responded))) => {
+            // Values must still be this attempt's write, and no later
+            // same-identity attempt may exist — otherwise the row belongs
+            // to the newer attempt and survives this compensation.
+            status == outcome
+                && responded == created
+                && !has_newer_rsvp_audit(&mut tx, guild_id, user_id, event_id, audit_id).await?
+        }
+        // No audit row to witness ownership: keep the legacy
+        // responded_at-guarded cleanup so the exact-timestamp case still
+        // removes its row (the guard below no-ops on mismatch).
+        (None, Some(_)) => true,
+        // No response row: nothing to clean, only the audit delete below.
+        (_, None) => false,
+    };
+    if owned_response {
+        if let Some((status, previous_responded_at)) = previous {
+            sqlx::query(
+                "UPDATE event_rsvps SET status = $4, responded_at = $5::timestamptz
+                 WHERE guild_id = $1 AND event_id = $2 AND user_id = $3
+                   AND responded_at = $6::timestamptz",
+            )
+            .bind(guild_id)
+            .bind(event_id)
+            .bind(user_id)
+            .bind(status.as_str())
+            .bind(previous_responded_at)
+            .bind(responded_at)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            sqlx::query(
+                "DELETE FROM event_rsvps
+                 WHERE guild_id = $1 AND event_id = $2 AND user_id = $3
+                   AND responded_at = $4::timestamptz",
+            )
+            .bind(guild_id)
+            .bind(event_id)
+            .bind(user_id)
+            .bind(responded_at)
+            .execute(&mut *tx)
+            .await?;
+        }
     }
     sqlx::query("DELETE FROM announcements_audit_log WHERE id = $1")
         .bind(audit_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(())
+}
+
+/// SQL predicate "`newer` committed after `owned`", comparing 32-bit
+/// transaction ids the way PostgreSQL itself does (`TransactionIdPrecedes`):
+/// the forward distance modulo 2^32 must fall in `[1, 2^31)`. A plain `>`
+/// on `xmin` inverts once the two ids straddle a transaction-id wraparound
+/// (an older pre-wrap audit then looks numerically greater than a new
+/// post-wrap attempt), so the fence must never compare `xmin` numerically.
+/// Operands interpolate as SQL fragments (column expressions in the fence,
+/// literals in the regression test) — never caller input.
+fn xid_committed_after(newer: &str, owned: &str) -> String {
+    format!("((({newer}) - ({owned}) + 4294967296) % 4294967296) BETWEEN 1 AND 2147483647")
+}
+
+/// True when a later same-identity RSVP attempt committed after `audit_id`,
+/// by insertion commit order (`xmin`) alone. Timestamps never order
+/// attempts: the handler mints `responded_at` before pool and lock
+/// acquisition, so concurrent attempts can mint in one order and commit in
+/// the other, and the store accepts decreasing timestamps. Same-user
+/// writers serialize on the budget lock and same-identity writers on the
+/// identity lock, so commit order matches write order here; the `xmin`
+/// comparison is wraparound-aware (see [`xid_committed_after`]), so it
+/// stays correct when transaction ids straddle a wraparound. Scoped to
+/// `event.rsvp` rows so other slices sharing the log table never fence an
+/// RSVP cleanup.
+async fn has_newer_rsvp_audit(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    guild_id: &str,
+    user_id: &str,
+    event_id: &str,
+    audit_id: &str,
+) -> Result<bool, sqlx::Error> {
+    // SAFETY: only the fixed predicate fragment interpolates; values bind.
+    let newer_after_owned =
+        xid_committed_after("newer.xmin::text::bigint", "owned.xmin::text::bigint");
+    let sql = format!(
+        "SELECT EXISTS(
+           SELECT 1
+           FROM announcements_audit_log AS newer,
+                announcements_audit_log AS owned
+           WHERE owned.id = $5
+             AND newer.guild_id = $1
+             AND newer.actor_id = $2
+             AND newer.action = $3
+             AND newer.target_key = $4
+             AND newer.id <> owned.id
+             AND {newer_after_owned}
+         )",
+    );
+    sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .bind(guild_id)
+        .bind(user_id)
+        .bind(RSVP_AUDIT_ACTION)
+        .bind(event_id)
+        .bind(audit_id)
+        .fetch_one(&mut **tx)
+        .await
 }
 
 /// RA-03 compensation (TOG-19773): remove the attendance fact one attempt
@@ -1400,6 +1538,114 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, RsvpStatus::Declined);
         assert_eq!(rows[0].responded_at, "2026-09-10T10:02:00.000Z");
+        drop_schema(&pool, &schema).await;
+    }
+
+    /// Commit order, not timestamp order, decides which attempt is newer: the
+    /// handler mints `responded_at` before lock acquisition, so a later
+    /// timestamp can commit first and an earlier timestamp second. Compensating
+    /// the last-committed attempt must restore its predecessor even though the
+    /// predecessor's timestamp is greater.
+    #[tokio::test]
+    async fn compensation_restores_predecessor_when_commit_order_inverts_timestamps() {
+        let Some((pool, schema)) = test_pool("rsvp_fence_order_inversion")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping rsvp_store test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        // Later timestamp commits first ...
+        let first = rsvp(RsvpStatus::Interested, "u1", "2026-09-10T10:00:00.500Z");
+        put_rsvp(&pool, &first).await.expect("first");
+        write_audit(&pool, &RsvpAudit::for_rsvp("audit-inversion-first", &first))
+            .await
+            .expect("audit");
+        // ... then the earlier timestamp commits second and owns the row.
+        let second = rsvp(RsvpStatus::Going, "u1", "2026-09-10T10:00:00.000Z");
+        let transition = put_rsvp(&pool, &second).await.expect("second");
+        write_audit(
+            &pool,
+            &RsvpAudit::for_rsvp("audit-inversion-second", &second),
+        )
+        .await
+        .expect("audit");
+        assert_eq!(
+            transition.previous_response(),
+            Some((RsvpStatus::Interested, "2026-09-10T10:00:00.500Z"))
+        );
+        compensate_rsvp_write(
+            &pool,
+            "1545644954272137297",
+            "1546451670500642999",
+            "u1",
+            "2026-09-10T10:00:00.000Z",
+            "audit-inversion-second",
+            transition.previous_response(),
+        )
+        .await
+        .expect("compensate inverted");
+        let rows = list_rsvps(&pool, "1545644954272137297", "1546451670500642999")
+            .await
+            .expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, RsvpStatus::Interested);
+        assert_eq!(rows[0].responded_at, "2026-09-10T10:00:00.500Z");
+        let audits: Vec<String> = sqlx::query_scalar("SELECT id FROM announcements_audit_log")
+            .fetch_all(&pool)
+            .await
+            .expect("audit ids");
+        assert_eq!(audits, ["audit-inversion-first".to_owned()]);
+        drop_schema(&pool, &schema).await;
+    }
+
+    /// The fence's commit-order predicate stays correct across transaction-id
+    /// wraparound: a plain numeric `>` on `xmin` inverts once ids straddle
+    /// the 2^32 boundary. Real `xmin` wraparound is not fabricable in a
+    /// test, so this pins the exact shared predicate over boundary
+    /// literals — including the wrap-straddling pairs a numeric comparison
+    /// gets backwards.
+    #[tokio::test]
+    async fn fence_commit_order_survives_transaction_id_wraparound() {
+        let Some((pool, schema)) = test_pool("rsvp_fence_xid_wraparound")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping rsvp_store test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        // (newer xid, owned xid, newer committed after owned)
+        let cases = [
+            ("101", "100", true),
+            ("100", "100", false),
+            ("100", "101", false),
+            // Post-wrap attempt after a pre-wrap audit: numerically
+            // smaller, but committed later.
+            ("5", "4294967295", true),
+            // Pre-wrap audit against a post-wrap attempt: numerically
+            // greater, but committed earlier — this is the inversion a
+            // numeric `xmin` comparison gets wrong.
+            ("4294967295", "5", false),
+            // Frozen-era audit against a recent attempt.
+            ("500000000", "2", true),
+            // Modulo-2^32 boundary, matching TransactionIdPrecedes: a
+            // forward distance of 2^31 - 1 is after, 2^31 is not.
+            ("2147483648", "1", true),
+            ("2147483649", "1", false),
+        ];
+        for (newer, owned, expected) in cases {
+            // SAFETY: only numeric literals interpolate; the predicate is
+            // the exact fragment the fence query uses.
+            let sql = format!("SELECT {}", xid_committed_after(newer, owned));
+            let actual: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+                .fetch_one(&pool)
+                .await
+                .expect("predicate probe");
+            assert_eq!(
+                actual, expected,
+                "commit order of newer={newer} against owned={owned}"
+            );
+        }
         drop_schema(&pool, &schema).await;
     }
 }

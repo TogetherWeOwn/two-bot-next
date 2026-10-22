@@ -304,7 +304,9 @@ jobs:
       - name: soak evidence parser (offline, fixtures only)
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p '*soak*evidence*.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_evidence_intake_acceptance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_gate5_outage.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_gate5_outage_intake_acceptance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_watch_checkpoint_doc_conformance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_voice_config_apply_doc_conformance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_sanitize_evidence_rows.py' -v
@@ -337,6 +339,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_release_sbom_target_gh_channel_refusal.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_compare_pipeline_bench_argparse_refusal_acceptance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_compare_pipeline_bench_negative_spellings.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_compare_pipeline_bench_intake_acceptance.py' -v
       - name: SBOM intake refusal acceptance (offline)
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_validate_sbom_intake_refusal_acceptance.py' -v
@@ -1248,8 +1251,30 @@ jobs:
           # Skip every other ignored test that cannot pass in this sweep, for
           # the same reason. Exact-URL suites refuse its two_bot_test_ci URL
           # and keep a fail-closed agent_test run (a re-run below or their own
-          # lane). The red backfill acceptance tests are skipped by the store
-          # lane too. test_workflows.py derives both lists from the sources.
+          # lane). The 15 quarantined red backfill acceptance tests below run
+          # in NO lane — skipped here, in the store lane and in the nightly
+          # sweep — until their builders land. Each carries its tracking ref
+          # in its #[ignore] reason; test_workflows.py BACKFILL_QUARANTINE
+          # pins the set shrink-only (growth fails, a fix ratchets the pin).
+          # Audit-log family, tracked by TOG-22948:
+          # audit_log_pagination_limit_1_to_100_before_after_covers_45d_window
+          # audit_log_requests_ride_rate_limit_client_never_direct_rest
+          # audit_cursor_persists_per_window_and_resumes_mid_window
+          # audit_rows_hold_ids_timestamps_enums_only
+          # audit_429_retry_after_pauses_without_losing_place
+          # Event-users/reactions/pins family, tracked by TOG-22951:
+          # event_users_paginate_through_rate_limit_client_with_max_100
+          # reaction_users_paginate_through_rate_limit_client
+          # pins_list_through_rate_limit_client_persists_metadata_only
+          # blocklisted_users_skipped_for_per_user_rows_while_aggregates_keep_counting
+          # persisted_rows_hold_ids_timestamps_enums_only
+          # resume_continues_from_persisted_cursors_per_family
+          # Bans/invites/onboarding family, tracked by TOG-22952:
+          # bans_fetch_applies_blocklist_and_counts_everyone
+          # invite_rows_hold_metadata_only
+          # onboarding_rows_hold_ids_enums_metadata_only
+          # bans_invites_onboarding_resume_continues_from_persisted_cursors
+          # test_workflows.py derives both skip lists from the sources.
           export MEMBER_TESTDB=agent-testdb
           # These fixtures accept only the exact agent_test URL, not the
           # two_bot_test_ci URL on this step; they run in their dedicated sweep
@@ -1737,6 +1762,8 @@ jobs:
           AUTOMOD_CI_TESTDB: '1'
         run: cargo test -p two-bot-core --features db --locked --test automod_store --test automod_preserved_replay -- --ignored
 
+      # The 15 quarantined red backfill tests (TOG-34944) are skipped in the
+      # run below; BACKFILL_QUARANTINE in test_workflows.py pins the set.
       - name: Store Postgres integration (isolated CI schemas)
         env:
           TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/postgres
@@ -2436,6 +2463,8 @@ jobs:
         run: cargo test -p two-bot-cutover --test self_role_store --locked -- --ignored
       - name: self-role ticket acknowledgement columns and caps
         run: cargo test -p two-bot-cutover --test self_role_ack_acceptance --locked -- --ignored
+      - name: self-role settlement through acknowledgement columns
+        run: cargo test -p two-bot-cutover --test self_role_settlement_acceptance --locked -- --ignored
       - name: self-role runtime admission and immutable snapshots (mock REST and isolated schema)
         run: >-
           cargo test -p two-bot --locked self_role_runtime:: -- --include-ignored --test-threads=1
@@ -2922,10 +2951,10 @@ jobs:
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fetch --locked
       # Builds all twenty-five libFuzzer targets. No campaign or generated corpus
-      # output; the existing weekly run replays the bounded eventsub_delivery,
+      # output; the per-PR seed replay below covers the bounded eventsub_delivery,
       # helix_token, custom_command_template, fb_page_events, database_url,
-      # feeds_http, self_role_custom_id, and helix_subscription_listing seeds
-      # below. Bounded vote_kick and helix_token smokes are manual (README).
+      # feeds_http, self_role_custom_id, and helix_subscription_listing seeds.
+      # Bounded vote_kick and helix_token smokes are manual (README).
       # The `+nightly-2026-10-01` selector is load-bearing: rustup resolves the
       # toolchain from the repo-root rust-toolchain.toml (stable 1.98.1) even
       # with working-directory fuzz/, so a bare `cargo fuzz build` runs under
@@ -3107,6 +3136,9 @@ jobs:
       - name: Verify staging voice synthetic gateway intake (offline fixtures)
         if: needs.job-inputs.outputs.voice != 'false'
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_voice_synthetic_gateway_intake_acceptance.py -v
+      - name: Verify staging voice synthetic owned-room probes (offline fixtures)
+        if: needs.job-inputs.outputs.voice != 'false'
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_voice_synthetic_owned_room_acceptance.py -v
       - name: Verify staging health-contract probe (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_health_contract_probe.py -v
       - name: Verify staging health-contract build identity (offline fixtures)
@@ -3121,6 +3153,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_prod_passive_probe_duplicate_key_acceptance.py -v
       - name: Verify synthetic alert delivery (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_synthetic_alert.py -v
+      - name: Verify synthetic history admission boundaries (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_synthetic_alert_admission.py -v
       - name: Verify synthetic alert dry-run (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_synthetic_alert_dry_run_acceptance.py -v
       - name: Verify dry-run exit-code pins (offline fixtures)
@@ -3145,6 +3179,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_events_read_acceptance.py -v
       - name: Verify cutover acceptance probes (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_qa_cutover_probes.py -v
+      - name: Verify cutover probe bounded redacted verdicts (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_qa_cutover_verdict_acceptance.py -v
       - name: Verify cutover freeze drill (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_cutover_freeze_drill.py -v
       - name: Verify rollback readiness probe (offline fixtures)

@@ -8,7 +8,7 @@ echoing rejected input again, so
 `str()`/`repr()`/`ascii()`/`.join()`/`format()`/`%` rendering
 (including `%(name)s` named specifiers and parenthesised operands),
 `+` concatenation and bare-variable messages inside `Refused`,
-`ReadFailed` and `require` refusal constructors in the three covered
+`ReadFailed` and `require` refusal constructors in the four covered
 files, with an allowlist for the fixed-vocabulary sites. `sgconfig.yml`
 already runs every rule in `ast-grep-rules/` against every fixture in
 `ast-grep-rule-tests/` via `ast-grep test`, so no config change is needed.
@@ -71,6 +71,7 @@ SMOKE_PATH = ROOT / "scripts/staging_automation_read_smoke.py"
 COVERED = [
     "scripts/ci/staging_schema_gate.py",
     "scripts/ci/production_schema_gate.py",
+    "scripts/ci/schema_gate_common.py",
     "scripts/staging_events_read.py",
 ]
 
@@ -94,7 +95,6 @@ EXPECTED_NOTS = (
     r"classify_failure\(",
     r"type\([A-Za-z_][A-Za-z0-9_]*\)\.__name__",
     r"has a bad \{key\}",
-    r"plan refused the gate",
     r"Refused\(str\(error\)\)",
     r"Refused\(\s*message\s*\)",
 )
@@ -315,28 +315,15 @@ EXPECTED_EXEMPTED = {
             'pin and "prod" not in lowered and "@" not in pin and "/" not in pin,\n'
             'f"{label} is empty, production-like or not a bare name",\n'
             ")",
-            "Refused(\n"
-            'f"staging-migrate plan refused the gate (exit {proc.returncode}): "\n'
-            'f"{proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() '
-            'else \'no detail\'}"\n'
-            ")",
-            # The require(condition, message) helper relay.
-            "Refused(message)",
         ]
     ),
     "scripts/ci/production_schema_gate.py": sorted(
         [
             "require(pin and \"@\" not in pin and \"/\" not in pin,\n"
             'f"{label} is empty or not a bare name")',
-            "Refused(\n"
-            'f"production-migrate plan refused the gate (exit {proc.returncode}): "\n'
-            'f"{proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() '
-            'else \'no detail\'}"\n'
-            ")",
-            # The require(condition, message) helper relay.
-            "Refused(message)",
         ]
     ),
+    "scripts/ci/schema_gate_common.py": ["Refused(message)"],
     "scripts/staging_events_read.py": sorted(
         [
             "ReadFailed(f\"{classify_failure(done.stderr)} "
@@ -469,6 +456,7 @@ class MutantTests(unittest.TestCase):
         'raise Refused(f"the binding port {parsed.port} is refused")',
         'raise Refused(f"the binding port {parts.port} is refused")',
         'raise Refused(f"psql said: {done.stderr}")',
+        'raise Refused(f"plan refused the gate: {proc.stderr}")',
         'raise Refused(f"plan said: {proc.stdout}")',
         'raise Refused(f"bad value {value} for key")',
         'raise Refused(f"bad binding {url}")',

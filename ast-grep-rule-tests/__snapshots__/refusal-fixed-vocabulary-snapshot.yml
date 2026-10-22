@@ -72,6 +72,12 @@ snapshots:
       style: primary
       start: 6
       end: 54
+  'raise Refused(f"plan refused the gate: {proc.stderr}")':
+    labels:
+    - source: 'Refused(f"plan refused the gate: {proc.stderr}")'
+      style: primary
+      start: 6
+      end: 54
   'raise Refused(f"psql said: {done.stderr}")':
     labels:
     - source: 'Refused(f"psql said: {done.stderr}")'
