@@ -116,9 +116,6 @@ pub const DUMP_TABLES: &[&str] = &[
     // restore and let a stale in-flight fetch resurrect rows); see
     // [`V10_ADDED_TABLES`]. No foreign keys, so order beside the mirror is free.
     "scheduled_events_claim",
-    "starboard_config",
-    "starboard_starrers",
-    "starboard_posts",
     "counter_snapshots",
     "member_exclusions",
     "presence_probe",
@@ -189,6 +186,10 @@ pub const DUMP_TABLES: &[&str] = &[
     "retention_guild_purge_queue",
     "retention_deletion_requests",
     "event_store",
+    // V11 starboard history and configuration (0452/0453), no foreign keys.
+    "starboard_config",
+    "starboard_starrers",
+    "starboard_posts",
 ];
 
 /// Tables first covered by v5. A v4 archive predates them and need not declare

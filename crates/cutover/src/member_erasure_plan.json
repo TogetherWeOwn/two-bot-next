@@ -3,7 +3,7 @@
     {
       "table": "starboard_starrers",
       "columns": ["user_id"],
-      "predicate": "guild_id::text = $1 AND user_id::text = $2"
+      "predicate": "guild_id = $1::bigint AND user_id = $2::bigint"
     },
     {
       "table": "internal_action_log",
