@@ -140,6 +140,68 @@ def effective_environment(service_lines):
     return values, False
 
 
+EXECSTART_CHAIN = re.compile(r"\s*ExecStart=")
+
+
+def _trailing_backslashes(line):
+    return len(line) - len(line.rstrip("\\"))
+
+
+def continuation_findings(text, unit_name):
+    """Refuse line continuations the lint could join differently than systemd.
+
+    Joining is lexical: a trailing backslash merges the next physical line
+    into the current directive before sections or keys are read. systemd
+    continues only on an unescaped trailing backslash and skips comment lines
+    inside continuations, so a disguised line can hide a whole directive the
+    lint never sees although systemd applies it. Only the shipped shape - a
+    chain starting at ExecStart=, plain script lines, single trailing
+    backslashes - is accepted; everything else fails closed.
+    """
+    findings = []
+    in_chain = False
+    for lineno, line in enumerate(text.splitlines(), 1):
+        if in_chain:
+            stripped = line.strip()
+            if (not stripped or stripped.startswith(("#", ";"))
+                    or (stripped.startswith("[") and stripped.endswith("]"))):
+                findings.append(
+                    f"{unit_name}:{lineno}: blank, comment and section lines "
+                    f"are not allowed inside a line continuation")
+                in_chain = False
+            elif line.endswith("\\"):
+                if _trailing_backslashes(line) % 2 == 0:
+                    findings.append(
+                        f"{unit_name}:{lineno}: escaped trailing backslash; "
+                        f"write one directive per line")
+                    in_chain = False
+            else:
+                if line.rstrip().endswith("\\"):
+                    findings.append(
+                        f"{unit_name}:{lineno}: backslash before trailing "
+                        f"whitespace; write one directive per line")
+                in_chain = False
+            continue
+        if line.endswith("\\"):
+            if _trailing_backslashes(line) % 2 == 0:
+                findings.append(
+                    f"{unit_name}:{lineno}: escaped trailing backslash; "
+                    f"write one directive per line")
+            elif not EXECSTART_CHAIN.match(line):
+                findings.append(
+                    f"{unit_name}:{lineno}: line continuations are only "
+                    f"allowed on ExecStart=")
+            else:
+                in_chain = True
+        elif line.rstrip().endswith("\\"):
+            findings.append(
+                f"{unit_name}:{lineno}: backslash before trailing "
+                f"whitespace; write one directive per line")
+    if in_chain:
+        findings.append(f"{unit_name}: dangling line continuation at end of file")
+    return findings
+
+
 def lint(deploy_dir):
     """One finding per problem, each naming the unit file."""
     findings = []
@@ -147,7 +209,9 @@ def lint(deploy_dir):
     if not any(unit.name == HANDLER for unit in units):
         findings.append(f"{HANDLER}: failure handler is missing")
     for unit in units:
-        sections = parse_sections(unit.read_text())
+        raw = unit.read_text()
+        findings.extend(continuation_findings(raw, unit.name))
+        sections = parse_sections(raw)
         service_lines = sections.get("Service", [])
         unit_lines = sections.get("Unit", [])
         all_lines = [line for lines in sections.values() for line in lines]
@@ -395,6 +459,66 @@ class UnitLintTests(unittest.TestCase):
                 path.write_text(path.read_text() + line + "\n")
                 self.assertTrue(any(f.startswith(unit + ":") for f in lint(tmp)),
                                 (unit, line, lint(tmp)))
+
+    def test_continuation_cannot_hide_a_directive(self):
+        # systemd continues only on an unescaped (odd) trailing backslash, so
+        # a line ending in "\\" leaves the next line a fresh directive that
+        # systemd applies - while a backslash-newline replace joins it into
+        # the previous value where values_for() never sees it.
+        backup_anchor = "SyslogIdentifier=two-bot-next-backup\n"
+        drill_anchor = "Environment=TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S=172800\n"
+        for unit, anchor_line, hidden in [
+            ("two-bot-next-backup.service", backup_anchor, "TimeoutSec=infinity"),
+            ("two-bot-next-backup.service", backup_anchor, "Type=simple"),
+            (DRILL, drill_anchor,
+             'Environment="TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S=999999999"'),
+        ]:
+            with self.subTest(unit=unit, hidden=hidden):
+                tmp = self.copy_deploy()
+                path = tmp / unit
+                text = path.read_text()
+                self.assertIn(anchor_line, text)
+                path.write_text(text.replace(
+                    anchor_line,
+                    anchor_line + "SyslogIdentifier=backup\\\\\n" + hidden + "\n", 1))
+                self.assertTrue(any(f.startswith(unit + ":") for f in lint(tmp)),
+                                (unit, hidden, lint(tmp)))
+
+    def test_continuation_cannot_reset_the_failure_hook_behind_a_comment(self):
+        # systemd skips comment lines before joining continuations, so this
+        # resets OnFailure= while the naive join still sees the shipped target.
+        tmp = self.copy_deploy()
+        path = tmp / "two-bot-next-backup.service"
+        text = path.read_text()
+        self.assertIn(ON_FAILURE + "\n", text)
+        path.write_text(text.replace(
+            ON_FAILURE + "\n",
+            ON_FAILURE + "\nOnFailure=\\\n# rotated by the night shift\n\n", 1))
+        self.assertTrue(
+            any(f.startswith("two-bot-next-backup.service:") for f in lint(tmp)), lint(tmp))
+
+    def test_ambiguous_continuation_endings_are_refused(self):
+        # A backslash before trailing whitespace, an escaped (even) trailing
+        # backslash, and a continued comment are all refused: the lint must
+        # never guess how systemd joins the line.
+        for extra in ["OnFailure=\\  \n", "# auditors were here\\\n",
+                      "SyslogIdentifier=x\\\\\n", "OnFailure=\\"]:
+            with self.subTest(extra=extra):
+                tmp = self.copy_deploy()
+                path = tmp / "two-bot-next-backup.service"
+                path.write_text(path.read_text() + extra)
+                self.assertTrue(
+                    any(f.startswith("two-bot-next-backup.service:") for f in lint(tmp)),
+                    (extra, lint(tmp)))
+
+    def test_comment_inside_the_drill_script_continuation_is_refused(self):
+        tmp = self.copy_deploy()
+        path = tmp / DRILL
+        text = path.read_text()
+        anchor = "  max=$TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S; \\\n"
+        self.assertIn(anchor, text)
+        path.write_text(text.replace(anchor, anchor + "# evil\n", 1))
+        self.assertTrue(any(f.startswith(DRILL + ":") for f in lint(tmp)), lint(tmp))
 
     def test_shipped_max_archive_age_is_pinned_and_capped(self):
         unit = (DEPLOY / DRILL).read_text()
