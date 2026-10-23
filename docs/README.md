@@ -105,6 +105,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Self-role storage](self-roles.md)
 - [Settings parser tests](internal-settings-acceptance.md)
 - [Settings refresh tests](settings-catalog-acceptance.md)
+- [Settings live-keys tests](ticket-feed-self-role-live-keys-acceptance.md)
 - [Community jobs](community-jobs.md)
 - [Snapshot edges](community-snapshot-edges.md)
 - [Member journey tests](member-journey-parity.md)
