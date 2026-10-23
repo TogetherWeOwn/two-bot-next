@@ -1626,13 +1626,13 @@ impl CommandRuntime {
                 .await;
             return;
         }
-        let note = afk_message_option(interaction);
-        if let Some(note) = &note {
-            if let Err(err) = validate_note(note) {
-                self.answer(interaction, ephemeral(err.to_string())).await;
+        let note = match afk_message_option(interaction) {
+            Ok(note) => note,
+            Err(reply) => {
+                self.answer(interaction, ephemeral(reply)).await;
                 return;
             }
-        }
+        };
         match afk_store::set_afk(
             &self.pool,
             &guild_id,
@@ -1659,7 +1659,7 @@ impl CommandRuntime {
                     interaction_id = %interaction.id.get(),
                     guild_id = %guild_id,
                     reason = db_class(&err),
-                    "afk set failed; no state written"
+                    "afk set failed"
                 );
                 self.answer(interaction, ephemeral(AFK_STORE_UNAVAILABLE_REPLY))
                     .await;
@@ -2729,22 +2729,27 @@ pub(crate) fn sticky_options(interaction: &Interaction) -> (Option<String>, Opti
     (body, debounce)
 }
 
-/// Extract `/afk`'s `message` option (optional string). A missing or blank
-/// note becomes `None`: the status sets without a note.
-pub(crate) fn afk_message_option(interaction: &Interaction) -> Option<String> {
+/// Accept no options or one bounded `message` string. Malformed shapes
+/// refuse before any write, rather than silently clearing an existing note.
+/// A blank note becomes `None`; nonblank notes are echoed verbatim.
+pub(crate) fn afk_message_option(interaction: &Interaction) -> Result<Option<String>, String> {
+    const INVALID: &str = "That AFK command is invalid; use /afk [message].";
     let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
         &interaction.data
     else {
-        return None;
+        return Err(INVALID.to_owned());
     };
-    data.options
-        .iter()
-        .find_map(|option| match (option.name.as_str(), &option.value) {
-            ("message", CommandOptionValue::String(value)) => Some(value.clone()),
-            _ => None,
-        })
-        .map(|note| note.trim().to_owned())
-        .filter(|note| !note.is_empty())
+    match data.options.as_slice() {
+        [] => Ok(None),
+        [option] if option.name == "message" => match &option.value {
+            CommandOptionValue::String(value) => {
+                validate_note(value).map_err(|err| err.to_string())?;
+                Ok((!value.trim().is_empty()).then(|| value.clone()))
+            }
+            _ => Err(INVALID.to_owned()),
+        },
+        _ => Err(INVALID.to_owned()),
+    }
 }
 
 #[cfg(test)]

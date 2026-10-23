@@ -179,13 +179,12 @@ pub mod store {
         Ok(rows.into_iter().map(decode).collect())
     }
 
-    /// Set or replace one member's AFK status. The insert fires only while
-    /// the guild is under `row_cap` or the member already holds a row, so
-    /// an update can never be refused as over-cap; concurrent inserts at
-    /// the cap may overshoot by the in-flight count (a benign race for an
-    /// anti-abuse bound, not a hard invariant). Returns `None` at the cap,
-    /// else whether the row was created (`xmax = 0` distinguishes insert
-    /// from update atomically — no read-then-write race).
+    /// Set or replace one member's AFK status. Serialize setters per guild
+    /// across pools/processes, then count and write in a fresh READ COMMITTED
+    /// snapshot: the count must run after the previous lock holder commits.
+    /// Existing members may update even at `row_cap`; new members return
+    /// `None` at the cap. Otherwise return whether the row was created
+    /// (`xmax = 0` distinguishes insert from update atomically).
     pub async fn set_afk(
         pool: &Pool<Postgres>,
         guild_id: &str,
@@ -194,6 +193,14 @@ pub mod store {
         now_ms: i64,
         row_cap: i64,
     ) -> Result<Option<bool>, sqlx::Error> {
+        let mut tx = pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("afk-status-cap:{guild_id}"))
+            .execute(&mut *tx)
+            .await?;
         let created: Option<(bool,)> = sqlx::query_as(
             "INSERT INTO afk_status (guild_id, user_id, note, set_at)
              SELECT $1, $2, $3, to_timestamp($4::DOUBLE PRECISION / 1000.0)
@@ -209,8 +216,9 @@ pub mod store {
         .bind(note)
         .bind(now_ms)
         .bind(row_cap)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(created.map(|(created,)| created))
     }
 
