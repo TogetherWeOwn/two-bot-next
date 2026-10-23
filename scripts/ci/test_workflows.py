@@ -110,6 +110,10 @@ JOB_INVENTORY = {
     # Advisory PR-size labels (org reusable, advisory only, never required):
     # thin caller to the central labeller + weekly tally.
     "pr-size.yml": {"pr-size", "pr-size-weekly"},
+    # Weekly DORA delivery metrics (docs/dora-metrics.md): reads 30 days of
+    # production Deployments and commits one JSON file plus a markdown
+    # summary to ops/metrics/ on the automation branch with the job token.
+    "dora-metrics.yml": {"metrics"},
 }
 # Reusable-workflow calls are allowed only to these non-deploy workflows.
 # TOG-10893 registers the read-only sbom.yml calls alongside the benchmark one.
@@ -401,6 +405,7 @@ NON_RUNTIME_PATHS = (
     "CONTRIBUTING.md", "LICENSE", ".editorconfig", ".gitignore", ".gitleaks.toml",
     ".gitleaksignore", ".github/ISSUE_TEMPLATE/bug_report.yml",
     ".github/pull_request_template.md", ".github/CODEOWNERS", ".github/dependabot.yml",
+    "ops/metrics/dora-2026-W43.json", "ops/metrics/dora-2026-W43.md",
 )
 
 
@@ -7873,6 +7878,13 @@ class WorkflowTests(unittest.TestCase):
                         # the one tracking issue per firing key (fixture
                         # proofs under the test label).
                         expected = {"contents": "read", "issues": "write"}
+                    elif (name, job_id) == ("dora-metrics.yml", "metrics"):
+                        # Weekly DORA file: commits the JSON and summary to
+                        # the automation branch, reads the production
+                        # Deployments history and verifies each recorded
+                        # deploy's Actions run.
+                        expected = {"contents": "write", "deployments": "read",
+                                    "actions": "read"}
                     self.assertEqual(job["permissions"], expected)
                     for step in job.get("steps", []):
                         if step.get("uses", "").startswith("actions/checkout@"):
