@@ -166,6 +166,21 @@ pub(crate) enum RuntimeError {
     PendingExchange,
 }
 
+impl std::fmt::Display for RuntimeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Store(_) => "self-role store operation failed",
+            Self::Rest(_) => "self-role REST operation failed",
+            Self::CatalogueChanged => "self-role catalogue changed",
+            Self::Stale => "self-role claim is stale",
+            Self::InvalidSnapshot => "self-role snapshot is invalid",
+            Self::PendingExchange => "self-role exchange is pending",
+        })
+    }
+}
+
+impl std::error::Error for RuntimeError {}
+
 async fn store_io<T>(
     operation: impl Future<Output = Result<T, StoreError>>,
 ) -> Result<T, RuntimeError> {
