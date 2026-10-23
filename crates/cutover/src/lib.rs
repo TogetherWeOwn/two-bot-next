@@ -19,7 +19,6 @@ pub mod cli;
 pub mod db;
 pub mod dedupe;
 pub mod deletion_intake;
-pub mod event_voice;
 pub mod gateway_session;
 pub mod ghost_cleanup;
 pub mod intake_cap;
@@ -53,6 +52,7 @@ pub mod voice_config_store;
 pub mod voice_ghosts;
 pub mod voice_reconcile;
 pub mod voice_rooms;
+mod voice_settings_change;
 
 pub use backfill_plan::{
     event_metadata_json, plan_backfill_merge, BackfillMerge, ListedMember, PlannedEvent,

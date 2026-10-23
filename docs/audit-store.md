@@ -89,32 +89,13 @@ instants round-trip as UTC ISO strings with millisecond precision, matching lega
   cleared by either path. Attempt count was already persisted at preparation;
   release/completion/recovery do not count it again. Both paths stamp the
   fairness yield, fixing the row's queue position at release time so aged
-  retries sort ahead of later arrivals. Uncertain read failures preserve a
-  prior `discord_reconcile_scan_bound` classification so they cannot reset
-  the bounded reconciliation budget.
-- Internal `bound_reconcile_scan(claim) -> ReconcileBound`: reconciliation
-  scans read at most 16 pages or run for 30 seconds per pass. The first bound
-  hit persists `discord_reconcile_scan_bound`, releases ownership and stamps
-  the fairness yield, leaving the row pending and reconciliation-only. The
-  next owner rescans from the head. If that pass also reaches either bound,
-  the store atomically quarantines with `ScanBoundExceeded`
-  (`discord_reconcile_scan_exhausted`). This two-hit state survives claims,
-  service restarts and intervening read errors, without a schema change or
-  any increment to the POST attempt count. Both transitions check the live
-  token/generation/lease after taking the row lock and retain the boundary,
-  nonce and acceptance evidence. A shallow marker can still reconcile after
-  the first bound hit; a deep row cannot rescan forever.
+  retries sort ahead of later arrivals.
 - `renew(claim) -> bool`: only a still-active owner can renew. An expired worker
   cannot revive a lease or affect a replacement owner.
 - `quarantine(claim, QuarantineReason) -> bool`: terminal hold with bounded
   classification and retained evidence, never resend eligibility. No automatic
   quarantine reset is exported. Reasons: marker missing, permission revoked,
-  evidence conflict, repeated reconciliation scan-budget exhaustion. The last
-  reason is an inspection hold, **not** evidence that the marker is missing
-  or that the POST failed. Inspect the retained destination, boundary and
-  nonce against channel history; do not clear the boundary or manually resend
-  an ambiguous POST. Quarantined rows remain out of queue discovery and no
-  automatic reset is exported.
+  evidence conflict.
 - `delivery_halt() -> Option<DeliveryHalt>`, `engage_halt(actor_id) -> bool`,
   `disengage_halt() -> bool`: persistent presence-based switch; first engagement
   identity/time wins. Every claim and send preparation reads current switch

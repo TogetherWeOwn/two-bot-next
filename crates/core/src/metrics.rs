@@ -211,11 +211,6 @@ pub const VOICE_DEAD_ACTIONS: &[&str] = &[
 /// (admit/extend/complete). Every other store reports `other` until its op
 /// joins this allowlist.
 pub const DB_ERROR_OPS: &[&str] = &["admission", "other"];
-/// Containment-store operations for
-/// `two_bot_containment_store_errors_total{op}`: a failed completion also
-/// surfaces as outcome-unknown in the staff alert, so the alert and the
-/// durable record never silently disagree. Unknown ops collapse to `other`.
-pub const CONTAINMENT_STORE_OPS: &[&str] = &["complete_incident", "other"];
 /// Terminal outcomes of one send-admission `admit()` decision:
 /// `admitted` on Ok, `blocked` on lane/cooldown refusal, `storage_error`
 /// when the admission SQL itself failed (also counted in
@@ -369,26 +364,20 @@ pub const DISPATCH_LANES: &[&str] = &[
 /// single checkpoint failure stops the worker, so there is no
 /// benign-singleton case.
 pub const CHECKPOINT_FAILURE_STAGES: &[&str] = &["pre_commit", "commit"];
-/// Drop-guard names for `two_bot_drop_poison_total{guard}`: the seven guards
+/// Drop-guard names for `two_bot_drop_poison_total{guard}`: the four guards
 /// whose `Drop` bodies recover a poisoned lock instead of panicking (which
 /// would abort the process when the drop runs during unwinding).
 /// `command_dispatch_guard` stops the command task scope,
 /// `schedule_run` finishes a feed poll schedule, `user_slot` releases an
 /// interaction admission count, `in_flight_guard` releases a voice REST
-/// attempt slot, `ticket_supervisor` stops the ticket task scope,
-/// `response_accounting` retires a REST response's rate-limit entries, and
-/// `voice_connection_guard` disconnects the voice sink. Exactly these seven
-/// series exist; unknown guards collapse to the trailing
-/// `voice_connection_guard` slot only when the allowlist grows.
+/// attempt slot. Exactly these four series exist; unknown guards collapse
+/// to the trailing `in_flight_guard` slot only when the allowlist grows.
 /// Panic payloads are never labels.
 pub const DROP_POISON_GUARDS: &[&str] = &[
     "command_dispatch_guard",
     "schedule_run",
     "user_slot",
     "in_flight_guard",
-    "ticket_supervisor",
-    "response_accounting",
-    "voice_connection_guard",
 ];
 /// Presence-capture outcomes for `two_bot_presence_capture_total{outcome}`
 /// (event-store S3): `inserted` for a first delivery that stored a row,
@@ -671,7 +660,6 @@ struct Values {
     moderation_enforcements: [[u64; MODERATION_ENFORCEMENT_OUTCOMES.len()]; MODERATION_VERBS.len()],
     voice_names: [u64; VOICE_NAME_OUTCOMES.len()],
     db_errors: [u64; DB_ERROR_OPS.len()],
-    containment_store_errors: [u64; CONTAINMENT_STORE_OPS.len()],
     send_admissions: [u64; SEND_ADMISSION_OUTCOMES.len()],
     prefix_trigger_refused: [u64; PREFIX_TRIGGER_REFUSED_REASONS.len()],
     dispatch_drops: [u64; DISPATCH_LANES.len()],
@@ -1376,18 +1364,6 @@ impl Metrics {
         *counter = counter.saturating_add(1);
     }
 
-    /// One containment-store failure. Unknown `op` values collapse
-    /// to `other`; no error text, query or identifier is retained.
-    pub fn containment_store_error(&self, op: &str) {
-        let mut values = self
-            .0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let counter =
-            &mut values.containment_store_errors[bounded_index(op, CONTAINMENT_STORE_OPS)];
-        *counter = counter.saturating_add(1);
-    }
-
     /// One send-admission `admit()` terminal outcome. Call once
     /// per admit decision, not per retry or per completion. Unknown outcomes
     /// collapse to `other`.
@@ -1448,7 +1424,7 @@ impl Metrics {
     /// One poisoned lock recovered by a drop guard instead of panicking
     /// inside `drop` (which aborts the process during unwinding). Call once
     /// per poisoned drop, with a [`DROP_POISON_GUARDS`] member. Unknown
-    /// guards collapse to `voice_connection_guard` only when the allowlist grows;
+    /// guards collapse to `in_flight_guard` only when the allowlist grows;
     /// panic payloads are never labels. No IDs, tokens or bodies are
     /// retained. Lock-free and saturating: safe to call from a `Drop` body
     /// while any thread holds or poisoned the `Values` mutex.
@@ -2122,22 +2098,6 @@ impl Metrics {
         );
         for (op, count) in DB_ERROR_OPS.iter().zip(values.db_errors) {
             writeln!(out, "two_bot_db_errors_total{{op=\"{op}\"}} {count}").unwrap();
-        }
-        header(
-            &mut out,
-            "two_bot_containment_store_errors_total",
-            "counter",
-            "Containment-store failures by bounded operation; a failed completion also surfaces as outcome-unknown in the staff alert.",
-        );
-        for (op, count) in CONTAINMENT_STORE_OPS
-            .iter()
-            .zip(values.containment_store_errors)
-        {
-            writeln!(
-                out,
-                "two_bot_containment_store_errors_total{{op=\"{op}\"}} {count}"
-            )
-            .unwrap();
         }
         header(
             &mut out,
@@ -3014,18 +2974,6 @@ mod tests {
     }
 
     #[test]
-    fn containment_store_errors_stay_bounded() {
-        let metrics = Metrics::default();
-        metrics.containment_store_error("complete_incident");
-        metrics.containment_store_error("hostile\"\\\nlabel");
-        let text = metrics.render(None);
-        assert!(
-            text.contains("two_bot_containment_store_errors_total{op=\"complete_incident\"} 1\n")
-        );
-        assert!(text.contains("two_bot_containment_store_errors_total{op=\"other\"} 1\n"));
-    }
-
-    #[test]
     fn prefix_trigger_refusals_stay_bounded_and_saturate() {
         // TOG-19932: verdict refusals count separately from unmatched content.
         let metrics = Metrics::default();
@@ -3129,18 +3077,11 @@ mod tests {
         metrics.drop_poison("user_slot");
         metrics.drop_poison("in_flight_guard");
         metrics.drop_poison("user_slot");
-        metrics.drop_poison("ticket_supervisor");
-        metrics.drop_poison("response_accounting");
-        metrics.drop_poison("response_accounting");
-        metrics.drop_poison("voice_connection_guard");
         let text = metrics.render(None);
         assert!(text.contains("two_bot_drop_poison_total{guard=\"command_dispatch_guard\"} 1\n"));
         assert!(text.contains("two_bot_drop_poison_total{guard=\"schedule_run\"} 1\n"));
         assert!(text.contains("two_bot_drop_poison_total{guard=\"user_slot\"} 2\n"));
         assert!(text.contains("two_bot_drop_poison_total{guard=\"in_flight_guard\"} 1\n"));
-        assert!(text.contains("two_bot_drop_poison_total{guard=\"ticket_supervisor\"} 1\n"));
-        assert!(text.contains("two_bot_drop_poison_total{guard=\"response_accounting\"} 2\n"));
-        assert!(text.contains("two_bot_drop_poison_total{guard=\"voice_connection_guard\"} 1\n"));
         // Fixed cardinality: exactly the allowlisted series render.
         assert_eq!(
             text.lines()
@@ -3217,7 +3158,7 @@ mod tests {
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
         assert!(!text.contains("secret"));
-        assert!(text.contains("two_bot_drop_poison_total{guard=\"voice_connection_guard\"} 100\n"));
+        assert!(text.contains("two_bot_drop_poison_total{guard=\"in_flight_guard\"} 100\n"));
     }
 
     #[test]

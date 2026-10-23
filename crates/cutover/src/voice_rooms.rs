@@ -6,8 +6,9 @@
 //!
 //! Parameter binding: <https://docs.rs/sqlx/0.9.0/sqlx/fn.query.html>
 
+use crate::voice_settings_change::VoiceSettingsChange;
 use sqlx::postgres::PgRow;
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::collections::{BTreeMap, BTreeSet};
 use time::OffsetDateTime;
 use two_bot_core::voice_access::{validate_access_controls, AccessControls};
@@ -92,12 +93,6 @@ impl PgRoomStore {
         Self { pool }
     }
 
-    /// This store's pool, for sibling persistence modules (event voice).
-    #[must_use]
-    pub(crate) fn pool(&self) -> &PgPool {
-        &self.pool
-    }
-
     /// V11 configuration persistence (`/export` reads, `/import` writes)
     /// over this store's pool. Snapshot and apply each run in one
     /// transaction; apply never touches live rooms or companions.
@@ -107,7 +102,18 @@ impl PgRoomStore {
     }
 
     pub async fn add_creator(&self, creator: &CreatorChannel) -> Result<(), sqlx::Error> {
+        self.add_creator_with_actor(creator, "discord:setup").await
+    }
+
+    /// Attribute slash-command creator changes without changing their write-through behavior.
+    pub async fn add_creator_with_actor(
+        &self,
+        creator: &CreatorChannel,
+        actor: &str,
+    ) -> Result<(), sqlx::Error> {
         creator.validate().map_err(invalid_argument)?;
+        let mut change =
+            VoiceSettingsChange::begin(&self.pool, creator.guild_id, actor, None).await?;
         let source = match creator.permission_source {
             PermissionSource::Creator => "creator",
             PermissionSource::Category => "category",
@@ -150,9 +156,9 @@ impl PgRoomStore {
         .bind(position)
         .bind(creator.first_room_number)
         .bind(creator.group_by_category)
-        .execute(&self.pool)
+        .execute(&mut *change.tx)
         .await?;
-        Ok(())
+        change.commit().await.map(|_| ())
     }
 
     pub async fn remove_creator(
@@ -160,15 +166,23 @@ impl PgRoomStore {
         guild_id: Snowflake,
         channel_id: Snowflake,
     ) -> Result<bool, sqlx::Error> {
-        Ok(
+        let mut change =
+            VoiceSettingsChange::begin(&self.pool, guild_id, "discord:creator-remove", None)
+                .await?;
+        let removed =
             sqlx::query("DELETE FROM voice_creators WHERE guild_id = $1 AND channel_id = $2")
                 .bind(guild_id.to_string())
                 .bind(channel_id.to_string())
-                .execute(&self.pool)
+                .execute(&mut *change.tx)
                 .await?
                 .rows_affected()
-                != 0,
-        )
+                != 0;
+        if removed {
+            change.commit().await?;
+        } else {
+            change.tx.rollback().await?;
+        }
+        Ok(removed)
     }
 
     pub async fn creators(&self, guild_id: Snowflake) -> Result<Vec<CreatorChannel>, sqlx::Error> {
@@ -1071,34 +1085,10 @@ impl PgRoomStore {
         guild_id: Snowflake,
         controls: &AccessControls,
     ) -> Result<(), sqlx::Error> {
-        validate_access_controls(controls).map_err(invalid_argument)?;
-        let command_roles: BTreeMap<&str, Vec<String>> = controls
-            .command_roles
-            .iter()
-            .map(|(command, roles)| {
-                (
-                    command.as_str(),
-                    roles.iter().map(ToString::to_string).collect(),
-                )
-            })
-            .collect();
-        let command_roles = serde_json::to_string(&command_roles).map_err(invalid_argument)?;
-        sqlx::query(
-            "INSERT INTO voice_access_controls
-             (guild_id, room_creation_enabled, required_role_id, command_roles)
-             VALUES ($1,$2,$3,$4::jsonb)
-             ON CONFLICT (guild_id) DO UPDATE SET
-               room_creation_enabled = EXCLUDED.room_creation_enabled,
-               required_role_id = EXCLUDED.required_role_id,
-               command_roles = EXCLUDED.command_roles",
-        )
-        .bind(guild_id.to_string())
-        .bind(controls.room_creation_enabled)
-        .bind(controls.required_role.map(|role| role.to_string()))
-        .bind(command_roles)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        let mut change =
+            VoiceSettingsChange::begin(&self.pool, guild_id, "discord:access", None).await?;
+        write_access_controls(&mut change.tx, guild_id, controls).await?;
+        change.commit().await.map(|_| ())
     }
 
     /// The guild's logging settings, or the defaults when never configured.
@@ -1126,29 +1116,75 @@ impl PgRoomStore {
         guild_id: Snowflake,
         settings: &LoggingSettings,
     ) -> Result<(), sqlx::Error> {
-        if settings.channel_id == Some(0) || settings.mention_role_id == Some(0) {
-            return Err(invalid_argument("logging ids must be nonzero"));
-        }
-        sqlx::query(
-            "INSERT INTO voice_logging_settings
+        let mut change =
+            VoiceSettingsChange::begin(&self.pool, guild_id, "discord:logging", None).await?;
+        write_logging_settings(&mut change.tx, guild_id, settings).await?;
+        change.commit().await.map(|_| ())
+    }
+}
+
+pub(crate) async fn write_access_controls(
+    tx: &mut Transaction<'_, Postgres>,
+    guild_id: Snowflake,
+    controls: &AccessControls,
+) -> Result<(), sqlx::Error> {
+    validate_access_controls(controls).map_err(invalid_argument)?;
+    let command_roles: BTreeMap<&str, Vec<String>> = controls
+        .command_roles
+        .iter()
+        .map(|(command, roles)| {
+            (
+                command.as_str(),
+                roles.iter().map(ToString::to_string).collect(),
+            )
+        })
+        .collect();
+    let command_roles = serde_json::to_string(&command_roles).map_err(invalid_argument)?;
+    sqlx::query(
+        "INSERT INTO voice_access_controls
+             (guild_id, room_creation_enabled, required_role_id, command_roles)
+             VALUES ($1,$2,$3,$4::jsonb)
+             ON CONFLICT (guild_id) DO UPDATE SET
+               room_creation_enabled = EXCLUDED.room_creation_enabled,
+               required_role_id = EXCLUDED.required_role_id,
+               command_roles = EXCLUDED.command_roles",
+    )
+    .bind(guild_id.to_string())
+    .bind(controls.room_creation_enabled)
+    .bind(controls.required_role.map(|role| role.to_string()))
+    .bind(command_roles)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn write_logging_settings(
+    tx: &mut Transaction<'_, Postgres>,
+    guild_id: Snowflake,
+    settings: &LoggingSettings,
+) -> Result<(), sqlx::Error> {
+    if settings.channel_id == Some(0) || settings.mention_role_id == Some(0) {
+        return Err(invalid_argument("logging ids must be nonzero"));
+    }
+    sqlx::query(
+        "INSERT INTO voice_logging_settings
              (guild_id, detail_level, log_channel_id, mention_role_id)
              VALUES ($1,$2,$3,$4)
              ON CONFLICT (guild_id) DO UPDATE SET
                detail_level = EXCLUDED.detail_level,
                log_channel_id = EXCLUDED.log_channel_id,
                mention_role_id = EXCLUDED.mention_role_id",
-        )
-        .bind(guild_id.to_string())
-        .bind(settings.level.as_str())
-        .bind(settings.channel_id.map(|id| id.to_string()))
-        .bind(settings.mention_role_id.map(|id| id.to_string()))
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
+    )
+    .bind(guild_id.to_string())
+    .bind(settings.level.as_str())
+    .bind(settings.channel_id.map(|id| id.to_string()))
+    .bind(settings.mention_role_id.map(|id| id.to_string()))
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
-fn decode_access_controls(row: &PgRow) -> Result<AccessControls, sqlx::Error> {
+pub(crate) fn decode_access_controls(row: &PgRow) -> Result<AccessControls, sqlx::Error> {
     let parse_role = |value: &str| {
         value
             .parse::<u64>()
@@ -1180,7 +1216,7 @@ fn decode_access_controls(row: &PgRow) -> Result<AccessControls, sqlx::Error> {
     Ok(controls)
 }
 
-fn decode_logging_settings(row: &PgRow) -> Result<LoggingSettings, sqlx::Error> {
+pub(crate) fn decode_logging_settings(row: &PgRow) -> Result<LoggingSettings, sqlx::Error> {
     let parse_id = |value: Option<String>| {
         value
             .map(|value| value.parse::<u64>())

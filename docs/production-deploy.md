@@ -473,9 +473,8 @@ fields, and the gate fails without being a rollback signal. In rollback mode
    ownership Durable Object keeps running the previous code until
    Cloudflare's deferred update reaches it (up to about 300 s, observed on
    2026-10-10 after both a deploy and a secret change). A mismatch that outlasts the window, and every other refusal or a
-   running container, is NO-GO and the run stops before any POST. The validated,
-   supported-field response is tee'd to the run log as the P2 receipt; arbitrary
-   remote fields are discarded (see the [control response contract](cutover.md#authenticated-control-contract)).
+   running container, is NO-GO and the run stops before any POST. The full
+   response is tee'd to the run log as the P2 receipt.
 4. P3 `Take over production ownership at the read epoch`: one POST with
    exactly `{"action":"takeover","expectedEpoch":<P2 epoch>,"actor":...}`.
    The actor is `github-actions:<run id>:<guarded SHA>` (audit label only;

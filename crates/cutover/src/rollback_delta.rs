@@ -69,10 +69,6 @@ pub struct TableSpec {
 /// here, and on any entry here that appears in neither list (outside the two
 /// documented feed tables).
 pub const TABLE_SPECS: &[TableSpec] = &[
-    // Admin API token registry (0456/0457): issuance plus the revocation and
-    // last-use lifecycle writes; expires_at is a future deadline, not a
-    // write time, so it stays out of the measure.
-    TableSpec { table: "admin_api_tokens", measure: TableMeasure::Columns(&["issued_at", "revoked_at", "last_used_at"]) },
     TableSpec { table: "announcements_audit_log", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec { table: "assistant_monthly_builds", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "audit_kill_switch", measure: TableMeasure::Columns(&["engaged_at"]) },
@@ -113,14 +109,6 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     // per row; the maximum across both is the row's last write.
     TableSpec { table: "event_store", measure: TableMeasure::Columns(&["event_time", "received_at"]) },
     TableSpec { table: "events", measure: TableMeasure::Columns(&["recorded_at"]) },
-    // Event voice idempotency rows (0455): the claim stamps created_at once;
-    // bind/clear/orphan transitions rewrite updated_at without touching
-    // created_at, so the maximum across both is the row's last write.
-    TableSpec { table: "event_voice_channels", measure: TableMeasure::Columns(&["created_at", "updated_at"]) },
-    // Event voice presence spans (0455): the join stamps joined_at once; the
-    // leave rewrites left_at from NULL without touching joined_at, so the
-    // maximum across both is the row's last write (same shape as tickets).
-    TableSpec { table: "event_voice_presence", measure: TableMeasure::Columns(&["joined_at", "left_at"]) },
     TableSpec { table: "feed_deliveries", measure: TableMeasure::Columns(&["first_seen_at"]) },
     TableSpec { table: "feed_relays", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "game_activity_guild_aggregates", measure: TableMeasure::Columns(&["updated_at"]) },
@@ -340,6 +328,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     // Append-only vote-kick audit rows (migration 0417); `occurred_at` is the
     // event time, written once per row.
     TableSpec { table: "voice_vote_kick_audit", measure: TableMeasure::Columns(&["occurred_at"]) },
+    TableSpec { table: "voice_settings_audit", measure: TableMeasure::Columns(&["at"]) },
     TableSpec {
         table: "web_contract_meta",
         measure: TableMeasure::Unmeasurable("singleton contract row with no timestamp column", DISPOSITION_MANUAL_RECONCILE_REQUIRED),

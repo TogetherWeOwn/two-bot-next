@@ -671,7 +671,7 @@ pub fn auth_failure(log_reason: impl Into<String>) -> ActionError {
 /// (TOG-5510). Adding a verb here without deciding which side of
 /// [`NEEDS_IDEMPOTENCY_KEY`] it falls on is the mistake that set exists to
 /// prevent.
-pub const IMPLEMENTED_ACTIONS: [&str; 19] = [
+pub const IMPLEMENTED_ACTIONS: [&str; 21] = [
     "role.assign",
     "guild.add_member",
     "announcement.post",
@@ -682,6 +682,8 @@ pub const IMPLEMENTED_ACTIONS: [&str; 19] = [
     "automations.export",
     "settings.get",
     "settings.set",
+    "voice.config.get",
+    "voice.config.set",
     "moderation.ban",
     "moderation.tempban",
     "moderation.kick",
@@ -698,12 +700,13 @@ pub const IMPLEMENTED_ACTIONS: [&str; 19] = [
 /// sits here because two deliveries of the same save are two audit rows and
 /// two version bumps — and a concurrent save landing in between would be
 /// silently reverted by the second delivery.
-pub const NEEDS_IDEMPOTENCY_KEY: [&str; 14] = [
+pub const NEEDS_IDEMPOTENCY_KEY: [&str; 15] = [
     "announcement.post",
     "event.upsert",
     "event.cancel",
     "automations.import",
     "settings.set",
+    "voice.config.set",
     "moderation.ban",
     "moderation.tempban",
     "moderation.kick",
@@ -717,7 +720,12 @@ pub const NEEDS_IDEMPOTENCY_KEY: [&str; 14] = [
 
 /// Actions that cannot run without the config store wired in. Configured-on
 /// with nothing behind it is a typed refusal, never a 500.
-pub const NEEDS_SETTINGS_STORE: [&str; 2] = ["settings.get", "settings.set"];
+pub const NEEDS_SETTINGS_STORE: [&str; 4] = [
+    "settings.get",
+    "settings.set",
+    "voice.config.get",
+    "voice.config.set",
+];
 
 /// The nine moderation verbs, in legacy publish order (mirrors
 /// `MODERATION_ACTIONS`; [`ModerationAction::action_name`] is the same list).
@@ -846,6 +854,10 @@ impl InternalFlags {
         if flag("TWO_INTERNAL_ALLOW_SETTINGS") {
             enabled.insert("settings.get".to_owned());
             enabled.insert("settings.set".to_owned());
+        }
+        if flag("TWO_INTERNAL_ALLOW_VOICE_CONFIG") {
+            enabled.insert("voice.config.get".to_owned());
+            enabled.insert("voice.config.set".to_owned());
         }
         if flag("TWO_INTERNAL_ALLOW_MODERATION") && flag("TWO_MODERATION") {
             enabled.extend(MODERATION_ACTIONS.iter().map(|s| (*s).to_owned()));
@@ -2024,124 +2036,6 @@ impl<'de> serde::de::Visitor<'de> for UniqueKeys {
             map.next_value::<UniqueKeys>()?;
         }
         Ok(self)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Admin API scope map v0 (slice 0: token registry + container authorize)
-// ---------------------------------------------------------------------------
-
-/// Scope literals held by admin API tokens. Scope changes ship as code in
-/// [`InternalFlags::required_admin_scope`], never as registry data.
-pub const ADMIN_SCOPE_READ: &str = "read";
-/// Moderate scope: reversible member/message actions.
-pub const ADMIN_SCOPE_MODERATE: &str = "moderate";
-/// Admin scope: irreversible, privilege, broadcast and server-wide effects.
-pub const ADMIN_SCOPE_ADMIN: &str = "admin";
-
-impl InternalFlags {
-    /// Scope the admin API requires for `action` (scope map v0).
-    ///
-    /// Covers the 19 verbs the endpoint runs today: 3 read, 8 moderate and
-    /// 8 admin. `role.assign` is deliberately admin (a privilege grant, not
-    /// membership tooling). Later slices extend the map with new verbs;
-    /// anything unmapped — including strings that can never be verbs —
-    /// resolves to no scope, which every allowance check refuses.
-    #[must_use]
-    pub fn required_admin_scope(action: &str) -> Option<&'static str> {
-        match action {
-            "settings.get" | "event.read" | "automations.export" => Some(ADMIN_SCOPE_READ),
-            "moderation.warn"
-            | "moderation.timeout"
-            | "moderation.kick"
-            | "moderation.purge"
-            | "moderation.slowmode"
-            | "guild.add_member"
-            | "event.upsert"
-            | "event.cancel" => Some(ADMIN_SCOPE_MODERATE),
-            "moderation.ban"
-            | "moderation.tempban"
-            | "moderation.lockdown"
-            | "moderation.unlock"
-            | "role.assign"
-            | "announcement.post"
-            | "settings.set"
-            | "automations.import" => Some(ADMIN_SCOPE_ADMIN),
-            _ => None,
-        }
-    }
-
-    /// Whether a token holding `scopes` may run `action`.
-    ///
-    /// Higher scope implies lower for reads only: any held scope allows a
-    /// read verb, while a write needs its listed scope or admin. Scope
-    /// names are exact lowercase literals; unknown or empty scope sets
-    /// allow nothing, and unmapped actions refuse even for admin.
-    #[must_use]
-    pub fn admin_scope_allows(scopes: &[&str], action: &str) -> bool {
-        match Self::required_admin_scope(action) {
-            // Reads: any held scope allows.
-            Some(ADMIN_SCOPE_READ) => scopes.iter().any(|scope| {
-                *scope == ADMIN_SCOPE_READ
-                    || *scope == ADMIN_SCOPE_MODERATE
-                    || *scope == ADMIN_SCOPE_ADMIN
-            }),
-            // Writes: the listed scope or admin.
-            Some(required @ (ADMIN_SCOPE_MODERATE | ADMIN_SCOPE_ADMIN)) => scopes
-                .iter()
-                .any(|scope| *scope == ADMIN_SCOPE_ADMIN || *scope == required),
-            // Unmapped actions — and any future scope the map has not named
-            // yet — fail closed.
-            Some(_) | None => false,
-        }
-    }
-
-    /// Whether a registry row authorizes `action` on `guild_id` at `now_unix`.
-    ///
-    /// Pure form of the container authorize step: live (not revoked, `now`
-    /// strictly before expiry), guild-allowlisted, and scope-allowed. The
-    /// expiry instant itself refuses. Runs after the HMAC/flag gate; it
-    /// narrows, never widens, what that gate allowed.
-    #[must_use]
-    pub fn admin_token_authorizes(
-        scopes: &[&str],
-        guild_ids: &[i64],
-        expires_at_unix: i64,
-        revoked: bool,
-        action: &str,
-        guild_id: i64,
-        now_unix: i64,
-    ) -> bool {
-        !revoked
-            && now_unix < expires_at_unix
-            && guild_ids.contains(&guild_id)
-            && Self::admin_scope_allows(scopes, action)
-    }
-
-    /// Whether `id` has the registry token-id shape: `adm_` plus 16
-    /// lowercase hex chars, nothing more.
-    #[must_use]
-    pub fn is_valid_admin_token_id(id: &str) -> bool {
-        const PREFIX: &str = "adm_";
-        id.len() == PREFIX.len() + 16
-            && id.starts_with(PREFIX)
-            && id.as_bytes()[PREFIX.len()..]
-                .iter()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    }
-
-    /// Sha256 hex of an admin token secret for hash-only registry storage.
-    ///
-    /// Secrets shorter than 32 bytes have no hash (`None`): the registry
-    /// never stores a weak secret's digest. The digest reveals nothing
-    /// about the input; refusal values elsewhere are bools and static
-    /// strings only.
-    #[must_use]
-    pub fn hash_admin_token_secret(secret: &[u8]) -> Option<String> {
-        if secret.len() < 32 {
-            return None;
-        }
-        Some(hex::encode(Sha256::digest(secret)))
     }
 }
 

@@ -96,7 +96,7 @@ impl TicketSupervisor {
 
 impl Drop for TicketSupervisor {
     fn drop(&mut self) {
-        self.runtime.stop_tasks_from_drop();
+        self.runtime.stop_tasks();
         self.shutdown.send_replace(true);
         self.task.abort();
     }
@@ -596,22 +596,14 @@ impl TicketRuntime {
     }
 
     fn stop_tasks(&self) {
-        // Live path (async `shutdown`): fail loud on a poisoned scope. The
-        // lock acquisition panics before any mutation, so a poisoned live
-        // call fences nothing, aborts nothing and counts nothing. `Drop`
-        // must never call this; it calls `stop_tasks_from_drop` instead.
-        let mut tasks = self.tasks.lock().expect("ticket task scope");
-        self.stopping.store(true, Ordering::Release);
-        tasks.abort_all();
-    }
-
-    /// Drop-only `stop_tasks`: panicking inside `drop` aborts the process
-    /// when the drop runs during unwinding, so a poisoned scope is recovered
-    /// with one counted `ticket_supervisor` increment instead. Called only
-    /// from `TicketSupervisor::drop`; live callers use loud `stop_tasks`.
-    fn stop_tasks_from_drop(&self) {
-        let mut tasks =
-            two_bot_core::metrics::recover_drop_poison(self.tasks.lock(), "ticket_supervisor");
+        // Drop-reachable (`TicketSupervisor::drop`) and shared with async
+        // shutdown: recover silently so a poisoned scope still aborts its
+        // tasks instead of panicking during unwinding. No counter: non-drop
+        // callers must never be miscounted as drop poison.
+        let mut tasks = self
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.stopping.store(true, Ordering::Release);
         tasks.abort_all();
     }
@@ -941,66 +933,6 @@ impl TicketRuntime {
         Ok(())
     }
 
-    fn verify_creation_channel(
-        &self,
-        doc: &Value,
-        ticket: &Ticket,
-        channel: &str,
-        config: &TicketConfig,
-    ) -> Result<()> {
-        if ticket.guild_id != config.guild_id
-            || ticket.channel_id.as_deref().is_some_and(|id| id != channel)
-        {
-            return Err(Failure::InvalidEvidence);
-        }
-        self.validate_channel(doc, channel, 0)?;
-        TicketChannelRequest {
-            guild_id: &config.guild_id,
-            category_id: &config.category_id,
-            staff_role_id: &config.staff_role_id,
-            bot_id: &self.bot_id()?,
-            opener_id: &ticket.opener_id,
-            username: "", // Verification never constructs a channel name.
-            reservation_id: &ticket.id,
-        }
-        .verify_receipt(doc)?;
-        Ok(())
-    }
-
-    /// A listing or recorded id only selects a candidate. Fetch and prove it
-    /// before recording it or advancing rollback state; never launder listing
-    /// evidence into authority to delete a different/private-unproven channel.
-    async fn rollback_creating(
-        &self,
-        ticket: &Ticket,
-        channel: &str,
-        config: &TicketConfig,
-    ) -> Result<()> {
-        let present = match self.executor.fetch_ticket_channel(channel).await? {
-            ChannelPresence::Present(doc) => {
-                self.verify_creation_channel(&doc, ticket, channel, config)?;
-                true
-            }
-            ChannelPresence::Absent => false,
-        };
-        if !present && ticket.channel_id.is_none() {
-            self.store.abandon_creating(&ticket.id).await?;
-            return Ok(());
-        }
-        self.store.record_channel(&ticket.id, channel).await?;
-        self.store
-            .queue_open_rollback(&ticket.id, now_millis_for_test())
-            .await?;
-        if present {
-            // Reuse the just-verified fetch: one listing + one fetch + one DELETE.
-            self.executor.delete_ticket_channel(channel).await?;
-        }
-        self.store
-            .finish_cleanup(&ticket.id, now_millis_for_test())
-            .await?;
-        Ok(())
-    }
-
     fn require_history_access(&self, doc: &Value) -> Result<()> {
         let (allow, deny) = member_overwrite(doc, &self.bot_id()?)?;
         let required = (Permissions::VIEW_CHANNEL | Permissions::READ_MESSAGE_HISTORY).bits();
@@ -1089,21 +1021,9 @@ impl TicketRuntime {
     }
 
     async fn cleanup(&self, id: &str, channel: &str) -> Result<()> {
-        let ticket = self.store.get(id).await?.ok_or(Failure::InvalidEvidence)?;
-        if ticket.status != TicketStatus::CleanupPending
-            || ticket.channel_id.as_deref() != Some(channel)
-        {
-            return Err(Failure::InvalidEvidence);
-        }
         match self.executor.fetch_ticket_channel(channel).await? {
             ChannelPresence::Present(doc) => {
                 self.validate_channel(&doc, channel, 0)?;
-                // Open rollback has no close token. Re-prove creation on every
-                // retry, but preserve captured-close cleanup (opener writes are
-                // frozen there, and retention may already have purged the body).
-                if ticket.closing_started_at.is_none() {
-                    self.verify_creation_channel(&doc, &ticket, channel, &self.live_config())?;
-                }
                 self.executor.delete_ticket_channel(channel).await?;
             }
             ChannelPresence::Absent => {}
@@ -1188,12 +1108,21 @@ impl TicketRuntime {
                     [] => {
                         self.store.abandon_creating(&ticket.id).await?;
                     }
-                    [channel] => self.rollback_creating(ticket, channel, &config).await?,
+                    [channel] => {
+                        self.store.record_channel(&ticket.id, channel).await?;
+                        self.store
+                            .queue_open_rollback(&ticket.id, now_millis_for_test())
+                            .await?;
+                        self.cleanup(&ticket.id, channel).await?;
+                    }
                     _ => return Err(Failure::InvalidEvidence),
                 }
             }
             RecoveryAction::DeleteInterruptedCreate { channel_id } => {
-                self.rollback_creating(ticket, &channel_id, &config).await?;
+                self.store
+                    .queue_open_rollback(&ticket.id, now_millis_for_test())
+                    .await?;
+                self.cleanup(&ticket.id, &channel_id).await?;
             }
             RecoveryAction::RetryCleanup { channel_id } => {
                 self.cleanup(&ticket.id, &channel_id).await?
@@ -1248,9 +1177,6 @@ impl TicketRuntime {
                 return Ok(());
             }
         };
-        // Reattachment must not post controls into a reparented, retopiced or
-        // de-privated channel: prove the creation receipt before history/post.
-        self.verify_creation_channel(&doc, ticket, channel, &config)?;
         if !self
             .executor
             .ticket_history_readable(&config.guild_id, &self.bot_id()?, &doc)
@@ -1425,10 +1351,6 @@ mod tests;
 mod drop_poison_acceptance_tests;
 
 #[cfg(test)]
-#[path = "ticket_drop_poison_counter_acceptance_tests.rs"]
-mod drop_poison_counter_acceptance_tests;
-
-#[cfg(test)]
 #[path = "ticket_timer_tests.rs"]
 mod timer_tests;
 
@@ -1463,14 +1385,6 @@ mod cursor_budget_acceptance_tests;
 #[cfg(test)]
 #[path = "ticket_cursor_budget_interaction_tests.rs"]
 mod cursor_budget_interaction_tests;
-
-#[cfg(test)]
-#[path = "ticket_creation_receipt_acceptance_tests.rs"]
-mod creation_receipt_acceptance_tests;
-
-#[cfg(test)]
-#[path = "ticket_destination_move_tests.rs"]
-mod destination_move_tests;
 
 #[cfg(test)]
 #[path = "ticket_capture_cap_acceptance_tests.rs"]

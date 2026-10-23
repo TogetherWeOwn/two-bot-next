@@ -419,13 +419,6 @@ pub fn checkin_duplicate_text(member_id: &str, event_occurrence_id: &str) -> Str
 /// audited, including repeats).
 pub const RSVP_AUDIT_ACTION: &str = "event.rsvp";
 
-/// Audit action for host check-in writes: every recorded check-in leaves one
-/// row, exactly like an RSVP response. Duplicates and refusals write none.
-pub const CHECKIN_AUDIT_ACTION: &str = "event.checkin";
-
-/// Audit outcome for a recorded host check-in.
-pub const CHECKIN_AUDIT_OUTCOME_RECORDED: &str = "recorded";
-
 /// RA-03 admission bounds (TOG-19773): bursts cannot grow rows without bound.
 ///
 /// * `MAX_RSVPS_PER_EVENT` caps distinct RSVP rows per scheduled event. One
@@ -505,35 +498,6 @@ impl RsvpAudit {
             outcome: record.status.as_str().to_owned(),
             reason: None,
             created_at: record.responded_at.clone(),
-        }
-    }
-
-    /// Audit row for one recorded host check-in: action `event.checkin`,
-    /// target the attendance fact's `source_event_id`
-    /// (`<occurrence>:<member>`), outcome `recorded`. The actor is the
-    /// acting host (the invoker), including on-behalf check-ins; the
-    /// checked-in member is named in the target key. The id carries the
-    /// interaction id (`checkin:<interaction id>`), reusing the RSVP
-    /// idempotency pattern: a retried id dedupes instead of doubling the
-    /// trail.
-    #[must_use]
-    pub fn for_checkin(
-        id: &str,
-        guild_id: &str,
-        actor_id: &str,
-        event_occurrence_id: &str,
-        member_id: &str,
-        occurred_at: &str,
-    ) -> Self {
-        Self {
-            id: id.to_owned(),
-            guild_id: guild_id.to_owned(),
-            actor_id: Some(actor_id.to_owned()),
-            action: CHECKIN_AUDIT_ACTION.to_owned(),
-            target_key: Some(checkin_source_event_id(event_occurrence_id, member_id)),
-            outcome: CHECKIN_AUDIT_OUTCOME_RECORDED.to_owned(),
-            reason: None,
-            created_at: occurred_at.to_owned(),
         }
     }
 }

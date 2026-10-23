@@ -530,7 +530,7 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
 /// Per-outcome counts, plus entry IDs for rows that need an operator:
 /// quarantines (with the bounded reason) and store failures (without text).
 fn log_report(report: &DrainReport) {
-    let mut counts = [0usize; 9];
+    let mut counts = [0usize; 8];
     for (entry_id, outcome) in &report.deliveries {
         let slot = match outcome {
             DeliverOutcome::Delivered { .. } => 0,
@@ -543,8 +543,7 @@ fn log_report(report: &DrainReport) {
                 tracing::warn!(job = JOB, entry_id = %entry_id, reason = ?reason, "audit_entry_quarantined");
                 6
             }
-            DeliverOutcome::ScanBoundReached => 7,
-            DeliverOutcome::Unclaimed => 8,
+            DeliverOutcome::Unclaimed => 7,
         };
         counts[slot] += 1;
     }
@@ -556,7 +555,7 @@ fn log_report(report: &DrainReport) {
         tracing::debug!(job = JOB, "audit_retry_idle");
         return;
     }
-    let [delivered, reconciled, held, deferred, rejected, ambiguous, quarantined, scan_bound_reached, unclaimed] =
+    let [delivered, reconciled, held, deferred, rejected, ambiguous, quarantined, unclaimed] =
         counts;
     tracing::info!(
         job = JOB,
@@ -568,7 +567,6 @@ fn log_report(report: &DrainReport) {
         rejected,
         ambiguous,
         quarantined,
-        scan_bound_reached,
         unclaimed,
         failed = report.failed.len(),
         "audit_retry_swept"

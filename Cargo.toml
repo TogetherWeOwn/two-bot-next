@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/discord", "crates/bot", "crates/cutover", "crates/store", "crates/testsupport", "crates/voice-probe"]
+members = ["crates/core", "crates/discord", "crates/bot", "crates/cutover", "crates/store", "crates/testsupport"]
 exclude = ["fuzz"]
 default-members = [".", "crates/core", "crates/discord", "crates/bot", "crates/cutover", "crates/store"]
 

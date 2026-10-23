@@ -240,34 +240,10 @@ pub(crate) fn build(
     ))
 }
 
-/// Parse a gateway delivery timestamp, refusing unparseable input: a
-/// broken clock must never anchor age math at epoch 0. Callers drop the
-/// delivery from automod inspection on `None`, the same way an
-/// unparseable Discord timestamp already refuses.
-pub(crate) fn receipt_ms(observed_at: &str) -> Option<u64> {
-    two_bot_core::parse_iso_millis(observed_at).and_then(|ms| u64::try_from(ms).ok())
-}
-
-/// Parse the receipt clock for one delivery, warning and refusing (`None`)
-/// on unparseable input instead of anchoring age math at epoch 0.
-pub(crate) fn received_at_ms(observed_at: &str) -> Option<u64> {
-    match receipt_ms(observed_at) {
-        Some(ms) => Some(ms),
-        None => {
-            warn!(
-                observed_at,
-                "automod_receipt_refused: unparseable delivery timestamp"
-            );
-            None
-        }
-    }
-}
-
-/// Decode a raw MESSAGE_UPDATE dispatch with its own receipt clock: an
-/// unparseable timestamp refuses the delivery (warned, `None`), never an
-/// epoch-0 receipt.
-pub(crate) fn partial_edit_received(text: &str, observed_at: &str) -> Option<MessageDelivery> {
-    partial_edit(text, received_at_ms(observed_at)?)
+pub(crate) fn receipt_ms(observed_at: &str) -> u64 {
+    two_bot_core::parse_iso_millis(observed_at)
+        .and_then(|ms| u64::try_from(ms).ok())
+        .unwrap_or(0)
 }
 
 /// Decode a raw MESSAGE_UPDATE dispatch BEFORE `twilight_gateway::parse`: a

@@ -2,7 +2,6 @@
 #![cfg(test)]
 
 use super::*;
-use crate::drop_poison_test_serial::DROP_POISON_SERIAL;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 fn poison(guard: &RateLimitGuard) {
@@ -48,12 +47,7 @@ async fn global_drop(poisoned: bool, existing_deadline: bool) {
         poison(&guard);
     }
 
-    // The poison counter series is process-global: hold the shared lock so
-    // this drop cannot land inside a counter test's delta window.
-    let outcome = {
-        let _serial = DROP_POISON_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        catch_unwind(AssertUnwindSafe(|| drop(accounting)))
-    };
+    let outcome = catch_unwind(AssertUnwindSafe(|| drop(accounting)));
     assert!(
         outcome.is_ok(),
         "global ResponseAccounting::drop must not panic"
@@ -104,12 +98,7 @@ async fn bare_drop(poisoned: bool) {
         poison(&guard);
     }
 
-    // The poison counter series is process-global: hold the shared lock so
-    // this drop cannot land inside a counter test's delta window.
-    let outcome = {
-        let _serial = DROP_POISON_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        catch_unwind(AssertUnwindSafe(|| drop(accounting)))
-    };
+    let outcome = catch_unwind(AssertUnwindSafe(|| drop(accounting)));
     assert!(
         outcome.is_ok(),
         "bare ResponseAccounting::drop must not panic"

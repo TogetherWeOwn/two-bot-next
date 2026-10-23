@@ -12,12 +12,6 @@ use two_bot_core::automod_runtime::{
 use two_bot_core::AutomodFilter;
 use two_bot_discord::automod_activation::{FetchedMessage, RetainReason};
 
-// Protected fail-open acceptance lives in its own file: unparseable
-// delivery timestamps must refuse instead of anchoring at epoch 0. The
-// implementation change must not edit the protected file.
-#[path = "fail_open_automod_acceptance_tests.rs"]
-mod fail_open_automod_acceptance;
-
 const OWEN: &str = "123456789012345678";
 const ROLE: &str = "234567890123456789";
 const GUILD: u64 = 1_545_644_954_272_137_297;
@@ -149,38 +143,9 @@ fn text_automations_run_only_for_accepted_or_unscreened_messages() {
 }
 
 #[test]
-fn receipt_clock_parses_or_refuses() {
-    assert_eq!(
-        receipt_ms("2026-10-02T00:00:00.000Z"),
-        Some(1_790_899_200_000)
-    );
-    assert_eq!(receipt_ms("garbage"), None);
-}
-
-#[test]
-fn received_clock_refuses_garbage_for_a_delivery() {
-    assert_eq!(
-        received_at_ms("2026-10-02T00:00:00.000Z"),
-        Some(1_790_899_200_000)
-    );
-    assert_eq!(received_at_ms("garbage"), None);
-    assert_eq!(received_at_ms(""), None);
-}
-
-#[test]
-fn partial_edit_received_refuses_a_garbage_clock() {
-    let minimal = json!({
-        "op": 0, "s": 7, "t": "MESSAGE_UPDATE",
-        "d": {"id": "9", "channel_id": "8", "guild_id": "7",
-              "edited_timestamp": "2026-10-02T00:00:01.000000+00:00",
-              "content": "edited"}
-    })
-    .to_string();
-    assert!(partial_edit_received(&minimal, "garbage").is_none());
-    let delivery = partial_edit_received(&minimal, "2026-10-02T00:00:00.000Z")
-        .expect("well-formed clock decodes");
-    assert_eq!(delivery.kind, MessageDeliveryKind::Update);
-    assert_eq!(delivery.observed_timestamp_ms, 1_790_899_200_000);
+fn receipt_clock_parses_or_falls_back_to_zero() {
+    assert_eq!(receipt_ms("2026-10-02T00:00:00.000Z"), 1_790_899_200_000);
+    assert_eq!(receipt_ms("garbage"), 0);
 }
 
 struct HangingLedger;

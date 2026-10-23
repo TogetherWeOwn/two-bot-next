@@ -35,7 +35,21 @@ use two_bot_core::voice_config::{
     LoggingConfiguration, PermissionSource, RandomList, RoomPosition, VoiceConfiguration,
     VOICE_CONFIG_VERSION,
 };
+use two_bot_core::voice_logging::LoggingSettings;
 use two_bot_core::voice_text_channel::DEFAULT_TEXT_CHANNEL_NAME;
+
+use crate::voice_rooms::decode_logging_settings;
+use crate::voice_settings_change::VoiceSettingsChange;
+
+/// A consistent configuration, runtime logging settings and concurrency token.
+/// `config.version` remains the document schema version, not this token.
+pub struct VoiceConfigSnapshot {
+    pub config: VoiceConfiguration,
+    pub version: i64,
+    pub updated_by: Option<String>,
+    pub updated_at: Option<String>,
+    pub logging_settings: LoggingSettings,
+}
 
 /// Defaults reported for a guild that has never been configured.
 const DEFAULT_TIME_ZONE: &str = "UTC";
@@ -63,6 +77,73 @@ impl PgVoiceConfigStore {
         let config = read_configuration(&mut tx, &guild).await?;
         tx.rollback().await?;
         Ok(config)
+    }
+
+    /// Read the value and its revision in the same MVCC snapshot.
+    pub async fn snapshot_versioned(
+        &self,
+        guild_id: u64,
+    ) -> Result<VoiceConfigSnapshot, sqlx::Error> {
+        let guild = guild_id.to_string();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *tx)
+            .await?;
+        let config = read_configuration(&mut tx, &guild).await?;
+        let metadata: Option<(i64, String, String)> = sqlx::query_as(
+            "SELECT version, actor, to_char(at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
+             FROM voice_settings_audit WHERE guild_id = $1 ORDER BY version DESC LIMIT 1",
+        )
+        .bind(&guild)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let row = sqlx::query(
+            "SELECT detail_level, log_channel_id, mention_role_id FROM voice_logging_settings WHERE guild_id = $1",
+        )
+        .bind(&guild)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let logging_settings = row
+            .as_ref()
+            .map(decode_logging_settings)
+            .transpose()?
+            .unwrap_or_default();
+        let (version, updated_by, updated_at) = metadata
+            .map(|(version, actor, at)| (version, Some(actor), Some(at)))
+            .unwrap_or((0, None, None));
+        tx.rollback().await?;
+        Ok(VoiceConfigSnapshot {
+            config,
+            version,
+            updated_by,
+            updated_at,
+            logging_settings,
+        })
+    }
+
+    /// Dashboard replacement with a guild-level optimistic token. A stale token
+    /// is `RowNotFound`; it leaves both values and audit unchanged. The caller
+    /// validates values before entering this transaction.
+    pub async fn apply_versioned(
+        &self,
+        guild_id: u64,
+        config: &VoiceConfiguration,
+        actor: &str,
+        expected_version: Option<i64>,
+        logging: Option<&LoggingSettings>,
+    ) -> Result<i64, sqlx::Error> {
+        check_target(guild_id, config)?;
+        let mut change =
+            VoiceSettingsChange::begin(&self.pool, guild_id, actor, expected_version).await?;
+        let guild = guild_id.to_string();
+        let current = read_configuration(&mut change.tx, &guild).await?;
+        two_bot_core::voice_config::validate_time_zone_change(&current.settings.time_zone, config)
+            .map_err(|_| invalid_argument("unsupported time zone"))?;
+        replace_configuration(&mut change.tx, &guild, config, false).await?;
+        if let Some(logging) = logging {
+            crate::voice_rooms::write_logging_settings(&mut change.tx, guild_id, logging).await?;
+        }
+        change.commit().await
     }
 
     /// Replace every configuration section for `guild_id` in one transaction,
@@ -96,30 +177,40 @@ impl PgVoiceConfigStore {
                 "expected configuration belongs to a different guild",
             ));
         }
-        let mut tx = self.pool.begin().await?;
-        // One writer per guild: concurrent applies would otherwise interleave
-        // their DELETE/INSERT pairs and trip primary keys.
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-            .bind(format!("voice_config:{guild}"))
-            .execute(&mut *tx)
-            .await?;
-        // Compare-and-swap inside the lock: the preview hash already bound
-        // (`current`, `candidate`), but the re-read happened without the
-        // lock. A mismatch here means the guild changed in between.
-        let current = read_configuration(&mut tx, &guild).await?;
+        let mut change =
+            VoiceSettingsChange::begin(&self.pool, guild_id, "discord:import", None).await?;
+        // The preview comparison and all writes share the same lock as the
+        // dashboard and slash-command configuration writers.
+        let current = read_configuration(&mut change.tx, &guild).await?;
         if current != *expected {
             return Err(sqlx::Error::RowNotFound);
         }
-        write_creators(&mut tx, &guild, config).await?;
-        write_templates(&mut tx, &guild, config).await?;
-        write_aliases(&mut tx, &guild, config).await?;
-        write_lists(&mut tx, &guild, config).await?;
-        write_logging(&mut tx, &guild, config).await?;
-        // Settings last: the usual rejected row is a bad setting, which
-        // exercises the rollback of every section written above.
-        write_settings(&mut tx, &guild, config).await?;
-        tx.commit().await
+        replace_configuration(&mut change.tx, &guild, config, true).await?;
+        change.commit().await.map(|_| ())
     }
+}
+
+fn check_target(guild_id: u64, config: &VoiceConfiguration) -> Result<(), sqlx::Error> {
+    if config.version != VOICE_CONFIG_VERSION || config.guild_id != guild_id.to_string() {
+        return Err(invalid_argument(
+            "unsupported voice configuration target or version",
+        ));
+    }
+    Ok(())
+}
+
+async fn replace_configuration(
+    tx: &mut Transaction<'_, Postgres>,
+    guild: &str,
+    config: &VoiceConfiguration,
+    preserve_inherited_limit: bool,
+) -> Result<(), sqlx::Error> {
+    write_creators(tx, guild, config, preserve_inherited_limit).await?;
+    write_templates(tx, guild, config).await?;
+    write_aliases(tx, guild, config).await?;
+    write_lists(tx, guild, config).await?;
+    write_logging(tx, guild, config).await?;
+    write_settings(tx, guild, config).await
 }
 
 /// Every configuration section for `guild`, read from the caller's
@@ -245,7 +336,7 @@ async fn read_configuration(
             }),
         }
     }
-    let settings = match sqlx::query("SELECT * FROM voice_guild_settings WHERE guild_id = $1")
+    let mut settings = match sqlx::query("SELECT * FROM voice_guild_settings WHERE guild_id = $1")
         .bind(guild)
         .fetch_optional(&mut **tx)
         .await?
@@ -275,6 +366,31 @@ async fn read_configuration(
             command_roles,
         },
     };
+    // Slash commands and the gateway use voice_access_controls. Prefer that
+    // row over the import projection so dashboard reads observe Discord writes.
+    if let Some(row) = sqlx::query(
+        "SELECT room_creation_enabled, required_role_id, command_roles::text AS command_roles
+         FROM voice_access_controls WHERE guild_id = $1",
+    )
+    .bind(guild)
+    .fetch_optional(&mut **tx)
+    .await?
+    {
+        let access = crate::voice_rooms::decode_access_controls(&row)?;
+        settings.creation_enabled = access.room_creation_enabled;
+        settings.command_role_id = access.required_role.map(|id| id.to_string());
+        settings.command_roles = access
+            .command_roles
+            .into_iter()
+            .map(|(command, mut role_ids)| {
+                role_ids.sort_unstable();
+                CommandRoles {
+                    command,
+                    role_ids: role_ids.into_iter().map(|id| id.to_string()).collect(),
+                }
+            })
+            .collect();
+    }
     Ok(VoiceConfiguration {
         version: VOICE_CONFIG_VERSION,
         guild_id: guild.to_owned(),
@@ -291,6 +407,7 @@ async fn write_creators(
     tx: &mut Transaction<'_, Postgres>,
     guild: &str,
     config: &VoiceConfiguration,
+    preserve_inherited_limit: bool,
 ) -> Result<(), sqlx::Error> {
     let keep = config
         .creators
@@ -326,7 +443,7 @@ async fn write_creators(
               permission_source = EXCLUDED.permission_source,
               permission_channel_id = EXCLUDED.permission_channel_id,
               default_limit = CASE
-                WHEN EXCLUDED.default_limit = 0 AND voice_creators.default_limit IS NULL
+                WHEN $13 AND EXCLUDED.default_limit = 0 AND voice_creators.default_limit IS NULL
                 THEN NULL ELSE EXCLUDED.default_limit END,
               private_default = EXCLUDED.private_default,
               text_channels = EXCLUDED.text_channels,
@@ -346,6 +463,7 @@ async fn write_creators(
         .bind(position)
         .bind(i64::from(creator.first_number))
         .bind(creator.group_by_category)
+        .bind(preserve_inherited_limit)
         .execute(&mut **tx)
         .await?;
     }
@@ -538,6 +656,30 @@ async fn write_settings(
             .await?;
         }
     }
+    let parse_id = |id: &str| snowflake(id)?.parse::<u64>().map_err(invalid_argument);
+    let access = two_bot_core::voice_access::AccessControls {
+        room_creation_enabled: settings.creation_enabled,
+        required_role: settings
+            .command_role_id
+            .as_deref()
+            .map(parse_id)
+            .transpose()?,
+        command_roles: settings
+            .command_roles
+            .iter()
+            .map(|entry| {
+                Ok((
+                    entry.command.clone(),
+                    entry
+                        .role_ids
+                        .iter()
+                        .map(|id| parse_id(id))
+                        .collect::<Result<Vec<_>, sqlx::Error>>()?,
+                ))
+            })
+            .collect::<Result<_, sqlx::Error>>()?,
+    };
+    crate::voice_rooms::write_access_controls(tx, parse_id(guild)?, &access).await?;
     Ok(())
 }
 
@@ -597,6 +739,39 @@ fn decode_creator(row: &PgRow) -> Result<CreatorConfiguration, sqlx::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn dashboard_zero_limit_is_explicit_unlimited_not_import_inheritance() {
+        let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
+            assert!(
+                std::env::var("GITHUB_ACTIONS").is_err(),
+                "CI must supply the test database"
+            );
+            return;
+        };
+        let db = two_bot_testsupport::TestDatabase::create(&url, &sqlx::migrate!("./migrations"))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO voice_creators (guild_id, channel_id, default_limit) VALUES ('100', '200', NULL)")
+            .execute(db.pool()).await.unwrap();
+        let store = PgVoiceConfigStore::new(db.pool().clone());
+        let config = store.snapshot(100).await.unwrap();
+        store
+            .apply_versioned(100, &config, "dashboard:admin", Some(0), None)
+            .await
+            .unwrap();
+        let stored: Option<i32> =
+            sqlx::query_scalar("SELECT default_limit FROM voice_creators WHERE guild_id = '100'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            stored,
+            Some(0),
+            "dashboard zero must clear inherited limits"
+        );
+        db.close().await.unwrap();
+    }
 
     #[test]
     fn canonical_ids_pass_through_unchanged() {

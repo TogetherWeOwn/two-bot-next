@@ -24,7 +24,6 @@ use std::{
 use crate::voice_room_plan::{
     category_room_ids, plan_room_diagnosed, RoomPlanError, RoomPlanInput, BOT_ROOM_ACCESS,
 };
-use time::OffsetDateTime;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tracing::{debug, error, info, warn};
 use twilight_cache_inmemory::DefaultInMemoryCache;
@@ -161,18 +160,6 @@ impl std::fmt::Display for StoreError {
     }
 }
 
-/// One live event-voice binding: the Discord channel hosting an event
-/// instance's voice room, for the guild presence repair.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EventVoiceBinding {
-    /// The bound Discord voice channel.
-    pub channel: Snowflake,
-    /// The scheduled event id.
-    pub event_id: String,
-    /// The event instance start (`instance_starts_at`).
-    pub instance: OffsetDateTime,
-}
-
 /// No synchronous database work is allowed on the gateway event loop.
 pub trait RoomPersistence: Send + Sync {
     fn creators(
@@ -187,6 +174,15 @@ pub trait RoomPersistence: Send + Sync {
         &self,
         creator: &CreatorChannel,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
+    /// Persistent adapters can record the exact configuration command. Other
+    /// adapters retain their existing write-through behavior.
+    fn add_creator_attributed(
+        &self,
+        creator: &CreatorChannel,
+        _actor: &str,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        self.add_creator(creator)
+    }
     /// The creator row for one channel, if an admin marked it (V9d
     /// `/textchannels` edits this row through the [`Self::add_creator`]
     /// upsert; the settings snapshot on existing companions never changes).
@@ -382,64 +378,6 @@ pub trait RoomPersistence: Send + Sync {
         room: Snowflake,
         member: Snowflake,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
-    /// Open an event-voice presence span for a join/move-in: the store
-    /// resolves (event, instance) from the channel binding. Channels with no
-    /// event mapping write nothing, and an already-open span is kept.
-    /// Default no-op for stores without the event voice tables.
-    fn record_event_voice_join(
-        &self,
-        channel: Snowflake,
-        member: Snowflake,
-    ) -> impl Future<Output = Result<(), StoreError>> + Send {
-        let _ = (channel, member);
-        async { Ok::<(), StoreError>(()) }
-    }
-    /// Stamp `left_at` on the member's open event-voice span in the
-    /// channel's event. Idempotent: no open span is success. Default no-op
-    /// for stores without the event voice tables.
-    fn record_event_voice_leave(
-        &self,
-        channel: Snowflake,
-        member: Snowflake,
-    ) -> impl Future<Output = Result<(), StoreError>> + Send {
-        let _ = (channel, member);
-        async { Ok::<(), StoreError>(()) }
-    }
-    /// Live event-voice bindings for one guild, for the presence repair.
-    /// Guild scope comes from the scheduled-event mirror. Default empty for
-    /// stores without the event voice tables.
-    fn event_voice_guild_bindings(
-        &self,
-        guild: Snowflake,
-    ) -> impl Future<Output = Result<Vec<EventVoiceBinding>, StoreError>> + Send {
-        let _ = guild;
-        async { Ok::<Vec<EventVoiceBinding>, StoreError>(Vec::new()) }
-    }
-    /// Repair-only backstop: ensure one open span per occupant of the
-    /// instance. Never closes spans; returns rows inserted. Default no-op
-    /// for stores without the event voice tables.
-    fn flush_event_voice_presence(
-        &self,
-        event_id: &str,
-        instance: OffsetDateTime,
-        occupants: &[Snowflake],
-    ) -> impl Future<Output = Result<u64, StoreError>> + Send {
-        let _ = (event_id, instance, occupants);
-        async { Ok::<u64, StoreError>(0) }
-    }
-    /// Stamp `left_at` on the open spans of members absent from the
-    /// authoritative occupant list; returns rows closed. An empty list
-    /// closes every open span of the instance. Default no-op for stores
-    /// without the event voice tables.
-    fn close_event_voice_spans_absent(
-        &self,
-        event_id: &str,
-        instance: OffsetDateTime,
-        present: &[Snowflake],
-    ) -> impl Future<Output = Result<u64, StoreError>> + Send {
-        let _ = (event_id, instance, present);
-        async { Ok::<u64, StoreError>(0) }
-    }
 }
 
 impl RoomPersistence for PgRoomStore {
@@ -454,6 +392,16 @@ impl RoomPersistence for PgRoomStore {
     async fn add_creator(&self, creator: &CreatorChannel) -> Result<(), StoreError> {
         self.add_creator(creator).await.map_err(store_error)?;
         Ok(())
+    }
+
+    async fn add_creator_attributed(
+        &self,
+        creator: &CreatorChannel,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        self.add_creator_with_actor(creator, actor)
+            .await
+            .map_err(store_error)
     }
 
     async fn creator_for(
@@ -685,75 +633,6 @@ impl RoomPersistence for PgRoomStore {
         member: Snowflake,
     ) -> Result<(), StoreError> {
         self.remove_join_grant(guild, room, member)
-            .await
-            .map_err(store_error)
-    }
-
-    async fn record_event_voice_join(
-        &self,
-        channel: Snowflake,
-        member: Snowflake,
-    ) -> Result<(), StoreError> {
-        self.record_event_voice_join(&channel.to_string(), &member.to_string())
-            .await
-            .map_err(store_error)
-    }
-
-    async fn record_event_voice_leave(
-        &self,
-        channel: Snowflake,
-        member: Snowflake,
-    ) -> Result<(), StoreError> {
-        self.record_event_voice_leave(&channel.to_string(), &member.to_string())
-            .await
-            .map_err(store_error)
-    }
-
-    async fn event_voice_guild_bindings(
-        &self,
-        guild: Snowflake,
-    ) -> Result<Vec<EventVoiceBinding>, StoreError> {
-        // A corrupt (non-numeric) binding cannot map to live channels; the
-        // bound reconcile pass already reports it, so the repair skips it.
-        self.bound_event_voice_channels_for_guild(&guild.to_string())
-            .await
-            .map_err(store_error)
-            .map(|rows| {
-                rows.into_iter()
-                    .filter_map(|(event_id, instance, channel)| {
-                        channel
-                            .parse::<Snowflake>()
-                            .ok()
-                            .map(|channel| EventVoiceBinding {
-                                channel,
-                                event_id,
-                                instance,
-                            })
-                    })
-                    .collect()
-            })
-    }
-
-    async fn flush_event_voice_presence(
-        &self,
-        event_id: &str,
-        instance: OffsetDateTime,
-        occupants: &[Snowflake],
-    ) -> Result<u64, StoreError> {
-        let occupants: Vec<String> = occupants.iter().map(|id| id.to_string()).collect();
-        self.flush_event_voice_presence(event_id, instance, &occupants)
-            .await
-            .map_err(store_error)
-    }
-
-    async fn close_event_voice_spans_absent(
-        &self,
-        event_id: &str,
-        instance: OffsetDateTime,
-        present: &[Snowflake],
-    ) -> Result<u64, StoreError> {
-        let present: Vec<String> = present.iter().map(|id| id.to_string()).collect();
-        self.close_event_voice_spans_absent(event_id, instance, &present)
             .await
             .map_err(store_error)
     }
@@ -2405,16 +2284,6 @@ impl LiveGuild {
         self.voice_update_at(member, channel, bot, wall_ms())
     }
 
-    /// The member's currently tracked voice channel, if any. Read before
-    /// `voice_update_*` so the sink can tell joins, leaves and moves apart
-    /// for the event-voice presence transition.
-    fn member_channel(&self, member: Snowflake) -> Option<Snowflake> {
-        self.read_state()
-            .members
-            .get(&member)
-            .and_then(|state| state.channel_id)
-    }
-
     /// Ticket plus the seeding-TEST occupancy sample: the humans already
     /// present in the target channel when the join arrived, excluding the
     /// joiner. The sample is `None` for mechanical transitions (joining a
@@ -3312,7 +3181,7 @@ const OWNER_REPAIR_COOLDOWN_MS: u64 = 60_000;
 /// to 10 s for a connection, but a lobby join must not wait that long.
 const CREATORS_REFRESH_DEBOUNCE_MS: u64 = 10_000;
 const CREATORS_REFRESH_INTERVAL_MS: u64 = 300_000;
-pub(crate) const REVALIDATE_TIMEOUT_MS: u64 = 1_000;
+const REVALIDATE_TIMEOUT_MS: u64 = 1_000;
 /// How long join-path creator re-reads back off after a failed, timed-out or
 /// refused bulk store read: one slow pool must not serialize every later
 /// join behind another long wait. A successful store read clears it early.
@@ -7574,17 +7443,7 @@ pub trait VoiceEventSink: Send + Sync {
     fn presence(&self, update: &twilight_model::gateway::payload::incoming::PresenceUpdate);
     /// Invalidate occupancy immediately on connection loss, including while an
     /// actor is awaiting SQL, HTTP or token-global rate-limit backoff.
-    /// Live path: panics on a poisoned registry (fail loud).
     fn disconnect(&self);
-    /// Drop-only `disconnect` for `VoiceConnectionGuard::drop`: recovers a
-    /// poisoned registry with one counted `voice_connection_guard`
-    /// increment instead of panicking (which would abort the process when
-    /// the drop runs during unwinding). Every production sink overrides
-    /// this; the default forwards to loud `disconnect` for lock-free test
-    /// doubles only.
-    fn disconnect_from_drop(&self) {
-        self.disconnect();
-    }
     /// A cold RESUME has replayed durably but cannot populate a fresh cache.
     /// The supervisor must IDENTIFY after committing RESUMED, not before replay.
     fn needs_bootstrap(&self, cache: &DefaultInMemoryCache) -> bool;
@@ -7641,15 +7500,6 @@ enum ActorCommand {
         seed: u64,
         created_at: String,
         received: tokio::time::Instant,
-    },
-    /// A member's voice channel changed (join, leave or move): the worker
-    /// records the event-voice presence transition. Sent only on actual
-    /// transitions (same-channel frames send none), alongside Join/Reconcile.
-    /// Idempotent at the store, so buffering and replays are safe.
-    EventVoicePresence {
-        member_id: Snowflake,
-        previous: Option<Snowflake>,
-        current: Option<Snowflake>,
     },
     /// A new or edited creator row (`/create`, `/textchannels`): the worker
     /// swaps it in for rooms created from here on.
@@ -7749,7 +7599,6 @@ impl ActorCommand {
                 | ActorCommand::NameSettingsChanged(_)
                 | ActorCommand::RoomFactsChanged(_)
                 | ActorCommand::Join { .. }
-                | ActorCommand::EventVoicePresence { .. }
                 | ActorCommand::CreatorAdded(_)
                 | ActorCommand::RefreshCreators
                 | ActorCommand::AccessChanged(_)
@@ -8377,7 +8226,6 @@ where
         let Some(actor) = self.live_actor(guild) else {
             return false;
         };
-        let previous = actor.live.member_channel(member);
         let command = match actor.live.voice_update_with_occupancy(member, channel, bot) {
             Some((ticket, occupancy_at_join)) => {
                 // Seeding TEST (occupancy-to-join curve): one label-free
@@ -8409,16 +8257,6 @@ where
                 ActorCommand::Reconcile
             }
         };
-        // Event-voice presence persists on the transition itself, ahead of
-        // room handling: same-channel frames (mute, video, role-only) send
-        // nothing, so this costs one command per join/leave/move only.
-        if previous != channel {
-            let _ = actor.tx.send(ActorCommand::EventVoicePresence {
-                member_id: member,
-                previous,
-                current: channel,
-            });
-        }
         actor.tx.send(command).is_ok()
     }
 
@@ -8803,32 +8641,17 @@ where
         // Clear before invalidating the views so a concurrent dispatch
         // cannot heal a view this transport loss is about to invalidate.
         self.gateway_connected.store(false, Ordering::Release);
-        // Live path (transport loss): fail loud on a poisoned registry.
-        // `VoiceConnectionGuard::drop` must never call this; it calls
-        // `disconnect_from_drop` through the sink instead.
-        let actors = self.actors.lock().expect("voice runtime lock");
-        self.disconnect_locked(&actors);
-    }
-
-    /// Drop-only `disconnect`: panicking inside `drop` aborts the process
-    /// when the drop runs during unwinding, so a poisoned registry is
-    /// recovered with one counted `voice_connection_guard` increment
-    /// instead. Called only from `VoiceConnectionGuard::drop` (through
-    /// `VoiceEventSink::disconnect_from_drop`); live callers use loud
-    /// `disconnect`.
-    pub fn disconnect_from_drop(&self) {
-        // Clear before invalidating the views so a concurrent dispatch
-        // cannot heal a view this transport loss is about to invalidate.
-        self.gateway_connected.store(false, Ordering::Release);
-        let actors = two_bot_core::metrics::recover_drop_poison(
-            self.actors.lock(),
-            "voice_connection_guard",
-        );
-        self.disconnect_locked(&actors);
-    }
-
-    fn disconnect_locked(&self, actors: &HashMap<Snowflake, GuildActor>) {
-        for actor in actors.values() {
+        // Drop-reachable (`VoiceConnectionGuard::drop` via `VoiceEventSink`)
+        // and shared with live disconnects: recover silently so a poisoned
+        // registry still invalidates its views instead of panicking during
+        // unwinding. No counter: non-drop callers must never be miscounted
+        // as drop poison.
+        for actor in self
+            .actors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+        {
             actor.live.transport_lost();
         }
         // Game-activity wiring: transport loss invalidates live voice state,
@@ -9126,10 +8949,6 @@ where
 
     fn disconnect(&self) {
         VoiceRuntime::disconnect(self);
-    }
-
-    fn disconnect_from_drop(&self) {
-        VoiceRuntime::disconnect_from_drop(self);
     }
 
     fn needs_bootstrap(&self, cache: &DefaultInMemoryCache) -> bool {
@@ -9602,7 +9421,6 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut dispatch_ready = false;
     let mut maintenance_ready = false;
-    let mut ev_repair_due_ms: u64 = 0;
     let mut dispatch_budget = 8u8;
     let mut consecutive_inbox_turns = 0u8;
     let mut complete_join_pair = false;
@@ -9671,21 +9489,6 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
         if let ActorCommand::Join { ticket, .. } = &command {
             worker.revalidate_creator(ticket.creator_id).await;
         }
-        if let ActorCommand::EventVoicePresence {
-            member_id,
-            previous,
-            current,
-        } = &command
-        {
-            crate::event_voice_channels::record_transition(
-                &worker.store,
-                worker.live.guild_id,
-                *member_id,
-                *previous,
-                *current,
-            )
-            .await;
-        }
         let accepted = apply_command(worker, command, now_ms);
         // An Ownership command stages its reply on the durable commit;
         // drive it before the next command so replies stay ordered.
@@ -9696,27 +9499,6 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
         }
         dispatch_ready |= accepted;
     }
-    // Snapshot occupants never sent a transition (`publish_snapshot` only
-    // sends `Reconcile`): flush them join-only so a member already sitting
-    // in a bound event channel owns an open span. Collected before any
-    // await so no live-state lock crosses a store write; the helper caps
-    // the whole flush at one total budget and the 60s repair picks up any
-    // occupants skipped past it.
-    let snapshot_occupants: Vec<(Snowflake, Snowflake)> = {
-        let live = worker.live.read_state();
-        live.members
-            .iter()
-            .filter_map(|(member_id, member)| {
-                member.channel_id.map(|channel| (*member_id, channel))
-            })
-            .collect()
-    };
-    let _ = crate::event_voice_channels::flush_bootstrap_presence(
-        &worker.store,
-        worker.live.guild_id,
-        &snapshot_occupants,
-    )
-    .await;
     stall.snapshot(worker, last_progress);
     loop {
         tokio::select! {
@@ -9737,23 +9519,6 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                 // unknown. Known creators and known rooms skip the store read.
                 if let ActorCommand::Join { ticket, .. } = &command {
                     worker.revalidate_creator(ticket.creator_id).await;
-                }
-                // Event-voice presence persists on the transition, before the
-                // room handling below; the store write is idempotent.
-                if let ActorCommand::EventVoicePresence {
-                    member_id,
-                    previous,
-                    current,
-                } = &command
-                {
-                    crate::event_voice_channels::record_transition(
-                        &worker.store,
-                        worker.live.guild_id,
-                        *member_id,
-                        *previous,
-                        *current,
-                    )
-                    .await;
                 }
                 let accepted = apply_command(worker, command, now_ms);
                 // An Ownership command stages its reply on the durable commit;
@@ -9889,31 +9654,6 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                 worker.refresh_empty_grace();
                 worker.send_notices(now_ms).await;
                 worker.flush_kick_audit(now_ms).await;
-                // Event-voice presence repair (at most every 60s): re-open a
-                // lost join and close a lost leave against the live occupant
-                // snapshot. The snapshot is collected before any await so no
-                // live-state lock crosses a store write; guilds with no
-                // bound event channels cost one cheap bindings read.
-                if now_ms >= ev_repair_due_ms {
-                    ev_repair_due_ms = now_ms.saturating_add(
-                        crate::event_voice_channels::EVENT_VOICE_REPAIR_INTERVAL_MS,
-                    );
-                    let repair_snapshot: Vec<(Snowflake, Snowflake)> = {
-                        let live = worker.live.read_state();
-                        live.members
-                            .iter()
-                            .filter_map(|(member_id, member)| {
-                                member.channel_id.map(|channel| (*member_id, channel))
-                            })
-                            .collect()
-                    };
-                    crate::event_voice_channels::repair_guild_presence(
-                        &worker.store,
-                        worker.live.guild_id,
-                        &repair_snapshot,
-                    )
-                    .await;
-                }
                 dispatch_budget = 8;
                 consecutive_inbox_turns = 0;
             }
@@ -9984,10 +9724,6 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             accepted_join =
                 worker.accept_join_received(ticket, &display, seed, created_at, received);
             worker.reconcile();
-        }
-        ActorCommand::EventVoicePresence { .. } => {
-            // Recorded by the actor loop before apply (the store write is
-            // async); nothing left to do here.
         }
         ActorCommand::CreatorAdded(creator) => {
             worker.live.protect_creators([creator.channel_id]);
@@ -10576,8 +10312,8 @@ pub fn decide_create_channel(request: CreateChannelRequest) -> CreateChannelPlan
 }
 
 /// `/textchannels` input after parsing. Unset options keep the stored value;
-/// an absent `enabled` never switches the companions on, so naming a
-/// channel or role alone leaves the toggle untouched.
+/// `enabled` defaults to on, so naming a channel or role also switches the
+/// companions on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextChannelsRequest {
     pub enabled: Option<bool>,
@@ -10606,9 +10342,7 @@ pub fn decide_text_channels(
     let Some(mut creator) = creator else {
         return refuse("That channel is not a voice-room creator. Pick one made with /create.");
     };
-    if let Some(enabled) = request.enabled {
-        creator.text_channels = enabled;
-    }
+    creator.text_channels = request.enabled.unwrap_or(true);
     if let Some(name) = &request.name {
         if !is_usable_channel_name(name) {
             return TextChannelsPlan::Refuse {
@@ -10676,8 +10410,7 @@ pub fn decide_position(creator: Option<CreatorChannel>, request: &PositionReques
     PositionPlan::Update(creator)
 }
 
-/// `/group` input after parsing. An omitted toggle refuses: the request
-/// carries nothing else, so there is nothing to apply.
+/// `/group` input after parsing. An omitted toggle turns grouping on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupRequest {
     pub enabled: Option<bool>,
@@ -10699,10 +10432,7 @@ pub fn decide_group(creator: Option<CreatorChannel>, request: &GroupRequest) -> 
     let Some(mut creator) = creator else {
         return refuse("That channel is not a voice-room creator. Pick one made with /create.");
     };
-    let Some(enabled) = request.enabled else {
-        return refuse("Choose whether to group rooms by category, then try again.");
-    };
-    creator.group_by_category = enabled;
+    creator.group_by_category = request.enabled.unwrap_or(true);
     if creator.validate().is_err() {
         return refuse("Those grouping settings are not valid. Try again.");
     }
@@ -10916,8 +10646,7 @@ pub fn decide_default_limit(
     DefaultLimitPlan::Update(creator)
 }
 
-/// `/alwaysprivate` input after parsing. An omitted toggle refuses: the
-/// request carries nothing else, so there is nothing to apply.
+/// `/alwaysprivate` input after parsing. An omitted toggle turns it on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlwaysPrivateRequest {
     pub enabled: Option<bool>,
@@ -10942,10 +10671,7 @@ pub fn decide_always_private(
     let Some(mut creator) = creator else {
         return refuse("That channel is not a voice-room creator. Pick one made with /create.");
     };
-    let Some(enabled) = request.enabled else {
-        return refuse("Choose whether new rooms start private, then try again.");
-    };
-    creator.private_default = enabled;
+    creator.private_default = request.enabled.unwrap_or(true);
     if creator.validate().is_err() {
         return refuse("Those privacy settings are not valid. Try again.");
     }
@@ -12141,33 +11867,6 @@ fn parse_vote_button(custom_id: &str) -> Option<VoiceCommand> {
     Some(VoiceCommand::Ballot { vote_id, ballot })
 }
 
-/// Whether the voice sink claims this component/modal id, so the shared
-/// stale-control path must stay silent instead of answering expired. Covers the
-/// same shapes the sink parses: bare `two:voice:` ids, runtime join buttons
-/// with the 32-hex worker-epoch suffix (via `split_runtime_join_id`, shared
-/// with `join_component_action`), and `votekick:` ballots (via
-/// `parse_vote_button`). A prefix alone never claims ownership.
-#[must_use]
-pub fn voice_claims_custom_id(custom_id: &str) -> bool {
-    if parse_voice_custom_id(custom_id).is_some() {
-        return true;
-    }
-    if split_runtime_join_id(custom_id).is_some_and(|(core, epoch)| {
-        epoch.is_some()
-            && matches!(
-                parse_voice_custom_id(core),
-                Some(
-                    VoiceAction::JoinApprove { .. }
-                        | VoiceAction::JoinDeny { .. }
-                        | VoiceAction::JoinBlock { .. }
-                )
-            )
-    }) {
-        return true;
-    }
-    parse_vote_button(custom_id).is_some()
-}
-
 /// Button custom ID for one ballot. Inverse of [`parse_vote_button`].
 fn vote_button_id(vote_id: Snowflake, ballot: VoteBallot) -> String {
     let vote = match ballot {
@@ -13030,7 +12729,7 @@ where
                 Err(error) => format!("Could not read the creator channel ({error}). Try again."),
                 Ok(creator) => match decide_text_channels(creator, &request) {
                     TextChannelsPlan::Refuse { message } => message,
-                    TextChannelsPlan::Update(creator) => match store.add_creator(&creator).await {
+                    TextChannelsPlan::Update(creator) => match store.add_creator_attributed(&creator, "discord:textchannels").await {
                         Ok(()) => {
                             runtime.creator_updated(&creator);
                             text_channels_summary(&creator)
@@ -13062,7 +12761,7 @@ where
                 Err(error) => format!("Could not read the creator channel ({error}). Try again."),
                 Ok(creator) => match decide_position(creator, &request) {
                     PositionPlan::Refuse { message } => message,
-                    PositionPlan::Update(creator) => match store.add_creator(&creator).await {
+                    PositionPlan::Update(creator) => match store.add_creator_attributed(&creator, "discord:position").await {
                         Ok(()) => {
                             runtime.creator_updated(&creator);
                             position_summary(&creator)
@@ -13094,7 +12793,7 @@ where
                 Err(error) => format!("Could not read the creator channel ({error}). Try again."),
                 Ok(creator) => match decide_group(creator, &request) {
                     GroupPlan::Refuse { message } => message,
-                    GroupPlan::Update(creator) => match store.add_creator(&creator).await {
+                    GroupPlan::Update(creator) => match store.add_creator_attributed(&creator, "discord:group").await {
                         Ok(()) => {
                             runtime.creator_updated(&creator);
                             group_summary(&creator)
@@ -13140,7 +12839,7 @@ where
                 Err(error) => format!("Could not read the creator channel ({error}). Try again."),
                 Ok(creator) => match decide_inherit_permissions(creator, &request) {
                     InheritPermissionsPlan::Refuse { message } => message,
-                    InheritPermissionsPlan::Update(creator) => match store.add_creator(&creator).await {
+                    InheritPermissionsPlan::Update(creator) => match store.add_creator_attributed(&creator, "discord:inheritpermissions").await {
                         Ok(()) => {
                             runtime.creator_updated(&creator);
                             inherit_permissions_summary(&creator)
@@ -13172,7 +12871,7 @@ where
                 Err(error) => format!("Could not read the creator channel ({error}). Try again."),
                 Ok(creator) => match decide_default_limit(creator, &request) {
                     DefaultLimitPlan::Refuse { message } => message,
-                    DefaultLimitPlan::Update(creator) => match store.add_creator(&creator).await {
+                    DefaultLimitPlan::Update(creator) => match store.add_creator_attributed(&creator, "discord:defaultlimit").await {
                         Ok(()) => {
                             runtime.creator_updated(&creator);
                             default_limit_summary(&creator)
@@ -13204,7 +12903,7 @@ where
                 Err(error) => format!("Could not read the creator channel ({error}). Try again."),
                 Ok(creator) => match decide_always_private(creator, &request) {
                     AlwaysPrivatePlan::Refuse { message } => message,
-                    AlwaysPrivatePlan::Update(creator) => match store.add_creator(&creator).await {
+                    AlwaysPrivatePlan::Update(creator) => match store.add_creator_attributed(&creator, "discord:alwaysprivate").await {
                         Ok(()) => {
                             runtime.creator_updated(&creator);
                             always_private_summary(&creator)
@@ -14230,10 +13929,6 @@ where
         self.runtime.disconnect();
     }
 
-    fn disconnect_from_drop(&self) {
-        self.runtime.disconnect_from_drop();
-    }
-
     fn needs_bootstrap(&self, cache: &DefaultInMemoryCache) -> bool {
         self.runtime.needs_bootstrap(cache)
     }
@@ -14262,8 +13957,7 @@ pub use private_runtime::PrivacyCommand;
 
 mod join_requests;
 use join_requests::{
-    handle_join_interaction, join_component_action, split_runtime_join_id, JoinDecisionCommand,
-    JoinReply,
+    handle_join_interaction, join_component_action, JoinDecisionCommand, JoinReply,
 };
 
 #[cfg(test)]

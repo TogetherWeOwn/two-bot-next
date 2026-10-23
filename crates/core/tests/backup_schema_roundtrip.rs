@@ -302,9 +302,12 @@ async fn triggers(pool: &PgPool) -> Vec<(String, String, String, String)> {
     .unwrap()
 }
 
-/// Migrated settings triggers. Restore suspends only the two guards; the CAS
-/// allocator stays enabled so restored rows receive fresh tokens.
-fn assert_settings_triggers(triggers: &[(String, String, String, String)]) {
+/// Every migrated settings trigger, in catalog order: the CAS allocator and
+/// two guards (0330/0331) plus the v12 voice writer contract (0455) — one
+/// append-only audit guard and thirteen stamp triggers, one per versioned
+/// voice configuration table. Restore suspends guards while loading rows;
+/// the CAS allocator stays enabled so restored rows receive fresh tokens.
+fn assert_expected_triggers(triggers: &[(String, String, String, String)]) {
     assert_eq!(
         triggers
             .iter()
@@ -317,8 +320,34 @@ fn assert_settings_triggers(triggers: &[(String, String, String, String)]) {
                 "guild_settings_audit",
                 "trg_guild_settings_audit_append_only"
             ),
+            ("voice_access_controls", "voice_access_controls_stamp"),
+            ("voice_channel_templates", "voice_channel_templates_stamp"),
+            (
+                "voice_command_role_members",
+                "voice_command_role_members_stamp"
+            ),
+            ("voice_command_roles", "voice_command_roles_stamp"),
+            ("voice_creators", "voice_creators_stamp"),
+            ("voice_game_aliases", "voice_game_aliases_stamp"),
+            ("voice_guild_settings", "voice_guild_settings_stamp"),
+            ("voice_logging", "voice_logging_stamp"),
+            (
+                "voice_logging_mention_members",
+                "voice_logging_mention_members_stamp"
+            ),
+            (
+                "voice_logging_mention_roles",
+                "voice_logging_mention_roles_stamp"
+            ),
+            ("voice_logging_settings", "voice_logging_settings_stamp"),
+            (
+                "voice_random_list_choices",
+                "voice_random_list_choices_stamp"
+            ),
+            ("voice_random_lists", "voice_random_lists_stamp"),
+            ("voice_settings_audit", "voice_settings_audit_append_only"),
         ],
-        "every migrated settings trigger exists"
+        "every migrated trigger exists"
     );
 }
 
@@ -625,6 +654,7 @@ async fn assert_default_inserts(
         ("moderation_member_bans", "generation", "INSERT INTO moderation_member_bans (request_id, guild_id, user_id, state, created_at) VALUES ('post-restore:ban', '100000000000000001', '100000000000000012', 'prepared', now()) RETURNING generation"),
         ("privacy_opt_out_audit", "id", "INSERT INTO privacy_opt_out_audit (guild_id, member_id) VALUES ('100000000000000001', '100000000000000002') RETURNING id"),
         ("event_store", "id", "INSERT INTO event_store (event_type, guild_id, user_id, event_time, dedup_key, presence_status, activity_type) VALUES ('PRESENCE_UPDATE', '100000000000000001', 'post-restore-member', now(), 'post-restore:event-store', 'online', 0) RETURNING id"),
+        ("voice_settings_audit", "version", "INSERT INTO voice_settings_audit (guild_id, actor) VALUES ('100000000000000001', 'post-restore') RETURNING version"),
     ];
     let cases: BTreeSet<(String, String)> = inserts
         .iter()
@@ -682,6 +712,43 @@ async fn forget_moderation_history(pool: &PgPool) {
     .execute(pool)
     .await
     .unwrap();
+}
+
+/// Reused disposable targets must also have no destination voice history.
+/// Only fixture construction suspends this guard; restore and the dedicated
+/// history-fence test always run with the original trigger mode restored.
+async fn forget_voice_audit_history(pool: &PgPool) {
+    let mut tx = pool.begin().await.unwrap();
+    let mode: String = sqlx::query_scalar(
+        "SELECT tgenabled::text FROM pg_trigger WHERE tgrelid = 'voice_settings_audit'::regclass AND tgname = 'voice_settings_audit_append_only'",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE voice_settings_audit DISABLE TRIGGER voice_settings_audit_append_only",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query("TRUNCATE voice_settings_audit")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let action = match mode.as_str() {
+        "O" => "ENABLE",
+        "A" => "ENABLE ALWAYS",
+        "R" => "ENABLE REPLICA",
+        "D" => "DISABLE",
+        _ => panic!("invalid voice fixture trigger mode"),
+    };
+    sqlx::query(audited(format!(
+        "ALTER TABLE voice_settings_audit {action} TRIGGER voice_settings_audit_append_only"
+    )))
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
 }
 
 async fn dirty_target(pool: &PgPool) {
@@ -886,7 +953,7 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
         "schema_migrations".to_owned(),
     ];
     let guard_before = triggers(pool).await;
-    assert_settings_triggers(&guard_before);
+    assert_expected_triggers(&guard_before);
     assert_guards_work(pool).await;
     let directory = ArchiveDirectory::new();
     let original = directory.path("complete.ndjson.gz");
@@ -966,6 +1033,7 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
         let modes_before = triggers(pool).await;
         dirty_target(pool).await;
         forget_moderation_history(pool).await;
+        forget_voice_audit_history(pool).await;
         // Keep the floors in force before the last restore.
         floors.extend(allocation_floors(pool, &reversed.manifest.sequence_marks).await);
         let cas_before = next_cas_token(pool).await;
@@ -1053,6 +1121,7 @@ async fn empty_archived_sequence_tables_keep_the_target_position() {
     let empty_path = directory.path("empty-sequences.ndjson.gz");
     write_archive(&empty_path, &empty);
     forget_moderation_history(pool).await;
+    forget_voice_audit_history(pool).await;
     let floors = allocation_floors(pool, &empty.manifest.sequence_marks).await;
     let report = restore(pool, &empty_path).await.unwrap();
     assert!(report.ok);
@@ -1305,6 +1374,7 @@ async fn restore_sql_failures_and_late_sequence_exhaustion_roll_back_data_guards
     write_archive(&bad_fk_path, &bad_fk);
     dirty_target(pool).await;
     forget_moderation_history(pool).await;
+    forget_voice_audit_history(pool).await;
     // Dirty sequence state too: rollback must not leave a reset high-water mark.
     for sequence in owned_sequences(pool).await {
         sqlx::query("SELECT nextval($1::regclass)")
@@ -1420,6 +1490,7 @@ async fn pre_reservation_v4_restores_and_clears_newer_reservation_rows() {
     // Restore fences a destination holding moderation history; this scenario
     // deliberately replaces a reused rehearsal target.
     forget_moderation_history(pool).await;
+    forget_voice_audit_history(pool).await;
     let report = restore(pool, &source).await.unwrap();
     assert!(report.ok);
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM voice_create_reservations")
@@ -1461,10 +1532,10 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v13-source.ndjson.gz");
+    let current_path = directory.path("v12-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 13);
+    assert_eq!(old.manifest.version, 12);
     for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -1482,6 +1553,7 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
     );
     // This test deliberately replaces a reused isolated rehearsal target.
     forget_moderation_history(pool).await;
+    forget_voice_audit_history(pool).await;
     let report = restore(pool, &old_path).await.unwrap();
     assert!(report.ok);
     for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
@@ -1510,17 +1582,11 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v13-source.ndjson.gz");
+    let current_path = directory.path("v12-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 13);
-    for name in [
-        "scheduled_events_claim",
-        "scheduled_events_tombstone",
-        "event_voice_channels",
-        "event_voice_presence",
-        "admin_api_tokens",
-    ] {
+    assert_eq!(old.manifest.version, 12);
+    for name in ["scheduled_events_claim", "scheduled_events_tombstone"] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
         old.manifest.tables.retain(|table| table.name != name);
@@ -1533,25 +1599,14 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     assert_eq!(inspected.manifest.version, 9);
     assert_eq!(
         inspected.manifest.missing_tables(),
-        [
-            "scheduled_events_claim",
-            "scheduled_events_tombstone",
-            "event_voice_channels",
-            "event_voice_presence",
-            "admin_api_tokens"
-        ]
+        ["scheduled_events_claim", "scheduled_events_tombstone"]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
     forget_moderation_history(pool).await;
+    forget_voice_audit_history(pool).await;
     let report = restore(pool, &old_path).await.unwrap();
     assert!(report.ok);
-    for name in [
-        "scheduled_events_claim",
-        "scheduled_events_tombstone",
-        "event_voice_channels",
-        "event_voice_presence",
-        "admin_api_tokens",
-    ] {
+    for name in ["scheduled_events_claim", "scheduled_events_tombstone"] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
             identifier(name)
@@ -1577,23 +1632,20 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v13-source.ndjson.gz");
+    let current_path = directory.path("v12-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 13);
+    assert_eq!(old.manifest.version, 12);
     // Frozen claim-only v10 shape: the merged v10 writer carried the
-    // epoch-claim guard but predates the delete tombstones, token registry
-    // and event voice pair.
-    for name in [
-        "scheduled_events_tombstone",
-        "event_voice_channels",
-        "event_voice_presence",
-        "admin_api_tokens",
-    ] {
-        let rows = old.buffers.remove(name).unwrap();
-        assert!(!rows.is_empty(), "fixture must populate newer {name}");
-        old.manifest.tables.retain(|table| table.name != name);
-    }
+    // epoch-claim guard but predates the delete tombstones.
+    let rows = old.buffers.remove("scheduled_events_tombstone").unwrap();
+    assert!(
+        !rows.is_empty(),
+        "fixture must populate newer scheduled_events_tombstone"
+    );
+    old.manifest
+        .tables
+        .retain(|table| table.name != "scheduled_events_tombstone");
     old.manifest.version = 10;
     old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
     let old_path = directory.path("pre-tombstone-v10.ndjson.gz");
@@ -1602,32 +1654,24 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
     assert_eq!(inspected.manifest.version, 10);
     assert_eq!(
         inspected.manifest.missing_tables(),
-        [
-            "scheduled_events_tombstone",
-            "event_voice_channels",
-            "event_voice_presence",
-            "admin_api_tokens"
-        ]
+        ["scheduled_events_tombstone"]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
     forget_moderation_history(pool).await;
+    forget_voice_audit_history(pool).await;
     let report = restore(pool, &old_path).await.unwrap();
     assert!(report.ok);
-    for name in [
-        "scheduled_events_tombstone",
-        "event_voice_channels",
-        "event_voice_presence",
-        "admin_api_tokens",
-    ] {
-        let count: i64 = sqlx::query_scalar(audited(format!(
-            "SELECT COUNT(*) FROM {}",
-            identifier(name)
-        )))
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        assert_eq!(count, 0, "v10 restore clears newer {name} target rows");
-    }
+    let count: i64 = sqlx::query_scalar(audited(format!(
+        "SELECT COUNT(*) FROM {}",
+        identifier("scheduled_events_tombstone")
+    )))
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        count, 0,
+        "v10 restore clears newer scheduled_events_tombstone target rows"
+    );
     let claims: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scheduled_events_claim")
         .fetch_one(pool)
         .await
@@ -1644,131 +1688,151 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
     db.close().await.unwrap();
 }
 
+/// V12 voice configuration audit (0455): the archive carries every audit row
+/// plus the revision allocator's mark, a fresh target resumes the revision
+/// sequence past the archived rows, and a destination holding audit history
+/// the archive would forget refuses without changing anything.
 #[tokio::test]
-async fn v11_archive_restores_and_clears_newer_registry() {
+async fn voice_audit_history_roundtrips_into_fresh_target_and_fences_newer_destination_history() {
     let Some(db) = database().await else {
         return;
     };
     let pool = db.pool();
     seed(pool).await;
-    let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v13-source.ndjson.gz");
-    dump(pool, &current_path).await.unwrap();
-    let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 13);
-    // Frozen tombstone-only v11 shape: the merged v11 writer carried the
-    // delete tombstones but predates the token registry and event voice pair.
-    for name in [
-        "event_voice_channels",
-        "event_voice_presence",
-        "admin_api_tokens",
-    ] {
-        let rows = old.buffers.remove(name).unwrap();
-        assert!(!rows.is_empty(), "fixture must populate newer {name}");
-        old.manifest.tables.retain(|table| table.name != name);
-    }
-    old.manifest.version = 11;
-    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
-    let old_path = directory.path("pre-registry-v11.ndjson.gz");
-    write_archive(&old_path, &old);
-    let inspected = inspect(&old_path).expect("pre-change v11 archive remains readable");
-    assert_eq!(inspected.manifest.version, 11);
-    assert_eq!(
-        inspected.manifest.missing_tables(),
-        [
-            "event_voice_channels",
-            "event_voice_presence",
-            "admin_api_tokens"
-        ]
-    );
-    // This test deliberately replaces a reused isolated rehearsal target.
-    forget_moderation_history(pool).await;
-    let report = restore(pool, &old_path).await.unwrap();
-    assert!(report.ok);
-    for name in [
-        "event_voice_channels",
-        "event_voice_presence",
-        "admin_api_tokens",
-    ] {
-        let count: i64 = sqlx::query_scalar(audited(format!(
-            "SELECT COUNT(*) FROM {}",
-            identifier(name)
-        )))
-        .fetch_one(pool)
+    // Allocator history must survive even beyond all extant audit revisions.
+    // A max(row.version)-only reset would incorrectly resume at 15, not 501.
+    sqlx::query("SELECT setval('voice_settings_audit_version_seq', 500, true)")
+        .execute(pool)
         .await
         .unwrap();
-        assert_eq!(count, 0, "v11 restore clears newer {name} target rows");
-    }
-    let tombstones: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scheduled_events_tombstone")
-        .fetch_one(pool)
-        .await
-        .unwrap();
+    let tables = covered_tables(pool).await;
     assert!(
-        tombstones > 0,
-        "the v11 delete tombstones are restored, not discarded"
+        tables.contains(&"voice_settings_audit".to_owned()),
+        "v12 backup covers the voice configuration audit"
     );
-    let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
-        .fetch_one(pool)
-        .await
+    let before = snapshot(pool, &tables).await;
+    assert!(
+        !before["voice_settings_audit"].rows.is_empty(),
+        "seed fixture populates voice_settings_audit"
+    );
+    let voice = &before["voice_settings_audit"];
+    let at_version = voice
+        .columns
+        .iter()
+        .position(|(name, _)| name == "version")
+        .expect("voice audit revision column");
+    let archived_max: i64 = voice
+        .rows
+        .iter()
+        .map(|row| row[at_version].as_deref().unwrap().parse::<i64>().unwrap())
+        .max()
         .unwrap();
-    assert!(members > 0, "older covered data is restored, not discarded");
-    db.close().await.unwrap();
-}
+    let guard_before = triggers(pool).await;
+    assert_expected_triggers(&guard_before);
+    let directory = ArchiveDirectory::new();
+    let path = directory.path("voice-audit-v12.ndjson.gz");
+    let manifest = dump(pool, &path).await.unwrap();
+    assert_eq!(manifest.version, 12);
+    let entry = manifest
+        .tables
+        .iter()
+        .find(|table| table.name == "voice_settings_audit")
+        .expect("voice audit rides the v12 manifest");
+    assert_eq!(
+        entry.columns.iter().map(String::as_str).collect::<Vec<_>>(),
+        ["version", "guild_id", "actor", "at"],
+        "backup carries voice audit row metadata"
+    );
+    assert!(
+        !entry.column_types.is_empty(),
+        "row metadata carries column types"
+    );
+    let marked = manifest
+        .sequence_marks
+        .iter()
+        .find(|mark| mark.table == "voice_settings_audit" && mark.column == "version")
+        .expect("archive marks the voice audit revision allocator")
+        .next()
+        .unwrap();
+    assert_eq!(archived_max, 14);
+    assert_eq!(
+        marked, 501,
+        "archive preserves issued revisions beyond row max"
+    );
 
-#[tokio::test]
-async fn v12_archive_restores_and_clears_newer_event_voice() {
-    let Some(db) = database().await else {
-        return;
-    };
-    let pool = db.pool();
-    seed(pool).await;
-    let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v13-source.ndjson.gz");
-    dump(pool, &current_path).await.unwrap();
-    let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 13);
-    for table in ["event_voice_channels", "event_voice_presence"] {
-        let rows = old.buffers.remove(table).unwrap();
-        assert!(!rows.is_empty(), "fixture must populate newer {table}");
-        old.manifest.tables.retain(|info| info.name != table);
-    }
-    old.manifest.version = 12;
-    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
-    let old_path = directory.path("pre-event-voice-v12.ndjson.gz");
-    write_archive(&old_path, &old);
-    let inspected = inspect(&old_path).expect("pre-change v12 archive remains readable");
-    assert_eq!(inspected.manifest.version, 12);
-    assert_eq!(
-        inspected.manifest.missing_tables(),
-        ["event_voice_channels", "event_voice_presence"]
-    );
-    // This test deliberately replaces a reused isolated rehearsal target.
-    forget_moderation_history(pool).await;
-    let report = restore(pool, &old_path).await.unwrap();
+    // Independent, freshly migrated destination, never a wipe of the source DB.
+    let target = database().await.expect("test bootstrap already configured");
+    let fresh = target.pool();
+    sqlx::query(BACKUP_IDENTITY).execute(fresh).await.unwrap();
+    let report = restore(fresh, &path).await.unwrap();
     assert!(report.ok);
-    for table in ["event_voice_channels", "event_voice_presence"] {
-        let count: i64 = sqlx::query_scalar(audited(format!(
-            "SELECT COUNT(*) FROM {}",
-            identifier(table)
-        )))
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        assert_eq!(count, 0, "v12 restore clears newer {table} target rows");
+    assert!(report.dropped_columns.is_empty());
+    assert_eq!(snapshot(fresh, &tables).await, before);
+    assert_eq!(triggers(fresh).await, guard_before);
+    // Append-only voice audit survives restore as an enforced guard, not rows alone.
+    for statement in [
+        "UPDATE voice_settings_audit SET actor = 'forbidden'",
+        "DELETE FROM voice_settings_audit",
+        "TRUNCATE voice_settings_audit",
+    ] {
+        let error = sqlx::query(audited(statement.to_owned()))
+            .execute(fresh)
+            .await
+            .expect_err("voice append-only guard must still fire");
+        assert_sqlstate(&error, "P0001");
+        assert!(error.to_string().contains("append only"), "{error}");
     }
-    let tokens: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_api_tokens")
-        .fetch_one(pool)
-        .await
-        .unwrap();
+    // The revision sequence resumes past both the archived rows and its mark.
+    let resumed: i64 = sqlx::query_scalar(
+        "INSERT INTO voice_settings_audit (guild_id, actor) VALUES ('100000000000000001', 'post-restore') RETURNING version",
+    )
+    .fetch_one(fresh)
+    .await
+    .unwrap();
     assert!(
-        tokens > 0,
-        "the v12 token registry is restored, not discarded"
+        resumed > archived_max,
+        "revision {resumed} reissued over archived max {archived_max}"
     );
-    let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
-        .fetch_one(pool)
+    assert!(
+        resumed >= marked,
+        "revision resumes past the archived mark {marked}"
+    );
+
+    // Destination-only audit history the archive would forget: refuse, preserve.
+    // Both the resumed row above and this planted row are absent from the archive.
+    sqlx::query(
+        "INSERT INTO voice_settings_audit (version, guild_id, actor) VALUES (5000, '100000000000000001', 'destination-only')",
+    )
+    .execute(fresh)
+    .await
+    .unwrap();
+    // The moderation fence runs first; remove only that disposable evidence so
+    // this refusal independently proves voice history is sufficient to fence.
+    forget_moderation_history(fresh).await;
+    let preserved = snapshot(fresh, &tables).await;
+    let sequences_before_refusal = sequence_snapshot(fresh).await;
+    let triggers_before_refusal = triggers(fresh).await;
+    let error = restore(fresh, &path)
         .await
-        .unwrap();
-    assert!(members > 0, "older covered data is restored, not discarded");
+        .expect_err("destination voice audit history must fence the restore");
+    assert!(
+        matches!(error, DbDumpError::Refused(_)),
+        "history refusal, not a SQL/setup failure: {error}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("destination voice configuration history exists"),
+        "{error}"
+    );
+    assert_eq!(sequence_snapshot(fresh).await, sequences_before_refusal);
+    assert_eq!(triggers(fresh).await, triggers_before_refusal);
+    assert_eq!(
+        snapshot(fresh, &tables).await,
+        preserved,
+        "refusal preserves destination voice audit history"
+    );
+    target.close().await.unwrap();
     db.close().await.unwrap();
 }
 
@@ -1848,6 +1912,7 @@ async fn v3_prefix_restores_into_migrated_schema_without_retaining_newer_target_
     // below runs only while the coverage list names one. Forgetting moderation
     // history stays unconditional: the v3 restore below requires it.
     forget_moderation_history(pool).await;
+    forget_voice_audit_history(pool).await;
     if let Some(absent_name) = OPTIONAL_LEGACY_TABLES.first() {
         let mut incompatible = copy_contents(&legacy);
         let absent = incompatible

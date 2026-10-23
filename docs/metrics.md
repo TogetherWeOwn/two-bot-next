@@ -44,7 +44,6 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_db_pool_idle_connections` | Current idle connections |
 | `two_bot_db_pool_max_connections` | Configured maximum |
 | `two_bot_db_errors_total{op}` | Recorded storage-layer failures: send-admission SQL uses `op="admission"`, voice actor load uses `op="other"`; unknown instrumented operations also collapse to `other`. Not a database-wide total |
-| `two_bot_containment_store_errors_total{op}` | Containment-store failures; `op` is `complete_incident` or `other`. A failed completion increments `complete_incident` once and marks the staff alert outcome-unknown because the terminal outcome could not be durably recorded. Fixed two series from process start; no guild, actor, incident or error text labels |
 | `two_bot_send_admissions_total{outcome}` | Send-admission `admit()` decisions; `outcome` is `admitted`, `blocked`, `storage_error` (also counted in `two_bot_db_errors_total{op="admission"}`) or `other` |
 | `two_bot_gateway_prefix_trigger_refused_total{reason}` | In-scope prefix candidates refused by the automod verdict before any trigger lookup; `reason` is `verdict` (contained, timed-out, uninspected, unrecorded or missing verdict) or `other`. The worker records candidates even when its capture-only gate prevents detached dispatch. Unmatched content (no trigger), scope mismatches, bot/webhook messages and disabled text-command gates never increment this family |
 | `two_bot_job_runs_total{job,outcome}` | Completed attempts; outcome is `success` or `failure` (including returned errors, timeouts and isolated panics) |
@@ -79,7 +78,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_voice_vote_kick_total{outcome}` | Vote-kick starts, refusals and terminal enforcements; `outcome` is `started`, a refusal code (`evidence_unavailable`, `not_a_room`, `initiator_not_occupant`, `target_not_occupant`, `self_target`, `protected_target`, `privileged_target`, `authority_unavailable`, `active_vote_exists`, `cooldown`, `initiator_limited`, `reused_vote_id`, `unknown_vote`, `wrong_vote_boundary`, `ineligible_voter`, `repeated_vote`, `invalid_time`), an enforcement code (`connect_denied_and_disconnected`, `connect_denied_target_absent`, `skipped_room_gone`, `skipped_target_protected`, `permission_missing`, `discord_error`, `gave_up`) or `other`; vote results (`passed`/`expired`/`cancelled`) are audit-only and never counted |
 | `two_bot_dispatch_drops_total{lane}` | Dispatch-lane saturation drops: every event refused because every attempted lane was full. `lane` is one of `messages`, `interactions`, `registry`, `privileged`, `busy`, `reactions` (see label allowlists below). The `reactions` lane additionally counts per-member fairness refusals: a reaction refused because its member already holds `PER_USER_IN_FLIGHT` reaction slots, even while the lane has free slots. A single-lane refusal counts its lane once; a privileged spill refused by both lanes counts both. Logs sample the first drop per 60 s per runtime, so bursts are O(1) lines with N counter increments. `dispatch_drops:<lane>` raises a ticket after growth in 3 consecutive completed keepalive sample windows; the first valid sample only establishes a baseline. A flat sample or counter reset clears the streak; missing/invalid samples break growth but never falsely resolve an active ticket. A single burst never pages. `reactions`-lane growth can reflect per-member fairness rather than an undersized lane. Dispatch refusals are not proof of gateway packet loss |
 | `two_bot_gateway_checkpoint_failures_total{stage}` | Failed gateway checkpoint commits from `apply_dispatch` and failed checkpoint clears: every failure stops the dispatch worker and is recorded on `operation`. `stage` is `pre_commit` (commit skipped after a funnel/leveling/acknowledgement failure) or `commit` (the durable store write itself failed); failure causes are never labels. Alert rule `gateway_checkpoint_failures` fires on any increase summed over every `stage` between consecutive keepalive samples (the first sample is baseline-only; the failing process lingers 75 s so a scrape lands before the restart resets the counter); unlike bursty dispatch drops, a single checkpoint failure stops the worker, so there is no benign-singleton case |
-| `two_bot_drop_poison_total{guard}` | Poisoned locks recovered by drop guards instead of panicking inside `drop` (which aborts the process when the drop runs during unwinding). `guard` is one of `command_dispatch_guard`, `schedule_run`, `user_slot`, `in_flight_guard`, `ticket_supervisor`, `response_accounting` or `voice_connection_guard` (see label allowlists below). Each poisoned drop counts once and logs one `drop guard recovered a poisoned lock` warn with the guard name; the drop still releases its state from the recovered guard. A `ResponseAccounting` drop taking both the bare and global header paths counts twice, once per recovered lock. Any increase is a fault worth a look in the container logs. Poison stays sticky on the mutex, so later non-drop lock sites still panic until the broad lock-poison conversion lands; those panics unwind to task boundaries instead of aborting. Counted scope is the seven named guards, recovered only on their drop paths through drop-only variants; the shared live paths (`stop_tasks`, `finish_global`/`observe_bare_retry_after`, `VoiceRuntime::disconnect`) fail loud with no counter, so non-drop callers are never miscounted |
+| `two_bot_drop_poison_total{guard}` | Poisoned locks recovered by drop guards instead of panicking inside `drop` (which aborts the process when the drop runs during unwinding). `guard` is one of `command_dispatch_guard`, `schedule_run`, `user_slot` or `in_flight_guard` (see label allowlists below). Each poisoned drop counts once and logs one `drop guard recovered a poisoned lock` warn with the guard name; the drop still releases its state from the recovered guard. Any increase is a fault worth a look in the container logs. Poison stays sticky on the mutex, so later non-drop lock sites still panic until the broad lock-poison conversion lands; those panics unwind to task boundaries instead of aborting. Counted scope is the four named guards; `TicketSupervisor`, `ResponseAccounting` and `VoiceRuntime::disconnect` recover their shared locks silently (`PoisonError::into_inner`) without counting, so non-drop callers are never miscounted |
 | `two_bot_internal_actions_total{family,outcome}` | Signed website-action receiver executions by bounded family and outcome. `family` is one of `announcement`, `event`, `settings`, `moderation`, `membership` or `other` (see label allowlists below). `outcome` is `executed` or the refusal class (`auth_failure`, `unknown_key`, `clock_skew`, `nonce_replay`, `rate_limit`, `unknown_action`, `action_disabled`, `malformed_body`, `conflict`, `upstream` or `internal`). Every request counts once; replays count on each serve. Refusal warn-summaries stay sampled; this counter is the alertable signal. Alert rule `receiver_refusals:<family>` fires when a family's refused outcomes rise in 3 consecutive keepalive samples (first sample and restarts clear the streak; one forged pre-auth probe in `other` stays silent) |
 | `two_bot_moderation_enforcements_total{verb,outcome}` | Moderation enforcement terminal outcomes. `verb` is one of `ban`, `tempban`, `kick`, `timeout`, `warn`, `purge`, `slowmode`, `lockdown` or `unlock` (see label allowlists below). `outcome` is `success`, `refused`, `discord_error`, `storage_error` or `other`. Each terminal member/channel enforcement counts once; retries and rate-limit backoffs are not outcomes. The `moderation_enforcement_failures` rule tickets on any summed `discord_error`/`storage_error` increase (first sample is baseline-only, restarts re-baseline, missing family is no window); `success`, `refused` and `other` stay quiet |
 | `two_bot_community_facts_drain_failures_total{reason}` | Warn-and-continue community-facts drain failures in the gateway dispatch worker. `reason` is `error` (the facts writer returned an error) or `timeout` (the drain missed the dispatch deadline), or `other` (see label allowlists below). Each failed dispatch counts once; a committed drain counts nothing. The worker never stalls on this, and the scorecard fails closed on missing coverage. Alert rule `community_facts_drain_failures` raises a ticket after summed growth in 3 consecutive completed keepalive sample windows; the first valid sample only establishes a baseline. A flat sample or counter reset clears the streak; missing/invalid samples break growth but never falsely resolve an active ticket. A single failed drain never pages |
@@ -328,11 +327,6 @@ as dynamic labels.
   by `Metrics::db_error`; send-admission SQL (admit/extend/complete storage
   failures) reports as `admission`, and failed voice actor store loads
   report as `other`.
-- `two_bot_containment_store_errors_total{op}` — `op` is `complete_incident`
-  or `other` (`CONTAINMENT_STORE_OPS`). Recorded by
-  `Metrics::containment_store_error`; a failed containment completion counts
-  once and marks the staff alert outcome-unknown, without retrying the write.
-  Unknown operations collapse to `other`; no error text becomes a label.
 - `two_bot_send_admissions_total{outcome}` — `outcome` is `admitted`,
   `blocked`, `storage_error` or `other`. Recorded once per `admit()`
   decision by the Postgres admission gate; failed `complete()`/`extend()`
@@ -367,8 +361,7 @@ as dynamic labels.
   dispatch drops, a single checkpoint failure stops the worker, so there is
   no benign-singleton case.
 - `two_bot_drop_poison_total{guard}` — `guard` is one of
-  `command_dispatch_guard`, `schedule_run`, `user_slot`, `in_flight_guard`,
-  `ticket_supervisor`, `response_accounting` or `voice_connection_guard`
+  `command_dispatch_guard`, `schedule_run`, `user_slot` or `in_flight_guard`
   (`crates/core/src/metrics.rs` `DROP_POISON_GUARDS`). Recorded once per
   poisoned drop through `recover_drop_poison`, alongside one
   `drop guard recovered a poisoned lock` warn carrying the guard name; the
@@ -401,22 +394,8 @@ as dynamic labels.
   `InternalMemberExecutor`), including definitive preflight refusals (slash:
   unknown roles and non-member target; website: resolver `ActionNotAllowed`
   such as non-member target, actor not member, or actor forbidden, recorded
-  by the website effect before the executor runs). Slash member authority
-  refresh failures also count once as `refused`, before any mutation; actor
-  cooldowns are not outcomes. Website resolver snapshot failures and other
-  indeterminate reads before terminal execution are not outcomes.
-  Slash member authority diagnostics use `warn!` with the fixed message
-  `member authority unavailable`, `verb`, and a bounded `cause`: `discord_403`
-  (confirmed 403 on guild/member reads), `transport` (timeout, unavailable,
-  rate-limit, guard or other HTTP refusal on those reads), `malformed_roles`
-  (invalid JSON, incomplete/malformed guild or member evidence, or unknown held
-  roles), `unknown_bot` (any failed bot-identity lookup, including HTTP failures,
-  or absent/non-bot bot membership), or `guild_mismatch` (interaction or fetched guild
-  identity differs from the configured guild). No provider text or payload is
-  logged. Only the first refusal per cause per 60 seconds per member runtime is
-  warned: five fixed sampling slots, no member-keyed state. Suppression never
-  changes the enforcement counter, denial audit, or generic member reply;
-  causes are log fields, not new metric labels or enforcement outcomes.
+  by the website effect before the executor runs); actor cooldowns, Discord
+  snapshot failures and other indeterminate reads are not outcomes.
   Recorded once per terminal channel enforcement (slash
   `ChannelModerationRuntime`, website `ChannelModerationExecutor` plus
   `InternalChannelExecutor`), with the same boundary: website resolver

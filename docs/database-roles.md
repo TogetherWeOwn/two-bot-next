@@ -86,20 +86,6 @@ transaction, and reads the guild high-water back through it before touching
 the mirror. The table carries no member column, so there is nothing to
 erase and no reader grant beyond the app pool.
 
-The event voice pair (`event_voice_channels`, `event_voice_presence`) is
-ordinary `table` kind for the same reason: the claim path, the presence
-transition hook and the reconcile passes read and write both tables through
-the app pool. The presence spans carry a member column (`user_id`, erased
-via the scheduled-event mirror); the channel row carries no member identity.
-
-The admin API token registry (`admin_api_tokens`) is ordinary `table` kind
-for the same reason: the container authorizer reads the token row through
-the app pool when the later transport slices land (slice 0 ships the table
-with no reader yet). Secrets are hash-only; `issued_by` is operator
-attribution retained by the erasure allowlist. The table carries no member
-column, so there is nothing to erase and no reader grant beyond the app
-pool.
-
 The reader cannot read bot base tables, including through inherited/public or
 column-level grants. Normal PostgreSQL views deliberately run with their owner's
 base-table privileges: only the reviewed `web_v1` projection is exposed. Do not
@@ -264,7 +250,11 @@ their login status or silently removing memberships. It contains no passwords.
    to a member login; (c) the provisioning identity reapplies the reviewed full
    plan after migrations and view updates, then `verify` reads 0 findings.
    `sql/web_v1.sql` is applied with `public` as the bot-table search
-   path before the bootstrap phase; functions stay strict in both phases.
+   path before the bootstrap phase; its functions stay strict in both phases.
+   The two voice-audit trigger functions from migration 0455 may be absent only
+   while `voice_settings_audit` is absent. Once that table exists, either missing
+   function fails closed. The full plan requires the audit table before reaching
+   those functions, so an unapplied migration cannot pass full provisioning.
 2. Review and apply the rendered role plan with the authorized provisioning
    identity. It transfers only allowlisted objects to `two_bot_migrator`; unrelated
    tables are not transferred or granted to the runtime.
