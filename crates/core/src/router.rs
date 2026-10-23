@@ -121,6 +121,7 @@ pub enum HandlerId {
     Leaderboard,
     Help,
     Privacy,
+    Remind,
     ScorecardAttendance,
     AutomationAdmin,
     AutomationCustom,
@@ -395,6 +396,7 @@ impl InteractionRouter {
             // Sticky/admin plus custom rows (`CustomCommandRuntime::register`).
             register(HandlerId::AutomationAdmin);
             register(HandlerId::AutomationCustom);
+            register(HandlerId::Remind);
         }
         if gates.announcements {
             for id in [
@@ -639,6 +641,11 @@ impl InteractionRouter {
             // definition (`feature_commands.rs`) and at dispatch (`rsvp.rs`
             // `require_manage_events`): Discord picker hiding is not
             // authorization, so the router enforces it server-side too.
+            "remind" => Row {
+                handler: HandlerId::Remind,
+                gate: RowGate::Automations,
+                permission_refusal: None,
+            },
             "attendance" => Row {
                 handler: HandlerId::ScorecardAttendance,
                 gate: RowGate::Scorecard,
@@ -769,6 +776,7 @@ impl InteractionRouter {
             .iter()
             .chain(std::iter::once(&scorecard_attendance_command()))
             .chain(automation_commands().iter())
+            .chain(std::iter::once(&crate::remind::command()))
             .chain(announcement_commands().iter())
             .chain(super::moderation::moderation_commands().iter())
             .map(|def| def.name.clone())
@@ -817,6 +825,7 @@ impl InteractionRouter {
         }
         if self.gates.automations {
             extra.push(automation_commands());
+            extra.push(vec![crate::remind::command()]);
         }
         if self.gates.announcements {
             extra.push(announcement_commands());
@@ -927,6 +936,7 @@ mod tests {
             ("schedule-list", HandlerId::AutomationAdmin),
             ("sticky", HandlerId::AutomationAdmin),
             ("sticky-remove", HandlerId::AutomationAdmin),
+            ("remind", HandlerId::Remind),
             ("rsvp", HandlerId::Rsvp),
             ("rsvp-attendance", HandlerId::RsvpAttendance),
             ("lfg", HandlerId::Lfg),
@@ -935,7 +945,7 @@ mod tests {
             ("feed-remove", HandlerId::FeedRemove),
             ("feed-list", HandlerId::FeedList),
         ];
-        assert_eq!(cases.len(), 29, "all 29 handler-owned builtins covered");
+        assert_eq!(cases.len(), 30, "all 30 handler-owned builtins covered");
         for (name, handler) in cases {
             assert_eq!(
                 r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
@@ -1020,6 +1030,7 @@ mod tests {
             ("attendance", RouterRefusal::ScorecardDisabled),
             ("command", RouterRefusal::AutomationsDisabled),
             ("schedule-list", RouterRefusal::AutomationsDisabled),
+            ("remind", RouterRefusal::AutomationsDisabled),
             ("rsvp", RouterRefusal::AnnouncementsDisabled),
             ("rsvp-attendance", RouterRefusal::AnnouncementsDisabled),
             ("lfg", RouterRefusal::AnnouncementsDisabled),
@@ -1125,6 +1136,17 @@ mod tests {
                 handler: HandlerId::Lfg
             }
         );
+        // Personal reminders are unprivileged: everyone while automations are
+        // on, including zero permission bits and missing bits.
+        for perms in [Some(0), None, Some(u64::MAX)] {
+            assert_eq!(
+                r.route_slash(&ctx("remind", Some(GUILD), perms)),
+                SlashOutcome::Handled {
+                    handler: HandlerId::Remind
+                },
+                "remind stays open with perms {perms:?}"
+            );
+        }
         // Feed without ManageGuild.
         assert_eq!(
             r.route_slash(&ctx("feed-add", Some(GUILD), Some(PERM_MANAGE_EVENTS))),
@@ -1410,23 +1432,27 @@ mod tests {
         }];
         let set = r.publish_set(&custom).expect("full set assembles");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        // 4 core + 1 scorecard + 8 automation + 7 announcement + 9 moderation
-        // + 1 custom = 30, in legacy publish order, guild-only throughout.
-        assert_eq!(set.len(), 30);
+        // 4 core + 1 scorecard + 8 automation + 1 remind + 7 announcement + 9
+        // moderation + 1 custom = 31, in legacy publish order, guild-only
+        // throughout.
+        assert_eq!(set.len(), 31);
         assert_eq!(
             &names[..5],
             ["rank", "leaderboard", "help", "privacy", "attendance"]
         );
+        // Automation-gated personal reminders sit at index 13, ahead of the
+        // announcement slice and moderation.
+        assert_eq!(names[13], "remind");
         assert!(names.contains(&"rsvp-attendance"));
         assert_eq!(names.iter().filter(|n| **n == "attendance").count(), 1);
         assert_eq!(
-            &names[20..29],
+            &names[21..30],
             [
                 "ban", "tempban", "kick", "timeout", "warn", "purge", "slowmode", "lockdown",
                 "unlock",
             ]
         );
-        assert_eq!(names[29], "faq");
+        assert_eq!(names[30], "faq");
         assert!(set.iter().all(|c| !c.dm_permission));
     }
 
@@ -1484,11 +1510,13 @@ mod tests {
             ("moderation", "ban"),
             ("announcements", "lfg"),
             ("scorecard", "attendance"),
+            ("automations", "remind"),
         ] {
             let mut gates = all_on();
             match gate {
                 "moderation" => gates.moderation = false,
                 "announcements" => gates.announcements = false,
+                "automations" => gates.automations = false,
                 _ => gates.scorecard = false,
             }
             let r = InteractionRouter::new(gates);
@@ -1589,7 +1617,7 @@ mod tests {
     fn voice_set_publishes_after_moderation_only_while_gated() {
         let off = published(all_on());
         let off_names: Vec<_> = off.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(off.len(), 29);
+        assert_eq!(off.len(), 30);
         for name in VOICE_NAMES.iter().filter(|name| **name != "kick") {
             assert!(
                 !off_names.contains(name),
@@ -1599,16 +1627,16 @@ mod tests {
 
         let on = published(voice_on());
         let on_names: Vec<_> = on.iter().map(|c| c.name.as_str()).collect();
-        // 29 builtins keep their order; the 21 voice names that survive
+        // 30 builtins keep their order; the 21 voice names that survive
         // first-wins follow in voice order. `kick` is already moderation's.
-        assert_eq!(on.len(), 50);
-        assert_eq!(on_names[..29], off_names[..]);
+        assert_eq!(on.len(), 51);
+        assert_eq!(on_names[..30], off_names[..]);
         let expected: Vec<_> = VOICE_NAMES
             .iter()
             .copied()
             .filter(|name| *name != "kick")
             .collect();
-        assert_eq!(on_names[29..], expected[..]);
+        assert_eq!(on_names[30..], expected[..]);
         assert!(!on_names.contains(&"templateassistant"));
         assert!(on.iter().all(|c| !c.dm_permission));
     }
@@ -1669,13 +1697,13 @@ mod tests {
                 "voice={voice} assistant={assistant}"
             );
         }
-        // Both gates on is the full voice set without the assistant: 29
+        // Both gates on is the full voice set without the assistant: 30
         // builtins plus the 21 surviving voice names.
         let both = published(RouterGates {
             voice_assistant: true,
             ..voice_on()
         });
-        assert_eq!(both.len(), 50);
+        assert_eq!(both.len(), 51);
     }
 
     #[test]

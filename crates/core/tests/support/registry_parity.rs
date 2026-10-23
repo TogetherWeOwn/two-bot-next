@@ -37,6 +37,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("feed-list", "docs/parity.md §1 #30 page"),
     ("privacy", "docs/parity.md §1 privacy"),
     ("command-list", "docs/parity.md §1 #16 page"),
+    ("remind", "docs/parity.md §1 remind"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -444,6 +445,65 @@ pub fn expected_registry() -> Value {
         )
         .expect("page option serializes");
         command["options"] = json!([page]);
+    }
+    // Next-only `/remind` personal reminders: no legacy counterpart. Insert
+    // at the publish position (after `sticky-remove`, before `rsvp`) as the
+    // exact published shape, so parity pins its options, bounds, guild-only
+    // scope and open permission gate too. Literals mirror
+    // `docs/parity.md §1 remind`: `me` takes integer `in` (1-525600 minutes)
+    // plus string `text` (240 UTF-16 units), `list` takes no options, `cancel`
+    // takes string `target` (240 UTF-16 units); no member permission gate.
+    {
+        let remind = serde_json::to_value(
+            CommandDefinition::new("remind", "Manage your personal reminders in this channel")
+                .options(vec![
+                    CommandOption::new(
+                        "me",
+                        "Remind me here after a delay",
+                        CommandOptionType::SubCommand,
+                    )
+                    .sub_options(vec![
+                        CommandOption::new(
+                            "in",
+                            "Minutes from now (1 to 525600)",
+                            CommandOptionType::Integer,
+                        )
+                        .required()
+                        .int_range(1, 525600),
+                        CommandOption::new(
+                            "text",
+                            "Reminder text (no pings)",
+                            CommandOptionType::String,
+                        )
+                        .required()
+                        .max_length(240),
+                    ]),
+                    CommandOption::new(
+                        "list",
+                        "List your pending reminders in this server",
+                        CommandOptionType::SubCommand,
+                    ),
+                    CommandOption::new(
+                        "cancel",
+                        "Cancel one of your pending reminders",
+                        CommandOptionType::SubCommand,
+                    )
+                    .sub_options(vec![CommandOption::new(
+                        "target",
+                        "Full id, unique id prefix or unique full reminder text",
+                        CommandOptionType::String,
+                    )
+                    .required()
+                    .max_length(240)]),
+                ]),
+        )
+        .expect("remind serializes");
+        let sticky = commands
+            .iter()
+            .position(|c| c["name"] == "sticky-remove")
+            .expect("sticky-remove sets the remind insert point");
+        assert_eq!(sticky + 1, 13, "remind publishes at index 13");
+        commands.insert(sticky + 1, remind);
     }
     canonical_registry(json!(commands))
 }

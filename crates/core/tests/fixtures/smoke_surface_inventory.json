@@ -1,6 +1,6 @@
 {
   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
-  "count": 29,
+  "count": 30,
   "dm_permission_all_false": true,
   "commands": [
     {
@@ -412,6 +412,83 @@
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Channel-state mutation; excluded from the read-only smoke."
+    },
+    {
+      "name": "remind",
+      "description": "Manage your personal reminders in this channel",
+      "family": "automations",
+      "gate": "automations",
+      "default_member_permissions": null,
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "me",
+          "description": "Remind me here after a delay",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [],
+          "options": [
+            {
+              "name": "in",
+              "description": "Minutes from now (1 to 525600)",
+              "type": "integer",
+              "required": true,
+              "min_value": 1,
+              "max_value": 525600,
+              "max_length": null,
+              "choices": []
+            },
+            {
+              "name": "text",
+              "description": "Reminder text (no pings)",
+              "type": "string",
+              "required": true,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 240,
+              "choices": []
+            }
+          ]
+        },
+        {
+          "name": "list",
+          "description": "List your pending reminders in this server",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "cancel",
+          "description": "Cancel one of your pending reminders",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [],
+          "options": [
+            {
+              "name": "target",
+              "description": "Full id, unique id prefix or unique full reminder text",
+              "type": "string",
+              "required": true,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 240,
+              "choices": []
+            }
+          ]
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Durable per-member write plus future channel delivery the read-only offline smoke cannot observe; needs a live member plus wall-clock delivery, pinned by the reminder acceptance tests instead."
     },
     {
       "name": "rsvp",

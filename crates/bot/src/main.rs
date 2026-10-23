@@ -116,6 +116,7 @@ mod privacy_command;
 mod raid_runtime;
 #[cfg(test)]
 mod raid_runtime_tests;
+mod remind_runtime;
 mod restore_drill;
 #[cfg(test)]
 mod retention_error_chain_acceptance_tests;

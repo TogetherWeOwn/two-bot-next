@@ -135,7 +135,7 @@ pub async fn resolve_scheduled_id(
     }
     let rows: Vec<(String,)> = sqlx::query_as(
         "SELECT id FROM scheduled_messages
-          WHERE guild_id = $1 AND starts_with(id, $2)
+          WHERE guild_id = $1 AND starts_with(id, $2) AND NOT starts_with(id, 'remind-')
           ORDER BY id LIMIT 2",
     )
     .bind(guild_id)
@@ -170,7 +170,7 @@ pub async fn list_scheduled(
                 last_run_at, last_message_id, created_by, created_at, updated_by, updated_at,
                 claim_token, claimed_at, occurrence_nonce,
                 COALESCE(delivery_uncertain, TRUE) AS delivery_uncertain
-           FROM scheduled_messages WHERE guild_id = $1 ORDER BY next_run_at, id LIMIT $2",
+           FROM scheduled_messages WHERE guild_id = $1 AND NOT starts_with(id, 'remind-') ORDER BY next_run_at, id LIMIT $2",
     )
     .bind(guild_id)
     .bind(SCHEDULE_LIST_CAP)
@@ -182,7 +182,7 @@ pub async fn list_scheduled(
 /// [`SCHEDULE_LIST_CAP`]-capped [`list_scheduled`] read. Only call it when
 /// the capped read came back full — under-cap guilds need no second query.
 pub async fn count_scheduled(pool: &Pool<Postgres>, guild_id: &str) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar("SELECT count(*) FROM scheduled_messages WHERE guild_id = $1")
+    sqlx::query_scalar("SELECT count(*) FROM scheduled_messages WHERE guild_id = $1 AND NOT starts_with(id, 'remind-')")
         .bind(guild_id)
         .fetch_one(pool)
         .await
@@ -205,7 +205,7 @@ pub async fn list_scheduled_window(
                 last_run_at, last_message_id, created_by, created_at, updated_by, updated_at,
                 claim_token, claimed_at, occurrence_nonce,
                 COALESCE(delivery_uncertain, TRUE) AS delivery_uncertain
-           FROM scheduled_messages WHERE guild_id = $1 ORDER BY next_run_at, id LIMIT $2 OFFSET $3",
+           FROM scheduled_messages WHERE guild_id = $1 AND NOT starts_with(id, 'remind-') ORDER BY next_run_at, id LIMIT $2 OFFSET $3",
     )
     .bind(guild_id)
     .bind(limit)
@@ -321,6 +321,9 @@ pub async fn put_scheduled(
     pool: &Pool<Postgres>,
     row: &ScheduledWrite,
 ) -> Result<bool, QuotaWriteError> {
+    if row.id.starts_with(crate::remind::ID_PREFIX) {
+        return Ok(false);
+    }
     let mut tx = pool.begin().await?;
     lock_quota(&mut tx, &row.guild_id, AutomationQuota::Schedules).await?;
     let owner: Option<String> =
@@ -335,7 +338,7 @@ pub async fn put_scheduled(
     } else {
         // Disabled and completed definitions still consume storage capacity.
         let count: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM scheduled_messages WHERE guild_id = $1")
+            sqlx::query_scalar("SELECT count(*) FROM scheduled_messages WHERE guild_id = $1 AND NOT starts_with(id, 'remind-')")
                 .bind(&row.guild_id)
                 .fetch_one(&mut *tx)
                 .await?;
@@ -444,7 +447,7 @@ pub async fn delete_scheduled(
     guild_id: &str,
     id: &str,
 ) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query("DELETE FROM scheduled_messages WHERE guild_id = $1 AND id = $2")
+    let result = sqlx::query("DELETE FROM scheduled_messages WHERE guild_id = $1 AND id = $2 AND NOT starts_with(id, 'remind-')")
         .bind(guild_id)
         .bind(id)
         .execute(pool)

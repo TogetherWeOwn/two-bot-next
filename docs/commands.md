@@ -20,7 +20,7 @@ Bounds below are registry bounds; a dash means no bound is declared there,
 not that handler validation is unlimited. Permissions are Discord default
 member-permission bitfields, not a replacement for runtime authorization.
 
-Built-in commands: 50.
+Built-in commands: 51.
 
 ## `/access`
 
@@ -418,6 +418,22 @@ Take back ownership of your temporary voice room
 - Available in DMs: false
 
 No options.
+
+## `/remind`
+
+Manage your personal reminders in this channel
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `me` | subcommand | false | — | — | — | — | Remind me here after a delay |
+| `me in` | integer | true | 1 | 525600 | — | — | Minutes from now (1 to 525600) |
+| `me text` | string | true | — | — | 240 | — | Reminder text (no pings) |
+| `list` | subcommand | false | — | — | — | — | List your pending reminders in this server |
+| `cancel` | subcommand | false | — | — | — | — | Cancel one of your pending reminders |
+| `cancel target` | string | true | — | — | 240 | — | Full id, unique id prefix or unique full reminder text |
 
 ## `/rsvp`
 
