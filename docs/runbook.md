@@ -1647,6 +1647,31 @@ reconcile-failure alerts, or when `notification` traffic for the same window
 collapses while tampered rises — the receiver may be refusing legitimate work
 and the fix belongs to the on-call engineer, not another redeploy.
 
+#### Alert: gateway drain skips
+
+`two_bot_gateway_drain_skips_total` rose between valid keepalive samples.
+`gateway_drain_skips` is a ticket: auxiliary leveling XP was skipped for
+SQLSTATE `42P01` (missing table) or `42501` (missing grant), not a gateway
+packet-loss signal. First sample and counter resets only baseline; flat
+samples resolve, missing/invalid families retain the baseline without a
+window verdict. Older containers may omit the counter.
+
+**First response:** inspect the `gateway leveling dispatch skipped; schema gap`
+warn with `drain=leveling`, bounded `cause`, `error_code` and committed-award
+count. Never enable raw SQL or error-chain logging. Compare the deployed build
+with the migration ledger and effective grants using the existing read-only
+inspection procedure. Route a confirmed mismatch to the authorized Operator's
+existing schema/ACL repair plan; do not run an ad hoc production migration.
+
+A skip allows checkpoint advance and may lose the failed auxiliary awards;
+it promises no automatic replay. Do not invoke retention purge replay for XP.
+Non-gap errors and deadlines still hold the cursor and retain their cause;
+use the checkpoint-failure procedure instead of bypassing that hold. Dropped
+interaction completion and invalid onboarding jobs keep fixed pre-commit
+reasons; the missing-ingress-ticket reason remains explicitly post-commit.
+After an approved repair, confirm the counter stays flat under normal traffic.
+This slice changes rule code only: no alert forwarding or deployment is claimed.
+
 #### Alert: retention replay needed
 
 `two_bot_retention_replay_needed_total` increased between two keepalive

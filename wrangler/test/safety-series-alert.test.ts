@@ -39,6 +39,7 @@ const ev = (lines: string[], state: MetricsAlertState = EMPTY_STATE) =>
 
 const counterCases = [
   { id: RETENTION, series: RETENTION_SERIES, get: (s: MetricsAlertState) => s.retentionReplayNeeded },
+  { id: "gateway_drain_skips", series: "two_bot_gateway_drain_skips_total", get: (s: MetricsAlertState) => s.gatewayDrainSkips },
   { id: TIMEOUTS, series: TIMEOUTS_SERIES, get: (s: MetricsAlertState) => s.voiceDispatchTimeouts },
   { id: STUCKS, series: STUCKS_SERIES, get: (s: MetricsAlertState) => s.voiceWatchdogStucks },
   { id: RECOVERIES, series: RECOVERIES_SERIES, get: (s: MetricsAlertState) => s.voiceHaltRecoveries },
