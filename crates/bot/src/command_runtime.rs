@@ -77,9 +77,10 @@ use two_bot_core::{
     moderation::ModerationAction,
     router::replies::EXPIRED_COMPONENT_REPLY,
     sticky::{
-        activity_eligible, decide_activity, normalize_debounce, sticky_removed_reply,
-        sticky_set_reply, store, validate_body, ActivityDecision, ActivityOutcome, PutSticky,
-        RemoveOutcome, StickyAudit, StickyAuditAction, StickyAuditOutcome,
+        activity_eligible, decide_activity, normalize_debounce, render_status_body,
+        render_status_metadata, sticky_removed_reply, sticky_set_reply, store, validate_body,
+        ActivityDecision, ActivityOutcome, PutSticky, RemoveOutcome, StickyAudit,
+        StickyAuditAction, StickyAuditOutcome, StickyStatusView,
     },
     tickets::TicketAction,
     ChannelModerationStore, ComponentHandler, ComponentOutcome, FeatureGates, HandlerId,
@@ -125,6 +126,17 @@ const FEED_STORE_FAILURE_REPLY: &str = "Feed command failed; try again.";
 const NO_CHANNEL_REPLY: &str = "This command only works in a channel.";
 /// The merged registry includes builtins whose runtime slices have not landed.
 const UNAVAILABLE_REPLY: &str = "This command is not available in this build yet.";
+/// `/sticky-status` scope refusal: the core router stays silent (`Ignore`) on a
+/// foreign/missing guild, so this runtime edge answers privately without
+/// opening a store or dispatch path. Other commands keep their fence behavior.
+const STATUS_SCOPE_REPLY: &str = "Sticky status is only available in the configured server.";
+/// `/sticky-status` absent configuration: distinct from outage and disabled.
+const STATUS_ABSENT_REPLY: &str = "No sticky configured in this channel. Use /sticky to set one.";
+/// `/sticky-status` invalid input: never echoes the rejected option value.
+const STATUS_INVALID_REPLY: &str = "Invalid view option. Use view:metadata or view:body.";
+/// `/sticky-status` store outage: unknown, never false absence or health.
+const STATUS_OUTAGE_REPLY: &str =
+    "Sticky status is unavailable; delivery state unknown. Try again.";
 
 /// Router handler marker: this runtime is the `AutomationAdmin` executor for
 /// the sticky commands. Registration documents the ownership the router
@@ -1423,6 +1435,11 @@ impl CommandRuntime {
             self.answer(interaction, response).await;
             return;
         }
+        if name == "sticky-status" && matches!(outcome, SlashOutcome::Ignore) {
+            self.answer(interaction, ephemeral(STATUS_SCOPE_REPLY))
+                .await;
+            return;
+        }
         let SlashOutcome::Handled { handler } = outcome else {
             return;
         };
@@ -1453,9 +1470,8 @@ impl CommandRuntime {
         // first, so an owner-map entry could never execute.
         let owner = match name.as_str() {
             "privacy" => Some(HandlerId::Privacy),
-            "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list" => {
-                Some(HandlerId::AutomationAdmin)
-            }
+            "sticky" | "sticky-remove" | "sticky-status" | "schedule" | "schedule-remove"
+            | "schedule-list" => Some(HandlerId::AutomationAdmin),
             "feed-add" => Some(HandlerId::FeedAdd),
             "feed-remove" => Some(HandlerId::FeedRemove),
             "feed-list" => Some(HandlerId::FeedList),
@@ -1488,6 +1504,7 @@ impl CommandRuntime {
             }
             "sticky" => self.sticky_set(interaction).await,
             "sticky-remove" => self.sticky_remove(interaction).await,
+            "sticky-status" => self.sticky_status(interaction).await,
             "feed-add" => self.feed_add(interaction).await,
             "feed-remove" => self.feed_remove(interaction).await,
             "feed-list" => self.feed_list(interaction).await,
@@ -1969,6 +1986,48 @@ impl CommandRuntime {
                 )
                 .await;
                 self.finish(interaction, STORE_FAILURE_REPLY).await;
+            }
+        }
+    }
+
+    /// `/sticky-status`: one coherent read → private metadata or bounded body
+    /// view. Never writes: no put, claim, fence, enablement, audit or channel
+    /// mutation. Invalid input, missing channel and store outage each get a
+    /// distinct private refusal with zero effects; a lookup failure is
+    /// unknown, never absent or healthy.
+    async fn sticky_status(&self, interaction: &Interaction) {
+        let guild_id = self.guild_id.to_string();
+        let Some(channel_id) = interaction_channel(interaction) else {
+            self.finish(interaction, NO_CHANNEL_REPLY).await;
+            return;
+        };
+        let view = match sticky_status_view(interaction) {
+            Ok(view) => view,
+            Err(()) => {
+                self.finish(interaction, STATUS_INVALID_REPLY).await;
+                return;
+            }
+        };
+        let status = match store::get_sticky_status(&self.pool, &guild_id, &channel_id).await {
+            Ok(status) => status,
+            Err(err) => {
+                warn!(reason = db_class(&err), "sticky status read failed");
+                self.finish(interaction, STATUS_OUTAGE_REPLY).await;
+                return;
+            }
+        };
+        let Some(status) = status else {
+            self.finish(interaction, STATUS_ABSENT_REPLY).await;
+            return;
+        };
+        match view {
+            StickyStatusView::Metadata => {
+                let reply =
+                    render_status_metadata(&status, now_millis_for_test(), &guild_id, &channel_id);
+                self.finish(interaction, reply).await;
+            }
+            StickyStatusView::Body => {
+                self.finish(interaction, render_status_body(&status)).await;
             }
         }
     }
@@ -2577,6 +2636,37 @@ pub(crate) fn sticky_options(interaction: &Interaction) -> (Option<String>, Opti
         }
     }
     (body, debounce)
+}
+
+/// Decode `/sticky-status`'s optional `view`: omitted means metadata. Any
+/// unknown option, duplicate `view`, non-string wire value or value outside
+/// `metadata|body` refuses without a store read and without echoing input.
+pub(crate) fn sticky_status_view(interaction: &Interaction) -> Result<StickyStatusView, ()> {
+    let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
+        &interaction.data
+    else {
+        return Ok(StickyStatusView::Metadata);
+    };
+    let mut seen = 0;
+    let mut view = StickyStatusView::Metadata;
+    for option in &data.options {
+        if option.name != "view" {
+            return Err(());
+        }
+        seen += 1;
+        if seen > 1 {
+            return Err(());
+        }
+        let CommandOptionValue::String(value) = &option.value else {
+            return Err(());
+        };
+        match value.as_str() {
+            "metadata" => view = StickyStatusView::Metadata,
+            "body" => view = StickyStatusView::Body,
+            _ => return Err(()),
+        }
+    }
+    Ok(view)
 }
 
 #[cfg(test)]

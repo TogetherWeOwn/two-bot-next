@@ -645,7 +645,7 @@ impl InteractionRouter {
                 permission_refusal: Some(RouterRefusal::ManageEventsRequired),
             },
             "command" | "command-remove" | "command-list" | "schedule" | "schedule-remove"
-            | "schedule-list" | "sticky" | "sticky-remove" => Row {
+            | "schedule-list" | "sticky" | "sticky-remove" | "sticky-status" => Row {
                 handler: HandlerId::AutomationAdmin,
                 gate: RowGate::Automations,
                 permission_refusal: Some(RouterRefusal::ManageServerRequired),
@@ -927,6 +927,7 @@ mod tests {
             ("schedule-list", HandlerId::AutomationAdmin),
             ("sticky", HandlerId::AutomationAdmin),
             ("sticky-remove", HandlerId::AutomationAdmin),
+            ("sticky-status", HandlerId::AutomationAdmin),
             ("rsvp", HandlerId::Rsvp),
             ("rsvp-attendance", HandlerId::RsvpAttendance),
             ("lfg", HandlerId::Lfg),
@@ -935,7 +936,7 @@ mod tests {
             ("feed-remove", HandlerId::FeedRemove),
             ("feed-list", HandlerId::FeedList),
         ];
-        assert_eq!(cases.len(), 29, "all 29 handler-owned builtins covered");
+        assert_eq!(cases.len(), 30, "all 30 handler-owned builtins covered");
         for (name, handler) in cases {
             assert_eq!(
                 r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),

@@ -9,7 +9,7 @@
 //! the denial order (guild fence → feature gate → permission bits →
 //! policy/validation).
 //!
-//! Scope: the 28 non-voice built-in slash commands in `docs/commands.md` (core +
+//! Scope: the 30 non-voice built-in slash commands in `docs/commands.md` (core +
 //! scorecard + automation + announcement + moderation). Out of scope on
 //! purpose: voice commands (`voice_commands`, separate slice with its own
 //! `TWO_VOICE` gate and a `kick` name collision resolved first-wins in favour
@@ -289,6 +289,20 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             "AutomationAdmin",
             "Ephemeral confirmation after removal plus audit row.",
             &["Gate:AutomationsDisabled", "Perm:ManageServerRequired"],
+        ),
+        row(
+            "sticky-status",
+            33,
+            E2eGate::Automations,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "AutomationAdmin",
+            "Ephemeral private metadata or bounded saved-body view; read-only, no audit row.",
+            &[
+                "Gate:AutomationsDisabled",
+                "Perm:ManageServerRequired",
+                "Valid:view:metadata|body",
+            ],
         ),
         row(
             "rsvp",

@@ -93,6 +93,21 @@ channel, delete any duplicate or orphan sticky post, then run `/sticky` again
 to reset the fence (or `/sticky-remove` plus `/sticky` to start over). Never
 wait out the fence or resend blindly.
 
+## Private inspection (`/sticky-status`)
+
+Guild admins check the current channel without touching delivery:
+`/sticky-status` (default `view:metadata`) reports configured state, enabled,
+debounce, last confirmed post/time with a historical-only link, claim
+none/active/stale and delivery idle/waiting/disabled/uncertain;
+`view:body` shows a bounded neutralized saved-text preview. Same `ManageGuild`
+and automations gate as set/remove; replies are ephemeral. Inspection never
+writes: no put, claim, fence, audit or channel mutation, and uncertainty still
+needs channel inspection plus an explicit `/sticky` reconfigure. A recorded
+message id is not proof it still exists; links use validated current
+guild/channel/message ids only. Pinned by
+`crates/bot/src/sticky_status_acceptance_tests.rs` and
+`crates/core/tests/sticky_status_surface_acceptance.rs`.
+
 ## Not covered here
 
 - Row 5 drives the plan through a test-local channel model in the documented

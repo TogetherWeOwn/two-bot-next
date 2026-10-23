@@ -428,6 +428,7 @@ fn every_section1_row_routes_to_its_registered_handler() {
         ("schedule-list", HandlerId::AutomationAdmin),
         ("sticky", HandlerId::AutomationAdmin),
         ("sticky-remove", HandlerId::AutomationAdmin),
+        ("sticky-status", HandlerId::AutomationAdmin),
         ("rsvp", HandlerId::Rsvp),
         ("rsvp-attendance", HandlerId::RsvpAttendance),
         ("lfg", HandlerId::Lfg),
@@ -436,7 +437,7 @@ fn every_section1_row_routes_to_its_registered_handler() {
         ("feed-remove", HandlerId::FeedRemove),
         ("feed-list", HandlerId::FeedList),
     ];
-    assert_eq!(cases.len(), 29, "all 29 handler-owned builtins covered");
+    assert_eq!(cases.len(), 30, "all 30 handler-owned builtins covered");
     for (_, id) in cases {
         router.register(Box::new(Stub(*id)));
     }
@@ -1101,7 +1102,7 @@ async fn publish_sends_the_complete_merged_set_once() {
         .iter()
         .map(|c| c["name"].as_str().expect("command has a name"))
         .collect();
-    assert_eq!(names.len(), 30, "no partial view");
+    assert_eq!(names.len(), 31, "no partial view");
     for expected in [
         "rank",
         "leaderboard",
@@ -1111,6 +1112,7 @@ async fn publish_sends_the_complete_merged_set_once() {
         "command",
         "schedule-list",
         "sticky-remove",
+        "sticky-status",
         "rsvp",
         "rsvp-attendance",
         "lfg",

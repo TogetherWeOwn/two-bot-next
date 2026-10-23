@@ -175,6 +175,27 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
             ]),
         CommandDefinition::new("sticky-remove", "Remove this channel's sticky message")
             .permissions(PERM_MANAGE_GUILD),
+        CommandDefinition::new(
+            "sticky-status",
+            "Inspect this channel's saved sticky and delivery state",
+        )
+        .permissions(PERM_MANAGE_GUILD)
+        .options(vec![CommandOption::new(
+            "view",
+            "Show delivery metadata or the bounded saved text",
+            CommandOptionType::String,
+        )
+        .max_length(8)
+        .choices(vec![
+            CommandChoice {
+                name: "Metadata".to_owned(),
+                value: "metadata".to_owned(),
+            },
+            CommandChoice {
+                name: "Saved body".to_owned(),
+                value: "body".to_owned(),
+            },
+        ])]),
     ]
 }
 
@@ -426,6 +447,7 @@ mod tests {
                 "schedule-list",
                 "sticky",
                 "sticky-remove",
+                "sticky-status",
                 "rsvp",
                 "rsvp-attendance",
                 "lfg",
@@ -440,8 +462,8 @@ mod tests {
     #[test]
     fn no_collision_with_leveling_core_or_within_slice() {
         let merged = merge_commands(&[feature_commands()], &[]).expect("slice 2 merges cleanly");
-        // 4 core + 1 scorecard + 8 automation + 7 announcement.
-        assert_eq!(merged.len(), 20);
+        // 4 core + 1 scorecard + 9 automation + 7 announcement.
+        assert_eq!(merged.len(), 21);
         assert_eq!(
             &names(&merged)[..5],
             ["rank", "leaderboard", "help", "privacy", "attendance"]
@@ -471,6 +493,7 @@ mod tests {
             "schedule-list",
             "sticky",
             "sticky-remove",
+            "sticky-status",
         ] {
             assert_eq!(is(&auto, name), manage_guild, "{name} gates ManageGuild");
         }
@@ -692,9 +715,9 @@ mod tests {
         assert_eq!(json[0]["default_member_permissions"], "8589934592");
         assert_eq!(json[0]["options"][0]["name"], "event-occurrence");
         assert_eq!(json[0]["options"][0]["max_length"], 128);
-        assert_eq!(json[10]["name"], "rsvp-attendance");
-        assert!(json[10].get("default_member_permissions").is_none());
-        assert_eq!(json[10]["options"][0]["name"], "event-id");
+        assert_eq!(json[11]["name"], "rsvp-attendance");
+        assert!(json[11].get("default_member_permissions").is_none());
+        assert_eq!(json[11]["options"][0]["name"], "event-id");
     }
 
     #[test]

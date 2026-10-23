@@ -66,9 +66,9 @@ Original registry surface: `CORE_COMMAND_DATA` (always published) = leveling onl
 | 30 | `/feed-list` | `page` opt ≥1 (1-based, default 1) | `ManageGuild` | **S4** |
 
 Runtime permission contract: `crates/core/src/command_permissions.rs` represents
-all 32 rows (29 retained builtins — the 27 legacy ones plus the Next-only
-`/help` and `/privacy` — the dropped rota command, custom slash commands,
-and prefix triggers). The router checks the invoking interaction's resolved
+all 33 rows (30 retained builtins — the 27 legacy ones plus the Next-only
+`/help`, `/privacy` and `/sticky-status` — the dropped rota command, custom
+slash commands, and prefix triggers). The router checks the invoking interaction's resolved
 `member.permissions`, not bot permissions or command-picker defaults, before
 returning a builtin handler. Missing restricted bits produce an ephemeral refusal
 and a metadata-only `command_permission_denied` tracing audit event (command,
@@ -117,6 +117,7 @@ golden exception or a claim of whole-baseline registry parity.
 | `feed-remove` | docs/parity.md §1 #29 caps | Advertise only `max_length` 128 on `id`; every other field stays legacy-identical. |
 | `schedule-list` | docs/parity.md §1 #19 page | Add the Next-only optional integer `page` (`min_value` 1, default 1) so every configured id through the first 50 rows stays discoverable within Discord's 2,000-unit cap (guild list reads at most 25 earliest rows per window; over-cap guilds page past the overflow line to reach hidden rows); command name, description and permissions stay legacy-identical. |
 | `feed-list` | docs/parity.md §1 #30 page | Add the Next-only optional integer `page` (`min_value` 1, default 1) so every stored relay id stays discoverable as deterministic whole rows within Discord's 2,000-unit cap (each page packs whole relay rows with source context; invalid or out-of-range pages refuse without mutation); command name, description and permissions stay legacy-identical. |
+| `sticky-status` | docs/parity.md §1 sticky-status | Add the Next-only `/sticky-status` private inspection (no legacy counterpart): `ManageGuild`, guild-only, current channel, automations-gated. Optional string `view` (`metadata` default, `body`), `max_length` 8. Read-only metadata/body views; no put, claim, fence, audit or channel mutation. |
 
 These are the complete registry exceptions, mirrored by the test allowlist.
 Only equivalent guild-API representation defaults are canonicalized: omitted
