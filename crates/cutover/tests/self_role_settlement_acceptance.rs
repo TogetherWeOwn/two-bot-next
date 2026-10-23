@@ -73,6 +73,7 @@
 //! natural home). Add it in the implementation PR alongside this file.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
@@ -216,8 +217,16 @@ const BASE_MIGRATIONS: [&str; 8] = [
     include_str!("../migrations/0449_self_role_ticket_acknowledgement.sql"),
 ];
 
+static SCHEMA_SEQ: AtomicU64 = AtomicU64::new(0);
+
 fn schema_name_at(pid: u32, timestamp: std::time::Duration) -> String {
-    format!("self_role_settle_{}_{}", pid, timestamp.as_nanos())
+    // Low 64 bits of the nanosecond clock: real timestamps fit entirely, and
+    // Duration::MAX stays bounded. The atomic sequence distinguishes identical
+    // PID/clock samples across concurrent fixtures in this process.
+    let nonce = timestamp.as_nanos() as u64;
+    let sequence = SCHEMA_SEQ.fetch_add(1, Ordering::Relaxed);
+    // At most 59 bytes: prefix 17 + PID 8 + separators 2 + nanos 16 + sequence 16.
+    format!("self_role_settle_{pid:x}_{nonce:x}_{sequence:016x}")
 }
 
 #[test]
