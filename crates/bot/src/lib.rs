@@ -8,6 +8,10 @@ pub mod voice_rooms;
 // jitter stream. The supervised episode runner stays in the binary.
 pub mod gateway_backoff;
 
+// Required event-voice category config + per-tick fail-closed preflight
+// (host decision D4): the gate the T-15 ticker consults before any create.
+pub mod event_voice_category;
+
 // Worker-path runtimes: the staging-soak acceptance pins
 // `containment_runtime::{start, ContainmentSettings, SettingsSource}` as its
 // seam. The binary compiles these same source files as crate-local modules.
