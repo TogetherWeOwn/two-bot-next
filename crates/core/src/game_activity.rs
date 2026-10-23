@@ -238,8 +238,10 @@ fn game_activity_report_value(
 /// Private Discord view of the same aggregate shape and order as the CLI.
 /// Only labels are neutralized; numeric totals are never transformed.
 #[must_use]
-pub fn render_game_activity_discord_report(guild_id: &str, rows: &[GuildGameAggregate]) -> String {
-    let mut report = game_activity_report_value(guild_id, rows, 10);
+pub fn render_game_activity_discord_report(guild_id: u64, rows: &[GuildGameAggregate]) -> String {
+    let guild_id = guild_id.to_string();
+    let total = rows.iter().filter(|row| row.guild_id == guild_id).count();
+    let mut report = game_activity_report_value(&guild_id, rows, 10);
     if let Some(rendered) = report["rows"].as_array_mut() {
         for row in rendered {
             if let Some(game) = row["game"].as_str() {
@@ -257,12 +259,35 @@ pub fn render_game_activity_discord_report(guild_id: &str, rows: &[GuildGameAggr
             }
         }
     }
-    let note = if report["truncated"] == true {
-        "\nShowing the top 10 games; more games were truncated."
+    let note = if total > 10 {
+        format!(
+            "\nShowing the top 10 games; {} more games omitted.",
+            total - 10
+        )
     } else {
-        ""
+        String::new()
     };
-    format!("```json\n{report}\n```{note}")
+    let content = format!("```json\n{report}\n```{note}");
+    if crate::message_safety::text_len(&content) <= crate::message_safety::CONTENT_LIMIT {
+        return content;
+    }
+    // Bound labels BEFORE serializing, never clip the finished JSON. Ten
+    // 24-unit labels (even all escaped quotes/backslashes), three 64-bit
+    // numbers per row, a u64 guild id and both notes fit below 2000 units.
+    if let Some(rendered) = report["rows"].as_array_mut() {
+        for row in rendered {
+            if let Some(game) = row["game"].as_str() {
+                if crate::message_safety::text_len(game) > 24 {
+                    row["game"] = serde_json::json!(format!(
+                        "{}…",
+                        crate::message_safety::truncate(game, 23)
+                    ));
+                }
+            }
+        }
+    }
+    report["truncated"] = serde_json::json!(true);
+    format!("```json\n{report}\n```{note}\nLong game names were shortened to fit Discord's limit.")
 }
 
 fn bounded(text: &str) -> Option<String> {

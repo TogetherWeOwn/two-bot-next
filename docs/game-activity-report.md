@@ -22,8 +22,8 @@ For the pipeline behind the numbers see the `game_activity` module docs
 - Every answer is private (ephemeral), with mentions disabled. It is one JSON
   fenced block, using the CLI keys below, capped at ten games and 2000 UTF-16
   units. Order and numeric totals match the CLI. Hostile labels are made inert;
-  labels may be shortened and fewer rows shown to fit, with an explicit note.
-  `truncated` is true when rows or labels are cut. No per-member fields appear.
+  labels are shortened to 24 UTF-16 units only when needed to fit the complete
+  JSON, with an explicit note. `truncated` is true when rows or labels are cut. No per-member fields appear.
 - Empty storage returns `rows: []`, `truncated: false` and
   `no game activity recorded for this guild`. It is a valid result, not an error.
   A store failure returns private **try again** guidance, with no JSON or

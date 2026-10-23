@@ -1489,6 +1489,12 @@ impl CommandRuntime {
             }
             "game-mix" => {
                 let guild_id = self.guild_id.to_string();
+                // The CLI requires an explicit live-guild opt-in. This
+                // optionless Discord read has no rollout approval mechanism.
+                if guild_id == two_bot_core::backup::guild_config::LIVE_GUILD_ID {
+                    self.finish(interaction, "Game activity reports are not enabled for the live guild. This command does not authorize production reporting.").await;
+                    return;
+                }
                 match two_bot_core::game_activity_store::read_guild_aggregates(
                     &self.pool, &guild_id,
                 )
@@ -1498,7 +1504,8 @@ impl CommandRuntime {
                         self.finish(
                             interaction,
                             two_bot_core::game_activity::render_game_activity_discord_report(
-                                &guild_id, &rows,
+                                self.guild_id,
+                                &rows,
                             ),
                         )
                         .await;
