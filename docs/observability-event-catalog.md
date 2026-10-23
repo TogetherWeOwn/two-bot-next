@@ -70,7 +70,7 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 | `voice database unavailable; voice rooms disabled` | `crates/bot/src/gateway.rs` (`build_voice_runtime`) | Voice store connect failed; gateway continues voice-off |
 | `voice rooms enabled; gateway sink attached` | `crates/bot/src/gateway.rs` (`build_voice_runtime`) | Voice runtime built; sink attached to the gateway writer |
 | `voice HTTP setup failed; voice rooms disabled` | `crates/bot/src/gateway.rs` (`build_voice_runtime`) | Voice HTTP setup failed; gateway continues voice-off |
-| `eventsub startup refused` | `crates/bot/src/main.rs` (`run`, two sites) | EventSub receiver config invalid or bind failed; process exits for supervisor restart |
+| `eventsub startup refused` | `crates/bot/src/main.rs` (`run`) | EventSub receiver/delivery config invalid, delivery prerequisite refused or bind failed; scalar `error_class` identifies the cause and the process exits 1 for supervisor restart; see the EventSub startup classes below |
 | `eventsub delivery refused` | `crates/bot/src/eventsub_http.rs` (`refuse`) | Delivery failed verification, admission, shape or classification; `status` and `error_class` name the refusal, bounded `message_type` (`webhook_callback_verification` / `notification` / `revocation` / `unknown`) names the delivery type (`unknown` before headers are established) |
 | `challenge answered` | `crates/bot/src/eventsub_http.rs` (`receive`) | Webhook verification challenge answered with the plaintext challenge; Twitch enables the subscription |
 | `notification acknowledged` | `crates/bot/src/eventsub_http.rs` (`handle_notification`, two sites) | Notification verified and acknowledged; when delivery dependencies are injected, the durable claim → send → settle flow has settled (or deduped) before the ack |
@@ -419,7 +419,34 @@ Startup `error_class` values logged before fatal exits (see
 `gateway_override_invalid`, `database_connect_failed`,
 `receiver_config_invalid`, `receiver_prerequisites_invalid`,
 `receiver_bind_failed`, `moderation_disable_unknown`,
-`container_service_failed`, plus the twelve classes above.
+`container_service_failed`, plus the twelve classes above and the five
+EventSub delivery classes below. `receiver_prerequisites_invalid` remains
+only for internal-action startup prerequisites, not EventSub delivery.
+
+### EventSub startup classes
+
+With delivery enabled, each prerequisite refusal emits one
+`eventsub startup refused` event with the scalar `error_class` below and
+exits 1. No token, URL or underlying error text is logged. Token presence
+is checked before the store because a missing token also prevents pool
+construction. Identity permission is checked before key derivation, and
+key derivation before proxy construction; with multiple invalid inputs,
+the first failing check wins.
+
+| Class | Meaning | Next action |
+| --- | --- | --- |
+| `receiver_token_missing` | `DISCORD_TOKEN` is absent or empty | Provision the correct bot token secret; never paste it into logs or tickets |
+| `receiver_store_missing` | No shared bot database pool exists for delivery | Check that `DATABASE_URL` and `GUILD_ID` are present and nonempty; database connection failures have their own `database_connect_failed` class |
+| `receiver_identity_refused` | The boot identity is not permitted to use Announcements for go-live delivery | Verify the staging bot/guild identity and activation policy; do not bypass the fence or enable delivery for an uncleared identity |
+| `receiver_admission_rejected` | Send-admission key derivation rejected the token format | Correct the token format or whitespace through secret provisioning without printing its value |
+| `receiver_proxy_invalid` | REST executor construction failed, normally from an unusable `DISCORD_API_BASE` override | Correct or remove the API override; it must be a supported origin without userinfo, path, query or fragment. If the override is valid or unset, check platform TLS verifier setup, which can also fail this constructor |
+
+The token/store classes originate in `crates/bot/src/main.rs` (`run`);
+the identity/admission/proxy classes originate in
+`crates/bot/src/eventsub_delivery.rs` (`build_delivery_deps`) and propagate
+unchanged to the same fatal log. Receiver/delivery configuration parsing
+continues to use `receiver_config_invalid`; private listener bind failures
+continue to use `receiver_bind_failed`.
 
 ## Voice responder overload
 

@@ -38,10 +38,11 @@
 
 use std::{
     cell::Cell,
-    io::{Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    io::{BufRead, BufReader, Read, Write},
+    net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     process::{Child, Command, Stdio},
-    thread,
+    sync::mpsc::{self, Receiver, Sender},
+    thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -94,53 +95,121 @@ const FORBIDDEN_KEYS: [&str; 7] = [
     "subject",
 ];
 
-struct Bot(Child);
+struct Bot {
+    child: Child,
+    logs: Receiver<String>,
+    readers: Vec<JoinHandle<()>>,
+    _port_lease: Option<TcpListener>,
+}
 
 impl Drop for Bot {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        for reader in self.readers.drain(..) {
+            let _ = reader.join();
+        }
+        // The port lease drops only after the child has been reaped.
     }
 }
 
-fn spawn_bot() -> (Bot, SocketAddr) {
-    // Reserve a non-default local port; no deployed service is contacted.
-    let reserved = TcpListener::bind("127.0.0.1:0").expect("reserve test port");
-    let addr = reserved.local_addr().unwrap();
-    assert_ne!(addr.port(), 8080);
-    drop(reserved);
+fn forward_logs(stream: impl Read + Send + 'static, sender: Sender<String>) -> JoinHandle<()> {
+    thread::spawn(move || {
+        for line in BufReader::new(stream).lines().map_while(Result::ok) {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    })
+}
 
+fn spawn_bot() -> (Bot, SocketAddr) {
+    // Retain an ephemeral-port lease on one loopback address and bind the child
+    // on another. Parallel fixtures cannot select the same leased port, and no
+    // reserve/drop/rebind gap exposes the child to a sibling's listener.
+    let reserved = TcpListener::bind("127.0.0.1:0").expect("reserve test port");
+    let port = reserved.local_addr().expect("reserved test addr").port();
+    let addr = SocketAddr::from((Ipv4Addr::new(127, 0, 0, 2), port));
+    assert_ne!(addr.port(), 8080);
+    let (mut bot, addr) = spawn_bot_at(addr);
+    bot._port_lease = Some(reserved);
+    (bot, addr)
+}
+
+fn spawn_bot_at(addr: SocketAddr) -> (Bot, SocketAddr) {
     // Parked boot: OMIT DATABASE_URL so gateway prerequisites fail and the
     // store stays None (empty-baseline 200). A synthetic non-postgres URL
     // with all three prerequisites present exits 1 via database_init
     // (see startup.rs configured_*_exits_nonzero), it never parks.
-    let mut bot = Bot(Command::new(env!("CARGO_BIN_EXE_two-bot"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_two-bot"));
+    command
         .env_clear()
-        .env("LISTEN_ADDR", format!("127.0.0.1:{}", addr.port()))
+        .env("LISTEN_ADDR", addr.to_string())
         .env("DISCORD_TOKEN", "INVALID")
         .env("GUILD_ID", "123")
         .env(
             "TWO_INTERNAL_KEYS",
             format!("{}:{}", FIXTURE_KEY_ID, fixture_secret()),
         )
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("start test bot"));
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(mut profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        profile.push(".backfill-child-%p.profraw");
+        command.env("LLVM_PROFILE_FILE", profile);
+    }
+    let child = command.spawn().expect("start test bot");
+    let (sender, logs) = mpsc::channel();
+    let mut bot = Bot {
+        child,
+        logs,
+        readers: Vec::new(),
+        _port_lease: None,
+    };
+    bot.readers.push(forward_logs(
+        bot.child.stdout.take().expect("child stdout"),
+        sender.clone(),
+    ));
+    bot.readers.push(forward_logs(
+        bot.child.stderr.take().expect("child stderr"),
+        sender,
+    ));
     let deadline = Instant::now() + Duration::from_secs(15);
+    let expected_addr = addr.to_string();
+    let mut listening = false;
+    let mut recent = std::collections::VecDeque::new();
     loop {
-        if let Ok(response) = raw_get(addr, "/health", &[]) {
-            if status_code(&response) == Some(200) {
-                break;
+        for line in bot.logs.try_iter() {
+            if let Ok(event) = serde_json::from_str::<Value>(&line) {
+                listening |= event["msg"] == "http_listening" && event["addr"] == expected_addr;
+            }
+            recent.push_back(line);
+            if recent.len() > 40 {
+                recent.pop_front();
+            }
+        }
+        let exited = bot.child.try_wait().expect("poll test bot");
+        if exited.is_some() {
+            for reader in bot.readers.drain(..) {
+                reader.join().expect("child log reader");
+            }
+            recent.extend(bot.logs.try_iter());
+        }
+        assert!(
+            exited.is_none(),
+            "bot exited before serving the configured port; child logs: {recent:?}"
+        );
+        // A health response is relevant only after this child's successful
+        // bind event. Another process answering 200 cannot prove readiness.
+        if listening {
+            if let Ok(response) = raw_get(addr, "/health", &[]) {
+                if status_code(&response) == Some(200) {
+                    break;
+                }
             }
         }
         assert!(
-            bot.0.try_wait().unwrap().is_none(),
-            "bot exited before serving the configured port"
-        );
-        assert!(
             Instant::now() < deadline,
-            "bot did not serve health on the configured port"
+            "bot did not serve health on the configured port; child logs: {recent:?}"
         );
         // Bounded 20 ms backoff under the 15 s deadline (~50 health
         // polls/s): lets the child boot without spinning a core per test.
@@ -501,6 +570,64 @@ fn serve_scripted(listener: TcpListener, scripts: Vec<Vec<u8>>) {
             conn.write_all(&script).expect("fake listener write");
         }
     }
+}
+
+#[test]
+fn fixture_port_lease_is_held_until_the_child_is_reaped() {
+    let (bot, addr) = spawn_bot();
+    let lease_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, addr.port()));
+    let collision = TcpListener::bind(lease_addr).expect_err("fixture must retain its port lease");
+    assert_eq!(collision.kind(), std::io::ErrorKind::AddrInUse);
+    // The lease is not the server: the child must independently serve reads.
+    assert_eq!(status_code(&signed_get(addr)), Some(200));
+    drop(bot);
+    let _released =
+        TcpListener::bind(lease_addr).expect("reaped child must release its port lease");
+}
+
+#[test]
+fn unrelated_health_cannot_make_a_failed_child_ready() {
+    // Force the reserve/drop/rebind race: another listener owns the requested
+    // address and returns 200, while our child cannot bind it. Readiness must
+    // belong to the spawned child, not merely to whoever answers that port.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind unrelated listener");
+    let addr = listener.local_addr().expect("unrelated listener addr");
+    let (release, held) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        serve_scripted(
+            listener.try_clone().expect("clone unrelated listener"),
+            vec![b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec()],
+        );
+        // Keep the address occupied until the child has been reaped.
+        held.recv().expect("release unrelated listener");
+    });
+    let outcome = std::panic::catch_unwind(|| spawn_bot_at(addr));
+    let incorrectly_ready = outcome.is_ok();
+    let failure = outcome.as_ref().err().map(|panic| {
+        panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("non-string panic")
+            .to_owned()
+    });
+    drop(outcome);
+    // A correct fixture never probes the unrelated health endpoint. Wake the
+    // scripted accept in that case, without adding a sleep or retry loop.
+    if !incorrectly_ready {
+        let _ = raw_get(addr, "/health", &[]);
+    }
+    release.send(()).expect("release unrelated listener");
+    server.join().expect("unrelated listener thread");
+    assert!(
+        !incorrectly_ready,
+        "an unrelated HTTP 200 must not make a child with a failed bind ready"
+    );
+    let failure = failure.expect("failed child must report a startup failure");
+    assert!(
+        failure.contains("listener_bind_failed"),
+        "fixture must preserve the child's bind-failure diagnostic: {failure}"
+    );
 }
 
 #[test]
