@@ -785,7 +785,7 @@ mod tests {
             .await?;
         sqlx::raw_sql(MIGRATION_0340).execute(&pool).await?;
         sqlx::raw_sql(include_str!(
-            "../../cutover/migrations/0460_audit_reconcile_cursor.sql"
+            "../../cutover/migrations/0462_audit_reconcile_cursor.sql"
         ))
         .execute(&pool)
         .await?;
