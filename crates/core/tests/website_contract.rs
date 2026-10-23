@@ -786,6 +786,53 @@ async fn events_mirror_swaps_atomically_and_keeps_last_good_on_failure() {
     fixture.close().await.expect("drop test database");
 }
 
+/// Presence spans are guild-scoped through the event mirror: when a swap
+/// drops an event, its spans must go in the same transaction, or member
+/// erasure and the guild purge can no longer select them.
+#[tokio::test]
+async fn events_mirror_swap_deletes_presence_for_removed_events() {
+    let fixture = connect().await;
+    let pool = fixture.pool().clone();
+
+    let seed = normalize_events(&[
+        raw_event("ev-keep", "2026-09-06T18:00:00.000Z", 1),
+        raw_event("ev-drop", "2026-09-06T18:00:00.000Z", 1),
+    ])
+    .expect("seed normalizes");
+    replace_events(&pool, GUILD, OBSERVED_AT, &seed)
+        .await
+        .expect("seed mirror");
+    for event in ["ev-keep", "ev-drop"] {
+        sqlx::query(
+            "INSERT INTO event_voice_presence (event_id, instance, user_id, joined_at, left_at)
+             VALUES ($1, '2026-09-06T18:00:00Z', '3201', NOW(), NULL)",
+        )
+        .bind(event)
+        .execute(&pool)
+        .await
+        .expect("seed presence spans");
+    }
+
+    let next = normalize_events(&[raw_event("ev-keep", "2026-09-06T18:00:00.000Z", 1)])
+        .expect("next normalizes");
+    replace_events(&pool, GUILD, OBSERVED_AT, &next)
+        .await
+        .expect("swap mirror");
+
+    let remaining: Vec<(String,)> =
+        sqlx::query_as("SELECT event_id FROM event_voice_presence ORDER BY event_id")
+            .fetch_all(&pool)
+            .await
+            .expect("presence rows");
+    assert_eq!(
+        remaining,
+        vec![("ev-keep".to_owned(),)],
+        "presence for the dropped event must go with its mirror row"
+    );
+
+    fixture.close().await.expect("drop test database");
+}
+
 /// Mirror ordering (TOG-20273): poller snapshots and mutation single-row
 /// writes share last-observed-wins on `updated_at`. A snapshot taken before a
 /// mutation leaves the newer mutation row in place; a stale mutation write

@@ -5,7 +5,7 @@
       "sha256": "ef1013d4b13d1fbdcbfbfc5eeee9dda23bde54e58d6f0472c2d8f32272e0f7fc",
       "justification": "Add inert starboard configuration, distinct starrers and unique post records to the store chain."
     },
-    "crates/cutover/migrations/0455_starboard.sql": {
+    "crates/cutover/migrations/0459_starboard.sql": {
       "sha256": "ef1013d4b13d1fbdcbfbfc5eeee9dda23bde54e58d6f0472c2d8f32272e0f7fc",
       "justification": "Mirror the starboard foundation in the deployed cutover migration chain."
     },
@@ -476,6 +476,10 @@
     "crates/cutover/migrations/0454_sticky_delivery_uncertainty.sql": {
       "sha256": "c813acffc8d44d4f3175acab3aadd9c81a2e611f7962fbba1725a828c3cee4fc",
       "justification": "Uncertain-delivery fence for sticky re-posts: one NOT NULL DEFAULT FALSE column delivery_uncertain on sticky_messages, armed by the atomic claim and disarmed only by confirmed record, proven no-send, confirmed orphan absence, or administrator reconfigure. Additive, IF NOT EXISTS; numbered 0454 because main owns 0452 (scheduled tombstone) and 0453 (store copy); global migration numbers remain unique across both chains; rollback drops the column."
+    },
+    "crates/cutover/migrations/0455_event_voice_channels.sql": {
+      "sha256": "3495774bcc64661f8dd70e99f0159a54890a2bd19f40637623577a85b6997704",
+      "justification": "Event voice channel idempotency key plus presence spans: event_voice_channels keyed UNIQUE (event_id, instance_starts_at) with timestamptz starts/ends, lease plus UNIQUE channel binding, and event_voice_presence spans (natural PK, one open span per member via inline EXCLUDE). Additive, IF NOT EXISTS, constraints inline; numbered 0455 because the merged sticky delivery fence owns 0454; rollback drops the tables."
     },
     "crates/cutover/migrations/0456_admin_api_tokens.sql": {
       "sha256": "3452a9adac7ee312a3f10f4150d34effff441e3fac32931a1e8bc08860ac4be2",

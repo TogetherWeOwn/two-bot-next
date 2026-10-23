@@ -86,6 +86,12 @@ transaction, and reads the guild high-water back through it before touching
 the mirror. The table carries no member column, so there is nothing to
 erase and no reader grant beyond the app pool.
 
+The event voice pair (`event_voice_channels`, `event_voice_presence`) is
+ordinary `table` kind for the same reason: the claim path, the presence
+transition hook and the reconcile passes read and write both tables through
+the app pool. The presence spans carry a member column (`user_id`, erased
+via the scheduled-event mirror); the channel row carries no member identity.
+
 The admin API token registry (`admin_api_tokens`) is ordinary `table` kind
 for the same reason: the container authorizer reads the token row through
 the app pool when the later transport slices land (slice 0 ships the table

@@ -824,6 +824,7 @@ async fn guild_purge_covers_every_plan_table_and_preserves_receipts() {
     const FIX_GONE: &str = "1545644954272137297";
     const FIX_OTHER: &str = "1545644954272137298";
     const FIX_USER: &str = "123456789012345678";
+    const FIX_USER_2: &str = "123456789012345679";
     for guild in [FIX_GONE, FIX_OTHER] {
         sqlx::query(
             "INSERT INTO presence_probe (guild_id, observed_at, approximate_presence_count, bot_floor)
@@ -863,8 +864,6 @@ async fn guild_purge_covers_every_plan_table_and_preserves_receipts() {
             .fetch_one(pool)
             .await
             .unwrap()
-        } else if entry.table == "retention_deletion_requests" {
-            0
         } else if entry.table == "starboard_starrers" {
             // BIGINT snowflake column against a decimal TEXT bind: cast the
             // bind, never the indexed column (same as the erasure predicate).
@@ -875,6 +874,20 @@ async fn guild_purge_covers_every_plan_table_and_preserves_receipts() {
             .fetch_one(pool)
             .await
             .unwrap()
+        } else if entry.table == "event_voice_presence" {
+            // Direct by seeded event id, not through the mirror join: an
+            // orphaned span (its event deleted from the mirror) must still
+            // be counted, or the purge looks complete while rows leak.
+            sqlx::query_scalar(
+                "SELECT count(*) FROM event_voice_presence WHERE event_id IN ($1, $2)",
+            )
+            .bind(format!("ev-{FIX_OTHER}:{FIX_USER}"))
+            .bind(format!("ev-{FIX_OTHER}:{FIX_USER_2}"))
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        } else if entry.table == "retention_deletion_requests" {
+            0
         } else {
             sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT count(*) FROM {} WHERE guild_id = $1",
@@ -952,6 +965,18 @@ async fn guild_purge_covers_every_plan_table_and_preserves_receipts() {
                 "SELECT count(*) FROM starboard_starrers WHERE guild_id = $1::bigint".to_owned(),
             ))
             .bind(FIX_GONE)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        } else if entry.table == "event_voice_presence" {
+            // Direct by seeded event id, not through the mirror join: an
+            // orphaned span (its event deleted from the mirror) must still
+            // be counted, or the purge looks complete while rows leak.
+            sqlx::query_scalar(
+                "SELECT count(*) FROM event_voice_presence WHERE event_id IN ($1, $2)",
+            )
+            .bind(format!("ev-{FIX_GONE}:{FIX_USER}"))
+            .bind(format!("ev-{FIX_GONE}:{FIX_USER_2}"))
             .fetch_one(pool)
             .await
             .unwrap()
@@ -1045,6 +1070,18 @@ async fn guild_purge_covers_every_plan_table_and_preserves_receipts() {
                 "SELECT count(*) FROM starboard_starrers WHERE guild_id = $1::bigint".to_owned(),
             ))
             .bind(FIX_OTHER)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        } else if table == "event_voice_presence" {
+            // Direct by seeded event id, not through the mirror join: an
+            // orphaned span (its event deleted from the mirror) must still
+            // be counted, or the purge looks complete while rows leak.
+            sqlx::query_scalar(
+                "SELECT count(*) FROM event_voice_presence WHERE event_id IN ($1, $2)",
+            )
+            .bind(format!("ev-{FIX_OTHER}:{FIX_USER}"))
+            .bind(format!("ev-{FIX_OTHER}:{FIX_USER_2}"))
             .fetch_one(pool)
             .await
             .unwrap()

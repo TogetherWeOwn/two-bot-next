@@ -1237,6 +1237,11 @@ fn guild_purge_predicate(table: &str) -> String {
         "self_role_exchanges" => {
             "event_id IN (SELECT event_id FROM self_role_audit WHERE guild_id = $1)".to_owned()
         }
+        // Presence spans carry no guild column: scope through the
+        // scheduled-event mirror, mirroring the erasure-plan predicate.
+        "event_voice_presence" => {
+            "event_id IN (SELECT event_id FROM scheduled_events WHERE guild_id = $1)".to_owned()
+        }
         // Keep the operator-released replay fence: only executions whose
         // parent idempotency row is itself purged go here.
         "moderation_channel_executions" => {
