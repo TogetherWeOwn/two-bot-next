@@ -20,7 +20,7 @@ Bounds below are registry bounds; a dash means no bound is declared there,
 not that handler validation is unlimited. Permissions are Discord default
 member-permission bitfields, not a replacement for runtime authorization.
 
-Built-in commands: 50.
+Built-in commands: 51.
 
 ## `/access`
 
@@ -159,6 +159,17 @@ Relay an RSS, YouTube, or Twitch feed into this channel
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `kind` | string | true | — | — | — | RSS = `"rss"`; YouTube = `"youtube"`; Twitch = `"twitch"` | Feed kind |
 | `source` | string | true | — | — | 2048 | — | HTTPS URL or YouTube channel id |
+
+## `/feed-inspect`
+
+Show a saved feed relay's source and last attempt
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `id` | string | true | — | — | 128 | — | Feed id |
 
 ## `/feed-list`
 
