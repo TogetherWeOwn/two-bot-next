@@ -20,7 +20,7 @@ high-rate event without a cap row fails the suite.
   guild/member/channel ID, token, query string, body or message content ever
   becomes a label or a log field.
 
-## Cardinality budget: 760 samples
+## Cardinality budget: 776 samples
 
 `GET /metrics` renders this many non-comment samples from process start,
 before any traffic. Adding any series fails the pinned count until this
@@ -31,6 +31,7 @@ table and the test are updated together.
 | `two_bot_process_incarnation{part}` | 4 | process-lifetime identity as exact unsigned 32-bit numeric parts; only fixed labels `0`, `1`, `2`, `3`, never identity-valued labels |
 | `two_bot_gateway_events_total{event}` | 21 | `EVENTS` allowlist |
 | reconnects, resumes, disconnects, missed | 4 | scalar counters |
+| `two_bot_gateway_rsvp_refused_total` | 1 | label-free counter: RSVP interactions refused past the 32 in-flight bound |
 | `two_bot_gateway_latency_seconds` | 1 | gauge, `NaN` until measured |
 | `two_bot_handler_duration_seconds` | 11 | 8 buckets + `+Inf` + sum + count |
 | `two_bot_voice_join_to_move_seconds` | 11 | label-free; 8 buckets + `+Inf` + sum + count |
@@ -38,7 +39,7 @@ table and the test are updated together.
 | `two_bot_rest_guard_*` | 11 | Fixed, label-free shared admission-guard counters and gauges |
 | job runs, timestamps, failure streaks | 64 | 16 jobs x (2 outcomes + timestamp + streak) |
 | `two_bot_job_last_error_class{job,class}` | 112 | 16 jobs x 7 classes (`database`, `rest`, `configuration`, `timeout`, `panic`, `feed`, `recovery_required`) |
-| voice ops, reconcile, dead-letters, state | 58 | 3x6 ops + 4 reconcile + 9 dead-letter + tracked + compensation + orphans + 7 join-refused reasons + 2 queue lanes + halted + oldest-age + live-not-ready age + live self-heals + rest-age + creator-map generation + creator-map age + backoff-capped + dispatch-timeouts + watchdog-stucks + halt-recoveries + inbox-turn bound + inbox turns + dispatch turns |
+| voice ops, reconcile, dead-letters, state | 60 | 3x6 ops + 4 reconcile + 9 dead-letter + tracked + compensation + orphans + 7 join-refused reasons + 2 queue lanes + halted + oldest-age + live-not-ready age + live self-heals + rest-age + creator-map generation + creator-map age + backoff-capped + dispatch-timeouts + watchdog-stucks + halt-recoveries + inbox-turn bound + inbox turns + dispatch turns + inbox-overflow drops + opt-in queue-overflow drops |
 | `two_bot_voice_join_occupancy_total{occupancy}` | 8 | seeding-TEST occupancy buckets `0`-`6` + `7+`; fixed vocabulary, no per-channel/member labels |
 | pool gauges | 4 | configured, size, idle, max |
 | `two_bot_db_errors_total{op}` | 2 | `admission`, `other` |
@@ -61,7 +62,7 @@ table and the test are updated together.
 | `two_bot_audit_delivery_halt` | 1 | label-free gauge: 1 engaged, 0 cleared |
 | `two_bot_event_store_consumer_lag_seconds` | 1 | label-free gauge: seconds of consumer lag, 0 when unobserved |
 | `two_bot_eventsub_received_total` | 1 | label-free counter: deliveries accepted for verification, including tampered signatures |
-| `two_bot_eventsub_classified_total{kind}` | 6 | `challenge`, `notification`, `revocation`, `tampered`, `ignored`, `other`; unknown kinds collapse to `other` |
+| `two_bot_eventsub_classified_total{kind}` | 19 | `challenge`, `notification`, `revocation`, `tampered`, `ignored`, the thirteen `EventSubError` snake_case labels, `other`; unknown kinds collapse to `other` |
 | `two_bot_eventsub_posts_total{outcome}` | 4 | `attempted`, `succeeded`, `failed`, `other`; zero until the go-live sender is wired |
 | `two_bot_eventsub_reconcile_passes_total{outcome}` | 3 | `healthy`, `pending`, `failed`; one sample per pass, unknown outcomes collapse to `failed` |
 | `two_bot_eventsub_reconcile_actions_total{action}` | 2 | `create`, `delete`; 409 already-exists confirmations fold into the pass outcome |
@@ -71,7 +72,7 @@ table and the test are updated together.
 | `two_bot_retention_replay_needed_total` | 1 | label-free counter: skipped retention purges needing Operator replay (one per real guild removal whose purge-queue write hit the schema gap); resets on process restart |
 | `two_bot_ticket_lifecycle_total{event,outcome}` | 22 | per-event subsets (2 `retire` + 3 `abandon` + 13 `purge` + 2 `claim` + 2 `close`): each event renders its success outcomes plus the `query` collapse trapdoor, and `purge` adds the 12 `db_cause` classes; closed vocabulary, no `other` row, no member text, channel names, ticket ids or error strings in labels |
 | `two_bot_ticket_component_drops_total` | 1 | label-free counter: ticket components refused before spawning (runtime or per-member saturated); resets on process restart |
-| `# HELP` / `# TYPE` headers | 166 | 83 families x 2 |
+| `# HELP` / `# TYPE` headers | 172 | 86 families x 2 |
 
 ## Per-event caps (gateway metric labels)
 

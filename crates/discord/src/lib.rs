@@ -54,6 +54,9 @@ pub mod rsvp;
 pub mod staging_slash_smoke;
 #[cfg(test)]
 mod test_clock;
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+pub mod test_wire;
 pub mod voice_rooms;
 
 #[cfg(feature = "db")]
