@@ -199,5 +199,22 @@ fn e2e_matrix_still_matches_the_publish_set() {
         matrix_names, published_names,
         "matrix drift: the fix must not change the parity publish set"
     );
-    assert_eq!(matrix.len(), 29, "contract covers the 29 built-in commands");
+    // Preserve every parity row while allowing the separately protected
+    // Next-only preview command to extend (never replace) this contract.
+    assert_eq!(
+        matrix
+            .iter()
+            .filter(|row| row.command != "welcome-preview")
+            .count(),
+        29,
+        "contract retains all 29 built-in commands besides welcome-preview"
+    );
+    assert!(
+        matrix
+            .iter()
+            .filter(|row| row.command == "welcome-preview")
+            .count()
+            <= 1,
+        "the independently tested welcome-preview row is unique"
+    );
 }
