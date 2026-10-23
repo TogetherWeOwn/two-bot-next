@@ -268,6 +268,38 @@ type VoiceChainKey = (Snowflake, Snowflake);
 struct ChainEntry {
     mutex: Arc<Mutex<()>>,
     last_seen_ms: i64,
+    /// A leave asked to retire this entry while another frame still held a
+    /// handle. The last handle to drop completes the retirement; see
+    /// [`ChainHandle`].
+    retire_requested: bool,
+}
+
+/// A frame's hold on its member's chain mutex. Derefs to the mutex for the
+/// critical section; on drop, completes a leave-requested retirement once no
+/// other frame still holds the chain. A completed frame whose handle outlives
+/// the leave's cleanup therefore cannot strand the entry: whichever handle
+/// drops last retires it, while a queued or active frame's live handle still
+/// keeps the entry (no fork) and a recreated entry is never retired by a
+/// stale handle (pointer-checked).
+#[derive(Debug)]
+struct ChainHandle<'a> {
+    chains: &'a VoiceChains,
+    key: VoiceChainKey,
+    mutex: Arc<Mutex<()>>,
+}
+
+impl std::ops::Deref for ChainHandle<'_> {
+    type Target = Mutex<()>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.mutex
+    }
+}
+
+impl Drop for ChainHandle<'_> {
+    fn drop(&mut self) {
+        self.chains.retire_if_requested(self.key, &self.mutex);
+    }
 }
 
 type VoiceChainMap = HashMap<VoiceChainKey, ChainEntry>;
@@ -278,29 +310,55 @@ struct VoiceChains {
 }
 
 impl VoiceChains {
-    fn lock_for(&self, guild_id: Snowflake, member_id: Snowflake, now_ms: i64) -> Arc<Mutex<()>> {
+    fn lock_for(&self, guild_id: Snowflake, member_id: Snowflake, now_ms: i64) -> ChainHandle<'_> {
         let mut chains = self.inner.lock().expect("chains lock");
-        let entry = chains.entry((guild_id, member_id)).or_default();
+        let key = (guild_id, member_id);
+        let entry = chains.entry(key).or_default();
         entry.last_seen_ms = now_ms;
-        entry.mutex.clone()
+        ChainHandle {
+            chains: self,
+            key,
+            mutex: entry.mutex.clone(),
+        }
     }
 
     /// Drop the member's chain after a full voice leave. Kept while another
     /// frame holds a handle (inside the critical section or queued on it), so
-    /// end/start stays serial. Pointer-checked so a recreated entry survives.
-    fn remove_after_leave(
-        &self,
-        guild_id: Snowflake,
-        member_id: Snowflake,
-        chain: &Arc<Mutex<()>>,
-    ) {
+    /// end/start stays serial — but the retirement is then requested, not
+    /// abandoned: the last handle to drop completes it. Pointer-checked so a
+    /// recreated entry survives.
+    fn remove_after_leave(&self, guild_id: Snowflake, member_id: Snowflake, chain: &ChainHandle) {
         let mut chains = self.inner.lock().expect("chains lock");
         let key = (guild_id, member_id);
-        // The map and this frame each hold one handle; more belong to another frame.
-        let keep = chains.get(&key).is_some_and(|entry| {
-            !Arc::ptr_eq(&entry.mutex, chain) || Arc::strong_count(&entry.mutex) > 2
+        let Some(entry) = chains.get_mut(&key) else {
+            return;
+        };
+        if !Arc::ptr_eq(&entry.mutex, &chain.mutex) {
+            return;
+        }
+        // The map and this frame each hold one handle; more belong to another
+        // frame. Request retirement instead of dropping it: the last handle
+        // to drop (live or already completed) finishes the job.
+        if Arc::strong_count(&entry.mutex) > 2 {
+            entry.retire_requested = true;
+            return;
+        }
+        chains.remove(&key);
+    }
+
+    /// Complete a leave-requested retirement once no other frame holds the
+    /// chain. Called from [`ChainHandle::drop`], so a completed frame whose
+    /// handle outlives the leave's cleanup still retires the entry.
+    fn retire_if_requested(&self, key: VoiceChainKey, mutex: &Arc<Mutex<()>>) {
+        let mut chains = self.inner.lock().expect("chains lock");
+        // During `ChainHandle::drop` the dropping handle is still alive, so
+        // the map plus the dropping handle is the drained count.
+        let drained = chains.get(&key).is_some_and(|entry| {
+            entry.retire_requested
+                && Arc::ptr_eq(&entry.mutex, mutex)
+                && Arc::strong_count(&entry.mutex) <= 2
         });
-        if !keep {
+        if drained {
             chains.remove(&key);
         }
     }
@@ -998,7 +1056,7 @@ mod tests {
         const HOT: u64 = 100;
         const NOW: i64 = 2 * VOICE_CHAIN_IDLE_MS as i64;
         let chains = VoiceChains::default();
-        let mut hot: Vec<(Snowflake, Arc<Mutex<()>>)> = Vec::new();
+        let mut hot: Vec<(Snowflake, ChainHandle<'_>)> = Vec::new();
         for member in 0..TOTAL {
             // Idle entries last touched long ago; hot entries at `NOW`.
             let seen = if member < HOT { NOW } else { 0 };
@@ -1013,7 +1071,10 @@ mod tests {
         assert_eq!(chains.len(), HOT as usize);
         for (member, chain) in &hot {
             let live = chains.lock_for(GUILD, *member, NOW);
-            assert!(Arc::ptr_eq(&live, chain), "hot entry untouched");
+            assert!(
+                Arc::ptr_eq(&live.mutex, &chain.mutex),
+                "hot entry untouched"
+            );
         }
         assert_eq!(chains.len(), HOT as usize, "re-touching hot adds nothing");
     }
@@ -1039,9 +1100,68 @@ mod tests {
         let old = chains.lock_for(GUILD, 3, 0);
         chains.remove_after_leave(GUILD, 3, &old);
         let fresh = chains.lock_for(GUILD, 3, 1);
-        assert!(!Arc::ptr_eq(&old, &fresh));
+        assert!(!Arc::ptr_eq(&old.mutex, &fresh.mutex));
         chains.remove_after_leave(GUILD, 3, &old);
         assert_eq!(chains.len(), 1, "stale leave keeps the fresh chain");
+    }
+
+    // A completed join whose handle outlives the leave's cleanup (the
+    // member-remove/inflight-join race): the leave still closes the session,
+    // and the last handle to drop retires the chain. Deterministic: no
+    // scheduler race, just handle lifetimes.
+    #[test]
+    fn completed_join_handle_does_not_strand_member_remove_chain() {
+        let p = MemPipeline::for_replay();
+        p.handle_at(&lifecycle_voice(GUILD, 1, 10), "2026-10-19T12:00:00.000Z");
+        let completed_join = p.voice_chains.lock_for(GUILD, 1, 0);
+        p.handle_at(&lifecycle_member_remove(1), "2026-10-19T12:00:10.000Z");
+        assert_eq!(
+            p.handlers
+                .voice_sessions
+                .lock()
+                .expect("tracker")
+                .open_count(),
+            0
+        );
+        drop(completed_join);
+        assert_eq!(
+            p.voice_chains.len(),
+            0,
+            "completed frames must retire the chain"
+        );
+    }
+
+    #[test]
+    fn queued_frame_keeps_same_chain_until_last_handle_drops() {
+        let chains = VoiceChains::default();
+        let leave = chains.lock_for(GUILD, 1, 0);
+        // A queued frame holds the same mutex: the leave must not fork it,
+        // and a later frame must serialize on the identical chain.
+        let queued = chains.lock_for(GUILD, 1, 0);
+        chains.remove_after_leave(GUILD, 1, &leave);
+        assert_eq!(chains.len(), 1, "queued frame keeps the chain");
+        let late = chains.lock_for(GUILD, 1, 0);
+        assert!(
+            Arc::ptr_eq(&late.mutex, &queued.mutex),
+            "frames share one chain while queued"
+        );
+        drop(queued);
+        drop(late);
+        assert_eq!(chains.len(), 1, "live handles still keep the chain");
+        drop(leave);
+        assert_eq!(chains.len(), 0, "last handle drop retires the chain");
+    }
+
+    #[test]
+    fn stale_handle_drop_keeps_recreated_chain() {
+        let chains = VoiceChains::default();
+        let old = chains.lock_for(GUILD, 1, 0);
+        chains.remove_after_leave(GUILD, 1, &old);
+        assert_eq!(chains.len(), 0);
+        let fresh = chains.lock_for(GUILD, 1, 1);
+        assert!(!Arc::ptr_eq(&old.mutex, &fresh.mutex));
+        drop(old);
+        assert_eq!(chains.len(), 1, "stale handle drop keeps the fresh chain");
     }
 
     fn lifecycle_voice(guild: u64, member: u64, channel: u64) -> Event {
@@ -1117,12 +1237,15 @@ mod tests {
                 );
             }
             if expected > 0 {
-                assert!(Arc::ptr_eq(&foreign, &p.voice_chains.lock_for(8, 1, 0)));
+                assert!(Arc::ptr_eq(
+                    &foreign.mutex,
+                    &p.voice_chains.lock_for(8, 1, 0).mutex
+                ));
             }
             if expected == 2 {
                 assert!(Arc::ptr_eq(
-                    &other_channel,
-                    &p.voice_chains.lock_for(GUILD, 2, 0)
+                    &other_channel.mutex,
+                    &p.voice_chains.lock_for(GUILD, 2, 0).mutex
                 ));
             }
         }
