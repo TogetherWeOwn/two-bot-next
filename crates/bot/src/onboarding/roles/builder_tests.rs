@@ -1,5 +1,8 @@
 #![cfg(test)]
 
+#[path = "review_acceptance_tests.rs"]
+mod review_acceptance_tests;
+
 use super::*;
 use crate::discord_test_common::{MockRest, RestRequest, ScriptedResponse};
 use std::sync::{Arc, Mutex};
@@ -45,6 +48,9 @@ async fn discord(state: Arc<Mutex<State>>) -> MockRest {
             ("GET", "/users/@me") => ScriptedResponse::json(200, json!({"id":"999","bot":true})),
             ("GET", "/guilds/22") => ScriptedResponse::json(200, json!({"id":"22","owner_id":"888"})),
             ("GET", "/guilds/22/roles") => ScriptedResponse::json(200, roles),
+            ("GET", "/guilds/22/channels") => ScriptedResponse::json(200, json!([
+                {"id":"12","guild_id":"22","type":0,"permission_overwrites":[]}
+            ])),
             ("GET", "/guilds/22/members/999") => ScriptedResponse::json(200, json!({"user":{"id":"999","bot":true},"roles":["1005","1006"]})),
             ("GET", "/guilds/22/members/44") if state.absent => ScriptedResponse::status(404),
             ("GET", "/guilds/22/members/44") => {
@@ -381,7 +387,19 @@ async fn onboarding_join_grants_without_a_welcome_channel_and_rejections_are_aud
     assert_eq!(puts(&mock), 1);
     state.lock().unwrap().held.clear();
     state.lock().unwrap().reject_put = true;
-    assert!(live.handle(job(), 1_790_781_200_001).await.is_err());
+    let rejected = live.handle(job(), 1_790_781_200_001).await;
+    assert!(
+        rejected.is_ok(),
+        "an optional join-role failure without a welcome destination is terminal, not queue-fatal"
+    );
+    assert_eq!(puts(&mock), 2, "one successful and one rejected attempt");
+    assert!(state.lock().unwrap().held.is_empty());
+    assert!(
+        mock.requests()
+            .iter()
+            .all(|request| { request.method != "POST" || !request.path.ends_with("/messages") }),
+        "no destination means no welcome message"
+    );
     let causes: Vec<String> =
         sqlx::query_scalar("SELECT action FROM operational_audit_log ORDER BY action")
             .fetch_all(db.pool())

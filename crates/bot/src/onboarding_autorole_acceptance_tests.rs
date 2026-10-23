@@ -163,6 +163,16 @@ async fn discord(state: Arc<Mutex<DiscordState>>) -> MockRest {
             ("GET", "/guilds/22/roles") => {
                 ScriptedResponse::json(200, Value::Array(guild_roles()))
             }
+            ("GET", "/guilds/22/channels") => ScriptedResponse::json(
+                200,
+                json!([
+                    {"id":"10","guild_id":"22","type":0,"permission_overwrites":[]},
+                    {"id":"11","guild_id":"22","type":2,"permission_overwrites":[]},
+                    {"id":"12","guild_id":"22","type":0,"permission_overwrites":[]},
+                    {"id":"13","guild_id":"22","type":0,"permission_overwrites":[]},
+                    {"id":"14","guild_id":"22","type":0,"permission_overwrites":[]}
+                ]),
+            ),
             ("GET", "/guilds/22/members/44") => ScriptedResponse::json(
                 200,
                 json!({"user": {"id": "44", "username": "member", "discriminator": "0"},

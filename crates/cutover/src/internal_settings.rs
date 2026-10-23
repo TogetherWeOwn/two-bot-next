@@ -111,5 +111,16 @@ mod tests {
         assert_eq!(invalid_gate.status(), 400);
         assert!(!invalid_gate.code.retryable());
         assert_eq!(invalid_gate.log_reason, "settings_value_invalid");
+        let invalid_role = action_error(SettingsWriteError::Refused(
+            WriteRefusal::InvalidRoleValue("raw-hostile-role-value".to_owned()),
+        ));
+        assert_eq!(invalid_role.status(), 400);
+        assert_eq!(invalid_role.code.as_str(), "malformed");
+        assert!(!invalid_role.code.retryable());
+        assert_eq!(invalid_role.log_reason, "settings_role_value_invalid");
+        assert!(invalid_role.message.contains("canonical role ids"));
+        assert!(invalid_role.message.contains("never everyone"));
+        assert!(!invalid_role.message.contains("raw-hostile-role-value"));
+        assert!(!format!("{invalid_role:?}").contains("raw-hostile-role-value"));
     }
 }
