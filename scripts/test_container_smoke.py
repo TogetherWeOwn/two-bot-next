@@ -361,7 +361,7 @@ def parked_readyz_body():
                 "counter", "rank", "scheduled_events", "settings", "presence_probe",
                 "community_scorecard", "inactivity", "audit_retry",
                 "self_role_recovery", "scheduled_messages", "feeds",
-                "member_unban_sweep", "retention",
+                "member_unban_sweep", "retention", "polls",
             )}}
 
 
@@ -656,13 +656,13 @@ class ContainerSmokeTests(unittest.TestCase):
         body = parked_readyz_body()
         del body["jobs"]
         self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
-        self.assert_rejected("all thirteen jobs parked")
+        self.assert_rejected("all fourteen jobs parked")
 
     def test_readyz_without_jobs_map_fails(self):
         body = parked_readyz_body()
         body["jobs"] = {}
         self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
-        self.assert_rejected("all thirteen jobs parked")
+        self.assert_rejected("all fourteen jobs parked")
 
     def test_readyz_with_missing_job_fails(self):
         for name in parked_readyz_body()["jobs"]:
@@ -670,13 +670,13 @@ class ContainerSmokeTests(unittest.TestCase):
                 body = parked_readyz_body()
                 del body["jobs"][name]
                 self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
-                self.assert_rejected("all thirteen jobs parked")
+                self.assert_rejected("all fourteen jobs parked")
 
     def test_readyz_with_unexpected_job_fails(self):
         body = parked_readyz_body()
         body["jobs"]["unexpected"] = dict(PARKED_JOB)
         self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
-        self.assert_rejected("all thirteen jobs parked")
+        self.assert_rejected("all fourteen jobs parked")
 
     def test_readyz_with_running_job_fails(self):
         for name in parked_readyz_body()["jobs"]:
@@ -684,7 +684,7 @@ class ContainerSmokeTests(unittest.TestCase):
                 body = parked_readyz_body()
                 body["jobs"][name] = dict(PARKED_JOB, running=True)
                 self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
-                self.assert_rejected("all thirteen jobs parked")
+                self.assert_rejected("all fourteen jobs parked")
 
     def test_readyz_with_started_job_fails(self):
         for name in parked_readyz_body()["jobs"]:
@@ -692,7 +692,46 @@ class ContainerSmokeTests(unittest.TestCase):
                 body = parked_readyz_body()
                 body["jobs"][name] = dict(PARKED_JOB, parked=False, last_start=100)
                 self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
-                self.assert_rejected("all thirteen jobs parked")
+                self.assert_rejected("all fourteen jobs parked")
+
+    def test_readyz_with_all_fourteen_jobs_including_polls_parked_passes(self):
+        output = self.run_smoke()
+        self.assertIn("PASS /health 200; /readyz 503 parked", output)
+        self.assertIn("PASS --healthcheck exits 1 without a listening server", output)
+        self.assertIn("PASS SIGTERM exits 0", output)
+        self.assertEqual(len(self.fixture.removals()), 3)
+
+    def test_readyz_without_polls_rejects_the_legacy_thirteen_job_inventory(self):
+        body = parked_readyz_body()
+        del body["jobs"]["polls"]
+        self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
+        self.assert_rejected("all fourteen jobs parked, non-running, never started")
+        self.assertEqual(len(self.fixture.removals()), 2)
+        self.assertFalse(any(args[0] in ("exec", "kill") for args, _ in self.fixture.calls))
+
+    def test_readyz_with_polls_requires_exact_job_membership_not_just_count(self):
+        for omitted in (None, "counter", "polls"):
+            with self.subTest(omitted=omitted):
+                self.fixture = DockerFixture()
+                body = parked_readyz_body()
+                body["jobs"]["unexpected"] = dict(PARKED_JOB)
+                if omitted is not None:
+                    del body["jobs"][omitted]
+                self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
+                self.assert_rejected("all fourteen jobs parked, non-running, never started")
+                self.assertEqual(len(self.fixture.removals()), 2)
+                self.assertFalse(any(args[0] in ("exec", "kill") for args, _ in self.fixture.calls))
+
+    def test_readyz_with_active_polls_fails_even_when_other_thirteen_jobs_are_parked(self):
+        for state in ({"running": True}, {"last_start": 100}, {"parked": False}):
+            with self.subTest(polls=state):
+                self.fixture = DockerFixture()
+                body = parked_readyz_body()
+                body["jobs"]["polls"].update(state)
+                self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
+                self.assert_rejected("all fourteen jobs parked, non-running, never started")
+                self.assertEqual(len(self.fixture.removals()), 2)
+                self.assertFalse(any(args[0] in ("exec", "kill") for args, _ in self.fixture.calls))
 
     def test_readyz_with_wrong_components_fails(self):
         body = parked_readyz_body()
