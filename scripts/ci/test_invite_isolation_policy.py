@@ -14,7 +14,7 @@ class InviteIsolationPolicyTests(unittest.TestCase):
         self.case = policy.WorkflowTests()
         self.case.setUp()
 
-    def policy_result(self, name, allow_errors=False):
+    def policy_result(self, name):
         # TestCase.run records failures inside subTest; calling the method
         # directly can miss them when an outer runner already owns the result.
         case = policy.WorkflowTests(name)
@@ -23,8 +23,7 @@ class InviteIsolationPolicyTests(unittest.TestCase):
         with patch.object(case, "setUp"):
             case.run(result)
         self.assertEqual(result.testsRun, 1)
-        if not allow_errors:
-            self.assertEqual(result.errors, [], result.errors)
+        self.assertEqual(result.errors, [], result.errors)
         return result
 
     def assert_isolation_rejected(
@@ -65,6 +64,20 @@ class InviteIsolationPolicyTests(unittest.TestCase):
                             + declaration.replace("tokio::test", attribute),
                         )
 
+    def test_discovery_refuses_unconsumed_tokio_test_tokens(self):
+        for source in (
+            "use tokio::test as renamed_test;\n#[renamed_test]\nasync fn unknown() {}\n",
+            "use tokio::test;\n#[test]\nasync fn unknown() {}\n",
+            "#[cfg_attr(all(), tokio::test)]\nasync fn unknown() {}\n",
+            "macro_rules! gen {\n"
+            "    () => { #[tokio::test] async fn unknown() {} };\n"
+            "}\n",
+            "#[tokio::test]\nasync fn ordinary() {}\n// historical note: tokio::test\n",
+        ):
+            with self.subTest(source=source):
+                with self.assertRaises(ValueError):
+                    policy.tokio_test_names(source)
+
     def test_signal_lane_rejects_parallel_invite_replay(self):
         steps = self.case.workflows["check.yml"]["jobs"]["rust-tests"]["steps"]
         replay = next(step for step in steps if "--test invite_uses_saturation_acceptance" in step.get("run", ""))
@@ -97,7 +110,6 @@ class InviteIsolationPolicyTests(unittest.TestCase):
         attributes = (
             "#[tokio::test]",
             '#[::tokio::test(flavor = "multi_thread", worker_threads = 2)]',
-            "#[tokio :: test]",
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -134,66 +146,23 @@ class InviteIsolationPolicyTests(unittest.TestCase):
                                 )
 
 
-    def test_unmarked_tokio_spellings_fail_closed_in_both_lanes(self):
+    def test_sibling_tokio_spellings_fail_closed_in_both_lanes(self):
         source_path = policy.ROOT / "crates/store/tests/invite_uses_saturation_acceptance.rs"
         original = source_path.read_text(encoding="utf-8")
         declarations = (
-            # Renamed import: the attribute carries no tokio::test token.
-            (
-                "renamed-import",
-                "use tokio::test as renamed_test;\n"
-                "#[renamed_test]\n"
-                "async fn unskipped_future_fixture() {}\n",
-            ),
-            # Plain import: #[test] resolves to the imported tokio macro.
-            (
-                "plain-import",
-                "use tokio::test;\n"
-                "#[test]\n"
-                "async fn unskipped_future_fixture() {}\n",
-            ),
-            # cfg_attr hides the path from the line-start mark regex.
-            (
-                "cfg-attr",
-                "#[cfg_attr(all(), tokio::test)]\n"
-                "async fn unskipped_future_fixture() {}\n",
-            ),
-            # Crate rename: no tokio::test token anywhere in the file.
-            (
-                "crate-rename",
-                "use tokio as tk;\n"
-                "#[tk::test]\n"
-                "async fn unskipped_future_fixture() {}\n",
-            ),
-            # Visibility-qualified rename: the fence scans from the keyword.
-            (
-                "pub-use-rename",
-                "pub(crate) use tokio as tk;\n"
-                "#[tk::test]\n"
-                "async fn unskipped_future_fixture() {}\n",
-            ),
-            # Extern-crate rename: not a use item at all.
-            (
-                "extern-crate-rename",
-                "extern crate tokio as tk;\n"
-                "#[tk::test]\n"
-                "async fn unskipped_future_fixture() {}\n",
-            ),
-            # Macro-generated: the token sits mid-line inside the macro body.
-            (
-                "macro-generated",
-                "macro_rules! gen_saturation {\n"
-                "    ($n:ident) => { #[tokio::test] async fn $n() {} };\n"
-                "}\n"
-                "gen_saturation!(unskipped_future_fixture);\n",
-            ),
+            "use tokio::test as renamed_test;\n#[renamed_test]\nasync fn unskipped_future_fixture() {}\n",
+            "use tokio::test;\n#[test]\nasync fn unskipped_future_fixture() {}\n",
+            "#[cfg_attr(all(), tokio::test)]\nasync fn unskipped_future_fixture() {}\n",
+            "macro_rules! gen_future_fixture {\n"
+            "    () => { #[tokio::test] async fn unskipped_future_fixture() {} };\n"
+            "}\n",
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / source_path.relative_to(policy.ROOT)
             source.parent.mkdir(parents=True)
-            for spelling, declaration in declarations:
-                with self.subTest(spelling=spelling):
+            for declaration in declarations:
+                with self.subTest(declaration=declaration):
                     source.write_text(original + "\n" + declaration, encoding="utf-8")
                     real_read = Path.read_text
 
@@ -206,10 +175,58 @@ class InviteIsolationPolicyTests(unittest.TestCase):
                             "test_patch_coverage_runs_with_db_and_includes_ignored_tests",
                         ):
                             with self.subTest(policy=name):
-                                result = self.policy_result(name, allow_errors=True)
+                                case = policy.WorkflowTests(name)
+                                case.workflows = deepcopy(self.case.workflows)
+                                result = unittest.TestResult()
+                                with patch.object(case, "setUp"):
+                                    case.run(result)
+                                self.assertEqual(result.testsRun, 1)
                                 self.assertEqual(result.failures, [], result.failures)
                                 self.assertEqual(len(result.errors), 1, result.errors)
-                                self.assertIn("tokio", result.errors[0][1])
+                                self.assertIn("tokio::test tokens", result.errors[0][1])
+
+
+    def test_crate_aliases_and_grouped_imports_fail_closed_in_both_policies(self):
+        source_path = policy.ROOT / "crates/store/tests/invite_uses_saturation_acceptance.rs"
+        original = source_path.read_text(encoding="utf-8")
+        imports = (
+            ("use tokio as rt;", "rt::test"),
+            ("extern crate tokio as rt;", "rt::test"),
+            ("use tokio::{self, test as fixture};", "fixture"),
+            ("pub(crate) use ::tokio as rt;", "rt::test"),
+            ("pub use {tokio::{self, test as fixture}};", "fixture"),
+            ("use tokio::{self as rt};", "rt::test"),
+            ("use tokio::*;", "test"),
+            ("use /* outer /* ; */ nested */ tokio as rt;", "rt::test"),
+            ("extern /* ; */ crate tokio as rt;", "rt::test"),
+            ("use tokio /* ; */ :: {self, test as fixture};", "fixture"),
+            ("pub use {std::sync::Arc, tokio::{self, test as fixture}};", "fixture"),
+        )
+        real_read = Path.read_text
+        for declaration, attribute in imports:
+            source = (
+                original + "\n" + declaration + "\n#[" + attribute + "]\n"
+                + "async fn unskipped_future_fixture() {}\n"
+            )
+
+            def read_text(path, *args, **kwargs):
+                return source if path == source_path else real_read(path, *args, **kwargs)
+
+            with patch.object(Path, "read_text", read_text):
+                for name in (
+                    "test_invite_saturation_isolation_in_both_lanes",
+                    "test_patch_coverage_runs_with_db_and_includes_ignored_tests",
+                ):
+                    with self.subTest(declaration=declaration, policy=name):
+                        case = policy.WorkflowTests(name)
+                        case.workflows = deepcopy(self.case.workflows)
+                        result = unittest.TestResult()
+                        with patch.object(case, "setUp"):
+                            case.run(result)
+                        self.assertEqual(result.testsRun, 1)
+                        self.assertEqual(result.failures, [], result.failures)
+                        self.assertEqual(len(result.errors), 1, result.errors)
+                        self.assertIn("unsupported Tokio import", result.errors[0][1])
 
 
 if __name__ == "__main__":

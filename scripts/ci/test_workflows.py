@@ -273,181 +273,50 @@ def ignored_test_names(suite):
     return names
 
 
-def _literal_end(text, i):
-    """Exclusive end of the string literal opening at `i`, else None.
-
-    Handles cooked, byte, raw and byte-raw strings. A malformed or
-    unterminated opener returns None so the caller keeps the text, which can
-    only add census tokens and fail closed.
-    """
-    j, end = i, len(text)
-    if text[j] == "b":
-        j += 1
-        if j >= end or text[j] not in "\"r":
-            return None
-    if text[j] == "r":
-        j += 1
-        hashes = 0
-        while j < end and text[j] == "#":
-            hashes += 1
-            j += 1
-        if j >= end or text[j] != '"':
-            return None
-        closer = '"' + "#" * hashes
-        found = text.find(closer, j + 1)
-        return None if found == -1 else found + len(closer)
-    if text[j] != '"':
-        return None
-    j += 1
-    while j < end:
-        if text[j] == "\\":
-            j += 2
-            continue
-        if text[j] == '"':
-            return j + 1
-        j += 1
-    return None
-
-
-def _char_end(text, i):
-    """Exclusive end of the char literal opening at `i`, else None.
-
-    Lifetimes (`'a`, `'static`) never match: a char literal needs its closing
-    quote exactly one char (or one escape) after the opener.
-    """
-    j, end = i + 1, len(text)
-    if j >= end:
-        return None
-    if text[j] == "\\":
-        j += 1
-        if j >= end:
-            return None
-        if text[j] == "x":
-            j += 3
-        elif text[j] == "u":
-            brace = text.find("}", j + 1)
-            if brace == -1 or brace - j > 8:
-                return None
-            j = brace + 1
-        else:
-            j += 1
-    elif text[j] in "'\n":
-        return None
-    else:
-        j += 1
-    if j < end and text[j] == "'":
-        return j + 1
-    return None
-
-
-def _strip_rust_code(text):
-    """Replace Rust comments and literals with a space, one byte at a time.
-
-    The token census runs on the stripped text so prose mentioning
-    `tokio::test` cannot trip the gate. Comments become whitespace (their Rust
-    semantics); string, char and raw-string contents are dropped. Anything
-    unrecognized is kept, which can only add tokens and fail closed.
-    """
-    out = []
-    i, end = 0, len(text)
-    while i < end:
-        if text.startswith("//", i):
-            newline = text.find("\n", i + 2)
-            out.append(" ")
-            i = end if newline == -1 else newline + 1
-            continue
-        if text.startswith("/*", i):
-            depth, j = 1, i + 2
-            while j < end and depth:
-                if text.startswith("/*", j):
-                    depth += 1
-                    j += 2
-                elif text.startswith("*/", j):
-                    depth -= 1
-                    j += 2
-                else:
-                    j += 1
-            out.append(" ")
-            i = j
-            continue
-        char = text[i]
-        prev = text[i - 1] if i else ""
-        if char in "br" and not (prev.isalnum() or prev == "_"):
-            literal = _literal_end(text, i)
-            if literal is not None:
-                out.append(" ")
-                i = literal
-                continue
-        elif char == '"':
-            literal = _literal_end(text, i)
-            if literal is not None:
-                out.append(" ")
-                i = literal
-                continue
-        elif char == "'":
-            char_end = _char_end(text, i)
-            if char_end is not None:
-                out.append(" ")
-                i = char_end
-                continue
-        out.append(char)
-        i += 1
-    return "".join(out)
-
-
 def tokio_test_names(text):
     """Collect each Tokio test through intervening trivia, or fail closed.
 
     Like ignored_test_names this is a source-style scanner, not a Rust parser.
-    Every attribute mark must resolve; unsupported declarations cannot shrink
-    the skip set silently while other ordinary declarations still match.
-
-    A mark census alone trusts the mark spelling: renamed or plain `use`
-    imports, `cfg_attr` wrappers and macro-generated attributes carry a
-    `tokio::test` token but produce no mark, so the skip set would silently
-    shrink. Every token must be consumed by a mark, and no `use` item may
-    mention `tokio` (the saturation file paths it fully), so a crate rename
-    like `use tokio as tk` plus `#[tk::test]` fails closed too. Paths are
-    token-based, so whitespace may surround `::` in both the mark and the
-    census patterns.
+    Every attribute mark must resolve, and every `tokio::test` token must be
+    consumed by exactly one mark; imported, renamed, cfg_attr or
+    macro-generated spellings the mark regex cannot see fail validation
+    instead of silently shrinking the skip set while other ordinary
+    declarations still match.
     """
-    marks = list(re.finditer(r"^[ \t]*#\[(?:::)?tokio\s*::\s*test\b", text, re.MULTILINE))
+    marks = list(re.finditer(r"^[ \t]*#\[(?:::)?tokio::test\b", text, re.MULTILINE))
+    tokens = re.findall(r"(?<!\w)tokio::test\b", text)
     names = []
     for mark in marks:
         line_end = text.find("\n", mark.end())
         name = None if line_end == -1 else _match_fn_name(text, _skip_trivia(text, line_end + 1))
         if name is not None:
             names.append(name)
-    if not marks or len(names) != len(marks) or len(set(names)) != len(names):
+    if (
+        not marks
+        or len(tokens) != len(marks)
+        or len(names) != len(marks)
+        or len(set(names)) != len(names)
+    ):
         raise ValueError(
-            f"discovered {len(names)} of {len(marks)} unique Tokio test functions; "
+            f"found {len(tokens)} tokio::test tokens and {len(marks)} marks "
+            f"for {len(names)} unique Tokio test functions; "
             "extend the scanner for the unsupported declaration",
         )
-    code = _strip_rust_code(text)
-    tokens = re.findall(r"(?<!\w)tokio\s*::\s*test(?!\w)", code)
-    if len(tokens) != len(marks):
-        raise ValueError(
-            f"found {len(tokens)} tokio::test tokens for {len(marks)} marks; "
-            "a renamed import, cfg_attr or macro-generated attribute hides a "
-            "fixture from the scanner — extend the scanner or spell it plainly",
-        )
-    # Any `use` keyword outside precise-capturing `use<...>` bounds starts a
-    # use item however it is qualified (`pub`, `pub(crate)`, attributes), so
-    # scan from the keyword rather than trusting a statement shape. `$`-led
-    # macro fragments such as `$use` are not keywords.
-    for keyword in re.finditer(r"(?<![\w$])use\b(?!\s*<)", code):
-        stop = code.find(";", keyword.end())
-        tree = code[keyword.end():] if stop == -1 else code[keyword.end():stop]
-        if re.search(r"\btokio\b", tree):
+    # The token census cannot see crate aliases or grouped/glob imports.
+    # This fixture paths Tokio fully: reject any use/extern item mentioning
+    # tokio, including visibility-qualified and nested use trees. Scan from
+    # the keyword, not the start of a line. Opaque import syntax also refuses
+    # validation: a comment/literal semicolon must not truncate the item and
+    # hide a Tokio rename. Like the census above this deliberately scans raw
+    # source and may reject prose; extend the scanner rather than waive it.
+    for keyword in re.finditer(r"(?<![\w$])(?:use|extern)\b", text):
+        stop = text.find(";", keyword.end())
+        item = text[keyword.end():] if stop == -1 else text[keyword.end():stop]
+        if re.search(r"\btokio\b|[/\"']", item):
             raise ValueError(
-                f"use item mentions tokio ({tree.strip()}); the saturation file "
-                "must path tokio fully so every test attribute stays visible",
+                "unsupported Tokio import or opaque import syntax; "
+                "path Tokio fully so every test attribute stays visible",
             )
-    if re.search(r"(?<![\w$])extern\s+crate\s+tokio\s+as\b", code):
-        raise ValueError(
-            "extern crate renames tokio; the saturation file must path tokio "
-            "fully so every test attribute stays visible",
-        )
     return names
 
 
