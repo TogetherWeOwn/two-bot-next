@@ -310,6 +310,20 @@ pub const VOICE_VOTE_KICK_OUTCOMES: &[&str] = &[
     "gave_up",
     "other",
 ];
+/// Event-voice tick outcomes for `two_bot_event_voice_tick_total{outcome}`:
+/// one observation per T-15 ticker tick that stays TBD, with the website
+/// reason (`EventVoiceTbdReason::as_str`), including backoff-skipped ticks.
+/// The ticker card extends this same series with its ready/create family.
+/// Unknown outcomes collapse to the trailing `other`, never to a dynamic
+/// label. No IDs, tokens or bodies are retained.
+pub const EVENT_VOICE_TICK_OUTCOMES: &[&str] = &[
+    "opens_soon",
+    "rate_limited",
+    "perm_denied",
+    "no_category",
+    "unavailable",
+    "other",
+];
 /// Moderation enforcement verbs for `two_bot_moderation_enforcements_total{verb,outcome}`
 /// (TOG-28482): exactly the nine `ModerationAction::command_name` verbs in
 /// legacy publish order. A test pins this list to
@@ -680,6 +694,7 @@ struct Values {
     /// Live views republished by the not-ready-while-connected self-heal.
     voice_live_self_heals: u64,
     voice_vote_kick: [u64; VOICE_VOTE_KICK_OUTCOMES.len()],
+    event_voice_tick: [u64; EVENT_VOICE_TICK_OUTCOMES.len()],
     moderation_enforcements: [[u64; MODERATION_ENFORCEMENT_OUTCOMES.len()]; MODERATION_VERBS.len()],
     voice_names: [u64; VOICE_NAME_OUTCOMES.len()],
     db_errors: [u64; DB_ERROR_OPS.len()],
@@ -1071,6 +1086,22 @@ impl Metrics {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let counter = &mut values.voice_vote_kick[bounded_index(outcome, VOICE_VOTE_KICK_OUTCOMES)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One event-voice tick that stayed TBD (host decision D4). Call once
+    /// per preflight that returns `Waiting`, including backoff-skipped
+    /// ticks, with the website reason (`EventVoiceTbdReason::as_str`).
+    /// `Ready` ticks record nothing here; the ticker card extends this same
+    /// series with its ready/create family. Unknown outcomes collapse to
+    /// `other`.
+    pub fn event_voice_tick(&self, outcome: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter =
+            &mut values.event_voice_tick[bounded_index(outcome, EVENT_VOICE_TICK_OUTCOMES)];
         *counter = counter.saturating_add(1);
     }
 
@@ -2134,6 +2165,22 @@ impl Metrics {
             writeln!(
                 out,
                 "two_bot_voice_vote_kick_total{{outcome=\"{outcome}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_event_voice_tick_total",
+            "counter",
+            "Event-voice T-15 ticks that stayed TBD, by website reason; backoff-skipped ticks count too.",
+        );
+        for (outcome, count) in EVENT_VOICE_TICK_OUTCOMES
+            .iter()
+            .zip(values.event_voice_tick)
+        {
+            writeln!(
+                out,
+                "two_bot_event_voice_tick_total{{outcome=\"{outcome}\"}} {count}"
             )
             .unwrap();
         }
