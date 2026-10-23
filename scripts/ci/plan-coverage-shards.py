@@ -311,7 +311,7 @@ def reverse_deps_from_metadata(metadata):
     if not isinstance(packages, list) or not isinstance(resolve, dict):
         raise ValueError("cargo metadata missing packages/resolve")
     nodes = resolve.get("nodes")
-    if not isinstance(nodes, list):
+    if not isinstance(nodes, list) or not nodes:
         raise ValueError("cargo metadata missing resolve.nodes")
     package_names = set()
     id_to_name = {}
@@ -340,6 +340,7 @@ def reverse_deps_from_metadata(metadata):
         if not workspace_names:
             raise ValueError("cargo metadata workspace_members unresolvable")
     reverse = {name: set() for name in workspace_names}
+    resolved_workspace = set()
     for node in nodes:
         if not isinstance(node, dict):
             raise ValueError("cargo metadata node must be an object")
@@ -355,6 +356,7 @@ def reverse_deps_from_metadata(metadata):
                 node_name = first
         if node_name is None or node_name not in workspace_names:
             continue
+        resolved_workspace.add(node_name)
         for dep in deps:
             if not isinstance(dep, dict):
                 raise ValueError("cargo metadata dep must be an object")
@@ -369,6 +371,8 @@ def reverse_deps_from_metadata(metadata):
             if dep_name is None or dep_name not in workspace_names:
                 continue
             reverse[dep_name].add(node_name)
+    if resolved_workspace != workspace_names:
+        raise ValueError("cargo metadata missing workspace dependency nodes")
     return reverse
 
 
