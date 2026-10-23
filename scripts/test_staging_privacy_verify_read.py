@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -397,6 +398,7 @@ class ReadTests(unittest.TestCase):
             self.assertEqual(call.kwargs["env"]["PGPASSWORD"], PASSWORD)
             self.assertEqual(call.kwargs["env"]["PGSSLMODE"], "verify-full")
             self.assertEqual(call.kwargs["env"]["PGSSLROOTCERT"], reader.SYSTEM_CA_BUNDLE)
+            self.assertEqual(call.kwargs.get("timeout"), 60)
         identity_call = fixture.calls()[0]
         self.assertEqual(identity_call["argv"],
                          ["-X", "-q", "-t", "--csv", "-v", "ON_ERROR_STOP=1", "-f", "-"])
@@ -609,6 +611,35 @@ class ReadTests(unittest.TestCase):
                         self.assertNotIn(secret, out + err)
                     self.assertFalse(fixture.output.exists())
 
+    def test_client_timeout_fails_without_publishing_or_echoing_exception_details(self):
+        for after_probe in (False, True):
+            with self.subTest(after_probe=after_probe):
+                fixture = Fixture(self)
+                failure = subprocess.TimeoutExpired(
+                    cmd=[str(fixture.psql), MEMBER, PASSWORD], timeout=60,
+                    output=f"partial output {MEMBER}", stderr=f"private diagnostic {PASSWORD}")
+                effects = [failure]
+                if after_probe:
+                    effects.insert(0, subprocess.CompletedProcess([], 0, IDENTITY, ""))
+                with mock.patch.object(reader.subprocess, "run", side_effect=effects):
+                    code, out, err = fixture.run()
+                self.assertEqual((code, out, err), (1, "", "failed: psql timed out\n"))
+                self.assertFalse(fixture.output.exists())
+                self.assertFalse(fixture.summary.exists())
+
+    def test_client_start_failure_does_not_publish_or_echo_os_details(self):
+        for after_probe in (False, True):
+            with self.subTest(after_probe=after_probe):
+                fixture = Fixture(self)
+                effects = [OSError(f"private OS diagnostic {MEMBER} {PASSWORD}")]
+                if after_probe:
+                    effects.insert(0, subprocess.CompletedProcess([], 0, IDENTITY, ""))
+                with mock.patch.object(reader.subprocess, "run", side_effect=effects):
+                    code, out, err = fixture.run()
+                self.assertEqual((code, out, err), (1, "", "failed: psql could not start\n"))
+                self.assertFalse(fixture.output.exists())
+                self.assertFalse(fixture.summary.exists())
+
     def test_an_unexpected_exception_does_not_print_a_traceback(self):
         fixture = Fixture(self)
         with mock.patch.object(reader, "read_verify",
@@ -663,6 +694,34 @@ class FenceTests(unittest.TestCase):
         fixture = Fixture(self)
         code, _, err = fixture.run(env={reader.URL_ENV: URL.replace("/two_bot?", "/two_bot_prod?")})
         self.assert_refused(fixture, code, err, "production-like")
+
+    def test_a_different_valid_staging_host_refuses_before_psql(self):
+        fixture = Fixture(self)
+        code, out, err = fixture.run(env={
+            reader.URL_ENV: URL.replace(STAGING_HOST, "other-staging.example.net")})
+        self.assert_refused(fixture, code, err, "host does not match the pinned staging endpoint")
+        self.assertEqual(out, "")
+        self.assertEqual(err, "refusing: the database host does not match the pinned staging endpoint\n")
+        self.assertFalse(fixture.summary.exists())
+
+    def test_an_absent_or_blank_host_pin_refuses_before_psql(self):
+        for pin in (None, "", "   "):
+            with self.subTest(pin=pin):
+                fixture = Fixture(self)
+                code, out, err = fixture.run(env={reader.HOST_ENV: pin})
+                self.assert_refused(fixture, code, err, "no valid staging host pin bound")
+                self.assertEqual(out, "")
+                self.assertEqual(err, f"refusing: no valid staging host pin bound (${reader.HOST_ENV})\n")
+                self.assertFalse(fixture.summary.exists())
+
+    def test_a_numeric_non_endpoint_port_refuses_before_psql(self):
+        fixture = Fixture(self)
+        code, out, err = fixture.run(env={
+            reader.URL_ENV: URL.replace(STAGING_HOST, STAGING_HOST + ":5433")})
+        self.assert_refused(fixture, code, err, "port must be the PostgreSQL endpoint port")
+        self.assertEqual(out, "")
+        self.assertEqual(err, "refusing: the database port must be the PostgreSQL endpoint port\n")
+        self.assertFalse(fixture.summary.exists())
 
     def test_a_runner_without_psql_refuses(self):
         fixture = Fixture(self)

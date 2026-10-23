@@ -1787,9 +1787,11 @@ def staging_privacy_verify_read_errors(workflow):
         errors.append(f"{name}:read: must run exactly checkout, the read and the upload, unconditionally")
         return errors
     checkout, run, upload = steps
+    # Checkout defaults to this workflow's immutable head. No ref, repository,
+    # path or other override may replace the reviewed code before secrets bind.
     if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
-            or (checkout.get("with") or {}).get("persist-credentials") != "false":
-        errors.append(f"{name}:read: checkout must be pinned and must not persist credentials")
+            or checkout.get("with") != {"persist-credentials": "false", "fetch-depth": "1"}:
+        errors.append(f"{name}:read: checkout must be shallow, non-persisting and use the workflow head")
     if run.get("env") != PRIVACY_VERIFY_READ_ENV:
         errors.append(f"{name}:read: Run step must bind exactly the four secrets, the guild and the run id")
     if run.get("run") != PRIVACY_VERIFY_READ_COMMAND or "uses" in run or "shell" in run:
@@ -6303,6 +6305,33 @@ class WorkflowTests(unittest.TestCase):
         del missing["staging-events-read.yml"]
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
+
+    def test_staging_privacy_verify_checkout_cannot_retarget_the_reviewed_head(self):
+        self.assertEqual(workflow_policy_errors(self.workflows), [])
+        for key, value in (("ref", "unreviewed-branch"),
+                           ("repository", "example/unreviewed"),
+                           ("path", "other-checkout"),
+                           ("sparse-checkout", "unreviewed"),
+                           ("fetch-depth", "0")):
+            with self.subTest(override=key):
+                workflows = deepcopy(self.workflows)
+                checkout = workflows["staging-privacy-verify-read.yml"]["jobs"]["read"]["steps"][0]
+                checkout["with"][key] = value
+                self.assertTrue(workflow_policy_errors(workflows),
+                                "the secret-bearing read must use the reviewed workflow head")
+
+    def test_staging_privacy_verify_suite_is_required_in_worker(self):
+        jobs = self.workflows["check.yml"]["jobs"]
+        command = "PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_privacy_verify_read.py -v"
+        steps = [step for step in jobs["worker"]["steps"] if step.get("run") == command]
+        self.assertEqual(len(steps), 1, "worker must run the collector suite exactly once")
+        self.assertNotIn("if", steps[0])
+        self.assertNotIn("continue-on-error", steps[0])
+        self.assertIn("worker", jobs["ci-ok"]["needs"])
+        aggregate = next(step for step in jobs["ci-ok"]["steps"]
+                         if step.get("name") == "Aggregate CI verdict")
+        self.assertEqual(aggregate["env"]["WORKER_RESULT"], "${{ needs.worker.result }}")
+        self.assertIn('(\"worker\", \"WORKER_RESULT\", \"WORKER_SELECTED\")', aggregate["run"])
 
     def test_staging_privacy_verify_read_shape_is_pinned(self):
         workflows = self.workflows
