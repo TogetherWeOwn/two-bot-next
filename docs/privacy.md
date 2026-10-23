@@ -40,6 +40,10 @@ are outside this implementation's scope.
   prospective recipients, pending or completed: erasure removes the erased
   member's rows by (`guild_id`, `member_id`), and deleting a parent room
   removes its journal rows through the migration's `ON DELETE CASCADE`.
+  Event voice presence spans (`event_voice_presence`) record per-member
+  join/leave spans: erasure removes the erased member's rows, guild-scoped
+  through the scheduled-event mirror. The channel claim row
+  (`event_voice_channels`) carries no member identity and is untouched.
   Erasure removes database tracking only, never the Discord channel.
   Guild room-command controls
   (`voice_access_controls`: creation switch, required role ID, per-command role
