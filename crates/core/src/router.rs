@@ -396,6 +396,8 @@ impl InteractionRouter {
             {
                 register(HandlerId::Moderation(action));
             }
+            register(HandlerId::PurgePreview);
+            register(HandlerId::ChannelInspect);
         }
         if gates.automations {
             // Sticky/admin plus custom rows (`CustomCommandRuntime::register`).
