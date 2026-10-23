@@ -50,10 +50,14 @@ identifier override is introduced by this repair.
 
 The forward file runs in the normal SQLx migration transaction. It locks the
 registry before inspecting the catalog and refuses any existing `holder_id` or
-`holder_kind` default, even on an empty partial schema. It never drops defaults
-or silently repairs fallback authority. Compatible partial schemas without
-defaults may upgrade: missing columns are added without defaults, made NOT NULL,
-and checked with validated constraints. Before any registry DDL, all four named
+`holder_kind` default, even on an empty partial schema. Any existing holder
+column must have the exact built-in `pg_catalog.text` type with no type modifier.
+Domains (with or without defaults), varchar and other types refuse before DDL:
+a domain default can fabricate authority on an omitted-column INSERT even when
+no column default exists. The migration never coerces types, rewrites domains,
+drops defaults or silently repairs fallback authority. Compatible plain-TEXT
+partial schemas without defaults may upgrade: missing columns are added without
+defaults, made NOT NULL, and checked with validated constraints. Before any registry DDL, all four named
 authority constraints are compared with canonical CHECK expressions parsed on
 that server using an empty transaction-local reference table (dropped on commit).
 A same-name constraint with a different expression, a different constraint kind
@@ -114,8 +118,9 @@ classification requires security review on the exact repair head before merge.
 Independent acceptance lives in `admin_registry_repair_acceptance` and
 `admin_token_registry_acceptance`. Both real migration chains are exercised on
 the guarded disposable test service, including atomic refusal of a populated
-historical schema, empty/populated defaulted partial-schema refusal and catalog
-preservation, compatible no-default upgrades, actual omitted-holder INSERTs,
+historical schema, empty/populated column- and domain-default refusal, noncanonical
+holder-type refusal with raw type/domain/catalog/history preservation, compatible
+plain-TEXT no-default upgrades, actual admin-scope omitted-holder INSERTs,
 exact 90-day positives, malformed authority, AI admin, invalid updates and
 nonfinite/overlong lifetimes. Existing backup roundtrip, erasure
 schema coverage and cross-chain convergence suites remain required regressions.

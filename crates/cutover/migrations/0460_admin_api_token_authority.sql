@@ -18,6 +18,15 @@ BEGIN
                AND NOT attisdropped AND atthasdef) THEN
     RAISE EXCEPTION 'admin_api_tokens holder columns must not have defaults';
   END IF;
+  -- ADD COLUMN IF NOT EXISTS retains existing types. Domains can supply a
+  -- fallback without atthasdef, so accept only the exact plain TEXT contract.
+  IF EXISTS (SELECT 1 FROM pg_attribute
+             WHERE attrelid = 'admin_api_tokens'::regclass
+               AND attname IN ('holder_id', 'holder_kind')
+               AND NOT attisdropped
+               AND (atttypid <> 'pg_catalog.text'::regtype OR atttypmod <> -1)) THEN
+    RAISE EXCEPTION 'admin_api_tokens holder columns must use plain pg_catalog.text';
+  END IF;
 END $$;
 
 -- Parse the canonical checks on this server instead of trusting a constraint

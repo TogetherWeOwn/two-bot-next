@@ -490,12 +490,12 @@
       "justification": "Store-chain mirror of cutover 0456, including the pre-merge 64-lowercase-hex secret_hash CHECK and refusal of NULL guild elements: identical table and index, IF NOT EXISTS, no writes to existing tables. Numbered 0457 because cutover owns 0456; global migration numbers remain unique across both chains. Renumbered before first merge after main claimed 0454; SQL body unchanged."
     },
     "crates/cutover/migrations/0460_admin_api_token_authority.sql": {
-      "sha256": "5278b578f6c905dee7dec80c94728481ca891931f8f3d6e7ce1a75d2ce91fe1e",
-      "justification": "Forward-only admin registry repair: required named human/ai_agent holders, humans-only admin and finite positive lifetime at most 7776000 seconds. Before first merge, add locked catalog refusal of holder defaults and incompatible same-name authority CHECK definitions/kinds/inheritance, including empty partial schemas; compare server-parsed canonical expressions and retain all data/catalog/history on refusal. Guarded mirrored DDL; no issuance, invented holders, expiry rewrite or deletion. Binary-only backout retains authority constraints."
+      "sha256": "cb5886ca8f3e858c26df0a020c8e15132fd12994dc447d6852ea3d86f5481396",
+      "justification": "Forward-only admin registry repair: required named human/ai_agent holders, humans-only admin and finite positive lifetime at most 7776000 seconds. Before first merge, reject noncanonical holder types under lock: require exact pg_catalog.text without a type modifier, excluding domains even without column defaults, alongside holder-default and incompatible named CHECK refusal. Preserve failed-upgrade data/type/domain/catalog/history; no coercion, invented holders, issuance, expiry rewrite or deletion. Binary-only backout retains authority constraints."
     },
     "crates/store/migrations/0461_admin_api_token_authority.sql": {
-      "sha256": "55525a512261b81f4d7bffec6314937e860de670780fb0abdde820027e18bc96",
-      "justification": "Store-chain mirror of cutover 0460: required holder authority, humans-only admin and finite positive lifetime of at most 90 elapsed days. Before first merge, reject holder defaults and incompatible same-name authority CHECK definitions/kinds/inheritance under the registry DDL lock using server-parsed canonical expressions, preserving failed-upgrade data/catalog/history; compatible no-default canonical cross-chain upgrades remain valid. No issuance, guessed holder or expiry rewrite."
+      "sha256": "99e41fa2d00f26760fe7effa4663c98952c35cb42c5c2ece762bee91e7eb4659",
+      "justification": "Store-chain mirror of cutover 0460: required holder authority, humans-only admin and finite positive lifetime at most 90 elapsed days. Before first merge, require exact unmodified pg_catalog.text holders under lock, rejecting domains with or without defaults and other noncanonical types before DDL. Retain holder-default/canonical-CHECK refusal and all data/type/domain/catalog/history; no coercion, fabricated authority or issuance. Compatible plain-TEXT no-default mirrored upgrades remain valid."
     }
   }
 }
