@@ -937,3 +937,103 @@ async fn member_snowflake_idempotency_key_is_erased_from_audit_but_retained_for_
     );
     db.close().await.unwrap();
 }
+
+/// Giveaway ids repeat across guilds, so the child predicates must scope on
+/// the child row's own guild: erasing USER in GUILD deletes the colliding
+/// A rows, the creator-owned rows, and the reroll round naming USER only in
+/// `reroll_kind`, while the same giveaway id in the other guild and
+/// unrelated members' rows survive. (Composite foreign keys bind every
+/// child row to a live `giveaways` parent, so parentless orphans are
+/// impossible; the `user_id` predicate branch still matches each entrant
+/// row directly.)
+#[tokio::test]
+async fn giveaway_erasure_is_guild_scoped_and_covers_reroll_kind() {
+    const OTHER_GUILD: &str = "1545644954272137298";
+    let Some(db) = database().await else { return };
+    sqlx::raw_sql(include_str!(
+        "fixtures/member_erasure_giveaway_collision.sql"
+    ))
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let dry = erase_member(db.pool(), GUILD, USER, ErasureMode::DryRun)
+        .await
+        .unwrap();
+    let rows = |table: &str| dry.iter().find(|row| row.table == table).unwrap().rows;
+    assert_eq!(rows("giveaway_entries"), 2);
+    assert_eq!(rows("giveaway_draws"), 3);
+    assert_eq!(rows("giveaways"), 1);
+    assert!(
+        dry.iter()
+            .filter(|row| !row.table.starts_with("giveaway"))
+            .all(|row| row.rows == 0),
+        "only giveaway tables seed rows"
+    );
+    assert_eq!(
+        erase_member(
+            db.pool(),
+            GUILD,
+            USER,
+            ErasureMode::Execute { actor: ACTOR },
+        )
+        .await
+        .unwrap(),
+        dry
+    );
+    let entries: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT guild_id, giveaway_id, user_id FROM giveaway_entries
+         ORDER BY guild_id, giveaway_id, user_id",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        entries,
+        vec![
+            (GUILD.to_owned(), "gw-v".to_owned(), OTHER.to_owned()),
+            (
+                OTHER_GUILD.to_owned(),
+                "gw-collide".to_owned(),
+                USER.to_owned()
+            ),
+        ]
+    );
+    let draws: Vec<(String, String, i32)> = sqlx::query_as(
+        "SELECT guild_id, giveaway_id, draw_no FROM giveaway_draws
+         ORDER BY guild_id, giveaway_id, draw_no",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        draws,
+        vec![
+            (GUILD.to_owned(), "gw-v".to_owned(), 0),
+            (OTHER_GUILD.to_owned(), "gw-collide".to_owned(), 0),
+        ]
+    );
+    let definitions: Vec<(String, String)> =
+        sqlx::query_as("SELECT guild_id, id FROM giveaways ORDER BY guild_id, id")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        definitions,
+        vec![
+            (GUILD.to_owned(), "gw-collide".to_owned()),
+            (GUILD.to_owned(), "gw-reroll".to_owned()),
+            (GUILD.to_owned(), "gw-v".to_owned()),
+            (OTHER_GUILD.to_owned(), "gw-collide".to_owned()),
+        ]
+    );
+    assert!(
+        erase_member(db.pool(), GUILD, USER, ErasureMode::DryRun)
+            .await
+            .unwrap()
+            .iter()
+            .all(|row| row.rows == 0),
+        "a second run reports zero"
+    );
+    assert_eq!(audit_count(db.pool()).await, 1);
+    db.close().await.unwrap();
+}
