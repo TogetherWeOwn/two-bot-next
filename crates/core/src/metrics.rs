@@ -383,6 +383,18 @@ pub const DISPATCH_LANES: &[&str] = &[
 /// single checkpoint failure stops the worker, so there is no
 /// benign-singleton case.
 pub const CHECKPOINT_FAILURE_STAGES: &[&str] = &["pre_commit", "commit"];
+
+/// Fixed reasons a raid/join-risk observer could not enqueue a join.
+#[derive(Clone, Copy)]
+pub enum JoinQueueDropReason {
+    QueueFull,
+    QueueClosed,
+}
+
+const JOIN_QUEUE_DROP_REASONS: [(&str, JoinQueueDropReason); 2] = [
+    ("queue_full", JoinQueueDropReason::QueueFull),
+    ("queue_closed", JoinQueueDropReason::QueueClosed),
+];
 /// Drop-guard names for `two_bot_drop_poison_total{guard}`: the seven guards
 /// whose `Drop` bodies recover a poisoned lock instead of panicking (which
 /// would abort the process when the drop runs during unwinding).
@@ -690,6 +702,8 @@ struct Values {
     send_admissions: [u64; SEND_ADMISSION_OUTCOMES.len()],
     prefix_trigger_refused: [u64; PREFIX_TRIGGER_REFUSED_REASONS.len()],
     dispatch_drops: [u64; DISPATCH_LANES.len()],
+    raid_dropped_joins: [u64; JOIN_QUEUE_DROP_REASONS.len()],
+    join_risk_dropped_joins: [u64; JOIN_QUEUE_DROP_REASONS.len()],
     checkpoint_failures: [u64; CHECKPOINT_FAILURE_STAGES.len()],
     presence_capture: [u64; PRESENCE_CAPTURE_OUTCOMES.len()],
     feed_fetch: [u64; FEED_FETCH_OUTCOMES.len()],
@@ -1460,6 +1474,28 @@ impl Metrics {
         *counter = counter.saturating_add(1);
     }
 
+    /// One join dropped before raid observation because its worker queue was
+    /// full or closed. No member, guild or error text is retained.
+    pub fn raid_dropped_join(&self, reason: JoinQueueDropReason) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.raid_dropped_joins[reason as usize];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One join dropped before risk scoring because its worker queue was
+    /// full or closed. Successful enqueueing records nothing here.
+    pub fn join_risk_dropped_join(&self, reason: JoinQueueDropReason) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.join_risk_dropped_joins[reason as usize];
+        *counter = counter.saturating_add(1);
+    }
+
     /// One failed gateway checkpoint commit from `apply_dispatch`: `pre_commit`
     /// when the commit was skipped after a funnel/leveling/acknowledgement
     /// failure, `commit` when the durable store write itself failed. Call once
@@ -2227,6 +2263,31 @@ impl Metrics {
                 "two_bot_dispatch_drops_total{{lane=\"{lane}\"}} {count}"
             )
             .unwrap();
+        }
+        for (name, counts) in [
+            (
+                "two_bot_raid_dropped_joins_total",
+                values.raid_dropped_joins,
+            ),
+            (
+                "two_bot_join_risk_dropped_joins_total",
+                values.join_risk_dropped_joins,
+            ),
+        ] {
+            header(
+                &mut out,
+                name,
+                "counter",
+                "Joins dropped before worker observation by bounded queue reason; no retry.",
+            );
+            for (reason, index) in JOIN_QUEUE_DROP_REASONS {
+                writeln!(
+                    out,
+                    "{name}{{reason=\"{reason}\"}} {}",
+                    counts[index as usize]
+                )
+                .unwrap();
+            }
         }
         header(
             &mut out,
