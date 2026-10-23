@@ -131,7 +131,7 @@ fn help_lists_only_handled_commands() {
     );
 }
 
-/// CONTROL (green before and after): the 29 parity builtins route to their
+/// CONTROL (green before and after): the 30 parity builtins route to their
 /// handlers. Unaffected by the templateassistant unpublish.
 #[test]
 fn parity_builtins_route_to_their_handlers() {
