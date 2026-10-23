@@ -166,7 +166,7 @@ class InventoryControls(unittest.TestCase):
         })
 
     def test_cutover_mirror_has_identical_supported_lifecycle(self):
-        sql = (self.root / "cutover/migrations/0462_admin_api_token_authority.sql").read_text()
+        sql = (self.root / "cutover/migrations/0464_admin_api_token_authority.sql").read_text()
         # Same SQL contract, but this API inventories the store chain only.
         self.assertEqual(self.scan(sql), self.scan(self.sql))
 
