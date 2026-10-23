@@ -3408,6 +3408,7 @@ fn production_router_matches_composed_production_wiring() {
             HandlerId::ScorecardAttendance,
             HandlerId::AutomationAdmin,
             HandlerId::AutomationCustom,
+            HandlerId::Giveaway,
             HandlerId::Rsvp,
             HandlerId::RsvpAttendance,
             HandlerId::Lfg,
@@ -3470,6 +3471,18 @@ fn production_router_matches_composed_production_wiring() {
                         };
                         let real = composed(gates, member_present);
                         let seam = InteractionRouter::production_router(gates, member_present);
+                        // Equal absence is not conformance: both constructors
+                        // must register the dedicated handler while enabled.
+                        for (name, router) in [("composed", &real), ("seam", &seam)] {
+                            assert_eq!(
+                                router.handler_for(&HandlerId::Giveaway).map(|h| h.id()),
+                                automations.then_some(HandlerId::Giveaway),
+                                "{name} giveaway registration follows automations \
+                                 (scorecard={scorecard} automations={automations} \
+                                 announcements={announcements} moderation={moderation} \
+                                 member={member_present})"
+                            );
+                        }
                         for id in every_handler_id() {
                             assert_eq!(
                                 real.handler_for(&id).is_some(),

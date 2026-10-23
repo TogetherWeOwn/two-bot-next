@@ -857,7 +857,7 @@ impl InteractionRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::PERM_MANAGE_EVENTS;
+    use crate::commands::{PERM_MANAGE_EVENTS, PERM_MANAGE_GUILD};
     use std::collections::HashMap;
 
     const GUILD: u64 = 2222;
@@ -933,7 +933,7 @@ mod tests {
             ("schedule-list", HandlerId::AutomationAdmin),
             ("sticky", HandlerId::AutomationAdmin),
             ("sticky-remove", HandlerId::AutomationAdmin),
-            ("giveaway", HandlerId::AutomationAdmin),
+            ("giveaway", HandlerId::Giveaway),
             ("rsvp", HandlerId::Rsvp),
             ("rsvp-attendance", HandlerId::RsvpAttendance),
             ("lfg", HandlerId::Lfg),
@@ -1152,6 +1152,69 @@ mod tests {
             r.route_slash(&ctx("rank", None, None)),
             SlashOutcome::Ignore
         );
+    }
+
+    #[test]
+    fn giveaway_requires_manage_guild_for_its_dedicated_handler() {
+        let r = router();
+        for permissions in [None, Some(0), Some(PERM_MANAGE_EVENTS)] {
+            assert_eq!(
+                r.route_slash(&ctx("giveaway", Some(GUILD), permissions)),
+                SlashOutcome::Refuse {
+                    refusal: RouterRefusal::ManageServerRequired
+                },
+                "giveaway refuses without Manage Guild: {permissions:?}",
+            );
+        }
+        assert_eq!(
+            r.route_slash(&ctx("giveaway", Some(GUILD), Some(PERM_MANAGE_GUILD))),
+            SlashOutcome::Handled {
+                handler: HandlerId::Giveaway
+            }
+        );
+    }
+
+    #[test]
+    fn giveaway_automation_gate_precedes_its_permission_check() {
+        let off = InteractionRouter::new(RouterGates {
+            automations: false,
+            ..all_on()
+        });
+        for permissions in [None, Some(0), Some(PERM_MANAGE_GUILD), Some(u64::MAX)] {
+            assert_eq!(
+                off.route_slash(&ctx("giveaway", Some(GUILD), permissions)),
+                SlashOutcome::Refuse {
+                    refusal: RouterRefusal::AutomationsDisabled
+                },
+                "disabled giveaway refuses before checking permissions: {permissions:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn giveaway_guild_fence_precedes_its_feature_and_permission_gates() {
+        for (configured_guild, guild_id) in [
+            (Some(GUILD), None),
+            (Some(GUILD), Some(9999)),
+            (None, None),
+            (None, Some(GUILD)),
+            (None, Some(9999)),
+        ] {
+            for automations in [false, true] {
+                let r = InteractionRouter::new(RouterGates {
+                    configured_guild,
+                    automations,
+                    ..all_on()
+                });
+                for permissions in [None, Some(u64::MAX)] {
+                    assert_eq!(
+                        r.route_slash(&ctx("giveaway", guild_id, permissions)),
+                        SlashOutcome::Ignore,
+                        "giveaway stays fenced: configured={configured_guild:?}, guild={guild_id:?}, automations={automations}, permissions={permissions:?}",
+                    );
+                }
+            }
+        }
     }
 
     #[test]
