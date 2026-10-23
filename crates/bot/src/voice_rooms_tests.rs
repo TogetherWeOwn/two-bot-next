@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 use serde_json::json;
 use std::sync::atomic::AtomicUsize;
@@ -15,10 +17,16 @@ mod cold_authority;
 mod creation_receipt_acceptance;
 #[path = "voice_delete_guard_tests.rs"]
 mod delete_guards;
+#[path = "voice_disconnect_loud_acceptance_tests.rs"]
+mod disconnect_loud_acceptance_tests;
 #[path = "voice_disconnect_poison_acceptance_tests.rs"]
 mod drop_poison_acceptance_tests;
 #[path = "voice_empty_grace_override_tests.rs"]
 mod empty_grace_override;
+#[path = "event_voice_channels_acceptance_tests.rs"]
+mod event_voice_channels_acceptance;
+#[path = "event_voice_channels_regression_tests.rs"]
+mod event_voice_channels_regression;
 #[path = "voice_actor_fair_scheduling_acceptance_tests.rs"]
 mod fair_scheduling_acceptance;
 #[path = "voice_invite_override_tests.rs"]
@@ -245,6 +253,9 @@ struct Store {
     /// V4 audit rows appended so far, in append order.
     kick_audit: Mutex<Vec<KickAuditRow>>,
     kick_audit_errors: Mutex<VecDeque<StoreError>>,
+    /// Scripted live event-voice bindings for the guild repair; empty by
+    /// default, so the repair is a no-op unless the test seeds a binding.
+    ev_bindings: Mutex<Vec<EventVoiceBinding>>,
 }
 
 impl Store {
@@ -302,6 +313,7 @@ impl Store {
             save_custom_name_errors: Mutex::new(VecDeque::new()),
             kick_audit: Mutex::new(Vec::new()),
             kick_audit_errors: Mutex::new(VecDeque::new()),
+            ev_bindings: Mutex::new(Vec::new()),
         }
     }
 }
@@ -519,6 +531,50 @@ impl RoomPersistence for Store {
         self.owner_intents.lock().unwrap().remove(&channel);
         self.owner_pending.lock().unwrap().remove(&channel);
         Ok(())
+    }
+    async fn record_event_voice_join(&self, channel: u64, member: u64) -> Result<(), StoreError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("evjoin:{channel}:{member}"));
+        Ok(())
+    }
+    async fn record_event_voice_leave(&self, channel: u64, member: u64) -> Result<(), StoreError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("evleave:{channel}:{member}"));
+        Ok(())
+    }
+    async fn event_voice_guild_bindings(
+        &self,
+        _: u64,
+    ) -> Result<Vec<EventVoiceBinding>, StoreError> {
+        Ok(self.ev_bindings.lock().unwrap().clone())
+    }
+    async fn flush_event_voice_presence(
+        &self,
+        event_id: &str,
+        _: OffsetDateTime,
+        occupants: &[u64],
+    ) -> Result<u64, StoreError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("evrepair_flush:{event_id}:{}", occupants.len()));
+        Ok(0)
+    }
+    async fn close_event_voice_spans_absent(
+        &self,
+        event_id: &str,
+        _: OffsetDateTime,
+        present: &[u64],
+    ) -> Result<u64, StoreError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("evrepair_close:{event_id}:{}", present.len()));
+        Ok(0)
     }
     async fn claim_create(
         &self,
@@ -5123,9 +5179,12 @@ async fn creator_join_moves_without_waiting_for_the_actor_tick() {
         tokio::task::yield_now().await;
     }
     assert_eq!(received.elapsed(), Duration::ZERO);
+    // The presence hook records each join ahead of room handling.
     assert_eq!(
         *trace.lock().unwrap(),
         [
+            "evjoin:200:300",
+            "evjoin:200:301",
             "create",
             "persist:500",
             "move:300:500",
@@ -5166,9 +5225,18 @@ async fn runtime_actor_creates_persists_and_moves_room() {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    // The join is recorded twice: once by the buffered transition, once by
+    // the bootstrap occupant flush (the store join is idempotent, so the
+    // second write is a no-op in production).
     assert_eq!(
         *trace.lock().unwrap(),
-        ["create", "persist:500", "move:300:500"]
+        [
+            "evjoin:200:300",
+            "evjoin:200:300",
+            "create",
+            "persist:500",
+            "move:300:500"
+        ]
     );
 }
 
@@ -7552,16 +7620,23 @@ fn plan_creator(plan: TextChannelsPlan) -> CreatorChannel {
 }
 
 #[test]
-fn decide_text_channels_defaults_to_on_and_keeps_unset_fields() {
+fn decide_text_channels_absent_toggle_keeps_the_stored_value() {
     let base = CreatorChannel::new(GUILD, CREATOR);
     let creator = plan_creator(decide_text_channels(
         Some(base.clone()),
         &request(None, None, None),
     ));
-    assert!(creator.text_channels, "omitted toggle turns companions on");
+    assert!(
+        !creator.text_channels,
+        "absent toggle preserves stored off, never enables"
+    );
     assert_eq!(creator.text_channel_name, None);
     assert_eq!(creator.text_viewer_role_id, None);
     assert_eq!(creator.name_template, base.name_template);
+    let mut on = CreatorChannel::new(GUILD, CREATOR);
+    on.text_channels = true;
+    let kept = plan_creator(decide_text_channels(Some(on), &request(None, None, None)));
+    assert!(kept.text_channels, "absent toggle preserves stored on");
 }
 
 #[test]
@@ -7684,9 +7759,20 @@ async fn handle_textchannels_refuses_without_manage_channels() {
 }
 
 #[tokio::test]
-async fn handle_textchannels_saves_settings_for_a_creator_channel() {
+async fn handle_textchannels_preserves_stored_toggle_on_rename_only() {
     let trace = Trace::default();
-    let runtime = test_runtime(trace.clone());
+    let runtime = VoiceRuntime::new(
+        {
+            let trace = trace.clone();
+            move || {
+                let store = Store::new(trace.clone());
+                store.creators.lock().unwrap()[0].text_channels = true;
+                (store, Http::new(trace.clone()))
+            }
+        },
+        Duration::from_millis(10),
+        true,
+    );
     let interaction = textchannels_interaction(
         vec![
             typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
@@ -7945,15 +8031,14 @@ fn decide_position_refuses_empty_and_bad_numbers() {
 }
 
 #[test]
-fn decide_group_defaults_to_on() {
-    let on = match decide_group(
+fn decide_group_refuses_without_a_toggle() {
+    let GroupPlan::Refuse { message } = decide_group(
         Some(CreatorChannel::new(GUILD, CREATOR)),
         &GroupRequest { enabled: None },
-    ) {
-        GroupPlan::Update(creator) => creator,
-        GroupPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    ) else {
+        panic!("absent toggle refuses, never enables by default");
     };
-    assert!(on.group_by_category);
+    assert!(message.contains("group"), "{message}");
     let off = match decide_group(
         Some(CreatorChannel::new(GUILD, CREATOR)),
         &GroupRequest {
@@ -8123,15 +8208,14 @@ fn decide_default_limit_sets_and_clears() {
 }
 
 #[test]
-fn decide_always_private_defaults_to_on() {
-    let on = match decide_always_private(
+fn decide_always_private_refuses_without_a_toggle() {
+    let AlwaysPrivatePlan::Refuse { message } = decide_always_private(
         Some(CreatorChannel::new(GUILD, CREATOR)),
         &AlwaysPrivateRequest { enabled: None },
-    ) {
-        AlwaysPrivatePlan::Update(creator) => creator,
-        AlwaysPrivatePlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    ) else {
+        panic!("absent toggle refuses, never enables by default");
     };
-    assert!(on.private_default);
+    assert!(message.contains("private"), "{message}");
     let off = match decide_always_private(
         Some(CreatorChannel::new(GUILD, CREATOR)),
         &AlwaysPrivateRequest {
@@ -8372,7 +8456,7 @@ async fn handle_defaultlimit_saves_the_limit() {
 }
 
 #[tokio::test]
-async fn handle_alwaysprivate_saves_the_default() {
+async fn handle_alwaysprivate_refuses_without_enabled() {
     let trace = Trace::default();
     let runtime = test_runtime(trace.clone());
     let interaction = v8_interaction(
@@ -8385,13 +8469,18 @@ async fn handle_alwaysprivate_saves_the_default() {
     let (owned, response) = handle_capture(&runtime, &interaction).await;
     assert!(owned);
     assert!(
-        response_text(response.as_ref().expect("reply")).contains("private"),
-        "alwaysprivate defaults on and reports it"
+        response_text(response.as_ref().expect("reply"))
+            .contains("Choose whether new rooms start private, then try again."),
+        "alwaysprivate refuses an absent toggle instead of defaulting on"
     );
-    assert!(trace
-        .lock()
-        .unwrap()
-        .contains(&format!("add_creator:{CREATOR}")));
+    assert!(
+        !trace
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.starts_with("add_creator")),
+        "a refused toggle writes nothing"
+    );
 }
 
 #[test]
@@ -16290,4 +16379,49 @@ async fn global_429_requeues_and_resumes_without_losing_the_move() {
     dispatch(&mut worker, 2_000).await;
     assert_eq!(worker.queue.pending_counts(GUILD), (0, 0));
     assert_eq!(worker.queue.oldest_pending_age(GUILD), None);
+}
+
+#[test]
+fn voice_claims_custom_id_matches_sink_shapes() {
+    use two_bot_core::voice_custom_id::{join_custom_id, name_modal_custom_id};
+    use two_bot_core::voice_private::JoinDecision;
+
+    let room = 777_000_111_222_333_444u64;
+    let request = 888_000_111_222_333_444u64;
+    let bare = join_custom_id(JoinDecision::Approve, room, request);
+    // Production runtime shape: codec core plus the 32-hex worker epoch.
+    let runtime = format!("{bare}:0123456789abcdef0123456789abcdef");
+    assert!(voice_claims_custom_id(&bare), "bare join button");
+    assert!(
+        voice_claims_custom_id(&runtime),
+        "epoch-suffixed join button"
+    );
+    assert!(
+        voice_claims_custom_id(&name_modal_custom_id(room)),
+        "name modal"
+    );
+    assert!(
+        voice_claims_custom_id("votekick:7000000111222333444:yes"),
+        "ballot yes"
+    );
+    assert!(
+        voice_claims_custom_id("votekick:7000000111222333444:no"),
+        "ballot no"
+    );
+    let short_epoch = format!("{bare}:0123456789abcdef0123456789abcde");
+    let upper_epoch = format!("{bare}:0123456789ABCDEF0123456789ABCDEF");
+    let nonhex_epoch = format!("{bare}:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz");
+    for unowned in [
+        "two:stale-widget:deadbeef",
+        "two:voice:join-approve:notanid:7",
+        "two:voice:join-approve:500",
+        short_epoch.as_str(),
+        upper_epoch.as_str(),
+        nonhex_epoch.as_str(),
+        "votekick:7000000111222333444:maybe",
+        "votekick:notanid:yes",
+        "votekick:7000000111222333444",
+    ] {
+        assert!(!voice_claims_custom_id(unowned), "unowned: {unowned}");
+    }
 }

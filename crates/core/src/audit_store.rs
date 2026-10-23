@@ -119,11 +119,25 @@ pub enum DeliveryFailure {
     UncertainAcceptance,
 }
 
+/// Result of spending a reconciliation scan budget under a live owner fence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReconcileBound {
+    Yielded,
+    Quarantined,
+    LostClaim,
+}
+
+// A durable first-bound classification, preserved by ambiguous read failures.
+// Two bound hits terminate; neither is counted as a Discord POST attempt.
+const RECONCILE_SCAN_BOUND: &str = "discord_reconcile_scan_bound";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuarantineReason {
     MarkerMissing,
     PermissionRevoked,
     EvidenceConflict,
+    /// Two scans spent their budget without proving presence or absence.
+    ScanBoundExceeded,
 }
 
 impl QuarantineReason {
@@ -132,6 +146,7 @@ impl QuarantineReason {
             Self::MarkerMissing => "discord_marker_missing",
             Self::PermissionRevoked => "mirror_channel_permission_revoked",
             Self::EvidenceConflict => "delivery_evidence_conflict",
+            Self::ScanBoundExceeded => "discord_reconcile_scan_exhausted",
         }
     }
 }
@@ -529,7 +544,8 @@ impl AuditStore {
         let updated = sqlx::query(
             "UPDATE operational_audit_log SET delivery_state = 'pending',
                delivery_claim_token = NULL, delivery_lease_until = NULL,
-               delivery_last_error = $4,
+               delivery_last_error = CASE
+                 WHEN NOT $5 AND delivery_last_error = $6 THEN delivery_last_error ELSE $4 END,
                delivery_yielded_at = clock_timestamp(),
                delivery_search_before = CASE WHEN $5 THEN NULL ELSE delivery_search_before END
              WHERE entry_id = $1 AND delivery_claim_token = $2 AND delivery_generation = $3
@@ -545,12 +561,55 @@ impl AuditStore {
             "discord_post_ambiguous"
         })
         .bind(definite)
+        .bind(RECONCILE_SCAN_BOUND)
         .execute(&mut *tx)
         .await?
         .rows_affected()
             == 1;
         tx.commit().await?;
         Ok(updated)
+    }
+
+    /// Yield the first bounded scan, then quarantine on the second bound hit.
+    /// The first-hit classification lives in `delivery_last_error`, survives
+    /// claims/restarts and uncertain reads, and never authorizes another POST.
+    /// This is a two-state retry budget, not proof of a missing marker. Both
+    /// transitions preserve the original boundary, nonce and POST attempt count.
+    pub(crate) async fn bound_reconcile_scan(
+        &self,
+        claim: &AuditClaim,
+    ) -> Result<ReconcileBound, AuditStoreError> {
+        if claim.intent() != DeliveryIntent::Reconcile {
+            return Ok(ReconcileBound::LostClaim);
+        }
+        let mut tx = self.pool.begin().await?;
+        lock_row(&mut tx, &claim.row.event.entry_id).await?;
+        let state: Option<String> = sqlx::query_scalar(
+            "UPDATE operational_audit_log SET
+               delivery_state = CASE WHEN delivery_last_error = $4
+                 THEN 'quarantined' ELSE 'pending' END,
+               delivery_last_error = CASE WHEN delivery_last_error = $4 THEN $5 ELSE $4 END,
+               delivery_claim_token = NULL, delivery_lease_until = NULL,
+               delivery_yielded_at = clock_timestamp()
+             WHERE entry_id = $1 AND delivery_claim_token = $2 AND delivery_generation = $3
+               AND delivery_state = 'delivering' AND delivery_lease_until > clock_timestamp()
+               AND delivery_search_before IS NOT NULL AND mirror_message_id IS NULL
+             RETURNING delivery_state",
+        )
+        .bind(&claim.row.event.entry_id)
+        .bind(claim.token.expose())
+        .bind(claim.generation)
+        .bind(RECONCILE_SCAN_BOUND)
+        .bind(QuarantineReason::ScanBoundExceeded.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        match state.as_deref() {
+            Some("pending") => Ok(ReconcileBound::Yielded),
+            Some("quarantined") => Ok(ReconcileBound::Quarantined),
+            None => Ok(ReconcileBound::LostClaim),
+            _ => Err(AuditStoreError::Invalid("bounded scan state")),
+        }
     }
 
     /// Renew an active owner only; expiration cannot be undone by a stale

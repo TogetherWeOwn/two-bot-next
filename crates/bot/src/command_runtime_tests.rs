@@ -17,6 +17,8 @@
 
 #![cfg(test)]
 
+#[path = "member_authority_cause_acceptance.rs"]
+mod member_authority_cause_acceptance;
 #[path = "member_dispatch_authority_acceptance.rs"]
 mod member_dispatch_authority_acceptance;
 #[path = "sticky_uncertain_acceptance_tests.rs"]
@@ -10776,4 +10778,251 @@ async fn privacy_command_repeat_opt_out_skips_purge_and_cooldown_blocks_rapid_re
     );
     mock.shutdown().await;
     db.close().await.expect("drop own disposable database");
+}
+
+// ---------------------------------------------------------------------------
+// Stale-control review pins: voice-epoch/ballot silence, cross-channel stale
+// replies, and split bot-author arms. The protected acceptance module owns the
+// normative suite; these pin the review fixes without touching it.
+// ---------------------------------------------------------------------------
+
+fn stale_unknown_component(
+    custom_id: &str,
+    component_type: ComponentType,
+    values: Vec<String>,
+) -> Interaction {
+    let mut interaction = slash("unused", Some(CHANNEL), Vec::new());
+    interaction.kind = InteractionType::MessageComponent;
+    interaction.data = Some(InteractionData::MessageComponent(Box::new(
+        MessageComponentInteractionData {
+            custom_id: custom_id.to_owned(),
+            component_type,
+            resolved: None,
+            values,
+        },
+    )));
+    interaction
+}
+
+fn assert_one_expired_reply(requests: &[RestRequest]) {
+    use two_bot_core::router::replies::EXPIRED_COMPONENT_REPLY;
+
+    assert_eq!(requests.len(), 1, "one callback, zero other effects");
+    let request = &requests[0];
+    assert_eq!(request.method, "POST");
+    assert!(
+        request.path.ends_with("/callback"),
+        "callback path: {}",
+        request.path
+    );
+    let reply: serde_json::Value = serde_json::from_slice(&request.body).expect("reply json");
+    assert_eq!(reply["type"], 4, "immediate response, not a defer");
+    assert_eq!(reply["data"]["flags"], 64, "ephemeral");
+    assert_eq!(reply["data"]["content"], EXPIRED_COMPONENT_REPLY);
+}
+
+#[tokio::test]
+async fn epoch_suffixed_voice_join_stays_silent() {
+    use two_bot_core::voice_custom_id::join_custom_id;
+    use two_bot_core::voice_private::JoinDecision;
+
+    let room = 777_000_111_222_333_444u64;
+    let request = 888_000_111_222_333_444u64;
+    // Production runtime shape, not the bare codec id.
+    let custom_id = format!(
+        "{}:0123456789abcdef0123456789abcdef",
+        join_custom_id(JoinDecision::Approve, room, request)
+    );
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    let button = stale_unknown_component(&custom_id, ComponentType::Button, Vec::new());
+    runtime.on_interaction(&button).await;
+    assert!(
+        mock.requests().is_empty(),
+        "epoch-suffixed join belongs to the voice sink: silence"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn votekick_ballot_buttons_stay_silent() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    for custom_id in [
+        "votekick:7000000111222333444:yes",
+        "votekick:7000000111222333444:no",
+    ] {
+        let button = stale_unknown_component(custom_id, ComponentType::Button, Vec::new());
+        runtime.on_interaction(&button).await;
+    }
+    assert!(
+        mock.requests().is_empty(),
+        "ballots belong to the voice sink: silence"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn bot_only_on_member_user_stays_silent() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    let mut button = stale_unknown_component(
+        "two:stale-widget:deadbeef",
+        ComponentType::Button,
+        Vec::new(),
+    );
+    button
+        .member
+        .as_mut()
+        .expect("guild member")
+        .user
+        .as_mut()
+        .expect("member user")
+        .bot = true;
+    assert!(
+        !button.user.as_ref().expect("top-level user").bot,
+        "top-level user stays non-bot: pins the member arm alone"
+    );
+    runtime.on_interaction(&button).await;
+    assert!(
+        mock.requests().is_empty(),
+        "bot on member.user only stays silent"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn bot_only_on_top_level_user_stays_silent() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    let mut button = stale_unknown_component(
+        "two:stale-widget:deadbeef",
+        ComponentType::Button,
+        Vec::new(),
+    );
+    button.user.as_mut().expect("top-level user").bot = true;
+    assert!(
+        !button
+            .member
+            .as_ref()
+            .expect("guild member")
+            .user
+            .as_ref()
+            .expect("member user")
+            .bot,
+        "member.user stays non-bot: pins the top-level arm alone"
+    );
+    runtime.on_interaction(&button).await;
+    assert!(
+        mock.requests().is_empty(),
+        "bot on top-level user only stays silent"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn cross_channel_replaced_self_role_gets_expired_reply() {
+    use std::collections::HashSet;
+    use two_bot_core::self_roles::{
+        self_role_custom_id, PanelMode, SelfRoleGates, SelfRoleOption, SelfRolePanel,
+    };
+    use two_bot_cutover::self_role_store::SelfRoleStore;
+
+    use crate::self_role_handlers::SelfRoleService;
+    use crate::self_role_runtime::SelfRoleRuntime;
+
+    const SR_GUILD: u64 = 100_000_000_000_000_001;
+    const OLD_CHANNEL: u64 = 100_000_000_000_000_007;
+    const OLD_MESSAGE: u64 = 100_000_000_000_000_008;
+    const NEW_CHANNEL: &str = "100000000000000017";
+    const NEW_MESSAGE: &str = "100000000000000018";
+    const SR_USER: u64 = 100_000_000_000_000_002;
+    const SR_BOT: &str = "100000000000000003";
+    const SR_EVENT: u64 = 100_000_000_000_000_011;
+
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+        .expect("lazy pool");
+    let executor = ActionExecutor::with_proxy("test-token".to_owned(), Some(origin.clone()))
+        .expect("mock executor");
+    // The panel moved to a new channel and message; the old source survives.
+    let service = Arc::new(
+        SelfRoleService::new(
+            SelfRoleRuntime {
+                store: SelfRoleStore::new(pool.clone()),
+                executor: executor.clone(),
+                guild_id: SR_GUILD.to_string(),
+                bot_id: SR_BOT.to_owned(),
+            },
+            SelfRoleGates {
+                panels: vec![SelfRolePanel {
+                    id: "games".into(),
+                    channel_id: NEW_CHANNEL.into(),
+                    message_id: NEW_MESSAGE.into(),
+                    mode: PanelMode::Button,
+                    exclusive: false,
+                    color: false,
+                    options: vec![SelfRoleOption {
+                        key: "new".into(),
+                        label: "New".into(),
+                        role_id: "100000000000000004".into(),
+                        permissions: "0".into(),
+                        emoji: None,
+                        description: None,
+                    }],
+                }],
+                dry_run: false,
+            },
+            &[SR_GUILD.to_string()].into_iter().collect::<HashSet<_>>(),
+        )
+        .expect("self-role service"),
+    );
+    let runtime = CommandRuntime::new_with_self_roles(
+        pool,
+        executor,
+        router_with_commands(RouterGates {
+            configured_guild: Some(SR_GUILD),
+            scorecard: false,
+            automations: true,
+            announcements: true,
+            moderation: false,
+            voice: false,
+            voice_assistant: false,
+            tickets: false,
+            self_roles: true,
+            onboarding_picker: false,
+            session_picker: false,
+        }),
+        SR_GUILD,
+        true,
+        service,
+    );
+    // A press on the old panel message in the old channel.
+    let mut press = slash("unused", Some(OLD_CHANNEL), Vec::new());
+    press.guild_id = Some(Id::new(SR_GUILD));
+    press.id = Id::new(SR_EVENT);
+    press.kind = InteractionType::MessageComponent;
+    press
+        .member
+        .as_mut()
+        .expect("guild member")
+        .user
+        .as_mut()
+        .expect("member user")
+        .id = Id::new(SR_USER);
+    let mut source = message(1, OLD_CHANNEL, false, Some(SR_GUILD));
+    source.id = Id::new(OLD_MESSAGE);
+    press.message = Some(source);
+    press.data = Some(InteractionData::MessageComponent(Box::new(
+        MessageComponentInteractionData {
+            custom_id: self_role_custom_id("games", Some("new")),
+            component_type: ComponentType::Button,
+            resolved: None,
+            values: Vec::new(),
+        },
+    )));
+    runtime.on_interaction(&press).await;
+    assert_one_expired_reply(&mock.requests());
+    mock.shutdown().await;
 }
