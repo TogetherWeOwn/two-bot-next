@@ -17,6 +17,7 @@ use std::sync::{
     Arc,
 };
 
+use crate::community_classifier::classifier_config_from_live;
 use crate::onboarding::OnboardingJob;
 
 use futures_util::StreamExt as _;
@@ -826,7 +827,7 @@ fn event_guild_id(event: &Event) -> String {
     }
 }
 
-/// Per-message classifier refresh from the poller-published snapshot: the
+/// Per-fact classifier refresh from the poller-published snapshot: the
 /// deployment environment is the base, stored channel and exclusion sets
 /// overlay it (all seven are `HOT_WIRED`, so only they can arrive from the
 /// snapshot). Parked or pre-first-poll readers layer nothing and the
@@ -835,10 +836,15 @@ fn refresh_channel_classifier_from_poller<I: InviteSource>(
     pipeline: &GatewayPipeline<I>,
     event: &Event,
 ) {
-    let Event::MessageCreate(msg) = event else {
-        return;
+    let guild_id = match event {
+        Event::MessageCreate(message) => message.guild_id,
+        Event::VoiceStateUpdate(update) => update.guild_id,
+        Event::MemberAdd(member) => Some(member.guild_id),
+        Event::MemberUpdate(member) => Some(member.guild_id),
+        Event::MemberRemove(member) => Some(member.guild_id),
+        _ => None,
     };
-    let Some(guild_id) = msg.guild_id else {
+    let Some(guild_id) = guild_id else {
         return;
     };
     let Some(live) = crate::settings_jobs::live() else {
@@ -850,36 +856,6 @@ fn refresh_channel_classifier_from_poller<I: InviteSource>(
         &guild_id.get().to_string(),
         &live,
     ));
-}
-
-/// Classifier config with one guild's stored channel and exclusion sets
-/// layered over the deployment environment: stored rows win, deleted rows
-/// fall back to the boot value (the automod `layered_vars` shape). Only
-/// the seven classifier keys overlay, so the paired facts-sink config
-/// keeps its environment values for every other field.
-fn classifier_config_from_live(
-    deployment: &HashMap<String, String>,
-    guild_id: &str,
-    live: &two_bot_core::settings::LiveSettings,
-) -> two_bot_core::ClassifierConfig {
-    let mut vars = deployment.clone();
-    vars.extend(
-        live.env_snapshot(Some(guild_id))
-            .into_iter()
-            .filter(|(key, _)| {
-                matches!(
-                    key.as_str(),
-                    "TWO_COMMUNITY_HUMAN_CHANNEL_IDS"
-                        | "TWO_COMMUNITY_WELCOME_CHANNEL_IDS"
-                        | "TWO_COMMUNITY_AUTOMATION_ACTOR_IDS"
-                        | "TWO_COMMUNITY_RAID_ACTOR_IDS"
-                        | "TWO_COMMUNITY_STAGING_ACTOR_IDS"
-                        | "TWO_COMMUNITY_STAGING_GUILD_IDS"
-                        | "TWO_COMMUNITY_TEST_ACTOR_IDS"
-                )
-            }),
-    );
-    two_bot_core::ClassifierConfig::from_map(&vars)
 }
 
 /// One blocking-worker dispatch step: run the funnel/leveling drain, await the
@@ -980,7 +956,7 @@ fn apply_dispatch<I: InviteSource>(
             checkpoint.sequence,
         );
         // Stored channel and exclusion sets reclassify live: refresh
-        // before the funnel stamps this message's channel class.
+        // before the funnel and deferred writers classify this dispatch's facts.
         refresh_channel_classifier_from_poller(pipeline, &dispatch.event);
         // Exactly one funnel call per dispatch, then drain deferred
         // XP awards through the leveling runtime under the
