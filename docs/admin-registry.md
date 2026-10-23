@@ -48,10 +48,13 @@ identifier override is introduced by this repair.
 
 ## Upgrade and backout
 
-The forward file runs in the normal SQLx migration transaction. Columns are
-added without defaults, made NOT NULL, and checked with validated constraints.
-Guarded constraint creation lets either chain run first and the other repeat the
-same DDL without changing valid registry rows.
+The forward file runs in the normal SQLx migration transaction. It locks the
+registry before inspecting the catalog and refuses any existing `holder_id` or
+`holder_kind` default, even on an empty partial schema. It never drops defaults
+or silently repairs fallback authority. Compatible partial schemas without
+defaults may upgrade: missing columns are added without defaults, made NOT NULL,
+and checked with validated constraints. Guarded constraint creation lets either
+chain run first and the other repeat the same DDL without changing valid rows.
 
 Any existing historical row lacks a named holder. The upgrade therefore aborts
 atomically, preserving the original rows, schema and migration history. It does
@@ -99,8 +102,10 @@ classification requires security review on the exact repair head before merge.
 Independent acceptance lives in `admin_registry_repair_acceptance` and
 `admin_token_registry_acceptance`. Both real migration chains are exercised on
 the guarded disposable test service, including atomic refusal of a populated
-historical schema, exact 90-day positives, malformed authority, AI admin, invalid
-updates and nonfinite/overlong lifetimes. Existing backup roundtrip, erasure
+historical schema, empty/populated defaulted partial-schema refusal and catalog
+preservation, compatible no-default upgrades, actual omitted-holder INSERTs,
+exact 90-day positives, malformed authority, AI admin, invalid updates and
+nonfinite/overlong lifetimes. Existing backup roundtrip, erasure
 schema coverage and cross-chain convergence suites remain required regressions.
 Follow [contribution test-database rules](../CONTRIBUTING.md#database-tests) and
 [controller build rules](../AGENTS.md#controller-builds); never test or migrate

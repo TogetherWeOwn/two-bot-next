@@ -7,6 +7,19 @@
 -- An operator must reconcile incompatible rows before retrying; this migration
 -- does not authorize that action. Backout is binary-only: keep these constraints.
 
+-- Freeze the catalog before inspection: a partial schema must not supply
+-- fallback authority, even when empty or when its existing rows are valid.
+LOCK TABLE admin_api_tokens IN ACCESS EXCLUSIVE MODE;
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_attribute
+             WHERE attrelid = 'admin_api_tokens'::regclass
+               AND attname IN ('holder_id', 'holder_kind')
+               AND NOT attisdropped AND atthasdef) THEN
+    RAISE EXCEPTION 'admin_api_tokens holder columns must not have defaults';
+  END IF;
+END $$;
+
 ALTER TABLE admin_api_tokens ADD COLUMN IF NOT EXISTS holder_id TEXT;
 ALTER TABLE admin_api_tokens ADD COLUMN IF NOT EXISTS holder_kind TEXT;
 ALTER TABLE admin_api_tokens ALTER COLUMN holder_id SET NOT NULL;
