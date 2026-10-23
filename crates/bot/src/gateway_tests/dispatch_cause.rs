@@ -43,6 +43,11 @@ const SKIP_COUNTER: &str = "two_bot_gateway_drain_skips_total";
 
 const METRICS_DOC: &str = include_str!("../../../../docs/metrics.md");
 
+/// Serializes the process-global drain-skip counter windows. Both schema-gap
+/// tests hold this from before their baseline through their final assertion,
+/// so a sibling increment can never satisfy a missing-increment mutant.
+static DRAIN_SKIP_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn database() -> Option<TestDatabase> {
     let url = match std::env::var("TWO_TEST_DATABASE_URL") {
         Ok(url) => url,
@@ -349,6 +354,7 @@ async fn leveling_drain_missing_table_skips_with_metric_and_advances_cursor() {
     );
     let mut peer = Peer::new().await;
     let Running { store, stop, task } = start_runner(pool, &peer, pool).await;
+    let _skip_guard = DRAIN_SKIP_GUARD.lock().await;
     let skips_before = drain_skip_count();
     let (outcome, logs) = run_message_dispatch(&mut peer, &store, task).await;
     match outcome {
@@ -362,11 +368,15 @@ async fn leveling_drain_missing_table_skips_with_metric_and_advances_cursor() {
         "skip warn must name the SQLSTATE, got:\n{logs}"
     );
     let skips_after = drain_skip_count();
-    assert!(
-        skips_after > skips_before,
-        "skipped drain must increment {SKIP_COUNTER}: before={skips_before}, after={skips_after}"
+    assert_eq!(
+        skips_after,
+        skips_before + 1,
+        "skipped drain must increment {SKIP_COUNTER} exactly once: before={skips_before}, after={skips_after}"
     );
     peer.close().await;
+    db.close()
+        .await
+        .expect("drop dispatch-cause 42P01 fixture database");
 }
 
 #[tokio::test]
@@ -416,6 +426,7 @@ async fn leveling_drain_permission_gap_skips_with_metric_and_advances_cursor() {
     );
     let mut peer = Peer::new().await;
     let Running { store, stop, task } = start_runner(pool, &peer, &role_pool).await;
+    let _skip_guard = DRAIN_SKIP_GUARD.lock().await;
     let skips_before = drain_skip_count();
     let (outcome, logs) = run_message_dispatch(&mut peer, &store, task).await;
     match outcome {
@@ -429,11 +440,16 @@ async fn leveling_drain_permission_gap_skips_with_metric_and_advances_cursor() {
         "skip warn must name the SQLSTATE, got:\n{logs}"
     );
     let skips_after = drain_skip_count();
-    assert!(
-        skips_after > skips_before,
-        "skipped drain must increment {SKIP_COUNTER}: before={skips_before}, after={skips_after}"
+    assert_eq!(
+        skips_after,
+        skips_before + 1,
+        "skipped drain must increment {SKIP_COUNTER} exactly once: before={skips_before}, after={skips_after}"
     );
     peer.close().await;
+    role_pool.close().await;
+    db.close()
+        .await
+        .expect("drop dispatch-cause 42501 fixture database");
 }
 
 #[tokio::test]
@@ -505,6 +521,9 @@ async fn leveling_drain_check_violation_holds_cursor_with_cause_and_sanitized_lo
         "failure logs must not echo SQL error text"
     );
     peer.close().await;
+    db.close()
+        .await
+        .expect("drop dispatch-cause 23514 fixture database");
 }
 
 #[tokio::test]
@@ -531,6 +550,9 @@ async fn leveling_drain_success_commits_and_writes_season_xp() {
         "the control drain must write the member's seasonal XP row"
     );
     peer.close().await;
+    db.close()
+        .await
+        .expect("drop dispatch-cause healthy fixture database");
 }
 
 #[test]
