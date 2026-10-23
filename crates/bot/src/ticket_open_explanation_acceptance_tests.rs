@@ -185,21 +185,86 @@ fn assert_no_mutating_discord(requests: &[RestRequest]) {
     );
 }
 
-/// Parse the first `<t:SECONDS:STYLE>` in a reply. Returns (seconds, style).
-fn discord_timestamp(reply: &str) -> Option<(u64, char)> {
-    let start = reply.find("<t:")? + 3;
-    let rest = &reply[start..];
-    let colon = rest.find(':')?;
-    let end = rest.find('>')?;
-    if colon > end {
-        return None;
+/// Parse every complete `<t:SECONDS:STYLE>` token, retaining order and style.
+/// Malformed tokens fail rather than masquerading as an omitted timestamp.
+fn discord_timestamps(reply: &str) -> Vec<(u64, char)> {
+    let mut timestamps = Vec::new();
+    let mut rest = reply;
+    while let Some(start) = rest.find("<t:") {
+        let (token, suffix) = rest[start + 3..]
+            .split_once('>')
+            .expect("Discord timestamp must be terminated");
+        let (seconds, style) = token
+            .split_once(':')
+            .expect("Discord timestamp must include its style");
+        let seconds = seconds.parse().expect("Discord timestamp seconds");
+        let mut chars = style.chars();
+        let style = chars.next().expect("Discord timestamp style");
+        assert!("tTdDfFR".contains(style) && chars.next().is_none());
+        timestamps.push((seconds, style));
+        rest = suffix;
     }
-    let seconds: u64 = rest[..colon].parse().ok()?;
-    let style = rest[colon + 1..end].chars().next()?;
-    if !"tTdDfFR".contains(style) {
-        return None;
+    timestamps
+}
+
+fn assert_next_try_timestamps(reply: &str, expected_seconds: u64) {
+    assert_eq!(
+        discord_timestamps(reply),
+        vec![(expected_seconds, 'F'), (expected_seconds, 'R')],
+        "next-try reply needs the complete absolute/relative pair at the same upward-rounded deadline: {reply}"
+    );
+}
+
+/// Exclude only validated timestamp tokens from disclosure checks. Mentions,
+/// channel URLs and bare channel identifiers elsewhere remain observable.
+fn without_discord_timestamps(reply: &str) -> String {
+    discord_timestamps(reply);
+    let mut text = String::new();
+    let mut rest = reply;
+    while let Some(start) = rest.find("<t:") {
+        text.push_str(&rest[..start]);
+        rest = rest[start..]
+            .split_once('>')
+            .expect("validated timestamp")
+            .1;
     }
-    Some((seconds, style))
+    text.push_str(rest);
+    text
+}
+
+async fn stored_ticket_state(pool: &PgPool) -> (Vec<Value>, Vec<Value>) {
+    let tickets = sqlx::query_scalar("SELECT to_jsonb(t) FROM tickets t ORDER BY id")
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    let transcripts = sqlx::query_scalar(
+        "SELECT to_jsonb(t) FROM ticket_transcripts t ORDER BY to_jsonb(t)::text",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    (tickets, transcripts)
+}
+
+// The oracle must notice a missing token, either wrong style, either wrong
+// epoch, a duplicate token, and malformed syntax (not just the first token).
+#[test]
+fn timestamp_pair_oracle_rejects_incomplete_or_changed_pairs() {
+    assert_next_try_timestamps("Next: <t:4102445660:F> (<t:4102445660:R>).", 4_102_445_660);
+    for reply in [
+        "Next: <t:4102445660:F>.",
+        "Next: <t:4102445660:f> (<t:4102445660:R>).",
+        "Next: <t:4102445660:F> (<t:4102445660:f>).",
+        "Next: <t:4102445659:F> (<t:4102445660:R>).",
+        "Next: <t:4102445660:F> (<t:4102445659:R>).",
+        "Next: <t:4102445660:F> (<t:4102445660:R>) <t:4102445660:R>.",
+        "Next: <t:4102445660:F> (<t:4102445660:RR>).",
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| assert_next_try_timestamps(reply, 4_102_445_660)).is_err(),
+            "timestamp oracle accepted a broken pair: {reply}"
+        );
+    }
 }
 
 async fn setup_creating_with_channel(
@@ -489,6 +554,134 @@ async fn creating_without_channel_stays_recovery_guidance() {
     assert!(!reply.contains("<#"), "no channel to name: {reply}");
 }
 
+// Replacing Open/NULL with the old Creating reply must fail this actual
+// button-path oracle. A legal channel-less Open row is unavailable, not being
+// created or recovered; explaining it must not repair it or touch transcripts.
+#[tokio::test]
+async fn open_without_channel_is_unavailable_not_creating_on_button_path() {
+    let Some(db) = database().await else { return };
+    let mock = router_mock().await;
+    let tickets = runtime(db.pool().clone(), &mock);
+    sqlx::query(
+        "INSERT INTO tickets (id, guild_id, opener_id, status, created_at) VALUES ('ex-open-bare', '100', '500', 'open', '2100-01-01T00:00:00.000Z')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    setup_closed_at(
+        &tickets,
+        db.pool(),
+        "ex-unrelated-closed",
+        "501",
+        "614",
+        0,
+        1,
+    )
+    .await;
+    let before = stored_ticket_state(db.pool()).await;
+    let commands = CommandRuntime::with_tickets(
+        db.pool().clone(),
+        tickets.executor.clone(),
+        Arc::clone(&tickets),
+    );
+    commands
+        .on_interaction(&button(
+            TicketAction::Open,
+            "100",
+            "500",
+            "Member Name",
+            "812",
+        ))
+        .await;
+    let reply = wait_for_reply(&mock, "812").await;
+    let requests = mock.requests();
+    let after = stored_ticket_state(db.pool()).await;
+    db.close().await.unwrap();
+    mock.shutdown().await;
+
+    assert_eq!(
+        after, before,
+        "Open/NULL refusal leaves every stored field unchanged"
+    );
+    assert_eq!((after.0.len(), after.1.len()), (2, 1));
+    let open_row = after
+        .0
+        .iter()
+        .find(|row| row["id"] == "ex-open-bare")
+        .unwrap();
+    assert_eq!(open_row["status"], "open");
+    assert!(open_row["channel_id"].is_null());
+    let content = reply["content"].as_str().expect("router reply content");
+    assert_open_without_channel_reply(content);
+    assert_mentions_suppressed(&reply);
+    assert_eq!(
+        requests.len(),
+        3,
+        "only defer, category validation and reply edit"
+    );
+    let defers: Vec<_> = requests
+        .iter()
+        .filter(|r| r.path.ends_with("/callback"))
+        .collect();
+    assert_eq!(defers.len(), 1);
+    assert_eq!(defers[0].method, "POST");
+    let defer: Value = serde_json::from_slice(&defers[0].body).unwrap();
+    assert_eq!(defer["type"], 5);
+    assert_eq!(defer["data"]["flags"], 64, "defer is ephemeral");
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.method == "GET" && r.path.ends_with("/channels/200"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(
+                |r| r.method == "PATCH" && r.path.ends_with("/ticket-test-812/messages/@original")
+            )
+            .count(),
+        1
+    );
+    assert_no_mutating_discord(&requests);
+}
+
+fn assert_open_without_channel_reply(reply: &str) {
+    let lower = reply.to_lowercase();
+    assert!(lower.contains("open"), "row remains Open: {reply}");
+    assert!(
+        lower.contains("unavailable"),
+        "missing channel is unavailable: {reply}"
+    );
+    assert!(
+        lower.contains("staff"),
+        "unavailable channel needs staff guidance: {reply}"
+    );
+    assert!(
+        !lower.contains("creat") && !lower.contains("recover"),
+        "Open is not Creating/recovery: {reply}"
+    );
+    assert!(
+        !reply.contains("<#")
+            && !lower.contains("discord.com/channels/")
+            && !lower.contains("discordapp.com/channels/"),
+        "no ready channel link: {reply}"
+    );
+    assert!(discord_timestamps(reply).is_empty());
+    assert!(reply.len() < 1000);
+}
+
+#[test]
+fn open_without_channel_oracle_rejects_old_creating_reply() {
+    assert!(
+        std::panic::catch_unwind(|| assert_open_without_channel_reply(
+            "Your ticket is still being created or recovered."
+        ))
+        .is_err()
+    );
+}
+
 // Closing/CleanupPending without channel identity still name their lifecycle
 // state, not creation. RED on baseline: channel-less refusals always say
 // "still being created or recovered." Rows are inserted via SQL because the
@@ -610,16 +803,11 @@ async fn cooldown_names_bounded_next_try_time() {
         !lower.contains("reserv") && !lower.contains("guarantee"),
         "a next-try hint is not a reservation or guarantee: {reply}"
     );
-    let (seconds, _) = discord_timestamp(&reply)
-        .unwrap_or_else(|| panic!("cooldown carries a Discord timestamp: {reply}"));
     let expected = ((created + 300_000 + 999) / 1000) as u64;
-    assert_eq!(
-        seconds, expected,
-        "display rounds last creation + cooldown upward, never earlier: {reply}"
-    );
+    assert_next_try_timestamps(&reply, expected);
     let now_seconds = (now_millis_for_test() / 1000).max(0) as u64;
     assert!(
-        seconds > now_seconds,
+        expected > now_seconds,
         "next-eligible is in the future, not already-eligible: {reply}"
     );
     assert!(reply.len() < 1000, "concise refusal: {reply}");
@@ -678,13 +866,7 @@ async fn cooldown_subsecond_display_rounds_up_without_delaying_admission() {
         "refusals capture nothing"
     );
     assert_only_category_get(&requests);
-    let (seconds, _) = discord_timestamp(&reply)
-        .unwrap_or_else(|| panic!("subsecond cooldown carries a timestamp: {reply}"));
-    assert_eq!(seconds, 4_102_445_102, "round display upward: {reply}");
-    assert!(
-        seconds * 1000 >= 4_102_445_101_001,
-        "display is not an earlier, falsely eligible instant: {reply}"
-    );
+    assert_next_try_timestamps(&reply, 4_102_445_102);
 }
 
 // Future stored creation stays in the future, without a misleading
@@ -718,17 +900,151 @@ async fn cooldown_future_input_stays_safe() {
     mock.shutdown().await;
 
     assert_only_category_get(&future_requests);
-    let (future_seconds, _) = discord_timestamp(&future_reply)
-        .unwrap_or_else(|| panic!("future cooldown carries a timestamp: {future_reply}"));
     let expected_future = ((future_created + 300_000 + 999) / 1000) as u64;
-    assert_eq!(
-        future_seconds, expected_future,
-        "future last + cooldown rounds upward, no clamp to now: {future_reply}"
-    );
+    assert_next_try_timestamps(&future_reply, expected_future);
     assert!(
-        future_seconds > (now / 1000).max(0) as u64,
+        expected_future > (now / 1000).max(0) as u64,
         "future next-eligible stays in the future: {future_reply}"
     );
+}
+
+// Independent literal deadlines straddle the conservative year-9999 display
+// endpoint. A one-second cutoff shift in either direction must be observable.
+#[tokio::test]
+async fn cooldown_display_endpoint_minus_one_keeps_exact_pair() {
+    assert_display_boundary(
+        253_402_300_498_000,
+        253_402_300_798_000,
+        Some(253_402_300_798),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn cooldown_display_endpoint_is_inclusive() {
+    assert_display_boundary(
+        253_402_300_499_000,
+        253_402_300_799_000,
+        Some(253_402_300_799),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn cooldown_display_endpoint_plus_one_is_explicitly_out_of_range() {
+    assert_display_boundary(253_402_300_500_000, 253_402_300_800_000, None).await;
+}
+
+#[tokio::test]
+async fn cooldown_subsecond_rounding_crosses_display_endpoint_not_admission() {
+    assert_display_boundary(253_402_300_499_001, 253_402_300_799_001, None).await;
+}
+
+async fn assert_display_boundary(created: i64, deadline_ms: i64, expected_seconds: Option<u64>) {
+    let Some(db) = database().await else { return };
+    let mock = refusal_mock().await;
+    let tickets = runtime(db.pool().clone(), &mock);
+    setup_closed_at(
+        &tickets,
+        db.pool(),
+        "ex-display-boundary",
+        "500",
+        "624",
+        created,
+        created + 1,
+    )
+    .await;
+    let before = stored_ticket_state(db.pool()).await;
+    let just_before = tickets
+        .store
+        .reserve(
+            "ex-boundary-before",
+            "500",
+            deadline_ms - 1,
+            COOLDOWN_SECONDS,
+        )
+        .await
+        .unwrap();
+    let reply = member_reply(
+        tickets
+            .execute(&open_button("500"), TicketAction::Open)
+            .await,
+    );
+    let after = stored_ticket_state(db.pool()).await;
+    let requests = mock.requests();
+    // Display cutoff and upward rounding cannot move actual admission.
+    let at = tickets
+        .store
+        .reserve("ex-boundary-at", "500", deadline_ms, COOLDOWN_SECONDS)
+        .await
+        .unwrap();
+    db.close().await.unwrap();
+    mock.shutdown().await;
+
+    assert!(
+        matches!(
+            just_before,
+            OpenResult::Refused(OpenDecision::Cooldown { .. })
+        ),
+        "one millisecond before the deadline still refuses"
+    );
+    assert!(
+        matches!(at, OpenResult::Created(_)),
+        "the exact millisecond deadline admits even outside display range"
+    );
+    assert_eq!(
+        after, before,
+        "refusals leave ticket/transcript fields and counts unchanged"
+    );
+    assert_eq!((after.0.len(), after.1.len()), (1, 1));
+    assert_only_category_get(&requests);
+    assert_display_boundary_reply(&reply, expected_seconds);
+}
+
+fn assert_display_boundary_reply(reply: &str, expected_seconds: Option<u64>) {
+    let lower = reply.to_lowercase();
+    assert!(
+        lower.contains("next") && lower.contains("try"),
+        "next-try guidance: {reply}"
+    );
+    assert!(
+        !lower.contains("reserv") && !lower.contains("guarantee"),
+        "no reservation or guarantee: {reply}"
+    );
+    assert!(reply.len() < 1000);
+    match expected_seconds {
+        Some(seconds) => assert_next_try_timestamps(reply, seconds),
+        None => {
+            assert!(
+                discord_timestamps(reply).is_empty(),
+                "out-of-range deadline has no clipped or invalid timestamp: {reply}"
+            );
+            assert!(
+                lower.contains("too far")
+                    || lower.contains("unrepresentable")
+                    || (lower.contains("cannot") && lower.contains("display"))
+                    || (lower.contains("outside") && lower.contains("range")),
+                "explicitly explain display range: {reply}"
+            );
+            assert!(
+                lower.contains("staff"),
+                "out-of-range deadline needs staff guidance: {reply}"
+            );
+        }
+    }
+}
+
+#[test]
+fn display_boundary_oracle_rejects_cutoff_shifts_in_both_directions() {
+    // Response-level negative controls; production source is never mutated.
+    let omitted = "Next time to try is outside the display range. Please contact staff.";
+    assert!(std::panic::catch_unwind(|| assert_display_boundary_reply(
+        omitted,
+        Some(253_402_300_799)
+    ))
+    .is_err());
+    let beyond = "Next time to try: <t:253402300800:F> (<t:253402300800:R>).";
+    assert!(std::panic::catch_unwind(|| assert_display_boundary_reply(beyond, None)).is_err());
 }
 
 // Maximum cooldown exceeds a bounded display date. A clamped timestamp
@@ -774,7 +1090,9 @@ async fn cooldown_max_input_has_honest_bounded_display() {
         || lower.contains("unrepresentable")
         || (lower.contains("cannot") && lower.contains("display"))
         || (lower.contains("outside") && lower.contains("range"));
-    if let Some((max_seconds, _)) = discord_timestamp(&max_reply) {
+    let max_timestamps = discord_timestamps(&max_reply);
+    if let Some(&(max_seconds, _)) = max_timestamps.first() {
+        assert_next_try_timestamps(&max_reply, max_seconds);
         let now_seconds = (now_millis_for_test() / 1000).max(0) as u64;
         assert!(
             max_seconds > now_seconds,
@@ -1005,7 +1323,7 @@ async fn invalid_timestamp_and_store_failure_stay_honest() {
         "invalid row is a store failure: {bad_reply}"
     );
     assert!(
-        discord_timestamp(&bad_reply).is_none(),
+        discord_timestamps(&bad_reply).is_empty(),
         "no fabricated timestamp on store failure: {bad_reply}"
     );
     assert!(
@@ -1038,7 +1356,7 @@ async fn invalid_timestamp_and_store_failure_stay_honest() {
         "sick store is an honest failure: {sick_reply}"
     );
     assert!(
-        discord_timestamp(&sick_reply).is_none(),
+        discord_timestamps(&sick_reply).is_empty(),
         "no timestamp on store failure: {sick_reply}"
     );
     assert_eq!(sick_requests.len(), 1);
@@ -1115,6 +1433,15 @@ async fn router_refusal_is_private_suppressed_and_state_aware_with_hostile_name(
 // must keep that property.
 #[tokio::test]
 async fn cooldown_does_not_disclose_transcript_or_other_member_channel() {
+    assert_cooldown_disclosure_collision(4_102_445_360_000, 4_102_445_660).await;
+}
+
+#[tokio::test]
+async fn cooldown_does_not_disclose_channel_when_timestamp_contains_661() {
+    assert_cooldown_disclosure_collision(4_102_445_361_000, 4_102_445_661).await;
+}
+
+async fn assert_cooldown_disclosure_collision(created: i64, expected_seconds: u64) {
     let Some(db) = database().await else { return };
     const SENTINEL: &str = "SENTINEL_PRIVATE_SUPPORT_DETAIL_MUST_NOT_LEAK";
     let mock = refusal_mock().await;
@@ -1125,7 +1452,7 @@ async fn cooldown_does_not_disclose_transcript_or_other_member_channel() {
     assert!(matches!(
         tickets
             .store
-            .reserve("leak-mine", "500", now_millis_for_test(), 0)
+            .reserve("leak-mine", "500", created, 0)
             .await
             .unwrap(),
         OpenResult::Created(_)
@@ -1138,7 +1465,7 @@ async fn cooldown_does_not_disclose_transcript_or_other_member_channel() {
     tickets.store.activate("leak-mine", "661").await.unwrap();
     let closing = tickets
         .store
-        .begin_close("leak-mine", now_millis_for_test() + 1)
+        .begin_close("leak-mine", created + 1)
         .await
         .unwrap();
     let snapshot = TranscriptSnapshot {
@@ -1150,37 +1477,63 @@ async fn cooldown_does_not_disclose_transcript_or_other_member_channel() {
         .save_transcript(
             "leak-mine",
             closing.closing_started_at.unwrap(),
-            now_millis_for_test() + 2,
+            created + 2,
             snapshot,
         )
         .await
         .unwrap();
     tickets
         .store
-        .finish_cleanup("leak-mine", now_millis_for_test() + 3)
+        .finish_cleanup("leak-mine", created + 3)
         .await
         .unwrap();
 
+    let before = stored_ticket_state(db.pool()).await;
     let reply = member_reply(
         tickets
             .execute(&open_button("500"), TicketAction::Open)
             .await,
     );
+    let after = stored_ticket_state(db.pool()).await;
+    let requests = mock.requests();
     db.close().await.unwrap();
     mock.shutdown().await;
 
+    assert_eq!(
+        after, before,
+        "refusal leaves all ticket/transcript state unchanged"
+    );
+    assert_eq!((after.0.len(), after.1.len()), (2, 1));
+    assert_only_category_get(&requests);
+    assert_next_try_timestamps(&reply, expected_seconds);
     assert!(
         !reply.contains(SENTINEL),
         "cooldown never leaks transcript bodies: {reply}"
     );
+    let non_timestamp_text = without_discord_timestamps(&reply);
     assert!(
-        !reply.contains("<#660>") && !reply.contains("660"),
-        "cooldown never names another member's channel: {reply}"
+        !reply.contains("<#660>") && !non_timestamp_text.contains("660"),
+        "cooldown never names another member's channel outside a timestamp: {reply}"
     );
     assert!(
-        !reply.contains("<#661>") && !reply.contains("661"),
-        "cooldown never names the closed channel as usable: {reply}"
+        !reply.contains("<#661>") && !non_timestamp_text.contains("661"),
+        "cooldown never names the closed channel outside a timestamp: {reply}"
     );
+    for disclosure in [
+        "<#660>",
+        "<#661>",
+        "channel 660",
+        "channel 661",
+        "https://discord.com/channels/100/660",
+        "https://discord.com/channels/100/661",
+    ] {
+        let contaminated = format!("{reply} {disclosure}");
+        let text = without_discord_timestamps(&contaminated);
+        assert!(
+            text.contains("660") || text.contains("661"),
+            "excluding timestamps must not hide channel disclosures: {contaminated}"
+        );
+    }
 }
 
 // Wrong-guild Open still refuses before any storage or Discord work.
