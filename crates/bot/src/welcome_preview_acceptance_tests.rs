@@ -1021,13 +1021,17 @@ async fn preview_fixture_identity_and_fail_closed_construction() {
         );
     }
     // A bogus deployment mode never constructs: use a lazy pool (no
-    // connection is opened) and the offline executor constructor.
+    // connection is opened) and a loopback-only executor (no requests).
+    // A production origin correctly requires durable send admission.
     let pool = sqlx::postgres::PgPoolOptions::new()
         .connect_lazy("postgres://agent_test@agent-testdb:5432/postgres")
         .expect("lazy pool builds offline");
     ensure_crypto_provider();
-    let executor =
-        ActionExecutor::with_proxy("welcome-preview-test-only-token".into(), None).unwrap();
+    let executor = ActionExecutor::with_proxy(
+        "welcome-preview-test-only-token".into(),
+        Some("http://127.0.0.1:1".into()),
+    )
+    .expect("loopback-only executor builds offline");
     let mut deployment = vars("bogus", false);
     deployment.insert("DISCORD_GUILD_ID".into(), "22".into());
     assert!(
