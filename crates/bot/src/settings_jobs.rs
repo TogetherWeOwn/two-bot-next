@@ -307,6 +307,10 @@ mod tests;
 mod trio_live_log_acceptance_tests;
 
 #[cfg(test)]
+#[path = "settings_community_live_log_acceptance_tests.rs"]
+mod community_live_log_acceptance_tests;
+
+#[cfg(test)]
 mod ops_log_tests {
     use super::*;
 

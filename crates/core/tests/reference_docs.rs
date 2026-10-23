@@ -60,8 +60,8 @@ a required value or an implemented consumer. Secret defaults are never rendered.
   Keys in\n\
   legacy `HOT_WIRED` are labeled “reload-report hot” (the `RefreshReport::hot`\n\
   partition in `settings.rs`); every other storable key reports cold.\n\n\
-Live snapshot consumers (canonical table; eleven `live()` call\n\
-sites total: ten across the six non-voice rows below, plus the voice\n\
+Live snapshot consumers (canonical table; twelve `live()` call\n\
+sites total: eleven across the seven non-voice rows below, plus the voice\n\
 gateway closure):\n\n\
 | Runtime | Call sites | Reads | When |\n\
 | --- | --- | --- | --- |\n\
@@ -71,8 +71,9 @@ gateway closure):\n\n\
 | ticket | `ticket_runtime.rs:749-752`, `:1491` | 3 destinations + cooldown (`:311-339`, `:719-744`) | every execute/recovery and purge; effective ops changes included |\n\
 | self-role | `self_role_handlers.rs:213-219`, `:419-441` | `TWO_SELF_ROLE_PANELS` (`:53`) | every dispatch (`:224`, `:309`, `:377`, `:419`) and sweep (`:472-473`); retirement waits for durable work |\n\
 | gateway classifier | `gateway.rs:834-853`, `:978` | human/welcome channel sets (`:860-877`) | every guild message; classifier + facts sink swap together (`leveling_runtime.rs:908-911`) |\n\
+| community | `community_jobs.rs:185-187` | 5 scorecard/presence/inactivity keys (`:174-180`) | every tick: probe (`:400`), scorecard (`:552`), sweep (`:638`) |\n\
 | voice | `gateway.rs:2204-2206` closure | empty grace (`voice_rooms.rs:10186`), invite code (`:10234`) | spawn (`:8222-8230`), maintenance (`:3571-3573`), `/invite` (`:14195-14204`) |\n\n\
-The thirty-nine keys in `STORE_READ_KEYS`\n\
+The forty-four keys in `STORE_READ_KEYS`\n\
 (`crates/core/tests/reference_docs.rs`) say “applied live by runtime refresh”\n\
 instead of “stored unwired”: containment applies `TWO_ANTI_NUKE_WINDOW_SECONDS`,\n\
 `TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS`, `TWO_ANTI_NUKE_HEAT_THRESHOLD` and\n\
@@ -127,14 +128,19 @@ the gateway funnel applies\n\
 `TWO_COMMUNITY_HUMAN_CHANNEL_IDS` and `TWO_COMMUNITY_WELCOME_CHANNEL_IDS`\n\
 from the snapshot on every guild message, refreshing the channel classifier\n\
 and the community-facts sink together before the message's channel class is\n\
-stamped (`crates/bot/src/gateway.rs:834-853`, `:978`, `crates/discord/src/leveling_runtime.rs:908-911`), with malformed entries filtered silently so a wholly-malformed row applies as the empty set (`crates/core/src/community.rs:252-260`); the voice sweep applies `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` from the snapshot on spawn and every maintenance refresh, so a stored per-guild grace reaches the deletion sweep without a restart (`crates/bot/src/voice_rooms.rs:8222-8230`, `:3571-3573`), and the invite responder applies `TWO_GUILD_INVITE_CODE` per `/invite` interaction (`crates/bot/src/voice_rooms.rs:14195-14204`), falling back to the live vanity code when the row is absent or invalid (`:10239-10255`). Two boot-only edges\n\
+stamped (`crates/bot/src/gateway.rs:834-853`, `:978`, `crates/discord/src/leveling_runtime.rs:908-911`), with malformed entries filtered silently so a wholly-malformed row applies as the empty set (`crates/core/src/community.rs:252-260`); the voice sweep applies `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` from the snapshot on spawn and every maintenance refresh, so a stored per-guild grace reaches the deletion sweep without a restart (`crates/bot/src/voice_rooms.rs:8222-8230`, `:3571-3573`), and the invite responder applies `TWO_GUILD_INVITE_CODE` per `/invite` interaction (`crates/bot/src/voice_rooms.rs:14195-14204`), falling back to the live vanity code when the row is absent or invalid (`:10239-10255`); the community jobs apply `TWO_COMMUNITY_SCORECARD`, `TWO_COMMUNITY_RECOMMENDATIONS`, `TWO_COMMUNITY_CORRECTION_CYCLES`, `TWO_PRESENCE_PROBE` and `TWO_INACTIVITY_DAYS` from the snapshot on every tick, layering stored rows over the boot gates with boot fallback for absent or unparsable counts (`crates/bot/src/community_jobs.rs:170-268`), where a stored `0` on either enable gate skips that tick while the sweep re-reads its horizon per run. Five boot-only edges\n\
 remain: the voice room-name policy is\n\
 built once at boot from the process environment\n\
-(`crates/bot/src/gateway.rs:2203`); and gateway intents plus ticket command\n\
+(`crates/bot/src/gateway.rs:2203`); gateway intents plus ticket command\n\
 publication read the ticket destination keys once at boot\n\
 (`crates/bot/src/gateway.rs:150`, `crates/bot/src/command_runtime.rs:448`), so a stored ticket\n\
 destination reaches already-published commands only through the per-operation\n\
-refresh above. Every other\n\
+refresh above; the community-facts sink arms once at boot\n\
+(`crates/bot/src/main.rs:697-698`), so a live scorecard `0` stops scoring but\n\
+not capture; the scorecard command surface publishes at boot\n\
+(`crates/bot/src/main.rs:1004`, `crates/bot/src/command_runtime.rs:440`); and\n\
+a boot-parked community job needs a restart to start ticking, like the parked\n\
+audit runtime. Every other\n\
 storable row's stored value is unwired.\n\n\
 Gateway boot reads process environment only, through a fixed set of loaders:\n\
 `Config::from_env` (`DISCORD_TOKEN`, `DATABASE_URL`, `LISTEN_ADDR`, `GUILD_ID`),\n\
@@ -235,7 +241,8 @@ const BOOT_ENV: &[&str] = &[
 /// cooldown refresh (`ticket_runtime.rs:613-638`), the feed poller's per-tick
 /// announcements gate (`feed_jobs.rs:250-267`, `:385-419`) and self-role's
 /// per-dispatch catalogue resolve
-/// (`self_role_handlers.rs:59-74`, `:215`, `:292`, `:334`, `:379`).
+/// (`self_role_handlers.rs:59-74`, `:215`, `:292`, `:334`, `:379`), and the community
+/// jobs' per-tick refresh (`community_jobs.rs:170-268`).
 /// These rows say “applied live by runtime refresh” in the table below;
 /// every other storable key keeps the legacy `HOT_WIRED`/boot-env labels.
 const STORE_READ_KEYS: &[&str] = &[
@@ -278,6 +285,11 @@ const STORE_READ_KEYS: &[&str] = &[
     "TWO_TICKET_COOLDOWN_SECONDS",
     "TWO_ANNOUNCEMENTS",
     "TWO_SELF_ROLE_PANELS",
+    "TWO_COMMUNITY_SCORECARD",
+    "TWO_COMMUNITY_RECOMMENDATIONS",
+    "TWO_COMMUNITY_CORRECTION_CYCLES",
+    "TWO_PRESENCE_PROBE",
+    "TWO_INACTIVITY_DAYS",
 ];
 
 fn repository_root() -> PathBuf {

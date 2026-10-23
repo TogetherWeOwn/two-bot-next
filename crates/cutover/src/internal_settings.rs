@@ -79,6 +79,20 @@ fn action_error(error: SettingsWriteError) -> ActionError {
                         "settings_value_invalid",
                     );
                 }
+                WriteRefusal::InvalidCorrectionCycles(_) => {
+                    return ActionError::new(
+                        ErrorCode::Malformed,
+                        "\"value\" must be a non-negative integer correction count for this setting",
+                        "settings_value_invalid",
+                    );
+                }
+                WriteRefusal::InvalidInactivityDays(_) => {
+                    return ActionError::new(
+                        ErrorCode::Malformed,
+                        "\"value\" must be a non-negative integer number of days for this setting",
+                        "settings_value_invalid",
+                    );
+                }
             };
             ActionError::new(
                 ErrorCode::ActionNotAllowed,
@@ -135,6 +149,8 @@ mod tests {
         for refusal in [
             WriteRefusal::InvalidCooldownValue("TWO_TICKET_COOLDOWN_SECONDS".to_owned()),
             WriteRefusal::InvalidPanelsValue("TWO_SELF_ROLE_PANELS".to_owned()),
+            WriteRefusal::InvalidCorrectionCycles("TWO_COMMUNITY_CORRECTION_CYCLES".to_owned()),
+            WriteRefusal::InvalidInactivityDays("TWO_INACTIVITY_DAYS".to_owned()),
         ] {
             let invalid = action_error(SettingsWriteError::Refused(refusal));
             assert_eq!(invalid.code, ErrorCode::Malformed);
