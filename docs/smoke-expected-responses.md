@@ -14,8 +14,8 @@ the whole smoke-relevant surface reads from one place.
 
 | Command | Happy-path reply shape | Denied-path copy (pointer / TBD) |
 | --- | --- | --- |
-| `/rank` | Ephemeral reply built by `rank_reply`: `content` is `rank_text`, visibility ephemeral (`crates/core/src/leveling.rs:150`, `crates/core/src/leveling.rs:251`). Ranked shape: `**{name}**`, `Level **{level}** · Rank **#{rank}** of **{members}**`, `XP **{xp}** · {progress}/{span} this level · **{to_next}** to level {next}`. Unranked shape replaces the rank clause with `Rank **Unranked** (no XP recorded)`. Numbers group with commas. | Core is always on: stays live while feature gates are off. Foreign or missing guild is fenced silently (`Ignore`). Unknown names get the uniform unknown-command reply (`crates/core/src/router/replies.rs:11`). Handler errors get the generic correlation reply (see shared copy below). Live-guild TBD: confirm the exact rendered rank line for a seeded profile. |
-| `/leaderboard` | Public reply built by `leaderboard_reply_for_season`: `content` is the seasonal header `**TWO XP Leaderboard ({season})**` plus body, mentions suppressed (`crates/core/src/leveling.rs:478`). The 2026-Q4 header carries ` — partial: early-season XP not counted` inside the same header line; later quarters render the plain header. One row per entry, `**{rank}.** <@{member_id}> · level **{level}** · {xp} XP`, where level and XP derive from that season's `seasonal_xp` (`crates/core/src/leveling.rs:364`, `crates/core/src/leveling_store.rs:715`). An empty season renders the header plus `No XP has been earned yet.` with no lifetime fallback. | Same fence as `/rank`: always on, foreign or missing guild is `Ignore`, unknown names get the uniform unknown-command reply. Live-guild TBD: confirm top-10 order and that no row pings (mention parse is empty). |
+| `/rank` | Ephemeral defer before the store read, completed by an edit built by `rank_reply`: `content` is `rank_text`, visibility ephemeral (`crates/core/src/leveling.rs:150`, `crates/core/src/leveling.rs:251`). Ranked shape: `**{name}**`, `Level **{level}** · Rank **#{rank}** of **{members}**`, `XP **{xp}** · {progress}/{span} this level · **{to_next}** to level {next}`. Unranked shape replaces the rank clause with `Rank **Unranked** (no XP recorded)`. Numbers group with commas. | Core is always on: stays live while feature gates are off. Foreign or missing guild is fenced silently (`Ignore`). Unknown names get the uniform unknown-command reply (`crates/core/src/router/replies.rs:11`). A store-read failure after the defer edits the original reply with `Rank is unavailable right now; try again.` and suppressed mentions; the store error propagates for logging, without a second reply or the shared generic correlation copy. Live-guild TBD: confirm the exact rendered rank line for a seeded profile. |
+| `/leaderboard` | Public defer before the store read, completed by an edit built by `leaderboard_reply_for_season`: `content` is the seasonal header `**TWO XP Leaderboard ({season})**` plus body, mentions suppressed (`crates/core/src/leveling.rs:478`). The 2026-Q4 header carries ` — partial: early-season XP not counted` inside the same header line; later quarters render the plain header. One row per entry, `**{rank}.** <@{member_id}> · level **{level}** · {xp} XP`, where level and XP derive from that season's `seasonal_xp` (`crates/core/src/leveling.rs:364`, `crates/core/src/leveling_store.rs:715`). An empty season renders the header plus `No XP has been earned yet.` with no lifetime fallback. | Same fence as `/rank`: always on, foreign or missing guild is `Ignore`, unknown names get the uniform unknown-command reply. A store-read failure after the defer edits the original reply with `Leaderboard is unavailable right now; try again.` and suppressed mentions; the store error propagates for logging, without a second reply. Live-guild TBD: confirm top-10 order and that no row pings (mention parse is empty). |
 | `/rsvp` | Ephemeral reply `RSVP saved: {status}.` where status is `going`, `interested`, or `declined` (`rsvp_saved_text`, `crates/core/src/rsvp.rs:192`). Open to everyone: no permission bits required. | Announcements gate off refuses with the announcements-disabled copy (`crates/core/src/router.rs:106`). Foreign or missing guild is `Ignore`. Live-guild TBD: confirm the saved-status echo for each of the three statuses. |
 | `/lfg` | Ephemeral reply ``LFG posted: `{post_id}`.`` (`created_reply`, `crates/core/src/lfg.rs:557`). The posted board content shape is `lfg_content` (`crates/core/src/lfg.rs:437`); signup and leave replies are `LFG {outcome}.` / `LFG left.` (`signup_reply`, `crates/core/src/lfg.rs:563`; `leave_reply`, `crates/core/src/lfg.rs:570`). Requires Manage Events. | Announcements gate off refuses with the announcements-disabled copy (`crates/core/src/router.rs:106`). Missing Manage Events refuses with the manage-events copy (`crates/core/src/router.rs:101`). Foreign or missing guild is `Ignore`. Live-guild TBD: confirm the posted board renders title, slots, and signups. |
 | `/ban` | Ephemeral reply `Banned {target}.` built by `outcome_text_with_target` (`MemberOutcome::Banned` arm, `crates/bot/src/member_runtime.rs`); the slot names the resolved display name (user id fallback), sanitized (single-line, mentions neutralized, pills split, 512-cap). The executor performs the REST membership effect from the `Banned { user_id }` outcome (`crates/core/src/action_outcomes.rs:36`) via `execute_outcome` (`crates/discord/src/executor.rs:3481`). Replayed bans append ` Already applied.` after the target. Pinned by `ban_success_confirmation_copy_is_pinned` (`crates/bot/src/member_runtime.rs`). Requires Ban Members. | Moderation gate off refuses with the moderation-disabled copy (`crates/core/src/router.rs:108`). Missing Ban Members refuses with `You need the Ban Members permission to use /ban. Ask a server moderator or admin to grant it.` (`crates/core/src/router.rs:287`, permission name from `crates/core/src/moderation.rs:104`). Outside the configured guild refuses with the guild-restricted copy (`crates/core/src/router.rs:104`). Code-pinned copy is `Banned {target}.` (replay: `Banned {target}. Already applied.`); live-guild pass records only verdict/shape, never member data. |
@@ -57,10 +57,13 @@ refusals included, as an ephemeral deferred reply completed by an edit
 - Guild fence (moderation only): `This command is restricted to the
   configured guild.` (`crates/core/src/router.rs:104`). All other families
   answer foreign or missing guilds with silence (`Ignore`), not a reply.
-- Handler error or panic: `Something went wrong (ref XXXXXXXX). Please try
-  again — if it keeps happening, share this reference with a server admin.`
-  The eight hex digits are random per failure; see the reply and error
-  contract in `docs/interaction-replies.md`.
+- Handler error or panic on the shared error-reply path: `Something went
+  wrong (ref XXXXXXXX). Please try again — if it keeps happening, share this
+  reference with a server admin.` The eight hex digits are random per
+  failure; see the reply and error contract in `docs/interaction-replies.md`.
+  This copy does not apply to acknowledged `/rank` or `/leaderboard` store
+  failures: their runtime owns the fixed unavailable edit above, while the
+  caller only logs the error.
 
 ## How the live-guild pass uses this table
 
@@ -87,9 +90,9 @@ refusals included, as an ephemeral deferred reply completed by an edit
   (`crates/core/src/router.rs:401`).
 - Refusal serialization: `refusal_response`
   (`crates/discord/src/interactions.rs:183`).
-- Leveling runtime ownership of the immediate rank/leaderboard callback:
+- Leveling runtime ownership of the defer-then-edit rank/leaderboard replies:
   the `HandlerId::Rank | HandlerId::Leaderboard` branch
-  (`crates/bot/src/command_runtime.rs:1352`).
+  (`crates/bot/src/command_runtime.rs:1429-1441`).
 - Discovery reply: `help_text` and `HELP_GROUPS`
   (`crates/core/src/help.rs`), served as one immediate ephemeral reply by
   `help_response` (`crates/discord/src/interactions.rs`) from the

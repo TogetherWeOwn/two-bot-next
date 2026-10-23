@@ -348,4 +348,4 @@ constants (the exact strings each `--help` path prints). The `two-bot`
 binary was not built in this docs run, so no binary `--help` transcript
 is claimed. Slash-command options are pasted from `docs/commands.md`
 (rendered from the compiled registry) and the option decoders at
-`crates/bot/src/command_runtime.rs:2144-2180`.
+`crates/bot/src/command_runtime.rs:2381-2416`.

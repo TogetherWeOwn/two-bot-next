@@ -147,6 +147,19 @@ No new alert rule, retry, tuning or delivery change is introduced. Do not
 replay joins to repair a missed alert; configuration and restart actions keep
 their existing gates. See [raid delivery boundaries](raid-port.md).
 
+## Ticket lifecycle signals
+
+When a ticket vanishes or a member is stuck on Creating, start with the
+`ticket_lifecycle` container lines (one per retire, abandon, purge and
+successful staff-button claim/close executed through the button path, with
+`ticket_id`, `prior_status` and a fixed-vocabulary `cause`) and the
+`two_bot_ticket_lifecycle_total{event,outcome}` counter, then the
+`ticket recovery deferred` / `ticket action incomplete` warns, which cite
+the action, ticket and status. The series, labels and causes are listed in
+[ticket-lifecycle-observability.md](ticket-lifecycle-observability.md). No
+alert rule consumes this family yet; read the samples directly from the
+container exposition.
+
 ## Voice boot-setting refusal
 
 If the gateway logs `voice HTTP setup failed`, look earlier in the same
