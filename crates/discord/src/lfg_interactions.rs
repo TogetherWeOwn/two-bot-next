@@ -334,7 +334,23 @@ impl LfgInteractions {
                                             "accepted message missing id".into(),
                                         )
                                     });
-                                    if error.is_safe_pre_mutation() {
+                                    let recovered = if error.is_safe_pre_mutation() {
+                                        None
+                                    } else {
+                                        executor
+                                            .recover_message_by_nonce(
+                                                &post.channel_id,
+                                                &nonce,
+                                                bot_user_id,
+                                            )
+                                            .await
+                                            .map_err(|_| LfgError::Uncertain)?
+                                    };
+                                    if let Some(id) = recovered {
+                                        id
+                                    } else {
+                                        // Both definitive no-send paths share cleanup;
+                                        // unreadable recovery still retains the row.
                                         store::delete_lfg(&self.pool, guild_id, &id).await?;
                                         self.audit(
                                             guild_id,
@@ -347,31 +363,6 @@ impl LfgInteractions {
                                         )
                                         .await?;
                                         return Err(error.into());
-                                    }
-                                    match executor
-                                        .recover_message_by_nonce(
-                                            &post.channel_id,
-                                            &nonce,
-                                            bot_user_id,
-                                        )
-                                        .await
-                                    {
-                                        Ok(Some(id)) => id,
-                                        Ok(None) => {
-                                            store::delete_lfg(&self.pool, guild_id, &id).await?;
-                                            self.audit(
-                                                guild_id,
-                                                actor_id,
-                                                interaction_id,
-                                                &id,
-                                                "lfg.create",
-                                                "failed",
-                                                &at,
-                                            )
-                                            .await?;
-                                            return Err(error.into());
-                                        }
-                                        Err(_) => return Err(LfgError::Uncertain),
                                     }
                                 }
                             }
@@ -545,7 +536,7 @@ impl LfgInteractions {
                 Err(_) => {
                     processed += 1;
                     // Never log raw SQL/REST errors or member-controlled text.
-                    tracing::warn!("lfg lifecycle row failed; continuing bounded batch");
+                    lifecycle_warning("lfg lifecycle row failed; continuing bounded batch");
                 }
             }
         }
@@ -603,7 +594,7 @@ impl LfgInteractions {
                     // Keep the durable row, but release its open-post capacity.
                     // An unreadable channel is never permission to resend.
                     unrecovered = true;
-                    tracing::warn!("lfg orphan recovery unreadable; closing retained row");
+                    lifecycle_warning("lfg orphan recovery unreadable; closing retained row");
                 }
             }
         }
@@ -616,35 +607,30 @@ impl LfgInteractions {
         Ok(true)
     }
 
-    // Share the refresh state machine across interaction and maintenance calls
-    // instead of embedding its SQL/REST futures in each caller's state machine.
-    fn refresh<'a>(
-        &'a self,
-        executor: &'a ActionExecutor,
-        guild_id: &'a str,
-        id: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), LfgError>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            let Some(post) = store::get_lfg(&self.pool, guild_id, id).await? else {
-                return Ok(());
-            };
-            let Some(message_id) = post.message_id.as_deref() else {
-                return Ok(());
-            };
-            let roles = store::list_lfg_roles(&self.pool, id).await?;
-            let signups = store::list_lfg_signups(&self.pool, id).await?;
-            let payload = message_payload(&post, &roles, &signups);
-            executor
-                .edit_message_with_components(
-                    &post.channel_id,
-                    message_id,
-                    payload["content"].as_str().unwrap_or_default(),
-                    Self::payload_components(&payload),
-                )
-                .await?;
-            Ok(())
-        })
+    async fn refresh(
+        &self,
+        executor: &ActionExecutor,
+        guild_id: &str,
+        id: &str,
+    ) -> Result<(), LfgError> {
+        let Some(post) = store::get_lfg(&self.pool, guild_id, id).await? else {
+            return Ok(());
+        };
+        let Some(message_id) = post.message_id.as_deref() else {
+            return Ok(());
+        };
+        let roles = store::list_lfg_roles(&self.pool, id).await?;
+        let signups = store::list_lfg_signups(&self.pool, id).await?;
+        let payload = message_payload(&post, &roles, &signups);
+        executor
+            .edit_message_with_components(
+                &post.channel_id,
+                message_id,
+                payload["content"].as_str().unwrap_or_default(),
+                Self::payload_components(&payload),
+            )
+            .await?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -681,6 +667,11 @@ impl LfgInteractions {
         .await?;
         Ok(())
     }
+}
+
+// One callsite for both constant warnings keeps tracing metadata shared.
+fn lifecycle_warning(message: &'static str) {
+    tracing::warn!(message = message);
 }
 
 /// Versioned, length-delimited request binding. Hashing keeps the audit reason

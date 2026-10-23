@@ -36,8 +36,7 @@ pub(crate) fn register_fenced(
     // Reuse the website pool and governed executor. Keep one maintenance
     // service/identity per registration, never one connection pool per tick.
     // Cross-runtime ordering uses the same DB advisory lock as interactions.
-    let service = Arc::new(OnceCell::<LfgInteractions>::new());
-    let bot_user = Arc::new(OnceCell::<u64>::new());
+    let state = Arc::new(OnceCell::<(LfgInteractions, u64)>::new());
     Some(Job {
         name: NAME,
         cadence: CADENCE,
@@ -46,24 +45,17 @@ pub(crate) fn register_fenced(
         timeout: Duration::from_secs(120),
         action: Arc::new(move || {
             let context = context.clone();
-            let service = service.clone();
-            let bot_user = bot_user.clone();
+            let state = state.clone();
             Box::pin(async move {
-                let service = service
+                let (service, bot_user) = state
                     .get_or_try_init(|| async {
-                        context
-                            .pool()
-                            .await
-                            .map(|pool| LfgInteractions::new(pool.clone()))
-                    })
-                    .await?;
-                let bot_user = bot_user
-                    .get_or_try_init(|| async {
-                        context
+                        let service = LfgInteractions::new(context.pool().await?.clone());
+                        let bot_user = context
                             .rest
                             .current_bot_user_id()
                             .await
-                            .map_err(|_| ErrorClass::Rest)
+                            .map_err(|_| ErrorClass::Rest)?;
+                        Ok::<_, ErrorClass>((service, bot_user))
                     })
                     .await?;
                 service
