@@ -2666,7 +2666,7 @@ mod tests {
                     count
                 );
             }
-            assert_eq!(JOBS.len(), 16);
+            assert_eq!(JOBS.len(), 17);
             assert!(!text.contains("unknown_job"));
         }
     }
@@ -2713,7 +2713,7 @@ mod tests {
                     count
                 );
             }
-            assert_eq!(JOBS.len(), 16);
+            assert_eq!(JOBS.len(), 17);
             assert!(!text.contains("unknown_job"));
         }
     }
