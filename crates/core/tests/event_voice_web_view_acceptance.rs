@@ -626,17 +626,16 @@ mod db_tests {
     /// the view contract needs are asserted present with explicit errors.
     /// Returns the write outcome so the invalid-reason test can observe a
     /// CHECK rejection instead of asserting success.
-    #[allow(clippy::too_many_arguments)]
     async fn exec_link(
         pool: &PgPool,
-        event_id: &str,
-        instance_starts_at: &str,
+        event: (&str, &str),
         channel_id: Option<&str>,
         channel_name: Option<&str>,
         state: Option<&str>,
         after_party: Option<bool>,
         tbd_reason: Option<&str>,
     ) -> Result<(), sqlx::Error> {
+        let (event_id, instance_starts_at) = event;
         let present = table_columns(pool, "event_voice_channels").await;
         for required in [
             "event_id",
@@ -719,11 +718,9 @@ mod db_tests {
         query.execute(pool).await.map(|_| ())
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn link_voice_row(
         pool: &PgPool,
-        event_id: &str,
-        instance_starts_at: &str,
+        event: (&str, &str),
         channel_id: Option<&str>,
         channel_name: Option<&str>,
         state: Option<&str>,
@@ -732,8 +729,7 @@ mod db_tests {
     ) {
         exec_link(
             pool,
-            event_id,
-            instance_starts_at,
+            event,
             channel_id,
             channel_name,
             state,
@@ -783,11 +779,10 @@ mod db_tests {
         let fixture = fixture(&url).await;
         let pool = fixture.pool().clone();
         let starts_at = future_iso(7);
-        seed_mirror_event(&pool, "evt-live", &starts_at, "scheduled", Some("111"));
+        seed_mirror_event(&pool, "evt-live", &starts_at, "scheduled", Some("111")).await;
         link_voice_row(
             &pool,
-            "evt-live",
-            &starts_at,
+            ("evt-live", &starts_at),
             Some("111"),
             Some("Friday 8s"),
             Some(STATE_LIVE),
@@ -819,7 +814,7 @@ mod db_tests {
         let fixture = fixture(&url).await;
         let pool = fixture.pool().clone();
         let starts_at = future_iso(7);
-        seed_mirror_event(&pool, "evt-tbd", &starts_at, "scheduled", None);
+        seed_mirror_event(&pool, "evt-tbd", &starts_at, "scheduled", None).await;
         assert_eq!(
             read_voice(&pool, "evt-tbd").await,
             Some((
@@ -841,11 +836,10 @@ mod db_tests {
         for (i, reason) in TBD_VOCABULARY.into_iter().enumerate() {
             let event_id = format!("evt-tbd-{i}");
             let starts_at = future_iso(7);
-            seed_mirror_event(&pool, &event_id, &starts_at, "scheduled", None);
+            seed_mirror_event(&pool, &event_id, &starts_at, "scheduled", None).await;
             link_voice_row(
                 &pool,
-                &event_id,
-                &starts_at,
+                (&event_id, &starts_at),
                 None,
                 None,
                 Some(STATE_TBD),
@@ -874,14 +868,13 @@ mod db_tests {
         let fixture = fixture(&url).await;
         let pool = fixture.pool().clone();
         let starts_at = future_iso(7);
-        seed_mirror_event(&pool, "evt-bogus", &starts_at, "scheduled", None);
+        seed_mirror_event(&pool, "evt-bogus", &starts_at, "scheduled", None).await;
         // A full consistent row varying only the reason, so a rejection can
         // only be the vocabulary CHECK. A missing table/column panics inside
         // exec_link with the schema-missing message (the RED signal).
         let outcome = exec_link(
             &pool,
-            "evt-bogus",
-            &starts_at,
+            ("evt-bogus", &starts_at),
             None,
             None,
             Some(STATE_TBD),
@@ -922,11 +915,10 @@ mod db_tests {
         let fixture = fixture(&url).await;
         let pool = fixture.pool().clone();
         let starts_at = future_iso(7);
-        seed_mirror_event(&pool, "evt-rename", &starts_at, "active", Some("222"));
+        seed_mirror_event(&pool, "evt-rename", &starts_at, "active", Some("222")).await;
         link_voice_row(
             &pool,
-            "evt-rename",
-            &starts_at,
+            ("evt-rename", &starts_at),
             Some("222"),
             Some("Before rename"),
             Some(STATE_LIVE),
@@ -961,11 +953,10 @@ mod db_tests {
         let fixture = fixture(&url).await;
         let pool = fixture.pool().clone();
         let starts_at = future_iso(7);
-        seed_mirror_event(&pool, "evt-delete", &starts_at, "scheduled", Some("333"));
+        seed_mirror_event(&pool, "evt-delete", &starts_at, "scheduled", Some("333")).await;
         link_voice_row(
             &pool,
-            "evt-delete",
-            &starts_at,
+            ("evt-delete", &starts_at),
             Some("333"),
             Some("Doomed room"),
             Some(STATE_LIVE),
@@ -1008,11 +999,10 @@ mod db_tests {
         let fixture = fixture(&url).await;
         let pool = fixture.pool().clone();
         let starts_at = future_iso(7);
-        seed_mirror_event(&pool, "evt-r15", &starts_at, "active", Some("444"));
+        seed_mirror_event(&pool, "evt-r15", &starts_at, "active", Some("444")).await;
         link_voice_row(
             &pool,
-            "evt-r15",
-            &starts_at,
+            ("evt-r15", &starts_at),
             Some("444"),
             Some("Original name"),
             Some(STATE_LIVE),
@@ -1144,14 +1134,18 @@ mod db_tests {
         let Some(url) = db_url() else { return };
         let fixture = fixture(&url).await;
         let pool = fixture.pool().clone();
-        sqlx::raw_sql("CREATE TABLE public._sqlx_migrations (version bigint PRIMARY KEY);")
-            .execute(&pool)
-            .await
-            .expect("ledger table");
-        sqlx::raw_sql("CREATE TABLE public._two_bot_migrations (version bigint PRIMARY KEY);")
-            .execute(&pool)
-            .await
-            .expect("ledger table");
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS public._sqlx_migrations (version bigint PRIMARY KEY);",
+        )
+        .execute(&pool)
+        .await
+        .expect("ledger table");
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS public._two_bot_migrations (version bigint PRIMARY KEY);",
+        )
+        .execute(&pool)
+        .await
+        .expect("ledger table");
         let roles = role_names();
         let plan = two_bot_core::database_roles::plan();
         execute(&pool, isolated(&plan, &roles)).await;
@@ -1199,11 +1193,10 @@ mod db_tests {
         let fixture = fixture(&url).await;
         let pool = fixture.pool().clone();
         let starts_at = future_iso(7);
-        seed_mirror_event(&pool, "evt-reapply", &starts_at, "scheduled", Some("555"));
+        seed_mirror_event(&pool, "evt-reapply", &starts_at, "scheduled", Some("555")).await;
         link_voice_row(
             &pool,
-            "evt-reapply",
-            &starts_at,
+            ("evt-reapply", &starts_at),
             Some("555"),
             Some("Sticky room"),
             Some(STATE_LIVE),
@@ -1236,11 +1229,10 @@ mod db_tests {
         let fixture = fixture(&url).await;
         let pool = fixture.pool().clone();
         let starts_at = future_iso(-1);
-        seed_mirror_event(&pool, "evt-party", &starts_at, "completed", Some("666"));
+        seed_mirror_event(&pool, "evt-party", &starts_at, "completed", Some("666")).await;
         link_voice_row(
             &pool,
-            "evt-party",
-            &starts_at,
+            ("evt-party", &starts_at),
             Some("666"),
             Some("After-party room"),
             Some(STATE_ENDED),
@@ -1258,7 +1250,7 @@ mod db_tests {
                 None,
             ))
         );
-        seed_mirror_event(&pool, "evt-hidden", &starts_at, "completed", None);
+        seed_mirror_event(&pool, "evt-hidden", &starts_at, "completed", None).await;
         assert_eq!(read_voice(&pool, "evt-hidden").await, None);
         fixture.close().await.expect("drop test database");
     }
