@@ -243,23 +243,23 @@ async fn reopen_component_retry_bounds_contention_and_slow_exchange_together() {
     let elapsed = start.elapsed();
     let requests = mock.requests();
     assert_eq!(requests.len(), 1, "one accepted send, no uncertain retry");
-    assert_eq!(executor.requests(), 1);
-    assert!(
-        lane.blocked.load(Ordering::SeqCst) > 1,
-        "pre-wire contention was exercised"
-    );
+    let blocked = lane.blocked.load(Ordering::SeqCst);
+    let admitted = lane.admitted.load(Ordering::SeqCst);
     assert_eq!(
-        lane.admitted.load(Ordering::SeqCst),
-        1,
-        "no second admitted attempt"
+        executor.requests(),
+        (blocked + admitted) as u64,
+        "the executor counts pre-wire refusals as well as admitted attempts"
     );
+    assert!(blocked > 1, "pre-wire contention was exercised");
+    assert_eq!(admitted, 1, "no second admitted attempt");
     assert!(
         elapsed < Duration::from_millis(2850),
         "2200 ms contention plus wire time must fit one 2500 ms budget (with scheduler margin), got {elapsed:?}"
     );
-    assert!(
-        matches!(result, Err(DiscordError::Unavailable(_))),
-        "the delayed accepted edit is uncertain, never a late success: {result:?}"
+    assert_eq!(
+        result,
+        Err(DiscordError::Timeout),
+        "the delayed accepted edit times out, never a late success"
     );
     assert_eq!(requests[0].method, "PATCH");
     assert!(requests[0].path.ends_with("/messages/@original"));
@@ -286,9 +286,15 @@ async fn reopen_component_retry_waits_out_short_contention_then_succeeds_control
             .await,
         Ok(())
     );
-    assert!(lane.blocked.load(Ordering::SeqCst) > 0);
-    assert_eq!(lane.admitted.load(Ordering::SeqCst), 1);
+    let blocked = lane.blocked.load(Ordering::SeqCst);
+    let admitted = lane.admitted.load(Ordering::SeqCst);
+    assert!(blocked > 0);
+    assert_eq!(admitted, 1);
     assert_eq!(mock.requests().len(), 1);
-    assert_eq!(executor.requests(), 1);
+    assert_eq!(
+        executor.requests(),
+        (blocked + admitted) as u64,
+        "the executor counts pre-wire refusals as well as admitted attempts"
+    );
     mock.shutdown().await;
 }
