@@ -360,6 +360,23 @@ class RollbackProofTests(unittest.TestCase):
             self.assertEqual(call.call_count, 1)
             self.assertIsNotNone(children[0].returncode)
 
+    def test_subprocess_timeout_after_both_pipes_close_kills_and_reaps_without_retry(self):
+        # Valid output and EOF do not mean the process has exited. Keep the
+        # mutant finite so removing the final wait timeout fails, not hangs.
+        script = ("import os,time; os.write(1, b'{\"workflow_run_id\":123}'); "
+                  "os.close(1); os.close(2); time.sleep(2)")
+        wait = subprocess.Popen.wait
+        with patch.object(proof, "GH_TIMEOUT", 0.5), \
+                patch.object(subprocess.Popen, "wait", autospec=True, side_effect=wait) as waits, \
+                local_gh(script) as (call, children):
+            with self.assertRaisesRegex(proof.ProofError, "^github_transport_failure$"):
+                proof.gh("repos/example")
+            self.assertEqual(call.call_count, 1)
+            self.assertIsNotNone(children[0].returncode)
+            self.assertNotEqual(children[0].returncode, 0)
+            # Prove EOF reached the bounded exit wait, not the selector timeout.
+            self.assertTrue(any(item.kwargs.get("timeout", 0) > 0 for item in waits.call_args_list))
+
     def test_success_writes_only_sanitized_evidence(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, ENV), \
                 patch.object(proof, "prove", return_value={"verdict": "pass", "child_run_id": 123}), \
@@ -429,6 +446,28 @@ class PromotionAndHoldTests(unittest.TestCase):
                 result = self.promotion(mutate_run=lambda row: row.update({key: value}))
                 self.assertEqual(result[0], 1, result[4])
                 self.assertEqual(result[1], {})
+
+    def test_wrong_or_missing_proof_job_identity_and_outcome_never_excuses_red_history(self):
+        # Mutate only job metadata: the listing, re-read run and all six steps
+        # still match, so none of their guards can mask a lost job binding.
+        for key, values in {
+            "run_id": (503, None), "run_attempt": (2, None),
+            "head_sha": ("b" * 40, None), "status": ("in_progress", "queued", None),
+            "conclusion": ("success", "cancelled", "skipped", None),
+        }.items():
+            for value in (*values, "missing"):
+                def mutate(data):
+                    job = data["jobs"][0]
+                    if value == "missing":
+                        del job[key]
+                    else:
+                        job[key] = value
+
+                with self.subTest(key=key, value=value):
+                    result = self.promotion(mutate_jobs=mutate)
+                    self.assertEqual(result[0], 1, result[4])
+                    self.assertEqual(result[1], {})
+                    self.assertTrue(any("/502/attempts/1/jobs" in path for path, _ in result[3]))
 
     def test_missing_failed_or_skipped_restore_chain_never_excuses_red_history(self):
         for name, required in EXPECTED_STEPS.items():
