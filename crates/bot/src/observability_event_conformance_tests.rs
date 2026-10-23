@@ -519,18 +519,21 @@ fn voice_event_values_are_bounded_by_the_catalog() {
     );
 }
 
-/// `crates/bot/src/eventsub_http.rs`: the Twitch EventSub receiver messages,
-/// in file order. The receiver file is not one of the six `SCOPED_SOURCES`
-/// (it lands with the receiver slice, after this pin), so it is read from
-/// disk at test time instead of via `include_str!`: a missing file must fail
-/// this one test, not break compilation of the whole suite. Once the file
-/// is permanent, fold it into `SCOPED_SOURCES` and drop the disk read.
-const EVENTSUB_RS_EVENTS: [&str; 5] = [
+/// `crates/bot/src/eventsub_http.rs`: the unique Twitch EventSub receiver
+/// messages. The receiver file is not one of the six `SCOPED_SOURCES` (it lands
+/// with the receiver slice, after this pin), so it is read from disk at test
+/// time instead of via `include_str!`: a missing file must fail this one test,
+/// not break compilation of the whole suite. Once the file is permanent, fold
+/// it into `SCOPED_SOURCES` and drop the disk read.
+const EVENTSUB_RS_EVENTS: [&str; 8] = [
     "eventsub delivery refused",
     "challenge answered",
     "notification acknowledged",
     "revocation acknowledged",
     "delivery ignored",
+    "delivery child failed; durable claim fences retain uncertainty",
+    "receiver shutdown deadline exhausted with delivery children unfinished",
+    "receiver shutdown deadline exhausted; unfinished delivery claims remain fenced",
 ];
 
 /// Test-only emissions inside the receiver file's `#[cfg(test)]` module,
@@ -625,6 +628,15 @@ fn eventsub_receiver_emissions_match_the_catalog() {
         fielded, receiver_callsites,
         "every eventsub receiver log callsite carries event = \"eventsub_receiver\" \
          ({fielded} fielded of {receiver_callsites} receiver callsites)"
+    );
+}
+
+#[test]
+fn eventsub_delivery_child_logs_do_not_format_join_errors() {
+    let source = eventsub_receiver_source();
+    assert!(
+        !source.contains("error = %error"),
+        "JoinError formatting can expose panic payloads; log only bounded failure state"
     );
 }
 
