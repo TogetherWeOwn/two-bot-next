@@ -67,6 +67,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
             "command",
             "command-remove",
             "command-list",
+            "command-inspect",
             "schedule",
             "schedule-remove",
             "schedule-list",
@@ -269,12 +270,12 @@ mod tests {
                 "{token} appears exactly once"
             );
         }
-        // 28 legacy builtins plus the Next-only help and privacy commands,
-        // plus the 21 gated voice commands (voice `kick` loses first-wins
-        // to moderation `/kick`; `/templateassistant` stays unpublished
-        // until its slice lands): matches the regenerated `docs/commands.md`
-        // total.
-        assert!(text.contains("**Server commands** (50 live)"));
+        // 28 legacy builtins plus the Next-only help, privacy and
+        // command-inspect commands, plus the 21 gated voice commands (voice
+        // `kick` loses first-wins to moderation `/kick`; `/templateassistant`
+        // stays unpublished until its slice lands): matches the regenerated
+        // `docs/commands.md` total.
+        assert!(text.contains("**Server commands** (51 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"
@@ -394,11 +395,11 @@ mod tests {
             .iter()
             .flat_map(|g| g.commands.iter().copied())
             .collect();
-        // 27 legacy builtins plus the Next-only help command and the
-        // Next-only privacy command, then the 21 voice names (voice `kick`
+        // 27 legacy builtins plus the Next-only help, privacy and
+        // command-inspect commands, then the 21 voice names (voice `kick`
         // shares the Kick group). `/templateassistant` stays out until its
         // slice lands.
-        assert_eq!(grouped.len(), 50);
+        assert_eq!(grouped.len(), 51);
         for name in [
             "rank",
             "leaderboard",

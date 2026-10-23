@@ -39,7 +39,8 @@ use super::commands::{
     OCCURRENCE_ID_MAX_CHARS, PERM_MANAGE_EVENTS, PERM_MANAGE_GUILD,
 };
 use super::custom_commands::{
-    MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_TEMPLATE_CHARS, MAX_TEXT_TRIGGER_CHARS,
+    MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_INSPECT_ARGUMENT_UNITS, MAX_TEMPLATE_CHARS,
+    MAX_TEXT_TRIGGER_CHARS,
 };
 use super::feeds_http::MAX_FEED_SOURCE_BYTES;
 use super::lfg::{MAX_ROLE_SPEC_CHARS, MAX_TITLE_CHARS};
@@ -124,6 +125,49 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
                 CommandOptionType::Integer,
             )
             .min_value(1)]),
+        // Next-only saved-response inspection (parity row 33): one bounded
+        // management workflow with three private views, no enable/disable
+        // policy. Published after `command-list`; automation-gated and
+        // `ManageGuild`-gated like the other admin commands.
+        CommandDefinition::new(
+            "command-inspect",
+            "Inspect or privately preview a saved custom command",
+        )
+        .permissions(PERM_MANAGE_GUILD)
+        .options(vec![
+            CommandOption::new(
+                "name",
+                "Saved command name, a-z 0-9 _ -",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(MAX_COMMAND_NAME_CHARS as u32),
+            CommandOption::new(
+                "view",
+                "Private view (summary by default)",
+                CommandOptionType::String,
+            )
+            .choices(vec![
+                CommandChoice {
+                    name: "Summary".to_owned(),
+                    value: "summary".to_owned(),
+                },
+                CommandChoice {
+                    name: "Saved template".to_owned(),
+                    value: "template".to_owned(),
+                },
+                CommandChoice {
+                    name: "Preview".to_owned(),
+                    value: "preview".to_owned(),
+                },
+            ]),
+            CommandOption::new(
+                "arguments",
+                "Sample invocation arguments (ignored by current templates)",
+                CommandOptionType::String,
+            )
+            .max_length(MAX_INSPECT_ARGUMENT_UNITS as u32),
+        ]),
         CommandDefinition::new("schedule", "Schedule a message, once or recurring")
             .permissions(PERM_MANAGE_GUILD)
             .options(vec![
@@ -421,6 +465,7 @@ mod tests {
                 "command",
                 "command-remove",
                 "command-list",
+                "command-inspect",
                 "schedule",
                 "schedule-remove",
                 "schedule-list",
@@ -440,8 +485,8 @@ mod tests {
     #[test]
     fn no_collision_with_leveling_core_or_within_slice() {
         let merged = merge_commands(&[feature_commands()], &[]).expect("slice 2 merges cleanly");
-        // 4 core + 1 scorecard + 8 automation + 7 announcement.
-        assert_eq!(merged.len(), 20);
+        // 4 core + 1 scorecard + 9 automation + 7 announcement.
+        assert_eq!(merged.len(), 21);
         assert_eq!(
             &names(&merged)[..5],
             ["rank", "leaderboard", "help", "privacy", "attendance"]
@@ -466,6 +511,7 @@ mod tests {
             "command",
             "command-remove",
             "command-list",
+            "command-inspect",
             "schedule",
             "schedule-remove",
             "schedule-list",
@@ -502,6 +548,8 @@ mod tests {
             ("command", 2, 100),
             ("command", 3, 33),
             ("command-remove", 0, 32),
+            ("command-inspect", 0, 32),
+            ("command-inspect", 2, 500),
             ("schedule", 0, 2000),
             ("schedule-remove", 0, 128),
             ("sticky", 0, 2000),
@@ -555,6 +603,18 @@ mod tests {
         let kind = get(&ann, "feed-add").options[0].clone();
         let values: Vec<_> = kind.choices.iter().map(|c| c.value.as_str()).collect();
         assert_eq!(values, ["rss", "youtube", "twitch"]);
+        // /command-inspect: one required name, three bounded optional views,
+        // one bounded optional sample. No enable/disable policy option.
+        let inspect = get(&auto, "command-inspect").options.clone();
+        assert_eq!(inspect.len(), 3);
+        assert_eq!(inspect[0].required, Some(true));
+        assert!(inspect[1].required.is_none() && inspect[2].required.is_none());
+        let values: Vec<_> = inspect[1]
+            .choices
+            .iter()
+            .map(|c| c.value.as_str())
+            .collect();
+        assert_eq!(values, ["summary", "template", "preview"]);
         // Scorecard attendance: both options required, user-typed member.
         let score = scorecard_attendance_command();
         assert!(score.options.iter().all(|o| o.required == Some(true)));

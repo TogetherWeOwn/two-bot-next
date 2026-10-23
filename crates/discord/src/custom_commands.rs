@@ -23,9 +23,12 @@ use twilight_model::{
 use two_bot_core::{
     custom_command_service as service, custom_command_store as store,
     custom_commands::{
-        accepted_text_trigger, builtin_command_names, format_command_list_page, render_template,
-        AuditRecord, AutomationMessageAcceptance, PutCommandInput, StoredCommand, TemplateContext,
-        INVALID_COMMAND_LIST_PAGE,
+        accepted_text_trigger, builtin_command_names, format_command_list_page,
+        format_inspect_miss, format_inspect_preview, format_inspect_summary,
+        format_inspect_template, inspect_preview_context_unavailable, invalid_inspect_option_reply,
+        invalid_inspect_view_reply, render_template, reserved_command_names, validate_inspect_name,
+        AuditRecord, AutomationMessageAcceptance, InspectView, PutCommandInput, StoredCommand,
+        TemplateContext, INVALID_COMMAND_LIST_PAGE, MAX_INSPECT_ARGUMENT_UNITS,
     },
     router::{replies::InteractionReply, InteractionHandler},
     HandlerId, InteractionRouter, SlashOutcome,
@@ -199,7 +202,7 @@ impl CustomCommandRuntime {
         };
         let management = matches!(
             data.name.as_str(),
-            "command" | "command-remove" | "command-list"
+            "command" | "command-remove" | "command-list" | "command-inspect"
         );
         let builtin = builtin_command_names().contains(&data.name);
         if builtin && !management {
@@ -257,7 +260,7 @@ impl CustomCommandRuntime {
                 handler: HandlerId::AutomationAdmin,
             } if management => {
                 self.defer(interaction, true, received).await?;
-                let reply = self.manage(interaction, data, &guild).await;
+                let reply = self.manage(interaction, data, &guild, guild_name).await;
                 self.complete(
                     interaction,
                     reply
@@ -609,12 +612,107 @@ impl CustomCommandRuntime {
             .map_err(|_| CustomCommandError::Storage)
     }
 
+    /// Private saved-response inspection: one ephemeral content-only view,
+    /// never a public send, registration, cooldown/claim touch, definition
+    /// mutation or `command.run` fact. The only store access is a live
+    /// `get_command` read after every validation passes — no cache, so a
+    /// deleted definition immediately misses.
+    async fn inspect(
+        &self,
+        interaction: &Interaction,
+        data: &CommandData,
+        guild: &str,
+        guild_name: Option<&str>,
+    ) -> String {
+        let name = match single_string_option(data, "name") {
+            SingleOption::Missing | SingleOption::Malformed => {
+                return invalid_inspect_option_reply(
+                    "command name",
+                    "a saved command name is required.",
+                );
+            }
+            SingleOption::Value(name) => name,
+        };
+        let name = match validate_inspect_name(name, &reserved_command_names()) {
+            Ok(name) => name,
+            Err(error @ two_bot_core::custom_commands::CommandError::ReservedName(_)) => {
+                return invalid_inspect_option_reply("command name", &error.to_string());
+            }
+            Err(_) => {
+                return invalid_inspect_option_reply(
+                    "command name",
+                    "must match ^[a-z0-9_-]{1,32}$ (lowercase).",
+                );
+            }
+        };
+        let view = match single_string_option(data, "view") {
+            SingleOption::Missing => InspectView::Summary,
+            SingleOption::Malformed => return invalid_inspect_view_reply(None),
+            SingleOption::Value(raw) => match InspectView::parse(raw) {
+                Some(view) => view,
+                None => return invalid_inspect_view_reply(Some(raw)),
+            },
+        };
+        match single_string_option(data, "arguments") {
+            SingleOption::Missing => {}
+            SingleOption::Malformed => {
+                return invalid_inspect_option_reply(
+                    "arguments",
+                    "expected a single text sample of invocation arguments.",
+                );
+            }
+            SingleOption::Value(sample) => {
+                if sample.encode_utf16().count() > MAX_INSPECT_ARGUMENT_UNITS {
+                    return invalid_inspect_option_reply(
+                        "arguments",
+                        "sample arguments must be at most 500 characters.",
+                    );
+                }
+            }
+        }
+        let row = match store::get_command(&self.pool, guild, &name).await {
+            Ok(row) => row,
+            Err(_) => return LOOKUP_OUTAGE_REPLY.to_owned(),
+        };
+        let Some(row) = row else {
+            return format_inspect_miss(&name);
+        };
+        match view {
+            InspectView::Summary => format_inspect_summary(&row),
+            InspectView::Template => format_inspect_template(&row),
+            InspectView::Preview => {
+                // Same invoking member/channel/guild context as real
+                // execution; the sample arguments are never interpolated.
+                let actor = interaction.author();
+                let context = actor.zip(interaction.channel.as_ref()).zip(guild_name).map(
+                    |((actor, channel), server)| TemplateContext {
+                        user: format!("<@{}>", actor.id),
+                        username: actor.name.clone(),
+                        server: server.to_owned(),
+                        channel: format!("<#{}>", channel.id),
+                    },
+                );
+                match context {
+                    Some(context) => format_inspect_preview(&row, &context),
+                    None => inspect_preview_context_unavailable(&row.name),
+                }
+            }
+        }
+    }
+
     async fn manage(
         &self,
         interaction: &Interaction,
         data: &CommandData,
         guild: &str,
+        guild_name: Option<&str>,
     ) -> Result<String, CustomCommandError> {
+        if data.name == "command-inspect" {
+            // Routing already enforced guild/application, ManageGuild and the
+            // feature gate. Reject forged types/duplicates before a store
+            // read; validate name/view/arguments before any lookup.
+            return Ok(self.inspect(interaction, data, guild, guild_name).await);
+        }
         let actor = interaction
             .author_id()
             .ok_or(CustomCommandError::Context)?
@@ -728,4 +826,26 @@ fn string_option<'a>(data: &'a CommandData, name: &str) -> Option<&'a str> {
         CommandOptionValue::String(value) if option.name == name => Some(value.as_str()),
         _ => None,
     })
+}
+
+/// One named option read strictly: a forged type or a duplicate refuses
+/// instead of silently taking the first value.
+enum SingleOption<'a> {
+    Missing,
+    Malformed,
+    Value(&'a str),
+}
+
+fn single_string_option<'a>(data: &'a CommandData, name: &str) -> SingleOption<'a> {
+    let mut matches = data.options.iter().filter(|option| option.name == name);
+    let Some(first) = matches.next() else {
+        return SingleOption::Missing;
+    };
+    if matches.next().is_some() {
+        return SingleOption::Malformed;
+    }
+    match &first.value {
+        CommandOptionValue::String(value) => SingleOption::Value(value.as_str()),
+        _ => SingleOption::Malformed,
+    }
 }
