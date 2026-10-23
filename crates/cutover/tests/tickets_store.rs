@@ -146,13 +146,13 @@ async fn concurrent_reservations_claims_and_closes_have_one_winner() {
         .await
         .unwrap();
     store.finish_cleanup(&ticket.id, 40).await.unwrap();
-    assert_eq!(
+    assert!(matches!(
         store
             .reserve("cooldown", "member", 299_999, COOLDOWN_SECONDS)
             .await
             .unwrap(),
-        OpenResult::Refused(OpenDecision::Cooldown)
-    );
+        OpenResult::Refused(OpenDecision::Cooldown { .. })
+    ));
     assert!(matches!(
         store
             .reserve("boundary", "member", 300_000, COOLDOWN_SECONDS)
@@ -418,13 +418,13 @@ async fn cooldown_orders_legacy_offsets_by_instant_not_text() {
         .unwrap();
     // At 12:00Z the newest ticket is 60s old: the cooldown must refuse.
     // 2026-09-30T12:00:00.000Z; the offset row is 10:00Z, the UTC row 11:59Z.
-    assert_eq!(
+    assert!(matches!(
         store
             .reserve("next", "member", 1_790_769_600_000, COOLDOWN_SECONDS)
             .await
             .unwrap(),
-        OpenResult::Refused(OpenDecision::Cooldown)
-    );
+        OpenResult::Refused(OpenDecision::Cooldown { .. })
+    ));
     db.close().await;
 }
 

@@ -608,22 +608,25 @@ mod tests {
             decide_open(None, None, 0, COOLDOWN_SECONDS),
             OpenDecision::Reserve
         );
-        assert_eq!(
+        assert!(matches!(
             decide_open(None, Some(0), 299_999, COOLDOWN_SECONDS),
-            OpenDecision::Cooldown
-        );
+            OpenDecision::Cooldown { .. }
+        ));
         assert_eq!(
             decide_open(None, Some(0), 300_000, COOLDOWN_SECONDS),
             OpenDecision::Reserve
         );
-        assert_eq!(
+        assert!(matches!(
             decide_open(None, Some(1), 0, COOLDOWN_SECONDS),
-            OpenDecision::Cooldown
-        );
-        assert_eq!(
+            OpenDecision::Cooldown { .. }
+        ));
+        assert!(matches!(
             decide_open(Some(&ticket()), Some(0), 1, COOLDOWN_SECONDS),
-            OpenDecision::Existing { channel_id: None }
-        );
+            OpenDecision::Existing {
+                channel_id: None,
+                ..
+            }
+        ));
     }
 
     #[test]

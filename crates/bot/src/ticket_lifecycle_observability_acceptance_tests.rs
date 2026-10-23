@@ -1001,7 +1001,7 @@ async fn cooldown_decisions_are_unchanged() {
             .reserve("lc-cd-3", "lc-op-cd", now + 2, COOLDOWN_SECONDS)
             .await
             .unwrap(),
-        OpenResult::Refused(OpenDecision::Cooldown)
+        OpenResult::Refused(OpenDecision::Cooldown { .. })
     ));
     assert!(matches!(
         store

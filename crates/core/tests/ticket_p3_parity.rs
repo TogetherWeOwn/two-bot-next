@@ -120,25 +120,53 @@ fn open_decision_prefers_active_and_enforces_300s_cooldown_boundary() {
         decide_open(None, None, 0, COOLDOWN_SECONDS),
         OpenDecision::Reserve
     );
-    assert_eq!(
+    assert!(matches!(
         decide_open(None, Some(0), 299_999, COOLDOWN_SECONDS),
-        OpenDecision::Cooldown
-    );
+        OpenDecision::Cooldown { .. }
+    ));
     assert_eq!(
         decide_open(None, Some(0), 300_000, COOLDOWN_SECONDS),
         OpenDecision::Reserve
     );
     let active = reservation();
-    assert_eq!(
+    assert!(matches!(
         decide_open(Some(&active), Some(0), 1, COOLDOWN_SECONDS),
-        OpenDecision::Existing { channel_id: None }
-    );
-    let with_channel = open_ticket();
-    assert_eq!(
-        decide_open(Some(&with_channel), Some(0), i64::MAX, COOLDOWN_SECONDS),
         OpenDecision::Existing {
-            channel_id: Some("channel".into())
+            channel_id: None,
+            ..
         }
+    ));
+    let with_channel = open_ticket();
+    assert!(matches!(
+        decide_open(Some(&with_channel), Some(0), i64::MAX, COOLDOWN_SECONDS),
+        OpenDecision::Existing { channel_id: Some(channel), .. } if channel == "channel"
+    ));
+}
+
+// A whole-second display must not move the millisecond eligibility boundary.
+#[test]
+fn subsecond_cooldown_preserves_exact_policy_boundary() {
+    // Created at 1001ms: at 301000ms there is still one millisecond to wait.
+    assert!(matches!(
+        decide_open(None, Some(1_001), 301_000, COOLDOWN_SECONDS),
+        OpenDecision::Cooldown { .. }
+    ));
+    for now in [301_001, 301_002, 302_000] {
+        assert_eq!(
+            decide_open(None, Some(1_001), now, COOLDOWN_SECONDS),
+            OpenDecision::Reserve,
+            "display rounding cannot delay admission at {now}ms"
+        );
+    }
+    // Keep the existing saturated-i64 duration predicate, even when the
+    // mathematical last + duration is beyond i64::MAX.
+    assert!(matches!(
+        decide_open(None, Some(1_001), i64::MAX, u64::MAX),
+        OpenDecision::Cooldown { .. }
+    ));
+    assert_eq!(
+        decide_open(None, Some(0), i64::MAX, u64::MAX),
+        OpenDecision::Reserve
     );
 }
 
