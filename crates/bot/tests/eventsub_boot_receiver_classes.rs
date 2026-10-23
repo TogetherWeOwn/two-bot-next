@@ -286,7 +286,8 @@ fn reserved_eventsub_bind() -> String {
 
 fn boot_with(vars: &[(&str, &str)]) -> SpawnedExit {
     let bind = reserved_eventsub_bind();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_two-bot"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_two-bot"));
+    command
         .env_clear()
         .env("LISTEN_ADDR", "127.0.0.1:0")
         .env("GUILD_ID", "123")
@@ -299,9 +300,15 @@ fn boot_with(vars: &[(&str, &str)]) -> SpawnedExit {
         .env("TWO_EVENTSUB_INVITE_URL", "https://discord.gg/example")
         .envs(vars.iter().copied())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("start test bot");
+        .stderr(Stdio::piped());
+    // Keep application env isolated, but return instrumented child coverage to
+    // the runner's destination. Preserve its %m/%p substitutions and add a PID
+    // suffix even when the supplied filename has no collision-safe pattern.
+    if let Some(mut profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        profile.push(".eventsub-child-%p.profraw");
+        command.env("LLVM_PROFILE_FILE", profile);
+    }
+    let mut child = command.spawn().expect("start test bot");
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if child.try_wait().expect("poll test bot").is_some() {
