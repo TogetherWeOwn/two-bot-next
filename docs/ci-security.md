@@ -236,6 +236,29 @@ Verify offline, without database/network access or a real interval sleep:
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_staging_retention_census.py' -v
 ```
 
+## Staging fixture census (manual)
+
+`staging-fixture-census.yml` is the point-in-time companion: it runs the
+same script in `fixture-scope` mode over the seven fixture tables the
+read-only role can `SELECT` (per-table totals plus fixture-marker
+counts with the two pinned auxiliaries, and the anonymous per-table
+guild inventory). The regression pins the same shape as the retention
+census: `workflow_dispatch`-only with no inputs, one `fixture-census`
+job from `main` only, the existing no-reviewer `staging-migrate-plan`
+environment, the routed runner for job `fixture-census`,
+`contents: read`, exactly two unconditional steps, log only with no
+artifact, and no `set -x`, wrangler, apply, seed or purge route. The
+only deliberate differences are its own non-cancelling concurrency
+group, a 10-minute timeout (no in-job sleep), and the exact `fixture-scope`
+command. Both fixture query groups share one psql session and one
+`REPEATABLE READ, READ ONLY` transaction, so the evidence has a single
+database snapshot despite concurrent staging writes. The report timestamp
+records runner-clock capture completion. The identity, role, timeout and
+output fences are the shared ones above; the marker prefix is fixed in
+the queries, so no per-run value ever crosses the dispatch boundary.
+Do not dispatch until the security review for the fixture queries is
+recorded. Procedure: `docs/staging-fixture-census.md`.
+
 ## Production route
 
 `deploy-production.yml` (main #243) is the one live deployment workflow. The

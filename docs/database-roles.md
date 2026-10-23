@@ -13,7 +13,7 @@ holds no membership path into the migrator group.
 | --- | --- | --- | --- | --- | --- |
 | `two_bot_migrator` | CONNECT, CREATE; no TEMP | Owner (DDL) | Owner | Owner | Owner |
 | `two_bot_runtime` | CONNECT; no CREATE/TEMP | USAGE, no CREATE | Ordinary tables: SELECT, INSERT, UPDATE, DELETE; admission lanes: SELECT, INSERT, UPDATE only | USAGE, SELECT; no UPDATE | No access |
-| `two_web_reader` | CONNECT; no CREATE/TEMP | No access | No access | No access | USAGE; SELECT on nine reviewed views |
+| `two_web_reader` | CONNECT; no CREATE/TEMP | No access | No access | No access | USAGE; SELECT on ten reviewed views |
 | `two_bot_migrator_ro` | CONNECT; no CREATE/TEMP | USAGE, no CREATE | SELECT on bot tables, admission lanes and SQLx ledger; no DML | No access | USAGE; no view or function access |
 
 The owner-grant journal (`voice_owner_grants`) is an ordinary `table`-kind
@@ -85,6 +85,14 @@ per DELETE-removed id through the app pool inside its snapshot-swap
 transaction, and reads the guild high-water back through it before touching
 the mirror. The table carries no member column, so there is nothing to
 erase and no reader grant beyond the app pool.
+
+The admin API token registry (`admin_api_tokens`) is ordinary `table` kind
+for the same reason: the container authorizer reads the token row through
+the app pool when the later transport slices land (slice 0 ships the table
+with no reader yet). Secrets are hash-only; `issued_by` is operator
+attribution retained by the erasure allowlist. The table carries no member
+column, so there is nothing to erase and no reader grant beyond the app
+pool.
 
 The reader cannot read bot base tables, including through inherited/public or
 column-level grants. Normal PostgreSQL views deliberately run with their owner's

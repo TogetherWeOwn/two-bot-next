@@ -68,3 +68,33 @@ fn lane_busy_and_no_ticket_replies_are_pinned() {
     );
     assert_eq!(Failure::NoTicket.reply(), "This channel is not a ticket.");
 }
+
+#[test]
+fn claim_conflicts_name_winner_or_lifecycle_without_recovery_promise() {
+    let owned = Failure::TicketClaimedBy("501".into()).reply();
+    assert_eq!(owned, "This ticket is already claimed by <@501>.");
+    let not_open = Failure::TicketNotOpen.reply();
+    assert_eq!(not_open, "This ticket is not open.");
+    assert!(
+        !owned.to_lowercase().contains("or not open"),
+        "ownership and lifecycle refusals must not be conflated: {owned:?}"
+    );
+    assert!(
+        !not_open.to_lowercase().contains("already claimed"),
+        "lifecycle refusal must not name an ownership conflict: {not_open:?}"
+    );
+    for reply in [&owned, &not_open] {
+        let lower = reply.to_lowercase();
+        for banned in ["recover", "unfinished", "will retry", "will be retried"] {
+            assert!(
+                !lower.contains(banned),
+                "claim refusal must not promise recovery ({banned:?}): {reply:?}"
+            );
+        }
+    }
+    assert_eq!(
+        Failure::TicketClaimedBy("501".into()).class(),
+        ErrorClass::Rest
+    );
+    assert_eq!(Failure::TicketNotOpen.class(), ErrorClass::Rest);
+}

@@ -48,7 +48,7 @@ file). It is a deterministic squawk subset: standard library only, no
 database, no network. CI runs with `--strict`: `adding-required-field`,
 `creating-index`, `adding-check-constraint`, and `changing-column-type` findings
 fail the PR. `dropping-object` remains a warning because safe, coordinated
-removal still ends with a `DROP TABLE` or `DROP COLUMN`. The two documented
+removal still ends with a `DROP TABLE` or `DROP COLUMN`. The four documented
 transactional index exceptions below are matched by exact migration path and
 complete normalized statement. Omit `--strict` for a local advisory preview of
 all five rules.
@@ -80,15 +80,18 @@ Write migrations that stay silent:
 - Type change or drop: prefer an additive migration (new column, backfill,
   swap) and coordinate removal across deploys.
 
-Two exact `creating-index` findings are waived for the transactional event-store
-indexes in migrations 0444 and 0445. The waiver matches only each migration path
+Four exact `creating-index` findings are waived: the transactional event-store
+indexes in migrations 0444 and 0445, and the same-file new-table live-lookup
+indexes in migrations 0456 and 0457. The waiver matches only each migration path
 and the complete normalized `CREATE INDEX` statement; any changed statement,
-additional index in either file, or index in another migration remains subject to
-strict lint. This exception is documented beside the checker configuration and
-is grounded in the observed CI deadlock: `CREATE INDEX CONCURRENTLY` waits on
-open snapshots while parallel disposable-database test migrators wait on SQLx's
-advisory lock, producing PostgreSQL `40P01`. It does not relax any other
-migration check or the required lint gate.
+additional index in any of these files, or index in another migration remains
+subject to strict lint. This exception is documented beside the checker
+configuration and is grounded in the observed CI deadlock: `CREATE INDEX
+CONCURRENTLY` waits on open snapshots while parallel disposable-database test
+migrators wait on SQLx's advisory lock, producing PostgreSQL `40P01`, and it
+cannot run inside the migration transaction at all. The 0456/0457 tables are
+empty at first apply, and the `IF NOT EXISTS` re-apply no-ops both statements.
+It does not relax any other migration check or the required lint gate.
 
 The checker discovers `crates/*/migrations/*.sql` dynamically with
 `--migration-glob` and `--exclude` overrides and no hardcoded crate list,

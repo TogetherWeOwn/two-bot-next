@@ -19,7 +19,8 @@ COPY crates/bot/Cargo.toml crates/bot/
 COPY crates/cutover/Cargo.toml crates/cutover/
 COPY crates/store/Cargo.toml crates/store/
 COPY crates/testsupport/Cargo.toml crates/testsupport/
-RUN mkdir -p src crates/core/src crates/discord/src crates/bot/src crates/cutover/src crates/store/src crates/testsupport/src \
+COPY crates/voice-probe/Cargo.toml crates/voice-probe/
+RUN mkdir -p src crates/core/src crates/discord/src crates/bot/src crates/cutover/src crates/store/src crates/testsupport/src crates/voice-probe/src \
     && echo '' > src/lib.rs \
     && echo 'fn main(){}' > crates/bot/src/main.rs \
     && echo '' > crates/core/src/lib.rs \
@@ -27,6 +28,8 @@ RUN mkdir -p src crates/core/src crates/discord/src crates/bot/src crates/cutove
     && echo '' > crates/cutover/src/lib.rs \
     && echo '' > crates/store/src/lib.rs \
     && echo '' > crates/testsupport/src/lib.rs \
+    && echo '' > crates/voice-probe/src/lib.rs \
+    && echo 'fn main(){}' > crates/voice-probe/src/main.rs \
     && cargo fetch --locked
 
 # Real sources; the release profile (opt-level=z, lto, strip) targets the

@@ -139,6 +139,36 @@ retry. If a later explicit call succeeds after a recorded refusal, the original
 failed fact remains unchanged. A first successful invocation records the same
 success fact as before.
 
+## Lookup outages and uncertain completion
+
+A failed definition lookup (timeout or SQL error) is not a definitive miss:
+unknown commands stay silent, but an outage cannot prove absence. When the
+surface is in scope (configured guild, automations on, non-builtin,
+non-management slash) the runtime owns the interaction with one bounded
+fixed-text ephemeral availability reply inside the existing receipt budget,
+without executing a cached or guessed definition:
+
+> Custom commands are temporarily unavailable. Please try again shortly.
+
+The copy is fixed and generic: no command name, error, or transport detail.
+A definitive absent/disabled command stays silent, as do all foreign/gated
+inputs — foreign app or guild, missing guild, builtin names, non-slash
+payloads, and a disabled automations gate even when the lookup itself fails.
+Management permission refusals still precede any lookup, and the gateway
+ownership keeps exactly one reply owner with no double fallback.
+
+Completion errors use the same uncertainty classification as the defer and
+prefix paths. A proven rejection (safe pre-mutation: Discord refused before
+any mutation) is `Delivery` and keeps its definitive failed `command.run`
+fact with reason `delivery_failed`. An uncertain completion — timeout,
+transport failure, 5xx, or 429, including an accepted edit whose response is
+lost — is `DeliveryUnknown`: exactly one PATCH, never an automatic resend,
+and no definitive failed fact, so a later explicit retry of the same
+interaction records only its own outcome. A successful completion delivers
+the rendered template and records `(ok, None)`; audit rows carry no template
+or rendered content. A render or context failure is definitive and local, so it still
+audits even when the fallback completion is uncertain.
+
 ## Explicit prefix acceptance and replay safety
 
 `AutomationMessageAcceptance` distinguishes deliberately disabled automod,

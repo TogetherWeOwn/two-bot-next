@@ -27,7 +27,7 @@ static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
 
 fn schema_name_at(nanos: u128) -> String {
     format!(
-        "tog36967_receipt_bounds_{}_{}_{}",
+        "welcome_receipt_bounds_{}_{}_{}",
         std::process::id(),
         NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed),
         nanos

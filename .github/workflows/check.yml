@@ -261,6 +261,7 @@ jobs:
       - name: offline build-cache safety regressions
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cargo_cache.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cargo_cache_idle_stale_validation_pins.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_ci_single_core.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_ci_postgres_storage.py' -v
 
@@ -275,6 +276,9 @@ jobs:
 
       - name: Scratch drill schema provenance (offline)
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_restore_drill_schema.py' -v
+
+      - name: Deploy unit bounds, failure hook and drill age refusal (offline)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_deploy_units.py' -v
 
       - name: Cutover runbook links resolve (offline)
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cutover_doc_links.py' -v
@@ -828,7 +832,16 @@ jobs:
         # first-match on the process-wide tracing capture; they run serially
         # in their own step below, so skip them here where sibling and
         # revision tests emit the same messages concurrently.
-        run: cargo test --workspace --lib --bins --features two-bot-core/db --locked -- --skip ticket_runtime::cursor_budget
+        run: |
+          cargo test --workspace --lib --bins --features two-bot-core/db --locked -- --skip ticket_runtime::cursor_budget --skip settings_jobs::tests::ops_overrides_acceptance_tests::
+
+      # The ops fixture mutates process env; a private DB/reader does not
+      # isolate it from the supervised guild poll in the threaded sweep.
+      - name: cargo test (isolated ops override acceptance)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: |
+          cargo test -p two-bot --bin two-bot --features two-bot-core/db --locked settings_jobs::tests::ops_overrides_acceptance_tests:: -- --test-threads=1
 
       # Global metric deltas must not be satisfied by a sibling hostile-name test.
       # Reuse the compiled feature graph, in a fresh process with serial tests.
@@ -1238,7 +1251,11 @@ jobs:
           cov_run "$COV" llvm-cov --workspace --lib --bins --tests \
             --features two-bot-core/db --locked --ignore-run-fail --no-report -- \
             --skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump \
-            --skip seeded_aggregates_render_exactly_guild_scoped_and_read_only
+            --skip seeded_aggregates_render_exactly_guild_scoped_and_read_only \
+            --skip settings_jobs::tests::ops_overrides_acceptance_tests::
+          # Run the env-mutating ops acceptance alone, before switching away
+          # from its disposable bootstrap URL. Failure remains fail-closed.
+          cov_run "$COV" llvm-cov --no-report -p two-bot --bin two-bot --features two-bot-core/db --locked -- settings_jobs::tests::ops_overrides_acceptance_tests:: --test-threads=1 --skip regenerate_reference_docs
           # The member-moderation suite's guard panics without MEMBER_TESTDB, so
           # export it before the ignored sweep: the suite runs green here
           # instead of printing 32 FAILED lines that the flake ledger
@@ -1721,7 +1738,7 @@ jobs:
           cargo test -p two-bot-core --features db --test backup_schema_roundtrip --locked shipped_backup_and_restore_drill -- --nocapture --test-threads=1
 
       - name: audit database regressions (CI service only)
-        run: cargo test -p two-bot-core --features db --test audit_store --test audit_service --test containment_store --test join_risk_store --locked -- --ignored
+        run: cargo test -p two-bot-core --features db --test audit_store --test audit_service --test reconcile_bound_acceptance --test reconcile_bound_guard --test containment_store --test join_risk_store --locked -- --ignored
 
       - name: LFG store regressions (CI service container only)
         run: >-
@@ -1815,6 +1832,9 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot-discord --features db --locked --test internal_member_moderation -- --include-ignored --test-threads=1
 
+      - name: Channel audit metadata pins (offline, db-featured harness)
+        run: cargo test -p two-bot-discord --features db --locked --test channel_moderation_audit_metadata -- --test-threads=1
+
       - name: Internal event executor mirror acceptance (CI service only)
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
@@ -1873,6 +1893,9 @@ jobs:
 
       - name: custom-command routed runtime proof (mock Discord and CI Postgres only)
         run: cargo test -p two-bot-discord --features db --locked --test custom_command_runtime -- --include-ignored
+
+      - name: custom-command uncertain-delivery acceptance (mock Discord and CI Postgres only)
+        run: cargo test -p two-bot-discord --features db --locked --test custom_command_uncertain_delivery_acceptance -- --include-ignored
 
       - name: Durable Discord send admission (isolated DBs and mock HTTP only)
         env:
@@ -2174,6 +2197,15 @@ jobs:
       - name: containment runtime acceptance (mock Discord and CI service only)
         run: cargo test -p two-bot --locked --lib --bins containment_worker_ -- --include-ignored
 
+      # Fail-closed gate for the fail-open refusal acceptance: the
+      # `fail_open_containment_acceptance` tests are `#[ignore]`d and their
+      # paths do not match the `containment_worker_` filter above, so without
+      # this step a revert of the outcome-unknown + metrics change stays
+      # green. The protected acceptance file owns the test names; this step
+      # selects them by module path instead of renaming them.
+      - name: containment fail-open refusal acceptance (mock Discord and CI service only)
+        run: cargo test -p two-bot --locked --lib --bins fail_open_containment_acceptance -- --include-ignored
+
       - name: containment worker-path soak (mock Discord and CI service only)
         run: cargo test -p two-bot --locked --test containment_worker_soak -- --include-ignored
 
@@ -2371,7 +2403,7 @@ jobs:
         run: cargo clippy -p two-bot-core --all-targets --features db --locked -- -D warnings
       - name: Test SQL ledger on ephemeral Postgres
         if: needs.job-inputs.outputs.rust != 'false'
-        run: cargo test -p two-bot-core --features db --locked --test member_moderation_db -- --ignored
+        run: cargo test -p two-bot-core --features db --locked --test member_moderation_db --test member_audit_suppression_db -- --ignored
 
   parity-docs:
     name: parity docs
@@ -2466,7 +2498,10 @@ jobs:
       - name: self-role claim, renewal, recovery and fencing tests
         run: cargo test -p two-bot-cutover --test self_role_store --locked -- --ignored
       - name: self-role ticket acknowledgement columns and caps
-        run: cargo test -p two-bot-cutover --test self_role_ack_acceptance --locked -- --ignored
+        # Serial: each test mints its schema as pid + clock nanos, so parallel
+        # setup collides on pg_namespace (duplicate-schema failure). The suite
+        # still runs in well under a second serially.
+        run: cargo test -p two-bot-cutover --test self_role_ack_acceptance --locked -- --ignored --test-threads=1
       - name: self-role settlement through acknowledgement columns
         run: cargo test -p two-bot-cutover --test self_role_settlement_acceptance --locked -- --ignored
       - name: self-role runtime admission and immutable snapshots (mock REST and isolated schema)
@@ -2896,9 +2931,22 @@ jobs:
         with:
           prefix-key: ${{ runner.os }}-cargo
           save-if: ${{ github.event_name == 'push' }}
+      # The non-ignored creation-receipt acceptance modules require the
+      # guarded disposable bootstrap, as in rust-tests; TestDb suites
+      # connect to agent_test directly and ignore this variable. The
+      # rust:bookworm job container ships no PostgreSQL client, so
+      # install it first as in the community-db lane.
+      - name: Prepare guarded test database
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends postgresql-client >/dev/null
+          rm -rf /var/lib/apt/lists/*
+          createdb -h agent-testdb -U agent_test two_bot_test_ci
       - name: Ticket lifecycle and migration integration tests
         run: cargo test -p two-bot-cutover --locked --test tickets_store -- --ignored
       - name: Ticket shared router and mock Discord lifecycle acceptance
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         # The ticket skip/budget log-assertion modules assert exact counts via
         # first-match on the process-wide tracing capture; they run serially
         # in the isolated step below, so skip them here where the revision
@@ -3112,6 +3160,10 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_container_drill_dryrun_acceptance.py -v
       - name: Verify staging ownership-takeover retry (offline fixtures)
         run: node --test scripts/test-ownership-control.mjs
+      - name: Verify ownership control response validation (offline fixtures)
+        run: node --test scripts/test-ownership-control-response-validation.mjs
+      - name: Verify ownership response audit fields and CLI projection (offline fixtures)
+        run: node --test scripts/test-ownership-control-response.mjs
       - name: Verify production ownership-status retry (offline fixtures)
         run: node --test scripts/test-production-ownership-control.mjs
       - name: Verify staging ownership status read (offline fixtures)
@@ -3198,23 +3250,30 @@ jobs:
       - name: Verify runner routing for every workflow job
         if: needs.job-inputs.outputs.worker != 'false'
         run: python3 ../scripts/test-runner-routing.py
-      - name: Verify offline release on promote
+      - name: Verify commit-parser step attribution (offline fixtures)
         if: needs.job-inputs.outputs.worker != 'false'
-        # Version bumps, notes, rollback guard and off-main refusal against a
-        # throwaway git repository (no network, no token).
-        run: node ../scripts/test-release-on-promote.cjs
-      - name: Verify release latest repair guard
+        run: python3 ../scripts/test-commit-parse-guard-ci.py
+      - name: Verify the daily digest release (offline fixtures)
         if: needs.job-inputs.outputs.worker != 'false'
-        # Repairing an older tag's missing release must not move "Latest"
-        # backward (mocked gh against a throwaway git repository).
-        run: node --test ../scripts/test-release-on-promote-latest-repair.cjs
-      - name: Verify the commit-parse guard
+        # Digest tags, notes, quiet-day and rollback skips, off-main refusal
+        # and the 200-commit ENOBUFS regression against a throwaway git
+        # repository (no network, no token).
+        run: node ../scripts/test-daily-digest.cjs
+      - name: Verify the production digest resolver (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_digest_resolve.py -v
+      - name: Verify digest failure, repair and SBOM replay (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_daily_digest_execution.py -v
+      - name: Verify the missing-digest alert (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_digest_alert.py -v
+      - name: Install pinned commit-parser fixture
         if: needs.job-inputs.outputs.worker != 'false'
         # The PR-side guard uses release-please's pinned conventional-commit
         # parser, in an isolated install with lifecycle scripts disabled.
         run: | # zizmor: ignore[adhoc-packages] pinned commit parser fixture only
           npm install --prefix "$RUNNER_TEMP/release-fixture" --ignore-scripts --no-audit --no-fund release-please@17.6.0
-          NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-commit-parse-guard.cjs
+      - name: Verify the commit-parse guard
+        if: needs.job-inputs.outputs.worker != 'false'
+        run: NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-commit-parse-guard.cjs
 
   # Single always-run aggregator for the path-filtered matrix. GitHub counts
   # a skipped job as passing and leaves a required context pending when its

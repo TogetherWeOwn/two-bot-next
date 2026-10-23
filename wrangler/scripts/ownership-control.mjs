@@ -2,6 +2,7 @@
 // Staging-only control client. Secrets are read from env, never argv or stdout.
 // Production handoff remains B4's separately authorized execution sheet.
 import { isDirectInvocation } from "./is-direct-invocation.mjs";
+import { parseOwnershipResponse } from "./ownership-control-response.mjs";
 
 class ControlError extends Error {}
 
@@ -80,10 +81,8 @@ export async function control({ action, url, token, actor, expectedEpoch, expect
       const reason = await refusalReason(response);
       throw new HttpFailure(`Ownership control failed (HTTP ${response.status}) reason=${reason} attempts=${attempts} elapsed=${elapsedSeconds()}s; stop, do not change credentials`, response.status, reason);
     }
-    const state = await response.json();
-    if (!state.deploymentId || !("owner" in state) || typeof state.running !== "boolean") {
-      throw new ControlError("Invalid ownership control response");
-    }
+    const state = parseOwnershipResponse(await response.json());
+    if (!state) throw new ControlError("Invalid ownership control response");
     return state;
   };
   let postedEpoch;

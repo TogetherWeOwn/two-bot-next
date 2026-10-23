@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "purpose": "Protected failing-first acceptance for private ticket creation receipts",
+  "protected_files": [
+    "crates/discord/tests/ticket_creation_receipt_acceptance.rs",
+    "crates/bot/src/ticket_creation_receipt_acceptance_tests.rs",
+    "tests/acceptance/ticket_creation_receipts.manifest.json"
+  ],
+  "test_only_registration": {
+    "path": "crates/bot/src/ticket_runtime.rs",
+    "module": "creation_receipt_acceptance_tests"
+  },
+  "public_branch": "test/ticket-creation-receipt-acceptance",
+  "executor_command": "python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test ticket_creation_receipt_acceptance -- --nocapture",
+  "runtime_command": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot ticket_runtime::creation_receipt_acceptance_tests -- --test-threads=1 --nocapture",
+  "required_behavior": [
+    "Validate guild, guild-text type, category, exact reservation topic and private overwrites before activation or opener/control POST.",
+    "An incomplete create receipt may be rejected as uncertain or corroborated by at most one existing channel fetch; a parseable id alone is never proof.",
+    "Reject contradictory identity, missing/malformed/duplicate/contradictory required overwrites, lost required access and unsupported extra visibility grants.",
+    "Malformed or contradictory 2xx is not proven unsent: preserve creating reservation, no fresh automatic create and no delete of an unproven/mismatched channel.",
+    "Valid full evidence preserves one create, one controls message, reservation ownership and existing proven recovery cleanup.",
+    "Member copy stays short, truthful and actionable; diagnostics stay bounded, structured and free of remote channel/message contents or tokens."
+  ],
+  "privacy_scope": "Channel overwrite evidence is not privacy from Discord administrators. Do not broaden requested permissions or issue live repair actions.",
+  "builder_handoff": [
+    "Consume the immutable handoff head recorded on the acceptance card; keep these protected files unchanged. Route test corrections to their author.",
+    "The separate builder owns implementation, concise privacy/receipt guidance, neighboring ticket regressions and one combined passing PR.",
+    "Do not merge this deliberately failing-first tests-only handoff. Follow exact-head required CI and independent review on the combined PR.",
+    "Observed evidence, including a compile/cache refusal instead of behavioral RED, is recorded separately on the acceptance card; this manifest does not claim tests ran."
+  ]
+}
