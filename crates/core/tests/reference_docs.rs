@@ -68,9 +68,9 @@ gateway closure):\n\n\
 | automod | `automod_gateway.rs:211-223`, `:328` | 10 live lists, thresholds, enforce flag (`:116-127`) | every message delivery |\n\
 | feed | `feed_jobs.rs:235-237`, `:266` | `TWO_FEED_POLL_SECONDS` (`:207`), `TWO_ANNOUNCEMENTS` (`:244`) | supervisor cadence + per-tick gates (`:276-327`, `:385-419`) |\n\
 | audit | `audit_runtime.rs:308`, `:438` | 3 mirror destinations (`:60-63`) | every record (`:483`) and sweep (`:497`), once installed |\n\
-| ticket | `ticket_runtime.rs:671-674`, `:1328` | 3 destinations + cooldown (`:230-258`, `:641-666`) | every execute/recovery and purge; effective ops changes included |\n\
+| ticket | `ticket_runtime.rs:749-752`, `:1491` | 3 destinations + cooldown (`:311-339`, `:719-744`) | every execute/recovery and purge; effective ops changes included |\n\
 | self-role | `self_role_handlers.rs:213-219`, `:419-441` | `TWO_SELF_ROLE_PANELS` (`:53`) | every dispatch (`:224`, `:309`, `:377`, `:419`) and sweep (`:472-473`); retirement waits for durable work |\n\
-| gateway classifier | `gateway.rs:834-853`, `:978` | human/welcome channel sets (`:860-877`) | every guild message; classifier + facts sink swap together (`leveling_runtime.rs:766`) |\n\
+| gateway classifier | `gateway.rs:834-853`, `:978` | human/welcome channel sets (`:860-877`) | every guild message; classifier + facts sink swap together (`leveling_runtime.rs:908-911`) |\n\
 | voice | `gateway.rs:2204-2206` closure | empty grace (`voice_rooms.rs:10186`), invite code (`:10234`) | spawn (`:8222-8230`), maintenance (`:3571-3573`), `/invite` (`:14195-14204`) |\n\n\
 The thirty-nine keys in `STORE_READ_KEYS`\n\
 (`crates/core/tests/reference_docs.rs`) say “applied live by runtime refresh”\n\
@@ -108,11 +108,11 @@ that parked runtime (`crates/bot/src/audit_runtime.rs:137-161`); ticket\n\
 operations apply\n\
 `DISCORD_TICKET_CATEGORY_ID`, `DISCORD_TICKET_PANEL_CHANNEL_ID` and\n\
 `DISCORD_TICKET_STAFF_ROLE_ID` from the snapshot on every execute, recovery\n\
-and purge (`crates/bot/src/ticket_runtime.rs:700`, `:791`, `:1172`, `:1328`), where a\n\
+and purge (`crates/bot/src/ticket_runtime.rs:778`, `:896`, `:1317`, `:1491`), where a\n\
 malformed row keeps the last good destinations like the audit mirror, and the same\n\
 refresh resolves `TWO_TICKET_COOLDOWN_SECONDS` from the effective layered values,\n\
 including ops apply, clearing and expiry without a database revision change, with\n\
-last-good fallback (`crates/bot/src/ticket_runtime.rs:641-666`); the feed poller\n\
+last-good fallback (`crates/bot/src/ticket_runtime.rs:719-744`); the feed poller\n\
 re-checks `TWO_ANNOUNCEMENTS` from the snapshot on every tick and skips while\n\
 a stored `0` stands (`crates/bot/src/feed_jobs.rs:250-267`, `:385-419`); self-role\n\
 dispatch and recovery resolve `TWO_SELF_ROLE_PANELS` from the snapshot on every\n\
@@ -127,12 +127,12 @@ the gateway funnel applies\n\
 `TWO_COMMUNITY_HUMAN_CHANNEL_IDS` and `TWO_COMMUNITY_WELCOME_CHANNEL_IDS`\n\
 from the snapshot on every guild message, refreshing the channel classifier\n\
 and the community-facts sink together before the message's channel class is\n\
-stamped (`crates/bot/src/gateway.rs:834-853`, `:978`, `crates/discord/src/leveling_runtime.rs:766`), with malformed entries filtered silently so a wholly-malformed row applies as the empty set (`crates/core/src/community.rs:252-260`); the voice sweep applies `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` from the snapshot on spawn and every maintenance refresh, so a stored per-guild grace reaches the deletion sweep without a restart (`crates/bot/src/voice_rooms.rs:8222-8230`, `:3571-3573`), and the invite responder applies `TWO_GUILD_INVITE_CODE` per `/invite` interaction (`crates/bot/src/voice_rooms.rs:14195-14204`), falling back to the live vanity code when the row is absent or invalid (`:10239-10255`). Two boot-only edges\n\
+stamped (`crates/bot/src/gateway.rs:834-853`, `:978`, `crates/discord/src/leveling_runtime.rs:908-911`), with malformed entries filtered silently so a wholly-malformed row applies as the empty set (`crates/core/src/community.rs:252-260`); the voice sweep applies `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` from the snapshot on spawn and every maintenance refresh, so a stored per-guild grace reaches the deletion sweep without a restart (`crates/bot/src/voice_rooms.rs:8222-8230`, `:3571-3573`), and the invite responder applies `TWO_GUILD_INVITE_CODE` per `/invite` interaction (`crates/bot/src/voice_rooms.rs:14195-14204`), falling back to the live vanity code when the row is absent or invalid (`:10239-10255`). Two boot-only edges\n\
 remain: the voice room-name policy is\n\
 built once at boot from the process environment\n\
 (`crates/bot/src/gateway.rs:2203`); and gateway intents plus ticket command\n\
 publication read the ticket destination keys once at boot\n\
-(`crates/bot/src/gateway.rs:150`, `crates/bot/src/command_runtime.rs:435`), so a stored ticket\n\
+(`crates/bot/src/gateway.rs:150`, `crates/bot/src/command_runtime.rs:448`), so a stored ticket\n\
 destination reaches already-published commands only through the per-operation\n\
 refresh above. Every other\n\
 storable row's stored value is unwired.\n\n\

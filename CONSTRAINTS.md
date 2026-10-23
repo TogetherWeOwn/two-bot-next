@@ -50,6 +50,7 @@ not adding one.
 | Floor | No waivers, skips, deleted tests, stripped assertions, lowered thresholds; `#[expect(...)]` and `cfg_attr(..., allow/expect/ignore)` count as waivers | `python3 scripts/ci/check-floor-guard.py`, `check` lane | every PR |
 | Patch coverage | Changed lines >= 80% covered | `cargo llvm-cov` sweeps + per-suite guarded re-runs, merged with `llvm-cov report --workspace`, + `scripts/ci/check-patch-coverage.py`, `patch-coverage` lane with disposable Postgres (see docs/quality-gates.md) | every Rust PR |
 | Dependencies | Nothing at high or above; advisories fail | `cargo-deny check all`, `check` lane | every PR |
+| Worker dependencies | Nothing at high or above; audit errors fail | `npm audit --audit-level=high --include=dev --json`, `worker check` lane | every worker PR, full main and scheduled runs |
 | Request-path unwrap | No new `.unwrap()` in route/handler/interaction/command/webhook files | ast-grep rule + `scripts/ci/check-unwrap-request-paths.py`, `check` lane | every Rust PR |
 | Rust pitfalls | No new `todo!`/`unimplemented!`, empty `.expect("")`, `panic!` in non-test code, `process::exit` in library code | vendored `.semgrep/rust-warn.yml` + `scripts/ci/check-semgrep-warn.py`, `check` lane | every Rust PR |
 | Test inventory | Every test/fuzz target is built or run by some CI job | `scripts/ci/check-test-inventory.py`, `check` lane | every PR |
