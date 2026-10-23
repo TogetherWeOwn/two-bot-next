@@ -108,19 +108,26 @@ fall back to raw `max_connections` and label the ceiling as such.
 
 ## Staging rollback drill (manual)
 
-`staging-rollback-drill.yml` is a manual, staging-only workflow that runs the
-reviewed [Worker-version rollback](runbook.md#worker-version-rollback) drill
-without giving any agent the staging ownership token. The regression pins it as
-`workflow_dispatch`-only with one required `target_version` input (no default,
-never "latest"). Its single `drill` job runs only from `main`, in the `staging`
-environment, on the routed runner for job `drill`, and shares the
-`deploy-staging` concurrency group without cancelling, so a push deploy cannot
-interleave with a drill. It has exactly three unconditional steps: pinned
-checkout, pinned setup-node, and one Run step that passes the input through the
-environment to `scripts/staging_rollback_drill.py`. The four existing `staging`
-bindings (`STAGING_WORKER_URL`, `STAGING_OWNERSHIP_CONTROL_TOKEN`,
-`CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`) are scoped to that step alone.
-It creates, rotates and exports no credential and has no production path.
+`staging-rollback-drill.yml` has a daily automatic recovery proof and a manual
+[Worker-version rollback](runbook.md#worker-version-rollback) option. The daily
+proof is described in [production-deploy.md](production-deploy.md#daily-staging-proof):
+only the fixed staging dispatch gets `actions: write`; the dispatcher has no
+Cloudflare or ownership credentials. Failed proofs alert through the existing
+`synthetic-alerts` environment. An independent daily read-only watcher catches
+missing/stale scheduled proof; healthy checks post nothing.
+
+For the manual Worker-only option, pass a named, previously served
+`target_version` (never "latest"). It is an optional string with empty default:
+empty selects the automatic proof, not an inferred Worker target. The `drill`
+job runs only on a manual dispatch from `main` with a non-empty target, in the
+`staging` environment, and holds the `deploy-staging` job-level concurrency
+lane without cancelling. Pinned checkout, pinned setup-node and the script run
+are unconditional within that job; a fourth `always()` step uploads evidence.
+The input travels through the environment to `scripts/staging_rollback_drill.py`.
+The four existing staging bindings (`STAGING_WORKER_URL`,
+`STAGING_OWNERSHIP_CONTROL_TOKEN`, `CLOUDFLARE_API_TOKEN`,
+`CLOUDFLARE_ACCOUNT_ID`) are scoped to the script step alone. It creates,
+rotates and exports no credential and has no production path.
 
 The script fences the singleton, moves the Worker to the target with one
 Cloudflare deployment request, hands ownership to it, times the first `/readyz`

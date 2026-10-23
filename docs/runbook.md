@@ -2332,8 +2332,8 @@ authorization, then repeat health/readiness/log observations. Confirm only one
 gateway session and record version, image, first ready time and remaining
 limitations. None of these examples were a live rollback drill.
 
-**Staging drill.** The manual `staging-rollback-drill` workflow (dispatch from
-`main`, input `target_version`) runs this procedure end to end in the protected
+**Staging drill.** The manual Worker-only option of `staging-rollback-drill`
+(dispatch from `main`, input `target_version`) runs this procedure end to end in the protected
 `staging` environment: fence, one unforced Cloudflare deployment of the target
 with `code_update_strategy: immediate`, epoch-checked takeover, a 2 s
 `/readyz` + `/health` poll, then the same sequence back to the original version.
@@ -2343,7 +2343,9 @@ refuses an unknown or never-deployed id). The job summary and evidence file hold
 the fence, rollback, takeover and first-ready times, the time-to-ready against
 the workflow's 60 s budget, probe counts, the container image digest and
 instance counts. This workflow interval is not an outage-start recovery
-measurement and cannot prove B2's under-60-second recovery criterion.
+measurement and cannot prove B2's under-60-second recovery criterion. An empty
+`target_version` instead selects the [daily automatic rollback proof](production-deploy.md#daily-staging-proof),
+which also runs on a daily schedule and verifies both Worker and image restoration.
 Gateway-session count is not observable from probes; read the Worker logs for it.
 If the run stops on a 401/403 it skips the restore: recover with a
 `deploy-staging` dispatch with `release_fence=true` after the binding is fixed.

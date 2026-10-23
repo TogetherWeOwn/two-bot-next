@@ -37,9 +37,9 @@ name: deploy-production
 # approval and no reviewers, a rollback runs only when its whole target
 # (version, image, sha) is a verified rollback snapshot of a recent
 # deploy-production run. A deploy always takes over ownership (only the
-# explicit `cutover_hold` input keeps the fence held), and failure injection
-# never runs here: the guard refuses `inject_error_rate_spike` and points to
-# deploy-staging (10-20 incidents 13:31Z and 20:54Z). The 30-minute
+# explicit `cutover_hold` input keeps the fence held). Fault switches have no
+# input or execution path here; daily recovery proofs run only on staging.
+# The 30-minute
 # soak sleeps in its own `soak` job OUTSIDE the deploy-production lane, and a
 # `recheck` job re-reads the hold and the live revision immediately before
 # the deploy: a hold set, or a target gone stale, while the gates built or
@@ -86,11 +86,6 @@ on:
         default: true
       cutover_hold:
         description: "B4 cutover hold only: deploy WITHOUT the ownership takeover so the fence stays held (production stays fenced until the cutover lead takes over). Deploy mode only"
-        required: false
-        type: boolean
-        default: false
-      inject_error_rate_spike:
-        description: "REFUSED on production (failure injection runs on staging only): dispatch deploy-staging with inject_error_rate_spike instead"
         required: false
         type: boolean
         default: false
@@ -143,10 +138,6 @@ jobs:
           TAKEOVER: ${{ inputs.takeover }}
           # B4 cutover hold: the only way a deploy skips the takeover.
           CUTOVER_HOLD: ${{ inputs.cutover_hold }}
-          # Drill switch, received only so the guard can refuse it: failure
-          # injection never runs against production (10-20 20:54Z incident:
-          # a forced drill left production degraded). Drills run on staging.
-          INJECT_ERROR_RATE_SPIKE: ${{ inputs.inject_error_rate_spike }}
           EVENT_NAME: ${{ github.event_name }}
           WORKFLOW_RUN_SHA: ${{ github.event.workflow_run.head_sha }}
           WORKFLOW_RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
@@ -330,17 +321,6 @@ jobs:
               refuse("takeover must be true or false")
           if allow_unstaged not in ("true", "false"):
               refuse("allow_unstaged must be true or false")
-          # Failure injection never runs against production, in any mode or
-          # combination: the 10-20 20:54Z forced drill deployed, failed the
-          # ownership read, and the auto-rollback refused on provenance, so
-          # production stayed degraded until the next automatic deploy.
-          # Drills belong on staging, which keeps the same switch.
-          spike = os.environ.get("INJECT_ERROR_RATE_SPIKE", "")
-          if spike not in ("", "true", "false"):
-              refuse("inject_error_rate_spike must be true or false")
-          if spike == "true":
-              refuse("failure injection never runs against production (inject_error_rate_spike); "
-                     "run the rollback drill on staging: dispatch deploy-staging with inject_error_rate_spike true")
           # A deploy ALWAYS takes over ownership, manual or automatic, unless
           # the explicit B4 cutover hold asks to keep the fence held. The
           # 10-20 13:31Z manual deploy without takeover left the new version
@@ -1617,9 +1597,8 @@ jobs:
       # restores the recorded pre-promote snapshot (Worker version AND
       # container image, step_percentage 100). Live mode scrapes with the
       # production scrape token; without that token the script records a
-      # skip, never a failure and never a silent pass. No rehearsal path:
-      # failure injection never runs against production (the guard refuses
-      # inject_error_rate_spike; the drill lives in deploy-staging). Reviewed
+      # skip, never a failure and never a silent pass. Only live observations
+      # can fail this gate; recovery proofs run on staging only. Reviewed
       # tooling runs from the workflow commit (../tooling), never the guarded
       # SHA. Deploy mode only: after a rollback restore there is no snapshot
       # to roll back to, so a firing verdict would fail the recovery run red

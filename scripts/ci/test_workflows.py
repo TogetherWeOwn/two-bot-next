@@ -48,11 +48,11 @@ JOB_INVENTORY = {
     "release.yml": {"sbom-target", "release-sbom", "attach-sbom", "verdict"},
     # Daily digest release (docs/releases.md): one vYYYY.MM.DD tag per day,
     # plus the missing-digest alert; pinned shape below.
-    "daily-digest.yml": {"digest", "alert"},
+    "daily-digest.yml": {"digest", "alert", "rollback-proof-watch"},
     "staging-migrate.yml": {"plan", "claim", "apply"},
     "production-migrate.yml": {"plan", "claim", "apply"},
-    # TOG-14008: manual staging-only Worker rollback drill; pinned shape below.
-    "staging-rollback-drill.yml": {"drill"},
+    # Daily staging automatic recovery proof plus the manual Worker-only drill.
+    "staging-rollback-drill.yml": {"drill", "proof", "alert"},
     # Container-image backout/restore drill: manual, staging-only, pinned shape below.
     "staging-container-drill.yml": {"container-drill"},
     # Manual read-only staging events read for the B2 soak; pinned shape below.
@@ -466,11 +466,10 @@ ERROR_RATE_MARKERS = (
 def production_error_rate_gate_errors(workflow, name="deploy-production.yml"):
     """The production error-rate gate scrapes live production, never a rehearsal.
 
-    Failure injection never runs against production (10-20 20:54Z forced
-    drill): the dispatch input stays declared (an opt-in boolean) only so the
-    guard can refuse it with a pointer to staging, and the input is read
-    exactly once, by the guard. No production step carries the drill switch
-    or a rehearsal flag. The error_rate_gate step scrapes live production
+    Failure injection has no production input, guard binding or runtime path.
+    An exact input allowlist also refuses newly named fault switches, not just
+    the retired switch. No production step carries a drill switch or a
+    rehearsal flag. The error_rate_gate step scrapes live production
     /ops/metrics and fails the stage so auto-rollback runs. The scrape token
     is the production binding only; the staging token must never appear.
     Reviewed tooling runs from the workflow commit (../tooling), never the
@@ -478,17 +477,14 @@ def production_error_rate_gate_errors(workflow, name="deploy-production.yml"):
     """
     errors = []
     inputs = (((workflow.get("on") or {}).get("workflow_dispatch") or {}).get("inputs") or {})
-    drill = inputs.get("inject_error_rate_spike") or {}
-    if drill.get("type") != "boolean" or drill.get("default") not in (False, "false") \
-            or str(drill.get("required")).lower() != "false":
-        errors.append(f"{name}: inject_error_rate_spike must stay an opt-in boolean defaulting to false")
-    if str(workflow).count("inputs.inject_error_rate_spike") != 1:
-        errors.append(f"{name}: inject_error_rate_spike may be read only by the guard (which refuses it)")
+    if set(inputs) != {"sha", "rollback", "image", "allow_unstaged", "takeover", "cutover_hold"}:
+        errors.append(f"{name}: production inputs must contain only the reviewed deploy/restore controls")
     jobs = workflow.get("jobs", {}) or {}
     steps = ((jobs.get("production") or {}).get("steps") or [])
-    for marker in ("INJECT_ERROR_RATE_SPIKE", "inject_error_rate_spike", "--rehearsal-firing", "rehearsal"):
-        if marker in str(jobs.get("production") or {}):
-            errors.append(f"{name}: production job must never carry the drill marker {marker}")
+    for marker in ("inject_error_rate_spike", "inject_gateway_failure", "--rehearsal-firing",
+                   "rehearsal", "fault_injection", "fail_injection"):
+        if marker in str(workflow).lower():
+            errors.append(f"{name}: workflow must never carry the drill marker {marker}")
     gates = [step for step in steps if isinstance(step, dict) and step.get("id") == "error_rate_gate"]
     if len(gates) != 1:
         errors.append(f"{name}: exactly one production step must be the error_rate_gate")
@@ -508,6 +504,33 @@ def production_error_rate_gate_errors(workflow, name="deploy-production.yml"):
                    "--sha", "--user-agent"):
         if run.count(needle) != 1:
             errors.append(f"{name}: error_rate_gate step must contain exactly one {needle}")
+    # Recovery is in this same job: no dispatch, reusable job or reviewer hop.
+    by_id = {item.get("id"): item for item in steps}
+    snapshot = by_id.get("snapshot", {})
+    deploy = by_id.get("deploy", {})
+    rollback = by_id.get("auto_rollback", {})
+    gate = by_id.get("gate", {})
+    if not all((snapshot, deploy, rollback, gate)):
+        errors.append(f"{name}: production must retain snapshot, deploy, gate and auto_rollback")
+    else:
+        if not (steps.index(snapshot) < steps.index(deploy) < steps.index(gate)
+                < steps.index(step) < steps.index(rollback)):
+            errors.append(f"{name}: snapshot must precede deploy and both gates must precede rollback")
+    if rollback.get("if") != ("failure() && env.MODE == 'deploy' && env.TAKEOVER == 'true' "
+                              "&& steps.deploy.outcome == 'success' && steps.snapshot.outcome == 'success'"):
+        errors.append(f"{name}: auto_rollback must retain the failure/deploy/takeover/snapshot chain")
+    restore = str(rollback.get("run") or "")
+    for required in ("../tooling/scripts/worker_container_rollback.py rollback",
+                     "--variant production", '--snapshot "$RUNNER_TEMP/production-rollback-snapshot.json"',
+                     '--evidence "$RUNNER_TEMP/production-auto-rollback-evidence.json"'):
+        if required not in restore:
+            errors.append(f"{name}: auto_rollback must restore the pre-deploy receipt: {required}")
+    if ("uses" in rollback or "workflow run" in restore or "dispatch" in restore
+            or "worker_container_rollback.py snapshot" not in str(snapshot.get("run") or "")):
+        errors.append(f"{name}: auto_rollback must restore the local snapshot without dispatch")
+    if "continue-on-error" in (jobs.get("production") or {}) or any(
+            "continue-on-error" in item for item in (snapshot, deploy, gate, step, rollback)):
+        errors.append(f"{name}: failure must stay red after recovery; never continue-on-error")
     # The evidence filename appears exactly twice: the --evidence write path
     # and the read-back print, which must name the same file.
     if run.count("production-error-rate-gate.json") != 2:
@@ -1333,44 +1356,90 @@ ROLLBACK_DRILL_ENV = {
 }
 
 
-def staging_rollback_drill_errors(workflow):
-    """Manual staging-only Worker-version rollback drill (TOG-14008).
+def rollback_proof_job_errors(job, mode):
+    """Pin the dispatcher/observer to reviewed tooling and the smallest token."""
+    errors = []
+    permissions = {"contents": "read"}
+    env = {}
+    if mode in ("run", "watch"):
+        permissions["actions"] = "write" if mode == "run" else "read"
+        env["GH_TOKEN"] = "${{ github.token }}"
+    if mode in ("alert", "watch"):
+        env["SYNTHETIC_ALERT_WEBHOOK_URL"] = "${{ secrets.SYNTHETIC_ALERT_WEBHOOK_URL }}"
+    expected_environment = "synthetic-alerts" if mode in ("alert", "watch") else None
+    if job.get("permissions") != permissions or job.get("environment") != expected_environment:
+        errors.append(f"rollback proof {mode}: least-privilege token/environment changed")
+    for key in ("env", "uses", "services", "container", "continue-on-error", "strategy", "concurrency"):
+        if key in job:
+            errors.append(f"rollback proof {mode}: must not set {key}")
+    job_id = {"run": "proof", "watch": "rollback-proof-watch", "alert": "alert"}[mode]
+    if not runner_allowed(job_id, job.get("runs-on")):
+        errors.append(f"rollback proof {mode}: must use the routed public-hosted runner")
+    if str(job.get("timeout-minutes")) != ("80" if mode == "run" else "5"):
+        errors.append(f"rollback proof {mode}: bounded job timeout changed")
+    steps = job.get("steps") or []
+    if len(steps) != (3 if mode == "run" else 2):
+        return errors + [f"rollback proof {mode}: unexpected steps"]
+    if any("if" in step or "continue-on-error" in step for step in steps):
+        errors.append(f"rollback proof {mode}: steps must run and fail closed")
+    checkout, command = steps[:2]
+    if (not str(checkout.get("uses") or "").startswith("actions/checkout@")
+            or (checkout.get("with") or {}).get("persist-credentials") != "false"):
+        errors.append(f"rollback proof {mode}: checkout must not persist credentials")
+    run = f"python3 scripts/rollback_proof.py {mode}"
+    if mode == "run":
+        run += ' --evidence "$RUNNER_TEMP/proof.json"'
+        upload = steps[2]
+        if (not str(upload.get("uses") or "").startswith("actions/upload-artifact@")
+                or (upload.get("with") or {}).get("name") != "staging-rollback-proof"
+                or (upload.get("with") or {}).get("path") != "${{ runner.temp }}/proof.json"
+                or (upload.get("with") or {}).get("if-no-files-found") != "error"):
+            errors.append("rollback proof run: must upload the non-empty proof artifact")
+    if command.get("run") != run or command.get("env") != env:
+        errors.append(f"rollback proof {mode}: only the reviewed script and bindings may run")
+    return errors
 
-    Dispatch-only with the single required `target_version` input. One job runs
-    from main through the `staging` environment and shares the deploy-staging
-    concurrency group (never cancelling), so a push deploy cannot interleave.
-    Exactly three steps: pinned checkout, pinned setup-node, and one Run step
-    that passes the dispatch input through the environment (never an inline
-    expression) to the reviewed script. The four existing staging bindings are
-    scoped to that step alone. No wrangler CLI or action: the rollback is the
-    script's one unforced Cloudflare deployment POST, so a changed-secret
-    target is refused instead of being auto-confirmed.
+
+def staging_rollback_drill_errors(workflow):
+    """Daily staging-only auto-rollback proof and optional manual Worker drill.
+
+    The orchestrator must not hold deploy-staging while waiting for its child;
+    only the manual Worker drill shares that lane. No production bindings.
     """
     name = "staging-rollback-drill.yml"
     errors = []
     on = workflow.get("on") or {}
-    if set(on) != {"workflow_dispatch"}:
-        errors.append(f"{name}: must be dispatch-only (no push/pull_request/schedule)")
+    if set(on) != {"workflow_dispatch", "schedule"} or on.get("schedule") != [{"cron": "17 3 * * *"}]:
+        errors.append(f"{name}: must run daily at 03:17 UTC plus manual dispatch only")
     dispatch = on.get("workflow_dispatch") or {}
     inputs = dispatch.get("inputs") or {}
     if set(dispatch) != {"inputs"} or set(inputs) != {"target_version"}:
         errors.append(f"{name}: workflow_dispatch must carry exactly the target_version input")
     else:
         field = inputs["target_version"] or {}
-        if (field.get("type") != "string" or str(field.get("required")).lower() != "true"
-                or "default" in field):
-            errors.append(f"{name}: target_version must be a required string with no default (never latest)")
-    if workflow.get("concurrency") != {"group": "deploy-staging", "cancel-in-progress": "false"}:
-        errors.append(f"{name}: must share the deploy-staging group without cancelling")
+        if (field.get("type") != "string" or str(field.get("required")).lower() != "false"
+                or field.get("default") != ""):
+            errors.append(f"{name}: target_version must be optional/empty for the daily automatic proof")
+    if workflow.get("concurrency") != {"group": "staging-rollback-proof", "cancel-in-progress": "false"}:
+        errors.append(f"{name}: orchestrator must serialize outside the deploy-staging lane")
     jobs = workflow.get("jobs") or {}
-    if set(jobs) != {"drill"}:
-        errors.append(f"{name}: jobs must be exactly drill")
+    if set(jobs) != {"drill", "proof", "alert"}:
+        errors.append(f"{name}: jobs must be exactly drill, proof and alert")
         return errors
+    errors.extend(rollback_proof_job_errors(jobs["proof"], "run"))
+    errors.extend(rollback_proof_job_errors(jobs["alert"], "alert"))
+    if jobs["proof"].get("if") != "github.ref == 'refs/heads/main' && inputs.target_version == ''":
+        errors.append(f"{name}: proof must run on main with no manual target")
+    if jobs["alert"].get("needs") != "proof" or jobs["alert"].get("if") != "${{ !cancelled() && needs.proof.result == 'failure' }}":
+        errors.append(f"{name}: alert must run on a failed proof only")
     job = jobs["drill"]
+    if job.get("concurrency") != {"group": "deploy-staging", "cancel-in-progress": "false"}:
+        errors.append(f"{name}:drill: must share deploy-staging without cancelling")
     if job.get("environment") != "staging":
         errors.append(f"{name}:drill: must stay scoped to the staging environment")
-    if job.get("if") != "github.ref == 'refs/heads/main'":
-        errors.append(f"{name}:drill: must run only from main")
+    if job.get("if") != ("github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' "
+                         "&& inputs.target_version != ''"):
+        errors.append(f"{name}:drill: must run only from main with a manual target")
     if not runner_allowed("drill", job.get("runs-on")):
         errors.append(f"{name}:drill: must use the routed runner expression for job 'drill'")
     for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
@@ -1381,10 +1450,14 @@ def staging_rollback_drill_errors(workflow):
         if marker in text.replace(" ", ""):
             errors.append(f"{name}:drill: must not contain {marker!r} (script-only, unforced, staging-only)")
     steps = job.get("steps") or []
-    if len(steps) != 3 or any(key in step for step in steps for key in ("if", "continue-on-error")):
-        errors.append(f"{name}:drill: must run exactly checkout, setup-node and the drill, unconditionally")
+    if len(steps) != 4 or any(key in step for step in steps[:3] for key in ("if", "continue-on-error")):
+        errors.append(f"{name}:drill: must run checkout, setup-node, drill and evidence upload")
         return errors
-    checkout, node, run = steps
+    checkout, node, run, upload = steps
+    if (upload.get("if") != "always()" or "continue-on-error" in upload
+            or not str(upload.get("uses") or "").startswith("actions/upload-artifact@")
+            or (upload.get("with") or {}).get("if-no-files-found") != "error"):
+        errors.append(f"{name}:drill: must always upload evidence, failing on missing files")
     if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
             or (checkout.get("with") or {}).get("persist-credentials") != "false":
         errors.append(f"{name}:drill: checkout must be pinned and must not persist credentials")
@@ -2150,9 +2223,13 @@ def daily_digest_errors(workflow):
     if workflow.get("concurrency") != {"group": "daily-digest", "cancel-in-progress": "false"}:
         errors.append(f"{name}: must serialize digests at the top level without cancelling")
     jobs = workflow.get("jobs") or {}
-    if set(jobs) != {"digest", "alert"}:
-        errors.append(f"{name}: jobs must be exactly digest and alert")
+    if set(jobs) != {"digest", "alert", "rollback-proof-watch"}:
+        errors.append(f"{name}: jobs must be exactly digest, alert and rollback-proof-watch")
         return errors
+    watcher = jobs["rollback-proof-watch"]
+    errors.extend(rollback_proof_job_errors(watcher, "watch"))
+    if ("needs" in watcher or watcher.get("if") != "github.ref == 'refs/heads/main' && inputs.dry_run != true"):
+        errors.append(f"{name}: rollback proof watcher must be independent of digest success, never dry-run")
     digest = jobs["digest"]
     if digest.get("if") != "github.ref == 'refs/heads/main'":
         errors.append(f"{name}:digest: must run on main only")
@@ -2318,15 +2395,9 @@ def production_errors(workflow):
                      'refuse("the production Environment has no required reviewers")'):
         if required not in script:
             errors.append(f"{name}:guard: missing check {required}")
-    # Failure injection never runs against production (10-20 20:54Z): the
-    # guard receives the drill switch only to refuse it, pointing to staging.
+    # Fault switches are absent from the entire production workflow, not
+    # forwarded to a guard that promises to refuse them.
     guard_env = (guard.get("steps") or [{}])[0].get("env", {})
-    if guard_env.get("INJECT_ERROR_RATE_SPIKE") != "${{ inputs.inject_error_rate_spike }}":
-        errors.append(f"{name}:guard: must receive the drill switch as an input env")
-    for required in ('if spike == "true":\n    refuse("failure injection never runs against production',
-                     "dispatch deploy-staging with inject_error_rate_spike true"):
-        if required not in script:
-            errors.append(f"{name}:guard: missing production drill refusal {required!r}")
     # A deploy always takes over (10-20 13:31Z: a manual deploy without
     # takeover left production fenced); only the explicit cutover_hold
     # input keeps the fence held.
@@ -4756,10 +4827,8 @@ class WorkflowTests(unittest.TestCase):
                     label,
                 )
                 self.assertTrue(workflow_policy_errors(changed), label)
-        # Production carries no rehearsal path at all (10-20 20:54Z forced
-        # drill): the guard alone reads the switch, to refuse it. Re-arming
-        # any production step, an armed default, a staging token or unpinned
-        # tooling there fails the policy.
+        # Production has no fault input at all. Reintroducing even an unarmed
+        # input, forwarding a switch or weakening automatic recovery fails.
         self.assertEqual(production_error_rate_gate_errors(workflows["deploy-production.yml"]), [])
         prod_steps = workflows["deploy-production.yml"]["jobs"]["production"]["steps"]
         self.assertEqual([s for s in prod_steps if "INJECT_ERROR_RATE_SPIKE" in str(s)], [])
@@ -4774,9 +4843,10 @@ class WorkflowTests(unittest.TestCase):
             "rehearsal flag on the gate": lambda w: w["jobs"]["production"]["steps"][prod_index]
                 .__setitem__("run", str(w["jobs"]["production"]["steps"][prod_index]["run"])
                              + " --rehearsal-firing '[\"rest_5xx_rate\"]'"),
-            "input defaults true": lambda w: w["on"]["workflow_dispatch"]["inputs"]["inject_error_rate_spike"]
-                .__setitem__("default", True),
-            "input removed": lambda w: w["on"]["workflow_dispatch"]["inputs"].pop("inject_error_rate_spike"),
+            "retired input returns": lambda w: w["on"]["workflow_dispatch"]["inputs"].update(
+                {"inject_error_rate_spike": {"type": "boolean", "default": False}}),
+            "renamed fault input": lambda w: w["on"]["workflow_dispatch"]["inputs"].update(
+                {"drill": {"type": "boolean", "default": False}}),
             "another production step reads it": lambda w: w["jobs"]["production"]["steps"][0]
                 .setdefault("env", {}).__setitem__("SPIKE", "${{ inputs.inject_error_rate_spike }}"),
             "gate step removed": lambda w: w["jobs"]["production"]["steps"][prod_index]
@@ -4808,6 +4878,32 @@ class WorkflowTests(unittest.TestCase):
                 job.setdefault("env", {})["FORWARD"] = "${{ inputs.inject_error_rate_spike }}"
                 self.assertTrue(staging_error_rate_gate_errors(changed))
                 self.assertTrue(workflow_policy_errors(changed))
+
+    def test_production_fault_inputs_absent_and_recovery_chain_stays_red(self):
+        text = (ROOT / ".github/workflows/deploy-production.yml").read_text()
+        self.assertNotIn("inject_error_rate_spike", text.lower())
+        self.assertNotIn("inject_gateway_failure", text.lower())
+        self.assertNotIn("--rehearsal-firing", text)
+        original = self.workflows["deploy-production.yml"]
+        self.assertEqual(production_error_rate_gate_errors(original), [])
+
+        def step(workflow, name):
+            return next(s for s in workflow["jobs"]["production"]["steps"] if s.get("id") == name)
+
+        for label, change in {
+            "snapshot after deploy": lambda w: w["jobs"]["production"]["steps"].remove(step(w, "snapshot")),
+            "recovery without failure": lambda w: step(w, "auto_rollback").update({"if": "always()"}),
+            "recovery without snapshot": lambda w: step(w, "auto_rollback").update({"run": "echo recovered"}),
+            "worker-only restore": lambda w: step(w, "auto_rollback").update({"run": "wrangler rollback"}),
+            "gate tolerates failure": lambda w: step(w, "gate").update({"continue-on-error": True}),
+            "error gate tolerates failure": lambda w: step(w, "error_rate_gate").update({"continue-on-error": True}),
+            "job tolerates failure": lambda w: w["jobs"]["production"].update({"continue-on-error": True}),
+            "dispatch recovery": lambda w: step(w, "auto_rollback").update({"run": "gh workflow run deploy-production.yml"}),
+        }.items():
+            changed = deepcopy(original)
+            change(changed)
+            with self.subTest(label=label):
+                self.assertTrue(production_error_rate_gate_errors(changed))
 
     def test_remediation_fault_injection_is_dispatch_only_and_never_forwarded(self):
         workflows = self.workflows
@@ -5343,8 +5439,8 @@ class WorkflowTests(unittest.TestCase):
             "cutover_hold not wired": lambda w: w["jobs"]["guard"]["steps"][0]["env"].pop("CUTOVER_HOLD"),
             "deploy takeover default dropped":
                 without('takeover = "false" if cutover_hold == "true" else "true"'),
-            "production drill refusal dropped":
-                without('refuse("failure injection never runs against production'),
+            "snapshot workflow binding dropped":
+                without('PRODUCTION_WORKFLOW = ".github/workflows/deploy-production.yml"'),
             "snapshot path dropped":
                 without('snapshot_run = verified_rollback_snapshot() if not reviewers and mode == "rollback" else None'),
             "snapshot pagination dropped":
@@ -5415,8 +5511,8 @@ class WorkflowTests(unittest.TestCase):
                 "actions"),
             "soak without the guard": lambda w: w["jobs"]["soak"].__setitem__("needs", "recheck"),
             "guard without the auto output": lambda w: w["jobs"]["guard"]["outputs"].pop("auto"),
-            "guard drill env removed": lambda w: w["jobs"]["guard"]["steps"][0]["env"].pop(
-                "INJECT_ERROR_RATE_SPIKE"),
+            "guard loses cutover hold": lambda w: w["jobs"]["guard"]["steps"][0]["env"].pop(
+                "CUTOVER_HOLD"),
         }.items():
             with self.subTest(lane=label):
                 self.assertTrue(mutated(change))
@@ -5861,8 +5957,8 @@ class WorkflowTests(unittest.TestCase):
             "extra input": lambda w: w["on"]["workflow_dispatch"]["inputs"].update({"force": {"type": "boolean"}}),
             "target default": lambda w: w["on"]["workflow_dispatch"]["inputs"]["target_version"].update(
                 {"default": "latest"}),
-            "optional target": lambda w: w["on"]["workflow_dispatch"]["inputs"]["target_version"].update(
-                {"required": "false"}),
+            "required target blocks daily proof": lambda w: w["on"]["workflow_dispatch"]["inputs"]["target_version"].update(
+                {"required": "true"}),
             "cancelling concurrency": lambda w: w["concurrency"].update({"cancel-in-progress": "true"}),
             "own concurrency group": lambda w: w["concurrency"].update({"group": "staging-rollback-drill"}),
             "second job": lambda w: w["jobs"].update({"again": deepcopy(w["jobs"]["drill"])}),
@@ -5894,6 +5990,45 @@ class WorkflowTests(unittest.TestCase):
         del missing["staging-rollback-drill.yml"]
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
+
+    def test_daily_rollback_proof_and_independent_finding_only_watch_are_pinned(self):
+        workflow = self.workflows["staging-rollback-drill.yml"]
+        self.assertEqual(staging_rollback_drill_errors(workflow), [])
+        for label, change in {
+            "missing daily schedule": lambda w: w["on"].pop("schedule"),
+            "weekly only": lambda w: w["on"].update({"schedule": [{"cron": "17 3 * * 1"}]}),
+            "dispatcher deadlocks staging lane": lambda w: w["jobs"]["proof"].update(
+                {"concurrency": {"group": "deploy-staging", "cancel-in-progress": False}}),
+            "dispatcher reads production secrets": lambda w: w["jobs"]["proof"].update({"environment": "production"}),
+            "dispatcher extra bindings": lambda w: w["jobs"]["proof"]["steps"][1]["env"].update({"URL": "production"}),
+            "missing evidence": lambda w: w["jobs"]["proof"]["steps"].pop(),
+            "alert on success": lambda w: w["jobs"]["alert"].update({"if": "always()"}),
+            "alert no webhook scope": lambda w: w["jobs"]["alert"].pop("environment"),
+            "manual drill loses lane": lambda w: w["jobs"]["drill"].pop("concurrency"),
+        }.items():
+            changed = deepcopy(workflow)
+            change(changed)
+            with self.subTest(label=label):
+                self.assertTrue(staging_rollback_drill_errors(changed))
+        watcher = self.workflows["daily-digest.yml"]["jobs"]["rollback-proof-watch"]
+        self.assertNotIn("needs", watcher)
+        self.assertEqual(rollback_proof_job_errors(watcher, "watch"), [])
+        for change in (lambda w: w["permissions"].update({"actions": "write"}),
+                       lambda w: w["steps"][1].update({"run": "python3 scripts/rollback_proof.py run"}),
+                       lambda w: w["steps"][1].update({"continue-on-error": True})):
+            changed = deepcopy(watcher)
+            change(changed)
+            self.assertTrue(rollback_proof_job_errors(changed, "watch"))
+        spec = importlib.util.spec_from_file_location("rollback_proof", ROOT / "scripts/rollback_proof.py")
+        proof = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(proof)
+        deploy = self.workflows["deploy-staging.yml"]["jobs"]["deploy"]
+        self.assertEqual(deploy["name"], "wrangler deploy + intended rollout gate")
+        self.assertTrue(set(proof.REQUIRED_STEPS) <= {s.get("name") for s in deploy["steps"]})
+        worker_steps = self.workflows["check.yml"]["jobs"]["worker"]["steps"]
+        covering = [s for s in worker_steps if "test_rollback_proof.py" in str(s.get("run") or "")]
+        self.assertEqual(len(covering), 1)
+        self.assertNotIn("if", covering[0])
 
     def test_staging_container_drill_shape_is_pinned(self):
         workflows = self.workflows
@@ -7088,6 +7223,10 @@ class WorkflowTests(unittest.TestCase):
                         # SBOM chain for the fresh digest tag.
                         expected = {"contents": "write", "deployments": "read",
                                     "actions": "write"}
+                    elif (name, job_id) == ("staging-rollback-drill.yml", "proof"):
+                        expected = {"contents": "read", "actions": "write"}
+                    elif (name, job_id) == ("daily-digest.yml", "rollback-proof-watch"):
+                        expected = {"contents": "read", "actions": "read"}
                     elif (name, job_id) == ("release.yml", "attach-sbom"):
                         # TOG-10893: uploads verified SBOMs to the published tag.
                         expected = {"contents": "write"}
