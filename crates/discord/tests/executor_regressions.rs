@@ -552,6 +552,38 @@ async fn numeric_nonce_posts_with_enforcement() {
     mock.shutdown().await;
 }
 
+// Decimal-string nonces keep their exact string identity on the wire:
+// recovery compares the echoed nonce as a string, and parsing the
+// string as a number would also drop leading zeroes (an all-digit hex
+// fixture nonce posted as a number fails the string-nonce assert).
+#[tokio::test]
+async fn decimal_string_nonce_posts_as_string_with_enforcement() {
+    let mock = MockRest::start(
+        vec![],
+        ScriptedResponse::json(201, serde_json::json!({"id": "99"})),
+    )
+    .await;
+    let call = ChannelCall::PostMessage {
+        channel_id: CHANNEL.to_owned(),
+        content: "fixture".to_owned(),
+        nonce: Some("0012345678901234".to_owned()),
+    };
+    let outcome = executor_for(&mock)
+        .execute_channel(&call)
+        .await
+        .expect("decimal string nonce must be sendable");
+    assert!(matches!(
+        outcome,
+        two_bot_discord::ChannelCallOutcome::Posted { .. }
+    ));
+    let reqs = mock.requests();
+    assert_eq!(reqs.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).expect("post body is JSON");
+    assert_eq!(body["nonce"], serde_json::json!("0012345678901234"));
+    assert_eq!(body["enforce_nonce"], serde_json::json!(true));
+    mock.shutdown().await;
+}
+
 // Finding 6: purge returns the observed deletion count, not the requested
 // one (Discord listed 3 of the 10 asked for).
 #[tokio::test]

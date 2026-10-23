@@ -26,7 +26,7 @@ Migration replay preserves populated legacy rows and the presence-based halt.
 Existing delivered rows stay delivered; no historical delivery is requeued.
 Legacy `rota_notice` rows are retained but excluded from claims/queue discovery.
 
-Migration `0455_audit_reconcile_cursor.sql` adds nullable TEXT
+Migration `0458_audit_reconcile_cursor.sql` adds nullable TEXT
 `delivery_reconcile_before`, the floor of fully inspected recovery history.
 NULL means start at head; existing rows need no rewrite or requeue. It is
 separate from the immutable pre-POST `delivery_search_before`. Apply through
