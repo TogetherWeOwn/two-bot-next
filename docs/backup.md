@@ -146,7 +146,7 @@ unsupported. A failed write or validation leaves existing published recovery
 points untouched; a crash may leave a temporary file, but retention and drill
 selectors ignore it.
 
-### Coverage and recovery semantics (v4–v14)
+### Coverage and recovery semantics
 
 `DUMP_TABLES` in `crates/core/src/backup/dump_file.rs` is the single ordered
 inventory for both dump and restore. It includes **105 durable tables from the
