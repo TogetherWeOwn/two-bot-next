@@ -13,6 +13,11 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 CONTAINER_ROOT = "/__w/two-bot-next/two-bot-next"
 SOURCE = "crates/core/src/action_outcomes.rs"
+INVALID_SOURCE_ROOT_CASES = (
+    ("/", f"/{SOURCE}"),
+    ("relative/path", SOURCE),
+    ("/producer/../checkout", SOURCE),
+)
 
 
 def load_script(name, filename):
@@ -166,6 +171,28 @@ class CoverageShardBoundaryTests(unittest.TestCase):
         expected = {(SOURCE, 129): 3}
         self.assertEqual(self.read_hits(output), expected)
         self.assertEqual(MERGE.merge_lcov(reports, source_roots=roots), expected)
+
+    def test_cli_rejects_invalid_source_roots_without_output(self):
+        # A slash root must not launder a foreign absolute SF into this checkout.
+        for root, source in INVALID_SOURCE_ROOT_CASES:
+            with self.subTest(root=root):
+                report = self.report("invalid-root.info", source, {129: 1})
+                result, output = self.merge_cli([report], [root])
+                diagnostic = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 1, diagnostic)
+                self.assertIn(f"invalid LCOV source root: {root!r}", diagnostic)
+                self.assertIn("::error::", diagnostic)
+                self.assertIn("failing closed", diagnostic)
+                self.assertFalse(output.exists(), "invalid roots must not publish coverage")
+
+    def test_api_rejects_invalid_source_roots(self):
+        for root, source in INVALID_SOURCE_ROOT_CASES:
+            with self.subTest(root=root):
+                report = self.report("invalid-root.info", source, {129: 1})
+                with self.assertRaises(ValueError) as raised:
+                    MERGE.merge_lcov([report], source_roots=(root,))
+                self.assertEqual(str(raised.exception),
+                                 f"invalid LCOV source root: {root!r}")
 
     def test_cli_rejects_outside_root_and_traversal_without_partial_output(self):
         valid = self.report("valid.info", SOURCE, {129: 1})
