@@ -199,7 +199,11 @@ REST clients are not silently claimed as covered.
 - Body: Prometheus text exposition 0.0.4. Every family is preceded by its
   `# HELP` / `# TYPE` lines, one sample per line, body ends with a trailing
   newline. All families render from process start at zero/`NaN`, before any
-  gateway event or job completion.
+  gateway event or job completion. Keep HELP descriptions concise: the full
+  exposition must fit the consumers' 64 KiB body cap, not only the series-count
+  budget. A regression saturates EventSub, pool and REST-guard samples and
+  reserves 1 KiB for other value growth; it does not bound every possible
+  combination of process counters at their maxima.
 
 ## Label allowlists (stable)
 
