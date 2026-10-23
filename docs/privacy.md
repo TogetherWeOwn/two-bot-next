@@ -9,6 +9,10 @@ are outside this implementation's scope.
 
 - Discord guild/member IDs, join/leave/activity milestones, invitation attribution
   and event metadata (`members`, `events`, `invite_snapshots`).
+- AFK status (`afk_status`): guild/member IDs, a set timestamp and an optional
+  member-supplied note bounded to 200 characters. The member's next eligible
+  message clears the row; member erasure removes it by guild and `user_id`,
+  including the note. Notes are reply content, not log or analytics payloads.
 - XP totals, awards and cooldowns, seasonal projections, rank projections and raid exclusions
   (`member_levels`, `member_season_xp`, `xp_awards`, `xp_cooldowns`, `member_ranks`, `member_exclusions`).
 - Join-risk evidence copied from legacy anti-raid scoring: member ID, account
@@ -40,6 +44,10 @@ are outside this implementation's scope.
   prospective recipients, pending or completed: erasure removes the erased
   member's rows by (`guild_id`, `member_id`), and deleting a parent room
   removes its journal rows through the migration's `ON DELETE CASCADE`.
+  Event voice presence spans (`event_voice_presence`) record per-member
+  join/leave spans: erasure removes the erased member's rows, guild-scoped
+  through the scheduled-event mirror. The channel claim row
+  (`event_voice_channels`) carries no member identity and is untouched.
   Erasure removes database tracking only, never the Discord channel.
   Guild room-command controls
   (`voice_access_controls`: creation switch, required role ID, per-command role
@@ -157,7 +165,7 @@ When your opt-out runs, the bot:
 3. Writes exactly one audit receipt: the guild/member scope plus the
    actor label and the database timestamp.
 
-Moderation, audit, XP/level, ticket, voice-room and settings rows are not
+Moderation, audit, XP/level, ticket, voice-room, AFK and settings rows are not
 part of an opt-out: they serve safety, delivery and accountability, not
 analytics. A member who needs full removal should request erasure (see
 Procedure below), which is a separate reviewed operation.

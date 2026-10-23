@@ -1,4 +1,4 @@
--- 0455_afk_status: one AFK row per member for `/afk` status with mention replies.
+-- 0458_afk_status: one AFK row per member for `/afk` status with mention replies.
 --
 -- `/afk [message]` upserts `(guild_id, user_id)` with the note (NULL when the
 -- setter gave none) and the set time; a later message mentioning an AFK

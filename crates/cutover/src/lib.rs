@@ -19,6 +19,7 @@ pub mod cli;
 pub mod db;
 pub mod dedupe;
 pub mod deletion_intake;
+pub mod event_voice;
 pub mod gateway_session;
 pub mod ghost_cleanup;
 pub mod intake_cap;

@@ -469,9 +469,9 @@
       "sha256": "c813acffc8d44d4f3175acab3aadd9c81a2e611f7962fbba1725a828c3cee4fc",
       "justification": "Uncertain-delivery fence for sticky re-posts: one NOT NULL DEFAULT FALSE column delivery_uncertain on sticky_messages, armed by the atomic claim and disarmed only by confirmed record, proven no-send, confirmed orphan absence, or administrator reconfigure. Additive, IF NOT EXISTS; numbered 0454 because main owns 0452 (scheduled tombstone) and 0453 (store copy); global migration numbers remain unique across both chains; rollback drops the column."
     },
-    "crates/cutover/migrations/0455_afk_status.sql": {
-      "sha256": "89a4a99e6e368c123bac636da010c5a0193f9cdeddf6c3515b95ee931ae95491",
-      "justification": "AFK status store for /afk with mention replies: new table afk_status(guild_id, user_id, note NULL, set_at TIMESTAMPTZ; PK(guild_id, user_id)), no sequences or secondary indexes. Additive, IF NOT EXISTS, cutover chain only (bot-runtime state like sticky); numbered 0455 as the next free global migration; rollback drops the table."
+    "crates/cutover/migrations/0455_event_voice_channels.sql": {
+      "sha256": "3495774bcc64661f8dd70e99f0159a54890a2bd19f40637623577a85b6997704",
+      "justification": "Event voice channel idempotency key plus presence spans: event_voice_channels keyed UNIQUE (event_id, instance_starts_at) with timestamptz starts/ends, lease plus UNIQUE channel binding, and event_voice_presence spans (natural PK, one open span per member via inline EXCLUDE). Additive, IF NOT EXISTS, constraints inline; numbered 0455 because the merged sticky delivery fence owns 0454; rollback drops the tables."
     },
     "crates/cutover/migrations/0456_admin_api_tokens.sql": {
       "sha256": "3452a9adac7ee312a3f10f4150d34effff441e3fac32931a1e8bc08860ac4be2",
@@ -480,6 +480,10 @@
     "crates/store/migrations/0457_admin_api_tokens.sql": {
       "sha256": "622bcbc5cfc2561432290c293e15d30d89997435970088c6e4c01f37e20f962d",
       "justification": "Store-chain mirror of cutover 0456, including the pre-merge 64-lowercase-hex secret_hash CHECK and refusal of NULL guild elements: identical table and index, IF NOT EXISTS, no writes to existing tables. Numbered 0457 because cutover owns 0456; global migration numbers remain unique across both chains. Renumbered before first merge after main claimed 0454; SQL body unchanged."
+    },
+    "crates/cutover/migrations/0458_afk_status.sql": {
+      "sha256": "8f2a0dc72b99681014bb98849de697760a5d6acbf971ab5756c4492f8c31eb82",
+      "justification": "AFK status store for /afk with mention replies: new table afk_status(guild_id, user_id, note NULL, set_at TIMESTAMPTZ; PK(guild_id, user_id)), no sequences or secondary indexes. Additive, IF NOT EXISTS, cutover chain only (bot-runtime state like sticky); renumbered before first merge from 0455 to 0458 because main owns 0455 event voice and 0456/0457 admin tokens. Only the filename and number comment changed; no deployed migration history is changed. Rollback drops the table."
     }
   }
 }

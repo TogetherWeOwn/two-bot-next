@@ -264,6 +264,11 @@
       "table": "afk_status",
       "columns": ["user_id"],
       "predicate": "guild_id = $1 AND user_id = $2"
+    },
+    {
+      "table": "event_voice_presence",
+      "columns": ["user_id"],
+      "predicate": "user_id = $2 AND event_id IN (SELECT event_id FROM scheduled_events WHERE guild_id = $1)"
     }
   ],
   "allowlist": [

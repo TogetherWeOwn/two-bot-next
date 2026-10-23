@@ -1,7 +1,7 @@
 //! AFK status with mention replies.
 //!
 //! `/afk [message]` records one row per member in `afk_status`
-//! (migration 0455); a later message that mentions an AFK member answers
+//! (migration 0458); a later message that mentions an AFK member answers
 //! once with the note plus elapsed time, and the member's own next message
 //! clears the status. This module owns the pure contract (note validation,
 //! elapsed rendering, reply texts) and the store; execution lives in the
@@ -136,7 +136,7 @@ pub fn mention_reply(display_name: &str, note: Option<&str>, elapsed: &str) -> S
     }
 }
 
-/// `afk_status` store (migration 0455). Timestamps cross the boundary as
+/// `afk_status` store (migration 0458). Timestamps cross the boundary as
 /// millisecond Unix times (`i64`); SQL converts via
 /// `to_timestamp(ms / 1000.0)` and reads back via
 /// `(extract(epoch from …) * 1000)::bigint`, like the sticky store.

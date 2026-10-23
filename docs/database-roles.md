@@ -86,6 +86,17 @@ transaction, and reads the guild high-water back through it before touching
 the mirror. The table carries no member column, so there is nothing to
 erase and no reader grant beyond the app pool.
 
+The event voice pair (`event_voice_channels`, `event_voice_presence`) is
+ordinary `table` kind for the same reason: the claim path, the presence
+transition hook and the reconcile passes read and write both tables through
+the app pool. The presence spans carry a member column (`user_id`, erased
+via the scheduled-event mirror); the channel row carries no member identity.
+
+The AFK member-status table (`afk_status`) is ordinary `table` kind: the
+runtime sets, updates, reads and clears away states through the app pool.
+Member erasure deletes the row by guild and `user_id`, including its optional
+note. The web reader has no access.
+
 The admin API token registry (`admin_api_tokens`) is ordinary `table` kind
 for the same reason: the container authorizer reads the token row through
 the app pool when the later transport slices land (slice 0 ships the table
