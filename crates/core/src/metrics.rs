@@ -2187,7 +2187,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_worker_halted",
             "gauge",
-            "Guild-actor halt latch: 1 while any guild actor is halted (CredentialRefused halted join processing).",
+            "1 if any guild actor halted joins on CredentialRefused; otherwise 0.",
         );
         writeln!(out, "two_bot_voice_worker_halted {voice_halted}").unwrap();
         header(
@@ -2218,7 +2218,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_live_not_ready_seconds",
             "gauge",
-            "Seconds a guild live voice view has been not ready while the gateway is connected (creator joins are dropped meanwhile), maximum across guild actors; 0 when every view is ready or the gateway is down.",
+            "Maximum guild voice-not-ready seconds while connected (joins dropped); 0 if all ready or disconnected.",
         );
         writeln!(
             out,
@@ -2762,7 +2762,7 @@ fn header(out: &mut String, name: &str, kind: &str, help: &str) {
 }
 
 fn scalar(out: &mut String, name: &str, kind: &str, value: u64) {
-    header(out, name, kind, "Process-local health metric.");
+    header(out, name, kind, "Process-local.");
     writeln!(out, "{name} {value}").unwrap();
 }
 
