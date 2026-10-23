@@ -1,7 +1,11 @@
 //! Onboarding orchestration; S3 retains ownership of join/gate/leave facts.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+use tokio::sync::Mutex;
+use tokio::time::Instant;
 
 use sqlx::PgPool;
 use twilight_model::application::interaction::Interaction;
@@ -90,6 +94,43 @@ pub enum RuntimeError {
     Store,
 }
 
+const BOT_ACCESS_TTL: Duration = Duration::from_secs(60);
+/// In-flight invalidations during identity load or a live channel check.
+/// The raced snapshot is never cached or used to post.
+const ACCESS_RELOAD_BOUND: u32 = 3;
+const MAX_ACCEPTED_WELCOMES: usize = 32;
+
+struct BotAccess {
+    access: MemberAccess,
+    loaded_at: Instant,
+    generation: u64,
+}
+
+/// Kept only until the accepted post's store transaction settles. Never expire
+/// or evict this receipt: losing it would turn a record retry into another post.
+struct AcceptedWelcome {
+    message_id: String,
+    channel_id: String,
+    occurred_at: String,
+    anchor: bool,
+}
+
+impl AcceptedWelcome {
+    async fn record(&self, guard: PromptGuard) -> Result<(), RuntimeError> {
+        let result = if self.anchor {
+            guard
+                .record_anchor_sent(&self.channel_id, &self.occurred_at)
+                .await
+        } else {
+            guard.record_sent(&self.channel_id, &self.occurred_at).await
+        };
+        result.map(|_| ()).map_err(|_| {
+            tracing::warn!(message_id = %self.message_id, "accepted welcome awaits prompt recording");
+            RuntimeError::Store
+        })
+    }
+}
+
 enum FreshRecipient {
     Eligible { roles: Vec<String> },
     Ineligible,
@@ -152,6 +193,11 @@ pub struct OnboardingRuntime {
     deployment: HashMap<String, String>,
     guild_id: u64,
     bot_id: u64,
+    bot_access: Mutex<Option<BotAccess>>,
+    access_generation: AtomicU64,
+    // Serialize local welcome attempts through send + receipt publication +
+    // recording. PromptGuard still supplies the cross-process member lock.
+    accepted_welcomes: Mutex<HashMap<u64, AcceptedWelcome>>,
 }
 
 /// Merge a stored `TWO_ONBOARDING_DRY_RUN` rendering over the deployment map.
@@ -267,6 +313,9 @@ impl OnboardingRuntime {
             deployment,
             guild_id,
             bot_id,
+            bot_access: Mutex::new(None),
+            access_generation: AtomicU64::new(0),
+            accepted_welcomes: Mutex::new(HashMap::new()),
         })
     }
 
@@ -304,6 +353,25 @@ impl OnboardingRuntime {
         event: &Event,
         pipeline: &GatewayPipeline<I>,
     ) -> Option<OnboardingJob> {
+        // Capture runs before the pipeline updates its cache. Invalidate without
+        // waiting for REST; an in-flight load cannot publish into a newer epoch.
+        if event.guild_id().is_some_and(|id| id.get() == self.guild_id)
+            && match event {
+                Event::RoleCreate(_)
+                | Event::RoleUpdate(_)
+                | Event::RoleDelete(_)
+                | Event::GuildCreate(_)
+                | Event::GuildUpdate(_)
+                | Event::GuildDelete(_)
+                | Event::UnavailableGuild(_) => true,
+                Event::MemberAdd(member) => member.user.id.get() == self.bot_id,
+                Event::MemberUpdate(member) => member.user.id.get() == self.bot_id,
+                Event::MemberRemove(member) => member.user.id.get() == self.bot_id,
+                _ => false,
+            }
+        {
+            self.access_generation.fetch_add(1, Ordering::SeqCst);
+        }
         match event {
             Event::MemberAdd(member) if member.guild_id.get() == self.guild_id => {
                 Some(OnboardingJob::Welcome {
@@ -520,7 +588,10 @@ impl OnboardingRuntime {
                     self.executor
                         .post_channel_message(&channel_id, &content, &[], mentions)
                         .await
-                        .map_err(|_| RuntimeError::Discord)?;
+                        .map_err(|_| {
+                            self.access_generation.fetch_add(1, Ordering::SeqCst);
+                            RuntimeError::Discord
+                        })?;
                 }
                 Ok(())
             }
@@ -538,23 +609,99 @@ impl OnboardingRuntime {
         if channels.is_empty() {
             return Ok(None);
         }
-        let Some(access) = MemberAccess::load(&self.executor, config.guild_id, self.bot_id)
-            .await
-            .map_err(|_| RuntimeError::Discord)?
-        else {
-            return Ok(None);
-        };
-        for channel in channels {
-            let channel = channel.to_string();
-            if access
-                .permits(&self.executor, &channel, true)
-                .await
-                .map_err(|_| RuntimeError::Discord)?
-            {
-                return Ok(Some(channel));
+        enum Probe {
+            Selected(String),
+            Denied,
+            Unavailable,
+            Stale,
+        }
+        // One guild/bot snapshot, singleflight even when both workers miss.
+        // Only a generation-stable success is cached; channel overwrites stay live.
+        // An invalidation during load or a live channel check discards that attempt
+        // and reloads. The raced snapshot is never cached or used to post.
+        // Sustained invalidation returns retryable Discord. A REST error or a
+        // missing identity is not a race: those return immediately.
+        let mut cached = self.bot_access.lock().await;
+        for _ in 0..ACCESS_RELOAD_BOUND {
+            let generation = self.access_generation.load(Ordering::SeqCst);
+            if cached.as_ref().is_some_and(|entry| {
+                entry.generation != generation || entry.loaded_at.elapsed() >= BOT_ACCESS_TTL
+            }) {
+                *cached = None;
+            }
+            if cached.is_none() {
+                let loaded_at = Instant::now();
+                let Some(access) = MemberAccess::load(&self.executor, config.guild_id, self.bot_id)
+                    .await
+                    .map_err(|_| RuntimeError::Discord)?
+                else {
+                    return Ok(None);
+                };
+                if self.access_generation.load(Ordering::SeqCst) != generation {
+                    continue;
+                }
+                *cached = Some(BotAccess {
+                    access,
+                    loaded_at,
+                    generation,
+                });
+            }
+            // End the cache borrow before a stale result clears it.
+            let probe = {
+                let Some(entry) = cached.as_ref() else {
+                    return Err(RuntimeError::Discord);
+                };
+                let mut selected = None;
+                let mut denied = false;
+                let mut unavailable = false;
+                for channel in channels {
+                    let channel = channel.to_string();
+                    match entry.access.permits(&self.executor, &channel, true).await {
+                        Ok(allowed) => {
+                            if self.access_generation.load(Ordering::SeqCst) != generation {
+                                selected = None;
+                                denied = false;
+                                break;
+                            }
+                            if allowed {
+                                selected = Some(channel);
+                                break;
+                            }
+                            denied = true;
+                        }
+                        Err(_) => {
+                            unavailable = true;
+                            break;
+                        }
+                    }
+                }
+                if unavailable {
+                    Probe::Unavailable
+                } else if self.access_generation.load(Ordering::SeqCst) != generation {
+                    Probe::Stale
+                } else if let Some(channel) = selected {
+                    Probe::Selected(channel)
+                } else if denied {
+                    Probe::Denied
+                } else {
+                    // The in-loop generation check cleared both flags. Reload.
+                    Probe::Stale
+                }
+            };
+            match probe {
+                Probe::Unavailable => {
+                    *cached = None;
+                    return Err(RuntimeError::Discord);
+                }
+                Probe::Stale => *cached = None,
+                Probe::Denied => {
+                    *cached = None;
+                    return Ok(None);
+                }
+                Probe::Selected(channel) => return Ok(Some(channel)),
             }
         }
-        Ok(None)
+        Err(RuntimeError::Discord)
     }
 
     /// Live guild member for a queued welcome. `Ineligible` is proven (404,
@@ -580,11 +727,25 @@ impl OnboardingRuntime {
         now_secs: i64,
         at: &str,
     ) -> Result<(), RuntimeError> {
+        let mut accepted = self.accepted_welcomes.lock().await;
+        let guild = config.guild_id.to_string();
+        let member = member_id.to_string();
+        // Reconcile an already accepted send before checking current destinations
+        // or dry-run. The original receipt, not a newly rendered welcome, owns it.
+        if let Some(receipt) = accepted.get(&member_id) {
+            if let Some(guard) = begin_prompt(&self.pool, &guild, &member)
+                .await
+                .map_err(|_| RuntimeError::Store)?
+            {
+                receipt.record(guard).await?;
+            }
+            // None also covers opt-out suppression; do not recreate its rows.
+            accepted.remove(&member_id);
+            return Ok(());
+        }
         if config.gates.dry_run && config.gates.mode != OnboardingMode::Session {
             return Ok(());
         }
-        let guild = config.guild_id.to_string();
-        let member = member_id.to_string();
         if has_onboarding_prompt(&self.pool, &guild, &member)
             .await
             .map_err(|_| RuntimeError::Store)?
@@ -625,7 +786,16 @@ impl OnboardingRuntime {
             return Ok(());
         };
         if config.gates.mode == OnboardingMode::Anchor {
-            content = content.replace(SUNDAY_SQUAD.channel_id, &channel);
+            content = content.replace(
+                &format!("<#{}>", SUNDAY_SQUAD.channel_id),
+                &format!("<#{channel}>"),
+            );
+        }
+        // Capacity is reserved by the local mutex across the send. Never evict
+        // an accepted receipt merely to admit another welcome.
+        if accepted.len() >= MAX_ACCEPTED_WELCOMES {
+            tracing::warn!("welcome receipt capacity exhausted; refusing new sends");
+            return Err(RuntimeError::Store);
         }
         let Some(guard) = begin_prompt(&self.pool, &guild, &member)
             .await
@@ -635,7 +805,8 @@ impl OnboardingRuntime {
         };
         let role_refs: Vec<_> = roles.iter().map(String::as_str).collect();
         let components = picker_components(picker, &role_refs, &config.session_picks);
-        self.executor
+        let message_id = self
+            .executor
             .post_channel_message(
                 &channel_id,
                 &content,
@@ -643,13 +814,31 @@ impl OnboardingRuntime {
                 MentionPolicy::Member(mention_user_id),
             )
             .await
-            .map_err(|_| RuntimeError::Discord)?;
-        if config.gates.mode == OnboardingMode::Anchor {
-            guard.record_anchor_sent(&channel_id, at).await
-        } else {
-            guard.record_sent(&channel_id, at).await
+            .map_err(|_| {
+                self.access_generation.fetch_add(1, Ordering::SeqCst);
+                RuntimeError::Discord
+            })?;
+        // No await between accepted send and receipt publication: cancellation
+        // during SQL recording must leave enough state for a record-only retry.
+        let receipt = accepted.entry(member_id).or_insert(AcceptedWelcome {
+            message_id,
+            channel_id,
+            occurred_at: at.to_owned(),
+            anchor: config.gates.mode == OnboardingMode::Anchor,
+        });
+        if receipt.record(guard).await.is_err() {
+            // Give a transient record rollback one bounded record-only retry
+            // before the worker reports failure (which can stop the runner).
+            // Reacquire rather than reuse an aborted transaction, and re-gate
+            // suppression. The accepted receipt survives either await failing.
+            if let Some(guard) = begin_prompt(&self.pool, &guild, &member)
+                .await
+                .map_err(|_| RuntimeError::Store)?
+            {
+                receipt.record(guard).await?;
+            }
         }
-        .map_err(|_| RuntimeError::Store)?;
+        accepted.remove(&member_id);
         Ok(())
     }
 
@@ -1196,5 +1385,82 @@ mod tests {
             .expect("merged map must parse")
             .expect("guild present");
         assert!(!config.gates.dry_run);
+    }
+
+    /// A channel REST error fails the welcome path loudly instead of becoming
+    /// a silent skip. No database: identity and channel reads are REST-only,
+    /// so the pool is a never-dialed lazy handle.
+    #[tokio::test]
+    async fn first_postable_channel_rest_error_is_discord_not_skip() {
+        use crate::discord_test_common::{MockRest, RestRequest, ScriptedResponse};
+        use two_bot_core::onboarding::{GAME_PICKS, PLATFORM_PICKS};
+
+        crate::gateway::ensure_crypto_provider();
+        let rest = MockRest::with_responder(|request: &RestRequest| {
+            let path = request.path.strip_prefix("/api/v10").unwrap();
+            match (request.method.as_str(), path) {
+                ("GET", "/guilds/22") => {
+                    ScriptedResponse::json(200, serde_json::json!({"id":"22","owner_id":"888"}))
+                }
+                ("GET", "/guilds/22/roles") => {
+                    let mut roles = vec![
+                        serde_json::json!({"id":"22","permissions":"1051648"}),
+                        serde_json::json!({"id":"77","permissions":"0"}),
+                    ];
+                    roles.extend(
+                        GAME_PICKS
+                            .iter()
+                            .chain(PLATFORM_PICKS.iter())
+                            .map(|pick| serde_json::json!({"id":pick.role_id,"permissions":"0"})),
+                    );
+                    ScriptedResponse::json(200, serde_json::Value::Array(roles))
+                }
+                ("GET", path) if path.starts_with("/guilds/22/members/") => {
+                    let id = path.strip_prefix("/guilds/22/members/").unwrap();
+                    ScriptedResponse::json(200, serde_json::json!({"user":{"id":id},"roles":[]}))
+                }
+                ("GET", path) if path.starts_with("/channels/") => ScriptedResponse::status(503),
+                _ => panic!("unexpected mock Discord route: {} {}", request.method, path),
+            }
+        })
+        .await;
+        let executor =
+            ActionExecutor::with_proxy("onboarding-test-only-token".into(), Some(rest.origin()))
+                .unwrap();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://127.0.0.1:1/unreadable")
+            .expect("lazy pool");
+        let vars = HashMap::from([
+            ("DISCORD_GUILD_ID".to_owned(), "22".to_owned()),
+            ("TWO_ONBOARDING_MODE".to_owned(), "session".to_owned()),
+            ("TWO_ONBOARDING_DRY_RUN".to_owned(), "0".to_owned()),
+            ("DISCORD_LANDING_CHANNEL_IDS".to_owned(), "12".to_owned()),
+            ("DISCORD_GOODBYE_CHANNEL_IDS".to_owned(), "13".to_owned()),
+            (
+                "DISCORD_ANCHOR_WELCOME_CHANNEL_ID".to_owned(),
+                "14".to_owned(),
+            ),
+            (
+                "DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID".to_owned(),
+                "10".to_owned(),
+            ),
+            (
+                "DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID".to_owned(),
+                "11".to_owned(),
+            ),
+        ]);
+        let runtime = OnboardingRuntime::new(pool, executor, &vars, 22, 999).unwrap();
+        let config = OnboardingConfig::from_map(&vars)
+            .expect("deployment map must parse")
+            .expect("guild present");
+        let error = runtime
+            .first_postable(&config, &[12u64])
+            .await
+            .expect_err("channel REST error must fail, not skip");
+        assert!(
+            matches!(error, RuntimeError::Discord),
+            "unexpected error: {error:?}"
+        );
     }
 }
