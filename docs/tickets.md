@@ -28,6 +28,18 @@ Framework-specific references: [sqlx 0.9 transactions](https://docs.rs/sqlx/0.9.
 - Transcript bodies live only in `ticket_transcripts`, not in funnel/audit events. Retention is exactly 90 days from capture; `purge_after <= now` is inclusive. Purge still applies when cleanup is pending: retention is a privacy ceiling. All store lookups, transitions, recovery, purge and member-erasure calls are guild-scoped. Member erasure uses the FK cascade to delete transcript bodies atomically.
 - Recovery can reconcile legacy `closing` rows that already have a transcript, without replacing its body. A saved snapshot never reopens the ticket.
 
+## Open-button state and next-try guidance
+
+Pressing Open again explains the invoking member's existing ticket in this guild, using the status and channel from the same reservation transaction:
+
+- **Creating / recovery pending:** the channel is not yet proven ready, even if its ID is recorded. Wait for creation/recovery; ask staff if it stays stuck. No channel link is offered.
+- **Open with a channel:** the reply links the existing ticket. If Discord will not let you view it, ask staff to check access; the reply does not recheck or restore permissions. Open without a channel instead asks staff for help.
+- **Closing:** wait while the transcript is captured; ask staff if it stays stuck. The channel is not offered as usable.
+- **Cleanup pending:** wait for cleanup before opening another ticket; ask staff if it stays stuck. This state can also represent an opening rollback, so it does not promise a saved transcript.
+- **Cooldown:** the private reply gives the next time to **try**, in Discord-localized and relative form. It is not a booking or a promise of availability. Display rounds upward to whole seconds, but admission keeps its exact millisecond boundary. Future stored creation times remain future deadlines; the configured duration keeps its existing saturating arithmetic. A date outside the conservative 1970–9999 display range is explained as outside that range, not clipped to an earlier false deadline. Invalid stored timestamps remain store errors, never cooldown or absence.
+
+These explanations create no ticket, channel, controls, transcript, repair or retry job. Active-ticket precedence, the guild/opener lock, cooldown duration, authorization and ephemeral acknowledgement/mention suppression remain unchanged. Existing recovery supervision, not a repeated button press, owns lifecycle progress.
+
 ## Shared-router / executor integration checklist
 
 1. Register all three component IDs through the shared router. Guild-fence first; Open defers an ephemeral reply, and Claim/Close additionally run `authorize`. Claim/Close resolve `by_channel` in the same guild; never trust an interaction-supplied ticket ID.

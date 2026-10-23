@@ -892,15 +892,39 @@ impl TicketRuntime {
             .await?
         {
             OpenResult::Created(ticket) => ticket,
-            OpenResult::Refused(OpenDecision::Existing { channel_id }) => {
-                return Ok(match channel_id {
-                    Some(channel) => format!("You already have a ticket: <#{channel}>."),
-                    None => "Your ticket is still being created or recovered.".into(),
+            OpenResult::Refused(OpenDecision::Existing { status, channel_id }) => {
+                return Ok(match (status, channel_id) {
+                    (TicketStatus::Creating, _) => {
+                        "Your ticket is still being created or recovered.".into()
+                    }
+                    (TicketStatus::Open, Some(channel)) => {
+                        format!("You already have a ticket: <#{channel}>.")
+                    }
+                    (TicketStatus::Open, None) => {
+                        "Your ticket is open, but its channel is unavailable. Ask staff for help."
+                            .into()
+                    }
+                    (TicketStatus::Closing, _) => {
+                        "Your ticket is closing while its transcript is captured. Please wait; ask staff for help if it stays stuck.".into()
+                    }
+                    (TicketStatus::CleanupPending, _) => {
+                        "Your ticket is awaiting cleanup before another can open. Please wait; ask staff for help if it stays stuck.".into()
+                    }
+                    (TicketStatus::Closed, _) => return Err(Failure::InvalidEvidence),
                 })
             }
-            OpenResult::Refused(_) => {
-                return Ok("Please wait before opening another ticket.".into())
+            OpenResult::Refused(OpenDecision::Cooldown { next_try_at_ms }) => {
+                // Round only the display, never eligibility. Restrict dates to
+                // years 1970–9999 rather than overflowing Discord's renderer.
+                let seconds = next_try_at_ms.div_euclid(1000)
+                    + i128::from(next_try_at_ms.rem_euclid(1000) != 0);
+                return Ok(if (0..=253_402_300_799).contains(&seconds) {
+                    format!("Please wait before opening another ticket. Next time to try: <t:{seconds}:F> (<t:{seconds}:R>).")
+                } else {
+                    "Please wait before opening another ticket. The next time to try is outside the display range; ask staff to check the cooldown.".into()
+                });
             }
+            OpenResult::Refused(OpenDecision::Reserve) => return Err(Failure::InvalidEvidence),
         };
         let channel = match self
             .executor
