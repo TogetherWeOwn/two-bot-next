@@ -189,6 +189,31 @@ impl Context {
     }
 }
 
+#[cfg(test)]
+impl Context {
+    /// Test-only constructor for sibling test modules, which cannot name the
+    /// private `observation`/`events_gate` fields. Pre-seeds the pool cell with
+    /// the caller's pool so offline tests never dial. Never compiled into the
+    /// deployed binary.
+    pub(crate) fn for_tests(
+        url: String,
+        pool: PgPool,
+        rest: ActionExecutor,
+        guild: String,
+    ) -> Self {
+        let cell = OnceCell::new();
+        cell.set(pool).expect("seed the pool cell");
+        Self {
+            url,
+            pool: cell,
+            rest,
+            guild,
+            observation: Mutex::new(()),
+            events_gate: JobGate::default(),
+        }
+    }
+}
+
 /// Fallback cancellation if the HTTP owner is dropped before graceful cleanup.
 struct Shutdown(watch::Sender<bool>);
 impl Drop for Shutdown {

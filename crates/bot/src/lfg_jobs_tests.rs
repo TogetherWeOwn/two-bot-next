@@ -12,9 +12,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::json;
-use tokio::sync::{Mutex, OnceCell};
 use two_bot_core::database_tls::TlsPolicy;
-use two_bot_core::{FeatureGates, JobGate};
+use two_bot_core::FeatureGates;
 use two_bot_discord::executor::ActionExecutor;
 use two_bot_discord::lfg_interactions::{LfgError, LfgInteractions};
 
@@ -50,16 +49,12 @@ fn offline_pool() -> sqlx::PgPool {
 }
 
 fn wired_context(mock: &MockRest) -> Context {
-    let pool = OnceCell::new();
-    pool.set(offline_pool()).expect("seed the pool cell");
-    Context {
-        url: OFFLINE_URL.to_owned(),
-        pool,
-        rest: executor(mock),
-        guild: GUILD.to_owned(),
-        observation: Mutex::new(()),
-        events_gate: JobGate::default(),
-    }
+    Context::for_tests(
+        OFFLINE_URL.to_owned(),
+        offline_pool(),
+        executor(mock),
+        GUILD.to_owned(),
+    )
 }
 
 #[tokio::test]
