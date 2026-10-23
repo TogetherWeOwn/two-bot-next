@@ -673,7 +673,7 @@ VALUES ('GUILD_SCHEDULED_EVENT_CREATE', '100000000000000001',
         '2026-08-03T10:00:00Z', '2026-08-03T10:00:01Z',
         'GUILD_SCHEDULED_EVENT_CREATE:100000000000000001:100000000000000065:2026-08-03T10:00:00Z');
 
--- Birthday v14: opt-ins/config travel with settled and uncertain delivery
+-- Birthday v15: opt-ins/config travel with settled and uncertain delivery
 -- fences and pre-wire grant intents, including a removed profile's old role.
 INSERT INTO birthday_profiles (guild_id, member_id, birth_month, birth_day)
 VALUES ('100000000000000001', '100000000000000002', 2, 29),
@@ -687,3 +687,25 @@ VALUES ('100000000000000001', '100000000000000002', '2026-02-28', '1000000000000
 INSERT INTO birthday_role_grants (guild_id, member_id, role_id, celebration_date)
 VALUES ('100000000000000001', '100000000000000002', '100000000000000034', '2026-02-28'),
        ('100000000000000001', '100000000000000009', '100000000000000035', '2026-05-01');
+
+-- Starboard foundation (v14): one configured guild plus one default/off guild;
+-- two starrers on one message and one on another; one posted board row plus
+-- one pending (NULL board message) below-threshold row. BIGINT snowflakes, so
+-- the roundtrip asserts archive coverage with numeric ids, not an empty seed.
+INSERT INTO starboard_config
+    (guild_id, board_channel_id, threshold, emoji, excluded_channel_ids, updated_by)
+VALUES (100000000000000001, 100000000000000010, 5, '🌟',
+        ARRAY[100000000000000003]::bigint[], 'backup-operator'),
+       (100000000000000002, NULL, 3, '⭐', '{}'::bigint[], NULL);
+INSERT INTO starboard_starrers
+    (guild_id, source_channel_id, source_message_id, user_id)
+VALUES (100000000000000001, 100000000000000003, 100000000000000006, 100000000000000002),
+       (100000000000000001, 100000000000000003, 100000000000000006, 100000000000000004),
+       (100000000000000001, 100000000000000003, 100000000000000007, 100000000000000002);
+INSERT INTO starboard_posts
+    (guild_id, source_channel_id, source_message_id, board_channel_id,
+     board_message_id, star_count, state)
+VALUES (100000000000000001, 100000000000000003, 100000000000000006,
+        100000000000000010, 100000000000000020, 2, 'posted'),
+       (100000000000000001, 100000000000000003, 100000000000000007,
+        100000000000000010, NULL, 1, 'below_threshold');

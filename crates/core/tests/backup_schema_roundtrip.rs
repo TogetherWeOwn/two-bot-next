@@ -24,6 +24,111 @@ use two_bot_core::backup::dump_file::{
 };
 use two_bot_testsupport::TestDatabase;
 
+// Frozen released v13: the voice pair and token registry, before starboard.
+const FROZEN_V13_TABLES: [&str; 101] = [
+    "events",
+    "members",
+    "invite_snapshots",
+    "operational_audit_log",
+    "moderation_warnings",
+    "moderation_scheduled_unbans",
+    "moderation_audit",
+    "moderation_lockdowns",
+    "moderation_idempotency",
+    "containment_events",
+    "containment_incidents",
+    "join_risk_flags",
+    "automation_commands",
+    "scheduled_messages",
+    "sticky_messages",
+    "automation_audit_log",
+    "tickets",
+    "ticket_transcripts",
+    "automod_violations",
+    "automod_processed_messages",
+    "self_role_audit",
+    "self_role_panel_claims",
+    "self_role_exchanges",
+    "self_role_exchange_baselines",
+    "automod_delivery_claims",
+    "gateway_boot_directives",
+    "member_erasure_audit",
+    "privacy_opt_outs",
+    "guild_analytics_settings",
+    "privacy_opt_out_audit",
+    "game_activity_guild_aggregates",
+    "assistant_monthly_builds",
+    "member_levels",
+    "member_season_xp",
+    "xp_awards",
+    "level_role_rewards",
+    "level_import_runs",
+    "event_rsvps",
+    "announcements_audit_log",
+    "community_facts",
+    "lfg_posts",
+    "lfg_roles",
+    "lfg_signups",
+    "feed_relays",
+    "feed_deliveries",
+    "web_contract_meta",
+    "guild_counters",
+    "rank_ladder",
+    "rank_snapshots",
+    "member_ranks",
+    "scheduled_events",
+    "scheduled_events_claim",
+    "scheduled_events_tombstone",
+    "event_voice_channels",
+    "event_voice_presence",
+    "counter_snapshots",
+    "member_exclusions",
+    "presence_probe",
+    "community_stream_heartbeats",
+    "community_scorecard_runs",
+    "community_scorecard_alerts",
+    "community_scorecard_attempts",
+    "gateway_sessions",
+    "guild_settings_revision",
+    "guild_settings",
+    "guild_settings_audit",
+    "admin_api_tokens",
+    "audit_kill_switch",
+    "internal_nonces",
+    "internal_clock_high_water",
+    "internal_idempotency",
+    "internal_action_log",
+    "internal_discord_events",
+    "internal_event_keys",
+    "stream_live_claims",
+    "moderation_channel_executions",
+    "moderation_member_bans",
+    "invite_campaigns",
+    "voice_creators",
+    "voice_rooms",
+    "voice_room_blocks",
+    "voice_join_grants",
+    "voice_owner_grants",
+    "voice_text_companions",
+    "voice_access_controls",
+    "voice_logging_settings",
+    "voice_channel_templates",
+    "voice_game_aliases",
+    "voice_random_lists",
+    "voice_random_list_choices",
+    "voice_logging",
+    "voice_logging_mention_members",
+    "voice_logging_mention_roles",
+    "voice_guild_settings",
+    "voice_command_roles",
+    "voice_command_role_members",
+    "voice_vote_kick_audit",
+    "voice_create_reservations",
+    "retention_guild_purge_queue",
+    "retention_deletion_requests",
+    "event_store",
+];
+
 async fn database() -> Option<TestDatabase> {
     let url = match std::env::var("TWO_TEST_DATABASE_URL") {
         Ok(url) => url,
@@ -613,18 +718,66 @@ async fn assert_default_inserts(
     // GENERATED ALWAYS must remain ALWAYS, while restore uses OVERRIDING SYSTEM VALUE.
     // https://www.postgresql.org/docs/16/sql-insert.html
     let inserts = [
-        ("events", "id", "INSERT INTO events (event_type, guild_id, occurred_at, source, idempotency_key) VALUES ('member_join', '100000000000000001', now(), 'backup-test', 'post-restore:event') RETURNING id"),
-        ("members", "backup_identity", "INSERT INTO members (guild_id, member_id) VALUES ('100000000000000001', 'post-restore-member') RETURNING backup_identity"),
-        ("xp_awards", "id", "INSERT INTO xp_awards (guild_id, member_id, source, xp, occurred_at) VALUES ('100000000000000001', '100000000000000002', 'message', 5, now()) RETURNING id"),
-        ("level_import_runs", "id", "INSERT INTO level_import_runs (guild_id, source, source_rows, unique_members, inserted, updated, unchanged, duplicate_rows, total_imported_xp, imported_at) VALUES ('100000000000000001', 'mee6', 1, 1, 1, 0, 0, 0, 100, now()) RETURNING id"),
-        ("community_facts", "id", "INSERT INTO community_facts (guild_id, event_type, source_event_id, occurred_at, source, classifier_version, classification, matched_rule, idempotency_key) VALUES ('100000000000000001', 'rules_accepted', 'post-restore:fact', '2026-08-04T00:00:00.000Z', 'backup-test', 'classifier-v1', 'test', 'default', 'post-restore:fact') RETURNING id"),
-        ("community_scorecard_runs", "id", "INSERT INTO community_scorecard_runs (guild_id, week_start, week_end, classifier_version, watermark, input_count, input_hash, idempotency_key, revision, run_status, coverage_state, evidence_state, scorecard_json, intervention_code, generated_at) VALUES ('100000000000000001', '2026-07-27T00:00:00.000Z', '2026-08-03T00:00:00.000Z', 'classifier-v1', 61, 7, 'post-restore-hash', 'post-restore:scorecard', 4, 'completed', 'complete', 'sufficient', '{}', 'maintain', '2026-08-04T00:00:00.000Z') RETURNING id"),
-        ("guild_settings_audit", "id", "INSERT INTO guild_settings_audit (guild_id, key, new_value, actor) VALUES ('100000000000000001', 'TWO_FEEDS_ENABLED', 'true', 'post-restore') RETURNING id"),
-        ("internal_idempotency", "intent_id", "INSERT INTO internal_idempotency (caller_hash, key_hash, action, payload_hash, state) VALUES (repeat('4', 64), repeat('5', 64), 'event.read', repeat('6', 64), 'in_flight') RETURNING intent_id"),
-        ("internal_action_log", "audit_id", "INSERT INTO internal_action_log (intent_id, phase, caller_hash, action, resolved_role_id) VALUES (83, 'intent', repeat('b', 64), 'role.assign', '100000000000000010') RETURNING audit_id"),
-        ("moderation_member_bans", "generation", "INSERT INTO moderation_member_bans (request_id, guild_id, user_id, state, created_at) VALUES ('post-restore:ban', '100000000000000001', '100000000000000012', 'prepared', now()) RETURNING generation"),
-        ("privacy_opt_out_audit", "id", "INSERT INTO privacy_opt_out_audit (guild_id, member_id) VALUES ('100000000000000001', '100000000000000002') RETURNING id"),
-        ("event_store", "id", "INSERT INTO event_store (event_type, guild_id, user_id, event_time, dedup_key, presence_status, activity_type) VALUES ('PRESENCE_UPDATE', '100000000000000001', 'post-restore-member', now(), 'post-restore:event-store', 'online', 0) RETURNING id"),
+        (
+            "events",
+            "id",
+            "INSERT INTO events (event_type, guild_id, occurred_at, source, idempotency_key) VALUES ('member_join', '100000000000000001', now(), 'backup-test', 'post-restore:event') RETURNING id",
+        ),
+        (
+            "members",
+            "backup_identity",
+            "INSERT INTO members (guild_id, member_id) VALUES ('100000000000000001', 'post-restore-member') RETURNING backup_identity",
+        ),
+        (
+            "xp_awards",
+            "id",
+            "INSERT INTO xp_awards (guild_id, member_id, source, xp, occurred_at) VALUES ('100000000000000001', '100000000000000002', 'message', 5, now()) RETURNING id",
+        ),
+        (
+            "level_import_runs",
+            "id",
+            "INSERT INTO level_import_runs (guild_id, source, source_rows, unique_members, inserted, updated, unchanged, duplicate_rows, total_imported_xp, imported_at) VALUES ('100000000000000001', 'mee6', 1, 1, 1, 0, 0, 0, 100, now()) RETURNING id",
+        ),
+        (
+            "community_facts",
+            "id",
+            "INSERT INTO community_facts (guild_id, event_type, source_event_id, occurred_at, source, classifier_version, classification, matched_rule, idempotency_key) VALUES ('100000000000000001', 'rules_accepted', 'post-restore:fact', '2026-08-04T00:00:00.000Z', 'backup-test', 'classifier-v1', 'test', 'default', 'post-restore:fact') RETURNING id",
+        ),
+        (
+            "community_scorecard_runs",
+            "id",
+            "INSERT INTO community_scorecard_runs (guild_id, week_start, week_end, classifier_version, watermark, input_count, input_hash, idempotency_key, revision, run_status, coverage_state, evidence_state, scorecard_json, intervention_code, generated_at) VALUES ('100000000000000001', '2026-07-27T00:00:00.000Z', '2026-08-03T00:00:00.000Z', 'classifier-v1', 61, 7, 'post-restore-hash', 'post-restore:scorecard', 4, 'completed', 'complete', 'sufficient', '{}', 'maintain', '2026-08-04T00:00:00.000Z') RETURNING id",
+        ),
+        (
+            "guild_settings_audit",
+            "id",
+            "INSERT INTO guild_settings_audit (guild_id, key, new_value, actor) VALUES ('100000000000000001', 'TWO_FEEDS_ENABLED', 'true', 'post-restore') RETURNING id",
+        ),
+        (
+            "internal_idempotency",
+            "intent_id",
+            "INSERT INTO internal_idempotency (caller_hash, key_hash, action, payload_hash, state) VALUES (repeat('4', 64), repeat('5', 64), 'event.read', repeat('6', 64), 'in_flight') RETURNING intent_id",
+        ),
+        (
+            "internal_action_log",
+            "audit_id",
+            "INSERT INTO internal_action_log (intent_id, phase, caller_hash, action, resolved_role_id) VALUES (83, 'intent', repeat('b', 64), 'role.assign', '100000000000000010') RETURNING audit_id",
+        ),
+        (
+            "moderation_member_bans",
+            "generation",
+            "INSERT INTO moderation_member_bans (request_id, guild_id, user_id, state, created_at) VALUES ('post-restore:ban', '100000000000000001', '100000000000000012', 'prepared', now()) RETURNING generation",
+        ),
+        (
+            "privacy_opt_out_audit",
+            "id",
+            "INSERT INTO privacy_opt_out_audit (guild_id, member_id) VALUES ('100000000000000001', '100000000000000002') RETURNING id",
+        ),
+        (
+            "event_store",
+            "id",
+            "INSERT INTO event_store (event_type, guild_id, user_id, event_time, dedup_key, presence_status, activity_type) VALUES ('PRESENCE_UPDATE', '100000000000000001', 'post-restore-member', now(), 'post-restore:event-store', 'online', 0) RETURNING id",
+        ),
     ];
     let cases: BTreeSet<(String, String)> = inserts
         .iter()
@@ -891,7 +1044,15 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
     let directory = ArchiveDirectory::new();
     let original = directory.path("complete.ndjson.gz");
     let manifest = dump(pool, &original).await.unwrap();
-    assert_eq!(manifest.version, 14, "birthday recovery requires v14");
+    assert_eq!(
+        manifest.version, 15,
+        "birthday and starboard recovery requires v15"
+    );
+    assert_eq!(
+        manifest.tables.len(),
+        108,
+        "both recovery families must be archived"
+    );
     assert_eq!(manifest.events_sequence, 107);
     assert_eq!(
         manifest.schema_migrations,
@@ -911,6 +1072,23 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
             "complete {table} recovery fixture"
         );
     }
+    for (table, expected) in [
+        ("starboard_config", 2),
+        ("starboard_starrers", 3),
+        ("starboard_posts", 2),
+    ] {
+        assert_eq!(
+            contents.buffers[table].len(),
+            expected,
+            "complete {table} recovery fixture"
+        );
+    }
+    assert!(contents.buffers["starboard_posts"]
+        .iter()
+        .any(|row| row["state"] == "below_threshold" && row["board_message_id"].is_null()));
+    assert!(contents.buffers["starboard_config"]
+        .iter()
+        .any(|row| row["emoji"] == "🌟" && row["excluded_channel_ids"] == "{100000000000000003}"));
     let profiles = &contents.buffers["birthday_profiles"];
     let leap = profiles
         .iter()
@@ -1066,7 +1244,13 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
         "INSERT INTO birthday_cheers SELECT * FROM birthday_cheers",
         "INSERT INTO birthday_role_grants SELECT * FROM birthday_role_grants",
     ] {
-        assert_sqlstate(&sqlx::query(audited(statement.to_owned())).execute(pool).await.unwrap_err(), "23505");
+        assert_sqlstate(
+            &sqlx::query(audited(statement.to_owned()))
+                .execute(pool)
+                .await
+                .unwrap_err(),
+            "23505",
+        );
     }
     target.close().await.unwrap();
     db.close().await.unwrap();
@@ -1141,8 +1325,7 @@ async fn empty_archived_sequence_tables_keep_the_target_position() {
 }
 
 const EVENT_INSERT: &str = "INSERT INTO events (event_type, guild_id, occurred_at, source, idempotency_key) VALUES ('member_join', '100000000000000001', now(), 'backup-test', $1) RETURNING id";
-const MEMBER_INSERT: &str =
-    "INSERT INTO members (guild_id, member_id) VALUES ('100000000000000001', $1) RETURNING backup_identity";
+const MEMBER_INSERT: &str = "INSERT INTO members (guild_id, member_id) VALUES ('100000000000000001', $1) RETURNING backup_identity";
 const FACT_INSERT: &str = "INSERT INTO community_facts (guild_id, event_type, source_event_id, occurred_at, source, classifier_version, classification, matched_rule, idempotency_key) VALUES ('100000000000000001', 'rules_accepted', $1, '2026-08-04T00:00:00.000Z', 'backup-test', 'classifier-v1', 'test', 'default', $1) RETURNING id";
 const SETTING_INSERT: &str = "INSERT INTO guild_settings (guild_id, key, value, version, updated_by) VALUES ('100000000000000001', 'TWO_BACKUP_TEST', 'true', nextval('guild_settings_version_seq'), $1) RETURNING version";
 const BACKUP_IDENTITY: &str = "ALTER TABLE members ADD COLUMN backup_identity BIGINT GENERATED ALWAYS AS IDENTITY (START WITH 17 INCREMENT BY 3) UNIQUE";
@@ -1547,12 +1730,23 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v14-source.ndjson.gz");
+    let current_path = directory.path("v15-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 14);
+    assert_eq!(old.manifest.version, 15);
     remove_birthdays_from_historical_archive(&mut old);
-    for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
+    for name in [
+        "game_activity_guild_aggregates",
+        "assistant_monthly_builds",
+        "scheduled_events_claim",
+        "scheduled_events_tombstone",
+        "event_voice_channels",
+        "event_voice_presence",
+        "admin_api_tokens",
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
+    ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
         old.manifest.tables.retain(|table| table.name != name);
@@ -1568,10 +1762,18 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
         [
             "game_activity_guild_aggregates",
             "assistant_monthly_builds",
+            "scheduled_events_claim",
+            "scheduled_events_tombstone",
+            "event_voice_channels",
+            "event_voice_presence",
+            "admin_api_tokens",
             "birthday_profiles",
             "birthday_config",
             "birthday_cheers",
-            "birthday_role_grants"
+            "birthday_role_grants",
+            "starboard_config",
+            "starboard_starrers",
+            "starboard_posts",
         ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
@@ -1579,7 +1781,18 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
     let report = restore(pool, &old_path).await.unwrap();
     assert!(report.ok);
     assert_birthday_tables_empty(pool).await;
-    for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
+    for name in [
+        "game_activity_guild_aggregates",
+        "assistant_monthly_builds",
+        "scheduled_events_claim",
+        "scheduled_events_tombstone",
+        "event_voice_channels",
+        "event_voice_presence",
+        "admin_api_tokens",
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
+    ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
             identifier(name)
@@ -1605,10 +1818,10 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v14-source.ndjson.gz");
+    let current_path = directory.path("v15-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 14);
+    assert_eq!(old.manifest.version, 15);
     remove_birthdays_from_historical_archive(&mut old);
     for name in [
         "scheduled_events_claim",
@@ -1616,6 +1829,9 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
         "event_voice_channels",
         "event_voice_presence",
         "admin_api_tokens",
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
     ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -1638,7 +1854,10 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
             "birthday_profiles",
             "birthday_config",
             "birthday_cheers",
-            "birthday_role_grants"
+            "birthday_role_grants",
+            "starboard_config",
+            "starboard_starrers",
+            "starboard_posts",
         ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
@@ -1652,6 +1871,9 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
         "event_voice_channels",
         "event_voice_presence",
         "admin_api_tokens",
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -1678,19 +1900,22 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v14-source.ndjson.gz");
+    let current_path = directory.path("v15-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 14);
+    assert_eq!(old.manifest.version, 15);
     remove_birthdays_from_historical_archive(&mut old);
     // Frozen claim-only v10 shape: the merged v10 writer carried the
     // epoch-claim guard but predates the delete tombstones, token registry
-    // and event voice pair.
+    // event voice pair and starboard tables.
     for name in [
         "scheduled_events_tombstone",
         "event_voice_channels",
         "event_voice_presence",
         "admin_api_tokens",
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
     ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -1712,7 +1937,10 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
             "birthday_profiles",
             "birthday_config",
             "birthday_cheers",
-            "birthday_role_grants"
+            "birthday_role_grants",
+            "starboard_config",
+            "starboard_starrers",
+            "starboard_posts",
         ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
@@ -1725,6 +1953,9 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
         "event_voice_channels",
         "event_voice_presence",
         "admin_api_tokens",
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -1759,17 +1990,20 @@ async fn v11_archive_restores_and_clears_newer_registry() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v14-source.ndjson.gz");
+    let current_path = directory.path("v15-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 14);
+    assert_eq!(old.manifest.version, 15);
     remove_birthdays_from_historical_archive(&mut old);
     // Frozen tombstone-only v11 shape: the merged v11 writer carried the
-    // delete tombstones but predates the token registry and event voice pair.
+    // delete tombstones but predates the token registry event voice pair and starboard tables.
     for name in [
         "event_voice_channels",
         "event_voice_presence",
         "admin_api_tokens",
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
     ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -1790,7 +2024,10 @@ async fn v11_archive_restores_and_clears_newer_registry() {
             "birthday_profiles",
             "birthday_config",
             "birthday_cheers",
-            "birthday_role_grants"
+            "birthday_role_grants",
+            "starboard_config",
+            "starboard_starrers",
+            "starboard_posts",
         ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
@@ -1802,6 +2039,9 @@ async fn v11_archive_restores_and_clears_newer_registry() {
         "event_voice_channels",
         "event_voice_presence",
         "admin_api_tokens",
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -1836,12 +2076,18 @@ async fn v12_archive_restores_and_clears_newer_event_voice() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v14-source.ndjson.gz");
+    let current_path = directory.path("v15-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 14);
+    assert_eq!(old.manifest.version, 15);
     remove_birthdays_from_historical_archive(&mut old);
-    for table in ["event_voice_channels", "event_voice_presence"] {
+    for table in [
+        "event_voice_channels",
+        "event_voice_presence",
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
+    ] {
         let rows = old.buffers.remove(table).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {table}");
         old.manifest.tables.retain(|info| info.name != table);
@@ -1860,7 +2106,10 @@ async fn v12_archive_restores_and_clears_newer_event_voice() {
             "birthday_profiles",
             "birthday_config",
             "birthday_cheers",
-            "birthday_role_grants"
+            "birthday_role_grants",
+            "starboard_config",
+            "starboard_starrers",
+            "starboard_posts",
         ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
@@ -1868,7 +2117,13 @@ async fn v12_archive_restores_and_clears_newer_event_voice() {
     let report = restore(pool, &old_path).await.unwrap();
     assert!(report.ok);
     assert_birthday_tables_empty(pool).await;
-    for table in ["event_voice_channels", "event_voice_presence"] {
+    for table in [
+        "event_voice_channels",
+        "event_voice_presence",
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
+    ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
             identifier(table)
@@ -1910,7 +2165,18 @@ async fn frozen_v13_restores_covered_data_and_clears_all_new_birthday_tables() {
     let old = inspect(&source).expect("frozen v13 reads without birthday tables");
     assert_eq!(old.manifest.version, 13);
     assert_eq!(old.manifest.tables.len(), 101);
-    assert_eq!(old.manifest.missing_tables(), BIRTHDAY_TABLES);
+    assert_eq!(
+        old.manifest.missing_tables(),
+        [
+            "birthday_profiles",
+            "birthday_config",
+            "birthday_cheers",
+            "birthday_role_grants",
+            "starboard_config",
+            "starboard_starrers",
+            "starboard_posts",
+        ]
+    );
     for table in BIRTHDAY_TABLES {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT count(*) FROM {}",
@@ -1942,6 +2208,334 @@ async fn frozen_v13_restores_covered_data_and_clears_all_new_birthday_tables() {
             "100000000000000002".to_owned()
         )],
         "v13 covered member data is restored, not discarded"
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v12_archive_restores_and_clears_newer_starboard_preserving_registry() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    seed(pool).await;
+    let directory = ArchiveDirectory::new();
+    let current_path = directory.path("v15-source.ndjson.gz");
+    dump(pool, &current_path).await.unwrap();
+    let mut old = inspect(&current_path).unwrap();
+    assert_eq!(old.manifest.version, 15);
+    remove_birthdays_from_historical_archive(&mut old);
+    // Frozen registry-present v12 shape: the released writer carried the
+    // token registry but predates the event voice pair and starboard tables.
+    for name in [
+        "event_voice_channels",
+        "event_voice_presence",
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
+    ] {
+        let rows = old.buffers.remove(name).unwrap();
+        assert!(!rows.is_empty(), "fixture must populate newer {name}");
+        old.manifest.tables.retain(|table| table.name != name);
+    }
+    let registry_tables = vec!["admin_api_tokens".to_owned()];
+    let registry_before = snapshot(pool, &registry_tables).await;
+    assert!(
+        !registry_before["admin_api_tokens"].rows.is_empty(),
+        "v12 contains issued tokens"
+    );
+    old.manifest.version = 12;
+    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
+    let old_path = directory.path("pre-starboard-v12.ndjson.gz");
+    write_archive(&old_path, &old);
+    let inspected = inspect(&old_path).expect("pre-change v12 archive remains readable");
+    assert_eq!(inspected.manifest.version, 12);
+    assert_eq!(
+        inspected.manifest.missing_tables(),
+        [
+            "event_voice_channels",
+            "event_voice_presence",
+            "birthday_profiles",
+            "birthday_config",
+            "birthday_cheers",
+            "birthday_role_grants",
+            "starboard_config",
+            "starboard_starrers",
+            "starboard_posts",
+        ]
+    );
+    assert_eq!(
+        inspected.manifest.tables.len(),
+        99,
+        "frozen released v12 coverage"
+    );
+    assert!(inspected
+        .manifest
+        .tables
+        .iter()
+        .any(|table| table.name == "admin_api_tokens" && table.count > 0));
+    sqlx::query("UPDATE admin_api_tokens SET label = 'destination-only registry label'")
+        .execute(pool)
+        .await
+        .unwrap();
+    assert_ne!(snapshot(pool, &registry_tables).await, registry_before);
+    // This test deliberately replaces a reused isolated rehearsal target.
+    forget_moderation_history(pool).await;
+    let report = restore(pool, &old_path).await.unwrap();
+    assert!(report.ok);
+    assert_birthday_tables_empty(pool).await;
+    assert_eq!(
+        snapshot(pool, &registry_tables).await,
+        registry_before,
+        "v12 restores the archived registry instead of clearing or retaining destination tokens"
+    );
+    for name in [
+        "event_voice_channels",
+        "event_voice_presence",
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
+    ] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(name)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "v12 restore clears newer {name} target rows");
+    }
+    let tombstones: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scheduled_events_tombstone")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(
+        tombstones > 0,
+        "the v12 delete tombstones are restored, not discarded"
+    );
+    let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(members > 0, "older covered data is restored, not discarded");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v13_archive_restores_voice_and_registry_and_clears_newer_starboard() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    seed(pool).await;
+    let restored_tables = vec![
+        "event_voice_channels".to_owned(),
+        "event_voice_presence".to_owned(),
+        "admin_api_tokens".to_owned(),
+    ];
+    let archived = snapshot(pool, &restored_tables).await;
+    for name in &restored_tables {
+        assert!(
+            !archived[name].rows.is_empty(),
+            "v13 fixture must contain {name}"
+        );
+    }
+    let directory = ArchiveDirectory::new();
+    let current_path = directory.path("v15-source.ndjson.gz");
+    dump(pool, &current_path).await.unwrap();
+    let mut old = inspect(&current_path).unwrap();
+    assert_eq!(old.manifest.version, 15);
+    remove_birthdays_from_historical_archive(&mut old);
+    for name in ["starboard_config", "starboard_starrers", "starboard_posts"] {
+        assert!(
+            !old.buffers.remove(name).unwrap().is_empty(),
+            "destination must start with starboard {name} rows"
+        );
+    }
+    // Literal released inventory, not today's prefix or a version-waiver array.
+    old.manifest
+        .tables
+        .retain(|table| FROZEN_V13_TABLES.contains(&table.name.as_str()));
+    assert_eq!(
+        old.manifest
+            .tables
+            .iter()
+            .map(|table| table.name.as_str())
+            .collect::<Vec<_>>(),
+        FROZEN_V13_TABLES
+    );
+    old.manifest.version = 13;
+    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
+    let old_path = directory.path("frozen-pre-starboard-v13.ndjson.gz");
+    write_archive(&old_path, &old);
+    let inspected = inspect(&old_path).expect("released v13 voice-and-registry archive inspects");
+    assert_eq!(inspected.manifest.version, 13);
+    assert_eq!(inspected.manifest.tables.len(), 101);
+    assert_eq!(
+        inspected.manifest.missing_tables(),
+        [
+            "birthday_profiles",
+            "birthday_config",
+            "birthday_cheers",
+            "birthday_role_grants",
+            "starboard_config",
+            "starboard_starrers",
+            "starboard_posts",
+        ]
+    );
+    for name in &restored_tables {
+        assert!(
+            inspected
+                .manifest
+                .tables
+                .iter()
+                .any(|table| table.name == *name && table.count > 0),
+            "v13 archived nonempty {name}"
+        );
+    }
+    // Remove both voice tables and change the registry in the destination. A
+    // no-op restore or blanket clearing of later tables cannot satisfy equality.
+    sqlx::query("DELETE FROM event_voice_presence")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM event_voice_channels")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE admin_api_tokens SET label = 'destination-only registry label'")
+        .execute(pool)
+        .await
+        .unwrap();
+    let dirty = snapshot(pool, &restored_tables).await;
+    for name in &restored_tables {
+        assert_ne!(
+            dirty[name], archived[name],
+            "destination must differ for {name}"
+        );
+    }
+    forget_moderation_history(pool).await;
+    let report = restore(pool, &old_path).await.unwrap();
+    assert!(report.ok);
+    assert_birthday_tables_empty(pool).await;
+    assert_eq!(
+        snapshot(pool, &restored_tables).await,
+        archived,
+        "v13 restores archived voice rows and issued tokens, not destination data"
+    );
+    for name in ["starboard_config", "starboard_starrers", "starboard_posts"] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(name)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "v13 restore clears newer {name} destination rows");
+    }
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn frozen_v14_restores_starboard_voice_registry_and_clears_only_new_birthdays() {
+    use std::io::Write as _;
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    seed(pool).await;
+    let directory = ArchiveDirectory::new();
+    let source = directory.path("pre-birthday-starboard-v14.ndjson.gz");
+    let mut encoder = new_encoder();
+    encoder
+        .write_all(include_bytes!("fixtures/pre-birthday-starboard-v14.ndjson"))
+        .unwrap();
+    std::fs::write(&source, finish_gzip(encoder).unwrap()).unwrap();
+    let old = inspect(&source).expect("released v14 starboard archive stays readable");
+    assert_eq!(old.manifest.version, 14);
+    assert_eq!(old.manifest.tables.len(), 104);
+    assert_eq!(old.manifest.missing_tables(), BIRTHDAY_TABLES);
+    for table in BIRTHDAY_TABLES {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(table)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            count, 2,
+            "destination starts with both {table} recovery states"
+        );
+    }
+    let family_tables = vec![
+        "starboard_config".to_owned(),
+        "starboard_starrers".to_owned(),
+        "starboard_posts".to_owned(),
+        "event_voice_channels".to_owned(),
+        "event_voice_presence".to_owned(),
+        "admin_api_tokens".to_owned(),
+        "members".to_owned(),
+    ];
+    let destination = snapshot(pool, &family_tables).await;
+    forget_moderation_history(pool).await;
+    let report = restore(pool, &source)
+        .await
+        .expect("v14 remains restorable into the birthday schema");
+    assert!(report.ok);
+    assert_birthday_tables_empty(pool).await;
+    let restored = snapshot(pool, &family_tables).await;
+    for table in &family_tables {
+        assert_eq!(
+            restored[table].rows.len(),
+            1,
+            "restore the frozen {table} row, not empty/default data"
+        );
+        assert_ne!(
+            restored[table], destination[table],
+            "replace destination-only {table} state"
+        );
+    }
+    let board: (i64, String, Option<i64>) =
+        sqlx::query_as("SELECT star_count, state, board_message_id FROM starboard_posts")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(board, (7, "posted".to_owned(), Some(100000000000000020)));
+    let config: (String, String, String) = sqlx::query_as(
+        "SELECT emoji, excluded_channel_ids::text, updated_by FROM starboard_config",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        config,
+        (
+            "🌟".to_owned(),
+            "{100000000000000003}".to_owned(),
+            "frozen v14 operator".to_owned()
+        )
+    );
+    let voice: (String, String) =
+        sqlx::query_as("SELECT owner_tick_lease, voice_channel_id FROM event_voice_channels")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        voice,
+        (
+            "frozen-v14-lease".to_owned(),
+            "100000000000000077".to_owned()
+        )
+    );
+    let registry: (String, String) = sqlx::query_as("SELECT token_id, label FROM admin_api_tokens")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        registry,
+        (
+            "adm_1000000000000001".to_owned(),
+            "frozen v14 reader".to_owned()
+        )
     );
     db.close().await.unwrap();
 }
@@ -2475,14 +3069,38 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
             "month {month}: settings version keeps allocating"
         );
         for (table, statement) in [
-            ("internal_nonces", "INSERT INTO internal_nonces SELECT * FROM internal_nonces WHERE nonce_hash = repeat('a', 64)"),
-            ("internal_discord_events", "INSERT INTO internal_discord_events SELECT * FROM internal_discord_events WHERE event_hash = repeat('3', 64)"),
-            ("internal_idempotency", "INSERT INTO internal_idempotency (caller_hash, key_hash, action, payload_hash, state) VALUES (repeat('b', 64), repeat('c', 64), 'role.assign', repeat('d', 64), 'in_flight')"),
-            ("feed_deliveries", "INSERT INTO feed_deliveries SELECT * FROM feed_deliveries WHERE item_key = 'backup:item:pending'"),
-            ("self_role_panel_claims", "INSERT INTO self_role_panel_claims SELECT * FROM self_role_panel_claims"),
-            ("automod_delivery_claims", "INSERT INTO automod_delivery_claims SELECT * FROM automod_delivery_claims"),
+            (
+                "internal_nonces",
+                "INSERT INTO internal_nonces SELECT * FROM internal_nonces WHERE nonce_hash = repeat('a', 64)",
+            ),
+            (
+                "internal_discord_events",
+                "INSERT INTO internal_discord_events SELECT * FROM internal_discord_events WHERE event_hash = repeat('3', 64)",
+            ),
+            (
+                "internal_idempotency",
+                "INSERT INTO internal_idempotency (caller_hash, key_hash, action, payload_hash, state) VALUES (repeat('b', 64), repeat('c', 64), 'role.assign', repeat('d', 64), 'in_flight')",
+            ),
+            (
+                "feed_deliveries",
+                "INSERT INTO feed_deliveries SELECT * FROM feed_deliveries WHERE item_key = 'backup:item:pending'",
+            ),
+            (
+                "self_role_panel_claims",
+                "INSERT INTO self_role_panel_claims SELECT * FROM self_role_panel_claims",
+            ),
+            (
+                "automod_delivery_claims",
+                "INSERT INTO automod_delivery_claims SELECT * FROM automod_delivery_claims",
+            ),
         ] {
-            assert_sqlstate(&sqlx::query(audited(statement.to_owned())).execute(&pool).await.unwrap_err(), "23505");
+            assert_sqlstate(
+                &sqlx::query(audited(statement.to_owned()))
+                    .execute(&pool)
+                    .await
+                    .unwrap_err(),
+                "23505",
+            );
             eprintln!("drill: month {month} replay refused (23505) in {table}");
         }
         pool.close().await;
