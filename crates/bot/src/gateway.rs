@@ -2283,12 +2283,13 @@ mod tests {
     }
 
     #[test]
-    fn stored_channel_sets_overlay_env_for_the_classifier() {
+    fn stored_classifier_sets_overlay_env_for_the_classifier() {
         use two_bot_core::settings::{live_channel, SettingRow, SettingsSnapshot};
         use two_bot_core::ChannelClass;
 
         const HUMAN: u64 = 200_000_000_000_000_001;
         const WELCOME: u64 = 300_000_000_000_000_001;
+        const TESTER: &str = "tester-1";
         let deployment: HashMap<String, String> = [(
             "TWO_COMMUNITY_HUMAN_CHANNEL_IDS".to_owned(),
             WELCOME.to_string(),
@@ -2301,9 +2302,11 @@ mod tests {
         let boot = classifier_config_from_live(&deployment, "22", &live);
         assert_eq!(boot.channel_class(WELCOME), ChannelClass::Human);
         assert_eq!(boot.channel_class(HUMAN), ChannelClass::Other);
+        assert!(boot.test_actor_ids.is_empty());
 
         // Stored rows win over the boot value for the same key, and a
         // stored welcome set classifies welcome (winning over human).
+        // The stored exclusion row exercises the exclusion overlay arms.
         writer.publish(&SettingsSnapshot {
             revision: 1,
             rows: vec![
@@ -2319,16 +2322,27 @@ mod tests {
                     value: serde_json::json!([WELCOME.to_string()]),
                     version: 1,
                 },
+                SettingRow {
+                    guild_id: "22".to_owned(),
+                    key: "TWO_COMMUNITY_TEST_ACTOR_IDS".to_owned(),
+                    value: serde_json::json!([TESTER]),
+                    version: 1,
+                },
             ],
         });
         let stored = classifier_config_from_live(&deployment, "22", &live);
         assert_eq!(stored.channel_class(HUMAN), ChannelClass::Human);
         assert_eq!(stored.channel_class(WELCOME), ChannelClass::Welcome);
+        assert_eq!(
+            stored.test_actor_ids,
+            std::collections::HashSet::from([TESTER.to_owned()])
+        );
 
         // Another guild's stored rows never layer onto this guild.
         let other = classifier_config_from_live(&deployment, "23", &live);
         assert_eq!(other.channel_class(HUMAN), ChannelClass::Other);
         assert_eq!(other.channel_class(WELCOME), ChannelClass::Human);
+        assert!(other.test_actor_ids.is_empty());
     }
 
     #[test]
