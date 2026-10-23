@@ -420,7 +420,6 @@ impl DeferredCommunityFacts {
 
     /// Buffered gate-clearing count (tests, health). Rules only. A poisoned
     /// buffer refuses typed, never a false zero.
-    #[must_use]
     pub fn len(&self) -> Result<usize, CommunityFactsError> {
         let state = self.0.lock().map_err(|_| CommunityFactsError::Poisoned)?;
         Ok(state.rules.len())
@@ -428,14 +427,12 @@ impl DeferredCommunityFacts {
 
     /// Whether the gate-clearing buffer holds no writes. Rules only. A
     /// poisoned buffer refuses typed, never a false healthy read.
-    #[must_use]
     pub fn is_empty(&self) -> Result<bool, CommunityFactsError> {
         Ok(self.len()? == 0)
     }
 
     /// Buffered gateway-join count (tests, health). A poisoned buffer
     /// refuses typed, never a false zero.
-    #[must_use]
     pub fn joins_len(&self) -> Result<usize, CommunityFactsError> {
         let state = self.0.lock().map_err(|_| CommunityFactsError::Poisoned)?;
         Ok(state.joins.len())
