@@ -100,6 +100,14 @@ attribution retained by the erasure allowlist. The table carries no member
 column, so there is nothing to erase and no reader grant beyond the app
 pool.
 
+The giveaway tables (`giveaways`, `giveaway_entries`, `giveaway_draws`) are
+ordinary `table` kind for the same reason: the giveaway store creates,
+enters, leases and draws through the app pool. Unlike the tables above they
+do carry member columns (`created_by`, `user_id`, `winner_ids`, and the
+`single:<id>` replaced-winner id inside `reroll_kind`), so member erasure
+and guild purge cover all three tables in the reviewed erasure plan; there
+is no reader grant beyond the app pool.
+
 The reader cannot read bot base tables, including through inherited/public or
 column-level grants. Normal PostgreSQL views deliberately run with their owner's
 base-table privileges: only the reviewed `web_v1` projection is exposed. Do not
@@ -265,7 +273,7 @@ their login status or silently removing memberships. It contains no passwords.
    plan after migrations and view updates, then `verify` reads 0 findings.
    `sql/web_v1.sql` is applied with `public` as the bot-table search
    path before the bootstrap phase; its functions stay strict in both phases.
-   The two voice-audit trigger functions from migration 0460 may be absent only
+   The two voice-audit trigger functions from migration 0463 may be absent only
    while `voice_settings_audit` is absent. Once that table exists, either missing
    function fails closed. The full plan requires the audit table before reaching
    those functions, so an unapplied migration cannot pass full provisioning.

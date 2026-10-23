@@ -14,8 +14,8 @@ name: dora-metrics
 # weekly metrics PR would need a human merge every week to say nothing new.
 # The automation branch carries no rulesets; its history is the audit trail.
 # The checkout keeps persist-credentials false; the push authenticates per
-# command through a bearer extraheader, so the token never lands in git
-# config. A refused or conflicting push fails the run closed; the artifact
+# command through a masked Basic extraheader, so the token never lands in
+# git config. A refused or conflicting push fails the run closed; the artifact
 # below still preserves the numbers for that week.
 #
 # `ops/**` sits in deploy-staging's push ignore list, so any future main-side
@@ -74,9 +74,11 @@ jobs:
           branch=automation/dora-metrics
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # Tokenless checkout: authenticate network commands only, per
-          # command, so the bearer never lands in .git/config.
-          auth=(-c "http.https://github.com/.extraheader=AUTHORIZATION: bearer ${GH_TOKEN}")
+          # Git HTTPS uses Basic auth, not the API bearer scheme. Mask the
+          # derived credential before use; keep it out of persistent config.
+          basic_auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          printf '::add-mask::%s\n' "$basic_auth"
+          auth=(-c "http.https://github.com/.extraheader=AUTHORIZATION: Basic ${basic_auth}")
           git "${auth[@]}" fetch origin
           base=HEAD
           if git rev-parse --verify -q "origin/${branch}" >/dev/null; then

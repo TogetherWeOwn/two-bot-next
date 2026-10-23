@@ -1,7 +1,7 @@
 # Backups, restore drills, and sealed guild-config snapshots (TOG-9881)
 
 Rust port of the legacy `two-bot` cutover-data surface (frozen source
-`two-bot` `main @ d5d11793`): v15 dump format with v3–v14 read compatibility,
+`two-bot` `main @ d5d11793`): v16 dump format with v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15 read compatibility,
 SigV4 off-box upload, retention
 math, sealed guild-config snapshot + restore planner, and the three timer
 equivalents. Code: `crates/core/src/backup/`, CLI: `two-bot backup |
@@ -109,11 +109,11 @@ plus thread lifecycle plus stage/interaction-observe/audit-log capture plus
 invite/scheduled-event capture, the stream go-live ledger, guild game-activity
 aggregates, the assistant monthly-cap ledger, the scheduled-event
 epoch-claim guard, the scheduled-event delete tombstones and the admin API
-token registry, event voice pair, three starboard tables and voice configuration revision audit); the reader also accepts
+token registry, event voice pair, three starboard tables, three giveaway tables and voice configuration revision audit); the reader also accepts
 frozen **v3**, pre-reservation **v4**, pre-v6-tables **v5**, pre-seasonal **v6**,
 pre-stream-ledger **v7**, pre-guild-counters **v8**, pre-epoch-claim **v9**,
-pre-tombstone **v10**, pre-registry **v11**, pre-event-voice **v12**, pre-starboard **v13** and
-pre-voice-audit **v14**.
+pre-tombstone **v10**, pre-registry **v11**, pre-event-voice **v12**,
+pre-starboard **v13**, pre-giveaways **v14** and pre-voice-audit **v15**.
 Other versions refuse.
 The manifest carries per-table `{name, columns, column_types, count}` taken
 inside one `REPEATABLE READ` transaction, the `events` high-water mark, the
@@ -172,42 +172,41 @@ aggregates (`game_activity_guild_aggregates`: 0441/0442), the assistant
 monthly-cap ledger (`assistant_monthly_builds`: 0446/0447), the
 scheduled-event epoch-claim guard (`scheduled_events_claim`: 0450/0451) and
 its delete tombstones (`scheduled_events_tombstone`: 0452/0453) and the
-admin API token registry (`admin_api_tokens`: 0456/0457) and the event
-voice pair (`event_voice_channels`, `event_voice_presence`: 0455), and voice
-configuration attribution/revision history (`voice_settings_audit`: 0460), plus
-starboard configuration, distinct starrers and post state (`starboard_config`,
-`starboard_starrers`, `starboard_posts`: 0458/0459).
+admin API token registry (`admin_api_tokens`: 0456/0457), the event
+voice pair (`event_voice_channels`, `event_voice_presence`: 0455), plus starboard
+configuration, distinct starrers and post state (`starboard_config`,
+`starboard_starrers`, `starboard_posts`: 0458/0459), plus giveaway definitions,
+entries and draw rounds (`giveaways`, `giveaway_entries`, `giveaway_draws`: 0460/0461),
+plus voice configuration attribution/revision history (`voice_settings_audit`: 0463).
 `OPTIONAL_LEGACY_TABLES` is empty: the coverage
 test fails if a covered table is not migrated. A dump from a fresh Rust schema
-has 105 table entries. A missing current table refuses a dump/restore: migrate
+has 108 table entries. A missing current table refuses a dump/restore: migrate
 the target first.
 Each readable version requires its historical inventory and waives only
 versioned additions introduced later:
 
 | Version | Tables it may omit |
 | --- | --- |
-| v4 | `V5_ADDED_TABLES` (reservations and privacy controls), `V6_ADDED_TABLES` (event store), `V7_ADDED_TABLES` (seasonal XP and retention queues), `V8_ADDED_TABLES` (stream ledger), `V9_ADDED_TABLES` (guild counters), `V10_ADDED_TABLES` (epoch-claim guard), `V11_ADDED_TABLES` (delete tombstones), `V12_ADDED_TABLES` (token registry), `V13_ADDED_TABLES` (event voice pair) |
-| v5 | `V6_ADDED_TABLES`, `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES` (event voice pair) |
-| v6 | `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES` (event voice pair) |
-| v7 | `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES` (event voice pair) |
-| v8 | `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES` (event voice pair) |
-| v9 | `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`: `scheduled_events_claim`, `scheduled_events_tombstone`, `admin_api_tokens`, `V13_ADDED_TABLES` (event voice pair) |
-| v10 | `V11_ADDED_TABLES`, `V12_ADDED_TABLES`: `scheduled_events_tombstone`, `admin_api_tokens`, `V13_ADDED_TABLES` (event voice pair) |
-| v11 | `V12_ADDED_TABLES`: `admin_api_tokens`, `V13_ADDED_TABLES` (event voice pair) |
-| v12 | `V13_ADDED_TABLES`: `event_voice_channels`, `event_voice_presence` |
-| v13 | `V14_ADDED_TABLES`: `starboard_config`, `starboard_starrers`, `starboard_posts`; `V15_ADDED_TABLES`: `voice_settings_audit` |
-| v14 | `V15_ADDED_TABLES`: `voice_settings_audit` |
-| v15 | None: the full current inventory is required |
+| v4 | `V5_ADDED_TABLES` (reservations and privacy controls), `V6_ADDED_TABLES` (event store), `V7_ADDED_TABLES` (seasonal XP and retention queues), `V8_ADDED_TABLES` (stream ledger), `V9_ADDED_TABLES` (guild counters), `V10_ADDED_TABLES` (epoch-claim guard), `V11_ADDED_TABLES` (delete tombstones), `V12_ADDED_TABLES` (token registry), `V13_ADDED_TABLES` (event voice pair), `V14_ADDED_TABLES` (starboard tables), `V15_ADDED_TABLES` (giveaway tables), `V16_ADDED_TABLES` (voice audit) |
+| v5 | `V6_ADDED_TABLES`, `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES`, `V14_ADDED_TABLES`, `V15_ADDED_TABLES`, `V16_ADDED_TABLES` (voice audit) |
+| v6 | `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES`, `V14_ADDED_TABLES`, `V15_ADDED_TABLES`, `V16_ADDED_TABLES` (voice audit) |
+| v7 | `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES`, `V14_ADDED_TABLES`, `V15_ADDED_TABLES`, `V16_ADDED_TABLES` (voice audit) |
+| v8 | `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES`, `V14_ADDED_TABLES`, `V15_ADDED_TABLES`, `V16_ADDED_TABLES` (voice audit) |
+| v9 | `V10_ADDED_TABLES` (epoch-claim guard), `V11_ADDED_TABLES` (delete tombstones), `V12_ADDED_TABLES` (token registry), `V13_ADDED_TABLES` (event voice pair), `V14_ADDED_TABLES` (starboard tables), `V15_ADDED_TABLES` (giveaway tables), `V16_ADDED_TABLES` (voice audit) |
+| v10 | `V11_ADDED_TABLES` (delete tombstones), `V12_ADDED_TABLES` (token registry), `V13_ADDED_TABLES` (event voice pair), `V14_ADDED_TABLES` (starboard tables), `V15_ADDED_TABLES` (giveaway tables), `V16_ADDED_TABLES` (voice audit) |
+| v11 | `V12_ADDED_TABLES` (token registry), `V13_ADDED_TABLES` (event voice pair), `V14_ADDED_TABLES` (starboard tables), `V15_ADDED_TABLES` (giveaway tables), `V16_ADDED_TABLES` (voice audit) |
+| v12 | `V13_ADDED_TABLES` (event voice pair), `V14_ADDED_TABLES` (starboard tables), `V15_ADDED_TABLES` (giveaway tables), `V16_ADDED_TABLES` (voice audit) |
+| v13 | `V14_ADDED_TABLES`: `starboard_config`, `starboard_starrers`, `starboard_posts`, `V15_ADDED_TABLES` (giveaway tables), `V16_ADDED_TABLES` (voice audit) |
+| v14 | `V15_ADDED_TABLES`: `giveaways`, `giveaway_entries`, `giveaway_draws`, `V16_ADDED_TABLES` (voice audit) |
+| v15 | `V16_ADDED_TABLES`: `voice_settings_audit` |
+| v16 | None: the full current inventory is required |
 
-Versions v4–v12 may additionally omit `V14_ADDED_TABLES` (starboard) and
-`V15_ADDED_TABLES` (voice configuration audit), which did not exist when those
-archives were written.
 These are narrow waivers, not permission to omit arbitrary tables. An
 incomplete new archive refuses at inspection. The frozen 85-table v4 fixture
 is unchanged from before these additions; older v4–v12 archives need not
 invent entries for the v9 guild counters, the v10 epoch-claim guard, the
 v11 delete tombstones, the v12 token registry, the v13 event voice pair,
-the v14 starboard tables or the v15 voice audit.
+the v14 starboard tables, the v15 giveaway tables or the v16 voice audit.
 Restoring an older archive clears
 destination rows for every omitted later table instead of retaining unrelated
 target state. In particular, restoring v8 without guild counters clears both
@@ -220,12 +219,16 @@ be re-issued, since secrets are shown once and cannot be re-derived. Use a
 v12 recovery point to preserve the monthly cap, both mirror fences and the
 issued tokens. Restoring v12 without the event voice pair clears both
 tables; the next tick re-claims open instances, but archived presence spans
-are lost. Use a v13 or newer recovery point to preserve claims and spans, and
-v14 to preserve starboard settings, starrers and post records. Restoring a
-pre-v14 archive clears those three tables, so the board is off until configured
-again. Use v15 to preserve voice configuration audit. Current v15 archives must
-include the monthly cap, both mirror-fence tables, registry, event voice pair,
-starboard tables and voice audit, so routine restores retain their archived state. Restores refuse a
+are lost. Use a v13 recovery point to preserve claims and spans. Use v14 to
+preserve starboard settings, starrers and post records too. Restoring a pre-v14
+archive clears those three tables, so the board is off until configured again.
+Restoring v14 clears giveaway definitions, entries and draw rounds while
+preserving starboard, event voice and issued tokens. Use v15 to preserve giveaways.
+Restoring v15 clears voice configuration audit while preserving giveaways,
+starboard, event voice and issued tokens. Use v16 to preserve voice configuration audit.
+Current v16 archives must include the monthly cap, both mirror-fence tables,
+the registry, event voice pair, starboard, giveaway and voice audit tables,
+so routine restores retain their archived state. Restores refuse a
 destination that already has voice audit history rather than overwrite its
 evidence; use a fresh migrated target. Older archives contain no voice audit
 and cannot recover prior attribution. Tombstone `deleted_at` cells must be real dates in

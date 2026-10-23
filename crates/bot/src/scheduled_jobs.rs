@@ -184,11 +184,95 @@ pub(crate) async fn tick(
             Step::Stop => return Err(ErrorClass::Database),
         }
     }
+    remind_event_attendees(pool, rest, guild, &clock).await?;
     if audit_failed {
         Err(ErrorClass::Database)
     } else {
         Ok(())
     }
+}
+
+/// Event reminders share this supervised, activation-fenced ticker, but are
+/// optional one-attempt effects. Never recycle their pre-wire audit fence,
+/// including after a definitive refusal, rendering failure or lost receipt.
+async fn remind_event_attendees(
+    pool: &PgPool,
+    rest: &ActionExecutor,
+    guild: &str,
+    clock: &impl Fn() -> u64,
+) -> Result<(), ErrorClass> {
+    use two_bot_core::event_reminder_store::{begin_event_reminder_delivery, due_event_reminders};
+
+    for event in due_event_reminders(pool, guild, clock())
+        .await
+        .map_err(database)?
+    {
+        let now = clock();
+        if !begin_event_reminder_delivery(pool, guild, &event, now)
+            .await
+            .map_err(database)?
+        {
+            continue;
+        }
+        let (outcome, reason) = if let Some(content) = event_reminder_content(&event) {
+            match rest
+                .post_message_confirmed(&event.channel_id, &content, &random_nonce())
+                .await
+            {
+                Ok(_) => ("posted", None),
+                Err(error) => (
+                    if error.proves_no_effect() || error.is_admission_blocked() {
+                        "failed"
+                    } else {
+                        "delivery_uncertain"
+                    },
+                    Some(discord_error_name(&error)),
+                ),
+            }
+        } else {
+            ("failed", Some("invalid_or_oversized_reminder"))
+        };
+        // Only the result is appended; the attempt fact remains immutable.
+        // No attendee ids, names or rendered content enter diagnostics/audits.
+        let input = ScheduledAuditInput {
+            guild_id: guild.to_owned(),
+            actor_id: None,
+            action: "rsvp.reminder".to_owned(),
+            target_key: Some(event.event_id),
+            outcome: outcome.to_owned(),
+            reason: reason.map(str::to_owned),
+        };
+        audit_scheduled(pool, &input, &format_iso_ms(now), &random_id())
+            .await
+            .map_err(database)?;
+    }
+    Ok(())
+}
+
+fn event_reminder_content(
+    event: &two_bot_core::event_reminder_store::EventReminder,
+) -> Option<String> {
+    use two_bot_core::message_safety::{text_len, truncate, CONTENT_LIMIT};
+    use two_bot_core::rsvp::{is_snowflake, MAX_RSVPS_PER_EVENT};
+
+    if event.attendees.is_empty()
+        || event.attendees.len() > MAX_RSVPS_PER_EVENT as usize
+        || !is_snowflake(&event.event_id)
+        || !is_snowflake(&event.channel_id)
+        || event.attendees.iter().any(|id| !is_snowflake(id))
+    {
+        return None;
+    }
+    let name = truncate(&neutralize_scheduled_body(&event.name), 200);
+    let attendees = event
+        .attendees
+        .iter()
+        .map(|id| format!("<@{id}>"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let content = format!("Event reminder: {name} starts soon.\n{attendees}");
+    // Do not split into a burst or truncate halfway through an attendee list.
+    (text_len(&content) <= CONTENT_LIMIT).then_some(content)
 }
 
 struct Occurrence<'a> {

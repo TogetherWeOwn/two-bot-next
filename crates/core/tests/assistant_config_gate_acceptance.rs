@@ -57,6 +57,7 @@ fn configured() -> AssistantConfig {
     AssistantConfig::from_map(&vars(&[
         ("TWO_ASSISTANT_ENDPOINT", SYNTHETIC_ENDPOINT),
         ("TWO_ASSISTANT_MODEL", "synthetic-model"),
+        ("TWO_ASSISTANT_API_KEY", "fixture-assistant-credential"),
     ]))
     .expect("synthetic endpoint must configure the assistant")
 }

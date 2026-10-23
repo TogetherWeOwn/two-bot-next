@@ -71,6 +71,9 @@ impl TestDb {
         let pool = Self::connect(&options, &schema).await?;
         if migrate {
             sqlx::raw_sql(MIGRATION).execute(&pool).await?;
+            // Expected-schema fixture only; this is not shipped-migration proof.
+            sqlx::query("ALTER TABLE operational_audit_log ADD COLUMN IF NOT EXISTS delivery_reconcile_before TEXT NULL")
+                .execute(&pool).await?;
         }
         Ok(Self {
             admin,
@@ -597,6 +600,27 @@ async fn populated_legacy_upgrade_preserves_inflight_recovery_and_halt() -> Test
     ).execute(&db.pool).await?;
     sqlx::raw_sql(MIGRATION).execute(&db.pool).await?;
     sqlx::raw_sql(MIGRATION).execute(&db.pool).await?;
+    let legacy_evidence: String = sqlx::query_scalar(
+        "SELECT to_jsonb(a)::text FROM operational_audit_log a WHERE entry_id = 'legacy'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    let reconcile_migration =
+        include_str!("../../cutover/migrations/0462_audit_reconcile_cursor.sql");
+    sqlx::raw_sql(reconcile_migration).execute(&db.pool).await?;
+    sqlx::raw_sql(reconcile_migration).execute(&db.pool).await?;
+    let upgraded_evidence: String = sqlx::query_scalar(
+        "SELECT (to_jsonb(a) - 'delivery_reconcile_before')::text FROM operational_audit_log a WHERE entry_id = 'legacy'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(upgraded_evidence, legacy_evidence);
+    let cursor: Option<String> = sqlx::query_scalar(
+        "SELECT delivery_reconcile_before FROM operational_audit_log WHERE entry_id = 'legacy'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(cursor.is_none());
     let store = AuditStore::new(&db.pool);
     assert!(store.claim("legacy").await?.is_none());
     assert_eq!(store.delivery_halt().await?.unwrap().engaged_by, "456");
