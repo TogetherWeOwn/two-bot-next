@@ -78,6 +78,11 @@ fn fixture_secret() -> String {
     "s".repeat(40)
 }
 
+const FIXTURE_ADMIN_SERVICE_ID: &str = "fixture-admin-service";
+fn fixture_admin_service_secret() -> String {
+    "t".repeat(40)
+}
+
 /// The one message every auth failure returns: unknown key ids, bad
 /// signatures, and tampered scope claims are one indistinguishable refusal.
 const AUTH_FAILURE_MESSAGE: &str = "Signature verification failed";
@@ -252,11 +257,15 @@ async fn spawn_bot(fixture_url: &str) -> (Bot, SocketAddr) {
         .env("TWO_INTERNAL_BIND", format!("127.0.0.1:{receiver_port}"))
         .env(
             "TWO_INTERNAL_KEYS",
-            format!("{FIXTURE_KEY_ID}:{}", fixture_secret()),
+            format!(
+                "{FIXTURE_KEY_ID}:{},{FIXTURE_ADMIN_SERVICE_ID}:{}",
+                fixture_secret(),
+                fixture_admin_service_secret()
+            ),
         )
         .env(
             "TWO_INTERNAL_CALLERS",
-            format!("{FIXTURE_KEY_ID}:website-staging"),
+            format!("{FIXTURE_KEY_ID}:website-staging,{FIXTURE_ADMIN_SERVICE_ID}:website-staging"),
         )
         .env("TWO_INTERNAL_CHANNEL_KEYS", "ann:333333333333333333")
         .stdout(Stdio::null())
@@ -738,11 +747,12 @@ async fn scoped_requests_ignore_idempotency_key_for_verify() {
 
 // Bearer proof is distinct from service authentication. These are real receiver
 // tests; the binding module's local scope checks are never registry authority.
-const TOKEN_ID: &str = "adm_0123456789abcdef";
+// Public registry row identifier, not a bearer; the secret suffix is separate.
+const PUBLIC_ADMIN_ID: &str = "adm_0123456789abcdef";
 const TOKEN_SECRET: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 fn bearer() -> String {
-    format!("{TOKEN_ID}.{TOKEN_SECRET}")
+    format!("{PUBLIC_ADMIN_ID}.{TOKEN_SECRET}")
 }
 
 async fn seed_read_token(pool: &sqlx::PgPool) {
@@ -772,14 +782,14 @@ async fn seed_read_token(pool: &sqlx::PgPool) {
         )
     };
     query
-        .bind(TOKEN_ID)
+        .bind(PUBLIC_ADMIN_ID)
         .bind(body_hash(TOKEN_SECRET.as_bytes()))
         .execute(pool)
         .await
         .expect("seed hash-only read token");
     let count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM admin_api_tokens WHERE token_id = $1")
-            .bind(TOKEN_ID)
+            .bind(PUBLIC_ADMIN_ID)
             .fetch_one(pool)
             .await
             .expect("confirm registry fixture");
@@ -789,7 +799,7 @@ async fn seed_read_token(pool: &sqlx::PgPool) {
 fn admin_body(action: &str, guild: &str, proof: Option<&str>) -> String {
     let mut value = serde_json::json!({
         "action": action, "guild_id": guild, "params": {},
-        "token_id": TOKEN_ID, "holder_kind": "human",
+        "token_id": PUBLIC_ADMIN_ID, "holder_kind": "human",
     });
     if let Some(proof) = proof {
         value["admin_bearer"] = Value::String(proof.to_owned());
@@ -802,7 +812,7 @@ async fn service_key_alone_cannot_impersonate_a_registered_bearer() {
     let Some(db) = migrated().await else { return };
     seed_read_token(db.pool()).await;
     let (bot, addr) = spawn_bot(&db_url(&db)).await;
-    let wrong_secret = format!("{TOKEN_ID}.{}", "z".repeat(40));
+    let wrong_secret = format!("{PUBLIC_ADMIN_ID}.{}", "z".repeat(40));
     for proof in [None, Some(wrong_secret.as_str())] {
         let raw = admin_body("event.read", PROBE_GUILD, proof);
         let (response, signed) = post_body_with_fresh_headers(addr, FIXTURE_KEY_ID, &raw, || {
@@ -955,6 +965,125 @@ async fn known_and_unknown_scoped_verbs_stay_closed_even_with_live_bearer_and_fl
     }
     bot.stop().await;
     db.close().await.expect("drops fixture database");
+}
+
+#[tokio::test]
+async fn dedicated_admin_service_key_cannot_downgrade_to_v1_without_ambient_classification() {
+    // Removing an ambient admin-key-id setting must not turn a dedicated key
+    // into a legacy website key. spawn_bot env_clear() installs BOTH keys and
+    // enables event.read, but sets no ambient admin-key classification at all.
+    // No bearer, token_id, or claim header marks this request as admin traffic:
+    // only the receiver's reserved key-id suffix can stop the downgrade.
+    let Some(db) = migrated().await else { return };
+    let (bot, addr) = spawn_bot(&db_url(&db)).await;
+    let raw = r#"{"action":"event.read","event_key":"ghost"}"#;
+    let malformed = r#"{"action":"event.read"}"#;
+    let service_secret = fixture_admin_service_secret();
+
+    let (legacy, legacy_signed) = post_body_with_fresh_headers(addr, FIXTURE_KEY_ID, raw, || {
+        (mint_v1(&fixture_secret(), raw.as_bytes()), None)
+    })
+    .expect("ordinary legacy event.read control");
+    let (legacy_malformed, malformed_signed) =
+        post_body_with_fresh_headers(addr, FIXTURE_KEY_ID, malformed, || {
+            (mint_v1(&fixture_secret(), malformed.as_bytes()), None)
+        })
+        .expect("ordinary legacy event.read validation control");
+    let (unknown, _) = post_body_with_fresh_headers(addr, "fixture-unknown-key", raw, || {
+        (mint_v1(&service_secret, raw.as_bytes()), None)
+    })
+    .expect("unknown-key reference refusal");
+    let (bad_signature, _) = post_body_with_fresh_headers(addr, FIXTURE_KEY_ID, raw, || {
+        (mint_v1(&service_secret, raw.as_bytes()), None)
+    })
+    .expect("known-key bad-signature reference refusal");
+    let (downgrade, downgrade_signed) =
+        post_body_with_fresh_headers(addr, FIXTURE_ADMIN_SERVICE_ID, raw, || {
+            (mint_v1(&service_secret, raw.as_bytes()), None)
+        })
+        .expect("dedicated service key with valid legacy signature and no bearer");
+    let (scoped, scoped_signed) = post_with_fresh_headers(addr, FIXTURE_ADMIN_SERVICE_ID, || {
+        (
+            mint(
+                &service_secret,
+                PROBE_BODY.as_bytes(),
+                PROBE_SCOPE,
+                PROBE_GUILD,
+                Some(PROBE_SCOPE),
+                Some(PROBE_GUILD),
+            ),
+            None,
+        )
+    })
+    .expect("dedicated key's positive scoped authentication control");
+
+    // Capture durable evidence and clean up before assertions, including RED.
+    let legacy_burned = nonce_burned(db.pool(), &legacy_signed.nonce).await;
+    let malformed_burned = nonce_burned(db.pool(), &malformed_signed.nonce).await;
+    let downgrade_burned = nonce_burned(db.pool(), &downgrade_signed.nonce).await;
+    let scoped_burned = nonce_burned(db.pool(), &scoped_signed.nonce).await;
+    let rows = terminal_rows(db.pool()).await;
+    bot.stop().await;
+    db.close().await.expect("drops fixture database");
+
+    assert_eq!(
+        status_code(&legacy),
+        Some(403),
+        "ordinary v1 still reaches the existing unmapped-event refusal: {}",
+        describe_response(&legacy)
+    );
+    assert_eq!(error_of(&legacy)["code"], "action_not_allowed");
+    assert!(
+        legacy_burned,
+        "ordinary v1 authenticates and burns its nonce"
+    );
+    assert_eq!(
+        status_code(&legacy_malformed),
+        Some(400),
+        "enabled legacy event.read still reaches payload validation, not a blanket auth/flag refusal"
+    );
+    assert_eq!(error_of(&legacy_malformed)["code"], "malformed");
+    assert!(
+        malformed_burned,
+        "legacy validation occurs after nonce burn"
+    );
+    assert_eq!(status_code(&unknown), Some(401));
+    assert_eq!(status_code(&bad_signature), Some(401));
+    let reference_error = error_of(&unknown);
+    assert_eq!(reference_error["code"], "unauthorized");
+    assert_eq!(reference_error["message"], AUTH_FAILURE_MESSAGE);
+    assert_eq!(error_of(&bad_signature), reference_error);
+
+    assert_eq!(
+        status_code(&downgrade),
+        Some(401),
+        "dedicated suffix refuses valid v1 without relying on any ambient admin-key setting: {}",
+        describe_response(&downgrade)
+    );
+    assert_eq!(
+        error_of(&downgrade),
+        reference_error,
+        "downgrade is indistinguishable from unknown key and invalid MAC"
+    );
+    assert!(
+        !downgrade_burned,
+        "dedicated-key v1 refuses before nonce burn"
+    );
+    assert!(
+        body_json(&downgrade).get("result").is_none(),
+        "no read result escapes"
+    );
+    assert_eq!(rows, (0, 0), "no execution intent or audit/effect receipt");
+    assert_eq!(
+        status_code(&scoped),
+        Some(403),
+        "dedicated key must be installed and usable for scoped authentication, not silently omitted"
+    );
+    assert_eq!(error_of(&scoped)["code"], "action_not_allowed");
+    assert!(
+        scoped_burned,
+        "valid scoped service MAC reaches closed dispatch"
+    );
 }
 
 #[tokio::test]
