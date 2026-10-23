@@ -88,11 +88,15 @@ def week_label(moment):
 
 def gh_api_get(path, **fields):
     """One read-only `gh api` call; the parsed JSON, or a fixed refusal."""
-    args = ["gh", "api", "--method", "GET", path]
+    field_args = []
     for key, value in fields.items():
-        args += ["-f", f"{key}={value}"]
+        field_args += ["-f", f"{key}={value}"]
     try:
-        result = subprocess.run(args, capture_output=True, text=True, timeout=GH_TIMEOUT)
+        # Keep the executable/method fixed and the endpoint out of option parsing.
+        result = subprocess.run(
+            ["gh", "api", "--method", "GET", *field_args, "--", path],
+            shell=False, capture_output=True, text=True, timeout=GH_TIMEOUT,
+        )
     except (OSError, subprocess.SubprocessError):
         raise DoraError("github api unavailable") from None
     if result.returncode != 0:
