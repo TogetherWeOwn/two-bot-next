@@ -280,7 +280,7 @@ def tokio_test_names(text):
     Every attribute mark must resolve; unsupported declarations cannot shrink
     the skip set silently while other ordinary declarations still match.
     """
-    marks = list(re.finditer(r"^[ \t]*#\[tokio::test\b", text, re.MULTILINE))
+    marks = list(re.finditer(r"^[ \t]*#\[(?:::)?tokio::test\b", text, re.MULTILINE))
     names = []
     for mark in marks:
         line_end = text.find("\n", mark.end())
