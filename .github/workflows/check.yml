@@ -529,6 +529,7 @@ jobs:
             --target "$RUNNER_TEMP/semgrep"
           export PATH="$RUNNER_TEMP/semgrep/bin:$PATH"
           export PYTHONPATH="$RUNNER_TEMP/semgrep${PYTHONPATH:+:$PYTHONPATH}"
+          python3 scripts/ci/check-semgrep-trust-store.py
           python3 scripts/ci/check-semgrep-warn.py \
             --base-ref "$QUALITY_BASE" --head-ref "$QUALITY_HEAD" --semgrep semgrep
 
