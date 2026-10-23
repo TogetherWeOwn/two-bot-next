@@ -66,13 +66,13 @@
         "row": [
           "2",
           "`/leaderboard`",
-          "none",
+          "`page` Int opt 1–1000 (1-based), `mine` Bool opt",
           "everyone"
         ]
       },
       "status": "manual",
-      "action": "Invoke /leaderboard as a normal fixture member after two approved fixture XP awards.",
-      "expected": "Ordering, tie handling and displayed ranks agree with the fixture awards.",
+      "action": "Invoke /leaderboard as a normal fixture member after two approved fixture XP awards; walk page:1, page:2, an out-of-range page, and mine:true.",
+      "expected": "Ordering, tie handling and displayed ranks agree with the fixture awards; every page fits Discord limits with a page indicator and absolute ranks; out-of-range pages and unranked mine:true are refused truthfully.",
       "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
     },
     {

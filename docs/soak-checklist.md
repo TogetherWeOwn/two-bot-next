@@ -60,8 +60,8 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s1-02: 2 — `/leaderboard`
 
 - **Method:** `manual` (not an execution verdict).
-- **Action:** Invoke /leaderboard as a normal fixture member after two approved fixture XP awards.
-- **Expected:** Ordering, tie handling and displayed ranks agree with the fixture awards.
+- **Action:** Invoke /leaderboard as a normal fixture member after two approved fixture XP awards; walk page:1, page:2, an out-of-range page, and mine:true.
+- **Expected:** Ordering, tie handling and displayed ranks agree with the fixture awards; every page fits Discord limits with a page indicator and absolute ranks; out-of-range pages and unranked mine:true are refused truthfully.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 
 ### s1-03: 3 — `/ban`
