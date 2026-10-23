@@ -286,6 +286,10 @@ jobs:
       - name: Docs script/workflow path citations resolve (offline)
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docs_path_conformance.py' -v
 
+      # Ungated: docs-only PRs must enforce discovery and size budgets too.
+      - name: Docs index, orphan and byte-budget conformance (offline)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docs_index.py' -v
+
       - name: parity soak checklist coverage (offline)
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py
@@ -529,6 +533,7 @@ jobs:
             --target "$RUNNER_TEMP/semgrep"
           export PATH="$RUNNER_TEMP/semgrep/bin:$PATH"
           export PYTHONPATH="$RUNNER_TEMP/semgrep${PYTHONPATH:+:$PYTHONPATH}"
+          python3 scripts/ci/check-semgrep-trust-store.py
           python3 scripts/ci/check-semgrep-warn.py \
             --base-ref "$QUALITY_BASE" --head-ref "$QUALITY_HEAD" --semgrep semgrep
 
@@ -2174,16 +2179,30 @@ jobs:
             -c "SELECT name, setting FROM pg_settings WHERE name IN ('data_directory', 'max_wal_size', 'min_wal_size') ORDER BY 1"
 
       - name: onboarding shared runtime acceptance (mock Discord and CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot --locked onboarding_ -- --include-ignored
 
       - name: raid runtime acceptance (mock Discord and CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot --locked raid_runtime_ -- --include-ignored
 
       - name: join-risk runtime acceptance (mock Discord and CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot --locked join_risk_runtime_ -- --include-ignored
 
       - name: containment runtime acceptance (mock Discord and CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot --locked --lib --bins containment_worker_ -- --include-ignored
+
+      # The shared observer is outside the runtime-name filters above.
+      - name: hot-path query observer acceptance (CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot --locked --lib --bins hotpath_settings_test_support::queries::observer_sees_actual_rows_and_rejects_unbounded_control -- --include-ignored --test-threads=1
 
       # Fail-closed gate for the fail-open refusal acceptance: the
       # `fail_open_containment_acceptance` tests are `#[ignore]`d and their

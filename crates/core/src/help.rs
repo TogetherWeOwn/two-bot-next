@@ -195,6 +195,9 @@ pub fn help_text(defs: &[CommandDefinition]) -> String {
         let names: Vec<String> = present.iter().map(|name| format!("/{name}")).collect();
         out.push_str(&names.join(" · "));
         out.push('\n');
+        if group.commands.contains(&"rsvp-attendance") && live.contains("rsvp-attendance") {
+            out.push_str("Totals include your saved response and saved time; live event availability is not checked.\n");
+        }
     }
     // DB custom rows publish alongside the builtins; anything else ungrouped
     // (a future builtin this table predates) still renders rather than

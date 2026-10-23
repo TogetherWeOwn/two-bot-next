@@ -24,6 +24,12 @@ fn repository_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+/// Fixed `reason` values for the raid/join-risk drop counters. Mirrors the
+/// private `JOIN_QUEUE_DROP_REASONS` table in `crates/core/src/metrics.rs`
+/// (`queue_full`, `queue_closed`); hardcoded because the production table is
+/// private and this conformance pin must fail closed on any drift.
+const JOIN_QUEUE_DROP_REASON_VALUES: &[&str] = &["queue_full", "queue_closed"];
+
 /// One `| Metric | Meaning |` row whose name ends in `_total`.
 #[derive(Debug, PartialEq, Eq)]
 struct DocCounter {
@@ -133,6 +139,8 @@ fn allowlisted_labels(name: &str) -> Vec<&'static str> {
         "two_bot_gateway_prefix_trigger_refused_total" => vec!["reason"],
         "two_bot_voice_join_refused_total" => vec!["reason"],
         "two_bot_dispatch_drops_total" => vec!["lane"],
+        "two_bot_raid_dropped_joins_total" => vec!["reason"],
+        "two_bot_join_risk_dropped_joins_total" => vec!["reason"],
         "two_bot_voice_vote_kick_total" => vec!["outcome"],
         "two_bot_event_voice_tick_total" => vec!["outcome"],
         "two_bot_voice_names_total" => vec!["outcome"],
@@ -190,6 +198,12 @@ fn expected_values(name: &str) -> Vec<(&'static str, Vec<&'static str>)> {
             vec![("reason", PREFIX_TRIGGER_REFUSED_REASONS.to_vec())]
         }
         "two_bot_dispatch_drops_total" => vec![("lane", DISPATCH_LANES.to_vec())],
+        "two_bot_raid_dropped_joins_total" => {
+            vec![("reason", JOIN_QUEUE_DROP_REASON_VALUES.to_vec())]
+        }
+        "two_bot_join_risk_dropped_joins_total" => {
+            vec![("reason", JOIN_QUEUE_DROP_REASON_VALUES.to_vec())]
+        }
         "two_bot_voice_vote_kick_total" => {
             vec![("outcome", VOICE_VOTE_KICK_OUTCOMES.to_vec())]
         }
@@ -261,6 +275,7 @@ const KNOWN_COUNTERS: &[&str] = &[
     "two_bot_gateway_resumes_total",
     "two_bot_gateway_disconnects_total",
     "two_bot_gateway_missed_events_total",
+    "two_bot_gateway_rsvp_refused_total",
     "two_bot_rest_requests_total",
     "two_bot_rest_guard_invalid_requests_total",
     "two_bot_rest_guard_rejected_requests_total",
@@ -284,12 +299,16 @@ const KNOWN_COUNTERS: &[&str] = &[
     "two_bot_voice_halt_recoveries_total",
     "two_bot_voice_actor_inbox_turns_total",
     "two_bot_voice_actor_dispatch_turns_total",
+    "two_bot_voice_inbox_overflow_dropped_total",
+    "two_bot_voice_queue_overflow_dropped_total",
     "two_bot_voice_live_self_heal_total",
     "two_bot_db_errors_total",
     "two_bot_containment_store_errors_total",
     "two_bot_send_admissions_total",
     "two_bot_gateway_prefix_trigger_refused_total",
     "two_bot_dispatch_drops_total",
+    "two_bot_raid_dropped_joins_total",
+    "two_bot_join_risk_dropped_joins_total",
     "two_bot_internal_actions_total",
     "two_bot_moderation_enforcements_total",
     "two_bot_community_facts_drain_failures_total",

@@ -66,6 +66,43 @@ impl<'a> SettingsStore<'a> {
         })
     }
 
+    /// Per-event read: the global revision and only this guild's rows from
+    /// one MVCC snapshot. Never loads another guild's settings. The supervisor
+    /// keeps using `load_snapshot` for its deliberately global cache.
+    pub async fn load_guild_snapshot(
+        &self,
+        guild_id: &str,
+    ) -> Result<SettingsSnapshot, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *tx)
+            .await?;
+        let revision = sqlx::query_scalar(
+            "SELECT revision FROM guild_settings_revision WHERE singleton = TRUE",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let rows: Vec<(String, String, serde_json::Value, i64)> = sqlx::query_as(
+            "SELECT guild_id, key, value, version FROM guild_settings WHERE guild_id = $1",
+        )
+        .bind(guild_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(SettingsSnapshot {
+            revision,
+            rows: rows
+                .into_iter()
+                .map(|(guild_id, key, value, version)| SettingRow {
+                    guild_id,
+                    key,
+                    value,
+                    version,
+                })
+                .collect(),
+        })
+    }
+
     /// The cheap poll: commit-safe revision and row count in one snapshot.
     /// The revision also sees deletes, rollbacks do not advance it, and a
     /// late commit with a lower row version cannot hide behind a sequence max.
@@ -74,6 +111,18 @@ impl<'a> SettingsStore<'a> {
             "SELECT revision, (SELECT count(*) FROM guild_settings)
              FROM guild_settings_revision WHERE singleton = TRUE",
         )
+        .fetch_one(self.pool)
+        .await
+    }
+
+    /// Poll marks for a scoped cache; the count must cover the same guild as
+    /// `load_guild_snapshot`, not the supervisor's global row count.
+    pub async fn poll_guild_marks(&self, guild_id: &str) -> Result<(i64, i64), sqlx::Error> {
+        sqlx::query_as(
+            "SELECT revision, (SELECT count(*) FROM guild_settings WHERE guild_id = $1)
+             FROM guild_settings_revision WHERE singleton = TRUE",
+        )
+        .bind(guild_id)
         .fetch_one(self.pool)
         .await
     }

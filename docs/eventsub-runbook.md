@@ -376,9 +376,11 @@ Classification after verification:
 
 If the challenge echo never arrives at Twitch, check in order: the Worker
 route gate (both flags `1`?), the container bind (did startup refuse?), the
-secret agreement (401s in the logs?), a `200 delivery ignored` right after
-the subscription creation (the challenge was not echoed — delete and
-recreate the subscription, see below), and only then the callback URL shape
+secret agreement (401s in the logs?), a `200` with an `eventsub delivery
+classification failed` warn (`error_variant = "wrong_subscription"`,
+`"invalid_body"`, or `"duplicate_keys"`) right after the subscription creation (the challenge was
+not echoed — delete and recreate the subscription, see below), and only
+then the callback URL shape
 (plain `https`, no port, query, fragment, or userinfo; canonical form).
 Source: `crates/core/src/twitch_eventsub.rs:428-446`,
 `crates/bot/src/eventsub_http.rs:403-411`.
@@ -387,8 +389,11 @@ Source: `crates/core/src/twitch_eventsub.rs:428-446`,
 
 Container refusals use the same JSON envelope
 (`{"ok": false, "request_id", "error": {"code", "message": "request refused", "retryable"}}`)
-and log one scalar warn line (`event="eventsub_receiver"`, `status`,
-`error_class`). Worker-ingress refusals use the same envelope except the
+and log one sampled scalar warn line (`event="eventsub_receiver"`,
+`status`, `error_class`): the first warn, then every 64th process-wide, so
+hostile bursts count in counters, never per-request logs. Classify errors
+warn through the same sampler with an added bounded `error_variant`.
+Worker-ingress refusals use the same envelope except the
 404 below, which is plain-text `not found`, and log
 `event="eventsub_ingress"`. Retryable refusals are the container
 timeout/busy rows, the Worker 429 / 504 / 503 rows, and the container's
@@ -442,7 +447,7 @@ direct `containerFetch`, because the Worker answers those shapes first):
 | 413 | `payload_too_large` | false | Body over the 64 KiB cap, checked before verification. Genuine `stream.online` bodies are well under 2 KiB; treat 413 as a malformed or abusive sender. Source: `crates/bot/src/eventsub_http.rs:37,290-301`, `crates/core/src/twitch_eventsub.rs:49-51`. |
 | 415 | `unsupported_media_type` | false | Content type is not exactly `application/json` or `application/json; charset=utf-8` (case-insensitive); anything else, including another encoding, is refused. Source: `crates/bot/src/eventsub_http.rs:247-266`. |
 | 503 | `busy` / `upstream_timeout` | true | All 32 permits held (`busy`), or the whole request past the 20 s budget (`upstream_timeout`). Both mean the receiver is saturated or stalled, not that the delivery was bad; the sender retries. Check container saturation, not the secret. Source: `crates/bot/src/eventsub_http.rs:38-40,167-199`. |
-| 503 | `unavailable` | true | A future/unrecognized post-verification classification error, or — with rotation armed — a missing, malformed, unauthenticated, stale, replayed, or invalid secret refresh. Both fail closed without verifying against a stale snapshot; the classification case counts metric `kind="other"`, the refresh case never reaches verification or classification. This is distinct from Worker-ingress `unavailable` above. The refusal log uses the bounded error class `unavailable`, so it identifies neither a specific future variant nor a specific refresh cause: check Worker secret/version and reload-key agreement, not the secret value. Do not assume saturation or a Worker relay failure. Source: `crates/bot/src/eventsub_http.rs:426-439`, `crates/core/src/eventsub_refresh.rs`. |
+| 503 | `unavailable` | true | A future/unrecognized post-verification classification error, or — with rotation armed — a missing, malformed, unauthenticated, stale, replayed, or invalid secret refresh. Both fail closed without verifying against a stale snapshot; the classification case counts its own variant metric label, the refresh case never reaches verification or classification. This is distinct from Worker-ingress `unavailable` above. The sampled classify warn carries the bounded `error_variant`, so the classification case names its variant; the refresh case identifies no specific cause: check Worker secret/version and reload-key agreement, not the secret value. Do not assume saturation or a Worker relay failure. Source: `crates/bot/src/eventsub_http.rs`, `crates/core/src/eventsub_refresh.rs`. |
 
 Verified deliveries that need no operator action answer `200`:
 
@@ -458,27 +463,31 @@ Verified deliveries that need no operator action answer `200`:
   `DuplicateKeys`): acknowledged with 2xx so Twitch does not retry what
   will never succeed.
   Unknown/future `classify()` errors are not included: they return retryable
-  503 `unavailable` and count as metric `kind="other"` so an unrecognized
-  failure is not silently discarded or conflated with known ignored deliveries.
+  503 `unavailable` and count under their own variant metric label so an
+  unrecognized failure is not silently discarded or conflated with known
+  ignored deliveries.
   This carve-out excludes `webhook_callback_verification`: `classify()`
   returns `WrongSubscription` / `InvalidBody` / `DuplicateKeys` for a challenge
   with the wrong type or version, an unparsable signed body, or a signed body
   that repeats a key, and the handler still acks
-  `200 {"ok": true, "request_id"}` with only an info `delivery ignored` line without
-  echoing the challenge — so the subscription is never enabled. A `200
-  delivery ignored` immediately after a subscription creation means the
-  challenge was not echoed: delete and recreate the subscription.
+  `200 {"ok": true, "request_id"}` with only a sampled `eventsub delivery
+  classification failed` warn (`error_variant = "wrong_subscription"`,
+  `"invalid_body"`, or `"duplicate_keys"`) without echoing the challenge — so
+  the subscription is never enabled. A `200` with that warn immediately after
+  a subscription creation means the challenge was not echoed: delete and
+  recreate the subscription.
 
 Source: `crates/bot/src/eventsub_http.rs:350-411`.
 
 Log lines to expect (scalar fields only):
 
-- `eventsub delivery refused` (warn: `status`, `error_class`)
+- `eventsub delivery refused` (sampled warn: `status`, `error_class`)
+- `eventsub delivery classification failed` (sampled warn: `status`,
+  `error_class`, bounded `error_variant`, `message_type`); for unknown/future
+  classification errors expect `status = 503` and
+  `error_class = "unavailable"`, plus the variant metric increment
 - `challenge answered`, `notification acknowledged`, `revocation acknowledged`,
   `delivery ignored` (info: `status = 200`)
-- `eventsub delivery refused` (warn: `status`, bounded `error_class`); for
-  unknown/future classification errors expect `status = 503` and
-  `error_class = "unavailable"`, plus the `kind="other"` metric increment
 
 Source: `crates/bot/src/eventsub_http.rs:131-148,324-439`.
 

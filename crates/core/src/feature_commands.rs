@@ -211,13 +211,16 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
         ]),
         // Namespaced: legacy `attendance` (RSVP totals) collides with the
         // scorecard `attendance` (#12) on `guild.commands.set`.
-        CommandDefinition::new("rsvp-attendance", "Show RSVP totals for a scheduled event")
-            .options(vec![CommandOption::new(
-                "event-id",
-                "Discord scheduled event id (number in the event URL), e.g. 12345",
-                CommandOptionType::String,
-            )
-            .required()]),
+        CommandDefinition::new(
+            "rsvp-attendance",
+            "Show RSVP totals and your saved response for an event",
+        )
+        .options(vec![CommandOption::new(
+            "event-id",
+            "Discord scheduled event id (number in the event URL), e.g. 12345",
+            CommandOptionType::String,
+        )
+        .required()]),
         CommandDefinition::new("lfg", "Post a raid/LFG signup with role slots")
             .permissions(PERM_MANAGE_EVENTS)
             .options(vec![
