@@ -286,6 +286,10 @@ jobs:
       - name: Docs script/workflow path citations resolve (offline)
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docs_path_conformance.py' -v
 
+      # Ungated: docs-only PRs must enforce discovery and size budgets too.
+      - name: Docs index, orphan and byte-budget conformance (offline)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docs_index.py' -v
+
       - name: parity soak checklist coverage (offline)
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py
@@ -529,6 +533,7 @@ jobs:
             --target "$RUNNER_TEMP/semgrep"
           export PATH="$RUNNER_TEMP/semgrep/bin:$PATH"
           export PYTHONPATH="$RUNNER_TEMP/semgrep${PYTHONPATH:+:$PYTHONPATH}"
+          python3 scripts/ci/check-semgrep-trust-store.py
           python3 scripts/ci/check-semgrep-warn.py \
             --base-ref "$QUALITY_BASE" --head-ref "$QUALITY_HEAD" --semgrep semgrep
 
