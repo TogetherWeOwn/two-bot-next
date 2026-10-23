@@ -78,26 +78,29 @@ pub struct StoreState {
 #[derive(Clone, Default)]
 pub struct PgPool(Arc<Mutex<StoreState>>);
 
-pub struct Transaction(());
+pub struct Postgres;
+
+// Match SQLx's lifetime/database type boundary without permitting picker SQL.
+pub struct Transaction<'c, DB>((), std::marker::PhantomData<&'c mut DB>);
 
 impl PgPool {
-    pub async fn begin(&self) -> Result<Transaction, Error> {
+    pub async fn begin(&self) -> Result<Transaction<'static, Postgres>, Error> {
         panic!("picker SQL is outside this welcome fixture")
     }
 }
 
-impl std::ops::Deref for Transaction {
+impl<DB> std::ops::Deref for Transaction<'_, DB> {
     type Target = ();
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
-impl std::ops::DerefMut for Transaction {
+impl<DB> std::ops::DerefMut for Transaction<'_, DB> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
-impl Transaction {
+impl<DB> Transaction<'_, DB> {
     pub async fn commit(self) -> Result<(), Error> {
         panic!("picker SQL is outside this welcome fixture")
     }
@@ -144,6 +147,19 @@ pub mod onboarding_store {
             .expect("fixture store")
             .prompted
             .contains(&(guild.into(), member.into())))
+    }
+
+    pub async fn clear_onboarding_prompt(
+        pool: &PgPool,
+        guild: &str,
+        member: &str,
+    ) -> Result<bool, Error> {
+        Ok(pool
+            .0
+            .lock()
+            .expect("fixture store")
+            .prompted
+            .remove(&(guild.into(), member.into())))
     }
 
     pub struct PromptGuard {
@@ -200,7 +216,7 @@ pub mod onboarding_store {
     }
 
     pub async fn record_game_selection_in_transaction(
-        _: &mut Transaction,
+        _: &mut Transaction<'_, Postgres>,
         _: &str,
         _: &str,
         _: &[String],
@@ -210,8 +226,27 @@ pub mod onboarding_store {
         panic!("picker record is outside this fixture")
     }
 
+    pub async fn record_game_partial_in_transaction(
+        _: &mut Transaction<'_, Postgres>,
+        _: &str,
+        _: &str,
+        _: &[String],
+        _: &str,
+    ) -> Result<(), Error> {
+        panic!("picker record is outside this fixture")
+    }
+
+    pub async fn retract_picker_rows(
+        _: &PgPool,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> Result<u64, Error> {
+        panic!("picker retraction is outside this fixture")
+    }
+
     pub async fn record_session_routed_in_transaction(
-        _: &mut Transaction,
+        _: &mut Transaction<'_, Postgres>,
         _: &str,
         _: &str,
         _: &SessionPlan,
