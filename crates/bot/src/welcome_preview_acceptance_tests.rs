@@ -47,8 +47,10 @@
 //! the missing piece). Guild identity is boot-validated, so the
 //! unconfigured case is empty channels / dry-run-off, not a missing guild.
 //!
-//! RED at baseline (9 tests): the slash is not captured, so every handle
-//! below is a silent no-op — no defer, no preview, no guidance.
+//! RED at baseline (12 tests): onboarding does not capture the slash; the
+//! shared runtime competes for its ACK and admits it to the busy gate. Preview
+//! rendering/click guidance is absent. Picker clicks must remain read-only
+//! before config lookup while preserving the byte-identical live components.
 //!
 //! Controls (2 tests): wrong-guild/bot/memberless silence, and the
 //! offline fixture + fail-closed-construction pins.
@@ -186,8 +188,76 @@ fn preview_without_member() -> Interaction {
     .expect("valid welcome-preview slash fixture")
 }
 
+/// Click the actual menu returned by the preview. Keep the original message's
+/// banner/components on the interaction: live and preview menus share IDs.
+fn click_rendered_picker(body: &Value, mode: &str) -> Interaction {
+    let menu = &body["components"][0]["components"][0];
+    let custom_id = menu["custom_id"].as_str().expect("rendered picker id");
+    let selection = if mode == "legacy" {
+        "fallguys"
+    } else {
+        "find-players"
+    };
+    assert!(
+        menu["options"]
+            .as_array()
+            .expect("rendered picker options")
+            .iter()
+            .any(|option| option["value"] == selection),
+        "the click selects a valid, mutating live option"
+    );
+    serde_json::from_value(json!({
+        "application_id": "111", "authorizing_integration_owners": {"0": "22"},
+        "id": "334", "token": "mock-picker-callback", "type": 3, "version": 1,
+        "guild_id": "22", "channel_id": "12",
+        "member": admin_member("44", Some("32")),
+        "message": {
+            "id": "98", "channel_id": "12", "type": 0,
+            "author": {"id": "999", "username": "bot", "discriminator": "0", "bot": true},
+            "content": body["content"], "components": body["components"], "flags": 64,
+            "timestamp": "2026-10-01T00:00:00.000000+00:00",
+            "attachments": [], "embeds": [], "mentions": [], "mention_roles": [],
+            "mention_everyone": false, "pinned": false, "tts": false
+        },
+        "data": {"custom_id": custom_id, "component_type": 3, "values": [selection]}
+    }))
+    .expect("rendered-preview picker click fixture")
+}
+
 fn job(interaction: Interaction) -> OnboardingJob {
     OnboardingJob::Interaction(Box::new(interaction))
+}
+
+fn shared_preview_runtime(
+    pool: &PgPool,
+    mock: &MockRest,
+) -> Arc<crate::command_runtime::CommandRuntime> {
+    ensure_crypto_provider();
+    let executor = ActionExecutor::with_proxy(
+        "welcome-preview-test-only-token".into(),
+        Some(mock.origin()),
+    )
+    .expect("loopback-only shared executor");
+    let gates = two_bot_core::RouterGates {
+        configured_guild: Some(22),
+        scorecard: false,
+        automations: false,
+        announcements: false,
+        moderation: false,
+        voice: false,
+        voice_assistant: false,
+        tickets: false,
+        self_roles: false,
+        onboarding_picker: true,
+        session_picker: false,
+    };
+    crate::command_runtime::CommandRuntime::new(
+        pool.clone(),
+        executor,
+        crate::command_runtime::router_with_commands(gates),
+        22,
+        false,
+    )
 }
 
 fn now_secs() -> i64 {
@@ -373,11 +443,21 @@ fn assert_no_success_markers(content: &str) {
     }
 }
 
+// Live anchor delivery substitutes the configured destination after rendering
+// the occurrence. The fixture uses channel 14, not the built-in Sunday channel.
+fn configured_anchor_welcome_text() -> String {
+    let deployment = vars("anchor", false);
+    anchor_welcome_text(PREVIEW_FIXTURE_MEMBER_ID, now_secs(), SUNDAY_SQUAD).replace(
+        SUNDAY_SQUAD.channel_id,
+        &deployment["DISCORD_ANCHOR_WELCOME_CHANNEL_ID"],
+    )
+}
+
 fn assert_no_welcome_body(content: &str, mode: &str) {
     let body = match mode {
         "legacy" => legacy_welcome_text(PREVIEW_FIXTURE_MEMBER_ID),
         "session" => session_welcome_text(PREVIEW_FIXTURE_MEMBER_ID),
-        "anchor" => anchor_welcome_text(PREVIEW_FIXTURE_MEMBER_ID, now_secs(), SUNDAY_SQUAD),
+        "anchor" => configured_anchor_welcome_text(),
         _ => panic!("known mode"),
     };
     assert!(
@@ -523,16 +603,16 @@ async fn preview_anchor_renders_live_body_without_picker() {
         let content = edit_content(&body);
         assert_banner(content, "anchor");
         assert!(
-            content.contains(&anchor_welcome_text(
-                PREVIEW_FIXTURE_MEMBER_ID,
-                now_secs(),
-                SUNDAY_SQUAD
-            )),
+            content.contains(&configured_anchor_welcome_text()),
             "the preview embeds the byte-identical anchor body for the fixture, got {content:?}"
         );
         assert!(
-            content.contains("14"),
-            "the preview names the anchor channel, got {content:?}"
+            content.contains("<#14>"),
+            "the preview names the configured anchor channel, got {content:?}"
+        );
+        assert!(
+            !content.contains(SUNDAY_SQUAD.channel_id),
+            "the preview never appends a stale built-in anchor body, got {content:?}"
         );
         assert_preview_wire_safe(&body);
         assert!(
@@ -626,6 +706,81 @@ async fn preview_matches_live_join_render_for_same_config_across_modes() {
         db.close().await;
         if let Err(error) = result {
             std::panic::resume_unwind(error);
+        }
+    }
+}
+
+// Missing preview-origin fencing must never turn a visual sample into a real
+// game-role grant or session-route event. Exercise the actual rendered menus,
+// not a new custom ID; broken config must not move this fence behind a lookup.
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb; never live Discord or DATABASE_URL"]
+async fn preview_rendered_picker_clicks_are_read_only_before_config_lookup() {
+    for mode in ["legacy", "session"] {
+        for broken_config in [false, true] {
+            let db = TestSchema::new().await;
+            let result = std::panic::AssertUnwindSafe(async {
+                let render_mock =
+                    preview_discord(Arc::new(Mutex::new(PreviewDiscordState::default()))).await;
+                let runtime = runtime(&db.pool, &render_mock, &vars(mode, false));
+                runtime.handle(job(preview()), NOW).await.unwrap();
+                assert_deferred_first(&render_mock);
+                let body = single_edit_body(&render_mock);
+                assert_banner(edit_content(&body), mode);
+                assert_zero_preview_effects(&db, &render_mock).await;
+                let expected = if mode == "legacy" {
+                    picker_components(Some(PickerKind::Games), &[], &[])
+                } else {
+                    picker_components(
+                        Some(PickerKind::Session),
+                        &[],
+                        &build_session_picks("10", "11"),
+                    )
+                };
+                assert_eq!(
+                    body["components"],
+                    serde_json::to_value(expected).unwrap(),
+                    "the visual sample retains the live {mode} components"
+                );
+                let click = click_rendered_picker(&body, mode);
+                if broken_config {
+                    SettingsStore::new(&db.pool)
+                        .set(
+                            "22",
+                            "DISCORD_LANDING_CHANNEL_IDS",
+                            Some(json!(["bogus"])),
+                            "test",
+                        )
+                        .await
+                        .unwrap();
+                }
+                // A separate strict responder records only the click lifecycle.
+                // Any member read/role write on a sample click panics here.
+                let click_mock =
+                    preview_discord(Arc::new(Mutex::new(PreviewDiscordState::default()))).await;
+                let click_runtime = super::runtime(&db.pool, &click_mock, &vars(mode, false));
+                assert!(
+                    click_runtime.accepts_interaction(&click),
+                    "a preview menu click gets private guidance, not silence"
+                );
+                click_runtime.handle(job(click), NOW + 1).await.unwrap();
+                assert_deferred_first(&click_mock);
+                let reply = single_edit_body(&click_mock);
+                let content = edit_content(&reply);
+                assert!(
+                    content.to_lowercase().contains("preview"),
+                    "the click explains the preview even with broken_config={broken_config}, got {content:?}"
+                );
+                assert_no_success_markers(content);
+                assert_no_welcome_body(content, mode);
+                assert_zero_preview_effects(&db, &click_mock).await;
+            })
+            .catch_unwind()
+            .await;
+            db.close().await;
+            if let Err(error) = result {
+                std::panic::resume_unwind(error);
+            }
         }
     }
 }
@@ -990,6 +1145,101 @@ async fn preview_wrong_guild_bot_and_memberless_stay_silent() {
     }
 }
 
+// A saturated shared command lane must yield ownership before it can send a
+// competing busy ACK. Occupancy is deterministic; no database or timers fill it.
+#[tokio::test]
+async fn preview_shared_dispatch_yields_before_busy_admission() {
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@agent-testdb:5432/postgres")
+        .expect("offline lazy pool");
+    pool.close().await;
+    let busy_seen = Arc::new(tokio::sync::Notify::new());
+    let signal = Arc::clone(&busy_seen);
+    let mock = MockRest::with_responder(move |request: &RestRequest| {
+        assert_eq!(request.method, "POST");
+        assert!(request.path.ends_with("/callback"));
+        signal.notify_one();
+        ScriptedResponse::status(204)
+    })
+    .await;
+    let shared = shared_preview_runtime(&pool, &mock);
+    let _dispatch_guard = shared.dispatch_guard();
+    let _slots: Vec<_> = (0..crate::interaction_admission::PER_USER_IN_FLIGHT)
+        .map(|_| {
+            shared
+                .acquire_user_slot_for_test(44)
+                .expect("hold actor slot")
+        })
+        .collect();
+    let mut invocation = preview();
+    // The shared test constructor pins this application; a mismatched fixture
+    // would silently bypass busy admission and make the oracle vacuous.
+    invocation.application_id = twilight_model::id::Id::new(1111);
+    let event = Event::InteractionCreate(Box::new(
+        twilight_model::gateway::payload::incoming::InteractionCreate(invocation),
+    ));
+    assert!(
+        shared.dispatch(&event),
+        "the shared runtime yields welcome-preview before its exhausted actor budget"
+    );
+    // The same actor's ordinary slash must still hit busy admission. This
+    // positive control rules out globally skipping the shared admission gate.
+    let mut ordinary = serde_json::to_value(preview()).unwrap();
+    ordinary["application_id"] = json!("1111");
+    ordinary["id"] = json!("335");
+    ordinary["token"] = json!("mock-busy-control");
+    ordinary["data"]["name"] = json!("help");
+    let ordinary = serde_json::from_value(ordinary).expect("ordinary slash control");
+    let ordinary = Event::InteractionCreate(Box::new(
+        twilight_model::gateway::payload::incoming::InteractionCreate(ordinary),
+    ));
+    assert!(!shared.dispatch(&ordinary), "the ordinary slash is busy");
+    tokio::time::timeout(Duration::from_secs(2), busy_seen.notified())
+        .await
+        .expect("the ordinary slash receives its busy callback");
+    let requests = callbacks(&mock);
+    assert_eq!(requests.len(), 1, "only the ordinary slash receives an ACK");
+    assert!(requests[0].path.contains("/335/mock-busy-control/"));
+    let reply: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(reply["type"], 4);
+    assert_eq!(reply["data"]["flags"], 64);
+    assert_eq!(
+        reply["data"]["content"],
+        crate::interaction_admission::BUSY_REPLY
+    );
+}
+
+// Both gateway consumers see the slash, but only onboarding may acknowledge.
+// A closed lazy pool forces post-defer guidance without any external database.
+#[tokio::test]
+async fn preview_shared_handler_and_onboarding_send_only_one_ack() {
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@agent-testdb:5432/postgres")
+        .expect("offline lazy pool");
+    pool.close().await;
+    let mock = preview_discord(Arc::new(Mutex::new(PreviewDiscordState::default()))).await;
+    let shared = shared_preview_runtime(&pool, &mock);
+    let _dispatch_guard = shared.dispatch_guard();
+    let runtime = runtime(&pool, &mock, &vars("legacy", false));
+    let mut invocation = preview();
+    invocation.application_id = twilight_model::id::Id::new(1111);
+    shared.on_interaction(&invocation).await;
+    assert!(
+        mock.requests().is_empty(),
+        "the shared handler sends no callback before onboarding owns the slash"
+    );
+    runtime.handle(job(invocation), NOW).await.unwrap();
+    assert_deferred_first(&mock);
+    let reply = single_edit_body(&mock);
+    let content = edit_content(&reply);
+    assert_banner(content, "legacy");
+    assert!(content.to_lowercase().contains("try again"));
+    assert_no_welcome_body(content, "legacy");
+    assert_no_success_markers(content);
+    assert!(role_writes(&mock).is_empty());
+    assert!(posts(&mock).is_empty());
+}
+
 // Control (offline): the fixture identity is fixed and documented, and
 // boot config with a bogus mode fails closed at construction — a broken
 // deployment never builds a runtime that could misrender. Tokio (not ignore):
@@ -1002,13 +1252,19 @@ async fn preview_fixture_identity_and_fail_closed_construction() {
         "the fixture id is pinned:docs and builder share it"
     );
     assert_eq!(PREVIEW_FIXTURE_PILL, "<@765432109876543210>");
+    let anchor = configured_anchor_welcome_text();
+    assert!(
+        anchor.contains("<#14>"),
+        "the anchor oracle uses fixture config"
+    );
+    assert!(
+        !anchor.contains(SUNDAY_SQUAD.channel_id),
+        "the anchor oracle excludes the stale built-in destination"
+    );
     for (body, mode) in [
         (legacy_welcome_text(PREVIEW_FIXTURE_MEMBER_ID), "legacy"),
         (session_welcome_text(PREVIEW_FIXTURE_MEMBER_ID), "session"),
-        (
-            anchor_welcome_text(PREVIEW_FIXTURE_MEMBER_ID, now_secs(), SUNDAY_SQUAD),
-            "anchor",
-        ),
+        (configured_anchor_welcome_text(), "anchor"),
     ] {
         assert_eq!(
             body.matches("<@").count(),
