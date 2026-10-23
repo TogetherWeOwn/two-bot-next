@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! Acceptance: admins preview the current welcome without a real join.
 //!
 //! BUILDER CONTRACT: this file is frozen. Build on the acceptance branch,
@@ -991,9 +992,11 @@ async fn preview_wrong_guild_bot_and_memberless_stay_silent() {
 
 // Control (offline): the fixture identity is fixed and documented, and
 // boot config with a bogus mode fails closed at construction — a broken
-// deployment never builds a runtime that could misrender.
-#[test]
-fn preview_fixture_identity_and_fail_closed_construction() {
+// deployment never builds a runtime that could misrender. Tokio (not ignore):
+// dropping the lazy pool requires a runtime context, but no connection is
+// ever opened, so this stays in the default offline lane.
+#[tokio::test]
+async fn preview_fixture_identity_and_fail_closed_construction() {
     assert_eq!(
         PREVIEW_FIXTURE_MEMBER_ID, 765_432_109_876_543_210,
         "the fixture id is pinned:docs and builder share it"
