@@ -1442,6 +1442,19 @@ impl CommandRuntime {
             self.answer(interaction, response).await;
             return;
         }
+        if handler == HandlerId::Birthday {
+            // Immediate, private result; bound all work within Discord's initial
+            // acknowledgement window. On timeout effect intents remain durable.
+            let content = match tokio::time::timeout(
+                std::time::Duration::from_millis(1500),
+                crate::birthday_command::execute(&self.pool, &self.executor, interaction),
+            ).await {
+                Ok(Ok(content)) => content,
+                _ => "Birthday command unavailable. Try /birthday show to check your saved state, then retry.".to_owned(),
+            };
+            self.answer(interaction, ephemeral(content)).await;
+            return;
+        }
         // No `"help"` entry: the help arm above owns `/help` and returns
         // first, so an owner-map entry could never execute.
         let owner = match name.as_str() {
@@ -2452,6 +2465,7 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     }
     if gates.announcements {
         for id in [
+            HandlerId::Birthday,
             HandlerId::FeedAdd,
             HandlerId::FeedRemove,
             HandlerId::FeedList,

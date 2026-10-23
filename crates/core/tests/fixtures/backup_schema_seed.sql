@@ -672,3 +672,18 @@ VALUES ('GUILD_SCHEDULED_EVENT_CREATE', '100000000000000001',
         '100000000000000033', '100000000000000065', 1, 2,
         '2026-08-03T10:00:00Z', '2026-08-03T10:00:01Z',
         'GUILD_SCHEDULED_EVENT_CREATE:100000000000000001:100000000000000065:2026-08-03T10:00:00Z');
+
+-- Birthday v14: opt-ins/config travel with settled and uncertain delivery
+-- fences and pre-wire grant intents, including a removed profile's old role.
+INSERT INTO birthday_profiles (guild_id, member_id, birth_month, birth_day)
+VALUES ('100000000000000001', '100000000000000002', 2, 29),
+       ('100000000000000001', '100000000000000004', 5, 1);
+INSERT INTO birthday_config (guild_id, channel_id, role_id, cheer)
+VALUES ('100000000000000001', '100000000000000033', '100000000000000034', '雪 {user}!'),
+       ('100000000000000099', NULL, NULL, NULL);
+INSERT INTO birthday_cheers (guild_id, member_id, celebration_date, channel_id, nonce, message_id)
+VALUES ('100000000000000001', '100000000000000002', '2026-02-28', '100000000000000033', 'backup-birthday-settled', '100000000000000088'),
+       ('100000000000000001', '100000000000000004', '2026-05-01', '100000000000000033', 'backup-birthday-uncertain', NULL);
+INSERT INTO birthday_role_grants (guild_id, member_id, role_id, celebration_date)
+VALUES ('100000000000000001', '100000000000000002', '100000000000000034', '2026-02-28'),
+       ('100000000000000001', '100000000000000009', '100000000000000035', '2026-05-01');

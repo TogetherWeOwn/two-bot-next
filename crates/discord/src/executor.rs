@@ -4189,6 +4189,7 @@ fn raw_get_route(path: &str) -> Result<Route<'static>, String> {
                 limit: query_param(query, "limit").and_then(|v| v.parse().ok()),
             }),
             Some("roles") if query.is_empty() => Ok(Route::GetGuildRoles { guild_id }),
+            Some("channels") if query.is_empty() => Ok(Route::GetChannels { guild_id }),
             Some(member) if member.starts_with("members/") && query.is_empty() => {
                 let user_id = member
                     .strip_prefix("members/")

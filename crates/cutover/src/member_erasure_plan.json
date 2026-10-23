@@ -251,6 +251,21 @@
       "predicate": "guild_id = $1 AND (actor_id = $2 OR target_id = $2 OR user_id = $2 OR inviter_id = $2)"
     },
     {
+      "table": "birthday_role_grants",
+      "columns": ["member_id"],
+      "predicate": "guild_id = $1 AND member_id = $2"
+    },
+    {
+      "table": "birthday_cheers",
+      "columns": ["member_id"],
+      "predicate": "guild_id = $1 AND member_id = $2"
+    },
+    {
+      "table": "birthday_profiles",
+      "columns": ["member_id"],
+      "predicate": "guild_id = $1 AND member_id = $2"
+    },
+    {
       "table": "members",
       "columns": ["member_id"],
       "predicate": "guild_id = $1 AND member_id = $2"

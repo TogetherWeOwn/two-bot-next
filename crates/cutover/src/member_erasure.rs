@@ -137,6 +137,11 @@ pub async fn schema_gaps(conn: &mut PgConnection) -> Result<Vec<String>, sqlx::E
 /// probe used by the guild-purge path. Every table here is guild-keyed, so
 /// the guild-wide probe scopes on `guild_id` alone.
 const REPLAY_GUARDS: &[(&str, &str)] = &[
+    // Role intents must be reconciled before deleting the only cleanup witness.
+    ("birthday_role_grants", "TRUE"),
+    // Same-day receipts prevent remove/re-enroll or deletion from sending twice;
+    // unknown Discord outcomes remain fenced until explicitly reconciled.
+    ("birthday_cheers", "message_id IS NULL OR celebration_date >= (clock_timestamp() AT TIME ZONE 'UTC')::date"),
     ("internal_idempotency", "state <> 'completed'"),
     ("moderation_idempotency", "state <> 'done'"),
     (

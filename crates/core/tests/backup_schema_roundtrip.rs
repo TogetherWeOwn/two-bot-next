@@ -891,6 +891,7 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
     let directory = ArchiveDirectory::new();
     let original = directory.path("complete.ndjson.gz");
     let manifest = dump(pool, &original).await.unwrap();
+    assert_eq!(manifest.version, 14, "birthday recovery requires v14");
     assert_eq!(manifest.events_sequence, 107);
     assert_eq!(
         manifest.schema_migrations,
@@ -898,6 +899,49 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
     );
     let contents = inspect(&original).unwrap();
     assert_archive_matches(&contents, &before);
+    for table in [
+        "birthday_profiles",
+        "birthday_config",
+        "birthday_cheers",
+        "birthday_role_grants",
+    ] {
+        assert_eq!(
+            contents.buffers[table].len(),
+            2,
+            "complete {table} recovery fixture"
+        );
+    }
+    let profiles = &contents.buffers["birthday_profiles"];
+    let leap = profiles
+        .iter()
+        .find(|row| row["member_id"] == "100000000000000002")
+        .unwrap();
+    assert_eq!(leap["birth_month"], "2");
+    assert_eq!(leap["birth_day"], "29");
+    let cheers = &contents.buffers["birthday_cheers"];
+    assert!(cheers
+        .iter()
+        .any(|row| row["nonce"] == "backup-birthday-settled"
+            && row["message_id"] == "100000000000000088"));
+    assert!(cheers
+        .iter()
+        .any(|row| row["nonce"] == "backup-birthday-uncertain" && row["message_id"].is_null()));
+    assert!(
+        contents.buffers["birthday_role_grants"]
+            .iter()
+            .any(|row| row["member_id"] == "100000000000000009"
+                && row["role_id"] == "100000000000000035"),
+        "removed profiles retain old-role cleanup intents"
+    );
+    assert!(contents.buffers["birthday_config"]
+        .iter()
+        .any(|row| row["cheer"] == "雪 {user}!"));
+    assert!(contents.buffers["birthday_config"]
+        .iter()
+        .any(|row| row["channel_id"].is_null()
+            && row["role_id"].is_null()
+            && row["cheer"].is_null()));
+
     assert!(contents
         .manifest
         .tables
@@ -1017,6 +1061,10 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
         "INSERT INTO feed_deliveries SELECT * FROM feed_deliveries WHERE item_key = 'backup:item:pending'",
         "INSERT INTO self_role_panel_claims SELECT * FROM self_role_panel_claims",
         "INSERT INTO automod_delivery_claims SELECT * FROM automod_delivery_claims",
+        "INSERT INTO birthday_profiles SELECT * FROM birthday_profiles",
+        "INSERT INTO birthday_config SELECT * FROM birthday_config",
+        "INSERT INTO birthday_cheers SELECT * FROM birthday_cheers",
+        "INSERT INTO birthday_role_grants SELECT * FROM birthday_role_grants",
     ] {
         assert_sqlstate(&sqlx::query(audited(statement.to_owned())).execute(pool).await.unwrap_err(), "23505");
     }
@@ -1453,6 +1501,44 @@ async fn pre_reservation_v4_restores_and_clears_newer_reservation_rows() {
     db.close().await.unwrap();
 }
 
+const BIRTHDAY_TABLES: [&str; 4] = [
+    "birthday_profiles",
+    "birthday_config",
+    "birthday_cheers",
+    "birthday_role_grants",
+];
+
+fn remove_birthdays_from_historical_archive(old: &mut DumpContents) {
+    for table in BIRTHDAY_TABLES {
+        let rows = old
+            .buffers
+            .remove(table)
+            .expect("birthday backup fixture is populated");
+        assert_eq!(
+            rows.len(),
+            2,
+            "both recovery states must be seeded in {table}"
+        );
+        old.manifest.tables.retain(|info| info.name != table);
+    }
+}
+
+async fn assert_birthday_tables_empty(pool: &PgPool) {
+    for table in BIRTHDAY_TABLES {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT count(*) FROM {}",
+            identifier(table)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            count, 0,
+            "pre-birthday restore must clear newer {table} target rows"
+        );
+    }
+}
+
 #[tokio::test]
 async fn v8_archive_restores_and_clears_newer_guild_counters() {
     let Some(db) = database().await else {
@@ -1461,10 +1547,11 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v13-source.ndjson.gz");
+    let current_path = directory.path("v14-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 13);
+    assert_eq!(old.manifest.version, 14);
+    remove_birthdays_from_historical_archive(&mut old);
     for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -1478,12 +1565,20 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
     assert_eq!(inspected.manifest.version, 8);
     assert_eq!(
         inspected.manifest.missing_tables(),
-        ["game_activity_guild_aggregates", "assistant_monthly_builds"]
+        [
+            "game_activity_guild_aggregates",
+            "assistant_monthly_builds",
+            "birthday_profiles",
+            "birthday_config",
+            "birthday_cheers",
+            "birthday_role_grants"
+        ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
     forget_moderation_history(pool).await;
     let report = restore(pool, &old_path).await.unwrap();
     assert!(report.ok);
+    assert_birthday_tables_empty(pool).await;
     for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -1510,10 +1605,11 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v13-source.ndjson.gz");
+    let current_path = directory.path("v14-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 13);
+    assert_eq!(old.manifest.version, 14);
+    remove_birthdays_from_historical_archive(&mut old);
     for name in [
         "scheduled_events_claim",
         "scheduled_events_tombstone",
@@ -1538,13 +1634,18 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
             "scheduled_events_tombstone",
             "event_voice_channels",
             "event_voice_presence",
-            "admin_api_tokens"
+            "admin_api_tokens",
+            "birthday_profiles",
+            "birthday_config",
+            "birthday_cheers",
+            "birthday_role_grants"
         ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
     forget_moderation_history(pool).await;
     let report = restore(pool, &old_path).await.unwrap();
     assert!(report.ok);
+    assert_birthday_tables_empty(pool).await;
     for name in [
         "scheduled_events_claim",
         "scheduled_events_tombstone",
@@ -1577,10 +1678,11 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v13-source.ndjson.gz");
+    let current_path = directory.path("v14-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 13);
+    assert_eq!(old.manifest.version, 14);
+    remove_birthdays_from_historical_archive(&mut old);
     // Frozen claim-only v10 shape: the merged v10 writer carried the
     // epoch-claim guard but predates the delete tombstones, token registry
     // and event voice pair.
@@ -1606,13 +1708,18 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
             "scheduled_events_tombstone",
             "event_voice_channels",
             "event_voice_presence",
-            "admin_api_tokens"
+            "admin_api_tokens",
+            "birthday_profiles",
+            "birthday_config",
+            "birthday_cheers",
+            "birthday_role_grants"
         ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
     forget_moderation_history(pool).await;
     let report = restore(pool, &old_path).await.unwrap();
     assert!(report.ok);
+    assert_birthday_tables_empty(pool).await;
     for name in [
         "scheduled_events_tombstone",
         "event_voice_channels",
@@ -1652,10 +1759,11 @@ async fn v11_archive_restores_and_clears_newer_registry() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v13-source.ndjson.gz");
+    let current_path = directory.path("v14-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 13);
+    assert_eq!(old.manifest.version, 14);
+    remove_birthdays_from_historical_archive(&mut old);
     // Frozen tombstone-only v11 shape: the merged v11 writer carried the
     // delete tombstones but predates the token registry and event voice pair.
     for name in [
@@ -1678,13 +1786,18 @@ async fn v11_archive_restores_and_clears_newer_registry() {
         [
             "event_voice_channels",
             "event_voice_presence",
-            "admin_api_tokens"
+            "admin_api_tokens",
+            "birthday_profiles",
+            "birthday_config",
+            "birthday_cheers",
+            "birthday_role_grants"
         ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
     forget_moderation_history(pool).await;
     let report = restore(pool, &old_path).await.unwrap();
     assert!(report.ok);
+    assert_birthday_tables_empty(pool).await;
     for name in [
         "event_voice_channels",
         "event_voice_presence",
@@ -1723,10 +1836,11 @@ async fn v12_archive_restores_and_clears_newer_event_voice() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v13-source.ndjson.gz");
+    let current_path = directory.path("v14-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 13);
+    assert_eq!(old.manifest.version, 14);
+    remove_birthdays_from_historical_archive(&mut old);
     for table in ["event_voice_channels", "event_voice_presence"] {
         let rows = old.buffers.remove(table).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {table}");
@@ -1740,12 +1854,20 @@ async fn v12_archive_restores_and_clears_newer_event_voice() {
     assert_eq!(inspected.manifest.version, 12);
     assert_eq!(
         inspected.manifest.missing_tables(),
-        ["event_voice_channels", "event_voice_presence"]
+        [
+            "event_voice_channels",
+            "event_voice_presence",
+            "birthday_profiles",
+            "birthday_config",
+            "birthday_cheers",
+            "birthday_role_grants"
+        ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
     forget_moderation_history(pool).await;
     let report = restore(pool, &old_path).await.unwrap();
     assert!(report.ok);
+    assert_birthday_tables_empty(pool).await;
     for table in ["event_voice_channels", "event_voice_presence"] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -1769,6 +1891,58 @@ async fn v12_archive_restores_and_clears_newer_event_voice() {
         .await
         .unwrap();
     assert!(members > 0, "older covered data is restored, not discarded");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn frozen_v13_restores_covered_data_and_clears_all_new_birthday_tables() {
+    use std::io::Write as _;
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    seed(pool).await;
+    let directory = ArchiveDirectory::new();
+    let source = directory.path("pre-birthday-v13.ndjson.gz");
+    let mut encoder = new_encoder();
+    encoder
+        .write_all(include_bytes!("fixtures/pre-birthday-v13.ndjson"))
+        .unwrap();
+    std::fs::write(&source, finish_gzip(encoder).unwrap()).unwrap();
+    let old = inspect(&source).expect("frozen v13 reads without birthday tables");
+    assert_eq!(old.manifest.version, 13);
+    assert_eq!(old.manifest.tables.len(), 101);
+    assert_eq!(old.manifest.missing_tables(), BIRTHDAY_TABLES);
+    for table in BIRTHDAY_TABLES {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT count(*) FROM {}",
+            identifier(table)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            count, 2,
+            "restore target must contain newer {table} rows before replacement"
+        );
+    }
+    forget_moderation_history(pool).await;
+    let report = restore(pool, &source)
+        .await
+        .expect("v13 remains restorable");
+    assert!(report.ok);
+    assert_birthday_tables_empty(pool).await;
+    let members: Vec<(String, String)> =
+        sqlx::query_as("SELECT guild_id, member_id FROM members ORDER BY guild_id, member_id")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        members,
+        vec![(
+            "100000000000000001".to_owned(),
+            "100000000000000002".to_owned()
+        )],
+        "v13 covered member data is restored, not discarded"
+    );
     db.close().await.unwrap();
 }
 

@@ -79,6 +79,8 @@ claim. Staging deploys from `main`; production deploys through the manual
   generation fencing, atomic audit and preserved lockdown recovery.
 - [Command registry drift](docs/command-publish.md): dry-run-first
   `two-bot commands diff|publish` and opt-in boot publication for cutover.
+- [Birthdays](docs/birthdays.md): private month/day commands, UTC silent cheers,
+  cosmetic role cycling and inspection-first uncertain-delivery recovery.
 - [Game-activity aggregate report](docs/game-activity-report.md): on-demand
   read-only per-game play/in-voice/session JSON for one guild.
 - [Automod operator guide](docs/automod-operator-guide.md): filter/effect

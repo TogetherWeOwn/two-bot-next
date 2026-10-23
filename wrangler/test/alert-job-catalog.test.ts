@@ -22,6 +22,7 @@ const metricsRs = read("crates/core/src/metrics.rs");
 const websiteJobsRs = read("crates/bot/src/website_jobs.rs");
 const communityJobsRs = read("crates/bot/src/community_jobs.rs");
 const feedJobsRs = read("crates/bot/src/feed_jobs.rs");
+const birthdayJobsRs = read("crates/bot/src/birthday_jobs.rs");
 const selfRoleHandlersRs = read("crates/bot/src/self_role_handlers.rs");
 const memberRuntimeRs = read("crates/bot/src/member_runtime.rs");
 const automodGatewayRs = read("crates/bot/src/automod_gateway.rs");
@@ -111,6 +112,12 @@ function rustCadenceSeconds(): Map<string, number> {
     assert.ok(!out.has(name), `${name} registered twice`);
     out.set(name, ms / 1000);
   }
+  const birthdayNames = directJobNames(birthdayJobsRs, "birthday_jobs.rs");
+  assert.deepEqual(birthdayNames, ["birthdays"], "birthday job producer must remain explicit");
+  const birthdayCadence = /cadence:\s*Duration::from_secs\((\d+)\)/.exec(birthdayJobsRs);
+  assert.ok(birthdayCadence, "birthday_jobs.rs: direct cadence not found");
+  assert.ok(!out.has("birthdays"), "birthdays registered twice");
+  out.set("birthdays", Number(birthdayCadence[1]));
   return out;
 }
 
@@ -196,6 +203,7 @@ const REGISTERED = [...new Set([
   ...directJobNames(selfRoleHandlersRs, "self_role_handlers.rs"),
   ...directJobNames(memberRuntimeRs, "member_runtime.rs"),
   ...directJobNames(automodGatewayRs, "automod_gateway.rs"),
+  ...directJobNames(birthdayJobsRs, "birthday_jobs.rs"),
 ])];
 const real: Catalog = { jobs: JOBS, registered: REGISTERED, rust: RUST, worker: JOB_INTERVAL_SECONDS, ticker: TICKER_COVERED, exempt: UNKNOWN_STALE_JOBS };
 
@@ -203,13 +211,13 @@ test("parses the full Rust job allowlist and every registered cadence", () => {
   assert.deepEqual(JOBS, [
     "invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events",
     "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages",
-    "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "other",
+    "feeds", "birthdays", "self_role_recovery", "member_unban_sweep", "automod_expiry", "other",
   ]);
   // Rust *_INTERVAL_MS / 1000: community_snapshots.rs:45,47, scheduled_events.rs:26,
   // presence.rs:36, community.rs:61, inactivity.rs:27.
   assert.deepEqual(Object.fromEntries(RUST), {
     counter: 60, rank: 600, scheduled_events: 600,
-    presence_probe: 3600, community_scorecard: 60, inactivity: 3600,
+    presence_probe: 3600, community_scorecard: 60, inactivity: 3600, birthdays: 300,
   });
 });
 
@@ -227,7 +235,7 @@ test("feed and self-role producers retain their real cadence and explicit unknow
 });
 
 test("unban sweep and automod expiry producers retain their real cadence and explicit unknown-stale entries", () => {
-  assert.deepEqual(REGISTERED, ["feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry"]);
+  assert.deepEqual(REGISTERED, ["feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "birthdays"]);
   assert.match(memberRuntimeRs, /UNBAN_SWEEP_INTERVAL_SECONDS/);
   assert.match(memberRuntimeRs, /Job\s*\{\s*name:\s*NAMES\[0\],\s*cadence,/);
   assert.match(automodGatewayRs, /const EXPIRY_CADENCE: Duration = Duration::from_secs\(60\);/);
@@ -240,7 +248,7 @@ test("unban sweep and automod expiry producers retain their real cadence and exp
 });
 
 test("a registered direct producer absent from JOBS fails the catalog", () => {
-  for (const [source, file] of [[feedJobsRs, "feed_jobs.rs"], [selfRoleHandlersRs, "self_role_handlers.rs"], [memberRuntimeRs, "member_runtime.rs"], [automodGatewayRs, "automod_gateway.rs"]]) {
+  for (const [source, file] of [[feedJobsRs, "feed_jobs.rs"], [selfRoleHandlersRs, "self_role_handlers.rs"], [memberRuntimeRs, "member_runtime.rs"], [automodGatewayRs, "automod_gateway.rs"], [birthdayJobsRs, "birthday_jobs.rs"]]) {
     const mutated = source + '\nfn fixture() -> Job { Job { name: "fake_producer", cadence: Duration::from_secs(30), } }';
     const registered = directJobNames(mutated, file!);
     assert.ok(registered.includes("fake_producer"), "fixture did not inject a registered producer");
@@ -295,6 +303,20 @@ test("a cadence drift on either side fails the catalog", () => {
   const { counter: _, ...withoutCounter } = JOB_INTERVAL_SECONDS;
   assert.deepEqual(catalogGaps({ ...real, worker: withoutCounter }), [
     "counter: no JOB_INTERVAL_SECONDS cadence, no ticker_stale coverage and no unknown-stale entry, so only the coarse fallback ticket covers it",
+  ]);
+});
+
+test("birthday producer and Worker retain the five-minute recovery cadence", () => {
+  assert.ok(REGISTERED.includes("birthdays"));
+  assert.equal(RUST.get("birthdays"), 300);
+  assert.equal(JOB_INTERVAL_SECONDS.birthdays, 300);
+  assert.ok(!UNKNOWN_STALE_JOBS.has("birthdays"));
+  assert.ok(!TICKER_STALE_JOBS.includes("birthdays"));
+  assert.deepEqual(catalogGaps({ ...real, worker: { ...JOB_INTERVAL_SECONDS, birthdays: 60 } }), [
+    "birthdays: JOB_INTERVAL_SECONDS 60s != Rust 300s",
+  ]);
+  assert.deepEqual(catalogGaps({ ...real, rust: new Map([...RUST, ["birthdays", 600]]) }), [
+    "birthdays: JOB_INTERVAL_SECONDS 300s != Rust 600s",
   ]);
 });
 

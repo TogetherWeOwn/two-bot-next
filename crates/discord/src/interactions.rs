@@ -83,7 +83,11 @@ pub fn route_interaction(
             };
             RoutedInteraction::Slash {
                 name: data.name.clone(),
-                outcome: router.route_slash(&ctx),
+                outcome: if data.name == "birthday" {
+                    router.route_birthday(&ctx, data.options.iter().any(|o| o.name == "config"))
+                } else {
+                    router.route_slash(&ctx)
+                },
             }
         }
         (InteractionType::MessageComponent, Some(InteractionData::MessageComponent(data))) => {

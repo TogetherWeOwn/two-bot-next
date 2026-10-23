@@ -803,9 +803,9 @@ async fn user_deletion_with_unresolved_guard_stays_pending_without_receipt() {
     db.close().await.unwrap();
 }
 
-/// A departed guild's purge covers every plan table (including `event_store`)
-/// while the other guild is untouched, and a pending deletion for the
-/// departed guild completes with a receipt instead of vanishing.
+/// A departed guild's purge waits for unrelated-member birthday recovery,
+/// then covers every plan table (including `event_store`) while the other
+/// guild is untouched. A pending deletion completes with a durable receipt.
 #[tokio::test]
 async fn guild_purge_covers_every_plan_table_and_preserves_receipts() {
     let Some(db) = database().await else { return };
@@ -838,7 +838,22 @@ async fn guild_purge_covers_every_plan_table_and_preserves_receipts() {
     // Snapshot the surviving guild's per-table counts before the purge.
     let plan = two_bot_cutover::member_erasure::plan();
     let mut other_before: Vec<(String, i64)> = Vec::new();
+    let mut guarded_survivors: Vec<(String, Vec<String>)> = Vec::new();
     for entry in &plan.tables {
+        if entry.table != "retention_deletion_requests" {
+            // The pending deletion may erase its target, but neither the
+            // guarded guild's other member nor the surviving guild may change.
+            let rows = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT to_jsonb({})::text FROM {} WHERE NOT COALESCE(({}), false) ORDER BY to_jsonb({})::text",
+                entry.table, entry.table, entry.predicate, entry.table
+            )))
+            .bind(FIX_GONE)
+            .bind(FIX_USER)
+            .fetch_all(pool)
+            .await
+            .unwrap();
+            guarded_survivors.push((entry.table.clone(), rows));
+        }
         let guild_count: i64 = if entry.table == "lfg_signups" || entry.table == "lfg_roles" {
             sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT count(*) FROM {} WHERE lfg_id IN (SELECT id FROM lfg_posts WHERE guild_id = $1)",
@@ -903,9 +918,62 @@ async fn guild_purge_covers_every_plan_table_and_preserves_receipts() {
         report.deletions_completed, 1,
         "the departed guild's pending deletion must complete, not vanish, got {report:?}"
     );
-    assert!(
-        report.guild_rows_purged > 0,
-        "the purge must delete rows, got {report:?}"
+    assert_eq!(
+        (
+            report.guild_rows_purged,
+            report.guild_purges_deferred,
+            report.guild_purges_failed
+        ),
+        (0, 1, 0),
+        "the other member's birthday role intent must defer the guild purge, got {report:?}"
+    );
+    for (entry, (table, expected)) in plan
+        .tables
+        .iter()
+        .filter(|entry| entry.table != "retention_deletion_requests")
+        .zip(&guarded_survivors)
+    {
+        let rows: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT to_jsonb({})::text FROM {} WHERE NOT COALESCE(({}), false) ORDER BY to_jsonb({})::text",
+            entry.table, entry.table, entry.predicate, entry.table
+        )))
+        .bind(FIX_GONE)
+        .bind(FIX_USER)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            &rows, expected,
+            "guarded purge must preserve unrelated rows in {table}"
+        );
+    }
+    let queued: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM retention_guild_purge_queue WHERE guild_id = $1")
+            .bind(FIX_GONE)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(queued, 1, "the guarded guild must stay queued");
+    let role_members: Vec<String> = sqlx::query_scalar(
+        "SELECT member_id FROM birthday_role_grants WHERE guild_id = $1 ORDER BY member_id",
+    )
+    .bind(FIX_GONE)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        role_members,
+        vec![FIX_USER_2.to_owned()],
+        "the unrelated member's recovery intent must survive"
+    );
+    assert_eq!(
+        count(
+            pool,
+            "SELECT count(*) FROM presence_probe WHERE guild_id = '1545644954272137297'"
+        )
+        .await,
+        1,
+        "the guarded guild's fresh probe must survive"
     );
     let receipted: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM retention_deletion_requests WHERE request_id = $1 AND status = 'completed'",
@@ -917,6 +985,50 @@ async fn guild_purge_covers_every_plan_table_and_preserves_receipts() {
     assert_eq!(
         receipted, 1,
         "the pending request for the departed guild must have a receipt"
+    );
+    let receipt_before: String = sqlx::query_scalar(
+        "SELECT to_jsonb(retention_deletion_requests)::text FROM retention_deletion_requests WHERE request_id = $1",
+    )
+    .bind(&request_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+
+    // Simulate completed role reconciliation for this departed guild only.
+    // Keep the shared fixture's other-guild recovery coverage intact.
+    let reconciled = sqlx::query("DELETE FROM birthday_role_grants WHERE guild_id = $1")
+        .bind(FIX_GONE)
+        .execute(pool)
+        .await
+        .unwrap();
+    assert_eq!(reconciled.rows_affected(), 1);
+    let report: RetentionReport = run_retention(pool, RetentionMode::Execute).await.unwrap();
+    assert!(
+        report.guild_rows_purged > 0,
+        "the purge must delete rows, got {report:?}"
+    );
+    assert_eq!(
+        (report.deletions_completed, report.guild_purges_deferred, report.guild_purges_failed),
+        (0, 0, 0),
+        "reconciliation must release the purge without completing the deletion twice, got {report:?}"
+    );
+    let queued: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM retention_guild_purge_queue WHERE guild_id = $1")
+            .bind(FIX_GONE)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(queued, 0, "the settled guild must dequeue");
+    let receipt_after: String = sqlx::query_scalar(
+        "SELECT to_jsonb(retention_deletion_requests)::text FROM retention_deletion_requests WHERE request_id = $1",
+    )
+    .bind(&request_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        receipt_after, receipt_before,
+        "the completed receipt must survive unchanged"
     );
     // Every plan table except the ledger must hold zero rows for the gone guild.
     for entry in &plan.tables {

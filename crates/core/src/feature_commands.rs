@@ -185,6 +185,59 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
 #[must_use]
 pub fn announcement_commands() -> Vec<CommandDefinition> {
     vec![
+        CommandDefinition::new(
+            "birthday",
+            "Set, show or remove your birthday (month/day only; UTC).",
+        )
+        .options(vec![
+            CommandOption::new(
+                "set",
+                "Save your month and day, never a year.",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![
+                CommandOption::new("month", "Month (1–12)", CommandOptionType::Integer)
+                    .required()
+                    .int_range(1, 12),
+                CommandOption::new("day", "Day (1–31)", CommandOptionType::Integer)
+                    .required()
+                    .int_range(1, 31),
+            ]),
+            CommandOption::new(
+                "remove",
+                "Delete your birthday.",
+                CommandOptionType::SubCommand,
+            ),
+            CommandOption::new(
+                "show",
+                "Show only your own birthday.",
+                CommandOptionType::SubCommand,
+            ),
+            CommandOption::new(
+                "config",
+                "Configure silent cheers and a cosmetic role (Manage Server).",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![
+                CommandOption::new(
+                    "channel",
+                    "Birthday text channel in this server",
+                    CommandOptionType::Channel,
+                )
+                .channel_types(vec![0, 5]),
+                CommandOption::new(
+                    "role",
+                    "Cosmetic birthday role (no permissions or channel grants)",
+                    CommandOptionType::Role,
+                ),
+                CommandOption::new(
+                    "cheer",
+                    "Mention-safe cheer; {user} names the celebrant without pinging",
+                    CommandOptionType::String,
+                )
+                .max_length(200),
+            ]),
+        ]),
         CommandDefinition::new("rsvp", "RSVP to a Discord scheduled event").options(vec![
             CommandOption::new(
                 "event-id",
@@ -426,6 +479,7 @@ mod tests {
                 "schedule-list",
                 "sticky",
                 "sticky-remove",
+                "birthday",
                 "rsvp",
                 "rsvp-attendance",
                 "lfg",
@@ -440,8 +494,8 @@ mod tests {
     #[test]
     fn no_collision_with_leveling_core_or_within_slice() {
         let merged = merge_commands(&[feature_commands()], &[]).expect("slice 2 merges cleanly");
-        // 4 core + 1 scorecard + 8 automation + 7 announcement.
-        assert_eq!(merged.len(), 20);
+        // 4 core + 1 scorecard + 8 automation + 8 announcement.
+        assert_eq!(merged.len(), 21);
         assert_eq!(
             &names(&merged)[..5],
             ["rank", "leaderboard", "help", "privacy", "attendance"]
@@ -692,9 +746,9 @@ mod tests {
         assert_eq!(json[0]["default_member_permissions"], "8589934592");
         assert_eq!(json[0]["options"][0]["name"], "event-occurrence");
         assert_eq!(json[0]["options"][0]["max_length"], 128);
-        assert_eq!(json[10]["name"], "rsvp-attendance");
-        assert!(json[10].get("default_member_permissions").is_none());
-        assert_eq!(json[10]["options"][0]["name"], "event-id");
+        assert_eq!(json[11]["name"], "rsvp-attendance");
+        assert!(json[11].get("default_member_permissions").is_none());
+        assert_eq!(json[11]["options"][0]["name"], "event-id");
     }
 
     #[test]

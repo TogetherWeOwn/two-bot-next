@@ -20,7 +20,7 @@ Bounds below are registry bounds; a dash means no bound is declared there,
 not that handler validation is unlimited. Permissions are Discord default
 member-permission bitfields, not a replacement for runtime authorization.
 
-Built-in commands: 50.
+Built-in commands: 51.
 
 ## `/access`
 
@@ -79,6 +79,25 @@ Ban a member
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `target` | user | true | — | — | — | — | Member to moderate |
 | `reason` | string | true | — | — | 512 | — | Mandatory audit reason |
+
+## `/birthday`
+
+Set, show or remove your birthday (month/day only; UTC).
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `set` | subcommand | false | — | — | — | — | Save your month and day, never a year. |
+| `set month` | integer | true | 1 | 12 | — | — | Month (1–12) |
+| `set day` | integer | true | 1 | 31 | — | — | Day (1–31) |
+| `remove` | subcommand | false | — | — | — | — | Delete your birthday. |
+| `show` | subcommand | false | — | — | — | — | Show only your own birthday. |
+| `config` | subcommand | false | — | — | — | — | Configure silent cheers and a cosmetic role (Manage Server). |
+| `config channel` | channel | false | — | — | — | — | Birthday text channel in this server |
+| `config role` | role | false | — | — | — | — | Cosmetic birthday role (no permissions or channel grants) |
+| `config cheer` | string | false | — | — | 200 | — | Mention-safe cheer; {user} names the celebrant without pinging |
 
 ## `/command`
 

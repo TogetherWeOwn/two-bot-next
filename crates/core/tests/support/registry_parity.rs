@@ -37,6 +37,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("feed-list", "docs/parity.md §1 #30 page"),
     ("privacy", "docs/parity.md §1 privacy"),
     ("command-list", "docs/parity.md §1 #16 page"),
+    ("birthday", "docs/parity.md §1 birthday"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -230,6 +231,65 @@ pub fn expected_registry() -> Value {
     )
     .expect("privacy serializes");
     commands.insert(3, privacy);
+    // Next-only birthday definition: pin its entire body, not just the name.
+    // The frozen legacy snapshot remains untouched.
+    let birthday = serde_json::to_value(
+        CommandDefinition::new(
+            "birthday",
+            "Set, show or remove your birthday (month/day only; UTC).",
+        )
+        .options(vec![
+            CommandOption::new(
+                "set",
+                "Save your month and day, never a year.",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![
+                CommandOption::new("month", "Month (1–12)", CommandOptionType::Integer)
+                    .required()
+                    .int_range(1, 12),
+                CommandOption::new("day", "Day (1–31)", CommandOptionType::Integer)
+                    .required()
+                    .int_range(1, 31),
+            ]),
+            CommandOption::new(
+                "remove",
+                "Delete your birthday.",
+                CommandOptionType::SubCommand,
+            ),
+            CommandOption::new(
+                "show",
+                "Show only your own birthday.",
+                CommandOptionType::SubCommand,
+            ),
+            CommandOption::new(
+                "config",
+                "Configure silent cheers and a cosmetic role (Manage Server).",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![
+                CommandOption::new(
+                    "channel",
+                    "Birthday text channel in this server",
+                    CommandOptionType::Channel,
+                )
+                .channel_types(vec![0, 5]),
+                CommandOption::new(
+                    "role",
+                    "Cosmetic birthday role (no permissions or channel grants)",
+                    CommandOptionType::Role,
+                ),
+                CommandOption::new(
+                    "cheer",
+                    "Mention-safe cheer; {user} names the celebrant without pinging",
+                    CommandOptionType::String,
+                )
+                .max_length(200),
+            ]),
+        ]),
+    )
+    .expect("birthday serializes");
+    commands.insert(13, birthday);
     // Picker-copy exceptions (registry golden exceptions table): command and
     // option descriptions intentionally differ from legacy. Pointers mirror
     // the published option order.

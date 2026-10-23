@@ -1288,6 +1288,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "leaderboard"
                         | "help"
                         | "privacy"
+                        | "birthday"
                 )
             })
             .collect();
@@ -1295,6 +1296,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
         assert!(!unwired.contains(&"leaderboard"));
         assert!(!unwired.contains(&"help"));
         assert!(!unwired.contains(&"privacy"));
+        assert!(!unwired.contains(&"birthday"));
         if router_gates.announcements {
             assert!(unwired.contains(&"rsvp"), "enabled unwired announcement");
         }

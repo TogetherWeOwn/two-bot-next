@@ -84,6 +84,22 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "automod_processed_messages", measure: TableMeasure::Columns(&["processed_at"]) },
     TableSpec { table: "automod_violations", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "backfill_cursors", measure: TableMeasure::Columns(&["updated_at"]) },
+    TableSpec {
+        table: "birthday_profiles",
+        measure: TableMeasure::Unmeasurable("private month/day rows have no write timestamp; preserve opt-ins during rollback", DISPOSITION_MANUAL_RECONCILE_REQUIRED),
+    },
+    TableSpec {
+        table: "birthday_config",
+        measure: TableMeasure::Unmeasurable("guild birthday settings have no write timestamp; preserve configuration during rollback", DISPOSITION_MANUAL_RECONCILE_REQUIRED),
+    },
+    TableSpec {
+        table: "birthday_cheers",
+        measure: TableMeasure::Unmeasurable("celebration_date is not a write timestamp; preserve pre-wire fences to prevent duplicate cheers", DISPOSITION_MANUAL_RECONCILE_REQUIRED),
+    },
+    TableSpec {
+        table: "birthday_role_grants",
+        measure: TableMeasure::Unmeasurable("celebration_date is not a write timestamp; reconcile tracked Discord roles before rollback", DISPOSITION_MANUAL_RECONCILE_REQUIRED),
+    },
     // History rows may be inserted long after their Discord send time during
     // catch-up; sent_at is source time, not the row's write time.
     TableSpec {

@@ -40,6 +40,12 @@ const EXPECTED_DISPOSITIONS: &[(&str, &str)] = &[
     // Catch-up inserts are invisible after the fact; no alternate measured
     // evidence is named for the window.
     ("backfill_history_messages", MANUAL_RECONCILE_REQUIRED),
+    // Birthday state has no write timestamp; celebration dates cannot measure
+    // changes in the rollback window.
+    ("birthday_profiles", MANUAL_RECONCILE_REQUIRED),
+    ("birthday_config", MANUAL_RECONCILE_REQUIRED),
+    ("birthday_cheers", MANUAL_RECONCILE_REQUIRED),
+    ("birthday_role_grants", MANUAL_RECONCILE_REQUIRED),
     // A completed week is visible via community_scorecard_runs.generated_at.
     ("community_scorecard_attempts", ACCEPT_WITH_REASON),
     // Transient restart-recovery queue; rows hold no durable member state.

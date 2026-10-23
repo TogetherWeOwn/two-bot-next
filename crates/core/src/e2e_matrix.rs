@@ -122,7 +122,7 @@ const fn row(
 //   staff protection, bot hierarchy, actor hierarchy, in that order.
 // - `Valid:<FIELD>:<BOUNDS>` — option validation before any side effect.
 
-/// The 29-row contract in publish order (core, scorecard, automation,
+/// The 30-row contract in publish order (core, scorecard, automation,
 /// announcement, moderation). The coverage test asserts this is exactly the
 /// all-gates-on [`crate::router::InteractionRouter::publish_set`].
 #[must_use]
@@ -289,6 +289,22 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             "AutomationAdmin",
             "Ephemeral confirmation after removal plus audit row.",
             &["Gate:AutomationsDisabled", "Perm:ManageServerRequired"],
+        ),
+        row(
+            "birthday",
+            33,
+            E2eGate::Announcements,
+            0,
+            "Everyone",
+            "Birthday",
+            "Immediate ephemeral month/day-only set/show/remove; Manage Server config merges safe channel/role/cheer. UTC sweep fences daily silent cheers and cycles cosmetic roles.",
+            &[
+                "Gate:AnnouncementsDisabled",
+                "Perm:ManageServerRequired:config",
+                "Valid:date:month1-12,calendar-day,no-year",
+                "Valid:show:own-only,no-options",
+                "Valid:config:same-guild-channel,cosmetic-role,mention-safe-cheer-max200",
+            ],
         ),
         row(
             "rsvp",

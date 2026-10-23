@@ -13,6 +13,7 @@ two_bot_job_last_success_timestamp_seconds{job="inactivity"} 0
 two_bot_job_last_success_timestamp_seconds{job="audit_retry"} 0
 two_bot_job_last_success_timestamp_seconds{job="scheduled_messages"} 0
 two_bot_job_last_success_timestamp_seconds{job="feeds"} 0
+two_bot_job_last_success_timestamp_seconds{job="birthdays"} 0
 two_bot_job_last_success_timestamp_seconds{job="self_role_recovery"} 0
 two_bot_job_last_success_timestamp_seconds{job="member_unban_sweep"} 0
 two_bot_job_last_success_timestamp_seconds{job="automod_expiry"} 0
@@ -29,6 +30,7 @@ two_bot_job_consecutive_failures{job="inactivity"} 0
 two_bot_job_consecutive_failures{job="audit_retry"} 0
 two_bot_job_consecutive_failures{job="scheduled_messages"} 0
 two_bot_job_consecutive_failures{job="feeds"} 0
+two_bot_job_consecutive_failures{job="birthdays"} 0
 two_bot_job_consecutive_failures{job="self_role_recovery"} 0
 two_bot_job_consecutive_failures{job="member_unban_sweep"} 0
 two_bot_job_consecutive_failures{job="automod_expiry"} 0
@@ -404,6 +406,8 @@ two_bot_job_runs_total{job="scheduled_messages",outcome="success"} 0
 two_bot_job_runs_total{job="scheduled_messages",outcome="failure"} 0
 two_bot_job_runs_total{job="feeds",outcome="success"} 0
 two_bot_job_runs_total{job="feeds",outcome="failure"} 0
+two_bot_job_runs_total{job="birthdays",outcome="success"} 0
+two_bot_job_runs_total{job="birthdays",outcome="failure"} 0
 two_bot_job_runs_total{job="self_role_recovery",outcome="success"} 0
 two_bot_job_runs_total{job="self_role_recovery",outcome="failure"} 0
 two_bot_job_runs_total{job="member_unban_sweep",outcome="success"} 0

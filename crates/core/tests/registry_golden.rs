@@ -68,6 +68,15 @@ fn diff_detects_each_kind_of_unlisted_drift_including_exception_bodies() {
         ("timeout", "/options/1/min_value", json!(59)),
         ("timeout", "/options/1/max_value", json!(2_419_201)),
         ("timeout", "/options/1/max_value", Value::Null),
+        ("birthday", "/default_member_permissions", json!("32")),
+        ("birthday", "/options/0/options/0/max_value", json!(13)),
+        ("birthday", "/options/0/options/1/max_value", json!(32)),
+        ("birthday", "/options/3/options/2/max_length", json!(201)),
+        (
+            "birthday",
+            "/options/2/description",
+            json!("Show another member birthday."),
+        ),
         ("rank", "/options/0/name", json!("target")),
         ("rank", "/options/0/type", json!(3)),
         ("rank", "/options/0/required", json!(true)),
@@ -104,6 +113,8 @@ fn diff_detects_each_kind_of_unlisted_drift_including_exception_bodies() {
             .unwrap();
         if pointer == "/dm_permission" {
             command["dm_permission"] = replacement;
+        } else if pointer == "/default_member_permissions" {
+            command["default_member_permissions"] = replacement;
         } else {
             *command.pointer_mut(pointer).expect("mutation field exists") = replacement;
         }

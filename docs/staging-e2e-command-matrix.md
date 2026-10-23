@@ -9,7 +9,7 @@ the harness slices define HOW it runs. Derived from code, not from a guild:
 The `e2e_matrix_coverage` integration test fails when a command ships without
 a matrix row and when this doc drops one.
 
-Scope: 29 built-in slash commands (core + scorecard + automation +
+Scope: 30 built-in slash commands (core + scorecard + automation +
 announcement + moderation — the commands `docs/commands.md` renders ahead of
 the voice set; with the voice gates on it renders 51). No guild was
 touched, no staging secrets used, no credentials created.
@@ -45,6 +45,7 @@ guild.`), all other builtins stay silent (`Ignore`); stale or unknown names
 | 19 | `/schedule-list` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral schedule list | `AutomationsDisabled`, `ManageServerRequired` |
 | 20 | `/sticky` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral defer then confirmation + audit row | `AutomationsDisabled`, `ManageServerRequired`, `body` required, `debounce` 1–300 |
 | 21 | `/sticky-remove` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral confirmation + audit row | `AutomationsDisabled`, `ManageServerRequired` |
+| 33 | `/birthday` | `TWO_ANNOUNCEMENTS` | Everyone; ManageGuild for config | Immediate ephemeral month/day set/show/remove; UTC silent cheer and cosmetic role cycle | `AnnouncementsDisabled`, config `ManageServerRequired`, invalid/year/target options refused, safe same-guild targets and mention-safe cheer ≤200 |
 | 24 | `/rsvp` | `TWO_ANNOUNCEMENTS` | Everyone | Ephemeral `RSVP saved: <status>.` | `AnnouncementsDisabled`, `event-id` required, `status` going/interested/declined |
 | 25 | `/rsvp-attendance` | `TWO_ANNOUNCEMENTS` | Everyone | Ephemeral RSVP totals | `AnnouncementsDisabled`, `event-id` required |
 | 26 | `/lfg` | `TWO_ANNOUNCEMENTS` | ManageEvents | Ephemeral signup post + audit row | `AnnouncementsDisabled`, `ManageEventsRequired`, `title`/`starts-at`/`roles` required |
@@ -69,7 +70,7 @@ UTF-16 units on every moderation row.
 
 ## Voice slice: vote-kick, setup/import (CI-proven handlers; staging round-trip UNPROVEN)
 
-The `TWO_VOICE` slice stays out of the live 29-row suite above. Its handlers
+The `TWO_VOICE` slice stays out of the live 30-row suite above. Its handlers
 are proven deterministically in CI with constructed interaction inputs and no
 guild, network, or database. The user-originated staging round-trip is
 UNPROVEN: a bot token cannot invoke slash commands or click components, so no
