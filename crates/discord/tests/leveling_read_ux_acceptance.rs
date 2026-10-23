@@ -291,7 +291,7 @@ fn plain(text: &str) -> String {
 fn assert_page_label(content: &str, page: u64, total: u64) {
     let text = plain(content);
     assert!(
-        text.contains(SEASON),
+        content.contains(SEASON),
         "season label survives navigation: {content}"
     );
     assert!(
