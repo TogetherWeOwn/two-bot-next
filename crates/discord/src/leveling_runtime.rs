@@ -12,9 +12,7 @@ use twilight_model::{
     application::interaction::{
         application_command::CommandOptionValue, Interaction, InteractionData,
     },
-    channel::message::{AllowedMentions, MessageFlags},
     gateway::event::Event,
-    http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
 };
 use two_bot_core::{
     classify,
@@ -548,6 +546,26 @@ impl FactsSink for DeferredCommunityFacts {
     }
 }
 
+/// Sanitized completion for an acknowledged `/rank` store failure: bounded,
+/// actionable, leaking no store detail. Mirrors the repo's "; try again."
+/// recovery convention; the store error still propagates for the caller's log.
+const RANK_UNAVAILABLE_REPLY: &str = "Rank is unavailable right now; try again.";
+/// Sanitized completion for an acknowledged `/leaderboard` store failure:
+/// same shape as [`RANK_UNAVAILABLE_REPLY`].
+const LEADERBOARD_UNAVAILABLE_REPLY: &str = "Leaderboard is unavailable right now; try again.";
+
+/// Validated store read awaiting its acknowledgement: built from the
+/// interaction alone (no store touch) so the defer can precede the read.
+enum PendingRead {
+    Rank {
+        member_id: String,
+        display_name: String,
+    },
+    Leaderboard {
+        season: String,
+    },
+}
+
 /// Award/reply slice of the shared command runtime; no private router or client.
 #[derive(Clone)]
 pub struct LevelingRuntime {
@@ -666,6 +684,17 @@ impl LevelingRuntime {
     /// fallback. `/rank` stays lifetime-based at every instant. Shaped like
     /// the pipeline's existing `handle_at` ISO-millis convention; the season
     /// convention itself is unchanged.
+    ///
+    /// Defer-then-edit lifecycle: the initial acknowledgement (ephemeral for
+    /// rank, public for leaderboard) precedes either store read, so a slow
+    /// database cannot exhaust Discord's initial-response deadline. A failed
+    /// or uncertain acknowledgement returns here with zero store reads and no
+    /// further sends — only provably pre-wire Blocked contention is retried
+    /// inside the executor, and that retry cannot double-acknowledge. A
+    /// successful acknowledgement is completed by exactly one original-response
+    /// edit: the rendered reply on success, one sanitized actionable
+    /// unavailable reply on store failure (the store error still propagates
+    /// so the caller logs the real cause). Never a second initial callback.
     pub async fn handle_interaction_at(
         &self,
         interaction: &Interaction,
@@ -682,7 +711,10 @@ impl LevelingRuntime {
             .ok_or(LevelingRuntimeError::InvalidInteraction)?
             .get()
             .to_string();
-        let response = match handler {
+        // Pure validation before the acknowledgement: resolving the rank
+        // target and the leaderboard season touches no store.
+        let ephemeral = matches!(handler, HandlerId::Rank);
+        let read = match handler {
             HandlerId::Rank => {
                 let Some(InteractionData::ApplicationCommand(data)) = interaction.data.as_ref()
                 else {
@@ -701,37 +733,16 @@ impl LevelingRuntime {
                         .or(interaction.user.as_ref())
                 }
                 .ok_or(LevelingRuntimeError::InvalidInteraction)?;
-                let profile =
-                    leveling_store::profile(&self.pool, &guild, &user.id.get().to_string()).await?;
-                let reply = rank_reply(&profile, user.global_name.as_deref().unwrap_or(&user.name));
-                InteractionResponse {
-                    kind: InteractionResponseType::ChannelMessageWithSource,
-                    data: Some(InteractionResponseData {
-                        content: Some(reply.content),
-                        flags: Some(MessageFlags::EPHEMERAL),
-                        ..Default::default()
-                    }),
+                PendingRead::Rank {
+                    member_id: user.id.get().to_string(),
+                    display_name: user.global_name.as_deref().unwrap_or(&user.name).to_owned(),
                 }
             }
             HandlerId::Leaderboard => {
                 let at_ms = two_bot_core::parse_iso_millis(at)
                     .ok_or(LevelingRuntimeError::InvalidInteraction)?;
-                let season = season_id_for_ms(at_ms);
-                let entries = leveling_store::seasonal_leaderboard(
-                    &self.pool,
-                    &guild,
-                    &season,
-                    LEADERBOARD_DEFAULT_LIMIT,
-                )
-                .await?;
-                let reply = leaderboard_reply_for_season(&entries, &season);
-                InteractionResponse {
-                    kind: InteractionResponseType::ChannelMessageWithSource,
-                    data: Some(InteractionResponseData {
-                        content: Some(reply.content),
-                        allowed_mentions: Some(AllowedMentions::default()),
-                        ..Default::default()
-                    }),
+                PendingRead::Leaderboard {
+                    season: season_id_for_ms(at_ms),
                 }
             }
             _ => unreachable!(),
@@ -740,10 +751,59 @@ impl LevelingRuntime {
             .answer_interaction_with_blocked_retry(
                 interaction.id.get(),
                 &interaction.token,
-                &response,
+                &super::interactions::deferred_response(ephemeral),
             )
             .await?;
-        Ok(true)
+        let content = match read {
+            PendingRead::Rank {
+                member_id,
+                display_name,
+            } => leveling_store::profile(&self.pool, &guild, &member_id)
+                .await
+                .map(|profile| rank_reply(&profile, &display_name).content),
+            PendingRead::Leaderboard { season } => leveling_store::seasonal_leaderboard(
+                &self.pool,
+                &guild,
+                &season,
+                LEADERBOARD_DEFAULT_LIMIT,
+            )
+            .await
+            .map(|entries| leaderboard_reply_for_season(&entries, &season).content),
+        };
+        let application_id = interaction.application_id.get();
+        match content {
+            Ok(content) => {
+                self.executor
+                    .edit_interaction_response_with_blocked_retry(
+                        application_id,
+                        &interaction.token,
+                        &content,
+                    )
+                    .await?;
+                Ok(true)
+            }
+            Err(store) => {
+                let unavailable = if ephemeral {
+                    RANK_UNAVAILABLE_REPLY
+                } else {
+                    LEADERBOARD_UNAVAILABLE_REPLY
+                };
+                // Best-effort completion: attempt the edit, then report the
+                // store failure regardless. The store error is the root cause
+                // the caller must log; a simultaneous edit failure must not
+                // hide it (same precedence as the channel slice's
+                // Persistence-over-Edit return).
+                let _edit = self
+                    .executor
+                    .edit_interaction_response_with_blocked_retry(
+                        application_id,
+                        &interaction.token,
+                        unavailable,
+                    )
+                    .await;
+                Err(LevelingRuntimeError::Store(store))
+            }
+        }
     }
 }
 
