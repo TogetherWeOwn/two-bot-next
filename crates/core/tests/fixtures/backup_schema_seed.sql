@@ -113,7 +113,7 @@ VALUES ('100000000000000001', '100000000000000003', E'Backup sticky | NULL\n雪 
         17, FALSE, '100000000000000006', '2026-08-01T10:00:00.123456Z',
         '100000000000000002', '2026-08-01T09:00:00Z', '100000000000000004',
         '2026-08-01T10:00:00Z', 'backup-sticky-claim', '2026-08-01T10:00:01Z');
--- AFK member status (0458, v14): one away member with a note plus one noteless
+-- AFK member status (0460, v15): one away member with a note plus one noteless
 -- row, covering both note shapes through dump and restore.
 INSERT INTO afk_status (guild_id, user_id, note, set_at)
 VALUES ('100000000000000001', '100000000000000002', E'Backup away | NULL\n雪 "quote"', '2026-08-01T10:00:00Z'),
@@ -677,3 +677,24 @@ VALUES ('GUILD_SCHEDULED_EVENT_CREATE', '100000000000000001',
         '100000000000000033', '100000000000000065', 1, 2,
         '2026-08-03T10:00:00Z', '2026-08-03T10:00:01Z',
         'GUILD_SCHEDULED_EVENT_CREATE:100000000000000001:100000000000000065:2026-08-03T10:00:00Z');
+-- Starboard foundation (v11): one configured guild plus one default/off guild;
+-- two starrers on one message and one on another; one posted board row plus
+-- one pending (NULL board message) below-threshold row. BIGINT snowflakes, so
+-- the roundtrip asserts archive coverage with numeric ids, not an empty seed.
+INSERT INTO starboard_config
+    (guild_id, board_channel_id, threshold, emoji, excluded_channel_ids, updated_by)
+VALUES (100000000000000001, 100000000000000010, 5, '🌟',
+        ARRAY[100000000000000003]::bigint[], 'backup-operator'),
+       (100000000000000002, NULL, 3, '⭐', '{}'::bigint[], NULL);
+INSERT INTO starboard_starrers
+    (guild_id, source_channel_id, source_message_id, user_id)
+VALUES (100000000000000001, 100000000000000003, 100000000000000006, 100000000000000002),
+       (100000000000000001, 100000000000000003, 100000000000000006, 100000000000000004),
+       (100000000000000001, 100000000000000003, 100000000000000007, 100000000000000002);
+INSERT INTO starboard_posts
+    (guild_id, source_channel_id, source_message_id, board_channel_id,
+     board_message_id, star_count, state)
+VALUES (100000000000000001, 100000000000000003, 100000000000000006,
+        100000000000000010, 100000000000000020, 2, 'posted'),
+       (100000000000000001, 100000000000000003, 100000000000000007,
+        100000000000000010, NULL, 1, 'below_threshold');

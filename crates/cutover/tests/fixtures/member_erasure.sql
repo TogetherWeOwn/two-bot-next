@@ -166,6 +166,15 @@ BEGIN
         VALUES (g, 'v-' || k, u, 'fixture-owner-revision', TRUE);
       INSERT INTO voice_logging_mention_members (guild_id, member_id) VALUES (g, u);
       INSERT INTO member_catchup_members (guild_id, member_id) VALUES (g, u);
+      -- Starboard starrers are BIGINT snowflakes (one row per guild/message/user
+      -- here, like every other member table): four rows total, one matching the
+      -- erasure target, three survivors. The erasure predicate is
+      -- guild_id = $1::bigint AND user_id = $2::bigint (cast the retained text
+      -- binds, never the indexed columns); config.updated_by stays a
+      -- retained-attribution allowlist and posts carry no member column.
+      INSERT INTO starboard_starrers
+        (guild_id, source_channel_id, source_message_id, user_id)
+        VALUES (g::bigint, 155000000000000001, 156000000000000001, u::bigint);
       INSERT INTO voice_vote_kick_audit
         (guild_id, vote_id, event, room_id, initiator_id, target_id, outcome, occurred_at)
         VALUES (g, 'vk-' || k, 'vote_started', 'v-' || k, u, u, 'started', '2026-10-01T00:00:00Z');

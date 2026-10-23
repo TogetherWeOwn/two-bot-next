@@ -69,7 +69,7 @@ pub struct TableSpec {
 /// here, and on any entry here that appears in neither list (outside the two
 /// documented feed tables).
 pub const TABLE_SPECS: &[TableSpec] = &[
-    // AFK member status (0458): every set and update rewrites set_at, so its
+    // AFK member status (0460): every set and update rewrites set_at, so its
     // maximum is the row's last write (a clear deletes the row, so only live
     // away states are measurable).
     TableSpec { table: "afk_status", measure: TableMeasure::Columns(&["set_at"]) },
@@ -252,6 +252,9 @@ pub const TABLE_SPECS: &[TableSpec] = &[
         measure: TableMeasure::Columns(&["created_at", "completed_at", "retired_at"]),
     },
     TableSpec { table: "self_role_panel_claims", measure: TableMeasure::Columns(&["processing_expires_at"]) },
+    TableSpec { table: "starboard_config", measure: TableMeasure::Columns(&["updated_at"]) },
+    TableSpec { table: "starboard_starrers", measure: TableMeasure::Columns(&["created_at"]) },
+    TableSpec { table: "starboard_posts", measure: TableMeasure::Columns(&["created_at", "updated_at"]) },
     TableSpec { table: "sticky_messages", measure: TableMeasure::Columns(&["updated_at"]) },
     // Claim/start/stamp/takeover transitions rewrite claimed_at,
     // send_started_at and delivered_at without touching the others, so the

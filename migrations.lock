@@ -1,6 +1,14 @@
 {
   "version": 1,
   "migrations": {
+    "crates/store/migrations/0458_starboard.sql": {
+      "sha256": "ef1013d4b13d1fbdcbfbfc5eeee9dda23bde54e58d6f0472c2d8f32272e0f7fc",
+      "justification": "Add inert starboard configuration, distinct starrers and unique post records to the store chain."
+    },
+    "crates/cutover/migrations/0459_starboard.sql": {
+      "sha256": "ef1013d4b13d1fbdcbfbfc5eeee9dda23bde54e58d6f0472c2d8f32272e0f7fc",
+      "justification": "Mirror the starboard foundation in the deployed cutover migration chain."
+    },
     "crates/cutover/migrations/0001_funnel.sql": {
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes.",
       "sha256": "45d9bc7e665ac79f43e4e43ac6a87fcbeb877c5396fb4dcb5ca3d81a738d5158"
@@ -481,9 +489,9 @@
       "sha256": "622bcbc5cfc2561432290c293e15d30d89997435970088c6e4c01f37e20f962d",
       "justification": "Store-chain mirror of cutover 0456, including the pre-merge 64-lowercase-hex secret_hash CHECK and refusal of NULL guild elements: identical table and index, IF NOT EXISTS, no writes to existing tables. Numbered 0457 because cutover owns 0456; global migration numbers remain unique across both chains. Renumbered before first merge after main claimed 0454; SQL body unchanged."
     },
-    "crates/cutover/migrations/0458_afk_status.sql": {
-      "sha256": "8f2a0dc72b99681014bb98849de697760a5d6acbf971ab5756c4492f8c31eb82",
-      "justification": "AFK status store for /afk with mention replies: new table afk_status(guild_id, user_id, note NULL, set_at TIMESTAMPTZ; PK(guild_id, user_id)), no sequences or secondary indexes. Additive, IF NOT EXISTS, cutover chain only (bot-runtime state like sticky); renumbered before first merge from 0455 to 0458 because main owns 0455 event voice and 0456/0457 admin tokens. Only the filename and number comment changed; no deployed migration history is changed. Rollback drops the table."
+    "crates/cutover/migrations/0460_afk_status.sql": {
+      "sha256": "99be7c0a6610b3a9814691fdd477694b272bcf4e8d2f75766c12bed88f3c26e8",
+      "justification": "AFK status store for /afk with mention replies: new table afk_status(guild_id, user_id, note NULL, set_at TIMESTAMPTZ; PK(guild_id, user_id)), no sequences or secondary indexes. Additive, IF NOT EXISTS, cutover chain only (bot-runtime state like sticky); renumbered before first merge to 0460 because main owns 0455 event voice, 0456/0457 admin tokens and 0458/0459 starboard. Only the filename and number comment changed; no deployed migration history is changed. Rollback drops the table."
     }
   }
 }

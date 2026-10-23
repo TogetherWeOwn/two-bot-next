@@ -53,6 +53,7 @@ pub mod database_roles;
 pub mod database_tls;
 pub mod database_url;
 pub mod disable_preflight;
+pub mod duplicate_keys;
 pub mod e2e_matrix;
 pub mod error_chain;
 pub mod events;
