@@ -348,9 +348,14 @@ impl VoiceChains {
 
     /// Complete a leave-requested retirement once no other frame holds the
     /// chain. Called from [`ChainHandle::drop`], so a completed frame whose
-    /// handle outlives the leave's cleanup still retires the entry.
+    /// handle outlives the leave's cleanup still retires the entry. A drop
+    /// path must never abort on a poisoned lock, so the map guard is
+    /// recovered instead of expected.
     fn retire_if_requested(&self, key: VoiceChainKey, mutex: &Arc<Mutex<()>>) {
-        let mut chains = self.inner.lock().expect("chains lock");
+        let mut chains = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // During `ChainHandle::drop` the dropping handle is still alive, so
         // the map plus the dropping handle is the drained count.
         let drained = chains.get(&key).is_some_and(|entry| {
