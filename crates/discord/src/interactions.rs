@@ -276,9 +276,13 @@ impl InteractionRuntime {
         .await
     }
 
+    /// Ordered acknowledge: `announcements_live` is the gateway-resolved
+    /// announcements bit (live snapshot store-first over boot); a stored `0`
+    /// refuses RSVP commands with the disabled reply before any defer.
     pub async fn prepare(
         &self,
         interaction: Interaction,
+        announcements_live: bool,
     ) -> Result<crate::rsvp::PreparedRsvp, crate::DiscordError> {
         // Same application-identity refusal as `handle`/`handle_routed`, before
         // any callback or store work: the callback route carries no app check.
@@ -296,7 +300,13 @@ impl InteractionRuntime {
         else {
             return Ok(crate::rsvp::PreparedRsvp::ignored());
         };
-        crate::rsvp::prepare_rsvp_interaction(&self.router, &self.executor, interaction).await
+        crate::rsvp::prepare_rsvp_interaction(
+            &self.router,
+            &self.executor,
+            interaction,
+            announcements_live,
+        )
+        .await
     }
 
     pub async fn complete(

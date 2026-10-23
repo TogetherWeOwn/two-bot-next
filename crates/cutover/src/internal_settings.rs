@@ -60,6 +60,20 @@ fn action_error(error: SettingsWriteError) -> ActionError {
                         "settings_value_invalid",
                     );
                 }
+                WriteRefusal::InvalidCooldownValue(_) => {
+                    return ActionError::new(
+                        ErrorCode::Malformed,
+                        "\"value\" must be a non-negative integer number of seconds for this setting",
+                        "settings_value_invalid",
+                    );
+                }
+                WriteRefusal::InvalidPanelsValue(_) => {
+                    return ActionError::new(
+                        ErrorCode::Malformed,
+                        "\"value\" must be a JSON array of self-role panels for this setting",
+                        "settings_value_invalid",
+                    );
+                }
             };
             ActionError::new(
                 ErrorCode::ActionNotAllowed,
@@ -104,5 +118,15 @@ mod tests {
         assert_eq!(invalid_gate.status(), 400);
         assert!(!invalid_gate.code.retryable());
         assert_eq!(invalid_gate.log_reason, "settings_value_invalid");
+        for refusal in [
+            WriteRefusal::InvalidCooldownValue("TWO_TICKET_COOLDOWN_SECONDS".to_owned()),
+            WriteRefusal::InvalidPanelsValue("TWO_SELF_ROLE_PANELS".to_owned()),
+        ] {
+            let invalid = action_error(SettingsWriteError::Refused(refusal));
+            assert_eq!(invalid.code, ErrorCode::Malformed);
+            assert_eq!(invalid.status(), 400);
+            assert!(!invalid.code.retryable());
+            assert_eq!(invalid.log_reason, "settings_value_invalid");
+        }
     }
 }

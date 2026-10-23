@@ -121,7 +121,7 @@ fn applied_swap_logs_spec_events_and_never_cold_values() {
         rows: vec![
             row("g1", "TWO_RAID_JOIN_THRESHOLD", json!(5)),
             row("g1", "TWO_FEED_POLL_SECONDS", json!(600)),
-            row("g1", "TWO_TICKET_COOLDOWN_SECONDS", json!(777)),
+            row("g1", "TWO_AUTOMATIONS", json!(777)),
             row("g1", "TWO_MADE_UP_KEY", json!("unlisted")),
         ],
     });
@@ -135,7 +135,7 @@ fn applied_swap_logs_spec_events_and_never_cold_values() {
         "setting_ignored_not_applied",
         "TWO_RAID_JOIN_THRESHOLD",
         "TWO_FEED_POLL_SECONDS",
-        "TWO_TICKET_COOLDOWN_SECONDS",
+        "TWO_AUTOMATIONS",
         "TWO_MADE_UP_KEY",
     ] {
         assert!(log.contains(needle), "missing {needle}: {log}");
@@ -148,7 +148,7 @@ fn applied_swap_logs_spec_events_and_never_cold_values() {
     assert!(applied.contains("TWO_RAID_JOIN_THRESHOLD"), "{applied}");
     assert!(applied.contains("TWO_FEED_POLL_SECONDS"), "{applied}");
     assert!(
-        !applied.contains("TWO_TICKET_COOLDOWN_SECONDS"),
+        !applied.contains("TWO_AUTOMATIONS"),
         "cold key reported as applied: {applied}"
     );
     // Key names only for the applied line's `keys`; hot values appear only on
@@ -208,7 +208,7 @@ fn settings_log_capture_excludes_unrelated_numeric_trace_events() {
     let (mut writer, _reader) = live_channel();
     let report = writer.publish(&SettingsSnapshot {
         revision: 1,
-        rows: vec![row("g1", "TWO_TICKET_COOLDOWN_SECONDS", json!(600))],
+        rows: vec![row("g1", "TWO_AUTOMATIONS", json!(600))],
     });
     let (capture, _guard) = captured();
     tracing::trace!(
@@ -224,7 +224,7 @@ fn settings_log_capture_excludes_unrelated_numeric_trace_events() {
     log_applied(&report);
     let log = capture.contents();
     assert!(log.contains("settings_restart_required"), "{log}");
-    assert!(log.contains("TWO_TICKET_COOLDOWN_SECONDS"), "{log}");
+    assert!(log.contains("TWO_AUTOMATIONS"), "{log}");
     assert!(
         !log.contains("elapsed_secs"),
         "unrelated event captured: {log}"
@@ -393,26 +393,18 @@ async fn supervised_poll_applies_real_guild_settings_writes() {
     let (capture, _guard) = captured();
     for value in [771, 772] {
         store
-            .set(
-                "g1",
-                "TWO_TICKET_COOLDOWN_SECONDS",
-                Some(json!(value)),
-                "test",
-            )
+            .set("g1", "TWO_AUTOMATIONS", Some(json!(value)), "test")
             .await
             .expect("cold write");
         let (revision, _) = store.poll_marks().await.expect("cold write revision");
         until_change("cold revision observed", || reader.revision() == revision).await;
-        assert_eq!(reader.get("g1", "TWO_TICKET_COOLDOWN_SECONDS"), None);
-        assert_eq!(
-            reader.snapshot().get("g1", "TWO_TICKET_COOLDOWN_SECONDS"),
-            None
-        );
+        assert_eq!(reader.get("g1", "TWO_AUTOMATIONS"), None);
+        assert_eq!(reader.snapshot().get("g1", "TWO_AUTOMATIONS"), None);
         assert!(!reader
             .env_snapshot(Some("g1"))
-            .contains_key("TWO_TICKET_COOLDOWN_SECONDS"));
+            .contains_key("TWO_AUTOMATIONS"));
         let stored: serde_json::Value = sqlx::query_scalar(
-            "SELECT value FROM guild_settings WHERE guild_id = 'g1' AND key = 'TWO_TICKET_COOLDOWN_SECONDS'",
+            "SELECT value FROM guild_settings WHERE guild_id = 'g1' AND key = 'TWO_AUTOMATIONS'",
         )
         .fetch_one(&pool)
         .await
@@ -425,7 +417,7 @@ async fn supervised_poll_applies_real_guild_settings_writes() {
     .await;
     let log = capture.contents();
     assert!(log.contains("settings_applied"), "{log}");
-    assert!(log.contains("TWO_TICKET_COOLDOWN_SECONDS"), "{log}");
+    assert!(log.contains("TWO_AUTOMATIONS"), "{log}");
     assert!(!log.contains("771"), "cold value leaked: {log}");
     assert!(!log.contains("772"), "updated cold value leaked: {log}");
 

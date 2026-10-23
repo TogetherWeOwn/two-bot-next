@@ -1574,7 +1574,14 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             if let Event::InteractionCreate(interaction) = &dispatch.event {
                                 let interaction = interaction.0.clone();
                                 let runtime = Arc::clone(runtime);
-                                let acknowledgement = tokio::spawn(async move { runtime.prepare(interaction).await });
+                                // Per-invocation live announcements bit for the
+                                // ordered RSVP path (self-role per-dispatch
+                                // pattern): a stored `0` refuses RSVP commands
+                                // with the disabled reply before any defer.
+                                let guild = interaction.guild_id.map(|id| id.get().to_string()).unwrap_or_default();
+                                let boot = runtime.router.gates().announcements;
+                                let announcements_live = crate::feed_jobs::live_announcements_on(&guild, boot);
+                                let acknowledgement = tokio::spawn(async move { runtime.prepare(interaction, announcements_live).await });
                                 // Track owned acknowledgement work so the bounded
                                 // completion policy can cancel it on timeout or
                                 // shard cancellation instead of detaching it.

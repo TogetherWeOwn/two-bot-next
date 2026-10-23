@@ -74,6 +74,7 @@ use two_bot_core::{
     funnel::now_millis_for_test,
     moderation::ModerationAction,
     router::replies::EXPIRED_COMPONENT_REPLY,
+    settings::LiveSettings,
     sticky::{
         activity_eligible, decide_activity, normalize_debounce, sticky_removed_reply,
         sticky_set_reply, store, validate_body, ActivityDecision, ActivityOutcome, PutSticky,
@@ -1312,6 +1313,19 @@ impl CommandRuntime {
     /// own their defer/audit lifecycle. Unwired builtins
     /// get an unavailable reply; router Ignore (unknown/guild) stays silent.
     pub(crate) async fn on_interaction(&self, interaction: &Interaction) {
+        self.on_interaction_with_live(interaction, crate::settings_jobs::live().as_ref())
+            .await;
+    }
+
+    /// [`on_interaction`] over an injectable live snapshot, for tests (the
+    /// `register_gated_with` shape). Production reads the poller-published
+    /// snapshot; a stored `0` refuses the live-gated announcement commands
+    /// with the disabled reply before any defer.
+    pub(crate) async fn on_interaction_with_live(
+        &self,
+        interaction: &Interaction,
+        live: Option<&LiveSettings>,
+    ) {
         let application_id = self.application_id.load(Ordering::Relaxed);
         if application_id != 0 && interaction.application_id.get() != application_id {
             return;
@@ -1335,6 +1349,29 @@ impl CommandRuntime {
             return;
         }
         let routed = route_interaction(&self.interactions.router, interaction, None);
+        // Per-invocation live overlay (self-role per-dispatch pattern): the
+        // live snapshot wins over the boot value the router already admitted,
+        // so a stored `0` refuses with the disabled reply while an absent row
+        // executes. Refuse-only, so boot-off registration is unchanged.
+        let routed = match routed {
+            RoutedInteraction::Slash { name, outcome } => {
+                let guild = interaction
+                    .guild_id
+                    .map(|id| id.get().to_string())
+                    .unwrap_or_default();
+                let boot = self.interactions.router.gates().announcements;
+                let announcements_live =
+                    crate::feed_jobs::live_announcements_with(&guild, boot, live);
+                RoutedInteraction::Slash {
+                    name,
+                    outcome: two_bot_core::live_gate_announcements_slash(
+                        outcome,
+                        announcements_live,
+                    ),
+                }
+            }
+            other => other,
+        };
         if matches!(
             &routed,
             RoutedInteraction::Slash {
