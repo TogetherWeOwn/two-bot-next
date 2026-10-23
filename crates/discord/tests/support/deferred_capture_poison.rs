@@ -591,19 +591,70 @@ macro_rules! fact_config_test {
     ($name:ident, $call:expr) => {
         #[tokio::test]
         async fn $name() {
-            let tripwires = Tripwires::new();
+            use crate::ChannelClassifier as _;
+
+            let previous_io = Tripwires::new();
+            let requested_io = Tripwires::new();
             let owner = pipeline();
+            // The implicit enable boundaries read this same config. Do not
+            // mutate process-global environment to make the fixture distinct.
+            let requested = ClassifierConfig::from_env();
+            let mut previous = requested.clone();
+            previous.version.push_str("-protected-previous");
+            let previous_class = if requested.channel_class(CHANNEL) == ChannelClass::Human {
+                previous.human_channel_ids.remove(&CHANNEL.to_string());
+                previous.welcome_channel_ids.remove(&CHANNEL.to_string());
+                ChannelClass::Other
+            } else {
+                previous.human_channel_ids.insert(CHANNEL.to_string());
+                previous.welcome_channel_ids.remove(&CHANNEL.to_string());
+                ChannelClass::Human
+            };
+            assert_ne!(
+                previous, requested,
+                "refusal must not be a no-op config test"
+            );
+            assert_ne!(requested.channel_class(CHANNEL), previous_class);
+            owner
+                .refresh_classifier_config(previous.clone())
+                .expect("healthy paired configuration");
+            owner
+                .facts
+                .enable_with_config(previous_io.pool.clone(), previous.clone())
+                .expect("healthy original sink");
+            assert_eq!(owner.classifier.classify(CHANNEL), previous_class);
             owner.facts.record_rules_accepted(rules());
             poison(Arc::clone(&owner.facts.0));
             let call = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                ($call)(&owner, &tripwires).observed()
+                ($call)(&owner, &requested_io, requested.clone())
             }));
             let drained = AssertUnwindSafe(owner.drain_facts()).catch_unwind().await;
-            tripwires.untouched();
+            previous_io.untouched();
+            requested_io.untouched();
             preserved_facts(&owner.facts, (0, 1, 0));
-            assert!(
-                call.is_ok(),
-                "configuration boundary must refuse/latch, not panic"
+            let error = call
+                .expect("configuration boundary must refuse, not panic")
+                .expect_err("poisoned enable/refresh must not return inner Ok(())");
+            assert!(matches!(error, CommunityFactsError::Poisoned));
+            diagnostic(&error.to_string(), FACT_REASON);
+            assert!(!format!("{error:?}").contains(PAYLOAD));
+            let held = owner.facts.0.lock().expect_err("state stays poisoned");
+            let state = held.get_ref();
+            assert_eq!(state.config, previous, "refusal must not refresh the sink");
+            assert_eq!(
+                state
+                    .pool
+                    .as_ref()
+                    .expect("original sink stays armed")
+                    .connect_options()
+                    .get_port(),
+                previous_io.pool.connect_options().get_port(),
+                "refusal must not replace the original sink pool"
+            );
+            assert_eq!(
+                owner.classifier.classify(CHANNEL),
+                previous_class,
+                "refusal must not refresh the paired channel classifier"
             );
             typed_fact_refusal(
                 drained.expect("configuration failure must reach the awaited owner"),
@@ -613,28 +664,31 @@ macro_rules! fact_config_test {
 }
 fact_config_test!(
     community_enable_poison_reaches_owner,
-    |p: &OrderedLevelingPipeline<MemStore>, t: &Tripwires| p.facts.enable(t.pool.clone())
+    |p: &OrderedLevelingPipeline<MemStore>, t: &Tripwires, _: ClassifierConfig| p
+        .facts
+        .enable(t.pool.clone())
 );
 fact_config_test!(
     community_explicit_enable_poison_reaches_owner,
-    |p: &OrderedLevelingPipeline<MemStore>, t: &Tripwires| p
+    |p: &OrderedLevelingPipeline<MemStore>, t: &Tripwires, requested: ClassifierConfig| p
         .facts
-        .enable_with_config(t.pool.clone(), ClassifierConfig::default())
+        .enable_with_config(t.pool.clone(), requested)
 );
 fact_config_test!(
     community_refresh_poison_reaches_owner,
-    |p: &OrderedLevelingPipeline<MemStore>, _: &Tripwires| p
+    |p: &OrderedLevelingPipeline<MemStore>, _: &Tripwires, requested: ClassifierConfig| p
         .facts
-        .refresh_config(ClassifierConfig::default())
+        .refresh_config(requested)
 );
 fact_config_test!(
     pipeline_enable_poison_reaches_owner,
-    |p: &OrderedLevelingPipeline<MemStore>, t: &Tripwires| p.enable_community_facts(t.pool.clone())
+    |p: &OrderedLevelingPipeline<MemStore>, t: &Tripwires, _: ClassifierConfig| p
+        .enable_community_facts(t.pool.clone())
 );
 fact_config_test!(
     pipeline_refresh_poison_reaches_owner,
-    |p: &OrderedLevelingPipeline<MemStore>, _: &Tripwires| p
-        .refresh_classifier_config(ClassifierConfig::default())
+    |p: &OrderedLevelingPipeline<MemStore>, _: &Tripwires, requested: ClassifierConfig| p
+        .refresh_classifier_config(requested)
 );
 
 #[tokio::test]

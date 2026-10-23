@@ -3216,27 +3216,44 @@ mod tests {
     /// failure wins.
     #[test]
     fn gateway_poisoned_collect_holds_checkpoint_without_requests() {
-        for poison in [
-            LevelingRuntimeError::LevelingPoisoned,
-            LevelingRuntimeError::CommunityFactsPoisoned,
+        for (poison, reason) in [
+            (
+                LevelingRuntimeError::LevelingPoisoned,
+                "deferred_leveling_poisoned",
+            ),
+            (
+                LevelingRuntimeError::CommunityFactsPoisoned,
+                "deferred_community_facts_poisoned",
+            ),
         ] {
             let mut held = None;
             let requests = requests_or_hold_cursor(Err(poison), &mut held);
             assert!(requests.is_empty(), "poison must not yield requests");
             assert!(
-                matches!(
-                    &held,
-                    Some(sqlx::Error::InvalidArgument(message))
-                        if message.as_str()
-                            == "leveling gateway dispatch failed; checkpoint unchanged"
-                ),
-                "poison must hold the cursor, got {held:?}"
+                matches!(&held, Some(sqlx::Error::InvalidArgument(_))),
+                "poison must hold the cursor as a typed checkpoint refusal, got {held:?}"
             );
+            let terminal = crate::db_log::failure_reason(held.as_ref().expect("held poison"));
+            assert!(
+                terminal.contains(reason),
+                "final supervisor reason lost {reason}: {terminal}"
+            );
+            assert!(terminal.contains("supervisor_restart_inspection"));
+            assert!(terminal.contains("checkpoint unchanged"));
+            assert!(terminal.len() <= 256);
+            assert!(!terminal.contains("leveling gateway dispatch failed"));
         }
         let mut held = None;
         let requests = requests_or_hold_cursor(Ok(Vec::new()), &mut held);
         assert!(requests.is_empty());
         assert!(held.is_none(), "healthy collect must not hold the cursor");
+        let requests =
+            requests_or_hold_cursor(Err(LevelingRuntimeError::InvalidInteraction), &mut held);
+        assert!(requests.is_empty(), "non-poison failure still refuses work");
+        assert_eq!(
+            crate::db_log::failure_reason(held.as_ref().expect("non-poison failure holds cursor")),
+            "leveling gateway dispatch failed; checkpoint unchanged"
+        );
         let mut held = Some(leveling_dispatch_failure());
         let requests =
             requests_or_hold_cursor(Err(LevelingRuntimeError::LevelingPoisoned), &mut held);
