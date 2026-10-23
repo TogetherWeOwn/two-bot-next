@@ -104,7 +104,7 @@ fn all_30_rows_equal_parity_section1() {
             .map(|row| row.command)
             .collect::<HashSet<_>>()
             .len(),
-        32
+        33
     );
     let help = command_permission("help").expect("help has a permission row");
     assert_eq!(help.required_permissions, 0);
