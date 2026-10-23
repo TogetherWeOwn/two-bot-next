@@ -23,6 +23,9 @@ const USER: &str = "1546451670500642888";
 const OTHER: &str = "1546451670500642777";
 const MANAGE_EVENTS: u64 = 1 << 33;
 
+#[path = "support/rsvp_personal_totals.rs"]
+mod saved_response_acceptance;
+
 fn router() -> InteractionRouter {
     InteractionRouter::new(RouterGates {
         configured_guild: Some(GUILD.parse().unwrap()),
@@ -368,6 +371,15 @@ async fn transitions_totals_and_audits_round_trip_through_router() {
         .unwrap();
         assert_eq!(&stored, status);
     }
+    let saved_epoch: i64 = sqlx::query_scalar(
+        "SELECT floor(extract(epoch FROM responded_at))::bigint FROM event_rsvps WHERE guild_id=$1 AND event_id=$2 AND user_id=$3",
+    )
+    .bind(GUILD)
+    .bind(EVENT)
+    .bind(USER)
+    .fetch_one(fixture.pool())
+    .await
+    .unwrap();
     run(
         fixture.pool(),
         &mock,
@@ -379,7 +391,11 @@ async fn transitions_totals_and_audits_round_trip_through_router() {
         ),
     )
     .await;
-    assert_reply(&mock, "Going: 0\nInterested: 0\nDeclined: 1", true);
+    assert_reply(
+        &mock,
+        &format!("Stored RSVPs for event `{EVENT}`\nGoing: 0\nInterested: 0\nDeclined: 1\nYour saved response: Declined\nSaved: <t:{saved_epoch}:f>\nHistorical saved responses; live event availability is not checked."),
+        true,
+    );
     assert_eq!(counts(fixture.pool()).await, (1, 4, 0));
     let audits: Vec<(String, String, String, String)> = sqlx::query_as(
         "SELECT actor_id, action, target_key, outcome FROM announcements_audit_log ORDER BY id",
@@ -574,7 +590,7 @@ async fn totals_remain_readable_without_live_event_access() {
             event_id: EVENT.into(),
             user_id: USER.into(),
             status: two_bot_core::RsvpStatus::Going,
-            responded_at: two_bot_core::now_iso(),
+            responded_at: "2020-01-02T03:04:05.000Z".into(),
         },
     )
     .await
@@ -603,7 +619,11 @@ async fn totals_remain_readable_without_live_event_access() {
             ),
         )
         .await;
-        assert_reply(&mock, "Going: 1\nInterested: 0\nDeclined: 0", true);
+        assert_reply(
+            &mock,
+            &format!("Stored RSVPs for event `{EVENT}`\nGoing: 1\nInterested: 0\nDeclined: 0\nYour saved response: Going\nSaved: <t:1577934245:f>\nHistorical saved responses; live event availability is not checked."),
+            true,
+        );
         assert_eq!(mock.requests().len(), 2);
         assert!(mock.requests().iter().all(|r| r.method != "GET"));
         assert_eq!(counts(fixture.pool()).await, (1, 0, 0));
