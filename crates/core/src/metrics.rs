@@ -2020,14 +2020,12 @@ impl Metrics {
             &mut out,
             "two_bot_voice_inbox_overflow_dropped_total",
             "counter",
-            "Fire-and-forget voice commands refused by the actor inbox gate.",
             values.voice_inbox_overflow_dropped,
         );
         scalar(
             &mut out,
             "two_bot_voice_queue_overflow_dropped_total",
             "counter",
-            "New voice actions refused by opt-in bounded intake, not the must-admit production path.",
             values.voice_queue_overflow_dropped,
         );
         // Aggregates over the current guild-actor set: any actor halted,
