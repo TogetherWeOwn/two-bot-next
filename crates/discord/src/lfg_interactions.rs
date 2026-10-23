@@ -616,30 +616,35 @@ impl LfgInteractions {
         Ok(true)
     }
 
-    async fn refresh(
-        &self,
-        executor: &ActionExecutor,
-        guild_id: &str,
-        id: &str,
-    ) -> Result<(), LfgError> {
-        let Some(post) = store::get_lfg(&self.pool, guild_id, id).await? else {
-            return Ok(());
-        };
-        let Some(message_id) = post.message_id.as_deref() else {
-            return Ok(());
-        };
-        let roles = store::list_lfg_roles(&self.pool, id).await?;
-        let signups = store::list_lfg_signups(&self.pool, id).await?;
-        let payload = message_payload(&post, &roles, &signups);
-        executor
-            .edit_message_with_components(
-                &post.channel_id,
-                message_id,
-                payload["content"].as_str().unwrap_or_default(),
-                Self::payload_components(&payload),
-            )
-            .await?;
-        Ok(())
+    // Share the refresh state machine across interaction and maintenance calls
+    // instead of embedding its SQL/REST futures in each caller's state machine.
+    fn refresh<'a>(
+        &'a self,
+        executor: &'a ActionExecutor,
+        guild_id: &'a str,
+        id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), LfgError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let Some(post) = store::get_lfg(&self.pool, guild_id, id).await? else {
+                return Ok(());
+            };
+            let Some(message_id) = post.message_id.as_deref() else {
+                return Ok(());
+            };
+            let roles = store::list_lfg_roles(&self.pool, id).await?;
+            let signups = store::list_lfg_signups(&self.pool, id).await?;
+            let payload = message_payload(&post, &roles, &signups);
+            executor
+                .edit_message_with_components(
+                    &post.channel_id,
+                    message_id,
+                    payload["content"].as_str().unwrap_or_default(),
+                    Self::payload_components(&payload),
+                )
+                .await?;
+            Ok(())
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
