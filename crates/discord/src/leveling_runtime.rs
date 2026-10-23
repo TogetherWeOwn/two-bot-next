@@ -351,34 +351,36 @@ impl DeferredCommunityFacts {
     /// Arm Postgres capture with the scorecard classifier resolved once from
     /// the process environment. Called once at boot when
     /// `TWO_COMMUNITY_SCORECARD=1`; tests call it with their fixture pool.
-    pub fn enable(&self, pool: PgPool) {
-        self.enable_with_config(pool, ClassifierConfig::from_env());
+    /// A poisoned buffer refuses typed and keeps its previous config.
+    pub fn enable(&self, pool: PgPool) -> Result<(), CommunityFactsError> {
+        self.enable_with_config(pool, ClassifierConfig::from_env())
     }
 
     /// Arm Postgres capture with an explicit classifier config, so the
     /// caller can seed the channel classifier from the same config and
-    /// the two never disagree. A poisoned buffer latches: the config is
-    /// not applied, and the owning drain refuses typed instead of
-    /// panicking.
-    pub fn enable_with_config(&self, pool: PgPool, config: ClassifierConfig) {
-        let Ok(mut state) = self.0.lock() else {
-            return;
-        };
+    /// the two never disagree. A poisoned buffer refuses typed: the config
+    /// is not applied, and the owning drain refuses instead of panicking.
+    pub fn enable_with_config(
+        &self,
+        pool: PgPool,
+        config: ClassifierConfig,
+    ) -> Result<(), CommunityFactsError> {
+        let mut state = self.0.lock().map_err(|_| CommunityFactsError::Poisoned)?;
         state.pool = Some(pool);
         state.config = config;
+        Ok(())
     }
 
     /// Replace the classifier config used at record/drain time. Paired
     /// with the channel classifier refresh in
     /// [`OrderedLevelingPipeline::refresh_classifier_config`]. A poisoned
-    /// buffer latches like [`Self::enable_with_config`].
-    pub fn refresh_config(&self, config: ClassifierConfig) {
-        let Ok(mut state) = self.0.lock() else {
-            return;
-        };
+    /// buffer refuses typed like [`Self::enable_with_config`].
+    pub fn refresh_config(&self, config: ClassifierConfig) -> Result<(), CommunityFactsError> {
+        let mut state = self.0.lock().map_err(|_| CommunityFactsError::Poisoned)?;
         if state.config != config {
             state.config = config;
         }
+        Ok(())
     }
 
     /// Refuse when the buffer mutex is poisoned without touching the
@@ -1004,21 +1006,30 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
 
     /// Arm Postgres community-facts capture for all live streams. Called once at boot when `TWO_COMMUNITY_SCORECARD=1`; without
     /// it the sink drops every fact, exactly like the previous no-op seam.
-    pub fn enable_community_facts(&self, pool: PgPool) {
+    /// A poisoned facts buffer refuses typed and the classifier keeps its
+    /// previous config, so the two still agree.
+    pub fn enable_community_facts(&self, pool: PgPool) -> Result<(), CommunityFactsError> {
         // One config load seeds both the facts sink and the channel
         // classifier, so classification at record time and the stamped
         // channel class always read the same sets.
         let config = ClassifierConfig::from_env();
-        self.facts.enable_with_config(pool, config.clone());
+        self.facts.enable_with_config(pool, config.clone())?;
         self.classifier.refresh(config);
+        Ok(())
     }
 
     /// Refresh the classifier config live (settings poll): the channel
     /// classifier and the facts sink swap together, so a stored channel
     /// set reclassifies without a restart and the two never disagree.
-    pub fn refresh_classifier_config(&self, config: ClassifierConfig) {
-        self.facts.refresh_config(config.clone());
+    /// A poisoned facts buffer refuses typed before the classifier swaps,
+    /// so a failed refresh changes neither side.
+    pub fn refresh_classifier_config(
+        &self,
+        config: ClassifierConfig,
+    ) -> Result<(), CommunityFactsError> {
+        self.facts.refresh_config(config.clone())?;
         self.classifier.refresh(config);
+        Ok(())
     }
 
     /// Persist buffered community facts without holding the async
@@ -1417,7 +1428,9 @@ mod tests {
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect(),
         );
-        pipeline.refresh_classifier_config(config);
+        pipeline
+            .refresh_classifier_config(config)
+            .expect("healthy config swap");
 
         assert_eq!(pipeline.classifier.classify(HUMAN), ChannelClass::Human);
         let state = pipeline.facts.0.lock().expect("community facts lock");
@@ -1437,7 +1450,9 @@ mod tests {
                 .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
                 .collect(),
         );
-        buffer.enable_with_config(pool, config);
+        buffer
+            .enable_with_config(pool, config)
+            .expect("healthy arming");
         let state = buffer.0.lock().expect("community facts lock");
         assert!(state.pool.is_some());
         assert_eq!(state.config.version, "community-v7");

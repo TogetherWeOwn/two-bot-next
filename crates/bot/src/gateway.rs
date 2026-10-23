@@ -902,7 +902,11 @@ fn refresh_channel_classifier_from_poller<I: InviteSource>(
         return;
     };
     let deployment: HashMap<String, String> = std::env::vars().collect();
-    pipeline.refresh_classifier_config(classifier_config_from_live(
+    // A refused refresh changes neither the sink nor the classifier, and the
+    // same dispatch already surfaces the poison typed at collection and at
+    // the facts drain (cursor held); a warn here would repeat once per
+    // message while the buffer stays poisoned.
+    let _ = pipeline.refresh_classifier_config(classifier_config_from_live(
         &deployment,
         &guild_id.get().to_string(),
         &live,
@@ -4070,7 +4074,9 @@ mod tests {
             .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
             .expect("lazy pool");
         let pipeline = build_pipeline(vec![], None);
-        pipeline.enable_community_facts(broken);
+        pipeline
+            .enable_community_facts(broken)
+            .expect("healthy fixture arming");
         // Gate-clearing join: `pending: false` buffers two facts, one
         // `member_joined` via `on_join` plus one `rules_accepted` via
         // `on_gate_cleared`, so the drain has work to fail on. A
@@ -4126,7 +4132,9 @@ mod tests {
         // path instead of the failure site.
         {
             let scratch = build_pipeline(vec![], None);
-            scratch.enable_community_facts(pool.clone());
+            scratch
+                .enable_community_facts(pool.clone())
+                .expect("healthy scratch arming");
             scratch
                 .collect_at(
                     &join(),
