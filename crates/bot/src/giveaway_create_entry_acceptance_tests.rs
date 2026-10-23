@@ -1,14 +1,15 @@
 //! Acceptance: giveaway create + button entry work end to end (tests FIRST).
 //!
 //! Protected file: the Builder makes these tests pass WITHOUT editing this
-//! file. Every test below compiles against seams that exist on the base
-//! commit and fails there for one reason only — no giveaway surface exists
-//! yet (router answers `Unknown`, no registry row, no docs section).
+//! file. The original corpus predates the giveaway surface (router answered
+//! `Unknown`, no registry row, no docs section). The prize ceiling is now
+//! reconciled with the merged domain contract: 200 characters, not 2000.
+//! The delivery-cleanup child module pins the post-success attachment seam.
 //!
 //! Pinned contract (the Builder implements exactly this):
 //!
 //! - Slash command `giveaway` with subcommands `create`, `list`, `cancel`.
-//! - `create` options: `prize` (string, required, max 2000), `duration`
+//! - `create` options: `prize` (string, required, max 200 characters), `duration`
 //!   (integer minutes, required), `winners` (integer 1-100, required),
 //!   `required-role` (role, optional), `min-account-age-days` (integer,
 //!   optional), `min-server-age-days` (integer, optional).
@@ -43,6 +44,9 @@
 //! CI already executes this child of `command_runtime_tests` in its ignored
 //! runtime lane. Do not move it into an unselected standalone ignored target.
 #![cfg(test)]
+
+#[path = "giveaway_delivery_cleanup_acceptance_tests.rs"]
+mod giveaway_delivery_cleanup_acceptance_tests;
 
 use super::*;
 use serde_json::Value;
@@ -484,8 +488,8 @@ fn giveaway_publish_set_carries_create_list_cancel() {
     assert_eq!(prize.required, Some(true));
     assert_eq!(
         prize.max_length,
-        Some(2000),
-        "prize text is bounded like schedule bodies"
+        Some(200),
+        "picker must not advertise prize lengths the giveaway domain rejects"
     );
     let duration = nested(create, "duration");
     assert_eq!(duration.kind, CommandOptionType::Integer.as_u8());
@@ -572,6 +576,79 @@ fn existing_schedule_permission_row_is_untouched() {
 // ---------------------------------------------------------------------------
 // Dispatch: create, entry, cancel through the real runtime + MockRest.
 // ---------------------------------------------------------------------------
+
+fn create_with_prize(id: u64, token: &str, prize: &str) -> Interaction {
+    let mut interaction = giveaway_create(id, token, Permissions::MANAGE_GUILD, Vec::new());
+    let Some(InteractionData::ApplicationCommand(data)) = interaction.data.as_mut() else {
+        panic!("create fixture is a slash command");
+    };
+    let CommandOptionValue::SubCommand(options) = &mut data.options[0].value else {
+        panic!("create fixture has subcommand options");
+    };
+    options
+        .iter_mut()
+        .find(|option| option.name == "prize")
+        .expect("create fixture includes prize")
+        .value = CommandOptionValue::String(prize.to_owned());
+    interaction
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn giveaway_create_accepts_200_character_prize_without_truncation() {
+    let db = TestDb::new().await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+    // Multibyte characters catch an accidental byte-count limit too.
+    let prize = "🎁".repeat(200);
+    runtime
+        .on_interaction(&create_with_prize(73_001, "gw-prize-200", &prize))
+        .await;
+    let requests = mock.requests();
+    let rows: Vec<String> = sqlx::query_scalar("SELECT prize FROM giveaways WHERE guild_id = $1")
+        .bind(GUILD_S)
+        .fetch_all(&db.pool)
+        .await
+        .expect("read persisted prize");
+    mock.shutdown().await;
+    db.close().await;
+
+    let posts = message_posts(&requests);
+    assert_eq!(posts.len(), 1, "200 characters creates one giveaway");
+    assert!(message_text(&posts[0]).contains(&prize), "no truncation");
+    assert_eq!(rows, vec![prize], "persist the complete prize");
+    let reply = reply_for(&requests, "gw-prize-200");
+    assert!(reply.found && reply.ephemeral, "ephemeral confirmation");
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn giveaway_create_refuses_201_character_prize_before_store_or_delivery() {
+    let db = TestDb::new().await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+    runtime
+        .on_interaction(&create_with_prize(73_002, "gw-prize-201", &"x".repeat(201)))
+        .await;
+    let requests = mock.requests();
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM giveaways WHERE guild_id = $1")
+        .bind(GUILD_S)
+        .fetch_one(&db.pool)
+        .await
+        .expect("count giveaway rows");
+    let audits = giveaway_audits(&db.pool).await;
+    mock.shutdown().await;
+    db.close().await;
+
+    assert!(
+        message_posts(&requests).is_empty(),
+        "no oversized prize post"
+    );
+    assert!(message_patches(&requests).is_empty(), "no message edited");
+    assert_eq!(rows, 0, "refuse before persisting an oversized prize");
+    assert!(audits.iter().all(|(_, _, outcome)| outcome != "ok"));
+    let reply = reply_for(&requests, "gw-prize-201");
+    assert!(reply.found && reply.ephemeral, "ephemeral refusal");
+    assert!(reply.text.to_lowercase().contains("giveaway"));
+}
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
