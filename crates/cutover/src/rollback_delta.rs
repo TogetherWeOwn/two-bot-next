@@ -248,6 +248,9 @@ pub const TABLE_SPECS: &[TableSpec] = &[
         measure: TableMeasure::Columns(&["created_at", "completed_at", "retired_at"]),
     },
     TableSpec { table: "self_role_panel_claims", measure: TableMeasure::Columns(&["processing_expires_at"]) },
+    TableSpec { table: "starboard_config", measure: TableMeasure::Columns(&["updated_at"]) },
+    TableSpec { table: "starboard_starrers", measure: TableMeasure::Columns(&["created_at"]) },
+    TableSpec { table: "starboard_posts", measure: TableMeasure::Columns(&["created_at", "updated_at"]) },
     TableSpec { table: "sticky_messages", measure: TableMeasure::Columns(&["updated_at"]) },
     // Claim/start/stamp/takeover transitions rewrite claimed_at,
     // send_started_at and delivered_at without touching the others, so the

@@ -106,7 +106,7 @@ ingress gate below admits them.
   gateway checkpoints; detached dispatch now fans MessageCreate/
   InteractionCreate events (including tickets) to the shared command runtime
   without awaiting REST or store writes (`crates/bot/src/gateway.rs:1542-1550`,
-  `crates/bot/src/command_runtime.rs:954-993`, tickets supervisor start/shutdown
+  `crates/bot/src/command_runtime.rs:956-995`, tickets supervisor start/shutdown
   at `gateway.rs:180`, `:192-193`). The gateway loop still does not invoke the
   internal-action executor; the ticket runtime shares `ActionExecutor`
   transport through its own guild-fenced handlers

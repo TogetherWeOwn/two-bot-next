@@ -1,6 +1,14 @@
 {
   "version": 1,
   "migrations": {
+    "crates/store/migrations/0458_starboard.sql": {
+      "sha256": "ef1013d4b13d1fbdcbfbfc5eeee9dda23bde54e58d6f0472c2d8f32272e0f7fc",
+      "justification": "Add inert starboard configuration, distinct starrers and unique post records to the store chain."
+    },
+    "crates/cutover/migrations/0459_starboard.sql": {
+      "sha256": "ef1013d4b13d1fbdcbfbfc5eeee9dda23bde54e58d6f0472c2d8f32272e0f7fc",
+      "justification": "Mirror the starboard foundation in the deployed cutover migration chain."
+    },
     "crates/cutover/migrations/0001_funnel.sql": {
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes.",
       "sha256": "45d9bc7e665ac79f43e4e43ac6a87fcbeb877c5396fb4dcb5ca3d81a738d5158"
