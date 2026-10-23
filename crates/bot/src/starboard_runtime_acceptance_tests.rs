@@ -363,7 +363,7 @@ const SEED_CONFIG: &str = "INSERT INTO starboard_config
   VALUES ('6666', '8888', 3, '⭐', '{}', '77', now())";
 const SEED_CONFIG_EXCLUDED: &str = "INSERT INTO starboard_config
   (guild_id, board_channel_id, threshold, emoji, excluded_channel_ids, updated_by, updated_at)
-  VALUES ('6666', '8888', 3, '⭐', ARRAY['7777'], '77', now())";
+  VALUES ('6666', '8888', 3, '⭐', ARRAY['7777']::BIGINT[], '77', now())";
 
 static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
 
