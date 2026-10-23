@@ -135,6 +135,9 @@ mod self_role_runtime;
 mod shutdown;
 #[cfg(test)]
 mod smoke_error_contract_tests;
+mod starboard_runtime;
+#[cfg(test)]
+mod starboard_runtime_acceptance_tests;
 #[cfg(test)]
 mod ticket_component_admission_acceptance_tests;
 mod ticket_runtime;
