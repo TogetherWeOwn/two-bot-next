@@ -67,6 +67,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
             "command",
             "command-remove",
             "command-list",
+            "command-inspect",
             "schedule",
             "schedule-remove",
             "schedule-list",

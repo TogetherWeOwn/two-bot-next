@@ -134,6 +134,7 @@ async fn newly_added_creator_cancels_a_preexisting_delete() {
         &mut worker,
         ActorCommand::CreatorAdded(CreatorChannel::new(GUILD, 500)),
         60_000,
+        &ActorInboxBackpressure::default(),
     );
     dispatch(&mut worker, 60_000).await;
     assert!(trace.lock().unwrap().is_empty());

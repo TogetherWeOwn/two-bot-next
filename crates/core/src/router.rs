@@ -647,8 +647,8 @@ impl InteractionRouter {
                 gate: RowGate::Scorecard,
                 permission_refusal: Some(RouterRefusal::ManageEventsRequired),
             },
-            "command" | "command-remove" | "command-list" | "schedule" | "schedule-remove"
-            | "schedule-list" | "sticky" | "sticky-remove" => Row {
+            "command" | "command-remove" | "command-list" | "command-inspect" | "schedule"
+            | "schedule-remove" | "schedule-list" | "sticky" | "sticky-remove" => Row {
                 handler: HandlerId::AutomationAdmin,
                 gate: RowGate::Automations,
                 permission_refusal: Some(RouterRefusal::ManageServerRequired),
