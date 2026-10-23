@@ -361,6 +361,23 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             ],
         ),
         row(
+            "lfg-edit",
+            26,
+            E2eGate::Announcements,
+            PERM_MANAGE_EVENTS,
+            "ManageEvents",
+            "LfgEdit",
+            "Ephemeral saved-edit receipt with canonical start time; refreshes the existing post, preserving signups.",
+            &[
+                "Gate:AnnouncementsDisabled",
+                "Perm:ManageEventsRequired",
+                "Valid:id:required",
+                "Valid:title|starts-at:at-least-one",
+                "Valid:starts-at:future,ISO-8601",
+                "Valid:post:open,same-guild",
+            ],
+        ),
+        row(
             "feed-add",
             28,
             E2eGate::Announcements,

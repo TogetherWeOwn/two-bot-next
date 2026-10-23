@@ -20,7 +20,7 @@ Bounds below are registry bounds; a dash means no bound is declared there,
 not that handler validation is unlimited. Permissions are Discord default
 member-permission bitfields, not a replacement for runtime authorization.
 
-Built-in commands: 51.
+Built-in commands: 52.
 
 ## `/access`
 
@@ -293,6 +293,19 @@ Close a raid/LFG signup
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `id` | string | true | — | — | 128 | — | LFG id from the posted signup |
+
+## `/lfg-edit`
+
+Update a raid/LFG title or start time
+
+- Default permissions: ManageEvents (`8589934592`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `id` | string | true | — | — | 128 | — | LFG id from the posted signup |
+| `title` | string | false | — | — | 100 | — | Event or group title |
+| `starts-at` | string | false | — | — | — | — | ISO-8601 start time, e.g. 2026-10-04T18:00:00Z |
 
 ## `/limit`
 

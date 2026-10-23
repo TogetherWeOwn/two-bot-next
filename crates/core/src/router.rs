@@ -128,6 +128,7 @@ pub enum HandlerId {
     RsvpAttendance,
     Lfg,
     LfgClose,
+    LfgEdit,
     FeedAdd,
     FeedRemove,
     FeedList,
@@ -430,9 +431,10 @@ impl InteractionRouter {
                 register(HandlerId::Moderation(action));
             }
         }
-        // LFG pair (`InteractionRuntime::with_router`, ungated).
+        // LFG management (`InteractionRuntime::with_router`, ungated).
         register(HandlerId::Lfg);
         register(HandlerId::LfgClose);
+        register(HandlerId::LfgEdit);
         router
     }
 
@@ -670,6 +672,11 @@ impl InteractionRouter {
             },
             "lfg-close" => Row {
                 handler: HandlerId::LfgClose,
+                gate: RowGate::Announcements,
+                permission_refusal: Some(RouterRefusal::ManageEventsRequired),
+            },
+            "lfg-edit" => Row {
+                handler: HandlerId::LfgEdit,
                 gate: RowGate::Announcements,
                 permission_refusal: Some(RouterRefusal::ManageEventsRequired),
             },

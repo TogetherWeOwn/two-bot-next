@@ -294,6 +294,24 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
             )
             .required()
             .max_length(MAX_RESOURCE_ID_CHARS as u32)]),
+        CommandDefinition::new("lfg-edit", "Update a raid/LFG title or start time")
+            .permissions(PERM_MANAGE_EVENTS)
+            .options(vec![
+                CommandOption::new(
+                    "id",
+                    "LFG id from the posted signup",
+                    CommandOptionType::String,
+                )
+                .required()
+                .max_length(MAX_RESOURCE_ID_CHARS as u32),
+                CommandOption::new("title", "Event or group title", CommandOptionType::String)
+                    .max_length(MAX_TITLE_CHARS as u32),
+                CommandOption::new(
+                    "starts-at",
+                    "ISO-8601 start time, e.g. 2026-10-04T18:00:00Z",
+                    CommandOptionType::String,
+                ),
+            ]),
         CommandDefinition::new(
             "feed-add",
             "Relay an RSS, YouTube, or Twitch feed into this channel",
