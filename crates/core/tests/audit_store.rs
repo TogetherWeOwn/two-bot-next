@@ -606,7 +606,7 @@ async fn populated_legacy_upgrade_preserves_inflight_recovery_and_halt() -> Test
     .fetch_one(&db.pool)
     .await?;
     let reconcile_migration =
-        include_str!("../../cutover/migrations/0455_audit_reconcile_cursor.sql");
+        include_str!("../../cutover/migrations/0458_audit_reconcile_cursor.sql");
     sqlx::raw_sql(reconcile_migration).execute(&db.pool).await?;
     sqlx::raw_sql(reconcile_migration).execute(&db.pool).await?;
     let upgraded_evidence: String = sqlx::query_scalar(
