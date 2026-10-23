@@ -443,9 +443,16 @@ fn inspect_redacts_userinfo_credential_query_and_fragment_with_notice() {
             "secret value must not survive rendering: {text}"
         );
     }
+    // The channel destination (`<#id>`) legitimately contains '#', so the
+    // fragment ban applies to the source projection only.
+    let source_line = text.lines().find(|line| line.starts_with("Source:"));
     assert!(
-        !text.contains('#'),
-        "fragments must not survive rendering: {text}"
+        source_line.is_some(),
+        "detail must project a Source line: {text}"
+    );
+    assert!(
+        !source_line.is_some_and(|line| line.contains('#')),
+        "fragments must not survive the source projection: {text}"
     );
     assert!(
         text.to_ascii_lowercase().contains("redact"),
