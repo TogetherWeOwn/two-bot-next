@@ -395,10 +395,24 @@ operator; a failed restore is never a reason to wait for the next deployment.
    containing the child run ID/SHA and restored members, retained for 14 days.
    The wrapper is green only after that proof is validated and uploaded.
 
-The wrapper serializes in `staging-rollback-proof`, **not** `deploy-staging`:
-its child must be able to acquire the staging deploy lane. The optional manual
-Worker-only drill still holds `deploy-staging` while it runs and now uploads
-its separate evidence artifact; it does not count as the daily automatic proof.
+The child is named `staging rollback proof`, not a staging certification run.
+Production excludes it from latest-certification history only after re-reading
+its same-repository main dispatch, exact first attempt, and all six expected
+step outcomes above. A name alone, a failed/missing restore, or a running proof
+never excuses a red staging run; a proof never certifies a commit for promotion.
+
+The child honors `STAGING_SOAK_HOLD_UNTIL` before the schema gates or deploy:
+an armed/invalid hold fails the proof without changing the observed staging
+build. Inspect the hold and resume the proof after the observation window;
+do not clear a hold to make a proof green. Explicit arm/disarm dispatches without
+the error-rate switch retain their exception.
+
+The wrapper uses separate `staging-rollback-proof-schedule` and
+`staging-rollback-proof-workflow_dispatch` groups, **not** `deploy-staging`:
+a later manual dispatch cannot replace the pending scheduled wrapper, and its
+child can acquire the staging deploy lane. The optional manual Worker-only
+drill still holds `deploy-staging` while it runs and now uploads its separate
+evidence artifact; it does not count as the daily automatic proof.
 
 A failed wrapper posts one finding through the existing `synthetic-alerts`
 Discord line. Independently, the **06:23 UTC** `daily-digest` workflow's

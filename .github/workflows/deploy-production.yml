@@ -515,6 +515,56 @@ jobs:
                   ) for run in staging_runs
               ):
                   refuse(f"deploy-staging has no verifiable latest run on {sha}")
+              def verified_proof(row):
+                  # A name alone cannot excuse red history. Only this workflow's
+                  # dispatch-only proof identity, exact attempt, and complete
+                  # expected failure + successful restore chain may be excluded.
+                  if row.get("display_title") != "staging rollback proof":
+                      return False
+                  current = api(f"repos/{repo}/actions/runs/{row['id']}", "the staging proof attempt")
+                  if any(current.get(key) != row.get(key) for key in ("id", "run_number", "head_sha")):
+                      return False
+                  if (current.get("display_title") != "staging rollback proof"
+                          or current.get("event") != "workflow_dispatch"
+                          or current.get("path", "").split("@")[0] != ".github/workflows/deploy-staging.yml"
+                          or current.get("head_branch") != "main"
+                          or (current.get("repository") or {}).get("full_name") != repo
+                          or (current.get("head_repository") or {}).get("full_name") != repo
+                          or current.get("status") != "completed" or current.get("conclusion") != "failure"
+                          or current.get("run_attempt") != 1):
+                      return False
+                  proof_jobs = collection(
+                      f"repos/{repo}/actions/runs/{row['id']}/attempts/1/jobs",
+                      "the staging proof jobs", "jobs",
+                  )
+                  deploy = [job for job in proof_jobs if any(
+                      step.get("name") == "Gate promotion on REST 5xx error rate"
+                      for step in job.get("steps", [])
+                  )]
+                  if len(deploy) != 1 or any(
+                      deploy[0].get(key) != expected for key, expected in {
+                          "run_id": row["id"], "run_attempt": 1, "head_sha": sha,
+                          "status": "completed", "conclusion": "failure",
+                      }.items()
+                  ):
+                      return False
+                  expected_steps = {
+                      "Snapshot the pre-deploy rollback state": "success",
+                      "Deploy to staging": "success",
+                      "Verify exact new rollout and serving Worker/container readiness": "success",
+                      "Gate promotion on REST 5xx error rate": "failure",
+                      "Auto-roll back Worker version and container image": "success",
+                      "Upload the rollout evidence": "success",
+                  }
+                  for name, outcome in expected_steps.items():
+                      steps = [step for step in deploy[0].get("steps", []) if step.get("name") == name]
+                      if len(steps) != 1 or steps[0].get("conclusion") != outcome:
+                          return False
+                  return True
+
+              staging_runs = [run for run in staging_runs if not verified_proof(run)]
+              if not staging_runs:
+                  refuse(f"deploy-staging has no certification run on {sha}; proofs never certify a build")
               staging_run = max(staging_runs, key=lambda run: (run["run_number"], run["id"]))
               if staging_run.get("status") != "completed" or staging_run.get("conclusion") != "success":
                   refuse(f"the latest deploy-staging run on {sha} is not a completed success")

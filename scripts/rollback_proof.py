@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
 import subprocess
 import sys
 import time
@@ -27,6 +28,8 @@ WORKFLOW = ".github/workflows/deploy-staging.yml"
 PROOF_WORKFLOW = ".github/workflows/staging-rollback-drill.yml"
 ARTIFACT = "staging-rollback-proof"
 MAX_BYTES = 2 << 20
+GH_TIMEOUT = 45
+REHEARSAL_TITLE = "staging rollback proof"
 MAX_WAIT = 70 * 60
 MAX_AGE = timedelta(hours=30)
 DISPATCH = {"ref": "main", "inputs": {"inject_error_rate_spike": True}}
@@ -66,17 +69,47 @@ def gh(path, *, body=None, binary=False):
             "-H", "X-GitHub-Api-Version: 2026-03-10", path]
     if body is not None:
         args += ["--input", "-"]
+    payload = json.dumps(body).encode() if body is not None else b""
+    # Dispatch bodies are tiny; never block writing a pipe-full of stdin before
+    # starting the readers. Drain BOTH output pipes, bounding bytes as received.
+    require(len(payload) <= 4096, "github_request_too_large")
+    output = bytearray()
     try:
-        result = subprocess.run(args, input=json.dumps(body).encode() if body is not None else None,
-                                capture_output=True, timeout=45, check=False)
+        with subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE) as child:
+            try:
+                deadline = time.monotonic() + GH_TIMEOUT
+                child.stdin.write(payload)
+                child.stdin.close()
+                with selectors.DefaultSelector() as selector:
+                    selector.register(child.stdout, selectors.EVENT_READ, "stdout")
+                    selector.register(child.stderr, selectors.EVENT_READ, "stderr")
+                    sizes = {"stdout": 0, "stderr": 0}
+                    while selector.get_map():
+                        remaining = deadline - time.monotonic()
+                        require(remaining > 0, "github_transport_failure")
+                        for key, _ in selector.select(remaining):
+                            stream = key.data
+                            chunk = os.read(key.fd, min(65536, MAX_BYTES - sizes[stream] + 1))
+                            if not chunk:
+                                selector.unregister(key.fileobj)
+                                continue
+                            sizes[stream] += len(chunk)
+                            require(sizes[stream] <= MAX_BYTES, "github_response_too_large")
+                            if stream == "stdout":
+                                output.extend(chunk)
+                child.wait(timeout=max(0.001, deadline - time.monotonic()))
+                require(child.returncode == 0, "github_request_failed_no_retry")
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                child.wait()
     except (OSError, subprocess.TimeoutExpired):
         raise ProofError("github_transport_failure") from None
-    require(result.returncode == 0, "github_request_failed_no_retry")
-    require(len(result.stdout) <= MAX_BYTES, "github_response_too_large")
     if binary:
-        return result.stdout
+        return bytes(output)
     try:
-        return json.loads(result.stdout, object_pairs_hook=unique_object)
+        return json.loads(output, object_pairs_hook=unique_object)
     except (ValueError, RecursionError):
         raise ProofError("github_invalid_json") from None
 
@@ -159,6 +192,7 @@ def prove(*, sleep=time.sleep, clock=time.monotonic):
         run = gh(f"repos/{REPO}/actions/runs/{run_id}")
         run_identity(run, WORKFLOW, "workflow_dispatch")
         require(run.get("id") == run_id and run.get("run_attempt") == 1, "run_id_or_attempt_changed")
+        require(run.get("display_title") == REHEARSAL_TITLE, "child_not_rehearsal")
         if run.get("status") == "completed":
             break
         require(clock() < deadline, "staging_run_timeout_inspect_child_no_redispatch")
@@ -191,9 +225,11 @@ def check_freshness(*, now=None):
             "daily_proof_not_green")
     require(timedelta(0) <= now - moment(run.get("created_at")) <= MAX_AGE, "daily_proof_stale")
     evidence = artifact_files(run["id"], ARTIFACT).get("proof.json") or {}
-    require(evidence.get("schema_version") == 1 and evidence.get("verdict") == "pass"
-            and evidence.get("environment") == "staging" and evidence.get("child_conclusion") == "failure"
-            and type(evidence.get("child_run_id")) is int, "daily_proof_evidence_invalid")
+    require(type(evidence.get("schema_version")) is int and evidence["schema_version"] == 1
+            and evidence.get("verdict") == "pass" and evidence.get("environment") == "staging"
+            and evidence.get("child_conclusion") == "failure"
+            and type(evidence.get("child_run_id")) is int and evidence["child_run_id"] > 0,
+            "daily_proof_evidence_invalid")
     return {"verdict": "pass", "proof_run_id": run["id"], "child_run_id": evidence["child_run_id"]}
 
 

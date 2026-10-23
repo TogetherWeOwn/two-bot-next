@@ -520,9 +520,12 @@ FAULT_MARKERS = (
 # deploy-staging must use exactly this expression.
 DEPLOY_SHA_EXPRESSION = "${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}"
 # Soak-hold bindings: the Operator-owned repo variable holding the ISO-8601
-# UTC deadline, plus the event name that lets dispatches bypass the hold.
+# UTC deadline, event name and dispatch-only rehearsal flag. Explicit arm/disarm
+# dispatches bypass the hold; automatic error-gate proofs never do.
 SOAK_HOLD_ENV = {"HOLD_UNTIL": "${{ vars.STAGING_SOAK_HOLD_UNTIL }}",
-                 "EVENT": "${{ github.event_name }}"}
+                 "EVENT": "${{ github.event_name }}",
+                 "REHEARSAL": "${{ github.event_name == 'workflow_dispatch' && inputs.inject_error_rate_spike && 'true' || 'false' }}"}
+REHEARSAL_RUN_NAME = "${{ github.event_name == 'workflow_dispatch' && inputs.inject_error_rate_spike && 'staging rollback proof' || github.workflow }}"
 
 
 def staging_gateway_injection_errors(workflows):
@@ -652,15 +655,13 @@ def production_error_rate_gate_errors(workflow, name="deploy-production.yml"):
 def staging_error_rate_gate_errors(workflows):
     """The error-rate promotion gate is dispatch-gated rehearsal plus live plumbing.
 
-    Exactly one expression in exactly one staging step may read the rehearsal
-    input, it must also require `workflow_dispatch` (a push never carries
-    inputs), and that step must be the error-rate gate step: it judges the
-    rehearsal firing when armed and scrapes live staging /ops/metrics
-    otherwise, failing the stage so auto-rollback runs. The scrape token is
-    optional (absent means a recorded skip, pinned in the gate script's
-    tests); the rehearsal path needs no secret. Every other workflow except
-    the pinned production mirror must not mention the switch at all, so no
-    unreviewed route can forward a drill anywhere else.
+    The input has exactly three pinned dispatch-only readers: run identity,
+    soak hold, and error-rate gate. The first two distinguish expected-red
+    proofs and prevent interrupting an observation window; only the gate
+    judges the rehearsal firing. It scrapes live staging /ops/metrics otherwise,
+    failing the stage so auto-rollback runs. The scrape token is optional
+    (absent means a recorded skip, pinned in the gate script's tests); the
+    rehearsal path needs no secret. No production input/binding may carry it.
     """
     errors = []
     for name, workflow in workflows.items():
@@ -672,8 +673,13 @@ def staging_error_rate_gate_errors(workflows):
                 errors.append(f"{name}: error-rate gate marker {marker} outside deploy-staging/deploy-production")
     staging = workflows.get("deploy-staging.yml") or {}
     text = str(staging)
-    if text.count("inputs.inject_error_rate_spike") != 1:
-        errors.append("deploy-staging.yml: inject_error_rate_spike must be read exactly once")
+    if text.count("inputs.inject_error_rate_spike") != 3:
+        errors.append("deploy-staging.yml: rehearsal input belongs only to its identity, hold and error gate")
+    if staging.get("run-name") != REHEARSAL_RUN_NAME:
+        errors.append("deploy-staging.yml: rehearsal identity must be pinned to the dispatch-only switch")
+    hold = ((staging.get("jobs") or {}).get("soak-hold") or {}).get("steps") or []
+    if len(hold) != 1 or hold[0].get("env") != SOAK_HOLD_ENV:
+        errors.append("deploy-staging.yml: rehearsal must honor the soak hold")
     steps = ((staging.get("jobs") or {}).get("deploy") or {}).get("steps") or []
     armed = [step for step in steps
              if isinstance(step, dict) and "INJECT_ERROR_RATE_SPIKE" in str(step)]
@@ -855,11 +861,12 @@ def soak_hold_errors(workflow, name="deploy-staging.yml"):
     push deploys must not redeploy it — and the run must fail fast here with
     a deferral message instead of reporting success without deploying (the
     production guard accepts a successful staging run as staging history, so
-    a quiet skip would void that leg). Dispatches (arm/disarm) always
-    proceed. One job runs first on every trigger (no `if:`, no `needs:`, no
-    environment, no checkout): a single step binds only the hold deadline var
-    and the event name, exits 0 for a dispatch, an empty var or an expired
-    deadline (fail open), and exits 1 for an unparsable or over-long value
+    a quiet skip would void that leg). Explicit arm/disarm dispatches
+    proceed, but error-rate proofs honor the hold. One job runs first on every
+    trigger (no `if:`, no `needs:`, no environment, no checkout): a single step
+    binds the hold deadline, event and pinned dispatch-only proof flag. It
+    exits 0 for a non-proof dispatch, empty var or expired deadline (fail open),
+    and exits 1 for an unparsable or over-long value
     (fail closed with a fix-it message) or an armed hold. Both the expiry and
     the deferral leave a job-summary line. The gates wait on this job; the
     deploy and the synthetic follow transitively, so a failed hold skips them
@@ -882,19 +889,18 @@ def soak_hold_errors(workflow, name="deploy-staging.yml"):
             errors.append(f"{name}:soak-hold: must not set {key} "
                           "(it runs first, on every trigger, with no bindings)")
     text = str(job)
-    if "secrets." in text or "inputs." in text:
-        errors.append(f"{name}:soak-hold: must read only the hold variable and the event name, "
-                      "never secrets or inputs")
+    if "secrets." in text:
+        errors.append(f"{name}:soak-hold: must never read secrets")
     steps = job.get("steps", [])
     if len(steps) != 1 or any("if" in step or "continue-on-error" in step for step in steps):
         errors.append(f"{name}:soak-hold: must run exactly one unconditional check step")
         return errors
     step = steps[0]
     if step.get("env") != SOAK_HOLD_ENV:
-        errors.append(f"{name}:soak-hold: step must bind exactly the hold deadline and the event name "
+        errors.append(f"{name}:soak-hold: step must bind exactly the hold deadline, event and rehearsal "
                       "via the environment")
     run = str(step.get("run") or "")
-    for needle in ("set -euo pipefail", '[ "$EVENT" = "workflow_dispatch" ]', '[ -z "$HOLD_UNTIL" ]',
+    for needle in ("set -euo pipefail", '[ "$EVENT" = "workflow_dispatch" ] && [ "${REHEARSAL:-false}" = "false" ]', '[ -z "$HOLD_UNTIL" ]',
                    'date -u -d "$HOLD_UNTIL" +%s', "14400", "GITHUB_STEP_SUMMARY", "::error::"):
         if needle not in run:
             errors.append(f"{name}:soak-hold: missing pin {needle}")
@@ -1529,8 +1535,8 @@ def staging_rollback_drill_errors(workflow):
         if (field.get("type") != "string" or str(field.get("required")).lower() != "false"
                 or field.get("default") != ""):
             errors.append(f"{name}: target_version must be optional/empty for the daily automatic proof")
-    if workflow.get("concurrency") != {"group": "staging-rollback-proof", "cancel-in-progress": "false"}:
-        errors.append(f"{name}: orchestrator must serialize outside the deploy-staging lane")
+    if workflow.get("concurrency") != {"group": "staging-rollback-proof-${{ github.event_name }}", "cancel-in-progress": "false"}:
+        errors.append(f"{name}: scheduled/manual wrappers must have separate groups outside deploy-staging")
     jobs = workflow.get("jobs") or {}
     if set(jobs) != {"drill", "proof", "alert"}:
         errors.append(f"{name}: jobs must be exactly drill, proof and alert")
@@ -6677,6 +6683,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(staging_rollback_drill_errors(workflow), [])
         for label, change in {
             "missing daily schedule": lambda w: w["on"].pop("schedule"),
+            "manual replaces pending schedule": lambda w: w["concurrency"].update({"group": "staging-rollback-proof"}),
             "weekly only": lambda w: w["on"].update({"schedule": [{"cron": "17 3 * * 1"}]}),
             "dispatcher deadlocks staging lane": lambda w: w["jobs"]["proof"].update(
                 {"concurrency": {"group": "deploy-staging", "cancel-in-progress": False}}),
@@ -6705,7 +6712,16 @@ class WorkflowTests(unittest.TestCase):
         spec.loader.exec_module(proof)
         deploy = self.workflows["deploy-staging.yml"]["jobs"]["deploy"]
         self.assertEqual(deploy["name"], "wrangler deploy + intended rollout gate")
-        self.assertTrue(set(proof.REQUIRED_STEPS) <= {s.get("name") for s in deploy["steps"]})
+        expected_steps = {
+            "Snapshot the pre-deploy rollback state": "success",
+            "Deploy to staging": "success",
+            "Verify exact new rollout and serving Worker/container readiness": "success",
+            "Gate promotion on REST 5xx error rate": "failure",
+            "Auto-roll back Worker version and container image": "success",
+            "Upload the rollout evidence": "success",
+        }
+        self.assertEqual(proof.REQUIRED_STEPS, expected_steps)
+        self.assertTrue(set(expected_steps) <= {s.get("name") for s in deploy["steps"]})
         worker_steps = self.workflows["check.yml"]["jobs"]["worker"]["steps"]
         covering = [s for s in worker_steps if "test_rollback_proof.py" in str(s.get("run") or "")]
         self.assertEqual(len(covering), 1)

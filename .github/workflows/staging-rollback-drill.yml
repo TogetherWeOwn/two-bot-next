@@ -17,7 +17,8 @@ on:
 permissions: {}
 
 concurrency:
-  group: staging-rollback-proof
+  # A later manual dispatch cannot replace the pending scheduled proof.
+  group: staging-rollback-proof-${{ github.event_name }}
   cancel-in-progress: false
 
 jobs:

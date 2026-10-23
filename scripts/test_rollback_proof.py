@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Offline fixtures for the daily staging rollback proof; no live dispatches."""
 
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+import importlib.util
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import io
@@ -9,12 +10,43 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
+import textwrap
+import time
 import unittest
 from unittest.mock import patch
 import zipfile
 
 import rollback_proof as proof
+import synthetic_alert
+
+# Independent oracle: never derive fixtures or negative cases from the code
+# under test. Deleting any guard entry must fail this contract and its cases.
+EXPECTED_STEPS = {
+    "Snapshot the pre-deploy rollback state": "success",
+    "Deploy to staging": "success",
+    "Verify exact new rollout and serving Worker/container readiness": "success",
+    "Gate promotion on REST 5xx error rate": "failure",
+    "Auto-roll back Worker version and container image": "success",
+    "Upload the rollout evidence": "success",
+}
+
+
+@contextmanager
+def local_gh(script):
+    """Replace only gh's executable, retaining real pipes, timeouts and cleanup."""
+    popen = subprocess.Popen
+    children = []
+
+    def launch(args, **kwargs):
+        child = popen([sys.executable, "-c", script], **kwargs)
+        children.append(child)
+        return child
+
+    with patch.object(proof.subprocess, "Popen", side_effect=launch) as call:
+        yield call, children
+
 
 NOW = datetime(2026, 10, 23, 6, 23, tzinfo=timezone.utc)
 VERSION = "11111111-1111-1111-1111-111111111111"
@@ -23,7 +55,7 @@ ENV = {"GITHUB_REPOSITORY": proof.REPO, "GITHUB_REF": "refs/heads/main"}
 
 
 def run(workflow=proof.WORKFLOW, event="workflow_dispatch", conclusion="failure"):
-    return {"id": 123, "path": workflow, "event": event, "head_branch": "main",
+    return {"id": 123, "display_title": "staging rollback proof", "path": workflow, "event": event, "head_branch": "main",
             "repository": {"full_name": proof.REPO}, "head_repository": {"full_name": proof.REPO},
             "head_sha": "a" * 40, "run_attempt": 1, "status": "completed", "conclusion": conclusion,
             "created_at": NOW.isoformat(), "updated_at": NOW.isoformat()}
@@ -41,7 +73,7 @@ def files():
 
 def jobs():
     return {"total_count": 1, "jobs": [{"name": "wrangler deploy + intended rollout gate",
-            "steps": [{"name": name, "conclusion": outcome} for name, outcome in proof.REQUIRED_STEPS.items()]}]}
+            "steps": [{"name": name, "conclusion": outcome} for name, outcome in EXPECTED_STEPS.items()]}]}
 
 
 class RollbackProofTests(unittest.TestCase):
@@ -70,7 +102,8 @@ class RollbackProofTests(unittest.TestCase):
         mutations = [lambda r: r.update(conclusion="success"), lambda r: r.update(conclusion="cancelled"),
                      lambda r: r.update(head_branch="feature"), lambda r: r.update(path="deploy-production.yml"),
                      lambda r: r.update(head_repository={"full_name": "fork/repo"}),
-                     lambda r: r.update(run_attempt=2), lambda r: r.update(id=124)]
+                     lambda r: r.update(run_attempt=2), lambda r: r.update(id=124),
+                     lambda r: r.update(display_title="deploy-staging")]
         for mutate in mutations:
             child = run()
             mutate(child)
@@ -90,14 +123,23 @@ class RollbackProofTests(unittest.TestCase):
         self.assertEqual(gh.call_count, 2)
 
     def test_every_expected_step_is_required(self):
-        for name in proof.REQUIRED_STEPS:
-            job = jobs()
-            next(s for s in job["jobs"][0]["steps"] if s["name"] == name)["conclusion"] = "skipped"
-            with self.subTest(name=name), patch.object(proof, "gh", side_effect=[{"workflow_run_id": 123}, run(), job]), \
-                    patch.object(proof, "artifact_files") as artifacts, redirect_stdout(io.StringIO()):
-                with self.assertRaisesRegex(proof.ProofError, "unexpected_staging_step_outcome"):
-                    proof.prove()
-                artifacts.assert_not_called()
+        self.assertEqual(proof.REQUIRED_STEPS, EXPECTED_STEPS)
+        for name in EXPECTED_STEPS:
+            for outcome in ("missing", "failure", "skipped", "success"):
+                if outcome == EXPECTED_STEPS[name]:
+                    continue
+                job = jobs()
+                steps = job["jobs"][0]["steps"]
+                if outcome == "missing":
+                    steps[:] = [step for step in steps if step["name"] != name]
+                else:
+                    next(s for s in steps if s["name"] == name)["conclusion"] = outcome
+                with self.subTest(name=name, outcome=outcome), patch.object(proof, "gh",
+                        side_effect=[{"workflow_run_id": 123}, run(), job]), \
+                        patch.object(proof, "artifact_files") as artifacts, redirect_stdout(io.StringIO()):
+                    with self.assertRaisesRegex(proof.ProofError, "unexpected_staging_step_outcome"):
+                        proof.prove()
+                    artifacts.assert_not_called()
 
     def test_evidence_rejects_wrong_version_image_staging_gate_or_injection(self):
         for file, key, value in [
@@ -172,17 +214,87 @@ class RollbackProofTests(unittest.TestCase):
         with patch.object(proof, "gh", return_value={"workflow_runs": []}), self.assertRaisesRegex(proof.ProofError, "missing"):
             proof.check_freshness(now=NOW)
 
+    def test_freshness_receipt_failures_execute_the_watcher_and_alert(self):
+        proof_check = proof.check_freshness
+        good = run(proof.PROOF_WORKFLOW, "schedule", "success")
+        receipt = {"schema_version": 1, "verdict": "pass", "environment": "staging",
+                   "child_conclusion": "failure", "child_run_id": 456}
+        invalid = []
+        for key, values in {
+            "schema_version": (None, True, 2, "1"), "verdict": (None, "fail"),
+            "environment": (None, "production"), "child_conclusion": (None, "success"),
+            "child_run_id": (None, "456", True, 0, -1, 1.5),
+        }.items():
+            for value in values:
+                invalid.append(dict(receipt, **{key: value}))
+            missing = dict(receipt)
+            del missing[key]
+            invalid.append(missing)
+        for evidence in invalid + [None, []]:
+            with self.subTest(evidence=evidence), patch.dict(os.environ, ENV), \
+                    patch.object(proof, "gh", return_value={"workflow_runs": [good]}), \
+                    patch.object(proof, "artifact_files", return_value={"proof.json": evidence}) as artifacts, \
+                    patch.object(proof, "check_freshness", wraps=lambda: proof_check(now=NOW)), \
+                    patch.object(synthetic_alert, "post") as post, \
+                    redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as stderr:
+                self.assertEqual(proof.main(["watch"]), 1)
+                self.assertEqual(json.loads(stderr.getvalue())["code"], "daily_proof_evidence_invalid")
+                artifacts.assert_called_once_with(123, "staging-rollback-proof")
+                self.assertEqual(post.call_count, 1)
+                self.assertIn("daily_proof_evidence_invalid", post.call_args.args[1])
+
+    def test_freshness_exact_age_boundaries(self):
+        for delta, passes in ((timedelta(0), True), (timedelta(hours=30), True),
+                              (timedelta(hours=30, microseconds=1), False),
+                              (timedelta(microseconds=-1), False)):
+            child = run(proof.PROOF_WORKFLOW, "schedule", "success")
+            child["created_at"] = (NOW - delta).isoformat()
+            evidence = {"schema_version": 1, "verdict": "pass", "environment": "staging",
+                        "child_conclusion": "failure", "child_run_id": 456}
+            with self.subTest(delta=delta), patch.object(proof, "gh", return_value={"workflow_runs": [child]}), \
+                    patch.object(proof, "artifact_files", return_value={"proof.json": evidence}):
+                if passes:
+                    self.assertEqual(proof.check_freshness(now=NOW)["verdict"], "pass")
+                else:
+                    with self.assertRaisesRegex(proof.ProofError, "daily_proof_stale"):
+                        proof.check_freshness(now=NOW)
+
     def test_watch_posts_only_on_a_finding_and_delivery_failure_is_red(self):
         for error in (None, proof.ProofError("daily_proof_missing"), ValueError("private-body")):
-            with patch.dict(os.environ, ENV), patch.object(proof, "check_freshness", side_effect=error,
-                    return_value={"verdict": "pass"}), patch.object(proof, "alert") as alert, \
-                    redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            with patch.dict(os.environ, dict(ENV, SYNTHETIC_ALERT_WEBHOOK_URL="synthetic-destination")), \
+                    patch.object(proof, "check_freshness", side_effect=error, return_value={"verdict": "pass"}), \
+                    patch.object(synthetic_alert, "post") as post, \
+                    patch.object(synthetic_alert, "run_link", return_value="https://example.test/run/123"), \
+                    redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as stderr:
                 code = proof.main(["watch"])
             self.assertEqual(code, 0 if error is None else 1)
-            self.assertEqual(alert.call_count, 0 if error is None else 1)
-        with patch.dict(os.environ, ENV), patch.object(proof, "alert", side_effect=proof.ProofError("alert_delivery_failed")), \
-                redirect_stderr(io.StringIO()):
+            if error is None:
+                post.assert_not_called()
+            else:
+                finding = "daily_proof_missing" if isinstance(error, proof.ProofError) else "daily_proof_unreadable"
+                post.assert_called_once_with("synthetic-destination", self.alert_text(finding))
+            self.assertNotIn("private-body", stderr.getvalue())
+        with patch.dict(os.environ, dict(ENV, SYNTHETIC_ALERT_WEBHOOK_URL="synthetic-destination")), \
+                patch.object(synthetic_alert, "post", side_effect=synthetic_alert.AlertError("private-body")) as post, \
+                redirect_stderr(io.StringIO()) as stderr:
             self.assertEqual(proof.main(["alert"]), 1)
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(json.loads(stderr.getvalue())["code"], "alert_delivery_failed")
+        self.assertNotIn("private-body", stderr.getvalue())
+
+    @staticmethod
+    def alert_text(code):
+        return (f"two-bot-next ALERT staging rollback proof: {code}. "
+                "Inspect the daily staging drill and its child run before retrying; never drill production. "
+                "Runbook: https://github.com/TogetherWeOwn/two-bot-next/blob/main/docs/production-deploy.md#daily-staging-proof "
+                "| logs https://example.test/run/123")
+
+    def test_alert_command_sends_exactly_one_notification(self):
+        with patch.dict(os.environ, dict(ENV, SYNTHETIC_ALERT_WEBHOOK_URL="synthetic-destination")), \
+                patch.object(synthetic_alert, "post") as post, \
+                patch.object(synthetic_alert, "run_link", return_value="https://example.test/run/123"):
+            self.assertEqual(proof.main(["alert"]), 0)
+        post.assert_called_once_with("synthetic-destination", self.alert_text("daily_proof_failed"))
 
     def test_dry_run_has_no_effects_and_missing_evidence_refuses_before_dispatch(self):
         with patch.object(proof, "gh") as gh, patch.object(proof, "alert") as alert, redirect_stdout(io.StringIO()):
@@ -194,12 +306,59 @@ class RollbackProofTests(unittest.TestCase):
             prove.assert_not_called()
 
     def test_api_version_is_pinned_and_failures_never_echo_stderr_or_retry(self):
-        output = subprocess.CompletedProcess([], 1, b"", b"private-body-secret")
-        with patch.object(proof.subprocess, "run", return_value=output) as call:
-            with self.assertRaisesRegex(proof.ProofError, "github_request_failed_no_retry"):
+        with local_gh("import sys; sys.stderr.write('private-body-secret'); sys.exit(1)") as (call, children):
+            with self.assertRaisesRegex(proof.ProofError, "^github_request_failed_no_retry$"):
                 proof.gh("repos/example")
         self.assertEqual(call.call_count, 1)
-        self.assertIn("X-GitHub-Api-Version: 2026-03-10", call.call_args.args[0])
+        self.assertEqual(call.call_args.args[0], ["gh", "api", "--method", "GET", "-H",
+                         "X-GitHub-Api-Version: 2026-03-10", "repos/example"])
+        self.assertIsNotNone(children[0].returncode)
+
+    def test_body_bearing_dispatch_uses_exact_post_argv_and_input_bytes(self):
+        path = "repos/TogetherWeOwn/two-bot-next/actions/workflows/deploy-staging.yml/dispatches"
+        body = {"ref": "main", "inputs": {"inject_error_rate_spike": True}}
+        script = ("import json,sys; data=sys.stdin.buffer.read(); "
+                  "print(json.dumps({'workflow_run_id':123,'input':data.decode()}))")
+        with local_gh(script) as (call, children):
+            response = proof.gh(path, body=body)
+        self.assertEqual(response, {"workflow_run_id": 123, "input": json.dumps(body)})
+        call.assert_called_once_with(["gh", "api", "--method", "POST", "-H",
+            "X-GitHub-Api-Version: 2026-03-10", path, "--input", "-"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(proof.GH_TIMEOUT, 45)
+        self.assertEqual(children[0].returncode, 0)
+
+    def test_empty_invalid_or_duplicate_json_response_fails_closed(self):
+        for raw in (b"", b"not-json", b'{"workflow_run_id":123,"workflow_run_id":124}'):
+            with self.subTest(raw=raw), local_gh(f"import sys; sys.stdout.buffer.write({raw!r})") as (call, _):
+                with self.assertRaises(proof.ProofError):
+                    proof.gh("repos/example")
+                self.assertEqual(call.call_count, 1)
+
+    def test_streaming_limits_both_pipes_before_child_finishes_and_reaps_it(self):
+        # The child writes cap+1 then sleeps. A post-buffer check cannot finish
+        # before the timeout; it must be killed for overflow, not timeout.
+        for stream in (1, 2):
+            script = f"import os,time; os.write({stream}, b'x' * {proof.MAX_BYTES + 1}); time.sleep(60)"
+            with self.subTest(stream=stream), patch.object(proof, "GH_TIMEOUT", 3), \
+                    local_gh(script) as (call, children):
+                start = time.monotonic()
+                with self.assertRaisesRegex(proof.ProofError, "^github_response_too_large$"):
+                    proof.gh("repos/example", binary=True)
+                self.assertLess(time.monotonic() - start, 3)
+                self.assertEqual(call.call_count, 1)
+                self.assertIsNotNone(children[0].returncode)
+        # Exactly at the cap is allowed, including stderr drained before stdout.
+        script = f"import os; os.write(2, b'x' * {proof.MAX_BYTES}); os.write(1, b'y' * {proof.MAX_BYTES})"
+        with local_gh(script):
+            self.assertEqual(proof.gh("repos/example", binary=True), b"y" * proof.MAX_BYTES)
+
+    def test_subprocess_timeout_kills_and_reaps_without_retry(self):
+        with patch.object(proof, "GH_TIMEOUT", 0.2), local_gh("import time; time.sleep(60)") as (call, children):
+            with self.assertRaisesRegex(proof.ProofError, "^github_transport_failure$"):
+                proof.gh("repos/example")
+            self.assertEqual(call.call_count, 1)
+            self.assertIsNotNone(children[0].returncode)
 
     def test_success_writes_only_sanitized_evidence(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, ENV), \
@@ -208,6 +367,108 @@ class RollbackProofTests(unittest.TestCase):
             path = Path(directory) / "proof.json"
             self.assertEqual(proof.main(["run", "--evidence", str(path)]), 0)
             self.assertEqual(json.loads(path.read_text()), {"verdict": "pass", "child_run_id": 123})
+
+
+class PromotionAndHoldTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Reuse the existing offline guard harness without modifying its
+        # Test Author acceptance cases (including short-SHA protection).
+        spec = importlib.util.spec_from_file_location("production_guard_fixture",
+            Path(__file__).with_name("test-deploy-production.py"))
+        cls.harness = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.harness)
+
+    def promotion(self, mutate_run=None, mutate_jobs=None, mutate_current=None, event="workflow_dispatch", live=False):
+        h = self.harness
+        child = dict(run(), id=502, run_number=6, head_sha=h.SHA)
+        if mutate_run:
+            mutate_run(child)
+        child_jobs = jobs()
+        child_jobs["jobs"][0].update(run_id=502, run_attempt=1, head_sha=h.SHA,
+                                      status="completed", conclusion="failure")
+        if mutate_jobs:
+            mutate_jobs(child_jobs)
+        history = [h.staging_run(), dict(child)]
+        current = deepcopy(child)
+        if mutate_current:
+            mutate_current(current)
+        # The guard re-reads the exact run and attempt, not just the listing.
+        return h.GuardBehaviourTests().guard(auto="true", event=event, **{
+            "staging-all": {"total_count": 2, "workflow_runs": history},
+            "ci-run": lambda path, query: current if path.endswith("/502") else h.workflow_run(),
+            "ci-jobs": lambda path, query: child_jobs if "/502/" in path else h.green()["ci-jobs"],
+            "production-readyz": {"status": 200, "build_revision": h.SHA if live else "f" * 40},
+        })
+
+    def test_verified_expected_red_rehearsal_does_not_hide_green_certification(self):
+        for event, live in (("workflow_dispatch", False), ("schedule", False), ("schedule", True)):
+            with self.subTest(event=event, live=live):
+                result = self.promotion(event=event, live=live)
+                self.assertEqual(result[0], 0, result[4])
+                self.assertEqual(result[1]["sha"], self.harness.SHA)
+                self.assertEqual(result[1]["skip"], "live" if live else "")
+                self.assertTrue(any(path.endswith("/actions/runs/502") for path, _ in result[3]))
+                self.assertTrue(any("/502/attempts/1/jobs" in path for path, _ in result[3]))
+
+    def test_listing_cannot_substitute_for_the_current_exact_run(self):
+        for key, value in (("id", 503), ("run_number", 7), ("head_sha", "b" * 40), ("run_attempt", 2)):
+            with self.subTest(key=key):
+                result = self.promotion(mutate_current=lambda row: row.update({key: value}))
+                self.assertEqual(result[0], 1, result[4])
+                self.assertEqual(result[1], {})
+                self.assertTrue(any(path.endswith("/actions/runs/502") for path, _ in result[3]))
+                self.assertFalse(any("/502/attempts/1/jobs" in path for path, _ in result[3]))
+
+    def test_name_alone_or_wrong_provenance_never_excuses_red_history(self):
+        for key, value in (("display_title", "ordinary deploy"), ("event", "push"),
+                           ("path", ".github/workflows/other.yml"), ("head_branch", "feature"),
+                           ("head_repository", {"full_name": "fork/repo"}), ("run_attempt", 2),
+                           ("status", "in_progress"), ("conclusion", "cancelled")):
+            with self.subTest(key=key):
+                result = self.promotion(mutate_run=lambda row: row.update({key: value}))
+                self.assertEqual(result[0], 1, result[4])
+                self.assertEqual(result[1], {})
+
+    def test_missing_failed_or_skipped_restore_chain_never_excuses_red_history(self):
+        for name, required in EXPECTED_STEPS.items():
+            for outcome in ("missing", "failure", "skipped", "success"):
+                if outcome == required:
+                    continue
+
+                def mutate(data):
+                    steps = data["jobs"][0]["steps"]
+                    if outcome == "missing":
+                        steps[:] = [step for step in steps if step["name"] != name]
+                    else:
+                        next(step for step in steps if step["name"] == name)["conclusion"] = outcome
+
+                with self.subTest(name=name, outcome=outcome):
+                    result = self.promotion(mutate_jobs=mutate)
+                    self.assertEqual(result[0], 1, result[4])
+                    self.assertEqual(result[1], {})
+
+    def test_daily_rehearsal_honors_the_hold_but_manual_arm_disarm_keeps_exception(self):
+        lines = (Path(__file__).resolve().parents[1] / ".github/workflows/deploy-staging.yml").read_text().splitlines()
+        start = lines.index("      - name: Defer the push while the soak hold is armed")
+        start = lines.index("        run: |", start) + 1
+        end = start
+        while end < len(lines) and (not lines[end].strip() or lines[end].startswith("          ")):
+            end += 1
+        shell = textwrap.dedent("\n".join(lines[start:end]))
+        now = datetime.now(timezone.utc)
+        for rehearsal, hold, expected in (
+            ("true", now + timedelta(hours=2), 1), ("false", now + timedelta(hours=2), 0),
+            ("true", now - timedelta(seconds=60), 0), ("true", "invalid", 1),
+            ("true", now + timedelta(hours=5), 1), ("true", "", 0),
+        ):
+            raw = hold.isoformat() if isinstance(hold, datetime) else hold
+            with self.subTest(rehearsal=rehearsal, hold=raw), \
+                    tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as directory:
+                env = dict(os.environ, EVENT="workflow_dispatch", REHEARSAL=rehearsal,
+                           HOLD_UNTIL=raw, GITHUB_STEP_SUMMARY=str(Path(directory) / "summary"))
+                result = subprocess.run(["bash", "-c", shell], env=env, capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, expected, result.stdout)
 
 
 if __name__ == "__main__":

@@ -2158,7 +2158,9 @@ disarms the drill by redeploy.
 3. Arm the fault at the pinned SHA: `gh workflow run deploy-staging.yml
    --ref main -f "sha=$DRILL_SHA" -f inject_voice_stall=true` (add
    `-f inject_unpaired_disconnect=true` for the crash-loop scope).
-   Dispatches bypass the hold, so arm and disarm work while it is armed.
+   Explicit arm/disarm dispatches bypass the hold. Error-rate rollback proofs,
+   including the daily automated dispatch, honor it and fail without deploying
+   while it is armed; do not clear the hold for a proof.
    The arm run stays red by design: the history guard fails it after a green
    deploy and synthetic so the pin never reads as staging history for the
    head. Read the deploy and synthetic steps, not the run color.
