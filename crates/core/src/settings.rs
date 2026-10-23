@@ -153,6 +153,9 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     ("TWO_EVENTSUB_BIND", SettingClass::EnvOnly),
     ("TWO_EVENTSUB_DELIVERY", SettingClass::EnvOnly),
     ("TWO_EVENTSUB_INVITE_URL", SettingClass::EnvOnly),
+    // --- required event-voice category (host decision D4): no default, the
+    // --- tick re-reads env and fails closed while unset. Never stored. ---
+    ("TWO_EVENT_VOICE_CATEGORY_ID", SettingClass::EnvOnly),
     ("TWO_TWITCH_BROADCASTERS", SettingClass::EnvOnly),
     ("TWO_TWITCH_CALLBACK_URL", SettingClass::EnvOnly),
     ("TWO_TWITCH_CLIENT_ID", SettingClass::EnvOnly),
@@ -1169,6 +1172,7 @@ mod tests {
         "TWO_EVENTSUB_BIND",
         "TWO_EVENTSUB_DELIVERY",
         "TWO_EVENTSUB_INVITE_URL",
+        "TWO_EVENT_VOICE_CATEGORY_ID",
         "TWO_HEALTH_BIND_HOST",
         "TWO_HEALTH_PORT",
         "TWO_INTERNAL_ACTIONS",
@@ -1222,7 +1226,7 @@ mod tests {
             assert_eq!(classify_key(key), Some(SettingClass::EnvOnly), "{key}");
         }
         let expected_total = EXPECTED_HOT.len() + EXPECTED_COLD.len() + EXPECTED_ENV_ONLY.len();
-        assert_eq!(expected_total, 134, "tripwire lists must stay complete");
+        assert_eq!(expected_total, 135, "tripwire lists must stay complete");
         assert_eq!(
             SETTING_CLASSES.len(),
             expected_total,
