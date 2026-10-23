@@ -1950,7 +1950,7 @@ impl Metrics {
         values.voice_join_to_move.render(
             &mut out,
             "two_bot_voice_join_to_move_seconds",
-            "Creator join gateway receipt to successful member move in seconds.",
+            "Seconds from creator join receipt to successful move.",
         );
         header(
             &mut out,
@@ -2030,7 +2030,7 @@ impl Metrics {
             &mut out,
             "two_bot_job_last_error_class",
             "gauge",
-            "One-hot last failure class by job; zero before failure or after success.",
+            "Last job error class, one-hot; cleared on success.",
         );
         for (job, current) in JOBS.iter().zip(&values.jobs) {
             for class in JOB_ERROR_CLASSES {
@@ -2062,7 +2062,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_reconcile_actions_total",
             "counter",
-            "Reconcile transitions and new enqueues by bounded action.",
+            "Reconcile transitions/new enqueues by action.",
         );
         for (action, count) in VOICE_RECONCILE_ACTIONS.iter().zip(values.voice_reconcile) {
             writeln!(
@@ -2075,7 +2075,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_dead_letters_total",
             "counter",
-            "Queue writes that exhausted QUEUE_MAX_ATTEMPTS by bounded family.",
+            "Queue writes exhausting QUEUE_MAX_ATTEMPTS by family.",
         );
         for (action, count) in VOICE_DEAD_ACTIONS.iter().zip(values.voice_dead) {
             writeln!(
@@ -2088,14 +2088,14 @@ impl Metrics {
             &mut out,
             "two_bot_voice_tracked_rooms",
             "gauge",
-            "Rooms tracked in memory; compare with live Discord channels for ghosts.",
+            "In-memory rooms; compare live channels for ghosts.",
         );
         writeln!(out, "two_bot_voice_tracked_rooms {}", values.voice_tracked).unwrap();
         header(
             &mut out,
             "two_bot_voice_compensation_pending",
             "gauge",
-            "Tracked rooms awaiting compensating delete after a failed write.",
+            "Rooms awaiting delete after failed write.",
         );
         writeln!(
             out,
@@ -2119,7 +2119,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_join_refused_total",
             "counter",
-            "Actor-received creator joins refused before queueing, by bounded reason.",
+            "Actor creator-join refusals before queueing by reason.",
         );
         for (reason, count) in VOICE_JOIN_REFUSAL_REASONS
             .iter()
@@ -2179,7 +2179,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_live_not_ready_seconds",
             "gauge",
-            "Max seconds a connected guild voice view is unready; 0 if ready or disconnected.",
+            "Max connected voice-unready seconds; 0 if ready/disconnected.",
         );
         writeln!(
             out,
@@ -2196,7 +2196,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_rest_in_flight_age_seconds",
             "gauge",
-            "Age of the oldest in-flight voice REST attempt in seconds; 0 when idle.",
+            "Oldest in-flight voice REST age, seconds; 0 if idle.",
         );
         writeln!(
             out,
@@ -2208,7 +2208,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_creator_map_generation",
             "gauge",
-            "Last merged creator-map generation; 0 before the first merge.",
+            "Creator-map generation; 0 before first merge.",
         );
         writeln!(
             out,
@@ -2220,7 +2220,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_creator_map_age_seconds",
             "gauge",
-            "Seconds since the last successful creator-map merge; 0 when never merged.",
+            "Seconds since creator-map merge; 0 if never merged.",
         );
         writeln!(
             out,
@@ -2256,7 +2256,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_actor_inbox_turn_bound",
             "gauge",
-            "Max inbox turns before other ready actor work; 0 before publication.",
+            "Max inbox turns before other ready work; 0 if unpublished.",
         );
         writeln!(
             out,
@@ -2280,7 +2280,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_vote_kick_total",
             "counter",
-            "Vote-kick starts, refusals and terminal enforcements; votes are audit-only.",
+            "Vote-kick starts/refusals/enforcements; votes audit-only.",
         );
         for (outcome, count) in VOICE_VOTE_KICK_OUTCOMES.iter().zip(values.voice_vote_kick) {
             writeln!(
@@ -2309,7 +2309,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_names_total",
             "counter",
-            "Room-name template creation, renders and dispatched or dropped renames.",
+            "Name-template creation/renders and rename dispatches/drops.",
         );
         for (outcome, count) in VOICE_NAME_OUTCOMES.iter().zip(values.voice_names) {
             writeln!(
@@ -2347,7 +2347,7 @@ impl Metrics {
             &mut out,
             "two_bot_send_admissions_total",
             "counter",
-            "Send-admission admit() decisions by bounded terminal outcome.",
+            "Terminal admit() decisions by outcome.",
         );
         for (outcome, count) in SEND_ADMISSION_OUTCOMES.iter().zip(values.send_admissions) {
             writeln!(
@@ -2399,7 +2399,7 @@ impl Metrics {
                 &mut out,
                 name,
                 "counter",
-                "Joins dropped before worker observation by bounded queue reason; no retry.",
+                "Joins lost before observation by queue reason; no retry.",
             );
             for (reason, index) in JOIN_QUEUE_DROP_REASONS {
                 writeln!(
@@ -2462,7 +2462,7 @@ impl Metrics {
             &mut out,
             "two_bot_moderation_enforcements_total",
             "counter",
-            "Terminal moderation outcomes by verb; excludes retries and backoffs.",
+            "Terminal moderation by verb; no retries/backoffs.",
         );
         for (verb, outcomes) in MODERATION_VERBS.iter().zip(values.moderation_enforcements) {
             for (outcome, count) in MODERATION_ENFORCEMENT_OUTCOMES.iter().zip(outcomes) {
@@ -2477,7 +2477,7 @@ impl Metrics {
             &mut out,
             "two_bot_community_facts_drain_failures_total",
             "counter",
-            "Community-facts drain failures by reason; one per failed dispatch.",
+            "Drain failures by reason; once per failed dispatch.",
         );
         for (reason, count) in COMMUNITY_FACTS_DRAIN_REASONS
             .iter()
@@ -2564,7 +2564,7 @@ impl Metrics {
             &mut out,
             "two_bot_eventsub_reconcile_passes_total",
             "counter",
-            "EventSub reconcile passes by bounded outcome; alert when failed rises across scrapes.",
+            "Reconcile passes by outcome; alert on failure deltas.",
         );
         for (outcome, count) in EVENTSUB_RECONCILE_OUTCOMES
             .iter()
@@ -2580,7 +2580,7 @@ impl Metrics {
             &mut out,
             "two_bot_eventsub_reconcile_actions_total",
             "counter",
-            "Successful EventSub reconcile mutations by bounded action.",
+            "Successful reconcile mutations by action.",
         );
         for (action, count) in EVENTSUB_RECONCILE_ACTIONS
             .iter()
