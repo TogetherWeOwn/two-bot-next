@@ -390,7 +390,7 @@ async fn refresh_failure_keeps_the_existing_honest_saved_state_suffix() {
         .expect("saved signup");
     assert_eq!(
         reply,
-        "LFG joined. Message refresh failed; the saved state is unchanged."
+        "LFG joined. Message refresh failed; the saved result above still applies."
     );
     assert_eq!(pool.signup_role("post-a", "2").as_deref(), Some("tank"));
     assert_eq!(pool.audits().len(), 1);
