@@ -17,6 +17,9 @@
 
 #![cfg(test)]
 
+#[path = "reopen_dispatch_review_acceptance_tests.rs"]
+mod reopen_dispatch_review_acceptance_tests;
+
 #[path = "leveling_ack_ordering_acceptance_tests.rs"]
 mod leveling_ack_ordering_acceptance_tests;
 #[path = "leveling_ack_visibility_acceptance_tests.rs"]
