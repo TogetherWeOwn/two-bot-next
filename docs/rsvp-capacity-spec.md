@@ -509,8 +509,9 @@ Admission remains dark through S1–S3; only a later separately authorized
 activation after S4's compatibility/worker proofs can admit anything. Every
 admission/finalize independently checks DB time, not just a periodic closer.
 
-The Test Author must create `crates/core/tests/rsvp_capacity_contract.rs` and
-make this command fail for missing capacity behavior before implementation.
+The Test Author must create the future `rsvp_capacity_contract.rs` acceptance
+file in the existing `crates/core/tests/` directory and make the command above
+fail for missing capacity behavior before implementation.
 A zero-tests/ignored run is not acceptance. Add corresponding runtime targets
 for S2/S3/S4 to the normal CI inventory; existing unchanged RSVP/reminder suites
 remain regression coverage, not proof of the missing capacity feature.
