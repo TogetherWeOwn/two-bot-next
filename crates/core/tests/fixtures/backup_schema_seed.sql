@@ -268,6 +268,19 @@ INSERT INTO giveaway_draws
      winner_ids, reroll_kind)
 VALUES ('100000000000000001', '100000000000000021', 0, '2026-08-02T18:00:00.000Z', 1,
         'eligible', 'seed', '["100000000000000005"]', NULL);
+-- Event voice pair (0455, v13): one claimed instance plus one closed and one
+-- open presence span, so the roundtrip covers the nullable lease/left_at.
+INSERT INTO event_voice_channels
+    (event_id, instance_starts_at, starts_at, ends_at, status, owner_tick_lease,
+     voice_channel_id, created_at, updated_at)
+VALUES ('100000000000000011', '2026-08-02T18:00:00.000Z', '2026-08-02T18:00:00.000Z',
+        '2026-08-02T20:00:00.000Z', 'creating', 'tick-seed', '100000000000000003',
+        '2026-08-01T10:00:00.000Z', '2026-08-01T10:00:00.000Z');
+INSERT INTO event_voice_presence (event_id, instance, user_id, joined_at, left_at)
+VALUES ('100000000000000011', '2026-08-02T18:00:00.000Z', '100000000000000002',
+        '2026-08-02T18:01:00.000Z', '2026-08-02T19:00:00.000Z'),
+       ('100000000000000011', '2026-08-02T18:00:00.000Z', '100000000000000004',
+        '2026-08-02T18:05:00.000Z', NULL);
 INSERT INTO counter_snapshots
     (guild_id, human_member_count, human_member_count_at, online_count, online_count_at)
 VALUES ('100000000000000001', 123, '2026-08-01T09:00:00.000Z', 13, '2026-08-01T09:01:00.000Z');

@@ -1461,10 +1461,10 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v13-source.ndjson.gz");
+    let current_path = directory.path("v14-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 13);
+    assert_eq!(old.manifest.version, 14);
     for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -1510,16 +1510,18 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v13-source.ndjson.gz");
+    let current_path = directory.path("v14-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 13);
+    assert_eq!(old.manifest.version, 14);
     for name in [
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
         "scheduled_events_claim",
         "scheduled_events_tombstone",
+        "event_voice_channels",
+        "event_voice_presence",
         "admin_api_tokens",
     ] {
         let rows = old.buffers.remove(name).unwrap();
@@ -1540,6 +1542,8 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
             "giveaway_draws",
             "scheduled_events_claim",
             "scheduled_events_tombstone",
+            "event_voice_channels",
+            "event_voice_presence",
             "admin_api_tokens"
         ]
     );
@@ -1553,6 +1557,8 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
         "giveaway_draws",
         "scheduled_events_claim",
         "scheduled_events_tombstone",
+        "event_voice_channels",
+        "event_voice_presence",
         "admin_api_tokens",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
@@ -1580,18 +1586,20 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v13-source.ndjson.gz");
+    let current_path = directory.path("v14-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 13);
+    assert_eq!(old.manifest.version, 14);
     // Frozen claim-only v10 shape: the merged v10 writer carried the
-    // epoch-claim guard but predates the delete tombstones and the token
-    // registry.
+    // epoch-claim guard but predates the delete tombstones, token registry
+    // event voice pair and giveaways.
     for name in [
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
         "scheduled_events_tombstone",
+        "event_voice_channels",
+        "event_voice_presence",
         "admin_api_tokens",
     ] {
         let rows = old.buffers.remove(name).unwrap();
@@ -1611,6 +1619,8 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
             "giveaway_entries",
             "giveaway_draws",
             "scheduled_events_tombstone",
+            "event_voice_channels",
+            "event_voice_presence",
             "admin_api_tokens"
         ]
     );
@@ -1623,6 +1633,8 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
         "giveaway_entries",
         "giveaway_draws",
         "scheduled_events_tombstone",
+        "event_voice_channels",
+        "event_voice_presence",
         "admin_api_tokens",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
@@ -1658,25 +1670,24 @@ async fn v11_archive_restores_and_clears_newer_registry() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v13-source.ndjson.gz");
+    let current_path = directory.path("v14-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 13);
+    assert_eq!(old.manifest.version, 14);
     // Frozen tombstone-only v11 shape: the merged v11 writer carried the
-    // delete tombstones but predates the token registry.
-    for name in ["giveaways", "giveaway_entries", "giveaway_draws"] {
+    // delete tombstones but predates the token registry event voice pair and giveaways.
+    for name in [
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
+        "event_voice_channels",
+        "event_voice_presence",
+        "admin_api_tokens",
+    ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
         old.manifest.tables.retain(|table| table.name != name);
     }
-    let rows = old.buffers.remove("admin_api_tokens").unwrap();
-    assert!(
-        !rows.is_empty(),
-        "fixture must populate newer admin_api_tokens"
-    );
-    old.manifest
-        .tables
-        .retain(|table| table.name != "admin_api_tokens");
     old.manifest.version = 11;
     old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
     let old_path = directory.path("pre-registry-v11.ndjson.gz");
@@ -1689,6 +1700,8 @@ async fn v11_archive_restores_and_clears_newer_registry() {
             "giveaways",
             "giveaway_entries",
             "giveaway_draws",
+            "event_voice_channels",
+            "event_voice_presence",
             "admin_api_tokens"
         ]
     );
@@ -1696,18 +1709,14 @@ async fn v11_archive_restores_and_clears_newer_registry() {
     forget_moderation_history(pool).await;
     let report = restore(pool, &old_path).await.unwrap();
     assert!(report.ok);
-    let count: i64 = sqlx::query_scalar(audited(format!(
-        "SELECT COUNT(*) FROM {}",
-        identifier("admin_api_tokens")
-    )))
-    .fetch_one(pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        count, 0,
-        "v11 restore clears newer admin_api_tokens target rows"
-    );
-    for name in ["giveaways", "giveaway_entries", "giveaway_draws"] {
+    for name in [
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
+        "event_voice_channels",
+        "event_voice_presence",
+        "admin_api_tokens",
+    ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
             identifier(name)
@@ -1734,28 +1743,103 @@ async fn v11_archive_restores_and_clears_newer_registry() {
 }
 
 #[tokio::test]
-async fn v12_archive_restores_and_clears_newer_giveaways() {
+async fn v12_archive_restores_and_clears_newer_event_voice() {
     let Some(db) = database().await else {
         return;
     };
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v13-source.ndjson.gz");
+    let current_path = directory.path("v14-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 13);
+    assert_eq!(old.manifest.version, 14);
+    for table in [
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
+        "event_voice_channels",
+        "event_voice_presence",
+    ] {
+        let rows = old.buffers.remove(table).unwrap();
+        assert!(!rows.is_empty(), "fixture must populate newer {table}");
+        old.manifest.tables.retain(|info| info.name != table);
+    }
+    old.manifest.version = 12;
+    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
+    let old_path = directory.path("pre-event-voice-v12.ndjson.gz");
+    write_archive(&old_path, &old);
+    let inspected = inspect(&old_path).expect("pre-change v12 archive remains readable");
+    assert_eq!(inspected.manifest.version, 12);
+    assert_eq!(
+        inspected.manifest.missing_tables(),
+        [
+            "giveaways",
+            "giveaway_entries",
+            "giveaway_draws",
+            "event_voice_channels",
+            "event_voice_presence"
+        ]
+    );
+    // This test deliberately replaces a reused isolated rehearsal target.
+    forget_moderation_history(pool).await;
+    let report = restore(pool, &old_path).await.unwrap();
+    assert!(report.ok);
+    for table in [
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
+        "event_voice_channels",
+        "event_voice_presence",
+    ] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(table)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "v12 restore clears newer {table} target rows");
+    }
+    let tokens: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_api_tokens")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(
+        tokens > 0,
+        "the v12 token registry is restored, not discarded"
+    );
+    let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(members > 0, "older covered data is restored, not discarded");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v13_archive_restores_and_clears_newer_giveaways() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    seed(pool).await;
+    let directory = ArchiveDirectory::new();
+    let current_path = directory.path("v14-source.ndjson.gz");
+    dump(pool, &current_path).await.unwrap();
+    let mut old = inspect(&current_path).unwrap();
+    assert_eq!(old.manifest.version, 14);
     for name in ["giveaways", "giveaway_entries", "giveaway_draws"] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
         old.manifest.tables.retain(|table| table.name != name);
     }
-    old.manifest.version = 12;
+    old.manifest.version = 13;
     old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
-    let old_path = directory.path("pre-giveaways-v12.ndjson.gz");
+    let old_path = directory.path("pre-giveaways-v13.ndjson.gz");
     write_archive(&old_path, &old);
-    let inspected = inspect(&old_path).expect("pre-change v12 archive remains readable");
-    assert_eq!(inspected.manifest.version, 12);
+    let inspected = inspect(&old_path).expect("pre-change v13 archive remains readable");
+    assert_eq!(inspected.manifest.version, 13);
     assert_eq!(
         inspected.manifest.missing_tables(),
         ["giveaways", "giveaway_entries", "giveaway_draws"]
@@ -1772,7 +1856,17 @@ async fn v12_archive_restores_and_clears_newer_giveaways() {
         .fetch_one(pool)
         .await
         .unwrap();
-        assert_eq!(count, 0, "v12 restore clears newer {name} target rows");
+        assert_eq!(count, 0, "v13 restore clears newer {name} target rows");
+    }
+    for name in ["event_voice_channels", "event_voice_presence"] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(name)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(count > 0, "the v13 {name} rows are restored, not discarded");
     }
     let tokens: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_api_tokens")
         .fetch_one(pool)
