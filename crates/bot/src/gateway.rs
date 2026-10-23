@@ -1541,7 +1541,10 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         // disposition: rejected creates never reach automations.
                         if let (Some(runtime), Some(dispatch)) = (runtime.as_ref(), dispatch.as_ref()) {
                             if !(automod_enabled && matches!(dispatch.event, Event::MessageCreate(_))) {
-                                if interactions.is_some() {
+                                if matches!(dispatch.event, Event::ReactionAdd(_) | Event::ReactionRemove(_) | Event::MessageDelete(_)) {
+                                    let delivery = two_bot_discord::adapter::reaction_delivery(&checkpoint.session_id, sequence);
+                                    runtime.dispatch_reaction_delivery(&dispatch.event, Some(&delivery));
+                                } else if interactions.is_some() {
                                     runtime.dispatch_remaining(&dispatch.event);
                                 } else {
                                     runtime.dispatch(&dispatch.event);

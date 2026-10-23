@@ -2882,6 +2882,62 @@ impl ActionExecutor {
         .await
     }
 
+    /// Send one highlight through the shared paced/admitted transport. The caller
+    /// owns a durable send reservation; ambiguous outcomes must never be resent.
+    pub async fn post_highlight(
+        &self,
+        channel_id: &str,
+        embed: &serde_json::Value,
+        nonce: u64,
+    ) -> Result<String, DiscordError> {
+        let channel: Id<ChannelMarker> = snowflake(channel_id)?;
+        let mut body = serde_json::json!({
+            "embeds": [embed], "nonce": nonce, "enforce_nonce": true,
+            "allowed_mentions": {"parse": []}
+        });
+        crate::message_safety::sanitize_message(&mut body);
+        crate::message_safety::validate_create(&body)?;
+        let body = serde_json::to_vec(&body)
+            .map_err(|_| DiscordError::Rejected("invalid highlight body".into()))?;
+        let request = Request::builder(&Route::CreateMessage {
+            channel_id: channel.get(),
+        })
+        .body(body)
+        .build()
+        .map_err(|_| DiscordError::Rejected("invalid highlight request".into()))?;
+        let mut response = self.call_once_raw_paced(request, &[200, 201]).await?;
+        let id = mutation_receipt_id(&response.body)?;
+        response.complete_confirmed().await?;
+        Ok(id)
+    }
+
+    /// Replace a highlight embed without pinging members or replaying a send.
+    pub async fn edit_highlight(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        embed: &serde_json::Value,
+    ) -> Result<(), DiscordError> {
+        let channel: Id<ChannelMarker> = snowflake(channel_id)?;
+        let message: Id<MessageMarker> = snowflake(message_id)?;
+        let mut body = serde_json::json!({
+            "embeds": [embed], "allowed_mentions": {"parse": []}
+        });
+        crate::message_safety::sanitize_message(&mut body);
+        let body = serde_json::to_vec(&body)
+            .map_err(|_| DiscordError::Rejected("invalid highlight body".into()))?;
+        let request = Request::builder(&Route::UpdateMessage {
+            channel_id: channel.get(),
+            message_id: message.get(),
+        })
+        .body(body)
+        .build()
+        .map_err(|_| DiscordError::Rejected("invalid highlight request".into()))?;
+        let mut response = self.call_once_raw_paced(request, &[200]).await?;
+        response.complete_confirmed().await?;
+        Ok(())
+    }
+
     /// Refresh content and selects. Edits must suppress mentions independently of POST.
     pub async fn edit_message_with_components(
         &self,

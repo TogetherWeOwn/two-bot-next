@@ -188,6 +188,8 @@ const SATURATION_LOG_WINDOW_SECS: u64 = 60;
 struct DispatchTasks {
     stopped: bool,
     lanes: [Vec<tokio::task::AbortHandle>; DISPATCH_LIMITS.len()],
+    /// Starboard coalesces per message, independently of self-role fairness.
+    highlights: Vec<tokio::task::AbortHandle>,
     /// Per-lane drops (test-visible mirror of the global
     /// `two_bot_dispatch_drops_total{lane}` counter, incremented alongside by
     /// `DispatchTasks::record_drop`; fairness drops share their lane's
@@ -234,6 +236,9 @@ impl Drop for CommandDispatchGuard {
             "command_dispatch_guard",
         );
         tasks.stopped = true;
+        for handle in tasks.highlights.drain(..) {
+            handle.abort();
+        }
         for lane in &mut tasks.lanes {
             for handle in lane.drain(..) {
                 handle.abort();
@@ -272,6 +277,7 @@ pub struct CommandRuntime {
     /// Shared self-role surface; production boot stays parked pending acceptance.
     self_roles: Option<Arc<SelfRoleService>>,
     leveling: LevelingRuntime,
+    starboard: Arc<crate::starboard_runtime::StarboardRuntime>,
     /// Configured guild (`GUILD_ID`); also the router's guild fence.
     guild_id: u64,
     tickets: Option<Arc<crate::ticket_runtime::TicketRuntime>>,
@@ -351,7 +357,13 @@ impl CommandRuntime {
             ChannelModerationStore::from_pool(pool.clone()),
             executor.clone(),
         );
+        let starboard = crate::starboard_runtime::StarboardRuntime::new(
+            pool.clone(),
+            executor.clone(),
+            guild_id,
+        );
         Arc::new(Self {
+            starboard,
             pool,
             executor,
             interactions,
@@ -1036,8 +1048,9 @@ impl CommandRuntime {
                     self.admit_interaction(interaction)
                 }
             }
-            Event::ReactionAdd(reaction) => self.dispatch_self_role_reaction(&reaction.0, false),
-            Event::ReactionRemove(reaction) => self.dispatch_self_role_reaction(&reaction.0, true),
+            Event::ReactionAdd(_) | Event::ReactionRemove(_) | Event::MessageDelete(_) => {
+                self.dispatch_reaction_delivery(event, None)
+            }
             Event::Ready(ready) => {
                 // A READY-supplied application id never overwrites the boot
                 // pin on faith: arm identity only when the token-derived pin
@@ -1074,6 +1087,37 @@ impl CommandRuntime {
             }
             _ => false,
         }
+    }
+
+    /// Ingress supplies the session-scoped identity before any detached work.
+    /// Keep self-role reaction dispatch independent of the starboard config.
+    pub(crate) fn dispatch_reaction_delivery(
+        &self,
+        event: &Event,
+        delivery: Option<&two_bot_core::events::ReactionDelivery>,
+    ) -> bool {
+        let admitted = match self.starboard.enqueue(event, delivery) {
+            Ok(Some(work)) => {
+                let mut tasks = self.tasks.lock().unwrap_or_else(PoisonError::into_inner);
+                tasks.highlights.retain(|handle| !handle.is_finished());
+                if tasks.stopped {
+                    false
+                } else {
+                    tasks
+                        .highlights
+                        .push(tokio::spawn(work.run()).abort_handle());
+                    true
+                }
+            }
+            Ok(None) => true,
+            Err(()) => false,
+        };
+        let self_role = match event {
+            Event::ReactionAdd(reaction) => self.dispatch_self_role_reaction(&reaction.0, false),
+            Event::ReactionRemove(reaction) => self.dispatch_self_role_reaction(&reaction.0, true),
+            _ => true,
+        };
+        admitted && self_role
     }
 
     /// Ticket identity is independent of which runtime owns registry publication.
