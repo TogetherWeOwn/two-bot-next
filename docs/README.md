@@ -121,6 +121,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Redirect safety](redirect-configuration.md)
 - [Scheduled queue order](schedule-queue-order.md)
 - [Scheduled skip tests](scheduled-events-skip-acceptance.md)
+- [Scheduled event reminders](event-reminders.md)
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
 - [Ticket runtime](tickets.md)
 - [Ticket lifecycle observability](ticket-lifecycle-observability.md)
