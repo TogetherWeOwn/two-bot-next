@@ -72,10 +72,11 @@ not the repair's operational backout. Keep migration history intact.
 
 ## Backup, rollback and privacy
 
-Backup discovers live columns dynamically; this is still the v12 table inventory,
-not a new table or archive version. New archives include both holder columns.
-Populated pre-holder v12 archives cannot restore valid authority: missing holder
-columns hit NOT NULL and roll back the restore transaction. An older readable
+Backup discovers live columns dynamically. The current v13 inventory includes the
+event voice pair; this holder repair adds no table or archive version. New archives
+include both holder columns. Populated pre-holder archives cannot restore valid
+authority: missing holder columns hit NOT NULL and roll back the restore
+transaction. An older readable
 archive that legitimately omits the registry (v4–v11) retains its existing
 versioned clearing behavior; it must not fabricate credential holders.
 

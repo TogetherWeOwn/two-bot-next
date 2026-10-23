@@ -13,6 +13,7 @@ pub mod gateway_backoff;
 // seam. The binary compiles these same source files as crate-local modules.
 // Visibility widens (`pub(crate)` -> `pub`) with no logic change.
 pub mod containment_runtime;
+pub mod event_voice_channels;
 pub mod join_risk_runtime;
 pub mod lane_jitter;
 pub mod raid_runtime;

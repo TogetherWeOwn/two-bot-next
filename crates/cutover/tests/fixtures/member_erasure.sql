@@ -169,6 +169,13 @@ BEGIN
         VALUES (g, 'vk-' || k, 'vote_started', 'v-' || k, u, u, 'started', '2026-10-01T00:00:00Z');
       INSERT INTO retention_deletion_requests (request_id, guild_id, user_id)
         VALUES (k, g, u);
+      -- Event voice presence is guild-scoped through the scheduled-event
+      -- mirror (one event per member keeps the loop conflict-free).
+      INSERT INTO scheduled_events
+        (guild_id, event_id, name, starts_at, channel_id, description, status, updated_at)
+        VALUES (g, 'ev-' || k, 'fixture', '2026-11-01T20:00:00Z', NULL, NULL, 'scheduled', '2026-10-01T00:00:00Z');
+      INSERT INTO event_voice_presence (event_id, instance, user_id, joined_at, left_at)
+        VALUES ('ev-' || k, '2026-11-01T20:00:00Z', u, '2026-11-01T20:00:00Z', NULL);
       -- Three S8 event_store rows per member, each binding the member in exactly
       -- one of actor_id, target_id and user_id (the others NULL) with distinct
       -- dedup_keys, so each erasure predicate branch is exercised
