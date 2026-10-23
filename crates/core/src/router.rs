@@ -1629,7 +1629,7 @@ mod tests {
             .copied()
             .filter(|name| *name != "kick")
             .collect();
-        assert_eq!(on_names[29..], expected[..]);
+        assert_eq!(on_names[30..], expected[..]);
         assert!(!on_names.contains(&"templateassistant"));
         assert!(on.iter().all(|c| !c.dm_permission));
     }
