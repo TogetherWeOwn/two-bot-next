@@ -345,6 +345,20 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             ],
         ),
         row(
+            "lfg-list",
+            33,
+            E2eGate::Announcements,
+            PERM_MANAGE_EVENTS,
+            "ManageEvents",
+            "LfgList",
+            "Ephemeral current-channel open confirmed-post list; at most five whole rows and bounded cursor continuation, no mutations.",
+            &[
+                "Gate:AnnouncementsDisabled",
+                "Perm:ManageEventsRequired",
+                "Valid:cursor:optional,bound-to-guild-and-channel,max-512",
+            ],
+        ),
+        row(
             "feed-add",
             28,
             E2eGate::Announcements,

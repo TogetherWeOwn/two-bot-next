@@ -98,6 +98,7 @@ pub mod leveling;
 #[cfg(feature = "db")]
 pub mod leveling_store;
 pub mod lfg;
+pub mod lfg_list;
 #[cfg(feature = "db")]
 pub mod lfg_store;
 pub mod mac;

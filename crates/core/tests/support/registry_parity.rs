@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use two_bot_core::commands::{
     CommandDefinition, CommandOption, CommandOptionType, HELP_DESCRIPTION, MAX_RESOURCE_ID_CHARS,
-    OCCURRENCE_ID_MAX_CHARS, PRIVACY_DESCRIPTION,
+    OCCURRENCE_ID_MAX_CHARS, PERM_MANAGE_EVENTS, PRIVACY_DESCRIPTION,
 };
 use two_bot_core::custom_commands::{
     MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_TEMPLATE_CHARS, MAX_TEXT_TRIGGER_CHARS,
@@ -230,6 +230,27 @@ pub fn expected_registry() -> Value {
     )
     .expect("privacy serializes");
     commands.insert(3, privacy);
+    // Next-only `/lfg-list` current-channel list: no legacy counterpart. Insert
+    // at the publish position (after `lfg-close`, before `feed-add`) as the
+    // exact published definition, so parity pins its shape too. Data-driven on
+    // the command name so the baseline still compiles before the runtime
+    // `BuiltinHandler::LfgList` arm lands.
+    let lfg_list = serde_json::to_value(
+        CommandDefinition::new("lfg-list", "List open game posts in this channel")
+            .permissions(PERM_MANAGE_EVENTS)
+            .options(vec![CommandOption::new(
+                "cursor",
+                "Continue a current-channel list",
+                CommandOptionType::String,
+            )
+            .max_length(512)]),
+    )
+    .expect("lfg-list serializes");
+    let lfg_close_pos = commands
+        .iter()
+        .position(|c| c["name"] == "lfg-close")
+        .expect("lfg-close is published");
+    commands.insert(lfg_close_pos + 1, lfg_list);
     // Picker-copy exceptions (registry golden exceptions table): command and
     // option descriptions intentionally differ from legacy. Pointers mirror
     // the published option order.
