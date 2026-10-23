@@ -226,6 +226,22 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             &["Gate:AutomationsDisabled", "Perm:ManageServerRequired"],
         ),
         row(
+            "command-inspect",
+            33,
+            E2eGate::Automations,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "AutomationAdmin",
+            "Ephemeral defer then one private content-only view: metadata summary by default, saved template, or rendered preview with sample arguments. No channel send, registration, cooldown, mutation or run audit.",
+            &[
+                "Gate:AutomationsDisabled",
+                "Perm:ManageServerRequired",
+                "Valid:name:required",
+                "Valid:view:choices",
+                "Valid:arguments:utf16<=500",
+            ],
+        ),
+        row(
             "schedule",
             17,
             E2eGate::Automations,
