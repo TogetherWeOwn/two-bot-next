@@ -241,6 +241,25 @@ outcomes. See `docs/metrics.md` for the full label table.
 | --- | --- |
 | `two_bot_moderation_enforcements_total{verb,outcome}` | Terminal moderation enforcements by bounded verb and outcome. `discord_error`/`storage_error` are consumed by `moderation_enforcement_failures` (tickets on any summed increase); `success`, `refused` and `other` stay quiet |
 
+## Ticket lifecycle series
+
+Counter emitted by the ticket runtime in `crates/bot/src/ticket_runtime.rs`
+(`emit_lifecycle` and `purge`) and rendered by
+`crates/core/src/metrics.rs`. Every retire, abandon, purge and successful
+staff-button claim/close executed through the button path counts once with
+a fixed-vocabulary cause; the purge pass counts one per deleted transcript
+body and reports a `db_cause` outcome when its storage write fails.
+Recovery completions and the open-path controls-post rollback are not
+instrumented. No member text, channel name, ticket id or error string ever
+becomes a label. No alert rule consumes this family yet; read it alongside
+the `ticket_lifecycle` log lines. Full series, label and cause vocabularies
+live in `docs/ticket-lifecycle-observability.md` and
+`docs/metrics.md`.
+
+| Series | Meaning |
+| --- | --- |
+| `two_bot_ticket_lifecycle_total{event,outcome}` | Terminal ticket lifecycle events by bounded event (`retire`, `abandon`, `purge`, `claim`, `close`) and outcome (success outcomes plus `db_cause` classes) |
+
 ## Retention replay series
 
 Label-free counter emitted by the retention purge-skip path in

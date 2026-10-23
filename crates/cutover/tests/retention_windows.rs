@@ -864,6 +864,16 @@ async fn guild_purge_covers_every_plan_table_and_preserves_receipts() {
             .fetch_one(pool)
             .await
             .unwrap()
+        } else if entry.table == "starboard_starrers" {
+            // BIGINT snowflake column against a decimal TEXT bind: cast the
+            // bind, never the indexed column (same as the erasure predicate).
+            sqlx::query_scalar(sqlx::AssertSqlSafe(
+                "SELECT count(*) FROM starboard_starrers WHERE guild_id = $1::bigint".to_owned(),
+            ))
+            .bind(FIX_OTHER)
+            .fetch_one(pool)
+            .await
+            .unwrap()
         } else if entry.table == "event_voice_presence" {
             // Direct by seeded event id, not through the mirror join: an
             // orphaned span (its event deleted from the mirror) must still
@@ -943,6 +953,16 @@ async fn guild_purge_covers_every_plan_table_and_preserves_receipts() {
         } else if entry.table == "self_role_exchanges" {
             sqlx::query_scalar(sqlx::AssertSqlSafe(
                 "SELECT count(*) FROM self_role_exchanges WHERE event_id IN (SELECT event_id FROM self_role_audit WHERE guild_id = $1)".to_owned(),
+            ))
+            .bind(FIX_GONE)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        } else if entry.table == "starboard_starrers" {
+            // BIGINT snowflake column against a decimal TEXT bind: cast the
+            // bind, never the indexed column (same as the erasure predicate).
+            sqlx::query_scalar(sqlx::AssertSqlSafe(
+                "SELECT count(*) FROM starboard_starrers WHERE guild_id = $1::bigint".to_owned(),
             ))
             .bind(FIX_GONE)
             .fetch_one(pool)
@@ -1038,6 +1058,16 @@ async fn guild_purge_covers_every_plan_table_and_preserves_receipts() {
         } else if table == "self_role_exchanges" {
             sqlx::query_scalar(sqlx::AssertSqlSafe(
                 "SELECT count(*) FROM self_role_exchanges WHERE event_id IN (SELECT event_id FROM self_role_audit WHERE guild_id = $1)".to_owned(),
+            ))
+            .bind(FIX_OTHER)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        } else if table == "starboard_starrers" {
+            // BIGINT snowflake column against a decimal TEXT bind: cast the
+            // bind, never the indexed column (same as the erasure predicate).
+            sqlx::query_scalar(sqlx::AssertSqlSafe(
+                "SELECT count(*) FROM starboard_starrers WHERE guild_id = $1::bigint".to_owned(),
             ))
             .bind(FIX_OTHER)
             .fetch_one(pool)
