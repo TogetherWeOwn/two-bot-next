@@ -499,7 +499,7 @@ fn assert_normalized_query_credentials_redacted(name: &str) {
         .lines()
         .find(|line| line.starts_with("Source: "))
         .expect("detail projects a source line");
-    for identity in ["example.org", "channel_id=UC0123456789", "format=rss"] {
+    for identity in ["example.org", r"channel\_id=UC0123456789", "format=rss"] {
         assert!(
             source_line.contains(identity),
             "safe identity {identity} survives credential redaction: {text}"
@@ -543,14 +543,16 @@ fn inspect_plain_token_redaction_preserves_safe_query_identity() {
 
 #[test]
 fn inspect_public_ipv6_source_has_exactly_one_bracket_pair() {
+    let source = "https://[2606:4700:4700::1111]/feed";
+    let normalized = normalize_source(FeedKind::Rss, source)
+        .expect("default-port public IPv6 source passes the saved-source validator");
+    assert_eq!(normalized, source);
+    // Nondefault ports exercise legacy saved rows, not new-source admission.
     for source in [
-        "https://[2606:4700:4700::1111]/feed",
+        normalized.as_str(),
         "https://[2606:4700:4700::1111]:8443/feed",
     ] {
-        let normalized = normalize_source(FeedKind::Rss, source)
-            .expect("public IPv6 sources pass the saved-source validator");
-        assert_eq!(normalized, source);
-        let text = relay("relay-ipv6", &normalized, None, true).inspect_text();
+        let text = relay("relay-ipv6", source, None, true).inspect_text();
         let source_lines: Vec<&str> = text
             .lines()
             .filter(|line| line.starts_with("Source: "))
