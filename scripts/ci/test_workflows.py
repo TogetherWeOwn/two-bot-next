@@ -4574,7 +4574,7 @@ class WorkflowTests(unittest.TestCase):
             ignored_sweep,
         )
         guarded = [run for run in cov_runs if "llvm-cov --no-report -p " in run]
-        self.assertEqual(len(guarded), 16)
+        self.assertEqual(len(guarded), 17)
         for run in guarded:
             with self.subTest(guarded=run):
                 self.assertIn("--test-threads=1", run)
@@ -4601,6 +4601,9 @@ class WorkflowTests(unittest.TestCase):
             "--test game_activity_report_db": False,
             "--test member_moderation_db": True,
             "--test invite_uses_saturation_acceptance": False,
+            "--test starboard_store": False,
+            "--test starboard_api": False,
+            "--test starboard_config_updated_at": False,
         }
         for needle, wants_db_feature in guarded_needles.items():
             with self.subTest(needle=needle):
