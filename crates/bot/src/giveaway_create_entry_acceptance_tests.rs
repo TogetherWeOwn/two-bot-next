@@ -648,6 +648,11 @@ async fn giveaway_create_refuses_201_character_prize_before_store_or_delivery() 
     let reply = reply_for(&requests, "gw-prize-201");
     assert!(reply.found && reply.ephemeral, "ephemeral refusal");
     assert!(reply.text.to_lowercase().contains("giveaway"));
+    assert!(
+        reply.text.contains("200"),
+        "refusal names the 200-character ceiling, proving validation (not a store failure) refused it: {}",
+        reply.text
+    );
 }
 
 #[tokio::test]
