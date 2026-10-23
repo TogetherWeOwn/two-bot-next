@@ -469,11 +469,11 @@ pub const INTERNAL_ACTION_OUTCOMES: &[&str] = &[
 /// dispatch deadline. Both warn and continue; `other` absorbs unknown reasons.
 pub const COMMUNITY_FACTS_DRAIN_REASONS: &[&str] = &["error", "timeout", "other"];
 /// Verified EventSub deliveries by bounded receiver classification. The
-/// twelve `EventSubError` snake_case labels record classify errors by
+/// thirteen `EventSubError` snake_case labels record classify errors by
 /// variant ([`crate::twitch_eventsub::eventsub_error_label`]); `other` stays
 /// the trailing entry absorbing unknown/future strings. No header, body,
 /// broadcaster, subscription, or secret data reaches the label.
-pub const EVENTSUB_DELIVERY_KINDS: [&str; 18] = [
+pub const EVENTSUB_DELIVERY_KINDS: [&str; 19] = [
     "challenge",
     "notification",
     "revocation",
@@ -486,6 +486,7 @@ pub const EVENTSUB_DELIVERY_KINDS: [&str; 18] = [
     "invalid_timestamp",
     "stale_timestamp",
     "invalid_body",
+    "duplicate_keys",
     "wrong_subscription",
     "invalid_challenge",
     "invalid_callback",

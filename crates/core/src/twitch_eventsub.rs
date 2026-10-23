@@ -84,6 +84,8 @@ pub enum EventSubError {
     StaleTimestamp,
     #[error("Body is not a valid EventSub message.")]
     InvalidBody,
+    #[error("Body contains a duplicate JSON object key.")]
+    DuplicateKeys,
     #[error("Message is not for the stream.online v1 subscription.")]
     WrongSubscription,
     #[error("Verification challenge is invalid.")]
@@ -97,7 +99,7 @@ pub enum EventSubError {
 }
 
 /// Bounded metric/log label for an [`EventSubError`] variant. Total over the
-/// enum: a future thirteenth variant fails compilation here until the
+/// enum: a future variant fails compilation here until the
 /// vocabulary grows with it, so labels can never silently collapse through
 /// `bounded_index`. Every label is a member of
 /// [`crate::metrics::EVENTSUB_DELIVERY_KINDS`]; unknown strings still
@@ -111,6 +113,7 @@ pub fn eventsub_error_label(error: &EventSubError) -> &'static str {
         EventSubError::InvalidTimestamp => "invalid_timestamp",
         EventSubError::StaleTimestamp => "stale_timestamp",
         EventSubError::InvalidBody => "invalid_body",
+        EventSubError::DuplicateKeys => "duplicate_keys",
         EventSubError::WrongSubscription => "wrong_subscription",
         EventSubError::InvalidChallenge => "invalid_challenge",
         EventSubError::InvalidCallback => "invalid_callback",
@@ -290,6 +293,9 @@ pub fn classify(message_type: &str, body: &[u8]) -> Result<Delivery, EventSubErr
     }
     let value: serde_json::Value =
         serde_json::from_slice(body).map_err(|_| EventSubError::InvalidBody)?;
+    // Second pass over bytes that already parsed: syntax and nesting depth
+    // are proven, so the only refusal left is a repeated key.
+    crate::duplicate_keys::reject_duplicate_keys(body).map_err(|_| EventSubError::DuplicateKeys)?;
     let subscription = value
         .get("subscription")
         .filter(|subscription| subscription.is_object())
@@ -631,6 +637,7 @@ mod tests {
             EventSubError::InvalidTimestamp,
             EventSubError::StaleTimestamp,
             EventSubError::InvalidBody,
+            EventSubError::DuplicateKeys,
             EventSubError::WrongSubscription,
             EventSubError::InvalidChallenge,
             EventSubError::InvalidCallback,

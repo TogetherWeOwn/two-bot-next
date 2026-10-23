@@ -82,7 +82,8 @@ fn assert_bounded(error: &ReplyError) {
         | ReplyError::NoSuggestions
         | ReplyError::TooManySuggestions { .. }
         | ReplyError::ExplanationTooLong { .. }
-        | ReplyError::InvalidTemplate { .. } => {}
+        | ReplyError::InvalidTemplate { .. }
+        | ReplyError::DuplicateKeys => {}
     }
 }
 
@@ -204,6 +205,22 @@ fn check_fixed_matrix() {
         parse_reply(&envelope(MARKER)),
         Err(ReplyError::ContentNotJson)
     );
+
+    // Repeated keys refuse at either document with the one fixed error,
+    // through both entry points.
+    let dup_envelope = br#"{"choices": [], "choices": []}"#.to_vec();
+    assert_eq!(parse_reply(&dup_envelope), Err(ReplyError::DuplicateKeys));
+    assert_eq!(
+        parse_reply_each(&dup_envelope),
+        Err(ReplyError::DuplicateKeys)
+    );
+    let dup_content = envelope(r#"{"suggestions": [], "suggestions": []}"#);
+    assert_eq!(parse_reply(&dup_content), Err(ReplyError::DuplicateKeys));
+    assert_eq!(
+        parse_reply_each(&dup_content),
+        Err(ReplyError::DuplicateKeys)
+    );
+    assert_bounded(&ReplyError::DuplicateKeys);
 
     // Empty suggestion list refuses.
     assert_eq!(

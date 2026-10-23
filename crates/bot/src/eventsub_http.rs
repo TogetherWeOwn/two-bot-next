@@ -615,12 +615,12 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
             ack(id)
         }
         // Deterministic planning errors: acknowledge with 2xx so Twitch does
-        // not retry what will never succeed. Unknown/future classification
-        // errors remain retryable through the fallback below. Every error
-        // arm records its own variant label (never the catch-all `other`)
-        // and warns through the sampled classify helper, so hostile bursts
-        // count in counters with at most one sampled warn each.
-        Err(e @ (EventSubError::WrongSubscription | EventSubError::InvalidBody)) => {
+        // not retry what will never succeed. A refused duplicate-key body is
+        // permanent too: the retry carries the same bytes. Unknown/future
+        // classification errors remain retryable through the fallback below.
+        // Every error arm records its variant and shares the sampled warn budget.
+        Err(e @ (EventSubError::WrongSubscription | EventSubError::InvalidBody))
+        | Err(e @ EventSubError::DuplicateKeys) => {
             let variant = eventsub_error_label(&e);
             two_bot_core::metrics::global().eventsub_classified(variant);
             sampled_classify_warn(
@@ -965,6 +965,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn duplicate_key_body_is_acknowledged_without_retry() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
+        let capture = crate::tracing_capture::global();
+        let start = capture.text().len();
+        // Valid signature over a notification body that repeats a key: the
+        // refusal is deterministic (a retry carries the same bytes), so the
+        // receiver answers 2xx and plans nothing from it.
+        let body = r#"{"subscription":{"id":"synthetic-sub-0031","status":"enabled","type":"stream.online","version":"1","condition":{"broadcaster_user_id":"123456"}},"subscription":{"id":"synthetic-sub-0031","status":"enabled","type":"stream.online","version":"1","condition":{"broadcaster_user_id":"123456"}},"event":{"id":"9001","broadcaster_user_id":"123456","broadcaster_user_login":"synthetic_user","broadcaster_user_name":"Synthetic_User","type":"live","started_at":"2026-10-13T00:00:00Z"}}"#;
+        let timestamp = fresh_timestamp();
+        let signature = sign("synthetic-delivery-0031", &timestamp, body.as_bytes());
+        let response = app()
+            .oneshot(request(
+                "POST",
+                EVENTSUB_PATH,
+                Some("synthetic-delivery-0031"),
+                Some(&timestamp),
+                Some(&signature),
+                Some("notification"),
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["ok"], true);
+        assert!(
+            value.get("error").is_none(),
+            "duplicate keys must not retry"
+        );
+        let text = capture.text().split_off(start);
+        assert_eq!(
+            text.matches("eventsub delivery classification failed")
+                .count(),
+            1
+        );
+        assert!(text.contains("error_variant=\"duplicate_keys\""), "{text}");
+        assert!(text.contains("error_class=\"acknowledged\""), "{text}");
+        assert!(!text.contains(body));
+        assert!(!text.contains(test_secret()));
     }
 
     // --- Injected go-live delivery (durable ledger glue) ---
