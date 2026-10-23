@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use two_bot_core::commands::{
     CommandDefinition, CommandOption, CommandOptionType, HELP_DESCRIPTION, MAX_RESOURCE_ID_CHARS,
-    OCCURRENCE_ID_MAX_CHARS, PRIVACY_DESCRIPTION,
+    OCCURRENCE_ID_MAX_CHARS, PERM_MANAGE_GUILD, PRIVACY_DESCRIPTION,
 };
 use two_bot_core::custom_commands::{
     MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_TEMPLATE_CHARS, MAX_TEXT_TRIGGER_CHARS,
@@ -37,6 +37,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("feed-list", "docs/parity.md §1 #30 page"),
     ("privacy", "docs/parity.md §1 privacy"),
     ("command-list", "docs/parity.md §1 #16 page"),
+    ("giveaway", "docs/parity.md §1 giveaway"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -230,6 +231,72 @@ pub fn expected_registry() -> Value {
     )
     .expect("privacy serializes");
     commands.insert(3, privacy);
+    // Next-only `/giveaway` timed entry: no legacy counterpart. Insert at the
+    // publish position (index 13, after sticky-remove and the help/privacy
+    // inserts above) as the exact published definition, so parity pins its
+    // shape too.
+    let giveaway = serde_json::to_value(
+        CommandDefinition::new("giveaway", "Create, list or cancel a giveaway")
+            .permissions(PERM_MANAGE_GUILD)
+            .options(vec![
+                CommandOption::new(
+                    "create",
+                    "Create a giveaway in this channel",
+                    CommandOptionType::SubCommand,
+                )
+                .sub_options(vec![
+                    CommandOption::new(
+                        "prize",
+                        "Prize text (up to 200 characters)",
+                        CommandOptionType::String,
+                    )
+                    .required()
+                    .max_length(2000),
+                    CommandOption::new(
+                        "duration",
+                        "Entry window in minutes (1–43200)",
+                        CommandOptionType::Integer,
+                    )
+                    .required()
+                    .int_range(1, 43200),
+                    CommandOption::new("winners", "Number of winners", CommandOptionType::Integer)
+                        .required()
+                        .int_range(1, 100),
+                    CommandOption::new(
+                        "required-role",
+                        "Role every entrant must hold",
+                        CommandOptionType::Role,
+                    ),
+                    CommandOption::new(
+                        "min-account-age-days",
+                        "Minimum account age in days",
+                        CommandOptionType::Integer,
+                    )
+                    .int_range(0, 3650),
+                    CommandOption::new(
+                        "min-server-age-days",
+                        "Minimum time in this server in days",
+                        CommandOptionType::Integer,
+                    )
+                    .int_range(0, 3650),
+                ]),
+                CommandOption::new("list", "List open giveaways", CommandOptionType::SubCommand),
+                CommandOption::new(
+                    "cancel",
+                    "Cancel an open or paused giveaway",
+                    CommandOptionType::SubCommand,
+                )
+                .sub_options(vec![CommandOption::new(
+                    "id",
+                    "Giveaway id",
+                    CommandOptionType::String,
+                )
+                .required()
+                .max_length(64)]),
+            ]),
+    )
+    .expect("giveaway serializes");
+    commands.insert(13, giveaway);
     // Picker-copy exceptions (registry golden exceptions table): command and
     // option descriptions intentionally differ from legacy. Pointers mirror
     // the published option order.
