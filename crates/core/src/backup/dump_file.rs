@@ -3953,7 +3953,7 @@ mod tests {
                 old.clone(),
                 serde_json::json!({"kind":"end","rows":0}),
             ]))
-            .unwrap_or_else(|error| panic!("frozen v{version} must remain readable: {error}"));
+            .expect("frozen v4-v14 dump must remain readable");
             assert_eq!(contents.manifest.version, version);
             assert_eq!(contents.manifest.tables.len(), 105 - missing.len());
             assert_eq!(
