@@ -1782,8 +1782,8 @@ mod tests {
 
             let output = logs.lock().unwrap()[before..].to_vec();
             if index.is_multiple_of(64) {
-                let event: serde_json::Value = serde_json::from_slice(&output)
-                    .unwrap_or_else(|_| panic!("expected exactly one warning at delivery {index}"));
+                let event: serde_json::Value =
+                    serde_json::from_slice(&output).expect("expected exactly one sampled warning");
                 assert_eq!(event["level"], "WARN");
                 let fields = &event["fields"];
                 assert_eq!(fields["event"], "eventsub_receiver");
