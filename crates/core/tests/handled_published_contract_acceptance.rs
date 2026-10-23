@@ -170,14 +170,15 @@ fn parity_builtins_route_to_their_handlers() {
         ("rsvp-attendance", HandlerId::RsvpAttendance),
         ("lfg", HandlerId::Lfg),
         ("lfg-close", HandlerId::LfgClose),
+        ("lfg-edit", HandlerId::LfgEdit),
         ("feed-add", HandlerId::FeedAdd),
         ("feed-remove", HandlerId::FeedRemove),
         ("feed-list", HandlerId::FeedList),
     ];
     assert_eq!(
         cases.len(),
-        30,
-        "all 30 parity and Next-only builtins covered"
+        31,
+        "all 31 parity and Next-only builtins covered"
     );
     for (name, handler) in cases {
         assert_eq!(
@@ -204,5 +205,5 @@ fn e2e_matrix_still_matches_the_publish_set() {
         matrix_names, published_names,
         "matrix drift: the fix must not change the parity publish set"
     );
-    assert_eq!(matrix.len(), 30, "contract covers the 30 built-in commands");
+    assert_eq!(matrix.len(), 31, "contract covers the 31 built-in commands");
 }
