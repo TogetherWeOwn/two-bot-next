@@ -323,7 +323,7 @@ export const JOB_FAILURE_SHARE_MIN_FAILURES = 2;
 /** Fixed error classes for `two_bot_feed_fetch_errors_total`, pinned to Rust `FEED_FETCH_ERROR_CLASSES`. */
 export const FEED_FETCH_ERROR_CLASSES: readonly string[] = ["invalid_source", "non_public_address", "redirect_refused", "too_large", "invalid_encoding", "unsupported_content_type", "unsupported_encoding", "resolve", "transport", "deadline", "http_error", "other"];
 /** Fixed kinds for `two_bot_eventsub_classified_total`, pinned to Rust `EVENTSUB_DELIVERY_KINDS`. */
-export const EVENTSUB_CLASSIFIED_KINDS: readonly string[] = ["challenge", "notification", "revocation", "tampered", "ignored", "other"];
+export const EVENTSUB_CLASSIFIED_KINDS: readonly string[] = ["challenge", "notification", "revocation", "tampered", "ignored", "invalid_secret", "invalid_header", "body_too_large", "bad_signature", "invalid_timestamp", "stale_timestamp", "invalid_body", "duplicate_keys", "wrong_subscription", "invalid_challenge", "invalid_callback", "invalid_broadcaster_id", "too_many_broadcasters", "other"];
 /** Consecutive valid samples with received deliveries ahead of classified ones before the ticket. */
 export const EVENTSUB_RECEIVE_GAP_SAMPLES = 3;
 /** Fixed verbs for `two_bot_moderation_enforcements_total`, pinned to Rust `MODERATION_VERBS`. */
