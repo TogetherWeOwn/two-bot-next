@@ -2963,7 +2963,7 @@ mod tests {
         // event-voice category slice adds one env-only key
         // (TWO_EVENT_VOICE_CATEGORY_ID).
         for (class, expected) in [
-            (SettingClass::Hot, 44),
+            (SettingClass::Hot, 46),
             (SettingClass::Cold, 26),
             (SettingClass::EnvOnly, 65),
         ] {

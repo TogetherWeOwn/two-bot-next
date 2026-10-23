@@ -80,6 +80,50 @@ anchor-welcome and session channel ids in `FORWARDED_DISCORD_IDS`
 (`wrangler/src/container-env.ts`). Adding a Worker var alone does not
 configure the container (see [runbook.md](runbook.md#logs-and-keepalive)).
 
+## Auto-role and verification
+
+These features are opt-in; publishing `/onboarding` changes no configuration.
+Administrators need **Manage Server**, checked again against fresh Discord
+membership/roles before settings or panel writes. All replies are ephemeral.
+
+- `/onboarding join-roles roles:1001,1002` replaces the stored auto-role list.
+  Use up to 10 distinct canonical nonzero role ids, no spaces or leading zeros,
+  never the guild id (`@everyone`). The signed settings API accepts the same
+  list as a JSON array of strings in `TWO_ONBOARDING_JOIN_ROLES`; deployment
+  uses a comma-separated string. A stored empty array disables auto-role grants.
+- `/onboarding member-role role:<role>` sets `TWO_ONBOARDING_MEMBER_ROLE`.
+  `/onboarding panel` posts one **Verify** button in the current text channel;
+  both the administrator and bot must be able to view and send there.
+- `/onboarding clear-join` and `/onboarding clear-member` delete their stored
+  overrides. **Deployment fallback applies again**; clearing is not a kill
+  switch when a deployment value remains. To disable verification completely,
+  clear its stored override and remove its deployment value. Dry-run is the
+  immediate no-role-write switch. No command revokes existing member roles.
+
+At write time, malformed values are refused before settings or settings-audit
+SQL. The Discord admin command also refuses missing, managed, bot-held,
+privileged or too-high roles. At execution time, the bot re-reads the member,
+its own roles, permissions and the guild role hierarchy. Auto-role grants do
+not depend on a welcome channel or prompt marker. They wait for Discord rules
+screening and never grant to bots or absent/pending members. Session mode and
+`TWO_ONBOARDING_DRY_RUN=1` suppress auto-role and verify grants.
+
+Every evaluated role/refusal records an `onboarding_role_grant` operational
+audit event with the member target, `action` cause and role id metadata when
+one was evaluated. Missing Manage Roles, managed/bot/privileged roles and
+roles at or above the bot's top role fail closed. Only the configured roles
+are added; unrelated roles are never replaced or removed. Join and verify
+share a database advisory lock and fetch held roles inside it, so duplicate
+presses/re-deliveries skip already-held roles. Rejoining does not automatically
+grant the verify-only role; a member who lost that role must press Verify again.
+
+A successful first press replies `You are now verified. Welcome!`; an already
+held role replies `You are already verified.`. Unconfigured verification
+replies `Verification isn't set up on this server yet.`. Failures never claim
+success; check the audit cause, repair permissions/configuration and press
+again. Corrupt stored role JSON disables only that grant feature and never
+falls back to a deployment grant or stops the ordinary welcome.
+
 ## Prompt decisions
 
 `decide_prompt` (`crates/core/src/onboarding.rs:157`) runs in legacy check

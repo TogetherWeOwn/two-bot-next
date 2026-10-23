@@ -53,6 +53,13 @@ fn action_error(error: SettingsWriteError) -> ActionError {
                         "settings_value_nul",
                     );
                 }
+                WriteRefusal::InvalidRoleValue(_) => {
+                    return ActionError::new(
+                        ErrorCode::Malformed,
+                        "\"value\" must contain bounded, distinct canonical role ids, never everyone",
+                        "settings_role_value_invalid",
+                    );
+                }
                 WriteRefusal::InvalidGateValue(_) => {
                     return ActionError::new(
                         ErrorCode::Malformed,

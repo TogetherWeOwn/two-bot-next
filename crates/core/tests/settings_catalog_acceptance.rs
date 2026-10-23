@@ -5,8 +5,8 @@
 //! the write guard, and the refresh partition by its declared class. Pure and
 //! offline: no database, no network, and no process-environment reads. Key
 //! names come only from the catalog constants, and loader defaults come from
-//! empty-map calls. This file carries no key string literals, so the
-//! container-env drift scanner keeps passing without reclassification.
+//! empty-map calls. The onboarding role keys additionally exercise their
+//! strict JSON schemas; other writable keys retain the generic value fixture.
 
 use std::collections::{HashMap, HashSet};
 
@@ -129,7 +129,12 @@ fn assert_storable_key_refuses_env_only_and_unknown() {
 fn validate_write_decides_per_key_class() {
     let prefix: &str = ENV_ONLY_KEY_PREFIXES[0];
     for (key, class) in SETTING_CLASSES {
-        let result = validate_write(GUILD, key, Some(json!(1)), ACTOR);
+        let value = match *key {
+            "TWO_ONBOARDING_JOIN_ROLES" => json!(["7", "8"]),
+            "TWO_ONBOARDING_MEMBER_ROLE" => json!("9"),
+            _ => json!(1),
+        };
+        let result = validate_write(GUILD, key, Some(value.clone()), ACTOR);
         if *class == SettingClass::EnvOnly || key.starts_with(prefix) {
             assert!(
                 matches!(result, Err(WriteRefusal::EnvOnly(_))),
@@ -138,11 +143,103 @@ fn validate_write_decides_per_key_class() {
         } else {
             let write = result.unwrap_or_else(|_| panic!("storable key refused: {key}"));
             assert_eq!(write.class, *class, "{key}");
-            assert_eq!(write.action, WriteAction::Upsert(json!(1)), "{key}");
+            assert_eq!(write.action, WriteAction::Upsert(value), "{key}");
             assert_eq!(write.guild_id, GUILD, "{key}");
             assert_eq!(write.key.as_str(), *key);
             assert_eq!(write.actor, ACTOR, "{key}");
         }
+    }
+}
+
+#[test]
+fn onboarding_role_catalog_expansion_keeps_the_three_class_partition() {
+    assert_eq!(SETTING_CLASSES.len(), 137);
+    for (class, expected) in [
+        (SettingClass::Hot, 46),
+        (SettingClass::Cold, 26),
+        (SettingClass::EnvOnly, 65),
+    ] {
+        assert_eq!(
+            SETTING_CLASSES
+                .iter()
+                .filter(|(_, found)| *found == class)
+                .count(),
+            expected
+        );
+    }
+    for key in ["TWO_ONBOARDING_JOIN_ROLES", "TWO_ONBOARDING_MEMBER_ROLE"] {
+        assert_eq!(classify_key(key), Some(SettingClass::Hot));
+        assert_eq!(
+            validate_write(GUILD, key, None, ACTOR)
+                .expect("delete role setting")
+                .action,
+            WriteAction::Delete
+        );
+    }
+}
+
+#[test]
+fn onboarding_join_roles_require_at_most_ten_distinct_canonical_json_strings() {
+    let key = "TWO_ONBOARDING_JOIN_ROLES";
+    for value in [
+        json!([]),
+        json!(["7", "8"]),
+        json!((1..=10).map(|id| id.to_string()).collect::<Vec<_>>()),
+    ] {
+        let write =
+            validate_write(GUILD, key, Some(value.clone()), ACTOR).expect("valid join roles");
+        assert_eq!(write.class, SettingClass::Hot);
+        assert_eq!(write.action, WriteAction::Upsert(value));
+    }
+    for value in [
+        Value::Null,
+        json!(false),
+        json!(7),
+        json!("7,8"),
+        json!({"roles": ["7"]}),
+        json!([7]),
+        json!([null]),
+        json!(["7", "7"]),
+        json!(["0"]),
+        json!(["07"]),
+        json!([" 7"]),
+        json!(["7 "]),
+        json!(["-7"]),
+        json!(["18446744073709551616"]),
+        json!((1..=11).map(|id| id.to_string()).collect::<Vec<_>>()),
+    ] {
+        assert!(
+            validate_write(GUILD, key, Some(value.clone()), ACTOR).is_err(),
+            "accepted invalid join roles: {value}"
+        );
+    }
+}
+
+#[test]
+fn onboarding_member_role_requires_one_canonical_nonzero_json_string() {
+    let key = "TWO_ONBOARDING_MEMBER_ROLE";
+    let write = validate_write(GUILD, key, Some(json!("9")), ACTOR).expect("valid member role");
+    assert_eq!(write.class, SettingClass::Hot);
+    assert_eq!(write.action, WriteAction::Upsert(json!("9")));
+    for value in [
+        Value::Null,
+        json!(false),
+        json!(9),
+        json!([]),
+        json!(["9"]),
+        json!({"role": "9"}),
+        json!(""),
+        json!("0"),
+        json!("09"),
+        json!(" 9"),
+        json!("9 "),
+        json!("-9"),
+        json!("18446744073709551616"),
+    ] {
+        assert!(
+            validate_write(GUILD, key, Some(value.clone()), ACTOR).is_err(),
+            "accepted invalid member role: {value}"
+        );
     }
 }
 

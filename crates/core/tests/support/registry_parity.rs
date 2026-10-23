@@ -37,6 +37,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("feed-list", "docs/parity.md §1 #30 page"),
     ("privacy", "docs/parity.md §1 privacy"),
     ("command-list", "docs/parity.md §1 #16 page"),
+    ("onboarding", "docs/parity.md §1 onboarding"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -230,6 +231,13 @@ pub fn expected_registry() -> Value {
     )
     .expect("privacy serializes");
     commands.insert(3, privacy);
+    // Next-only onboarding is a single additive definition, frozen separately
+    // from legacy. Independent acceptance pins its authority and input schema;
+    // canonical comparison here keeps every field and nested option strict.
+    let onboarding: Value =
+        serde_json::from_str(include_str!("../fixtures/onboarding_registry.json"))
+            .expect("frozen onboarding registry definition");
+    commands.insert(4, onboarding);
     // Picker-copy exceptions (registry golden exceptions table): command and
     // option descriptions intentionally differ from legacy. Pointers mirror
     // the published option order.

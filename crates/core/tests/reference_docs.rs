@@ -70,8 +70,8 @@ gateway closure):\n\n\
 | audit | `audit_runtime.rs:308`, `:438` | 3 mirror destinations (`:60-63`) | every record (`:483`) and sweep (`:497`), once installed |\n\
 | ticket | `ticket_runtime.rs:457`, `:981` | 3 ticket destinations (`:172-175`) | every execute/recovery and purge |\n\
 | gateway classifier | `gateway.rs:834-853`, `:978` | human/welcome channel sets (`:860-877`) | every guild message; classifier + facts sink swap together (`leveling_runtime.rs:766`) |\n\
-| voice | `gateway.rs:2204-2206` closure | empty grace (`voice_rooms.rs:9932`), invite code (`:9980`) | spawn (`:8097-8099`), maintenance (`:3421-3423`), `/invite` (`:13942-13943`) |\n\n\
-The thirty-six keys in `STORE_READ_KEYS`\n\
+| voice | `gateway.rs:2204-2206` closure | empty grace (`voice_rooms.rs:10186`), invite code (`:10234`) | spawn (`:8224-8228`), maintenance (`:3571-3573`, `:9887-9889`), `/invite` (`:14195-14204`) |\n\n\
+The thirty-eight keys in `STORE_READ_KEYS`\n\
 (`crates/core/tests/reference_docs.rs`) say “applied live by runtime refresh”\n\
 instead of “stored unwired”: containment applies `TWO_ANTI_NUKE_WINDOW_SECONDS`,\n\
 `TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS`, `TWO_ANTI_NUKE_HEAT_THRESHOLD` and\n\
@@ -88,8 +88,8 @@ while refused (`crates/bot/src/containment_runtime.rs:318-330`,\n\
 `crates/bot/src/raid_runtime.rs:236-247`,\n\
 `crates/bot/src/join_risk_runtime.rs:300-309`); onboarding merges its\n\
 `CONFIG_KEYS` from a per-event snapshot\n\
-(`crates/bot/src/onboarding.rs:21-30`, `:271-295`), where only a malformed\n\
-dry-run row keeps the boot value (`:159-168`) while a malformed channel row\n\
+(`crates/bot/src/onboarding.rs:24-35`, `:191-211`, `:281-304`), where only a malformed\n\
+dry-run row keeps the boot value (`:169-178`) while a malformed channel row\n\
 fails the job; message-path automod\n\
 applies its ten live lists, thresholds and the enforce flag from the snapshot\n\
 on every delivery (`crates/bot/src/automod_gateway.rs:116-127`, `:211-223`, `:328`);\n\
@@ -112,12 +112,12 @@ malformed row keeps the last good destinations like the audit mirror; the gatewa
 `TWO_COMMUNITY_HUMAN_CHANNEL_IDS` and `TWO_COMMUNITY_WELCOME_CHANNEL_IDS`\n\
 from the snapshot on every guild message, refreshing the channel classifier\n\
 and the community-facts sink together before the message's channel class is\n\
-stamped (`crates/bot/src/gateway.rs:834-853`, `:978`, `crates/discord/src/leveling_runtime.rs:766`), with malformed entries filtered silently so a wholly-malformed row applies as the empty set (`crates/core/src/community.rs:252-260`); the voice sweep applies `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` from the snapshot on spawn and every maintenance refresh, so a stored per-guild grace reaches the deletion sweep without a restart (`crates/bot/src/voice_rooms.rs:8097-8099`, `:3421-3423`), and the invite responder applies `TWO_GUILD_INVITE_CODE` per `/invite` interaction (`crates/bot/src/voice_rooms.rs:13942-13943`), falling back to the live vanity code when the row is absent or invalid (`:9985-9990`). Two boot-only edges\n\
+stamped (`crates/bot/src/gateway.rs:834-853`, `:978`, `crates/discord/src/leveling_runtime.rs:766`), with malformed entries filtered silently so a wholly-malformed row applies as the empty set (`crates/core/src/community.rs:252-260`); the voice sweep applies `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` from the snapshot on spawn and every maintenance refresh, so a stored per-guild grace reaches the deletion sweep without a restart (`crates/bot/src/voice_rooms.rs:8224-8228`, `:3571-3573`, `:9887-9889`), and the invite responder applies `TWO_GUILD_INVITE_CODE` per `/invite` interaction (`crates/bot/src/voice_rooms.rs:14195-14204`), falling back to the live vanity code when the row is absent or invalid (`:10243-10255`). Two boot-only edges\n\
 remain: the voice room-name policy is\n\
 built once at boot from the process environment\n\
 (`crates/bot/src/gateway.rs:2203`); and gateway intents plus ticket command\n\
 publication read the ticket destination keys once at boot\n\
-(`crates/bot/src/gateway.rs:150`, `crates/bot/src/command_runtime.rs:435`), so a stored ticket\n\
+(`crates/bot/src/gateway.rs:150`, `crates/bot/src/command_runtime.rs:446-457`), so a stored ticket\n\
 destination reaches already-published commands only through the per-operation\n\
 refresh above. Every other\n\
 storable row's stored value is unwired.\n\n\
@@ -141,7 +141,7 @@ for delete protection, not creator provisioning. Its empty grace is fixed at\n\
 Automod and scorecard typed loaders exist but are not\n\
 called during boot; their defaults below come from empty-map calls.\n\
 Onboarding gates are validated at boot (`OnboardingGates::from_env`,\n\
-`crates/bot/src/main.rs:563`): an invalid `TWO_ONBOARDING_MODE` fails startup. The\n\
+`crates/bot/src/main.rs:599`): an invalid `TWO_ONBOARDING_MODE` fails startup. The\n\
 classifier loader runs when the ordered pipeline is built and again when\n\
 community-facts capture is armed, then refreshes live per guild message as\n\
 above. The separate\n\
@@ -216,7 +216,7 @@ const BOOT_ENV: &[&str] = &[
 /// (`containment_runtime.rs:61-67`, `:278-286`), join-risk
 /// (`join_risk_runtime.rs:66-70`, `:239-249`), raid
 /// (`raid_runtime.rs:45-48`, `:194-202`) and onboarding's per-event
-/// `CONFIG_KEYS` merge (`onboarding.rs:21-30`, `:271`).
+/// `CONFIG_KEYS` merge (`onboarding.rs:24-35`, `:191-211`, `:281-304`).
 /// These rows say “applied live by runtime refresh” in the table below;
 /// every other storable key keeps the legacy `HOT_WIRED`/boot-env labels.
 const STORE_READ_KEYS: &[&str] = &[
@@ -229,6 +229,8 @@ const STORE_READ_KEYS: &[&str] = &[
     "TWO_RAID_JOIN_THRESHOLD",
     "TWO_RAID_WINDOW_SECONDS",
     "TWO_ONBOARDING_DRY_RUN",
+    "TWO_ONBOARDING_JOIN_ROLES",
+    "TWO_ONBOARDING_MEMBER_ROLE",
     "DISCORD_LANDING_CHANNEL_IDS",
     "DISCORD_GOODBYE_CHANNEL_IDS",
     "DISCORD_ANCHOR_WELCOME_CHANNEL_ID",
@@ -622,7 +624,14 @@ fn configuration_fixture_path_resolves_from_repo_root() {
 #[test]
 #[ignore = "explicitly regenerate committed docs; never update during normal tests"]
 fn regenerate_reference_docs() {
+    // Test-only export supports a reviewable handoff without editing docs from
+    // a test-author workspace; the default regeneration path is unchanged.
+    let root = std::env::var_os("ACCEPTANCE_EXPORT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(repository_root);
     for (path, generated) in generated_documents() {
-        std::fs::write(repository_root().join(path), generated).unwrap();
+        let output = root.join(path);
+        std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+        std::fs::write(output, generated).unwrap();
     }
 }

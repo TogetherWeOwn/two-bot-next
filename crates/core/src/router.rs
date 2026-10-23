@@ -121,6 +121,7 @@ pub enum HandlerId {
     Leaderboard,
     Help,
     Privacy,
+    Onboarding,
     ScorecardAttendance,
     AutomationAdmin,
     AutomationCustom,
@@ -139,6 +140,7 @@ pub enum HandlerId {
 pub enum ComponentHandler {
     GamePicker,
     SessionPicker,
+    OnboardingVerify,
     SelfRole,
     Tickets,
     LfgSignup,
@@ -415,6 +417,7 @@ impl InteractionRouter {
             HandlerId::Leaderboard,
             HandlerId::Help,
             HandlerId::Privacy,
+            HandlerId::Onboarding,
         ] {
             register(id);
         }
@@ -609,6 +612,11 @@ impl InteractionRouter {
         }
 
         let row = match name {
+            "onboarding" => Row {
+                handler: HandlerId::Onboarding,
+                gate: RowGate::Always,
+                permission_refusal: Some(RouterRefusal::ManageServerRequired),
+            },
             "rank" => Row {
                 handler: HandlerId::Rank,
                 gate: RowGate::Always,
@@ -724,6 +732,13 @@ impl InteractionRouter {
                 return ComponentOutcome::Ignore;
             }
             ComponentHandler::SessionPicker
+        } else if custom_id == crate::onboarding_roles::VERIFY_CUSTOM_ID {
+            if !(self.gates.onboarding_picker || self.gates.session_picker)
+                || !self.guild_ok(guild_id)
+            {
+                return ComponentOutcome::Ignore;
+            }
+            ComponentHandler::OnboardingVerify
         } else if custom_id == TICKET_OPEN_ID
             || custom_id == TICKET_CLAIM_ID
             || custom_id == TICKET_CLOSE_ID
@@ -1412,21 +1427,28 @@ mod tests {
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
         // 4 core + 1 scorecard + 8 automation + 7 announcement + 9 moderation
         // + 1 custom = 30, in legacy publish order, guild-only throughout.
-        assert_eq!(set.len(), 30);
+        assert_eq!(set.len(), 31);
         assert_eq!(
-            &names[..5],
-            ["rank", "leaderboard", "help", "privacy", "attendance"]
+            &names[..6],
+            [
+                "rank",
+                "leaderboard",
+                "help",
+                "privacy",
+                "onboarding",
+                "attendance"
+            ]
         );
         assert!(names.contains(&"rsvp-attendance"));
         assert_eq!(names.iter().filter(|n| **n == "attendance").count(), 1);
         assert_eq!(
-            &names[20..29],
+            &names[21..30],
             [
                 "ban", "tempban", "kick", "timeout", "warn", "purge", "slowmode", "lockdown",
                 "unlock",
             ]
         );
-        assert_eq!(names[29], "faq");
+        assert_eq!(names[30], "faq");
         assert!(set.iter().all(|c| !c.dm_permission));
     }
 
@@ -1441,7 +1463,10 @@ mod tests {
         });
         let set = off.publish_set(&[]).expect("core-only set");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["rank", "leaderboard", "help", "privacy"]);
+        assert_eq!(
+            names,
+            ["rank", "leaderboard", "help", "privacy", "onboarding"]
+        );
     }
 
     #[test]
@@ -1462,7 +1487,10 @@ mod tests {
         // invocation refuses at dispatch, so publishing burns the ceiling.
         let set = off.publish_set(&[row()]).expect("core-only set");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["rank", "leaderboard", "help", "privacy"]);
+        assert_eq!(
+            names,
+            ["rank", "leaderboard", "help", "privacy", "onboarding"]
+        );
         // Over-limit stored catalogs no longer fail the publish either.
         let crowded: Vec<_> = (0..99)
             .map(|i| CustomCommand {
@@ -1472,7 +1500,7 @@ mod tests {
             })
             .collect();
         let set = off.publish_set(&crowded).expect("core-only set");
-        assert_eq!(set.len(), 4);
+        assert_eq!(set.len(), 5);
     }
 
     #[test]
@@ -1589,7 +1617,7 @@ mod tests {
     fn voice_set_publishes_after_moderation_only_while_gated() {
         let off = published(all_on());
         let off_names: Vec<_> = off.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(off.len(), 29);
+        assert_eq!(off.len(), 30);
         for name in VOICE_NAMES.iter().filter(|name| **name != "kick") {
             assert!(
                 !off_names.contains(name),
@@ -1601,14 +1629,14 @@ mod tests {
         let on_names: Vec<_> = on.iter().map(|c| c.name.as_str()).collect();
         // 29 builtins keep their order; the 21 voice names that survive
         // first-wins follow in voice order. `kick` is already moderation's.
-        assert_eq!(on.len(), 50);
-        assert_eq!(on_names[..29], off_names[..]);
+        assert_eq!(on.len(), 51);
+        assert_eq!(on_names[..30], off_names[..]);
         let expected: Vec<_> = VOICE_NAMES
             .iter()
             .copied()
             .filter(|name| *name != "kick")
             .collect();
-        assert_eq!(on_names[29..], expected[..]);
+        assert_eq!(on_names[30..], expected[..]);
         assert!(!on_names.contains(&"templateassistant"));
         assert!(on.iter().all(|c| !c.dm_permission));
     }
@@ -1675,7 +1703,7 @@ mod tests {
             voice_assistant: true,
             ..voice_on()
         });
-        assert_eq!(both.len(), 50);
+        assert_eq!(both.len(), 51);
     }
 
     #[test]

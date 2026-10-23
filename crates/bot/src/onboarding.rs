@@ -18,10 +18,15 @@ use two_bot_discord::{route_interaction, ActionExecutor, RoutedInteraction};
 
 use crate::gateway::GatewayPipeline;
 
+mod roles;
+pub(crate) use roles::admin_command;
+
 const CONFIG_KEYS: &[&str] = &[
     "DISCORD_GUILD_ID",
     "TWO_ONBOARDING_MODE",
     "TWO_ONBOARDING_DRY_RUN",
+    "TWO_ONBOARDING_JOIN_ROLES",
+    "TWO_ONBOARDING_MEMBER_ROLE",
     "DISCORD_LANDING_CHANNEL_IDS",
     "DISCORD_GOODBYE_CHANNEL_IDS",
     "DISCORD_ANCHOR_WELCOME_CHANNEL_ID",
@@ -355,6 +360,9 @@ impl OnboardingRuntime {
     /// never settings SQL. Stale/disabled mode submissions get an honest edit
     /// after defer; hot configuration cannot delay the initial acknowledgement.
     pub fn accepts_interaction(&self, interaction: &Interaction) -> bool {
+        if self.accepts_verify(interaction) {
+            return true;
+        }
         let router = InteractionRouter::new(RouterGates {
             configured_guild: Some(self.guild_id),
             scorecard: false,
@@ -436,6 +444,9 @@ impl OnboardingRuntime {
                     .await;
             }
         };
+        if self.accepts_verify(interaction) {
+            return self.verify(&config, interaction, &occurred_at).await;
+        }
         self.interaction(&config, interaction, &occurred_at).await
     }
 
@@ -464,6 +475,10 @@ impl OnboardingRuntime {
                 trigger,
                 roles: _,
             } => {
+                if guild_id == config.guild_id && welcome_trigger(trigger) {
+                    self.join_roles(&config, member_id, bot, pending, &occurred_at)
+                        .await?;
+                }
                 // Captured eligibility is a ceiling. welcome re-reads the member
                 // and may only narrow it; an ineligible capture performs no read.
                 if guild_id != config.guild_id

@@ -62,6 +62,62 @@ fn published_names(router: &InteractionRouter, custom: &[CustomCommand]) -> Vec<
         .collect()
 }
 
+/// Export only when explicitly requested; the ordinary test remains read-only.
+/// The independent onboarding acceptance target pins the approved schema before
+/// this code-derived snapshot is consumed by the golden-parity test.
+#[test]
+fn regenerated_manifest_matches_the_committed_publish_snapshot() {
+    let mut generated = manifest();
+    let router = InteractionRouter::new(staging_gates());
+    let definitions = router.publish_set(&[]).expect("publish set assembles");
+    generated["builtins_in_publish_order"] = serde_json::json!(published_names(&router, &[]));
+    let custom: Vec<CustomCommand> = generated["example_dynamic"]
+        .as_array()
+        .expect("example dynamic commands")
+        .iter()
+        .map(|row| CustomCommand {
+            name: row["name"].as_str().expect("name").to_owned(),
+            description: row["description"].as_str().expect("description").to_owned(),
+            enabled: row["enabled"].as_bool().expect("enabled"),
+        })
+        .collect();
+    generated["expected_with_example_dynamic_in_publish_order"] =
+        serde_json::json!(published_names(&router, &custom));
+    generated["voice"]["_comment"] = serde_json::json!(generated["voice"]["_comment"]
+        .as_str()
+        .expect("voice comment")
+        .replace("29 builtins", "30 builtins"));
+    if let Some(output) = std::env::var_os("ACCEPTANCE_EXPORT_DIR") {
+        let output = std::path::PathBuf::from(output);
+        std::fs::create_dir_all(&output).expect("create export directory");
+        std::fs::write(
+            output.join("staging_published_commands.json"),
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&generated).expect("manifest JSON")
+            ),
+        )
+        .expect("export manifest");
+        let onboarding = definitions
+            .iter()
+            .find(|definition| definition.name == "onboarding")
+            .expect("always-published onboarding command");
+        std::fs::write(
+            output.join("onboarding_registry.json"),
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(onboarding).expect("onboarding JSON")
+            ),
+        )
+        .expect("export onboarding definition");
+    }
+    assert_eq!(
+        generated,
+        manifest(),
+        "regenerate the staging snapshot from publish_set"
+    );
+}
+
 #[test]
 fn staging_builtin_set_matches_manifest_in_publish_order() {
     let router = InteractionRouter::new(staging_gates());
@@ -110,10 +166,10 @@ fn automations_off_withholds_automation_builtins_and_all_dynamics() {
         enabled: true,
     };
     let names = published_names(&router, &[faq]);
-    // 29 all-on builtins minus the 8 automation admin commands, and the
+    // 30 all-on builtins minus the 8 automation admin commands, and the
     // stored dynamic row stays unpublished: every such invocation refuses
     // at dispatch while gated off, so publishing would burn the ceiling.
-    assert_eq!(names.len(), 21, "automations-off staging set: {names:?}");
+    assert_eq!(names.len(), 22, "automations-off staging set: {names:?}");
     assert!(
         !names.iter().any(|name| name == "faq"),
         "dynamic rows must not publish while automations are off: {names:?}"

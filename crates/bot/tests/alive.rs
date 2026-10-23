@@ -595,12 +595,19 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
         // The harness boots with a synthetic token no clearance recognizes,
         // so activation narrows every clearable surface while scorecard
         // stays: the single boot PUT carries exactly core plus scorecard
-        // plus the always-on help discovery command, each once. Uncleared
-        // surfaces stay unpublished (and refused at dispatch) rather than
-        // advertised.
+        // plus always-on help discovery, privacy and onboarding, each once.
+        // Uncleared surfaces stay unpublished (and refused at dispatch)
+        // rather than advertised.
         assert_eq!(
             names,
-            ["rank", "leaderboard", "help", "privacy", "attendance"],
+            [
+                "rank",
+                "leaderboard",
+                "help",
+                "privacy",
+                "onboarding",
+                "attendance"
+            ],
             "publish the narrowed shared registry exactly once, nothing withheld or extra"
         );
         if boot == 1 {

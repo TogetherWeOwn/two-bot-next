@@ -20,7 +20,7 @@ Bounds below are registry bounds; a dash means no bound is declared there,
 not that handler validation is unlimited. Permissions are Discord default
 member-permission bitfields, not a replacement for runtime authorization.
 
-Built-in commands: 50.
+Built-in commands: 51.
 
 ## `/access`
 
@@ -328,6 +328,23 @@ Set a custom name for your temporary voice room, or restore the template name
 - Available in DMs: false
 
 No options.
+
+## `/onboarding`
+
+Configure join roles and the member verification button.
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `join-roles` | subcommand | false | — | — | — | — | Replace the auto-role list (up to 10 role ids). |
+| `join-roles roles` | string | true | — | — | 209 | — | Comma-separated role ids; no spaces or duplicates. |
+| `member-role` | subcommand | false | — | — | — | — | Set the role granted by the Verify button. |
+| `member-role role` | role | true | — | — | — | — | Member role to grant after verification. |
+| `clear-join` | subcommand | false | — | — | — | — | Clear the stored join-role override (deployment fallback applies). |
+| `clear-member` | subcommand | false | — | — | — | — | Clear the stored member-role override (deployment fallback applies). |
+| `panel` | subcommand | false | — | — | — | — | Post a Verify button in this channel. |
 
 ## `/ping`
 

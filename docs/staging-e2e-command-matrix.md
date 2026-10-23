@@ -9,7 +9,7 @@ the harness slices define HOW it runs. Derived from code, not from a guild:
 The `e2e_matrix_coverage` integration test fails when a command ships without
 a matrix row and when this doc drops one.
 
-Scope: 29 built-in slash commands (core + scorecard + automation +
+Scope: 30 built-in slash commands (core + scorecard + automation +
 announcement + moderation — the commands `docs/commands.md` renders ahead of
 the voice set; with the voice gates on it renders 51). No guild was
 touched, no staging secrets used, no credentials created.
@@ -36,6 +36,7 @@ guild.`), all other builtins stay silent (`Ignore`); stale or unknown names
 | 2 | `/leaderboard` | always | Everyone | Public mention-suppressed top ten | — |
 | 31 | `/help` | always | Everyone | Immediate ephemeral list of the live published commands, grouped by audience with permission hints (no defer, no store read) | — |
 | 32 | `/privacy` | always | Everyone | Deferred ephemeral reply; analytics `opt-out` purges the invoker's guild rows plus suppression plus one audit receipt, `opt-in` clears suppression, `status` reports suppression plus guild switches; `delete` queues the invoker's erasure request (fresh requests acknowledge as pending; same-interaction retries reuse the request and direct the member to status), and deletion status/receipt reads bind to the same invoker and guild | subcommand required (`opt-out`/`opt-in`/`status`/`delete`/`deletion-status`/`deletion-receipt`); request id required for `deletion-status` and `deletion-receipt`; guild-only |
+| 33 | `/onboarding` | always | ManageGuild | Admin configuration of join roles and the verified member role, explicit clears, or verification panel; publication alone changes no settings | Guild-only; live Manage Server authority and role-policy rechecks; `join-roles` requires String `roles` ≤209 with at most 10 distinct canonical role ids; `member-role` requires Role `role`; no arguments for `clear-join`, `clear-member`, `panel` |
 | 12 | `/attendance` | `TWO_COMMUNITY_SCORECARD` | ManageEvents | Ephemeral confirmation/refusal; records verified attendee | `ScorecardDisabled`, `ManageEventsRequired`, `event-occurrence` required ≤128, `member` required |
 | 14 | `/command` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral confirmation + audit row | `AutomationsDisabled`, `ManageServerRequired`, `name`/`template` required |
 | 15 | `/command-remove` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral confirmation + audit row | `AutomationsDisabled`, `ManageServerRequired`, `name` required |
@@ -69,7 +70,7 @@ UTF-16 units on every moderation row.
 
 ## Voice slice: vote-kick, setup/import (CI-proven handlers; staging round-trip UNPROVEN)
 
-The `TWO_VOICE` slice stays out of the live 29-row suite above. Its handlers
+The `TWO_VOICE` slice stays out of the live 30-row suite above. Its handlers
 are proven deterministically in CI with constructed interaction inputs and no
 guild, network, or database. The user-originated staging round-trip is
 UNPROVEN: a bot token cannot invoke slash commands or click components, so no

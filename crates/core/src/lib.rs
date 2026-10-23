@@ -107,6 +107,7 @@ pub mod metrics;
 pub mod moderation;
 pub mod music_voice;
 pub mod onboarding;
+pub mod onboarding_roles;
 #[cfg(feature = "db")]
 pub mod onboarding_store;
 pub mod ops_fetch;

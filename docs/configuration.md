@@ -41,9 +41,9 @@ gateway closure):
 | audit | `audit_runtime.rs:308`, `:438` | 3 mirror destinations (`:60-63`) | every record (`:483`) and sweep (`:497`), once installed |
 | ticket | `ticket_runtime.rs:457`, `:981` | 3 ticket destinations (`:172-175`) | every execute/recovery and purge |
 | gateway classifier | `gateway.rs:834-853`, `:978` | human/welcome channel sets (`:860-877`) | every guild message; classifier + facts sink swap together (`leveling_runtime.rs:766`) |
-| voice | `gateway.rs:2204-2206` closure | empty grace (`voice_rooms.rs:9932`), invite code (`:9980`) | spawn (`:8097-8099`), maintenance (`:3421-3423`), `/invite` (`:13942-13943`) |
+| voice | `gateway.rs:2204-2206` closure | empty grace (`voice_rooms.rs:10186`), invite code (`:10234`) | spawn (`:8224-8228`), maintenance (`:3571-3573`, `:9887-9889`), `/invite` (`:14195-14204`) |
 
-The thirty-six keys in `STORE_READ_KEYS`
+The thirty-eight keys in `STORE_READ_KEYS`
 (`crates/core/tests/reference_docs.rs`) say “applied live by runtime refresh”
 instead of “stored unwired”: containment applies `TWO_ANTI_NUKE_WINDOW_SECONDS`,
 `TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS`, `TWO_ANTI_NUKE_HEAT_THRESHOLD` and
@@ -60,8 +60,8 @@ while refused (`crates/bot/src/containment_runtime.rs:318-330`,
 `crates/bot/src/raid_runtime.rs:236-247`,
 `crates/bot/src/join_risk_runtime.rs:300-309`); onboarding merges its
 `CONFIG_KEYS` from a per-event snapshot
-(`crates/bot/src/onboarding.rs:21-30`, `:271-295`), where only a malformed
-dry-run row keeps the boot value (`:159-168`) while a malformed channel row
+(`crates/bot/src/onboarding.rs:24-35`, `:191-211`, `:281-304`), where only a malformed
+dry-run row keeps the boot value (`:169-178`) while a malformed channel row
 fails the job; message-path automod
 applies its ten live lists, thresholds and the enforce flag from the snapshot
 on every delivery (`crates/bot/src/automod_gateway.rs:116-127`, `:211-223`, `:328`);
@@ -84,12 +84,12 @@ malformed row keeps the last good destinations like the audit mirror; the gatewa
 `TWO_COMMUNITY_HUMAN_CHANNEL_IDS` and `TWO_COMMUNITY_WELCOME_CHANNEL_IDS`
 from the snapshot on every guild message, refreshing the channel classifier
 and the community-facts sink together before the message's channel class is
-stamped (`crates/bot/src/gateway.rs:834-853`, `:978`, `crates/discord/src/leveling_runtime.rs:766`), with malformed entries filtered silently so a wholly-malformed row applies as the empty set (`crates/core/src/community.rs:252-260`); the voice sweep applies `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` from the snapshot on spawn and every maintenance refresh, so a stored per-guild grace reaches the deletion sweep without a restart (`crates/bot/src/voice_rooms.rs:8097-8099`, `:3421-3423`), and the invite responder applies `TWO_GUILD_INVITE_CODE` per `/invite` interaction (`crates/bot/src/voice_rooms.rs:13942-13943`), falling back to the live vanity code when the row is absent or invalid (`:9985-9990`). Two boot-only edges
+stamped (`crates/bot/src/gateway.rs:834-853`, `:978`, `crates/discord/src/leveling_runtime.rs:766`), with malformed entries filtered silently so a wholly-malformed row applies as the empty set (`crates/core/src/community.rs:252-260`); the voice sweep applies `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` from the snapshot on spawn and every maintenance refresh, so a stored per-guild grace reaches the deletion sweep without a restart (`crates/bot/src/voice_rooms.rs:8224-8228`, `:3571-3573`, `:9887-9889`), and the invite responder applies `TWO_GUILD_INVITE_CODE` per `/invite` interaction (`crates/bot/src/voice_rooms.rs:14195-14204`), falling back to the live vanity code when the row is absent or invalid (`:10243-10255`). Two boot-only edges
 remain: the voice room-name policy is
 built once at boot from the process environment
 (`crates/bot/src/gateway.rs:2203`); and gateway intents plus ticket command
 publication read the ticket destination keys once at boot
-(`crates/bot/src/gateway.rs:150`, `crates/bot/src/command_runtime.rs:435`), so a stored ticket
+(`crates/bot/src/gateway.rs:150`, `crates/bot/src/command_runtime.rs:446-457`), so a stored ticket
 destination reaches already-published commands only through the per-operation
 refresh above. Every other
 storable row's stored value is unwired.
@@ -114,7 +114,7 @@ for delete protection, not creator provisioning. Its empty grace is fixed at
 Automod and scorecard typed loaders exist but are not
 called during boot; their defaults below come from empty-map calls.
 Onboarding gates are validated at boot (`OnboardingGates::from_env`,
-`crates/bot/src/main.rs:563`): an invalid `TWO_ONBOARDING_MODE` fails startup. The
+`crates/bot/src/main.rs:599`): an invalid `TWO_ONBOARDING_MODE` fails startup. The
 classifier loader runs when the ordered pipeline is built and again when
 community-facts capture is armed, then refreshes live per guild message as
 above. The separate
@@ -158,7 +158,7 @@ gates (`feature_commands.rs`), moderation (`moderation.rs`), onboarding
 (`onboarding.rs`), automod (`automod.rs`), scorecard and classifier
 (`community.rs`). An empty ID list never contains a live ID.
 
-Catalog entries: 135.
+Catalog entries: 137.
 
 | Key | Class | Parsed default | Application | Description |
 | --- | --- | --- | --- | --- |
@@ -258,6 +258,8 @@ Catalog entries: 135.
 | `TWO_MODERATION_AUDIT_SECRET` | env_only | Not rendered (secret) | environment only | Authentication secret for moderation audit handoff; never rendered. |
 | `TWO_MODERATION_PROTECTED_ROLE_IDS` | env_only | `[]` | environment only | Roles moderation may not target; strict comma-separated 17-20 digit snowflakes with no spaces or empty segments (empty segments and leading/trailing commas refused, padding refused); missing or empty means no roles. |
 | `TWO_ONBOARDING_DRY_RUN` | hot | `false` | stored, applied live by runtime refresh | Suppress onboarding role writes, legacy/anchor welcomes and session goodbyes. A stored non-0/1 rendering is ignored (deployment wins). |
+| `TWO_ONBOARDING_JOIN_ROLES` | hot | Not specified in Next | stored, applied live by runtime refresh | Auto-role list: deployment comma-separated canonical nonzero role ids, stored JSON array of at most 10 distinct strings; never everyone. Stored overrides refresh per join, corrupt values disable grants. Session/dry-run suppress grants. |
+| `TWO_ONBOARDING_MEMBER_ROLE` | hot | Not specified in Next | stored, applied live by runtime refresh | Member role granted by the Verify button: canonical nonzero role-id string, never everyone. Stored overrides refresh per press; corrupt values disable verification. Session/dry-run suppress grants. |
 | `TWO_ONBOARDING_MODE` | env_only | `"legacy"` | environment only | Onboarding selector: legacy, session or anchor; session suppresses role writes. |
 | `TWO_ONBOARDING_ROTA_MEASUREMENT` | env_only | Not specified in Next | environment only | Dropped staging rota measurement gate; env-only refusal is retained. |
 | `TWO_ONBOARDING_ROTA_NOTICE` | env_only | Not specified in Next | environment only | Dropped staging rota notice gate; env-only refusal is retained. |

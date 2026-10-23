@@ -71,7 +71,9 @@ fn matching_registry() -> Value {
         object.insert("guild_id".into(), json!(GUILD_ID.to_string()));
         object.insert("version".into(), json!("9876"));
         object.insert("nsfw".into(), json!(false));
-        object.insert("default_member_permissions".into(), Value::Null);
+        object
+            .entry("default_member_permissions")
+            .or_insert(Value::Null);
         object.insert("name_localizations".into(), json!({}));
         object.insert("description_localizations".into(), json!({}));
         object.entry("options").or_insert(json!([]));
@@ -128,6 +130,8 @@ async fn diff_and_publish_default_to_get_only_without_opening_a_database() {
             "+ 1/rank",
             "+ 1/leaderboard",
             "+ 1/help",
+            "+ 1/privacy",
+            "+ 1/onboarding",
             "Dry run: no commands written.",
         ] {
             assert!(
