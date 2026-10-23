@@ -97,10 +97,13 @@ checks and write gateway audit before exposing any control tool. The existing
 
 ## Refusal counters and staging proof
 
-Pre-auth refusals increment only fixed counters, with no per-attempt auth log
-and no gateway audit row. Missing/malformed bearers get the fixed `401`
-`unauthorized` plus `WWW-Authenticate: Bearer`; syntactically valid tokens require
-the authoritative container lookup to reject a bad **value**. A bounded
+Worker pre-auth refusals increment only fixed counters, with no per-attempt
+auth log, gateway audit row or container request. Missing/malformed bearers get
+the fixed `401` `unauthorized` plus `WWW-Authenticate: Bearer`. Syntactically valid
+tokens require the authoritative container lookup to reject a bad **value**;
+that receiver retains its inherited bounded, sampled scalar refusal telemetry,
+without bearer, body or credential fields. This is not a zero-log guarantee for
+end-to-end auth refusals; do not disable the container telemetry. A bounded
 per-caller bucket (20 burst / 1 token per second) caps guessing with fixed `429`
 `slow down\n` and `Retry-After`. Eight concurrent forwards per isolate are
 admitted; an uncooperative forward retains admission until it settles, even
@@ -128,7 +131,9 @@ merge, the authorized executor must verify the deployed artifact identity,
 health and rollback target before enabling only the closed gateway in staging.
 Prove malformed bearer 401 without container contact, a forged registered-token
 secret 401 on a mapped/enabled probe, and a live bearer 403 with no effects or
-execution rows. Check counter deltas and absence of credential/per-attempt logs.
+execution rows. Check counter deltas, no Worker pre-auth per-attempt logs and no
+credentials in logs. Container refusals may emit the inherited bounded, sampled
+scalar telemetry; verify its limits rather than requiring all such logs absent.
 No real moderation operation, token issuance, production migration or production
 flag change is part of this proof. Deployment and alert activation are not
 proven by local fixture tests.
