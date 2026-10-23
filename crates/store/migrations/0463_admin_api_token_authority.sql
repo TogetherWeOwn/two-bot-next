@@ -1,6 +1,6 @@
 -- 0463_admin_api_token_authority: named holders and bounded credential authority.
 -- 0458/0459 are starboard; 0460/0461 are giveaways. Never rewrite
--- shipped 0456/0457. Mirrors cutover 0462; both chains may run on one schema.
+-- shipped 0456/0457. Mirrors cutover 0464; both chains may run on one schema.
 -- SQLx runs this entire file in one transaction. Existing rows have no named
 -- holder: SET NOT NULL must abort the upgrade, leaving data and DDL untouched.
 -- No invented holder/default, deletion, expiry truncation or token issuance.

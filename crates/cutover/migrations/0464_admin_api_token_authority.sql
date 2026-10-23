@@ -1,4 +1,4 @@
--- 0462_admin_api_token_authority: named holders and bounded credential authority.
+-- 0464_admin_api_token_authority: named holders and bounded credential authority.
 -- 0458/0459 are starboard; 0460/0461 are giveaways. Never rewrite
 -- shipped 0456/0457. Mirrored in store 0463; both chains may run on one schema.
 -- SQLx runs this entire file in one transaction. Existing rows have no named

@@ -8,7 +8,7 @@ security gates still apply.
 ## Authority contract
 
 The historical table is created by cutover `0456` / store `0457`; the forward
-repair is cutover `0462_admin_api_token_authority.sql` and its store `0463`
+repair is cutover `0464_admin_api_token_authority.sql` and its store `0463`
 mirror. Applied historical SQL and checksums are immutable. The starboard
 foundation uses store `0458` / cutover `0459`; giveaways use cutover `0460` /
 store `0461`. The holder repair remains a
