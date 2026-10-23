@@ -98,6 +98,10 @@ export const FORWARDED_FLAGS = [
   // Staging-only synthetic voice test identities (docs/voice-synthetic.md).
   "TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS",
   "TWO_TEMP_VOICE_SWEEP_SECONDS",
+  // Event voice channels (per-event create + after-party handoff): required
+  // category id. Non-secret runtime flag; the bot fails closed (inactive,
+  // TBD `no_category`) until a usable category exists.
+  "TWO_EVENT_VOICE_CATEGORY_ID",
   // Staging-only music voice-node spike (docs/music-voice-node-spike.md):
   // attaches the Lavalink voice-update forwarder. Staging vars only, same
   // treatment as TWO_VOICE; the node password travels as its own Container
