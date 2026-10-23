@@ -266,10 +266,11 @@ No settings values, rank ladder or other application history are synthesized.
 Restore ignores manifest ordering and inserts parents before children using the
 inventory. It acquires explicit `ACCESS EXCLUSIVE` table locks and truncates the
 owned set in one transaction, **without CASCADE**. It temporarily disables only
-`trg_guild_settings_revision`, `trg_guild_settings_audit_append_only`,
-`voice_settings_audit_append_only` and the thirteen `voice_settings_stamp`
-triggers, preserving archived revision and audit rows exactly; their original enable modes are
-restored before commit. FK, CHECK and other triggers remain active. An explicit
+`trg_guild_settings_revision`, `trg_guild_settings_audit_append_only` and
+`voice_settings_audit_append_only`, preserving archived revision and audit rows
+exactly; their original enable modes are restored before commit. The thirteen
+voice row-stamping triggers remain active and preserve supplied metadata when
+no voice-change transaction context is set. FK, CHECK and other triggers remain active. An explicit
 restore role must already own these tables/sequences (or have equivalent existing
 authority); this implementation grants **no** runtime privileges. Run restoration
 with application writers stopped and rehearse into an isolated test target.
