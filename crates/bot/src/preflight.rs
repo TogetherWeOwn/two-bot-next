@@ -358,6 +358,8 @@ async fn read_discord<T: serde::de::DeserializeOwned>(
 
 // Keep admission, timeout and status handling out of the seven typed decoders
 // so each response type does not instantiate the same transport state machine.
+// Preserve that poll boundary when release LTO optimizes the typed callers.
+#[inline(never)]
 async fn read_discord_response(
     transport: &HyperTransport,
     check: &'static str,
