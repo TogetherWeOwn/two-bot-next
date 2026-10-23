@@ -307,7 +307,7 @@ async fn selected_schedule_reads_requiredness_choices_and_bounds_from_snapshot()
         &text,
         &[
             "usage",
-            "template",
+            "body",
             "required",
             "in-minutes",
             "integer",
