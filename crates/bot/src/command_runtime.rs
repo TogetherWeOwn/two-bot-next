@@ -1580,7 +1580,30 @@ impl CommandRuntime {
         let reply = match tickets.execute(interaction, action).await {
             Ok(reply) => reply,
             Err(error) => {
-                warn!(error_class = ?error.class(), "ticket action incomplete");
+                let action_token = ticket_action_token(action);
+                // Best-effort enrichment: when the failure is itself a SQL
+                // storage failure, skip the decorating lookup instead of
+                // spending a second pool acquisition on a sick store. The
+                // lookup is also time-boxed so a slow store cannot delay the
+                // user-visible error reply; expiry degrades to no context.
+                let context = if error.is_storage_failure() {
+                    None
+                } else {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        tickets.warn_ticket_context(interaction, action),
+                    )
+                    .await
+                    .unwrap_or(None)
+                };
+                match context {
+                    Some((ticket_id, status)) => {
+                        warn!(error_class = ?error.class(), action = %action_token, ticket_id = %ticket_id, status = %status, "ticket action incomplete")
+                    }
+                    None => {
+                        warn!(error_class = ?error.class(), action = %action_token, "ticket action incomplete")
+                    }
+                }
                 error.reply()
             }
         };
@@ -2313,6 +2336,16 @@ impl CommandRuntime {
                 "sticky audit write failed"
             );
         }
+    }
+}
+
+/// Fixed-vocabulary token for the `ticket action incomplete` warn's `action`
+/// field.
+fn ticket_action_token(action: TicketAction) -> &'static str {
+    match action {
+        TicketAction::Open => "open",
+        TicketAction::Claim => "claim",
+        TicketAction::Close => "close",
     }
 }
 
