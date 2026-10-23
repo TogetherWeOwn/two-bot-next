@@ -1462,8 +1462,10 @@ impl CommandRuntime {
         // first, so an owner-map entry could never execute.
         let owner = match name.as_str() {
             "privacy" => Some(HandlerId::Privacy),
-            "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list"
-            | "giveaway" => Some(HandlerId::AutomationAdmin),
+            "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list" => {
+                Some(HandlerId::AutomationAdmin)
+            }
+            "giveaway" => Some(HandlerId::Giveaway),
             "feed-add" => Some(HandlerId::FeedAdd),
             "feed-remove" => Some(HandlerId::FeedRemove),
             "feed-list" => Some(HandlerId::FeedList),
@@ -2493,6 +2495,7 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     }
     if gates.automations {
         router.register(Box::new(StickyHandler));
+        router.register(Box::new(SliceHandler(HandlerId::Giveaway)));
         // Custom commands are an automations capability: a refused identity
         // must not even resolve their handlers (4014 isolation depends on the
         // narrowed intent too). Dispatch refuses and publish withholds when
