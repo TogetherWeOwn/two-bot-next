@@ -1491,9 +1491,9 @@ impl TicketRuntime {
                 tracing::warn!(dropped, "ticket open retry budget exhausted");
                 break;
             }
-            // The re-read shares the row's item timeout with the attempt below:
-            // an unbounded pool wait here could otherwise push row work past
-            // the shared envelope and starve the panel slot.
+            // The re-read is bounded by the row's item timeout: an unbounded
+            // pool wait here could otherwise push row work past the shared
+            // envelope and starve the panel slot.
             let fresh = tokio::time::timeout(
                 remaining.min(RECOVERY_ITEM_TIMEOUT),
                 self.store.get(&ticket_id),
@@ -1524,6 +1524,14 @@ impl TicketRuntime {
                     continue;
                 }
             };
+            // Size the attempt from a fresh reading: the re-read above already
+            // spent part of this row's share of the envelope.
+            let remaining = rows_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let dropped = total - index;
+                tracing::warn!(dropped, "ticket open retry budget exhausted");
+                break;
+            }
             // The timeout arm drops the attempt future, so the guard retains
             // the entry and reports `interrupted`; only the pass outcome is
             // recorded here. The guard reports explicit outcomes from inside
