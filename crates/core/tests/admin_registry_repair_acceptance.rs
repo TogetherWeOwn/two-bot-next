@@ -2094,7 +2094,14 @@ mod database {
         // matrix above independently covers limited-role success/refusal/mirrors.
         async fn quoted_namespace_reference(chain: &str, shipped: i64, collision: bool) {
             let Some(url) = bootstrap() else { return };
-            let (prefix, latest) = pre_repair_migrators(chain, shipped).await;
+            let (prefix, mut latest) = pre_repair_migrators(chain, shipped).await;
+            // Pin sqlx bookkeeping to the real public history. This pool runs
+            // quoted-first, and CREATE TABLE IF NOT EXISTS checks existence in
+            // the creation schema only: an unqualified history table would be
+            // shadowed into the registry schema, read back empty, and make
+            // sqlx re-apply the whole chain. The repair SQL itself still
+            // resolves every product object through the quoted namespace.
+            latest.dangerous_set_table_name("public._sqlx_migrations");
             let db = TestDatabase::create(&url, &prefix)
                 .await
                 .expect("create isolated reference-namespace fixture");
