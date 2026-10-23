@@ -1,5 +1,24 @@
 # Parity matrix: legacy `two-bot` → `two-bot-next`
 
+<!-- start-here -->
+**Start here — section map**
+
+- [1. Slash / prefix commands (30 rows, including dynamic/prefix and one drop)](#1-slash--prefix-commands-30-rows-including-dynamicprefix-and-one-drop)
+- [Registry golden exceptions](#registry-golden-exceptions)
+- [2. Non-command interactions (buttons / selects / reactions)](#2-non-command-interactions-buttons--selects--reactions)
+- [3. Gateway event handlers](#3-gateway-event-handlers)
+- [4. Scheduled jobs & timers](#4-scheduled-jobs--timers)
+- [5. DB tables & queries](#5-db-tables--queries)
+- [6. External integrations](#6-external-integrations)
+- [7. Config / env](#7-config--env)
+- [8. Observable behaviours](#8-observable-behaviours)
+- [9. Drops (not ported, with reason)](#9-drops-not-ported-with-reason)
+- [10. New slice cards (created from this matrix)](#10-new-slice-cards-created-from-this-matrix)
+- [11. B4 gate checklist](#11-b4-gate-checklist)
+- [12. Baseline additions and post-freeze obligations](#12-baseline-additions-and-post-freeze-obligations)
+- [13. Exact-range post-freeze ledger](#13-exact-range-post-freeze-ledger)
+<!-- /start-here -->
+
 - **Source baseline:** [`TogetherWeOwn/two-bot` main @ `bffccf3`](https://github.com/TogetherWeOwn/two-bot/tree/bffccf3e3a9f56a3da37de67c6f272ac10ecb3b3) (2026-09-30). Full SHA and historical range are recorded in [parity-baseline.json](parity-baseline.json). This is a reviewed inventory pin, not a moving-main claim.
 - **Historical freeze:** `d5d1179348feb9157bcac8c875de9399d4f5c76a` is no longer an ancestor of legacy main. Its rewritten equivalent is [`dbee695`](https://github.com/TogetherWeOwn/two-bot/commit/dbee695b95aabf9234cad28a6b24692e2d07314d): the two `src/` trees are identical (`631cc8d1b85d19f8a597e4e9bfdcfb72d85786d3`). §§1–8 retain the original surface inventory; §12 adds source deltas and §13 accounts for **all 217** source-touching commits in the exact old-freeze-to-baseline range, including **120** history-rewrite replay rows. A mapped/carded row is not proof that it works on staging.
 - **Target:** `two-bot-next` (Rust/twilight, one always-on Cloudflare Container, shared Postgres, sqlx) — see `docs/adr/0001-discord-framework.md`.

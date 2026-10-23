@@ -20,7 +20,7 @@ high-rate event without a cap row fails the suite.
   guild/member/channel ID, token, query string, body or message content ever
   becomes a label or a log field.
 
-## Cardinality budget: 756 samples
+## Cardinality budget: 773 samples
 
 `GET /metrics` renders this many non-comment samples from process start,
 before any traffic. Adding any series fails the pinned count until this
@@ -46,6 +46,8 @@ table and the test are updated together.
 | `two_bot_send_admissions_total{outcome}` | 4 | `admitted`, `blocked`, `storage_error`, `other` |
 | `two_bot_gateway_prefix_trigger_refused_total{reason}` | 2 | `verdict`, `other` |
 | `two_bot_dispatch_drops_total{lane}` | 6 | `messages`, `interactions`, `registry`, `privileged`, `busy`, `reactions` |
+| `two_bot_raid_dropped_joins_total{reason}` | 2 | `queue_full`, `queue_closed`; fixed queue-drop reasons, no per-member/guild labels |
+| `two_bot_join_risk_dropped_joins_total{reason}` | 2 | `queue_full`, `queue_closed`; fixed queue-drop reasons, no per-member/guild labels |
 | `two_bot_voice_vote_kick_total{outcome}` | 26 | `started` + 2 worker refusals + 15 vote-core refusals (including `cooldown`, `initiator_limited`) + 7 enforcements + `other` |
 | `two_bot_event_voice_tick_total{outcome}` | 6 | 5 website TBD reasons (`opens_soon`, `rate_limited`, `perm_denied`, `no_category`, `unavailable`) + `other`; one observation per TBD tick including backoff-skipped ticks |
 | `two_bot_voice_names_total{outcome}` | 16 | 1 create + 5 template-render outcomes + 9 dispatch outcomes (including `name_blocked` for rename or custom-override refusal) + `other` |
@@ -59,7 +61,7 @@ table and the test are updated together.
 | `two_bot_audit_delivery_halt` | 1 | label-free gauge: 1 engaged, 0 cleared |
 | `two_bot_event_store_consumer_lag_seconds` | 1 | label-free gauge: seconds of consumer lag, 0 when unobserved |
 | `two_bot_eventsub_received_total` | 1 | label-free counter: deliveries accepted for verification, including tampered signatures |
-| `two_bot_eventsub_classified_total{kind}` | 6 | `challenge`, `notification`, `revocation`, `tampered`, `ignored`, `other`; unknown kinds collapse to `other` |
+| `two_bot_eventsub_classified_total{kind}` | 19 | `challenge`, `notification`, `revocation`, `tampered`, `ignored`, the thirteen `EventSubError` snake_case labels, `other`; unknown kinds collapse to `other` |
 | `two_bot_eventsub_posts_total{outcome}` | 4 | `attempted`, `succeeded`, `failed`, `other`; zero until the go-live sender is wired |
 | `two_bot_eventsub_reconcile_passes_total{outcome}` | 3 | `healthy`, `pending`, `failed`; one sample per pass, unknown outcomes collapse to `failed` |
 | `two_bot_eventsub_reconcile_actions_total{action}` | 2 | `create`, `delete`; 409 already-exists confirmations fold into the pass outcome |
@@ -69,7 +71,7 @@ table and the test are updated together.
 | `two_bot_retention_replay_needed_total` | 1 | label-free counter: skipped retention purges needing Operator replay (one per real guild removal whose purge-queue write hit the schema gap); resets on process restart |
 | `two_bot_ticket_lifecycle_total{event,outcome}` | 22 | per-event subsets (2 `retire` + 3 `abandon` + 13 `purge` + 2 `claim` + 2 `close`): each event renders its success outcomes plus the `query` collapse trapdoor, and `purge` adds the 12 `db_cause` classes; closed vocabulary, no `other` row, no member text, channel names, ticket ids or error strings in labels |
 | `two_bot_ticket_component_drops_total` | 1 | label-free counter: ticket components refused before spawning (runtime or per-member saturated); resets on process restart |
-| `# HELP` / `# TYPE` headers | 162 | 81 families x 2 |
+| `# HELP` / `# TYPE` headers | 166 | 83 families x 2 |
 
 ## Per-event caps (gateway metric labels)
 

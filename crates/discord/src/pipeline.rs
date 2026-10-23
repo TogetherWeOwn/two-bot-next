@@ -32,8 +32,8 @@
 //! production guild or tokens.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 
 use twilight_cache_inmemory::{DefaultInMemoryCache, InMemoryCache};
 use twilight_model::gateway::event::Event;
@@ -264,9 +264,44 @@ const VOICE_CHAIN_PRUNE_AT: usize = 2_048;
 /// grows one entry per member who ever moved channel.
 type VoiceChainKey = (Snowflake, Snowflake);
 
+/// One member's serial lock. `users` counts frames that took a handle via
+/// [`VoiceChains::lock_for`] and have not left the critical section yet: the
+/// count drops when the section guard drops, strictly before the mutex
+/// unlocks. `remove_after_leave` reads this instead of `Arc::strong_count`,
+/// whose clones outlive the critical section (the finished frame's `Arc` is
+/// dropped only when its `handle` frame returns) and made removal racy.
+#[derive(Debug, Default)]
+struct ChainLock {
+    mutex: Mutex<()>,
+    users: AtomicUsize,
+}
+
+impl ChainLock {
+    fn lock(&self) -> ChainGuard<'_> {
+        ChainGuard {
+            _guard: self.mutex.lock().expect("voice chain"),
+            lock: self,
+        }
+    }
+}
+
+/// Critical-section guard: leaving the section scope releases the `users`
+/// hold before the mutex unlocks, so the next holder observes the drop.
+#[derive(Debug)]
+struct ChainGuard<'a> {
+    _guard: MutexGuard<'a, ()>,
+    lock: &'a ChainLock,
+}
+
+impl Drop for ChainGuard<'_> {
+    fn drop(&mut self) {
+        self.lock.users.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 #[derive(Debug, Default)]
 struct ChainEntry {
-    mutex: Arc<Mutex<()>>,
+    lock: Arc<ChainLock>,
     last_seen_ms: i64,
 }
 
@@ -278,27 +313,28 @@ struct VoiceChains {
 }
 
 impl VoiceChains {
-    fn lock_for(&self, guild_id: Snowflake, member_id: Snowflake, now_ms: i64) -> Arc<Mutex<()>> {
+    fn lock_for(&self, guild_id: Snowflake, member_id: Snowflake, now_ms: i64) -> Arc<ChainLock> {
         let mut chains = self.inner.lock().expect("chains lock");
         let entry = chains.entry((guild_id, member_id)).or_default();
         entry.last_seen_ms = now_ms;
-        entry.mutex.clone()
+        entry.lock.users.fetch_add(1, Ordering::SeqCst);
+        entry.lock.clone()
     }
 
-    /// Drop the member's chain after a full voice leave. Kept while another
-    /// frame holds a handle (inside the critical section or queued on it), so
+    /// Drop the member's chain after a full voice leave. The caller already
+    /// left the critical section, so `users` counts only other frames (inside
+    /// the section or queued on it); the entry is kept while any remain, so
     /// end/start stays serial. Pointer-checked so a recreated entry survives.
     fn remove_after_leave(
         &self,
         guild_id: Snowflake,
         member_id: Snowflake,
-        chain: &Arc<Mutex<()>>,
+        chain: &Arc<ChainLock>,
     ) {
         let mut chains = self.inner.lock().expect("chains lock");
         let key = (guild_id, member_id);
-        // The map and this frame each hold one handle; more belong to another frame.
         let keep = chains.get(&key).is_some_and(|entry| {
-            !Arc::ptr_eq(&entry.mutex, chain) || Arc::strong_count(&entry.mutex) > 2
+            !Arc::ptr_eq(&entry.lock, chain) || entry.lock.users.load(Ordering::SeqCst) > 0
         });
         if !keep {
             chains.remove(&key);
@@ -796,7 +832,7 @@ impl<
                 let now_ms = two_bot_core::parse_iso_millis(observed_at).unwrap_or(0);
                 let chain = self.voice_chains.lock_for(guild_id, member_id, now_ms);
                 {
-                    let _guard = chain.lock().expect("voice chain");
+                    let _guard = chain.lock();
                     self.cache.update(event);
                     self.handlers.on_leave(
                         guild_id,
@@ -882,7 +918,7 @@ impl<
                 let now_ms = two_bot_core::parse_iso_millis(observed_at).unwrap_or(0);
                 let chain = self.voice_chains.lock_for(guild_id, member_id, now_ms);
                 {
-                    let _guard = chain.lock().expect("voice chain");
+                    let _guard = chain.lock();
                     let at = observed_at.to_owned();
                     if let Some(old) = old_channel {
                         self.handlers.on_voice_leave(VoiceInput {
@@ -998,7 +1034,7 @@ mod tests {
         const HOT: u64 = 100;
         const NOW: i64 = 2 * VOICE_CHAIN_IDLE_MS as i64;
         let chains = VoiceChains::default();
-        let mut hot: Vec<(Snowflake, Arc<Mutex<()>>)> = Vec::new();
+        let mut hot: Vec<(Snowflake, Arc<ChainLock>)> = Vec::new();
         for member in 0..TOTAL {
             // Idle entries last touched long ago; hot entries at `NOW`.
             let seen = if member < HOT { NOW } else { 0 };
@@ -1022,21 +1058,24 @@ mod tests {
     fn leave_removes_chain_unless_contended() {
         let chains = VoiceChains::default();
         let chain = chains.lock_for(GUILD, 1, 0);
+        drop(chain.lock());
         chains.remove_after_leave(GUILD, 1, &chain);
         assert_eq!(chains.len(), 0, "full leave drops the chain");
 
-        // Another frame's handle (inside the critical section or queued on it) keeps the entry.
+        // Another frame's hold (inside the critical section or queued on it) keeps the entry.
         let chain = chains.lock_for(GUILD, 2, 0);
         let other = chains.lock_for(GUILD, 2, 0);
+        drop(chain.lock());
         chains.remove_after_leave(GUILD, 2, &chain);
         assert_eq!(chains.len(), 1, "contended chain survives the leave");
-        drop(other);
+        drop(other.lock());
         chains.remove_after_leave(GUILD, 2, &chain);
         assert_eq!(chains.len(), 0, "uncontended retry drops it");
 
         // A recreated entry is a different chain and is never dropped by a
         // stale leave for the old one.
         let old = chains.lock_for(GUILD, 3, 0);
+        drop(old.lock());
         chains.remove_after_leave(GUILD, 3, &old);
         let fresh = chains.lock_for(GUILD, 3, 1);
         assert!(!Arc::ptr_eq(&old, &fresh));

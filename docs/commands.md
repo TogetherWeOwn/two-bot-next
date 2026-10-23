@@ -453,7 +453,7 @@ RSVP to a Discord scheduled event
 
 ## `/rsvp-attendance`
 
-Show RSVP totals for a scheduled event
+Show RSVP totals and your saved response for an event
 
 - Default permissions: Everyone (no default permission gate)
 - Available in DMs: false

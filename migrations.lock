@@ -496,6 +496,10 @@
     "crates/store/migrations/0461_giveaways.sql": {
       "sha256": "5309afc33d9e77216a6aa2d53c077bc6a3917355f1d7541b0e32016cac4eda1d",
       "justification": "Giveaways slice 1: additive IF NOT EXISTS definitions, entries and draws with composite foreign keys. Renumbered only the unmerged pair to cutover 0460/store 0461 after main claimed 0458/0459 for starboard. Never merged or deployed under earlier numbers; SQL body unchanged; only migration-number comments changed."
+    },
+    "crates/cutover/migrations/0462_audit_reconcile_cursor.sql": {
+      "sha256": "5c0ddbb7a347f3cf0c23e3e5216fe30aa276d6dbe5747dbbaae358fec6d9ee02",
+      "justification": "Nullable durable audit reconciliation floor: checkpoint only fully inspected pages, resume across bounded claims without another POST, and preserve the original boundary and acceptance evidence. Additive IF NOT EXISTS; previous-binary rollback retains this column. Renumbered before first merge to 0462 because main owns 0458/0459 starboard and 0460/0461 giveaways; SQL bytes unchanged and no live migration performed."
     }
   }
 }

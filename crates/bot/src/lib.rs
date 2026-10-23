@@ -22,6 +22,10 @@ pub mod join_risk_runtime;
 pub mod lane_jitter;
 pub mod raid_runtime;
 
+// Shared query observer and settings fixture; one module per test crate.
+#[cfg(test)]
+mod hotpath_settings_test_support;
+
 // Shared by the raid/containment tuning test modules; declared once so the
 // file is not loaded as two modules (clippy::duplicate_mod).
 #[cfg(test)]

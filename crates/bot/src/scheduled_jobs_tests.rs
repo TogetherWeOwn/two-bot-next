@@ -1,3 +1,7 @@
+#[path = "event_reminder_acceptance_tests.rs"]
+mod event_reminder_acceptance;
+#[path = "event_reminder_regression_tests.rs"]
+mod event_reminder_regression;
 #[path = "scheduled_uncertainty_acceptance_tests.rs"]
 mod uncertainty_acceptance;
 

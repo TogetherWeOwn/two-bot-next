@@ -235,10 +235,22 @@ permission, channel, tuning or runtime changes.
   undeliverable — the 12 s delivery timeout, or a failed send,
   `RaidDelivery::post_staff_message` and `post`). Join-risk equivalents are
   `join_risk_posted`, `join_risk_undeliverable`, `join_risk_post_failed` and
-  `join_risk_refused` (`crates/bot/src/join_risk_runtime.rs:372-389`). The
+  `join_risk_refused` (`JoinRiskWorker::handle`). Each ERROR site carries a
+  stable `error_class` matching its message stem, including the log-first
+  `raid_alert` and `join_risk_evidence` proposals. The
   proposal consumes the cooldown, so a missing channel, a refusal and a
   failed send are all logged and never retried — do not re-post, replay or
   "fix" them into a second send.
+- Queue drops. Each runtime's 2048-slot queue drops rather than waits when
+  full; each dropped join increments its
+  `two_bot_raid_dropped_joins_total{reason="queue_full"}` or
+  `two_bot_join_risk_dropped_joins_total{reason="queue_full"}` counter. A closed
+  receiver increments the same runtime's `reason="queue_closed"` series and
+  logs ERROR `raid_queue_closed` / `join_risk_queue_closed`. All four series
+  start at zero and reset on process restart; labels never include member or
+  guild IDs. No retry, policy change or alert rule is added. These are observer
+  drops after gateway persistence, not proof of lost join rows. See
+  [queue triage](runbook-observability.md#raid-and-join-risk-queue-drops).
 - Restart semantics. Restarting clears the volatile `RaidWatch` (window,
   repeat and cooldown), because one worker owns it in memory. That resets
   future detection; it does not repair, re-deliver or erase an old alert,
