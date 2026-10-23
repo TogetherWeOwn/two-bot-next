@@ -317,6 +317,39 @@ def tokio_test_names(text):
                 "unsupported Tokio import or opaque import syntax; "
                 "path Tokio fully so every test attribute stays visible",
             )
+    # Supported macro source is deliberately small: no local definitions
+    # (including nested/raw-identifier forms), macro imports or opaque item/
+    # source generators. Only these bare standard expression macros are used
+    # by the fixture. Do not try to expand arbitrary Rust with this scanner.
+    # Scan raw words so trivia, metavariables and repetitions cannot hide a
+    # definition; prose/literals may conservatively refuse validation too.
+    expression_macros = r"assert|assert_eq|assert_ne|eprintln|format|vec"
+    macro_error = (
+        "unsupported macro source; keep fixtures as direct Tokio test functions "
+        "and use only bare standard expression macros, or extend the scanner"
+    )
+    if re.search(r"\b(?:macro_rules|macro|macro_use)\b", text):
+        raise ValueError(macro_error)
+    for keyword in re.finditer(r"\buse\b", text):
+        stop = text.find(";", keyword.end())
+        item = text[keyword.end():] if stop == -1 else text[keyword.end():stop]
+        # A glob or renamed import could shadow an allowed expression macro.
+        if re.search(rf"\b(?:{expression_macros})\b|\*", item):
+            raise ValueError(macro_error)
+    for bang in re.finditer(r"!\s*(?:[({\[]|/\*|//)", text):
+        prefix = text[:bang.start()]
+        if prefix.rsplit("\n", 1)[-1].lstrip().startswith("//"):
+            continue  # Inner doc comments (`//!`) are not macro invocations.
+        name = re.search(rf"\b(?:{expression_macros})\s*$", prefix)
+        before = "" if name is None else prefix[:name.start()].rstrip()
+        # Require a bare name after an expression/statement separator. Refuse
+        # qualified/raw/Unicode-suffixed names and comment-obscured paths or
+        # delimiters rather than normalizing them into an allowed spelling.
+        # include! and imported item macros are opaque even without Tokio text.
+        if (name is None or (before and before[-1] not in "([{=,;}")
+                or "//" in before.rsplit("\n", 1)[-1]
+                or bang.group().rstrip().endswith(("/*", "//"))):
+            raise ValueError(macro_error)
     return names
 
 
