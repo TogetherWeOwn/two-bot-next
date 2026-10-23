@@ -333,6 +333,186 @@ fn ordinary_init_fifo_is_bounded_and_preserves_nonoverflow_order() {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RetainedInitEntry {
+    Ordinary(u64, String),
+    Seed(Vec<(u64, String)>),
+    Names(NameSettings),
+    Access(AccessControls),
+    Creator(CreatorChannel),
+}
+
+fn retained_init_entries(buffered: &VecDeque<ActorCommand>) -> Vec<RetainedInitEntry> {
+    buffered
+        .iter()
+        .map(|command| match command {
+            ActorCommand::Display { member_id, display } => {
+                RetainedInitEntry::Ordinary(*member_id, display.clone())
+            }
+            ActorCommand::DisplaySeed(seed) => RetainedInitEntry::Seed(seed.clone()),
+            ActorCommand::NameSettingsChanged(names) => RetainedInitEntry::Names(names.clone()),
+            ActorCommand::AccessChanged(access) => RetainedInitEntry::Access(access.clone()),
+            ActorCommand::CreatorAdded(creator) => RetainedInitEntry::Creator(creator.clone()),
+            _ => panic!("unexpected command in keyed retention fixture"),
+        })
+        .collect()
+}
+
+fn assert_keyed_init_retention(window: InitWindow, ordinary_sent: usize) {
+    // Break: deleting only the keyed remove retains every old saved payload,
+    // even though applying them all still leaves the worker at the latest value.
+    // Inspect before applying anything, independently of init_state_key().
+    let mut buffered = VecDeque::new();
+    for revision in 0..ordinary_sent {
+        window.push(
+            &mut buffered,
+            ActorCommand::Display {
+                member_id: MEMBER + revision as u64,
+                display: format!("ordinary-{revision}"),
+            },
+        );
+        let seed = vec![
+            (MEMBER, format!("owner-{revision}")),
+            (MEMBER + 1, format!("guest-{revision}")),
+        ];
+        let mut config = empty_config();
+        config.settings.no_game_label = format!("no-game-{revision}");
+        config.settings.unique_names = revision.is_multiple_of(2);
+        let names = NameSettings::from_config(&config);
+        let access = AccessControls {
+            room_creation_enabled: revision.is_multiple_of(2),
+            required_role: Some(1000 + revision as u64),
+            command_roles: [("name".to_owned(), vec![2000 + revision as u64])]
+                .into_iter()
+                .collect(),
+        };
+        let creators = [CREATOR, CREATOR + 1].map(|channel_id| {
+            let mut creator = CreatorChannel::new(GUILD, channel_id);
+            creator.name_template = format!("creator-{channel_id}-revision-{revision}");
+            creator.private_default = (channel_id + revision as u64).is_multiple_of(2);
+            creator
+        });
+        window.push(&mut buffered, ActorCommand::DisplaySeed(seed.clone()));
+        window.push(
+            &mut buffered,
+            ActorCommand::NameSettingsChanged(names.clone()),
+        );
+        window.push(&mut buffered, ActorCommand::AccessChanged(access.clone()));
+        for creator in &creators {
+            window.push(&mut buffered, ActorCommand::CreatorAdded(creator.clone()));
+        }
+        let expected_saved = vec![
+            RetainedInitEntry::Seed(seed),
+            RetainedInitEntry::Names(names),
+            RetainedInitEntry::Access(access),
+            RetainedInitEntry::Creator(creators[0].clone()),
+            RetainedInitEntry::Creator(creators[1].clone()),
+        ];
+        assert_retained_init_snapshot(window, &buffered, revision, &expected_saved, 512);
+        if matches!(window, InitWindow::FailedAttempt) {
+            // A real reply waits during the attempt, then closes on purge.
+            // The last 511 ordinary entries and all five state keys survive.
+            let (reply, mut response) = oneshot::channel();
+            window.push(&mut buffered, ActorCommand::Status(reply));
+            assert!(matches!(
+                response.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            assert!(buffered.len() <= 512 + 5);
+            let surviving_ordinary = buffered
+                .iter()
+                .filter(|command| matches!(command, ActorCommand::Display { .. }))
+                .count();
+            assert_eq!(surviving_ordinary, (revision + 1).min(511));
+            purge_unanswerable_buffered(&mut buffered);
+            assert!(matches!(
+                response.try_recv(),
+                Err(oneshot::error::TryRecvError::Closed)
+            ));
+            assert_retained_init_snapshot(window, &buffered, revision, &expected_saved, 511);
+        }
+    }
+}
+
+fn assert_retained_init_snapshot(
+    window: InitWindow,
+    buffered: &VecDeque<ActorCommand>,
+    revision: usize,
+    expected_saved: &[RetainedInitEntry],
+    ordinary_cap: usize,
+) {
+    let actual = retained_init_entries(buffered);
+    for (key, count) in [
+        (
+            "DisplaySeed",
+            actual.iter().filter(|entry| matches!(entry, RetainedInitEntry::Seed(_))).count(),
+        ),
+        (
+            "NameSettings",
+            actual.iter().filter(|entry| matches!(entry, RetainedInitEntry::Names(_))).count(),
+        ),
+        (
+            "Access",
+            actual.iter().filter(|entry| matches!(entry, RetainedInitEntry::Access(_))).count(),
+        ),
+        (
+            "Creator(first)",
+            actual.iter().filter(|entry| matches!(entry, RetainedInitEntry::Creator(creator) if creator.channel_id == CREATOR)).count(),
+        ),
+        (
+            "Creator(second)",
+            actual.iter().filter(|entry| matches!(entry, RetainedInitEntry::Creator(creator) if creator.channel_id == CREATOR + 1)).count(),
+        ),
+    ] {
+        assert_eq!(count, 1, "{window:?}: {key} retained cardinality at revision {revision}");
+    }
+    let ordinary_retained = actual
+        .iter()
+        .filter(|entry| matches!(entry, RetainedInitEntry::Ordinary(..)))
+        .count();
+    assert!(ordinary_retained <= 512, "{window:?}: ordinary bound");
+    assert!(actual.len() <= 512 + 5, "{window:?}: total retained bound");
+    let oldest_survivor = (revision + 1).saturating_sub(ordinary_cap);
+    let mut expected: Vec<_> = (oldest_survivor..=revision)
+        .map(|index| {
+            RetainedInitEntry::Ordinary(MEMBER + index as u64, format!("ordinary-{index}"))
+        })
+        .collect();
+    // Latest replacements append at their arrival position; ordinary survivors
+    // stay FIFO. Full payload equality also prevents cross-channel replacement.
+    assert_eq!(
+        &actual[ordinary_retained..],
+        expected_saved,
+        "{window:?}: exact latest saved payloads and arrival order"
+    );
+    expected.extend_from_slice(expected_saved);
+    assert_eq!(
+        actual, expected,
+        "{window:?}: oldest ordinary eviction and surviving FIFO"
+    );
+}
+
+#[test]
+fn keyed_init_retention_during_attempt_has_one_latest_entry_per_key() {
+    for ordinary_sent in [4, 529] {
+        assert_keyed_init_retention(InitWindow::Attempt, ordinary_sent);
+    }
+}
+
+#[test]
+fn keyed_init_retention_during_backoff_has_one_latest_entry_per_key() {
+    for ordinary_sent in [4, 529] {
+        assert_keyed_init_retention(InitWindow::Backoff, ordinary_sent);
+    }
+}
+
+#[test]
+fn keyed_init_retention_after_failed_attempt_has_one_latest_entry_per_key() {
+    for ordinary_sent in [4, 529] {
+        assert_keyed_init_retention(InitWindow::FailedAttempt, ordinary_sent);
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn real_loader_keeps_startup_seed_after_receiving_more_than_init_capacity() {
     // Exercise receive -> release slot -> buffer -> load-success drain, not
