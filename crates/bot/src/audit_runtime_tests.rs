@@ -1103,20 +1103,56 @@ fn log_report_counts_scan_bound_reached_and_unclaimed() {
 
 // ------------------------------------------ protected cursor budget tests --
 
-/// Time moves only inside a history read, after claim/halt/renew SQL has
-/// completed. Cancellation resumes the clock before checkpoint/release SQL.
-struct CursorReadClock;
+/// Freeze wall time for the entire real job, including every SQL await. A
+/// runnable task prevents Tokio's idle-time advance while SQL is in flight.
+/// Only a deliberately pending history read parks that task, letting the
+/// actual scan/outer timers fire; cancelling the read makes it runnable again
+/// before checkpoint/release SQL. Neither deadline is replaced by a test seam.
+struct CursorReadClock {
+    runnable: watch::Sender<bool>,
+    driver: tokio::task::JoinHandle<()>,
+}
 
 impl CursorReadClock {
     fn pause() -> Self {
         tokio::time::pause();
-        Self
+        let (runnable, mut enabled) = watch::channel(true);
+        let driver = tokio::spawn(async move {
+            loop {
+                let run = *enabled.borrow_and_update();
+                if run {
+                    tokio::task::yield_now().await;
+                } else if enabled.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+        Self { runnable, driver }
     }
 }
 
 impl Drop for CursorReadClock {
     fn drop(&mut self) {
+        self.driver.abort();
         tokio::time::resume();
+    }
+}
+
+/// Drop runs inside the real history timeout, before the service starts SQL.
+/// Waking the parked driver here forbids another automatic clock jump during
+/// that SQL, even if the database takes longer than the checkpoint reserve.
+struct CursorHistoryWait(watch::Sender<bool>);
+
+impl CursorHistoryWait {
+    fn new(runnable: watch::Sender<bool>) -> Self {
+        runnable.send_replace(false);
+        Self(runnable)
+    }
+}
+
+impl Drop for CursorHistoryWait {
+    fn drop(&mut self) {
+        self.0.send_replace(true);
     }
 }
 
@@ -1124,7 +1160,7 @@ impl Drop for CursorReadClock {
 struct PacedHistory {
     scanning: bool,
     shared_batch: bool,
-    started: Option<tokio::time::Instant>,
+    clock: Option<watch::Sender<bool>>,
     requests: Vec<(String, Option<String>)>,
     markers: HashMap<String, MirrorMessage>,
 }
@@ -1161,7 +1197,7 @@ impl AuditMirror for PacedCursorMirror {
 
     async fn channel_history(&self, channel: &str, before: Option<&str>, limit: u8) -> PageResult {
         assert_eq!(limit, 100);
-        let (shared, started) = {
+        let (shared, clock) = {
             let mut history = self.history.lock().unwrap();
             history
                 .requests
@@ -1172,7 +1208,7 @@ impl AuditMirror for PacedCursorMirror {
             if let Some(marker) = history.markers.get(channel) {
                 return Ok(vec![marker.clone()]);
             }
-            (history.shared_batch, history.started.unwrap())
+            (history.shared_batch, history.clock.clone().unwrap())
         };
         let newest = match channel {
             AUDIT_CH => 900_000_u64,
@@ -1187,20 +1223,13 @@ impl AuditMirror for PacedCursorMirror {
             page == 10
         };
         if stall {
-            let _clock = CursorReadClock::pause();
-            // Stop just short of the REAL outer job timeout, giving any
-            // reserved caller deadline a chance to cancel this page first.
-            // If absent, paused time reaches the outer timeout instead: the
-            // baseline loses its progress, an observable behavioral RED.
-            let before_outer = started + TIMEOUT - Duration::from_millis(100);
-            tokio::time::advance(
-                before_outer.saturating_duration_since(tokio::time::Instant::now()),
-            )
-            .await;
+            // Auto-advance is safe only while this read is pending: there is
+            // no SQL until its actual deadline cancels it. Without the reserve
+            // (or the shared budget), the real outer timeout cancels the job.
+            let _wait = CursorHistoryWait::new(clock);
             return std::future::pending().await;
         }
         if page < 10 || channel == VOICE_CH {
-            let _clock = CursorReadClock::pause();
             tokio::time::advance(Duration::from_secs(2)).await;
         }
         Ok((0..100_u64)
@@ -1235,7 +1264,7 @@ fn paced_runtime(
     )
 }
 
-async fn cursor_budget_case(shared: bool) {
+async fn cursor_budget_case(shared: bool, delay_halt: bool) {
     let url = std::env::var("TWO_TEST_DATABASE_URL").expect("guarded test bootstrap required");
     let db = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
         .await
@@ -1280,18 +1309,55 @@ async fn cursor_budget_case(shared: bool) {
         } else {
             None
         };
+    // The delayed variant holds only this disposable fixture's halt table.
+    // A real, successful server-side wait releases it below, within the
+    // fixture's five-second statement allowance; no production seam changes.
+    let halt_lock = if delay_halt {
+        let mut tx = db.pool().begin().await.unwrap();
+        sqlx::query("LOCK TABLE audit_kill_switch IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        Some(tx)
+    } else {
+        None
+    };
+    let clock = CursorReadClock::pause();
     {
         let mut history = mirror.history.lock().unwrap();
         history.scanning = true;
         history.shared_batch = shared;
         history.requests.clear();
-        history.started = Some(tokio::time::Instant::now());
+        history.clock = Some(clock.runnable.clone());
     }
     let (_stop, shutdown) = watch::channel(false);
     let job = retry_job(runtime.clone(), shutdown, Duration::ZERO);
     // Same timeout wrapper as the production supervisor, using the actual
     // retry_job action -> runtime sweep -> service drain_pending path.
-    let outcome = tokio::time::timeout(job.timeout, (job.action)()).await;
+    let sweep = tokio::time::timeout(job.timeout, (job.action)());
+    let outcome = if let Some(mut tx) = halt_lock {
+        let started = tokio::time::Instant::now();
+        let (outcome, ()) = tokio::join!(
+            biased;
+            sweep,
+            async {
+                sqlx::query("SELECT pg_sleep(1.5)")
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    tokio::time::Instant::now(), started,
+                    "successful SQL wall time must not consume the logical budget"
+                );
+                assert!(mirror.history.lock().unwrap().requests.is_empty());
+                tx.rollback().await.unwrap();
+            }
+        );
+        outcome
+    } else {
+        sweep.await
+    };
+    drop(clock);
     let requests = mirror.history.lock().unwrap().requests.clone();
     let mut bounded = Vec::new();
     for (entry, _, _) in &entries {
@@ -1431,12 +1497,37 @@ async fn cursor_budget_case(shared: bool) {
 /// 25-second job timeout; otherwise ten validated pages are lost on cancel.
 #[tokio::test]
 async fn retry_job_checkpoints_progress_before_its_production_timeout() {
-    cursor_budget_case(false).await;
+    cursor_budget_case(false, false).await;
 }
 
 /// A 20-second first row consumes the same sweep budget as the later row.
 /// Giving each row a fresh timeout loses the later row's validated floor.
 #[tokio::test]
 async fn retry_job_later_rows_share_the_remaining_sweep_budget() {
-    cursor_budget_case(true).await;
+    cursor_budget_case(true, false).await;
+}
+
+/// A successful 1.5-second halt-table wait must not alter either exact page
+/// sequence, saved cursor, restart, untouched-row or single-POST observation.
+#[tokio::test]
+async fn retry_job_cursor_budget_excludes_successful_sql_wall_time() {
+    for shared in [false, true] {
+        cursor_budget_case(shared, true).await;
+    }
+}
+
+#[tokio::test]
+async fn cursor_budget_clock_restores_time_when_its_action_is_cancelled() {
+    let (ready, wait) = tokio::sync::oneshot::channel();
+    let action = tokio::spawn(async move {
+        let clock = CursorReadClock::pause();
+        let _wait = CursorHistoryWait::new(clock.runnable.clone());
+        ready.send(()).unwrap();
+        std::future::pending::<()>().await;
+    });
+    wait.await.unwrap();
+    action.abort();
+    assert!(action.await.unwrap_err().is_cancelled());
+    // pause() would panic if cancellation had left the runtime clock paused.
+    drop(CursorReadClock::pause());
 }
