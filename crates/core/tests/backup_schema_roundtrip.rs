@@ -1461,10 +1461,10 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v13-source.ndjson.gz");
+    let current_path = directory.path("v14-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 13);
+    assert_eq!(old.manifest.version, 14);
     for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -1510,10 +1510,10 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v13-source.ndjson.gz");
+    let current_path = directory.path("v14-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 13);
+    assert_eq!(old.manifest.version, 14);
     for name in [
         "scheduled_events_claim",
         "scheduled_events_tombstone",
@@ -1577,10 +1577,10 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v13-source.ndjson.gz");
+    let current_path = directory.path("v14-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 13);
+    assert_eq!(old.manifest.version, 14);
     // Frozen claim-only v10 shape: the merged v10 writer carried the
     // epoch-claim guard but predates the delete tombstones, token registry
     // and event voice pair.
@@ -1652,10 +1652,10 @@ async fn v11_archive_restores_and_clears_newer_registry() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v13-source.ndjson.gz");
+    let current_path = directory.path("v14-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 13);
+    assert_eq!(old.manifest.version, 14);
     // Frozen tombstone-only v11 shape: the merged v11 writer carried the
     // delete tombstones but predates the token registry and event voice pair.
     for name in [
@@ -1723,11 +1723,11 @@ async fn v12_archive_restores_and_clears_newer_event_voice() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v13-source.ndjson.gz");
+    let current_path = directory.path("v14-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 13);
-    for table in ["event_voice_channels", "event_voice_presence"] {
+    assert_eq!(old.manifest.version, 14);
+    for table in ["event_voice_channels", "event_voice_presence", "afk_status"] {
         let rows = old.buffers.remove(table).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {table}");
         old.manifest.tables.retain(|info| info.name != table);
@@ -1740,13 +1740,13 @@ async fn v12_archive_restores_and_clears_newer_event_voice() {
     assert_eq!(inspected.manifest.version, 12);
     assert_eq!(
         inspected.manifest.missing_tables(),
-        ["event_voice_channels", "event_voice_presence"]
+        ["event_voice_channels", "event_voice_presence", "afk_status"]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
     forget_moderation_history(pool).await;
     let report = restore(pool, &old_path).await.unwrap();
     assert!(report.ok);
-    for table in ["event_voice_channels", "event_voice_presence"] {
+    for table in ["event_voice_channels", "event_voice_presence", "afk_status"] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
             identifier(table)
@@ -1769,6 +1769,111 @@ async fn v12_archive_restores_and_clears_newer_event_voice() {
         .await
         .unwrap();
     assert!(members > 0, "older covered data is restored, not discarded");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v13_archive_restores_and_clears_only_afk_preserving_event_voice_and_registry() {
+    let Some(db) = database().await else {
+        return;
+    };
+    assert_eq!(DUMP_VERSION, 14, "current writer must include AFK");
+    let pool = db.pool();
+    seed(pool).await;
+    // Main's v13 fixture has no AFK rows; seed these explicitly so omission
+    // cannot pass through an already-empty target. The parent's shared fixture
+    // may also seed different AFK members.
+    sqlx::query(
+        "INSERT INTO afk_status (guild_id, user_id, note, set_at) VALUES \
+         ('100000000000000001', '900000000000000001', 'away before restore', '2026-08-01T10:00:00Z'), \
+         ('100000000000000001', '900000000000000002', NULL, '2026-08-01T10:01:00Z')",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let tables: Vec<_> = covered_tables(pool)
+        .await
+        .into_iter()
+        .filter(|name| name != "afk_status")
+        .collect();
+    let expected = snapshot(pool, &tables).await;
+    assert_eq!(
+        expected["event_voice_channels"].rows.len(),
+        1,
+        "seeded instance claim"
+    );
+    assert_eq!(
+        expected["event_voice_presence"].rows.len(),
+        2,
+        "seeded open and closed spans"
+    );
+    assert!(
+        !expected["admin_api_tokens"].rows.is_empty(),
+        "seeded token registry"
+    );
+    let directory = ArchiveDirectory::new();
+    let current_path = directory.path("v14-source.ndjson.gz");
+    dump(pool, &current_path).await.unwrap();
+    let mut old = inspect(&current_path).unwrap();
+    assert_eq!(old.manifest.version, 14);
+    let afk = old.buffers.remove("afk_status").expect("writer covers AFK");
+    assert!(
+        afk.len() >= 2,
+        "archive contains both explicitly seeded away members"
+    );
+    old.manifest
+        .tables
+        .retain(|table| table.name != "afk_status");
+    old.manifest.version = 13;
+    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
+    let old_path = directory.path("pre-afk-v13.ndjson.gz");
+    write_archive(&old_path, &old);
+    let inspected = inspect(&old_path).expect("genuine v13 archive remains readable");
+    assert_eq!(inspected.manifest.version, 13);
+    assert_eq!(inspected.manifest.missing_tables(), ["afk_status"]);
+    for name in [
+        "event_voice_channels",
+        "event_voice_presence",
+        "admin_api_tokens",
+    ] {
+        assert!(
+            !inspected.buffers[name].is_empty(),
+            "v13 retains archived {name}"
+        );
+    }
+    // Erase these rows only in this owned disposable database: equality after
+    // restore must prove replay of claims, complete spans and token metadata,
+    // not merely leave the original seed untouched.
+    sqlx::raw_sql("DELETE FROM event_voice_presence; DELETE FROM event_voice_channels; DELETE FROM admin_api_tokens;")
+        .execute(pool)
+        .await
+        .unwrap();
+    let afk_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM afk_status")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(
+        afk_before >= 2,
+        "target is populated with AFK before restore"
+    );
+    assert_ne!(
+        snapshot(pool, &tables).await,
+        expected,
+        "target differs from the archive"
+    );
+    forget_moderation_history(pool).await;
+    let report = restore(pool, &old_path).await.unwrap();
+    assert!(report.ok);
+    let afk_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM afk_status")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(afk_after, 0, "v13 restore clears newer target AFK history");
+    assert_eq!(
+        snapshot(pool, &tables).await,
+        expected,
+        "v13 restores all covered rows, including claims, spans and registry"
+    );
     db.close().await.unwrap();
 }
 
