@@ -25,6 +25,8 @@ mod leveling_ack_visibility_acceptance_tests;
 mod member_authority_cause_acceptance;
 #[path = "member_dispatch_authority_acceptance.rs"]
 mod member_dispatch_authority_acceptance;
+#[path = "sticky_status_acceptance_tests.rs"]
+mod sticky_status_acceptance_tests;
 #[path = "sticky_uncertain_acceptance_tests.rs"]
 mod sticky_uncertain_acceptance_tests;
 
