@@ -803,27 +803,35 @@ pub async fn apply_seasonal_decay(
     let mut tx = pool.begin().await?;
     let mut decayed = 0u64;
     let mut after = None::<String>;
-    // TOP-25 keyset pages, at most 25 actual decays per call. Scan past
-    // unchanged/zero-XP rows so zero remains a truthful drain marker. Row
-    // locks serialize the read/modify/write with awards and other ticks.
+    // Fixed TOP-25 keyset pages, separately capped at 25 actual decays.
+    // Filter before locking: positive XP owes another week only once the
+    // floored update millisecond is at least 28 + 7*(watermark+1) days old.
+    // PostgreSQL rechecks this predicate after a contended row lock; keep
+    // the Rust recheck too, so an award cannot be overwritten by stale math.
     while decayed < 25 {
         let rows: Vec<(String, i64, i32, i64)> = sqlx::query_as(
             "SELECT member_id, seasonal_xp, decayed_weeks,
                     FLOOR(EXTRACT(EPOCH FROM updated_at) * 1000)::bigint
              FROM member_season_xp WHERE guild_id = $1 AND season_id = $2
                AND ($3::text IS NULL OR member_id > $3)
-             ORDER BY member_id LIMIT $4 FOR UPDATE",
+               AND seasonal_xp > 0
+               AND FLOOR(EXTRACT(EPOCH FROM updated_at) * 1000)::bigint <=
+                   $4::bigint - (28::bigint + 7 * (GREATEST(decayed_weeks, 0)::bigint + 1)) * 86400000
+             ORDER BY member_id LIMIT 25 FOR UPDATE",
         )
         .bind(guild_id)
         .bind(season_id)
         .bind(after.as_deref())
-        .bind((25 - decayed) as i64)
+        .bind(as_of_ms)
         .fetch_all(&mut *tx)
         .await?;
         if rows.is_empty() {
             break;
         }
         for (member_id, seasonal_xp, decayed_weeks, updated_ms) in rows {
+            if decayed == 25 {
+                break;
+            }
             after = Some(member_id.clone());
             let days_inactive = (as_of_ms - updated_ms).max(0) as u64 / 86_400_000;
             let new_weeks = seasonal_decay_new_weeks(days_inactive, decayed_weeks.max(0) as u64);
