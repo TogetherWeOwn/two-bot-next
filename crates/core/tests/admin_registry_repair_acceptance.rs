@@ -479,6 +479,218 @@ mod database {
         assert_eq!(after_catalog, before_catalog, "migration transaction must leave no partial DDL, unvalidated CHECK or applied-history entry");
     }
 
+    async fn pre_repair_migrators(chain: &str, shipped: i64) -> (Migrator, Migrator) {
+        // Apply unrelated predecessors too: a refusal must roll back the repair,
+        // not accidentally compare history across a successful earlier migration.
+        let first_repair = super::forward_registry_files(chain, shipped)
+            .first()
+            .expect("forward registry repair exists")
+            .file_name()
+            .expect("repair filename")
+            .to_str()
+            .expect("UTF-8 repair filename")
+            .split('_')
+            .next()
+            .expect("repair version")
+            .parse::<i64>()
+            .expect("numeric repair version");
+        let latest = migrator(chain).await;
+        let prefix = Migrator::with_migrations(
+            latest
+                .iter()
+                .filter(|m| m.version < first_repair)
+                .cloned()
+                .collect(),
+        );
+        (prefix, latest)
+    }
+
+    async fn registry_rows(pool: &PgPool) -> Value {
+        sqlx::query_scalar("SELECT coalesce(jsonb_agg(to_jsonb(t) ORDER BY token_id), '[]'::jsonb) FROM admin_api_tokens t")
+            .fetch_one(pool).await.expect("snapshot all partial-registry data")
+    }
+
+    async fn omitted_holder_inserts(pool: &PgPool) -> Vec<(&'static str, String)> {
+        let mut probes = Vec::new();
+        for (name, statement) in [
+            ("both omitted", "INSERT INTO admin_api_tokens (token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at) VALUES ($1, $2, '{read}', '{1}', 'fixture-label', 'fixture-issuer', $3::timestamptz, $4::timestamptz)"),
+            ("holder_id omitted", "INSERT INTO admin_api_tokens (token_id, secret_hash, scopes, guild_ids, label, issued_by, holder_kind, issued_at, expires_at) VALUES ($1, $2, '{read}', '{1}', 'fixture-label', 'fixture-issuer', 'human', $3::timestamptz, $4::timestamptz)"),
+            ("holder_kind omitted", "INSERT INTO admin_api_tokens (token_id, secret_hash, scopes, guild_ids, label, issued_by, holder_id, issued_at, expires_at) VALUES ($1, $2, '{read}', '{1}', 'fixture-label', 'fixture-issuer', 'fixture-holder', $3::timestamptz, $4::timestamptz)"),
+        ] {
+            let hash = row()["secret_hash"].as_str().expect("fixture hash").to_owned();
+            let result = sqlx::query(statement)
+                .bind(TOKEN)
+                .bind(hash)
+                .bind(ISSUED)
+                .bind(NINETY_DAYS)
+                .execute(pool)
+                .await;
+            let outcome = match result {
+                Ok(_) => "ACCEPTED fallback holder".to_owned(),
+                Err(error) => error
+                    .as_database_error()
+                    .and_then(|error| error.code())
+                    .map(|code| code.into_owned())
+                    .unwrap_or_else(|| "non-database failure".to_owned()),
+            };
+            clear(pool).await;
+            probes.push((name, outcome));
+        }
+        probes
+    }
+
+    async fn partial_holder_defaults_refuse_atomically(chain: &str, shipped: i64) {
+        let Some(url) = bootstrap() else { return };
+        let (prefix, latest) = pre_repair_migrators(chain, shipped).await;
+        let mut failures = Vec::new();
+        // The defaults are valid principals on purpose. Row/NOT NULL checks
+        // alone cannot detect the omission-based authority they would permit.
+        for (name, has_id, has_kind, default_id, default_kind) in [
+            ("id column only", true, false, true, false),
+            ("kind column only", false, true, false, true),
+            ("both columns, id default only", true, true, true, false),
+            ("both columns, kind default only", true, true, false, true),
+            ("both columns, both defaults", true, true, true, true),
+        ] {
+            for populated in [false, true] {
+                let db = TestDatabase::create(&url, &prefix)
+                    .await
+                    .expect("create isolated pre-repair default fixture");
+                for (column, present, has_default, literal) in [
+                    (
+                        "holder_id",
+                        has_id,
+                        default_id,
+                        "'fixture-fallback-principal'",
+                    ),
+                    ("holder_kind", has_kind, default_kind, "'human'"),
+                ] {
+                    if present {
+                        // Both nullable-empty and NOT NULL-populated catalogs
+                        // must survive refusal byte-for-byte in the snapshot.
+                        let nullability = if populated { "NOT NULL" } else { "" };
+                        let default = if has_default {
+                            format!("DEFAULT {literal}")
+                        } else {
+                            String::new()
+                        };
+                        sqlx::query(sqlx::AssertSqlSafe(format!("ALTER TABLE admin_api_tokens ADD COLUMN {column} text {default} {nullability}")))
+                            .execute(db.pool()).await.expect("install partial holder column");
+                    }
+                }
+                if populated {
+                    let mut existing = row();
+                    existing["holder_kind"] = json!("human");
+                    insert(db.pool(), &existing)
+                        .await
+                        .expect("insert otherwise valid pre-repair named fixture");
+                }
+                let before_rows = registry_rows(db.pool()).await;
+                let before_catalog = catalog(db.pool()).await;
+                let result = latest.run(db.pool()).await;
+                // Snapshot BEFORE behavior probes so even a permissive repair's
+                // DDL/data/history changes cannot be obscured by probe cleanup.
+                let after_rows = registry_rows(db.pool()).await;
+                let after_catalog = catalog(db.pool()).await;
+                let omissions = if result.is_ok() {
+                    clear(db.pool()).await;
+                    omitted_holder_inserts(db.pool()).await
+                } else {
+                    Vec::new()
+                };
+                db.close().await.expect("drop partial-default fixture");
+                if result.is_ok() || after_rows != before_rows || after_catalog != before_catalog {
+                    failures.push(format!(
+                        "{name}, populated={populated}: refused={}, data_preserved={}, catalog_and_history_preserved={}, omissions={omissions:?}",
+                        result.is_err(), after_rows == before_rows, after_catalog == before_catalog
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{chain}: reject any pre-existing holder default atomically; do not DROP DEFAULT, fabricate authority, alter nullability/constraints/history or leave added DDL: {failures:#?}");
+    }
+
+    async fn partial_holders_without_defaults_upgrade(chain: &str, shipped: i64) {
+        let Some(url) = bootstrap() else { return };
+        let (prefix, latest) = pre_repair_migrators(chain, shipped).await;
+        let mut failures = Vec::new();
+        for (name, has_id, has_kind, populated) in [
+            ("empty id column only", true, false, false),
+            ("empty kind column only", false, true, false),
+            ("empty both columns", true, true, false),
+            ("populated named columns", true, true, true),
+        ] {
+            let db = TestDatabase::create(&url, &prefix)
+                .await
+                .expect("create isolated no-default control");
+            for (column, present) in [("holder_id", has_id), ("holder_kind", has_kind)] {
+                if present {
+                    sqlx::query(sqlx::AssertSqlSafe(format!(
+                        "ALTER TABLE admin_api_tokens ADD COLUMN {column} text"
+                    )))
+                    .execute(db.pool())
+                    .await
+                    .expect("install no-default partial column");
+                }
+            }
+            if populated {
+                let mut existing = row();
+                existing["holder_kind"] = json!("human");
+                insert(db.pool(), &existing)
+                    .await
+                    .expect("valid named pre-repair row inserts");
+            }
+            let before_rows = registry_rows(db.pool()).await;
+            let result = latest.run(db.pool()).await;
+            let after_rows = registry_rows(db.pool()).await;
+            let columns: Vec<(String, String, Option<String>)> = sqlx::query_as(
+                "SELECT column_name, is_nullable, column_default FROM information_schema.columns
+                 WHERE table_schema='public' AND table_name='admin_api_tokens'
+                   AND column_name IN ('holder_id', 'holder_kind') ORDER BY column_name",
+            )
+            .fetch_all(db.pool())
+            .await
+            .expect("read migrated no-default authority columns");
+            let omissions = if result.is_ok() {
+                clear(db.pool()).await;
+                omitted_holder_inserts(db.pool()).await
+            } else {
+                Vec::new()
+            };
+            db.close().await.expect("drop no-default control");
+            if result.is_err()
+                || after_rows != before_rows
+                || columns
+                    != vec![
+                        ("holder_id".into(), "NO".into(), None),
+                        ("holder_kind".into(), "NO".into(), None),
+                    ]
+                || omissions.len() != 3
+                || omissions.iter().any(|(_, state)| state != "23502")
+            {
+                failures.push(format!("{name}: migrated={}, data_preserved={}, columns={columns:?}, omissions={omissions:?}", result.is_ok(), after_rows == before_rows));
+            }
+        }
+        assert!(failures.is_empty(), "{chain}: compatible partial schemas without defaults must migrate, preserve named data and refuse every omitted-holder INSERT with NOT NULL SQLSTATE 23502: {failures:#?}");
+    }
+
+    #[tokio::test]
+    async fn cutover_partial_holder_defaults_refuse_atomically() {
+        partial_holder_defaults_refuse_atomically("cutover", 456).await;
+    }
+    #[tokio::test]
+    async fn store_partial_holder_defaults_refuse_atomically() {
+        partial_holder_defaults_refuse_atomically("store", 457).await;
+    }
+    #[tokio::test]
+    async fn cutover_partial_holders_without_defaults_upgrade() {
+        partial_holders_without_defaults_upgrade("cutover", 456).await;
+    }
+    #[tokio::test]
+    async fn store_partial_holders_without_defaults_upgrade() {
+        partial_holders_without_defaults_upgrade("store", 457).await;
+    }
+
     // Separate functions preserve independent failures for the two real chains.
     #[tokio::test]
     async fn cutover_named_holders_and_exact_ninety_days() {
