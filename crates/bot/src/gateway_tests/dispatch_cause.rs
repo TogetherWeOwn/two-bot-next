@@ -301,6 +301,17 @@ fn lines_with<'a>(logs: &'a str, needles: &[&str]) -> Vec<&'a str> {
         .collect()
 }
 
+fn drain_skip_count() -> u64 {
+    let metrics = two_bot_core::metrics::global().render(None);
+    let prefix = format!("{SKIP_COUNTER} ");
+    metrics
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .expect("drain skip counter sample must be present")
+        .parse()
+        .expect("drain skip counter sample must be an unsigned integer")
+}
+
 /// READY then one award-queueing message, returning the dispatch outcome and
 /// the logs captured around the message only.
 async fn run_message_dispatch(
@@ -338,6 +349,7 @@ async fn leveling_drain_missing_table_skips_with_metric_and_advances_cursor() {
     );
     let mut peer = Peer::new().await;
     let Running { store, stop, task } = start_runner(pool, &peer, pool).await;
+    let skips_before = drain_skip_count();
     let (outcome, logs) = run_message_dispatch(&mut peer, &store, task).await;
     match outcome {
         Outcome::Advanced(task) => stop_runner(stop, task).await,
@@ -349,11 +361,10 @@ async fn leveling_drain_missing_table_skips_with_metric_and_advances_cursor() {
         !lines_with(&logs, &["42P01", "leveling", "skip"]).is_empty(),
         "skip warn must name the SQLSTATE, got:\n{logs}"
     );
+    let skips_after = drain_skip_count();
     assert!(
-        two_bot_core::metrics::global()
-            .render(None)
-            .contains(SKIP_COUNTER),
-        "skipped drain must increment {SKIP_COUNTER}"
+        skips_after > skips_before,
+        "skipped drain must increment {SKIP_COUNTER}: before={skips_before}, after={skips_after}"
     );
     peer.close().await;
 }
@@ -405,6 +416,7 @@ async fn leveling_drain_permission_gap_skips_with_metric_and_advances_cursor() {
     );
     let mut peer = Peer::new().await;
     let Running { store, stop, task } = start_runner(pool, &peer, &role_pool).await;
+    let skips_before = drain_skip_count();
     let (outcome, logs) = run_message_dispatch(&mut peer, &store, task).await;
     match outcome {
         Outcome::Advanced(task) => stop_runner(stop, task).await,
@@ -416,11 +428,10 @@ async fn leveling_drain_permission_gap_skips_with_metric_and_advances_cursor() {
         !lines_with(&logs, &["42501", "leveling", "skip"]).is_empty(),
         "skip warn must name the SQLSTATE, got:\n{logs}"
     );
+    let skips_after = drain_skip_count();
     assert!(
-        two_bot_core::metrics::global()
-            .render(None)
-            .contains(SKIP_COUNTER),
-        "skipped drain must increment {SKIP_COUNTER}"
+        skips_after > skips_before,
+        "skipped drain must increment {SKIP_COUNTER}: before={skips_before}, after={skips_after}"
     );
     peer.close().await;
 }
