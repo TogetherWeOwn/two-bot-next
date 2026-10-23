@@ -150,11 +150,15 @@ fn spawn_actor(
 ) -> tokio::task::JoinHandle<GuildRoomWorker<Store, Http>> {
     tokio::spawn(async move {
         let mut worker = worker;
+        // These tests drive a raw channel (no permits acquired), so the
+        // loop's releases saturate against this throwaway ledger.
+        let backpressure = ActorInboxBackpressure::default();
         run_actor_with_limits(
             &mut worker,
             rx,
             Duration::from_millis(100),
             ActorLimits::default(),
+            &backpressure,
         )
         .await;
         worker
