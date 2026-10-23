@@ -192,12 +192,6 @@ fn sample_every_n(counter: u64) -> bool {
 }
 
 fn sampled_refusal_warn_emits() -> bool {
-    // Unit tests pin separation and redaction at full volume, so they emit
-    // every warn; the sampling math itself is pinned by
-    // `refusal_warn_sampling_emits_first_then_every_nth` below.
-    if cfg!(test) {
-        return true;
-    }
     sample_every_n(REFUSAL_WARN_SAMPLE.fetch_add(1, Ordering::Relaxed))
 }
 
@@ -970,6 +964,9 @@ mod tests {
     #[tokio::test]
     async fn duplicate_key_body_is_acknowledged_without_retry() {
         let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
+        // Start a sampling window while holding the shared receiver-test lock
+        // so the redaction assertions inspect an emitted production warning.
+        REFUSAL_WARN_SAMPLE.store(0, Ordering::Relaxed);
         let capture = crate::tracing_capture::global();
         let start = capture.text().len();
         // Valid signature over a notification body that repeats a key: the
@@ -1339,6 +1336,9 @@ mod tests {
         // an ack. Each body is signed exactly as sent.
         let (logs, _subscriber) = capture_eventsub_logs();
         for challenge in ["", "has space"] {
+            // Pin each malformed payload's log fields at the start of a
+            // sampling window; the receiver-test lock excludes peer requests.
+            REFUSAL_WARN_SAMPLE.store(0, Ordering::Relaxed);
             let body = format!(
                 r#"{{"challenge":{challenge:?},"subscription":{{"id":"synthetic-sub-0014","status":"webhook_callback_verification_pending","type":"stream.online","version":"1","condition":{{"broadcaster_user_id":"123456"}},"transport":{{"method":"webhook","callback":"https://example.com/hooks/twitch"}},"created_at":"2026-10-13T00:00:00Z"}}}}"#
             );
@@ -1709,6 +1709,109 @@ mod tests {
         );
     }
 
+    /// Run alone so both the production counter and tracing callsites start
+    /// fresh. No sampler reset or test-only sampling path is used in the child.
+    #[tokio::test]
+    async fn warning_sampling_shares_one_budget_across_receiver_error_paths() {
+        const TEST: &str =
+            "eventsub_http::tests::warning_sampling_shares_one_budget_across_receiver_error_paths";
+        const PROBE: &str = "EVENTSUB_WARNING_SAMPLING_PROBE";
+        if std::env::var_os(PROBE).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.env_clear().args([TEST, "--exact", "--nocapture"]);
+            // Keep the child's executed lines in the CI coverage report.
+            if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+                child.env("LLVM_PROFILE_FILE", profile);
+            }
+            let output = child.env(PROBE, "1").output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "isolated warning-sampling probe failed:\n{stdout}\n{stderr}"
+            );
+            assert!(stdout.contains("running 1 test"));
+            assert!(stdout.contains(&format!("{TEST} ... ok")));
+            return;
+        }
+
+        let (logs, _subscriber) = capture_eventsub_logs();
+        let bound = app();
+        let timestamp = fresh_timestamp();
+        let body = r#"{"subscription":null}"#;
+        let mut emitted = [0_usize; 2];
+        for index in 0..1000_u64 {
+            // Alternate paths within a window and at each emission boundary.
+            // Separate refusal/classification counters would warn too often.
+            let classification = (index + index / 64) % 2 == 1;
+            let message_id = format!("synthetic-sampling-{index:04}");
+            let signature = if classification {
+                sign(&message_id, &timestamp, body.as_bytes())
+            } else {
+                format!("sha256={}", "0".repeat(64))
+            };
+            let before = logs.lock().unwrap().len();
+            let response = bound
+                .clone()
+                .oneshot(request(
+                    "POST",
+                    EVENTSUB_PATH,
+                    Some(&message_id),
+                    Some(&timestamp),
+                    Some(&signature),
+                    Some("notification"),
+                    body,
+                ))
+                .await
+                .unwrap();
+            let status = if classification {
+                StatusCode::OK
+            } else {
+                StatusCode::UNAUTHORIZED
+            };
+            assert_eq!(response.status(), status, "delivery {index}");
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(response["ok"], classification);
+            if !classification {
+                assert_eq!(response["error"]["code"], "unauthorized");
+                assert_eq!(response["error"]["retryable"], false);
+            }
+
+            let output = logs.lock().unwrap()[before..].to_vec();
+            if index.is_multiple_of(64) {
+                let event: serde_json::Value = serde_json::from_slice(&output)
+                    .unwrap_or_else(|_| panic!("expected exactly one warning at delivery {index}"));
+                assert_eq!(event["level"], "WARN");
+                let fields = &event["fields"];
+                assert_eq!(fields["event"], "eventsub_receiver");
+                assert_eq!(fields["status"], status.as_u16());
+                assert_eq!(fields["message_type"], "notification");
+                if classification {
+                    assert_eq!(fields["error_class"], "acknowledged");
+                    assert_eq!(fields["error_variant"], "invalid_body");
+                } else {
+                    assert_eq!(fields["error_class"], "unauthorized");
+                    assert!(fields.get("error_variant").is_none());
+                }
+                emitted[usize::from(classification)] += 1;
+            } else {
+                assert!(
+                    output.is_empty(),
+                    "delivery {index} must suppress its warning"
+                );
+            }
+        }
+        assert_eq!(emitted, [8, 8], "1000 mixed errors emit only 16 warnings");
+        assert_eq!(REFUSAL_WARN_SAMPLE.load(Ordering::Relaxed), 1000);
+        let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        for private in [test_secret(), body, "synthetic-sampling-"] {
+            assert!(!text.contains(private), "per-delivery value reached logs");
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn stalled_request_times_out_with_503_and_retryable() {
         let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
@@ -2014,6 +2117,9 @@ mod tests {
         let timestamp = fresh_timestamp();
         let old_id = "synthetic-reload-0006";
         let old_signature = sign_with(&old_secret, old_id, &timestamp, body.as_bytes());
+        // The receiver-test lock isolates this sampling window for the
+        // refusal redaction assertions below; sampling still runs normally.
+        REFUSAL_WARN_SAMPLE.store(0, Ordering::Relaxed);
         let refused =
             reload_response(bound.clone(), old_id, &timestamp, &old_signature, body).await;
         assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
