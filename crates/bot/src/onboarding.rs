@@ -361,6 +361,7 @@ impl OnboardingRuntime {
     /// The `/reopen` self-service slash rides the same capture so a member
     /// whose welcome is lost can open a fresh menu through the same
     /// defer-first pipeline as the picker components.
+    #[cfg(test)]
     pub fn accepts_interaction(&self, interaction: &Interaction) -> bool {
         self.resolve_interaction(interaction).is_some()
     }
