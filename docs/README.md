@@ -33,6 +33,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Startup diagnostics](startup-diagnostics.md)
 - [Gateway recovery](gateway-recovery.md)
 - [Gateway failure rules](gateway-failure-classification.md)
+- [Deferred capture poison contract](deferred-capture-poison.md)
 - [Backups and restores](backup.md)
 - [Backfill procedure](backfill-runbook.md)
 - [Deploy preflight](preflight.md)
