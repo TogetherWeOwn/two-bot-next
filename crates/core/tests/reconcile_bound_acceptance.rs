@@ -466,8 +466,26 @@ async fn empty_history_still_quarantines() -> TestResult {
 #[derive(Clone)]
 enum CursorRead {
     Reply(PageResult),
-    Delay(Duration),
+    ExpireDeadline(Duration),
     Pause(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>),
+}
+
+/// Pause only while the double owns a history read. Cancellation drops this
+/// guard before the service performs any checkpoint SQL; real SQLx I/O never
+/// runs under paused-clock auto-advance.
+struct HistoryClock;
+
+impl HistoryClock {
+    fn pause() -> Self {
+        tokio::time::pause();
+        Self
+    }
+}
+
+impl Drop for HistoryClock {
+    fn drop(&mut self) {
+        tokio::time::resume();
+    }
 }
 
 #[derive(Default)]
@@ -553,7 +571,20 @@ impl AuditMirror for CursorMirror {
         };
         match override_read {
             Some(CursorRead::Reply(reply)) => return reply,
-            Some(CursorRead::Delay(delay)) => tokio::time::sleep(delay).await,
+            Some(CursorRead::ExpireDeadline(elapsed)) => {
+                // A stale std::Instant loop retries the already timed-out page.
+                // Make that regression a finite behavioral failure, not a spin
+                // until wall time catches up with the controlled Tokio clock.
+                self.override_read(
+                    before,
+                    CursorRead::Reply(Err(MirrorError::Uncertain(
+                        "timed-out page was requested again".to_owned(),
+                    ))),
+                );
+                let _clock = HistoryClock::pause();
+                tokio::time::advance(elapsed).await;
+                return std::future::pending().await;
+            }
             Some(CursorRead::Pause(entered, release)) => {
                 entered.notify_one();
                 release.notified().await;
@@ -712,9 +743,14 @@ async fn time_bound_saves_only_pages_completed_before_deadline() -> TestResult {
     let mirror = CursorMirror::default();
     cursor_seed(&db, entry, &mirror).await?;
     mirror.install(40, Some(&event(entry)));
-    mirror.override_read(Some("899801"), CursorRead::Delay(Duration::from_secs(3)));
-    let service = AuditMirrorService::new(AuditStore::new(&db.pool), mirror.clone(), config())
-        .with_reconcile_scan_deadline(Instant::now() + Duration::from_secs(2));
+    // Reaching page 3 proves pages 1 and 2 were validated and renewed. Only
+    // then advance the scan's default 30-second clock beyond its deadline;
+    // no short absolute deadline races claim/halt/renew database latency.
+    mirror.override_read(
+        Some("899801"),
+        CursorRead::ExpireDeadline(Duration::from_secs(31)),
+    );
+    let service = AuditMirrorService::new(AuditStore::new(&db.pool), mirror.clone(), config());
     let start = mirror.requests().len();
     let result = service.deliver_entry(entry).await?;
     drop(service);
@@ -988,6 +1024,137 @@ async fn cursor_write_cannot_outlive_lease_generation_or_new_acceptance() -> Tes
         db.finish().await?;
     }
     Ok(())
+}
+
+/// Removing the failed-renew stop guard must cause an observable extra read,
+/// even if the final checkpoint still rejects the stale capability.
+#[tokio::test]
+async fn lost_owner_on_second_full_page_stops_before_a_third_history_read() -> TestResult {
+    for fault in ["expired", "replaced", "accepted"] {
+        let db = TestDb::new().await?;
+        let entry = "intermediate-owner-fence";
+        let mirror = CursorMirror::default();
+        cursor_seed(&db, entry, &mirror).await?;
+        seed_floor(&db, entry, "899901").await?;
+        mirror.install(40, Some(&event(entry)));
+        let pool = peer(&db).await?;
+        let store = AuditStore::new(&db.pool);
+        let claim = store.claim(entry).await?.unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        mirror.override_read(
+            Some("899801"),
+            CursorRead::Pause(entered.clone(), release.clone()),
+        );
+        let service = AuditMirrorService::new(AuditStore::new(&db.pool), mirror.clone(), config());
+        let start = mirror.requests().len();
+        let mutate = async {
+            entered.notified().await;
+            let other = AuditStore::new(&pool);
+            let mut replacement = None;
+            if fault == "accepted" {
+                assert!(other.note_accepted(&claim, "895100").await?);
+            } else {
+                db.expire(entry).await?;
+                if fault == "replaced" {
+                    replacement = Some(other.claim(entry).await?.unwrap());
+                }
+            }
+            // Includes state, cursor, token, generation, lease, attempt and
+            // acceptance evidence; do not print ownership capabilities.
+            let snapshot: serde_json::Value = sqlx::query_scalar(
+                "SELECT to_jsonb(a) FROM operational_audit_log a WHERE entry_id = $1",
+            )
+            .bind(entry)
+            .fetch_one(&pool)
+            .await?;
+            release.notify_one();
+            Ok::<_, Box<dyn std::error::Error>>((snapshot, replacement))
+        };
+        let (result, snapshot) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(service.deliver(&claim), mutate)
+        })
+        .await?;
+        let (snapshot, replacement) = snapshot?;
+        assert_eq!(result?, DeliverOutcome::Unclaimed, "{fault}");
+        assert_eq!(
+            mirror.requests()[start..],
+            [Some("899901".to_owned()), Some("899801".to_owned())],
+            "{fault}: lost ownership must stop at page 2, not just reject the final checkpoint"
+        );
+        let after: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(a) FROM operational_audit_log a WHERE entry_id = $1",
+        )
+        .bind(entry)
+        .fetch_one(&pool)
+        .await?;
+        assert!(after == snapshot, "{fault}: authoritative row was mutated");
+        assert_eq!(cursor(&pool, entry).await?.as_deref(), Some("899901"));
+        if let Some(replacement) = replacement {
+            assert!(
+                store.renew(&replacement).await?,
+                "replacement keeps ownership"
+            );
+        }
+        if fault == "accepted" {
+            assert!(
+                store.complete(&claim).await?,
+                "accepted owner keeps completion"
+            );
+        }
+        assert_eq!(mirror.posts.load(Ordering::Relaxed), 1);
+        drop(service);
+        pool.close().await;
+        db.finish().await?;
+    }
+    Ok(())
+}
+
+/// Lexical comparison would reject 998401 as forward from 1000001. The
+/// service must checkpoint numeric progress and another owner must use it.
+#[tokio::test]
+async fn numeric_floor_crosses_decimal_width_and_restarts_at_exact_checkpoint() -> TestResult {
+    let db = TestDb::new().await?;
+    let entry = "decimal-width-progress";
+    let mirror = CursorMirror::default();
+    cursor_seed(&db, entry, &mirror).await?;
+    seed_floor(&db, entry, "1000001").await?;
+    mirror.history.lock().unwrap().messages = (0..40)
+        .flat_map(|page| noise_page(1_000_000 - page * 100))
+        .collect();
+    let original = AuditStore::new(&db.pool).get(entry).await?.unwrap();
+    let service = AuditMirrorService::new(AuditStore::new(&db.pool), mirror.clone(), config());
+    let start = mirror.requests().len();
+    assert_eq!(
+        service.deliver_entry(entry).await?,
+        DeliverOutcome::ScanBoundReached
+    );
+    assert_eq!(mirror.requests().len() - start, 16);
+    assert_eq!(mirror.requests()[start].as_deref(), Some("1000001"));
+    assert_eq!(mirror.requests()[start + 15].as_deref(), Some("998501"));
+    assert_eq!(cursor(&db.pool, entry).await?.as_deref(), Some("998401"));
+    assert_released(&db.pool, entry).await?;
+    drop(service);
+    let pool = peer(&db).await?;
+    let restarted = AuditMirrorService::new(AuditStore::new(&pool), mirror.clone(), config());
+    let start = mirror.requests().len();
+    assert_eq!(
+        restarted.deliver_entry(entry).await?,
+        DeliverOutcome::ScanBoundReached
+    );
+    assert_eq!(mirror.requests().len() - start, 16);
+    assert_eq!(mirror.requests()[start].as_deref(), Some("998401"));
+    assert_eq!(cursor(&pool, entry).await?.as_deref(), Some("996801"));
+    assert_released(&pool, entry).await?;
+    let after = AuditStore::new(&pool).get(entry).await?.unwrap();
+    assert_eq!(after.search_before, original.search_before);
+    assert_eq!(after.nonce, original.nonce);
+    assert_eq!(after.attempted_at, original.attempted_at);
+    assert_eq!(after.attempts, 1);
+    assert_eq!(mirror.posts.load(Ordering::Relaxed), 1);
+    drop(restarted);
+    pool.close().await;
+    db.finish().await
 }
 
 #[tokio::test]

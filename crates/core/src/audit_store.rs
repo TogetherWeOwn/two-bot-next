@@ -835,6 +835,10 @@ fn snowflake_id(value: &str) -> bool {
 }
 
 #[cfg(test)]
+#[path = "audit_cursor_checkpoint_acceptance.rs"]
+mod cursor_checkpoint_acceptance;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
