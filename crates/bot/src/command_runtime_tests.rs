@@ -1279,6 +1279,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "feed-add"
                         | "feed-remove"
                         | "feed-list"
+                        | "feed-inspect"
                         | "purge"
                         | "slowmode"
                         | "lockdown"
