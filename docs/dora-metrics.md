@@ -59,7 +59,10 @@ Every input ID (deployment IDs, SHAs, run IDs, verdicts) lands in the JSON
 - A live dispatch (or the Monday schedule) on `main` commits straight to
   the `automation/dora-metrics` branch with the job token: `main` only
   accepts pull requests, and the automation branch carries no rulesets. The
-  checkout stays credentialless and the push authenticates per command. The
+  checkout stays credentialless. Fetch and push use command-scoped Git HTTPS
+  Basic authentication (`x-access-token` with the existing job token), not the
+  API's bearer scheme. The base64 credential is masked before network use and
+  never stored in Git config; base64 is encoding, not encryption. The
   checked-out code computes the report; a separate temporary worktree publishes
   only its JSON and Markdown on the automation branch's existing tree (the
   current checkout is the first-run fallback). Same-week reruns replace that

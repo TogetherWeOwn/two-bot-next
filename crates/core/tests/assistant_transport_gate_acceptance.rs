@@ -136,6 +136,10 @@ fn assistant_config(endpoint: &str) -> Option<AssistantConfig> {
             "TWO_ASSISTANT_MODEL".to_string(),
             "fixture-model".to_string(),
         ),
+        (
+            "TWO_ASSISTANT_API_KEY".to_string(),
+            "fixture-assistant-credential".to_string(),
+        ),
     ]))
 }
 
