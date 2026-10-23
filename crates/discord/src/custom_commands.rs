@@ -870,15 +870,9 @@ fn single_string_option<'a>(data: &'a CommandData, name: &str) -> SingleOption<'
 }
 
 #[cfg(test)]
-#[path = "../tests/common/mod.rs"]
-pub mod inspect_test_wire;
-
-#[cfg(test)]
 mod inspect_regressions {
-    use super::{
-        inspect_test_wire::{MockRest, ScriptedResponse},
-        *,
-    };
+    use super::*;
+    use crate::test_wire::{MockRest, ScriptedResponse};
     use serde_json::{json, Value};
     use two_bot_core::RouterGates;
     use two_bot_testsupport::TestDatabase;
