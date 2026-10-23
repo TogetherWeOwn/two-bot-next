@@ -3522,6 +3522,92 @@ mod tests {
         assert!(value.parse::<f64>().is_ok(), "bad sample: {}", series[0]);
     }
 
+    /// Adapter: today nothing counts voice overflow drops, so the adapter is
+    /// a no-op. After the Builder adds inherent
+    /// `Metrics::voice_inbox_overflow_dropped` /
+    /// `Metrics::voice_queue_overflow_dropped`, method resolution prefers the
+    /// inherent methods and the tests below exercise the real counters. This
+    /// is what makes RED behavioral: this file compiles today and the
+    /// assertions fail on the missing series.
+    trait VoiceOverflowCounters {
+        fn voice_inbox_overflow_dropped(&self) {}
+        fn voice_queue_overflow_dropped(&self) {}
+    }
+
+    impl VoiceOverflowCounters for Metrics {}
+
+    #[test]
+    fn voice_inbox_overflow_dropped_counter_is_label_free_and_zero_fresh() {
+        // Refused voice actor inbox sends render as one label-free counter
+        // series — 0 on a fresh registry, +1 per refused send — so no guild,
+        // member or channel label can reach exposition.
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("# TYPE two_bot_voice_inbox_overflow_dropped_total counter\n"));
+        assert!(text.contains("two_bot_voice_inbox_overflow_dropped_total 0\n"));
+        metrics.voice_inbox_overflow_dropped();
+        metrics.voice_inbox_overflow_dropped();
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_inbox_overflow_dropped_total 2\n"));
+        assert!(!text.contains("two_bot_voice_inbox_overflow_dropped_total{"));
+        let series: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("two_bot_voice_inbox_overflow_dropped_total "))
+            .collect();
+        assert_eq!(series.len(), 1);
+        let (_, value) = series[0].rsplit_once(' ').unwrap();
+        assert!(value.parse::<f64>().is_ok(), "bad sample: {}", series[0]);
+    }
+
+    #[test]
+    fn voice_queue_overflow_dropped_counter_is_label_free_and_zero_fresh() {
+        // Refused voice action queue enqueues render as one label-free counter
+        // series — 0 on a fresh registry, +1 per refused enqueue — so no
+        // guild or channel label can reach exposition.
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("# TYPE two_bot_voice_queue_overflow_dropped_total counter\n"));
+        assert!(text.contains("two_bot_voice_queue_overflow_dropped_total 0\n"));
+        metrics.voice_queue_overflow_dropped();
+        metrics.voice_queue_overflow_dropped();
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_queue_overflow_dropped_total 2\n"));
+        assert!(!text.contains("two_bot_voice_queue_overflow_dropped_total{"));
+        let series: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("two_bot_voice_queue_overflow_dropped_total "))
+            .collect();
+        assert_eq!(series.len(), 1);
+        let (_, value) = series[0].rsplit_once(' ').unwrap();
+        assert!(value.parse::<f64>().is_ok(), "bad sample: {}", series[0]);
+    }
+
+    #[test]
+    fn voice_overflow_dropped_counters_are_isolated_from_each_other() {
+        // The inbox and queue overflow meters count independently: bumping one
+        // never moves the other.
+        let metrics = Metrics::default();
+        metrics.voice_inbox_overflow_dropped();
+        metrics.voice_inbox_overflow_dropped();
+        metrics.voice_queue_overflow_dropped();
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_inbox_overflow_dropped_total 2\n"));
+        assert!(text.contains("two_bot_voice_queue_overflow_dropped_total 1\n"));
+    }
+
+    #[test]
+    fn voice_overflow_legacy_adapter_path_stays_available() {
+        // Control pinning the legacy adapter path: qualified calls bypass any
+        // inherent overflow gate by design, so this passes both before and
+        // after the Builder adds inherent `voice_inbox_overflow_dropped` /
+        // `voice_queue_overflow_dropped`. It also keeps the adapter trait
+        // referenced once inherent methods shadow unqualified calls, avoiding
+        // never-used warnings under `-D warnings`.
+        let metrics = Metrics::default();
+        <Metrics as VoiceOverflowCounters>::voice_inbox_overflow_dropped(&metrics);
+        <Metrics as VoiceOverflowCounters>::voice_queue_overflow_dropped(&metrics);
+    }
+
     #[test]
     fn voice_actor_fair_scheduling_series_are_label_free() {
         // The fair-scheduling diagnosis is one gauge (the bound) plus two
