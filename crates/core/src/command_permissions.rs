@@ -75,10 +75,11 @@ use PolicyHook::{
 
 /// All 30 parity rows, including the three non-static-slash dispositions,
 /// plus the Next-only `/help` discovery command (parity row 31 — legacy has
-/// no help command) and the Next-only `/privacy` member self-serve
-/// (parity row 32).
+/// no help command), the Next-only `/privacy` member self-serve
+/// (parity row 32) and the Next-only `/feed-inspect` relay detail
+/// (parity row 33).
 /// No Administrator-only exception: preserve the legacy resolved-bit check.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 32] = [
+pub const COMMAND_PERMISSIONS: [CommandPermission; 33] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),
@@ -147,6 +148,7 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 32] = [
     row(28, "feed-add", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(29, "feed-remove", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(30, "feed-list", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(33, "feed-inspect", BuiltinSlash, PERM_MANAGE_GUILD, None),
 ];
 
 /// Only retained builtins participate in slash-name lookup. The dropped and

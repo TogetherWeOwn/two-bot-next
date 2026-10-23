@@ -94,6 +94,7 @@ impl ProductionRegistrations for InteractionRouter {
                 HandlerId::FeedAdd,
                 HandlerId::FeedRemove,
                 HandlerId::FeedList,
+                HandlerId::FeedInspect,
             ] {
                 router.register(Box::new(Stub(id)));
             }
@@ -177,6 +178,7 @@ fn owner_map(name: &str, member_present: bool) -> Option<HandlerId> {
         "feed-add" => Some(HandlerId::FeedAdd),
         "feed-remove" => Some(HandlerId::FeedRemove),
         "feed-list" => Some(HandlerId::FeedList),
+        "feed-inspect" => Some(HandlerId::FeedInspect),
         "ban" if member_present => Some(HandlerId::Moderation(ModerationAction::Ban)),
         "tempban" if member_present => Some(HandlerId::Moderation(ModerationAction::TempBan)),
         "kick" if member_present => Some(HandlerId::Moderation(ModerationAction::Kick)),

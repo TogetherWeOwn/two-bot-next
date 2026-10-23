@@ -5,7 +5,7 @@
 //! Two layers, mirroring `funnel_replay.rs`:
 //!
 //! 1. `route_*` — in-memory twilight `Interaction`s through
-//!    [`route_interaction`]: all 29 builtins, gates-off refusals, permission
+//!    [`route_interaction`]: all 30 builtins, gates-off refusals, permission
 //!    refusals, custom rows, unknown names/ids, modal submits, and the
 //!    refusal-response wire shape.
 //! 2. `publish_*` — the router's complete set through the real
@@ -435,8 +435,9 @@ fn every_section1_row_routes_to_its_registered_handler() {
         ("feed-add", HandlerId::FeedAdd),
         ("feed-remove", HandlerId::FeedRemove),
         ("feed-list", HandlerId::FeedList),
+        ("feed-inspect", HandlerId::FeedInspect),
     ];
-    assert_eq!(cases.len(), 29, "all 29 handler-owned builtins covered");
+    assert_eq!(cases.len(), 30, "all 30 handler-owned builtins covered");
     for (_, id) in cases {
         router.register(Box::new(Stub(*id)));
     }
