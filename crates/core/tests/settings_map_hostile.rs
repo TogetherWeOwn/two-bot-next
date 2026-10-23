@@ -131,9 +131,13 @@ fn assistant_control_characters_in_endpoint_disabled() {
 
 #[test]
 fn assistant_endpoint_length_boundary_in_chars() {
-    let pad = MAX_ENDPOINT_CHARS - "https://".len();
-    let at_bound = format!("https://{}", "a".repeat(pad));
+    // Pad a path, not a hostname: a huge Unicode label hits the IDNA
+    // parser's Punycode bound before it can exercise the endpoint char bound.
+    let prefix = format!("{VALID_ENDPOINT}/");
+    let pad = MAX_ENDPOINT_CHARS - prefix.chars().count();
+    let at_bound = format!("{prefix}{}", "a".repeat(pad));
     assert_eq!(at_bound.chars().count(), MAX_ENDPOINT_CHARS);
+    assert!(url::Url::parse(&at_bound).is_ok());
     assert!(
         AssistantConfig::from_map(&map(&[
             ("TWO_ASSISTANT_ENDPOINT", &at_bound),
@@ -142,7 +146,18 @@ fn assistant_endpoint_length_boundary_in_chars() {
         .is_some(),
         "endpoint exactly at MAX_ENDPOINT_CHARS must be accepted"
     );
+    assert_eq!(
+        AssistantConfig::from_map(&map(&[
+            ("TWO_ASSISTANT_ENDPOINT", &at_bound),
+            ("TWO_ASSISTANT_API_KEY", "fixture-assistant-credential"),
+        ]))
+        .expect("ASCII endpoint at the char bound enables")
+        .endpoint(),
+        at_bound
+    );
     let over_bound = format!("{at_bound}a");
+    assert_eq!(over_bound.chars().count(), MAX_ENDPOINT_CHARS + 1);
+    assert!(url::Url::parse(&over_bound).is_ok());
     assert_eq!(
         AssistantConfig::from_map(&map(&[
             ("TWO_ASSISTANT_ENDPOINT", &over_bound),
@@ -152,9 +167,10 @@ fn assistant_endpoint_length_boundary_in_chars() {
         "endpoint one char over the bound must be refused, not truncated"
     );
     // The bound is in characters, not bytes.
-    let multibyte = format!("https://{}", "é".repeat(pad));
+    let multibyte = format!("{prefix}{}", "é".repeat(pad));
     assert_eq!(multibyte.chars().count(), MAX_ENDPOINT_CHARS);
     assert!(multibyte.len() > MAX_ENDPOINT_CHARS);
+    assert!(url::Url::parse(&multibyte).is_ok());
     assert!(
         AssistantConfig::from_map(&map(&[
             ("TWO_ASSISTANT_ENDPOINT", &multibyte),
@@ -162,6 +178,26 @@ fn assistant_endpoint_length_boundary_in_chars() {
         ]))
         .is_some(),
         "multibyte endpoint at the char bound must be accepted"
+    );
+    assert_eq!(
+        AssistantConfig::from_map(&map(&[
+            ("TWO_ASSISTANT_ENDPOINT", &multibyte),
+            ("TWO_ASSISTANT_API_KEY", "fixture-assistant-credential"),
+        ]))
+        .expect("multibyte endpoint at the char bound enables")
+        .endpoint(),
+        multibyte
+    );
+    let multibyte_over_bound = format!("{multibyte}é");
+    assert_eq!(multibyte_over_bound.chars().count(), MAX_ENDPOINT_CHARS + 1);
+    assert!(url::Url::parse(&multibyte_over_bound).is_ok());
+    assert_eq!(
+        AssistantConfig::from_map(&map(&[
+            ("TWO_ASSISTANT_ENDPOINT", &multibyte_over_bound),
+            ("TWO_ASSISTANT_API_KEY", "fixture-assistant-credential"),
+        ])),
+        None,
+        "multibyte endpoint one char over the bound must be refused, not truncated"
     );
 }
 
