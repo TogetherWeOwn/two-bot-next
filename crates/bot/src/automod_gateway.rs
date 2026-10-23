@@ -274,15 +274,27 @@ pub(crate) fn partial_edit_received(text: &str, observed_at: &str) -> Option<Mes
 /// minimal edit omits fields a full Twilight `Message` requires and would fail
 /// decoding upstream of enrichment. Any other dispatch is `None`.
 pub(crate) fn partial_edit(text: &str, receipt_ms: u64) -> Option<MessageDelivery> {
-    if !text.contains("MESSAGE_UPDATE") {
+    if !is_message_update_dispatch(text) {
         return None;
     }
     let packet: serde_json::Value = serde_json::from_str(text).ok()?;
-    if packet.get("t")?.as_str()? != "MESSAGE_UPDATE" {
-        return None;
-    }
+    // Bytes already parsed: a repeated key refuses the edit before any ID
+    // routes the verdict pipeline.
+    two_bot_core::duplicate_keys::reject_duplicate_keys(text.as_bytes()).ok()?;
     let edit = PartialEdit::from_dispatch(packet.get("d")?)?;
     Some(partial_edit_delivery(&edit, receipt_ms))
+}
+
+/// True when `text` parses as JSON whose decoded `t` event type is
+/// `MESSAGE_UPDATE`. Selection is by decoded value, so an escaped spelling
+/// of the event name still matches, while another event whose content
+/// merely mentions the name does not. Frames that do not parse are not
+/// edits: they keep the pre-existing parse path in the runner.
+pub(crate) fn is_message_update_dispatch(text: &str) -> bool {
+    let Ok(packet) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
+    packet.get("t").and_then(serde_json::Value::as_str) == Some("MESSAGE_UPDATE")
 }
 
 /// What one delivery decided: `funnel` is its single call into the funnel and
@@ -370,3 +382,9 @@ pub(crate) fn expiry_job(slot: Slot) -> Job {
 #[cfg(test)]
 #[path = "automod_gateway_tests.rs"]
 mod tests;
+
+// Duplicate-key refusal acceptance (paired Test Author file; test-only,
+// production unchanged). The builder must preserve this wiring.
+#[cfg(test)]
+#[path = "automod_gateway_duplicate_key_acceptance_tests.rs"]
+mod duplicate_key_acceptance_tests;

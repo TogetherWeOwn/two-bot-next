@@ -9,8 +9,9 @@ security gates still apply.
 
 The historical table is created by cutover `0456` / store `0457`; the forward
 repair is cutover `0460_admin_api_token_authority.sql` and its store `0461`
-mirror. Applied historical SQL and checksums are immutable. Numbers `0458` and
-`0459` remain reserved for audit/confirmation work.
+mirror. Applied historical SQL and checksums are immutable. The starboard
+foundation uses store `0458` / cutover `0459`; the holder repair remains a
+separate forward migration.
 
 `admin_api_tokens` has twelve columns: `token_id`, `secret_hash`, `scopes`,
 `guild_ids`, `label`, `issued_by`, `issued_at`, `expires_at`, `revoked_at`,
@@ -72,8 +73,9 @@ not the repair's operational backout. Keep migration history intact.
 
 ## Backup, rollback and privacy
 
-Backup discovers live columns dynamically. The current v13 inventory includes the
-event voice pair; this holder repair adds no table or archive version. New archives
+Backup discovers live columns dynamically. The current v14 inventory includes the
+event voice pair and starboard tables; this holder repair adds no table or archive
+version. New archives
 include both holder columns. Populated pre-holder archives cannot restore valid
 authority: missing holder columns hit NOT NULL and roll back the restore
 transaction. An older readable
