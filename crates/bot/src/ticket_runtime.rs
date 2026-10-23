@@ -1668,3 +1668,7 @@ mod capture_cap_acceptance_tests;
 #[cfg(test)]
 #[path = "ticket_capture_cap_boundary_tests.rs"]
 mod capture_cap_boundary_tests;
+
+#[cfg(test)]
+#[path = "ticket_open_explanation_acceptance_tests.rs"]
+mod open_explanation_acceptance_tests;
