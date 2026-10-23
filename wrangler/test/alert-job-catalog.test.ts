@@ -14,10 +14,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
-import { EMPTY_STATE, evaluateMetrics, JOB_INTERVAL_SECONDS, JOB_RUNS_JOBS, parseExposition, TICKER_STALE_JOBS, TICKER_STALE_SECONDS, UNKNOWN_STALE_EXCLUDED } from "../src/alert-rules.ts";
-import { ALERT_INPUT_LABELS, parseAlertScrape } from "../src/metrics-scrape.ts";
+import { EMPTY_STATE, evaluateMetrics, JOB_INTERVAL_SECONDS, JOB_RUNS_JOBS, parseExposition, TICKER_STALE_JOBS, TICKER_STALE_SECONDS, transitionMessages, UNKNOWN_STALE_EXCLUDED } from "../src/alert-rules.ts";
+import { ALERT_INPUT_LABELS, ALERT_OPTIONAL_INPUT_LABELS, parseAlertScrape } from "../src/metrics-scrape.ts";
 import { FORWARDED_FLAGS, forwardedFlagVars, NOT_FORWARDED } from "../src/container-env.ts";
-import { metricsBody, metricsLines } from "./fixtures/metrics.ts";
+import { metricsBody, metricsLines, rustLabels } from "./fixtures/metrics.ts";
 
 const root = new URL("../../", import.meta.url);
 const read = (path: string) => readFileSync(new URL(path, root), "utf8");
@@ -299,21 +299,90 @@ test("polls join the boot status map and the shared Skip-on-missed-ticks supervi
     "missed poll ticks must skip, never burst into catch-up writes");
 });
 
-test("poll alert inputs retain the full Rust job vocabulary and reject missing poll rows", () => {
+test("poll alert inputs retain the full Rust job vocabulary in their required and optional maps", () => {
   assert.deepEqual([...JOB_RUNS_JOBS], JOBS);
   for (const name of [
-    "two_bot_job_last_success_timestamp_seconds", "two_bot_job_consecutive_failures",
-    "two_bot_job_last_error_class", "two_bot_job_runs_total",
+    "two_bot_job_last_success_timestamp_seconds", "two_bot_job_consecutive_failures", "two_bot_job_runs_total",
   ]) {
     assert.deepEqual(ALERT_INPUT_LABELS[name]?.job, JOBS, `${name}: polls must not be treated as an unknown future label`);
+    assert.equal(Object.hasOwn(ALERT_OPTIONAL_INPUT_LABELS, name), false, `${name}: poll rows remain required`);
   }
+  assert.equal(Object.hasOwn(ALERT_INPUT_LABELS, "two_bot_job_last_error_class"), false,
+    "requiring the error-class family would silence rollback-container monitoring");
+  assert.deepEqual(ALERT_OPTIONAL_INPUT_LABELS.two_bot_job_last_error_class, {
+    job: JOBS, class: rustLabels("JOB_ERROR_CLASSES"),
+  }, "optional error classes still validate the complete Rust vocabulary, including polls");
+});
+
+test("missing required poll rows fail the scrape with or without the optional error-class family", () => {
   assert.ok(parseAlertScrape(metricsBody()), "the complete Rust scrape must validate");
   const lines = metricsLines();
+  const requiredPollRows = [
+    'two_bot_job_last_success_timestamp_seconds{job="polls"} 0',
+    'two_bot_job_consecutive_failures{job="polls"} 0',
+    'two_bot_job_runs_total{job="polls",outcome="success"} 0',
+    'two_bot_job_runs_total{job="polls",outcome="failure"} 0',
+  ];
   const pollRows = lines.filter((line) => /\{job="polls"[,}]/.test(line));
-  assert.equal(pollRows.length, 2 + ALERT_INPUT_LABELS.two_bot_job_last_error_class!.class!.length + 2);
-  for (const removed of pollRows) {
-    assert.equal(parseAlertScrape(lines.filter((line) => line !== removed).join("\n")), null,
-      `missing required poll row must fail the scrape: ${removed}`);
+  assert.equal(pollRows.length, requiredPollRows.length + rustLabels("JOB_ERROR_CLASSES").length);
+  const older = lines.filter((line) => !line.startsWith("two_bot_job_last_error_class{"));
+  for (const scrape of [lines, older]) {
+    assert.ok(parseAlertScrape(scrape.join("\n")), "the intact scrape must validate before removing a required row");
+    for (const removed of requiredPollRows) {
+      assert.ok(scrape.includes(removed), `fixture must contain the required row: ${removed}`);
+      assert.equal(parseAlertScrape(scrape.filter((line) => line !== removed).join("\n")), null,
+        `missing required poll row must fail the scrape: ${removed}`);
+    }
+  }
+});
+
+test("rollback exposition without the optional error-class family still scrapes and emits classless poll alerts", () => {
+  const lines = metricsLines();
+  const older = lines.filter((line) => !line.startsWith("two_bot_job_last_error_class{"));
+  assert.equal(lines.length - older.length, JOBS.length * rustLabels("JOB_ERROR_CLASSES").length,
+    "remove the entire optional family, not just the poll rows");
+  const samples = parseAlertScrape(older.map((line) =>
+    line === 'two_bot_job_consecutive_failures{job="polls"} 0'
+      ? 'two_bot_job_consecutive_failures{job="polls"} 3' : line).join("\n"));
+  assert.ok(samples, "a rollback container without error classes must still scrape");
+  assert.equal(samples.some((sample) => sample.name === "two_bot_job_last_error_class"), false);
+  const failed = evaluateMetrics(samples, EMPTY_STATE, 1_000_000);
+  assert.deepEqual(failed.firing, ["job_consecutive_failures:polls"]);
+  assert.equal(failed.state.jobErrorClasses?.polls, undefined);
+  const messages = transitionMessages([], failed.firing, {}, failed.state.jobErrorClasses);
+  assert.equal(messages.length, 1);
+  assert.match(messages[0]!, /job_consecutive_failures:polls/);
+  assert.doesNotMatch(messages[0]!, /last error class/);
+});
+
+test("present optional poll error classes are validated rather than passed through as unknown metrics", () => {
+  const lines = metricsLines();
+  for (const errorClass of rustLabels("JOB_ERROR_CLASSES")) {
+    const row = `two_bot_job_last_error_class{job="polls",class="${errorClass}"} 0`;
+    assert.ok(lines.includes(row), `fixture must emit ${row}`);
+    assert.ok(parseAlertScrape(lines.filter((line) => line !== row).join("\n")),
+      `an optional class row need not be present: ${errorClass}`);
+    const samples = parseAlertScrape(lines.map((line) => line === row ? row.replace(/ 0$/, " 1")
+      : line === 'two_bot_job_consecutive_failures{job="polls"} 0'
+        ? 'two_bot_job_consecutive_failures{job="polls"} 3' : line).join("\n"));
+    assert.ok(samples, `valid present class must scrape: ${errorClass}`);
+    const failed = evaluateMetrics(samples, EMPTY_STATE, 1_000_000);
+    assert.deepEqual(failed.firing, ["job_consecutive_failures:polls"]);
+    assert.equal(failed.state.jobErrorClasses?.polls, errorClass);
+    assert.ok(transitionMessages([], failed.firing, {}, failed.state.jobErrorClasses)[0]!
+      .includes(`job_consecutive_failures:polls (last error class: ${errorClass})`));
+    for (const value of ["NaN", "+Inf", "-Inf", "-1", "0.5", "garbage", "1e20"]) {
+      assert.equal(parseAlertScrape(lines.map((line) => line === row ? row.replace(/ 0$/, ` ${value}`) : line).join("\n")), null,
+        `present optional poll class must reject ${value}: ${errorClass}`);
+    }
+    for (const malformed of [
+      `two_bot_job_last_error_class{job="polls"} 0`,
+      row.replace("class=", "reason="),
+      row.replace("} 0", ',unexpected="x"} 0'),
+    ]) {
+      assert.equal(parseAlertScrape(lines.map((line) => line === row ? malformed : line).join("\n")), null,
+        `present optional poll class must reject malformed labels: ${malformed}`);
+    }
   }
 });
 
