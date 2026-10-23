@@ -30,6 +30,8 @@ mod sticky_uncertain_acceptance_tests;
 
 #[path = "custom_command_list_pages_acceptance.rs"]
 mod custom_command_list_pages_acceptance;
+#[path = "schedule_body_edit_acceptance_tests.rs"]
+mod schedule_body_edit_acceptance_tests;
 
 use std::collections::VecDeque;
 use std::str::FromStr;
@@ -1288,6 +1290,8 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "schedule"
                         | "schedule-remove"
                         | "schedule-list"
+                        | "schedule-inspect"
+                        | "schedule-edit"
                         | "rank"
                         | "leaderboard"
                         | "help"
@@ -3072,19 +3076,25 @@ async fn feed_commands_from_other_guilds_are_silent() {
 async fn schedule_commands_refuse_ephemerally_while_automations_off() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     // automations OFF in the router gates → the shared router refuses all
-    // three schedule commands; the runtime answers through the shared executor.
+    // five schedule commands; the runtime answers through the shared executor.
     let runtime = runtime_without_db(gates(false, true), false, origin);
-    for name in ["schedule", "schedule-remove", "schedule-list"] {
+    for name in [
+        "schedule",
+        "schedule-remove",
+        "schedule-list",
+        "schedule-inspect",
+        "schedule-edit",
+    ] {
         runtime
             .on_interaction(&slash(name, Some(CHANNEL), Vec::new()))
             .await;
     }
     let requests = mock.requests();
     let callbacks = mock.posts_to("/callback").await;
-    assert_eq!(callbacks.len(), 3, "one ephemeral refusal per command");
+    assert_eq!(callbacks.len(), 5, "one ephemeral refusal per command");
     assert_eq!(
         requests.len(),
-        3,
+        5,
         "no defer, no edit, no publish: {requests:?}"
     );
     for callback in &callbacks {
@@ -3124,7 +3134,13 @@ async fn schedule_without_manage_server_is_refused() {
 async fn schedule_commands_from_other_guilds_are_silent() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     let runtime = runtime_without_db(gates(true, true), true, origin);
-    for name in ["schedule", "schedule-remove", "schedule-list"] {
+    for name in [
+        "schedule",
+        "schedule-remove",
+        "schedule-list",
+        "schedule-inspect",
+        "schedule-edit",
+    ] {
         let mut interaction = slash(name, Some(CHANNEL), Vec::new());
         interaction.guild_id = Some(Id::new(9999));
         runtime.on_interaction(&interaction).await;
@@ -3256,6 +3272,8 @@ async fn ready_publishes_the_complete_merged_registry_once() {
         "schedule",
         "schedule-remove",
         "schedule-list",
+        "schedule-inspect",
+        "schedule-edit",
         "sticky",
         "sticky-remove",
         "rsvp",
