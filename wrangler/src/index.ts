@@ -21,6 +21,7 @@
  */
 
 import { Container } from "@cloudflare/containers";
+import { adminAuthMetrics, adminGatewayEnabled, handleAdminGateway } from "./admin-gateway.ts";
 // SDK 0.3.7 reattaches outbound callbacks even for an already-running process.
 // https://developers.cloudflare.com/containers/container-package/
 export { ContainerProxy } from "@cloudflare/containers";
@@ -178,6 +179,9 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   METRICS_SCRAPE_TOKEN?: string;
   /** Optional Worker secret: bearer token for POST /mcp (`mcp:read`). Unset → route 404s. */
   MCP_TOKEN?: string;
+  /** Dedicated Worker signer; neither binding enables an admin verb. */
+  ADMIN_GATEWAY_SERVICE_KEY_ID?: string;
+  ADMIN_GATEWAY_SERVICE_KEY?: string;
   /**
    * Optional Worker secrets: Cloudflare Access service-token pair gating the
    * read-only ops dashboard page and summary. Either unset (or short) → both
@@ -1110,7 +1114,8 @@ export class TwoBotContainer extends Container<Env> {
    * so an unauthenticated flood cannot cause a cold start.
    */
   private async internalActions(request: Request): Promise<Response> {
-    if (!ingressEnabled(this.env) || !isActionsRequest(request)) return notFound();
+    if ((!ingressEnabled(this.env) && !(adminGatewayEnabled(this.env) && receiverEnabled(this.env)))
+      || !isActionsRequest(request)) return notFound();
     // The Worker's stamped id (or a fresh one): the forward already carries
     // it via the allowlisted headers, and these envelopes echo it so a 503
     // still joins the flow's Worker and container logs.
@@ -1899,6 +1904,13 @@ export default {
       } catch (error) { return refused(error); }
     }
 
+    if ((url.pathname === "/admin/v1" || url.pathname.startsWith("/admin/v1/")) && adminGatewayEnabled(env)) {
+      return handleAdminGateway(request, env, async (sanitized) => {
+        sanitized.headers.set(DEPLOYMENT_HEADER, deploymentId(env.CF_VERSION_METADATA?.id));
+        return env.TWO_BOT.getByName(SINGLETON_NAME).fetch(sanitized);
+      });
+    }
+
     // Staging-only receiver ingress. Dark (no match here, today's behavior)
     // unless INTERNAL_ACTIONS_INGRESS and TWO_INTERNAL_ACTIONS are both "1".
     if (url.pathname === ACTIONS_PATH && ingressEnabled(env)) {
@@ -2123,7 +2135,15 @@ export default {
         // stamp it here like the health/readyz forward above.
         const forwarded = new Request(request);
         forwarded.headers.set(DEPLOYMENT_HEADER, deploymentId(env.CF_VERSION_METADATA?.id));
-        return await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(forwarded);
+        const response = await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(forwarded);
+        if (url.pathname === OPS_METRICS_PATH && adminGatewayEnabled(env) && response.status === 200) {
+          const body = await readBoundedText(response, MAX_METRICS_BODY_BYTES, AbortSignal.timeout(METRICS_FETCH_TIMEOUT_MS));
+          if (body === null) return new Response("metrics unavailable\n", { status: 503, headers: withSecurityHeaders() });
+          const headers = new Headers(response.headers);
+          headers.delete("content-length");
+          return new Response(`${body}\n${adminAuthMetrics()}`, { status: 200, headers });
+        }
+        return response;
       } catch (error) { return refused(error); }
     }
 

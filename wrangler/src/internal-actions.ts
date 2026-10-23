@@ -181,6 +181,15 @@ export function allowlistedHeaders(
     }
     headers.set(name, value);
   }
+  if (source.has("x-two-scope") || source.has("x-two-guild")) {
+    const scope = source.get("x-two-scope") ?? "";
+    const guild = source.get("x-two-guild") ?? "";
+    if (!/^(read|moderate|admin)$/.test(scope) || !/^\d{1,20}$/.test(guild)) {
+      return { refusal: envelope(401, "unauthorized", false, {}, requestId) };
+    }
+    headers.set("x-two-scope", scope);
+    headers.set("x-two-guild", guild);
+  }
   const [name, max] = IDEMPOTENCY_HEADER;
   const key = source.get(name);
   if (key !== null) {
