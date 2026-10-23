@@ -1,5 +1,6 @@
 //! Onboarding orchestration; S3 retains ownership of join/gate/leave facts.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
@@ -347,9 +348,9 @@ impl OnboardingRuntime {
                     member_id: Some(member.user.id.get()),
                 })
             }
-            Event::InteractionCreate(interaction) if self.accepts_interaction(&interaction.0) => {
-                Some(OnboardingJob::Interaction(Box::new(interaction.0.clone())))
-            }
+            Event::InteractionCreate(interaction) => self
+                .resolve_interaction(&interaction.0)
+                .map(|resolved| OnboardingJob::Interaction(Box::new(resolved.into_owned()))),
             _ => None,
         }
     }
@@ -361,6 +362,20 @@ impl OnboardingRuntime {
     /// whose welcome is lost can open a fresh menu through the same
     /// defer-first pipeline as the picker components.
     pub fn accepts_interaction(&self, interaction: &Interaction) -> bool {
+        self.resolve_interaction(interaction).is_some()
+    }
+
+    /// Use the executor's confirmed slash identity before taking ownership, and
+    /// retain the canonical payload for ingress and post-commit processing.
+    /// Component payloads pass through the shared resolver unchanged.
+    pub(crate) fn resolve_interaction<'a>(
+        &self,
+        interaction: &'a Interaction,
+    ) -> Option<Cow<'a, Interaction>> {
+        let interaction = self
+            .executor
+            .command_identities()
+            .resolve_interaction(interaction)?;
         let router = InteractionRouter::new(RouterGates {
             configured_guild: Some(self.guild_id),
             scorecard: false,
@@ -374,13 +389,13 @@ impl OnboardingRuntime {
             onboarding_picker: true,
             session_picker: true,
         });
-        interaction
+        let eligible = interaction
             .member
             .as_ref()
             .and_then(|member| member.user.as_ref())
             .is_some_and(|user| !user.bot)
             && matches!(
-                route_interaction(&router, interaction, None),
+                route_interaction(&router, &interaction, None),
                 RoutedInteraction::Component {
                     outcome: ComponentOutcome::Handled {
                         handler: ComponentHandler::GamePicker | ComponentHandler::SessionPicker
@@ -392,7 +407,8 @@ impl OnboardingRuntime {
                     },
                     ..
                 }
-            )
+            );
+        eligible.then_some(interaction)
     }
 
     pub async fn acknowledge(
@@ -432,6 +448,10 @@ impl OnboardingRuntime {
         interaction: &Interaction,
         now_ms: i64,
     ) -> Result<(), RuntimeError> {
+        let Some(interaction) = self.resolve_interaction(interaction) else {
+            return Ok(());
+        };
+        let interaction = interaction.as_ref();
         let occurred_at = two_bot_core::funnel::format_iso_millis(now_ms);
         // Configuration/settings failures are inside the post-defer boundary.
         // A successful error edit is terminal, with no role or success writes.
@@ -452,9 +472,9 @@ impl OnboardingRuntime {
 
     pub async fn handle(&self, job: OnboardingJob, now_ms: i64) -> Result<(), RuntimeError> {
         if let OnboardingJob::Interaction(interaction) = job {
-            if !self.accepts_interaction(&interaction) {
+            let Some(interaction) = self.resolve_interaction(&interaction) else {
                 return Ok(());
-            }
+            };
             return if self
                 .acknowledge(&interaction, tokio::time::Instant::now())
                 .await

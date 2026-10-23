@@ -1002,10 +1002,20 @@ impl CommandRuntime {
                 else {
                     return true;
                 };
-                // The gateway also delivers these to the live voice sink. Yield
-                // before user-slot/lane admission so overload cannot answer a
-                // voice-owned command with the shared runtime's busy callback.
-                if self.voice_owns_interaction(&interaction) {
+                // The gateway also delivers these to their feature owners. Yield
+                // before user-slot/lane admission so overload cannot race the
+                // voice or onboarding defer with the shared busy callback.
+                if self.voice_owns_interaction(&interaction)
+                    || matches!(
+                        route_interaction(&self.interactions.router, &interaction, None),
+                        RoutedInteraction::Slash {
+                            outcome: SlashOutcome::Handled {
+                                handler: HandlerId::Reopen
+                            },
+                            ..
+                        }
+                    )
+                {
                     return true;
                 }
                 let runtime = Arc::clone(self);

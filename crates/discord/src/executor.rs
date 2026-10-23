@@ -3853,6 +3853,24 @@ impl ActionExecutor {
         content: &str,
         components: &[twilight_model::channel::message::Component],
     ) -> Result<(), DiscordError> {
+        self.edit_interaction_response_with_components_with_timeout(
+            application_id,
+            interaction_token,
+            content,
+            components,
+            self.inner.moderation_timeout,
+        )
+        .await
+    }
+
+    async fn edit_interaction_response_with_components_with_timeout(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        content: &str,
+        components: &[twilight_model::channel::message::Component],
+        timeout: Duration,
+    ) -> Result<(), DiscordError> {
         let application = Id::<ApplicationMarker>::new_checked(application_id)
             .ok_or_else(|| DiscordError::Rejected("bad application id".to_owned()))?;
         let content = two_bot_core::message_safety::content(content);
@@ -3867,7 +3885,9 @@ impl ActionExecutor {
                 .allowed_mentions(Some(&mentions)),
         )?;
         let req = Self::explicit_mentions(req, &mentions)?;
-        let mut res = self.call_once_raw(req, &[200]).await?;
+        let mut res = self
+            .call_once_raw_lane_for(&req, &[200], None, timeout)
+            .await?;
         mutation_receipt_id(&res.body)?;
         res.complete().await;
         Ok(())
@@ -3903,14 +3923,14 @@ impl ActionExecutor {
         content: &str,
         components: &[twilight_model::channel::message::Component],
     ) -> Result<(), DiscordError> {
-        self.retry_admission_blocked(|_| async {
-            self.edit_interaction_response_with_components(
+        self.retry_admission_blocked(|timeout| {
+            self.edit_interaction_response_with_components_with_timeout(
                 application_id,
                 interaction_token,
                 content,
                 components,
+                timeout,
             )
-            .await
         })
         .await
     }
