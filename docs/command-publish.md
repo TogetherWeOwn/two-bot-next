@@ -29,7 +29,8 @@ The desired set is the compiled builtins enabled by the same publishing gates:
 moderation on, because the voice `kick` loses first-wins to moderation `/kick`;
 22 with moderation off). `/templateassistant` stays unpublished until its
 slice lands with a handler, so `TWO_ASSISTANT_ENDPOINT` currently publishes
-nothing. The running bot
+nothing. Per-command gates and the shadowed shapes live in the
+[command reference](commands.md). The running bot
 publishes the voice set only while its voice sink actually built; this CLI reads
 the same env flags and cannot see that, so a diff against a bot whose voice
 sink failed to start will show the voice commands as extra desired entries.

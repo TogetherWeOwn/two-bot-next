@@ -5,6 +5,15 @@ Empty `{missing,stale,oversize}` = 0; else 1.
 Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 
 ## References
+Check: `python3 scripts/check_docs_index.py --json` from the repo root.
+Output: `{missing,stale,oversize}`, sorted path arrays; empty means PASS (exit 0).
+Otherwise exit 1: repair missing/stale rows or split oversized docs.
+Reference check: `python3 scripts/cargo_cache.py run -- test -p two-bot-core --test reference_docs`.
+Malformed/duplicate rows use `docs/README.md:<line>` in `stale`.
+Budgets: index <12,000 bytes; other docs ≤65,536 bytes. Explicit legacy exceptions
+and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second catalog.
+
+## References and architecture
 
 - [Find a doc](README.md)
 - [Framework](adr/0001-discord-framework.md)
