@@ -1491,34 +1491,36 @@ impl TicketRuntime {
                 tracing::warn!(dropped, "ticket open retry budget exhausted");
                 break;
             }
-            let ticket = match self.store.get(&ticket_id).await {
-                Ok(Some(ticket)) if ticket.status == TicketStatus::Open => ticket,
-                Ok(Some(_)) => {
+            // The re-read shares the row's item timeout with the attempt below:
+            // an unbounded pool wait here could otherwise push row work past
+            // the shared envelope and starve the panel slot.
+            let fresh = tokio::time::timeout(
+                remaining.min(RECOVERY_ITEM_TIMEOUT),
+                self.store.get(&ticket_id),
+            )
+            .await;
+            let ticket = match fresh {
+                Ok(Ok(Some(ticket))) if ticket.status == TicketStatus::Open => ticket,
+                Ok(Ok(Some(_))) => {
                     self.shed_open_retry(&ticket_id, "status_changed");
                     continue;
                 }
-                Ok(None) => {
+                Ok(Ok(None)) => {
                     self.shed_open_retry(&ticket_id, "missing_row");
                     continue;
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     // A sick store defers without attempting: no Discord I/O.
                     let failure = Failure::from(error);
-                    let reason = open_retry_reason(&failure);
-                    if let Ok(mut retries) = self.open_retries.lock() {
-                        if let Some(entry) = retries.get_mut(&ticket_id) {
-                            backoff_entry(entry);
-                        }
-                    }
+                    self.defer_open_retry_read(&ticket_id, &failure);
                     failed = Some(failure.class());
-                    tracing::warn!(
-                        ticket_id = %ticket_id,
-                        retryable = true,
-                        reason = %reason,
-                        outcome = %"deferred",
-                        next_action = %"await_retry",
-                        "ticket open retry deferred"
-                    );
+                    continue;
+                }
+                Err(_) => {
+                    // A stalled re-read defers like a sick store.
+                    let failure = Failure::Timeout;
+                    self.defer_open_retry_read(&ticket_id, &failure);
+                    failed = Some(failure.class());
                     continue;
                 }
             };
@@ -1543,6 +1545,26 @@ impl TicketRuntime {
             }
         }
         failed
+    }
+
+    /// Defer one retry entry after its re-read failed or stalled: back the
+    /// entry off and report one deferred line. The row is not attempted, so
+    /// no Discord I/O happens on a sick or slow store.
+    fn defer_open_retry_read(&self, ticket_id: &str, failure: &Failure) {
+        let reason = open_retry_reason(failure);
+        if let Ok(mut retries) = self.open_retries.lock() {
+            if let Some(entry) = retries.get_mut(ticket_id) {
+                backoff_entry(entry);
+            }
+        }
+        tracing::warn!(
+            ticket_id = %ticket_id,
+            retryable = true,
+            reason = %reason,
+            outcome = %"deferred",
+            next_action = %"await_retry",
+            "ticket open retry deferred"
+        );
     }
 
     /// Drop one retry entry whose row can no longer be repaired: it left Open
