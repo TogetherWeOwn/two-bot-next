@@ -186,5 +186,48 @@ class InviteIsolationPolicyTests(unittest.TestCase):
                                 self.assertIn("tokio::test tokens", result.errors[0][1])
 
 
+    def test_crate_aliases_and_grouped_imports_fail_closed_in_both_policies(self):
+        source_path = policy.ROOT / "crates/store/tests/invite_uses_saturation_acceptance.rs"
+        original = source_path.read_text(encoding="utf-8")
+        imports = (
+            ("use tokio as rt;", "rt::test"),
+            ("extern crate tokio as rt;", "rt::test"),
+            ("use tokio::{self, test as fixture};", "fixture"),
+            ("pub(crate) use ::tokio as rt;", "rt::test"),
+            ("pub use {tokio::{self, test as fixture}};", "fixture"),
+            ("use tokio::{self as rt};", "rt::test"),
+            ("use tokio::*;", "test"),
+            ("use /* outer /* ; */ nested */ tokio as rt;", "rt::test"),
+            ("extern /* ; */ crate tokio as rt;", "rt::test"),
+            ("use tokio /* ; */ :: {self, test as fixture};", "fixture"),
+            ("pub use {std::sync::Arc, tokio::{self, test as fixture}};", "fixture"),
+        )
+        real_read = Path.read_text
+        for declaration, attribute in imports:
+            source = (
+                original + "\n" + declaration + "\n#[" + attribute + "]\n"
+                + "async fn unskipped_future_fixture() {}\n"
+            )
+
+            def read_text(path, *args, **kwargs):
+                return source if path == source_path else real_read(path, *args, **kwargs)
+
+            with patch.object(Path, "read_text", read_text):
+                for name in (
+                    "test_invite_saturation_isolation_in_both_lanes",
+                    "test_patch_coverage_runs_with_db_and_includes_ignored_tests",
+                ):
+                    with self.subTest(declaration=declaration, policy=name):
+                        case = policy.WorkflowTests(name)
+                        case.workflows = deepcopy(self.case.workflows)
+                        result = unittest.TestResult()
+                        with patch.object(case, "setUp"):
+                            case.run(result)
+                        self.assertEqual(result.testsRun, 1)
+                        self.assertEqual(result.failures, [], result.failures)
+                        self.assertEqual(len(result.errors), 1, result.errors)
+                        self.assertIn("unsupported Tokio import", result.errors[0][1])
+
+
 if __name__ == "__main__":
     unittest.main()

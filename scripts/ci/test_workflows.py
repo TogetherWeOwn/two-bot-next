@@ -302,6 +302,21 @@ def tokio_test_names(text):
             f"for {len(names)} unique Tokio test functions; "
             "extend the scanner for the unsupported declaration",
         )
+    # The token census cannot see crate aliases or grouped/glob imports.
+    # This fixture paths Tokio fully: reject any use/extern item mentioning
+    # tokio, including visibility-qualified and nested use trees. Scan from
+    # the keyword, not the start of a line. Opaque import syntax also refuses
+    # validation: a comment/literal semicolon must not truncate the item and
+    # hide a Tokio rename. Like the census above this deliberately scans raw
+    # source and may reject prose; extend the scanner rather than waive it.
+    for keyword in re.finditer(r"(?<![\w$])(?:use|extern)\b", text):
+        stop = text.find(";", keyword.end())
+        item = text[keyword.end():] if stop == -1 else text[keyword.end():stop]
+        if re.search(r"\btokio\b|[/\"']", item):
+            raise ValueError(
+                "unsupported Tokio import or opaque import syntax; "
+                "path Tokio fully so every test attribute stays visible",
+            )
     return names
 
 
