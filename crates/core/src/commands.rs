@@ -255,7 +255,8 @@ pub const PERM_MANAGE_EVENTS: u64 = 8589934592;
 /// Always-published core commands (two-bot `CORE_COMMAND_DATA` = leveling,
 /// plus the Next-only `/help` discovery surface — legacy has no help command,
 /// see the `help` row in the registry golden exceptions — plus the Next-only
-/// `/privacy` member self-serve for analytics privacy and deletion requests).
+/// `/privacy` member self-serve for analytics privacy and deletion requests,
+/// plus the Next-only `/reopen` self-service picker recovery).
 #[must_use]
 pub fn core_commands() -> Vec<CommandDefinition> {
     vec![
@@ -314,6 +315,20 @@ pub fn core_commands() -> Vec<CommandDefinition> {
                 .max_length(128),
             ]),
         ]),
+        CommandDefinition::new("reopen", REOPEN_DESCRIPTION).options(vec![
+            CommandOption::new("kind", "Which picker to reopen.", CommandOptionType::String)
+                .required()
+                .choices(vec![
+                    CommandChoice {
+                        name: "Games".to_owned(),
+                        value: "games".to_owned(),
+                    },
+                    CommandChoice {
+                        name: "Session".to_owned(),
+                        value: "session".to_owned(),
+                    },
+                ]),
+        ]),
     ]
 }
 
@@ -323,6 +338,9 @@ pub const HELP_DESCRIPTION: &str = "Show this server's live commands, grouped by
 /// Member self-serve privacy description, shared by the registry fixtures.
 pub const PRIVACY_DESCRIPTION: &str =
     "Manage your analytics privacy and deletion requests for this server.";
+
+/// Self-service picker-recovery description, shared by the registry fixtures.
+pub const REOPEN_DESCRIPTION: &str = "Reopen your games or session picker in a private menu.";
 
 /// Merge the authoritative guild command set.
 ///
@@ -510,10 +528,10 @@ mod tests {
                 }
             }
             let actual = merge_commands(&[builtins, duplicates], &custom);
-            // 4 core (rank, leaderboard, help, privacy) plus the generated
-            // builtins; the duplicated slice adds no new names.
-            if builtin_count + 4 > 100 {
-                prop_assert_eq!(actual, Err(RegistryError::BuiltinLimit(builtin_count + 4)));
+            // 5 core (rank, leaderboard, help, privacy, reopen) plus the
+            // generated builtins; the duplicated slice adds no new names.
+            if builtin_count + 5 > 100 {
+                prop_assert_eq!(actual, Err(RegistryError::BuiltinLimit(builtin_count + 5)));
             } else if expected.len() > 100 {
                 prop_assert_eq!(actual, Err(RegistryError::TotalLimit(expected.len())));
             } else {
@@ -531,11 +549,12 @@ mod tests {
     #[test]
     fn core_commands_match_legacy_names() {
         let core = core_commands();
-        assert_eq!(core.len(), 4);
+        assert_eq!(core.len(), 5);
         assert_eq!(core[0].name, "rank");
         assert_eq!(core[1].name, "leaderboard");
         assert_eq!(core[2].name, "help");
         assert_eq!(core[3].name, "privacy");
+        assert_eq!(core[4].name, "reopen");
         // Guild-only, DM off (legacy `setDMPermission(false)`).
         assert!(core.iter().all(|c| !c.dm_permission));
         // `rank` has one optional `member` user option; `leaderboard` and the
@@ -578,6 +597,22 @@ mod tests {
                 assert!(option.options.is_empty());
             }
         }
+        // The Next-only `reopen` picker recovery takes one required `kind`
+        // choice (games/session), is open to everyone, and takes no
+        // other-member target or role-management option.
+        assert_eq!(core[4].description, REOPEN_DESCRIPTION);
+        assert!(core[4].default_member_permissions.is_none());
+        assert_eq!(core[4].options.len(), 1);
+        let kind = &core[4].options[0];
+        assert_eq!(kind.name, "kind");
+        assert_eq!(kind.kind, CommandOptionType::String.as_u8());
+        assert_eq!(kind.required, Some(true));
+        let choices: Vec<(&str, &str)> = kind
+            .choices
+            .iter()
+            .map(|choice| (choice.name.as_str(), choice.value.as_str()))
+            .collect();
+        assert_eq!(choices, [("Games", "games"), ("Session", "session")]);
     }
 
     #[test]
@@ -595,7 +630,15 @@ mod tests {
         let names: Vec<_> = merged.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
             names,
-            ["rank", "leaderboard", "help", "privacy", "rsvp", "faq"]
+            [
+                "rank",
+                "leaderboard",
+                "help",
+                "privacy",
+                "reopen",
+                "rsvp",
+                "faq"
+            ]
         );
     }
 
@@ -609,8 +652,8 @@ mod tests {
         )];
         let rsvp_totals = vec![CommandDefinition::new("attendance", "Show RSVP totals")];
         let merged = merge_commands(&[scorecard, rsvp_totals], &[]).expect("merges");
-        assert_eq!(merged.len(), 5); // rank, leaderboard, help, privacy, attendance×1
-        assert_eq!(merged[4].description, "Record a verified attendee");
+        assert_eq!(merged.len(), 6); // rank, leaderboard, help, privacy, reopen, attendance×1
+        assert_eq!(merged[5].description, "Record a verified attendee");
     }
 
     #[test]
@@ -639,13 +682,16 @@ mod tests {
         ];
         let merged = merge_commands(&[], &custom).expect("merges");
         let names: Vec<_> = merged.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["rank", "leaderboard", "help", "privacy", "faq"]);
+        assert_eq!(
+            names,
+            ["rank", "leaderboard", "help", "privacy", "reopen", "faq"]
+        );
     }
 
     #[test]
     fn builtin_limit_enforced() {
-        // 4 core + 97 fillers = 101: one past the ceiling.
-        let extra: Vec<CommandDefinition> = (0..97)
+        // 5 core + 96 fillers = 101: one past the ceiling.
+        let extra: Vec<CommandDefinition> = (0..96)
             .map(|i| CommandDefinition::new(&format!("cmd-{i}"), "filler"))
             .collect();
         let err = merge_commands(&[extra], &[]).expect_err("must exceed 100");

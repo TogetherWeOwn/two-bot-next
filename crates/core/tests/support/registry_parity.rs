@@ -1,8 +1,8 @@
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use two_bot_core::commands::{
-    CommandDefinition, CommandOption, CommandOptionType, HELP_DESCRIPTION, MAX_RESOURCE_ID_CHARS,
-    OCCURRENCE_ID_MAX_CHARS, PRIVACY_DESCRIPTION,
+    CommandChoice, CommandDefinition, CommandOption, CommandOptionType, HELP_DESCRIPTION,
+    MAX_RESOURCE_ID_CHARS, OCCURRENCE_ID_MAX_CHARS, PRIVACY_DESCRIPTION, REOPEN_DESCRIPTION,
 };
 use two_bot_core::custom_commands::{
     MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_TEMPLATE_CHARS, MAX_TEXT_TRIGGER_CHARS,
@@ -37,6 +37,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("feed-list", "docs/parity.md §1 #30 page"),
     ("privacy", "docs/parity.md §1 privacy"),
     ("command-list", "docs/parity.md §1 #16 page"),
+    ("reopen", "docs/parity.md §1 reopen"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -230,6 +231,29 @@ pub fn expected_registry() -> Value {
     )
     .expect("privacy serializes");
     commands.insert(3, privacy);
+    // Next-only `/reopen` self-service picker recovery: no legacy
+    // counterpart. Insert at the publish position (fifth, after privacy) as
+    // the exact published definition, so parity pins its shape too.
+    let reopen = serde_json::to_value(
+        CommandDefinition::new("reopen", REOPEN_DESCRIPTION).options(vec![CommandOption::new(
+            "kind",
+            "Which picker to reopen.",
+            CommandOptionType::String,
+        )
+        .required()
+        .choices(vec![
+            CommandChoice {
+                name: "Games".to_owned(),
+                value: "games".to_owned(),
+            },
+            CommandChoice {
+                name: "Session".to_owned(),
+                value: "session".to_owned(),
+            },
+        ])]),
+    )
+    .expect("reopen serializes");
+    commands.insert(4, reopen);
     // Picker-copy exceptions (registry golden exceptions table): command and
     // option descriptions intentionally differ from legacy. Pointers mirror
     // the published option order.

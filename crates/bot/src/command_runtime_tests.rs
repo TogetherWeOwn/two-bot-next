@@ -731,7 +731,7 @@ async fn activation_boot_resumed_uses_current_clearance_and_checks_identity() {
                 .collect();
             assert_eq!(
                 names,
-                vec!["rank", "leaderboard", "help", "privacy"],
+                vec!["rank", "leaderboard", "help", "privacy", "reopen"],
                 "unrelated core commands remain; uncleared surfaces are replaced"
             );
         }
@@ -845,7 +845,7 @@ async fn activation_boot_from_env_fixture() {
     let defs = runtime.router().publish_set(&[]).unwrap();
     let names: Vec<_> = defs.iter().map(|def| def.name.as_str()).collect();
     if expected == "narrowed" {
-        assert_eq!(names, ["rank", "leaderboard", "help", "privacy"]);
+        assert_eq!(names, ["rank", "leaderboard", "help", "privacy", "reopen"]);
         assert!(!runtime.router().gates().moderation);
         assert!(!runtime.router().gates().automations);
         assert!(!runtime.router().gates().announcements);
@@ -3395,6 +3395,7 @@ fn production_router_matches_composed_production_wiring() {
             HandlerId::Leaderboard,
             HandlerId::Help,
             HandlerId::Privacy,
+            HandlerId::Reopen,
             HandlerId::ScorecardAttendance,
             HandlerId::AutomationAdmin,
             HandlerId::AutomationCustom,

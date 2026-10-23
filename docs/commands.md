@@ -20,7 +20,7 @@ Bounds below are registry bounds; a dash means no bound is declared there,
 not that handler validation is unlimited. Permissions are Discord default
 member-permission bitfields, not a replacement for runtime authorization.
 
-Built-in commands: 50.
+Built-in commands: 51.
 
 ## `/access`
 
@@ -418,6 +418,17 @@ Take back ownership of your temporary voice room
 - Available in DMs: false
 
 No options.
+
+## `/reopen`
+
+Reopen your games or session picker in a private menu.
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `kind` | string | true | — | — | — | Games = `"games"`; Session = `"session"` | Which picker to reopen. |
 
 ## `/rsvp`
 
