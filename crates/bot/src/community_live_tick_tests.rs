@@ -212,6 +212,107 @@ async fn scorecard_tick_obeys_published_disable_and_delete() {
     db.close().await.expect("drop disposable database");
 }
 
+async fn persisted_scorecard_tick(
+    pool: &PgPool,
+    rest: &ActionExecutor,
+    state: &State,
+    now: &str,
+) -> Value {
+    run_once(
+        Kind::Scorecard,
+        pool,
+        rest,
+        GUILD,
+        state,
+        parse_iso_millis(now).expect("eligible Monday"),
+    )
+    .await
+    .expect("scorecard tick");
+    // Exact generated_at requires a fresh output, not reuse of a completed week.
+    let payload: String = sqlx::query_scalar(
+        "SELECT scorecard_json FROM community_scorecard_runs WHERE guild_id=$1 AND generated_at=$2",
+    )
+    .bind(GUILD)
+    .bind(now)
+    .fetch_one(pool)
+    .await
+    .expect("fresh persisted scorecard");
+    let scorecard: Value = serde_json::from_str(&payload).expect("scorecard JSON");
+    assert_eq!(scorecard["coverageState"], "incomplete");
+    scorecard
+}
+
+// A boot-only recommendation field at ScorecardLoad must lose the live enable.
+#[tokio::test]
+async fn scorecard_tick_uses_published_recommendations_and_boot_fallback() {
+    if !isolated_child(
+        "community_jobs::live_tick_tests::scorecard_tick_uses_published_recommendations_and_boot_fallback",
+    )
+    .await
+    {
+        return;
+    }
+    let (db, poll) = fixture().await;
+    let pool = db.pool();
+    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let rest = executor(&mock);
+    // Boot recommendations off, correction cycles zero.
+    let mut state = state();
+    // A Monday 06:15 boot misses all of the first week and the opening hours
+    // of the second: neither tick can claim complete stream coverage.
+    state.capture_started_at = "2026-09-28T06:15:00.000Z".to_owned();
+    for (now, stored, recommendations) in [
+        ("2026-09-28T06:15:00.000Z", Some(json!(1)), true),
+        ("2026-10-05T06:15:00.000Z", None, false),
+    ] {
+        publish(pool, &poll, "TWO_COMMUNITY_RECOMMENDATIONS", stored).await;
+        let scorecard = persisted_scorecard_tick(pool, &rest, &state, now).await;
+        assert_eq!(
+            scorecard["recommendationsEnabled"], recommendations,
+            "{now}"
+        );
+        assert_eq!(scorecard["killSwitchActive"], false, "{now}");
+    }
+    assert!(mock.requests().is_empty(), "scorecard never calls Discord");
+    mock.shutdown().await;
+    drop(poll);
+    db.close().await.expect("drop disposable database");
+}
+
+// A boot-only correction field at ScorecardLoad must miss the live kill switch.
+#[tokio::test]
+async fn scorecard_tick_uses_published_corrections_and_boot_fallback() {
+    if !isolated_child(
+        "community_jobs::live_tick_tests::scorecard_tick_uses_published_corrections_and_boot_fallback",
+    )
+    .await
+    {
+        return;
+    }
+    let (db, poll) = fixture().await;
+    let pool = db.pool();
+    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let rest = executor(&mock);
+    let mut state = state();
+    state.gates.recommendations_enabled = true;
+    state.capture_started_at = "2026-09-28T06:15:00.000Z".to_owned();
+    // This late boot leaves both weeks incompletely covered, so two corrections
+    // trip the kill switch. Boot zero and deletion must leave recommendations on.
+    for (now, stored, kill_switch) in [
+        ("2026-09-28T06:15:00.000Z", Some(json!(2)), true),
+        ("2026-10-05T06:15:00.000Z", None, false),
+    ] {
+        publish(pool, &poll, "TWO_COMMUNITY_CORRECTION_CYCLES", stored).await;
+        let scorecard = persisted_scorecard_tick(pool, &rest, &state, now).await;
+        assert_eq!(scorecard["killSwitchActive"], kill_switch, "{now}");
+        assert_eq!(scorecard["recommendationsEnabled"], !kill_switch, "{now}");
+    }
+    assert!(mock.requests().is_empty(), "scorecard never calls Discord");
+    mock.shutdown().await;
+    drop(poll);
+    db.close().await.expect("drop disposable database");
+}
+
 // Replacing inactivity_tick's live horizon with state.inactivity_days (14)
 // flags this 20-day-quiet member on the first tick instead of waiting for 7.
 #[tokio::test]

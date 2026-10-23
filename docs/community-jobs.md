@@ -294,7 +294,12 @@ write verb; bind that job to a capability in `BootActivation` before it ships.
   production tick without leaking the process-wide reader into other tests.
   Presence and scorecard must skip all work on stored `0` and resume after
   deletion; inactivity must persist flags using the stored horizon and restore
-  the boot horizon after deletion. Only Discord REST is doubled.
+  the boot horizon after deletion. Independent scorecard cases publish
+  recommendations and correction cycles different from boot, then assert the
+  persisted `recommendationsEnabled` and `killSwitchActive` payload fields.
+  Missing stream coverage exercises the two-correction kill switch. Each delete
+  runs in the next eligible week, requiring a fresh output with boot fallback
+  instead of reusing a completed scorecard. Only Discord REST is doubled.
 
   ```sh
   TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local \
