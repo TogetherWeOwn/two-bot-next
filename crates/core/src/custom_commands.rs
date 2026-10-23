@@ -718,12 +718,26 @@ impl InspectView {
 /// sees the saved text as stored. Plain text passes through byte-identical.
 #[must_use]
 pub fn escape_inspect_text(value: &str) -> String {
+    // Folding newlines leaves only the initial non-whitespace prefix able to
+    // open a block. Escape its marker without changing mention/channel pills
+    // or punctuation elsewhere in the body.
+    let leading = value.trim_start_matches(char::is_whitespace);
+    let digits = leading.bytes().take_while(u8::is_ascii_digit).count();
+    let block_marker = if leading.starts_with(['#', '>', '-', '+']) {
+        Some(value.len() - leading.len())
+    } else if digits > 0 && leading[digits..].starts_with(['.', ')']) {
+        Some(value.len() - leading.len() + digits)
+    } else {
+        None
+    };
     let mut escaped = String::with_capacity(value.len());
-    for ch in value.chars() {
+    for (index, ch) in value.char_indices() {
         if matches!(ch, '\r' | '\n') {
             escaped.push(' ');
         } else {
-            if matches!(ch, '\\' | '`' | '*' | '_' | '~' | '|' | '[' | ']') {
+            if Some(index) == block_marker
+                || matches!(ch, '\\' | '`' | '*' | '_' | '~' | '|' | '[' | ']')
+            {
                 escaped.push('\\');
             }
             escaped.push(ch);
@@ -754,17 +768,18 @@ fn truncate_escaped_units(value: &str, limit: usize) -> String {
 }
 
 /// Normalize and validate a saved-command name for inspection: the same
-/// shape and reservation rules as writes (`/command`), since a reserved name
-/// can never be a custom row. Lowercases first, like the management path.
+/// shape rules as writes, but only dispatch-owned builtin names are excluded.
+/// Write-only reservations must not hide grandfathered saved rows. Lowercases
+/// first, like the management path.
 pub fn validate_inspect_name(
     name: &str,
-    reserved: &HashSet<String>,
+    builtins: &HashSet<String>,
 ) -> Result<String, CommandError> {
     let name = name.to_lowercase();
     if !valid_name(&name) {
         return Err(CommandError::InvalidName);
     }
-    if reserved.contains(&name) {
+    if builtins.contains(&name) {
         return Err(CommandError::ReservedName(name.clone()));
     }
     Ok(name)
@@ -883,10 +898,22 @@ pub fn format_inspect_template(row: &StoredCommand) -> String {
 #[must_use]
 pub fn format_inspect_preview(row: &StoredCommand, ctx: &TemplateContext) -> String {
     if let Err(error) = validate_template(&row.template) {
-        return format!(
-            "Template for /{} is invalid: {error} Replace it with /command name:{} template:...",
-            row.name, row.name
-        );
+        let prefix = format!("Template for /{} is invalid: ", row.name);
+        let correction = format!(" Replace it with /command name:{} template:...", row.name);
+        let mut detail = escape_inspect_text(&error.to_string());
+        let budget = MAX_RENDERED_CHARS
+            .saturating_sub(prefix.encode_utf16().count() + correction.encode_utf16().count());
+        if detail.encode_utf16().count() > budget {
+            const MARKER: &str = "…[truncated]";
+            detail = format!(
+                "{}{MARKER}",
+                truncate_escaped_units(
+                    &detail,
+                    budget.saturating_sub(MARKER.encode_utf16().count())
+                )
+            );
+        }
+        return format!("{prefix}{detail}{correction}");
     }
     let rendered = match render_template(&row.template, ctx) {
         Ok(rendered) => rendered,
@@ -1637,8 +1664,11 @@ mod tests {
     }
 
     #[test]
-    fn inspect_name_validation_matches_write_rules_after_lowercasing() {
-        let reserved = reserved_command_names();
+    fn inspect_name_validation_matches_dispatch_rules_after_lowercasing() {
+        let reserved = builtin_command_names();
+        for name in ["setup", "export"] {
+            assert_eq!(validate_inspect_name(name, &reserved), Ok(name.to_owned()));
+        }
         assert_eq!(
             validate_inspect_name("FAQ", &reserved).expect("normalizes"),
             "faq"
@@ -1712,7 +1742,83 @@ mod tests {
         let view = format_inspect_template(&row);
         assert!(view.to_lowercase().contains("truncated"));
         assert!(view.encode_utf16().count() <= MAX_RENDERED_CHARS);
-        assert!(!view.ends_with("\\\n[truncated"));
+        assert_eq!(
+            view,
+            format!(
+                "Saved template /faq\n{}\n[truncated: showing 1920 of 3980 units]",
+                "\\*".repeat(960)
+            )
+        );
+    }
+
+    #[test]
+    fn inspect_template_and_preview_escape_block_markdown_after_leading_whitespace() {
+        for (raw, escaped) in [
+            ("# Welcome", "\\# Welcome"),
+            ("  ## Welcome", "  \\## Welcome"),
+            ("-# small", "\\-# small"),
+            ("> Approved", "\\> Approved"),
+            ("\t>>> Approved", "\t\\>>> Approved"),
+            ("- item", "\\- item"),
+            ("  + item", "  \\+ item"),
+            ("1. item", "1\\. item"),
+            ("  123) item", "  123\\) item"),
+            ("\n # Welcome", "  \\# Welcome"),
+            ("plain - text # tag 1.0", "plain - text # tag 1.0"),
+            ("<@3333> <#4444> @everyone", "<@3333> <#4444> @everyone"),
+        ] {
+            let row = StoredCommand {
+                template: raw.to_owned(),
+                ..inspect_row()
+            };
+            assert_eq!(
+                format_inspect_template(&row),
+                format!("Saved template /faq\n{escaped}"),
+                "saved {raw:?}"
+            );
+            let row = StoredCommand {
+                template: "{username}".to_owned(),
+                ..row
+            };
+            let ctx = TemplateContext {
+                username: raw.to_owned(),
+                ..inspect_ctx()
+            };
+            assert_eq!(
+                format_inspect_preview(&row, &ctx),
+                format!("Preview /faq\n{escaped}"),
+                "rendered {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inspect_truncation_ends_on_a_complete_escape_pair_with_an_odd_budget() {
+        let row = StoredCommand {
+            name: "faqs".to_owned(),
+            template: "*".repeat(1990),
+            ..inspect_row()
+        };
+        assert_eq!(
+            format_inspect_template(&row),
+            format!(
+                "Saved template /faqs\n{}\n[truncated: showing 1918 of 3980 units]",
+                "\\*".repeat(959)
+            )
+        );
+    }
+
+    #[test]
+    fn inspect_long_invalid_template_preserves_bounded_detail_and_correction() {
+        let row = StoredCommand {
+            template: format!("{{{}}}", "a".repeat(1998)),
+            ..inspect_row()
+        };
+        let view = format_inspect_preview(&row, &inspect_ctx());
+        assert!(view.encode_utf16().count() <= MAX_RENDERED_CHARS);
+        assert!(view.starts_with("Template for /faq is invalid: Unknown placeholder"));
+        assert!(view.contains("…[truncated]"));
+        assert!(view.ends_with(" Replace it with /command name:faq template:..."));
     }
 
     #[test]

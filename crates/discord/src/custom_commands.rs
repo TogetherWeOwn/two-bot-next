@@ -26,9 +26,9 @@ use two_bot_core::{
         accepted_text_trigger, builtin_command_names, format_command_list_page,
         format_inspect_miss, format_inspect_preview, format_inspect_summary,
         format_inspect_template, inspect_preview_context_unavailable, invalid_inspect_option_reply,
-        invalid_inspect_view_reply, render_template, reserved_command_names, validate_inspect_name,
-        AuditRecord, AutomationMessageAcceptance, InspectView, PutCommandInput, StoredCommand,
-        TemplateContext, INVALID_COMMAND_LIST_PAGE, MAX_INSPECT_ARGUMENT_UNITS,
+        invalid_inspect_view_reply, render_template, validate_inspect_name, AuditRecord,
+        AutomationMessageAcceptance, InspectView, PutCommandInput, StoredCommand, TemplateContext,
+        INVALID_COMMAND_LIST_PAGE, MAX_INSPECT_ARGUMENT_UNITS,
     },
     router::{replies::InteractionReply, InteractionHandler},
     HandlerId, InteractionRouter, SlashOutcome,
@@ -658,7 +658,7 @@ impl CustomCommandRuntime {
             }
             SingleOption::Value(name) => name,
         };
-        let name = match validate_inspect_name(name, &reserved_command_names()) {
+        let name = match validate_inspect_name(name, &builtin_command_names()) {
             Ok(name) => name,
             Err(reason) => {
                 return invalid_inspect_option_reply("command name", &reason.to_string());
@@ -866,5 +866,236 @@ fn single_string_option<'a>(data: &'a CommandData, name: &str) -> SingleOption<'
     match &first.value {
         CommandOptionValue::String(value) => SingleOption::Value(value.as_str()),
         _ => SingleOption::Malformed,
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+pub mod inspect_test_wire;
+
+#[cfg(test)]
+mod inspect_regressions {
+    use super::{
+        inspect_test_wire::{MockRest, ScriptedResponse},
+        *,
+    };
+    use serde_json::{json, Value};
+    use two_bot_core::RouterGates;
+    use two_bot_testsupport::TestDatabase;
+
+    const TOKEN: &str = "inspect-regression-fixture";
+
+    struct Fixture {
+        db: TestDatabase,
+        http: MockRest,
+        runtime: CustomCommandRuntime,
+    }
+
+    impl Fixture {
+        async fn new(name: &str, template: &str) -> Self {
+            let url =
+                std::env::var("TWO_TEST_DATABASE_URL").expect("disposable test bootstrap required");
+            let db = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+                .await
+                .expect("isolated migrated fixture");
+            store::put_command(
+                db.pool(),
+                &StoredCommand {
+                    guild_id: "2222".to_owned(),
+                    name: name.to_owned(),
+                    description: "Saved response".to_owned(),
+                    template: template.to_owned(),
+                    text_trigger: Some(format!("!{name}")),
+                    enabled: true,
+                },
+                "3333",
+                "3333",
+                "2026-10-01T00:00:00Z",
+                "2026-10-02T00:00:00Z",
+            )
+            .await
+            .expect("seed existing row without write-time validation");
+            let http = MockRest::with_responder(|request| match request.method.as_str() {
+                "POST" if request.path.ends_with("/callback") => ScriptedResponse::status(204),
+                "PATCH" if request.path.ends_with("/messages/@original") => {
+                    ScriptedResponse::json(200, json!({"id": "9000"}))
+                }
+                _ => ScriptedResponse::status(403),
+            })
+            .await;
+            let mut router = InteractionRouter::new(RouterGates {
+                configured_guild: Some(2222),
+                automations: true,
+                moderation: false,
+                voice: false,
+                voice_assistant: false,
+                scorecard: false,
+                announcements: false,
+                tickets: false,
+                self_roles: false,
+                onboarding_picker: false,
+                session_picker: false,
+            });
+            CustomCommandRuntime::register(&mut router);
+            let runtime = CustomCommandRuntime::new(
+                db.pool().clone(),
+                Arc::new(router),
+                ActionExecutor::with_proxy(TOKEN.to_owned(), Some(http.origin()))
+                    .expect("loopback executor"),
+                1111,
+            );
+            Self { db, http, runtime }
+        }
+
+        async fn definitions(&self) -> Vec<Value> {
+            sqlx::query_scalar(
+                "SELECT to_jsonb(c) FROM automation_commands c ORDER BY guild_id, name",
+            )
+            .fetch_all(self.db.pool())
+            .await
+            .expect("full definition snapshot")
+        }
+
+        async fn assert_read_only(&self, before: Vec<Value>) {
+            assert_eq!(self.definitions().await, before);
+            let facts: i64 = sqlx::query_scalar("SELECT count(*) FROM automation_audit_log")
+                .fetch_one(self.db.pool())
+                .await
+                .expect("execution and management facts");
+            assert_eq!(facts, 0);
+            assert!(self.runtime.published_commands().is_none());
+        }
+
+        async fn reply(&self, input: &Interaction, guild_name: Option<&str>) -> String {
+            let start = self.http.requests().len();
+            assert!(matches!(
+                self.runtime.handle_interaction(input, guild_name).await,
+                Ok(true)
+            ));
+            let requests = self.http.requests();
+            let requests = &requests[start..];
+            assert_eq!(
+                requests.len(),
+                2,
+                "one private defer and completion, no execution/registration"
+            );
+            assert_eq!(requests[0].method, "POST");
+            assert!(requests[0]
+                .path
+                .ends_with(&format!("/interactions/{}/{TOKEN}/callback", input.id)));
+            let defer: Value = serde_json::from_slice(&requests[0].body).expect("defer JSON");
+            assert_eq!(defer["type"], 5);
+            assert_eq!(defer["data"]["flags"].as_u64().expect("flags") & 64, 64);
+            assert_eq!(requests[1].method, "PATCH");
+            assert!(requests[1]
+                .path
+                .ends_with(&format!("/webhooks/1111/{TOKEN}/messages/@original")));
+            let edit: Value = serde_json::from_slice(&requests[1].body).expect("edit JSON");
+            for body in [&defer["data"], &edit] {
+                assert_eq!(body["allowed_mentions"]["parse"], json!([]));
+                for key in ["users", "roles"] {
+                    assert!(
+                        body["allowed_mentions"][key].is_null()
+                            || body["allowed_mentions"][key] == json!([])
+                    );
+                }
+                assert_ne!(body["allowed_mentions"]["replied_user"], true);
+                assert!(body["embeds"].is_null() || body["embeds"] == json!([]));
+            }
+            let content = edit["content"].as_str().expect("private content");
+            assert!(!content.is_empty());
+            assert!(content.encode_utf16().count() <= 2000);
+            content.to_owned()
+        }
+
+        async fn close(self) {
+            self.http.shutdown().await;
+            self.db.close().await.expect("drop isolated fixture");
+        }
+    }
+
+    fn inspect(id: u64, name: &str, view: &str) -> Interaction {
+        serde_json::from_value(json!({
+            "id": id.to_string(), "application_id": "1111", "type": 2,
+            "token": TOKEN, "version": 1,
+            "guild_id": "2222", "channel": {"id": "4444", "type": 0},
+            "authorizing_integration_owners": {"0": "2222"}, "entitlements": [],
+            "member": {
+                "permissions": "32", "roles": [], "joined_at": null,
+                "deaf": false, "mute": false, "flags": 0,
+                "user": {"id": "3333", "username": "tester", "discriminator": "0000", "avatar": null}
+            },
+            "data": {"id": "5555", "name": "command-inspect", "type": 1, "options": [
+                {"name": "name", "type": 3, "value": name},
+                {"name": "view", "type": 3, "value": view}
+            ]}
+        })).expect("Twilight interaction fixture")
+    }
+
+    #[tokio::test]
+    async fn grandfathered_voice_name_remains_privately_inspectable_with_voice_off() {
+        let fixture = Fixture::new("setup", "Legacy {username}").await;
+        let before = fixture.definitions().await;
+        let summary = fixture
+            .reply(&inspect(6001, "SETUP", "summary"), Some("TWO"))
+            .await;
+        assert_eq!(summary, "Summary /setup\nDescription: Saved response\nStatus: Enabled\nText trigger: !setup\nSaved template: /command-inspect name:setup view:template\nPrivate preview: /command-inspect name:setup view:preview\nReplace the definition: /command name:setup template:...");
+        assert_eq!(
+            fixture
+                .reply(&inspect(6002, "setup", "template"), Some("TWO"))
+                .await,
+            "Saved template /setup\nLegacy {username}"
+        );
+        assert_eq!(
+            fixture
+                .reply(&inspect(6003, "setup", "preview"), Some("TWO"))
+                .await,
+            "Preview /setup\nLegacy tester"
+        );
+        fixture.assert_read_only(before).await;
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn missing_preview_context_refuses_privately_without_execution_effects() {
+        let fixture = Fixture::new("faq", "Hi {username}").await;
+        let before = fixture.definitions().await;
+        for missing in 0..3 {
+            let mut input = inspect(6100 + missing, "faq", "preview");
+            let mut guild_name = Some("TWO");
+            match missing {
+                0 => guild_name = None,
+                1 => input.channel = None,
+                _ => {
+                    input
+                        .member
+                        .as_mut()
+                        .expect("member permissions retained")
+                        .user = None;
+                    input.user = None;
+                }
+            }
+            assert_eq!(
+                fixture.reply(&input, guild_name).await,
+                "Preview for /faq is unavailable: command context is missing. Please try again."
+            );
+        }
+        fixture.assert_read_only(before).await;
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn long_invalid_template_keeps_correction_on_the_private_wire() {
+        let fixture = Fixture::new("faq", &format!("{{{}}}", "a".repeat(1998))).await;
+        let before = fixture.definitions().await;
+        let reply = fixture
+            .reply(&inspect(6200, "faq", "preview"), Some("TWO"))
+            .await;
+        assert_eq!(reply.encode_utf16().count(), 2000);
+        assert!(reply.starts_with("Template for /faq is invalid: Unknown placeholder"));
+        assert!(reply.contains("…[truncated]"));
+        assert!(reply.ends_with(" Replace it with /command name:faq template:..."));
+        fixture.assert_read_only(before).await;
+        fixture.close().await;
     }
 }
