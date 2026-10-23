@@ -17,6 +17,11 @@
 
 #![cfg(test)]
 
+#[path = "live_feed_command_consumer_acceptance_tests.rs"]
+mod live_feed_command_consumer_acceptance_tests;
+#[path = "live_self_role_consumer_acceptance_tests.rs"]
+mod live_self_role_consumer_acceptance_tests;
+
 #[path = "member_authority_cause_acceptance.rs"]
 mod member_authority_cause_acceptance;
 #[path = "member_dispatch_authority_acceptance.rs"]
