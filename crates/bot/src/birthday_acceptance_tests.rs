@@ -387,6 +387,37 @@ fn runtime_for(pool: PgPool, executor: ActionExecutor) -> Arc<CommandRuntime> {
     CommandRuntime::new(pool, executor, router_with_commands(gates), GUILD_ID, true)
 }
 
+/// Mirror the existing command-runtime fixture: a successful bulk PUT returns
+/// the complete command array, not an empty or malformed publication receipt.
+async fn help_publication_mock() -> MockRest {
+    MockRest::with_responder(|request: &RestRequest| {
+        if request.method == "PUT"
+            && request.path == "/api/v10/applications/1111/guilds/8128/commands"
+        {
+            ScriptedResponse::json(
+                200,
+                serde_json::from_slice(&request.body).expect("publication request JSON"),
+            )
+        } else {
+            ScriptedResponse::json(200, json!({}))
+        }
+    })
+    .await
+}
+
+/// Help reports only a successfully published registry; exercise the existing
+/// fixture publication path rather than inventing a live set in the runtime.
+async fn published_runtime_for_help(mock: &MockRest) -> Arc<CommandRuntime> {
+    let runtime = runtime_for(lazy_pool(), executor_for(mock));
+    assert!(runtime.published_commands().is_none());
+    runtime
+        .publish_registry_checked(Some(1111))
+        .await
+        .expect("fixture registry publication succeeds");
+    assert!(runtime.published_commands().is_some());
+    runtime
+}
+
 /// Live role state behind the loopback Discord double: member GETs read it,
 /// role PUTs/DELETEs mutate it, so assertions are state-based and a fix may
 /// change read counts without breaking the contract.
@@ -397,6 +428,7 @@ struct DiscoState {
     guild_roles: Mutex<Option<Value>>,
     guild_channels: Mutex<Vec<Value>>,
     uncertain_post: AtomicBool,
+    rejected_post: AtomicBool,
     hold_role_put: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
@@ -440,6 +472,12 @@ async fn start_stateful(state: Arc<DiscoState>) -> MockRest {
             && seg.get(2) == Some(&"channels")
             && seg.get(4) == Some(&"messages")
         {
+            if state.rejected_post.load(Ordering::SeqCst) {
+                return ScriptedResponse::json(
+                    403,
+                    json!({"code": 50013, "message": "Missing Permissions"}),
+                );
+            }
             let response = ScriptedResponse::json(200, json!({"id": "990000000000000002"}));
             return if state.uncertain_post.swap(false, Ordering::SeqCst) {
                 // Discord has accepted the send but the response cannot be read.
@@ -893,15 +931,14 @@ async fn unknown_command_still_refused_for_gibberish() {
 
 #[tokio::test]
 async fn help_still_answers_through_dispatch_fixture() {
-    let mock = MockRest::start(Vec::new(), ScriptedResponse::json(200, json!({}))).await;
-    let runtime = runtime_for(lazy_pool(), executor_for(&mock));
+    let mock = help_publication_mock().await;
+    let runtime = published_runtime_for_help(&mock).await;
     let mut ix = birthday_ix(opt_sub("set", Vec::new()), ALICE, Permissions::empty());
     if let Some(InteractionData::ApplicationCommand(data)) = ix.data.as_mut() {
         data.name = "help".to_owned();
         data.options.clear();
     }
-    runtime.on_interaction(&ix).await;
-    let reply = only_callback(&mock.requests());
+    let reply = dispatch_callback(&runtime, &mock, &ix).await;
     assert_ephemeral(&reply, "help");
     assert!(!content_of(&reply).is_empty(), "help answers");
     mock.shutdown().await;
@@ -909,8 +946,8 @@ async fn help_still_answers_through_dispatch_fixture() {
 
 #[tokio::test]
 async fn birthday_help_is_member_facing_without_config_permission_hint() {
-    let mock = MockRest::start(Vec::new(), ScriptedResponse::json(200, json!({}))).await;
-    let runtime = runtime_for(lazy_pool(), executor_for(&mock));
+    let mock = help_publication_mock().await;
+    let runtime = published_runtime_for_help(&mock).await;
     let mut ix = birthday_ix(opt_sub("set", Vec::new()), ALICE, Permissions::empty());
     if let Some(InteractionData::ApplicationCommand(data)) = ix.data.as_mut() {
         data.name = "help".to_owned();
@@ -934,8 +971,8 @@ async fn birthday_help_is_member_facing_without_config_permission_hint() {
 
 #[tokio::test]
 async fn repeated_dispatches_select_their_own_callback() {
-    let mock = MockRest::start(Vec::new(), ScriptedResponse::json(200, json!({}))).await;
-    let runtime = runtime_for(lazy_pool(), executor_for(&mock));
+    let mock = help_publication_mock().await;
+    let runtime = published_runtime_for_help(&mock).await;
     let mut help = birthday_ix(opt_sub("set", Vec::new()), ALICE, Permissions::empty());
     if let Some(InteractionData::ApplicationCommand(data)) = help.data.as_mut() {
         data.name = "help".to_owned();
@@ -1039,6 +1076,133 @@ async fn set_show_remove_round_trip() {
 
     mock.shutdown().await;
     db.close().await.expect("drop test database");
+}
+
+/// A timed-out write must not outlive the guild lock and resurrect opt-in
+/// data after a subsequently confirmed remove, including on a fresh pool.
+#[tokio::test]
+async fn timed_out_set_cannot_resurrect_profile_after_remove() {
+    let Some(url) = db_url() else { return };
+    let db = test_db(&url).await;
+    let pool = db.pool().clone();
+    let state = Arc::new(DiscoState::default());
+    let mock = start_stateful(state).await;
+    let executor = executor_for(&mock);
+    let runtime = runtime_for(pool.clone(), executor.clone());
+    let old = dispatch_set(&runtime, &mock, ALICE, 5, 1).await;
+    assert!(content_of(&old).contains("May"));
+    sqlx::raw_sql(
+        "CREATE FUNCTION birthday_fixture_insert_barrier() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN IF NEW.birth_month = 6 THEN PERFORM pg_advisory_xact_lock(88321704::bigint); END IF;
+         RETURN NEW; END $$;
+         CREATE TRIGGER birthday_fixture_insert_barrier BEFORE INSERT ON birthday_profiles
+         FOR EACH ROW EXECUTE FUNCTION birthday_fixture_insert_barrier();",
+    )
+    .execute(&pool)
+    .await
+    .expect("install isolated insert barrier");
+    let mut barrier = pool.begin().await.expect("barrier transaction");
+    sqlx::query("SELECT pg_advisory_xact_lock(88321704::bigint)")
+        .execute(&mut *barrier)
+        .await
+        .expect("hold insert barrier");
+    let first = mock.requests().len();
+    let setting = Arc::clone(&runtime);
+    let set_task = tokio::spawn(async move {
+        setting.on_interaction(&set_ix(ALICE, 6, 15)).await;
+    });
+    let blocked_pid = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let pid: Option<i32> = sqlx::query_scalar(
+                "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND NOT granted
+                 AND objid = 88321704 AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+            ).fetch_optional(&pool).await.expect("observe blocked insert");
+            if let Some(pid) = pid { break pid; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("set reaches the fixture barrier");
+    tokio::time::timeout(Duration::from_secs(3), set_task)
+        .await
+        .expect("set request has a bounded deadline")
+        .expect("set task");
+    let timed_out = only_callback(&mock.requests()[first..]);
+    let remove_first = mock.requests().len();
+    let removing = Arc::clone(&runtime);
+    let remove_task = tokio::spawn(async move {
+        removing.on_interaction(&remove_ix(ALICE)).await;
+    });
+    // Broken separate-connection writes let remove finish immediately. A
+    // correctly locked transaction keeps remove waiting until rollback.
+    let remove_observed = tokio::time::timeout(Duration::from_millis(750), async {
+        loop {
+            if remove_task.is_finished() { break; }
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted
+                 AND objid <> 88321704 AND database = (SELECT oid FROM pg_database WHERE datname = current_database()))",
+            ).fetch_one(&pool).await.expect("observe remove lock wait");
+            if waiting { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await;
+    barrier
+        .rollback()
+        .await
+        .expect("release insert barrier before remove deadline");
+    tokio::time::timeout(Duration::from_secs(2), remove_task)
+        .await
+        .expect("remove completes after release")
+        .expect("remove task");
+    let removed = only_callback(&mock.requests()[remove_first..]);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let active: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND pid = $1 AND state = 'active')",
+            ).bind(blocked_pid).fetch_one(&pool).await.expect("observe old insert completion");
+            if !active { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("old insert settles before checking durable state");
+    let fresh = db.independent_pool().await.expect("fresh pool");
+    let fresh_runtime = runtime_for(fresh.clone(), executor);
+    let shown = dispatch_callback(&fresh_runtime, &mock, &show_ix(ALICE)).await;
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM birthday_profiles WHERE guild_id = $1 AND member_id = $2",
+    )
+    .bind(GUILD_S)
+    .bind(ALICE.to_string())
+    .fetch_one(&fresh)
+    .await
+    .expect("inspect durable opt-in state");
+    fresh.close().await;
+    mock.shutdown().await;
+    db.close().await.expect("drop test database");
+
+    assert!(
+        remove_observed.is_ok(),
+        "remove must complete or enter its guild-lock wait before barrier release"
+    );
+    assert_ephemeral(&timed_out, "timed-out set");
+    assert!(
+        content_of(&timed_out)
+            .to_lowercase()
+            .contains("unavailable"),
+        "blocked set reports its timeout"
+    );
+    assert_ephemeral(&removed, "remove");
+    let confirmation = content_of(&removed).to_lowercase();
+    assert!(
+        confirmation.contains("remov") || confirmation.contains("delet"),
+        "remove confirms success: {confirmation}"
+    );
+    assert_eq!(
+        remaining, 0,
+        "a cancelled insert must not resurrect a profile after confirmed remove"
+    );
+    let shown = content_of(&shown).to_lowercase();
+    assert!(
+        shown.contains("not set") || shown.contains("no birthday"),
+        "fresh-pool show remains unset: {shown}"
+    );
 }
 
 #[tokio::test]
@@ -1625,6 +1789,89 @@ async fn sweep_posts_exactly_one_cheer_per_celebrant() {
     db.close().await.expect("drop test database");
 }
 
+/// Missing role-safety evidence is not proof that a valid same-day grant is
+/// invalid. Preserve its cleanup witness across a failed lookup and restart.
+#[tokio::test]
+async fn unavailable_role_evidence_preserves_same_day_grant_until_expiry() {
+    let Some(url) = db_url() else { return };
+    let db = test_db(&url).await;
+    let pool = db.pool().clone();
+    let state = Arc::new(DiscoState::default());
+    let mock = start_stateful(Arc::clone(&state)).await;
+    let executor = executor_for(&mock);
+    let runtime = runtime_for(pool.clone(), executor.clone());
+    let config = dispatch_callback(
+        &runtime,
+        &mock,
+        &config_ix(
+            Some(CHANNEL_ID),
+            Some(8130),
+            None,
+            ALICE,
+            Permissions::MANAGE_GUILD,
+        ),
+    )
+    .await;
+    assert_ephemeral(&config, "config");
+    let reply = dispatch_set(&runtime, &mock, ALICE, 5, 1).await;
+    assert!(content_of(&reply).contains("May"));
+    let today = utc_ms("2026-05-01T12:00:00.000Z");
+    sweep(&pool, &executor, today).await;
+    assert!(member_roles(&state, &ALICE.to_string()).contains(ROLE_ID));
+    assert_eq!(channel_posts(&mock.requests(), CHANNEL_S).len(), 1);
+    let before = birthday_rows(&pool).await;
+    let first = mock.requests().len();
+
+    // Successful HTTP with an invalid roles envelope cannot prove role safety.
+    *state.guild_roles.lock().expect("guild roles lock") = Some(json!({}));
+    let restarted = db.independent_pool().await.expect("restart pool");
+    let result = MemberRuntime::run_birthday_sweep(&restarted, &executor, GUILD_S, today).await;
+    let failed_requests = mock.requests()[first..].to_vec();
+    let preserved = birthday_rows(&restarted).await;
+    let held_during_failure = member_roles(&state, &ALICE.to_string()).contains(ROLE_ID);
+
+    *state.guild_roles.lock().expect("guild roles lock") = None;
+    sweep(&restarted, &executor, utc_ms("2026-05-02T12:00:00.000Z")).await;
+    let held_after_expiry = member_roles(&state, &ALICE.to_string()).contains(ROLE_ID);
+    let deletes = role_ops(&mock.requests(), "DELETE");
+    let cheers = channel_posts(&mock.requests(), CHANNEL_S).len();
+    restarted.close().await;
+    mock.shutdown().await;
+    db.close().await.expect("drop test database");
+
+    assert_eq!(
+        result,
+        Err(ErrorClass::Rest),
+        "unavailable safety evidence is observable"
+    );
+    assert!(
+        role_ops(&failed_requests, "DELETE").is_empty(),
+        "a failed lookup must not revoke a valid same-day grant"
+    );
+    assert!(
+        role_ops(&failed_requests, "PUT").is_empty(),
+        "a failed lookup must not regrant a role"
+    );
+    assert!(
+        held_during_failure,
+        "the current-day cosmetic role remains held"
+    );
+    assert_eq!(
+        preserved, before,
+        "failed evidence preserves all durable recovery rows"
+    );
+    assert!(
+        !held_after_expiry,
+        "the preserved grant remains revocable after expiry"
+    );
+    assert_eq!(
+        deletes,
+        vec![(ALICE.to_string(), ROLE_ID.to_owned())],
+        "exactly one expiry cleanup"
+    );
+    assert_eq!(cheers, 1, "recovery never reopens the cheer fence");
+}
+
 #[tokio::test]
 async fn sweep_cycles_birthday_role_for_the_day() {
     let Some(url) = db_url() else { return };
@@ -1758,6 +2005,76 @@ async fn restart_never_double_posts_nor_strands_role() {
     db.close().await.expect("drop test database");
 }
 
+/// A definitive Discord rejection proves no cheer was accepted; unlike an
+/// uncertain send it must not poison the daily delivery fence after repair.
+#[tokio::test]
+async fn known_cheer_rejection_can_retry_once_after_permission_repair_and_restart() {
+    let Some(url) = db_url() else { return };
+    let db = test_db(&url).await;
+    let pool = db.pool().clone();
+    let state = Arc::new(DiscoState::default());
+    let mock = start_stateful(Arc::clone(&state)).await;
+    let executor = executor_for(&mock);
+    let runtime = runtime_for(pool.clone(), executor.clone());
+    let config = dispatch_callback(
+        &runtime,
+        &mock,
+        &config_ix(
+            Some(CHANNEL_ID),
+            None,
+            None,
+            ALICE,
+            Permissions::MANAGE_GUILD,
+        ),
+    )
+    .await;
+    assert_ephemeral(&config, "config");
+    let reply = dispatch_set(&runtime, &mock, ALICE, 5, 1).await;
+    assert!(content_of(&reply).contains("May"));
+    state.rejected_post.store(true, Ordering::SeqCst);
+    let now = utc_ms("2026-05-01T12:00:00.000Z");
+    let rejected = MemberRuntime::run_birthday_sweep(&pool, &executor, GUILD_S, now).await;
+    let rejected_attempts = channel_posts(&mock.requests(), CHANNEL_S).len();
+    let rejected_fences: i64 = sqlx::query_scalar("SELECT count(*) FROM birthday_cheers")
+        .fetch_one(&pool)
+        .await
+        .expect("count rejected cheer fences");
+
+    state.rejected_post.store(false, Ordering::SeqCst);
+    let restarted = db.independent_pool().await.expect("restart pool");
+    let repaired = MemberRuntime::run_birthday_sweep(&restarted, &executor, GUILD_S, now).await;
+    let after_repair = channel_posts(&mock.requests(), CHANNEL_S).len();
+    let repeated = MemberRuntime::run_birthday_sweep(&pool, &executor, GUILD_S, now).await;
+    let after_repeat = channel_posts(&mock.requests(), CHANNEL_S).len();
+    let messages: Vec<Option<String>> =
+        sqlx::query_scalar("SELECT message_id FROM birthday_cheers ORDER BY member_id")
+            .fetch_all(&pool)
+            .await
+            .expect("inspect settled cheer");
+    restarted.close().await;
+    mock.shutdown().await;
+    db.close().await.expect("drop test database");
+
+    assert_eq!(
+        after_repair, 2,
+        "a proven 403 must allow one same-day send after repair and restart"
+    );
+    assert_eq!(rejected_attempts, 1);
+    assert!(rejected.is_err(), "known rejection must remain observable");
+    assert_eq!(
+        rejected_fences, 0,
+        "a rejected send leaves no uncertain fence"
+    );
+    assert_eq!(repaired, Ok(()));
+    assert_eq!(repeated, Ok(()));
+    assert_eq!(after_repeat, 2, "confirmed retry is never sent again");
+    assert_eq!(
+        messages,
+        vec![Some("990000000000000002".to_owned())],
+        "the accepted retry is durably settled"
+    );
+}
+
 /// Catch retrying a send whose success response was lost, including after a
 /// fresh pool/executor restart. Delivery uncertainty is not permission to resend.
 #[tokio::test]
@@ -1804,7 +2121,23 @@ async fn uncertain_cheer_never_auto_resends_after_restart() {
         1,
         "durable sending receipt fences every retry"
     );
-    sweep(&pool2, &executor2, utc_ms("2026-05-02T12:00:00.000Z")).await;
+    let next_day = MemberRuntime::run_birthday_sweep(
+        &pool2,
+        &executor2,
+        GUILD_S,
+        utc_ms("2026-05-02T12:00:00.000Z"),
+    )
+    .await;
+    assert_eq!(
+        next_day,
+        Err(ErrorClass::RecoveryRequired),
+        "unsettled delivery remains visible after restart and date rollover"
+    );
+    assert_eq!(
+        channel_posts(&mock.requests(), CHANNEL_S).len(),
+        1,
+        "date rollover must not reopen the uncertain send fence"
+    );
     assert!(
         !member_roles(&state, &ALICE.to_string()).contains(ROLE_ID),
         "uncertain cheer does not strand the role"

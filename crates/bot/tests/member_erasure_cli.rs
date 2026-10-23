@@ -130,12 +130,15 @@ async fn real_erasure_cli_dry_execute_and_second_execute_counts() {
     for line in &dry_lines {
         let expected = if line.starts_with("event_store\t") {
             "\t5"
+        } else if line.starts_with("birthday_role_grants\t") {
+            // No unresolved target role intent: those correctly block execute.
+            "\t0"
         } else {
             "\t1"
         };
         assert!(
             line.ends_with(expected),
-            "dry-run count for {line}; event_store seeds 5, others 1"
+            "dry-run count for {line}; event_store seeds 5, target role grants 0, others 1"
         );
     }
     let execute = cli(&execute_args, Some(&url), Some("fixture-privacy-operator")).await;

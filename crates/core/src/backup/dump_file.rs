@@ -1378,6 +1378,14 @@ mod tests {
     use super::*;
     use flate2::write::GzEncoder as WEnc;
 
+    // Literal test contract, independent of the implementation's version sets.
+    const BIRTHDAY_TABLES: [&str; 4] = [
+        "birthday_profiles",
+        "birthday_config",
+        "birthday_cheers",
+        "birthday_role_grants",
+    ];
+
     fn complete_tables(overrides: &BTreeMap<&str, (Vec<&str>, u64)>) -> Vec<Value> {
         DUMP_TABLES
             .iter()
@@ -1389,6 +1397,21 @@ mod tests {
                     "column_types": cols.iter().map(|_| "text").collect::<Vec<_>>(),
                     "count": count,
                 })
+            })
+            .collect()
+    }
+
+    fn pre_birthday_tables(overrides: &BTreeMap<&str, (Vec<&str>, u64)>) -> Vec<Value> {
+        complete_tables(overrides)
+            .into_iter()
+            .filter(|table| {
+                ![
+                    "birthday_profiles",
+                    "birthday_config",
+                    "birthday_cheers",
+                    "birthday_role_grants",
+                ]
+                .contains(&table["name"].as_str().unwrap())
             })
             .collect()
     }
@@ -2048,6 +2071,7 @@ mod tests {
                     && !V11_ADDED_TABLES.contains(name)
                     && !V12_ADDED_TABLES.contains(name)
                     && !V13_ADDED_TABLES.contains(name)
+                    && !BIRTHDAY_TABLES.contains(name)
             })
             .collect();
         assert_eq!(names, expected);
@@ -2066,6 +2090,10 @@ mod tests {
                 "event_voice_channels",
                 "event_voice_presence",
                 "admin_api_tokens",
+                "birthday_profiles",
+                "birthday_config",
+                "birthday_cheers",
+                "birthday_role_grants",
                 "stream_live_claims",
                 "voice_create_reservations",
                 "retention_guild_purge_queue",
@@ -2096,7 +2124,7 @@ mod tests {
         // (The retention queues, the seasonal projection and the stream ledger
         // stay declared here: v5 predates the event-store capture, and the v5
         // waiver covers the v6 event store and the v7/v8 additions.)
-        let v5_tables: Vec<Value> = complete_tables(&BTreeMap::new())
+        let v5_tables: Vec<Value> = pre_birthday_tables(&BTreeMap::new())
             .into_iter()
             .filter(|table| table["name"] != "event_store")
             .collect();
@@ -2110,10 +2138,19 @@ mod tests {
         let bytes = gzip_lines(&[v5.clone(), serde_json::json!({"kind":"end","rows":0})]);
         let contents = inspect_bytes(&bytes).expect("v5 without event_store inspects");
         assert_eq!(contents.manifest.version, 5);
-        assert_eq!(contents.manifest.missing_tables(), ["event_store"]);
+        assert_eq!(
+            contents.manifest.missing_tables(),
+            [
+                "birthday_profiles",
+                "birthday_config",
+                "birthday_cheers",
+                "birthday_role_grants",
+                "event_store"
+            ]
+        );
         // The same inventory at the current version refuses: new archives must
         // cover the event store.
-        assert_eq!(DUMP_VERSION, 13);
+        assert_eq!(DUMP_VERSION, 14);
         let mut current = v5;
         current["version"] = serde_json::json!(DUMP_VERSION);
         assert!(validate_manifest(&current)
@@ -2132,7 +2169,7 @@ mod tests {
         let tables: Vec<Value> = DUMP_TABLES
             .iter()
             .copied()
-            .filter(|name| !V6_ADDED_TABLES.contains(name))
+            .filter(|name| !V6_ADDED_TABLES.contains(name) && !BIRTHDAY_TABLES.contains(name))
             .map(|name| {
                 serde_json::json!({
                     "name": name,
@@ -2171,7 +2208,7 @@ mod tests {
         let tables: Vec<Value> = DUMP_TABLES
             .iter()
             .copied()
-            .filter(|name| !V6_ADDED_TABLES.contains(name))
+            .filter(|name| !V6_ADDED_TABLES.contains(name) && !BIRTHDAY_TABLES.contains(name))
             .map(|name| {
                 serde_json::json!({
                     "name": name,
@@ -2199,7 +2236,7 @@ mod tests {
             .contains("event_store"));
         let mut current = v5;
         current["version"] = serde_json::json!(DUMP_VERSION);
-        assert_eq!(DUMP_VERSION, 13, "frozen v5 test pins the v13 bump");
+        assert_eq!(DUMP_VERSION, 14, "frozen v5 test pins the v14 bump");
         assert!(validate_manifest(&current)
             .unwrap_err()
             .to_string()
@@ -2221,7 +2258,7 @@ mod tests {
         // building the old manifest from today's inventory (as the v5 tests
         // do) would silently include the new table and miss the refusal.
         let mut v6 = manifest(without(
-            complete_tables(&BTreeMap::new()),
+            pre_birthday_tables(&BTreeMap::new()),
             "member_season_xp",
         ));
         v6["version"] = serde_json::json!(6);
@@ -2233,7 +2270,16 @@ mod tests {
         let bytes = gzip_lines(&[v6.clone(), serde_json::json!({"kind":"end","rows":0})]);
         let contents = inspect_bytes(&bytes).expect("v6 without member_season_xp inspects");
         assert_eq!(contents.manifest.version, 6);
-        assert_eq!(contents.manifest.missing_tables(), ["member_season_xp"]);
+        assert_eq!(
+            contents.manifest.missing_tables(),
+            [
+                "member_season_xp",
+                "birthday_profiles",
+                "birthday_config",
+                "birthday_cheers",
+                "birthday_role_grants"
+            ]
+        );
         // Dropping a v6-covered table from a v6 manifest still refuses.
         let mut v6_gap = v6.clone();
         v6_gap["tables"]
@@ -2250,7 +2296,7 @@ mod tests {
             "member_season_xp",
         ));
         assert_eq!(v7_gap["version"], serde_json::json!(DUMP_VERSION));
-        assert_eq!(DUMP_VERSION, 13, "frozen v6 test pins the v13 bump");
+        assert_eq!(DUMP_VERSION, 14, "frozen v6 test pins the v14 bump");
         assert!(validate_manifest(&v7_gap)
             .unwrap_err()
             .to_string()
@@ -2278,7 +2324,7 @@ mod tests {
         // would silently include the new tables and miss the refusal, so the
         // pre-PR inventory is pinned here by explicit table names.
         let pre_retention = without_any(
-            complete_tables(&BTreeMap::new()),
+            pre_birthday_tables(&BTreeMap::new()),
             &[
                 "member_season_xp",
                 "retention_guild_purge_queue",
@@ -2299,6 +2345,10 @@ mod tests {
             contents.manifest.missing_tables(),
             [
                 "member_season_xp",
+                "birthday_profiles",
+                "birthday_config",
+                "birthday_cheers",
+                "birthday_role_grants",
                 "retention_guild_purge_queue",
                 "retention_deletion_requests"
             ]
@@ -2317,8 +2367,8 @@ mod tests {
         let mut v7_gap = v6.clone();
         v7_gap["version"] = serde_json::json!(DUMP_VERSION);
         assert_eq!(
-            DUMP_VERSION, 13,
-            "frozen pre-retention test pins the v13 bump"
+            DUMP_VERSION, 14,
+            "frozen pre-retention test pins the v14 bump"
         );
         let err = validate_manifest(&v7_gap).unwrap_err().to_string();
         assert!(err.contains("retention_guild_purge_queue"), "{err}");
@@ -2341,7 +2391,7 @@ mod tests {
         // new table and miss the refusal, so the pre-PR inventory is pinned
         // here by the explicit table name.
         let mut v7 = manifest(without(
-            complete_tables(&BTreeMap::new()),
+            pre_birthday_tables(&BTreeMap::new()),
             "stream_live_claims",
         ));
         v7["version"] = serde_json::json!(7);
@@ -2353,7 +2403,16 @@ mod tests {
         let bytes = gzip_lines(&[v7.clone(), serde_json::json!({"kind":"end","rows":0})]);
         let contents = inspect_bytes(&bytes).expect("v7 without stream_live_claims inspects");
         assert_eq!(contents.manifest.version, 7);
-        assert_eq!(contents.manifest.missing_tables(), ["stream_live_claims"]);
+        assert_eq!(
+            contents.manifest.missing_tables(),
+            [
+                "birthday_profiles",
+                "birthday_config",
+                "birthday_cheers",
+                "birthday_role_grants",
+                "stream_live_claims"
+            ]
+        );
         // Dropping a v7-covered table from a v7 manifest still refuses.
         let mut v7_gap = v7.clone();
         v7_gap["tables"]
@@ -2370,7 +2429,7 @@ mod tests {
             "stream_live_claims",
         ));
         assert_eq!(v8_gap["version"], serde_json::json!(DUMP_VERSION));
-        assert_eq!(DUMP_VERSION, 13, "frozen v7 test pins the v13 bump");
+        assert_eq!(DUMP_VERSION, 14, "frozen v7 test pins the v14 bump");
         assert!(validate_manifest(&v8_gap)
             .unwrap_err()
             .to_string()
@@ -2381,7 +2440,7 @@ mod tests {
     fn v8_archives_read_without_guild_counters_but_v9_requires_them() {
         // Literal names, not V9_ADDED_TABLES: this reproduces the pre-change
         // inventory even if the version waiver is accidentally removed.
-        let tables = complete_tables(&BTreeMap::new())
+        let tables = pre_birthday_tables(&BTreeMap::new())
             .into_iter()
             .filter(|table| {
                 table["name"] != "assistant_monthly_builds"
@@ -2399,7 +2458,14 @@ mod tests {
             assert_eq!(contents.manifest.version, version);
             assert_eq!(
                 contents.manifest.missing_tables(),
-                ["game_activity_guild_aggregates", "assistant_monthly_builds"]
+                [
+                    "game_activity_guild_aggregates",
+                    "assistant_monthly_builds",
+                    "birthday_profiles",
+                    "birthday_config",
+                    "birthday_cheers",
+                    "birthday_role_grants"
+                ]
             );
             let mut gap = old.clone();
             gap["tables"]
@@ -2411,13 +2477,13 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 13, "new dumps require both guild counters");
+        assert_eq!(DUMP_VERSION, 14, "new dumps require both guild counters");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v13 archive inspects");
+        .expect("complete v14 archive inspects");
         for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
             let mut gap = current.clone();
             gap["tables"]
@@ -2438,7 +2504,7 @@ mod tests {
     fn v9_archives_read_without_epoch_claim_but_v10_requires_it() {
         // Literal name, not V10_ADDED_TABLES: this reproduces the pre-change
         // inventory even if the version waiver is accidentally removed.
-        let tables = complete_tables(&BTreeMap::new())
+        let tables = pre_birthday_tables(&BTreeMap::new())
             .into_iter()
             .filter(|table| table["name"] != "scheduled_events_claim")
             .collect();
@@ -2453,7 +2519,13 @@ mod tests {
             assert_eq!(contents.manifest.version, version);
             assert_eq!(
                 contents.manifest.missing_tables(),
-                ["scheduled_events_claim"]
+                [
+                    "scheduled_events_claim",
+                    "birthday_profiles",
+                    "birthday_config",
+                    "birthday_cheers",
+                    "birthday_role_grants"
+                ]
             );
             let mut gap = old.clone();
             gap["tables"]
@@ -2465,13 +2537,13 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 13, "new dumps require the epoch-claim guard");
+        assert_eq!(DUMP_VERSION, 14, "new dumps require the epoch-claim guard");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v13 archive inspects");
+        .expect("complete v14 archive inspects");
         let mut gap = current.clone();
         gap["tables"]
             .as_array_mut()
@@ -2494,7 +2566,7 @@ mod tests {
         // the epoch-claim guard is present, the delete tombstones and v13
         // event voice pair are absent. The v12 token registry rides along:
         // a present table needs no waiver.
-        let tables = complete_tables(&BTreeMap::new())
+        let tables = pre_birthday_tables(&BTreeMap::new())
             .into_iter()
             .filter(|table| {
                 table["name"] != "scheduled_events_tombstone"
@@ -2516,7 +2588,11 @@ mod tests {
                 [
                     "scheduled_events_tombstone",
                     "event_voice_channels",
-                    "event_voice_presence"
+                    "event_voice_presence",
+                    "birthday_profiles",
+                    "birthday_config",
+                    "birthday_cheers",
+                    "birthday_role_grants"
                 ]
             );
             let mut gap = old.clone();
@@ -2529,13 +2605,13 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 13, "new dumps require the delete tombstones");
+        assert_eq!(DUMP_VERSION, 14, "new dumps require the delete tombstones");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v13 archive inspects");
+        .expect("complete v14 archive inspects");
         let mut gap = current.clone();
         gap["tables"]
             .as_array_mut()
@@ -2557,7 +2633,7 @@ mod tests {
         // is the frozen tombstone-only v11 shape written by the merged v11
         // writer: the delete tombstones are present, the token registry is
         // absent, as is the v13 event voice pair.
-        let tables = complete_tables(&BTreeMap::new())
+        let tables = pre_birthday_tables(&BTreeMap::new())
             .into_iter()
             .filter(|table| {
                 table["name"] != "admin_api_tokens"
@@ -2579,7 +2655,11 @@ mod tests {
                 [
                     "event_voice_channels",
                     "event_voice_presence",
-                    "admin_api_tokens"
+                    "admin_api_tokens",
+                    "birthday_profiles",
+                    "birthday_config",
+                    "birthday_cheers",
+                    "birthday_role_grants"
                 ]
             );
             let mut gap = old.clone();
@@ -2598,13 +2678,13 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("admin_api_tokens"));
-        assert_eq!(DUMP_VERSION, 13, "new dumps require the token registry");
+        assert_eq!(DUMP_VERSION, 14, "new dumps require the token registry");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v13 archive inspects");
+        .expect("complete v14 archive inspects");
         let mut gap = current.clone();
         gap["tables"]
             .as_array_mut()
@@ -2623,7 +2703,7 @@ mod tests {
     fn v12_archives_read_without_event_voice_but_v13_requires_it() {
         // Literal names, not V13_ADDED_TABLES: this reproduces the pre-change
         // inventory even if the version waiver is accidentally removed.
-        let tables = complete_tables(&BTreeMap::new())
+        let tables = pre_birthday_tables(&BTreeMap::new())
             .into_iter()
             .filter(|table| {
                 table["name"] != "event_voice_channels" && table["name"] != "event_voice_presence"
@@ -2640,7 +2720,14 @@ mod tests {
             assert_eq!(contents.manifest.version, version);
             assert_eq!(
                 contents.manifest.missing_tables(),
-                ["event_voice_channels", "event_voice_presence"]
+                [
+                    "event_voice_channels",
+                    "event_voice_presence",
+                    "birthday_profiles",
+                    "birthday_config",
+                    "birthday_cheers",
+                    "birthday_role_grants"
+                ]
             );
             let mut gap = old.clone();
             gap["tables"]
@@ -2652,13 +2739,13 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 13, "new dumps require the event voice pair");
+        assert_eq!(DUMP_VERSION, 14, "new dumps require the event voice pair");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v13 archive inspects");
+        .expect("complete v14 archive inspects");
         for name in ["event_voice_channels", "event_voice_presence"] {
             let mut gap = current.clone();
             gap["tables"]
@@ -2676,6 +2763,72 @@ mod tests {
     }
 
     #[test]
+    fn frozen_v13_without_birthdays_reads_but_v14_requires_each_birthday_table() {
+        let mut encoder = new_encoder();
+        encoder
+            .write_all(include_bytes!(
+                "../../tests/fixtures/pre-birthday-v13.ndjson"
+            ))
+            .unwrap();
+        let contents =
+            inspect_bytes(&finish_gzip(encoder).unwrap()).expect("frozen v13 stays readable");
+        assert_eq!(contents.manifest.version, 13);
+        assert_eq!(
+            contents.manifest.tables.len(),
+            101,
+            "pre-birthday writer inventory is frozen"
+        );
+        assert_eq!(contents.rows, 1);
+        assert_eq!(
+            contents.buffers["members"][0]["member_id"],
+            "100000000000000002"
+        );
+        assert_eq!(
+            contents.manifest.missing_tables(),
+            [
+                "birthday_profiles",
+                "birthday_config",
+                "birthday_cheers",
+                "birthday_role_grants",
+            ]
+        );
+        let mut old = serde_json::to_value(&contents.manifest).unwrap();
+        old["tables"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|table| table["name"] != "event_voice_channels");
+        assert!(
+            validate_manifest(&old)
+                .unwrap_err()
+                .to_string()
+                .contains("event_voice_channels"),
+            "v13 still requires its own inventory"
+        );
+        assert_eq!(DUMP_VERSION, 14);
+        let current = empty_dump();
+        inspect_bytes(&gzip_lines(&current)).expect("complete v14 inventory reads");
+        for name in [
+            "birthday_profiles",
+            "birthday_config",
+            "birthday_cheers",
+            "birthday_role_grants",
+        ] {
+            let mut missing = current.clone();
+            missing[0]["tables"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|table| table["name"] != name);
+            let error = inspect_bytes(&gzip_lines(&missing))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(name),
+                "v14 must reject missing {name}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn v5_archives_read_without_event_store_but_v6_requires_it() {
         fn without(tables: Vec<Value>, name: &str) -> Vec<Value> {
             tables
@@ -2687,7 +2840,10 @@ mod tests {
         // event-store capture (voice, presence, member deltas, thread
         // lifecycle, message/reaction, stage/interaction/audit), and the v5
         // waiver covers every v6 table.
-        let mut v5 = manifest(without(complete_tables(&BTreeMap::new()), "event_store"));
+        let mut v5 = manifest(without(
+            pre_birthday_tables(&BTreeMap::new()),
+            "event_store",
+        ));
         v5["version"] = serde_json::json!(5);
         assert!(
             validate_manifest(&v5).is_ok(),
@@ -2697,7 +2853,16 @@ mod tests {
         let bytes = gzip_lines(&[v5.clone(), serde_json::json!({"kind":"end","rows":0})]);
         let contents = inspect_bytes(&bytes).expect("v5 without event_store inspects");
         assert_eq!(contents.manifest.version, 5);
-        assert_eq!(contents.manifest.missing_tables(), ["event_store"]);
+        assert_eq!(
+            contents.manifest.missing_tables(),
+            [
+                "birthday_profiles",
+                "birthday_config",
+                "birthday_cheers",
+                "birthday_role_grants",
+                "event_store"
+            ]
+        );
         // Dropping a v5-covered table from a v5 manifest still refuses.
         let mut v5_gap = v5.clone();
         v5_gap["tables"]
@@ -2724,21 +2889,37 @@ mod tests {
         // must also let a v5 archive reach it.
         let mut v5 = good_dump();
         v5[0]["version"] = serde_json::json!(5);
-        v5[0]["tables"]
-            .as_array_mut()
-            .unwrap()
-            .retain(|t| t.get("name").and_then(Value::as_str) != Some("event_store"));
+        v5[0]["tables"].as_array_mut().unwrap().retain(|t| {
+            let name = t["name"].as_str().unwrap();
+            name != "event_store"
+                && ![
+                    "birthday_profiles",
+                    "birthday_config",
+                    "birthday_cheers",
+                    "birthday_role_grants",
+                ]
+                .contains(&name)
+        });
         let contents = inspect_bytes(&gzip_lines(&v5)).expect("a v5 archive stays readable");
         assert_eq!(contents.manifest.version, 5);
         assert_eq!(contents.rows, 1);
-        assert_eq!(contents.manifest.missing_tables(), ["event_store"]);
+        assert_eq!(
+            contents.manifest.missing_tables(),
+            [
+                "birthday_profiles",
+                "birthday_config",
+                "birthday_cheers",
+                "birthday_role_grants",
+                "event_store"
+            ]
+        );
 
         let mut future = good_dump();
         future[0]["version"] = serde_json::json!(DUMP_VERSION + 1);
         let message = inspect_bytes(&gzip_lines(&future)).unwrap_err().to_string();
         assert!(
             message.contains(&format!(
-                "reads 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 and {DUMP_VERSION}"
+                "reads 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 and {DUMP_VERSION}"
             )),
             "unknown versions are refused with the readable list: {message}"
         );

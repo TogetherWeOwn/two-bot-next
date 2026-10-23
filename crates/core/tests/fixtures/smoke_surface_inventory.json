@@ -1,6 +1,6 @@
 {
   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
-  "count": 29,
+  "count": 30,
   "dm_permission_all_false": true,
   "commands": [
     {
@@ -412,6 +412,113 @@
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Channel-state mutation; excluded from the read-only smoke."
+    },
+    {
+      "name": "birthday",
+      "description": "Set, show or remove your birthday (month/day only; UTC).",
+      "family": "birthdays",
+      "gate": "announcements",
+      "default_member_permissions": null,
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "set",
+          "description": "Save your month and day, never a year.",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [],
+          "options": [
+            {
+              "name": "month",
+              "description": "Month (1–12)",
+              "type": "integer",
+              "required": true,
+              "min_value": 1,
+              "max_value": 12,
+              "max_length": null,
+              "choices": []
+            },
+            {
+              "name": "day",
+              "description": "Day (1–31)",
+              "type": "integer",
+              "required": true,
+              "min_value": 1,
+              "max_value": 31,
+              "max_length": null,
+              "choices": []
+            }
+          ]
+        },
+        {
+          "name": "remove",
+          "description": "Delete your birthday.",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "show",
+          "description": "Show only your own birthday.",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "config",
+          "description": "Configure silent cheers and a cosmetic role (Manage Server).",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [],
+          "options": [
+            {
+              "name": "channel",
+              "description": "Birthday text channel in this server",
+              "type": "channel",
+              "required": false,
+              "min_value": null,
+              "max_value": null,
+              "max_length": null,
+              "choices": []
+            },
+            {
+              "name": "role",
+              "description": "Cosmetic birthday role (no permissions or channel grants)",
+              "type": "role",
+              "required": false,
+              "min_value": null,
+              "max_value": null,
+              "max_length": null,
+              "choices": []
+            },
+            {
+              "name": "cheer",
+              "description": "Mention-safe cheer; {user} names the celebrant without pinging",
+              "type": "string",
+              "required": false,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 200,
+              "choices": []
+            }
+          ]
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Next-only private month/day commands and daily delivery are exercised by offline dispatch and disposable-database birthday acceptance tests, not the live smoke five."
     },
     {
       "name": "rsvp",

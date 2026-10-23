@@ -112,6 +112,7 @@ async fn dry_run_execute_counts_scope_survivors_and_second_run_zero() {
         "guild_settings",
         "guild_settings_audit",
         "audit_kill_switch",
+        "birthday_config",
     ] {
         exceptions.push((table, snapshot(db.pool(), table).await));
     }
@@ -120,7 +121,13 @@ async fn dry_run_execute_counts_scope_survivors_and_second_run_zero() {
         .unwrap();
     assert_eq!(before.len(), plan.tables.len());
     for row in &before {
-        let expected = if row.table == "event_store" { 5 } else { 1 };
+        let expected = match row.table.as_str() {
+            "event_store" => 5,
+            // Unresolved grants block execute; the fixture keeps only the
+            // unrelated members' grants and proves they survive above.
+            "birthday_role_grants" => 0,
+            _ => 1,
+        };
         assert_eq!(row.rows, expected, "{} dry-run count", row.table);
     }
     assert_eq!(audit_count(db.pool()).await, 0);
@@ -176,6 +183,63 @@ async fn dry_run_execute_counts_scope_survivors_and_second_run_zero() {
         assert_eq!(json["actor"], ACTOR);
         assert!(!audit.contains(USER) && !audit.contains(GUILD) && !audit.contains(OTHER));
     }
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn birthday_recovery_witnesses_block_erasure_until_settled() {
+    let Some(db) = database().await else { return };
+    seed(db.pool()).await;
+    for (name, statement, reset) in [
+        (
+            "unconfirmed cheer even after date rollover",
+            "UPDATE birthday_cheers SET message_id = NULL WHERE guild_id = $1 AND member_id = $2",
+            "UPDATE birthday_cheers SET message_id = 'settled-fixture' WHERE guild_id = $1 AND member_id = $2",
+        ),
+        (
+            "settled same-day cheer still fences redelivery",
+            "UPDATE birthday_cheers SET celebration_date = (now() AT TIME ZONE 'UTC')::date WHERE guild_id = $1 AND member_id = $2",
+            "UPDATE birthday_cheers SET celebration_date = '2000-01-01' WHERE guild_id = $1 AND member_id = $2",
+        ),
+        (
+            "outstanding cosmetic-role intent",
+            "INSERT INTO birthday_role_grants (guild_id, member_id, role_id, celebration_date) VALUES ($1, $2, 'fixture-birthday-role', '2000-01-01')",
+            "DELETE FROM birthday_role_grants WHERE guild_id = $1 AND member_id = $2",
+        ),
+    ] {
+        sqlx::query(statement).bind(GUILD).bind(USER).execute(db.pool()).await.unwrap();
+        let counts = erase_member(db.pool(), GUILD, USER, ErasureMode::DryRun).await.unwrap();
+        let mut before = Vec::new();
+        for table in ["birthday_profiles", "birthday_config", "birthday_cheers", "birthday_role_grants", "members"] {
+            before.push((table, snapshot(db.pool(), table).await));
+        }
+        assert!(
+            erase_member(db.pool(), GUILD, USER, ErasureMode::Execute { actor: ACTOR }).await.is_err(),
+            "{name} must refuse execute, not discard recovery state"
+        );
+        assert_eq!(erase_member(db.pool(), GUILD, USER, ErasureMode::DryRun).await.unwrap(), counts, "{name}: no partial deletion");
+        for (table, rows) in before {
+            assert_eq!(snapshot(db.pool(), table).await, rows, "{name}: {table} changed");
+        }
+        assert_eq!(audit_count(db.pool()).await, 0, "{name}: no committed erasure receipt");
+        sqlx::query(reset).bind(GUILD).bind(USER).execute(db.pool()).await.unwrap();
+    }
+    let deleted = erase_member(
+        db.pool(),
+        GUILD,
+        USER,
+        ErasureMode::Execute { actor: ACTOR },
+    )
+    .await
+    .unwrap();
+    for table in ["birthday_profiles", "birthday_cheers"] {
+        assert_eq!(
+            deleted.iter().find(|row| row.table == table).unwrap().rows,
+            1,
+            "settled {table} can be erased"
+        );
+    }
+    assert_eq!(audit_count(db.pool()).await, 1);
     db.close().await.unwrap();
 }
 

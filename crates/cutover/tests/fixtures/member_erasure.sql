@@ -8,9 +8,23 @@ DECLARE
   intent BIGINT;
 BEGIN
   FOR g IN SELECT unnest(ARRAY['1545644954272137297', '1545644954272137298']) LOOP
+    INSERT INTO birthday_config (guild_id, channel_id, role_id, cheer)
+      VALUES (g, 'birthday-channel-' || g, 'birthday-role-' || g, 'Happy birthday {user}!');
     FOR u IN SELECT unnest(ARRAY['123456789012345678', '123456789012345679']) LOOP
       k := g || ':' || u;
       INSERT INTO members (guild_id, member_id) VALUES (g, u);
+      -- Old, confirmed cheers may be erased. The target has no outstanding
+      -- role intent; the three unrelated members retain their recovery rows.
+      INSERT INTO birthday_profiles (guild_id, member_id, birth_month, birth_day)
+        VALUES (g, u, 5, 1);
+      INSERT INTO birthday_cheers
+        (guild_id, member_id, celebration_date, channel_id, nonce, message_id)
+        VALUES (g, u, '2000-01-01', 'birthday-channel-' || g, 'birthday-' || k, 'birthday-message-' || k);
+      IF g <> '1545644954272137297' OR u <> '123456789012345678' THEN
+        INSERT INTO birthday_role_grants (guild_id, member_id, role_id, celebration_date)
+          VALUES (g, u, 'birthday-role-' || g, '2000-01-01');
+      END IF;
+
       INSERT INTO events (event_type, member_id, guild_id, occurred_at, source, metadata, idempotency_key)
         VALUES ('member_join', u, g, now(), 'fixture', '{}', k);
       -- event_store is shared by the S1-S8 slices: one presence row per member
