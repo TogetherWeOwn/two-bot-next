@@ -481,7 +481,7 @@ mod tests {
 
     #[test]
     fn slice2_names_match_legacy_in_order() {
-        assert_eq!(automation_commands().len(), 9);
+        assert_eq!(automation_commands().len(), 10);
         assert_eq!(
             names(&feature_commands()),
             [
@@ -489,6 +489,7 @@ mod tests {
                 "command",
                 "command-remove",
                 "command-list",
+                "command-inspect",
                 "schedule",
                 "schedule-remove",
                 "schedule-list",
@@ -509,8 +510,8 @@ mod tests {
     #[test]
     fn no_collision_with_leveling_core_or_within_slice() {
         let merged = merge_commands(&[feature_commands()], &[]).expect("slice 2 merges cleanly");
-        // 4 core + 1 scorecard + 9 automation + 7 announcement.
-        assert_eq!(merged.len(), 21);
+        // 4 core + 1 scorecard + 10 automation + 7 announcement.
+        assert_eq!(merged.len(), 22);
         assert_eq!(
             &names(&merged)[..5],
             ["rank", "leaderboard", "help", "privacy", "attendance"]
@@ -535,6 +536,7 @@ mod tests {
             "command",
             "command-remove",
             "command-list",
+            "command-inspect",
             "schedule",
             "schedule-remove",
             "schedule-list",
@@ -572,6 +574,8 @@ mod tests {
             ("command", 2, 100),
             ("command", 3, 33),
             ("command-remove", 0, 32),
+            ("command-inspect", 0, 32),
+            ("command-inspect", 2, 500),
             ("schedule", 0, 2000),
             ("schedule-remove", 0, 128),
             ("sticky", 0, 2000),
@@ -625,6 +629,18 @@ mod tests {
         let kind = get(&ann, "feed-add").options[0].clone();
         let values: Vec<_> = kind.choices.iter().map(|c| c.value.as_str()).collect();
         assert_eq!(values, ["rss", "youtube", "twitch"]);
+        // /command-inspect: one required name, three bounded optional views,
+        // one bounded optional sample. No enable/disable policy option.
+        let inspect = get(&auto, "command-inspect").options.clone();
+        assert_eq!(inspect.len(), 3);
+        assert_eq!(inspect[0].required, Some(true));
+        assert!(inspect[1].required.is_none() && inspect[2].required.is_none());
+        let values: Vec<_> = inspect[1]
+            .choices
+            .iter()
+            .map(|c| c.value.as_str())
+            .collect();
+        assert_eq!(values, ["summary", "template", "preview"]);
         // Scorecard attendance: both options required, user-typed member.
         let score = scorecard_attendance_command();
         assert!(score.options.iter().all(|o| o.required == Some(true)));
@@ -762,11 +778,15 @@ mod tests {
         assert_eq!(json[0]["default_member_permissions"], "8589934592");
         assert_eq!(json[0]["options"][0]["name"], "event-occurrence");
         assert_eq!(json[0]["options"][0]["max_length"], 128);
-        assert_eq!(json[9]["name"], "giveaway");
-        assert_eq!(json[9]["default_member_permissions"], "32");
-        assert_eq!(json[11]["name"], "rsvp-attendance");
-        assert!(json[11].get("default_member_permissions").is_none());
-        assert_eq!(json[11]["options"][0]["name"], "event-id");
+        // Inspection follows command-list; giveaway follows sticky-remove.
+        // Both shift the announcement slice without replacing any command.
+        assert_eq!(json[4]["name"], "command-inspect");
+        assert_eq!(json[4]["options"][2]["max_length"], 500);
+        assert_eq!(json[10]["name"], "giveaway");
+        assert_eq!(json[10]["default_member_permissions"], "32");
+        assert_eq!(json[12]["name"], "rsvp-attendance");
+        assert!(json[12].get("default_member_permissions").is_none());
+        assert_eq!(json[12]["options"][0]["name"], "event-id");
     }
 
     #[test]

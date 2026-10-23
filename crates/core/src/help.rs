@@ -278,11 +278,11 @@ mod tests {
                 "{token} appears exactly once"
             );
         }
-        // 30 non-voice commands (4 core + 17 feature + 9 moderation),
-        // including giveaway, plus 21 additional voice commands (voice
-        // `kick` loses first-wins to moderation `/kick`).
+        // 31 non-voice commands (4 core + 18 feature + 9 moderation),
+        // including inspection and giveaway, plus 21 additional voice commands
+        // (voice `kick` loses first-wins to moderation `/kick`).
         // `/templateassistant` stays unpublished until its slice lands.
-        assert!(text.contains("**Server commands** (51 live)"));
+        assert!(text.contains("**Server commands** (52 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"
@@ -406,10 +406,10 @@ mod tests {
             .iter()
             .flat_map(|g| g.commands.iter().copied())
             .collect();
-        // 30 non-voice names, including giveaway, plus 21 additional voice
-        // names (voice `kick` shares the Kick group). `/templateassistant`
-        // stays out until its slice lands.
-        assert_eq!(grouped.len(), 51);
+        // 31 non-voice names, including inspection and giveaway, plus 21
+        // additional voice names (voice `kick` shares the Kick group).
+        // `/templateassistant` stays out until its slice lands.
+        assert_eq!(grouped.len(), 52);
         for name in [
             "rank",
             "leaderboard",
@@ -417,6 +417,7 @@ mod tests {
             "privacy",
             "attendance",
             "command",
+            "command-inspect",
             "schedule-list",
             "sticky-remove",
             "rsvp",
