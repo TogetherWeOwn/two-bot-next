@@ -178,6 +178,9 @@ mod receipt_retry_tests;
 #[path = "ticket_open_retry_acceptance_tests.rs"]
 mod open_retry_acceptance_tests;
 
+#[path = "ticket_open_retry_store_tests.rs"]
+mod open_retry_store_tests;
+
 fn history(id: u64) -> Value {
     json!({"id":id.to_string(),"timestamp":two_bot_core::funnel::format_iso_millis(id as i64),
         "author":{"id":"500","username":"member","discriminator":"0"},

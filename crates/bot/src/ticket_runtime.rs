@@ -1800,7 +1800,13 @@ impl TicketRuntime {
             .executor
             .fetch_channel_messages(&config.panel_channel_id, None, 50)
             .await?;
-        if panel_needed(&self.bot_id()?, &panels(messages)?) {
+        let (panels, isolated) = panels_with_isolation(messages)?;
+        if panel_needed(&self.bot_id()?, &panels) {
+            // A malformed row may hide an existing panel. Preserve found-first
+            // handling, but never treat uncertain history as proof of absence.
+            if isolated > 0 {
+                return Err(Failure::InvalidEvidence);
+            }
             self.executor
                 .post_ticket_message(&config.panel_channel_id, TicketMessage::Panel)
                 .await?;
@@ -1916,6 +1922,7 @@ fn parse_panel_message(message: &Value) -> Option<(PanelMessage, bool)> {
     ))
 }
 
+#[cfg(test)]
 fn panels(messages: Vec<Value>) -> Result<Vec<PanelMessage>> {
     panels_with_isolation(messages).map(|(panels, _)| panels)
 }
