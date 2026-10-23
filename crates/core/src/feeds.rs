@@ -410,39 +410,40 @@ fn sanitize_source_segment(segment: &str) -> (String, bool) {
 /// survive (escaped); only values are replaced, so relays stay
 /// distinguishable by their non-secret parameters.
 fn redact_source_query(raw: &str, reasons: &mut Vec<&'static str>) -> String {
-    raw.split('&')
-        .map(|pair| {
-            let (name, value) = pair
-                .split_once('=')
-                .map_or((pair, None), |(n, v)| (n, Some(v)));
-            let (safe_name, name_had_link) = sanitize_source_segment(name);
-            if name_had_link {
-                push_redaction_reason(reasons, "embedded link");
-            }
-            match value {
-                None => safe_name,
-                Some(raw_value) => {
-                    // Decode only for classification; keep the original name
-                    // and non-secret value spelling in the safe projection.
-                    let decoded_name = url::form_urlencoded::parse(pair.as_bytes())
-                        .next()
-                        .map(|(name, _)| name)
-                        .unwrap_or_default();
-                    if is_credential_query_param(&decoded_name) {
-                        push_redaction_reason(reasons, "secret query values");
-                        format!("{safe_name}=[redacted]")
-                    } else {
-                        let (safe_value, value_had_link) = sanitize_source_segment(raw_value);
-                        if value_had_link {
-                            push_redaction_reason(reasons, "embedded link");
-                        }
-                        format!("{safe_name}={safe_value}")
-                    }
+    let mut query = String::new();
+    for (index, pair) in raw.split('&').enumerate() {
+        if index > 0 {
+            query.push('&');
+        }
+        let (name, value) = pair
+            .split_once('=')
+            .map_or((pair, None), |(n, v)| (n, Some(v)));
+        let (safe_name, name_had_link) = sanitize_source_segment(name);
+        if name_had_link {
+            push_redaction_reason(reasons, "embedded link");
+        }
+        query.push_str(&safe_name);
+        if let Some(raw_value) = value {
+            query.push('=');
+            // Decode only for classification; keep the original name
+            // and non-secret value spelling in the safe projection.
+            let decoded_name = url::form_urlencoded::parse(pair.as_bytes())
+                .next()
+                .map(|(name, _)| name)
+                .unwrap_or_default();
+            if is_credential_query_param(&decoded_name) {
+                push_redaction_reason(reasons, "secret query values");
+                query.push_str("[redacted]");
+            } else {
+                let (safe_value, value_had_link) = sanitize_source_segment(raw_value);
+                if value_had_link {
+                    push_redaction_reason(reasons, "embedded link");
                 }
+                query.push_str(&safe_value);
             }
-        })
-        .collect::<Vec<_>>()
-        .join("&")
+        }
+    }
+    query
 }
 
 fn push_redaction_reason(reasons: &mut Vec<&'static str>, reason: &'static str) {

@@ -25,12 +25,21 @@ use sqlx::{postgres::PgRow, Pool, Postgres, Row};
 use two_bot_core::{
     analytics_family::AnalyticsCategory,
     membership::{
-        advance_observation, is_membership, project, set_observation, valid_observation,
-        Membership, MembershipStore,
+        advance_observation, is_membership, set_observation, valid_observation, Membership,
+        MembershipProjection, MembershipStore,
     },
     metrics, EventType, FunnelEvent, FunnelStore, RecordOutcome, Snowflake, StoredRow,
     MESSAGE_RUNGS,
 };
+
+/// Membership projected across TOP-25 keyset pages. `truncated` means the
+/// first page did not contain the whole history; the membership itself is
+/// complete, including evidence in later pages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MembershipPage {
+    pub membership: Membership,
+    pub truncated: bool,
+}
 
 /// Postgres-backed [`FunnelStore`].
 ///
@@ -59,6 +68,26 @@ impl PgFunnelStore {
     #[must_use]
     pub fn pool(&self) -> &Pool<Postgres> {
         &self.pool
+    }
+
+    /// Full membership with a fixed-vocabulary receipt for a multi-page read.
+    /// SQL holds at most TOP-25 rows plus one lookahead; the chronological
+    /// fold keeps constant state and never silently drops older evidence.
+    pub fn membership_paged(
+        &self,
+        guild_id: Snowflake,
+        member_id: Snowflake,
+    ) -> Option<MembershipPage> {
+        match crate::retry::block_on_retry(&self.handle, || {
+            fetch_membership_paged(&self.pool, guild_id, member_id)
+        }) {
+            Ok(page) => page,
+            Err(error) => {
+                metrics::global().db_error("other");
+                tracing::warn!(error = %error, "funnel membership degraded to None after retries");
+                None
+            }
+        }
     }
 
     /// Fallible append + projection for async callers. The sync core seam
@@ -268,6 +297,51 @@ async fn advance_duplicate(
         }
     }
     Ok(RecordOutcome { inserted: false })
+}
+
+async fn fetch_membership_paged(
+    pool: &Pool<Postgres>,
+    guild_id: Snowflake,
+    member_id: Snowflake,
+) -> Result<Option<MembershipPage>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    // One snapshot across pages: a reconfirmation cannot move observation
+    // evidence while the fold is crossing the page boundary.
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    let mut after = None::<i64>;
+    let mut projection = MembershipProjection::default();
+    let mut truncated = false;
+    loop {
+        let rows = sqlx::query(
+            "SELECT id, event_type, member_id, guild_id,
+                    to_char(occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS occurred_at,
+                    source, metadata, idempotency_key
+             FROM events WHERE guild_id = $1 AND member_id = $2
+               AND ($3::bigint IS NULL OR id > $3)
+             ORDER BY id LIMIT 26",
+        )
+        .bind(snowflake_text(guild_id))
+        .bind(snowflake_text(member_id))
+        .bind(after)
+        .fetch_all(&mut *tx)
+        .await?;
+        let more = rows.len() > 25;
+        truncated |= more;
+        for row in rows.iter().take(25) {
+            projection.observe(&stored_row(row)?);
+            after = Some(row.try_get("id")?);
+        }
+        if !more {
+            break;
+        }
+    }
+    tx.commit().await?;
+    Ok(projection.finish().map(|membership| MembershipPage {
+        membership,
+        truncated,
+    }))
 }
 
 /// Read back one member's event rows with microsecond UTC ISO text. The
@@ -657,24 +731,8 @@ impl FunnelStore for PgFunnelStore {
 /// [`FunnelStore::record`].
 impl MembershipStore for PgFunnelStore {
     fn membership(&self, guild_id: Snowflake, member_id: Snowflake) -> Option<Membership> {
-        let rows = match crate::retry::block_on_retry(&self.handle, || {
-            fetch_member_rows(&self.pool, guild_id, member_id)
-        }) {
-            Ok(rows) => rows,
-            Err(error) => {
-                metrics::global().db_error("other");
-                tracing::warn!(
-                    error = %error,
-                    "funnel membership degraded to None after retries"
-                );
-                // Fail closed as unknown: `None` is what a never-seen member
-                // reads (`project` over zero rows), so consumers take the
-                // new-member path instead of acting on a fabricated
-                // membership.
-                return None;
-            }
-        };
-        project(rows.iter())
+        self.membership_paged(guild_id, member_id)
+            .map(|page| page.membership)
     }
 
     fn membership_rows(&self, guild_id: Snowflake, member_id: Snowflake) -> Vec<StoredRow> {

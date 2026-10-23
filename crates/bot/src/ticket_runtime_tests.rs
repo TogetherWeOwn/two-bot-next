@@ -180,6 +180,69 @@ fn malformed_panel_rows_are_counted_without_echoing_content() {
     assert!(panel_isolated_count_for_test() > before);
 }
 
+#[test]
+fn open_retry_backoff_doubles_to_the_hourly_cap() {
+    assert_eq!(open_retry_backoff(0), Duration::from_secs(300));
+    assert_eq!(open_retry_backoff(1), Duration::from_secs(600));
+    assert_eq!(open_retry_backoff(2), Duration::from_secs(1200));
+    assert_eq!(open_retry_backoff(3), Duration::from_secs(2400));
+    assert_eq!(open_retry_backoff(4), Duration::from_secs(3600));
+    assert_eq!(open_retry_backoff(u32::MAX), Duration::from_secs(3600));
+    // The first step is exactly one recovery cadence: an immediate
+    // recover/Ready burst at the same clock reading replays nothing, and the
+    // next periodic pass is already eligible.
+    assert_eq!(open_retry_backoff(0), RECOVERY_CADENCE);
+}
+
+#[test]
+fn open_retry_bounds_match_the_acceptance_envelope() {
+    // Pinned against the protected retry acceptance envelope: retention is
+    // finite but never discards every failure, and one pass never spends
+    // more than the per-pass work cap on retries.
+    assert_eq!(OPEN_RETRY_RETAINED_CAP, 128);
+    assert_eq!(OPEN_RETRY_PER_PASS_CAP, 64);
+    // Const context: clippy `assertions_on_constants` rejects this as a
+    // runtime assert, and a cap edited out of order fails the build here.
+    const _: () = {
+        assert!(OPEN_RETRY_PER_PASS_CAP <= OPEN_RETRY_RETAINED_CAP);
+    };
+}
+
+#[test]
+fn open_retry_reasons_are_bounded_machine_tokens() {
+    use two_bot_cutover::tickets::StoreError;
+    let failures = [
+        Failure::Store(StoreError::NotFound),
+        Failure::Store(StoreError::InvalidRow("status")),
+        Failure::Store(StoreError::Domain(
+            two_bot_core::tickets::TicketError::AlreadyClaimed,
+        )),
+        Failure::Rest(DiscordError::Timeout),
+        Failure::Rest(DiscordError::RateLimited),
+        Failure::Rest(DiscordError::Rejected("rejected".into())),
+        Failure::Rest(DiscordError::Unavailable("unavailable".into())),
+        Failure::InvalidEvidence,
+        Failure::Timeout,
+        Failure::LaneBusy,
+        Failure::NoTicket,
+        Failure::TicketClaimedBy("1".into()),
+        Failure::TicketNotOpen,
+    ];
+    for failure in failures {
+        let reason = open_retry_reason(&failure);
+        assert!(
+            !reason.is_empty()
+                && reason.len() <= 64
+                && reason
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+            "bounded machine token: {reason:?}"
+        );
+    }
+    // Database failures reuse the shared `db_cause` vocabulary, whose own
+    // token shape is pinned in `two_bot_core::error_chain` tests.
+}
+
 #[tokio::test]
 async fn ticket_history_fetches_all_pages_and_keeps_attachments_and_total_count() {
     let first: Vec<_> = (901..=1000).rev().map(message).collect();
