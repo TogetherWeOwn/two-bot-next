@@ -667,6 +667,333 @@ mod database {
         assert!(failures.is_empty(), "{chain}: compatible partial schemas without defaults must migrate, preserve named data and refuse every omitted-holder INSERT with NOT NULL SQLSTATE 23502: {failures:#?}");
     }
 
+    async fn holder_type_catalog(pool: &PgPool) -> Value {
+        // information_schema.column_default does not expose domain fallbacks.
+        // Include raw type identities/defaults and domain CHECKs, as well as the
+        // ordinary catalog, so refusal cannot silently coerce or rewrite them.
+        sqlx::query_scalar(
+            "SELECT jsonb_build_object(
+             'registry', $1::jsonb,
+             'attributes', (SELECT jsonb_agg(jsonb_build_object(
+                 'name', a.attname, 'type_oid', a.atttypid, 'type', format_type(a.atttypid, a.atttypmod),
+                 'typmod', a.atttypmod, 'not_null', a.attnotnull, 'has_default', a.atthasdef,
+                 'identity', a.attidentity, 'generated', a.attgenerated, 'collation', a.attcollation,
+                 'default', pg_get_expr(d.adbin, d.adrelid)) ORDER BY a.attnum)
+                 FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum
+                 WHERE a.attrelid='admin_api_tokens'::regclass AND a.attnum>0 AND NOT a.attisdropped),
+             'domains', (SELECT jsonb_agg(to_jsonb(t) ORDER BY t.typname) FROM pg_type t
+                 WHERE t.typnamespace='public'::regnamespace AND t.typtype='d'),
+             'domain_constraints', (SELECT jsonb_agg(jsonb_build_object(
+                 'catalog', to_jsonb(c), 'definition', pg_get_constraintdef(c.oid)) ORDER BY c.contypid, c.conname)
+                 FROM pg_constraint c JOIN pg_type t ON t.oid=c.contypid
+                 WHERE t.typnamespace='public'::regnamespace AND t.typtype='d'))",
+        )
+        .bind(catalog(pool).await)
+        .fetch_one(pool)
+        .await
+        .expect("snapshot holder types, domain definitions and migration history")
+    }
+
+    async fn admin_omission_probes(pool: &PgPool) -> Vec<(&'static str, String)> {
+        let mut probes = Vec::new();
+        clear(pool).await;
+        // Real omitted-column INSERTs, not jsonb_populate_record (which supplies
+        // NULL instead of invoking a default). Every probe requests admin scope.
+        for (name, statement) in [
+            ("holder_kind omitted", "INSERT INTO admin_api_tokens (token_id, secret_hash, scopes, guild_ids, label, issued_by, holder_id, issued_at, expires_at) VALUES ($1, $2, '{admin}', '{1}', 'domain-probe', 'fixture-issuer', 'fixture-explicit-principal', $3::timestamptz, $4::timestamptz) RETURNING to_jsonb(admin_api_tokens)"),
+            ("holder_id omitted", "INSERT INTO admin_api_tokens (token_id, secret_hash, scopes, guild_ids, label, issued_by, holder_kind, issued_at, expires_at) VALUES ($1, $2, '{admin}', '{1}', 'domain-probe', 'fixture-issuer', 'human', $3::timestamptz, $4::timestamptz) RETURNING to_jsonb(admin_api_tokens)"),
+            ("both omitted", "INSERT INTO admin_api_tokens (token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at) VALUES ($1, $2, '{admin}', '{1}', 'domain-probe', 'fixture-issuer', $3::timestamptz, $4::timestamptz) RETURNING to_jsonb(admin_api_tokens)"),
+        ] {
+            let hash = row()["secret_hash"].as_str().expect("fixture hash").to_owned();
+            let result: Result<Value, _> = sqlx::query_scalar(statement)
+                .bind(TOKEN)
+                .bind(hash)
+                .bind(ISSUED)
+                .bind(NINETY_DAYS)
+                .fetch_one(pool)
+                .await;
+            let outcome = match result {
+                Ok(actual) => format!(
+                    "ACCEPTED fabricated admin: holder_id={}, holder_kind={}, scopes={}",
+                    actual["holder_id"], actual["holder_kind"], actual["scopes"]
+                ),
+                Err(error) => error
+                    .as_database_error()
+                    .and_then(|error| error.code())
+                    .map(|code| code.into_owned())
+                    .unwrap_or_else(|| "non-database failure".to_owned()),
+            };
+            // Prevent duplicate-token failures from masquerading as refusal.
+            clear(pool).await;
+            probes.push((name, outcome));
+        }
+        probes
+    }
+
+    async fn domain_holder_defaults_refuse_atomically(chain: &str, shipped: i64) {
+        let Some(url) = bootstrap() else { return };
+        let (prefix, latest) = pre_repair_migrators(chain, shipped).await;
+        let mut failures = Vec::new();
+        for (name, has_id, has_kind, domain_id, domain_kind) in [
+            ("id domain, kind absent", true, false, true, false),
+            ("kind domain, id absent", false, true, false, true),
+            ("id domain, plain kind", true, true, true, false),
+            ("plain id, kind domain", true, true, false, true),
+            ("both domains", true, true, true, true),
+        ] {
+            for populated in [false, true] {
+                let db = TestDatabase::create(&url, &prefix)
+                    .await
+                    .expect("create pre-repair domain-default fixture");
+                for (column, present, domain, literal, predicate) in [
+                    (
+                        "holder_id",
+                        has_id,
+                        domain_id,
+                        "'fixture-domain-principal'",
+                        "VALUE <> ''",
+                    ),
+                    (
+                        "holder_kind",
+                        has_kind,
+                        domain_kind,
+                        "'human'",
+                        "VALUE IN ('human', 'ai_agent')",
+                    ),
+                ] {
+                    if !present {
+                        continue;
+                    }
+                    let type_name = if domain {
+                        let type_name = format!("fixture_{column}_domain");
+                        sqlx::query(sqlx::AssertSqlSafe(format!(
+                            "CREATE DOMAIN {type_name} AS pg_catalog.text DEFAULT {literal} CONSTRAINT {type_name}_valid CHECK ({predicate})"
+                        )))
+                        .execute(db.pool()).await.expect("create valid default-bearing text domain");
+                        type_name
+                    } else {
+                        "pg_catalog.text".to_owned()
+                    };
+                    let nullability = if populated { "NOT NULL" } else { "" };
+                    sqlx::query(sqlx::AssertSqlSafe(format!(
+                        "ALTER TABLE admin_api_tokens ADD COLUMN {column} {type_name} {nullability}"
+                    )))
+                    .execute(db.pool())
+                    .await
+                    .expect("install holder without a column default");
+                }
+                let column_defaults: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM pg_attribute a WHERE a.attrelid='admin_api_tokens'::regclass
+                     AND a.attname IN ('holder_id', 'holder_kind') AND (a.atthasdef OR EXISTS (
+                         SELECT 1 FROM pg_attrdef d WHERE d.adrelid=a.attrelid AND d.adnum=a.attnum))",
+                ).fetch_one(db.pool()).await.expect("inspect raw column-default metadata");
+                let domain_defaults: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM pg_attribute a JOIN pg_type t ON t.oid=a.atttypid
+                     WHERE a.attrelid='admin_api_tokens'::regclass AND a.attname IN ('holder_id', 'holder_kind')
+                     AND t.typtype='d' AND t.typbasetype='pg_catalog.text'::regtype
+                     AND t.typdefault IS NOT NULL AND t.typdefaultbin IS NOT NULL",
+                ).fetch_one(db.pool()).await.expect("inspect independent domain-default metadata");
+                assert_eq!(
+                    column_defaults, 0,
+                    "fixture must bypass an atthasdef-only guard"
+                );
+                assert_eq!(
+                    domain_defaults,
+                    i64::from(domain_id) + i64::from(domain_kind)
+                );
+                if populated {
+                    let mut human = row();
+                    human["holder_kind"] = json!("human");
+                    human["scopes"] = json!(["admin"]);
+                    insert(db.pool(), &human)
+                        .await
+                        .expect("insert otherwise valid named human admin fixture");
+                }
+                let before_rows = registry_rows(db.pool()).await;
+                let before_catalog = holder_type_catalog(db.pool()).await;
+                let result = latest.run(db.pool()).await;
+                // All preservation evidence precedes cleanup and bypass probes.
+                let after_rows = registry_rows(db.pool()).await;
+                let after_catalog = holder_type_catalog(db.pool()).await;
+                let omissions = if result.is_ok() {
+                    admin_omission_probes(db.pool()).await
+                } else {
+                    Vec::new()
+                };
+                db.close().await.expect("drop owned domain-default fixture");
+                if result.is_ok() || after_rows != before_rows || after_catalog != before_catalog {
+                    failures.push(format!(
+                        "{name}, populated={populated}: refused={}, rows_preserved={}, types_domains_catalog_history_preserved={}, admin_omissions={omissions:?}",
+                        result.is_err(), after_rows == before_rows, after_catalog == before_catalog
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{chain}: domain fallbacks must refuse before authority DDL; never fabricate holders, coerce types, drop defaults or rewrite domains/constraints/history: {failures:#?}");
+    }
+
+    async fn noncanonical_holder_types_refuse_atomically(chain: &str, shipped: i64) {
+        let Some(url) = bootstrap() else { return };
+        let (prefix, latest) = pre_repair_migrators(chain, shipped).await;
+        let mut failures = Vec::new();
+        // The supported boundary is exact pg_catalog.TEXT, not arbitrary domain
+        // or varchar support/conversion. No-default domains must refuse too.
+        for column in ["holder_id", "holder_kind"] {
+            for type_name in ["fixture_no_default_domain", "pg_catalog.varchar(80)"] {
+                for populated in [false, true] {
+                    let db = TestDatabase::create(&url, &prefix)
+                        .await
+                        .expect("create noncanonical holder-type fixture");
+                    sqlx::query("CREATE DOMAIN fixture_no_default_domain AS pg_catalog.text CONSTRAINT fixture_nonempty CHECK (VALUE <> '')")
+                        .execute(db.pool()).await.expect("create domain without any default");
+                    for field in ["holder_id", "holder_kind"] {
+                        let selected = if column == field {
+                            type_name
+                        } else {
+                            "pg_catalog.text"
+                        };
+                        sqlx::query(sqlx::AssertSqlSafe(format!(
+                            "ALTER TABLE admin_api_tokens ADD COLUMN {field} {selected}"
+                        )))
+                        .execute(db.pool())
+                        .await
+                        .expect("install noncanonical holder and plain peer");
+                    }
+                    let defaults: i64 = sqlx::query_scalar(
+                        "SELECT count(*) FROM pg_attribute a JOIN pg_type t ON t.oid=a.atttypid
+                         WHERE a.attrelid='admin_api_tokens'::regclass AND a.attname IN ('holder_id', 'holder_kind')
+                         AND (a.atthasdef OR t.typdefault IS NOT NULL OR t.typdefaultbin IS NOT NULL)",
+                    ).fetch_one(db.pool()).await.expect("verify no column or type defaults");
+                    assert_eq!(
+                        defaults, 0,
+                        "no-default type fixture is independent of the domain fallback"
+                    );
+                    if populated {
+                        insert(db.pool(), &row())
+                            .await
+                            .expect("insert named AI non-admin control");
+                    }
+                    let before_rows = registry_rows(db.pool()).await;
+                    let before_catalog = holder_type_catalog(db.pool()).await;
+                    let result = latest.run(db.pool()).await;
+                    let after_rows = registry_rows(db.pool()).await;
+                    let after_catalog = holder_type_catalog(db.pool()).await;
+                    db.close().await.expect("drop noncanonical holder fixture");
+                    if result.is_ok()
+                        || before_rows != after_rows
+                        || before_catalog != after_catalog
+                    {
+                        failures.push(format!("{column} {type_name}, populated={populated}: refused={}, rows_preserved={}, catalog_preserved={}", result.is_err(), before_rows == after_rows, before_catalog == after_catalog));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{chain}: noncanonical no-default holder types must refuse atomically, not be coerced or silently supported: {failures:#?}");
+    }
+
+    async fn plain_text_holder_type_controls(chain: &str, shipped: i64) {
+        let Some(url) = bootstrap() else { return };
+        let (prefix, latest) = pre_repair_migrators(chain, shipped).await;
+        let mut failures = Vec::new();
+        for (has_id, has_kind) in [(false, false), (true, false), (false, true), (true, true)] {
+            // Populated partials with an absent holder cannot satisfy NOT NULL;
+            // those refusals are covered elsewhere. Both named types do survive.
+            for populated in [false, true] {
+                if populated && (!has_id || !has_kind) {
+                    continue;
+                }
+                let db = TestDatabase::create(&url, &prefix)
+                    .await
+                    .expect("create exact-TEXT positive control");
+                for (column, present) in [("holder_id", has_id), ("holder_kind", has_kind)] {
+                    if present {
+                        sqlx::query(sqlx::AssertSqlSafe(format!(
+                            "ALTER TABLE admin_api_tokens ADD COLUMN {column} pg_catalog.text"
+                        )))
+                        .execute(db.pool())
+                        .await
+                        .expect("install plain no-default holder");
+                    }
+                }
+                if populated {
+                    for (token, kind, scopes) in [
+                        (TOKEN, "human", json!(["admin"])),
+                        (
+                            "adm_fedcba9876543210",
+                            "ai_agent",
+                            json!(["read", "moderate"]),
+                        ),
+                    ] {
+                        let mut valid = row();
+                        valid["token_id"] = json!(token);
+                        valid["secret_hash"] =
+                            json!(hex::encode(sha2::Sha256::digest(token.as_bytes())));
+                        valid["holder_kind"] = json!(kind);
+                        valid["scopes"] = scopes;
+                        insert(db.pool(), &valid)
+                            .await
+                            .expect("insert explicit named positive control");
+                    }
+                }
+                let before_rows = registry_rows(db.pool()).await;
+                let result = latest.run(db.pool()).await;
+                let after_rows = registry_rows(db.pool()).await;
+                let canonical: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM pg_attribute a WHERE a.attrelid='admin_api_tokens'::regclass
+                     AND a.attname IN ('holder_id', 'holder_kind') AND a.atttypid='pg_catalog.text'::regtype
+                     AND a.atttypmod=-1 AND a.attnotnull AND NOT a.atthasdef AND NOT EXISTS (
+                         SELECT 1 FROM pg_attrdef d WHERE d.adrelid=a.attrelid AND d.adnum=a.attnum)",
+                ).fetch_one(db.pool()).await.expect("verify exact TEXT without defaults after repair");
+                let omissions = if result.is_ok() {
+                    admin_omission_probes(db.pool()).await
+                } else {
+                    Vec::new()
+                };
+                let writes = if result.is_ok() {
+                    authority_write_probes(db.pool()).await
+                } else {
+                    Vec::new()
+                };
+                db.close().await.expect("drop plain TEXT positive control");
+                if result.is_err()
+                    || before_rows != after_rows
+                    || canonical != 2
+                    || omissions.len() != 3
+                    || omissions.iter().any(|(_, state)| state != "23502")
+                    || !writes.is_empty()
+                {
+                    failures.push(format!("id={has_id}, kind={has_kind}, populated={populated}: migrated={}, rows_preserved={}, canonical={canonical}, admin_omissions={omissions:?}, writes={writes:?}", result.is_ok(), before_rows == after_rows));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{chain}: absent or plain TEXT no-default holders must migrate, preserve explicit human-admin/AI-nonadmin rows and refuse omitted authority with NOT NULL 23502: {failures:#?}");
+    }
+
+    #[tokio::test]
+    async fn cutover_domain_holder_defaults_refuse_atomically() {
+        domain_holder_defaults_refuse_atomically("cutover", 456).await;
+    }
+    #[tokio::test]
+    async fn store_domain_holder_defaults_refuse_atomically() {
+        domain_holder_defaults_refuse_atomically("store", 457).await;
+    }
+    #[tokio::test]
+    async fn cutover_noncanonical_holder_types_refuse_atomically() {
+        noncanonical_holder_types_refuse_atomically("cutover", 456).await;
+    }
+    #[tokio::test]
+    async fn store_noncanonical_holder_types_refuse_atomically() {
+        noncanonical_holder_types_refuse_atomically("store", 457).await;
+    }
+    #[tokio::test]
+    async fn cutover_plain_text_holder_type_controls() {
+        plain_text_holder_type_controls("cutover", 456).await;
+    }
+    #[tokio::test]
+    async fn store_plain_text_holder_type_controls() {
+        plain_text_holder_type_controls("store", 457).await;
+    }
+
     const AUTHORITY_CHECKS: [(&str, &str); 4] = [
         ("admin_api_tokens_holder_named", "holder_id <> ''"),
         ("admin_api_tokens_holder_kind_closed", "holder_kind <> ''"),
