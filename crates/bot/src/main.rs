@@ -705,7 +705,7 @@ async fn run(cli_args: &[String]) {
                         // capture stays disabled, exactly like the flag being off.
                         if let Err(error) = pipeline.enable_community_facts(pool.clone()) {
                             tracing::warn!(
-                                error = %error,
+                                reason = %error,
                                 "community facts arming refused; capture disabled"
                             );
                         }
