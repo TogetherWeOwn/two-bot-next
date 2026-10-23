@@ -116,17 +116,10 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(slot.name, 'slot-0')
 
     def test_guard_stops_growth_and_retains_lease(self):
-        self.policy['slot_budget_bytes'] = 24 * 1024
-        self.save_policy()
-        self.fake.write_text('#!' + sys.executable + '\n'
-                             'import os,time,pathlib\n'
-                             'p=pathlib.Path(os.environ["CARGO_TARGET_DIR"])/"growing"\n'
-                             'with p.open("wb", buffering=0) as f:\n'
-                             ' while True: f.write(b"x"*4096); time.sleep(.05)\n')
-        with self.assertRaisesRegex(cache.Refusal, 'sampled byte budget'):
-            cache.run_cargo(self.pool, ['check'], cargo=str(self.fake), interval=.01)
-        self.assertTrue((self.pool / 'slot-0' / 'lease.json').exists())
-        self.assertLessEqual(cache.usage(self.pool / 'slot-0' / 'target'), 32 * 1024)
+        self.assert_growth_stopped('target', sampler_delay=0)
+
+    def test_target_growth_is_stopped_with_delayed_sampler(self):
+        self.assert_growth_stopped('target', sampler_delay=.40)
 
     def test_crash_sentinel_is_not_stolen(self):
         for slot in self.pool.glob('slot-*'):
@@ -249,15 +242,18 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(list(external.iterdir()), [])
 
     def test_scratch_growth_is_counted_and_stopped(self):
-        self.assert_scratch_growth_stopped(sampler_delay=0)
+        self.assert_growth_stopped('scratch', sampler_delay=0)
 
     def test_scratch_growth_is_stopped_with_delayed_sampler(self):
-        self.assert_scratch_growth_stopped(sampler_delay=.35)
+        self.assert_growth_stopped('scratch', sampler_delay=.35)
 
-    def assert_scratch_growth_stopped(self, sampler_delay):
-        # Catch missing scratch accounting/refusal and leader-only/no-op stops.
+    def assert_growth_stopped(self, growth_area, sampler_delay):
+        # Catch missing target/scratch accounting, refusal and full-group stop.
+        # Each case grows only one tree, independently of the other's accounting.
         # The writer grants one bounded burst, not a scheduler-dependent rate:
         # a sampled guard promises termination, not a hard overshoot ceiling.
+        growth_env = {'target': 'CARGO_TARGET_DIR', 'scratch': 'TMPDIR'}[growth_area]
+        idle_area = 'scratch' if growth_area == 'target' else 'target'
         self.policy['slot_budget_bytes'] = 32 * 1024
         self.save_policy()
         self.fake.write_text('#!' + sys.executable + '\n'
@@ -266,7 +262,7 @@ class CacheTests(unittest.TestCase):
                              ' signal.signal(signal.SIGTERM, lambda *_: None)\n'
                              ' writer=subprocess.Popen([sys.executable,__file__,"--writer"])\n'
                              ' sys.exit(writer.wait(timeout=40))\n'
-                             'p=pathlib.Path(os.environ["TMPDIR"])/"growing"\n'
+                             f'p=pathlib.Path(os.environ[{growth_env!r}])/"growing"\n'
                              'print("ready", flush=True)\n'
                              'for _ in range(3):\n'
                              ' if not select.select([sys.stdin],[],[],10)[0]: break\n'
@@ -302,7 +298,7 @@ class CacheTests(unittest.TestCase):
 
         def read_reply(child):
             self.assertTrue(select.select([child.stdout], [], [], 10)[0],
-                            'scratch writer did not acknowledge the command')
+                            f'{growth_area} writer did not acknowledge the command')
             return child.stdout.readline()
 
         grew = False
@@ -331,15 +327,16 @@ class CacheTests(unittest.TestCase):
             with self.assertRaisesRegex(cache.Refusal, 'sampled byte budget'):
                 cache.run_cargo(self.pool, ['check'], cargo=str(self.fake), interval=.01)
         slot = self.pool / 'slot-0'
-        growing = slot / 'scratch' / 'growing'
-        self.assertTrue(grew, 'refusal must follow real scratch growth, not admission')
+        growing = slot / growth_area / 'growing'
+        self.assertTrue(grew, f'refusal must follow real {growth_area} growth, not admission')
         self.assertEqual(growing.read_bytes(), b'x' * 65536)
         allocated = growing.stat().st_blocks * 512
         self.assertGreaterEqual(allocated, 65536)
+        self.assertGreaterEqual(cache.usage(slot / growth_area), allocated)
         self.assertGreaterEqual(cache.usage(slot), allocated)
         self.assertGreater(cache.usage(slot), self.policy['slot_budget_bytes'] - 1)
         self.assertTrue((slot / 'lease.json').exists())
-        self.assertEqual(list((slot / 'target').iterdir()), [])
+        self.assertEqual(list((slot / idle_area).iterdir()), [])
         child = children[0]
         # Both leader and descendant hold these pipes. A surviving writer can
         # accept this command and append another block even if Cargo is dead.
