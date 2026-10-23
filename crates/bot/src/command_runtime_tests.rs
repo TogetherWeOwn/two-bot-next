@@ -3405,6 +3405,8 @@ fn production_router_matches_composed_production_wiring() {
             HandlerId::FeedAdd,
             HandlerId::FeedRemove,
             HandlerId::FeedList,
+            HandlerId::PurgePreview,
+            HandlerId::ChannelInspect,
         ];
         ids.extend(ModerationAction::ALL.map(HandlerId::Moderation));
         ids
