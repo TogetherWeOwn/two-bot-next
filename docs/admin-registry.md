@@ -64,18 +64,20 @@ collations remain compatible; collations are never rewritten. Compatible plain-T
 partial schemas without defaults may upgrade: missing columns are added without
 defaults, made NOT NULL, and checked with validated constraints. Before any registry DDL, all four named
 authority constraints are compared with canonical CHECK expressions parsed on
-that server using an empty transaction-local reference table (dropped on commit).
+that server using an empty ordinary reference table in the locked registry's own
+schema. The existing schema CREATE privilege suffices; database TEMPORARY is not
+required and no privileges are granted. The helper is dropped before registry
+ALTER statements, within the same SQLx file transaction. Failure rolls back helper,
+registry and history changes; success leaves no helper. A helper-name collision
+refuses without replacing or removing the pre-existing object.
 A same-name constraint with a different expression, a different constraint kind
 or NO INHERIT refuses atomically; VALIDATE alone cannot strengthen a weak CHECK.
 Exact canonical pre-existing checks are accepted, including NOT VALID checks
 that are then validated. Equivalent but noncanonical expressions may refuse
 conservatively rather than silently replacing authority. Guarded creation lets
 either chain run first and the other repeat the DDL without changing valid rows,
-existing constraint identities or migration history. Creating the empty reference
-requires the migration principal's existing TEMPORARY privilege on the database;
-a missing privilege refuses the migration, not permission to grant it here. Run
-each file through SQLx's normal per-file transaction, not both files inside one
-ad hoc outer transaction with the same temporary reference still present.
+existing constraint identities or migration history. Run each file through SQLx's
+normal per-file transaction; do not execute individual statements outside it.
 
 Any existing historical row lacks a named holder. The upgrade therefore aborts
 atomically, preserving the original rows, schema and migration history. It does
@@ -128,7 +130,10 @@ holder-type and nondeterministic-collation refusal with raw type/domain/catalog/
 preservation, uppercase-kind admin INSERT probes, compatible
 plain-TEXT no-default upgrades, actual admin-scope omitted-holder INSERTs,
 exact 90-day positives, malformed authority, AI admin, invalid updates and
-nonfinite/overlong lifetimes. Existing backup roundtrip, erasure
+nonfinite/overlong lifetimes. Both-chain no-TEMP controls use a verified restricted
+LOGIN without effective TEMPORARY or privileged memberships: empty/canonical
+upgrades, genuine authority refusal with unchanged rows/catalog/history, mirrored
+convergence and no helper residue. Existing backup roundtrip, erasure
 schema coverage and cross-chain convergence suites remain required regressions.
 Follow [contribution test-database rules](../CONTRIBUTING.md#database-tests) and
 [controller build rules](../AGENTS.md#controller-builds); never test or migrate

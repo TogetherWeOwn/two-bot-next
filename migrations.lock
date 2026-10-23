@@ -498,12 +498,12 @@
       "justification": "Giveaways slice 1: additive IF NOT EXISTS definitions, entries and draws with composite foreign keys. Renumbered only the unmerged pair to cutover 0460/store 0461 after main claimed 0458/0459 for starboard. Never merged or deployed under earlier numbers; SQL body unchanged; only migration-number comments changed."
     },
     "crates/cutover/migrations/0462_admin_api_token_authority.sql": {
-      "sha256": "e64b9dd3eaab2800f7c46c1d00f1b94ebba9a500f3794c824f659ebca4d77755",
-      "justification": "Forward-only named-holder, human-only admin and bounded 90-day authority repair; renumber unmerged 0460 to 0462 after main claimed 0460/0461 for giveaways. Before first merge, refuse nondeterministic holder collations under lock as well as defaults, noncanonical types and CHECK definitions. Preserve authority and all failed-upgrade data/catalog/history without rewriting collations, coercion, issuance or grants; binary-only backout retains constraints."
+      "sha256": "31b3200528475ddc62a1d3ed48789ea4127d6422756ff11b42661166eb0649ac",
+      "justification": "Forward-only named-holder, human-only admin and bounded 90-day authority repair; renumber unmerged 0460 to 0462 after main claimed 0460/0461 for giveaways. Before first merge, refuse nondeterministic holder collations under lock as well as defaults, noncanonical types and CHECK definitions. Preserve authority and all failed-upgrade data/catalog/history without rewriting collations, coercion, issuance or grants; binary-only backout retains constraints. Before first merge, remove the unsupported TEMPORARY prerequisite: create an empty same-server canonical CHECK reference in the registry schema using existing CREATE, then drop it within the file transaction; collisions refuse, failure rolls back, and no helper or new grant persists."
     },
     "crates/store/migrations/0463_admin_api_token_authority.sql": {
-      "sha256": "c5a05b5f2421ed06b47975ea060a07f0ce887a6a6ef790b83b856ddc3ecab871",
-      "justification": "Forward-only named-holder, human-only admin and bounded 90-day authority repair; renumber unmerged 0461 to 0463 after main claimed 0460/0461 for giveaways. Before first merge, refuse nondeterministic holder collations under lock as well as defaults, noncanonical types and CHECK definitions. Preserve authority and all failed-upgrade data/catalog/history without rewriting collations, coercion, issuance or grants; binary-only backout retains constraints."
+      "sha256": "4b628e43b555d7d4408670ada5a0df31bd8f2982043e0080cb0c3a2ac5678dc4",
+      "justification": "Forward-only named-holder, human-only admin and bounded 90-day authority repair; renumber unmerged 0461 to 0463 after main claimed 0460/0461 for giveaways. Before first merge, refuse nondeterministic holder collations under lock as well as defaults, noncanonical types and CHECK definitions. Preserve authority and all failed-upgrade data/catalog/history without rewriting collations, coercion, issuance or grants; binary-only backout retains constraints. Before first merge, remove the unsupported TEMPORARY prerequisite: create an empty same-server canonical CHECK reference in the registry schema using existing CREATE, then drop it within the file transaction; collisions refuse, failure rolls back, and no helper or new grant persists."
     }
   }
 }
