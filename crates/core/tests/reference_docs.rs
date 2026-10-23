@@ -60,16 +60,16 @@ a required value or an implemented consumer. Secret defaults are never rendered.
   Keys in\n\
   legacy `HOT_WIRED` are labeled “reload-report hot” (the `RefreshReport::hot`\n\
   partition in `settings.rs`); every other storable key reports cold.\n\n\
-Live snapshot consumers at `1643438` (canonical table; ten `live()` call\n\
-sites total: nine across the six non-voice rows below, plus the voice\n\
+Live snapshot consumers (canonical table; eleven `live()` call\n\
+sites total: ten across the six non-voice rows below, plus the voice\n\
 gateway closure):\n\n\
 | Runtime | Call sites | Reads | When |\n\
 | --- | --- | --- | --- |\n\
 | automod | `automod_gateway.rs:211-223`, `:328` | 10 live lists, thresholds, enforce flag (`:116-127`) | every message delivery |\n\
 | feed | `feed_jobs.rs:235-237`, `:266` | `TWO_FEED_POLL_SECONDS` (`:207`), `TWO_ANNOUNCEMENTS` (`:244`) | supervisor cadence + per-tick gates (`:276-327`, `:385-419`) |\n\
 | audit | `audit_runtime.rs:308`, `:438` | 3 mirror destinations (`:60-63`) | every record (`:483`) and sweep (`:497`), once installed |\n\
-| ticket | `ticket_runtime.rs:673-675`, `:1330` | 3 destinations + cooldown (`:228-261`, `:643-658`) | every execute/recovery and purge |\n\
-| self-role | `self_role_handlers.rs:204-211` | `TWO_SELF_ROLE_PANELS` (`:53`) | every dispatch (`:215`, `:300`, `:368`, `:410`) and sweep (`:455-456`) |\n\
+| ticket | `ticket_runtime.rs:671-674`, `:1328` | 3 destinations + cooldown (`:230-258`, `:641-666`) | every execute/recovery and purge; effective ops changes included |\n\
+| self-role | `self_role_handlers.rs:213-219`, `:419-441` | `TWO_SELF_ROLE_PANELS` (`:53`) | every dispatch (`:224`, `:309`, `:377`, `:419`) and sweep (`:472-473`); retirement waits for durable work |\n\
 | gateway classifier | `gateway.rs:834-853`, `:978` | human/welcome channel sets (`:860-877`) | every guild message; classifier + facts sink swap together (`leveling_runtime.rs:766`) |\n\
 | voice | `gateway.rs:2204-2206` closure | empty grace (`voice_rooms.rs:10186`), invite code (`:10234`) | spawn (`:8222-8230`), maintenance (`:3571-3573`), `/invite` (`:14195-14204`) |\n\n\
 The thirty-nine keys in `STORE_READ_KEYS`\n\
@@ -108,15 +108,21 @@ that parked runtime (`crates/bot/src/audit_runtime.rs:137-161`); ticket\n\
 operations apply\n\
 `DISCORD_TICKET_CATEGORY_ID`, `DISCORD_TICKET_PANEL_CHANNEL_ID` and\n\
 `DISCORD_TICKET_STAFF_ROLE_ID` from the snapshot on every execute, recovery\n\
-and purge (`crates/bot/src/ticket_runtime.rs:172-175`, `:457`, `:981`), where a\n\
+and purge (`crates/bot/src/ticket_runtime.rs:700`, `:791`, `:1172`, `:1328`), where a\n\
 malformed row keeps the last good destinations like the audit mirror, and the same\n\
-refresh resolves `TWO_TICKET_COOLDOWN_SECONDS` from the layered snapshot with\n\
-last-good fallback (`crates/bot/src/ticket_runtime.rs:613-638`); the feed poller\n\
+refresh resolves `TWO_TICKET_COOLDOWN_SECONDS` from the effective layered values,\n\
+including ops apply, clearing and expiry without a database revision change, with\n\
+last-good fallback (`crates/bot/src/ticket_runtime.rs:641-666`); the feed poller\n\
 re-checks `TWO_ANNOUNCEMENTS` from the snapshot on every tick and skips while\n\
 a stored `0` stands (`crates/bot/src/feed_jobs.rs:250-267`, `:385-419`); self-role\n\
 dispatch and recovery resolve `TWO_SELF_ROLE_PANELS` from the snapshot on every\n\
 interaction and sweep, falling back to the boot catalogue on absent or unparsable\n\
-rows (`crates/bot/src/self_role_handlers.rs:59-74`, `:215`, `:292`, `:334`, `:379`);\n\
+rows (`crates/bot/src/self_role_handlers.rs:59-83`, `:224`, `:309`, `:377`, `:419`).\n\
+Catalogue edits and deletes refuse while processing, terminal repair or unknown\n\
+exchanges remain; admission rechecks the same snapshot revision under the settings\n\
+writer lock. Drain first, then retry through the settings API. Do not bypass the\n\
+boundary with SQL or change boot catalogues before draining. The independently\n\
+expiring ops overlay cannot set `TWO_SELF_ROLE_PANELS`;\n\
 the gateway funnel applies\n\
 `TWO_COMMUNITY_HUMAN_CHANNEL_IDS` and `TWO_COMMUNITY_WELCOME_CHANNEL_IDS`\n\
 from the snapshot on every guild message, refreshing the channel classifier\n\

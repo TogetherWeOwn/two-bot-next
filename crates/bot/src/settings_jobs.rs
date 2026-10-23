@@ -295,6 +295,10 @@ fn log_applied(report: &RefreshReport) {
 }
 
 #[cfg(test)]
+#[path = "settings_consumer_wiring_tests.rs"]
+mod consumer_wiring_tests;
+
+#[cfg(test)]
 #[path = "settings_jobs_tests.rs"]
 mod tests;
 

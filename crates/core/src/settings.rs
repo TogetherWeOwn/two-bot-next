@@ -346,12 +346,17 @@ pub fn is_storable_key(key: &str) -> bool {
 }
 
 /// True for keys the live reader serves: hot AND hot-wired. Cold,
-/// hot-but-unwired, env-only and unknown keys never reach live readers,
-/// whether they arrive as guild rows or /ops overrides (Slice 0a filters
-/// the override layer with this same predicate).
+/// hot-but-unwired, env-only and unknown keys never reach live readers.
+/// The independently expiring ops layer additionally excludes catalogues
+/// whose retirement must synchronize with durable work in Postgres.
 #[must_use]
 pub fn is_live_key(key: &str) -> bool {
     classify_key(key) == Some(SettingClass::Hot) && HOT_WIRED.contains(&key)
+}
+
+fn is_ops_key(key: &str) -> bool {
+    // An expiring overlay cannot participate in the catalogue's DB drain lock.
+    is_live_key(key) && key != "TWO_SELF_ROLE_PANELS"
 }
 
 /// A refused settings write: the key must stay in the environment.
@@ -583,7 +588,7 @@ impl SettingsCache {
         if !is_storable_key(key) {
             return None;
         }
-        if let Some(value) = self.ops.get(key).filter(|_| is_live_key(key)) {
+        if let Some(value) = self.ops.get(key).filter(|_| is_ops_key(key)) {
             return Some(value);
         }
         self.entries.get(&(guild_id.to_owned(), key.to_owned()))
@@ -610,7 +615,7 @@ impl SettingsCache {
         }
         // Global /ops overrides win over the guild row, verbatim strings.
         for (key, value) in &self.ops {
-            if !is_live_key(key) {
+            if !is_ops_key(key) {
                 continue;
             }
             if let Some(rendered) = to_env_string(value) {
@@ -883,7 +888,7 @@ impl LiveSettingsWriter {
     fn apply_fresh_record(&mut self, record: &OpsRecord, now: Instant) -> OpsApplyOutcome {
         let mut live = HashMap::with_capacity(record.overrides.len());
         for (key, value) in &record.overrides {
-            if is_live_key(key) {
+            if is_ops_key(key) {
                 live.insert(key.to_owned(), Value::String(value.to_owned()));
             }
         }

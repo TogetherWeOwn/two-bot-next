@@ -30,8 +30,8 @@ Keys in
 legacy `HOT_WIRED` are labeled “reload-report hot” (the `RefreshReport::hot`
 partition in `settings.rs`); every other storable key reports cold.
 
-Live snapshot consumers at `1643438` (canonical table; ten `live()` call
-sites total: nine across the six non-voice rows below, plus the voice
+Live snapshot consumers (canonical table; eleven `live()` call
+sites total: ten across the six non-voice rows below, plus the voice
 gateway closure):
 
 | Runtime | Call sites | Reads | When |
@@ -39,8 +39,8 @@ gateway closure):
 | automod | `automod_gateway.rs:211-223`, `:328` | 10 live lists, thresholds, enforce flag (`:116-127`) | every message delivery |
 | feed | `feed_jobs.rs:235-237`, `:266` | `TWO_FEED_POLL_SECONDS` (`:207`), `TWO_ANNOUNCEMENTS` (`:244`) | supervisor cadence + per-tick gates (`:276-327`, `:385-419`) |
 | audit | `audit_runtime.rs:308`, `:438` | 3 mirror destinations (`:60-63`) | every record (`:483`) and sweep (`:497`), once installed |
-| ticket | `ticket_runtime.rs:673-675`, `:1330` | 3 destinations + cooldown (`:228-261`, `:643-658`) | every execute/recovery and purge |
-| self-role | `self_role_handlers.rs:204-211` | `TWO_SELF_ROLE_PANELS` (`:53`) | every dispatch (`:215`, `:300`, `:368`, `:410`) and sweep (`:455-456`) |
+| ticket | `ticket_runtime.rs:671-674`, `:1328` | 3 destinations + cooldown (`:230-258`, `:641-666`) | every execute/recovery and purge; effective ops changes included |
+| self-role | `self_role_handlers.rs:213-219`, `:419-441` | `TWO_SELF_ROLE_PANELS` (`:53`) | every dispatch (`:224`, `:309`, `:377`, `:419`) and sweep (`:472-473`); retirement waits for durable work |
 | gateway classifier | `gateway.rs:834-853`, `:978` | human/welcome channel sets (`:860-877`) | every guild message; classifier + facts sink swap together (`leveling_runtime.rs:766`) |
 | voice | `gateway.rs:2204-2206` closure | empty grace (`voice_rooms.rs:10186`), invite code (`:10234`) | spawn (`:8222-8230`), maintenance (`:3571-3573`), `/invite` (`:14195-14204`) |
 
@@ -80,15 +80,21 @@ that parked runtime (`crates/bot/src/audit_runtime.rs:137-161`); ticket
 operations apply
 `DISCORD_TICKET_CATEGORY_ID`, `DISCORD_TICKET_PANEL_CHANNEL_ID` and
 `DISCORD_TICKET_STAFF_ROLE_ID` from the snapshot on every execute, recovery
-and purge (`crates/bot/src/ticket_runtime.rs:172-175`, `:457`, `:981`), where a
+and purge (`crates/bot/src/ticket_runtime.rs:700`, `:791`, `:1172`, `:1328`), where a
 malformed row keeps the last good destinations like the audit mirror, and the same
-refresh resolves `TWO_TICKET_COOLDOWN_SECONDS` from the layered snapshot with
-last-good fallback (`crates/bot/src/ticket_runtime.rs:613-638`); the feed poller
+refresh resolves `TWO_TICKET_COOLDOWN_SECONDS` from the effective layered values,
+including ops apply, clearing and expiry without a database revision change, with
+last-good fallback (`crates/bot/src/ticket_runtime.rs:641-666`); the feed poller
 re-checks `TWO_ANNOUNCEMENTS` from the snapshot on every tick and skips while
 a stored `0` stands (`crates/bot/src/feed_jobs.rs:250-267`, `:385-419`); self-role
 dispatch and recovery resolve `TWO_SELF_ROLE_PANELS` from the snapshot on every
 interaction and sweep, falling back to the boot catalogue on absent or unparsable
-rows (`crates/bot/src/self_role_handlers.rs:59-74`, `:215`, `:292`, `:334`, `:379`);
+rows (`crates/bot/src/self_role_handlers.rs:59-83`, `:224`, `:309`, `:377`, `:419`).
+Catalogue edits and deletes refuse while processing, terminal repair or unknown
+exchanges remain; admission rechecks the same snapshot revision under the settings
+writer lock. Drain first, then retry through the settings API. Do not bypass the
+boundary with SQL or change boot catalogues before draining. The independently
+expiring ops overlay cannot set `TWO_SELF_ROLE_PANELS`;
 the gateway funnel applies
 `TWO_COMMUNITY_HUMAN_CHANNEL_IDS` and `TWO_COMMUNITY_WELCOME_CHANNEL_IDS`
 from the snapshot on every guild message, refreshing the channel classifier

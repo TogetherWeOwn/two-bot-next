@@ -226,6 +226,55 @@ async fn stored_cooldown_rows_move_the_live_ticket_cooldown_without_restart() {
     mock.shutdown().await;
 }
 
+#[tokio::test]
+async fn ops_cooldown_apply_clear_and_expiry_refresh_without_a_database_revision() {
+    use two_bot_core::settings::{OpsApplyOutcome, OpsRecord, MAX_OPS_STALENESS};
+
+    let mock = MockRest::start(Vec::new(), ScriptedResponse::status(500)).await;
+    let runtime = runtime(&mock);
+    let (mut writer, live) = live_channel();
+    writer.publish(&SettingsSnapshot {
+        revision: 1,
+        rows: vec![],
+    });
+    runtime.refresh_config_with(Some(&live));
+    assert_eq!(runtime.config_for_test().cooldown_seconds, COOLDOWN_SECONDS);
+    let now = std::time::Instant::now();
+    for (epoch, overrides, expected) in [
+        (
+            1,
+            HashMap::from([(COOLDOWN_KEY.to_owned(), "60".to_owned())]),
+            60,
+        ),
+        (2, HashMap::new(), COOLDOWN_SECONDS),
+        (
+            3,
+            HashMap::from([(COOLDOWN_KEY.to_owned(), "30".to_owned())]),
+            30,
+        ),
+    ] {
+        assert!(matches!(
+            writer.apply_ops(Some(&OpsRecord { epoch, overrides }), now),
+            OpsApplyOutcome::Applied { .. }
+        ));
+        assert_eq!(live.revision(), 1, "ops does not move the DB revision");
+        runtime.refresh_config_with(Some(&live));
+        assert_eq!(runtime.config_for_test().cooldown_seconds, expected);
+    }
+    assert_eq!(
+        writer.apply_ops(None, now + MAX_OPS_STALENESS + Duration::from_secs(1)),
+        OpsApplyOutcome::Expired
+    );
+    assert_eq!(live.revision(), 1);
+    runtime.refresh_config_with(Some(&live));
+    assert_eq!(runtime.config_for_test().cooldown_seconds, COOLDOWN_SECONDS);
+    assert!(
+        mock.requests().is_empty(),
+        "refresh needs no REST or DB I/O"
+    );
+    mock.shutdown().await;
+}
+
 #[test]
 fn ordinary_messages_without_optional_components_do_not_block_panel_ensure() {
     let messages = panels(vec![

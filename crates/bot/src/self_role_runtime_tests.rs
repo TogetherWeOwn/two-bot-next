@@ -362,7 +362,43 @@ async fn admission_fresh_reads_recovery_and_both_lease_renewals() -> TestResult 
     result
 }
 
+async fn stale_catalogue_admission_is_ignored_before_rest(pool: &PgPool) -> TestResult {
+    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let clock = Arc::new(AtomicI64::new(NOW));
+    let feature = runtime(pool, &clock, &mock);
+    let request = request(
+        "stale-catalogue",
+        Selection::Button {
+            option_key: "new".into(),
+        },
+    );
+    assert!(matches!(
+        feature
+            .prepare_at_revision(&request, &panel(PanelMode::Button), -1)
+            .await?,
+        Admission::Ignored
+    ));
+    assert!(
+        mock.requests().is_empty(),
+        "retired input is not already being handled"
+    );
+    let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM self_role_audit WHERE event_id=$1")
+        .bind(&request.event_id)
+        .fetch_one(pool)
+        .await?;
+    assert_eq!(count, 0);
+    mock.shutdown().await;
+    Ok(())
+}
+
 async fn exercise(pool: &PgPool) -> TestResult {
+    // The production service's fresh admission shares the settings revision
+    // lock. This fixture has no settings rows/poller, so its boot view is 0.
+    sqlx::raw_sql(
+        "CREATE TABLE guild_settings_revision (singleton BOOLEAN PRIMARY KEY CHECK (singleton), revision BIGINT NOT NULL); INSERT INTO guild_settings_revision VALUES (TRUE, 0)",
+    )
+    .execute(pool)
+    .await?;
     sqlx::raw_sql(include_str!("../../cutover/migrations/0200_self_roles.sql"))
         .execute(pool)
         .await?;
@@ -396,6 +432,7 @@ async fn exercise(pool: &PgPool) -> TestResult {
     ))
     .execute(pool)
     .await?;
+    stale_catalogue_admission_is_ignored_before_rest(pool).await?;
     processing_superseded_before_preparation(pool).await?;
     terminal_restart_repairs_committed_target(pool).await?;
     terminal_restart_refuses_unknown_or_uninitialized_target(pool).await?;

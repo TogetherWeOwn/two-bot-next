@@ -266,6 +266,28 @@ def ignored_test_names(suite):
     return names
 
 
+def tokio_test_names(text):
+    """Collect each Tokio test through intervening trivia, or fail closed.
+
+    Like ignored_test_names this is a source-style scanner, not a Rust parser.
+    Every attribute mark must resolve; unsupported declarations cannot shrink
+    the skip set silently while other ordinary declarations still match.
+    """
+    marks = list(re.finditer(r"^[ \t]*#\[tokio::test\b", text, re.MULTILINE))
+    names = []
+    for mark in marks:
+        line_end = text.find("\n", mark.end())
+        name = None if line_end == -1 else _match_fn_name(text, _skip_trivia(text, line_end + 1))
+        if name is not None:
+            names.append(name)
+    if not marks or len(names) != len(marks) or len(set(names)) != len(names):
+        raise ValueError(
+            f"discovered {len(names)} of {len(marks)} unique Tokio test functions; "
+            "extend the scanner for the unsupported declaration",
+        )
+    return names
+
+
 def skip_blocks_test(skip, name):
     """Whether a cargo `--skip` token blocks a bare test fn `name`.
 
@@ -4329,6 +4351,65 @@ class WorkflowTests(unittest.TestCase):
                         step["run"].index("export TWO_TEST_DATABASE_URL="),
                     )
 
+    def test_invite_saturation_isolation_in_both_lanes(self):
+        suite = "invite_uses_saturation_acceptance"
+        source = (ROOT / f"crates/store/tests/{suite}.rs").read_text(encoding="utf-8")
+        names = set(tokio_test_names(source))
+        for job_name in ("rust-tests", "patch-coverage"):
+            with self.subTest(job=job_name):
+                steps = self.workflows["check.yml"]["jobs"][job_name]["steps"]
+                runs = [
+                    (step, line)
+                    for step in steps
+                    for line in shell_logical_lines(step.get("run", ""))
+                ]
+                sweeps = [
+                    line for _, line in runs
+                    if "--workspace" in line and ("--tests" in line or "--test '*'" in line)
+                    and "--ignored" not in line and "property_" not in line
+                ]
+                self.assertEqual(len(sweeps), 1)
+                skips = set(re.findall(r"--skip (\S+)", sweeps[0]))
+                for name in sorted(names):
+                    with self.subTest(fixture=name):
+                        self.assertIn(name, skips)
+                replays = [(step, line) for step, line in runs if f"--test {suite}" in line]
+                self.assertEqual(len(replays), 1)
+                step, replay = replays[0]
+                self.assertIn("-p two-bot-store", replay)
+                self.assertIn("--locked", replay)
+                self.assertIn("--test-threads=1", replay)
+                self.assertNotIn("--ignore-run-fail", replay)
+                self.assertNotIn("--ignored", replay)
+                # Neither Cargo's positional filter nor libtest's filters
+                # may silently narrow the complete serial replay.
+                self.assertEqual(
+                    replay.split(" -- ", 1)[0],
+                    f'cov_run "$COV" llvm-cov --no-report -p two-bot-store --features two-bot-core/db --locked --test {suite}'
+                    if job_name == "patch-coverage" else
+                    f"cargo test -p two-bot-store --test {suite} --features two-bot-core/db --locked",
+                )
+                self.assertEqual(
+                    replay.split(" -- ", 1)[1].split(),
+                    ["--test-threads=1", "--skip", "regenerate_reference_docs"]
+                    if job_name == "patch-coverage" else ["--test-threads=1"],
+                )
+                if job_name == "patch-coverage":
+                    self.assertIn("--no-report", replay)
+                    exports = [
+                        line for line in shell_logical_lines(step["run"].split(replay, 1)[0])
+                        if line.startswith("export TWO_TEST_DATABASE_URL=")
+                    ]
+                    self.assertTrue(exports)
+                    self.assertEqual(
+                        exports[-1],
+                        "export TWO_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test",
+                    )
+                self.assertEqual(
+                    step["env"]["TWO_TEST_DATABASE_URL"],
+                    "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
+                )
+
     def test_patch_coverage_runs_with_db_and_includes_ignored_tests(self):
         job = self.workflows["check.yml"]["jobs"]["patch-coverage"]
         step = next(
@@ -4534,9 +4615,7 @@ class WorkflowTests(unittest.TestCase):
         saturation_source = (
             ROOT / "crates/store/tests/invite_uses_saturation_acceptance.rs"
         ).read_text()
-        saturation_names = set(
-            re.findall(r"#\[tokio::test[^\]]*\]\s*async fn (\w+)\(", saturation_source)
-        )
+        saturation_names = set(tokio_test_names(saturation_source))
         self.assertTrue(saturation_names, "saturation fixtures must be discovered")
         main_skips = set(re.findall(r"--skip (\S+)", main_sweep))
         for name in sorted(saturation_names):

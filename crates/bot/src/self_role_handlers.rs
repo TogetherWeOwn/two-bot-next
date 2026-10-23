@@ -24,7 +24,7 @@ use two_bot_core::{
         parse_self_role_custom_id, parse_self_role_panels, reaction_option_key, self_role_reply,
         PanelMode, SelfRoleGates, SelfRolePanel, SettledOutcome,
     },
-    settings::{to_env_string, LiveSettings},
+    settings::{to_env_string, LiveSettings, SettingsCache},
 };
 use two_bot_cutover::self_role_store::SelfRoleStore;
 use two_bot_discord::ActionExecutor;
@@ -61,13 +61,22 @@ pub(crate) fn live_panels_with(
     boot: &[SelfRolePanel],
     live: Option<&LiveSettings>,
 ) -> Vec<SelfRolePanel> {
-    let Some(live) = live else {
+    let snapshot = live.map(LiveSettings::snapshot);
+    panels_from_snapshot(guild, boot, snapshot.as_deref())
+}
+
+fn panels_from_snapshot(
+    guild: &str,
+    boot: &[SelfRolePanel],
+    snapshot: Option<&SettingsCache>,
+) -> Vec<SelfRolePanel> {
+    let Some(live) = snapshot else {
         return boot.to_vec();
     };
     let Some(value) = live.get(guild, PANELS_KEY) else {
         return boot.to_vec();
     };
-    let Some(rendered) = to_env_string(&value) else {
+    let Some(rendered) = to_env_string(value) else {
         return boot.to_vec();
     };
     parse_self_role_panels(&rendered).unwrap_or_else(|_| boot.to_vec())
@@ -408,11 +417,19 @@ impl SelfRoleService {
     }
 
     pub async fn handle(&self, input: &SelfRoleInput) -> SelfRoleResult {
-        if !self.live_panels().contains(&input.panel) {
+        // Pin the catalogue and revision together. The store rechecks this
+        // revision under the settings writer lock before creating durable work.
+        let snapshot = crate::settings_jobs::live().map(|live| live.snapshot());
+        let panels =
+            panels_from_snapshot(&self.runtime.guild_id, &self.panels, snapshot.as_deref());
+        if !panels.contains(&input.panel) {
             return SelfRoleResult::Ignored;
         }
+        let revision = snapshot.as_ref().map_or(0, |snapshot| snapshot.revision());
         self.handle_admission(
-            self.runtime.prepare(&input.request, &input.panel).await,
+            self.runtime
+                .prepare_at_revision(&input.request, &input.panel, revision)
+                .await,
             &input.panel,
             &input.request.event_id,
         )
