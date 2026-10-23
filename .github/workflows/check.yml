@@ -317,9 +317,9 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_stdout_read_acceptance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_stdout_read_duplicate_key_acceptance.py' -v
 
-      - name: weekly DORA metrics scoring (offline)
+      - name: weekly DORA metrics scoring and publication (offline)
         run: |
-          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_dora_metrics.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_dora_*.py' -v
 
       - name: cutover rollback-readiness probe and freeze drill (offline)
         run: |

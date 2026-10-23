@@ -46,6 +46,10 @@ Every input ID (deployment IDs, SHAs, run IDs, verdicts) lands in the JSON
   skipped when finding that predecessor. A failed, statusless or in-flight
   predecessor leaves the first compare unresolved rather than scoring a
   build that never served; the scan remains subject to the page cap.
+- A successful redeploy of the previous successful SHA has a known zero
+  commits-per-deploy count, including when it matches the successful boundary
+  SHA. That zero stays in the mean and maximum without a compare API read;
+  it is not an enrichment gap.
 - An empty window reports nulls, never zeros.
 
 ## Operating the job

@@ -299,16 +299,16 @@ def score_throughput(repo, records, boundary_sha):
     for record in records:
         if record["state"] != "success":
             continue
-        if prev_sha is None or prev_sha == record["sha"]:
-            if prev_sha != record["sha"]:
-                unresolved += 1
-            prev_sha = record["sha"]
-            continue
-        ahead = fetch_ahead_by(repo, prev_sha, record["sha"])
-        if ahead is None:
+        if prev_sha is None:
             unresolved += 1
+        elif prev_sha == record["sha"]:
+            record["commits_since_prev"] = 0
         else:
-            record["commits_since_prev"] = ahead
+            ahead = fetch_ahead_by(repo, prev_sha, record["sha"])
+            if ahead is None:
+                unresolved += 1
+            else:
+                record["commits_since_prev"] = ahead
         prev_sha = record["sha"]
     return unresolved
 
