@@ -252,7 +252,7 @@ pub fn expected_registry() -> Value {
         (
             "rsvp-attendance",
             "/description",
-            "Show RSVP totals for a scheduled event",
+            "Show RSVP totals and your saved response for an event",
         ),
         (
             "rsvp-attendance",
