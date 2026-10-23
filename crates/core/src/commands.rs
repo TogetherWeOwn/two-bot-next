@@ -96,6 +96,11 @@ pub struct CommandOption {
     pub max_value: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_length: Option<u32>,
+    /// Declared `min_length` for a string option. Discord publishes and
+    /// enforces it; the model must preserve it rather than guess it, so
+    /// confirmed-publication help can explain it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_length: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub choices: Vec<CommandChoice>,
     /// Allowed Discord channel type integers for a channel picker.
@@ -118,6 +123,7 @@ impl CommandOption {
             min_value: None,
             max_value: None,
             max_length: None,
+            min_length: None,
             choices: Vec::new(),
             channel_types: Vec::new(),
             options: Vec::new(),
@@ -156,6 +162,12 @@ impl CommandOption {
     #[must_use]
     pub fn max_length(mut self, max: u32) -> Self {
         self.max_length = Some(max);
+        self
+    }
+
+    #[must_use]
+    pub fn min_length(mut self, min: u32) -> Self {
+        self.min_length = Some(min);
         self
     }
 
@@ -212,6 +224,11 @@ pub struct CommandDefinition {
     pub default_member_permissions: Option<String>,
     /// `false` in legacy (`setDMPermission(false)`): guild-only, no DMs.
     pub dm_permission: bool,
+    /// Static usage examples rendered by confirmed-publication help detail.
+    /// Never serialized or published to Discord: the wire shape carries no
+    /// per-command prose, so help examples live only in the definition.
+    #[serde(skip)]
+    pub examples: Vec<String>,
 }
 
 impl CommandDefinition {
@@ -225,6 +242,7 @@ impl CommandDefinition {
             options: Vec::new(),
             default_member_permissions: None,
             dm_permission: false,
+            examples: Vec::new(),
         }
     }
 
@@ -239,12 +257,21 @@ impl CommandDefinition {
         self.options = options;
         self
     }
+
+    #[must_use]
+    pub fn examples(mut self, examples: Vec<String>) -> Self {
+        self.examples = examples;
+        self
+    }
 }
 
 // Verified against the legacy tree's discord.js (`PermissionFlagsBits`):
 // BanMembers=4, KickMembers=2, ModerateMembers=2^40, ManageMessages=8192,
-// ManageChannels=16, ManageGuild=32, ManageEvents=2^33.
+// ManageChannels=16, ManageGuild=32, ManageEvents=2^33,
+// Administrator=8, CreateInstantInvite=1.
+pub const PERM_CREATE_INSTANT_INVITE: u64 = 1;
 pub const PERM_BAN_MEMBERS: u64 = 4;
+pub const PERM_ADMINISTRATOR: u64 = 8;
 pub const PERM_KICK_MEMBERS: u64 = 2;
 pub const PERM_MODERATE_MEMBERS: u64 = 1099511627776;
 pub const PERM_MANAGE_MESSAGES: u64 = 8192;
@@ -263,7 +290,20 @@ pub fn core_commands() -> Vec<CommandDefinition> {
             CommandOption::new("member", "Show another member.", CommandOptionType::User),
         ]),
         CommandDefinition::new("leaderboard", "Show the server XP leaderboard."),
-        CommandDefinition::new("help", HELP_DESCRIPTION),
+        CommandDefinition::new("help", HELP_DESCRIPTION)
+            .options(vec![
+                CommandOption::new(
+                    "command",
+                    "Command name (case-insensitive; optional leading /)",
+                    CommandOptionType::String,
+                )
+                .max_length(32),
+            ])
+            .examples(vec![
+                "/help".to_owned(),
+                "/help command:rank".to_owned(),
+                "/help command:privacy".to_owned(),
+            ]),
         CommandDefinition::new("privacy", PRIVACY_DESCRIPTION).options(vec![
             CommandOption::new(
                 "opt-out",
