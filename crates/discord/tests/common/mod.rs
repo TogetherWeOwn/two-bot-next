@@ -655,6 +655,16 @@ impl MockRest {
         .await
     }
 
+    /// Route-aware gates for fault injection between production reads.
+    pub async fn with_gated_responder(
+        responder: impl Fn(&RestRequest) -> (ScriptedResponse, Option<Arc<ResponseGate>>)
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        Self::serve(Arc::new(responder), Some(Duration::ZERO), None).await
+    }
+
     async fn serve(
         responder: RestResponder,
         body_delay: Option<Duration>,
