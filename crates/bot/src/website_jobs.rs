@@ -361,6 +361,11 @@ pub async fn serve(
                 } else {
                     parked.push(feed_jobs::NAME);
                 }
+                if let Some(job) = crate::lfg_jobs::register(context.clone(), &activation) {
+                    registered.push(job);
+                } else {
+                    parked.push(crate::lfg_jobs::NAME);
+                }
                 // Repeat-history expiry rides the shared supervisor.
                 if crate::automod_gateway::enabled() {
                     registered.push(crate::automod_gateway::expiry_job(automod));
@@ -497,6 +502,7 @@ async fn registered_statuses(
         .chain(member_runtime::NAMES)
         .chain([RECOVERY_JOB_NAME])
         .chain([feed_jobs::NAME])
+        .chain([crate::lfg_jobs::NAME])
         .chain([crate::retention_jobs::NAME])
         .collect();
     if crate::automod_gateway::enabled() {

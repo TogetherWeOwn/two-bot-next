@@ -24,13 +24,56 @@ Legacy create/signup/leave/close outcomes use the available shared `rsvp_store::
 
 Signup/move is admitted by a bounded five-second guild+actor window before the deferred callback, queue, SQL, audit or channel refresh. Refusals use one ephemeral initial reply with no domain writes or refresh. Leave and close are exempt; other actors/guilds and moderation retain independent admission. The service repeats the gate for direct callers, allowing the already-admitted event. See [automation actor admission](automation-admission.md) for capacity, expiry and restart semantics.
 
-READY supplies the bot user and application ids. A resumed session carries neither, so LFG reuses the lookups the runtime already makes: the ticket runtime's bot-user read and the registry's application read. No extra identity request is issued. With tickets disabled, the first LFG create resolves the bot user once through the shared executor; signup, leave and close need no identity lookup. Until it is known, nonce recovery reports acceptance as uncertain and keeps durable state instead of matching a guessed author. Once the application id is known, foreign-application interactions are ignored. The Worker's allowlisted flag forwarding already passes the optional `TWO_ANNOUNCEMENTS` string through without enabling it by default. No deployed configuration is changed by this PR. Source: [current bot identity](https://docs.rs/twilight-http/0.17.1/twilight_http/client/struct.Client.html#method.current_user).
+READY supplies the bot user and application ids. A resumed session carries neither, so LFG reuses the lookups the runtime already makes: the ticket runtime's bot-user read and the registry's application read. Gateway identity recovery itself issues no extra identity request. With tickets disabled, the first LFG create resolves the bot user once through the shared executor; signup, leave and close need no identity lookup. Until it is known, nonce recovery reports acceptance as uncertain and keeps durable state instead of matching a guessed author. Once the application id is known, foreign-application interactions are ignored. The Worker's allowlisted flag forwarding already passes the optional `TWO_ANNOUNCEMENTS` string through without enabling it by default. No deployed configuration is changed by this PR. Source: [current bot identity](https://docs.rs/twilight-http/0.17.1/twilight_http/client/struct.Client.html#method.current_user).
 
-`CommandRuntime::dispatch` spawns interaction work off the shard loop, so SQL and paced REST never block Twilight's polling. Dispatch is bounded per lane and per member (see `docs/channel-moderation-runtime.md`). `LfgInteractions` admits `LFG_MAX_IN_FLIGHT` (1) execution per process before taking a pool connection; that execution holds at most two connections, its advisory-lock transaction plus one store call. Queued interactions hold none, so the 5-connection pool keeps room for the gateway checkpoint writer and other features. A compile-time assertion in the bot ties the cap to `DB_POOL_MAX`. At most `LFG_MAX_WAITING` (8) executions queue behind the running one; each queued select holds a slot of the shared interaction lane, so the next request is answered "LFG is busy right now" instead of queueing. The permit stays held across the paced refresh: it guards the advisory-lock transaction, which orders refreshes per post so a stale render cannot overwrite a newer one. This slice does **not** add a durable interaction inbox or guarantee replay of an interaction aborted during restart; already-persisted LFG state stays available for nonce recovery.
+`CommandRuntime::dispatch` spawns interaction work off the shard loop, so SQL and paced REST never block Twilight's polling. Dispatch is bounded per lane and per member (see `docs/channel-moderation-runtime.md`). The member interaction `LfgInteractions` service admits `LFG_MAX_IN_FLIGHT` (1) execution before taking a pool connection; that execution holds at most two connections, its advisory-lock transaction plus one store call. Queued interactions hold none, so the 5-connection pool keeps room for the gateway checkpoint writer and other features. A compile-time assertion in the bot ties the cap to `DB_POOL_MAX`. At most `LFG_MAX_WAITING` (8) executions queue behind the running one; each queued select holds a slot of the shared interaction lane, so the next request is answered "LFG is busy right now" instead of queueing. The permit stays held across the paced refresh: it guards the advisory-lock transaction, which orders refreshes per post so a stale render cannot overwrite a newer one. This slice does **not** add a durable interaction inbox or guarantee replay of an interaction aborted during restart; already-persisted LFG state stays available for nonce recovery.
 
 Publication uses the router's **whole** gate-filtered registry, never an LFG-only replacement. With automations disabled, custom rows are intentionally excluded by the router. With automations enabled, publication is deferred until TOG-10080 supplies an authoritative custom-command store/load: unavailable storage is not an empty custom set. Existing remote registrations are left untouched in that case. A failed lookup or publish is logged and stays eligible to retry on a later gateway connection event. Staging/production deployment and enabling announcements remain separately gated.
 
 No private dispatcher, Discord client, or temporary voice channel feature is included here.
+
+## Bounded lifecycle maintenance
+
+The existing jobs supervisor runs `lfg_sweep` every 60 seconds, only for the
+configured guild when announcements and the boot identity fence permit it.
+It reuses the website jobs' lazy pool and governed executor, resolves the
+current bot user once per registration, and uses the interaction runtime's
+same database advisory lock per post. Its maintenance service admits one row
+at a time before taking connections; it does not add a private scheduler.
+
+Signups stop at the post's start time. A refused member is told to ask an
+organizer for a new `/lfg` post. The store also checks `starts_at <= joined_at`
+under its existing signup lock. The sweep closes posts at least 15 minutes
+past start and removes their signup controls by editing the existing message.
+Posts and their original signups are retained, never deleted by the sweep.
+The member-visible footer reserves space for the ID needed by `/lfg-close`,
+even when a full roster would otherwise consume the 2000-UTF-16-unit body.
+
+An open row without a saved message ID becomes eligible after five minutes.
+The same bounded, authoritative bot-author/nonce lookup recovers its message
+without reposting. If history has no match or is unreadable, the sweep closes
+the retained row to release capacity; unreadable history is still not evidence
+that Discord never accepted the message. A recovered expired post is closed
+and refreshed too. An unresolved bot identity refuses the pass without changing
+rows. This maintenance lookup is independent of the gateway identity cache;
+it may make one additional current-user request before any member uses LFG.
+
+Each invocation selects at most `min(limit, 20)` open candidates in stable
+creation/ID order; the production limit is 20. Zero budget does no SQL or REST.
+A contended runtime lock is skipped for the next tick. Each row is rechecked
+under that lock. Row-local database/REST failures log a constant warning and
+continue; the processed count includes failed eligible attempts, not skipped
+locks. Existing job success/failure counters use the dedicated `lfg_sweep`
+label and the batch log carries `processed`. The supervisor retains its
+120-second attempt timeout and shutdown cancellation; no work is detached.
+
+Message refresh is best effort: a failed edit cannot undo a committed signup
+or close, and member replies say the saved result still applies. A closed row
+is no longer eligible, so a failed close refresh is not automatically retried
+by this sweep. Stale visible controls remain harmless because signup checks
+the saved state/start time. The open-post cap remains 20, the organizer
+permission gate is unchanged, and saved select receipts remain authoritative
+on replay. This change does not enable announcements or deploy anything.
 
 ## Verification
 

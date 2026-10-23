@@ -128,6 +128,7 @@ pub const JOBS: &[&str] = &[
     "self_role_recovery",
     "member_unban_sweep",
     "automod_expiry",
+    "lfg_sweep",
     "other",
 ];
 pub const JOB_OUTCOMES: &[&str] = &["success", "failure"];
@@ -159,7 +160,7 @@ impl JobErrorClass {
     }
 }
 
-/// Complete error-class allowlist. With `JOBS`, this yields 112 fixed series.
+/// Complete error-class allowlist. With `JOBS`, this yields 119 fixed series.
 pub const JOB_ERROR_CLASSES: &[JobErrorClass] = &[
     JobErrorClass::Database,
     JobErrorClass::Rest,
