@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 use sqlx::PgPool;
 use twilight_model::{
     application::interaction::{
-        application_command::CommandOptionValue, Interaction, InteractionData,
+        application_command::{CommandDataOption, CommandOptionValue},
+        Interaction, InteractionData,
     },
     gateway::event::Event,
 };
@@ -21,8 +22,11 @@ use two_bot_core::{
         voice_ended_fact, voice_started_fact, CommunityStoreError, FactWrite, MessageFactInput,
     },
     leveling::{
-        leaderboard_reply_for_season, plan_reward_roles, rank_reply, season_id_for_ms,
-        RewardPlanError, XpAward, LEADERBOARD_DEFAULT_LIMIT,
+        leaderboard_out_of_range_reply_for_season, leaderboard_page_invalid_text,
+        leaderboard_page_reply_for_season, leaderboard_reply_for_season,
+        leaderboard_unranked_reply_for_season, plan_reward_roles, rank_reply_with_rewards,
+        season_id_for_ms, RewardPlanError, XpAward, LEADERBOARD_DEFAULT_LIMIT,
+        LEADERBOARD_PAGE_MAX,
     },
     leveling_store::{self, LevelingStoreError},
     ClassifierConfig, ClassifyInput, FactsSink, FunnelHandlers, FunnelStore, HandlerId,
@@ -566,6 +570,68 @@ enum PendingRead {
     },
 }
 
+/// Decoded `/leaderboard` navigation: the omitted-options default, one
+/// explicit 1-based page, the invoker's own seasonal page, or a malformed
+/// option set that answers with a correction and no store read.
+enum LeaderboardRequest {
+    Default,
+    Page(u64),
+    Mine,
+    Invalid,
+}
+
+/// Decode the `page`/`mine` options by name (feed-list grade): a present
+/// option with the wrong wire type refuses instead of silently serving the
+/// default page, and so do duplicates, out-of-range pages and `page`
+/// combined with `mine:true`. Unknown options are ignored for forward
+/// compatibility. Pure: no store touch, so invalid input never acquires a
+/// database connection.
+fn leaderboard_request(options: &[CommandDataOption]) -> LeaderboardRequest {
+    let mut page: Option<i64> = None;
+    let mut page_valid = true;
+    let mut mine: Option<bool> = None;
+    let mut mine_valid = true;
+    for option in options {
+        match option.name.as_str() {
+            "page" => {
+                if page.is_some() {
+                    page_valid = false;
+                    continue;
+                }
+                if let CommandOptionValue::Integer(value) = option.value {
+                    page = Some(value);
+                } else {
+                    page_valid = false;
+                }
+            }
+            "mine" => {
+                if mine.is_some() {
+                    mine_valid = false;
+                    continue;
+                }
+                if let CommandOptionValue::Boolean(value) = option.value {
+                    mine = Some(value);
+                } else {
+                    mine_valid = false;
+                }
+            }
+            _ => {}
+        }
+    }
+    if !page_valid || !mine_valid {
+        return LeaderboardRequest::Invalid;
+    }
+    match (page, mine.unwrap_or(false)) {
+        (Some(_), true) => LeaderboardRequest::Invalid,
+        (Some(page), false) if (1..=LEADERBOARD_PAGE_MAX).contains(&page) => {
+            LeaderboardRequest::Page(page as u64)
+        }
+        (Some(_), false) => LeaderboardRequest::Invalid,
+        (None, true) => LeaderboardRequest::Mine,
+        (None, false) => LeaderboardRequest::Default,
+    }
+}
+
 /// Award/reply slice of the shared command runtime; no private router or client.
 #[derive(Clone)]
 pub struct LevelingRuntime {
@@ -758,17 +824,14 @@ impl LevelingRuntime {
             PendingRead::Rank {
                 member_id,
                 display_name,
-            } => leveling_store::profile(&self.pool, &guild, &member_id)
-                .await
-                .map(|profile| rank_reply(&profile, &display_name).content),
-            PendingRead::Leaderboard { season } => leveling_store::seasonal_leaderboard(
-                &self.pool,
-                &guild,
-                &season,
-                LEADERBOARD_DEFAULT_LIMIT,
-            )
-            .await
-            .map(|entries| leaderboard_reply_for_season(&entries, &season).content),
+            } => {
+                self.rank_with_rewards(&guild, &member_id, &display_name)
+                    .await
+            }
+            PendingRead::Leaderboard { season } => {
+                self.leaderboard_navigation(interaction, &guild, &season)
+                    .await
+            }
         };
         let application_id = interaction.application_id.get();
         match content {
@@ -802,6 +865,127 @@ impl LevelingRuntime {
                     )
                     .await;
                 Err(LevelingRuntimeError::Store(store))
+            }
+        }
+    }
+
+    /// `/rank` with the configured reward preview: the lifetime profile plus
+    /// the guild's reward ladder. Either read failing completes as the
+    /// sanitized unavailable reply with the store error propagated — a
+    /// reward-read failure never fabricates an end-of-ladder line. Previews
+    /// perform no role lookup or grant.
+    async fn rank_with_rewards(
+        &self,
+        guild: &str,
+        member_id: &str,
+        display_name: &str,
+    ) -> Result<String, LevelingStoreError> {
+        let profile = leveling_store::profile(&self.pool, guild, member_id).await?;
+        let rewards = leveling_store::role_rewards(&self.pool, guild).await?;
+        Ok(rank_reply_with_rewards(&profile, display_name, &rewards).content)
+    }
+
+    /// Route one acknowledged `/leaderboard` to its navigation: omitted
+    /// options keep the exact default top-ten read; explicit pages and
+    /// `mine:true` read one bounded page plus scalar count/position reads;
+    /// malformed options answer with a correction and zero store reads.
+    async fn leaderboard_navigation(
+        &self,
+        interaction: &Interaction,
+        guild: &str,
+        season: &str,
+    ) -> Result<String, LevelingStoreError> {
+        let request = match interaction.data.as_ref() {
+            Some(InteractionData::ApplicationCommand(data)) => leaderboard_request(&data.options),
+            // The router only delivers slash interactions here; a non-command
+            // payload keeps the historical default read.
+            _ => LeaderboardRequest::Default,
+        };
+        match request {
+            LeaderboardRequest::Default => {
+                let entries = leveling_store::seasonal_leaderboard(
+                    &self.pool,
+                    guild,
+                    season,
+                    LEADERBOARD_DEFAULT_LIMIT,
+                )
+                .await?;
+                Ok(leaderboard_reply_for_season(&entries, season).content)
+            }
+            LeaderboardRequest::Page(page) => {
+                self.leaderboard_page(guild, season, page, None).await
+            }
+            LeaderboardRequest::Mine => {
+                let member_id = interaction
+                    .member
+                    .as_ref()
+                    .and_then(|member| member.user.as_ref())
+                    .or(interaction.user.as_ref())
+                    .map(|user| user.id.get().to_string());
+                match member_id {
+                    Some(member_id) => self.leaderboard_mine(guild, season, &member_id).await,
+                    None => Ok(leaderboard_page_invalid_text()),
+                }
+            }
+            LeaderboardRequest::Invalid => Ok(leaderboard_page_invalid_text()),
+        }
+    }
+
+    /// Render one explicit 1-based page: an empty season answers honestly
+    /// empty, a page past the last one names it, otherwise exactly one
+    /// bounded page is read and rendered with absolute positions.
+    /// `own_position` carries the invoker's absolute position for `mine:true`.
+    async fn leaderboard_page(
+        &self,
+        guild: &str,
+        season: &str,
+        page: u64,
+        own_position: Option<u64>,
+    ) -> Result<String, LevelingStoreError> {
+        let total = leveling_store::seasonal_member_count(&self.pool, guild, season).await?;
+        if total == 0 {
+            return Ok(leaderboard_reply_for_season(&[], season).content);
+        }
+        let total_pages = total.div_ceil(LEADERBOARD_DEFAULT_LIMIT);
+        if page > total_pages {
+            return Ok(
+                leaderboard_out_of_range_reply_for_season(season, page, total_pages).content,
+            );
+        }
+        let entries = leveling_store::seasonal_leaderboard_page(
+            &self.pool,
+            guild,
+            season,
+            LEADERBOARD_DEFAULT_LIMIT,
+            (page - 1) * LEADERBOARD_DEFAULT_LIMIT,
+        )
+        .await?;
+        Ok(
+            leaderboard_page_reply_for_season(&entries, season, page, total_pages, own_position)
+                .content,
+        )
+    }
+
+    /// Render the invoker's own seasonal page: their absolute seasonal
+    /// position selects the page, never lifetime totals or held roles. No
+    /// seasonal row answers explicitly unranked without creating one.
+    async fn leaderboard_mine(
+        &self,
+        guild: &str,
+        season: &str,
+        member_id: &str,
+    ) -> Result<String, LevelingStoreError> {
+        match leveling_store::seasonal_member_position(&self.pool, guild, season, member_id).await?
+        {
+            None => Ok(leaderboard_unranked_reply_for_season(season).content),
+            Some(position) => {
+                self.leaderboard_page(
+                    guild,
+                    season,
+                    position.div_ceil(LEADERBOARD_DEFAULT_LIMIT),
+                    Some(position),
+                )
+                .await
             }
         }
     }

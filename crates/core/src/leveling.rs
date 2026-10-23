@@ -448,6 +448,12 @@ pub fn clamp_leaderboard_limit(limit: u64) -> u64 {
     limit.clamp(1, LEADERBOARD_MAX_LIMIT)
 }
 
+/// Highest `/leaderboard page` the registration advertises and the runtime
+/// accepts (1-based). Ten rows per page keeps 10,000 ranked members
+/// reachable; larger values refuse with a correction before any store read,
+/// so an absurd offset can never reach SQL.
+pub const LEADERBOARD_PAGE_MAX: i64 = 1000;
+
 /// A member's full leveling read model (legacy `LevelProfile`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LevelProfile {
@@ -499,6 +505,68 @@ pub fn rank_reply(profile: &LevelProfile, display_name: &str) -> RankReply {
     }
 }
 
+/// Next-reward preview line for the `/rank` reply: the first configured
+/// threshold strictly above `level`, with the remaining level distance, or
+/// the explicit end-of-ladder state when none is above (including an empty
+/// ladder). The role renders as a suppressed `<@&id>` pill from the stored
+/// role id only — never a resolved Discord role name, so stale or hostile
+/// role labels cannot leak in, and no role is looked up or granted.
+#[must_use]
+pub fn next_reward_line(level: u64, rewards: &[LevelRoleReward]) -> String {
+    match rewards.iter().find(|reward| reward.level > level) {
+        Some(next) => {
+            let remaining = next.level - level;
+            let levels = if remaining == 1 { "level" } else { "levels" };
+            format!(
+                "Next reward: <@&{}> at level {} · {remaining} {levels} away",
+                next.role_id, next.level,
+            )
+        }
+        None => "No further rewards on this ladder.".to_owned(),
+    }
+}
+
+/// [`rank_text`] plus the [`next_reward_line`] preview as a fourth line. The
+/// first three lines stay byte-identical to [`rank_text`]: existing XP
+/// progress, rank and level rendering is preserved, not rebuilt.
+#[must_use]
+pub fn rank_text_with_rewards(
+    display_name: &str,
+    level: u64,
+    rank: Option<u64>,
+    member_count: u64,
+    xp: u64,
+    rewards: &[LevelRoleReward],
+) -> String {
+    format!(
+        "{}\n{}",
+        rank_text(display_name, level, rank, member_count, xp),
+        next_reward_line(level, rewards),
+    )
+}
+
+/// [`rank_reply`] with the configured reward preview. `rewards` must come
+/// from the reward store for the target's guild; a read failure is the
+/// caller's unavailable path, never a fabricated end-of-ladder line.
+#[must_use]
+pub fn rank_reply_with_rewards(
+    profile: &LevelProfile,
+    display_name: &str,
+    rewards: &[LevelRoleReward],
+) -> RankReply {
+    RankReply {
+        content: rank_text_with_rewards(
+            display_name,
+            profile.level,
+            profile.rank,
+            profile.member_count,
+            profile.xp,
+            rewards,
+        ),
+        ephemeral: true,
+    }
+}
+
 /// A `/leaderboard` reply: legacy posts it publicly with mentions suppressed
 /// (`allowedMentions: { parse: [] }`), never ephemerally.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -534,6 +602,17 @@ pub const FIRST_PARTIAL_SEASON: &str = "2026-Q4";
 /// members see the gap, not just operators reading docs.
 pub const PARTIAL_SEASON_NOTE: &str = " — partial: early-season XP not counted";
 
+/// Seasonal board header shared by the default reply and every explicit
+/// navigation state, so the season label and the first-quarter partial
+/// marker survive paging.
+fn seasonal_board_header(season_id: &str) -> String {
+    if season_id == FIRST_PARTIAL_SEASON {
+        format!("**TWO XP Leaderboard ({season_id}{PARTIAL_SEASON_NOTE})**")
+    } else {
+        format!("**TWO XP Leaderboard ({season_id})**")
+    }
+}
+
 /// Build the seasonal `/leaderboard` reply (AC3): same 1–25 clamp and top-10
 /// public shape as [`leaderboard_reply`], scoped to one season. Lifetime
 /// stays behind an explicit flag owned by a later slice. The first partial
@@ -554,15 +633,90 @@ pub fn leaderboard_reply_for_season(
     } else {
         rows.join("\n")
     };
-    let header = if season_id == FIRST_PARTIAL_SEASON {
-        format!("**TWO XP Leaderboard ({season_id}{PARTIAL_SEASON_NOTE})**")
-    } else {
-        format!("**TWO XP Leaderboard ({season_id})**")
-    };
     LeaderboardReply {
-        content: format!("{header}\n{body}"),
+        content: format!("{}\n{body}", seasonal_board_header(season_id)),
         suppress_mentions: true,
     }
+}
+
+/// Build one explicit seasonal page: the shared header, a truthful one-based
+/// `Page N of M` label, the invoker's own absolute position when this page
+/// answers `mine:true`, then this page's rows with absolute positions. The
+/// caller reads exactly one bounded page; `entries` must already carry
+/// absolute ranks.
+#[must_use]
+pub fn leaderboard_page_reply_for_season(
+    entries: &[LeaderboardEntry],
+    season_id: &str,
+    page: u64,
+    total_pages: u64,
+    own_position: Option<u64>,
+) -> LeaderboardReply {
+    let mut content = format!(
+        "{}\nPage {page} of {total_pages}",
+        seasonal_board_header(season_id),
+    );
+    if let Some(position) = own_position {
+        content.push_str(&format!("\nYour position: #{position}"));
+    }
+    for entry in entries {
+        content.push('\n');
+        content.push_str(&leaderboard_line(
+            entry.rank,
+            &entry.member_id,
+            entry.level,
+            entry.xp,
+        ));
+    }
+    LeaderboardReply {
+        content,
+        suppress_mentions: true,
+    }
+}
+
+/// Truthful reply for a well-formed page past the last one: no rows (never a
+/// silent top-ten fallback), the populated season is not called empty, and
+/// the last valid page is offered as the correction.
+#[must_use]
+pub fn leaderboard_out_of_range_reply_for_season(
+    season_id: &str,
+    page: u64,
+    total_pages: u64,
+) -> LeaderboardReply {
+    let noun = if total_pages == 1 { "page" } else { "pages" };
+    LeaderboardReply {
+        content: format!(
+            "{}\nPage {page} is out of range — this season has {total_pages} {noun}. Try page {total_pages}.",
+            seasonal_board_header(season_id),
+        ),
+        suppress_mentions: true,
+    }
+}
+
+/// Truthful reply for `mine:true` with no seasonal row: explicitly unranked
+/// (never a rank inferred from lifetime totals), with a route back to page
+/// one. The caller performs no write; the read stays a read.
+#[must_use]
+pub fn leaderboard_unranked_reply_for_season(season_id: &str) -> LeaderboardReply {
+    LeaderboardReply {
+        content: format!(
+            "{}\nYou're unranked this season (no seasonal XP recorded). See page 1 with `/leaderboard page:1`.",
+            seasonal_board_header(season_id),
+        ),
+        suppress_mentions: true,
+    }
+}
+
+/// Correction for malformed `/leaderboard` options (zero/negative/over-cap
+/// or wrong-typed `page`, wrong-typed `mine`, duplicates, or `page` combined
+/// with `mine:true`): states the valid page range and the own-page route.
+/// Rendered without any store read.
+#[must_use]
+pub fn leaderboard_page_invalid_text() -> String {
+    format!(
+        "Choose a page from 1 to {} or `mine:true` for your own page — not both.",
+        LEADERBOARD_PAGE_MAX,
+    )
 }
 
 /// One level → role pair as stored (legacy `LevelRoleReward`).

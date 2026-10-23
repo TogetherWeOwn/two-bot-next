@@ -19,6 +19,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::leveling::LEADERBOARD_PAGE_MAX;
+
 /// Discord's guild application-command ceiling (two-bot
 /// `DISCORD_GUILD_COMMAND_LIMIT`).
 pub const GUILD_COMMAND_LIMIT: usize = 100;
@@ -262,7 +264,19 @@ pub fn core_commands() -> Vec<CommandDefinition> {
         CommandDefinition::new("rank", "Show your XP, level and server rank.").options(vec![
             CommandOption::new("member", "Show another member.", CommandOptionType::User),
         ]),
-        CommandDefinition::new("leaderboard", "Show the server XP leaderboard."),
+        CommandDefinition::new("leaderboard", "Show the server XP leaderboard.").options(vec![
+            CommandOption::new(
+                "page",
+                "Page of the seasonal standings (1-based)",
+                CommandOptionType::Integer,
+            )
+            .int_range(1, LEADERBOARD_PAGE_MAX),
+            CommandOption::new(
+                "mine",
+                "Show your own page of the seasonal standings",
+                CommandOptionType::Boolean,
+            ),
+        ]),
         CommandDefinition::new("help", HELP_DESCRIPTION),
         CommandDefinition::new("privacy", PRIVACY_DESCRIPTION).options(vec![
             CommandOption::new(
@@ -538,12 +552,21 @@ mod tests {
         assert_eq!(core[3].name, "privacy");
         // Guild-only, DM off (legacy `setDMPermission(false)`).
         assert!(core.iter().all(|c| !c.dm_permission));
-        // `rank` has one optional `member` user option; `leaderboard` and the
-        // Next-only `help` take none; `help` is open to everyone.
+        // `rank` has one optional `member` user option; `leaderboard` has the
+        // optional `page` integer and `mine` boolean; the Next-only `help`
+        // takes none; `help` is open to everyone.
         assert_eq!(core[0].options.len(), 1);
         assert_eq!(core[0].options[0].kind, 6);
         assert!(core[0].options[0].required.is_none());
-        assert!(core[1].options.is_empty());
+        assert_eq!(core[1].options.len(), 2);
+        assert_eq!(core[1].options[0].name, "page");
+        assert_eq!(core[1].options[0].kind, CommandOptionType::Integer.as_u8());
+        assert!(core[1].options[0].required.is_none());
+        assert_eq!(core[1].options[0].min_value, Some(1));
+        assert_eq!(core[1].options[0].max_value, Some(LEADERBOARD_PAGE_MAX));
+        assert_eq!(core[1].options[1].name, "mine");
+        assert_eq!(core[1].options[1].kind, CommandOptionType::Boolean.as_u8());
+        assert!(core[1].options[1].required.is_none());
         assert!(core[2].options.is_empty());
         assert_eq!(core[2].description, HELP_DESCRIPTION);
         assert!(core[2].default_member_permissions.is_none());

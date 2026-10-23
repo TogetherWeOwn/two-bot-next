@@ -255,7 +255,10 @@ Show the server XP leaderboard.
 - Default permissions: Everyone (no default permission gate)
 - Available in DMs: false
 
-No options.
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `page` | integer | false | 1 | 1000 | — | — | Page of the seasonal standings (1-based) |
+| `mine` | boolean | false | — | — | — | — | Show your own page of the seasonal standings |
 
 ## `/lfg`
 

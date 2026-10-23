@@ -1005,6 +1005,93 @@ pub async fn seasonal_leaderboard(
         .collect())
 }
 
+/// One bounded seasonal page past the top ten: same scope and ordering as
+/// [`seasonal_leaderboard`] (`seasonal_xp` descending, member id ascending),
+/// with `LIMIT`/`OFFSET` applied in SQL so only the requested page crosses
+/// the database boundary — never a whole-guild load sliced in Rust. Each
+/// entry's `rank` is its absolute 1-based season position (`offset + 1` for
+/// the first row), so pages number continuously across ties and boundaries.
+pub async fn seasonal_leaderboard_page(
+    pool: &PgPool,
+    guild_id: &str,
+    season_id: &str,
+    limit: u64,
+    offset: u64,
+) -> Result<Vec<LeaderboardEntry>, LevelingStoreError> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT member_id, seasonal_xp FROM member_season_xp
+         WHERE guild_id = $1 AND season_id = $2
+         ORDER BY seasonal_xp DESC, member_id ASC LIMIT $3 OFFSET $4",
+    )
+    .bind(guild_id)
+    .bind(season_id)
+    .bind(clamp_leaderboard_limit(limit) as i64)
+    .bind(offset as i64)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .enumerate()
+        .map(|(index, (member_id, xp))| {
+            let xp = xp as u64;
+            LeaderboardEntry {
+                member_id,
+                xp,
+                level: level_for_xp(xp),
+                rank: offset + index as u64 + 1,
+            }
+        })
+        .collect())
+}
+
+/// Scalar count of seasonal rows for one `(guild_id, season_id)`: the page
+/// total behind explicit navigation. Previous seasons, foreign guilds and
+/// absent rows never enter the count.
+pub async fn seasonal_member_count(
+    pool: &PgPool,
+    guild_id: &str,
+    season_id: &str,
+) -> Result<u64, LevelingStoreError> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM member_season_xp WHERE guild_id = $1 AND season_id = $2",
+    )
+    .bind(guild_id)
+    .bind(season_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(count as u64)
+}
+
+/// Absolute 1-based season position for one member under the board ordering
+/// (`seasonal_xp` descending, member id ascending), in a single statement so
+/// the XP bound and the comparison share one snapshot (same shape as
+/// [`profile`]). A stored zero-XP row still ranks; a member with no seasonal
+/// row is `None` — never a rank inferred from lifetime totals.
+pub async fn seasonal_member_position(
+    pool: &PgPool,
+    guild_id: &str,
+    season_id: &str,
+    member_id: &str,
+) -> Result<Option<u64>, LevelingStoreError> {
+    let position: Option<i64> = sqlx::query_scalar(
+        "SELECT CASE WHEN m.member_id IS NULL THEN NULL
+                ELSE (SELECT COUNT(*) + 1 FROM member_season_xp
+                      WHERE guild_id = $1 AND season_id = $2
+                        AND (seasonal_xp > m.seasonal_xp
+                             OR (seasonal_xp = m.seasonal_xp AND member_id < $3)))
+           END
+         FROM (SELECT 1) AS one
+         LEFT JOIN member_season_xp m
+           ON m.guild_id = $1 AND m.season_id = $2 AND m.member_id = $3",
+    )
+    .bind(guild_id)
+    .bind(season_id)
+    .bind(member_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(position.map(|position| position as u64))
+}
+
 /// Stored reward ladder, ascending by level (legacy `roleRewards`).
 pub async fn role_rewards(
     pool: &PgPool,
