@@ -142,6 +142,7 @@ pub enum ComponentHandler {
     SelfRole,
     Tickets,
     LfgSignup,
+    GiveawayEntry,
 }
 
 /// Contract feature slices implement so the router can hand a routed
@@ -645,7 +646,7 @@ impl InteractionRouter {
                 permission_refusal: Some(RouterRefusal::ManageEventsRequired),
             },
             "command" | "command-remove" | "command-list" | "schedule" | "schedule-remove"
-            | "schedule-list" | "sticky" | "sticky-remove" => Row {
+            | "schedule-list" | "sticky" | "sticky-remove" | "giveaway" => Row {
                 handler: HandlerId::AutomationAdmin,
                 gate: RowGate::Automations,
                 permission_refusal: Some(RouterRefusal::ManageServerRequired),
@@ -742,6 +743,11 @@ impl InteractionRouter {
                 return ComponentOutcome::Ignore;
             }
             ComponentHandler::SelfRole
+        } else if custom_id.starts_with("gw:") {
+            if !self.gates.automations || !self.guild_ok(guild_id) {
+                return ComponentOutcome::Ignore;
+            }
+            ComponentHandler::GiveawayEntry
         } else {
             return if self.guild_ok(guild_id) {
                 ComponentOutcome::Unknown

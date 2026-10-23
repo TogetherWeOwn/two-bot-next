@@ -269,6 +269,7 @@ pub struct CommandRuntime {
     gateway_commands: tokio::sync::OnceCell<crate::gateway_commands::GatewayCommands>,
     channel: ChannelModerationRuntime,
     tasks: Mutex<DispatchTasks>,
+    giveaways: crate::giveaway_runtime::GiveawayRuntime,
     /// Interactions admitted per member; see [`crate::interaction_admission`].
     user_slots: UserSlots,
     /// Shared self-role surface; production boot stays parked pending acceptance.
@@ -353,7 +354,10 @@ impl CommandRuntime {
             ChannelModerationStore::from_pool(pool.clone()),
             executor.clone(),
         );
+        let giveaways =
+            crate::giveaway_runtime::GiveawayRuntime::new(pool.clone(), executor.clone());
         Arc::new(Self {
+            giveaways,
             pool,
             executor,
             interactions,
@@ -1371,6 +1375,11 @@ impl CommandRuntime {
         } = &routed
         {
             match handler {
+                ComponentHandler::GiveawayEntry => {
+                    if self.defer(interaction, "giveaway").await {
+                        self.giveaways.enter(interaction, custom_id).await;
+                    }
+                }
                 ComponentHandler::SelfRole => {
                     self.self_role_component(interaction).await;
                 }
@@ -1453,9 +1462,8 @@ impl CommandRuntime {
         // first, so an owner-map entry could never execute.
         let owner = match name.as_str() {
             "privacy" => Some(HandlerId::Privacy),
-            "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list" => {
-                Some(HandlerId::AutomationAdmin)
-            }
+            "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list"
+            | "giveaway" => Some(HandlerId::AutomationAdmin),
             "feed-add" => Some(HandlerId::FeedAdd),
             "feed-remove" => Some(HandlerId::FeedRemove),
             "feed-list" => Some(HandlerId::FeedList),
@@ -1486,6 +1494,7 @@ impl CommandRuntime {
                 crate::privacy_command::privacy_command(&self.pool, &self.executor, interaction)
                     .await;
             }
+            "giveaway" => self.giveaways.command(interaction).await,
             "sticky" => self.sticky_set(interaction).await,
             "sticky-remove" => self.sticky_remove(interaction).await,
             "feed-add" => self.feed_add(interaction).await,

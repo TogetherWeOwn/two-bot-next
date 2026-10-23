@@ -344,6 +344,11 @@ pub async fn serve(
                 let scheduled = scheduled_jobs::register(context.clone(), &activation);
                 let scheduled_parked = scheduled.is_none();
                 registered.extend(scheduled);
+                if let Some(job) = crate::giveaway_runtime::register(context.clone(), &activation) {
+                    registered.push(job);
+                } else {
+                    parked.push(crate::giveaway_runtime::REFRESH_JOB);
+                }
                 // The unban sweep shares the boot-composed member consumer:
                 // one guild store across commands and sweep, never a second
                 // same-guild consumer with its own local queues.
@@ -497,6 +502,7 @@ async fn registered_statuses(
         .chain(member_runtime::NAMES)
         .chain([RECOVERY_JOB_NAME])
         .chain([feed_jobs::NAME])
+        .chain([crate::giveaway_runtime::REFRESH_JOB])
         .chain([crate::retention_jobs::NAME])
         .collect();
     if crate::automod_gateway::enabled() {

@@ -20,7 +20,7 @@ Bounds below are registry bounds; a dash means no bound is declared there,
 not that handler validation is unlimited. Permissions are Discord default
 member-permission bitfields, not a replacement for runtime authorization.
 
-Built-in commands: 50.
+Built-in commands: 51.
 
 ## `/access`
 
@@ -181,6 +181,26 @@ Remove a feed relay
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `id` | string | true | — | — | 128 | — | Feed id |
+
+## `/giveaway`
+
+Create, list or cancel a giveaway
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `create` | subcommand | false | — | — | — | — | Create a giveaway in this channel |
+| `create prize` | string | true | — | — | 2000 | — | Prize text (up to 200 characters) |
+| `create duration` | integer | true | 1 | 43200 | — | — | Entry window in minutes (1–43200) |
+| `create winners` | integer | true | 1 | 100 | — | — | Number of winners |
+| `create required-role` | role | false | — | — | — | — | Role every entrant must hold |
+| `create min-account-age-days` | integer | false | 0 | 3650 | — | — | Minimum account age in days |
+| `create min-server-age-days` | integer | false | 0 | 3650 | — | — | Minimum time in this server in days |
+| `list` | subcommand | false | — | — | — | — | List open giveaways |
+| `cancel` | subcommand | false | — | — | — | — | Cancel an open or paused giveaway |
+| `cancel id` | string | true | — | — | 64 | — | Giveaway id |
 
 ## `/group`
 
