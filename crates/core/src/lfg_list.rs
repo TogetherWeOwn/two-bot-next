@@ -70,8 +70,10 @@ impl ListCursor {
             return None;
         }
         let units: Vec<_> = encoded_id
-            .chunks_exact(2)
-            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_be_bytes(*pair))
             .collect();
         let id = String::from_utf16(&units).ok()?;
         lfg::valid_post_id(&id).then_some(Self { created_at, id })
