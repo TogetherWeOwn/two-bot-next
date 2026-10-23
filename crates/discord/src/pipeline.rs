@@ -268,6 +268,9 @@ type VoiceChainKey = (Snowflake, Snowflake);
 struct ChainEntry {
     mutex: Arc<Mutex<()>>,
     last_seen_ms: i64,
+    /// Live `ChainHandle`s for this entry. Changed only under the `inner`
+    /// lock, so drop-path retirement decisions linearize with the accounting.
+    handles: usize,
     /// A leave asked to retire this entry while another frame still held a
     /// handle. The last handle to drop completes the retirement; see
     /// [`ChainHandle`].
@@ -315,6 +318,7 @@ impl VoiceChains {
         let key = (guild_id, member_id);
         let entry = chains.entry(key).or_default();
         entry.last_seen_ms = now_ms;
+        entry.handles += 1;
         ChainHandle {
             chains: self,
             key,
@@ -336,10 +340,10 @@ impl VoiceChains {
         if !Arc::ptr_eq(&entry.mutex, &chain.mutex) {
             return;
         }
-        // The map and this frame each hold one handle; more belong to another
+        // This frame's own handle is counted; any others belong to another
         // frame. Request retirement instead of dropping it: the last handle
         // to drop (live or already completed) finishes the job.
-        if Arc::strong_count(&entry.mutex) > 2 {
+        if entry.handles > 1 {
             entry.retire_requested = true;
             return;
         }
@@ -356,14 +360,19 @@ impl VoiceChains {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // During `ChainHandle::drop` the dropping handle is still alive, so
-        // the map plus the dropping handle is the drained count.
-        let drained = chains.get(&key).is_some_and(|entry| {
-            entry.retire_requested
-                && Arc::ptr_eq(&entry.mutex, mutex)
-                && Arc::strong_count(&entry.mutex) <= 2
-        });
-        if drained {
+        let Some(entry) = chains.get_mut(&key) else {
+            return;
+        };
+        // A stale handle must not change a recreated entry.
+        if !Arc::ptr_eq(&entry.mutex, mutex) {
+            return;
+        }
+        // The decision and the accounting linearize under the map lock: the
+        // dropping handle releases its count here, while still alive, so
+        // concurrent drops serialize and exactly one observes zero.
+        // Saturating: a drop path must never panic.
+        entry.handles = entry.handles.saturating_sub(1);
+        if entry.retire_requested && entry.handles == 0 {
             chains.remove(&key);
         }
     }
@@ -1167,6 +1176,58 @@ mod tests {
         assert!(!Arc::ptr_eq(&old.mutex, &fresh.mutex));
         drop(old);
         assert_eq!(chains.len(), 1, "stale handle drop keeps the fresh chain");
+    }
+
+    // The drop-path pointer fence is load-bearing: a stale handle drop
+    // landing on a flagged fresh entry must not retire it while a fresh
+    // handle is still alive. Red without the `ptr_eq` fence (the stale drop
+    // would complete the retirement), green with it.
+    #[test]
+    fn stale_handle_drop_against_flagged_fresh_chain_keeps_it() {
+        let chains = VoiceChains::default();
+        let stale = chains.lock_for(GUILD, 1, 0);
+        chains.remove_after_leave(GUILD, 1, &stale);
+        assert_eq!(chains.len(), 0);
+        let fresh = chains.lock_for(GUILD, 1, 1);
+        let extra = chains.lock_for(GUILD, 1, 1);
+        assert!(!Arc::ptr_eq(&stale.mutex, &fresh.mutex));
+        chains.remove_after_leave(GUILD, 1, &fresh);
+        assert_eq!(chains.len(), 1, "contended leave flags the fresh chain");
+        drop(extra);
+        assert_eq!(chains.len(), 1, "one live fresh handle keeps the chain");
+        drop(stale);
+        assert_eq!(
+            chains.len(),
+            1,
+            "stale handle drop must not retire the flagged fresh chain"
+        );
+        drop(fresh);
+        assert_eq!(chains.len(), 0, "last fresh handle retires the chain");
+    }
+
+    // Two last-handle drops racing on different threads must still retire a
+    // flagged entry: the decision and the accounting linearize under the map
+    // lock, so exactly one drop observes zero. Barrier-aligned, no sleeps.
+    #[test]
+    fn concurrent_last_handle_drops_retire_flagged_chain() {
+        use std::sync::Barrier;
+        let chains = VoiceChains::default();
+        let first = chains.lock_for(GUILD, 1, 0);
+        let second = chains.lock_for(GUILD, 1, 0);
+        chains.remove_after_leave(GUILD, 1, &first);
+        assert_eq!(chains.len(), 1, "contended leave flags the chain");
+        let barrier = Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                drop(first);
+            });
+            scope.spawn(|| {
+                barrier.wait();
+                drop(second);
+            });
+        });
+        assert_eq!(chains.len(), 0, "racing last drops retire the chain");
     }
 
     fn lifecycle_voice(guild: u64, member: u64, channel: u64) -> Event {
