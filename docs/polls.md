@@ -55,15 +55,21 @@ not an anonymous poll service: member IDs are stored for vote changes.
 
 ## Delivery recovery and limitations
 
-A restart automatically closes due polls and recovers closed polls that have
-not yet started results delivery. Competing recoverers share the same durable
-fence. Creation reservations and results send fences commit **before** sending.
+A restart selects due or dirty open polls. A closed row is eligible only when
+it has neither a results receipt nor an in-flight fence, for example after
+an authorized no-send reconciliation. The current closer atomically closes and
+arms that fence; a restart does not automatically recover a crash between the
+claim and the results POST. Competing recoverers share the same durable fence.
+Creation reservations and results send fences commit **before** sending.
 A definitive rejection of the closing display PATCH (for example a deleted
 message) does not suppress the single permitted results POST. Other closing
 edit failures retain the no-replay fence and send no results automatically.
 A confirmed result receipt atomically records `results_posted_at` and clears
-the in-flight fence. Stable Discord nonces also suppress immediate duplicates,
-but their short lifetime is not durable replay safety.
+the in-flight fence. Every failed results POST, including a definitive HTTP
+403/404 rejection, retains the fence and requires the authorized reconciliation
+below; rejection is not automatic retry permission. Stable Discord nonces also
+suppress immediate duplicates, but their short lifetime is not durable replay
+safety.
 
 An ambiguous send (including process cancellation after the fence commits)
 is **not automatically repeated**. This favors no duplicate results over silently
