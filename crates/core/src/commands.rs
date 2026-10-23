@@ -317,7 +317,7 @@ pub fn core_commands() -> Vec<CommandDefinition> {
         ]),
         CommandDefinition::new(
             "game-mix",
-            "Privately show this server's stored game play time, voice overlap and sessions.",
+            "Show this server's aggregate game activity.",
         )
         .permissions(PERM_MANAGE_GUILD),
     ]

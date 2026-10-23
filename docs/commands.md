@@ -197,7 +197,7 @@ Remove a feed relay
 
 ## `/game-mix`
 
-Privately show this server's stored game play time, voice overlap and sessions.
+Show this server's aggregate game activity.
 
 - Default permissions: ManageGuild (`32`)
 - Available in DMs: false
