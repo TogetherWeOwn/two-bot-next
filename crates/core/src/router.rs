@@ -851,7 +851,7 @@ impl InteractionRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::PERM_MANAGE_EVENTS;
+    use crate::commands::{PERM_MANAGE_EVENTS, PERM_MANAGE_GUILD};
     use std::collections::HashMap;
 
     const GUILD: u64 = 2222;
