@@ -20,7 +20,7 @@ high-rate event without a cap row fails the suite.
   guild/member/channel ID, token, query string, body or message content ever
   becomes a label or a log field.
 
-## Cardinality budget: 750 samples
+## Cardinality budget: 756 samples
 
 `GET /metrics` renders this many non-comment samples from process start,
 before any traffic. Adding any series fails the pinned count until this
@@ -47,6 +47,7 @@ table and the test are updated together.
 | `two_bot_gateway_prefix_trigger_refused_total{reason}` | 2 | `verdict`, `other` |
 | `two_bot_dispatch_drops_total{lane}` | 6 | `messages`, `interactions`, `registry`, `privileged`, `busy`, `reactions` |
 | `two_bot_voice_vote_kick_total{outcome}` | 26 | `started` + 2 worker refusals + 15 vote-core refusals (including `cooldown`, `initiator_limited`) + 7 enforcements + `other` |
+| `two_bot_event_voice_tick_total{outcome}` | 6 | 5 website TBD reasons (`opens_soon`, `rate_limited`, `perm_denied`, `no_category`, `unavailable`) + `other`; one observation per TBD tick including backoff-skipped ticks |
 | `two_bot_voice_names_total{outcome}` | 16 | 1 create + 5 template-render outcomes + 9 dispatch outcomes (including `name_blocked` for rename or custom-override refusal) + `other` |
 | `two_bot_gateway_checkpoint_failures_total{stage}` | 2 | `pre_commit`, `commit` |
 | `two_bot_drop_poison_total{guard}` | 7 | `command_dispatch_guard`, `schedule_run`, `user_slot`, `in_flight_guard`, `ticket_supervisor`, `response_accounting`, `voice_connection_guard`; fixed vocabulary, each recovery logs one warn |
@@ -68,7 +69,7 @@ table and the test are updated together.
 | `two_bot_retention_replay_needed_total` | 1 | label-free counter: skipped retention purges needing Operator replay (one per real guild removal whose purge-queue write hit the schema gap); resets on process restart |
 | `two_bot_ticket_lifecycle_total{event,outcome}` | 22 | per-event subsets (2 `retire` + 3 `abandon` + 13 `purge` + 2 `claim` + 2 `close`): each event renders its success outcomes plus the `query` collapse trapdoor, and `purge` adds the 12 `db_cause` classes; closed vocabulary, no `other` row, no member text, channel names, ticket ids or error strings in labels |
 | `two_bot_ticket_component_drops_total` | 1 | label-free counter: ticket components refused before spawning (runtime or per-member saturated); resets on process restart |
-| `# HELP` / `# TYPE` headers | 160 | 80 families x 2 |
+| `# HELP` / `# TYPE` headers | 162 | 81 families x 2 |
 
 ## Per-event caps (gateway metric labels)
 

@@ -10,14 +10,14 @@ use two_bot_core::metrics::{
     Metrics, AUTOMOD_DECISION_OUTCOMES, CHECKPOINT_FAILURE_STAGES, COMMUNITY_FACTS_DRAIN_REASONS,
     CONTAINMENT_STORE_OPS, DB_ERROR_OPS, DISPATCH_LANES, DROP_POISON_GUARDS, EVENTS,
     EVENTSUB_DELIVERY_KINDS, EVENTSUB_POST_OUTCOMES, EVENTSUB_RECONCILE_ACTIONS,
-    EVENTSUB_RECONCILE_ERROR_CLASSES, EVENTSUB_RECONCILE_OUTCOMES, FEED_FETCH_ERROR_CLASSES,
-    FEED_FETCH_OUTCOMES, INTERNAL_ACTION_FAMILIES, INTERNAL_ACTION_OUTCOMES, JOBS,
-    JOB_ERROR_CLASSES, JOB_OUTCOMES, MODERATION_ENFORCEMENT_OUTCOMES, MODERATION_VERBS,
-    PREFIX_TRIGGER_REFUSED_REASONS, PRESENCE_CAPTURE_OUTCOMES, REST_ROUTES, RESULTS,
-    SEND_ADMISSION_OUTCOMES, TICKET_LIFECYCLE_EVENTS, TICKET_LIFECYCLE_OUTCOMES,
-    VOICE_DEAD_ACTIONS, VOICE_JOIN_OCCUPANCY_BUCKETS, VOICE_JOIN_REFUSAL_REASONS,
-    VOICE_NAME_OUTCOMES, VOICE_OPERATIONS, VOICE_OUTCOMES, VOICE_RECONCILE_ACTIONS,
-    VOICE_VOTE_KICK_OUTCOMES,
+    EVENTSUB_RECONCILE_ERROR_CLASSES, EVENTSUB_RECONCILE_OUTCOMES, EVENT_VOICE_TICK_OUTCOMES,
+    FEED_FETCH_ERROR_CLASSES, FEED_FETCH_OUTCOMES, INTERNAL_ACTION_FAMILIES,
+    INTERNAL_ACTION_OUTCOMES, JOBS, JOB_ERROR_CLASSES, JOB_OUTCOMES,
+    MODERATION_ENFORCEMENT_OUTCOMES, MODERATION_VERBS, PREFIX_TRIGGER_REFUSED_REASONS,
+    PRESENCE_CAPTURE_OUTCOMES, REST_ROUTES, RESULTS, SEND_ADMISSION_OUTCOMES,
+    TICKET_LIFECYCLE_EVENTS, TICKET_LIFECYCLE_OUTCOMES, VOICE_DEAD_ACTIONS,
+    VOICE_JOIN_OCCUPANCY_BUCKETS, VOICE_JOIN_REFUSAL_REASONS, VOICE_NAME_OUTCOMES,
+    VOICE_OPERATIONS, VOICE_OUTCOMES, VOICE_RECONCILE_ACTIONS, VOICE_VOTE_KICK_OUTCOMES,
 };
 
 fn repository_root() -> PathBuf {
@@ -134,6 +134,7 @@ fn allowlisted_labels(name: &str) -> Vec<&'static str> {
         "two_bot_voice_join_refused_total" => vec!["reason"],
         "two_bot_dispatch_drops_total" => vec!["lane"],
         "two_bot_voice_vote_kick_total" => vec!["outcome"],
+        "two_bot_event_voice_tick_total" => vec!["outcome"],
         "two_bot_voice_names_total" => vec!["outcome"],
         "two_bot_internal_actions_total" => vec!["family", "outcome"],
         "two_bot_moderation_enforcements_total" => vec!["verb", "outcome"],
@@ -191,6 +192,9 @@ fn expected_values(name: &str) -> Vec<(&'static str, Vec<&'static str>)> {
         "two_bot_dispatch_drops_total" => vec![("lane", DISPATCH_LANES.to_vec())],
         "two_bot_voice_vote_kick_total" => {
             vec![("outcome", VOICE_VOTE_KICK_OUTCOMES.to_vec())]
+        }
+        "two_bot_event_voice_tick_total" => {
+            vec![("outcome", EVENT_VOICE_TICK_OUTCOMES.to_vec())]
         }
         "two_bot_voice_names_total" => vec![("outcome", VOICE_NAME_OUTCOMES.to_vec())],
         "two_bot_voice_join_refused_total" => {
@@ -269,6 +273,7 @@ const KNOWN_COUNTERS: &[&str] = &[
     "two_bot_voice_dead_letters_total",
     "two_bot_voice_join_occupancy_total",
     "two_bot_voice_vote_kick_total",
+    "two_bot_event_voice_tick_total",
     "two_bot_voice_names_total",
     "two_bot_voice_orphans_total",
     "two_bot_voice_joins_received_total",
