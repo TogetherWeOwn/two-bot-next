@@ -40,8 +40,8 @@
 //! disposable fixture and skip locally when the bootstrap variable is absent.
 
 use two_bot_core::feeds::{
-    feed_list_page, feed_list_text, plan_command, FeedCommand, FeedCommandContext, FeedCommandPlan,
-    FeedError, FeedKind, FeedRelay,
+    feed_list_page, feed_list_text, normalize_source, plan_command, FeedCommand,
+    FeedCommandContext, FeedCommandPlan, FeedError, FeedKind, FeedRelay,
 };
 use two_bot_core::{announcement_commands, help_text};
 
@@ -469,6 +469,98 @@ fn inspect_redacts_userinfo_credential_query_and_fragment_with_notice() {
     assert_no_success_labels(&text);
 }
 
+fn assert_normalized_query_credentials_redacted(name: &str) {
+    let secret = "fixture-encoded-credential-value";
+    let source = format!(
+        "https://example.org/{}/feed?{name}={secret}&channel_id=UC0123456789&format=rss",
+        "a".repeat(160)
+    );
+    assert!(
+        source.find(secret).expect("fixture has credential") > 128,
+        "credential must be beyond the legacy source preview"
+    );
+    let normalized = normalize_source(FeedKind::Rss, &source)
+        .expect("encoded and compound credential names are valid saved sources");
+    assert!(
+        normalized.contains(secret),
+        "normalization is not redaction"
+    );
+    let text = relay("relay-query-redaction", &normalized, None, true).inspect_text();
+    assert_bounded(&text);
+    assert!(
+        !text.contains(secret),
+        "credential value for {name} must not survive inspect: {text}"
+    );
+    assert!(
+        text.to_ascii_lowercase().contains("redact"),
+        "credential removal for {name} must have an explicit notice: {text}"
+    );
+    let source_line = text
+        .lines()
+        .find(|line| line.starts_with("Source: "))
+        .expect("detail projects a source line");
+    for identity in ["example.org", "channel_id=UC0123456789", "format=rss"] {
+        assert!(
+            source_line.contains(identity),
+            "safe identity {identity} survives credential redaction: {text}"
+        );
+    }
+    assert_no_success_labels(&text);
+}
+
+#[test]
+fn inspect_redacts_lower_hex_encoded_credential_names_after_normalization() {
+    for name in ["to%6ben", "%74oken", "client%53ecret"] {
+        assert_normalized_query_credentials_redacted(name);
+    }
+}
+
+#[test]
+fn inspect_redacts_upper_hex_encoded_credential_names_after_normalization() {
+    for name in ["to%6Ben", "access%54oken", "client%53ecret"] {
+        assert_normalized_query_credentials_redacted(name);
+    }
+}
+
+#[test]
+fn inspect_redacts_compound_credential_names_after_normalization() {
+    for name in ["accessToken", "clientSecret"] {
+        assert_normalized_query_credentials_redacted(name);
+    }
+}
+
+#[test]
+fn inspect_redacts_case_variant_credential_names_after_normalization() {
+    for name in ["AccessToken", "ACCESSTOKEN", "ClientSecret", "CLIENTSECRET"] {
+        assert_normalized_query_credentials_redacted(name);
+    }
+}
+
+#[test]
+fn inspect_plain_token_redaction_preserves_safe_query_identity() {
+    assert_normalized_query_credentials_redacted("token");
+}
+
+#[test]
+fn inspect_public_ipv6_source_has_exactly_one_bracket_pair() {
+    for source in [
+        "https://[2606:4700:4700::1111]/feed",
+        "https://[2606:4700:4700::1111]:8443/feed",
+    ] {
+        let normalized = normalize_source(FeedKind::Rss, source)
+            .expect("public IPv6 sources pass the saved-source validator");
+        assert_eq!(normalized, source);
+        let text = relay("relay-ipv6", &normalized, None, true).inspect_text();
+        let source_lines: Vec<&str> = text
+            .lines()
+            .filter(|line| line.starts_with("Source: "))
+            .collect();
+        assert_eq!(source_lines, vec![format!("Source: {source}")]);
+        assert_bounded(&text);
+        assert_no_success_labels(&text);
+    }
+}
+
 #[test]
 fn inspect_suppresses_mentions_embeds_and_hostile_markdown() {
     let hostile =
@@ -560,29 +652,137 @@ fn list_pages_preserve_every_id_at_capacity_with_deterministic_unicode_paging() 
     );
 }
 
+fn advertised_list_rows(rows: &[FeedRelay]) -> Vec<String> {
+    let first = feed_list_page(rows, 1);
+    let total = first
+        .lines()
+        .find_map(|line| line.strip_prefix("Page 1 of "))
+        .map(|rest| {
+            rest.split_once('.')
+                .expect("page footer has a complete page count")
+                .0
+                .parse::<usize>()
+                .expect("advertised page count is numeric")
+        })
+        .unwrap_or(1);
+    assert!((1..=rows.len()).contains(&total));
+    let mut rendered = Vec::new();
+    for page in 1..=total {
+        let page = i64::try_from(page).expect("bounded page count fits command input");
+        let text = feed_list_page(rows, page);
+        assert_bounded(&text);
+        assert_no_success_labels(&text);
+        assert_eq!(text, feed_list_page(rows, page), "paging is deterministic");
+        if total > 1 {
+            assert!(text.contains(&format!("Page {page} of {total}.")));
+        }
+        rendered.extend(
+            text.lines()
+                .filter(|line| line.starts_with('`'))
+                .map(str::to_owned),
+        );
+    }
+    let seen: Vec<&str> = rendered
+        .iter()
+        .map(|line| {
+            line.strip_prefix('`')
+                .and_then(|rest| rest.split_once('`').map(|(id, _)| id))
+                .expect("whole row keeps its complete stable ID")
+        })
+        .collect();
+    let expected: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+    assert_eq!(
+        seen, expected,
+        "every ID occurs once across advertised pages"
+    );
+    rendered
+}
+
+fn assert_list_attempt_suffix(line: &str, expected: &str) {
+    assert_eq!(
+        line.rsplit_once(" · ").map(|(_, suffix)| suffix),
+        Some(expected),
+        "whole row must end in the exact attempt phrase: {line}"
+    );
+    assert_eq!(line.matches("Last attempt:").count(), 1);
+}
+
 #[test]
 fn list_pages_apply_same_attempt_vocabulary_without_losing_rows() {
     let mut rows: Vec<FeedRelay> = (1..=25).map(page_relay).collect();
-    rows[0].last_checked_at = None;
-    rows[1].last_checked_at = Some(1_700_000_000_000);
-    rows[2].last_checked_at = Some(-1);
-    let first = feed_list_page(&rows, 1);
-    let lowered = first.to_ascii_lowercase();
-    assert!(
-        lowered.contains("attempt"),
-        "list rows share the attempt vocabulary: {first}"
-    );
-    assert!(
-        lowered.contains("never") || lowered.contains("unknown"),
-        "list distinguishes never and unknown attempts: {first}"
-    );
-    assert_no_success_labels(&first);
-    for row in rows.iter().take(3) {
-        assert!(
-            feed_list_page(&rows, 1).contains(&format!("`{}`", row.id))
-                || feed_list_page(&rows, 2).contains(&format!("`{}`", row.id)),
-            "attempt vocabulary must not hide whole rows"
+    let attempts = [
+        (None, "Last attempt: never"),
+        (Some(1_700_000_000_000), "Last attempt: <t:1700000000:R>"),
+        (Some(-1), "Last attempt: unknown"),
+    ];
+    for (index, row) in rows.iter_mut().enumerate() {
+        row.last_checked_at = attempts[index % attempts.len()].0;
+        row.source = format!("https://example.org/{}/feed-{index}", "🦀".repeat(40));
+    }
+    assert!(feed_list_page(&rows, 1).contains("Page 1 of "));
+    let rendered = advertised_list_rows(&rows);
+    for (index, row) in rows.iter().enumerate() {
+        let prefix = format!("`{}` ", row.id);
+        let line = rendered
+            .iter()
+            .find(|line| line.starts_with(&prefix))
+            .expect("exact stable-ID row stays reachable across advertised pages");
+        assert_list_attempt_suffix(line, attempts[index % attempts.len()].1);
+    }
+}
+
+// Literal expected phrases make each millisecond boundary independent of the
+// renderer's range predicate and integer division. In particular MAX-1 must
+// not round up, and MAX+1 must not become credible after division by 1000.
+const ATTEMPT_BOUNDARIES: [(i64, &str); 7] = [
+    (-1, "Last attempt: unknown"),
+    (0, "Last attempt: <t:0:R>"),
+    (1, "Last attempt: <t:0:R>"),
+    (253_402_300_798_999, "Last attempt: <t:253402300798:R>"),
+    (253_402_300_799_000, "Last attempt: <t:253402300799:R>"),
+    (253_402_300_799_001, "Last attempt: unknown"),
+    (i64::MAX, "Last attempt: unknown"),
+];
+
+#[test]
+fn inspect_attempt_timestamp_millisecond_boundaries_are_exact() {
+    for (stamp, expected) in ATTEMPT_BOUNDARIES {
+        let feed = relay(
+            "relay-timestamp-boundary",
+            "https://example.org/feed?format=rss",
+            Some(stamp),
+            true,
         );
+        let text = feed.inspect_text();
+        let phrases: Vec<&str> = text
+            .lines()
+            .filter(|line| line.starts_with("Last attempt:"))
+            .collect();
+        assert_eq!(phrases, vec![expected], "detail timestamp {stamp}: {text}");
+        assert_bounded(&text);
+        assert_no_success_labels(&text);
+    }
+}
+
+#[test]
+fn list_attempt_timestamp_millisecond_boundaries_are_exact() {
+    let rows: Vec<FeedRelay> = ATTEMPT_BOUNDARIES
+        .iter()
+        .enumerate()
+        .map(|(index, (stamp, _))| {
+            let mut feed = page_relay(index + 1);
+            feed.last_checked_at = Some(*stamp);
+            feed
+        })
+        .collect();
+    let rendered = advertised_list_rows(&rows);
+    for (row, (_, expected)) in rows.iter().zip(ATTEMPT_BOUNDARIES) {
+        let prefix = format!("`{}` ", row.id);
+        let line = rendered
+            .iter()
+            .find(|line| line.starts_with(&prefix))
+            .expect("exact boundary row remains reachable");
+        assert_list_attempt_suffix(line, expected);
     }
 }
 
