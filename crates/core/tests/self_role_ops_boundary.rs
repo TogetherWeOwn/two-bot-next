@@ -26,9 +26,10 @@ fn independently_expiring_ops_cannot_replace_a_drain_guarded_catalogue() {
         Instant::now(),
     );
     assert_eq!(live.get("100", key), Some(json!([])));
+    // Empty arrays render as an empty env string, not JSON.
     assert_eq!(
         live.env_snapshot(Some("100")).get(key).map(String::as_str),
-        Some("[]")
+        Some("")
     );
     assert_eq!(
         live.get("100", "TWO_TICKET_COOLDOWN_SECONDS"),
