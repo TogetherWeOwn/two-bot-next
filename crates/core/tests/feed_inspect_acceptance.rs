@@ -404,6 +404,17 @@ fn inspect_invalid_legacy_timestamps_are_unknown_not_healthy() {
 
 #[test]
 fn attempt_vocabulary_never_uses_success_labels_in_list_controls() {
+    // Qualified call keeps the baseline trait live after an inherent method lands.
+    let feed = relay(
+        "relay-keepalive-1",
+        "https://example.org/news/keepalive?format=rss",
+        Some(1_700_000_000_000),
+        true,
+    );
+    assert_eq!(
+        <FeedRelay as BaselineFeedInspect>::inspect_text(&feed),
+        feed_list_text(std::slice::from_ref(&feed))
+    );
     let rows: Vec<FeedRelay> = (1..=3).map(page_relay).collect();
     let single = feed_list_page(&rows, 1);
     let many: Vec<FeedRelay> = (1..=25).map(page_relay).collect();
