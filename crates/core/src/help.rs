@@ -125,6 +125,12 @@ const HELP_GROUPS: &[HelpGroup] = &[
         anchor: None,
     },
     HelpGroup {
+        title: "Game activity (private, live guild unavailable)",
+        requires: Some("Manage Server"),
+        commands: &["game-mix"],
+        anchor: None,
+    },
+    HelpGroup {
         title: "Voice rooms",
         requires: None,
         commands: &[

@@ -314,6 +314,11 @@ pub fn core_commands() -> Vec<CommandDefinition> {
                 .max_length(128),
             ]),
         ]),
+        CommandDefinition::new(
+            "game-mix",
+            "Privately show this server's stored game play time, voice overlap and sessions.",
+        )
+        .permissions(PERM_MANAGE_GUILD),
     ]
 }
 

@@ -47,6 +47,10 @@ impl CommandPermission {
     #[must_use]
     pub fn allows(self, actor_permissions: Option<u64>) -> bool {
         self.required_permissions == 0
+            // This Next-only staff read follows /export's Administrator OR
+            // Manage Guild contract. Preserve every legacy command's mask.
+            || (self.command == "game-mix"
+                && actor_permissions.is_some_and(|bits| bits & 8 != 0))
             || actor_permissions
                 .is_some_and(|bits| bits & self.required_permissions == self.required_permissions)
     }
@@ -77,13 +81,14 @@ use PolicyHook::{
 /// plus the Next-only `/help` discovery command (parity row 31 — legacy has
 /// no help command), the Next-only `/privacy` member self-serve
 /// (parity row 32) and the Next-only management-only `/command-inspect`
-/// (parity row 33).
-/// No Administrator-only exception: preserve the legacy resolved-bit check.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 33] = [
+/// (parity row 33), and staff aggregate `/game-mix` (parity row 34).
+/// Only `/game-mix` admits Administrator alone; legacy masks are unchanged.
+pub const COMMAND_PERMISSIONS: [CommandPermission; 34] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),
     row(32, "privacy", BuiltinSlash, 0, None),
+    row(34, "game-mix", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(
         3,
         "ban",

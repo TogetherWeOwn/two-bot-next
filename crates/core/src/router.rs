@@ -121,6 +121,7 @@ pub enum HandlerId {
     Leaderboard,
     Help,
     Privacy,
+    GameMix,
     ScorecardAttendance,
     AutomationAdmin,
     AutomationCustom,
@@ -415,6 +416,7 @@ impl InteractionRouter {
             HandlerId::Leaderboard,
             HandlerId::Help,
             HandlerId::Privacy,
+            HandlerId::GameMix,
         ] {
             register(id);
         }
@@ -634,6 +636,11 @@ impl InteractionRouter {
                 handler: HandlerId::Privacy,
                 gate: RowGate::Always,
                 permission_refusal: None,
+            },
+            "game-mix" => Row {
+                handler: HandlerId::GameMix,
+                gate: RowGate::Always,
+                permission_refusal: Some(RouterRefusal::ManageServerRequired),
             },
             // Scorecard check-in gates `ManageEvents` both in the published
             // definition (`feature_commands.rs`) and at dispatch (`rsvp.rs`

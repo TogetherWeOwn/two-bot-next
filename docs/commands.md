@@ -20,7 +20,7 @@ Bounds below are registry bounds; a dash means no bound is declared there,
 not that handler validation is unlimited. Permissions are Discord default
 member-permission bitfields, not a replacement for runtime authorization.
 
-Built-in commands: 51.
+Built-in commands: 52.
 
 ## `/access`
 
@@ -194,6 +194,15 @@ Remove a feed relay
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `id` | string | true | — | — | 128 | — | Feed id |
+
+## `/game-mix`
+
+Privately show this server's stored game play time, voice overlap and sessions.
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+No options.
 
 ## `/group`
 

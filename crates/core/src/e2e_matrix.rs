@@ -172,6 +172,16 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             ],
         ),
         row(
+            "game-mix",
+            34,
+            E2eGate::Always,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "GameMix",
+            "Deferred private guild aggregate JSON: up to ten games, play milliseconds, in-voice milliseconds and session counts; empty hint or truthful truncation note. Live guild refused without a read.",
+            &["Perm:ManageServerRequired"],
+        ),
+        row(
             "attendance",
             12,
             E2eGate::Scorecard,

@@ -1453,6 +1453,7 @@ impl CommandRuntime {
         // first, so an owner-map entry could never execute.
         let owner = match name.as_str() {
             "privacy" => Some(HandlerId::Privacy),
+            "game-mix" => Some(HandlerId::GameMix),
             "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list" => {
                 Some(HandlerId::AutomationAdmin)
             }
@@ -1485,6 +1486,31 @@ impl CommandRuntime {
             "privacy" => {
                 crate::privacy_command::privacy_command(&self.pool, &self.executor, interaction)
                     .await;
+            }
+            "game-mix" => {
+                let guild_id = self.guild_id.to_string();
+                match two_bot_core::game_activity_store::read_guild_aggregates(
+                    &self.pool, &guild_id,
+                )
+                .await
+                {
+                    Ok(rows) => {
+                        self.finish(
+                            interaction,
+                            two_bot_core::game_activity::render_game_activity_discord_report(
+                                &guild_id, &rows,
+                            ),
+                        )
+                        .await;
+                    }
+                    Err(_) => {
+                        self.finish(
+                            interaction,
+                            "Game activity is unavailable right now. Please try again shortly.",
+                        )
+                        .await;
+                    }
+                }
             }
             "sticky" => self.sticky_set(interaction).await,
             "sticky-remove" => self.sticky_remove(interaction).await,
@@ -2517,6 +2543,7 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     // `/privacy` member self-serve is never activation-fenced either: every
     // member may opt out of analytics in any guild.
     router.register(Box::new(SliceHandler(HandlerId::Privacy)));
+    router.register(Box::new(SliceHandler(HandlerId::GameMix)));
     router
 }
 
