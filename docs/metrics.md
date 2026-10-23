@@ -601,7 +601,10 @@ labels reach exposition. REST paths are matched to templates, never copied as
 labels: no guild/member/channel IDs, tokens, query strings, visitor data or message
 content. Unknown routes/events/jobs collapse to `other`. Histograms have eight
 fixed finite buckets and `+Inf`, sum and count. A scrape allocates a bounded-size
-text response; observations retain no input string.
+text response; observations retain no input string. Wire `HELP` descriptions stay
+concise to preserve the 64 KiB scrape budget as fixed series are added; the catalog
+above retains the detailed semantics. Shortening `HELP` prose does not change
+metric names, types, labels, values or series counts.
 
 `crates/core/examples/metrics_rss.rs` fills every series, submits 100,000 unique
 unknown labels, then renders 10,000 scrapes. It reports Linux `/proc/self/status`

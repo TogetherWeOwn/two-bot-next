@@ -2165,7 +2165,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_live_not_ready_seconds",
             "gauge",
-            "Seconds a guild live voice view has been not ready while the gateway is connected (creator joins are dropped meanwhile), maximum across guild actors; 0 when every view is ready or the gateway is down.",
+            "Maximum guild voice-view not-ready age while connected; 0 when ready or disconnected.",
         );
         writeln!(
             out,
@@ -2242,7 +2242,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_actor_inbox_turn_bound",
             "gauge",
-            "At most this many consecutive guild-actor inbox turns before a ready dispatch, timer or maintenance branch runs; 0 until the first actor publishes.",
+            "Inbox turns allowed before another ready actor branch; 0 before publication.",
         );
         writeln!(
             out,
@@ -2295,7 +2295,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_names_total",
             "counter",
-            "Automatic room-name decisions: created with the template name, template renders by outcome, and queued renames sent or dropped at dispatch.",
+            "Room-name creation, template renders and dispatched rename outcomes.",
         );
         for (outcome, count) in VOICE_NAME_OUTCOMES.iter().zip(values.voice_names) {
             writeln!(
@@ -2317,7 +2317,7 @@ impl Metrics {
             &mut out,
             "two_bot_containment_store_errors_total",
             "counter",
-            "Containment-store failures by bounded operation; a failed completion also surfaces as outcome-unknown in the staff alert.",
+            "Containment-store failures by operation.",
         );
         for (op, count) in CONTAINMENT_STORE_OPS
             .iter()
@@ -2362,7 +2362,7 @@ impl Metrics {
             &mut out,
             "two_bot_dispatch_drops_total",
             "counter",
-            "Dispatch-lane saturation drops by bounded lane (reactions lane also counts per-member fairness refusals); logs sample one warn per 60 s per runtime.",
+            "Dispatch saturation drops by lane; reactions include fairness refusals.",
         );
         for (lane, count) in DISPATCH_LANES.iter().zip(values.dispatch_drops) {
             writeln!(
@@ -2416,7 +2416,7 @@ impl Metrics {
             &mut out,
             "two_bot_drop_poison_total",
             "counter",
-            "Poisoned locks recovered by drop guards instead of panicking inside drop (which aborts during unwinding); every recovery also logs one warn with the guard name.",
+            "Poisoned locks recovered by drop guards; one warning per recovery.",
         );
         let drop_poisons = self
             .1
@@ -2433,7 +2433,7 @@ impl Metrics {
             &mut out,
             "two_bot_internal_actions_total",
             "counter",
-            "Signed website-action receiver executions by bounded family and outcome; refusals share the warn-summary classes.",
+            "Signed website-action executions by family and outcome.",
         );
         for (family, outcomes) in INTERNAL_ACTION_FAMILIES.iter().zip(values.internal_actions) {
             for (outcome, count) in INTERNAL_ACTION_OUTCOMES.iter().zip(outcomes) {
@@ -2463,7 +2463,7 @@ impl Metrics {
             &mut out,
             "two_bot_community_facts_drain_failures_total",
             "counter",
-            "Community-facts drain failures by bounded reason; the worker warns and continues, so each failed dispatch counts once.",
+            "Failed community-facts dispatches by reason; one count per failure.",
         );
         for (reason, count) in COMMUNITY_FACTS_DRAIN_REASONS
             .iter()
@@ -2479,7 +2479,7 @@ impl Metrics {
             &mut out,
             "two_bot_audit_delivery_halt",
             "gauge",
-            "Audit mirror delivery halt; 1 while the persistent kill switch is engaged, 0 otherwise. Set once per readable audit_retry sweep; an unreadable halt keeps the last reported state.",
+            "Audit mirror kill switch: 1 halted, 0 running; unreadable sweeps retain the last value.",
         );
         writeln!(
             out,
@@ -2503,7 +2503,7 @@ impl Metrics {
             &mut out,
             "two_bot_event_store_consumer_lag_seconds",
             "gauge",
-            "Event-store consumer lag in seconds (received_at minus event_time for the newest observed capture row); 0 when unobserved. Single label-free series.",
+            "Newest capture received_at minus event_time, in seconds; 0 when unobserved.",
         );
         writeln!(
             out,
