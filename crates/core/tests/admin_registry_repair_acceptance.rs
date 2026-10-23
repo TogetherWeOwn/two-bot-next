@@ -433,17 +433,10 @@ mod database {
 
     async fn incompatible_upgrade_is_atomic(chain: &str, shipped: i64) {
         let Some(url) = bootstrap() else { return };
-        let latest = migrator(chain).await;
-        let prefix = Migrator::with_migrations(
-            latest
-                .iter()
-                .filter(|m| m.version <= shipped)
-                .cloned()
-                .collect(),
-        );
+        let (prefix, latest) = pre_repair_migrators(chain, shipped).await;
         let db = TestDatabase::create(&url, &prefix)
             .await
-            .expect("create shipped-schema fixture");
+            .expect("create pre-repair-schema fixture");
         let mut legacy = row();
         legacy
             .as_object_mut()
