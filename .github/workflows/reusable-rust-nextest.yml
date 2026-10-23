@@ -240,14 +240,14 @@ jobs:
           disable_annotations: true
 
       # A shared-cache outage must not prevent the required suite from running.
-      # --show-stats connects to or starts the server, exercising backend setup
+      # --zero-stats connects to or starts the server, validating backend setup
       # before Cargo's first rustc probe. Do not print startup errors: remote
       # cache diagnostics can contain signed URLs.
       - name: Verify sccache availability (uncached fallback)
         shell: bash
         run: |
           set -euo pipefail
-          if sccache --show-stats >/dev/null 2>&1; then
+          if sccache --zero-stats >/dev/null 2>&1; then
             echo "sccache ready"
           else
             echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
