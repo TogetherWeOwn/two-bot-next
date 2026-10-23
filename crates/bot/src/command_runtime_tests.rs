@@ -3721,10 +3721,12 @@ async fn shared_runtime_routes_leveling_once_with_legacy_visibility_and_guild_fe
         .iter()
         .map(|r| serde_json::from_slice(&r.body).unwrap())
         .collect();
+    // Empty reward ladder: lifetime values plus the explicit end-of-ladder
+    // line.
     for (reply, name) in replies[..2].iter().zip(["member", "Target member"]) {
         assert_eq!(
             reply["content"],
-            two_bot_core::leveling::rank_text(name, 0, None, 0, 0)
+            two_bot_core::leveling::rank_text_with_rewards(name, 0, None, 0, 0, &[])
         );
     }
     assert_eq!(

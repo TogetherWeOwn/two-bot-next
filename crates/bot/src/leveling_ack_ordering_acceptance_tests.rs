@@ -35,7 +35,8 @@
 
 use super::*;
 use two_bot_core::leveling::{
-    leaderboard_reply_for_season, level_for_xp, rank_text, season_id_for_ms, LeaderboardEntry,
+    leaderboard_reply_for_season, level_for_xp, rank_text_with_rewards, season_id_for_ms,
+    LeaderboardEntry,
 };
 use two_bot_testsupport::TestDatabase;
 
@@ -545,7 +546,16 @@ async fn rank_success_completes_via_edit_with_lifetime_values() {
     let reply: serde_json::Value = serde_json::from_slice(&done[0].body).expect("edit is json");
     assert_eq!(
         reply["content"],
-        serde_json::Value::String(rank_text(hostile, level_for_xp(1500), Some(1), 1, 1500)),
+        // Empty reward ladder: lifetime values plus the explicit end-of-ladder
+        // line, hostile name still neutralized.
+        serde_json::Value::String(rank_text_with_rewards(
+            hostile,
+            level_for_xp(1500),
+            Some(1),
+            1,
+            1500,
+            &[],
+        )),
         "rank renders the lifetime profile with the hostile name neutralized"
     );
     assert_eq!(
