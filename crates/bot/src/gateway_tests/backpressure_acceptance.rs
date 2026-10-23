@@ -46,7 +46,10 @@
 //! hold stalls the serial drain while the burst arrives; the refusal poll
 //! resolves in about a second, inside the hold window.
 
-use super::rsvp::{connect_with_shutdown, global_series, interaction, lane_holding_rest};
+use super::rsvp::{
+    connect_with_shutdown, connect_with_shutdown_and_heartbeat, global_series, interaction,
+    lane_holding_rest,
+};
 use super::*;
 use crate::discord_test_common::MockRest;
 use std::sync::atomic::AtomicBool;
@@ -164,5 +167,328 @@ async fn rsvp_burst_against_stalled_drain_refuses_and_counts() {
         .unwrap();
     drop(ws);
     rest.shutdown().await;
+    db.close().await;
+}
+
+fn mixed_rsvp(sequence: u64, status: &str) -> Value {
+    let mut packet = interaction(sequence, status);
+    // Keep the per-member write-rate budget out of the ingress-capacity test.
+    packet["d"]["member"]["user"]["id"] = json!((70_000 + sequence).to_string());
+    packet
+}
+
+fn mixed_slash(sequence: u64, name: &str) -> Value {
+    let mut packet = interaction(sequence, "going");
+    packet["d"]["token"] = json!(format!("mock-other-{sequence}"));
+    packet["d"]["member"]["permissions"] = json!("32");
+    packet["d"]["data"]["name"] = json!(name);
+    packet["d"]["data"]["options"] = json!([]);
+    packet
+}
+
+fn mixed_component(sequence: u64) -> Value {
+    let mut packet = mixed_slash(sequence, "not-rsvp");
+    packet["d"]["type"] = json!(3);
+    packet["d"]["data"] = json!({
+        "custom_id": "not-rsvp-acceptance-probe", "component_type": 2
+    });
+    packet
+}
+
+fn token_requests(rest: &MockRest, method: &str, suffix: &str) -> usize {
+    rest.requests()
+        .iter()
+        .filter(|request| request.method == method && request.path.ends_with(suffix))
+        .count()
+}
+
+async fn mixed_receipt(
+    rest: &MockRest,
+    runner: &JoinHandle<Result<(), sqlx::Error>>,
+    method: &str,
+    suffix: &str,
+    refused_before: u64,
+) -> Result<(), String> {
+    // The outer stalled-phase deadline bounds every wait together. In
+    // particular a capacity mutant must not wait through 32 separate budgets.
+    loop {
+        let refused = global_series(REFUSED_SERIES) - refused_before;
+        if refused != 0 {
+            return Err(format!(
+                "unrelated traffic consumed RSVP capacity or counted a refusal: {refused}"
+            ));
+        }
+        if runner.is_finished() {
+            return Err("runner stopped before the stalled phase completed".to_owned());
+        }
+        if token_requests(rest, method, suffix) == 1 {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI disposable test database"]
+async fn real_gateway_mixed_traffic_does_not_spend_rsvp_capacity_or_refusals() {
+    // Breaks: candidate=true at run_shard reception consumes slots for
+    // ignored prepares; unconditional refusal counting charges bypasses.
+    // Neither a pure classifier assertion nor all-callback counting can
+    // detect both mistakes. Hold actual SQL work until both phases finish.
+    // Exclusive TestDb fences all gateway peers so exact global deltas are
+    // meaningful (including in the serial ignored-runtime CI lane).
+    let db = TestDb::exclusive_with_pool_max(8).await;
+    let rest = lane_holding_rest(Arc::new(AtomicBool::new(false)), Duration::ZERO).await;
+    let refused_before = global_series(REFUSED_SERIES);
+    let (shutdown, receiver) = tokio::sync::watch::channel(false);
+    let (runner, mut ws) =
+        connect_with_shutdown_and_heartbeat(&db, &rest, Some(receiver), 600_000).await;
+    let lock_pool = db.independent_pool(1).await;
+    let mut lock = lock_pool.begin().await.unwrap();
+    let locker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *lock)
+        .await
+        .unwrap();
+    sqlx::query("LOCK TABLE event_rsvps IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let admitted: Vec<u64> = std::iter::once(2).chain(6..=36).collect();
+    assert_eq!(admitted.len(), MAX_RSVP_IN_FLIGHT);
+    // READY=1, 32 admitted RSVPs, six unrelated packets, eight true
+    // overflows: 46 dispatches total. Even with NO funnel drain this is
+    // below the independent fatal DISPATCH_BACKLOG=64.
+    let phase = tokio::time::timeout(Duration::from_secs(15), async {
+        ws.send(Message::text(mixed_rsvp(2, "going").to_string()))
+            .await
+            .map_err(|_| "head packet send failed")?;
+        mixed_receipt(
+            &rest,
+            &runner,
+            "POST",
+            "/interactions/2/mock-rsvp-2/callback",
+            refused_before,
+        )
+        .await?;
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'relation' \
+                 AND relation = 'event_rsvps'::regclass AND NOT granted \
+                 AND $1::integer = ANY(pg_blocking_pids(pid)))",
+            )
+            .bind(locker)
+            .fetch_one(&db.pool)
+            .await
+            .map_err(|_| "lock waiter query failed")?;
+            if waiting {
+                break;
+            }
+            if runner.is_finished() {
+                return Err("runner stopped before SQL stall".to_owned());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Both phases run while the head holds the serial RSVP drain. A
+        // sticky validation completion is a reception barrier after unknown
+        // slash/component packets; those unknown packets need not reply.
+        for (slash, component, barrier) in [(3, 4, 5), (37, 38, 39)] {
+            ws.send(Message::text(
+                mixed_slash(slash, "not-rsvp-acceptance-probe").to_string(),
+            ))
+            .await
+            .map_err(|_| "unrelated slash send failed")?;
+            ws.send(Message::text(mixed_component(component).to_string()))
+                .await
+                .map_err(|_| "unrelated component send failed")?;
+            ws.send(Message::text(mixed_slash(barrier, "sticky").to_string()))
+                .await
+                .map_err(|_| "sticky barrier send failed")?;
+            mixed_receipt(
+                &rest,
+                &runner,
+                "POST",
+                &format!("/interactions/{barrier}/mock-other-{barrier}/callback"),
+                refused_before,
+            )
+            .await?;
+            mixed_receipt(
+                &rest,
+                &runner,
+                "PATCH",
+                &format!("/webhooks/1111/mock-other-{barrier}/messages/@original"),
+                refused_before,
+            )
+            .await?;
+            if slash == 3 {
+                for (index, sequence) in admitted.iter().copied().enumerate().skip(1) {
+                    let status = if index % 2 == 0 {
+                        "going"
+                    } else {
+                        "interested"
+                    };
+                    ws.send(Message::text(mixed_rsvp(sequence, status).to_string()))
+                        .await
+                        .map_err(|_| "admitted RSVP send failed")?;
+                    mixed_receipt(
+                        &rest,
+                        &runner,
+                        "POST",
+                        &format!("/interactions/{sequence}/mock-rsvp-{sequence}/callback"),
+                        refused_before,
+                    )
+                    .await?;
+                }
+            }
+            if global_series(REFUSED_SERIES) != refused_before {
+                return Err("non-RSVP packets added RSVP refusals".to_owned());
+            }
+        }
+        for sequence in &admitted {
+            if token_requests(
+                &rest,
+                "PATCH",
+                &format!("/webhooks/1111/mock-rsvp-{sequence}/messages/@original"),
+            ) != 0
+            {
+                return Err("RSVP drain was not stalled through saturation".to_owned());
+            }
+        }
+        for sequence in 40..=47 {
+            ws.send(Message::text(mixed_rsvp(sequence, "going").to_string()))
+                .await
+                .map_err(|_| "overflow RSVP send failed")?;
+        }
+        loop {
+            let refused = global_series(REFUSED_SERIES) - refused_before;
+            if refused >= 8 {
+                if refused != 8 {
+                    return Err(format!(
+                        "expected only eight genuine RSVP refusals, got {refused}"
+                    ));
+                }
+                break;
+            }
+            if runner.is_finished() {
+                return Err("runner stopped on genuine overflow".to_owned());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Ok::<(), String>(())
+    })
+    .await;
+    // Always request cooperative shutdown, even when a mutation caused an
+    // early phase error. Keep the websocket open until accepted work drains.
+    shutdown.send_replace(true);
+    lock.rollback().await.unwrap();
+    let drained = tokio::time::timeout(Duration::from_secs(60), runner).await;
+    drop(ws);
+    let phase = phase.expect("whole stalled mixed-traffic phase deadline");
+    phase.expect("mixed traffic must not consume RSVP capacity or refusal counts");
+    drained
+        .expect("cooperative mixed-traffic drain deadline")
+        .unwrap()
+        .unwrap();
+    assert_eq!(global_series(REFUSED_SERIES) - refused_before, 8);
+    let requests = rest.requests();
+    let mut completed = Vec::new();
+    for (index, sequence) in admitted.iter().copied().enumerate() {
+        let callback = format!("/interactions/{sequence}/mock-rsvp-{sequence}/callback");
+        let callbacks: Vec<_> = requests
+            .iter()
+            .filter(|r| r.path.ends_with(&callback))
+            .collect();
+        assert_eq!(callbacks.len(), 1, "one defer per admitted RSVP {sequence}");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&callbacks[0].body).unwrap()["type"],
+            5
+        );
+        let original = format!("/webhooks/1111/mock-rsvp-{sequence}/messages/@original");
+        let edits: Vec<_> = requests
+            .iter()
+            .filter(|r| r.method == "PATCH" && r.path.ends_with(&original))
+            .collect();
+        assert_eq!(
+            edits.len(),
+            1,
+            "one completion per admitted RSVP {sequence}"
+        );
+        let expected = if index % 2 == 0 {
+            "RSVP saved: going."
+        } else {
+            "RSVP saved: interested."
+        };
+        assert_eq!(
+            serde_json::from_slice::<Value>(&edits[0].body).unwrap()["content"],
+            expected
+        );
+        completed.push(
+            requests
+                .iter()
+                .position(|r| std::ptr::eq(r, edits[0]))
+                .unwrap(),
+        );
+    }
+    assert!(
+        completed.windows(2).all(|pair| pair[0] < pair[1]),
+        "admitted RSVP completion order"
+    );
+    for sequence in 40..=47 {
+        assert_eq!(
+            token_requests(
+                &rest,
+                "POST",
+                &format!("/interactions/{sequence}/mock-rsvp-{sequence}/callback")
+            ),
+            0,
+            "overflow must not defer"
+        );
+        assert_eq!(
+            token_requests(
+                &rest,
+                "PATCH",
+                &format!("/webhooks/1111/mock-rsvp-{sequence}/messages/@original")
+            ),
+            0,
+            "overflow must not execute"
+        );
+    }
+    for sequence in [5, 39] {
+        assert_eq!(
+            token_requests(
+                &rest,
+                "PATCH",
+                &format!("/webhooks/1111/mock-other-{sequence}/messages/@original")
+            ),
+            1,
+            "unrelated validation completes even at saturation"
+        );
+    }
+    assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 47);
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT user_id, status FROM event_rsvps ORDER BY user_id")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(rows.len(), 32, "one durable RSVP per admitted human");
+    for (index, sequence) in admitted.iter().copied().enumerate() {
+        assert_eq!(rows[index].0, (70_000 + sequence).to_string());
+        assert_eq!(
+            rows[index].1,
+            if index % 2 == 0 {
+                "going"
+            } else {
+                "interested"
+            }
+        );
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM announcements_audit_log")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        32
+    );
+    rest.shutdown().await;
+    lock_pool.close().await;
     db.close().await;
 }

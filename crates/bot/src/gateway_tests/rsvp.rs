@@ -109,13 +109,27 @@ pub(super) async fn connect_with_shutdown(
     JoinHandle<Result<(), sqlx::Error>>,
     tokio_websockets::WebSocketStream<tokio::net::TcpStream>,
 ) {
+    connect_with_shutdown_and_heartbeat(db, rest, shutdown, 45_000).await
+}
+
+/// A long drain test must not mistake an unserviced mock heartbeat for a
+/// product failure. Ordinary fixtures retain their original HELLO interval.
+pub(super) async fn connect_with_shutdown_and_heartbeat(
+    db: &TestDb,
+    rest: &MockRest,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    heartbeat_interval: u64,
+) -> (
+    JoinHandle<Result<(), sqlx::Error>>,
+    tokio_websockets::WebSocketStream<tokio::net::TcpStream>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", listener.local_addr().unwrap());
     let runner = spawn_with_shutdown(db, &url, rest, shutdown).await;
     let (socket, _) = listener.accept().await.unwrap();
     let (_, mut ws) = ServerBuilder::new().accept(socket).await.unwrap();
     ws.send(Message::text(
-        json!({"op":10,"d":{"heartbeat_interval":45000}}).to_string(),
+        json!({"op":10,"d":{"heartbeat_interval":heartbeat_interval}}).to_string(),
     ))
     .await
     .unwrap();

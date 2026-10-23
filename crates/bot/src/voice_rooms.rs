@@ -7728,8 +7728,9 @@ impl GuildActor {
     /// updates use this: a refused `AccessChanged` would leave the worker
     /// enforcing the previous policy after the administrator already saw
     /// "Saved", and a refused `NameSettingsChanged` would likewise keep the
-    /// previous settings and skip the prompt reload. The startup
-    /// display-name seed travels as one batch here for the same reason.
+    /// previous settings and skip the prompt reload. Persisted creator
+    /// updates (including default privacy) and the startup display-name seed
+    /// use the same lossless path.
     /// Bufferable commands still claim an uncounted ledger slot up front,
     /// released on reception like any other: without it the receive would
     /// spend a gated send's slot and the gate would admit past the cap.
@@ -7891,7 +7892,27 @@ enum ActorCommand {
     },
 }
 
+#[derive(PartialEq, Eq)]
+enum ActorInitStateKey {
+    DisplaySeed,
+    NameSettings,
+    Access,
+    Creator(Snowflake),
+}
+
 impl ActorCommand {
+    /// Startup snapshots and acknowledged saves must survive ordinary init
+    /// churn. Only the latest value for each key is needed before loading.
+    fn init_state_key(&self) -> Option<ActorInitStateKey> {
+        match self {
+            Self::DisplaySeed(_) => Some(ActorInitStateKey::DisplaySeed),
+            Self::NameSettingsChanged(_) => Some(ActorInitStateKey::NameSettings),
+            Self::AccessChanged(_) => Some(ActorInitStateKey::Access),
+            Self::CreatorAdded(creator) => Some(ActorInitStateKey::Creator(creator.channel_id)),
+            _ => None,
+        }
+    }
+
     /// True for fire-and-forget state that can wait for the worker:
     /// snapshots, voice frames, config swaps and public ballot message
     /// references apply in arrival order once it loads. Anything else carries
@@ -7920,19 +7941,37 @@ impl ActorCommand {
     }
 }
 
-/// Cap on commands buffered while actor initialization is pending: voice
-/// state converges on the latest frame and `Reconcile` is idempotent, so
-/// a long outage sheds the oldest instead of growing without bound.
+/// Cap on ordinary commands buffered while actor initialization is pending:
+/// voice state converges and `Reconcile` is idempotent, so an outage sheds
+/// the oldest ordinary entry. Saved control state has a separate budget:
+/// one latest value per init-state key, never evicted by ordinary churn.
 const VOICE_ACTOR_INIT_BUFFER_CAP: usize = 512;
 
-/// Buffer one command that arrived during a load attempt. Everything waits
-/// (capped, oldest shed): when the attempt succeeds the worker answers the
-/// reply-bearing commands in arrival order, so a status or vote-kick sent
-/// right after the snapshot still resolves. Shedding the oldest at the cap
-/// drops its one-shot sender, so an overflowed caller fails fast with `None`.
+/// Buffer one command that arrived during a load attempt. Replies wait in
+/// the ordinary FIFO; shedding one drops its sender so its caller fails
+/// fast with `None`. Keep saved state and the startup seed outside that
+/// eviction budget. Replacing a control key appends the latest value at its
+/// arrival position, preserving the order of all surviving commands.
 fn buffer_attempt_command(buffered: &mut VecDeque<ActorCommand>, command: ActorCommand) {
-    if buffered.len() >= VOICE_ACTOR_INIT_BUFFER_CAP {
-        let _ = buffered.pop_front();
+    if let Some(key) = command.init_state_key() {
+        if let Some(index) = buffered
+            .iter()
+            .position(|previous| previous.init_state_key().as_ref() == Some(&key))
+        {
+            let _ = buffered.remove(index);
+        }
+    } else if buffered
+        .iter()
+        .filter(|entry| entry.init_state_key().is_none())
+        .count()
+        >= VOICE_ACTOR_INIT_BUFFER_CAP
+    {
+        if let Some(index) = buffered
+            .iter()
+            .position(|entry| entry.init_state_key().is_none())
+        {
+            let _ = buffered.remove(index);
+        }
     }
     buffered.push_back(command);
 }
@@ -9065,7 +9104,7 @@ where
     fn creator_updated(&self, creator: &CreatorChannel) {
         if let Some(actor) = self.live_actor(creator.guild_id) {
             actor.live.protect_creators([creator.channel_id]);
-            let _ = actor.try_send_command(ActorCommand::CreatorAdded(creator.clone()));
+            let _ = actor.send_command_lossless(ActorCommand::CreatorAdded(creator.clone()));
         }
     }
 
@@ -9415,9 +9454,11 @@ where
 /// [`voice_actor_load_backoff_jittered`] between attempts, and the same single
 /// spawned task owns every attempt — retries never spawn a second actor.
 ///
-/// While a load attempt is in flight, every inbox command waits in order
-/// (capped, oldest shed) and is handed to `run_actor_with_initial` on
-/// success, so a status sent right after the snapshot still resolves once
+/// While a load attempt is in flight, ordinary inbox commands wait in a
+/// capped FIFO (oldest ordinary entry shed). The startup seed and saved
+/// naming/access/per-creator state retain one latest value per key outside
+/// that eviction budget. Surviving commands reach `run_actor_with_initial`
+/// in order on success, so a status sent after the snapshot still resolves once
 /// the worker exists. When the attempt fails or times out, buffered
 /// reply-bearing commands are purged (see [`ActorCommand::is_bufferable`])
 /// so their callers get the existing "syncing" fallback instead of hanging

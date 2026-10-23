@@ -101,6 +101,31 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_feed_fetch_errors_total{error_class}` | Failed feed fetches by bounded error class: `invalid_source`, `non_public_address`, `redirect_refused`, `too_large`, `invalid_encoding`, `unsupported_content_type`, `unsupported_encoding`, `resolve`, `transport`, `deadline`, `http_error` (completed non-2xx fetch) or `other`. One sample per failed fetch alongside `two_bot_feed_fetches_total`; successes record nothing here. No URL, host, header or body bytes reach a label. The `feed_fetch_failures` rule tickets on any summed increase (first sample is baseline-only, restarts re-baseline, missing family is no window) |
 | `two_bot_ticket_lifecycle_total{event,outcome}` | Terminal ticket lifecycle events by bounded `event` and `outcome` (see label allowlists below). Retire, abandon, successful claim and successful close count once each alongside their `ticket_lifecycle` log line; the purge pass counts one per deleted transcript body (not one per pass) and reports a `db_cause` outcome instead of `deleted` when its storage write fails. No member text, channel name, ticket id or error string ever becomes a label. No alert rule consumes this family yet; read it alongside the lifecycle log lines in [ticket-lifecycle-observability.md](ticket-lifecycle-observability.md) |
 
+## Voice overload bounds
+
+The actor inbox refuses ordinary fire-and-forget sends at 256 outstanding
+entries. Reply-bearing requests, acknowledged naming/access saves, edits to
+existing creator rows and the startup display-name seed bypass this admission
+gate; the limit is not a hard memory bound for all actor traffic. New-creator
+notifications still use gated admission and can converge by periodic refresh
+or first-join read-through. Saved edits to an existing creator's privacy must
+reach an already-loaded worker before it plans the next room.
+
+During initialization, up to 512 ordinary commands wait in arrival order;
+overflow sheds the oldest ordinary command. Saved naming/access settings, each
+creator channel's latest saved row and the latest startup display-name seed
+are retained outside that eviction budget, coalesced by state key. They survive
+failed attempts and backoff, while failed-attempt reply waiters close promptly.
+This retains at most three guild-wide state entries plus one per distinct
+creator channel, in addition to the ordinary FIFO; seed contents scale with the
+guild snapshot. It is not a fixed total-memory bound. Init-buffer shedding is
+not an inbox admission refusal and does not increment the inbox overflow counter.
+
+The action-queue cap is opt-in: all current production producers still use
+must-admit `enqueue`, not bounded `try_enqueue`. A stalled production action
+drain can therefore grow cumulatively; zero overflow refusals do not prove
+healthy drainage. Compare queue depth, oldest age and dispatch progress.
+
 ## REST admission guard
 
 The eleven `two_bot_rest_guard_*` series have constant names and **no labels**.

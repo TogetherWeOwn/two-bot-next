@@ -15,6 +15,8 @@ mod admission_spawn;
 mod boot_settings_acceptance;
 #[path = "voice_cold_authority_tests.rs"]
 mod cold_authority;
+#[path = "voice_control_plane_overflow_acceptance_tests.rs"]
+mod control_plane_overflow_acceptance;
 #[path = "voice_creation_receipt_acceptance_tests.rs"]
 mod creation_receipt_acceptance;
 #[path = "voice_delete_guard_tests.rs"]
@@ -178,7 +180,7 @@ fn room(channel_id: u64) -> VoiceRoom {
 
 struct Store {
     trace: Trace,
-    creators: Mutex<Vec<CreatorChannel>>,
+    creators: Arc<Mutex<Vec<CreatorChannel>>>,
     rooms: Mutex<HashMap<u64, VoiceRoom>>,
     rooms_errors: Mutex<VecDeque<StoreError>>,
     /// One-shot hang for the next `rooms()` call, consumed when it
@@ -266,7 +268,7 @@ impl Store {
     fn new(trace: Trace) -> Self {
         Self {
             trace,
-            creators: Mutex::new(vec![CreatorChannel::new(GUILD, CREATOR)]),
+            creators: Arc::new(Mutex::new(vec![CreatorChannel::new(GUILD, CREATOR)])),
             rooms: Mutex::new(HashMap::new()),
             rooms_errors: Mutex::new(VecDeque::new()),
             rooms_delay: Mutex::new(None),
@@ -7538,12 +7540,39 @@ async fn a_confirmed_import_hands_its_settings_to_the_worker_past_a_full_inbox()
     let trace = Trace::default();
     let bytes = serde_json::to_vec(&full_config()).unwrap();
     let (runtime, _) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let (probe_store, _) = runtime.make_pair();
+    let reads = probe_store.config_reads.clone();
+    let initial_reads = reads.load(Ordering::Relaxed);
     let inventory = config_inventory();
     let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
     let (_, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
     let (confirm_id, _) = preview_buttons(&preview.expect("preview"));
-    // The worker has loaded (the preview read it); fill the inbox gate
-    // synchronously so the actor cannot drain mid-burst, then confirm.
+    // Preview reads shared storage and ensure_actor only spawns. Await a
+    // worker-applied probe before the save, otherwise a lost notification
+    // escapes through the worker's first read of the NEW durable settings.
+    let (before, _) = runtime
+        .naming_probe(GUILD)
+        .await
+        .expect("loaded worker probe");
+    assert_eq!(before, NameSettings::from_config(&empty_config()));
+    assert_ne!(before, NameSettings::from_config(&full_config()));
+    // The first timer maintenance is also a read-through escape: let it
+    // finish on OLD state before the save. This harness has one preview
+    // read, one load read, then the first paced worker reload.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while reads.load(Ordering::Relaxed) < initial_reads + 3 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("old-state worker maintenance read before the save");
+    let (before, _) = runtime
+        .naming_probe(GUILD)
+        .await
+        .expect("warm worker probe");
+    assert_eq!(before, NameSettings::from_config(&empty_config()));
+    // Current-thread execution: there is no yield between filling this gate
+    // and the synchronous persistence/notification in the Confirm harness.
     let actor = runtime.ensure_actor(GUILD).expect("live actor");
     let mut refused = false;
     for member in 0..10_000u64 {
@@ -7556,6 +7585,7 @@ async fn a_confirmed_import_hands_its_settings_to_the_worker_past_a_full_inbox()
         }
     }
     assert!(refused, "burst must fill the inbox gate to refusal");
+    assert_eq!(actor.inbox_depth(), VOICE_ACTOR_INBOX_CAP);
     let confirm = component_interaction(&confirm_id, manager(), UPLOADER);
     let (_, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
     assert!(response_text(&response.expect("applied")).starts_with("Import applied:"));
@@ -10703,10 +10733,12 @@ fn import_harness(
     let shared_config = Arc::new(Mutex::new(config));
     let shared_downloads = Arc::new(Mutex::new(downloads.into_iter().collect::<VecDeque<_>>()));
     let closure_config = shared_config.clone();
+    let config_reads = Arc::new(AtomicU64::new(0));
     let runtime = VoiceRuntime::new(
         move || {
             let mut store = Store::new(trace.clone());
             store.config = closure_config.clone();
+            store.config_reads = config_reads.clone();
             store.snapshot_uses_creator_rows = false;
             let mut http = Http::new(trace.clone());
             http.download_results = shared_downloads.clone();
