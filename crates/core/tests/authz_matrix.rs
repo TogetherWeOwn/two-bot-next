@@ -146,8 +146,8 @@ fn role_x_route_matrix_matches_expected_status() {
             checked += 1;
         }
     }
-    // 29 routes x 10 roles: a silently emptied fixture must not pass.
-    assert_eq!(checked, 290, "matrix size drifted");
+    // 30 routes x 10 roles: a silently emptied fixture must not pass.
+    assert_eq!(checked, 300, "matrix size drifted");
 }
 
 #[test]

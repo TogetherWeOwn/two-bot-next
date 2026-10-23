@@ -129,6 +129,114 @@ const FROZEN_V13_TABLES: [&str; 101] = [
     "event_store",
 ];
 
+// Frozen released v14 adds starboard, but predates AFK.
+const FROZEN_V14_TABLES: [&str; 104] = [
+    "events",
+    "members",
+    "invite_snapshots",
+    "operational_audit_log",
+    "moderation_warnings",
+    "moderation_scheduled_unbans",
+    "moderation_audit",
+    "moderation_lockdowns",
+    "moderation_idempotency",
+    "containment_events",
+    "containment_incidents",
+    "join_risk_flags",
+    "automation_commands",
+    "scheduled_messages",
+    "sticky_messages",
+    "automation_audit_log",
+    "tickets",
+    "ticket_transcripts",
+    "automod_violations",
+    "automod_processed_messages",
+    "self_role_audit",
+    "self_role_panel_claims",
+    "self_role_exchanges",
+    "self_role_exchange_baselines",
+    "automod_delivery_claims",
+    "gateway_boot_directives",
+    "member_erasure_audit",
+    "privacy_opt_outs",
+    "guild_analytics_settings",
+    "privacy_opt_out_audit",
+    "game_activity_guild_aggregates",
+    "assistant_monthly_builds",
+    "member_levels",
+    "member_season_xp",
+    "xp_awards",
+    "level_role_rewards",
+    "level_import_runs",
+    "event_rsvps",
+    "announcements_audit_log",
+    "community_facts",
+    "lfg_posts",
+    "lfg_roles",
+    "lfg_signups",
+    "feed_relays",
+    "feed_deliveries",
+    "web_contract_meta",
+    "guild_counters",
+    "rank_ladder",
+    "rank_snapshots",
+    "member_ranks",
+    "scheduled_events",
+    "scheduled_events_claim",
+    "scheduled_events_tombstone",
+    "event_voice_channels",
+    "event_voice_presence",
+    "counter_snapshots",
+    "member_exclusions",
+    "presence_probe",
+    "community_stream_heartbeats",
+    "community_scorecard_runs",
+    "community_scorecard_alerts",
+    "community_scorecard_attempts",
+    "gateway_sessions",
+    "guild_settings_revision",
+    "guild_settings",
+    "guild_settings_audit",
+    "admin_api_tokens",
+    "audit_kill_switch",
+    "internal_nonces",
+    "internal_clock_high_water",
+    "internal_idempotency",
+    "internal_action_log",
+    "internal_discord_events",
+    "internal_event_keys",
+    "stream_live_claims",
+    "moderation_channel_executions",
+    "moderation_member_bans",
+    "invite_campaigns",
+    "voice_creators",
+    "voice_rooms",
+    "voice_room_blocks",
+    "voice_join_grants",
+    "voice_owner_grants",
+    "voice_text_companions",
+    "voice_access_controls",
+    "voice_logging_settings",
+    "voice_channel_templates",
+    "voice_game_aliases",
+    "voice_random_lists",
+    "voice_random_list_choices",
+    "voice_logging",
+    "voice_logging_mention_members",
+    "voice_logging_mention_roles",
+    "voice_guild_settings",
+    "voice_command_roles",
+    "voice_command_role_members",
+    "voice_vote_kick_audit",
+    "voice_create_reservations",
+    "retention_guild_purge_queue",
+    "retention_deletion_requests",
+    "event_store",
+    "starboard_config",
+    "starboard_starrers",
+    "starboard_posts",
+];
+
 async fn database() -> Option<TestDatabase> {
     let url = match std::env::var("TWO_TEST_DATABASE_URL") {
         Ok(url) => url,
@@ -1521,7 +1629,33 @@ async fn pre_reservation_v4_restores_and_clears_newer_reservation_rows() {
         two_bot_core::backup::dump_file::finish_gzip(encoder).unwrap(),
     )
     .unwrap();
-    assert_eq!(inspect(&source).unwrap().manifest.version, 4);
+    let inspected = inspect(&source).unwrap();
+    assert_eq!(inspected.manifest.version, 4);
+    assert_eq!(
+        inspected.manifest.missing_tables(),
+        [
+            "privacy_opt_outs",
+            "guild_analytics_settings",
+            "privacy_opt_out_audit",
+            "game_activity_guild_aggregates",
+            "assistant_monthly_builds",
+            "member_season_xp",
+            "scheduled_events_claim",
+            "scheduled_events_tombstone",
+            "event_voice_channels",
+            "event_voice_presence",
+            "admin_api_tokens",
+            "stream_live_claims",
+            "voice_create_reservations",
+            "retention_guild_purge_queue",
+            "retention_deletion_requests",
+            "event_store",
+            "starboard_config",
+            "starboard_starrers",
+            "starboard_posts",
+            "afk_status",
+        ]
+    );
     // Restore fences a destination holding moderation history; this scenario
     // deliberately replaces a reused rehearsal target.
     forget_moderation_history(pool).await;
@@ -1536,9 +1670,26 @@ async fn pre_reservation_v4_restores_and_clears_newer_reservation_rows() {
         "old archives must not retain newer target history"
     );
     for table in [
+        "privacy_opt_outs",
+        "guild_analytics_settings",
+        "privacy_opt_out_audit",
+        "game_activity_guild_aggregates",
+        "assistant_monthly_builds",
+        "member_season_xp",
+        "scheduled_events_claim",
+        "scheduled_events_tombstone",
+        "event_voice_channels",
+        "event_voice_presence",
+        "admin_api_tokens",
+        "stream_live_claims",
+        "voice_create_reservations",
         "retention_guild_purge_queue",
         "retention_deletion_requests",
         "event_store",
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
+        "afk_status",
     ] {
         let sql = format!("SELECT COUNT(*) FROM {table}");
         let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
@@ -1547,7 +1698,7 @@ async fn pre_reservation_v4_restores_and_clears_newer_reservation_rows() {
             .unwrap();
         assert_eq!(
             count, 0,
-            "v4 archives predate the v6/v7 tables; restore must clear newer {table} rows"
+            "v4 archives predate this table; restore must clear newer {table} rows"
         );
     }
     let channel: String = sqlx::query_scalar("SELECT channel_id FROM voice_rooms")
@@ -1566,10 +1717,10 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v14-source.ndjson.gz");
+    let current_path = directory.path("v15-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 14);
+    assert_eq!(old.manifest.version, 15);
     for name in [
         "game_activity_guild_aggregates",
         "assistant_monthly_builds",
@@ -1581,6 +1732,7 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
         "starboard_config",
         "starboard_starrers",
         "starboard_posts",
+        "afk_status",
     ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -1604,7 +1756,8 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
             "admin_api_tokens",
             "starboard_config",
             "starboard_starrers",
-            "starboard_posts"
+            "starboard_posts",
+            "afk_status"
         ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
@@ -1622,6 +1775,7 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
         "starboard_config",
         "starboard_starrers",
         "starboard_posts",
+        "afk_status",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -1648,10 +1802,10 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v14-source.ndjson.gz");
+    let current_path = directory.path("v15-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 14);
+    assert_eq!(old.manifest.version, 15);
     for name in [
         "scheduled_events_claim",
         "scheduled_events_tombstone",
@@ -1661,6 +1815,7 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
         "starboard_config",
         "starboard_starrers",
         "starboard_posts",
+        "afk_status",
     ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -1682,7 +1837,8 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
             "admin_api_tokens",
             "starboard_config",
             "starboard_starrers",
-            "starboard_posts"
+            "starboard_posts",
+            "afk_status"
         ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
@@ -1698,6 +1854,7 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
         "starboard_config",
         "starboard_starrers",
         "starboard_posts",
+        "afk_status",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -1724,10 +1881,10 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v14-source.ndjson.gz");
+    let current_path = directory.path("v15-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 14);
+    assert_eq!(old.manifest.version, 15);
     // Frozen claim-only v10 shape: the merged v10 writer carried the
     // epoch-claim guard but predates the delete tombstones, token registry
     // event voice pair and starboard tables.
@@ -1739,6 +1896,7 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
         "starboard_config",
         "starboard_starrers",
         "starboard_posts",
+        "afk_status",
     ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -1759,7 +1917,8 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
             "admin_api_tokens",
             "starboard_config",
             "starboard_starrers",
-            "starboard_posts"
+            "starboard_posts",
+            "afk_status"
         ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
@@ -1774,6 +1933,7 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
         "starboard_config",
         "starboard_starrers",
         "starboard_posts",
+        "afk_status",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -1808,10 +1968,10 @@ async fn v11_archive_restores_and_clears_newer_registry() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v14-source.ndjson.gz");
+    let current_path = directory.path("v15-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 14);
+    assert_eq!(old.manifest.version, 15);
     // Frozen tombstone-only v11 shape: the merged v11 writer carried the
     // delete tombstones but predates the token registry event voice pair and starboard tables.
     for name in [
@@ -1821,6 +1981,7 @@ async fn v11_archive_restores_and_clears_newer_registry() {
         "starboard_config",
         "starboard_starrers",
         "starboard_posts",
+        "afk_status",
     ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -1840,7 +2001,8 @@ async fn v11_archive_restores_and_clears_newer_registry() {
             "admin_api_tokens",
             "starboard_config",
             "starboard_starrers",
-            "starboard_posts"
+            "starboard_posts",
+            "afk_status"
         ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
@@ -1854,6 +2016,7 @@ async fn v11_archive_restores_and_clears_newer_registry() {
         "starboard_config",
         "starboard_starrers",
         "starboard_posts",
+        "afk_status",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -1888,16 +2051,17 @@ async fn v12_archive_restores_and_clears_newer_event_voice() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v14-source.ndjson.gz");
+    let current_path = directory.path("v15-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 14);
+    assert_eq!(old.manifest.version, 15);
     for table in [
         "event_voice_channels",
         "event_voice_presence",
         "starboard_config",
         "starboard_starrers",
         "starboard_posts",
+        "afk_status",
     ] {
         let rows = old.buffers.remove(table).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {table}");
@@ -1916,7 +2080,8 @@ async fn v12_archive_restores_and_clears_newer_event_voice() {
             "event_voice_presence",
             "starboard_config",
             "starboard_starrers",
-            "starboard_posts"
+            "starboard_posts",
+            "afk_status"
         ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
@@ -1929,6 +2094,7 @@ async fn v12_archive_restores_and_clears_newer_event_voice() {
         "starboard_config",
         "starboard_starrers",
         "starboard_posts",
+        "afk_status",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -1963,10 +2129,10 @@ async fn v12_archive_restores_and_clears_newer_starboard_preserving_registry() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v14-source.ndjson.gz");
+    let current_path = directory.path("v15-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 14);
+    assert_eq!(old.manifest.version, 15);
     // Frozen registry-present v12 shape: the released writer carried the
     // token registry but predates the event voice pair and starboard tables.
     for name in [
@@ -1975,6 +2141,7 @@ async fn v12_archive_restores_and_clears_newer_starboard_preserving_registry() {
         "starboard_config",
         "starboard_starrers",
         "starboard_posts",
+        "afk_status",
     ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -1999,7 +2166,8 @@ async fn v12_archive_restores_and_clears_newer_starboard_preserving_registry() {
             "event_voice_presence",
             "starboard_config",
             "starboard_starrers",
-            "starboard_posts"
+            "starboard_posts",
+            "afk_status"
         ]
     );
     assert_eq!(
@@ -2032,6 +2200,7 @@ async fn v12_archive_restores_and_clears_newer_starboard_preserving_registry() {
         "starboard_config",
         "starboard_starrers",
         "starboard_posts",
+        "afk_status",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -2078,11 +2247,16 @@ async fn v13_archive_restores_voice_and_registry_and_clears_newer_starboard() {
         );
     }
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v14-source.ndjson.gz");
+    let current_path = directory.path("v15-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 14);
-    for name in ["starboard_config", "starboard_starrers", "starboard_posts"] {
+    assert_eq!(old.manifest.version, 15);
+    for name in [
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
+        "afk_status",
+    ] {
         assert!(
             !old.buffers.remove(name).unwrap().is_empty(),
             "destination must start with starboard {name} rows"
@@ -2109,7 +2283,12 @@ async fn v13_archive_restores_voice_and_registry_and_clears_newer_starboard() {
     assert_eq!(inspected.manifest.tables.len(), 101);
     assert_eq!(
         inspected.manifest.missing_tables(),
-        ["starboard_config", "starboard_starrers", "starboard_posts"]
+        [
+            "starboard_config",
+            "starboard_starrers",
+            "starboard_posts",
+            "afk_status"
+        ]
     );
     for name in &restored_tables {
         assert!(
@@ -2150,7 +2329,12 @@ async fn v13_archive_restores_voice_and_registry_and_clears_newer_starboard() {
         archived,
         "v13 restores archived voice rows and issued tokens, not destination data"
     );
-    for name in ["starboard_config", "starboard_starrers", "starboard_posts"] {
+    for name in [
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
+        "afk_status",
+    ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
             identifier(name)
@@ -2160,6 +2344,123 @@ async fn v13_archive_restores_voice_and_registry_and_clears_newer_starboard() {
         .unwrap();
         assert_eq!(count, 0, "v13 restore clears newer {name} destination rows");
     }
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v14_archive_restores_and_clears_only_afk_preserving_starboard_event_voice_and_registry() {
+    let Some(db) = database().await else {
+        return;
+    };
+    assert_eq!(DUMP_VERSION, 15, "current writer must include AFK");
+    let pool = db.pool();
+    seed(pool).await;
+    // Explicit away members ensure omission cannot pass through an empty
+    // target, independently of the shared schema fixture's AFK members.
+    sqlx::query(
+        "INSERT INTO afk_status (guild_id, user_id, note, set_at) VALUES \
+         ('100000000000000001', '900000000000000001', 'away before restore', '2026-08-01T10:00:00Z'), \
+         ('100000000000000001', '900000000000000002', NULL, '2026-08-01T10:01:00Z')",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let tables: Vec<_> = covered_tables(pool)
+        .await
+        .into_iter()
+        .filter(|name| name != "afk_status")
+        .collect();
+    let expected = snapshot(pool, &tables).await;
+    assert_eq!(
+        expected["event_voice_channels"].rows.len(),
+        1,
+        "seeded instance claim"
+    );
+    assert_eq!(
+        expected["event_voice_presence"].rows.len(),
+        2,
+        "seeded open and closed spans"
+    );
+    assert!(
+        !expected["admin_api_tokens"].rows.is_empty(),
+        "seeded token registry"
+    );
+    let directory = ArchiveDirectory::new();
+    let current_path = directory.path("v15-source.ndjson.gz");
+    dump(pool, &current_path).await.unwrap();
+    let mut old = inspect(&current_path).unwrap();
+    assert_eq!(old.manifest.version, 15);
+    let afk = old.buffers.remove("afk_status").expect("writer covers AFK");
+    assert!(
+        afk.len() >= 2,
+        "archive contains both explicitly seeded away members"
+    );
+    // Literal released inventory, independent of current tables and waivers.
+    old.manifest
+        .tables
+        .retain(|table| FROZEN_V14_TABLES.contains(&table.name.as_str()));
+    assert_eq!(
+        old.manifest
+            .tables
+            .iter()
+            .map(|table| table.name.as_str())
+            .collect::<Vec<_>>(),
+        FROZEN_V14_TABLES,
+    );
+    old.manifest.version = 14;
+    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
+    let old_path = directory.path("pre-afk-v14.ndjson.gz");
+    write_archive(&old_path, &old);
+    let inspected = inspect(&old_path).expect("genuine v14 archive remains readable");
+    assert_eq!(inspected.manifest.version, 14);
+    assert_eq!(inspected.manifest.tables.len(), 104);
+    assert_eq!(inspected.manifest.missing_tables(), ["afk_status"]);
+    for name in [
+        "event_voice_channels",
+        "event_voice_presence",
+        "admin_api_tokens",
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
+    ] {
+        assert!(
+            !inspected.buffers[name].is_empty(),
+            "v14 retains archived {name}"
+        );
+    }
+    // Erase these rows only in this owned disposable database: equality after
+    // restore must prove replay of claims, complete spans, token metadata and starboard,
+    // not merely leave the original seed untouched.
+    sqlx::raw_sql("DELETE FROM event_voice_presence; DELETE FROM event_voice_channels; DELETE FROM admin_api_tokens; DELETE FROM starboard_posts; DELETE FROM starboard_starrers; DELETE FROM starboard_config;")
+        .execute(pool)
+        .await
+        .unwrap();
+    let afk_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM afk_status")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(
+        afk_before >= 2,
+        "target is populated with AFK before restore"
+    );
+    assert_ne!(
+        snapshot(pool, &tables).await,
+        expected,
+        "target differs from the archive"
+    );
+    forget_moderation_history(pool).await;
+    let report = restore(pool, &old_path).await.unwrap();
+    assert!(report.ok);
+    let afk_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM afk_status")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(afk_after, 0, "v14 restore clears newer target AFK history");
+    assert_eq!(
+        snapshot(pool, &tables).await,
+        expected,
+        "v14 restores all covered rows, including starboard, claims, spans and registry"
+    );
     db.close().await.unwrap();
 }
 

@@ -69,6 +69,10 @@ pub struct TableSpec {
 /// here, and on any entry here that appears in neither list (outside the two
 /// documented feed tables).
 pub const TABLE_SPECS: &[TableSpec] = &[
+    // AFK member status (0460): every set and update rewrites set_at, so its
+    // maximum is the row's last write (a clear deletes the row, so only live
+    // away states are measurable).
+    TableSpec { table: "afk_status", measure: TableMeasure::Columns(&["set_at"]) },
     // Admin API token registry (0456/0457): issuance plus the revocation and
     // last-use lifecycle writes; expires_at is a future deadline, not a
     // write time, so it stays out of the measure.

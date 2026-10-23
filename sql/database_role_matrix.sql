@@ -109,6 +109,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'assistant_monthly_builds', 'table'),
     ('public', 'scheduled_events_claim', 'table'),
     ('public', 'scheduled_events_tombstone', 'table'),
+    ('public', 'afk_status', 'table'),
     ('public', 'event_voice_channels', 'table'),
     ('public', 'event_voice_presence', 'table'),
     ('public', 'admin_api_tokens', 'table'),

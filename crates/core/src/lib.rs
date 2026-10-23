@@ -7,6 +7,7 @@
 
 pub mod action_outcomes;
 pub mod activation;
+pub mod afk;
 pub mod analytics_family;
 pub mod anchor_event;
 pub mod assistant_transport;
@@ -188,6 +189,11 @@ pub use action_outcomes::{
     retry_after_ms_unclamped, set_send_bit, unlock_overwrite, ActionOutcome, KickOutcome,
     KickResult, KickStatus, ModerationExecution, BACKOFF_BASE_MS, MAX_BACKFILL_RETRY_AFTER_MS,
     MAX_HTTP_TRIES, MAX_RETRY_AFTER_MS, RETRY_AFTER_PADDING_MS,
+};
+pub use afk::{
+    mention_reply, render_elapsed, set_confirmation, validate_note, AfkNoteError, AfkStatus,
+    AFK_CLEARED_REPLY, AFK_GUILD_CAP_REPLY, AFK_GUILD_ROW_CAP, AFK_MENTION_COOLDOWN_SECS,
+    AFK_NOTE_MAX_CHARS, AFK_STORE_UNAVAILABLE_REPLY,
 };
 pub use automation_transfer::{
     diff_import, export_document, max_import_entries, parse_import_document, ExportDocument,

@@ -34,7 +34,7 @@
 //! intentionally excepted) — the channel slice's `handler_for` pattern
 //! generalized. Surfaces, in production dispatch order: the ordered RSVP
 //! surface (`dispatch_remaining` skip + `prepare` claim), the channel slice,
-//! the LFG arm, the leveling arm, the help arm, the owner-map execution, the
+//! the LFG arm, the leveling arm, the help and AFK arms, the owner-map execution, the
 //! unavailable terminal (the owner-mismatch reply, for names that reach
 //! `on_interaction`), and the custom-command surface.
 //!
@@ -66,7 +66,7 @@ impl InteractionHandler for Stub {
 /// - `router_with_commands` (`command_runtime.rs`): channel handlers while
 ///   `moderation`, sticky `AutomationAdmin` + custom commands while
 ///   `automations`, feeds while `announcements`, rank/leaderboard/help/
-///   privacy always. The channel and custom registrations below call the
+///   privacy/afk always. The channel and custom registrations below call the
 ///   real public functions; the rest are marker ids, as in production.
 /// - `CommandRuntime::build` member verbs (`command_runtime.rs`): the five
 ///   member moderation ids while a member consumer exists.
@@ -103,6 +103,7 @@ impl ProductionRegistrations for InteractionRouter {
             HandlerId::Leaderboard,
             HandlerId::Help,
             HandlerId::Privacy,
+            HandlerId::Afk,
         ] {
             router.register(Box::new(Stub(id)));
         }
@@ -230,6 +231,9 @@ fn claiming_surfaces(
     if name == "help" && handler == HandlerId::Help && admitted {
         claims.push("help");
     }
+    if name == "afk" && handler == HandlerId::Afk && admitted {
+        claims.push("afk");
+    }
     if owner_map(name, member_present) == Some(handler) && admitted {
         claims.push("owner");
     }
@@ -239,6 +243,7 @@ fn claiming_surfaces(
             HandlerId::Lfg | HandlerId::LfgClose | HandlerId::Rank | HandlerId::Leaderboard
         )
         || (name == "help" && handler == HandlerId::Help)
+        || (name == "afk" && handler == HandlerId::Afk)
         || owner_map(name, member_present) == Some(handler);
     if !is_rsvp_command(name) && custom_row.is_none() && !earlier_arm_matches {
         claims.push("unavailable");
@@ -335,6 +340,33 @@ fn every_handled_outcome_is_claimed_by_exactly_one_surface() {
     }
 }
 
+#[test]
+fn afk_is_claimed_by_its_immediate_arm_not_the_unavailable_terminal() {
+    for member_present in [true, false] {
+        let router = InteractionRouter::production_router(all_gates_on(), member_present);
+        let exceptions = HashSet::new();
+        assert_eq!(
+            router.route_slash(&ctx("afk", None)),
+            SlashOutcome::Handled {
+                handler: HandlerId::Afk
+            }
+        );
+        assert_eq!(
+            claiming_surfaces(
+                &router,
+                &exceptions,
+                all_gates_on(),
+                "afk",
+                None,
+                HandlerId::Afk,
+                member_present,
+            ),
+            ["afk"],
+            "AFK has exactly its immediate arm, even without a member consumer"
+        );
+    }
+}
+
 /// CONTROL (green before and after): explicit qualified calls keep the
 /// [`ProductionRegistrations`] trait live after the builder's inherent seam
 /// lands (inherent methods would otherwise shadow every unqualified call and
@@ -350,6 +382,7 @@ fn baseline_mirror_keeps_the_adapter_trait_live() {
         HandlerId::AutomationCustom,
         HandlerId::Lfg,
         HandlerId::FeedList,
+        HandlerId::Afk,
     ] {
         assert!(
             mirror.handler_for(&id).is_some(),

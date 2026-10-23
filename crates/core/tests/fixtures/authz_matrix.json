@@ -20,6 +20,7 @@
     {"name": "privacy", "allow": "*"},
     {"name": "rsvp", "allow": "*"},
     {"name": "rsvp-attendance", "allow": "*"},
+    {"name": "afk", "allow": "*"},
     {"name": "ban", "allow": ["ban_members", "all_bits"], "deny": "ModerationPermission(Ban)"},
     {"name": "tempban", "allow": ["ban_members", "all_bits"], "deny": "ModerationPermission(TempBan)"},
     {"name": "kick", "allow": ["kick_members", "all_bits"], "deny": "ModerationPermission(Kick)"},

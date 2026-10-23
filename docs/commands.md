@@ -20,7 +20,7 @@ Bounds below are registry bounds; a dash means no bound is declared there,
 not that handler validation is unlimited. Permissions are Discord default
 member-permission bitfields, not a replacement for runtime authorization.
 
-Built-in commands: 50.
+Built-in commands: 51.
 
 ## `/access`
 
@@ -43,6 +43,17 @@ Set who can create voice rooms and use room commands
 | `restrict role3` | role | false | — | — | — | — | Another allowed role |
 | `unrestrict` | subcommand | false | — | — | — | — | Lift a room command's role restriction |
 | `unrestrict command` | string | true | — | — | 32 | — | The command name without the slash, e.g. kick |
+
+## `/afk`
+
+Mark yourself away; mentions answer while you're gone
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `message` | string | false | — | — | 200 | — | Away note shown to members who mention you |
 
 ## `/alwaysprivate`
 

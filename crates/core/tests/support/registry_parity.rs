@@ -1,5 +1,6 @@
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
+use two_bot_core::afk::AFK_NOTE_MAX_CHARS;
 use two_bot_core::commands::{
     CommandDefinition, CommandOption, CommandOptionType, HELP_DESCRIPTION, MAX_RESOURCE_ID_CHARS,
     OCCURRENCE_ID_MAX_CHARS, PRIVACY_DESCRIPTION,
@@ -7,6 +8,7 @@ use two_bot_core::commands::{
 use two_bot_core::custom_commands::{
     MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_TEMPLATE_CHARS, MAX_TEXT_TRIGGER_CHARS,
 };
+use two_bot_core::feature_commands::AFK_DESCRIPTION;
 use two_bot_core::feeds_http::MAX_FEED_SOURCE_BYTES;
 use two_bot_core::lfg::{MAX_ROLE_SPEC_CHARS, MAX_TITLE_CHARS};
 use two_bot_core::router::{InteractionRouter, RouterGates};
@@ -37,6 +39,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("feed-list", "docs/parity.md §1 #30 page"),
     ("privacy", "docs/parity.md §1 privacy"),
     ("command-list", "docs/parity.md §1 #16 page"),
+    ("afk", "docs/parity.md §1 afk"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -230,6 +233,19 @@ pub fn expected_registry() -> Value {
     )
     .expect("privacy serializes");
     commands.insert(3, privacy);
+    // Next-only `/afk` status: no legacy counterpart. Insert at the publish
+    // position (automation block end, after sticky-remove) as the exact
+    // published definition, so parity pins its shape too.
+    let afk = serde_json::to_value(CommandDefinition::new("afk", AFK_DESCRIPTION).options(
+        vec![CommandOption::new(
+            "message",
+            "Away note shown to members who mention you",
+            CommandOptionType::String,
+        )
+        .max_length(AFK_NOTE_MAX_CHARS as u32)],
+    ))
+    .expect("afk serializes");
+    commands.insert(13, afk);
     // Picker-copy exceptions (registry golden exceptions table): command and
     // option descriptions intentionally differ from legacy. Pointers mirror
     // the published option order.

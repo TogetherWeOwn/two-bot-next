@@ -9,7 +9,7 @@
 //! the denial order (guild fence → feature gate → permission bits →
 //! policy/validation).
 //!
-//! Scope: the 28 non-voice built-in slash commands in `docs/commands.md` (core +
+//! Scope: the 30 non-voice built-in slash commands in `docs/commands.md` (core +
 //! scorecard + automation + announcement + moderation). Out of scope on
 //! purpose: voice commands (`voice_commands`, separate slice with its own
 //! `TWO_VOICE` gate and a `kick` name collision resolved first-wins in favour
@@ -122,7 +122,7 @@ const fn row(
 //   staff protection, bot hierarchy, actor hierarchy, in that order.
 // - `Valid:<FIELD>:<BOUNDS>` — option validation before any side effect.
 
-/// The 29-row contract in publish order (core, scorecard, automation,
+/// The 30-row contract in publish order (core, scorecard, automation,
 /// announcement, moderation). The coverage test asserts this is exactly the
 /// all-gates-on [`crate::router::InteractionRouter::publish_set`].
 #[must_use]
@@ -289,6 +289,19 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             "AutomationAdmin",
             "Ephemeral confirmation after removal plus audit row.",
             &["Gate:AutomationsDisabled", "Perm:ManageServerRequired"],
+        ),
+        row(
+            "afk",
+            33,
+            E2eGate::Automations,
+            0,
+            "Everyone",
+            "Afk",
+            "Immediate ephemeral set/update confirmation echoing the note; mentions of the AFK member answer once with note plus elapsed, and the member's next message auto-clears with a quiet confirmation.",
+            &[
+                "Gate:AutomationsDisabled",
+                "Valid:message:max200,no-mentions",
+            ],
         ),
         row(
             "rsvp",
