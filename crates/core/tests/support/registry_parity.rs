@@ -38,6 +38,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("privacy", "docs/parity.md §1 privacy"),
     ("command-list", "docs/parity.md §1 #16 page"),
     ("command-inspect", "docs/parity.md §1 command-inspect"),
+    ("lfg-edit", "docs/parity.md §1 #26 Next-only companion"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -257,6 +258,29 @@ pub fn expected_registry() -> Value {
         .expect("legacy command-list remains published")
         + 1;
     commands.insert(after_list, inspect);
+    // Next-only metadata editing reuses LFG's parity row, never the frozen
+    // legacy snapshot. Pin the complete wire shape independently of production.
+    assert!(commands.iter().all(|command| command["name"] != "lfg-edit"));
+    let edit = json!({
+        "name": "lfg-edit",
+        "description": "Update a raid/LFG title or start time",
+        "dm_permission": false,
+        "default_member_permissions": "8589934592",
+        "options": [
+            {"name": "id", "description": "LFG id from the posted signup", "type": 3,
+             "required": true, "max_length": 128},
+            {"name": "title", "description": "Event or group title", "type": 3,
+             "max_length": 100},
+            {"name": "starts-at", "description": "ISO-8601 start time, e.g. 2026-10-04T18:00:00Z",
+             "type": 3}
+        ]
+    });
+    let after_close = commands
+        .iter()
+        .position(|command| command["name"] == "lfg-close")
+        .expect("legacy lfg-close remains published")
+        + 1;
+    commands.insert(after_close, edit);
     // Picker-copy exceptions (registry golden exceptions table): command and
     // option descriptions intentionally differ from legacy. Pointers mirror
     // the published option order.
