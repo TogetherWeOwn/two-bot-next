@@ -201,7 +201,11 @@ fn open_retry_bounds_match_the_acceptance_envelope() {
     // more than the per-pass work cap on retries.
     assert_eq!(OPEN_RETRY_RETAINED_CAP, 128);
     assert_eq!(OPEN_RETRY_PER_PASS_CAP, 64);
-    assert!(OPEN_RETRY_PER_PASS_CAP <= OPEN_RETRY_RETAINED_CAP);
+    // Const context: clippy `assertions_on_constants` rejects this as a
+    // runtime assert, and a cap edited out of order fails the build here.
+    const _: () = {
+        assert!(OPEN_RETRY_PER_PASS_CAP <= OPEN_RETRY_RETAINED_CAP);
+    };
 }
 
 #[test]
