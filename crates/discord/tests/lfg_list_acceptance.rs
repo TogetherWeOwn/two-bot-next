@@ -864,7 +864,10 @@ async fn store_selection_has_a_sql_bound_and_never_materializes_foreign_channel_
         // Unlike grepping Rust source, it rejects a whole-guild fetch followed by
         // Rust filtering, an unbounded fetch_all, and an OFFSET query at runtime.
         // Session settings are instrumentation only; no probe or domain row writes.
-        sqlx::query("CREATE FUNCTION lfg_list_projection_guard(g text, c text, title text) RETURNS text LANGUAGE plpgsql AS $$
+        // STABLE lets PostgreSQL defer title projection until after ORDER BY/LIMIT.
+        // VOLATILE would force this view to project every candidate before sorting,
+        // falsely rejecting even the bounded read-only control below.
+        sqlx::query("CREATE FUNCTION lfg_list_projection_guard(g text, c text, title text) RETURNS text LANGUAGE plpgsql STABLE AS $$
             DECLARE q text := lower(current_query()); stamp text := statement_timestamp()::text; n int;
             BEGIN
               IF g <> '2222' OR c <> '4444' OR position('limit' in q) = 0
