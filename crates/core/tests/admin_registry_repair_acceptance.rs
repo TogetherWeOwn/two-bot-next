@@ -1754,4 +1754,347 @@ mod database {
     async fn store_incompatible_upgrade_aborts_without_partial_ddl() {
         incompatible_upgrade_is_atomic("store", 457).await;
     }
+
+    mod no_temp_contract {
+        use super::*;
+        use sqlx::postgres::PgPoolOptions;
+
+        // Break caught: a forward authority repair starts requiring TEMPORARY,
+        // or an error unrelated to authority is mistaken for safe refusal.
+        fn sqlstate(error: &(dyn std::error::Error + 'static)) -> String {
+            let mut source = Some(error);
+            while let Some(error) = source {
+                if let Some(error) = error.downcast_ref::<sqlx::Error>() {
+                    if let Some(code) = error.as_database_error().and_then(|e| e.code()) {
+                        return code.into_owned();
+                    }
+                }
+                if let Some(error) = error.downcast_ref::<sqlx::postgres::PgDatabaseError>() {
+                    return error.code().to_owned();
+                }
+                source = error.source();
+            }
+            "non-database failure".to_owned()
+        }
+
+        async fn no_helper_inventory(pool: &PgPool) -> Result<Value, sqlx::Error> {
+            // Include pg_temp, other schemas and functions, not just public
+            // tables. Compare before probes, on the same role's live pool.
+            sqlx::query_scalar(
+                "SELECT jsonb_build_object(
+                 'schemas', (SELECT jsonb_agg(nspname ORDER BY nspname) FROM pg_namespace WHERE nspname <> 'information_schema' AND nspname !~ '^pg_(catalog|toast)'),
+                 'relations', (SELECT jsonb_agg(jsonb_build_array(n.nspname,c.relname,c.relkind,c.relpersistence) ORDER BY n.nspname,c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname <> 'information_schema' AND n.nspname !~ '^pg_(catalog|toast)' AND c.relkind NOT IN ('i','I')),
+                 'functions', (SELECT jsonb_agg(jsonb_build_array(n.nspname,p.proname,pg_get_function_identity_arguments(p.oid)) ORDER BY n.nspname,p.proname,p.oid) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname <> 'information_schema' AND n.nspname !~ '^pg_(catalog|toast)'))",
+            ).fetch_one(pool).await
+        }
+
+        async fn assert_limited_role(pool: &PgPool) -> Result<(), String> {
+            let actual: (bool, bool, bool, bool, bool, bool) = sqlx::query_as(
+                "SELECT current_user = session_user, r.rolsuper, r.rolcreatedb,
+                 r.rolcreaterole, has_database_privilege(current_user,current_database(),'TEMPORARY'),
+                 NOT EXISTS (SELECT 1 FROM pg_auth_members WHERE member=r.oid)
+                 FROM pg_roles r WHERE r.rolname=current_user",
+            ).fetch_one(pool).await.map_err(|e| format!("role verification: {}", sqlstate(&e)))?;
+            if actual != (true, false, false, false, false, true) {
+                return Err(format!("fixture must really be a non-superuser without effective TEMPORARY: {actual:?}"));
+            }
+            let grants: (bool, bool) = sqlx::query_as(
+                "SELECT has_database_privilege(current_user,current_database(),'CONNECT'),
+                 has_database_privilege(current_user,current_database(),'CREATE')",
+            )
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("contract grants: {}", sqlstate(&e)))?;
+            if grants != (true, true) {
+                return Err(format!(
+                    "missing existing CONNECT,CREATE fixture contract: {grants:?}"
+                ));
+            }
+            Ok(())
+        }
+
+        async fn check_behavior(pool: &PgPool) -> Vec<String> {
+            let mut failures = authority_write_probes(pool).await;
+            let omissions = omitted_holder_inserts(pool).await;
+            if omissions.iter().any(|(_, code)| code != "23502") {
+                failures.push(format!(
+                    "omitted holders must fail NOT NULL, not permissions: {omissions:?}"
+                ));
+            }
+            let mut uppercase = row();
+            uppercase["holder_kind"] = json!("HUMAN");
+            uppercase["scopes"] = json!(["admin"]);
+            if !refused(pool, &uppercase, "23514").await {
+                failures.push("uppercase HUMAN admin INSERT must fail CHECK 23514".to_owned());
+            }
+            let mut human = row();
+            human["holder_kind"] = json!("human");
+            human["scopes"] = json!(["admin"]);
+            insert(pool, &human)
+                .await
+                .expect("valid human admin UPDATE control");
+            let before = snapshot(pool).await;
+            let result =
+                sqlx::query("UPDATE admin_api_tokens SET holder_kind='HUMAN' WHERE token_id=$1")
+                    .bind(TOKEN)
+                    .execute(pool)
+                    .await;
+            let after = snapshot(pool).await;
+            if result.as_ref().err().map(|e| sqlstate(e)).as_deref() != Some("23514")
+                || after != before
+            {
+                failures.push(
+                    "uppercase HUMAN admin UPDATE must fail CHECK 23514 without changing row"
+                        .to_owned(),
+                );
+            }
+            clear(pool).await;
+            failures
+        }
+
+        async fn exercise(
+            chain: &str,
+            shipped: i64,
+            case: &str,
+            mirror_chain: Option<(&str, i64)>,
+        ) {
+            let Some(url) = bootstrap() else { return };
+            let (prefix, latest) = pre_repair_migrators(chain, shipped).await;
+            // Existing helper captures same-server CHECK spelling for compatible
+            // setup only; literal invalid INSERT/UPDATE probes are the oracle.
+            let canonical = canonical_authority_checks(&url, chain).await;
+            let empty = Migrator::with_migrations(Vec::new());
+            let db = TestDatabase::create(&url, &empty)
+                .await
+                .expect("create disposable no-TEMP fixture");
+            let name: String = sqlx::query_scalar("SELECT current_database()")
+                .fetch_one(db.pool())
+                .await
+                .expect("read owned fixture name");
+            let role = format!(
+                "admin_no_temp_{}",
+                &hex::encode(sha2::Sha256::digest(name.as_bytes()))[..24]
+            );
+            let created = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "CREATE ROLE {role} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS"
+            ))).execute(db.pool()).await;
+            if let Err(error) = created {
+                let code = sqlstate(&error);
+                db.close()
+                    .await
+                    .expect("drop unprovisioned no-TEMP fixture");
+                panic!("fixture role provisioning failed ({code}); this is not migration RED");
+            }
+            let mut limited = None;
+            // Always release the role and database before asserting on RED.
+            let outcome: Result<Vec<String>, String> = async {
+                for statement in [
+                    format!("REVOKE ALL ON DATABASE \"{name}\" FROM PUBLIC"),
+                    format!("GRANT CONNECT,CREATE ON DATABASE \"{name}\" TO {role}"),
+                    format!("GRANT USAGE,CREATE ON SCHEMA public TO {role}"),
+                    // Even an empty Migrator initializes this ledger as the
+                    // bootstrap principal; its ownership belongs to migrator.
+                    format!("ALTER TABLE public._sqlx_migrations OWNER TO {role}"),
+                ] {
+                    sqlx::query(sqlx::AssertSqlSafe(statement)).execute(db.pool()).await
+                        .map_err(|e| format!("disposable fixture grants: {}", sqlstate(&e)))?;
+                }
+                // Trust-auth login on the guarded disposable service: neither
+                // session_user nor current_user is the bootstrap superuser.
+                let pool = PgPoolOptions::new().max_connections(1)
+                    .connect_with((*db.pool().connect_options()).clone().username(&role)).await
+                    .map_err(|e| format!("limited fixture connection: {}", sqlstate(&e)))?;
+                limited = Some(pool.clone());
+                assert_limited_role(&pool).await?;
+                prefix.run(&pool).await.map_err(|e| format!("predecessor setup: {} (not intended authority refusal)", sqlstate(&e)))?;
+                if case != "empty" {
+                    partial_authority_columns(&pool).await;
+                    if case == "named canonical" {
+                        for (name, expression) in &canonical {
+                            sqlx::query(sqlx::AssertSqlSafe(format!(
+                                "ALTER TABLE admin_api_tokens ADD CONSTRAINT {name} CHECK ({expression}) NOT VALID"
+                            ))).execute(&pool).await.map_err(|e| format!("canonical fixture CHECK: {}", sqlstate(&e)))?;
+                        }
+                    } else if case == "weak same-name CHECK" {
+                        sqlx::query("ALTER TABLE admin_api_tokens ADD CONSTRAINT admin_api_tokens_holder_named CHECK (true) NOT VALID")
+                            .execute(&pool).await.map_err(|e| format!("weak fixture CHECK: {}", sqlstate(&e)))?;
+                    }
+                    let mut human = row();
+                    human["holder_kind"] = json!("human");
+                    human["scopes"] = json!(["moderate", "admin"]);
+                    if case == "missing holder" {
+                        human["holder_id"] = Value::Null;
+                    } else if case == "AI admin" {
+                        human["holder_kind"] = json!("ai_agent");
+                    }
+                    insert(&pool, &human).await.map_err(|e| format!("populate authority fixture: {}", sqlstate(&e)))?;
+                    let mut ai = row();
+                    ai["token_id"] = json!("adm_fedcba9876543210");
+                    ai["holder_id"] = json!("fixture-ai-two");
+                    ai["secret_hash"] = json!(hex::encode(sha2::Sha256::digest(b"second-synthetic-no-temp-row")));
+                    insert(&pool, &ai).await.map_err(|e| format!("populate AI non-admin control: {}", sqlstate(&e)))?;
+                }
+                let before_rows = registry_rows(&pool).await;
+                let before_catalog = catalog(&pool).await;
+                let before_helpers = no_helper_inventory(&pool).await.map_err(|e| format!("before inventory: {}", sqlstate(&e)))?;
+                assert_limited_role(&pool).await?;
+                let result = latest.run(&pool).await;
+                let after_rows = registry_rows(&pool).await;
+                let after_catalog = catalog(&pool).await;
+                let after_helpers = no_helper_inventory(&pool).await.map_err(|e| format!("after inventory: {}", sqlstate(&e)))?;
+                assert_limited_role(&pool).await?;
+                let mut failures = Vec::new();
+                let invalid = matches!(case, "missing holder" | "AI admin" | "weak same-name CHECK");
+                if invalid {
+                    let code = result.as_ref().err().map(|e| sqlstate(e));
+                    if !matches!(code.as_deref(), Some("P0001" | "23502" | "23514")) {
+                        failures.push(format!("authority must refuse, not succeed or fail permissions/setup: {code:?}"));
+                    }
+                    if before_catalog != after_catalog {
+                        failures.push("authority refusal changed columns/constraints/indexes/migration history".to_owned());
+                    }
+                } else if let Err(error) = &result {
+                    failures.push(format!("compatible upgrade requires only CONNECT,CREATE, not TEMPORARY; got {}", sqlstate(error)));
+                } else {
+                    let checks = authority_checks(&pool).await;
+                    let validated: i64 = sqlx::query_scalar(
+                        "SELECT count(*) FROM pg_constraint WHERE conrelid='admin_api_tokens'::regclass
+                         AND conname IN ('admin_api_tokens_holder_named','admin_api_tokens_holder_kind_closed',
+                         'admin_api_tokens_admin_human','admin_api_tokens_lifetime_bounded')
+                         AND contype='c' AND convalidated AND NOT connoinherit",
+                    ).fetch_one(&pool).await.map_err(|e| format!("validate catalog: {}", sqlstate(&e)))?;
+                    if checks != canonical || validated != 4 {
+                        failures.push(format!("real canonical CHECKs must remain exact and validated: count={validated}, exact={}", checks == canonical));
+                    }
+                    failures.extend(check_behavior(&pool).await);
+                }
+                if before_rows != after_rows {
+                    failures.push("migration changed explicit holder rows".to_owned());
+                }
+                if before_helpers != after_helpers {
+                    failures.push("migration left a helper schema/relation/function or temporary object".to_owned());
+                }
+                // Restore the seeded rows after behavior probes before checking
+                // mirror convergence. This is fixture data, not real issuance.
+                if result.is_ok() && !invalid {
+                    sqlx::query("DELETE FROM admin_api_tokens").execute(&pool).await
+                        .map_err(|e| format!("clear probe fixture: {}", sqlstate(&e)))?;
+                    for value in before_rows.as_array().expect("row array") {
+                        insert(&pool, value).await.map_err(|e| format!("restore seeded rows: {}", sqlstate(&e)))?;
+                    }
+                    if let Some((other, other_shipped)) = mirror_chain {
+                        let (other_prefix, other_latest) = pre_repair_migrators(other, other_shipped).await;
+                        let mut mirror = Migrator::with_migrations(other_latest.iter()
+                            .filter(|m| !other_prefix.iter().any(|p| p.version == m.version)).cloned().collect());
+                        mirror.set_ignore_missing(true);
+                        let mut before = catalog(&pool).await;
+                        let prior_history = before["migrations"].clone();
+                        let mirrored = mirror.run(&pool).await;
+                        assert_limited_role(&pool).await?;
+                        let mut after = catalog(&pool).await;
+                        let history = after["migrations"].as_array().expect("mirror history");
+                        let preserved: Vec<_> = history.iter().filter(|entry| prior_history.as_array().expect("prior history").iter()
+                            .any(|old| old["version"] == entry["version"])).cloned().collect();
+                        let recorded = mirror.iter().all(|m| history.iter().any(|entry|
+                            entry["version"].as_i64() == Some(m.version) && entry["success"] == json!(true)));
+                        before.as_object_mut().expect("catalog").remove("migrations");
+                        after.as_object_mut().expect("catalog").remove("migrations");
+                        if mirrored.is_err() || before != after || json!(preserved) != prior_history || !recorded
+                            || registry_rows(&pool).await != before_rows {
+                            failures.push(format!("{chain} -> {other}: mirror failed/convergence drift; SQLSTATE={:?}", mirrored.as_ref().err().map(|e| sqlstate(e))));
+                        }
+                        if mirrored.is_ok() {
+                            let before_repeat = catalog(&pool).await;
+                            let repeated = mirror.run(&pool).await;
+                            if repeated.is_err() || catalog(&pool).await != before_repeat {
+                                failures.push("repeat mirror was not history/schema-idempotent".to_owned());
+                            }
+                            failures.extend(check_behavior(&pool).await);
+                        }
+                        if no_helper_inventory(&pool).await.map_err(|e| format!("mirror inventory: {}", sqlstate(&e)))? != before_helpers {
+                            failures.push("mirror left helper/temporary residue".to_owned());
+                        }
+                        assert_limited_role(&pool).await?;
+                    }
+                }
+                Ok(failures)
+            }.await;
+            if let Some(pool) = limited {
+                pool.close().await;
+            }
+            // Role owns only objects in this disposable database, never the DB
+            // itself. Reassign here before dropping the fixture-local grants.
+            for statement in [
+                format!("REASSIGN OWNED BY {role} TO CURRENT_USER"),
+                format!("DROP OWNED BY {role}"),
+                format!("DROP ROLE {role}"),
+            ] {
+                sqlx::query(sqlx::AssertSqlSafe(statement))
+                    .execute(db.pool())
+                    .await
+                    .expect(
+                        "clean disposable role and its grants; cleanup failure is not intended RED",
+                    );
+            }
+            db.close()
+                .await
+                .expect("drop no-TEMP database; cleanup must succeed");
+            let failures = outcome.unwrap_or_else(|reason| {
+                panic!("{chain}/{case}: fixture/setup limitation, not intended RED: {reason}")
+            });
+            assert!(
+                failures.is_empty(),
+                "{chain}/{case}: no-TEMP migration contract: {failures:#?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn cutover_no_temp_empty_upgrade() {
+            exercise("cutover", 456, "empty", None).await;
+        }
+        #[tokio::test]
+        async fn store_no_temp_empty_upgrade() {
+            exercise("store", 457, "empty", None).await;
+        }
+        #[tokio::test]
+        async fn cutover_no_temp_named_canonical_upgrade() {
+            exercise("cutover", 456, "named canonical", None).await;
+        }
+        #[tokio::test]
+        async fn store_no_temp_named_canonical_upgrade() {
+            exercise("store", 457, "named canonical", None).await;
+        }
+        #[tokio::test]
+        async fn cutover_no_temp_missing_holder_refuses_atomically() {
+            exercise("cutover", 456, "missing holder", None).await;
+        }
+        #[tokio::test]
+        async fn store_no_temp_missing_holder_refuses_atomically() {
+            exercise("store", 457, "missing holder", None).await;
+        }
+        #[tokio::test]
+        async fn cutover_no_temp_ai_admin_refuses_atomically() {
+            exercise("cutover", 456, "AI admin", None).await;
+        }
+        #[tokio::test]
+        async fn store_no_temp_ai_admin_refuses_atomically() {
+            exercise("store", 457, "AI admin", None).await;
+        }
+        #[tokio::test]
+        async fn cutover_no_temp_weak_named_check_refuses_atomically() {
+            exercise("cutover", 456, "weak same-name CHECK", None).await;
+        }
+        #[tokio::test]
+        async fn store_no_temp_weak_named_check_refuses_atomically() {
+            exercise("store", 457, "weak same-name CHECK", None).await;
+        }
+        #[tokio::test]
+        async fn cutover_then_store_no_temp_mirror_is_idempotent() {
+            exercise("cutover", 456, "named canonical", Some(("store", 457))).await;
+        }
+        #[tokio::test]
+        async fn store_then_cutover_no_temp_mirror_is_idempotent() {
+            exercise("store", 457, "named canonical", Some(("cutover", 456))).await;
+        }
+    }
 }
