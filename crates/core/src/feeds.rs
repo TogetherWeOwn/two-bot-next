@@ -319,37 +319,30 @@ fn attempt_phrase(last_checked_at: Option<i64>) -> String {
     }
 }
 
-/// Query parameters whose values are credentials until proven otherwise. The
-/// name is split on non-alphanumeric boundaries and matched token-wise, so
-/// `api_key` and `token` redact while `channel_id` and `format` survive.
+/// Query parameters whose values are credentials until proven otherwise.
+/// Match decoded names case-insensitively, including compound names such as
+/// `accessToken` and `clientSecret`; `channel_id` and `format` survive.
 /// Names survive redaction — only values are replaced — so the admin still
 /// sees which secret-bearing parameter a relay carries.
 fn is_credential_query_param(name: &str) -> bool {
-    name.split(|c: char| !c.is_ascii_alphanumeric())
-        .any(|token| {
-            matches!(
-                token.to_ascii_lowercase().as_str(),
-                "token"
-                    | "tokens"
-                    | "secret"
-                    | "secrets"
-                    | "password"
-                    | "passwd"
-                    | "pwd"
-                    | "pass"
-                    | "key"
-                    | "keys"
-                    | "apikey"
-                    | "auth"
-                    | "authorization"
-                    | "credential"
-                    | "credentials"
-                    | "signature"
-                    | "sig"
-                    | "private"
-                    | "bearer"
-            )
-        })
+    let normalized = name.to_ascii_lowercase();
+    [
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "pwd",
+        "pass",
+        "key",
+        "auth",
+        "credential",
+        "signature",
+        "sig",
+        "private",
+        "bearer",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
 }
 
 /// Markdown-structure characters escaped inside untrusted source segments.
@@ -429,7 +422,13 @@ fn redact_source_query(raw: &str, reasons: &mut Vec<&'static str>) -> String {
             match value {
                 None => safe_name,
                 Some(raw_value) => {
-                    if is_credential_query_param(name) {
+                    // Decode only for classification; keep the original name
+                    // and non-secret value spelling in the safe projection.
+                    let decoded_name = url::form_urlencoded::parse(pair.as_bytes())
+                        .next()
+                        .map(|(name, _)| name)
+                        .unwrap_or_default();
+                    if is_credential_query_param(&decoded_name) {
                         push_redaction_reason(reasons, "secret query values");
                         format!("{safe_name}=[redacted]")
                     } else {
@@ -484,14 +483,9 @@ fn safe_source_projection(source: &str, budget: usize) -> (String, Vec<&'static 
     if path_had_link {
         push_redaction_reason(&mut reasons, "embedded link");
     }
-    // A colon in the parsed host means an IPv6 literal (reg-names cannot
-    // carry one), so re-bracket it; `host_str` strips the brackets.
+    // `host_str` already includes the brackets around an IPv6 literal.
     let host = url.host_str().unwrap_or_default();
-    let mut projection = if host.contains(':') {
-        format!("{}://[{host}]", url.scheme())
-    } else {
-        format!("{}://{host}", url.scheme())
-    };
+    let mut projection = format!("{}://{host}", url.scheme());
     if let Some(port) = url.port() {
         projection.push_str(&format!(":{port}"));
     }

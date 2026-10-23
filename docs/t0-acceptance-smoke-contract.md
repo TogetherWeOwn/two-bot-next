@@ -64,11 +64,11 @@ Two 503s that are truthful, never acceptance:
 ## 3. Top command-surface presence
 
 The publish set (`InteractionRouter::publish_set`,
-`crates/core/src/router.rs:817-855`) with all gates on is **28 built-ins**,
+`crates/core/src/router.rs:817-855`) with all gates on is **30 built-ins**,
 guild-only (`dm_permission` false throughout), in legacy publish order
 (pinned `crates/core/src/router.rs:1412-1440`):
 
-`rank`, `leaderboard`, `attendance` (scorecard), `command`,
+`rank`, `leaderboard`, `help`, `privacy` (core), `attendance` (scorecard), `command`,
 `command-remove`, `command-list`, `schedule`, `schedule-remove`,
 `schedule-list`, `sticky`, `sticky-remove` (automation), `rsvp`,
 `rsvp-attendance`, `lfg`, `lfg-close`, `feed-add`, `feed-remove`,
