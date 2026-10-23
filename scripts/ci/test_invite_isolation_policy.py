@@ -14,23 +14,40 @@ class InviteIsolationPolicyTests(unittest.TestCase):
         self.case = policy.WorkflowTests()
         self.case.setUp()
 
-    def assert_isolation_rejected(self):
-        # Exercise the actual workflow-policy checks, not another copy of them.
-        names = [
-            name for name in unittest.defaultTestLoader.getTestCaseNames(policy.WorkflowTests)
-            if "invite" in name or name == "test_patch_coverage_runs_with_db_and_includes_ignored_tests"
-        ]
-        for name in names:
-            case = policy.WorkflowTests(name)
-            case.workflows = deepcopy(self.case.workflows)
-            try:
-                getattr(case, name)()
-            except AssertionError:
-                return
-        self.fail("workflow policy accepted an unsafe invite fixture schedule")
+    def policy_result(self, name):
+        # TestCase.run records failures inside subTest; calling the method
+        # directly can miss them when an outer runner already owns the result.
+        case = policy.WorkflowTests(name)
+        case.workflows = deepcopy(self.case.workflows)
+        result = unittest.TestResult()
+        with patch.object(case, "setUp"):
+            case.run(result)
+        self.assertEqual(result.testsRun, 1)
+        self.assertEqual(result.errors, [], result.errors)
+        return result
+
+    def assert_isolation_rejected(
+        self,
+        name="test_invite_saturation_isolation_in_both_lanes",
+        jobs=("rust-tests",),
+    ):
+        result = self.policy_result(name)
+        self.assertEqual(len(result.failures), len(jobs), result.failures)
+        for job in jobs:
+            self.assertTrue(
+                any(f"job='{job}'" in case.id() for case, _ in result.failures),
+                f"{name} accepted an unsafe schedule in {job}",
+            )
+        return result
 
     def test_unmodified_workflow_passes_invite_policy(self):
-        self.case.test_invite_saturation_isolation_in_both_lanes()
+        for name in (
+            "test_invite_saturation_isolation_in_both_lanes",
+            "test_patch_coverage_runs_with_db_and_includes_ignored_tests",
+        ):
+            with self.subTest(policy=name):
+                result = self.policy_result(name)
+                self.assertTrue(result.wasSuccessful(), result.failures)
 
     def test_discovery_refuses_unmapped_tokio_attributes(self):
         for declaration in (
@@ -39,9 +56,13 @@ class InviteIsolationPolicyTests(unittest.TestCase):
             "#[tokio::test]\n/* outer /* nested */ comment */\nasync fn unknown() {}\n",
             "#[tokio::test]",
         ):
-            with self.subTest(declaration=declaration):
-                with self.assertRaises(ValueError):
-                    policy.tokio_test_names("#[tokio::test]\nasync fn ordinary() {}\n" + declaration)
+            for attribute in ("tokio::test", "::tokio::test"):
+                with self.subTest(declaration=declaration, attribute=attribute):
+                    with self.assertRaises(ValueError):
+                        policy.tokio_test_names(
+                            "#[tokio::test]\nasync fn ordinary() {}\n"
+                            + declaration.replace("tokio::test", attribute),
+                        )
 
     def test_signal_lane_rejects_parallel_invite_replay(self):
         steps = self.case.workflows["check.yml"]["jobs"]["rust-tests"]["steps"]
@@ -72,21 +93,43 @@ class InviteIsolationPolicyTests(unittest.TestCase):
             "/* block comment */\n",
             "#[allow(dead_code)]\n// comment\n/* block */\n",
         )
+        attributes = (
+            "#[tokio::test]",
+            '#[::tokio::test(flavor = "multi_thread", worker_threads = 2)]',
+        )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / source_path.relative_to(policy.ROOT)
             source.parent.mkdir(parents=True)
-            for trivia in variants:
-                with self.subTest(trivia=trivia):
-                    source.write_text(original + "\n#[tokio::test]\n" + trivia + "async fn unskipped_future_fixture() {}\n", encoding="utf-8")
-                    real_read = Path.read_text
+            for attribute in attributes:
+                for trivia in variants:
+                    with self.subTest(attribute=attribute, trivia=trivia):
+                        source.write_text(
+                            original + "\n" + attribute + "\n" + trivia
+                            + "async fn unskipped_future_fixture() {}\n",
+                            encoding="utf-8",
+                        )
+                        real_read = Path.read_text
 
-                    def read_text(path, *args, **kwargs):
-                        return real_read(source if path == source_path else path, *args, **kwargs)
+                        def read_text(path, *args, **kwargs):
+                            return real_read(source if path == source_path else path, *args, **kwargs)
 
-                    with patch.object(Path, "read_text", read_text):
-                        with self.assertRaises(AssertionError):
-                            self.case.test_patch_coverage_runs_with_db_and_includes_ignored_tests()
+                        with patch.object(Path, "read_text", read_text):
+                            with self.subTest(policy="both lanes"):
+                                result = self.assert_isolation_rejected(
+                                    jobs=("rust-tests", "patch-coverage"),
+                                )
+                                for case, _ in result.failures:
+                                    self.assertIn("fixture='unskipped_future_fixture'", case.id())
+                            with self.subTest(policy="patch coverage"):
+                                result = self.policy_result(
+                                    "test_patch_coverage_runs_with_db_and_includes_ignored_tests",
+                                )
+                                self.assertEqual(len(result.failures), 1, result.failures)
+                                self.assertIn(
+                                    "saturation_skip='unskipped_future_fixture'",
+                                    result.failures[0][0].id(),
+                                )
 
 
 if __name__ == "__main__":

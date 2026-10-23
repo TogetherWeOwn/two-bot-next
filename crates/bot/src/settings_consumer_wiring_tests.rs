@@ -5,6 +5,7 @@
 use super::*;
 use crate::{
     activation::fixtures,
+    discord_test_common::{MockRest, ScriptedResponse},
     feed_jobs,
     jobs::JobAction,
     self_role_handlers::{self, SelfRoleResult, SelfRoleService},
@@ -21,6 +22,7 @@ use two_bot_core::{
 };
 use two_bot_cutover::self_role_store::SelfRoleStore;
 use two_bot_discord::ActionExecutor;
+use two_bot_testsupport::TestDatabase;
 
 async fn isolated(test: &'static str) -> bool {
     const CHILD: &str = "LIVE_CONSUMER_PROBE_MODE";
@@ -156,6 +158,162 @@ fn catalogue(panels: &[SelfRolePanel]) -> serde_json::Value {
             })
             .collect(),
     )
+}
+
+#[tokio::test]
+async fn self_role_handle_admits_matching_nonzero_revision_and_fences_stale_snapshot() {
+    if isolated("settings_jobs::consumer_wiring_tests::self_role_handle_admits_matching_nonzero_revision_and_fences_stale_snapshot").await {
+        return;
+    }
+    // Required, not an optional local/CI skip. Both the unit/binary lane and
+    // the coverage sweep supply this guarded bootstrap; the child inherits it.
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("disposable test bootstrap required");
+    let db = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+        .await
+        .expect("create migrated disposable fixture");
+    let guild = self_role_handlers::tests::GUILD.to_string();
+    let boot = panels("100000000000000008", "100000000000000009");
+    let live = panels("100000000000000018", "100000000000000019");
+    let store = SettingsStore::new(db.pool());
+    store
+        .set(
+            &guild,
+            self_role_handlers::PANELS_KEY,
+            Some(catalogue(&live)),
+            "test",
+        )
+        .await
+        .expect("write live catalogue");
+    let published = store
+        .load_snapshot()
+        .await
+        .expect("committed catalogue snapshot");
+    assert!(
+        published.revision > 0,
+        "zero cannot prove revision forwarding"
+    );
+    let mut writer = install_live();
+    writer.publish(&published);
+    assert_eq!(
+        super::live().unwrap().snapshot().revision(),
+        published.revision
+    );
+
+    // Real service admission and planning, but only loopback Discord reads.
+    // Dry-run still initializes and settles the durable admission audit.
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(200, json!({"user":{"id":"100000000000000002"},"roles":[]})),
+            ScriptedResponse::json(200, json!({"user":{"id":"100000000000000003","bot":true},"roles":["100000000000000006"]})),
+            ScriptedResponse::json(200, json!([
+                {"id":guild,"permissions":"1024","position":0,"managed":false,"color":0},
+                {"id":"100000000000000004","permissions":"0","position":2,"managed":false,"color":0},
+                {"id":"100000000000000006","permissions":"268435456","position":10,"managed":true,"color":0}
+            ])),
+            ScriptedResponse::json(200, json!([
+                {"id":"100000000000000007","guild_id":guild,"name":"games","permission_overwrites":[]}
+            ])),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let service = SelfRoleService::new(
+        SelfRoleRuntime {
+            store: SelfRoleStore::new(db.pool().clone()),
+            executor: ActionExecutor::with_proxy("fixture-token".into(), Some(mock.origin()))
+                .unwrap(),
+            guild_id: guild.clone(),
+            bot_id: "100000000000000003".into(),
+        },
+        SelfRoleGates {
+            panels: boot,
+            dry_run: true,
+        },
+        &[guild.clone()].into_iter().collect(),
+    )
+    .unwrap();
+    let press = self_role_handlers::tests::component(&live[0], 100000000000000110, vec![]);
+    let input = service
+        .component_input(&press)
+        .expect("live matching panel");
+    assert_eq!(input.panel, live[0]);
+    let matching = service.handle(&input).await;
+    let admitted: Vec<(String, String, Option<String>, bool)> = sqlx::query_as(
+        "SELECT event_id, outcome, code, intent_initialized FROM self_role_audit ORDER BY event_id",
+    )
+    .fetch_all(db.pool())
+    .await
+    .expect("read durable admission");
+    let requests_before = mock.requests();
+
+    // Commit the identical catalogue again, but deliberately do not publish
+    // its new revision. Membership still matches, so only admission can fence it.
+    store
+        .set(
+            &guild,
+            self_role_handlers::PANELS_KEY,
+            Some(catalogue(&live)),
+            "test",
+        )
+        .await
+        .expect("advance DB revision without changing the panel");
+    let advanced = store.load_snapshot().await.expect("advanced DB snapshot");
+    assert!(advanced.revision > published.revision);
+    assert_eq!(
+        super::live().unwrap().snapshot().revision(),
+        published.revision
+    );
+    let stale_press = self_role_handlers::tests::component(&live[0], 100000000000000111, vec![]);
+    let stale_input = service
+        .component_input(&stale_press)
+        .expect("still-matching panel");
+    assert_eq!(stale_input.panel, input.panel);
+    assert_ne!(stale_input.request.event_id, input.request.event_id);
+    let stale = service.handle(&stale_input).await;
+    let after_stale: Vec<(String, String, Option<String>, bool)> = sqlx::query_as(
+        "SELECT event_id, outcome, code, intent_initialized FROM self_role_audit ORDER BY event_id",
+    )
+    .fetch_all(db.pool())
+    .await
+    .expect("read audit after stale admission");
+    let requests_after = mock.requests();
+    drop(service);
+    db.close()
+        .await
+        .expect("verify disposable fixture teardown");
+
+    assert_eq!(
+        matching,
+        SelfRoleResult::DryRun,
+        "matching nonzero revision must admit"
+    );
+    assert_eq!(
+        admitted,
+        vec![(
+            input.request.event_id,
+            "rejected".into(),
+            Some("dry_run".into()),
+            true
+        )]
+    );
+    assert_eq!(
+        requests_before.len(),
+        4,
+        "admission reads a complete Discord snapshot"
+    );
+    assert!(requests_before
+        .iter()
+        .all(|request| request.method == "GET"));
+    assert_eq!(stale, SelfRoleResult::Ignored);
+    assert_eq!(
+        after_stale, admitted,
+        "stale admission must create zero additional audit rows"
+    );
+    assert_eq!(
+        requests_after.len(),
+        requests_before.len(),
+        "stale admission must not reach Discord"
+    );
 }
 
 #[tokio::test]
