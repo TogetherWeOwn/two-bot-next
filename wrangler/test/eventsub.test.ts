@@ -622,6 +622,111 @@ test("relay unit: oversize, wrong-media and bodyless answers never leave; envelo
   assert.equal(odd.headers.get("cache-control"), "no-store");
 });
 
+test("relay unit: shutting_down refusals remain retryable and unknown codes fail closed", async () => {
+  const requestId = "00000000000000000000000000";
+  const shuttingDown = await relayEventsubResponse(Response.json({
+    ok: false,
+    request_id: requestId,
+    error: { code: "shutting_down", message: "untrusted detail", retryable: true },
+  }, { status: 503 }), requestId);
+  assert.deepEqual(await shuttingDown.json(), {
+    ok: false,
+    request_id: requestId,
+    error: { code: "shutting_down", message: "request refused", retryable: true },
+  });
+
+  const unknown = await relayEventsubResponse(Response.json({
+    ok: false,
+    request_id: requestId,
+    error: { code: "unknown_receiver_code", message: "untrusted detail", retryable: true },
+  }, { status: 503 }), requestId);
+  assert.equal(unknown.status, 503);
+  assert.deepEqual(await unknown.json(), {
+    ok: false,
+    request_id: requestId,
+    error: { code: "unavailable", message: "request refused", retryable: true },
+  });
+});
+
+test("relay unit: invalid challenge bytes fail closed", async () => {
+  const requestId = "00000000000000000000000000";
+  for (const bytes of [new Uint8Array([0x7f]), new Uint8Array(257).fill(0x61)]) {
+    const response = await relayEventsubResponse(new Response(
+      bytes,
+      { status: 200, headers: { "content-type": "text/plain" } },
+    ), requestId);
+
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), {
+      ok: false,
+      request_id: requestId,
+      error: { code: "unavailable", message: "request refused", retryable: true },
+    });
+  }
+});
+
+test("relay unit: valid acknowledgements project to the correlation envelope", async () => {
+  const requestId = "00000000000000000000000000";
+  const response = await relayEventsubResponse(Response.json({
+    ok: true,
+    request_id: requestId,
+    private: "synthetic-private-receiver-outflow",
+  }), requestId);
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { ok: true, request_id: requestId });
+});
+
+test("relay unit: mismatched receiver request IDs fail closed", async () => {
+  const requestId = "00000000000000000000000000";
+  const response = await relayEventsubResponse(Response.json({
+    ok: true,
+    request_id: "00000000000000000000000001",
+  }), requestId);
+
+  assert.equal(response.status, 503);
+  assert.deepEqual(await response.json(), {
+    ok: false,
+    request_id: requestId,
+    error: { code: "unavailable", message: "request refused", retryable: true },
+  });
+});
+
+test("relay unit: malformed JSON fails closed without relaying receiver bytes", async () => {
+  const requestId = "00000000000000000000000000";
+  const response = await relayEventsubResponse(new Response(
+    `{"ok":true,"request_id":"${requestId}","private":"synthetic-private-receiver-outflow"}!`,
+    { status: 200, headers: { "content-type": "application/json" } },
+  ), requestId);
+
+  assert.equal(response.status, 503);
+  assert.deepEqual(await response.json(), {
+    ok: false,
+    request_id: requestId,
+    error: { code: "unavailable", message: "request refused", retryable: true },
+  });
+});
+
+test("relay unit: malformed UTF-8 fails closed before JSON projection", async () => {
+  const requestId = "00000000000000000000000000";
+  const prefix = new TextEncoder().encode(`{"ok":true,"request_id":"${requestId}","private":"`);
+  const suffix = new TextEncoder().encode('"}');
+  const bytes = new Uint8Array(prefix.length + 1 + suffix.length);
+  bytes.set(prefix);
+  bytes[prefix.length] = 0xff;
+  bytes.set(suffix, prefix.length + 1);
+  const response = await relayEventsubResponse(new Response(bytes, {
+    status: 200, headers: { "content-type": "application/json" },
+  }), requestId);
+
+  assert.equal(response.status, 503);
+  assert.deepEqual(await response.json(), {
+    ok: false,
+    request_id: requestId,
+    error: { code: "unavailable", message: "request refused", retryable: true },
+  });
+});
+
 test("public ingress never starts the container: a cold instance answers 503 without a receiver call", async (t) => {
   const h = await harness(t, ENABLED_ENV);
   const response = await h.call(post());

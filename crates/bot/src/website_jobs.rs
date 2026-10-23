@@ -528,7 +528,7 @@ async fn registered_statuses(
 }
 
 /// First listener termination stops admission everywhere and drains its sibling.
-/// Both futures stay owned by serve_jobs; its existing HTTP drain bound applies.
+/// Both futures stay owned by serve_jobs for the total configured shutdown deadline.
 pub(crate) async fn serve_listeners(
     public: impl std::future::Future<Output = std::io::Result<()>>,
     private: impl std::future::Future<Output = std::io::Result<()>>,
@@ -554,7 +554,9 @@ pub(crate) async fn serve_listeners(
     Ok(())
 }
 
-pub(crate) const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) fn http_drain_timeout() -> Duration {
+    crate::shutdown::deadline()
+}
 
 /// Own the production spawn/cancel/join path independently of job registration.
 pub(crate) async fn serve_jobs(
@@ -591,7 +593,7 @@ async fn drain_http(
         biased;
         result = &mut http => result,
         _ = server::shutdown_requested(shutdown) => {
-            tokio::time::timeout(HTTP_DRAIN_TIMEOUT, &mut http)
+            tokio::time::timeout(http_drain_timeout(), &mut http)
                 .await
                 .unwrap_or_else(|_| Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,

@@ -447,7 +447,7 @@ async fn stopped_http_drain_has_a_deadline() {
     shutdown.send_replace(true);
     let stopped_at = tokio::time::Instant::now();
     let error = tokio::time::timeout(
-        crate::website_jobs::HTTP_DRAIN_TIMEOUT + Duration::from_secs(1),
+        crate::website_jobs::http_drain_timeout() + Duration::from_secs(1),
         service,
     )
     .await
@@ -456,7 +456,38 @@ async fn stopped_http_drain_has_a_deadline() {
     .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     assert_eq!(error.to_string(), "HTTP shutdown drain timed out");
-    assert!(stopped_at.elapsed() >= crate::website_jobs::HTTP_DRAIN_TIMEOUT);
+    assert!(stopped_at.elapsed() >= crate::website_jobs::http_drain_timeout());
+}
+
+#[tokio::test(start_paused = true)]
+async fn production_http_drain_allows_receiver_work_past_old_five_second_cap() {
+    let (shutdown, _) = watch::channel(false);
+    let (started, started_rx) = oneshot::channel();
+    let completed = Arc::new(AtomicBool::new(false));
+    let http_completed = Arc::clone(&completed);
+    let http = async move {
+        started.send(()).unwrap();
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        http_completed.store(true, Ordering::SeqCst);
+        Ok(())
+    };
+    let service = tokio::spawn(crate::website_jobs::serve_jobs(
+        vec![],
+        crate::jobs::statuses(&[], true),
+        shutdown.clone(),
+        http,
+    ));
+    started_rx.await.unwrap();
+    shutdown.send_replace(true);
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(10)).await;
+
+    assert!(tokio::time::timeout(Duration::from_secs(1), service)
+        .await
+        .expect("receiver work must finish before the shutdown deadline")
+        .unwrap()
+        .is_ok());
+    assert!(completed.load(Ordering::SeqCst));
 }
 
 #[tokio::test(start_paused = true)]
@@ -511,20 +542,22 @@ async fn stalled_http_drain_does_not_bypass_website_job_join() {
         .await
         .expect("production job supervisor must start the pending action");
     // The deadline is for draining after stop, not the HTTP service's lifetime.
-    tokio::time::advance(crate::website_jobs::HTTP_DRAIN_TIMEOUT * 2).await;
+    tokio::time::advance(crate::website_jobs::http_drain_timeout() * 2).await;
     tokio::task::yield_now().await;
     assert!(!http_dropped.load(Ordering::SeqCst));
     assert!(!service.is_finished());
     let status_gate = status.write().await;
     fail.send(()).unwrap();
-    assert!(
-        tokio::time::timeout(
-            crate::website_jobs::HTTP_DRAIN_TIMEOUT + Duration::from_millis(25),
-            &mut service,
-        )
-        .await
-        .is_err(),
-        "HTTP deadline must not bypass the job supervisor's gated cleanup"
+    let result = tokio::time::timeout(
+        crate::website_jobs::http_drain_timeout() + Duration::from_millis(25),
+        &mut service,
+    )
+    .await
+    .expect("the total shutdown deadline must bound HTTP and job cleanup")
+    .unwrap();
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "service shutdown deadline exceeded"
     );
     assert!(http_dropped.load(Ordering::SeqCst), "HTTP drain is bounded");
     assert!(
@@ -532,15 +565,6 @@ async fn stalled_http_drain_does_not_bypass_website_job_join() {
         "job action must be cancelled"
     );
     drop(status_gate);
-    let error = tokio::time::timeout(Duration::from_secs(1), service)
-        .await
-        .expect("restart must finish once independent job cleanup completes")
-        .unwrap()
-        .unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "gateway task stopped; container restart required"
-    );
     assert!(!status.read().await["pending"].running);
     tokio::time::advance(Duration::from_secs(60)).await;
     tokio::task::yield_now().await;

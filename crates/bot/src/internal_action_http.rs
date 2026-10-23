@@ -1234,9 +1234,12 @@ impl BoundReceiver {
     /// Shutdown budget shared by the Axum drain and the child drain, armed
     /// when shutdown latches. It sits inside the supervisor's HTTP drain
     /// budget by [`SUPERVISOR_HEADROOM`], so the receiver reports (and runs
-    /// its child-abort path) before the supervisor backstop fires.
+    /// its child-abort path) before the supervisor backstop fires. Preserve
+    /// the existing five-second cap when the supervisor allows a longer drain.
     fn shutdown_budget() -> Duration {
-        crate::website_jobs::HTTP_DRAIN_TIMEOUT.saturating_sub(SUPERVISOR_HEADROOM)
+        crate::website_jobs::http_drain_timeout()
+            .min(Duration::from_secs(5))
+            .saturating_sub(SUPERVISOR_HEADROOM)
     }
 
     /// Supervised by website_jobs along with the other runtime services.

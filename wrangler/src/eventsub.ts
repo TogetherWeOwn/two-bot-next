@@ -431,53 +431,6 @@ export async function handleEventsubIngress(
 const RELAYED_RESPONSE_HEADERS = ["content-type", "retry-after"];
 
 /**
- * Race a body read against the existing receiver deadline (`signal`). No new
- * budget is created: an already-fired signal settles promptly and a stalled
- * read cannot hold the caller past the deadline. Cleanup stays with the
- * caller (best-effort release, never awaited).
- */
-function boundRead<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
-  if (!signal) return work;
-  if (signal.aborted) return Promise.reject(new Error("receiver deadline exceeded"));
-  let onAbort = () => {};
-  const aborted = new Promise<never>((_, reject) => {
-    onAbort = () => reject(new Error("receiver deadline exceeded"));
-    signal.addEventListener("abort", onAbort, { once: true });
-  });
-  return Promise.race([work, aborted]).finally(() => {
-    signal.removeEventListener("abort", onAbort);
-  });
-}
-
-/** Best-effort body release: a stalling cancel hook must not hold the caller. */
-function releaseUpstream(upstream: Response): void {
-  if (!upstream.body) return;
-  try {
-    void upstream.body.cancel().catch(() => {});
-  } catch {
-    // Ignore a synchronously-throwing hook: the fixed refusal below stands.
-  }
-}
-
-/**
- * Best-effort reader release: cancel is attempted but never awaited, so a
- * never-settling cancel cannot hold the wrapper critical section. The lock is
- * dropped where possible; a still-pending read settles on its own.
- */
-function releaseReader(reader: ReadableStreamDefaultReader<Uint8Array>): void {
-  try {
-    void reader.cancel().catch(() => {});
-  } catch {
-    // Ignore a synchronously-throwing hook: the fixed refusal stands.
-  }
-  try {
-    reader.releaseLock();
-  } catch {
-    // Ignore: a pending read may still hold the lock; it settles on its own.
-  }
-}
-
-/**
  * The receiver's refusal vocabulary, mirrored from its constructors and call
  * sites (`crates/bot/src/eventsub_http.rs`: `envelope`/`refuse`/`ack`): each
  * code is emitted with exactly one status and one retry policy. Verification
@@ -496,6 +449,7 @@ const RECEIVER_REFUSALS: ReadonlyMap<string, { status: number; retryable: boolea
   ["unsupported_media_type", { status: 415, retryable: false }],
   ["busy", { status: 503, retryable: true }],
   ["upstream_timeout", { status: 503, retryable: true }],
+  ["shutting_down", { status: 503, retryable: true }],
   ["unavailable", { status: 503, retryable: true }],
 ]);
 
@@ -551,6 +505,53 @@ function projectReceiverJson(
     request_id: requestId,
     error: { code, message: "request refused", retryable },
   };
+}
+
+/**
+ * Race a body read against the existing receiver deadline (`signal`). No new
+ * budget is created: an already-fired signal settles promptly and a stalled
+ * read cannot hold the caller past the deadline. Cleanup stays with the
+ * caller (best-effort release, never awaited).
+ */
+function boundRead<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return work;
+  if (signal.aborted) return Promise.reject(new Error("receiver deadline exceeded"));
+  let onAbort = () => {};
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(new Error("receiver deadline exceeded"));
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  return Promise.race([work, aborted]).finally(() => {
+    signal.removeEventListener("abort", onAbort);
+  });
+}
+
+/** Best-effort body release: a stalling cancel hook must not hold the caller. */
+function releaseUpstream(upstream: Response): void {
+  if (!upstream.body) return;
+  try {
+    void upstream.body.cancel().catch(() => {});
+  } catch {
+    // Ignore a synchronously-throwing hook: the fixed refusal below stands.
+  }
+}
+
+/**
+ * Best-effort reader release: cancel is attempted but never awaited, so a
+ * never-settling cancel cannot hold the wrapper critical section. The lock is
+ * dropped where possible; a still-pending read settles on its own.
+ */
+function releaseReader(reader: ReadableStreamDefaultReader<Uint8Array>): void {
+  try {
+    void reader.cancel().catch(() => {});
+  } catch {
+    // Ignore a synchronously-throwing hook: the fixed refusal stands.
+  }
+  try {
+    reader.releaseLock();
+  } catch {
+    // Ignore: a pending read may still hold the lock; it settles on its own.
+  }
 }
 
 /**
