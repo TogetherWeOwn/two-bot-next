@@ -277,19 +277,29 @@ def tokio_test_names(text):
     """Collect each Tokio test through intervening trivia, or fail closed.
 
     Like ignored_test_names this is a source-style scanner, not a Rust parser.
-    Every attribute mark must resolve; unsupported declarations cannot shrink
-    the skip set silently while other ordinary declarations still match.
+    Every attribute mark must resolve, and every `tokio::test` token must be
+    consumed by exactly one mark; imported, renamed, cfg_attr or
+    macro-generated spellings the mark regex cannot see fail validation
+    instead of silently shrinking the skip set while other ordinary
+    declarations still match.
     """
     marks = list(re.finditer(r"^[ \t]*#\[(?:::)?tokio::test\b", text, re.MULTILINE))
+    tokens = re.findall(r"(?<!\w)tokio::test\b", text)
     names = []
     for mark in marks:
         line_end = text.find("\n", mark.end())
         name = None if line_end == -1 else _match_fn_name(text, _skip_trivia(text, line_end + 1))
         if name is not None:
             names.append(name)
-    if not marks or len(names) != len(marks) or len(set(names)) != len(names):
+    if (
+        not marks
+        or len(tokens) != len(marks)
+        or len(names) != len(marks)
+        or len(set(names)) != len(names)
+    ):
         raise ValueError(
-            f"discovered {len(names)} of {len(marks)} unique Tokio test functions; "
+            f"found {len(tokens)} tokio::test tokens and {len(marks)} marks "
+            f"for {len(names)} unique Tokio test functions; "
             "extend the scanner for the unsupported declaration",
         )
     return names
