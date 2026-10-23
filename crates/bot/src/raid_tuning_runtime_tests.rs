@@ -1,8 +1,7 @@
 #![cfg(test)]
 //! Builder-owned live settings and no-effect regression tests.
 
-#[path = "hotpath_settings_test_support.rs"]
-mod hotpath_scope;
+use crate::hotpath_settings_test_support as hotpath_scope;
 
 #[tokio::test]
 async fn raid_runtime_hotpath_settings_reads_are_guild_scoped() {

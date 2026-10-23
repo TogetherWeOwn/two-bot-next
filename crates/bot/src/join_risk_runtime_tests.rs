@@ -1,8 +1,7 @@
 //! Join-risk runtime acceptance against the mock Discord double. The worker
 //! test is ignored and runs only on agent-testdb / the CI service container.
 
-#[path = "hotpath_settings_test_support.rs"]
-mod hotpath_scope;
+use crate::hotpath_settings_test_support as hotpath_scope;
 
 #[tokio::test]
 async fn join_risk_runtime_hotpath_settings_reads_are_guild_scoped() {

@@ -31,7 +31,7 @@ pub async fn database(key: &str) -> TestDatabase {
         .set(
             "22",
             "DISCORD_STAFF_ALERT_CHANNEL_ID",
-            Some(json!("12")),
+            Some(json!("123456789012345678")),
             "fixture",
         )
         .await
