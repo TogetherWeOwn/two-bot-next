@@ -6,6 +6,7 @@ A filesystem quota is the hard byte bound; the sampled guard is defense in depth
 """
 
 import argparse
+import errno
 import fcntl
 import json
 import os
@@ -20,6 +21,13 @@ import time
 GIB = 1024 ** 3
 DEFAULT_POOL = Path('/paperclip/.cache/two-bot-next-bounded')
 TERMINAL = {'done', 'cancelled'}
+
+# Bounded-subprocess policy (docs/bounded-subprocess-checks.md): each
+# retention-audit provenance Git wait is finite and never longer than the
+# remaining receipt freshness allowance, so a stalled child fails closed
+# into candidate ineligibility instead of hanging past the receipt guard.
+# Local Git probes answer in well under a second; 30s bounds the stall.
+PROVENANCE_GIT_TIMEOUT_SECONDS = 30
 
 
 class Refusal(Exception):
@@ -317,8 +325,9 @@ def process_references(proc_root):
 
     Scans cwd/exe/fd/maps plus cmdline argv tokens. Inodes are compared too,
     so container mount path spellings need not match the host. cmdline entries
-    that no longer stat are kept as lexical-only references (dev/ino None);
-    any other denied read aborts the whole scan.
+    that no longer stat, or whose token exceeds PATH_MAX (ENAMETOOLONG),
+    are kept as lexical-only references (dev/ino None); any other denied
+    read aborts the whole scan.
 
     Deleted entries are (path, device, inode, stat_backed): fd/cwd/exe
     devices come from stat and compare directly with slot stat devices;
@@ -446,8 +455,16 @@ def process_references(proc_root):
                         references.append((text, None, None))
                     except NotADirectoryError:
                         references.append((text, None, None))
-                    except (PermissionError, OSError):
-                        raise Refusal(f'incomplete process visibility: pid {entry.name}')
+                    except OSError as error:
+                        # A token longer than PATH_MAX (headless Chrome
+                        # rewrites its argv into one long title) can never
+                        # name a real file; keep it lexical like a missing
+                        # path. PermissionError and every other OSError
+                        # still fail the whole scan closed.
+                        if error.errno == errno.ENAMETOOLONG:
+                            references.append((text, None, None))
+                        else:
+                            raise Refusal(f'incomplete process visibility: pid {entry.name}')
                     else:
                         references.append((text, info.st_dev, info.st_ino))
         except FileNotFoundError:
@@ -654,9 +671,12 @@ def validate_shared_pool_inventory(pool, policy, inventory, now, max_age):
        "captured_at_unix": <unix>,
        "slots": [{"path": "<pool>/slot-N", "issue_id": "<uuid>",
                   "status": "done|...", "live_run": bool, "referenced": bool,
-                  "target_provenance": "build_output_only"}, ...]}
+                  "target_provenance": "build_output_only",
+                  "idle_stale": bool (optional)}, ...]}
     live_run covers running/queued/retry runs; referenced covers all
-    execution/project/shared workspace refs. Returns (indexed, captured).
+    execution/project/shared workspace refs. idle_stale lets a nonterminal
+    row pass the status gate; every other gate is unchanged.
+    Returns (indexed, captured).
     """
     if (inventory.get('version') != 1 or inventory.get('complete') is not True
             or inventory.get('process_scope') != 'host'):
@@ -677,7 +697,9 @@ def validate_shared_pool_inventory(pool, policy, inventory, now, max_age):
         canonical = os.path.normpath(raw)
         if raw != canonical or canonical in indexed:
             raise Refusal('ambiguous slot attribution')
-        if type(row.get('live_run')) is not bool or type(row.get('referenced')) is not bool:
+        if (type(row.get('live_run')) is not bool
+                or type(row.get('referenced')) is not bool
+                or ('idle_stale' in row and type(row['idle_stale']) is not bool)):
             raise Refusal('ambiguous slot attribution')
         if not row.get('issue_id') or row.get('status') not in TERMINAL | {
                 'backlog', 'todo', 'in_progress', 'in_review', 'blocked'}:
@@ -810,7 +832,12 @@ def shared_pool_retain(pool, inventory, proc_root='/proc', now=None, max_age=60,
                     results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
                                      'reason': 'unattributed slot; skipped, lease kept'}
                     continue
-                if row['status'] not in TERMINAL or row['live_run'] or row['referenced']:
+                # An over-budget slot is never handed out by acquire(), so its
+                # retained output helps nobody. A row the control plane marks
+                # idle_stale passes the nonterminal-status gate; live_run,
+                # referenced, and every gate below are unchanged.
+                if ((row['status'] not in TERMINAL and row.get('idle_stale') is not True)
+                        or row['live_run'] or row['referenced']):
                     results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
                                      'reason': ('live run, slot reference, or nonterminal issue; '
                                                 'skipped, lease kept')}
@@ -1129,23 +1156,91 @@ def retention_audit(worktrees, inventory, proc_root='/proc', now=None, max_age=6
         git_env = {key: value for key, value in os.environ.items()
                    if key not in {'GIT_INDEX_FILE', 'GIT_DIR', 'GIT_WORK_TREE',
                                   'GIT_COMMON_DIR', 'GIT_NAMESPACE'}}
+        # Bound every provenance wait by the live remaining receipt
+        # freshness: static age minus monotonic elapsed since audit
+        # entry. Each of the three calls recomputes the budget, so a
+        # stalled earlier call cannot lend its budget to a later one,
+        # and each candidate's first call rechecks freshness before
+        # probing. Under one second of live freshness no bounded call
+        # fits, so the audit refuses instead of probing.
+        def live_git_timeout():
+            remaining = (max_age - (now - captured)
+                         - (time.monotonic() - started))
+            if remaining < 1:
+                raise Refusal('control-plane inventory is stale or from '
+                              'the future; capture a new inventory')
+            return min(PROVENANCE_GIT_TIMEOUT_SECONDS, remaining)
         try:
             toplevel = subprocess.run(['git', '-C', str(workspace), 'rev-parse',
                                        '--show-toplevel'],
                                       capture_output=True, check=True, env=git_env,
-                                      text=True)
+                                      text=True, timeout=live_git_timeout())
+        except subprocess.TimeoutExpired:
+            result['reason'] = ('unverified workspace repository '
+                                '(git-timeout); next: capture a new '
+                                'inventory and re-run the audit')
+            continue
+        except OSError:
+            result['reason'] = ('unverified workspace repository '
+                                '(git-spawn); next: capture a new '
+                                'inventory and re-run the audit on a host '
+                                'with git installed')
+            continue
         except subprocess.CalledProcessError:
-            result['reason'] = 'unverified workspace repository'
+            result['reason'] = ('unverified workspace repository '
+                                '(git-unverified); next: verify the '
+                                'workspace is a git checkout, capture a new '
+                                'inventory and re-run the audit')
             continue
         if Path(toplevel.stdout.strip()) != workspace:
             result['reason'] = 'unverified workspace repository'
             continue
-        tracked = subprocess.run(['git', '-C', str(workspace), 'ls-files', '-z', '--', 'target'],
-                                 capture_output=True, check=True, env=git_env)
-        ignored = subprocess.run(['git', '-C', str(workspace), 'check-ignore', '-q', 'target'],
-                                 env=git_env)
-        if tracked.stdout or ignored.returncode != 0:
+        try:
+            tracked = subprocess.run(['git', '-C', str(workspace), 'ls-files', '-z', '--', 'target'],
+                                     capture_output=True, check=True, env=git_env,
+                                     timeout=live_git_timeout())
+        except subprocess.TimeoutExpired:
+            result['reason'] = ('cannot verify workspace index '
+                                '(git-timeout); next: capture a new '
+                                'inventory and re-run the audit')
+            continue
+        except OSError:
+            result['reason'] = ('cannot verify workspace index (git-spawn); '
+                                'next: capture a new inventory and re-run '
+                                'the audit on a host with git installed')
+            continue
+        except subprocess.CalledProcessError as error:
+            result['reason'] = ('cannot verify workspace index (git-ls-files, '
+                                f'exit status {error.returncode}); next: '
+                                'verify the workspace index, capture a new '
+                                'inventory and re-run the audit')
+            continue
+        try:
+            ignored = subprocess.run(['git', '-C', str(workspace), 'check-ignore', '-q', 'target'],
+                                     capture_output=True, env=git_env,
+                                     timeout=live_git_timeout())
+        except subprocess.TimeoutExpired:
+            result['reason'] = ('cannot verify ignore status (git-timeout); '
+                                'next: capture a new inventory and re-run '
+                                'the audit')
+            continue
+        except OSError:
+            result['reason'] = ('cannot verify ignore status (git-spawn); '
+                                'next: capture a new inventory and re-run '
+                                'the audit on a host with git installed')
+            continue
+        # Freshness is rechecked after the waits: Git success that arrives
+        # past max_age must not establish eligibility.
+        if now - captured + time.monotonic() - started > max_age:
+            raise Refusal('audit took too long; capture a new inventory')
+        if tracked.stdout or ignored.returncode == 1:
             result['reason'] = 'tracked or not ignored'
+            continue
+        if ignored.returncode != 0:
+            result['reason'] = ('cannot verify ignore status (git-ignore, '
+                                f'exit status {ignored.returncode}); next: '
+                                'verify the workspace checkout, capture a '
+                                'new inventory and re-run the audit')
             continue
         # .gitignore proves nothing about provenance: an ignored target can
         # still hold preserved evidence/backups/sources. Only Cargo's own

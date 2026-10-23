@@ -145,6 +145,25 @@ fn assert_policy_denial(store: &MemMemberStore, action: &str, request_id: &str, 
     );
 }
 
+fn assert_uncertain_timeout_audit(store: &MemMemberStore) {
+    let audits = store.audits();
+    assert_eq!(audits.len(), 1);
+    let row = &audits[0];
+    assert_eq!(row.request_id, "req-uncertain:in_progress");
+    assert_eq!(row.outcome, "in_progress");
+    assert_eq!(row.action, "moderation.timeout");
+    assert_eq!(row.guild_id, GUILD);
+    assert_eq!(row.actor_id, ACTOR);
+    assert_eq!(row.target_id.as_deref(), Some(TARGET));
+    assert_eq!(row.idempotency_key, "key-uncertain");
+    assert_eq!(row.reason, "Member moderation did not complete");
+    let metadata: Value = serde_json::from_str(&row.metadata_json).unwrap();
+    assert_eq!(
+        metadata,
+        json!({"stage": "discord", "request_id": "req-uncertain"})
+    );
+}
+
 fn decode_reason(header: &str) -> String {
     let mut bytes = Vec::new();
     let input = header.as_bytes();
@@ -673,6 +692,10 @@ async fn uncertain_timeout_keeps_fence() {
         .await
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::DiscordUnavailable);
+    assert_eq!(mock.requests().len(), 1);
+    // The uncertain Discord 500 leaves one bound in_progress/discord row; the
+    // suffixed id keeps it from masking a later accepted row.
+    assert_uncertain_timeout_audit(&store);
     // The uncertain effect stays fenced: same-key retry refuses, never a
     // second PATCH, and no completion was recorded.
     let err = exec
@@ -689,7 +712,16 @@ async fn uncertain_timeout_keeps_fence() {
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::InProgress);
     assert_eq!(mock.requests().len(), 1);
-    assert!(store.audits().is_empty());
+    // The retry's in-flight claim audits under the same suffixed id and is
+    // deduplicated, so the original discord observation survives untouched.
+    assert_uncertain_timeout_audit(&store);
+    assert!(
+        store
+            .audits()
+            .iter()
+            .all(|row| row.outcome == "in_progress"),
+        "no success or completion row"
+    );
     mock.shutdown().await;
 }
 

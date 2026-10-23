@@ -8,10 +8,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use two_bot_core::metrics::{
     Metrics, AUTOMOD_DECISION_OUTCOMES, CHECKPOINT_FAILURE_STAGES, COMMUNITY_FACTS_DRAIN_REASONS,
-    DB_ERROR_OPS, DISPATCH_LANES, DROP_POISON_GUARDS, EVENTS, EVENTSUB_DELIVERY_KINDS,
-    EVENTSUB_POST_OUTCOMES, EVENTSUB_RECONCILE_ACTIONS, EVENTSUB_RECONCILE_ERROR_CLASSES,
-    EVENTSUB_RECONCILE_OUTCOMES, FEED_FETCH_ERROR_CLASSES, FEED_FETCH_OUTCOMES,
-    INTERNAL_ACTION_FAMILIES, INTERNAL_ACTION_OUTCOMES, JOBS, JOB_ERROR_CLASSES, JOB_OUTCOMES,
+    CONTAINMENT_STORE_OPS, DB_ERROR_OPS, DISPATCH_LANES, DROP_POISON_GUARDS, EVENTS,
+    EVENTSUB_DELIVERY_KINDS, EVENTSUB_POST_OUTCOMES, EVENTSUB_RECONCILE_ACTIONS,
+    EVENTSUB_RECONCILE_ERROR_CLASSES, EVENTSUB_RECONCILE_OUTCOMES, EVENT_VOICE_TICK_OUTCOMES,
+    FEED_FETCH_ERROR_CLASSES, FEED_FETCH_OUTCOMES, INTERNAL_ACTION_FAMILIES,
+    INTERNAL_ACTION_OUTCOMES, JOBS, JOB_ERROR_CLASSES, JOB_OUTCOMES,
     MODERATION_ENFORCEMENT_OUTCOMES, MODERATION_VERBS, PREFIX_TRIGGER_REFUSED_REASONS,
     PRESENCE_CAPTURE_OUTCOMES, REST_ROUTES, RESULTS, SEND_ADMISSION_OUTCOMES, VOICE_DEAD_ACTIONS,
     VOICE_JOIN_OCCUPANCY_BUCKETS, VOICE_JOIN_REFUSAL_REASONS, VOICE_NAME_OUTCOMES,
@@ -126,11 +127,13 @@ fn allowlisted_labels(name: &str) -> Vec<&'static str> {
         "two_bot_voice_dead_letters_total" => vec!["action"],
         "two_bot_voice_join_occupancy_total" => vec!["occupancy"],
         "two_bot_db_errors_total" => vec!["op"],
+        "two_bot_containment_store_errors_total" => vec!["op"],
         "two_bot_send_admissions_total" => vec!["outcome"],
         "two_bot_gateway_prefix_trigger_refused_total" => vec!["reason"],
         "two_bot_voice_join_refused_total" => vec!["reason"],
         "two_bot_dispatch_drops_total" => vec!["lane"],
         "two_bot_voice_vote_kick_total" => vec!["outcome"],
+        "two_bot_event_voice_tick_total" => vec!["outcome"],
         "two_bot_voice_names_total" => vec!["outcome"],
         "two_bot_internal_actions_total" => vec!["family", "outcome"],
         "two_bot_moderation_enforcements_total" => vec!["verb", "outcome"],
@@ -177,6 +180,7 @@ fn expected_values(name: &str) -> Vec<(&'static str, Vec<&'static str>)> {
             vec![("occupancy", VOICE_JOIN_OCCUPANCY_BUCKETS.to_vec())]
         }
         "two_bot_db_errors_total" => vec![("op", DB_ERROR_OPS.to_vec())],
+        "two_bot_containment_store_errors_total" => vec![("op", CONTAINMENT_STORE_OPS.to_vec())],
         "two_bot_send_admissions_total" => {
             vec![("outcome", SEND_ADMISSION_OUTCOMES.to_vec())]
         }
@@ -186,6 +190,9 @@ fn expected_values(name: &str) -> Vec<(&'static str, Vec<&'static str>)> {
         "two_bot_dispatch_drops_total" => vec![("lane", DISPATCH_LANES.to_vec())],
         "two_bot_voice_vote_kick_total" => {
             vec![("outcome", VOICE_VOTE_KICK_OUTCOMES.to_vec())]
+        }
+        "two_bot_event_voice_tick_total" => {
+            vec![("outcome", EVENT_VOICE_TICK_OUTCOMES.to_vec())]
         }
         "two_bot_voice_names_total" => vec![("outcome", VOICE_NAME_OUTCOMES.to_vec())],
         "two_bot_voice_join_refused_total" => {
@@ -260,6 +267,7 @@ const KNOWN_COUNTERS: &[&str] = &[
     "two_bot_voice_dead_letters_total",
     "two_bot_voice_join_occupancy_total",
     "two_bot_voice_vote_kick_total",
+    "two_bot_event_voice_tick_total",
     "two_bot_voice_names_total",
     "two_bot_voice_orphans_total",
     "two_bot_voice_joins_received_total",
@@ -272,6 +280,7 @@ const KNOWN_COUNTERS: &[&str] = &[
     "two_bot_voice_actor_dispatch_turns_total",
     "two_bot_voice_live_self_heal_total",
     "two_bot_db_errors_total",
+    "two_bot_containment_store_errors_total",
     "two_bot_send_admissions_total",
     "two_bot_gateway_prefix_trigger_refused_total",
     "two_bot_dispatch_drops_total",
@@ -291,6 +300,7 @@ const KNOWN_COUNTERS: &[&str] = &[
     "two_bot_feed_fetches_total",
     "two_bot_feed_fetch_errors_total",
     "two_bot_retention_replay_needed_total",
+    "two_bot_ticket_component_drops_total",
 ];
 
 fn check_docs_against_exposition(doc: &str, exposition: &str) -> Result<(), String> {

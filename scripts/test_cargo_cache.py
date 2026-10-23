@@ -2,6 +2,7 @@
 """Offline regressions: no Cargo, network, services, or large fixtures."""
 
 import contextlib
+import errno
 import fcntl
 import io
 import json
@@ -1385,6 +1386,188 @@ class SharedPoolRetainTests(unittest.TestCase):
         receipt = self.retain()
         self.assertTrue(all(row['eligible'] for row in receipt['slots']))
         self.assertEqual(len(list(scratch.glob('*/fixture'))), 3)
+
+
+class RetainIdleStaleAcceptanceTests(unittest.TestCase):
+    """Retain survives long cmdline tokens and reclaims idle_stale slots.
+
+    Incident: the host retain timer exited 75 on every tick because
+    process_references() stat every absolute cmdline token, and headless
+    Chrome rewrites its argv into one long title. os.stat then fails with
+    ENAMETOOLONG, which refused the whole run, so no over-budget slot was
+    ever reclaimed.
+
+    RED (fail before the fix, pass after):
+    - a cmdline token longer than PATH_MAX is kept as a lexical reference
+    - an over-budget in_review slot with idle_stale is reclaimed
+    Guards (green before and after):
+    - PermissionError and other OSErrors on a cmdline stat still refuse
+    - in_review without idle_stale is still skipped
+    - idle_stale with live_run or referenced is still skipped
+    - idle_stale with a held slot lock is still skipped
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=os.environ.get('PAPERCLIP_RUN_SCRATCH_DIR'))
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.pool = self.root / 'pool'
+        self.pool.mkdir()
+        self.policy = {'version': 1, 'slots': 2, 'slot_budget_bytes': 256 * 1024,
+                       'min_available_bytes': 1, 'hard_limit_bytes': 1024 * 1024,
+                       'quota_receipt': 'synthetic fixture; not a real quota receipt',
+                       'scratch_coverage_receipt': 'synthetic fixture; not host coverage'}
+        (self.pool / 'policy.json').write_text(json.dumps(self.policy))
+        for number in range(2):
+            slot = self.pool / f'slot-{number}'
+            slot.mkdir()
+            target = slot / 'target'
+            target.mkdir()
+            (target / 'debug').mkdir()
+            (target / 'debug' / 'fixture').write_bytes(b'x' * 4096)
+            (target / '.rustc_info.json').write_text('{}')
+            scratch = slot / 'scratch'
+            scratch.mkdir()
+            (scratch / 'tmp-out').write_bytes(b'x' * 4096)
+            (slot / 'lock').touch()
+            (slot / 'lease.json').write_text(json.dumps(
+                {'workspace': str(self.root), 'wrapper_pid': 99999999,
+                 'started_at': 0, 'cargo_pgid': 99999998}))
+        self.proc = self.root / 'proc'
+        self.proc.mkdir()
+        self.now = time.time()
+        self.inventory = {'version': 1, 'complete': True, 'process_scope': 'host',
+                          'captured_at_unix': self.now,
+                          'slots': [self.row(f'slot-{n}') for n in range(2)]}
+
+    def row(self, name):
+        return {'path': str(self.pool / name), 'issue_id': 'fixture-terminal',
+                'status': 'done', 'live_run': False, 'referenced': False,
+                'target_provenance': 'build_output_only'}
+
+    def retain(self, **kwargs):
+        kwargs.setdefault('proc_root', self.proc)
+        kwargs.setdefault('now', self.now)
+        return cache.shared_pool_retain(self.pool, self.inventory, **kwargs)
+
+    def by_slot(self, receipt):
+        return {row['slot']: row for row in receipt['slots']}
+
+    def fake_pid(self):
+        pid = self.proc / '123'
+        if not pid.exists():
+            pid.mkdir()
+            (pid / 'fd').mkdir()
+            (pid / 'stat').write_text('123 (fixture) S 1 123 123 0 -1 0\n')
+            (pid / 'cwd').symlink_to(self.root)
+            (pid / 'exe').symlink_to(sys.executable)
+            (pid / 'maps').write_text('')
+        return pid
+
+    def test_long_cmdline_token_is_kept_as_lexical_reference(self):
+        # RED: headless-Chrome argv shape -- one absolute token longer than
+        # PATH_MAX. Must survive as (text, None, None) like a missing path,
+        # not refuse the whole scan with exit 75.
+        pid = self.fake_pid()
+        token = '/' + 'x' * 5000
+        try:
+            os.stat(token)
+        except OSError as error:
+            self.assertEqual(error.errno, errno.ENAMETOOLONG,
+                             f'fixture token must fail with ENAMETOOLONG: {error}')
+        else:
+            self.fail('fixture token unexpectedly stats; ENAMETOOLONG shape lost')
+        (pid / 'cmdline').write_bytes(token.encode() + b'\0')
+        refs, _deleted = cache.process_references(self.proc)
+        self.assertIn((token, None, None), refs)
+
+    def test_idle_stale_in_review_over_budget_slot_is_reclaimed(self):
+        # RED: an over-budget slot is never handed out by acquire() again,
+        # so its retained output helps nobody. An in_review row that is
+        # idle_stale (and otherwise clean) must be reclaimed.
+        slot = self.pool / 'slot-0'
+        (slot / 'scratch' / 'retained').write_bytes(
+            b'x' * self.policy['slot_budget_bytes'])
+        self.assertGreater(cache.usage(slot), self.policy['slot_budget_bytes'])
+        row = self.inventory['slots'][0]
+        row['status'] = 'in_review'
+        row['idle_stale'] = True
+        self.assertFalse(row['live_run'])
+        self.assertFalse(row['referenced'])
+        self.assertEqual(row['target_provenance'], 'build_output_only')
+        receipt = self.retain()
+        result = self.by_slot(receipt)['slot-0']
+        self.assertTrue(result['eligible'], result)
+        self.assertGreater(result['reclaimed_bytes'], 0)
+        self.assertTrue(result['lock_held_through_mutation'])
+        self.assertFalse((slot / 'lease.json').exists())
+        self.assertEqual(list((slot / 'target').iterdir()), [])
+        self.assertEqual(list((slot / 'scratch').iterdir()), [])
+
+    def test_denied_cmdline_stat_still_refuses(self):
+        # Guard: only ENAMETOOLONG (and missing paths) degrade to lexical
+        # references. PermissionError and every other OSError still refuse.
+        pid = self.fake_pid()
+        target = self.pool / 'slot-0' / 'target' / 'debug' / 'fixture'
+        (pid / 'cmdline').write_bytes(str(target).encode() + b'\0')
+        real_stat = os.stat
+        failures = {'permission': PermissionError('denied'),
+                    'io': OSError(errno.EIO, 'i/o error')}
+        for name, failure in failures.items():
+            with self.subTest(name=name):
+                def denied(path, *args, _failure=failure, **kwargs):
+                    if os.fspath(path) == str(target):
+                        raise _failure
+                    return real_stat(path, *args, **kwargs)
+
+                with patch.object(cache.os, 'stat', side_effect=denied):
+                    with self.assertRaisesRegex(cache.Refusal, 'visibility'):
+                        cache.process_references(self.proc)
+
+    def test_in_review_without_idle_stale_still_skipped(self):
+        # Guard: the nonterminal gate is unchanged for rows without idle_stale.
+        for idle_stale in (None, False):
+            with self.subTest(idle_stale=idle_stale):
+                row = self.inventory['slots'][0]
+                row['status'] = 'in_review'
+                if idle_stale is None:
+                    row.pop('idle_stale', None)
+                else:
+                    row['idle_stale'] = False
+                result = self.by_slot(self.retain())['slot-0']
+                self.assertFalse(result['eligible'])
+                self.assertIn('nonterminal', result['reason'])
+                self.assertTrue((self.pool / 'slot-0' / 'lease.json').exists())
+
+    def test_idle_stale_with_live_run_or_referenced_still_skipped(self):
+        # Guard: idle_stale opens only the nonterminal gate. Live and
+        # referenced rows stay skipped.
+        for key in ('live_run', 'referenced'):
+            with self.subTest(key=key):
+                row = self.inventory['slots'][0]
+                row['status'] = 'in_review'
+                row['idle_stale'] = True
+                row[key] = True
+                try:
+                    result = self.by_slot(self.retain())['slot-0']
+                finally:
+                    row[key] = False
+                self.assertFalse(result['eligible'])
+                self.assertTrue((self.pool / 'slot-0' / 'lease.json').exists())
+
+    def test_idle_stale_with_held_lock_still_skipped(self):
+        # Guard: lock-through-mutation is unchanged; a held lock skips.
+        slot = self.pool / 'slot-0'
+        held = os.open(slot / 'lock', os.O_RDWR | os.O_NOFOLLOW)
+        self.addCleanup(os.close, held)
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        row = self.inventory['slots'][0]
+        row['status'] = 'in_review'
+        row['idle_stale'] = True
+        result = self.by_slot(self.retain())['slot-0']
+        self.assertFalse(result['eligible'])
+        self.assertIn('lock held', result['reason'])
+        self.assertTrue((slot / 'lease.json').exists())
 
 
 if __name__ == '__main__':

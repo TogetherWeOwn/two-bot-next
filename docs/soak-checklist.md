@@ -231,8 +231,8 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s1-29: 30 — `/feed-list`
 
 - **Method:** `manual` (not an execution verdict).
-- **Action:** Invoke /feed-list before/after relay changes and as actor without ManageGuild.
-- **Expected:** List matches this guild only; unauthorized actor refused; no credentials in output.
+- **Action:** Before the check, seed enough approved fixture relays for /feed-list to report at least two pages; invoke /feed-list before/after relay changes and as actor without ManageGuild; walk page:1, page:2, and an out-of-range page.
+- **Expected:** List matches this guild only; unauthorized actor refused; no credentials in output; every page fits Discord limits; multi-page lists show a page indicator with navigation and totals on each page; out-of-range pages are refused.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 
 ## 2. Non-command interactions
