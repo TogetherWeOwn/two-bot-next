@@ -1270,6 +1270,10 @@ mod tests {
                 calls: Mutex::new(Vec::new()),
             })
         }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
     }
 
     impl LiveSender for BlockingSender {
@@ -1363,7 +1367,7 @@ mod tests {
         let sender = BlockingSender::new();
         let state = Arc::new(ReceiverState::with_delivery(
             &config(),
-            Some(delivery_deps_for(Arc::clone(&ledger), Arc::clone(&sender))),
+            Some(delivery_deps_for(Arc::clone(&ledger), sender.clone())),
         ));
         let in_flight = tokio::spawn(post_notification(
             router(Arc::clone(&state)),
@@ -1435,7 +1439,7 @@ mod tests {
             .expect("ephemeral bind must succeed");
         let state = Arc::new(ReceiverState::with_delivery(
             &config(),
-            Some(delivery_deps_for(Arc::clone(&ledger), Arc::clone(&sender))),
+            Some(delivery_deps_for(Arc::clone(&ledger), sender.clone())),
         ));
         let bound = BoundEventsubReceiver {
             listener,
