@@ -75,6 +75,7 @@ EXEMPT_SERIES = {
     "two_bot_voice_compensation_pending": _VOICE_SERIES_REASON,
     "two_bot_voice_names_total": _VOICE_SERIES_REASON,
     "two_bot_voice_vote_kick_total": _VOICE_SERIES_REASON,
+    "two_bot_event_voice_tick_total": _VOICE_SERIES_REASON,
     "two_bot_dispatch_drops_total": _ALERT_INPUT_REASON + " (dispatch_drops)",
     "two_bot_gateway_checkpoint_failures_total": (
         _ALERT_INPUT_REASON + " (gateway_checkpoint_failures)"
