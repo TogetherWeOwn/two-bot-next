@@ -2962,13 +2962,13 @@ mod tests {
         // slice adds one hot key (TWO_GUILD_INVITE_CODE). The ticket/feed/
         // self-role live-keys slice moves TWO_TICKET_COOLDOWN_SECONDS,
         // TWO_ANNOUNCEMENTS and TWO_SELF_ROLE_PANELS from cold to hot,
-        // shifting three entries between those classes. The required
-        // event-voice category slice adds one env-only key
-        // (TWO_EVENT_VOICE_CATEGORY_ID).
+        // shifting three entries between those classes. The assistant
+        // credential binding and required event-voice category slices add two
+        // env-only keys (TWO_ASSISTANT_API_KEY, TWO_EVENT_VOICE_CATEGORY_ID).
         for (class, expected) in [
             (SettingClass::Hot, 47),
             (SettingClass::Cold, 23),
-            (SettingClass::EnvOnly, 65),
+            (SettingClass::EnvOnly, 66),
         ] {
             assert_eq!(
                 SETTING_CLASSES.iter().filter(|(_, c)| *c == class).count(),
