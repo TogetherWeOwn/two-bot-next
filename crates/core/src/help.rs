@@ -84,7 +84,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
     HelpGroup {
         title: "Looking for group",
         requires: Some("Manage Events"),
-        commands: &["lfg", "lfg-close"],
+        commands: &["lfg", "lfg-close", "lfg-list"],
         anchor: None,
     },
     HelpGroup {
@@ -274,7 +274,7 @@ mod tests {
         // to moderation `/kick`; `/templateassistant` stays unpublished
         // until its slice lands): matches the regenerated `docs/commands.md`
         // total.
-        assert!(text.contains("**Server commands** (50 live)"));
+        assert!(text.contains("**Server commands** (51 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"
@@ -398,7 +398,7 @@ mod tests {
         // Next-only privacy command, then the 21 voice names (voice `kick`
         // shares the Kick group). `/templateassistant` stays out until its
         // slice lands.
-        assert_eq!(grouped.len(), 50);
+        assert_eq!(grouped.len(), 51);
         for name in [
             "rank",
             "leaderboard",
@@ -412,6 +412,7 @@ mod tests {
             "rsvp-attendance",
             "lfg",
             "lfg-close",
+            "lfg-list",
             "feed-add",
             "ban",
             "tempban",

@@ -41,6 +41,8 @@ pub mod internal_member_moderation;
 pub mod leveling_runtime;
 #[cfg(feature = "db")]
 pub mod lfg_interactions;
+#[cfg(feature = "db")]
+mod lfg_list;
 pub mod member_moderation;
 mod message_safety;
 pub mod onboarding_config;
