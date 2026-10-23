@@ -370,6 +370,11 @@ mod tests {
     }
 
     #[test]
+    fn holder_id_is_an_identity_candidate() {
+        assert!(is_identity_column("holder_id"));
+    }
+
+    #[test]
     fn new_user_columns_are_identity_candidates() {
         for column in [
             "user_id",

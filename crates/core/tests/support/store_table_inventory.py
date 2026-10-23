@@ -215,6 +215,41 @@ class InventoryControls(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unknown/malformed"):
             self.scan(sql + "\nEXECUTE format('CREATE ' || 'TABLE hidden (id TEXT)');", name=name)
 
+    def test_standalone_drop_outside_real_reference_lifecycle_refuses(self):
+        for ddl in (
+            "DROP TABLE rollback_journal;",
+            "drop table rollback_journal;",
+            "DrOp TaBlE rollback_journal;",
+            "DROP TABLE IF EXISTS rollback_journal;",
+            "drop table if exists rollback_journal;",
+            "DrOp TaBlE If ExIsTs rollback_journal;",
+        ):
+            with self.subTest(ddl=ddl), self.assertRaisesRegex(
+                ValueError,
+                "^" + re.escape(REFERENCE_MIGRATION
+                    + ": unaccounted DROP TABLE outside reference lifecycle") + "$",
+            ):
+                self.scan(self.sql + "\n" + ddl)
+
+    def test_standalone_drop_in_ordinary_migration_refuses(self):
+        name = "0405_timestamptz_and_boolean.sql"
+        sql = (self.root / "store/migrations" / name).read_text()
+        self.assertEqual(self.scan(sql, name=name), {"tables": [], "transaction_local": []})
+        for ddl in (
+            "DROP TABLE rollback_journal;",
+            "drop table rollback_journal;",
+            "DrOp TaBlE rollback_journal;",
+            "DROP TABLE IF EXISTS rollback_journal;",
+            "drop table if exists rollback_journal;",
+            "DrOp TaBlE If ExIsTs rollback_journal;",
+        ):
+            with self.subTest(ddl=ddl), self.assertRaisesRegex(
+                ValueError,
+                "^" + re.escape(name
+                    + ": unaccounted DROP TABLE outside reference lifecycle") + "$",
+            ):
+                self.scan(sql + "\n" + ddl, name=name)
+
     def test_identity_derivation_template_and_drop_must_match(self):
         for old, new in (
             ("%I.admin_api_token_authority_contract", "%I.other_authority_reference"),
