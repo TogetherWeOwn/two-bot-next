@@ -1,6 +1,6 @@
 -- 0458_bump_reminders: one durable pending bump reminder per guild.
 --
--- Store-chain copy of cutover 0455 (the bot upserts the guild row on each
+-- Store-chain copy of cutover 0459 (the bot upserts the guild row on each
 -- bumper-bot success embed so a fresh bump replaces the pending reminder,
 -- and lazily claims the row once its cooldown elapses through a single
 -- atomic UPDATE that flips one due, unfired row to fired). Additive only:
