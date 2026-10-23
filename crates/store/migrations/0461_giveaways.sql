@@ -1,25 +1,25 @@
--- 0458_giveaways: timed-entry giveaways with a verifiable draw (slice 1).
+-- 0461_giveaways: timed-entry giveaways with a verifiable draw (slice 1).
 --
--- Three new guild-scoped tables: `giveaways` (definitions plus the
+-- Store-chain copy of cutover 0460: `giveaways` (definitions plus the
 -- draw-ticker claim lease), `giveaway_entries` (one row per entrant, so the
 -- PK collapses double-clicks and double POSTs), and `giveaway_draws` (one
--- row per draw round; rerolls insert, never update). `draw_nonce` is minted
--- at create (128-bit hex); the draw seed is
--- `sha256("{nonce}:{draw_no}")` and `eligible_hash` commits to the sorted
--- eligible list, so any member can replay the draw from the stored row.
--- Both child tables carry a composite foreign key to `giveaways`
+-- row per draw round; rerolls insert, never update). The draw seed is
+-- `sha256("{draw_nonce}:{draw_no}")` and `eligible_hash` commits to the
+-- sorted eligible list, so any member can replay the draw from the stored
+-- row. Both child tables carry a composite foreign key to `giveaways`
 -- (`guild_id`, `giveaway_id`), so entries and draws stay bound to a live
 -- definition: a parent delete with live children is refused instead of
 -- orphaning them, and removals delete children first (`delete_giveaway`,
 -- the erasure plan's creator branches, restore's parent-first order).
--- Additive only: no writes to existing tables, `IF NOT EXISTS` throughout
--- so cross-running the store and cutover chains against one schema stays
--- safe in either order. No secondary indexes: a plain `CREATE INDEX` fails
--- the squawk-strict lint and `CONCURRENTLY` cannot run in the transactional
--- migrators, so the due-scan index is a follow-up with the reviewer.
--- Rollback is `DROP TABLE IF EXISTS giveaway_draws, giveaway_entries,
--- giveaways`. Numbered 0458; the store chain owns the 0459 copy; global
--- migration numbers remain unique across both chains.
+-- Additive only: one feature's new tables, no writes to existing
+-- tables, `IF NOT EXISTS` throughout so cross-running the store and
+-- cutover chains against one schema stays safe in either order. No
+-- secondary indexes: a plain `CREATE INDEX` fails the squawk-strict lint
+-- and `CONCURRENTLY` cannot run in the transactional migrators, so the
+-- due-scan index is a follow-up with the reviewer. Rollback is
+-- `DROP TABLE IF EXISTS giveaway_draws, giveaway_entries, giveaways`.
+-- Numbered 0461 because cutover owns 0460; global migration numbers remain
+-- unique across both chains.
 -- Bot schema range: 0001-0999. Database tests use test containers only.
 
 CREATE TABLE IF NOT EXISTS giveaways (
