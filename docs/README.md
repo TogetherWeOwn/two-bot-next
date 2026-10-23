@@ -236,6 +236,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Quality gates](quality-gates.md)
 - [CI security](ci-security.md)
 - [CI speed rollout](ci-speed-rollout.md)
+- [Weekly delivery metrics](dora-metrics.md)
 - [Docs-only queue timing](ci-docs-only-queue-note.md)
 - [Bounded subprocess checks](bounded-subprocess-checks.md)
 - [Build-cache safety](build-cache.md)
