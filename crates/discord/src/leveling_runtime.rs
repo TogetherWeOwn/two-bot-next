@@ -1622,3 +1622,7 @@ mod tests {
 #[cfg(test)]
 #[path = "../tests/support/deferred_capture_poison.rs"]
 mod deferred_capture_poison_acceptance;
+
+#[cfg(feature = "test-support")]
+#[path = "../tests/support/deferred_worker_poison.rs"]
+pub mod deferred_worker_poison;

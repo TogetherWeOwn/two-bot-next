@@ -429,6 +429,13 @@ fn leveling_dispatch_failure() -> sqlx::Error {
     sqlx::Error::InvalidArgument("leveling gateway dispatch failed; checkpoint unchanged".into())
 }
 
+fn leveling_poison_failure() -> sqlx::Error {
+    sqlx::Error::InvalidArgument(
+        "leveling buffer poisoned (deferred_leveling_poisoned); supervisor_restart_inspection; checkpoint unchanged"
+            .into(),
+    )
+}
+
 /// A poisoned community-facts buffer holds the cursor like any other
 /// pre-commit failure: the buffer never heals in place, so warn-and-continue
 /// would recur forever while silently losing capture. The reason code and
@@ -763,7 +770,13 @@ fn requests_or_hold_cursor(
                 "gateway leveling collect failed"
             );
             if dispatch_error.is_none() {
-                *dispatch_error = Some(leveling_dispatch_failure());
+                *dispatch_error = Some(match error {
+                    LevelingRuntimeError::LevelingPoisoned => leveling_poison_failure(),
+                    LevelingRuntimeError::CommunityFactsPoisoned => {
+                        community_facts_poison_failure()
+                    }
+                    _ => leveling_dispatch_failure(),
+                });
             }
             Vec::new()
         }
@@ -2308,6 +2321,10 @@ mod drop_poison_acceptance_tests;
 #[cfg(test)]
 #[path = "gateway_drop_poison_counter_acceptance_tests.rs"]
 mod drop_poison_counter_acceptance_tests;
+
+#[cfg(test)]
+#[path = "gateway_deferred_poison_acceptance_tests.rs"]
+mod deferred_poison_acceptance;
 
 #[cfg(test)]
 mod tests {
