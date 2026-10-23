@@ -16,8 +16,8 @@ use std::collections::BTreeSet;
 // them to. The message string (last argument to the `tracing` macro) is the
 // event name; fields such as `sequence` or `guild_id` are context, not names.
 
-/// `crates/bot/src/gateway.rs`: all twenty-one traced in the file are cataloged.
-const GATEWAY_RS_EVENTS: [&str; 21] = [
+/// `crates/bot/src/gateway.rs`: all twenty-two traced in the file are cataloged.
+const GATEWAY_RS_EVENTS: [&str; 22] = [
     "cold resume committed; requesting voice snapshot via identify",
     "gateway reconnect failed; Twilight will retry",
     "gateway shard loop started",
@@ -25,6 +25,7 @@ const GATEWAY_RS_EVENTS: [&str; 21] = [
     "gateway leveling dispatch skipped; schema gap",
     "gateway community facts dispatch failed",
     "gateway community facts dispatch timed out",
+    "gateway dispatch refused: duplicate JSON key",
     "gateway onboarding job invalid",
     "gateway ready; checkpoint committed",
     "onboarding interaction interrupted; member must reselect",
