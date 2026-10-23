@@ -129,6 +129,237 @@ pub fn sticky_removed_reply(removed: bool) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// Private inspection (`/sticky-status`): read-only status projection
+// ---------------------------------------------------------------------------
+
+/// Which private view `/sticky-status` renders. Metadata never carries the
+/// saved body; the body view never carries delivery timestamps or links.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StickyStatusView {
+    Metadata,
+    Body,
+}
+
+/// Framework-free projection for one private inspection: saved configuration
+/// plus delivery truth (last confirmation, claim presence/time, uncertainty
+/// fence) in a single coherent read. The claim token itself is never
+/// projected — presence and start time are the display metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StickyStatus {
+    pub guild_id: String,
+    pub channel_id: String,
+    pub body: String,
+    pub debounce_seconds: u64,
+    pub enabled: bool,
+    pub last_message_id: Option<String>,
+    pub last_posted_at_ms: Option<i64>,
+    pub has_claim: bool,
+    pub claimed_at_ms: Option<i64>,
+    pub delivery_uncertain: bool,
+}
+
+/// Claim display state: none held, actively blocking, or expired while the
+/// row still carries it. An expired claim never authorizes a post on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimState {
+    None,
+    Active,
+    Stale,
+}
+
+/// Delivery display state. Uncertain outranks disabled: a fenced channel must
+/// not read healthy even when the saved row is disabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryState {
+    Idle,
+    Waiting,
+    Disabled,
+    Uncertain,
+}
+
+/// Classify the held claim without touching its ownership token. A present
+/// token with a missing timestamp is conservatively active.
+#[must_use]
+pub fn claim_state(has_claim: bool, claimed_at_ms: Option<i64>, now_ms: i64) -> ClaimState {
+    if !has_claim {
+        return ClaimState::None;
+    }
+    let Some(claimed) = claimed_at_ms else {
+        return ClaimState::Active;
+    };
+    if claim_blocks(Some(claimed), now_ms) {
+        ClaimState::Active
+    } else {
+        ClaimState::Stale
+    }
+}
+
+/// Classify delivery for the metadata view. Waiting means inside the quiet
+/// window with no fence; idle means due (or never sent) with no fence.
+#[must_use]
+pub fn delivery_state(
+    enabled: bool,
+    uncertain: bool,
+    last_posted_at_ms: Option<i64>,
+    now_ms: i64,
+    debounce_seconds: u64,
+) -> DeliveryState {
+    if uncertain {
+        return DeliveryState::Uncertain;
+    }
+    if !enabled {
+        return DeliveryState::Disabled;
+    }
+    if last_posted_at_ms.is_some() && !repost_due(last_posted_at_ms, now_ms, debounce_seconds) {
+        return DeliveryState::Waiting;
+    }
+    DeliveryState::Idle
+}
+
+/// True for a Discord snowflake usable in a historical link: decimal `u64`,
+/// nonzero. Rejects empty, negative, overflowed, path/query-suffixed and
+/// mention-wrapped legacy values without echoing them.
+#[must_use]
+pub fn valid_snowflake(id: &str) -> bool {
+    !id.is_empty()
+        && id.bytes().all(|b| b.is_ascii_digit())
+        && id.parse::<u64>().is_ok_and(|n| n != 0)
+}
+
+/// Historical link from validated current guild/channel plus a stored message
+/// id. Returns `None` for any invalid stored id — the caller keeps the
+/// timestamp and reports the link unavailable instead.
+#[must_use]
+pub fn status_link(guild_id: &str, channel_id: &str, message_id: &str) -> Option<String> {
+    if !valid_snowflake(guild_id) || !valid_snowflake(channel_id) || !valid_snowflake(message_id) {
+        return None;
+    }
+    Some(format!(
+        "https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
+    ))
+}
+
+/// Neutralize untrusted saved text for the private body view. Mass mentions
+/// split via the shared neutralizer; mention brackets, markdown, link syntax
+/// and URL separators map to lookalikes so no `<@…>`, `**…**`, `[…](…)`,
+/// code fence or `https://…` survives verbatim. Idempotent on safe text.
+#[must_use]
+pub fn sanitize_status_body(body: &str) -> String {
+    let neutralized = crate::message_safety::neutralize_mentions(body);
+    let mut safe = String::with_capacity(neutralized.len());
+    for ch in neutralized.chars() {
+        match ch {
+            '<' => safe.push('‹'),
+            '>' => safe.push('›'),
+            '`' => safe.push('ˋ'),
+            '*' => safe.push('∗'),
+            '_' => safe.push('＿'),
+            '~' => safe.push('∼'),
+            '[' => safe.push('［'),
+            ']' => safe.push('］'),
+            '(' => safe.push('（'),
+            ')' => safe.push('）'),
+            '#' => safe.push('＃'),
+            '|' => safe.push('│'),
+            ':' => safe.push('꞉'),
+            '/' => safe.push('⁄'),
+            _ => safe.push(ch),
+        }
+    }
+    safe
+}
+
+/// Milliseconds since the Unix epoch as Discord-localized full timestamp.
+fn discord_timestamp(ms: i64) -> String {
+    format!("<t:{}:F>", ms.div_euclid(1000))
+}
+
+/// Private metadata view: configured state, debounce, last confirmation with
+/// a historical-only link, claim and delivery truth, plus recovery help for
+/// uncertainty. Never carries the saved body or the claim token.
+#[must_use]
+pub fn render_status_metadata(
+    status: &StickyStatus,
+    now_ms: i64,
+    guild_id: &str,
+    channel_id: &str,
+) -> String {
+    let claim = claim_state(status.has_claim, status.claimed_at_ms, now_ms);
+    let delivery = delivery_state(
+        status.enabled,
+        status.delivery_uncertain,
+        status.last_posted_at_ms,
+        now_ms,
+        status.debounce_seconds,
+    );
+    let mut out = String::from("Sticky status for this channel: configured.\n");
+    out.push_str(&format!(
+        "Enabled: {}.\n",
+        if status.enabled { "yes" } else { "no" }
+    ));
+    out.push_str(&format!("Debounce: {}s.\n", status.debounce_seconds));
+    match status.last_posted_at_ms {
+        None => out.push_str("Last confirmed: never sent.\n"),
+        Some(posted) => {
+            let when = discord_timestamp(posted);
+            match status.last_message_id.as_deref() {
+                Some(id) => match status_link(guild_id, channel_id, id) {
+                    Some(link) => out.push_str(&format!(
+                        "Last confirmed: {when} {link} (may no longer exist).\n"
+                    )),
+                    None => out.push_str(&format!("Last confirmed: {when} (link unavailable).\n")),
+                },
+                None => out.push_str(&format!("Last confirmed: {when}.\n")),
+            }
+        }
+    }
+    match (claim, status.claimed_at_ms) {
+        (ClaimState::None, _) => out.push_str("Claim: none.\n"),
+        (ClaimState::Active, Some(claimed)) => out.push_str(&format!(
+            "Claim: active (started {}).\n",
+            discord_timestamp(claimed)
+        )),
+        (ClaimState::Active, None) => out.push_str("Claim: active.\n"),
+        (ClaimState::Stale, _) => out.push_str("Claim: stale.\n"),
+    }
+    out.push_str(&format!(
+        "Delivery: {}.\n",
+        match delivery {
+            DeliveryState::Idle => "idle",
+            DeliveryState::Waiting => "waiting",
+            DeliveryState::Disabled => "disabled",
+            DeliveryState::Uncertain => "uncertain",
+        }
+    ));
+    if delivery == DeliveryState::Uncertain {
+        out.push_str(
+            "Delivery is uncertain. Inspection does not reset state: inspect the channel, then reconfigure explicitly with /sticky if needed.\n",
+        );
+    }
+    out.push_str("Use view:body to see saved text.");
+    out
+}
+
+/// Private body view: bounded neutralized saved text, never a public preview.
+/// Truncates to Discord's content ceiling with an explicit marker.
+#[must_use]
+pub fn render_status_body(status: &StickyStatus) -> String {
+    const HEADER: &str = "Saved body for this channel (private preview, formatting neutralized):\n";
+    const TRAILER: &str = "\nUse /sticky-status view:metadata for delivery state.";
+    let safe = sanitize_status_body(&status.body);
+    let budget = crate::message_safety::CONTENT_LIMIT
+        .saturating_sub(crate::message_safety::text_len(HEADER))
+        .saturating_sub(crate::message_safety::text_len(TRAILER))
+        .saturating_sub(crate::message_safety::text_len("\n…(truncated)"));
+    let truncated = crate::message_safety::truncate(&safe, budget);
+    if truncated == safe {
+        format!("{HEADER}{safe}{TRAILER}")
+    } else {
+        format!("{HEADER}{truncated}\n…(truncated){TRAILER}")
+    }
+}
+
+// ---------------------------------------------------------------------------
 // State + decisions (framework-free projection of the sticky row)
 // ---------------------------------------------------------------------------
 
@@ -377,7 +608,7 @@ pub fn automations_enabled(vars: &HashMap<String, String>) -> bool {
 pub mod store {
     use sqlx::{Pool, Postgres};
 
-    use super::{PutSticky, StickyAudit, StickyState};
+    use super::{PutSticky, StickyAudit, StickyState, StickyStatus};
 
     /// One decoded `sticky_messages` row (column order of `get_sticky`).
     type StickyRow = (
@@ -388,6 +619,22 @@ pub mod store {
         bool,
         Option<String>,
         Option<i64>,
+    );
+
+    /// One decoded status row (column order of `get_sticky_status`): the
+    /// configuration/confirmation columns plus claim presence/time and the
+    /// uncertainty fence. The claim token itself never leaves the store.
+    type StickyStatusRow = (
+        String,
+        String,
+        String,
+        i32,
+        bool,
+        Option<String>,
+        Option<i64>,
+        bool,
+        Option<i64>,
+        bool,
     );
 
     /// Fetch one channel's sticky (`store.getSticky`).
@@ -423,6 +670,57 @@ pub mod store {
                     enabled,
                     last_message_id,
                     last_posted_at_ms,
+                }
+            },
+        ))
+    }
+
+    /// Fetch one channel's private-inspection projection in a single bounded
+    /// read: saved configuration plus last confirmation, claim presence/time
+    /// and the uncertainty fence. One statement keeps configuration,
+    /// confirmation and claim data in the same snapshot — separate config and
+    /// claim queries could tear across a concurrent delivery transition.
+    pub async fn get_sticky_status(
+        pool: &Pool<Postgres>,
+        guild_id: &str,
+        channel_id: &str,
+    ) -> Result<Option<StickyStatus>, sqlx::Error> {
+        let row: Option<StickyStatusRow> = sqlx::query_as(
+            "SELECT guild_id, channel_id, body, debounce_seconds, enabled, last_message_id,
+                        (extract(epoch from last_posted_at) * 1000)::BIGINT AS last_posted_at_ms,
+                        (claim_token IS NOT NULL) AS has_claim,
+                        (extract(epoch from claimed_at) * 1000)::BIGINT AS claimed_at_ms,
+                        delivery_uncertain
+                   FROM sticky_messages WHERE guild_id = $1 AND channel_id = $2",
+        )
+        .bind(guild_id)
+        .bind(channel_id)
+        .fetch_optional(pool)
+        .await?;
+        Ok(row.map(
+            |(
+                guild_id,
+                channel_id,
+                body,
+                debounce,
+                enabled,
+                last_message_id,
+                last_posted_at_ms,
+                has_claim,
+                claimed_at_ms,
+                delivery_uncertain,
+            )| {
+                StickyStatus {
+                    guild_id,
+                    channel_id,
+                    body,
+                    debounce_seconds: debounce.max(0) as u64,
+                    enabled,
+                    last_message_id,
+                    last_posted_at_ms,
+                    has_claim,
+                    claimed_at_ms,
+                    delivery_uncertain,
                 }
             },
         ))
@@ -680,6 +978,31 @@ mod tests {
         );
         // BMP characters occupy one UTF-16 unit regardless of UTF-8 width.
         assert!(validate_body(&"é".repeat(2000)).is_ok());
+    }
+
+    #[test]
+    fn snowflake_validation_rejects_non_decimal_and_zero_ids() {
+        assert!(valid_snowflake("4444"));
+        assert!(valid_snowflake("18446744073709551615"));
+        for bad in [
+            "",
+            "0",
+            "+4444",
+            "-4444",
+            " 4444",
+            "4444 ",
+            "44.44",
+            "٤٤٤٤",
+            "18446744073709551616",
+            "4444?x=1",
+            "<@4444>",
+        ] {
+            assert!(!valid_snowflake(bad), "{bad:?} must not validate");
+            assert!(
+                status_link("111", "222", bad).is_none(),
+                "{bad:?} must not build a link"
+            );
+        }
     }
 
     #[test]

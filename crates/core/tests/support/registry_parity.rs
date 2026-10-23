@@ -37,6 +37,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("feed-list", "docs/parity.md §1 #30 page"),
     ("privacy", "docs/parity.md §1 privacy"),
     ("command-list", "docs/parity.md §1 #16 page"),
+    ("sticky-status", "docs/parity.md §1 sticky-status"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -78,6 +79,31 @@ pub fn expected_registry() -> Value {
             .count(),
         2,
         "do not silently dedupe the legacy attendance collision"
+    );
+    // Next-only private inspection: the frozen legacy fixture stays untouched.
+    let status_at = commands
+        .iter()
+        .position(|c| c["name"] == "sticky-remove")
+        .expect("existing sticky management surface")
+        + 1;
+    commands.insert(
+        status_at,
+        json!({
+            "name": "sticky-status",
+            "description": "Inspect this channel's saved sticky and delivery state",
+            "dm_permission": false,
+            "default_member_permissions": "32",
+            "options": [{
+                "name": "view",
+                "description": "Show delivery metadata or the bounded saved text",
+                "type": 3,
+                "max_length": 8,
+                "choices": [
+                    {"name": "Metadata", "value": "metadata"},
+                    {"name": "Saved body", "value": "body"}
+                ]
+            }]
+        }),
     );
     let rsvp = commands
         .iter_mut()

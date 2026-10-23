@@ -1,6 +1,6 @@
 {
   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
-  "count": 29,
+  "count": 30,
   "dm_permission_all_false": true,
   "commands": [
     {
@@ -412,6 +412,30 @@
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Channel-state mutation; excluded from the read-only smoke."
+    },
+    {
+      "name": "sticky-status",
+      "description": "Inspect this channel's saved sticky and delivery state",
+      "family": "automations",
+      "gate": "automations",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [{
+        "name": "view",
+        "description": "Show delivery metadata or the bounded saved text",
+        "type": "string",
+        "required": false,
+        "min_value": null,
+        "max_value": null,
+        "max_length": 8,
+        "choices": [
+          {"name": "Metadata", "value": "metadata"},
+          {"name": "Saved body", "value": "body"}
+        ]
+      }],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Needs seeded sticky delivery states (DB); protected runtime fixtures cover the read-only inspection."
     },
     {
       "name": "rsvp",

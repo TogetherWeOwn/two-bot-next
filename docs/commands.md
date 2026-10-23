@@ -20,7 +20,7 @@ Bounds below are registry bounds; a dash means no bound is declared there,
 not that handler validation is unlimited. Permissions are Discord default
 member-permission bitfields, not a replacement for runtime authorization.
 
-Built-in commands: 50.
+Built-in commands: 51.
 
 ## `/access`
 
@@ -518,6 +518,17 @@ Remove this channel's sticky message
 - Available in DMs: false
 
 No options.
+
+## `/sticky-status`
+
+Inspect this channel's saved sticky and delivery state
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `view` | string | false | — | — | 8 | Metadata = `"metadata"`; Saved body = `"body"` | Show delivery metadata or the bounded saved text |
 
 ## `/tempban`
 

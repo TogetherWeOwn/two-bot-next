@@ -466,10 +466,12 @@ pub use settings::{
     WriteAction, WriteRefusal, ENV_ONLY_KEY_PREFIXES, HOT_WIRED, POLL_SECONDS, SETTING_CLASSES,
 };
 pub use sticky::{
-    activity_eligible, automations_enabled, claim_blocks, decide_activity, normalize_debounce,
-    repost_due, sticky_removed_reply, sticky_set_reply, validate_body, ActivityDecision,
-    ActivityOutcome, ClaimGrant, PutSticky, RemoveOutcome, StickyAudit, StickyAuditAction,
-    StickyAuditOutcome, StickyError, StickyState, CLAIM_EXPIRY_SECONDS, DEFAULT_DEBOUNCE_SECONDS,
+    activity_eligible, automations_enabled, claim_blocks, claim_state, decide_activity,
+    delivery_state, normalize_debounce, render_status_body, render_status_metadata, repost_due,
+    sanitize_status_body, status_link, sticky_removed_reply, sticky_set_reply, valid_snowflake,
+    validate_body, ActivityDecision, ActivityOutcome, ClaimGrant, ClaimState, DeliveryState,
+    PutSticky, RemoveOutcome, StickyAudit, StickyAuditAction, StickyAuditOutcome, StickyError,
+    StickyState, StickyStatus, StickyStatusView, CLAIM_EXPIRY_SECONDS, DEFAULT_DEBOUNCE_SECONDS,
     MAX_BODY_CHARS, MAX_DEBOUNCE_SECONDS, MIN_DEBOUNCE_SECONDS,
 };
 pub use voice::{

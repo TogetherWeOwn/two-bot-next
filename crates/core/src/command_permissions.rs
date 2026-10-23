@@ -73,12 +73,13 @@ use PolicyHook::{
     AutomationsEnabled, ConfiguredPrimaryActor, MemberModeration, TextCommandsEnabled,
 };
 
-/// All 30 parity rows, including the three non-static-slash dispositions,
+/// All 31 parity rows, including the three non-static-slash dispositions,
 /// plus the Next-only `/help` discovery command (parity row 31 — legacy has
-/// no help command) and the Next-only `/privacy` member self-serve
-/// (parity row 32).
+/// no help command), the Next-only `/privacy` member self-serve
+/// (parity row 32) and the Next-only `/sticky-status` private inspection
+/// (parity row 33).
 /// No Administrator-only exception: preserve the legacy resolved-bit check.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 32] = [
+pub const COMMAND_PERMISSIONS: [CommandPermission; 33] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),
@@ -138,6 +139,7 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 32] = [
     row(19, "schedule-list", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(20, "sticky", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(21, "sticky-remove", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(33, "sticky-status", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(22, "<custom>", DynamicSlash, 0, Some(AutomationsEnabled)),
     row(23, "<trigger>", Prefix, 0, Some(TextCommandsEnabled)),
     row(24, "rsvp", BuiltinSlash, 0, None),
