@@ -50,7 +50,7 @@ fn runtime(pool: PgPool, mock: &MockRest, mode: OnboardingMode) -> LevelingRunti
         },
     )
 }
-fn assert_celebration(request: &common::RestRequest) {
+fn assert_celebration(request: &common::RestRequest, member: u64) {
     assert_eq!(request.method, "POST");
     assert_eq!(
         request.path,
@@ -58,6 +58,16 @@ fn assert_celebration(request: &common::RestRequest) {
     );
     let body: Value = serde_json::from_slice(&request.body).unwrap();
     let content = body["content"].as_str().expect("celebration text");
+    assert!(
+        content.contains(&format!("<@{member}>")),
+        "copy identifies the exact earning member: {content:?}"
+    );
+    assert!(
+        content
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '/' && c != '_')
+            .any(|token| token == "/rank"),
+        "copy points to the /rank command, not another command: {content:?}"
+    );
     assert!(content.to_lowercase().contains("level 1"));
     assert!(content.chars().count() <= 200);
     assert!(!content.contains("@everyone") && !content.contains("@here"));
@@ -278,7 +288,7 @@ async fn ordered_gateway_concurrent_sources_award_once_and_read_back_rewards() {
     );
     assert_eq!(requests[1].method, "PUT");
     assert!(requests[1].path.ends_with(&format!("/roles/{ROLE}")));
-    assert_celebration(&requests[2]);
+    assert_celebration(&requests[2], MEMBER);
     // Fresh member-role readback produces no grants after the first plan applied.
     let ladder = store::role_rewards(&db.pool, &GUILD.to_string())
         .await
@@ -455,7 +465,7 @@ async fn slow_reward_reads_yield_tokio_and_do_not_reorder_later_member_events() 
         requests[0].path,
         format!("/api/v10/guilds/{GUILD}/members/{MEMBER}")
     );
-    assert_celebration(&requests[1]);
+    assert_celebration(&requests[1], MEMBER);
     mock.shutdown().await;
     db.close().await;
 }
@@ -494,7 +504,7 @@ async fn gateway_reward_and_interaction_executor_errors_propagate() {
         requests[0].path,
         format!("/api/v10/guilds/{GUILD}/members/{MEMBER}")
     );
-    assert_celebration(&requests[1]);
+    assert_celebration(&requests[1], MEMBER);
     assert_eq!(requests[2].method, "POST");
     assert_eq!(
         requests[2].path,

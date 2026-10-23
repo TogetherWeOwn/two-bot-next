@@ -99,9 +99,19 @@ fn posts(requests: &[RestRequest]) -> Vec<&RestRequest> {
         .collect()
 }
 
-fn assert_celebration(request: &RestRequest, level: u64) {
+fn assert_celebration(request: &RestRequest, member: u64, level: u64) {
     let body: Value = serde_json::from_slice(&request.body).unwrap();
     let content = body["content"].as_str().expect("celebration text");
+    assert!(
+        content.contains(&format!("<@{member}>")),
+        "copy identifies the exact earning member: {content:?}"
+    );
+    assert!(
+        content
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '/' && c != '_')
+            .any(|token| token == "/rank"),
+        "copy points to the /rank command, not another command: {content:?}"
+    );
     assert!(content.to_lowercase().contains(&format!("level {level}")));
     assert!(content.chars().count() <= 200);
     assert!(!content.contains("@everyone") && !content.contains("@here"));
@@ -139,7 +149,7 @@ async fn duplicate_collection_drain_and_restart_never_celebrate_the_same_crossin
         requests[0].path,
         format!("/api/v10/channels/{CHANNEL}/messages")
     );
-    assert_celebration(&requests[0], 1);
+    assert_celebration(&requests[0], MEMBER, 1);
 
     let awards = first.drain(already_collected).await.unwrap();
     assert!(awards.iter().all(|a| a.awarded == 0 && !a.leveled_up));
@@ -217,13 +227,15 @@ async fn one_drain_collapses_multiple_crossings_per_member_not_globally() {
     let pipeline = pipeline(db.pool().clone(), &mock);
     let stamps: Vec<i64> = (0..10)
         .map(|i| i * 120)
-        .chain((0..5).map(|i| 68_000 + i * 120))
+        // Index 14 crosses level 2; index 15 is an eligible non-crossing
+        // tail in another channel. Neither first nor last channel is right.
+        .chain((0..6).map(|i| 68_000 + i * 120))
         .collect();
     let mut batch = Vec::new();
     for (index, seconds) in stamps.iter().enumerate() {
         for offset in [0_u64, 1] {
-            // Disjoint source-channel sets identify which member owns a post
-            // without prescribing the celebration's member-name formatting.
+            // Disjoint channel sets pair each exact crossing channel with
+            // its own member, independent of post order or incidental prose.
             batch.extend(pipeline.collect_at(
                 &message(
                     MEMBER + offset,
@@ -235,11 +247,11 @@ async fn one_drain_collapses_multiple_crossings_per_member_not_globally() {
             ));
         }
     }
-    assert_eq!(batch.len(), 30);
+    assert_eq!(batch.len(), 32);
     let awards = pipeline.drain(batch).await.unwrap();
-    assert_eq!(awards.len(), 30);
+    assert_eq!(awards.len(), 32);
     assert_eq!(awards.iter().filter(|a| a.leveled_up).count(), 4);
-    let expected = [15, 15, 15, 15, 15, 5, 5, 5, 5, 5, 15, 15, 15, 15, 15];
+    let expected = [15, 15, 15, 15, 15, 5, 5, 5, 5, 5, 15, 15, 15, 15, 15, 5];
     for offset in [0_usize, 1] {
         assert_eq!(
             awards
@@ -259,7 +271,7 @@ async fn one_drain_collapses_multiple_crossings_per_member_not_globally() {
         .unwrap();
         assert_eq!(
             (profile.xp, profile.message_xp, profile.level),
-            (265, 175, 2)
+            (270, 180, 2)
         );
     }
     let requests = mock.requests();
@@ -274,21 +286,19 @@ async fn one_drain_collapses_multiple_crossings_per_member_not_globally() {
         let owned: Vec<_> = celebrations
             .iter()
             .filter(|r| {
-                (0..15).any(|index| {
-                    r.path
-                        == format!(
-                            "/api/v10/channels/{}/messages",
-                            CHANNEL + offset * 100 + index
-                        )
-                })
+                r.path == format!("/api/v10/channels/{}/messages", CHANNEL + offset * 100 + 14)
             })
             .collect();
         assert_eq!(
             owned.len(),
             1,
-            "each member owns one surviving source-channel post"
+            "each member owns one post in the highest crossing's exact channel"
         );
-        assert_celebration(owned[0], 2);
+        assert_celebration(owned[0], MEMBER + offset, 2);
+        assert!(awards[28 + offset as usize].leveled_up);
+        assert_eq!(awards[28 + offset as usize].total_xp, 265);
+        assert!(!awards[30 + offset as usize].leveled_up);
+        assert_eq!(awards[30 + offset as usize].total_xp, 270);
     }
     assert!(pipeline.drain(vec![]).await.unwrap().is_empty());
     assert_eq!(
@@ -426,7 +436,16 @@ async fn failed_post_logs_only_fixed_vocabulary_without_member_or_remote_data() 
         4,
         "one bounded POST per crossing, no retries"
     );
-    assert_eq!(posts(&mock.requests()).len(), 4);
+    let requests = mock.requests();
+    let celebrations = posts(&requests);
+    assert_eq!(celebrations.len(), 4);
+    for (offset, request) in celebrations.iter().enumerate() {
+        assert_eq!(
+            request.path,
+            format!("/api/v10/channels/{}/messages", CHANNEL + offset as u64)
+        );
+        assert_celebration(request, MEMBER + offset as u64, 1);
+    }
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM xp_awards")
         .fetch_one(db.pool())
         .await

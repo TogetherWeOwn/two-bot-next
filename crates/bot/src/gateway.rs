@@ -2239,6 +2239,10 @@ mod drop_poison_acceptance_tests;
 mod drop_poison_counter_acceptance_tests;
 
 #[cfg(test)]
+#[path = "gateway_tests/leveling_announcements.rs"]
+mod leveling_announcements;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
