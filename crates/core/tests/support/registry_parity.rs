@@ -37,6 +37,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("feed-list", "docs/parity.md §1 #30 page"),
     ("privacy", "docs/parity.md §1 privacy"),
     ("command-list", "docs/parity.md §1 #16 page"),
+    ("welcome-preview", "docs/parity.md §1 welcome preview"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -230,6 +231,15 @@ pub fn expected_registry() -> Value {
     )
     .expect("privacy serializes");
     commands.insert(3, privacy);
+    let welcome_preview = serde_json::to_value(
+        CommandDefinition::new(
+            "welcome-preview",
+            "Privately preview the current welcome for a synthetic newcomer. No delivery.",
+        )
+        .permissions(32),
+    )
+    .expect("welcome preview serializes");
+    commands.insert(4, welcome_preview);
     // Picker-copy exceptions (registry golden exceptions table): command and
     // option descriptions intentionally differ from legacy. Pointers mirror
     // the published option order.

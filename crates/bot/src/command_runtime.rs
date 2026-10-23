@@ -1005,7 +1005,9 @@ impl CommandRuntime {
                 // The gateway also delivers these to the live voice sink. Yield
                 // before user-slot/lane admission so overload cannot answer a
                 // voice-owned command with the shared runtime's busy callback.
-                if self.voice_owns_interaction(&interaction) {
+                if self.voice_owns_interaction(&interaction)
+                    || crate::onboarding::owns_welcome_preview(&interaction)
+                {
                     return true;
                 }
                 let runtime = Arc::clone(self);
@@ -1326,6 +1328,11 @@ impl CommandRuntime {
             return;
         };
         let interaction = interaction.as_ref();
+        // The onboarding ingress already owns the preview's receive-relative
+        // ACK and private refusal. Never double-answer it here.
+        if crate::onboarding::owns_welcome_preview(interaction) {
+            return;
+        }
         if ChannelModerationRuntime::accepts(interaction) {
             if let Err(error) = self
                 .channel
@@ -2517,6 +2524,8 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     // `/privacy` member self-serve is never activation-fenced either: every
     // member may opt out of analytics in any guild.
     router.register(Box::new(SliceHandler(HandlerId::Privacy)));
+    // Onboarding ingress owns the preview, including its private refusal.
+    router.register(Box::new(SliceHandler(HandlerId::WelcomePreview)));
     router
 }
 

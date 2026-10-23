@@ -34,7 +34,7 @@ use crate::commands::{
 /// must set on staging for the command to be published at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum E2eGate {
-    /// Always published (`rank`, `leaderboard`, `help`, `privacy`).
+    /// Always published (`rank`, `leaderboard`, `help`, `privacy`, `welcome-preview`).
     Always,
     /// `TWO_COMMUNITY_SCORECARD=1`.
     Scorecard,
@@ -122,7 +122,7 @@ const fn row(
 //   staff protection, bot hierarchy, actor hierarchy, in that order.
 // - `Valid:<FIELD>:<BOUNDS>` — option validation before any side effect.
 
-/// The 29-row contract in publish order (core, scorecard, automation,
+/// The 30-row contract in publish order (core, scorecard, automation,
 /// announcement, moderation). The coverage test asserts this is exactly the
 /// all-gates-on [`crate::router::InteractionRouter::publish_set`].
 #[must_use]
@@ -170,6 +170,16 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
                 "Valid:subcommand:required,opt-out|opt-in|status|delete|deletion-status|deletion-receipt",
                 "Valid:request-id:required,max128,deletion-status|deletion-receipt",
             ],
+        ),
+        row(
+            "welcome-preview",
+            33,
+            E2eGate::Always,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "WelcomePreview",
+            "Deferred private preview of the current welcome and picker for a fixed synthetic newcomer; no delivery, member lookup or state mutation. Disabled or invalid configuration returns private guidance.",
+            &["Perm:ManageServerRequired"],
         ),
         row(
             "attendance",

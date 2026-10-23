@@ -18,6 +18,10 @@ use two_bot_discord::{route_interaction, ActionExecutor, RoutedInteraction};
 
 use crate::gateway::GatewayPipeline;
 
+#[path = "welcome_preview.rs"]
+mod welcome_preview;
+pub(crate) use welcome_preview::owns_welcome_preview;
+
 const CONFIG_KEYS: &[&str] = &[
     "DISCORD_GUILD_ID",
     "TWO_ONBOARDING_MODE",
@@ -373,15 +377,27 @@ impl OnboardingRuntime {
             .as_ref()
             .and_then(|member| member.user.as_ref())
             .is_some_and(|user| !user.bot)
-            && matches!(
-                route_interaction(&router, interaction, None),
-                RoutedInteraction::Component {
-                    outcome: ComponentOutcome::Handled {
-                        handler: ComponentHandler::GamePicker | ComponentHandler::SessionPicker
-                    },
-                    ..
-                }
-            )
+            && (if owns_welcome_preview(interaction) {
+                // Refusals belong here too: defer before private authorization
+                // guidance, but never read settings for a non-admin.
+                !matches!(
+                    route_interaction(&router, interaction, None),
+                    RoutedInteraction::Slash {
+                        outcome: two_bot_core::SlashOutcome::Ignore,
+                        ..
+                    } | RoutedInteraction::Ignore
+                )
+            } else {
+                matches!(
+                    route_interaction(&router, interaction, None),
+                    RoutedInteraction::Component {
+                        outcome: ComponentOutcome::Handled {
+                            handler: ComponentHandler::GamePicker | ComponentHandler::SessionPicker
+                        },
+                        ..
+                    }
+                )
+            })
     }
 
     pub async fn acknowledge(
@@ -409,6 +425,14 @@ impl OnboardingRuntime {
         &self,
         interaction: &Interaction,
     ) -> Result<(), RuntimeError> {
+        if owns_welcome_preview(interaction) {
+            return self
+                .preview_guidance(
+                    interaction,
+                    "I couldn't confirm this preview. Please try again. No delivery was attempted.",
+                )
+                .await;
+        }
         self.reply(
             interaction,
             "I couldn't confirm this interaction. Your selection may already have been processed, so I won't apply it again. Please open the menu and try again.",
@@ -421,6 +445,12 @@ impl OnboardingRuntime {
         interaction: &Interaction,
         now_ms: i64,
     ) -> Result<(), RuntimeError> {
+        if owns_welcome_preview(interaction) {
+            return self.welcome_preview(interaction, now_ms).await;
+        }
+        if welcome_preview::is_preview_control(interaction) {
+            return self.reply(interaction, "This menu is a preview, not a delivery. No selection was applied. Use the newcomer menu for real selections.").await;
+        }
         let occurred_at = two_bot_core::funnel::format_iso_millis(now_ms);
         // Configuration/settings failures are inside the post-defer boundary.
         // A successful error edit is terminal, with no role or success writes.

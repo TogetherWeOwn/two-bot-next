@@ -3820,18 +3820,50 @@ impl ActionExecutor {
         interaction_token: &str,
         content: &str,
     ) -> Result<(), DiscordError> {
+        self.edit_interaction_response_body(application_id, interaction_token, content, None)
+            .await
+    }
+
+    /// Render a private visual sample with the same components as the live
+    /// message. The initial callback owns ephemerality; all mentions are off.
+    /// One attempt, including on ambiguous failure: this never retries an ACK.
+    pub async fn edit_interaction_response_with_components(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        content: &str,
+        components: &[twilight_model::channel::message::Component],
+    ) -> Result<(), DiscordError> {
+        self.edit_interaction_response_body(
+            application_id,
+            interaction_token,
+            content,
+            Some(components),
+        )
+        .await
+    }
+
+    async fn edit_interaction_response_body(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        content: &str,
+        components: Option<&[twilight_model::channel::message::Component]>,
+    ) -> Result<(), DiscordError> {
         let application = Id::<ApplicationMarker>::new_checked(application_id)
             .ok_or_else(|| DiscordError::Rejected("bad application id".to_owned()))?;
         let content = two_bot_core::message_safety::content(content);
         let mentions = AllowedMentions::default();
-        let req = Self::request_of(
-            self.inner
-                .factory
-                .interaction(application)
-                .update_response(interaction_token)
-                .content(Some(&content))
-                .allowed_mentions(Some(&mentions)),
-        )?;
+        let client = self.inner.factory.interaction(application);
+        let update = client
+            .update_response(interaction_token)
+            .content(Some(&content))
+            .allowed_mentions(Some(&mentions));
+        let update = match components {
+            Some(components) if !components.is_empty() => update.components(Some(components)),
+            _ => update,
+        };
+        let req = Self::request_of(update)?;
         let req = Self::explicit_mentions(req, &mentions)?;
         let mut res = self.call_once_raw(req, &[200]).await?;
         mutation_receipt_id(&res.body)?;
