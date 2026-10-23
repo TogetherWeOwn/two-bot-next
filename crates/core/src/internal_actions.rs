@@ -2960,11 +2960,12 @@ mod tests {
         // TOG-29862 moves TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS from cold to hot,
         // shifting one entry between those classes. The stored invite-code
         // slice adds one hot key (TWO_GUILD_INVITE_CODE). The assistant
-        // credential binding adds one env-only key (TWO_ASSISTANT_API_KEY).
+        // credential binding and required event-voice category slices add two
+        // env-only keys (TWO_ASSISTANT_API_KEY, TWO_EVENT_VOICE_CATEGORY_ID).
         for (class, expected) in [
             (SettingClass::Hot, 44),
             (SettingClass::Cold, 26),
-            (SettingClass::EnvOnly, 65),
+            (SettingClass::EnvOnly, 66),
         ] {
             assert_eq!(
                 SETTING_CLASSES.iter().filter(|(_, c)| *c == class).count(),
