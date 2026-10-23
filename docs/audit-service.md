@@ -109,7 +109,9 @@ restart or new channel traffic. An in-flight read is cancelled at the deadline;
 its unexamined page cannot establish a checkpoint. Strict numeric progress
 returns `ScanBoundReached`, atomically saves the floor and releases ownership,
 and resets the consecutive no-progress budget. The original pre-POST boundary,
-nonce, attempt count and acceptance evidence never change.
+nonce, attempt count and acceptance evidence never change. Scan comparisons
+and read cancellation use the same Tokio monotonic clock, including the
+explicit deadline test seam.
 
 A bound without new progress preserves the cursor, yields and records
 `discord_reconcile_scan_bound`. A second consecutive no-progress bound
@@ -126,9 +128,12 @@ A repeated full page, or any page with IDs equal to/newer than the requested
 cursor, ends the pass as ambiguous immediately: it cannot renew an identical
 cursor indefinitely. Invalid evidence preserves the saved boundary, nonce,
 attempt and any accepted receipt; it never produces `MarkerMissing` or clears
-prior ambiguity. Existing claim/lease fences still exclude stale owners. A
-later healthy owner can reconcile without resending. Valid empty/short pages
-still prove exhaustion, and valid full pages continue strictly backwards.
+prior ambiguity. Existing claim/lease fences still exclude stale owners.
+Between full pages, renewal refuses a Reconcile owner whose acceptance was
+recorded concurrently, stopping before another read without changing that
+receipt or lease. The accepted owner can still complete. A later healthy
+owner can reconcile without resending. Valid empty/short pages still prove
+exhaustion, and valid full pages continue strictly backwards.
 
 ## Kill switch
 
@@ -159,8 +164,14 @@ that is not a canonical nonzero snowflake parks it as `invalid_config`;
 the raw value is never logged.
 
 - `audit_retry` (legacy `audit.retryPending()` + 30 s sweep): every 30 s,
-  first run within 5 s of start, timeout 25 s. One `drain_pending` call
-  claims at most 25 rows. An engaged halt skips the sweep before any claim;
+  first run within 5 s of start, timeout 25 s. One `drain_pending_until` call
+  claims at most 25 rows. At sweep entry it sets one absolute history deadline
+  23 s later, reserving 2 s for checkpoint/release before supervisor cancellation.
+  Each Reconcile scan uses the earlier local or shared deadline; later rows
+  never receive a fresh sweep budget, and no new claims start once it expires.
+  A cancelled page cannot advance the cursor. A DB failure can still prevent
+  checkpointing, preserving the original send fence; an in-flight Send keeps
+  its existing delivery protocol. An engaged halt skips the sweep before any claim;
   a halt that lands mid-sweep is honored per row and held claims are
   released unattempted. Rows whose store write failed fail the run
   (`database`); every per-row Discord outcome counts as success. Outcomes

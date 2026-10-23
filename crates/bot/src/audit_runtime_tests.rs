@@ -1100,3 +1100,343 @@ fn log_report_counts_scan_bound_reached_and_unclaimed() {
     );
     assert!(logs.contains("unclaimed=1"), "report counts the refusal");
 }
+
+// ------------------------------------------ protected cursor budget tests --
+
+/// Time moves only inside a history read, after claim/halt/renew SQL has
+/// completed. Cancellation resumes the clock before checkpoint/release SQL.
+struct CursorReadClock;
+
+impl CursorReadClock {
+    fn pause() -> Self {
+        tokio::time::pause();
+        Self
+    }
+}
+
+impl Drop for CursorReadClock {
+    fn drop(&mut self) {
+        tokio::time::resume();
+    }
+}
+
+#[derive(Default)]
+struct PacedHistory {
+    scanning: bool,
+    shared_batch: bool,
+    started: Option<tokio::time::Instant>,
+    requests: Vec<(String, Option<String>)>,
+    markers: HashMap<String, MirrorMessage>,
+}
+
+#[derive(Clone, Default)]
+struct PacedCursorMirror {
+    history: Arc<Mutex<PacedHistory>>,
+    posts: Arc<Mutex<Vec<String>>>,
+}
+
+impl AuditMirror for PacedCursorMirror {
+    async fn post_mirror_checked<Fut, E>(
+        &self,
+        channel: &str,
+        _content: &str,
+        _nonce: &str,
+        authorize: Fut,
+    ) -> Result<Result<String, MirrorError>, E>
+    where
+        Fut: std::future::Future<Output = Result<(), E>> + Send,
+        E: Send,
+    {
+        authorize.await?;
+        self.posts.lock().unwrap().push(channel.to_owned());
+        Ok(Err(MirrorError::Uncertain(
+            "accepted but timed out".to_owned(),
+        )))
+    }
+
+    async fn channel_document(&self, channel: &str) -> Result<MirrorChannel, MirrorError> {
+        assert!([AUDIT_CH, VOICE_CH].contains(&channel));
+        Ok(private_document())
+    }
+
+    async fn channel_history(&self, channel: &str, before: Option<&str>, limit: u8) -> PageResult {
+        assert_eq!(limit, 100);
+        let (shared, started) = {
+            let mut history = self.history.lock().unwrap();
+            history
+                .requests
+                .push((channel.to_owned(), before.map(str::to_owned)));
+            if !history.scanning {
+                return Ok(vec![]);
+            }
+            if let Some(marker) = history.markers.get(channel) {
+                return Ok(vec![marker.clone()]);
+            }
+            (history.shared_batch, history.started.unwrap())
+        };
+        let newest = match channel {
+            AUDIT_CH => 900_000_u64,
+            VOICE_CH => 800_000,
+            _ => panic!("unexpected synthetic channel"),
+        };
+        let top = before.map_or(newest, |id| id.parse::<u64>().unwrap() - 1);
+        let page = (newest - top) / 100;
+        let stall = if shared {
+            channel == VOICE_CH && page == 1
+        } else {
+            page == 10
+        };
+        if stall {
+            let _clock = CursorReadClock::pause();
+            // Stop just short of the REAL outer job timeout, giving any
+            // reserved caller deadline a chance to cancel this page first.
+            // If absent, paused time reaches the outer timeout instead: the
+            // baseline loses its progress, an observable behavioral RED.
+            let before_outer = started + TIMEOUT - Duration::from_millis(100);
+            tokio::time::advance(
+                before_outer.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await;
+            return std::future::pending().await;
+        }
+        if page < 10 || channel == VOICE_CH {
+            let _clock = CursorReadClock::pause();
+            tokio::time::advance(Duration::from_secs(2)).await;
+        }
+        Ok((0..100_u64)
+            .map(|offset| MirrorMessage {
+                id: (top - offset).to_string(),
+                author_id: "1234".to_owned(),
+                content: "unrelated channel noise".to_owned(),
+            })
+            .collect())
+    }
+}
+
+fn paced_runtime(
+    pool: &PgPool,
+    mirror: &PacedCursorMirror,
+) -> Arc<AuditRuntime<PacedCursorMirror>> {
+    let (pool, mirror) = (pool.clone(), mirror.clone());
+    Arc::new(
+        AuditRuntime::new(
+            all_vars(),
+            GUILD.to_owned(),
+            Box::new(move || {
+                let parts = Parts {
+                    pool: pool.clone(),
+                    mirror: mirror.clone(),
+                    bot_user_id: BOT.to_owned(),
+                };
+                Box::pin(async move { Ok(parts) })
+            }),
+        )
+        .unwrap(),
+    )
+}
+
+async fn cursor_budget_case(shared: bool) {
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("guarded test bootstrap required");
+    let db = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+        .await
+        .expect("create disposable runtime cursor fixture");
+    let mirror = PacedCursorMirror::default();
+    let runtime = paced_runtime(db.pool(), &mirror);
+    let mut entries = vec![("paced-audit", AUDIT_CH, event("paced-audit"))];
+    if shared {
+        let mut voice = event("paced-voice");
+        voice.kind = AuditKind::VoiceJoin;
+        voice.channel = two_bot_core::audit::AuditChannel::Voice;
+        entries.push(("paced-voice", VOICE_CH, voice));
+    }
+    for (_, channel, event) in &entries {
+        assert_eq!(
+            runtime.record(event).await.unwrap(),
+            RecordOutcome::Queued {
+                mirror_channel_id: (*channel).to_owned()
+            }
+        );
+    }
+    let seeded = drained(&runtime).await;
+    assert_eq!(seeded.len(), entries.len());
+    assert!(seeded
+        .iter()
+        .all(|(_, result)| *result == DeliverOutcome::Ambiguous));
+    let store = AuditStore::new(db.pool());
+    let mut originals = Vec::new();
+    for (entry, _, _) in &entries {
+        originals.push(store.get(entry).await.unwrap().unwrap());
+        sqlx::query("UPDATE operational_audit_log SET delivery_lease_until = clock_timestamp() - interval '1 second' WHERE entry_id = $1")
+            .bind(entry).execute(db.pool()).await.unwrap();
+    }
+    // A later fresh row is not even claimed once the shared deadline has
+    // elapsed. Its entire authoritative row must remain untouched.
+    let untouched =
+        if shared {
+            runtime.record(&event("after-budget")).await.unwrap();
+            Some(sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT to_jsonb(a) FROM operational_audit_log a WHERE entry_id = 'after-budget'",
+        ).fetch_one(db.pool()).await.unwrap())
+        } else {
+            None
+        };
+    {
+        let mut history = mirror.history.lock().unwrap();
+        history.scanning = true;
+        history.shared_batch = shared;
+        history.requests.clear();
+        history.started = Some(tokio::time::Instant::now());
+    }
+    let (_stop, shutdown) = watch::channel(false);
+    let job = retry_job(runtime.clone(), shutdown, Duration::ZERO);
+    // Same timeout wrapper as the production supervisor, using the actual
+    // retry_job action -> runtime sweep -> service drain_pending path.
+    let outcome = tokio::time::timeout(job.timeout, (job.action)()).await;
+    let requests = mirror.history.lock().unwrap().requests.clone();
+    let mut bounded = Vec::new();
+    for (entry, _, _) in &entries {
+        let row = store.get(entry).await.unwrap().unwrap();
+        let released: bool = sqlx::query_scalar("SELECT delivery_state = 'pending' AND delivery_claim_token IS NULL AND delivery_lease_until IS NULL FROM operational_audit_log WHERE entry_id = $1")
+            .bind(entry).fetch_one(db.pool()).await.unwrap();
+        bounded.push((row, released));
+        // Also permit observation of restart behavior on the broken baseline;
+        // release itself was already captured above, not repaired as evidence.
+        sqlx::query("UPDATE operational_audit_log SET delivery_lease_until = clock_timestamp() - interval '1 second' WHERE entry_id = $1 AND delivery_lease_until IS NOT NULL")
+            .bind(entry).execute(db.pool()).await.unwrap();
+    }
+    let untouched_after = if shared {
+        let after = sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT to_jsonb(a) FROM operational_audit_log a WHERE entry_id = 'after-budget'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        // Hold this fixture row out of the independent restart below. The
+        // comparison captures the production sweep before this test-only claim.
+        let _held = store.claim("after-budget").await.unwrap();
+        Some(after)
+    } else {
+        None
+    };
+    drop((job, runtime));
+    let peer = db.independent_pool().await.unwrap();
+    {
+        let mut history = mirror.history.lock().unwrap();
+        history.requests.clear();
+        history.markers.insert(
+            AUDIT_CH.to_owned(),
+            marked(
+                if shared { "898400" } else { "899000" },
+                &event("paced-audit"),
+            ),
+        );
+        if shared {
+            let mut voice = event("paced-voice");
+            voice.kind = AuditKind::VoiceJoin;
+            voice.channel = two_bot_core::audit::AuditChannel::Voice;
+            history
+                .markers
+                .insert(VOICE_CH.to_owned(), marked("799900", &voice));
+        }
+    }
+    let restarted = paced_runtime(&peer, &mirror);
+    let recovered = drained(&restarted).await;
+    let restart_requests = mirror.history.lock().unwrap().requests.clone();
+    let posts = mirror.posts.lock().unwrap().clone();
+    drop(restarted);
+    peer.close().await;
+    db.close().await.unwrap();
+
+    assert!(
+        matches!(outcome, Ok(Ok(()))),
+        "sweep must checkpoint before outer cancellation: {outcome:?}"
+    );
+    assert!(
+        untouched_after == untouched,
+        "deadline must prevent starting a later row"
+    );
+    let audit_pages = if shared { 16 } else { 11 };
+    let mut expected: Vec<_> = (0..audit_pages)
+        .map(|n| {
+            (
+                AUDIT_CH.to_owned(),
+                if n == 0 {
+                    None
+                } else {
+                    Some((900_001 - n * 100).to_string())
+                },
+            )
+        })
+        .collect();
+    if shared {
+        expected.extend([
+            (VOICE_CH.to_owned(), None),
+            (VOICE_CH.to_owned(), Some("799901".to_owned())),
+        ]);
+    }
+    assert_eq!(
+        requests, expected,
+        "only completed pages can advance the cursor"
+    );
+    let audit_floor = if shared { "898401" } else { "899001" };
+    let mut expected_restart = vec![(AUDIT_CH.to_owned(), Some(audit_floor.to_owned()))];
+    if shared {
+        expected_restart.push((VOICE_CH.to_owned(), Some("799901".to_owned())));
+    }
+    assert_eq!(
+        restart_requests, expected_restart,
+        "independent owners resume at the exact saved floors"
+    );
+    for (n, (row, released)) in bounded.iter().enumerate() {
+        assert!(
+            *released,
+            "bounded scan must release before the outer timeout"
+        );
+        assert_eq!(
+            row.reconcile_before.as_deref(),
+            Some(if n == 0 { audit_floor } else { "799901" })
+        );
+        assert_eq!(row.attempts, 1);
+        assert_eq!(row.search_before, originals[n].search_before);
+        assert_eq!(row.nonce, originals[n].nonce);
+        assert_eq!(row.attempted_at, originals[n].attempted_at);
+    }
+    assert_eq!(
+        posts,
+        entries
+            .iter()
+            .map(|(_, channel, _)| (*channel).to_owned())
+            .collect::<Vec<_>>(),
+        "reconcile cannot POST again"
+    );
+    assert_eq!(recovered.len(), entries.len());
+    for (entry, result) in recovered {
+        let id = if entry == "paced-voice" {
+            "799900"
+        } else if shared {
+            "898400"
+        } else {
+            "899000"
+        };
+        assert_eq!(
+            result,
+            DeliverOutcome::Reconciled {
+                message_id: id.to_owned()
+            }
+        );
+    }
+}
+
+/// Default 30-second reconcile scanning must yield before the production
+/// 25-second job timeout; otherwise ten validated pages are lost on cancel.
+#[tokio::test]
+async fn retry_job_checkpoints_progress_before_its_production_timeout() {
+    cursor_budget_case(false).await;
+}
+
+/// A 20-second first row consumes the same sweep budget as the later row.
+/// Giving each row a fresh timeout loses the later row's validated floor.
+#[tokio::test]
+async fn retry_job_later_rows_share_the_remaining_sweep_budget() {
+    cursor_budget_case(true).await;
+}

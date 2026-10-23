@@ -28,6 +28,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use futures_util::future::BoxFuture;
+use tokio::time::Instant as TokioInstant;
 
 use crate::audit::{
     delivery_nonce, format_audit_event, route_for_sink, AuditChannelIds, AuditEvent, KillSwitchLog,
@@ -269,26 +270,63 @@ impl<M: AuditMirror> AuditMirrorService<M> {
     /// Claim one pending row and drive it to a terminal-or-held outcome.
     /// `Unclaimed` covers missing, halted, deferred and lost-fence rows.
     pub async fn deliver_entry(&self, entry_id: &str) -> Result<DeliverOutcome, AuditStoreError> {
+        self.deliver_entry_before(entry_id, None).await
+    }
+
+    async fn deliver_entry_before(
+        &self,
+        entry_id: &str,
+        deadline: Option<TokioInstant>,
+    ) -> Result<DeliverOutcome, AuditStoreError> {
         let Some(claim) = self.store.claim(entry_id).await? else {
             return Ok(DeliverOutcome::Unclaimed);
         };
-        self.deliver(&claim).await
+        self.deliver_before(&claim, deadline).await
     }
 
     /// Drive an already-held claim (Send or Reconcile by its stored intent).
     pub async fn deliver(&self, claim: &AuditClaim) -> Result<DeliverOutcome, AuditStoreError> {
+        self.deliver_before(claim, None).await
+    }
+
+    async fn deliver_before(
+        &self,
+        claim: &AuditClaim,
+        deadline: Option<TokioInstant>,
+    ) -> Result<DeliverOutcome, AuditStoreError> {
         match claim.intent() {
             DeliveryIntent::Send => self.deliver_send(claim).await,
-            DeliveryIntent::Reconcile => self.deliver_reconcile(claim).await,
+            DeliveryIntent::Reconcile => self.deliver_reconcile(claim, deadline).await,
         }
     }
 
     /// Claim and deliver every row `pending_ids` surfaces (bounded batch);
     /// per-row store errors are collected, never fatal to the sweep.
     pub async fn drain_pending(&self) -> Result<DrainReport, AuditStoreError> {
+        self.drain_pending_before(None).await
+    }
+
+    /// Drain within one caller's remaining sweep budget. Stop claiming rows at
+    /// the deadline and cap each Reconcile scan at that same instant, leaving
+    /// checkpoint/release time reserved by the caller before its outer timeout.
+    /// An in-flight Send keeps its existing durable delivery protocol.
+    pub async fn drain_pending_until(
+        &self,
+        deadline: TokioInstant,
+    ) -> Result<DrainReport, AuditStoreError> {
+        self.drain_pending_before(Some(deadline)).await
+    }
+
+    async fn drain_pending_before(
+        &self,
+        deadline: Option<TokioInstant>,
+    ) -> Result<DrainReport, AuditStoreError> {
         let mut report = DrainReport::default();
         for entry_id in self.store.pending_ids().await? {
-            match self.deliver_entry(&entry_id).await {
+            if deadline.is_some_and(|deadline| TokioInstant::now() >= deadline) {
+                break;
+            }
+            match self.deliver_entry_before(&entry_id, deadline).await {
                 Ok(outcome) => report.deliveries.push((entry_id, outcome)),
                 Err(err) => report.failed.push((entry_id, err.to_string())),
             }
@@ -518,6 +556,7 @@ impl<M: AuditMirror> AuditMirrorService<M> {
     async fn deliver_reconcile(
         &self,
         claim: &AuditClaim,
+        caller_deadline: Option<TokioInstant>,
     ) -> Result<DeliverOutcome, AuditStoreError> {
         let row = claim.row();
         // The durable accepted id wins outright: a crash between the POST and
@@ -546,13 +585,18 @@ impl<M: AuditMirror> AuditMirrorService<M> {
         // Resume below fully inspected history. A progressing bound saves
         // the floor and yields; only consecutive no-progress bounds quarantine.
         // Neither transition proves absence or permits another POST.
-        let scan_deadline = self
+        // Convert the explicit std-clock seam once; comparisons and read
+        // cancellation must use the same monotonic clock. A sweep never grants
+        // later rows a fresh caller budget after earlier rows consumed it.
+        let local_deadline = self
             .reconcile_scan_deadline
-            .unwrap_or_else(|| Instant::now() + RECONCILE_SCAN_TIMEOUT);
+            .map(TokioInstant::from_std)
+            .unwrap_or_else(|| TokioInstant::now() + RECONCILE_SCAN_TIMEOUT);
+        let scan_deadline = caller_deadline.map_or(local_deadline, |d| d.min(local_deadline));
         let mut pages: usize = 0;
         let mut before = row.reconcile_before.clone();
         loop {
-            if pages >= RECONCILE_MAX_PAGES || Instant::now() >= scan_deadline {
+            if pages >= RECONCILE_MAX_PAGES || TokioInstant::now() >= scan_deadline {
                 return Ok(
                     match self
                         .store
@@ -568,7 +612,7 @@ impl<M: AuditMirror> AuditMirrorService<M> {
                 );
             }
             let read = match tokio::time::timeout_at(
-                scan_deadline.into(),
+                scan_deadline,
                 self.mirror
                     .channel_history(&destination, before.as_deref(), HISTORY_PAGE_LIMIT),
             )
@@ -634,7 +678,7 @@ impl<M: AuditMirror> AuditMirrorService<M> {
             // A completed budget goes directly through the locked checkpoint
             // fence. Do not renew a lost/accepted owner while yielding it.
             if pages < RECONCILE_MAX_PAGES
-                && Instant::now() < scan_deadline
+                && TokioInstant::now() < scan_deadline
                 && !self.store.renew(claim).await?
             {
                 return Ok(DeliverOutcome::Unclaimed);
@@ -741,7 +785,7 @@ mod tests {
             .await?;
         sqlx::raw_sql(MIGRATION_0340).execute(&pool).await?;
         sqlx::raw_sql(include_str!(
-            "../../cutover/migrations/0458_audit_reconcile_cursor.sql"
+            "../../cutover/migrations/0460_audit_reconcile_cursor.sql"
         ))
         .execute(&pool)
         .await?;

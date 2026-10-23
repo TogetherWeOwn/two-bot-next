@@ -654,15 +654,18 @@ impl AuditStore {
     }
 
     /// Renew an active owner only; expiration cannot be undone by a stale
-    /// worker. Recovery may renew while scanning, but may never POST.
+    /// worker. Recovery stops scanning once acceptance is recorded; it may
+    /// complete that evidence, but must not renew it to keep reading or POST.
     pub async fn renew(&self, claim: &AuditClaim) -> Result<bool, AuditStoreError> {
         let mut tx = self.pool.begin().await?;
         lock_row(&mut tx, &claim.row.event.entry_id).await?;
         let updated = sqlx::query(
             "UPDATE operational_audit_log SET delivery_lease_until = clock_timestamp() + interval '5 minutes'
              WHERE entry_id = $1 AND delivery_claim_token = $2 AND delivery_generation = $3
-               AND delivery_state = 'delivering' AND delivery_lease_until > clock_timestamp()",
+               AND delivery_state = 'delivering' AND delivery_lease_until > clock_timestamp()
+               AND ($4 OR mirror_message_id IS NULL)",
         ).bind(&claim.row.event.entry_id).bind(claim.token.expose()).bind(claim.generation)
+            .bind(claim.intent() == DeliveryIntent::Send)
             .execute(&mut *tx).await?.rows_affected() == 1;
         tx.commit().await?;
         Ok(updated)
@@ -833,6 +836,10 @@ fn snowflake_cursor(value: &str) -> bool {
 fn snowflake_id(value: &str) -> bool {
     snowflake_cursor(value) && value.bytes().any(|b| b != b'0')
 }
+
+#[cfg(test)]
+#[path = "audit_cursor_checkpoint_acceptance.rs"]
+mod cursor_checkpoint_acceptance;
 
 #[cfg(test)]
 mod tests {
