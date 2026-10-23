@@ -153,11 +153,11 @@ fn validate_write_decides_per_key_class() {
 
 #[test]
 fn onboarding_role_catalog_expansion_keeps_the_three_class_partition() {
-    assert_eq!(SETTING_CLASSES.len(), 136);
+    assert_eq!(SETTING_CLASSES.len(), 137);
     for (class, expected) in [
         (SettingClass::Hot, 46),
         (SettingClass::Cold, 26),
-        (SettingClass::EnvOnly, 64),
+        (SettingClass::EnvOnly, 65),
     ] {
         assert_eq!(
             SETTING_CLASSES
