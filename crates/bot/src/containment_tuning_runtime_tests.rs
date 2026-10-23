@@ -1,8 +1,7 @@
 #![cfg(test)]
 //! Builder-owned live settings, boot refusal and no-effect regression tests.
 
-#[path = "hotpath_settings_test_support.rs"]
-mod hotpath_scope;
+use crate::hotpath_settings_test_support as hotpath_scope;
 
 // Independently catches a global snapshot on cold refresh and a global poll
 // count on warm refresh, through the actual runtime (not a store-only call).

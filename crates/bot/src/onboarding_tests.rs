@@ -261,8 +261,7 @@ fn runtime(pool: &PgPool, mock: &MockRest, vars: &HashMap<String, String>) -> On
     OnboardingRuntime::new(pool.clone(), executor, vars, 22, 999).unwrap()
 }
 
-#[path = "hotpath_settings_test_support.rs"]
-mod hotpath_scope;
+use crate::hotpath_settings_test_support as hotpath_scope;
 
 #[tokio::test]
 async fn onboarding_runtime_hotpath_config_materializes_only_its_guild() {
