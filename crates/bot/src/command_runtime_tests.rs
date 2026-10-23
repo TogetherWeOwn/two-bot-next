@@ -1967,6 +1967,24 @@ async fn foreign_non_moderation_commands_remain_silent() {
     mock.shutdown().await;
 }
 
+/// `/reopen` routes `Handled` but executes in the onboarding worker, not
+/// here: this runtime must stay silent (no unavailable reply, no defer),
+/// exactly like it does for the picker components, so the single initial
+/// callback belongs to the onboarding owner.
+#[tokio::test]
+async fn reopen_stays_silent_for_the_onboarding_owner() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime
+        .on_interaction(&slash("reopen", Some(CHANNEL), Vec::new()))
+        .await;
+    assert!(
+        mock.requests().is_empty(),
+        "the onboarding worker owns /reopen; this runtime answers nothing"
+    );
+    mock.shutdown().await;
+}
+
 /// The inner leveling fence (legacy 7df2a95, `registerLeveling`): a foreign or
 /// missing guild returns `Ok(false)` before the profile or leaderboard read.
 /// The pool here is a never-used lazy connection to a closed port, so a read
