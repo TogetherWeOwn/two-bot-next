@@ -749,7 +749,7 @@ pub async fn claim_refresh(
 ) -> Result<bool, sqlx::Error> {
     let id = format!("giveaway.refresh:{}:{}:{threshold}", row.guild_id, row.id);
     Ok(sqlx::query("INSERT INTO automation_audit_log (id, guild_id, action, target_key, outcome, created_at) VALUES ($1, $2, 'giveaway.refresh', $3, 'claimed', $4) ON CONFLICT (id) DO NOTHING")
-        .bind(id).bind(&row.guild_id).bind(&row.id).bind(OffsetDateTime::now_utc().to_string())
+        .bind(id).bind(&row.guild_id).bind(&row.id).bind(OffsetDateTime::now_utc())
         .execute(pool).await?.rows_affected() == 1)
 }
 
@@ -762,7 +762,7 @@ async fn surface_audit(
 ) -> Result<(), sqlx::Error> {
     sqlx::query("INSERT INTO automation_audit_log (id, guild_id, actor_id, action, target_key, outcome, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)")
         .bind(format!("{action}:{}:{}", row.guild_id, row.id)).bind(&row.guild_id).bind(actor)
-        .bind(action).bind(&row.id).bind(outcome).bind(row.updated_at.to_string()).execute(&mut **tx).await?;
+        .bind(action).bind(&row.id).bind(outcome).bind(row.updated_at).execute(&mut **tx).await?;
     Ok(())
 }
 

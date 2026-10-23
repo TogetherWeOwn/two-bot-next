@@ -37,6 +37,8 @@ mod giveaway_admission_edge_acceptance_tests;
 mod giveaway_countdown_edge_acceptance_tests;
 #[path = "giveaway_create_entry_acceptance_tests.rs"]
 mod giveaway_create_entry_acceptance_tests;
+#[path = "giveaway_delivery_cleanup_acceptance_tests.rs"]
+mod giveaway_delivery_cleanup_acceptance_tests;
 
 use std::collections::VecDeque;
 use std::str::FromStr;
@@ -1299,9 +1301,11 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "leaderboard"
                         | "help"
                         | "privacy"
+                        | "giveaway"
                 )
             })
             .collect();
+        assert!(!unwired.contains(&"giveaway"));
         assert!(!unwired.contains(&"rank"));
         assert!(!unwired.contains(&"leaderboard"));
         assert!(!unwired.contains(&"help"));

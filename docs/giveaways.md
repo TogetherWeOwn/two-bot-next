@@ -5,9 +5,8 @@ gate and require **Manage Server**. The shared router checks resolved permission
 bits, not just picker visibility. Entry buttons are open to human server members;
 roles and ages are checked against the member evidence on each interaction.
 
-- Prize: 1–200 characters after trimming. The picker advertises a 2000-character
-  transport ceiling for compatibility; the option help and runtime enforce the
-  narrower domain limit.
+- Prize: 1–200 characters after trimming. The picker, option help and runtime
+  all enforce the same 200-character domain limit.
 - Duration: 1–43200 minutes. Winners: 1–100.
 - Optional required role, minimum account age and minimum server age (0–3650 days).
   Required-role admission uses the member's held roles, not permission overrides.

@@ -2369,7 +2369,7 @@ fn ticket_action_token(action: TicketAction) -> &'static str {
 /// wire but still the field Discord populates for guild slash commands; the
 /// replacement `channel` object carries the id plus a payload we never read.
 #[allow(deprecated)]
-fn interaction_channel(interaction: &Interaction) -> Option<String> {
+pub(crate) fn interaction_channel(interaction: &Interaction) -> Option<String> {
     interaction
         .channel
         .as_ref()

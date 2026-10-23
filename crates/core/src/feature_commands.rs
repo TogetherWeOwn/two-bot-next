@@ -197,7 +197,7 @@ pub fn giveaway_command() -> CommandDefinition {
                     CommandOptionType::String,
                 )
                 .required()
-                .max_length(2000),
+                .max_length(200),
                 CommandOption::new(
                     "duration",
                     "Entry window in minutes (1–43200)",

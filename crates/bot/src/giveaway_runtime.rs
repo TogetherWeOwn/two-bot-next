@@ -14,7 +14,10 @@ use two_bot_core::{
 };
 use two_bot_discord::ActionExecutor;
 
-use crate::{command_runtime::actor_id, jobs::ErrorClass};
+use crate::{
+    command_runtime::{actor_id, interaction_channel},
+    jobs::ErrorClass,
+};
 
 const FAILURE: &str = "Giveaway unavailable; try again later.";
 const INVALID: &str = "Invalid giveaway options. Use a prize up to 200 characters, 1–43200 minutes and 1–100 winners.";
@@ -145,12 +148,7 @@ impl GiveawayRuntime {
                 _ => return Ok(INVALID.into()),
             }
         }
-        let channel = interaction
-            .channel
-            .as_ref()
-            .map(|c| c.id.get())
-            .or_else(|| interaction.channel_id.map(|id| id.get()));
-        let Some(channel) = channel else {
+        let Some(channel) = interaction_channel(interaction) else {
             return Ok(INVALID.into());
         };
         let actor = actor_id(interaction);
@@ -165,7 +163,7 @@ impl GiveawayRuntime {
             guild_id: guild.into(),
             id: id.clone(),
             prize: validated.prize,
-            channel_id: channel.to_string(),
+            channel_id: channel,
             message_id: "pending".into(),
             created_by: actor,
             winners_count: validated.winners_count as i32,
@@ -181,10 +179,25 @@ impl GiveawayRuntime {
         let nonce = format!("gw{id}");
         match self.executor.post_message_with_components(&row.channel_id, &render(&row, 0), &components(&row), &nonce).await {
             Ok(message) => {
-                if !store::attach_message(&self.pool, guild, &id, &message).await? {
-                    return Ok("Giveaway recorded but its message needs administrator inspection; do not recreate it blindly.".into());
+                if matches!(store::attach_message(&self.pool, guild, &id, &message).await, Ok(true)) {
+                    return Ok(format!("Giveaway `{id}` created."));
                 }
-                Ok(format!("Giveaway `{id}` created."))
+                // A confirmed POST with a failed attach must not leave an
+                // enabled orphan. Govern exactly one DELETE of the known id;
+                // redelivery resolves exists-before-POST, so this never rePOSTs.
+                if self
+                    .executor
+                    .delete_message(
+                        &row.channel_id,
+                        &message,
+                        "giveaway attach failed; neutralizing orphan entry message",
+                    )
+                    .await
+                    .is_ok()
+                {
+                    return Ok("Giveaway recorded but its entry message could not be attached; the orphan was neutralized. Do not recreate it blindly.".into());
+                }
+                Ok(format!("Giveaway entry message {message} could not be cleaned up after a failed attach; inspect the channel and remove it manually. Do not recreate it blindly."))
             }
             Err(_) => Ok(format!("Giveaway `{id}` recorded but message delivery is unconfirmed. Inspect the channel before cancelling or recreating it.")),
         }

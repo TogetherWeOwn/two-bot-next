@@ -192,7 +192,7 @@ Create, list or cancel a giveaway
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `create` | subcommand | false | — | — | — | — | Create a giveaway in this channel |
-| `create prize` | string | true | — | — | 2000 | — | Prize text (up to 200 characters) |
+| `create prize` | string | true | — | — | 200 | — | Prize text (up to 200 characters) |
 | `create duration` | integer | true | 1 | 43200 | — | — | Entry window in minutes (1–43200) |
 | `create winners` | integer | true | 1 | 100 | — | — | Number of winners |
 | `create required-role` | role | false | — | — | — | — | Role every entrant must hold |
