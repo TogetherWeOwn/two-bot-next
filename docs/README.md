@@ -123,6 +123,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Scheduled skip tests](scheduled-events-skip-acceptance.md)
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
 - [Ticket runtime](tickets.md)
+- [Community suggestions triage spec](suggestions-triage-box.md)
 
 ## Voice
 
