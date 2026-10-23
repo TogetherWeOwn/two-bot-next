@@ -238,9 +238,9 @@ pub fn help_text(defs: &[CommandDefinition]) -> String {
 // unknown permission bits keep their decimal bitfield.
 // ---------------------------------------------------------------------------
 
-/// UTF-16 budget for one detail reply: Discord's 6000-unit aggregate embed
-/// budget minus room for the truncation notice.
-const DETAIL_BUDGET: usize = 5880;
+/// UTF-16 budget for one detail reply: the embed description ceiling minus
+/// room for the truncation notice.
+const DETAIL_BUDGET: usize = message_safety::EMBED_DESCRIPTION_LIMIT - 64;
 /// One hostile field must not eat the whole budget.
 const DESCRIPTION_CAP: usize = 400;
 const OPTION_DESCRIPTION_CAP: usize = 200;
