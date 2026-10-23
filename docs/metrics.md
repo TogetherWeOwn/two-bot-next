@@ -266,13 +266,14 @@ as dynamic labels.
   `two_bot_job_consecutive_failures{job}` — `job` is one of
   `invite_snapshot`, `session_checkpoint`, `counter`, `rank`,
   `scheduled_events`, `settings`, `presence_probe`, `community_scorecard`,
-  `inactivity`, `audit_retry`, `scheduled_messages`, `feeds`, `self_role_recovery`,
+  `inactivity`, `audit_retry`, `scheduled_messages`, `polls`, `feeds`, `self_role_recovery`,
   `member_unban_sweep`, `automod_expiry`, `other`; `outcome` is `success` or `failure`.
   `session_checkpoint` records successful durable gateway commits; zero means
   never run. `audit_retry` is the audit supervisor's 30 s retry sweep.
   `member_unban_sweep` is the 30 s unban sweep. `automod_expiry` is the 60 s
   repeat-history expiry tick (real work only when `TWO_AUTOMOD=1`).
-  `settings` is the DB-only 15 s `guild_settings` version poll.
+  `settings` is the DB-only 15 s `guild_settings` version poll. `polls` is the
+  15 s announcements-gated timed-poll close and display-recovery supervisor.
 - `two_bot_job_last_error_class{job,class}` — `job` uses the list above;
   `class` is one of `database`, `rest`, `configuration`, `timeout`, `panic`,
   `feed` or `recovery_required` (the fixed `ErrorClass` variants). Each of the
@@ -766,7 +767,7 @@ count cannot be distinguished from growth by this rule.
 
 `job_stale` uses `JOB_INTERVAL_SECONDS`, which must equal each scheduled job's
 Rust `*_INTERVAL_MS / 1000`. The 15 s tickers (`scheduled_messages`,
-`settings`) use `ticker_stale` with the explicit `TICKER_STALE_SECONDS` (600)
+`polls`, `settings`) use `ticker_stale` with the explicit `TICKER_STALE_SECONDS` (600)
 window instead: at two intervals a 15 s cadence would flap on a single slow
 scrape, and skipped busy deadlines are neither success nor failure, so
 `job_stale` and `job_consecutive_failures` cannot see a wedged ticker.

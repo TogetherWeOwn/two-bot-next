@@ -1,5 +1,7 @@
 -- Bounded single-question polls. Existing tables and rows are untouched.
-CREATE TABLE IF NOT EXISTS polls (
+-- Fail closed on an untracked relation: this transaction must own an empty table
+-- before building its indexes. SQLx's ledger makes repeated migration runs no-ops.
+CREATE TABLE polls (
     guild_id TEXT NOT NULL,
     id TEXT NOT NULL,
     question TEXT NOT NULL CHECK (char_length(question) BETWEEN 1 AND 256),
@@ -20,6 +22,12 @@ CREATE TABLE IF NOT EXISTS polls (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (guild_id, id)
 );
+-- Concurrent indexes would wait on snapshots held by advisory-lock waiters in
+-- parallel SQLx migrators. Transactional builds here only lock our new table.
+CREATE INDEX polls_due ON polls (guild_id, ends_at)
+    WHERE status = 'open';
+CREATE INDEX polls_unposted ON polls (guild_id, closed_at)
+    WHERE status = 'closed' AND results_posted_at IS NULL;
 CREATE TABLE IF NOT EXISTS poll_votes (
     guild_id TEXT NOT NULL,
     poll_id TEXT NOT NULL,

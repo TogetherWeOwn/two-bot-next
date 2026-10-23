@@ -26,12 +26,15 @@ at most ten due, closed-unposted or dirty-display polls. Votes expire against th
 clock, not the next tick. Expect up to one cadence plus workload for the close
 message, not a strict delivery deadline.
 
-Migration `0458_timed_polls.sql` creates `polls` and `poll_votes`. Migrations
-0459 and 0460 add the lookup indexes concurrently, each as one statement outside
-a transaction. For an interrupted index build, inspect index validity and the
-migration ledger before retrying; follow [migration recovery](migrations.md).
-Migration 0461 adds the durable dirty-display marker. Apply the migrations and
-reviewed database role inventory before deploying the binary.
+Migration `0458_timed_polls.sql` creates `polls` and `poll_votes`, building both
+lookup indexes transactionally on the new, empty `polls` table. Unconditional
+creation refuses an untracked pre-existing `polls` relation instead of locking
+its writes; SQLx's migration ledger makes repeated runs no-ops. This avoids
+concurrent-index snapshot waits deadlocking parallel SQLx migrators. The
+unpublished separate index migrations 0459/0460 were consolidated before first
+merge; no deployed migration changed. Migration 0461 adds the durable
+dirty-display marker. Apply the migrations and reviewed database role inventory
+before deploying the binary; follow [migration recovery](migrations.md) on error.
 Creation quotas share a guild advisory lock. A vote and its dirty-display marker
 commit before the live edit, so cancellation cannot undo a displayed vote.
 The edit re-reads durable counts under the same row lock as close, rather than
