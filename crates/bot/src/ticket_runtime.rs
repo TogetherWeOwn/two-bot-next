@@ -538,13 +538,13 @@ impl TicketRuntime {
         config: TicketConfig,
         deployment: HashMap<String, String>,
     ) -> std::result::Result<Self, StoreError> {
-        // The layered refresh falls back to deployment on delete: carry the
-        // effective boot cooldown (default included) so a deleted row restores
-        // boot instead of sticking at the last stored value. Production
-        // filters deployment to the destination keys, so the cooldown would
-        // otherwise never be present here.
-        let mut deployment = deployment;
-        deployment.insert(COOLDOWN_KEY.to_owned(), config.cooldown_seconds.to_string());
+        // The layered refresh needs a complete boot fallback, including
+        // destinations already resolved in config but omitted from deployment.
+        // Preserve explicit deployment destinations and the effective boot
+        // cooldown so ops-only updates and deleted rows can rebuild config.
+        // Keep this normalization separate from later live snapshot layering.
+        let deployment = boot_deployment(&config, deployment);
+        // Live settings are layered over these boot defaults at each refresh.
         Ok(Self {
             store: TicketStore::new(pool, config.guild_id.clone())?,
             executor,
@@ -1613,6 +1613,23 @@ fn panels(messages: Vec<Value>) -> Result<Vec<PanelMessage>> {
         tracing::debug!(skipped, "ticket panel messages isolated");
     }
     Ok(out)
+}
+
+fn boot_deployment(
+    config: &TicketConfig,
+    mut deployment: HashMap<String, String>,
+) -> HashMap<String, String> {
+    for (key, value) in [
+        ("DISCORD_TICKET_CATEGORY_ID", &config.category_id),
+        ("DISCORD_TICKET_PANEL_CHANNEL_ID", &config.panel_channel_id),
+        ("DISCORD_TICKET_STAFF_ROLE_ID", &config.staff_role_id),
+    ] {
+        deployment
+            .entry(key.to_owned())
+            .or_insert_with(|| value.clone());
+    }
+    deployment.insert(COOLDOWN_KEY.to_owned(), config.cooldown_seconds.to_string());
+    deployment
 }
 
 #[cfg(test)]
