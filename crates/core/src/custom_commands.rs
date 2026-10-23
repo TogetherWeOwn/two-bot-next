@@ -890,9 +890,9 @@ pub fn format_inspect_preview(row: &StoredCommand, ctx: &TemplateContext) -> Str
     }
     let rendered = match render_template(&row.template, ctx) {
         Ok(rendered) => rendered,
-        Err(TemplateError::RenderTooLong(units)) => {
+        Err(refusal @ TemplateError::RenderTooLong(_)) => {
             return format!(
-                "Template for /{} renders too long to preview ({units} units; Discord's ceiling is 2000). Shorten it with /command name:{} template:...",
+                "Template for /{} renders too long to preview ({refusal}). Shorten it with /command name:{} template:...",
                 row.name, row.name
             );
         }

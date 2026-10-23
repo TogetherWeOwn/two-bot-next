@@ -635,14 +635,8 @@ impl CustomCommandRuntime {
         };
         let name = match validate_inspect_name(name, &reserved_command_names()) {
             Ok(name) => name,
-            Err(error @ two_bot_core::custom_commands::CommandError::ReservedName(_)) => {
-                return invalid_inspect_option_reply("command name", &error.to_string());
-            }
-            Err(_) => {
-                return invalid_inspect_option_reply(
-                    "command name",
-                    "must match ^[a-z0-9_-]{1,32}$ (lowercase).",
-                );
+            Err(reason) => {
+                return invalid_inspect_option_reply("command name", &reason.to_string());
             }
         };
         let view = match single_string_option(data, "view") {
