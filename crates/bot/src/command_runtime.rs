@@ -61,16 +61,19 @@ use twilight_model::{
     gateway::GatewayReaction,
     http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
 };
+use two_bot::voice_rooms::voice_claims_custom_id;
 use two_bot_core::{
     automod_runtime::FunnelDisposition,
     commands::PERM_MANAGE_GUILD,
     feeds::{
-        feed_list_text, feed_removed_text, plan_command, FeedCommand, FeedCommandContext,
-        FeedCommandPlan, FeedError, FeedKind, FEED_REMOVAL_RECOVERY_REQUIRED_TEXT,
+        feed_list_page, feed_list_page_invalid_text, feed_list_page_underflow_text,
+        feed_removed_text, plan_command, FeedCommand, FeedCommandContext, FeedCommandPlan,
+        FeedError, FeedKind, FEED_REMOVAL_RECOVERY_REQUIRED_TEXT,
     },
     feeds_store::{add_feed, list_feeds, remove_feed, write_audit, FeedAudit, FeedRemoval},
     funnel::now_millis_for_test,
     moderation::ModerationAction,
+    router::replies::EXPIRED_COMPONENT_REPLY,
     sticky::{
         activity_eligible, decide_activity, normalize_debounce, sticky_removed_reply,
         sticky_set_reply, store, validate_body, ActivityDecision, ActivityOutcome, PutSticky,
@@ -83,7 +86,7 @@ use two_bot_core::{
 };
 use two_bot_discord::{
     help_response, publish_commands, register_channel_handlers, response_for_slash,
-    route_interaction, ActionExecutor, ChannelModerationRuntime, LevelingRuntime,
+    route_interaction, ActionExecutor, ChannelModerationRuntime, DiscordError, LevelingRuntime,
     RoutedInteraction,
 };
 
@@ -100,6 +103,15 @@ use crate::interaction_admission::{
 const RETIRE_REASON: &str = "sticky re-post";
 /// Reason for deleting a replacement post whose claim moved on.
 const ORPHAN_REASON: &str = "sticky re-post rolled back";
+/// Bounded diagnostic code logged when a re-post attempt leaves delivery
+/// uncertainty behind (the store fence stays armed — no retry until an
+/// administrator reconfigures). Fixed vocabulary; the log line carries ids
+/// and cause tokens only, never the sticky body, tokens or member content.
+const UNCERTAIN_DELIVERY_CODE: &str = "sticky_delivery_uncertain";
+/// Recovery next action for [`UNCERTAIN_DELIVERY_CODE`]: inspect the channel
+/// and resolve any possible orphan before explicitly resetting the sticky.
+/// Never wait out the lease or blindly resend — the fence outlives both.
+const UNCERTAIN_DELIVERY_NEXT_ACTION: &str = "inspect_channel_before_sticky_reset";
 /// Reason for the `/sticky-remove` Discord cleanup delete.
 const REMOVE_REASON: &str = "sticky-remove";
 /// Safe reply when the store fails — never leak sqlx internals to Discord.
@@ -1120,6 +1132,13 @@ impl CommandRuntime {
             return;
         };
         let Some(input) = service.component_input(interaction) else {
+            // Stale reference (removed panel, replaced source message, or
+            // removed option): one expired-control reply, zero mutation.
+            // Malformed input stays silent.
+            if service.stale_component(interaction) {
+                self.answer(interaction, ephemeral(EXPIRED_COMPONENT_REPLY))
+                    .await;
+            }
             return;
         };
         if !self.defer(interaction, "self-role").await {
@@ -1127,6 +1146,38 @@ impl CommandRuntime {
         }
         let result = service.handle(&input).await;
         self.finish(interaction, result.reply(input.panel.color))
+            .await;
+    }
+
+    /// One expired-control reply for genuinely unowned, in-scope components
+    /// and modal submits. The router has already fenced the guild (foreign
+    /// and missing guilds route `Ignore`) and the surface gates (known ids on
+    /// disabled surfaces route `Ignore`), so `Unknown` here means unowned,
+    /// not merely unserved. Voice-owned controls belong to the voice sink,
+    /// which answers each exactly once; bot authors stay silent.
+    async fn answer_stale_control(&self, interaction: &Interaction, routed: &RoutedInteraction) {
+        let custom_id = match routed {
+            RoutedInteraction::Component {
+                custom_id,
+                outcome: ComponentOutcome::Unknown,
+                ..
+            }
+            | RoutedInteraction::Modal {
+                custom_id,
+                outcome: ComponentOutcome::Unknown,
+            } => custom_id,
+            _ => return,
+        };
+        // Ownership is the sink's own predicate: bare `two:voice:` ids,
+        // epoch-suffixed runtime join buttons, and `votekick:` ballots. A bare
+        // prefix never claims ownership on its own.
+        if voice_claims_custom_id(custom_id) {
+            return;
+        }
+        if author_is_bot(interaction) {
+            return;
+        }
+        self.answer(interaction, ephemeral(EXPIRED_COMPONENT_REPLY))
             .await;
     }
 
@@ -1333,8 +1384,12 @@ impl CommandRuntime {
             }
             return;
         }
-        let RoutedInteraction::Slash { name, outcome } = routed else {
-            return;
+        let (name, outcome) = match routed {
+            RoutedInteraction::Slash { name, outcome } => (name, outcome),
+            other => {
+                self.answer_stale_control(interaction, &other).await;
+                return;
+            }
         };
         // V4 `kick` collision: this router is the only answerer. The guild
         // fence, the moderation gate and the Kick Members check run first, and
@@ -1611,7 +1666,7 @@ impl CommandRuntime {
                 }
             })
         else {
-            // Debounced, disabled, or another attempt holds the claim.
+            // Debounced, disabled, claimed, or fenced by an uncertain delivery.
             return ActivityOutcome::Held;
         };
 
@@ -1653,64 +1708,104 @@ impl CommandRuntime {
                     Ok(false) => {
                         // The claim moved on between post and record: the
                         // replacement we just posted is an orphan (legacy
-                        // deletes exactly this, then reports held).
-                        self.delete_quiet(&channel_id, &message_id, ORPHAN_REASON)
-                            .await;
-                        ActivityOutcome::Held
+                        // deletes exactly this, then reports held). Proven
+                        // absence keeps that shape; an unconfirmed cleanup
+                        // re-arms the fence instead of authorizing a
+                        // duplicate, and a removed row stays absent.
+                        match self.delete_orphan(&channel_id, &message_id).await {
+                            Ok(_) => ActivityOutcome::Held,
+                            Err(err) => {
+                                let cause = discord_class(&err);
+                                self.fence_uncertain(&guild_id, &channel_id).await;
+                                self.diagnose_uncertain(&guild_id, &channel_id, cause).await;
+                                ActivityOutcome::Held
+                            }
+                        }
                     }
                     Err(err) => {
-                        // Record failed — the post may be live but unrecorded,
-                        // so roll back what we can: release our claim and
-                        // delete the orphan, then audit post_failed.
+                        // Record failed — the post may be live but unrecorded.
+                        // Only proven orphan absence reopens the window;
+                        // anything else re-arms the fence claim-blind: an
+                        // administrator reconfigure during the POST may have
+                        // disarmed the fence the claim armed.
                         warn!(
                             reason = db_class(&err),
-                            "sticky record failed; rolling back"
+                            "sticky record failed; confirming orphan absence"
                         );
-                        self.release(&guild_id, &channel_id, &claim_token).await;
-                        self.delete_quiet(&channel_id, &message_id, ORPHAN_REASON)
-                            .await;
-                        self.audit(
-                            &guild_id,
-                            None,
-                            StickyAuditAction::Run,
-                            Some(&channel_id),
-                            StickyAuditOutcome::PostFailed,
-                            Some("record failed"),
-                        )
-                        .await;
-                        ActivityOutcome::Held
+                        match self.delete_orphan(&channel_id, &message_id).await {
+                            Ok(_) => {
+                                self.release(&guild_id, &channel_id, &claim_token).await;
+                                self.audit(
+                                    &guild_id,
+                                    None,
+                                    StickyAuditAction::Run,
+                                    Some(&channel_id),
+                                    StickyAuditOutcome::PostFailed,
+                                    Some("record failed"),
+                                )
+                                .await;
+                                ActivityOutcome::Held
+                            }
+                            Err(cleanup_err) => {
+                                // An administrator reconfigure during the POST
+                                // may have disarmed the claim's fence; re-arm
+                                // claim-blind before diagnosing.
+                                self.fence_uncertain(&guild_id, &channel_id).await;
+                                self.diagnose_uncertain(
+                                    &guild_id,
+                                    &channel_id,
+                                    discord_class(&cleanup_err),
+                                )
+                                .await;
+                                ActivityOutcome::Held
+                            }
+                        }
                     }
                 }
             }
             Ok(_) => {
-                // A 2xx without a usable id is not a confirmed replacement.
-                // Keep the previous message; the unknown post cannot safely
-                // be recorded or cleaned up by id.
-                self.release(&guild_id, &channel_id, &claim_token).await;
-                self.audit(
-                    &guild_id,
-                    None,
-                    StickyAuditAction::Run,
-                    Some(&channel_id),
-                    StickyAuditOutcome::PostFailed,
-                    Some("replacement message id missing or invalid"),
-                )
-                .await;
+                // A 2xx without a usable id is not a confirmed replacement
+                // (the executor normally rejects these before they arrive).
+                // Discord may have accepted the post, so re-arm the fence
+                // claim-blind — an administrator reconfigure during the POST
+                // may have disarmed the claim's fence — then diagnose.
+                self.fence_uncertain(&guild_id, &channel_id).await;
+                self.diagnose_uncertain(&guild_id, &channel_id, "receipt_id_unusable")
+                    .await;
                 ActivityOutcome::Held
             }
             Err(err) => {
-                // Post did not land (or its id was lost): release the claim so
-                // the next message can retry.
-                self.release(&guild_id, &channel_id, &claim_token).await;
-                self.audit(
-                    &guild_id,
-                    None,
-                    StickyAuditAction::Run,
-                    Some(&channel_id),
-                    StickyAuditOutcome::PostFailed,
-                    Some(&err.to_string()),
-                )
-                .await;
+                // Only a proven no-send reopens the window (explicit
+                // rejection, rate limit, local guard, or a pre-wire
+                // admission refusal — none of them reached Discord as a
+                // mutation). Timeouts, transport losses and ambiguous
+                // statuses re-arm the fence: the post may be live.
+                let admission_refused = err.is_admission_blocked()
+                    || matches!(
+                        discord_class(&err),
+                        "admission_storage_unavailable"
+                            | "admission_configuration_invalid"
+                            | "admission_stale_claim"
+                    );
+                if admission_refused || err.proves_no_effect() {
+                    self.release(&guild_id, &channel_id, &claim_token).await;
+                    self.audit(
+                        &guild_id,
+                        None,
+                        StickyAuditAction::Run,
+                        Some(&channel_id),
+                        StickyAuditOutcome::PostFailed,
+                        Some(&err.to_string()),
+                    )
+                    .await;
+                } else {
+                    // Ambiguous outcome, possibly live: re-arm claim-blind
+                    // (an administrator reconfigure during the POST may have
+                    // disarmed the fence) before diagnosing.
+                    self.fence_uncertain(&guild_id, &channel_id).await;
+                    self.diagnose_uncertain(&guild_id, &channel_id, discord_class(&err))
+                        .await;
+                }
                 ActivityOutcome::Held
             }
         }
@@ -1974,27 +2069,43 @@ impl CommandRuntime {
         }
     }
 
-    /// `/feed-list`: plan → guild-scoped list → ephemeral text. Legacy
-    /// `listFeeds` lists every relay for the guild (not `enabled` only) and
-    /// writes no audit row.
+    /// `/feed-list`: plan → page decode → guild-scoped list → ephemeral
+    /// text. Legacy `listFeeds` lists every relay for the guild (not `enabled`
+    /// only) and writes no audit row. An omitted `page` means page 1; a
+    /// present-but-unusable option refuses without a store read, and
+    /// out-of-range refuses after the same bounded read every list uses.
     async fn feed_list(&self, interaction: &Interaction) {
         let channel_id = interaction_channel(interaction).unwrap_or_default();
         let inputs = self.feed_inputs(interaction);
         let context = inputs.context(&channel_id);
         match plan_command(&context, FeedCommand::List) {
             Ok(FeedCommandPlan::List { guild_id }) => {
-                match list_feeds(&self.pool, &guild_id, false).await {
-                    Ok(feeds) => self.finish(interaction, feed_list_text(&feeds)).await,
-                    Err(err) => {
-                        warn!(reason = feed_store_class(&err), "feed list failed");
-                        self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
+                let reply = match feed_list_page_request(interaction) {
+                    FeedListPage::Invalid => feed_list_page_invalid_text().to_owned(),
+                    FeedListPage::Default => self.list_feed_page(&guild_id, 1).await,
+                    FeedListPage::Page(page) if page < 1 => {
+                        feed_list_page_underflow_text().to_owned()
                     }
-                }
+                    FeedListPage::Page(page) => self.list_feed_page(&guild_id, page).await,
+                };
+                self.finish(interaction, reply).await;
             }
             Ok(plan) => {
                 warn!(?plan, "feed-list planned to a non-list variant");
             }
             Err(err) => self.finish(interaction, err.to_string()).await,
+        }
+    }
+
+    /// One bounded guild-scoped relay read rendered as the requested page.
+    /// A failed read keeps the fixed safe reply and writes no audit row.
+    async fn list_feed_page(&self, guild_id: &str, page: i64) -> String {
+        match list_feeds(&self.pool, guild_id, false).await {
+            Ok(feeds) => feed_list_page(&feeds, page),
+            Err(err) => {
+                warn!(reason = feed_store_class(&err), "feed list failed");
+                FEED_STORE_FAILURE_REPLY.to_owned()
+            }
         }
     }
 
@@ -2119,16 +2230,81 @@ impl CommandRuntime {
         }
     }
 
-    /// Release this attempt's claim; failure means expiry clears it in 60s.
+    /// Release this attempt's claim after a definitive outcome; failure
+    /// leaves the delivery fence armed for an administrator reset (the claim
+    /// itself still expires in 60s, but expiry no longer authorizes a post).
     async fn release(&self, guild_id: &str, channel_id: &str, claim_token: &str) {
         if let Err(err) =
             store::release_sticky_post(&self.pool, guild_id, channel_id, claim_token).await
         {
             warn!(
                 reason = db_class(&err),
-                "sticky claim release failed; expiry will clear it"
+                "sticky claim release failed; uncertainty fence retained"
             );
         }
+    }
+
+    /// Confirming orphan delete: `Ok(true)` deleted, `Ok(false)` already
+    /// absent (both proven — a retry is safe), `Err` the orphan may still be
+    /// live. An unconfirmed cleanup is never reported as success; the caller
+    /// keeps or re-arms the delivery fence.
+    async fn delete_orphan(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+    ) -> Result<bool, DiscordError> {
+        let outcome = self
+            .executor
+            .delete_message_with_absence_receipt(channel_id, message_id, ORPHAN_REASON)
+            .await;
+        if let Err(err) = &outcome {
+            warn!(
+                reason = discord_class(err),
+                "sticky orphan cleanup unconfirmed; fencing delivery"
+            );
+        }
+        outcome
+    }
+
+    /// Re-arm the delivery fence on any uncertain outcome — the claim's
+    /// own fence may have been disarmed by an administrator reconfigure
+    /// mid-flight; a no-op when the administrator removed the row. A
+    /// failed write is logged — without a claim no further post is
+    /// possible until the store recovers, and the next attempt re-fences
+    /// if needed.
+    async fn fence_uncertain(&self, guild_id: &str, channel_id: &str) {
+        if let Err(err) =
+            store::mark_sticky_delivery_uncertain(&self.pool, guild_id, channel_id).await
+        {
+            warn!(
+                reason = db_class(&err),
+                "sticky uncertainty fence write failed; orphan may be live"
+            );
+        }
+    }
+
+    /// Log the bounded uncertainty diagnostic and audit the attempt as
+    /// failed — never as success. `cause` is a fixed cause token, never
+    /// payload or member content.
+    async fn diagnose_uncertain(&self, guild_id: &str, channel_id: &str, cause: &str) {
+        warn!(
+            code = UNCERTAIN_DELIVERY_CODE,
+            retryable = false,
+            next_action = UNCERTAIN_DELIVERY_NEXT_ACTION,
+            reason = cause,
+            guild_id = %guild_id,
+            channel_id = %channel_id,
+            "sticky re-post outcome uncertain; inspect the channel before resetting the sticky"
+        );
+        self.audit(
+            guild_id,
+            None,
+            StickyAuditAction::Run,
+            Some(channel_id),
+            StickyAuditOutcome::PostFailed,
+            Some(cause),
+        )
+        .await;
     }
 
     /// Append one `sticky.*` audit row; an audit write failure is logged but
@@ -2265,6 +2441,31 @@ pub(crate) fn feed_remove_option(interaction: &Interaction) -> Option<String> {
         })
 }
 
+/// `/feed-list`'s optional 1-based `page` option, decoded by name first: an
+/// omitted option means page 1, while a present option with a non-integer
+/// wire value is unusable and must refuse rather than silently list page 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FeedListPage {
+    Default,
+    Page(i64),
+    Invalid,
+}
+
+pub(crate) fn feed_list_page_request(interaction: &Interaction) -> FeedListPage {
+    let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
+        &interaction.data
+    else {
+        return FeedListPage::Default;
+    };
+    let Some(page) = data.options.iter().find(|option| option.name == "page") else {
+        return FeedListPage::Default;
+    };
+    match &page.value {
+        CommandOptionValue::Integer(value) => FeedListPage::Page(*value),
+        _ => FeedListPage::Invalid,
+    }
+}
+
 /// Shared sticky/feed/channel/leveling registrations over the narrowed boot
 /// gates; LFG is composed by `InteractionRuntime`. Tests that bypass
 /// `from_env`'s env reads use this same router, matching `from_env`'s
@@ -2323,6 +2524,17 @@ pub(crate) fn ephemeral(text: impl Into<String>) -> InteractionResponse {
             ..Default::default()
         }),
     }
+}
+
+/// Bot-authored interactions stay silent: guild presses carry the author on
+/// the member, DMs on the top-level user.
+fn author_is_bot(interaction: &Interaction) -> bool {
+    interaction.user.as_ref().is_some_and(|user| user.bot)
+        || interaction
+            .member
+            .as_ref()
+            .and_then(|member| member.user.as_ref())
+            .is_some_and(|user| user.bot)
 }
 
 /// Invoker id: guild member's user, else the DM user (legacy reads

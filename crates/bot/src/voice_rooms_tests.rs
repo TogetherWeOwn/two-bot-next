@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 use serde_json::json;
 use std::sync::atomic::AtomicUsize;
@@ -15,10 +17,16 @@ mod cold_authority;
 mod creation_receipt_acceptance;
 #[path = "voice_delete_guard_tests.rs"]
 mod delete_guards;
+#[path = "voice_disconnect_loud_acceptance_tests.rs"]
+mod disconnect_loud_acceptance_tests;
 #[path = "voice_disconnect_poison_acceptance_tests.rs"]
 mod drop_poison_acceptance_tests;
 #[path = "voice_empty_grace_override_tests.rs"]
 mod empty_grace_override;
+#[path = "event_voice_channels_acceptance_tests.rs"]
+mod event_voice_channels_acceptance;
+#[path = "event_voice_channels_regression_tests.rs"]
+mod event_voice_channels_regression;
 #[path = "voice_actor_fair_scheduling_acceptance_tests.rs"]
 mod fair_scheduling_acceptance;
 #[path = "voice_invite_override_tests.rs"]
@@ -43,6 +51,8 @@ mod name;
 mod name_filter_acceptance;
 #[path = "voice_name_rerender_tests.rs"]
 mod name_rerender;
+#[path = "voice_ownership_receipt_acceptance_tests.rs"]
+mod ownership_receipt_acceptance;
 #[path = "voice_private_runtime_tests.rs"]
 mod private;
 #[path = "voice_responder_admission_acceptance_tests.rs"]
@@ -55,6 +65,8 @@ mod snapshot_fence_acceptance;
 mod tracing_capture;
 #[path = "voice_votekick_ballot_truth_acceptance_tests.rs"]
 mod votekick_ballot_truth_acceptance;
+#[path = "voice_worker_reply_acceptance_tests.rs"]
+mod worker_reply_acceptance;
 
 const GUILD: u64 = 100;
 const CREATOR: u64 = 200;
@@ -174,6 +186,10 @@ struct Store {
     owner_revision: AtomicU64,
     prepare_errors: Mutex<VecDeque<StoreError>>,
     ownership_errors: Mutex<VecDeque<StoreError>>,
+    /// Times `update_ownership` yields before writing, consumed when the
+    /// write starts, so a test can prove an expired reply budget never
+    /// cancels an in-flight commit nobody is listening on.
+    update_ownership_yields: AtomicUsize,
     companions: Mutex<HashMap<(u64, u64), TextCompanion>>,
     persist_error: Option<StoreError>,
     access: Arc<Mutex<AccessControls>>,
@@ -237,6 +253,9 @@ struct Store {
     /// V4 audit rows appended so far, in append order.
     kick_audit: Mutex<Vec<KickAuditRow>>,
     kick_audit_errors: Mutex<VecDeque<StoreError>>,
+    /// Scripted live event-voice bindings for the guild repair; empty by
+    /// default, so the repair is a no-op unless the test seeds a binding.
+    ev_bindings: Mutex<Vec<EventVoiceBinding>>,
 }
 
 impl Store {
@@ -253,6 +272,7 @@ impl Store {
             owner_revision: AtomicU64::new(0),
             prepare_errors: Mutex::new(VecDeque::new()),
             ownership_errors: Mutex::new(VecDeque::new()),
+            update_ownership_yields: AtomicUsize::new(0),
             companions: Mutex::new(HashMap::new()),
             persist_error: None,
             access: Arc::new(Mutex::new(AccessControls::default())),
@@ -293,6 +313,7 @@ impl Store {
             save_custom_name_errors: Mutex::new(VecDeque::new()),
             kick_audit: Mutex::new(Vec::new()),
             kick_audit_errors: Mutex::new(VecDeque::new()),
+            ev_bindings: Mutex::new(Vec::new()),
         }
     }
 }
@@ -433,6 +454,10 @@ impl RoomPersistence for Store {
         Ok(intent.clone())
     }
     async fn update_ownership(&self, room: &VoiceRoom, revision: &str) -> Result<bool, StoreError> {
+        if self.update_ownership_yields.load(Ordering::Relaxed) > 0 {
+            self.update_ownership_yields.fetch_sub(1, Ordering::Relaxed);
+            tokio::task::yield_now().await;
+        }
         self.trace.lock().unwrap().push(format!(
             "update_ownership:{}:{}",
             room.channel_id, room.owner_id
@@ -506,6 +531,50 @@ impl RoomPersistence for Store {
         self.owner_intents.lock().unwrap().remove(&channel);
         self.owner_pending.lock().unwrap().remove(&channel);
         Ok(())
+    }
+    async fn record_event_voice_join(&self, channel: u64, member: u64) -> Result<(), StoreError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("evjoin:{channel}:{member}"));
+        Ok(())
+    }
+    async fn record_event_voice_leave(&self, channel: u64, member: u64) -> Result<(), StoreError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("evleave:{channel}:{member}"));
+        Ok(())
+    }
+    async fn event_voice_guild_bindings(
+        &self,
+        _: u64,
+    ) -> Result<Vec<EventVoiceBinding>, StoreError> {
+        Ok(self.ev_bindings.lock().unwrap().clone())
+    }
+    async fn flush_event_voice_presence(
+        &self,
+        event_id: &str,
+        _: OffsetDateTime,
+        occupants: &[u64],
+    ) -> Result<u64, StoreError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("evrepair_flush:{event_id}:{}", occupants.len()));
+        Ok(0)
+    }
+    async fn close_event_voice_spans_absent(
+        &self,
+        event_id: &str,
+        _: OffsetDateTime,
+        present: &[u64],
+    ) -> Result<u64, StoreError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("evrepair_close:{event_id}:{}", present.len()));
+        Ok(0)
     }
     async fn claim_create(
         &self,
@@ -2648,6 +2717,131 @@ async fn transfer_hands_room_to_occupant_and_remembers_creator() {
         .lock()
         .unwrap()
         .contains(&"update_ownership:500:301".to_owned()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn suspended_room_transfer_reports_finalizing_and_keeps_the_handoff_queued() {
+    let (live, store, http, _) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // Suspend the room so the queued handoff is never due: the staged reply
+    // must answer from the pump deadline, not hang on the queue.
+    assert!(worker.queue.suspend(GUILD, 500));
+    let (reply, inbox) = oneshot::channel();
+    apply_command(
+        &mut worker,
+        ActorCommand::Ownership {
+            actor_id: MEMBER,
+            is_admin: false,
+            command: OwnershipCommand::Transfer { target_id: 301 },
+            reply,
+        },
+        0,
+    );
+    worker.drive_staged_ownership(0).await;
+    assert_eq!(inbox.await.unwrap(), OWNERSHIP_FINALIZING);
+    assert!(
+        worker.ownership_queued.contains(&500),
+        "an unconfirmed handoff stays queued for retry"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn held_owner_grant_reports_finalizing_before_the_write_finishes() {
+    let (live, store, mut http, trace) = owned_room();
+    let gate = Arc::new(OverwriteGate::default());
+    http.overwrites_gate = Some(gate.clone());
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let (reply, inbox) = oneshot::channel();
+    apply_command(
+        &mut worker,
+        ActorCommand::Ownership {
+            actor_id: MEMBER,
+            is_admin: false,
+            command: OwnershipCommand::Transfer { target_id: 301 },
+            reply,
+        },
+        0,
+    );
+    let observe = async {
+        gate.sent.notified().await;
+        let response = tokio::time::timeout(Duration::from_millis(2_000), inbox).await;
+        // Release even on failure so the queued action can finish, rather
+        // than hiding a dropped in-flight dispatch behind test shutdown.
+        gate.release.notify_one();
+        let text = response
+            .expect("reply before the held grant finishes")
+            .unwrap();
+        assert!(
+            text.contains("Recorded") && text.contains("finalized"),
+            "{text}"
+        );
+        assert!(!text.contains("Transferred"), "{text}");
+        assert!(
+            !trace
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call.starts_with("update_ownership:")),
+            "the reply must precede the held grant's durable completion"
+        );
+    };
+    tokio::join!(worker.drive_staged_ownership(0), observe);
+    assert!(
+        trace
+            .lock()
+            .unwrap()
+            .contains(&"update_ownership:500:301".to_owned()),
+        "the in-flight handoff must finish after its reply, not be cancelled"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn held_owner_grant_with_slow_store_still_commits_after_finalizing() {
+    let (live, store, mut http, trace) = owned_room();
+    let gate = Arc::new(OverwriteGate::default());
+    http.overwrites_gate = Some(gate.clone());
+    // A real Postgres write pends on its first poll: the expired reply
+    // budget must not cancel the in-flight commit once nobody listens.
+    store.update_ownership_yields.store(1, Ordering::Relaxed);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let (reply, inbox) = oneshot::channel();
+    apply_command(
+        &mut worker,
+        ActorCommand::Ownership {
+            actor_id: MEMBER,
+            is_admin: false,
+            command: OwnershipCommand::Transfer { target_id: 301 },
+            reply,
+        },
+        0,
+    );
+    let observe = async {
+        gate.sent.notified().await;
+        let response = tokio::time::timeout(Duration::from_millis(2_000), inbox).await;
+        // Release even on failure so the queued action can finish, rather
+        // than hiding a dropped in-flight dispatch behind test shutdown.
+        gate.release.notify_one();
+        let text = response
+            .expect("reply before the held grant finishes")
+            .unwrap();
+        assert!(
+            text.contains("Recorded") && text.contains("finalized"),
+            "{text}"
+        );
+        assert!(!text.contains("Transferred"), "{text}");
+    };
+    tokio::join!(worker.drive_staged_ownership(0), observe);
+    assert!(
+        trace
+            .lock()
+            .unwrap()
+            .contains(&"update_ownership:500:301".to_owned()),
+        "a Pending-first store write must run to completion after its reply, not be cancelled by the expired budget"
+    );
+    assert!(
+        !worker.ownership_queued.contains(&500),
+        "the committed handoff leaves the retry queue instead of failing back into it"
+    );
 }
 
 fn owner_overwrite(member: u64) -> PermissionOverwrite {
@@ -4985,9 +5179,12 @@ async fn creator_join_moves_without_waiting_for_the_actor_tick() {
         tokio::task::yield_now().await;
     }
     assert_eq!(received.elapsed(), Duration::ZERO);
+    // The presence hook records each join ahead of room handling.
     assert_eq!(
         *trace.lock().unwrap(),
         [
+            "evjoin:200:300",
+            "evjoin:200:301",
             "create",
             "persist:500",
             "move:300:500",
@@ -5028,9 +5225,18 @@ async fn runtime_actor_creates_persists_and_moves_room() {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    // The join is recorded twice: once by the buffered transition, once by
+    // the bootstrap occupant flush (the store join is idempotent, so the
+    // second write is a no-op in production).
     assert_eq!(
         *trace.lock().unwrap(),
-        ["create", "persist:500", "move:300:500"]
+        [
+            "evjoin:200:300",
+            "evjoin:200:300",
+            "create",
+            "persist:500",
+            "move:300:500"
+        ]
     );
 }
 
@@ -7414,16 +7620,23 @@ fn plan_creator(plan: TextChannelsPlan) -> CreatorChannel {
 }
 
 #[test]
-fn decide_text_channels_defaults_to_on_and_keeps_unset_fields() {
+fn decide_text_channels_absent_toggle_keeps_the_stored_value() {
     let base = CreatorChannel::new(GUILD, CREATOR);
     let creator = plan_creator(decide_text_channels(
         Some(base.clone()),
         &request(None, None, None),
     ));
-    assert!(creator.text_channels, "omitted toggle turns companions on");
+    assert!(
+        !creator.text_channels,
+        "absent toggle preserves stored off, never enables"
+    );
     assert_eq!(creator.text_channel_name, None);
     assert_eq!(creator.text_viewer_role_id, None);
     assert_eq!(creator.name_template, base.name_template);
+    let mut on = CreatorChannel::new(GUILD, CREATOR);
+    on.text_channels = true;
+    let kept = plan_creator(decide_text_channels(Some(on), &request(None, None, None)));
+    assert!(kept.text_channels, "absent toggle preserves stored on");
 }
 
 #[test]
@@ -7546,9 +7759,20 @@ async fn handle_textchannels_refuses_without_manage_channels() {
 }
 
 #[tokio::test]
-async fn handle_textchannels_saves_settings_for_a_creator_channel() {
+async fn handle_textchannels_preserves_stored_toggle_on_rename_only() {
     let trace = Trace::default();
-    let runtime = test_runtime(trace.clone());
+    let runtime = VoiceRuntime::new(
+        {
+            let trace = trace.clone();
+            move || {
+                let store = Store::new(trace.clone());
+                store.creators.lock().unwrap()[0].text_channels = true;
+                (store, Http::new(trace.clone()))
+            }
+        },
+        Duration::from_millis(10),
+        true,
+    );
     let interaction = textchannels_interaction(
         vec![
             typed_option("channel", CommandOptionValue::Channel(Id::new(CREATOR))),
@@ -7807,15 +8031,14 @@ fn decide_position_refuses_empty_and_bad_numbers() {
 }
 
 #[test]
-fn decide_group_defaults_to_on() {
-    let on = match decide_group(
+fn decide_group_refuses_without_a_toggle() {
+    let GroupPlan::Refuse { message } = decide_group(
         Some(CreatorChannel::new(GUILD, CREATOR)),
         &GroupRequest { enabled: None },
-    ) {
-        GroupPlan::Update(creator) => creator,
-        GroupPlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    ) else {
+        panic!("absent toggle refuses, never enables by default");
     };
-    assert!(on.group_by_category);
+    assert!(message.contains("group"), "{message}");
     let off = match decide_group(
         Some(CreatorChannel::new(GUILD, CREATOR)),
         &GroupRequest {
@@ -7985,15 +8208,14 @@ fn decide_default_limit_sets_and_clears() {
 }
 
 #[test]
-fn decide_always_private_defaults_to_on() {
-    let on = match decide_always_private(
+fn decide_always_private_refuses_without_a_toggle() {
+    let AlwaysPrivatePlan::Refuse { message } = decide_always_private(
         Some(CreatorChannel::new(GUILD, CREATOR)),
         &AlwaysPrivateRequest { enabled: None },
-    ) {
-        AlwaysPrivatePlan::Update(creator) => creator,
-        AlwaysPrivatePlan::Refuse { message } => panic!("unexpected refusal: {message}"),
+    ) else {
+        panic!("absent toggle refuses, never enables by default");
     };
-    assert!(on.private_default);
+    assert!(message.contains("private"), "{message}");
     let off = match decide_always_private(
         Some(CreatorChannel::new(GUILD, CREATOR)),
         &AlwaysPrivateRequest {
@@ -8234,7 +8456,7 @@ async fn handle_defaultlimit_saves_the_limit() {
 }
 
 #[tokio::test]
-async fn handle_alwaysprivate_saves_the_default() {
+async fn handle_alwaysprivate_refuses_without_enabled() {
     let trace = Trace::default();
     let runtime = test_runtime(trace.clone());
     let interaction = v8_interaction(
@@ -8247,13 +8469,18 @@ async fn handle_alwaysprivate_saves_the_default() {
     let (owned, response) = handle_capture(&runtime, &interaction).await;
     assert!(owned);
     assert!(
-        response_text(response.as_ref().expect("reply")).contains("private"),
-        "alwaysprivate defaults on and reports it"
+        response_text(response.as_ref().expect("reply"))
+            .contains("Choose whether new rooms start private, then try again."),
+        "alwaysprivate refuses an absent toggle instead of defaulting on"
     );
-    assert!(trace
-        .lock()
-        .unwrap()
-        .contains(&format!("add_creator:{CREATOR}")));
+    assert!(
+        !trace
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.starts_with("add_creator")),
+        "a refused toggle writes nothing"
+    );
 }
 
 #[test]
@@ -8581,6 +8808,86 @@ async fn runtime_worker_status_reports_live_actor() {
         .expect("live actor");
     assert_eq!(status.tracked_rooms, 0);
     assert!(!status.halted);
+}
+
+/// Two-second ceiling shared by the sibling worker-wait regression tests
+/// (`/name`, join-request decisions, `/setup` status): mirrors the protected
+/// worker-reply suite's guard so an unbounded production future fails fast
+/// instead of hanging the test.
+const SIBLING_ACK_BOUND: Duration = Duration::from_millis(2_000);
+const SIBLING_TEST_GUARD: Duration = Duration::from_millis(2_100);
+
+/// A runtime whose guild actor never answers: the test holds the inbox
+/// receiver without polling it, so every worker wait must time out.
+fn stalled_worker_runtime() -> (
+    VoiceRuntime<Store, Http>,
+    mpsc::UnboundedReceiver<ActorCommand>,
+) {
+    let runtime = test_runtime(Trace::default());
+    let live = LiveGuild::new(GUILD);
+    live.publish(command_snapshot());
+    let (tx, rx) = mpsc::unbounded_channel();
+    runtime
+        .actors
+        .lock()
+        .unwrap()
+        .insert(GUILD, GuildActor { live, tx });
+    (runtime, rx)
+}
+
+async fn bounded_sibling_wait<T>(future: impl Future<Output = T>) -> T {
+    let start = tokio::time::Instant::now();
+    let result = tokio::time::timeout(SIBLING_TEST_GUARD, future)
+        .await
+        .expect("sibling worker wait must return within the two-second /limit budget");
+    assert!(
+        start.elapsed() <= SIBLING_ACK_BOUND,
+        "sibling worker wait exceeded its documented bound"
+    );
+    result
+}
+
+fn assert_sibling_worker_lost_reply(response: &InteractionResponse) {
+    let text = response_text(response);
+    let lower = text.to_lowercase();
+    assert!(
+        !lower.contains("warm") && !lower.contains("syncing"),
+        "a known worker lost its reply, not its cache: {text}"
+    );
+    assert!(
+        [
+            "timed out",
+            "unavailable",
+            "not responding",
+            "couldn't",
+            "stopped"
+        ]
+        .iter()
+        .any(|reason| lower.contains(reason)),
+        "state the worker failure honestly: {text}"
+    );
+    assert!(
+        ["try again", "retry", "check", "wait"]
+            .iter()
+            .any(|next| lower.contains(next)),
+        "worker failure needs a next action: {text}"
+    );
+    assert_eq!(
+        response.kind,
+        InteractionResponseType::ChannelMessageWithSource
+    );
+    assert_eq!(
+        response.data.as_ref().and_then(|data| data.flags),
+        Some(MessageFlags::EPHEMERAL)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn status_wait_is_bounded_with_a_live_unanswered_inbox() {
+    let (runtime, _rx) = stalled_worker_runtime();
+    assert!(bounded_sibling_wait(runtime.worker_status(GUILD))
+        .await
+        .is_none());
 }
 
 struct Replies {
@@ -16072,4 +16379,49 @@ async fn global_429_requeues_and_resumes_without_losing_the_move() {
     dispatch(&mut worker, 2_000).await;
     assert_eq!(worker.queue.pending_counts(GUILD), (0, 0));
     assert_eq!(worker.queue.oldest_pending_age(GUILD), None);
+}
+
+#[test]
+fn voice_claims_custom_id_matches_sink_shapes() {
+    use two_bot_core::voice_custom_id::{join_custom_id, name_modal_custom_id};
+    use two_bot_core::voice_private::JoinDecision;
+
+    let room = 777_000_111_222_333_444u64;
+    let request = 888_000_111_222_333_444u64;
+    let bare = join_custom_id(JoinDecision::Approve, room, request);
+    // Production runtime shape: codec core plus the 32-hex worker epoch.
+    let runtime = format!("{bare}:0123456789abcdef0123456789abcdef");
+    assert!(voice_claims_custom_id(&bare), "bare join button");
+    assert!(
+        voice_claims_custom_id(&runtime),
+        "epoch-suffixed join button"
+    );
+    assert!(
+        voice_claims_custom_id(&name_modal_custom_id(room)),
+        "name modal"
+    );
+    assert!(
+        voice_claims_custom_id("votekick:7000000111222333444:yes"),
+        "ballot yes"
+    );
+    assert!(
+        voice_claims_custom_id("votekick:7000000111222333444:no"),
+        "ballot no"
+    );
+    let short_epoch = format!("{bare}:0123456789abcdef0123456789abcde");
+    let upper_epoch = format!("{bare}:0123456789ABCDEF0123456789ABCDEF");
+    let nonhex_epoch = format!("{bare}:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz");
+    for unowned in [
+        "two:stale-widget:deadbeef",
+        "two:voice:join-approve:notanid:7",
+        "two:voice:join-approve:500",
+        short_epoch.as_str(),
+        upper_epoch.as_str(),
+        nonhex_epoch.as_str(),
+        "votekick:7000000111222333444:maybe",
+        "votekick:notanid:yes",
+        "votekick:7000000111222333444",
+    ] {
+        assert!(!voice_claims_custom_id(unowned), "unowned: {unowned}");
+    }
 }
