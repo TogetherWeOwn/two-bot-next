@@ -2600,6 +2600,16 @@ impl ActionExecutor {
         channel_id: &str,
         count: u64,
     ) -> Result<Vec<Id<MessageMarker>>, DiscordError> {
+        Ok(self.sample_purge_messages(channel_id, count).await?.ids)
+    }
+
+    /// The same newest-page sample as execution, retaining only bounded counts
+    /// and validated IDs for a private preview. Never carries message content.
+    pub(crate) async fn sample_purge_messages(
+        &self,
+        channel_id: &str,
+        count: u64,
+    ) -> Result<PurgeSample, DiscordError> {
         if !(1..=100).contains(&count) {
             return Err(DiscordError::Rejected(format!(
                 "purge out of range: {count}"
@@ -2631,11 +2641,33 @@ impl ActionExecutor {
         } else {
             None
         };
-        Ok(rows
-            .into_iter()
-            .filter(|(_, row)| !purge_protected(row, own_id.as_deref()))
-            .map(|(id, _)| id)
-            .collect())
+        Ok(PurgeSample {
+            listed: rows.len(),
+            pinned: rows
+                .iter()
+                .filter(|(_, row)| row["pinned"].as_bool() == Some(true))
+                .count(),
+            own_bot: rows
+                .iter()
+                .filter(|(_, row)| {
+                    own_id
+                        .as_deref()
+                        .is_some_and(|own| row["author"]["id"].as_str() == Some(own))
+                })
+                .count(),
+            system: rows
+                .iter()
+                .filter(|(_, row)| {
+                    row.get("type")
+                        .is_some_and(|kind| !matches!(kind.as_u64(), Some(0 | 19)))
+                })
+                .count(),
+            ids: rows
+                .into_iter()
+                .filter(|(_, row)| !purge_protected(row, own_id.as_deref()))
+                .map(|(id, _)| id)
+                .collect(),
+        })
     }
 
     /// Deletion phase. Messages Discord still bulk-deletes go in one bulk call;
@@ -3825,7 +3857,7 @@ impl ActionExecutor {
     }
 
     /// Complete an acknowledged interaction without mention neutralization.
-    /// Only for ephemeral management views (saved-response inspection) whose
+    /// Only for ephemeral management views (saved responses or lockdown reasons) whose
     /// mention safety comes from this edit's explicit empty `allowed_mentions`
     /// — the admin must see the saved text exactly as stored. Every other
     /// completion must keep using [`Self::edit_interaction_response`].
@@ -4107,6 +4139,14 @@ impl IntoOther for DiscordError {
             other => other,
         }
     }
+}
+
+pub(crate) struct PurgeSample {
+    pub ids: Vec<Id<MessageMarker>>,
+    pub listed: usize,
+    pub pinned: usize,
+    pub own_bot: usize,
+    pub system: usize,
 }
 
 /// Messages `/purge` leaves alone: pinned ones, and this bot's own posts.

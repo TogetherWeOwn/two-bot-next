@@ -115,13 +115,13 @@ const HELP_GROUPS: &[HelpGroup] = &[
     HelpGroup {
         title: "Message cleanup",
         requires: Some("Manage Messages"),
-        commands: &["purge"],
+        commands: &["purge", "purge-preview"],
         anchor: None,
     },
     HelpGroup {
         title: "Channel slowmode and locks",
         requires: Some("Manage Channels"),
-        commands: &["slowmode", "lockdown", "unlock"],
+        commands: &["slowmode", "lockdown", "unlock", "channel-inspect"],
         anchor: None,
     },
     HelpGroup {

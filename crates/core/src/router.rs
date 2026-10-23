@@ -132,6 +132,8 @@ pub enum HandlerId {
     FeedRemove,
     FeedList,
     Moderation(ModerationAction),
+    PurgePreview,
+    ChannelInspect,
 }
 
 /// Which feature slice owns a routed component / modal submit (parity §2).
@@ -268,6 +270,8 @@ pub enum RouterRefusal {
     ManageEventsRequired,
     GuildRestricted,
     ModerationPermission(ModerationAction),
+    PurgePreviewPermission,
+    ChannelInspectPermission,
 }
 
 impl RouterRefusal {
@@ -283,6 +287,8 @@ impl RouterRefusal {
             Self::ManageServerRequired => MANAGE_SERVER_REQUIRED.to_owned(),
             Self::ManageEventsRequired => MANAGE_EVENTS_REQUIRED.to_owned(),
             Self::GuildRestricted => GUILD_RESTRICTED_REPLY.to_owned(),
+            Self::PurgePreviewPermission => "You need the Manage Messages permission to use /purge-preview. Ask a server moderator or admin to grant it.".to_owned(),
+            Self::ChannelInspectPermission => "You need the Manage Channels permission to use /channel-inspect. Ask a server moderator or admin to grant it.".to_owned(),
             // Names the Discord permission (Ban Members, …) and the slash
             // command, not the internal `moderation.ban` action id.
             Self::ModerationPermission(action) => {
@@ -549,10 +555,26 @@ impl InteractionRouter {
         actor_permissions: Option<u64>,
     ) -> Option<SlashOutcome> {
         // Moderation carries its own guild fence (refusal, not silence).
-        if let Some(action) = ModerationAction::ALL
-            .iter()
-            .find(|a| a.command_name() == name)
-        {
+        let moderation = match name {
+            "purge-preview" => Some((
+                HandlerId::PurgePreview,
+                RouterRefusal::PurgePreviewPermission,
+            )),
+            "channel-inspect" => Some((
+                HandlerId::ChannelInspect,
+                RouterRefusal::ChannelInspectPermission,
+            )),
+            _ => ModerationAction::ALL
+                .iter()
+                .find(|a| a.command_name() == name)
+                .map(|action| {
+                    (
+                        HandlerId::Moderation(*action),
+                        RouterRefusal::ModerationPermission(*action),
+                    )
+                }),
+        };
+        if let Some((handler, permission_refusal)) = moderation {
             if !self.guild_ok(guild_id) {
                 return Some(SlashOutcome::Refuse {
                     refusal: RouterRefusal::GuildRestricted,
@@ -565,12 +587,10 @@ impl InteractionRouter {
             }
             if !Self::permission_allowed(name, guild_id, actor_permissions) {
                 return Some(SlashOutcome::Refuse {
-                    refusal: RouterRefusal::ModerationPermission(*action),
+                    refusal: permission_refusal,
                 });
             }
-            return Some(SlashOutcome::Handled {
-                handler: HandlerId::Moderation(*action),
-            });
+            return Some(SlashOutcome::Handled { handler });
         }
 
         /// Which feature gate a builtin row needs.

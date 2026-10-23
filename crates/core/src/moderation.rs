@@ -206,6 +206,23 @@ pub fn moderation_commands() -> Vec<CommandDefinition> {
         CommandDefinition::new("unlock", "Allow @everyone to send messages")
             .permissions(PERM_MANAGE_CHANNELS)
             .options(vec![CommandOption::reason()]),
+        CommandDefinition::new(
+            "purge-preview",
+            "Privately preview a purge without deleting messages",
+        )
+        .permissions(PERM_MANAGE_MESSAGES)
+        .options(vec![CommandOption::new(
+            "count",
+            "Newest messages to sample (1-100)",
+            CommandOptionType::Integer,
+        )
+        .required()
+        .int_range(1, 100)]),
+        CommandDefinition::new(
+            "channel-inspect",
+            "Privately inspect saved lockdown and live slowmode",
+        )
+        .permissions(PERM_MANAGE_CHANNELS),
     ]
 }
 
