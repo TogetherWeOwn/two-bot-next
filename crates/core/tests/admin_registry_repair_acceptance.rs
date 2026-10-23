@@ -994,6 +994,316 @@ mod database {
         plain_text_holder_type_controls("store", 457).await;
     }
 
+    async fn holder_collation_catalog(pool: &PgPool) -> Value {
+        sqlx::query_scalar(
+            "SELECT jsonb_build_object(
+             'holder_types_and_registry', $1::jsonb,
+             'collations', (SELECT jsonb_agg(jsonb_build_object(
+                 'namespace', n.nspname, 'catalog', to_jsonb(c)) ORDER BY c.oid)
+                 FROM pg_collation c JOIN pg_namespace n ON n.oid=c.collnamespace
+                 WHERE c.collnamespace='public'::regnamespace OR c.oid IN (
+                     SELECT a.attcollation FROM pg_attribute a
+                     WHERE a.attrelid='admin_api_tokens'::regclass
+                       AND a.attnum>0 AND NOT a.attisdropped)))",
+        )
+        .bind(holder_type_catalog(pool).await)
+        .fetch_one(pool)
+        .await
+        .expect("snapshot collation definitions, holder attributes, rows' schema and history")
+    }
+
+    async fn install_case_insensitive_collation(pool: &PgPool) -> Result<(), &'static str> {
+        // This is an owned disposable database, never a live registry. Missing
+        // ICU/CREATE COLLATION permission is fixture infrastructure failure,
+        // not evidence that the migration rejected incompatible authority.
+        sqlx::query("CREATE COLLATION fixture_holder_ci (provider=icu, locale='und-u-ks-level2', deterministic=false)")
+            .execute(pool).await.map_err(|_| "INFRA: disposable PostgreSQL must support ICU collation fixtures; do not add grants or change the host")?;
+        let semantics: (bool, bool, bool, bool) = sqlx::query_as(
+            "SELECT c.collprovider='i', NOT c.collisdeterministic,
+             'HUMAN'::text COLLATE fixture_holder_ci = 'human'::text COLLATE fixture_holder_ci,
+             convert_to('HUMAN', 'UTF8') <> convert_to('human', 'UTF8')
+             FROM pg_collation c WHERE c.oid='fixture_holder_ci'::regcollation",
+        )
+        .fetch_one(pool)
+        .await
+        .map_err(|_| "INFRA: cannot verify actual ICU metadata and case-insensitive equality")?;
+        if semantics != (true, true, true, true) {
+            return Err("INFRA: fixture requires genuinely nondeterministic equality across different bytes");
+        }
+        Ok(())
+    }
+
+    async fn collation_insert_probe(
+        pool: &PgPool,
+        kind: &str,
+        scopes: &[&str],
+    ) -> Result<Value, (String, Option<String>)> {
+        // A distinct, synthetic token and hash avoid duplicate-key interference.
+        // Roll back each probe, leaving preservation/control rows untouched.
+        let token = "adm_c011a71000000001";
+        let hash = hex::encode(sha2::Sha256::digest(b"synthetic-collation-probe-only"));
+        let mut tx = pool.begin().await.expect("begin isolated collation probe");
+        let result = sqlx::query_scalar(
+            "INSERT INTO admin_api_tokens
+             (token_id, secret_hash, scopes, guild_ids, holder_id, holder_kind, label, issued_by, issued_at, expires_at)
+             VALUES ($1, $2, $3, '{1}', 'fixture-collation-principal', $4, 'collation-fixture', 'fixture-operator', $5::timestamptz, $6::timestamptz)
+             RETURNING to_jsonb(admin_api_tokens)",
+        )
+        .bind(token)
+        .bind(hash)
+        .bind(scopes)
+        .bind(kind)
+        .bind(ISSUED)
+        .bind(NINETY_DAYS)
+        .fetch_one(&mut *tx)
+        .await;
+        tx.rollback()
+            .await
+            .expect("roll back owned collation probe");
+        result.map_err(|error| {
+            let database = error.as_database_error();
+            (
+                database
+                    .and_then(|e| e.code())
+                    .map(|c| c.into_owned())
+                    .unwrap_or_else(|| "non-database failure".to_owned()),
+                database.and_then(|e| e.constraint()).map(str::to_owned),
+            )
+        })
+    }
+
+    async fn nondeterministic_holder_collations_refuse_atomically(chain: &str, shipped: i64) {
+        let Some(url) = bootstrap() else { return };
+        let (prefix, latest) = pre_repair_migrators(chain, shipped).await;
+        let mut failures = Vec::new();
+        for (name, has_id, ci_id, ci_kind) in [
+            ("kind only, id absent", false, false, true),
+            ("canonical id, case-insensitive kind", true, false, true),
+            ("case-insensitive id, canonical kind", true, true, false),
+            ("both case-insensitive", true, true, true),
+        ] {
+            for populated in [false, true] {
+                let db = TestDatabase::create(&url, &prefix)
+                    .await
+                    .expect("create pre-repair collation fixture");
+                if let Err(limitation) = install_case_insensitive_collation(db.pool()).await {
+                    db.close()
+                        .await
+                        .expect("drop fixture after ICU infrastructure failure");
+                    panic!("{limitation}");
+                }
+                for (column, present, incompatible) in
+                    [("holder_id", has_id, ci_id), ("holder_kind", true, ci_kind)]
+                {
+                    if present {
+                        let collation = if incompatible {
+                            "fixture_holder_ci"
+                        } else {
+                            "pg_catalog.\"default\""
+                        };
+                        let nullability = if populated { "NOT NULL" } else { "" };
+                        sqlx::query(sqlx::AssertSqlSafe(format!(
+                            "ALTER TABLE admin_api_tokens ADD COLUMN {column} pg_catalog.text COLLATE {collation} {nullability}"
+                        ))).execute(db.pool()).await.expect("install exact TEXT with explicit fixture collation");
+                    }
+                }
+                let identities: Vec<(String, bool, bool, bool)> = sqlx::query_as(
+                    "SELECT a.attname::text, a.atttypid='pg_catalog.text'::regtype AND a.atttypmod=-1,
+                     a.attcollation='fixture_holder_ci'::regcollation,
+                     a.attcollation='pg_catalog.\"default\"'::regcollation
+                     FROM pg_attribute a WHERE a.attrelid='admin_api_tokens'::regclass
+                       AND a.attname IN ('holder_id', 'holder_kind') ORDER BY a.attname",
+                ).fetch_all(db.pool()).await.expect("verify exact TEXT and actual column collation OIDs");
+                let mut expected = Vec::new();
+                if has_id {
+                    expected.push(("holder_id".to_owned(), true, ci_id, !ci_id));
+                }
+                expected.push(("holder_kind".to_owned(), true, ci_kind, !ci_kind));
+                assert_eq!(
+                    identities, expected,
+                    "fixture must isolate collation from type/domain/default mismatches"
+                );
+                if populated {
+                    let mut existing = row();
+                    existing["holder_kind"] = json!("human");
+                    existing["scopes"] = json!(["admin"]);
+                    insert(db.pool(), &existing)
+                        .await
+                        .expect("insert valid available holder fields before repair");
+                }
+                let before_rows = registry_rows(db.pool()).await;
+                let before_catalog = holder_collation_catalog(db.pool()).await;
+                let result = latest.run(db.pool()).await;
+                // Capture everything before a diagnostic INSERT or teardown.
+                let after_rows = registry_rows(db.pool()).await;
+                let after_catalog = holder_collation_catalog(db.pool()).await;
+                let (intended_refusal, migration_state) = match &result {
+                    Err(sqlx::migrate::MigrateError::ExecuteMigration(error, _)) => {
+                        let database = error.as_database_error();
+                        let code = database
+                            .and_then(|e| e.code())
+                            .map(|c| c.into_owned())
+                            .unwrap_or_default();
+                        let meaningful = database.is_some_and(|e| {
+                            let message = e.message().to_ascii_lowercase();
+                            message.contains("collation") || message.contains("holder")
+                        });
+                        (
+                            matches!(code.as_str(), "P0001" | "23514") && meaningful,
+                            code,
+                        )
+                    }
+                    Err(_) => (false, "migration infrastructure/history failure".to_owned()),
+                    Ok(()) => (false, "ACCEPTED incompatible collation".to_owned()),
+                };
+                // The essential witness keeps holder_id canonical: PG17 cannot
+                // hide kind equality behind nondeterministic-regex SQLSTATE 0A000.
+                let diagnostic = if result.is_ok() {
+                    match collation_insert_probe(db.pool(), "HUMAN", &["admin"]).await {
+                        Ok(actual) => {
+                            let preserved = actual["holder_id"] == json!("fixture-collation-principal")
+                                && actual["holder_kind"] == json!("HUMAN")
+                                && actual["scopes"] == json!(["admin"]);
+                            format!(
+                                "{}: holder_id={}, holder_kind={}, scopes={}",
+                                if preserved { "ACCEPTED uppercase admin" } else { "INSERT rewrote authority; not the unchanged-uppercase witness" },
+                                actual["holder_id"], actual["holder_kind"], actual["scopes"]
+                            )
+                        },
+                        Err((state, constraint)) => format!("INSERT SQLSTATE={state}, constraint={constraint:?}; not an accepted bypass"),
+                    }
+                } else {
+                    "not run: migration did not succeed".to_owned()
+                };
+                db.close().await.expect("drop owned collation fixture");
+                if !intended_refusal || before_rows != after_rows || before_catalog != after_catalog
+                {
+                    failures.push(format!(
+                        "{name}, populated={populated}: intended_refusal={intended_refusal}, migration={migration_state}, rows_preserved={}, attributes_collations_constraints_indexes_history_preserved={}, diagnostic={diagnostic}",
+                        before_rows == after_rows, before_catalog == after_catalog
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{chain}: nondeterministic holder collation must refuse atomically without rewriting collations/types/defaults/nullability, inventing holders, changing rows or recording repair history; unrelated SQLSTATEs are not intended refusals: {failures:#?}");
+    }
+
+    async fn canonical_holder_collation_controls(chain: &str, shipped: i64) {
+        let Some(url) = bootstrap() else { return };
+        let (prefix, latest) = pre_repair_migrators(chain, shipped).await;
+        let mut failures = Vec::new();
+        // Absent holders can upgrade only on an empty registry. Populated rows
+        // must already identify both holders; missing-authority refusal is kept.
+        for (name, collation, populated) in [
+            ("absent holders", None, false),
+            ("default TEXT empty", Some("pg_catalog.\"default\""), false),
+            (
+                "default TEXT populated",
+                Some("pg_catalog.\"default\""),
+                true,
+            ),
+            ("deterministic C empty", Some("pg_catalog.\"C\""), false),
+            ("deterministic C populated", Some("pg_catalog.\"C\""), true),
+        ] {
+            let db = TestDatabase::create(&url, &prefix)
+                .await
+                .expect("create canonical collation control");
+            if let Some(collation) = collation {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "ALTER TABLE admin_api_tokens ADD COLUMN holder_id pg_catalog.text COLLATE {collation}, ADD COLUMN holder_kind pg_catalog.text COLLATE {collation}"
+                ))).execute(db.pool()).await.expect("install canonical deterministic holders");
+            }
+            if populated {
+                for (token, kind, scopes) in [
+                    (TOKEN, "human", json!(["admin"])),
+                    (
+                        "adm_fedcba9876543210",
+                        "ai_agent",
+                        json!(["read", "moderate"]),
+                    ),
+                ] {
+                    let mut existing = row();
+                    existing["token_id"] = json!(token);
+                    existing["secret_hash"] =
+                        json!(hex::encode(sha2::Sha256::digest(token.as_bytes())));
+                    existing["holder_kind"] = json!(kind);
+                    existing["scopes"] = scopes;
+                    insert(db.pool(), &existing)
+                        .await
+                        .expect("insert explicit human admin and AI non-admin controls");
+                }
+            }
+            let before_rows = registry_rows(db.pool()).await;
+            let result = latest.run(db.pool()).await;
+            let after_rows = registry_rows(db.pool()).await;
+            let deterministic: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_attribute a JOIN pg_collation c ON c.oid=a.attcollation
+                 WHERE a.attrelid='admin_api_tokens'::regclass AND a.attname IN ('holder_id', 'holder_kind')
+                   AND a.atttypid='pg_catalog.text'::regtype AND a.atttypmod=-1 AND c.collisdeterministic",
+            ).fetch_one(db.pool()).await.expect("verify upgraded holders use deterministic TEXT");
+            let mut probes = Vec::new();
+            if result.is_ok() {
+                for (kind, scopes, valid) in [
+                    ("human", vec!["admin"], true),
+                    ("ai_agent", vec!["read", "moderate"], true),
+                    ("HUMAN", vec!["admin"], false),
+                    ("Human", vec!["admin"], false),
+                    ("AI_AGENT", vec!["read"], false),
+                    ("robot", vec!["read"], false),
+                ] {
+                    let probe = collation_insert_probe(db.pool(), kind, &scopes).await;
+                    let correct = if valid {
+                        probe.as_ref().is_ok_and(|actual| {
+                            actual["holder_id"] == json!("fixture-collation-principal")
+                                && actual["holder_kind"] == json!(kind)
+                                && actual["scopes"] == json!(scopes)
+                        })
+                    } else {
+                        matches!(&probe, Err((code, Some(constraint))) if code == "23514"
+                            && matches!(constraint.as_str(), "admin_api_tokens_holder_kind_closed" | "admin_api_tokens_admin_human"))
+                    };
+                    if !correct {
+                        let outcome = match probe {
+                            Ok(_) => "ACCEPTED".to_owned(),
+                            Err((state, constraint)) => {
+                                format!("SQLSTATE={state}, constraint={constraint:?}")
+                            }
+                        };
+                        probes.push(format!("kind={kind}, valid={valid}: {outcome}"));
+                    }
+                }
+            }
+            let after_probes = registry_rows(db.pool()).await;
+            db.close().await.expect("drop canonical collation control");
+            if result.is_err()
+                || before_rows != after_rows
+                || after_rows != after_probes
+                || deterministic != 2
+                || !probes.is_empty()
+            {
+                failures.push(format!("{name}: migrated={}, rows_preserved={}, probes_preserve_rows={}, deterministic={deterministic}, probes={probes:?}", result.is_ok(), before_rows == after_rows, after_rows == after_probes));
+            }
+        }
+        assert!(failures.is_empty(), "{chain}: absent/default/canonical deterministic TEXT must upgrade, preserve named rows, accept lowercase authority and reject noncanonical kinds with real authority CHECK errors: {failures:#?}");
+    }
+
+    #[tokio::test]
+    async fn cutover_nondeterministic_holder_collations_refuse_atomically() {
+        nondeterministic_holder_collations_refuse_atomically("cutover", 456).await;
+    }
+    #[tokio::test]
+    async fn store_nondeterministic_holder_collations_refuse_atomically() {
+        nondeterministic_holder_collations_refuse_atomically("store", 457).await;
+    }
+    #[tokio::test]
+    async fn cutover_canonical_holder_collation_controls() {
+        canonical_holder_collation_controls("cutover", 456).await;
+    }
+    #[tokio::test]
+    async fn store_canonical_holder_collation_controls() {
+        canonical_holder_collation_controls("store", 457).await;
+    }
+
     const AUTHORITY_CHECKS: [(&str, &str); 4] = [
         ("admin_api_tokens_holder_named", "holder_id <> ''"),
         ("admin_api_tokens_holder_kind_closed", "holder_kind <> ''"),
