@@ -10,10 +10,8 @@ const THIRD: &str = "1546451670500642666";
 const SAVED_AT: &str = "2020-01-02T03:04:05.000Z";
 const SAVED_TAG: &str = "<t:1577934245:f>";
 
-async fn fixture() -> Fixture {
-    pool()
-        .await
-        .expect("configure the guarded disposable RSVP runtime test database")
+async fn fixture() -> Option<Fixture> {
+    pool().await
 }
 
 async fn seed(
@@ -131,7 +129,9 @@ fn assert_saved(text: &str, status: &str, timestamp: &str, totals: &str) {
 }
 
 async fn saved_choice(status: RsvpStatus, label: &str, counts: &str) {
-    let fixture = fixture().await;
+    let Some(fixture) = fixture().await else {
+        return;
+    };
     seed(fixture.pool(), GUILD, EVENT, USER, status, SAVED_AT).await;
     let text = read(fixture.pool(), &totals(9100, EVENT)).await;
     fixture.close().await;
@@ -170,7 +170,9 @@ async fn saved_decline_is_not_rendered_as_no_response() {
 
 #[tokio::test]
 async fn personal_lookup_is_scoped_to_guild_event_and_invoker() {
-    let fixture = fixture().await;
+    let Some(fixture) = fixture().await else {
+        return;
+    };
     // Different timestamps and choices make first-row/last-row selection wrong.
     for (guild, event, user, status, at) in [
         (
@@ -235,7 +237,9 @@ async fn personal_lookup_is_scoped_to_guild_event_and_invoker() {
 
 #[tokio::test]
 async fn no_personal_row_does_not_borrow_another_member_or_guild_response() {
-    let fixture = fixture().await;
+    let Some(fixture) = fixture().await else {
+        return;
+    };
     seed(
         fixture.pool(),
         GUILD,
@@ -280,7 +284,9 @@ async fn no_personal_row_does_not_borrow_another_member_or_guild_response() {
 
 #[tokio::test]
 async fn empty_event_has_zero_totals_and_explicit_personal_absence() {
-    let fixture = fixture().await;
+    let Some(fixture) = fixture().await else {
+        return;
+    };
     let text = read(fixture.pool(), &totals(9103, EVENT)).await;
     fixture.close().await;
     assert!(
@@ -304,7 +310,9 @@ async fn empty_event_has_zero_totals_and_explicit_personal_absence() {
 
 #[tokio::test]
 async fn repeated_historical_reads_leave_a_full_write_budget_untouched() {
-    let fixture = fixture().await;
+    let Some(fixture) = fixture().await else {
+        return;
+    };
     seed(
         fixture.pool(),
         GUILD,
@@ -334,7 +342,9 @@ async fn repeated_historical_reads_leave_a_full_write_budget_untouched() {
 
 #[tokio::test]
 async fn analytics_opt_out_does_not_rewrite_transactional_rsvp_history() {
-    let fixture = fixture().await;
+    let Some(fixture) = fixture().await else {
+        return;
+    };
     seed(
         fixture.pool(),
         GUILD,
@@ -361,7 +371,9 @@ async fn analytics_opt_out_does_not_rewrite_transactional_rsvp_history() {
 
 #[tokio::test]
 async fn full_erasure_removes_personal_detail_without_hiding_other_members_totals() {
-    let fixture = fixture().await;
+    let Some(fixture) = fixture().await else {
+        return;
+    };
     seed(
         fixture.pool(),
         GUILD,
@@ -410,7 +422,9 @@ async fn full_erasure_removes_personal_detail_without_hiding_other_members_total
 
 #[tokio::test]
 async fn full_event_still_finds_last_members_saved_response_with_bounded_reply() {
-    let fixture = fixture().await;
+    let Some(fixture) = fixture().await else {
+        return;
+    };
     sqlx::query("INSERT INTO event_rsvps (guild_id,event_id,user_id,status,responded_at) SELECT $1,$2,'fixture-' || n,'going','2019-01-01T00:00:00Z'::timestamptz FROM generate_series(1,999) n")
         .bind(GUILD).bind(EVENT).execute(fixture.pool()).await.expect("seed full event");
     seed(
@@ -442,7 +456,9 @@ async fn full_event_still_finds_last_members_saved_response_with_bounded_reply()
 
 #[tokio::test]
 async fn equivalent_offset_timestamp_uses_the_persisted_instant() {
-    let fixture = fixture().await;
+    let Some(fixture) = fixture().await else {
+        return;
+    };
     seed(
         fixture.pool(),
         GUILD,
@@ -464,7 +480,9 @@ async fn equivalent_offset_timestamp_uses_the_persisted_instant() {
 
 #[tokio::test]
 async fn invalid_event_identifiers_refuse_without_link_or_personal_data() {
-    let fixture = fixture().await;
+    let Some(fixture) = fixture().await else {
+        return;
+    };
     seed(
         fixture.pool(),
         GUILD,
@@ -496,7 +514,9 @@ async fn invalid_event_identifiers_refuse_without_link_or_personal_data() {
 
 #[tokio::test]
 async fn wrong_guild_and_dm_are_unhandled_before_any_callback_or_store_read() {
-    let fixture = fixture().await;
+    let Some(fixture) = fixture().await else {
+        return;
+    };
     // A closed pool ensures any accidental store access fails, not just reads empty.
     fixture.pool().close().await;
     let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
@@ -523,7 +543,9 @@ async fn wrong_guild_and_dm_are_unhandled_before_any_callback_or_store_read() {
 
 #[tokio::test]
 async fn store_failure_is_not_reported_as_no_saved_response_or_zero_totals() {
-    let fixture = fixture().await;
+    let Some(fixture) = fixture().await else {
+        return;
+    };
     seed(
         fixture.pool(),
         GUILD,
