@@ -41,7 +41,7 @@ fn iso(ms: u64, offset: i32) -> String {
 }
 
 fn canonical(ms: u64) -> String {
-    let format = time::format_description::parse(
+    let format = time::format_description::parse_borrowed::<2>(
         "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z",
     )
     .expect("independent UTC millisecond format");
@@ -51,10 +51,14 @@ fn canonical(ms: u64) -> String {
         .expect("canonical fixture")
 }
 
+fn fixture_now() -> u64 {
+    u64::try_from(now_millis_for_test()).expect("fixture clock is after the Unix epoch")
+}
+
 fn future() -> u64 {
     // Midnight two days ahead, plus a fractional second. The negative offset
     // crosses the calendar date, catching wall-clock-only normalization.
-    (now_millis_for_test() / 86_400_000 + 2) * 86_400_000 + 123
+    (fixture_now() / 86_400_000 + 2) * 86_400_000 + 123
 }
 
 fn options(
@@ -339,7 +343,7 @@ async fn wrong_type_at_is_not_ignored_when_valid_relative_timing_is_present() {
 #[tokio::test]
 async fn out_of_horizon_at_cannot_fall_back_to_a_valid_relative_time() {
     refuse_time(
-        CommandOptionValue::String(iso(now_millis_for_test() + 31_536_000_000 + 86_400_000, 0)),
+        CommandOptionValue::String(iso(fixture_now() + 31_536_000_000 + 86_400_000, 0)),
         Some(5),
         None,
         &["one", "either", "conflict", "horizon", "year", "range"],
@@ -350,7 +354,7 @@ async fn out_of_horizon_at_cannot_fall_back_to_a_valid_relative_time() {
 #[tokio::test]
 async fn absolute_horizon_accepts_the_existing_year_limit_but_refuses_a_day_beyond() {
     let db = database().await;
-    let due = now_millis_for_test() + 31_536_000_000;
+    let due = fixture_now() + 31_536_000_000;
     command(
         db.pool(),
         "schedule",
@@ -366,7 +370,7 @@ async fn absolute_horizon_accepts_the_existing_year_limit_but_refuses_a_day_beyo
     );
     assert_eq!(stored[0].next_run_at, canonical(due));
     refuse_time(
-        CommandOptionValue::String(iso(now_millis_for_test() + 31_536_000_000 + 86_400_000, 0)),
+        CommandOptionValue::String(iso(fixture_now() + 31_536_000_000 + 86_400_000, 0)),
         None,
         None,
         &["horizon", "525600", "year", "range", "365"],
@@ -383,14 +387,14 @@ async fn relative_and_interval_controls_retain_their_existing_first_run_semantic
         (None, Some(90), 5_400_000, Some(5_400)),
         (Some(5), Some(90), 300_000, Some(5_400)),
     ] {
-        let before = now_millis_for_test();
+        let before = fixture_now();
         let reply = command(
             db.pool(),
             "schedule",
             options("relative control", None, relative, every),
         )
         .await;
-        let after = now_millis_for_test();
+        let after = fixture_now();
         let stored = rows(db.pool()).await;
         let row = stored
             .iter()
