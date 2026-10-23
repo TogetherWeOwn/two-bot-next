@@ -30,6 +30,8 @@ mod sticky_uncertain_acceptance_tests;
 
 #[path = "custom_command_list_pages_acceptance.rs"]
 mod custom_command_list_pages_acceptance;
+#[path = "help_detail_acceptance.rs"]
+mod help_detail_acceptance;
 
 use std::collections::VecDeque;
 use std::str::FromStr;
