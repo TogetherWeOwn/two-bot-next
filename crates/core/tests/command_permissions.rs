@@ -94,20 +94,35 @@ fn all_30_rows_equal_parity_section1() {
     // The 30 legacy parity rows plus the Next-only `/help` discovery command
     // (parity row 31 — legacy has no help command) and the Next-only
     // `/privacy` member self-serve (parity row 32) and management-only
-    // `/command-inspect` (parity row 33). Next-only rows do not appear in the
-    // legacy §1 table above; registry equality covers every published builtin.
-    assert_eq!(COMMAND_PERMISSIONS.len(), 33);
+    // `/command-inspect` (parity row 33), `/purge-preview` (34) and
+    // `/channel-inspect` (35). Next-only rows do not appear in the legacy §1
+    // table above; registry equality covers every published builtin.
+    assert_eq!(COMMAND_PERMISSIONS.len(), 35);
     assert_eq!(
         COMMAND_PERMISSIONS
             .iter()
             .map(|row| row.command)
             .collect::<HashSet<_>>()
             .len(),
-        33
+        35
     );
     let help = command_permission("help").expect("help has a permission row");
     assert_eq!(help.required_permissions, 0);
     assert_eq!(help.surface, CommandSurface::BuiltinSlash);
+}
+
+#[test]
+fn next_only_read_permission_rows_do_not_become_mutation_policy_hooks() {
+    for (name, number, bits) in [("purge-preview", 34, 8192), ("channel-inspect", 35, 16)] {
+        let row = command_permission(name).expect("read has a permission row");
+        assert_eq!(row.parity_row, number);
+        assert_eq!(row.required_permissions, bits);
+        assert_eq!(row.surface, CommandSurface::BuiltinSlash);
+        assert_eq!(row.policy_hook, None);
+        assert!(!ModerationAction::ALL
+            .iter()
+            .any(|action| action.command_name() == name));
+    }
 }
 
 #[test]
@@ -123,7 +138,7 @@ fn permission_table_equals_the_complete_published_registry() {
         .iter()
         .filter(|row| row.surface == CommandSurface::BuiltinSlash)
         .collect();
-    assert_eq!(builtins.len(), 30);
+    assert_eq!(builtins.len(), 32);
     assert_eq!(published.len(), builtins.len() + 1);
     for row in builtins {
         let definition = published
@@ -247,7 +262,7 @@ fn every_routed_builtin_name_has_a_permission_row() {
             other => panic!("{name} is published or retained but does not route: {other:?}"),
         }
     }
-    assert_eq!(routed, 30, "every retained builtin routes");
+    assert_eq!(routed, 32, "every retained builtin routes");
 }
 
 #[test]
