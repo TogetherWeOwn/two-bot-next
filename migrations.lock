@@ -504,6 +504,10 @@
     "crates/store/migrations/0463_admin_api_token_authority.sql": {
       "sha256": "4b628e43b555d7d4408670ada5a0df31bd8f2982043e0080cb0c3a2ac5678dc4",
       "justification": "Forward-only named-holder, human-only admin and bounded 90-day authority repair; renumber unmerged 0461 to 0463 after main claimed 0460/0461 for giveaways. Before first merge, refuse nondeterministic holder collations under lock as well as defaults, noncanonical types and CHECK definitions. Preserve authority and all failed-upgrade data/catalog/history without rewriting collations, coercion, issuance or grants; binary-only backout retains constraints. Before first merge, remove the unsupported TEMPORARY prerequisite: create an empty same-server canonical CHECK reference in the registry schema using existing CREATE, then drop it within the file transaction; collisions refuse, failure rolls back, and no helper or new grant persists."
+    },
+    "crates/cutover/migrations/0462_audit_reconcile_cursor.sql": {
+      "sha256": "5c0ddbb7a347f3cf0c23e3e5216fe30aa276d6dbe5747dbbaae358fec6d9ee02",
+      "justification": "Nullable durable audit reconciliation floor: checkpoint only fully inspected pages, resume across bounded claims without another POST, and preserve the original boundary and acceptance evidence. Additive IF NOT EXISTS; previous-binary rollback retains this column. Renumbered before first merge to 0462 because main owns 0458/0459 starboard and 0460/0461 giveaways; SQL bytes unchanged and no live migration performed."
     }
   }
 }
