@@ -279,6 +279,50 @@ struct Hello {
     heartbeat_interval: u64,
 }
 
+/// Why an op-9 session flag was refused. No variant carries frame bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionFlagError {
+    /// The frame is not JSON.
+    InvalidPacket,
+    /// The `d` flag is missing or not a bool.
+    InvalidFlag,
+    /// The frame repeats an object key.
+    DuplicateKeys,
+}
+
+impl std::fmt::Display for SessionFlagError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            SessionFlagError::InvalidPacket => "invalid gateway session packet",
+            SessionFlagError::InvalidFlag => "invalid gateway session flag",
+            SessionFlagError::DuplicateKeys => {
+                "gateway session flag contains a duplicate JSON object key"
+            }
+        })
+    }
+}
+
+impl std::error::Error for SessionFlagError {}
+
+impl Header {
+    /// Decode the op-9 `d` session flag, refusing frames that repeat an
+    /// object key at any depth instead of silently last-winning into a
+    /// resume-vs-`Clear` decision. Pre-existing failures keep their own
+    /// vocabulary; only a positively identified repeat carries the fixed
+    /// duplicate-key refusal.
+    fn parse_session_resumable(text: &str) -> Result<bool, SessionFlagError> {
+        let packet: serde_json::Value =
+            serde_json::from_str(text).map_err(|_| SessionFlagError::InvalidPacket)?;
+        // Bytes already parsed: a repeated key is the only refusal left.
+        two_bot_core::duplicate_keys::reject_duplicate_keys(text.as_bytes())
+            .map_err(|_| SessionFlagError::DuplicateKeys)?;
+        packet
+            .get("d")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or(SessionFlagError::InvalidFlag)
+    }
+}
+
 /// Client-side bound from pool acquisition through COMMIT, including stalled
 /// responses on an acquired connection. Never restore readiness during drain.
 /// A successful call restores only the snapshot it armed itself: a newer Ready
@@ -1451,8 +1495,22 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             deadline = CHECKPOINT_IO_MAX.min(std::time::Duration::from_millis(hello.d.heartbeat_interval) / 4);
                         }
                         if header.op == 9 {
-                            let packet: serde_json::Value = serde_json::from_str(&text).map_err(|_| sqlx::Error::InvalidArgument("invalid gateway session packet".into()))?;
-                            let resumable = packet["d"].as_bool().ok_or_else(|| sqlx::Error::InvalidArgument("invalid gateway session flag".into()))?;
+                            let resumable = Header::parse_session_resumable(&text).map_err(|error| {
+                                sqlx::Error::InvalidArgument(
+                                    match error {
+                                        SessionFlagError::DuplicateKeys => {
+                                            "duplicate JSON object key in gateway session flag"
+                                        }
+                                        SessionFlagError::InvalidPacket => {
+                                            "invalid gateway session packet"
+                                        }
+                                        SessionFlagError::InvalidFlag => {
+                                            "invalid gateway session flag"
+                                        }
+                                    }
+                                    .into(),
+                                )
+                            })?;
                             transport_disconnected(&state, &generation, &generation_wake).await;
                             voice_disconnected(voice.as_ref());
                             if invalidates_session(resumable) { received = None; return Ok(Some(ReceivedWork::Clear(deadline))); }
@@ -1479,18 +1537,42 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         if missed > 0 {
                             two_bot_core::metrics::global().gateway_missed_events(missed);
                         }
+                        // A duplicate key in a MESSAGE_UPDATE refuses the
+                        // automod edit below; selection is by decoded `t` so
+                        // escaped spellings still match. The same bytes must
+                        // neither route through last-wins Twilight parsing (the
+                        // event path would still produce a verdict input) nor
+                        // fail the runner (the checkpoint would never advance
+                        // past a deterministic refusal). Skip the parse and
+                        // dispatch nothing; the checkpoint still commits.
+                        let duplicate_refused = automod_enabled
+                            && crate::automod_gateway::is_message_update_dispatch(&text)
+                            && two_bot_core::duplicate_keys::reject_duplicate_keys(
+                                text.as_bytes(),
+                            )
+                            .is_err();
+                        if duplicate_refused {
+                            tracing::debug!(
+                                sequence,
+                                "gateway dispatch refused: duplicate JSON key"
+                            );
+                        }
                         // A partial MESSAGE_UPDATE omits fields a full Twilight
                         // Message needs: decode its raw IDs before parsing.
-                        let edit = if automod_enabled {
+                        let edit = if automod_enabled && !duplicate_refused {
                             crate::automod_gateway::partial_edit_received(&text, &observed_at)
                                 .map(|delivery| Box::new((delivery, observed_at.clone())))
                         } else {
                             None
                         };
-                        let parsed = match twilight_gateway::parse(text, EventTypeFlags::all()) {
-                            Ok(parsed) => parsed,
-                            Err(_) if edit.is_some() => None,
-                            Err(_) => return Err(sqlx::Error::InvalidArgument("gateway dispatch parse failed".into())),
+                        let parsed = if duplicate_refused {
+                            None
+                        } else {
+                            match twilight_gateway::parse(text, EventTypeFlags::all()) {
+                                Ok(parsed) => parsed,
+                                Err(_) if edit.is_some() => None,
+                                Err(_) => return Err(sqlx::Error::InvalidArgument("gateway dispatch parse failed".into())),
+                            }
                         };
                         received = Some(checkpoint.clone());
                         let mut dispatch = parsed.map(|parsed| Box::new(ReceivedDispatch { event: Event::from(parsed), observed_at, received: received_at, completion: None }));
@@ -2210,6 +2292,13 @@ pub async fn build_voice_runtime(
         }
     }
 }
+
+// Duplicate-key refusal acceptance (paired Test Author file; test-only,
+// production unchanged). Child module so the tests can reach the private
+// frame structs. The builder must preserve this wiring.
+#[cfg(test)]
+#[path = "gateway_duplicate_key_acceptance_tests.rs"]
+mod gateway_duplicate_key_acceptance_tests;
 
 #[cfg(test)]
 #[path = "gateway_drop_poison_acceptance_tests.rs"]
