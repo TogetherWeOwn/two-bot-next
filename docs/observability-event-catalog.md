@@ -37,6 +37,7 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 | `gateway leveling dispatch failed` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Leveling funnel drain failed inside the checkpoint deadline |
 | `gateway community facts dispatch failed` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Community facts drain failed; worker continues and the scorecard fails closed on missing coverage |
 | `gateway community facts dispatch timed out` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Community facts drain missed the checkpoint deadline; worker continues and the scorecard fails closed on missing coverage |
+| `gateway dispatch refused: duplicate JSON key` | `crates/bot/src/gateway.rs` (`run_shard`) | MESSAGE_UPDATE bytes carried a repeated JSON key; parse and dispatch skipped with no verdict input, worker still commits the checkpoint so a resume replays nothing |
 | `gateway onboarding job invalid` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Dispatch-worker durable onboarding payload failed to serialize; recorded as a typed error, checkpoint unchanged |
 | `onboarding interaction interrupted; member must reselect` | `crates/bot/src/gateway.rs` (`onboarding_queue`) | Durable onboarding job recovered without callback credentials; kept as interruption receipt |
 | `invite counter read unavailable; retaining snapshot` | `crates/bot/src/gateway.rs` (`HttpInvites::current`) | REST invite read failed; persisted baseline kept instead of an empty listing |
@@ -239,6 +240,25 @@ outcomes. See `docs/metrics.md` for the full label table.
 | --- | --- |
 | `two_bot_moderation_enforcements_total{verb,outcome}` | Terminal moderation enforcements by bounded verb and outcome. `discord_error`/`storage_error` are consumed by `moderation_enforcement_failures` (tickets on any summed increase); `success`, `refused` and `other` stay quiet |
 
+## Ticket lifecycle series
+
+Counter emitted by the ticket runtime in `crates/bot/src/ticket_runtime.rs`
+(`emit_lifecycle` and `purge`) and rendered by
+`crates/core/src/metrics.rs`. Every retire, abandon, purge and successful
+staff-button claim/close executed through the button path counts once with
+a fixed-vocabulary cause; the purge pass counts one per deleted transcript
+body and reports a `db_cause` outcome when its storage write fails.
+Recovery completions and the open-path controls-post rollback are not
+instrumented. No member text, channel name, ticket id or error string ever
+becomes a label. No alert rule consumes this family yet; read it alongside
+the `ticket_lifecycle` log lines. Full series, label and cause vocabularies
+live in `docs/ticket-lifecycle-observability.md` and
+`docs/metrics.md`.
+
+| Series | Meaning |
+| --- | --- |
+| `two_bot_ticket_lifecycle_total{event,outcome}` | Terminal ticket lifecycle events by bounded event (`retire`, `abandon`, `purge`, `claim`, `close`) and outcome (success outcomes plus `db_cause` classes) |
+
 ## Retention replay series
 
 Label-free counter emitted by the retention purge-skip path in
@@ -252,6 +272,20 @@ re-baseline, missing family is no window). Full semantics live in
 | Series | Meaning |
 | --- | --- |
 | `two_bot_retention_replay_needed_total` | Skipped retention purges needing Operator replay: one per real guild removal whose purge-queue write hit the schema gap; successful queue writes and rejoin-cancel skips never increment it |
+
+## Containment store error series
+
+Counter emitted by the containment completion path in
+`crates/bot/src/containment_runtime.rs` (`finish`) and rendered by
+`crates/core/src/metrics.rs` (`render`). A failed `complete_incident` also
+surfaces as outcome-unknown in the staff alert, so the alert and the durable
+record never silently disagree. Unknown ops collapse to `other`; no error
+text, query or identifier ever becomes a label. Manual check, not an alert
+input: consumed by no alert rule. Full semantics live in `docs/metrics.md`.
+
+| Series | Meaning |
+| --- | --- |
+| `two_bot_containment_store_errors_total{op}` | Containment-store failures by bounded operation; `op` is `complete_incident` or `other` |
 
 ## Drop-guard poison recovery series
 

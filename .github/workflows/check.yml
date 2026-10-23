@@ -318,6 +318,10 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_stdout_read_acceptance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_stdout_read_duplicate_key_acceptance.py' -v
 
+      - name: weekly DORA metrics scoring and publication (offline)
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_dora_*.py' -v
+
       - name: cutover rollback-readiness probe and freeze drill (offline)
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_rollback_readiness_probe.py' -v
@@ -1358,6 +1362,7 @@ jobs:
           cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test reengagement_list_db --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
           cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test game_activity_report_db --locked -- --test-threads=1 --skip regenerate_reference_docs
           cov_run "$COV" llvm-cov --no-report -p two-bot-core --features db --locked --test member_moderation_db -- --ignored --test-threads=1 --skip regenerate_reference_docs
+          cov_run env TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test "$COV" llvm-cov --no-report -p two-bot-store --locked --test starboard_store --test starboard_api --test starboard_config_updated_at -- --ignored --test-threads=1 --skip regenerate_reference_docs
           # Merge every collected profile into the mounted workspace report the gate reads.
           # `report` must carry --workspace: without it the report scopes to
           # the current (root) package only and excludes every crates/*
@@ -1771,7 +1776,7 @@ jobs:
       - name: Store Postgres integration (isolated CI schemas)
         env:
           TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/postgres
-        run: cargo test -p two-bot-store --locked --test postgres --test journal --test journal_writer --test membership_pg --test backfill_cursors --test backfill_history --test backfill_audit_log --test backfill_event_users_reactions_pins --test backfill_bans_invites_onboarding --test explain_seqscan --test assistant_cap_ledger_acceptance -- --ignored --skip audit_log_pagination_limit_1_to_100_before_after_covers_45d_window --skip audit_log_requests_ride_rate_limit_client_never_direct_rest --skip audit_cursor_persists_per_window_and_resumes_mid_window --skip audit_rows_hold_ids_timestamps_enums_only --skip audit_429_retry_after_pauses_without_losing_place --skip event_users_paginate_through_rate_limit_client_with_max_100 --skip reaction_users_paginate_through_rate_limit_client --skip pins_list_through_rate_limit_client_persists_metadata_only --skip blocklisted_users_skipped_for_per_user_rows_while_aggregates_keep_counting --skip persisted_rows_hold_ids_timestamps_enums_only --skip resume_continues_from_persisted_cursors_per_family --skip bans_fetch_applies_blocklist_and_counts_everyone --skip invite_rows_hold_metadata_only --skip onboarding_rows_hold_ids_enums_metadata_only --skip bans_invites_onboarding_resume_continues_from_persisted_cursors
+        run: cargo test -p two-bot-store --locked --test postgres --test journal --test journal_writer --test membership_pg --test backfill_cursors --test backfill_history --test backfill_audit_log --test backfill_event_users_reactions_pins --test backfill_bans_invites_onboarding --test explain_seqscan --test assistant_cap_ledger_acceptance --test starboard_store --test starboard_api --test starboard_config_updated_at -- --ignored --skip audit_log_pagination_limit_1_to_100_before_after_covers_45d_window --skip audit_log_requests_ride_rate_limit_client_never_direct_rest --skip audit_cursor_persists_per_window_and_resumes_mid_window --skip audit_rows_hold_ids_timestamps_enums_only --skip audit_429_retry_after_pauses_without_losing_place --skip event_users_paginate_through_rate_limit_client_with_max_100 --skip reaction_users_paginate_through_rate_limit_client --skip pins_list_through_rate_limit_client_persists_metadata_only --skip blocklisted_users_skipped_for_per_user_rows_while_aggregates_keep_counting --skip persisted_rows_hold_ids_timestamps_enums_only --skip resume_continues_from_persisted_cursors_per_family --skip bans_fetch_applies_blocklist_and_counts_everyone --skip invite_rows_hold_metadata_only --skip onboarding_rows_hold_ids_enums_metadata_only --skip bans_invites_onboarding_resume_continues_from_persisted_cursors
 
       - name: sticky live store regressions (CI service container only)
         run: cargo test -p two-bot-core --features db --locked --test sticky_store_live -- --ignored
@@ -2194,6 +2199,15 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot --locked --lib --bins hotpath_settings_test_support::queries::observer_sees_actual_rows_and_rejects_unbounded_control -- --include-ignored --test-threads=1
 
+      # Fail-closed gate for the fail-open refusal acceptance: the
+      # `fail_open_containment_acceptance` tests are `#[ignore]`d and their
+      # paths do not match the `containment_worker_` filter above, so without
+      # this step a revert of the outcome-unknown + metrics change stays
+      # green. The protected acceptance file owns the test names; this step
+      # selects them by module path instead of renaming them.
+      - name: containment fail-open refusal acceptance (mock Discord and CI service only)
+        run: cargo test -p two-bot --locked --lib --bins fail_open_containment_acceptance -- --include-ignored
+
       - name: containment worker-path soak (mock Discord and CI service only)
         run: cargo test -p two-bot --locked --test containment_worker_soak -- --include-ignored
 
@@ -2486,7 +2500,10 @@ jobs:
       - name: self-role claim, renewal, recovery and fencing tests
         run: cargo test -p two-bot-cutover --test self_role_store --locked -- --ignored
       - name: self-role ticket acknowledgement columns and caps
-        run: cargo test -p two-bot-cutover --test self_role_ack_acceptance --locked -- --ignored
+        # Serial: each test mints its schema as pid + clock nanos, so parallel
+        # setup collides on pg_namespace (duplicate-schema failure). The suite
+        # still runs in well under a second serially.
+        run: cargo test -p two-bot-cutover --test self_role_ack_acceptance --locked -- --ignored --test-threads=1
       - name: self-role settlement through acknowledgement columns
         run: cargo test -p two-bot-cutover --test self_role_settlement_acceptance --locked -- --ignored
       - name: self-role runtime admission and immutable snapshots (mock REST and isolated schema)
@@ -2916,9 +2933,22 @@ jobs:
         with:
           prefix-key: ${{ runner.os }}-cargo
           save-if: ${{ github.event_name == 'push' }}
+      # The non-ignored creation-receipt acceptance modules require the
+      # guarded disposable bootstrap, as in rust-tests; TestDb suites
+      # connect to agent_test directly and ignore this variable. The
+      # rust:bookworm job container ships no PostgreSQL client, so
+      # install it first as in the community-db lane.
+      - name: Prepare guarded test database
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends postgresql-client >/dev/null
+          rm -rf /var/lib/apt/lists/*
+          createdb -h agent-testdb -U agent_test two_bot_test_ci
       - name: Ticket lifecycle and migration integration tests
         run: cargo test -p two-bot-cutover --locked --test tickets_store -- --ignored
       - name: Ticket shared router and mock Discord lifecycle acceptance
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         # The ticket skip/budget log-assertion modules assert exact counts via
         # first-match on the process-wide tracing capture; they run serially
         # in the isolated step below, so skip them here where the revision
@@ -3063,6 +3093,9 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: wrangler/package-lock.json
+      - name: Audit Worker dependencies (high/critical gate)
+        if: needs.job-inputs.outputs.worker != 'false'
+        run: npm audit --audit-level=high --include=dev --json
       - run: npm ci
         if: needs.job-inputs.outputs.worker != 'false'
       - run: npm run typecheck
@@ -3132,6 +3165,10 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_container_drill_dryrun_acceptance.py -v
       - name: Verify staging ownership-takeover retry (offline fixtures)
         run: node --test scripts/test-ownership-control.mjs
+      - name: Verify ownership control response validation (offline fixtures)
+        run: node --test scripts/test-ownership-control-response-validation.mjs
+      - name: Verify ownership response audit fields and CLI projection (offline fixtures)
+        run: node --test scripts/test-ownership-control-response.mjs
       - name: Verify production ownership-status retry (offline fixtures)
         run: node --test scripts/test-production-ownership-control.mjs
       - name: Verify staging ownership status read (offline fixtures)
@@ -3218,6 +3255,9 @@ jobs:
       - name: Verify runner routing for every workflow job
         if: needs.job-inputs.outputs.worker != 'false'
         run: python3 ../scripts/test-runner-routing.py
+      - name: Verify commit-parser step attribution (offline fixtures)
+        if: needs.job-inputs.outputs.worker != 'false'
+        run: python3 ../scripts/test-commit-parse-guard-ci.py
       - name: Verify the daily digest release (offline fixtures)
         if: needs.job-inputs.outputs.worker != 'false'
         # Digest tags, notes, quiet-day and rollback skips, off-main refusal
@@ -3230,13 +3270,15 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_daily_digest_execution.py -v
       - name: Verify the missing-digest alert (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_digest_alert.py -v
-      - name: Verify the commit-parse guard
+      - name: Install pinned commit-parser fixture
         if: needs.job-inputs.outputs.worker != 'false'
         # The PR-side guard uses release-please's pinned conventional-commit
         # parser, in an isolated install with lifecycle scripts disabled.
         run: | # zizmor: ignore[adhoc-packages] pinned commit parser fixture only
           npm install --prefix "$RUNNER_TEMP/release-fixture" --ignore-scripts --no-audit --no-fund release-please@17.6.0
-          NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-commit-parse-guard.cjs
+      - name: Verify the commit-parse guard
+        if: needs.job-inputs.outputs.worker != 'false'
+        run: NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-commit-parse-guard.cjs
 
   # Single always-run aggregator for the path-filtered matrix. GitHub counts
   # a skipped job as passing and leaves a required context pending when its

@@ -19,7 +19,7 @@ use tokio::{
     time::{Instant, MissedTickBehavior},
 };
 use twilight_model::{application::interaction::Interaction, guild::Permissions};
-use two_bot_core::{funnel::now_millis_for_test, settings::LiveSettings, tickets::*};
+use two_bot_core::{funnel::now_millis_for_test, metrics, settings::LiveSettings, tickets::*};
 use two_bot_cutover::tickets::{OpenResult, StoreError, TicketStore};
 use two_bot_discord::{
     executor::{ChannelPresence, TicketChannelRequest, TicketMessage},
@@ -102,6 +102,55 @@ impl Drop for TicketSupervisor {
     }
 }
 
+/// Fixed-vocabulary token for the `ticket recovery deferred` warn's `action`
+/// field. `None` selects no action (nothing was attempted).
+fn recovery_action_token(action: &RecoveryAction) -> Option<&'static str> {
+    match action {
+        RecoveryAction::ReattachOpenControls { .. } => Some("reattach_open_controls"),
+        RecoveryAction::FindCreatingChannel { .. } => Some("find_creating_channel"),
+        RecoveryAction::DeleteInterruptedCreate { .. } => Some("delete_interrupted_create"),
+        RecoveryAction::RestoreOpenerThenReopen { .. } => Some("restore_opener_then_reopen"),
+        RecoveryAction::RecoverSavedClose { .. } => Some("recover_saved_close"),
+        RecoveryAction::RetryCleanup { .. } => Some("retry_cleanup"),
+        RecoveryAction::None => None,
+    }
+}
+
+/// Emit one `ticket_lifecycle` line and its counter sample for a terminal
+/// ticket event. Every retire, abandon, and successful staff-button claim and
+/// close executed through the button path reports exactly once with a
+/// fixed-vocabulary cause; the purge pass reports separately with its deleted
+/// count. Recovery completions and the open-path controls-post rollback reach
+/// their terminal states without emitting. See
+/// `docs/ticket-lifecycle-observability.md` for the vocabularies.
+fn emit_lifecycle(
+    event: &'static str,
+    outcome: &'static str,
+    ticket_id: &str,
+    prior_status: &'static str,
+    cause: &'static str,
+) {
+    tracing::info!(
+        event = %event,
+        ticket_id = %ticket_id,
+        prior_status = %prior_status,
+        cause = %cause,
+        "ticket_lifecycle"
+    );
+    metrics::global().ticket_lifecycle(event, outcome);
+}
+
+/// Storage-failure outcome for the purge pass: the shared `db_cause` class
+/// for SQL failures, so the failure mode survives in the counter and the log
+/// instead of collapsing to a bare `database`. Non-SQL store errors keep the
+/// generic class.
+fn purge_outcome(error: &StoreError) -> &'static str {
+    match error {
+        StoreError::Database(error) => two_bot_core::error_chain::db_cause(error),
+        StoreError::Domain(_) | StoreError::InvalidRow(_) | StoreError::NotFound => "database",
+    }
+}
+
 async fn recovery_batch<F, Fut>(
     cursor: &TaskMutex<Option<(i64, String)>>,
     mut tickets: Vec<Ticket>,
@@ -109,7 +158,7 @@ async fn recovery_batch<F, Fut>(
 ) -> Option<ErrorClass>
 where
     F: Fn(Ticket) -> Fut,
-    Fut: Future<Output = Result<()>>,
+    Fut: Future<Output = (Result<()>, Option<&'static str>)>,
 {
     if tickets.is_empty() {
         return None;
@@ -170,9 +219,31 @@ where
                 *guard = Some(key);
             }
         }
-        if let Err(error) = bounded(remaining.min(RECOVERY_ITEM_TIMEOUT), action(ticket)).await {
+        let ticket_id = ticket.id.clone();
+        let status = ticket.status.as_str();
+        // The timeout arm reports no attempted action: the future never
+        // finished selecting one. `None` likewise covers a transcript-probe
+        // failure before any action was selected. The timeout wraps the
+        // tuple future directly (`bounded` only wraps `Result` futures).
+        let (result, attempted) = match tokio::time::timeout(
+            remaining.min(RECOVERY_ITEM_TIMEOUT),
+            action(ticket),
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(_) => (Err(Failure::Timeout), None),
+        };
+        if let Err(error) = result {
             failed = Some(error.class());
-            tracing::warn!(error_class = ?error.class(), "ticket recovery deferred");
+            match attempted {
+                Some(action) => {
+                    tracing::warn!(error_class = ?error.class(), action = %action, ticket_id = %ticket_id, status = %status, "ticket recovery deferred")
+                }
+                None => {
+                    tracing::warn!(error_class = ?error.class(), ticket_id = %ticket_id, status = %status, "ticket recovery deferred")
+                }
+            }
         }
     }
     failed
@@ -408,6 +479,13 @@ impl Failure {
             | Self::TicketClaimedBy(_)
             | Self::TicketNotOpen => ErrorClass::Rest,
         }
+    }
+    /// True only for SQL storage failures (pool, connection or query), never
+    /// for domain refusals. Warn enrichment skips its decorating store
+    /// lookup then, instead of spending a second pool acquisition on a sick
+    /// store to decorate a failure line.
+    pub fn is_storage_failure(&self) -> bool {
+        matches!(self, Self::Store(StoreError::Database(_)))
     }
 }
 
@@ -707,6 +785,29 @@ impl TicketRuntime {
         )
     }
 
+    /// Resolve the ticket context for the `ticket action incomplete` warn:
+    /// the channel-bound ticket for claim/close, if it still resolves. Open
+    /// mints its reservation inside `execute`, so a failed open has no
+    /// stable ticket to cite and resolves to `None`, as does a failure in a
+    /// channel with no tracked ticket.
+    pub(crate) async fn warn_ticket_context(
+        &self,
+        interaction: &Interaction,
+        action: TicketAction,
+    ) -> Option<(String, &'static str)> {
+        match action {
+            TicketAction::Open => None,
+            TicketAction::Claim | TicketAction::Close => {
+                let channel = interaction
+                    .channel
+                    .as_ref()
+                    .map(|channel| channel.id.get().to_string())?;
+                let ticket = self.store.by_channel(&channel).await.ok()??;
+                Some((ticket.id, ticket.status.as_str()))
+            }
+        }
+    }
+
     /// Called only after the shared router and successful ephemeral defer.
     pub async fn execute(&self, interaction: &Interaction, action: TicketAction) -> Result<String> {
         self.authorize(interaction, action)
@@ -746,7 +847,9 @@ impl TicketRuntime {
                 match action {
                     TicketAction::Claim => match self.store.claim(&ticket.id, &actor).await {
                         Ok(_) => {
+                            let prior = ticket.status.as_str();
                             self.post_claim_marker(&channel, &actor).await;
+                            emit_lifecycle("claim", "claimed", &ticket.id, prior, "staff_claim");
                             Ok("Ticket claimed.".into())
                         }
                         Err(StoreError::Domain(TicketError::AlreadyClaimed)) => {
@@ -755,7 +858,9 @@ impl TicketRuntime {
                         Err(error) => Err(error.into()),
                     },
                     TicketAction::Close => {
+                        let prior = ticket.status.as_str();
                         let truncated = self.close(&ticket).await?;
+                        emit_lifecycle("close", "closed", &ticket.id, prior, "staff_close");
                         Ok(if truncated {
                             "Ticket closed; transcript was truncated, saved for up to 90 days."
                                 .into()
@@ -815,7 +920,24 @@ impl TicketRuntime {
                 // A single-attempt rejection proves no channel was created;
                 // timeout/transport/malformed successes keep the reservation.
                 if error.is_safe_pre_mutation() {
-                    self.store.abandon_creating(&ticket.id).await?;
+                    let prior = ticket.status.as_str();
+                    if self.store.abandon_creating(&ticket.id).await? {
+                        emit_lifecycle(
+                            "abandon",
+                            "abandoned",
+                            &ticket.id,
+                            prior,
+                            "create_rejected",
+                        );
+                    } else {
+                        emit_lifecycle(
+                            "abandon",
+                            "already_gone",
+                            &ticket.id,
+                            prior,
+                            "already_gone",
+                        );
+                    }
                 }
                 return Err(error.into());
             }
@@ -941,6 +1063,66 @@ impl TicketRuntime {
         Ok(())
     }
 
+    fn verify_creation_channel(
+        &self,
+        doc: &Value,
+        ticket: &Ticket,
+        channel: &str,
+        config: &TicketConfig,
+    ) -> Result<()> {
+        if ticket.guild_id != config.guild_id
+            || ticket.channel_id.as_deref().is_some_and(|id| id != channel)
+        {
+            return Err(Failure::InvalidEvidence);
+        }
+        self.validate_channel(doc, channel, 0)?;
+        TicketChannelRequest {
+            guild_id: &config.guild_id,
+            category_id: &config.category_id,
+            staff_role_id: &config.staff_role_id,
+            bot_id: &self.bot_id()?,
+            opener_id: &ticket.opener_id,
+            username: "", // Verification never constructs a channel name.
+            reservation_id: &ticket.id,
+        }
+        .verify_receipt(doc)?;
+        Ok(())
+    }
+
+    /// A listing or recorded id only selects a candidate. Fetch and prove it
+    /// before recording it or advancing rollback state; never launder listing
+    /// evidence into authority to delete a different/private-unproven channel.
+    async fn rollback_creating(
+        &self,
+        ticket: &Ticket,
+        channel: &str,
+        config: &TicketConfig,
+    ) -> Result<()> {
+        let present = match self.executor.fetch_ticket_channel(channel).await? {
+            ChannelPresence::Present(doc) => {
+                self.verify_creation_channel(&doc, ticket, channel, config)?;
+                true
+            }
+            ChannelPresence::Absent => false,
+        };
+        if !present && ticket.channel_id.is_none() {
+            self.store.abandon_creating(&ticket.id).await?;
+            return Ok(());
+        }
+        self.store.record_channel(&ticket.id, channel).await?;
+        self.store
+            .queue_open_rollback(&ticket.id, now_millis_for_test())
+            .await?;
+        if present {
+            // Reuse the just-verified fetch: one listing + one fetch + one DELETE.
+            self.executor.delete_ticket_channel(channel).await?;
+        }
+        self.store
+            .finish_cleanup(&ticket.id, now_millis_for_test())
+            .await?;
+        Ok(())
+    }
+
     fn require_history_access(&self, doc: &Value) -> Result<()> {
         let (allow, deny) = member_overwrite(doc, &self.bot_id()?)?;
         let required = (Permissions::VIEW_CHANNEL | Permissions::READ_MESSAGE_HISTORY).bits();
@@ -1029,9 +1211,21 @@ impl TicketRuntime {
     }
 
     async fn cleanup(&self, id: &str, channel: &str) -> Result<()> {
+        let ticket = self.store.get(id).await?.ok_or(Failure::InvalidEvidence)?;
+        if ticket.status != TicketStatus::CleanupPending
+            || ticket.channel_id.as_deref() != Some(channel)
+        {
+            return Err(Failure::InvalidEvidence);
+        }
         match self.executor.fetch_ticket_channel(channel).await? {
             ChannelPresence::Present(doc) => {
                 self.validate_channel(&doc, channel, 0)?;
+                // Open rollback has no close token. Re-prove creation on every
+                // retry, but preserve captured-close cleanup (opener writes are
+                // frozen there, and retention may already have purged the body).
+                if ticket.closing_started_at.is_none() {
+                    self.verify_creation_channel(&doc, &ticket, channel, &self.live_config())?;
+                }
                 self.executor.delete_ticket_channel(channel).await?;
             }
             ChannelPresence::Absent => {}
@@ -1064,7 +1258,7 @@ impl TicketRuntime {
         let mut failed = match tickets {
             Ok(tickets) => {
                 recovery_batch(&self.recovery_cursor, tickets, |ticket| async move {
-                    self.recover_ticket(&ticket).await
+                    self.recover_ticket_traced(&ticket).await
                 })
                 .await
             }
@@ -1078,10 +1272,32 @@ impl TicketRuntime {
         failed.map_or(Ok(()), Err)
     }
 
+    // Test-only shim over the traced recovery: the ticket acceptance suites
+    // drive recovery through the untraced API while production calls
+    // `recover_ticket_traced` directly.
+    #[cfg(test)]
     async fn recover_ticket(&self, ticket: &Ticket) -> Result<()> {
+        self.recover_ticket_traced(ticket).await.0
+    }
+
+    /// Recover one row, reporting the selected recovery action alongside the
+    /// outcome so the `ticket recovery deferred` warn can name the action
+    /// that failed. The token is `None` when selection itself failed (the
+    /// transcript probe) or selected no action.
+    async fn recover_ticket_traced(&self, ticket: &Ticket) -> (Result<()>, Option<&'static str>) {
+        let saved = match self.store.transcript_exists(&ticket.id).await {
+            Ok(saved) => saved,
+            Err(error) => return (Err(error.into()), None),
+        };
+        let action = recovery_action(ticket, now_millis_for_test(), saved);
+        let attempted = recovery_action_token(&action);
+        let result = self.run_recovery_action(ticket, action).await;
+        (result, attempted)
+    }
+
+    async fn run_recovery_action(&self, ticket: &Ticket, action: RecoveryAction) -> Result<()> {
         let config = self.live_config();
-        let saved = self.store.transcript_exists(&ticket.id).await?;
-        match recovery_action(ticket, now_millis_for_test(), saved) {
+        match action {
             RecoveryAction::None => {}
             RecoveryAction::ReattachOpenControls { channel_id } => {
                 self.ensure_controls(ticket, &channel_id).await?
@@ -1114,23 +1330,31 @@ impl TicketRuntime {
                 }
                 match matches.as_slice() {
                     [] => {
-                        self.store.abandon_creating(&ticket.id).await?;
+                        let prior = ticket.status.as_str();
+                        if self.store.abandon_creating(&ticket.id).await? {
+                            emit_lifecycle(
+                                "abandon",
+                                "abandoned",
+                                &ticket.id,
+                                prior,
+                                "orphan_not_found",
+                            );
+                        } else {
+                            emit_lifecycle(
+                                "abandon",
+                                "already_gone",
+                                &ticket.id,
+                                prior,
+                                "already_gone",
+                            );
+                        }
                     }
-                    [channel] => {
-                        self.store.record_channel(&ticket.id, channel).await?;
-                        self.store
-                            .queue_open_rollback(&ticket.id, now_millis_for_test())
-                            .await?;
-                        self.cleanup(&ticket.id, channel).await?;
-                    }
+                    [channel] => self.rollback_creating(ticket, channel, &config).await?,
                     _ => return Err(Failure::InvalidEvidence),
                 }
             }
             RecoveryAction::DeleteInterruptedCreate { channel_id } => {
-                self.store
-                    .queue_open_rollback(&ticket.id, now_millis_for_test())
-                    .await?;
-                self.cleanup(&ticket.id, &channel_id).await?;
+                self.rollback_creating(ticket, &channel_id, &config).await?;
             }
             RecoveryAction::RetryCleanup { channel_id } => {
                 self.cleanup(&ticket.id, &channel_id).await?
@@ -1179,12 +1403,17 @@ impl TicketRuntime {
                 doc
             }
             ChannelPresence::Absent => {
+                let prior = ticket.status.as_str();
                 self.store
                     .retire_missing_open(&ticket.id, channel, now_millis_for_test())
                     .await?;
+                emit_lifecycle("retire", "retired", &ticket.id, prior, "missing_channel");
                 return Ok(());
             }
         };
+        // Reattachment must not post controls into a reparented, retopiced or
+        // de-privated channel: prove the creation receipt before history/post.
+        self.verify_creation_channel(&doc, ticket, channel, &config)?;
         if !self
             .executor
             .ticket_history_readable(&config.guild_id, &self.bot_id()?, &doc)
@@ -1242,11 +1471,29 @@ impl TicketRuntime {
             return Ok(());
         };
         self.refresh_config_with(crate::settings_jobs::live().as_ref());
-        self.store
-            .purge_expired(now_millis_for_test())
-            .await
-            .map(|_| ())
-            .map_err(|_| ErrorClass::Database)
+        match self.store.purge_expired(now_millis_for_test()).await {
+            Ok(deleted) => {
+                tracing::info!(
+                    event = %"purge",
+                    deleted,
+                    cause = %"retention_expired",
+                    "ticket_lifecycle"
+                );
+                metrics::global().ticket_lifecycle_n("purge", "deleted", deleted);
+                Ok(())
+            }
+            Err(error) => {
+                let outcome = purge_outcome(&error);
+                tracing::info!(
+                    event = %"purge",
+                    deleted = 0,
+                    cause = %outcome,
+                    "ticket_lifecycle"
+                );
+                metrics::global().ticket_lifecycle("purge", outcome);
+                Err(ErrorClass::Database)
+            }
+        }
     }
 }
 
@@ -1397,6 +1644,22 @@ mod cursor_budget_acceptance_tests;
 #[cfg(test)]
 #[path = "ticket_cursor_budget_interaction_tests.rs"]
 mod cursor_budget_interaction_tests;
+
+#[cfg(test)]
+#[path = "ticket_lifecycle_observability_acceptance_tests.rs"]
+mod lifecycle_observability_acceptance_tests;
+
+#[cfg(test)]
+#[path = "ticket_lifecycle_review_guard_acceptance_tests.rs"]
+mod review_guard_acceptance_tests;
+
+#[cfg(test)]
+#[path = "ticket_creation_receipt_acceptance_tests.rs"]
+mod creation_receipt_acceptance_tests;
+
+#[cfg(test)]
+#[path = "ticket_destination_move_tests.rs"]
+mod destination_move_tests;
 
 #[cfg(test)]
 #[path = "ticket_capture_cap_acceptance_tests.rs"]

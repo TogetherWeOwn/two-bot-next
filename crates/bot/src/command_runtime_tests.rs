@@ -17,6 +17,12 @@
 
 #![cfg(test)]
 
+#[path = "leveling_ack_ordering_acceptance_tests.rs"]
+mod leveling_ack_ordering_acceptance_tests;
+#[path = "leveling_ack_visibility_acceptance_tests.rs"]
+mod leveling_ack_visibility_acceptance_tests;
+#[path = "member_authority_cause_acceptance.rs"]
+mod member_authority_cause_acceptance;
 #[path = "member_dispatch_authority_acceptance.rs"]
 mod member_dispatch_authority_acceptance;
 #[path = "sticky_uncertain_acceptance_tests.rs"]
@@ -3642,7 +3648,7 @@ async fn shared_runtime_routes_leveling_once_with_legacy_visibility_and_guild_fe
         two_bot_testsupport::TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
             .await
             .expect("migrated test database; no credential fallback");
-    let (mock, origin) = MockRest::start(vec![204; 4]).await;
+    let (mock, origin) = MockRest::start(vec![204, 200, 204, 200, 204, 200, 204, 200]).await;
     let executor = ActionExecutor::with_proxy("mock-only-token".into(), Some(origin)).unwrap();
     let runtime = CommandRuntime::new(
         db.pool().clone(),
@@ -3685,50 +3691,59 @@ async fn shared_runtime_routes_leveling_once_with_legacy_visibility_and_guild_fe
     let requests = mock.requests();
     assert_eq!(
         requests.len(),
-        4,
-        "exactly one callback per accepted command"
+        8,
+        "exactly one defer plus one completion edit per accepted command"
     );
-    assert!(requests
+    let callbacks: Vec<&RestRequest> = requests
         .iter()
-        .all(|r| r.method == "POST" && r.path.ends_with("/callback")));
-    let replies: Vec<serde_json::Value> = requests
+        .filter(|r| r.method == "POST" && r.path.ends_with("/callback"))
+        .collect();
+    let edits: Vec<&RestRequest> = requests
+        .iter()
+        .filter(|r| r.method == "PATCH" && r.path.ends_with("/messages/@original"))
+        .collect();
+    assert_eq!(callbacks.len(), 4, "one acknowledgement per command");
+    assert_eq!(edits.len(), 4, "one completion edit per command");
+    let defers: Vec<serde_json::Value> = callbacks
         .iter()
         .map(|r| serde_json::from_slice(&r.body).unwrap())
         .collect();
-    for reply in &replies {
-        assert_eq!(reply["type"], 4, "no generic defer or second response");
+    for defer in &defers {
+        assert_eq!(defer["type"], 5, "leveling acknowledges with a defer");
     }
+    for defer in &defers[..2] {
+        assert_eq!(defer["data"]["flags"], 64, "rank defers ephemerally");
+    }
+    for defer in &defers[2..] {
+        assert_ne!(defer["data"]["flags"], 64, "leaderboard defers publicly");
+    }
+    let replies: Vec<serde_json::Value> = edits
+        .iter()
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
     for (reply, name) in replies[..2].iter().zip(["member", "Target member"]) {
-        assert_eq!(reply["data"]["flags"], 64, "rank is ephemeral");
         assert_eq!(
-            reply["data"]["content"],
+            reply["content"],
             two_bot_core::leveling::rank_text(name, 0, None, 0, 0)
         );
     }
     assert_eq!(
-        replies[2]["data"]["content"],
+        replies[2]["content"],
         two_bot_core::leveling::leaderboard_reply_for_season(&[], &season).content
     );
-    for reply in &replies[2..] {
-        assert!(reply["data"]["flags"].is_null(), "leaderboard stays public");
+    for reply in &replies {
         assert_eq!(
-            reply["data"]["allowed_mentions"]["parse"],
-            serde_json::json!([])
+            reply["allowed_mentions"]["parse"],
+            serde_json::json!([]),
+            "every completion edit suppresses mentions"
         );
-        assert!(reply["data"]["components"].is_null(), "no invented paging");
     }
     assert_eq!(
-        replies[3]["data"]["content"]
-            .as_str()
-            .unwrap()
-            .lines()
-            .count(),
-        11
+        replies[3]["content"].as_str().unwrap().lines().count(),
+        11,
+        "no invented paging on the completed board"
     );
-    assert!(!replies[3]["data"]["content"]
-        .as_str()
-        .unwrap()
-        .contains("<@77>"));
+    assert!(!replies[3]["content"].as_str().unwrap().contains("<@77>"));
     drop(pipeline);
     drop(runtime);
     mock.shutdown().await;

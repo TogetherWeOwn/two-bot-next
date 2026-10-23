@@ -118,7 +118,7 @@ async fn slow_recovery_prefix_rotates_and_leaves_a_panel_slot_on_each_pass() {
                     attempted.lock().unwrap().push(ticket.id);
                     // Every stable prefix row is slower than its individual budget.
                     tokio::time::sleep(Duration::from_secs(50)).await;
-                    Ok(())
+                    (Ok(()), None)
                 }
             },
         )
@@ -172,7 +172,7 @@ async fn cancelled_recovery_resumes_after_the_in_flight_row_even_if_it_disappear
         (2..=3).map(recovery_ticket).collect(),
         |ticket| async {
             attempted.lock().unwrap().push(ticket.id);
-            Ok(())
+            (Ok(()), None)
         },
     )
     .await;
@@ -201,7 +201,7 @@ async fn sub_millisecond_import_order_cannot_starve_decoded_cursor_rows() {
                 async move {
                     attempted.lock().unwrap().push(ticket.id);
                     tokio::time::sleep(Duration::from_secs(50)).await;
-                    Ok(())
+                    (Ok(()), None)
                 }
             },
         )

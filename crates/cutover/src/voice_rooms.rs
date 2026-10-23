@@ -101,6 +101,12 @@ impl PgRoomStore {
         Self { pool }
     }
 
+    /// This store's pool, for sibling persistence modules (event voice).
+    #[must_use]
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     /// V11 configuration persistence (`/export` reads, `/import` writes)
     /// over this store's pool. Snapshot and apply each run in one
     /// transaction; apply never touches live rooms or companions.

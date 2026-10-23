@@ -52,6 +52,7 @@ pub mod database_roles;
 pub mod database_tls;
 pub mod database_url;
 pub mod disable_preflight;
+pub mod duplicate_keys;
 pub mod e2e_matrix;
 pub mod error_chain;
 pub mod events;
@@ -388,8 +389,9 @@ pub use rsvp::{
     rsvp_rate_limited_text, rsvp_saved_text, validate_event_id, validate_occurrence_id,
     AttendanceClassification, AttendanceOccurrence, AttendanceProof, CheckinError, RsvpAudit,
     RsvpError, RsvpRecord, RsvpStatus, RsvpTotals, RsvpTransition, ATTENDANCE_EVENT_TYPE,
-    AUDIT_RETENTION_DAYS, MAX_CHECKINS_PER_OCCURRENCE, MAX_RSVPS_PER_EVENT,
-    MAX_RSVP_WRITES_PER_USER_PER_MINUTE, RSVP_AUDIT_ACTION, RSVP_RETENTION_DAYS,
+    AUDIT_RETENTION_DAYS, CHECKIN_AUDIT_ACTION, CHECKIN_AUDIT_OUTCOME_RECORDED,
+    MAX_CHECKINS_PER_OCCURRENCE, MAX_RSVPS_PER_EVENT, MAX_RSVP_WRITES_PER_USER_PER_MINUTE,
+    RSVP_AUDIT_ACTION, RSVP_RETENTION_DAYS,
 };
 pub use rsvp_conversion::{
     assign_variant, compute_conversion, reminders_due, render_report_text, AnnouncementVariant,
@@ -398,7 +400,8 @@ pub use rsvp_conversion::{
 #[cfg(feature = "db")]
 pub use rsvp_store::{
     compensate_checkin_write, compensate_rsvp_write, list_rsvps, prune_rsvp_history, put_rsvp,
-    put_rsvp_with_audit, record_checkin, write_audit, CheckinWrite, RsvpStoreError,
+    put_rsvp_with_audit, record_checkin, record_checkin_with_audit, write_audit, CheckinWrite,
+    RsvpStoreError,
 };
 pub use scheduled::{
     advance_next_run_iso, advance_next_run_ms, clamp_retry_delay_ms, format_iso_ms, lease_until_ms,

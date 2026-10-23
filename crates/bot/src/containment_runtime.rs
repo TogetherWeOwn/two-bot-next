@@ -759,13 +759,15 @@ impl<S: CheckedSettingsSource> ContainmentWorker<S> {
         }
     }
 
-    /// Persist the outcome and post the flag-only staff alert.
+    /// Persist the outcome and post the flag-only staff alert. A dropped
+    /// completion surfaces as outcome-unknown (plus a metered store error),
+    /// never as the unrecorded outcome posted as fact.
     async fn finish(
         &self,
         settings: &ContainmentSettings,
         event: &DestructiveAuditEvent,
         incident: &ContainmentIncident,
-        completion: Completion,
+        mut completion: Completion,
     ) {
         if self
             .store
@@ -782,6 +784,8 @@ impl<S: CheckedSettingsSource> ContainmentWorker<S> {
             .is_err()
         {
             error!(incident_id = %incident.id, "containment_store_failed: incident not completed");
+            two_bot_core::metrics::global().containment_store_error("complete_incident");
+            completion.outcome = ContainmentIncidentState::Uncertain;
         }
         self.alert(settings, event, incident, &completion).await;
     }
