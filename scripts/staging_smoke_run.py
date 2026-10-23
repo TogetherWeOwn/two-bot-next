@@ -10,9 +10,9 @@ build and the TWO Staging guild:
   build       readyz build identity matches the tested revision
   identity    GET /users/@me   the token belongs to the staging application
   registry    guild command list + per-command resource read for every
-              present builtin: the core surfaces (/rank, /leaderboard, /help)
-              always, then each present gated builtin from the compiled
-              publish set
+              present builtin: the core surfaces (/rank, /leaderboard, /help,
+              /privacy, /bump) always, then each present gated builtin from
+              the compiled publish set
 
 It is read-mostly by construction: only GET requests, no request bodies, and
 nothing is created or changed in the guild. It does NOT invoke a slash
@@ -57,7 +57,7 @@ PUBLISH_SET = ROOT / "crates/core/tests/fixtures/staging_published_commands.json
 # The "always" rows of docs/staging-e2e-command-matrix.md: published with no
 # staging env gate, so a missing one is a failure, not an unset flag. The unit
 # tests cross-check this tuple against the matrix doc.
-CORE_SURFACES = ("rank", "leaderboard", "help", "privacy")
+CORE_SURFACES = ("rank", "leaderboard", "help", "privacy", "bump")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 BUILD_ID_RE = re.compile(r"([0-9]+)-[0-9]+")
 RUN_ID_RE = re.compile(r"[0-9]+")

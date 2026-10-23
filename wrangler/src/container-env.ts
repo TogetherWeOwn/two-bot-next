@@ -64,6 +64,11 @@ export const FORWARDED_FLAGS = [
   "TWO_INACTIVITY_DAYS",
   "TWO_PRESENCE_PROBE",
   "TWO_TICKET_COOLDOWN_SECONDS",
+  // Bump reminders: non-secret gate, bumper allowlist, opt-in role and cooldown.
+  "TWO_BUMP_REMINDERS",
+  "TWO_BUMP_BOT_IDS",
+  "TWO_BUMP_ROLE_ID",
+  "TWO_BUMP_COOLDOWN_SECS",
   // Raid watch, join risk and anti-nuke.
   "TWO_RAID_JOIN_THRESHOLD",
   "TWO_RAID_WINDOW_SECONDS",

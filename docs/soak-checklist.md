@@ -678,6 +678,14 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
 - **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
+### s5-bump-reminders: `bump_reminders` — one pending bump reminder per guild
+
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the bump-reminder gateway fixtures against a disposable test database with mock Discord REST, including fresh-bump replacement and runtime restart.
+- **Expected:** One pending reminder per guild survives restart, a fresh bump replaces it, and expiry claims at most one role-only ping; refused success messages never arm.
+- **Evidence:** Attach the exact-head command, sanitized test result and disposable-database guard receipt. This fixture evidence is not staging or production enablement.
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot gateway_tests::bump_reminders -- --ignored --test-threads=1
+
 ### s5-14: `self_role_audit`, `self_role_panel_claims` — self-role audit + claim leases
 
 - **Method:** `waived` (not an execution verdict).

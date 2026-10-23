@@ -342,6 +342,10 @@ pub const EXCLUDED_TABLES: &[&str] = &[
     "_sqlx_migrations",
     "schema_migrations",
     "_two_bot_migrations",
+    // Pending bump reminders (0459/0458): one short-lived row per guild that
+    // expires within hours. Never replay a pre-restore ping into a recovered
+    // process; the next successful bump re-arms the reminder.
+    "bump_reminders",
 ];
 
 /// Columns the destination allocates itself: never archived, never restored.

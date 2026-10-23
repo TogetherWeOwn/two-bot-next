@@ -40,6 +40,9 @@ const EXPECTED_DISPOSITIONS: &[(&str, &str)] = &[
     // Catch-up inserts are invisible after the fact; no alternate measured
     // evidence is named for the window.
     ("backfill_history_messages", MANUAL_RECONCILE_REQUIRED),
+    // Transient reminder queue; deadlines are not write times. Excluded from
+    // backups to avoid replay; the next successful bump re-arms the reminder.
+    ("bump_reminders", ACCEPT_WITH_REASON),
     // A completed week is visible via community_scorecard_runs.generated_at.
     ("community_scorecard_attempts", ACCEPT_WITH_REASON),
     // Transient restart-recovery queue; rows hold no durable member state.
@@ -124,6 +127,66 @@ fn acceptance_every_unmeasurable_spec_has_a_pinned_disposition() {
         "unmeasurable specs and pinned dispositions differ; \
          pin a disposition for every unmeasurable table"
     );
+}
+
+// Catch a deadline being mistaken for a last-write time, or an accepted
+// disposition losing the operational reason that makes transient loss safe.
+#[test]
+fn acceptance_bump_reminders_are_transient_not_deadline_measured() {
+    let spec = TABLE_SPECS
+        .iter()
+        .find(|spec| spec.table == "bump_reminders")
+        .expect("bump_reminders must be classified for rollback");
+    let TableMeasure::Unmeasurable(reason, disposition) = spec.measure else {
+        panic!("fires_at is a delivery deadline, not a bump_reminders write timestamp");
+    };
+    assert_eq!(disposition, ACCEPT_WITH_REASON);
+    for required in [
+        "no write timestamp",
+        "fires_at is a delivery deadline",
+        "fired changes without a timestamp",
+        "excluded from backups to avoid replay",
+        "next successful bump re-arms",
+    ] {
+        assert!(
+            reason.contains(required),
+            "bump_reminders reason must explain {required}: {reason}"
+        );
+    }
+}
+
+// Catch queue rows becoming backup/export eligible or accepted for replay,
+// whether still pending or already claimed. Durable rows remain importable.
+#[test]
+fn acceptance_bump_reminders_cannot_be_replayed() {
+    use two_bot_cutover::rollback_import::{is_exportable_table, parse_import, ImportError};
+
+    assert!(!two_bot_core::backup::DUMP_TABLES.contains(&"bump_reminders"));
+    assert!(!is_exportable_table("bump_reminders"));
+    let durable = r#"{"table":"member_levels","row":{"guild_id":"g","member_id":"m","xp":30,"message_xp":30,"updated_at":"2026-10-01T12:00:00Z"}}"#;
+    assert_eq!(
+        parse_import(durable).expect("durable delta allowed").len(),
+        1
+    );
+    for fired in [false, true] {
+        let reminder = serde_json::json!({
+            "table": "bump_reminders",
+            "row": {
+                "guild_id": "g",
+                "channel_id": "ch",
+                "fires_at": "2026-10-01T12:00:00Z",
+                "fired": fired,
+            },
+        });
+        let input = format!("{durable}\n{reminder}\n");
+        assert!(
+            matches!(
+                parse_import(&input),
+                Err(ImportError::UnknownTable { table }) if table == "bump_reminders"
+            ),
+            "transient reminder rows must be refused before apply (fired={fired})"
+        );
+    }
 }
 
 #[test]

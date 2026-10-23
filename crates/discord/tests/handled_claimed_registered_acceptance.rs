@@ -66,7 +66,7 @@ impl InteractionHandler for Stub {
 /// - `router_with_commands` (`command_runtime.rs`): channel handlers while
 ///   `moderation`, sticky `AutomationAdmin` + custom commands while
 ///   `automations`, feeds while `announcements`, rank/leaderboard/help/
-///   privacy always. The channel and custom registrations below call the
+///   privacy/bump always. The channel and custom registrations below call the
 ///   real public functions; the rest are marker ids, as in production.
 /// - `CommandRuntime::build` member verbs (`command_runtime.rs`): the five
 ///   member moderation ids while a member consumer exists.
@@ -103,6 +103,7 @@ impl ProductionRegistrations for InteractionRouter {
             HandlerId::Leaderboard,
             HandlerId::Help,
             HandlerId::Privacy,
+            HandlerId::Bump,
         ] {
             router.register(Box::new(Stub(id)));
         }
@@ -230,13 +231,20 @@ fn claiming_surfaces(
     if name == "help" && handler == HandlerId::Help && admitted {
         claims.push("help");
     }
+    if handler == HandlerId::Bump && admitted {
+        claims.push("bump");
+    }
     if owner_map(name, member_present) == Some(handler) && admitted {
         claims.push("owner");
     }
     let earlier_arm_matches = is_channel_claim(name, handler)
         || matches!(
             handler,
-            HandlerId::Lfg | HandlerId::LfgClose | HandlerId::Rank | HandlerId::Leaderboard
+            HandlerId::Lfg
+                | HandlerId::LfgClose
+                | HandlerId::Rank
+                | HandlerId::Leaderboard
+                | HandlerId::Bump
         )
         || (name == "help" && handler == HandlerId::Help)
         || owner_map(name, member_present) == Some(handler);

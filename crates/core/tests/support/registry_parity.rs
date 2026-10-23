@@ -1,8 +1,8 @@
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use two_bot_core::commands::{
-    CommandDefinition, CommandOption, CommandOptionType, HELP_DESCRIPTION, MAX_RESOURCE_ID_CHARS,
-    OCCURRENCE_ID_MAX_CHARS, PRIVACY_DESCRIPTION,
+    CommandDefinition, CommandOption, CommandOptionType, BUMP_DESCRIPTION, HELP_DESCRIPTION,
+    MAX_RESOURCE_ID_CHARS, OCCURRENCE_ID_MAX_CHARS, PRIVACY_DESCRIPTION,
 };
 use two_bot_core::custom_commands::{
     MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_TEMPLATE_CHARS, MAX_TEXT_TRIGGER_CHARS,
@@ -37,6 +37,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("feed-list", "docs/parity.md §1 #30 page"),
     ("privacy", "docs/parity.md §1 privacy"),
     ("command-list", "docs/parity.md §1 #16 page"),
+    ("bump", "docs/parity.md §1 bump"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -230,6 +231,35 @@ pub fn expected_registry() -> Value {
     )
     .expect("privacy serializes");
     commands.insert(3, privacy);
+    // Next-only `/bump` reminders: no legacy counterpart. Insert at the
+    // publish position (fifth, after privacy) as the exact published
+    // definition — the same subcommand shape `core_commands` publishes.
+    let bump = serde_json::to_value(CommandDefinition::new("bump", BUMP_DESCRIPTION).options(
+        vec![
+            CommandOption::new(
+                "opt-in",
+                "Get pinged when the server can be bumped again.",
+                CommandOptionType::SubCommand,
+            ),
+            CommandOption::new(
+                "opt-out",
+                "Stop the bump pings.",
+                CommandOptionType::SubCommand,
+            ),
+            CommandOption::new(
+                "status",
+                "Show the pending bump reminder.",
+                CommandOptionType::SubCommand,
+            ),
+            CommandOption::new(
+                "help",
+                "Show the bump commands.",
+                CommandOptionType::SubCommand,
+            ),
+        ],
+    ))
+    .expect("bump serializes");
+    commands.insert(4, bump);
     // Picker-copy exceptions (registry golden exceptions table): command and
     // option descriptions intentionally differ from legacy. Pointers mirror
     // the published option order.

@@ -20,6 +20,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'sticky_messages', 'table'),
     ('public', 'automation_commands', 'table'),
     ('public', 'scheduled_messages', 'table'),
+    ('public', 'bump_reminders', 'table'),
     ('public', 'automation_audit_log', 'table'),
     ('public', 'event_rsvps', 'table'),
     ('public', 'announcements_audit_log', 'table'),
