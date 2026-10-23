@@ -96,6 +96,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_eventsub_reconcile_errors_total{error_class}` | EventSub reconcile failure sites by the same fixed `error_class` strings as the `error_class` log field: `reconcile_action_failed` (once per failed plan action), `reconcile_prior_failed` (once per pass that found failed subscriptions), `reconcile_unhealthy` (once per non-converged pass) or `reconcile_failed` (listing or plan failures), plus `other` for unknown classes. No status code, body, broadcaster, subscription id or secret ever becomes a label. The `eventsub_reconcile_prior_failed` rule tickets on any `reconcile_prior_failed` increase after a healthy or pending pass completes with no failed-pass growth in the window (mid-pass scrapes retain all baselines; first samples and any counter reset re-baseline silently; a missing or invalid finding or pass-outcome row is no window); the other sites pair with a failed pass in the same run, so the failed-pass ticket already names that window |
 | `two_bot_feed_fetches_total{outcome}` | Feed fetch attempts by bounded outcome: `success` (2xx fetch), `invalid_source` (source refused before dialling), `refused_redirect` (redirect refused by policy) or `failure` (every other failure, including non-2xx HTTP). One sample per fetch; per-outcome, never per-feed, so no source URL, host or feed id reaches a label. Deliberately unwatched: every non-success attempt pairs 1:1 with an errors increment, so the errors sum carries the same signal with finer reason codes; see the catalog |
 | `two_bot_feed_fetch_errors_total{error_class}` | Failed feed fetches by bounded error class: `invalid_source`, `non_public_address`, `redirect_refused`, `too_large`, `invalid_encoding`, `unsupported_content_type`, `unsupported_encoding`, `resolve`, `transport`, `deadline`, `http_error` (completed non-2xx fetch) or `other`. One sample per failed fetch alongside `two_bot_feed_fetches_total`; successes record nothing here. No URL, host, header or body bytes reach a label. The `feed_fetch_failures` rule tickets on any summed increase (first sample is baseline-only, restarts re-baseline, missing family is no window) |
+| `two_bot_ticket_lifecycle_total{event,outcome}` | Terminal ticket lifecycle events by bounded `event` and `outcome` (see label allowlists below). Retire, abandon, successful claim and successful close count once each alongside their `ticket_lifecycle` log line; the purge pass counts one per deleted transcript body (not one per pass) and reports a `db_cause` outcome instead of `deleted` when its storage write fails. No member text, channel name, ticket id or error string ever becomes a label. No alert rule consumes this family yet; read it alongside the lifecycle log lines in [ticket-lifecycle-observability.md](ticket-lifecycle-observability.md) |
 
 ## REST admission guard
 
@@ -452,6 +453,22 @@ as dynamic labels.
   (`crates/core/src/metrics.rs` `FEED_FETCH_ERROR_CLASSES`). Recorded once
   per failed fetch alongside the outcome above; successes record nothing
   here. No URL, host, header or body bytes become labels.
+- `two_bot_ticket_lifecycle_total{event,outcome}` — `event` is one of
+  `retire`, `abandon`, `purge`, `claim` or `close`
+  (`crates/core/src/metrics.rs` `TICKET_LIFECYCLE_EVENTS`); `outcome` is one
+  of `retired`, `abandoned`, `already_gone`, `deleted`, `claimed`, `closed`
+  or a storage-failure `db_cause` (`unique_violation`,
+  `foreign_key_violation`, `not_null_violation`, `check_violation`,
+  `exclusion_violation`, `database`, `pool_timeout`, `pool_closed`,
+  `worker_crashed`, `connection`, `row_not_found`, `query`)
+  (`crates/core/src/metrics.rs` `TICKET_LIFECYCLE_OUTCOMES`, sharing
+  `crates/core/src/error_chain.rs` `db_cause`). Recorded once per
+  instrumented terminal ticket event in `crates/bot/src/ticket_runtime.rs`
+  (retire, abandon, purge, successful staff-button claim/close; recovery
+  completions excluded) alongside its `ticket_lifecycle` log line; the purge
+  pass reports its deleted count, not one per pass. No member text, channel
+  name, ticket id or error string becomes a label; the closed vocabulary has
+  no `other` row.
 - Log fields (coordinated with blocked structured-log work, which owns JSON
   formatting): `voice_event="voice_operation"` with `op`/`outcome`,
   `voice_event="voice_reconcile"` with plan counts,

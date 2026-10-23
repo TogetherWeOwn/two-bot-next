@@ -37,6 +37,17 @@ Framework-specific references: [sqlx 0.9 transactions](https://docs.rs/sqlx/0.9.
 5. Recovery ticks every 300 seconds and uses the 15-minute stale-work cutoff. Each pass skips settled Open rows the cursor has passed without attempting them, while rows in an in-flight status (creating, closing, cleanup_pending) are always re-attempted even behind the cursor — they turn actionable only after the 15-minute stale cutoff or move status across passes — and the cursor never moves backwards. Failed Open work still waits for a process restart (the cursor is in-memory) while budget-truncated rows ahead of the cursor resume on the next pass. Purge runs on startup notification and every 3,600 seconds. The gateway-owned supervisor coalesces notifications, skips elapsed busy ticks, and bounds recovery/purge at 240/60 seconds. Recovery loads rows within 20 seconds, uses 20-second item budgets within a 180-second row budget, sorts rows by the decoded millisecond/id cursor key, skips settled Open rows at or behind the persisted cursor without attempting them, advances the cursor before each await without ever moving it backwards, and reserves a separate 30-second panel slot. Steady-state passes with no newer row attempt zero tickets. Skip and truncation outcomes are observable log lines with stable identifiers: `ticket recovery skipped behind-cursor rows` (info, `skipped=<n>` drained behind-cursor Open rows) and `ticket recovery budget exhausted` (warn, `dropped=<n>` post-skip rows never attempted). This permits five slow successful role-backed panel calls and still bounds identity + row load + row work + panel at 236 seconds within the 240-second supervisor deadline. Slow prefixes cannot permanently starve later rows or the panel. Recovery/buttons share one lane; button admission is bounded at 10 seconds and total button work at 120 seconds. Purge has its own lane so slow Discord work cannot postpone retention cleanup. Shared shutdown cancels and joins ticket buttons and maintenance before shard exit; an aborted shard scope also cancels work. Cancellation leaves durable creating/closing/cleanup state for restart recovery.
 6. Permission changes, deletion, Ready hooks, and history pagination must be exercised against the shared mock Discord double before runtime enablement. No production guild/token or production/staging database is used by these tests.
 
+## Observability
+
+Every retire, abandon, purge and successful staff-button claim/close
+executed through the button path emits one `ticket_lifecycle` log line and
+one `two_bot_ticket_lifecycle_total{event,outcome}` sample with a
+fixed-vocabulary cause; the `ticket recovery deferred` and `ticket action
+incomplete` warns cite the action, ticket and status. Recovery completions
+and the open-path controls-post rollback reach their terminal states
+without emitting. The series, labels and causes are listed in
+[ticket-lifecycle-observability.md](ticket-lifecycle-observability.md).
+
 ## Component admission and overload
 
 Ticket button presses never enter the shared user-slot/lane admission, so the ticket runtime admits them itself, synchronously, before spawning any handler task:

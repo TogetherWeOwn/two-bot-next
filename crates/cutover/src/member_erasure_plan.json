@@ -1,6 +1,11 @@
 {
   "tables": [
     {
+      "table": "starboard_starrers",
+      "columns": ["user_id"],
+      "predicate": "guild_id = $1::bigint AND user_id = $2::bigint"
+    },
+    {
       "table": "internal_action_log",
       "columns": ["actor_id", "target_id", "intent_id"],
       "predicate": "guild_id = $1 AND (actor_id = $2 OR target_id = $2 OR intent_id IN (SELECT intent_id FROM internal_idempotency WHERE guild_id = $1 AND (actor_id = $2 OR target_id = $2 OR resource_id = $2)))"
@@ -267,6 +272,11 @@
     }
   ],
   "allowlist": [
+    {
+      "table": "starboard_config",
+      "column": "updated_by",
+      "reason": "Guild configuration attribution is retained with the active board settings; member activity erasure removes starrers, not guild policy or its operator attribution."
+    },
     {
       "table": "guild_settings",
       "column": "updated_by",

@@ -110,6 +110,10 @@ JOB_INVENTORY = {
     # Advisory PR-size labels (org reusable, advisory only, never required):
     # thin caller to the central labeller + weekly tally.
     "pr-size.yml": {"pr-size", "pr-size-weekly"},
+    # Weekly DORA delivery metrics (docs/dora-metrics.md): reads 30 days of
+    # production Deployments and commits one JSON file plus a markdown
+    # summary to ops/metrics/ on the automation branch with the job token.
+    "dora-metrics.yml": {"metrics"},
 }
 # Reusable-workflow calls are allowed only to these non-deploy workflows.
 # TOG-10893 registers the read-only sbom.yml calls alongside the benchmark one.
@@ -401,6 +405,7 @@ NON_RUNTIME_PATHS = (
     "CONTRIBUTING.md", "LICENSE", ".editorconfig", ".gitignore", ".gitleaks.toml",
     ".gitleaksignore", ".github/ISSUE_TEMPLATE/bug_report.yml",
     ".github/pull_request_template.md", ".github/CODEOWNERS", ".github/dependabot.yml",
+    "ops/metrics/dora-2026-W43.json", "ops/metrics/dora-2026-W43.md",
 )
 
 
@@ -4558,7 +4563,7 @@ class WorkflowTests(unittest.TestCase):
             ignored_sweep,
         )
         guarded = [run for run in cov_runs if "llvm-cov --no-report -p " in run]
-        self.assertEqual(len(guarded), 15)
+        self.assertEqual(len(guarded), 16)
         for run in guarded:
             with self.subTest(guarded=run):
                 self.assertIn("--test-threads=1", run)
@@ -4567,7 +4572,8 @@ class WorkflowTests(unittest.TestCase):
                 # Deliberate: a guard panic in a guarded suite fails the step.
                 self.assertNotIn("--ignore-run-fail", run)
         # needle -> carries `--features db` (core/discord suites need the db
-        # feature to build their guarded targets; cutover suites do not).
+        # feature to build their guarded targets; cutover and store suites do
+        # not).
         guarded_needles = {
             "--test stream_live_store": True,
             "--test mutation_429_proves_no_effect_channel": True,
@@ -4583,6 +4589,9 @@ class WorkflowTests(unittest.TestCase):
             "--test reengagement_list_db": False,
             "--test game_activity_report_db": False,
             "--test member_moderation_db": True,
+            "--test starboard_store": False,
+            "--test starboard_api": False,
+            "--test starboard_config_updated_at": False,
         }
         for needle, wants_db_feature in guarded_needles.items():
             with self.subTest(needle=needle):
@@ -7869,6 +7878,13 @@ class WorkflowTests(unittest.TestCase):
                         # the one tracking issue per firing key (fixture
                         # proofs under the test label).
                         expected = {"contents": "read", "issues": "write"}
+                    elif (name, job_id) == ("dora-metrics.yml", "metrics"):
+                        # Weekly DORA file: commits the JSON and summary to
+                        # the automation branch, reads the production
+                        # Deployments history and verifies each recorded
+                        # deploy's Actions run.
+                        expected = {"contents": "write", "deployments": "read",
+                                    "actions": "read"}
                     self.assertEqual(job["permissions"], expected)
                     for step in job.get("steps", []):
                         if step.get("uses", "").startswith("actions/checkout@"):
