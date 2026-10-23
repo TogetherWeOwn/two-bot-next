@@ -1,4 +1,4 @@
-//! The v14 backup envelope (also reads v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13): manifest / rows / end marker, gzipped NDJSON.
+//! The v15 backup envelope (also reads v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14): manifest / rows / end marker, gzipped NDJSON.
 //!
 //! Port of the file half of legacy `src/store/dump.ts`. The writer side lives
 //! in [`super::dump`]; everything here touches no database, so every refusal
@@ -197,7 +197,11 @@ pub const DUMP_TABLES: &[&str] = &[
     "retention_guild_purge_queue",
     "retention_deletion_requests",
     "event_store",
-    // Voice configuration revisions and attribution must survive recovery.
+    // V14 starboard history and configuration (0458/0459), no foreign keys.
+    "starboard_config",
+    "starboard_starrers",
+    "starboard_posts",
+    // V15 voice configuration revisions and attribution must survive recovery.
     "voice_settings_audit",
 ];
 
@@ -275,8 +279,15 @@ pub const V12_ADDED_TABLES: &[&str] = &["admin_api_tokens"];
 /// Older archives may omit both; new archives must retain the complete pair.
 pub const V13_ADDED_TABLES: &[&str] = &["event_voice_channels", "event_voice_presence"];
 
-/// Voice configuration revision and actor history (0458), first archived in v14.
-pub const V14_ADDED_TABLES: &[&str] = &["voice_settings_audit"];
+/// Tables first covered by v14: the starboard foundation (0458/0459).
+/// Older archives may omit them; restore clears their destination rows.
+/// The merged v13 writer covered event voice state but not starboard, so
+/// v13 retains its frozen inventory and remains readable without these tables.
+pub const V14_ADDED_TABLES: &[&str] =
+    &["starboard_config", "starboard_starrers", "starboard_posts"];
+
+/// Voice configuration revision and actor history (0460), first archived in v15.
+pub const V15_ADDED_TABLES: &[&str] = &["voice_settings_audit"];
 
 /// Covered tables not created by the current cutover migration set, if any.
 /// Keep legacy data when such tables exist, but do not require nonexistent
@@ -353,8 +364,8 @@ pub fn is_destination_owned(table: &str, column: &str) -> bool {
         .any(|(owned_table, owned_column)| *owned_table == table && *owned_column == column)
 }
 
-/// Write complete v14 coverage; the reader also accepts frozen v3 through v13 coverage.
-pub const DUMP_VERSION: u32 = 14;
+/// Write complete v15 coverage; the reader also accepts frozen v3 through v14 coverage.
+pub const DUMP_VERSION: u32 = 15;
 
 /// A table name in the dump, validated against [`DUMP_TABLES`].
 pub type DumpTable = String;
@@ -910,10 +921,11 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                     && version != 11
                     && version != 12
                     && version != 13
+                    && version != 14
                     && version != u64::from(DUMP_VERSION)
                 {
                     return Err(refuse(format!(
-                        "dump version {version}, this build reads 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 and {DUMP_VERSION}"
+                        "dump version {version}, this build reads 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 and {DUMP_VERSION}"
                     )));
                 }
                 retain_within_cap(&mut retained, &obj, limits.retained)?;
@@ -1197,10 +1209,11 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
         let _ = count;
     }
     // Historical inventories are pinned by fixtures. Each old version waives
-    // only tables first covered by a later version. New v14 archives require
+    // only tables first covered by a later version. New v15 archives require
     // the full inventory, including both guild counters (0441/0442/0446/0447),
     // the epoch-claim guard (0450/0451), delete tombstones (0452/0453), token
-    // registry (0456/0457), event voice pair (0455) and voice audit (0458).
+    // registry (0456/0457), event voice pair (0455), starboard (0458/0459)
+    // and voice audit (0460).
     let version = obj.get("version").and_then(Value::as_u64);
     let missing: Vec<&str> = DUMP_TABLES
         .iter()
@@ -1209,6 +1222,7 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
         .filter(|(_, name)| version.is_some_and(|v| v >= 12) || !V12_ADDED_TABLES.contains(name))
         .filter(|(_, name)| version.is_some_and(|v| v >= 13) || !V13_ADDED_TABLES.contains(name))
         .filter(|(_, name)| version.is_some_and(|v| v >= 14) || !V14_ADDED_TABLES.contains(name))
+        .filter(|(_, name)| version.is_some_and(|v| v >= 15) || !V15_ADDED_TABLES.contains(name))
         .filter(|(index, name)| match version {
             Some(3) => *index < 22,
             Some(4) => {
@@ -1348,6 +1362,322 @@ pub fn new_encoder() -> GzEncoder<Vec<u8>> {
 mod tests {
     use super::*;
     use flate2::write::GzEncoder as WEnc;
+
+    // Frozen released v12 inventory: registry present, no starboard tables.
+    const FROZEN_V12_TABLES: [&str; 99] = [
+        "events",
+        "members",
+        "invite_snapshots",
+        "operational_audit_log",
+        "moderation_warnings",
+        "moderation_scheduled_unbans",
+        "moderation_audit",
+        "moderation_lockdowns",
+        "moderation_idempotency",
+        "containment_events",
+        "containment_incidents",
+        "join_risk_flags",
+        "automation_commands",
+        "scheduled_messages",
+        "sticky_messages",
+        "automation_audit_log",
+        "tickets",
+        "ticket_transcripts",
+        "automod_violations",
+        "automod_processed_messages",
+        "self_role_audit",
+        "self_role_panel_claims",
+        "self_role_exchanges",
+        "self_role_exchange_baselines",
+        "automod_delivery_claims",
+        "gateway_boot_directives",
+        "member_erasure_audit",
+        "privacy_opt_outs",
+        "guild_analytics_settings",
+        "privacy_opt_out_audit",
+        "game_activity_guild_aggregates",
+        "assistant_monthly_builds",
+        "member_levels",
+        "member_season_xp",
+        "xp_awards",
+        "level_role_rewards",
+        "level_import_runs",
+        "event_rsvps",
+        "announcements_audit_log",
+        "community_facts",
+        "lfg_posts",
+        "lfg_roles",
+        "lfg_signups",
+        "feed_relays",
+        "feed_deliveries",
+        "web_contract_meta",
+        "guild_counters",
+        "rank_ladder",
+        "rank_snapshots",
+        "member_ranks",
+        "scheduled_events",
+        "scheduled_events_claim",
+        "scheduled_events_tombstone",
+        "counter_snapshots",
+        "member_exclusions",
+        "presence_probe",
+        "community_stream_heartbeats",
+        "community_scorecard_runs",
+        "community_scorecard_alerts",
+        "community_scorecard_attempts",
+        "gateway_sessions",
+        "guild_settings_revision",
+        "guild_settings",
+        "guild_settings_audit",
+        "admin_api_tokens",
+        "audit_kill_switch",
+        "internal_nonces",
+        "internal_clock_high_water",
+        "internal_idempotency",
+        "internal_action_log",
+        "internal_discord_events",
+        "internal_event_keys",
+        "stream_live_claims",
+        "moderation_channel_executions",
+        "moderation_member_bans",
+        "invite_campaigns",
+        "voice_creators",
+        "voice_rooms",
+        "voice_room_blocks",
+        "voice_join_grants",
+        "voice_owner_grants",
+        "voice_text_companions",
+        "voice_access_controls",
+        "voice_logging_settings",
+        "voice_channel_templates",
+        "voice_game_aliases",
+        "voice_random_lists",
+        "voice_random_list_choices",
+        "voice_logging",
+        "voice_logging_mention_members",
+        "voice_logging_mention_roles",
+        "voice_guild_settings",
+        "voice_command_roles",
+        "voice_command_role_members",
+        "voice_vote_kick_audit",
+        "voice_create_reservations",
+        "retention_guild_purge_queue",
+        "retention_deletion_requests",
+        "event_store",
+    ];
+
+    // Frozen released v13: the voice pair and token registry, before starboard.
+    const FROZEN_V13_TABLES: [&str; 101] = [
+        "events",
+        "members",
+        "invite_snapshots",
+        "operational_audit_log",
+        "moderation_warnings",
+        "moderation_scheduled_unbans",
+        "moderation_audit",
+        "moderation_lockdowns",
+        "moderation_idempotency",
+        "containment_events",
+        "containment_incidents",
+        "join_risk_flags",
+        "automation_commands",
+        "scheduled_messages",
+        "sticky_messages",
+        "automation_audit_log",
+        "tickets",
+        "ticket_transcripts",
+        "automod_violations",
+        "automod_processed_messages",
+        "self_role_audit",
+        "self_role_panel_claims",
+        "self_role_exchanges",
+        "self_role_exchange_baselines",
+        "automod_delivery_claims",
+        "gateway_boot_directives",
+        "member_erasure_audit",
+        "privacy_opt_outs",
+        "guild_analytics_settings",
+        "privacy_opt_out_audit",
+        "game_activity_guild_aggregates",
+        "assistant_monthly_builds",
+        "member_levels",
+        "member_season_xp",
+        "xp_awards",
+        "level_role_rewards",
+        "level_import_runs",
+        "event_rsvps",
+        "announcements_audit_log",
+        "community_facts",
+        "lfg_posts",
+        "lfg_roles",
+        "lfg_signups",
+        "feed_relays",
+        "feed_deliveries",
+        "web_contract_meta",
+        "guild_counters",
+        "rank_ladder",
+        "rank_snapshots",
+        "member_ranks",
+        "scheduled_events",
+        "scheduled_events_claim",
+        "scheduled_events_tombstone",
+        "event_voice_channels",
+        "event_voice_presence",
+        "counter_snapshots",
+        "member_exclusions",
+        "presence_probe",
+        "community_stream_heartbeats",
+        "community_scorecard_runs",
+        "community_scorecard_alerts",
+        "community_scorecard_attempts",
+        "gateway_sessions",
+        "guild_settings_revision",
+        "guild_settings",
+        "guild_settings_audit",
+        "admin_api_tokens",
+        "audit_kill_switch",
+        "internal_nonces",
+        "internal_clock_high_water",
+        "internal_idempotency",
+        "internal_action_log",
+        "internal_discord_events",
+        "internal_event_keys",
+        "stream_live_claims",
+        "moderation_channel_executions",
+        "moderation_member_bans",
+        "invite_campaigns",
+        "voice_creators",
+        "voice_rooms",
+        "voice_room_blocks",
+        "voice_join_grants",
+        "voice_owner_grants",
+        "voice_text_companions",
+        "voice_access_controls",
+        "voice_logging_settings",
+        "voice_channel_templates",
+        "voice_game_aliases",
+        "voice_random_lists",
+        "voice_random_list_choices",
+        "voice_logging",
+        "voice_logging_mention_members",
+        "voice_logging_mention_roles",
+        "voice_guild_settings",
+        "voice_command_roles",
+        "voice_command_role_members",
+        "voice_vote_kick_audit",
+        "voice_create_reservations",
+        "retention_guild_purge_queue",
+        "retention_deletion_requests",
+        "event_store",
+    ];
+
+    // Frozen released v14: starboard is present, voice audit is not.
+    const FROZEN_V14_TABLES: [&str; 104] = [
+        "events",
+        "members",
+        "invite_snapshots",
+        "operational_audit_log",
+        "moderation_warnings",
+        "moderation_scheduled_unbans",
+        "moderation_audit",
+        "moderation_lockdowns",
+        "moderation_idempotency",
+        "containment_events",
+        "containment_incidents",
+        "join_risk_flags",
+        "automation_commands",
+        "scheduled_messages",
+        "sticky_messages",
+        "automation_audit_log",
+        "tickets",
+        "ticket_transcripts",
+        "automod_violations",
+        "automod_processed_messages",
+        "self_role_audit",
+        "self_role_panel_claims",
+        "self_role_exchanges",
+        "self_role_exchange_baselines",
+        "automod_delivery_claims",
+        "gateway_boot_directives",
+        "member_erasure_audit",
+        "privacy_opt_outs",
+        "guild_analytics_settings",
+        "privacy_opt_out_audit",
+        "game_activity_guild_aggregates",
+        "assistant_monthly_builds",
+        "member_levels",
+        "member_season_xp",
+        "xp_awards",
+        "level_role_rewards",
+        "level_import_runs",
+        "event_rsvps",
+        "announcements_audit_log",
+        "community_facts",
+        "lfg_posts",
+        "lfg_roles",
+        "lfg_signups",
+        "feed_relays",
+        "feed_deliveries",
+        "web_contract_meta",
+        "guild_counters",
+        "rank_ladder",
+        "rank_snapshots",
+        "member_ranks",
+        "scheduled_events",
+        "scheduled_events_claim",
+        "scheduled_events_tombstone",
+        "event_voice_channels",
+        "event_voice_presence",
+        "counter_snapshots",
+        "member_exclusions",
+        "presence_probe",
+        "community_stream_heartbeats",
+        "community_scorecard_runs",
+        "community_scorecard_alerts",
+        "community_scorecard_attempts",
+        "gateway_sessions",
+        "guild_settings_revision",
+        "guild_settings",
+        "guild_settings_audit",
+        "admin_api_tokens",
+        "audit_kill_switch",
+        "internal_nonces",
+        "internal_clock_high_water",
+        "internal_idempotency",
+        "internal_action_log",
+        "internal_discord_events",
+        "internal_event_keys",
+        "stream_live_claims",
+        "moderation_channel_executions",
+        "moderation_member_bans",
+        "invite_campaigns",
+        "voice_creators",
+        "voice_rooms",
+        "voice_room_blocks",
+        "voice_join_grants",
+        "voice_owner_grants",
+        "voice_text_companions",
+        "voice_access_controls",
+        "voice_logging_settings",
+        "voice_channel_templates",
+        "voice_game_aliases",
+        "voice_random_lists",
+        "voice_random_list_choices",
+        "voice_logging",
+        "voice_logging_mention_members",
+        "voice_logging_mention_roles",
+        "voice_guild_settings",
+        "voice_command_roles",
+        "voice_command_role_members",
+        "voice_vote_kick_audit",
+        "voice_create_reservations",
+        "retention_guild_purge_queue",
+        "retention_deletion_requests",
+        "event_store",
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
+    ];
 
     fn complete_tables(overrides: &BTreeMap<&str, (Vec<&str>, u64)>) -> Vec<Value> {
         DUMP_TABLES
@@ -2018,9 +2348,11 @@ mod tests {
                     && !V10_ADDED_TABLES.contains(name)
                     && !V11_ADDED_TABLES.contains(name)
                     && !V12_ADDED_TABLES.contains(name)
+                    && !["event_voice_channels", "event_voice_presence"].contains(name)
                     && ![
-                        "event_voice_channels",
-                        "event_voice_presence",
+                        "starboard_config",
+                        "starboard_starrers",
+                        "starboard_posts",
                         "voice_settings_audit",
                     ]
                     .contains(name)
@@ -2047,6 +2379,9 @@ mod tests {
                 "retention_guild_purge_queue",
                 "retention_deletion_requests",
                 "event_store",
+                "starboard_config",
+                "starboard_starrers",
+                "starboard_posts",
                 "voice_settings_audit"
             ]
         );
@@ -2075,7 +2410,17 @@ mod tests {
         // waiver covers the v6 event store and the v7/v8 additions.)
         let v5_tables: Vec<Value> = complete_tables(&BTreeMap::new())
             .into_iter()
-            .filter(|table| table["name"] != "event_store")
+            .filter(|table| {
+                table["name"] != "event_store"
+                    && ![
+                        "starboard_config",
+                        "starboard_starrers",
+                        "starboard_posts",
+                        "voice_settings_audit",
+                    ]
+                    .iter()
+                    .any(|n| table["name"] == *n)
+            })
             .collect();
         let mut v5 = manifest(v5_tables);
         v5["version"] = serde_json::json!(5);
@@ -2087,10 +2432,19 @@ mod tests {
         let bytes = gzip_lines(&[v5.clone(), serde_json::json!({"kind":"end","rows":0})]);
         let contents = inspect_bytes(&bytes).expect("v5 without event_store inspects");
         assert_eq!(contents.manifest.version, 5);
-        assert_eq!(contents.manifest.missing_tables(), ["event_store"]);
+        assert_eq!(
+            contents.manifest.missing_tables(),
+            [
+                "event_store",
+                "starboard_config",
+                "starboard_starrers",
+                "starboard_posts",
+                "voice_settings_audit"
+            ]
+        );
         // The same inventory at the current version refuses: new archives must
         // cover the event store.
-        assert_eq!(DUMP_VERSION, 14);
+        assert_eq!(DUMP_VERSION, 15);
         let mut current = v5;
         current["version"] = serde_json::json!(DUMP_VERSION);
         assert!(validate_manifest(&current)
@@ -2109,7 +2463,16 @@ mod tests {
         let tables: Vec<Value> = DUMP_TABLES
             .iter()
             .copied()
-            .filter(|name| !V6_ADDED_TABLES.contains(name))
+            .filter(|name| {
+                !V6_ADDED_TABLES.contains(name)
+                    && ![
+                        "starboard_config",
+                        "starboard_starrers",
+                        "starboard_posts",
+                        "voice_settings_audit",
+                    ]
+                    .contains(name)
+            })
             .map(|name| {
                 serde_json::json!({
                     "name": name,
@@ -2148,7 +2511,16 @@ mod tests {
         let tables: Vec<Value> = DUMP_TABLES
             .iter()
             .copied()
-            .filter(|name| !V6_ADDED_TABLES.contains(name))
+            .filter(|name| {
+                !V6_ADDED_TABLES.contains(name)
+                    && ![
+                        "starboard_config",
+                        "starboard_starrers",
+                        "starboard_posts",
+                        "voice_settings_audit",
+                    ]
+                    .contains(name)
+            })
             .map(|name| {
                 serde_json::json!({
                     "name": name,
@@ -2176,7 +2548,7 @@ mod tests {
             .contains("event_store"));
         let mut current = v5;
         current["version"] = serde_json::json!(DUMP_VERSION);
-        assert_eq!(DUMP_VERSION, 14, "frozen v5 test pins the v14 bump");
+        assert_eq!(DUMP_VERSION, 15, "frozen v5 test pins the v15 bump");
         assert!(validate_manifest(&current)
             .unwrap_err()
             .to_string()
@@ -2188,13 +2560,23 @@ mod tests {
         fn without(tables: Vec<Value>, name: &str) -> Vec<Value> {
             tables
                 .into_iter()
-                .filter(|t| t.get("name").and_then(Value::as_str) != Some(name))
+                .filter(|t| {
+                    t.get("name").and_then(Value::as_str) != Some(name)
+                        && ![
+                            "starboard_config",
+                            "starboard_starrers",
+                            "starboard_posts",
+                            "voice_settings_audit",
+                        ]
+                        .iter()
+                        .any(|n| t["name"] == *n)
+                })
                 .collect()
         }
         // A v6 recovery point written before the seasonal XP projection (0100)
         // declares every covered table except member_season_xp and stays
         // readable; promoting it to v7 without the table is refused. This is
-        // the frozen-manifest guard for the v7 bump (now pinned at v14):
+        // the frozen-manifest guard for the v7 bump (now pinned at v15):
         // building the old manifest from today's inventory (as the v5 tests
         // do) would silently include the new table and miss the refusal.
         let mut v6 = manifest(without(
@@ -2210,7 +2592,16 @@ mod tests {
         let bytes = gzip_lines(&[v6.clone(), serde_json::json!({"kind":"end","rows":0})]);
         let contents = inspect_bytes(&bytes).expect("v6 without member_season_xp inspects");
         assert_eq!(contents.manifest.version, 6);
-        assert_eq!(contents.manifest.missing_tables(), ["member_season_xp"]);
+        assert_eq!(
+            contents.manifest.missing_tables(),
+            [
+                "member_season_xp",
+                "starboard_config",
+                "starboard_starrers",
+                "starboard_posts",
+                "voice_settings_audit"
+            ]
+        );
         // Dropping a v6-covered table from a v6 manifest still refuses.
         let mut v6_gap = v6.clone();
         v6_gap["tables"]
@@ -2227,7 +2618,7 @@ mod tests {
             "member_season_xp",
         ));
         assert_eq!(v7_gap["version"], serde_json::json!(DUMP_VERSION));
-        assert_eq!(DUMP_VERSION, 14, "frozen v6 test pins the v14 bump");
+        assert_eq!(DUMP_VERSION, 15, "frozen v6 test pins the v15 bump");
         assert!(validate_manifest(&v7_gap)
             .unwrap_err()
             .to_string()
@@ -2240,9 +2631,16 @@ mod tests {
             tables
                 .into_iter()
                 .filter(|t| {
-                    t.get("name")
-                        .and_then(Value::as_str)
-                        .is_none_or(|n| !names.contains(&n))
+                    t.get("name").and_then(Value::as_str).is_none_or(|n| {
+                        !names.contains(&n)
+                            && ![
+                                "starboard_config",
+                                "starboard_starrers",
+                                "starboard_posts",
+                                "voice_settings_audit",
+                            ]
+                            .contains(&n)
+                    })
                 })
                 .collect()
         }
@@ -2277,7 +2675,11 @@ mod tests {
             [
                 "member_season_xp",
                 "retention_guild_purge_queue",
-                "retention_deletion_requests"
+                "retention_deletion_requests",
+                "starboard_config",
+                "starboard_starrers",
+                "starboard_posts",
+                "voice_settings_audit"
             ]
         );
         // Dropping the v6 event store from a v6 manifest still refuses.
@@ -2294,8 +2696,8 @@ mod tests {
         let mut v7_gap = v6.clone();
         v7_gap["version"] = serde_json::json!(DUMP_VERSION);
         assert_eq!(
-            DUMP_VERSION, 14,
-            "frozen pre-retention test pins the v14 bump"
+            DUMP_VERSION, 15,
+            "frozen pre-retention test pins the v15 bump"
         );
         let err = validate_manifest(&v7_gap).unwrap_err().to_string();
         assert!(err.contains("retention_guild_purge_queue"), "{err}");
@@ -2307,7 +2709,17 @@ mod tests {
         fn without(tables: Vec<Value>, name: &str) -> Vec<Value> {
             tables
                 .into_iter()
-                .filter(|t| t.get("name").and_then(Value::as_str) != Some(name))
+                .filter(|t| {
+                    t.get("name").and_then(Value::as_str) != Some(name)
+                        && ![
+                            "starboard_config",
+                            "starboard_starrers",
+                            "starboard_posts",
+                            "voice_settings_audit",
+                        ]
+                        .iter()
+                        .any(|n| t["name"] == *n)
+                })
                 .collect()
         }
         // A v7 recovery point written before the stream go-live ledger (0440/0443)
@@ -2330,7 +2742,16 @@ mod tests {
         let bytes = gzip_lines(&[v7.clone(), serde_json::json!({"kind":"end","rows":0})]);
         let contents = inspect_bytes(&bytes).expect("v7 without stream_live_claims inspects");
         assert_eq!(contents.manifest.version, 7);
-        assert_eq!(contents.manifest.missing_tables(), ["stream_live_claims"]);
+        assert_eq!(
+            contents.manifest.missing_tables(),
+            [
+                "stream_live_claims",
+                "starboard_config",
+                "starboard_starrers",
+                "starboard_posts",
+                "voice_settings_audit"
+            ]
+        );
         // Dropping a v7-covered table from a v7 manifest still refuses.
         let mut v7_gap = v7.clone();
         v7_gap["tables"]
@@ -2347,7 +2768,7 @@ mod tests {
             "stream_live_claims",
         ));
         assert_eq!(v8_gap["version"], serde_json::json!(DUMP_VERSION));
-        assert_eq!(DUMP_VERSION, 14, "frozen v7 test pins the v14 bump");
+        assert_eq!(DUMP_VERSION, 15, "frozen v7 test pins the v15 bump");
         assert!(validate_manifest(&v8_gap)
             .unwrap_err()
             .to_string()
@@ -2363,6 +2784,10 @@ mod tests {
             .filter(|table| {
                 table["name"] != "assistant_monthly_builds"
                     && table["name"] != "game_activity_guild_aggregates"
+                    && table["name"] != "starboard_config"
+                    && table["name"] != "starboard_starrers"
+                    && table["name"] != "starboard_posts"
+                    && table["name"] != "voice_settings_audit"
             })
             .collect();
         let mut old = manifest(tables);
@@ -2376,7 +2801,14 @@ mod tests {
             assert_eq!(contents.manifest.version, version);
             assert_eq!(
                 contents.manifest.missing_tables(),
-                ["game_activity_guild_aggregates", "assistant_monthly_builds"]
+                [
+                    "game_activity_guild_aggregates",
+                    "assistant_monthly_builds",
+                    "starboard_config",
+                    "starboard_starrers",
+                    "starboard_posts",
+                    "voice_settings_audit"
+                ]
             );
             let mut gap = old.clone();
             gap["tables"]
@@ -2388,13 +2820,13 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 14, "new dumps require both guild counters");
+        assert_eq!(DUMP_VERSION, 15, "new dumps require both guild counters");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v14 archive inspects");
+        .expect("complete v15 archive inspects");
         for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
             let mut gap = current.clone();
             gap["tables"]
@@ -2417,7 +2849,17 @@ mod tests {
         // inventory even if the version waiver is accidentally removed.
         let tables = complete_tables(&BTreeMap::new())
             .into_iter()
-            .filter(|table| table["name"] != "scheduled_events_claim")
+            .filter(|table| {
+                table["name"] != "scheduled_events_claim"
+                    && ![
+                        "starboard_config",
+                        "starboard_starrers",
+                        "starboard_posts",
+                        "voice_settings_audit",
+                    ]
+                    .iter()
+                    .any(|n| table["name"] == *n)
+            })
             .collect();
         let mut old = manifest(tables);
         for version in 4..=9 {
@@ -2430,7 +2872,13 @@ mod tests {
             assert_eq!(contents.manifest.version, version);
             assert_eq!(
                 contents.manifest.missing_tables(),
-                ["scheduled_events_claim"]
+                [
+                    "scheduled_events_claim",
+                    "starboard_config",
+                    "starboard_starrers",
+                    "starboard_posts",
+                    "voice_settings_audit"
+                ]
             );
             let mut gap = old.clone();
             gap["tables"]
@@ -2442,13 +2890,13 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 14, "new dumps require the epoch-claim guard");
+        assert_eq!(DUMP_VERSION, 15, "new dumps require the epoch-claim guard");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v14 archive inspects");
+        .expect("complete v15 archive inspects");
         let mut gap = current.clone();
         gap["tables"]
             .as_array_mut()
@@ -2469,14 +2917,18 @@ mod tests {
         // inventory even if the version waiver is accidentally removed. This
         // is the frozen claim-only v10 shape written by the merged v10 writer:
         // the epoch-claim guard is present, the delete tombstones and v13
-        // event voice pair are absent. The v12 token registry rides along:
-        // a present table needs no waiver.
+        // event voice pair, v12 registry and v14 starboard tables are absent.
         let tables = complete_tables(&BTreeMap::new())
             .into_iter()
             .filter(|table| {
                 table["name"] != "scheduled_events_tombstone"
                     && table["name"] != "event_voice_channels"
                     && table["name"] != "event_voice_presence"
+                    && table["name"] != "starboard_config"
+                    && table["name"] != "starboard_starrers"
+                    && table["name"] != "starboard_posts"
+                    && table["name"] != "voice_settings_audit"
+                    && table["name"] != "admin_api_tokens"
             })
             .collect();
         let mut old = manifest(tables);
@@ -2493,7 +2945,12 @@ mod tests {
                 [
                     "scheduled_events_tombstone",
                     "event_voice_channels",
-                    "event_voice_presence"
+                    "event_voice_presence",
+                    "admin_api_tokens",
+                    "starboard_config",
+                    "starboard_starrers",
+                    "starboard_posts",
+                    "voice_settings_audit"
                 ]
             );
             let mut gap = old.clone();
@@ -2506,13 +2963,58 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 14, "new dumps require the delete tombstones");
+        assert_eq!(DUMP_VERSION, 15, "new dumps require the delete tombstones");
+        // v11 kept the tombstones mandatory but predates registry and starboard:
+        // the frozen old-v11 shape carries the tombstone and omits the
+        // registry, event voice pair and starboard three.
+        assert_eq!(DUMP_VERSION, 15, "new dumps require the v11 tombstones");
+        let old_v11: Vec<Value> = complete_tables(&BTreeMap::new())
+            .into_iter()
+            .filter(|table| {
+                table["name"] != "admin_api_tokens"
+                    && table["name"] != "event_voice_channels"
+                    && table["name"] != "event_voice_presence"
+                    && table["name"] != "starboard_config"
+                    && table["name"] != "starboard_starrers"
+                    && table["name"] != "starboard_posts"
+                    && table["name"] != "voice_settings_audit"
+            })
+            .collect();
+        let mut at_v11 = manifest(old_v11);
+        at_v11["version"] = serde_json::json!(11);
+        let contents = inspect_bytes(&gzip_lines(&[
+            at_v11.clone(),
+            serde_json::json!({"kind":"end","rows":0}),
+        ]))
+        .expect("old v11 archives without the starboard tables stay readable");
+        assert_eq!(contents.manifest.version, 11);
+        assert_eq!(
+            contents.manifest.missing_tables(),
+            [
+                "event_voice_channels",
+                "event_voice_presence",
+                "admin_api_tokens",
+                "starboard_config",
+                "starboard_starrers",
+                "starboard_posts",
+                "voice_settings_audit"
+            ]
+        );
+        let mut tombstone_gap = at_v11.clone();
+        tombstone_gap["tables"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|table| table["name"] != "scheduled_events_tombstone");
+        assert!(validate_manifest(&tombstone_gap)
+            .unwrap_err()
+            .to_string()
+            .contains("scheduled_events_tombstone"));
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v14 archive inspects");
+        .expect("complete v15 archive inspects");
         let mut gap = current.clone();
         gap["tables"]
             .as_array_mut()
@@ -2533,13 +3035,17 @@ mod tests {
         // inventory even if the version waiver is accidentally removed. This
         // is the frozen tombstone-only v11 shape written by the merged v11
         // writer: the delete tombstones are present, the token registry is
-        // absent, as is the v13 event voice pair.
+        // absent, as are the v13 voice pair and v14 starboard tables.
         let tables = complete_tables(&BTreeMap::new())
             .into_iter()
             .filter(|table| {
                 table["name"] != "admin_api_tokens"
                     && table["name"] != "event_voice_channels"
                     && table["name"] != "event_voice_presence"
+                    && table["name"] != "starboard_config"
+                    && table["name"] != "starboard_starrers"
+                    && table["name"] != "starboard_posts"
+                    && table["name"] != "voice_settings_audit"
             })
             .collect();
         let mut old = manifest(tables);
@@ -2556,7 +3062,11 @@ mod tests {
                 [
                     "event_voice_channels",
                     "event_voice_presence",
-                    "admin_api_tokens"
+                    "admin_api_tokens",
+                    "starboard_config",
+                    "starboard_starrers",
+                    "starboard_posts",
+                    "voice_settings_audit"
                 ]
             );
             let mut gap = old.clone();
@@ -2575,13 +3085,13 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("admin_api_tokens"));
-        assert_eq!(DUMP_VERSION, 14, "new dumps require the token registry");
+        assert_eq!(DUMP_VERSION, 15, "new dumps require the token registry");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v14 archive inspects");
+        .expect("complete v15 archive inspects");
         let mut gap = current.clone();
         gap["tables"]
             .as_array_mut()
@@ -2603,7 +3113,12 @@ mod tests {
         let tables = complete_tables(&BTreeMap::new())
             .into_iter()
             .filter(|table| {
-                table["name"] != "event_voice_channels" && table["name"] != "event_voice_presence"
+                table["name"] != "event_voice_channels"
+                    && table["name"] != "event_voice_presence"
+                    && table["name"] != "starboard_config"
+                    && table["name"] != "starboard_starrers"
+                    && table["name"] != "starboard_posts"
+                    && table["name"] != "voice_settings_audit"
             })
             .collect();
         let mut old = manifest(tables);
@@ -2617,7 +3132,14 @@ mod tests {
             assert_eq!(contents.manifest.version, version);
             assert_eq!(
                 contents.manifest.missing_tables(),
-                ["event_voice_channels", "event_voice_presence"]
+                [
+                    "event_voice_channels",
+                    "event_voice_presence",
+                    "starboard_config",
+                    "starboard_starrers",
+                    "starboard_posts",
+                    "voice_settings_audit"
+                ]
             );
             let mut gap = old.clone();
             gap["tables"]
@@ -2634,13 +3156,13 @@ mod tests {
         let error = validate_manifest(&v13_gap).unwrap_err().to_string();
         assert!(error.contains("event_voice_channels"), "{error}");
         assert!(error.contains("event_voice_presence"), "{error}");
-        assert_eq!(DUMP_VERSION, 14, "new dumps require the event voice pair");
+        assert_eq!(DUMP_VERSION, 15, "new dumps require the event voice pair");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v14 archive inspects");
+        .expect("complete v15 archive inspects");
         for name in ["event_voice_channels", "event_voice_presence"] {
             let mut gap = current.clone();
             gap["tables"]
@@ -2658,22 +3180,190 @@ mod tests {
     }
 
     #[test]
-    fn v13_archives_read_without_voice_audit_but_v14_requires_it() {
-        // Literal table name: a missing-table waiver must not hide itself by
-        // changing the production version inventory used to build this fixture.
-        let tables = complete_tables(&BTreeMap::new())
-            .into_iter()
-            .filter(|table| table["name"] != "voice_settings_audit")
-            .collect();
+    fn v12_archives_read_without_starboard_but_v14_requires_each_table() {
+        let tables = FROZEN_V12_TABLES.iter().map(|name| {
+            serde_json::json!({"name": name, "columns": [], "column_types": [], "count": 0})
+        }).collect();
         let mut old = manifest(tables);
-        for version in 4..=13 {
+        for version in 4..=12 {
             old["version"] = serde_json::json!(version);
             let contents = inspect_bytes(&gzip_lines(&[
                 old.clone(),
                 serde_json::json!({"kind":"end","rows":0}),
             ]))
-            .expect("pre-v14 archives without voice revision history stay readable");
+            .expect("frozen registry-present v12 coverage stays readable");
             assert_eq!(contents.manifest.version, version);
+            assert_eq!(contents.manifest.tables.len(), 99);
+            assert_eq!(
+                contents.manifest.missing_tables(),
+                [
+                    "event_voice_channels",
+                    "event_voice_presence",
+                    "starboard_config",
+                    "starboard_starrers",
+                    "starboard_posts",
+                    "voice_settings_audit"
+                ]
+            );
+            let mut gap = old.clone();
+            gap["tables"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|table| table["name"] != "events");
+            assert!(validate_manifest(&gap)
+                .unwrap_err()
+                .to_string()
+                .contains("missing tables: events"));
+        }
+        let mut missing_registry = old;
+        missing_registry["version"] = serde_json::json!(12);
+        missing_registry["tables"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|table| table["name"] != "admin_api_tokens");
+        let error = inspect_bytes(&gzip_lines(&[
+            missing_registry,
+            serde_json::json!({"kind":"end","rows":0}),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("admin_api_tokens"), "{error}");
+        let released_without_voice: Vec<_> = FROZEN_V13_TABLES
+            .iter()
+            .copied()
+            .filter(|name| !["event_voice_channels", "event_voice_presence"].contains(name))
+            .collect();
+        assert_eq!(released_without_voice, FROZEN_V12_TABLES);
+        assert_eq!(
+            DUMP_VERSION, 15,
+            "new dumps require the v14 starboard tables"
+        );
+        assert_eq!(
+            DUMP_TABLES.len(),
+            105,
+            "released 101 plus three starboard tables and voice audit"
+        );
+        assert_eq!(&DUMP_TABLES[..101], FROZEN_V13_TABLES.as_slice());
+        assert_eq!(
+            &DUMP_TABLES[101..104],
+            ["starboard_config", "starboard_starrers", "starboard_posts"]
+        );
+        let current = manifest(complete_tables(&BTreeMap::new()));
+        inspect_bytes(&gzip_lines(&[
+            current.clone(),
+            serde_json::json!({"kind":"end","rows":0}),
+        ]))
+        .expect("complete v15 archive inspects");
+        for name in [
+            "starboard_config",
+            "starboard_starrers",
+            "starboard_posts",
+            "event_voice_channels",
+            "event_voice_presence",
+            "admin_api_tokens",
+        ] {
+            let mut gap = current.clone();
+            gap["tables"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|table| table["name"] != name);
+            let error = inspect_bytes(&gzip_lines(&[
+                gap,
+                serde_json::json!({"kind":"end","rows":0}),
+            ]))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(name), "{error}");
+        }
+    }
+
+    #[test]
+    fn frozen_v13_inspects_without_starboard_and_requires_voice_and_registry() {
+        // This literal released inventory does not depend on current DUMP_TABLES
+        // or version-waiver constants: relabeling v13 as starboard must fail.
+        let tables = FROZEN_V13_TABLES.iter().map(|name| {
+            serde_json::json!({"name": name, "columns": [], "column_types": [], "count": 0})
+        }).collect();
+        let mut old = manifest(tables);
+        old["version"] = serde_json::json!(13);
+        let contents = inspect_bytes(&gzip_lines(&[
+            old.clone(),
+            serde_json::json!({"kind":"end","rows":0}),
+        ]))
+        .expect("released voice-and-registry v13 archive remains readable without starboard");
+        assert_eq!(contents.manifest.version, 13);
+        assert_eq!(contents.manifest.tables.len(), 101);
+        assert_eq!(
+            contents.manifest.missing_tables(),
+            [
+                "starboard_config",
+                "starboard_starrers",
+                "starboard_posts",
+                "voice_settings_audit"
+            ]
+        );
+        assert_eq!(
+            contents
+                .manifest
+                .tables
+                .iter()
+                .map(|table| table.name.as_str())
+                .filter(|name| ["event_voice_channels", "event_voice_presence"].contains(name))
+                .collect::<Vec<_>>(),
+            ["event_voice_channels", "event_voice_presence"]
+        );
+        for name in [
+            "event_voice_channels",
+            "event_voice_presence",
+            "admin_api_tokens",
+            "events",
+        ] {
+            let mut gap = old.clone();
+            gap["tables"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|table| table["name"] != name);
+            let error = inspect_bytes(&gzip_lines(&[
+                gap,
+                serde_json::json!({"kind":"end","rows":0}),
+            ]))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains(name),
+                "v13 must still require {name}: {error}"
+            );
+        }
+        let mut mislabeled = old;
+        mislabeled["version"] = serde_json::json!(14);
+        let error = inspect_bytes(&gzip_lines(&[
+            mislabeled,
+            serde_json::json!({"kind":"end","rows":0}),
+        ]))
+        .unwrap_err()
+        .to_string();
+        for name in ["starboard_config", "starboard_starrers", "starboard_posts"] {
+            assert!(error.contains(name), "v14 must require {name}: {error}");
+        }
+    }
+
+    #[test]
+    fn v14_archives_read_without_voice_audit_but_v15_requires_it() {
+        // Literal table name: a missing-table waiver must not hide itself by
+        // changing the production version inventory used to build this fixture.
+        let tables = FROZEN_V14_TABLES.iter().map(|name| {
+            serde_json::json!({"name": name, "columns": [], "column_types": [], "count": 0})
+        }).collect();
+        let mut old = manifest(tables);
+        for version in 4..=14 {
+            old["version"] = serde_json::json!(version);
+            let contents = inspect_bytes(&gzip_lines(&[
+                old.clone(),
+                serde_json::json!({"kind":"end","rows":0}),
+            ]))
+            .expect("pre-v15 archives without voice revision history stay readable");
+            assert_eq!(contents.manifest.version, version);
+            assert_eq!(contents.manifest.tables.len(), 104);
             assert_eq!(contents.manifest.missing_tables(), ["voice_settings_audit"]);
             let mut gap = old.clone();
             gap["tables"]
@@ -2685,7 +3375,27 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 14, "new dumps require voice revision history");
+        // v14 owns starboard, so its voice-audit waiver must not waive any
+        // released starboard table or accidentally require the later audit.
+        old["version"] = serde_json::json!(14);
+        for name in ["starboard_config", "starboard_starrers", "starboard_posts"] {
+            let mut gap = old.clone();
+            gap["tables"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|table| table["name"] != name);
+            let error = inspect_bytes(&gzip_lines(&[
+                gap,
+                serde_json::json!({"kind":"end","rows":0}),
+            ]))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(name), "v14 must require {name}: {error}");
+        }
+        assert_eq!(DUMP_VERSION, 15, "new dumps require voice revision history");
+        assert_eq!(DUMP_TABLES.len(), 105);
+        assert_eq!(&DUMP_TABLES[..104], FROZEN_V14_TABLES.as_slice());
+        assert_eq!(&DUMP_TABLES[104..], ["voice_settings_audit"]);
         let current = manifest(complete_tables(&BTreeMap::new()));
         assert!(current["tables"]
             .as_array()
@@ -2696,8 +3406,8 @@ mod tests {
             current,
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v14 archive inspects");
-        old["version"] = serde_json::json!(14);
+        .expect("complete v15 archive inspects");
+        old["version"] = serde_json::json!(15);
         let error = inspect_bytes(&gzip_lines(&[
             old,
             serde_json::json!({"kind":"end","rows":0}),
@@ -2712,7 +3422,17 @@ mod tests {
         fn without(tables: Vec<Value>, name: &str) -> Vec<Value> {
             tables
                 .into_iter()
-                .filter(|t| t.get("name").and_then(Value::as_str) != Some(name))
+                .filter(|t| {
+                    t.get("name").and_then(Value::as_str) != Some(name)
+                        && ![
+                            "starboard_config",
+                            "starboard_starrers",
+                            "starboard_posts",
+                            "voice_settings_audit",
+                        ]
+                        .iter()
+                        .any(|n| t["name"] == *n)
+                })
                 .collect()
         }
         // A v5 manifest without event_store stays readable: v5 predates
@@ -2729,7 +3449,16 @@ mod tests {
         let bytes = gzip_lines(&[v5.clone(), serde_json::json!({"kind":"end","rows":0})]);
         let contents = inspect_bytes(&bytes).expect("v5 without event_store inspects");
         assert_eq!(contents.manifest.version, 5);
-        assert_eq!(contents.manifest.missing_tables(), ["event_store"]);
+        assert_eq!(
+            contents.manifest.missing_tables(),
+            [
+                "event_store",
+                "starboard_config",
+                "starboard_starrers",
+                "starboard_posts",
+                "voice_settings_audit"
+            ]
+        );
         // Dropping a v5-covered table from a v5 manifest still refuses.
         let mut v5_gap = v5.clone();
         v5_gap["tables"]
@@ -2756,21 +3485,37 @@ mod tests {
         // must also let a v5 archive reach it.
         let mut v5 = good_dump();
         v5[0]["version"] = serde_json::json!(5);
-        v5[0]["tables"]
-            .as_array_mut()
-            .unwrap()
-            .retain(|t| t.get("name").and_then(Value::as_str) != Some("event_store"));
+        v5[0]["tables"].as_array_mut().unwrap().retain(|t| {
+            t.get("name").and_then(Value::as_str) != Some("event_store")
+                && ![
+                    "starboard_config",
+                    "starboard_starrers",
+                    "starboard_posts",
+                    "voice_settings_audit",
+                ]
+                .iter()
+                .any(|n| t["name"] == *n)
+        });
         let contents = inspect_bytes(&gzip_lines(&v5)).expect("a v5 archive stays readable");
         assert_eq!(contents.manifest.version, 5);
         assert_eq!(contents.rows, 1);
-        assert_eq!(contents.manifest.missing_tables(), ["event_store"]);
+        assert_eq!(
+            contents.manifest.missing_tables(),
+            [
+                "event_store",
+                "starboard_config",
+                "starboard_starrers",
+                "starboard_posts",
+                "voice_settings_audit"
+            ]
+        );
 
         let mut future = good_dump();
         future[0]["version"] = serde_json::json!(DUMP_VERSION + 1);
         let message = inspect_bytes(&gzip_lines(&future)).unwrap_err().to_string();
         assert!(
             message.contains(&format!(
-                "reads 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 and {DUMP_VERSION}"
+                "reads 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 and {DUMP_VERSION}"
             )),
             "unknown versions are refused with the readable list: {message}"
         );

@@ -1,7 +1,7 @@
 # Backups, restore drills, and sealed guild-config snapshots (TOG-9881)
 
 Rust port of the legacy `two-bot` cutover-data surface (frozen source
-`two-bot` `main @ d5d11793`): v14 dump format with v3–v13 read compatibility,
+`two-bot` `main @ d5d11793`): v15 dump format with v3–v14 read compatibility,
 SigV4 off-box upload, retention
 math, sealed guild-config snapshot + restore planner, and the three timer
 equivalents. Code: `crates/core/src/backup/`, CLI: `two-bot backup |
@@ -102,18 +102,18 @@ upload command; argv and child output never echoed):
 ## The format
 
 Gzipped NDJSON, one object per line: `manifest` / `row` / `end`. New dumps
-write **v14** (including durable voice-create reservations, the retention
+write **v15** (including durable voice-create reservations, the retention
 queues, the seasonal XP projection, the event store: voice capture plus
 presence capture plus member-capture deltas plus message/reaction capture
 plus thread lifecycle plus stage/interaction-observe/audit-log capture plus
 invite/scheduled-event capture, the stream go-live ledger, guild game-activity
 aggregates, the assistant monthly-cap ledger, the scheduled-event
 epoch-claim guard, the scheduled-event delete tombstones and the admin API
-token registry, event voice pair and voice configuration revision audit); the reader also accepts
+token registry, event voice pair, three starboard tables and voice configuration revision audit); the reader also accepts
 frozen **v3**, pre-reservation **v4**, pre-v6-tables **v5**, pre-seasonal **v6**,
 pre-stream-ledger **v7**, pre-guild-counters **v8**, pre-epoch-claim **v9**,
-pre-tombstone **v10**, pre-registry **v11**, pre-event-voice **v12** and
-pre-voice-audit **v13**.
+pre-tombstone **v10**, pre-registry **v11**, pre-event-voice **v12**, pre-starboard **v13** and
+pre-voice-audit **v14**.
 Other versions refuse.
 The manifest carries per-table `{name, columns, column_types, count}` taken
 inside one `REPEATABLE READ` transaction, the `events` high-water mark, the
@@ -146,10 +146,10 @@ unsupported. A failed write or validation leaves existing published recovery
 points untouched; a crash may leave a temporary file, but retention and drill
 selectors ignore it.
 
-### Coverage and recovery semantics (v4, v5, v6, v7, v8, v9, v10, v11, v12, v13 and v14)
+### Coverage and recovery semantics (v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14 and v15)
 
 `DUMP_TABLES` in `crates/core/src/backup/dump_file.rs` is the single ordered
-inventory for both dump and restore. It includes **102 durable tables from the
+inventory for both dump and restore. It includes **105 durable tables from the
 current cutover migrations**, including the bot-owned website-contract backing
 tables, the member-moderation ledger, the self-role send receipts
 (`self_role_exchanges`) plus their uncertainty baselines
@@ -174,10 +174,12 @@ scheduled-event epoch-claim guard (`scheduled_events_claim`: 0450/0451) and
 its delete tombstones (`scheduled_events_tombstone`: 0452/0453) and the
 admin API token registry (`admin_api_tokens`: 0456/0457) and the event
 voice pair (`event_voice_channels`, `event_voice_presence`: 0455), and voice
-configuration attribution/revision history (`voice_settings_audit`: 0458).
+configuration attribution/revision history (`voice_settings_audit`: 0460), plus
+starboard configuration, distinct starrers and post state (`starboard_config`,
+`starboard_starrers`, `starboard_posts`: 0458/0459).
 `OPTIONAL_LEGACY_TABLES` is empty: the coverage
 test fails if a covered table is not migrated. A dump from a fresh Rust schema
-has 102 table entries. A missing current table refuses a dump/restore: migrate
+has 105 table entries. A missing current table refuses a dump/restore: migrate
 the target first.
 Each readable version requires its historical inventory and waives only
 versioned additions introduced later:
@@ -193,16 +195,19 @@ versioned additions introduced later:
 | v10 | `V11_ADDED_TABLES`, `V12_ADDED_TABLES`: `scheduled_events_tombstone`, `admin_api_tokens`, `V13_ADDED_TABLES` (event voice pair) |
 | v11 | `V12_ADDED_TABLES`: `admin_api_tokens`, `V13_ADDED_TABLES` (event voice pair) |
 | v12 | `V13_ADDED_TABLES`: `event_voice_channels`, `event_voice_presence` |
-| v13 | `V14_ADDED_TABLES`: `voice_settings_audit` |
-| v14 | None: the full current inventory is required |
+| v13 | `V14_ADDED_TABLES`: `starboard_config`, `starboard_starrers`, `starboard_posts`; `V15_ADDED_TABLES`: `voice_settings_audit` |
+| v14 | `V15_ADDED_TABLES`: `voice_settings_audit` |
+| v15 | None: the full current inventory is required |
 
-Versions v4–v12 may additionally omit `V14_ADDED_TABLES` (voice configuration
-audit), which did not exist when those archives were written.
+Versions v4–v12 may additionally omit `V14_ADDED_TABLES` (starboard) and
+`V15_ADDED_TABLES` (voice configuration audit), which did not exist when those
+archives were written.
 These are narrow waivers, not permission to omit arbitrary tables. An
 incomplete new archive refuses at inspection. The frozen 85-table v4 fixture
 is unchanged from before these additions; older v4–v12 archives need not
 invent entries for the v9 guild counters, the v10 epoch-claim guard, the
-v11 delete tombstones, the v12 token registry or the v13 event voice pair.
+v11 delete tombstones, the v12 token registry, the v13 event voice pair,
+the v14 starboard tables or the v15 voice audit.
 Restoring an older archive clears
 destination rows for every omitted later table instead of retaining unrelated
 target state. In particular, restoring v8 without guild counters clears both
@@ -216,9 +221,11 @@ v12 recovery point to preserve the monthly cap, both mirror fences and the
 issued tokens. Restoring v12 without the event voice pair clears both
 tables; the next tick re-claims open instances, but archived presence spans
 are lost. Use a v13 or newer recovery point to preserve claims and spans, and
-v14 to preserve voice configuration audit. Current v14 archives must include
-the monthly cap, both mirror-fence tables, registry, event voice pair and voice
-audit, so routine restores retain their archived state. Restores refuse a
+v14 to preserve starboard settings, starrers and post records. Restoring a
+pre-v14 archive clears those three tables, so the board is off until configured
+again. Use v15 to preserve voice configuration audit. Current v15 archives must
+include the monthly cap, both mirror-fence tables, registry, event voice pair,
+starboard tables and voice audit, so routine restores retain their archived state. Restores refuse a
 destination that already has voice audit history rather than overwrite its
 evidence; use a fresh migrated target. Older archives contain no voice audit
 and cannot recover prior attribution. Tombstone `deleted_at` cells must be real dates in
