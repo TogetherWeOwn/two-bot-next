@@ -439,8 +439,10 @@ subscription whose challenge has not succeeded.
 
 Remaining receiver lines for completeness: `notification acknowledged`
 (verified go-live acked; a `--contains "acknowledged"` read also matches
-`revocation acknowledged`) and `delivery ignored` (unknown type or deterministic
-planning error, acknowledged with 2xx so Twitch does not retry). The separate
+`revocation acknowledged`), `delivery ignored` (unknown type, acknowledged
+with 2xx so Twitch does not retry), and the sampled `eventsub delivery
+classification failed` warn (deterministic planning error, acknowledged with
+2xx, `error_variant` naming the variant). The separate
 `eventsub startup refused` line is emitted from `crates/bot/src/main.rs` during
 receiver setup; it records a fatal config/bind failure before the process exits
 nonzero, not a receiver-request log.

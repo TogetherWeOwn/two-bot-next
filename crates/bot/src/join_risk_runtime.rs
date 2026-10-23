@@ -243,11 +243,11 @@ impl StoreSettings {
         // Bound to a local so the timeout future is dropped before the borrows
         // above end (edition-2021 tail-expression temporaries).
         let loaded = tokio::time::timeout(SETTINGS_READ_MAX, async {
-            let (revision, rows) = store.poll_marks().await?;
+            let (revision, rows) = store.poll_guild_marks(&self.guild_id).await?;
             if stale.is_some_and(|cache| !cache.needs_refresh(revision, rows)) {
                 return Ok::<_, sqlx::Error>(None);
             }
-            let snapshot = store.load_snapshot().await?;
+            let snapshot = store.load_guild_snapshot(&self.guild_id).await?;
             Ok(Some(SettingsCache::load(&snapshot)))
         })
         .await;

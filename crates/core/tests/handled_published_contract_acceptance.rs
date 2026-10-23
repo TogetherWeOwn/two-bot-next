@@ -131,8 +131,8 @@ fn help_lists_only_handled_commands() {
     );
 }
 
-/// CONTROL (green before and after): the 29 parity builtins route to their
-/// handlers. Unaffected by the templateassistant unpublish.
+/// Registry compatibility: parity builtins plus Next-only inspection route
+/// to their handlers. The original templateassistant control remains covered.
 #[test]
 fn parity_builtins_route_to_their_handlers() {
     let router = InteractionRouter::new(parity_gates());
@@ -160,6 +160,7 @@ fn parity_builtins_route_to_their_handlers() {
         ("command", HandlerId::AutomationAdmin),
         ("command-remove", HandlerId::AutomationAdmin),
         ("command-list", HandlerId::AutomationAdmin),
+        ("command-inspect", HandlerId::AutomationAdmin),
         ("schedule", HandlerId::AutomationAdmin),
         ("schedule-remove", HandlerId::AutomationAdmin),
         ("schedule-list", HandlerId::AutomationAdmin),
@@ -173,7 +174,11 @@ fn parity_builtins_route_to_their_handlers() {
         ("feed-remove", HandlerId::FeedRemove),
         ("feed-list", HandlerId::FeedList),
     ];
-    assert_eq!(cases.len(), 29, "all 29 parity builtins covered");
+    assert_eq!(
+        cases.len(),
+        30,
+        "all 30 parity and Next-only builtins covered"
+    );
     for (name, handler) in cases {
         assert_eq!(
             router.route_slash(&ctx(name)),
@@ -199,5 +204,5 @@ fn e2e_matrix_still_matches_the_publish_set() {
         matrix_names, published_names,
         "matrix drift: the fix must not change the parity publish set"
     );
-    assert_eq!(matrix.len(), 29, "contract covers the 29 built-in commands");
+    assert_eq!(matrix.len(), 30, "contract covers the 30 built-in commands");
 }

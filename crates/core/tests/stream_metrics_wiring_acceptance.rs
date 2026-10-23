@@ -10,8 +10,10 @@
 //! - `eventsub_classified("challenge")` when a verified challenge is
 //!   answered, `"notification"` for a verified stream.online notification,
 //!   `"revocation"` for a verified revocation, `"ignored"` for deliveries
-//!   acknowledged without effect (unknown type, deterministic classify
-//!   errors), and `"tampered"` when signature verification fails.
+//!   acknowledged without effect (unknown type, non-signature verification
+//!   failures), the variant label for classify errors (see
+//!   `eventsub_error_label`), and `"tampered"` when signature verification
+//!   fails.
 //! - The kind is a fixed literal chosen by the receiver branch, never
 //!   formatted from a header, body, ID or secret.
 //!

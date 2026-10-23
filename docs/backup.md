@@ -102,7 +102,7 @@ upload command; argv and child output never echoed):
 ## The format
 
 Gzipped NDJSON, one object per line: `manifest` / `row` / `end`. New dumps
-write **v15** (including durable voice-create reservations, the retention
+write **v16** (including durable voice-create reservations, the retention
 queues, the seasonal XP projection, the event store: voice capture plus
 presence capture plus member-capture deltas plus message/reaction capture
 plus thread lifecycle plus stage/interaction-observe/audit-log capture plus
@@ -146,7 +146,7 @@ unsupported. A failed write or validation leaves existing published recovery
 points untouched; a crash may leave a temporary file, but retention and drill
 selectors ignore it.
 
-### Coverage and recovery semantics (v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14 and v15)
+### Coverage and recovery semantics (v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15 and v16)
 
 `DUMP_TABLES` in `crates/core/src/backup/dump_file.rs` is the single ordered
 inventory for both dump and restore. It includes **105 durable tables from the
@@ -172,12 +172,18 @@ aggregates (`game_activity_guild_aggregates`: 0441/0442), the assistant
 monthly-cap ledger (`assistant_monthly_builds`: 0446/0447), the
 scheduled-event epoch-claim guard (`scheduled_events_claim`: 0450/0451) and
 its delete tombstones (`scheduled_events_tombstone`: 0452/0453) and the
-admin API token registry (`admin_api_tokens`: 0456/0457), the event
-voice pair (`event_voice_channels`, `event_voice_presence`: 0455), plus starboard
+admin API token registry (`admin_api_tokens`: 0456/0457, named-holder and
+90-day lifetime repair 0464/0463), the event voice pair
+(`event_voice_channels`, `event_voice_presence`: 0455), plus starboard
 configuration, distinct starrers and post state (`starboard_config`,
 `starboard_starrers`, `starboard_posts`: 0458/0459), plus giveaway definitions,
 entries and draw rounds (`giveaways`, `giveaway_entries`, `giveaway_draws`: 0460/0461),
-plus voice configuration attribution/revision history (`voice_settings_audit`: 0463).
+plus voice configuration attribution/revision history (`voice_settings_audit`: 0465).
+The [registry contract](admin-registry.md) adds no table or archive version:
+new dumps discover `holder_id` / `holder_kind` dynamically. Populated
+pre-holder archives refuse transactionally on the required authority columns
+instead of inventing holders; older readable archives that omit the table
+retain their versioned clearing behavior.
 `OPTIONAL_LEGACY_TABLES` is empty: the coverage
 test fails if a covered table is not migrated. A dump from a fresh Rust schema
 has 108 table entries. A missing current table refuses a dump/restore: migrate
