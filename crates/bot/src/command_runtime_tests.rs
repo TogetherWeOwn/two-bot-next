@@ -48,6 +48,8 @@ mod giveaway_countdown_edge_acceptance_tests;
 mod giveaway_create_entry_acceptance_tests;
 #[path = "schedule_strict_decode_acceptance_tests.rs"]
 mod schedule_strict_decode_acceptance_tests;
+#[path = "schedule_absolute_acceptance_tests.rs"]
+mod schedule_absolute_acceptance;
 
 use std::collections::VecDeque;
 use std::str::FromStr;
