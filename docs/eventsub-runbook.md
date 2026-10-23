@@ -80,8 +80,8 @@ Rules for the signing secret:
 - The value travels only inside `WebhookSecret` / `Secret`. Its `Debug` form
   renders `[REDACTED]`, and it leaves that wrapper only at the HMAC boundary
   and inside the create-subscription body, which is itself a `Secret`.
-  Source: `crates/core/src/twitch_eventsub.rs:99-125`,
-  `crates/core/src/twitch_eventsub.rs:436-455`.
+  Source: `crates/core/src/twitch_eventsub.rs:101-127`,
+  `crates/core/src/twitch_eventsub.rs:457-476`.
 - The handler never re-reads the environment: the secret is cloned into
   receiver state at bind time. Unarmed, a new value takes effect on container
   restart, not on secret edit alone. Armed (the Operator provisioned
@@ -161,7 +161,7 @@ proves the running container now holds the new secret. A `401` means it
 does not (ownership transfer incomplete, or the wrong secret value):
 stop, fix that, do not delete. A `503` means the refresh itself failed:
 stop and triage per the `503 unavailable` list below, do not delete.
-Source: `crates/core/src/twitch_eventsub.rs:142-149,169-197,277-288`,
+Source: `crates/core/src/twitch_eventsub.rs:142-159,171-199,282-292`,
 `crates/bot/src/eventsub_http.rs:518-534`,
 `wrangler/src/eventsub.ts:198-235`.
 
@@ -187,11 +187,11 @@ transferred, since the new Worker version forwards the new secret to a
 fresh container). Confirm agreement by watching for `notification
 acknowledged` or `challenge answered` lines after the reconciler's
 recreated subscription verifies, not by printing either value.
-Source: `crates/core/src/twitch_eventsub.rs:542-545` (deletes first; a
-duplicate create answers `409`), `:559-563` (healthy wanted subscriptions
-on our callback are kept without comparing secrets), `:481-488`
+Source: `crates/core/src/twitch_eventsub.rs:547-550` (deletes first; a
+duplicate create answers `409`), `:564-568` (healthy wanted subscriptions
+on our callback are kept without comparing secrets), `:486-493`
 (`ExistingSubscription` carries no secret),
-`crates/core/src/twitch_helix.rs:591-593` (a `409` create counts as
+`crates/core/src/twitch_helix.rs:595-597` (a `409` create counts as
 `AlreadyExists` only after a follow-up listing confirms a healthy
 subscription on our callback).
 
@@ -358,18 +358,18 @@ unauthenticated sender learns nothing about the clock:
    (`MAX_TIMESTAMP_SKEW_MS`), past or future.
 
 Source: `crates/core/src/twitch_eventsub.rs:51-53`,
-`crates/core/src/twitch_eventsub.rs:166-197`.
+`crates/core/src/twitch_eventsub.rs:168-199`.
 
 Classification after verification:
 
 - A well-formed challenge (nonempty, at most 256 printable ASCII characters)
   on a `stream.online` v1 subscription is echoed as the `200 text/plain`
   body with `Cache-Control: no-store`.
-  Source: `crates/core/src/twitch_eventsub.rs:245-272`,
+  Source: `crates/core/src/twitch_eventsub.rs:243-249,263-292`,
   `crates/bot/src/eventsub_http.rs:350-366`.
 - Only `stream.online` version `1` is accepted; any other subscription type
   or version is a deterministic `WrongSubscription` error.
-  Source: `crates/core/src/twitch_eventsub.rs:225-231`.
+  Source: `crates/core/src/twitch_eventsub.rs:243-249,275-280`.
 - An empty, oversized, or non-graphic challenge is `InvalidChallenge` and
   answers `400 malformed`, never an echo.
   Source: `crates/bot/src/eventsub_http.rs:412-425`.
@@ -380,7 +380,7 @@ secret agreement (401s in the logs?), a `200 delivery ignored` right after
 the subscription creation (the challenge was not echoed — delete and
 recreate the subscription, see below), and only then the callback URL shape
 (plain `https`, no port, query, fragment, or userinfo; canonical form).
-Source: `crates/core/src/twitch_eventsub.rs:400-431`,
+Source: `crates/core/src/twitch_eventsub.rs:428-446`,
 `crates/bot/src/eventsub_http.rs:403-411`.
 
 ## Refusal matrix
@@ -454,14 +454,16 @@ Verified deliveries that need no operator action answer `200`:
   re-subscription after a revocation is automatic, not manual and not
   immediate — and not bounded by one hour (see above).
 - Unknown message types, and known deterministic classification errors on
-  non-verification messages (`WrongSubscription`, `InvalidBody`):
-  acknowledged with 2xx so Twitch does not retry what will never succeed.
+  non-verification messages (`WrongSubscription`, `InvalidBody`,
+  `DuplicateKeys`): acknowledged with 2xx so Twitch does not retry what
+  will never succeed.
   Unknown/future `classify()` errors are not included: they return retryable
   503 `unavailable` and count as metric `kind="other"` so an unrecognized
   failure is not silently discarded or conflated with known ignored deliveries.
   This carve-out excludes `webhook_callback_verification`: `classify()`
-  returns `WrongSubscription` / `InvalidBody` for a challenge with the wrong
-  type or version, or an unparsable signed body, and the handler still acks
+  returns `WrongSubscription` / `InvalidBody` / `DuplicateKeys` for a challenge
+  with the wrong type or version, an unparsable signed body, or a signed body
+  that repeats a key, and the handler still acks
   `200 {"ok": true, "request_id"}` with only an info `delivery ignored` line without
   echoing the challenge — so the subscription is never enabled. A `200
   delivery ignored` immediately after a subscription creation means the

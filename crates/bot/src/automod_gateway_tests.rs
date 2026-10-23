@@ -12,6 +12,12 @@ use two_bot_core::automod_runtime::{
 use two_bot_core::AutomodFilter;
 use two_bot_discord::automod_activation::{FetchedMessage, RetainReason};
 
+// Protected fail-open acceptance lives in its own file: unparseable
+// delivery timestamps must refuse instead of anchoring at epoch 0. The
+// implementation change must not edit the protected file.
+#[path = "fail_open_automod_acceptance_tests.rs"]
+mod fail_open_automod_acceptance;
+
 const OWEN: &str = "123456789012345678";
 const ROLE: &str = "234567890123456789";
 const GUILD: u64 = 1_545_644_954_272_137_297;
@@ -143,9 +149,38 @@ fn text_automations_run_only_for_accepted_or_unscreened_messages() {
 }
 
 #[test]
-fn receipt_clock_parses_or_falls_back_to_zero() {
-    assert_eq!(receipt_ms("2026-10-02T00:00:00.000Z"), 1_790_899_200_000);
-    assert_eq!(receipt_ms("garbage"), 0);
+fn receipt_clock_parses_or_refuses() {
+    assert_eq!(
+        receipt_ms("2026-10-02T00:00:00.000Z"),
+        Some(1_790_899_200_000)
+    );
+    assert_eq!(receipt_ms("garbage"), None);
+}
+
+#[test]
+fn received_clock_refuses_garbage_for_a_delivery() {
+    assert_eq!(
+        received_at_ms("2026-10-02T00:00:00.000Z"),
+        Some(1_790_899_200_000)
+    );
+    assert_eq!(received_at_ms("garbage"), None);
+    assert_eq!(received_at_ms(""), None);
+}
+
+#[test]
+fn partial_edit_received_refuses_a_garbage_clock() {
+    let minimal = json!({
+        "op": 0, "s": 7, "t": "MESSAGE_UPDATE",
+        "d": {"id": "9", "channel_id": "8", "guild_id": "7",
+              "edited_timestamp": "2026-10-02T00:00:01.000000+00:00",
+              "content": "edited"}
+    })
+    .to_string();
+    assert!(partial_edit_received(&minimal, "garbage").is_none());
+    let delivery = partial_edit_received(&minimal, "2026-10-02T00:00:00.000Z")
+        .expect("well-formed clock decodes");
+    assert_eq!(delivery.kind, MessageDeliveryKind::Update);
+    assert_eq!(delivery.observed_timestamp_ms, 1_790_899_200_000);
 }
 
 struct HangingLedger;
@@ -932,4 +967,77 @@ fn verdict_mapping_covers_every_outcome_by_delivery_kind() {
             }
         }
     }
+}
+
+/// The JSON escape introducer (U+005C) without a literal backslash, so the
+/// escaped-`t` fixtures below carry a genuine backslash-u escape in the
+/// frame text rather than the decoded character.
+fn escape_introducer() -> char {
+    char::from_u32(0x5C).expect("0x5C is the backslash code point")
+}
+
+#[test]
+fn escaped_event_name_still_selects_message_update() {
+    let escape = escape_introducer();
+    let frame =
+        format!("{{\"op\":0,\"s\":7,\"t\":\"MESSAGE_{escape}u0055PDATE\",\"d\":{{\"id\":\"9\"}}}}");
+    assert!(
+        !frame.contains("MESSAGE_UPDATE"),
+        "fixture must not contain the plain event name"
+    );
+    assert!(
+        is_message_update_dispatch(&frame),
+        "decoded `t` selects the edit path for escaped spellings"
+    );
+}
+
+#[test]
+fn other_events_are_not_selected_even_when_they_mention_the_name() {
+    // Converse case: a create whose content mentions MESSAGE_UPDATE is not
+    // an edit, so its bytes keep the pre-existing parse path.
+    let create = json!({
+        "op": 0, "s": 7, "t": "MESSAGE_CREATE",
+        "d": {"id": "9", "content": "MESSAGE_UPDATE"}
+    })
+    .to_string();
+    assert!(!is_message_update_dispatch(&create));
+    assert!(!is_message_update_dispatch(
+        r#"{"op":0,"s":7,"t":"MESSAGE_CREATE","d":{"id":"9"}}"#
+    ));
+    assert!(is_message_update_dispatch(
+        r#"{"op":0,"s":7,"t":"MESSAGE_UPDATE","d":{"id":"9"}}"#
+    ));
+}
+
+#[test]
+fn frames_without_a_decoded_event_name_are_not_selected() {
+    assert!(!is_message_update_dispatch("not json"));
+    assert!(!is_message_update_dispatch(r#"{"op":0,"s":7}"#));
+    assert!(!is_message_update_dispatch(
+        r#"{"op":0,"s":7,"t":7,"d":{"id":"9"}}"#
+    ));
+}
+
+#[test]
+fn partial_edit_refuses_duplicate_keys_under_an_escaped_event_name() {
+    let escape = escape_introducer();
+    // Duplicate `id` under an escaped `t`: refused, never last-wins.
+    let refused = format!(
+        "{{\"op\":0,\"s\":7,\"t\":\"MESSAGE_{escape}u0055PDATE\",\"d\":{{\"id\":\"9\",\"id\":\"10\",\"channel_id\":\"8\",\"guild_id\":\"7\",\"edited_timestamp\":\"2026-10-02T00:00:01.000000+00:00\",\"content\":\"edited\"}}}}"
+    );
+    assert!(
+        !refused.contains("MESSAGE_UPDATE"),
+        "fixture must not contain the plain event name"
+    );
+    assert!(
+        partial_edit(&refused, 0).is_none(),
+        "escaped MESSAGE_UPDATE with duplicate keys must be refused"
+    );
+    // Unique keys under an escaped `t`: still an edit.
+    let unique = format!(
+        "{{\"op\":0,\"s\":7,\"t\":\"MESSAGE_{escape}u0055PDATE\",\"d\":{{\"id\":\"9\",\"channel_id\":\"8\",\"guild_id\":\"7\",\"edited_timestamp\":\"2026-10-02T00:00:01.000000+00:00\",\"content\":\"edited\"}}}}"
+    );
+    let delivery = partial_edit(&unique, 0).expect("escaped unique edit decodes");
+    assert_eq!(delivery.kind, MessageDeliveryKind::Update);
+    assert_eq!(delivery.message_id, "9");
 }

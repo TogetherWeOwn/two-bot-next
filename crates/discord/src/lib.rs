@@ -18,6 +18,8 @@ pub mod command_identity;
 pub mod command_registry;
 #[cfg(feature = "db")]
 pub mod custom_commands;
+#[cfg(test)]
+mod drop_poison_test_serial;
 pub mod executor;
 mod executor_metrics;
 pub mod funnel_invites;
