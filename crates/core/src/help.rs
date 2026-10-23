@@ -339,7 +339,7 @@ fn channel_type_name(kind: u8) -> String {
         2 => "voice".to_owned(),
         4 => "category".to_owned(),
         5 => "announcement".to_owned(),
-        10 | 11 | 12 => "thread".to_owned(),
+        10..=12 => "thread".to_owned(),
         13 => "stage".to_owned(),
         15 => "forum".to_owned(),
         16 => "media".to_owned(),
