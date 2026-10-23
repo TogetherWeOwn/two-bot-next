@@ -11,6 +11,8 @@ use crate::{
 
 use crate::tracing_capture;
 
+#[path = "poll_timed_runtime_acceptance_tests.rs"]
+mod poll_timed_runtime_acceptance_tests;
 #[path = "website_event_age_acceptance_tests.rs"]
 mod website_event_age_acceptance_tests;
 

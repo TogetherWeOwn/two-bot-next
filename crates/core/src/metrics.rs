@@ -124,6 +124,7 @@ pub const JOBS: &[&str] = &[
     "inactivity",
     "audit_retry",
     "scheduled_messages",
+    "polls",
     "feeds",
     "self_role_recovery",
     "member_unban_sweep",
@@ -2666,7 +2667,7 @@ mod tests {
                     count
                 );
             }
-            assert_eq!(JOBS.len(), 16);
+            assert_eq!(JOBS.len(), 17);
             assert!(!text.contains("unknown_job"));
         }
     }
@@ -2713,7 +2714,7 @@ mod tests {
                     count
                 );
             }
-            assert_eq!(JOBS.len(), 16);
+            assert_eq!(JOBS.len(), 17);
             assert!(!text.contains("unknown_job"));
         }
     }

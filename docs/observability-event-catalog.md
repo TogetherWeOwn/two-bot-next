@@ -294,6 +294,7 @@ staleness tickets via `job_unknown_stale` below instead of `job_stale`.
 
 | Job label | Producer (stable anchor) | Meaning |
 | --- | --- | --- |
+| `polls` | `poll_jobs.rs` (`register`) | Timed-poll close/recovery every 15 s under the boot identity and announcements gate; at most ten poll closes per tick. Failures report only the fixed recovery-required class, never voter data. Delivery uncertainty requires reconciliation, not automatic replay; see [Timed polls](polls.md) |
 | `feeds` | `feed_jobs.rs` (`scheduled_job_live` via `register` / `register_fenced`) | Feed poller sweep on the boot-configured interval with a live inner polling gate; gated skips return success and reset the streak |
 | `self_role_recovery` | `self_role_handlers.rs` (`recovery_job`) | Self-role repair sweep every 30 s; a successful sweep need not settle every pending repair; failure-only alerting, no `job_stale` paging |
 | `member_unban_sweep` | `member_runtime.rs` (`sweep_job`) | Member unban sweep every 30 s with an attempt timeout that may outlive its cadence; a successful sweep need not complete any unban; failure-only alerting |

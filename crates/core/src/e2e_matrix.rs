@@ -291,6 +291,16 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             &["Gate:AutomationsDisabled", "Perm:ManageServerRequired"],
         ),
         row(
+            "poll",
+            33,
+            E2eGate::Announcements,
+            0,
+            "Everyone",
+            "Poll",
+            "Deferred ephemeral reply; create a bounded timed poll or author-close with one results embed.",
+            &["Gate:AnnouncementsDisabled", "Valid:choices:2..=10", "Valid:duration:1..=10080", "Valid:author-close"],
+        ),
+        row(
             "rsvp",
             24,
             E2eGate::Announcements,

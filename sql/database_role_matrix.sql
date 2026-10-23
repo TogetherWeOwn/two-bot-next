@@ -22,6 +22,8 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'scheduled_messages', 'table'),
     ('public', 'automation_audit_log', 'table'),
     ('public', 'event_rsvps', 'table'),
+    ('public', 'polls', 'table'),
+    ('public', 'poll_votes', 'table'),
     ('public', 'announcements_audit_log', 'table'),
     ('public', 'community_facts', 'table'),
     ('public', 'lfg_posts', 'table'),

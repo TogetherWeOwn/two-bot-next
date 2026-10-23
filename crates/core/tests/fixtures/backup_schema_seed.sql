@@ -210,6 +210,17 @@ VALUES (61, '100000000000000001', 'event_attended', '100000000000000011',
         'host_checkin', 'classifier-v1', 'eligible_human', 'default',
         '{"attended":true}', 'backup:fact:attended');
 
+INSERT INTO polls
+    (guild_id, id, question, options_json, channel_id, message_id, created_by,
+     ends_at, status, closed_at, winner_index, counts_json, results_posted_at, results_message_id,
+     created_at, updated_at)
+VALUES ('100000000000000001', 'backup:poll', E'Backup poll | 雪\nquestion', '["one","two"]',
+        '100000000000000003', '100000000000000006', '100000000000000002',
+        '2026-08-01T10:00:00Z', 'closed', '2026-08-01T10:00:00Z', 0, '[1,0]',
+        '2026-08-01T10:00:01Z', '100000000000000007', '2026-08-01T09:00:00Z', '2026-08-01T10:00:01Z');
+INSERT INTO poll_votes (guild_id, poll_id, user_id, option_index, voted_at)
+VALUES ('100000000000000001', 'backup:poll', '100000000000000002', 0, '2026-08-01T09:30:00Z');
+
 INSERT INTO lfg_posts
     (id, guild_id, channel_id, message_id, title, starts_at, status, created_by, created_at, closed_at)
 VALUES ('backup:lfg', '100000000000000001', '100000000000000003', '100000000000000006',

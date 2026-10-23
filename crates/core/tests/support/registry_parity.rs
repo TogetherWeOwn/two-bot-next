@@ -37,6 +37,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("feed-list", "docs/parity.md §1 #30 page"),
     ("privacy", "docs/parity.md §1 privacy"),
     ("command-list", "docs/parity.md §1 #16 page"),
+    ("poll", "polls.md"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -230,6 +231,69 @@ pub fn expected_registry() -> Value {
     )
     .expect("privacy serializes");
     commands.insert(3, privacy);
+    // Next-only poll exception: pin the complete bounded wire shape without
+    // changing the frozen legacy fixture or calling the production poll builder.
+    let mut poll_args = vec![
+        CommandOption::new(
+            "question",
+            "Single poll question",
+            CommandOptionType::String,
+        )
+        .required()
+        .max_length(256),
+        CommandOption::new("option1", "First choice", CommandOptionType::String)
+            .required()
+            .max_length(80),
+        CommandOption::new("option2", "Second choice", CommandOptionType::String)
+            .required()
+            .max_length(80),
+        CommandOption::new(
+            "duration-minutes",
+            "Close after 1 minute to 7 days",
+            CommandOptionType::Integer,
+        )
+        .required()
+        .int_range(1, 10_080),
+    ];
+    for index in 3..=10 {
+        poll_args.push(
+            CommandOption::new(
+                &format!("option{index}"),
+                "Additional choice",
+                CommandOptionType::String,
+            )
+            .max_length(80),
+        );
+    }
+    let poll =
+        CommandDefinition::new("poll", "Create a timed poll or close your poll").options(vec![
+            CommandOption::new(
+                "create",
+                "One changeable vote per member; up to 10 choices",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(poll_args),
+            CommandOption::new(
+                "close",
+                "Close your poll and publish results",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![CommandOption::new(
+                "id",
+                "Poll id shown in the poll message",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(20)]),
+        ]);
+    assert_eq!(
+        commands[20]["name"], "ban",
+        "poll appends to announcements, before moderation"
+    );
+    commands.insert(
+        20,
+        serde_json::to_value(poll).expect("poll exception serializes"),
+    );
     // Picker-copy exceptions (registry golden exceptions table): command and
     // option descriptions intentionally differ from legacy. Pointers mirror
     // the published option order.

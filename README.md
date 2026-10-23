@@ -63,6 +63,8 @@ claim. Staging deploys from `main`; production deploys through the manual
   the reference names every reader — automod, feed, audit, ticket, gateway
   classifier and voice — alongside the per-runtime store and per-event
   refresh paths (re-checked at `1643438`).
+- [Timed polls](docs/polls.md): bounded changeable votes, automatic/author close,
+  results, persistence and uncertain-delivery recovery.
 - [Feed supervisor](docs/feed-supervisor.md): running feed delivery —
   source configuration, fetch cadence as-coded, failure signals and triage,
   read-only guarantees, and worked examples.

@@ -1,6 +1,16 @@
 {
   "tables": [
     {
+      "table": "poll_votes",
+      "columns": ["user_id", "poll_id"],
+      "predicate": "guild_id = $1 AND (user_id = $2 OR poll_id IN (SELECT id FROM polls WHERE guild_id = $1 AND created_by = $2))"
+    },
+    {
+      "table": "polls",
+      "columns": ["created_by", "question", "options_json"],
+      "predicate": "guild_id = $1 AND created_by = $2"
+    },
+    {
       "table": "internal_action_log",
       "columns": ["actor_id", "target_id", "intent_id"],
       "predicate": "guild_id = $1 AND (actor_id = $2 OR target_id = $2 OR intent_id IN (SELECT intent_id FROM internal_idempotency WHERE guild_id = $1 AND (actor_id = $2 OR target_id = $2 OR resource_id = $2)))"

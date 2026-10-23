@@ -1339,6 +1339,25 @@ impl CommandRuntime {
             &routed,
             RoutedInteraction::Slash {
                 outcome: SlashOutcome::Handled {
+                    handler: HandlerId::Poll
+                },
+                ..
+            } | RoutedInteraction::Component {
+                outcome: ComponentOutcome::Handled {
+                    handler: ComponentHandler::PollVote
+                },
+                ..
+            }
+        ) {
+            if self.interactions.handle(interaction).await.is_err() {
+                warn!("poll execution failed; details withheld");
+            }
+            return;
+        }
+        if matches!(
+            &routed,
+            RoutedInteraction::Slash {
+                outcome: SlashOutcome::Handled {
                     handler: HandlerId::Lfg | HandlerId::LfgClose,
                 },
                 ..

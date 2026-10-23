@@ -316,9 +316,18 @@ class RollbackReadinessProbeTests(unittest.TestCase):
     def test_current_dump_version_12_manifest_passes(self):
         self.fx.write_archive("two-funnel-20261002T051700Z.ndjson.gz", archive_lines(manifest(version=12)),
                               mtime=2_120_000_000)
-        code, results, _ = self.probe()
+        code, results, summary = self.probe()
         self.assertEqual(code, 0, results)
         self.assertIn("two-funnel-20261002T051700Z.ndjson.gz v12", results["PASS manifest"])
+        self.assertEqual(summary, "rollback readiness: 4/4 checks passed")
+
+    def test_current_dump_version_13_manifest_passes(self):
+        self.fx.write_archive("two-funnel-20261002T051700Z.ndjson.gz", archive_lines(manifest(version=13)),
+                              mtime=2_130_000_000)
+        code, results, summary = self.probe()
+        self.assertEqual(code, 0, results)
+        self.assertIn("two-funnel-20261002T051700Z.ndjson.gz v13", results["PASS manifest"])
+        self.assertEqual(summary, "rollback readiness: 4/4 checks passed")
 
     def assert_invalid_created_at(self, value):
         self.fx.write_archive("two-funnel-20261002T041700Z.ndjson.gz",
@@ -484,7 +493,7 @@ class RollbackReadinessProbeTests(unittest.TestCase):
             "empty archive": ([], None, "is empty"),
             "manifest not JSON": ([b"{manifest", *good[1:]], None, "manifest line is not JSON"),
             "row before manifest": (good[1:], None, "first line is not a manifest"),
-            "unknown version": (lines(version=13), None, "manifest version 13 is not one of (3, 4, 5, 6, 7, 8, 9, 10, 11, 12)"),
+            "unknown version": (lines(version=14), None, "manifest version 14 is not one of (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)"),
             "boolean version": (lines(version=True), None, "manifest version True"),
             "no createdAt": (lines(createdAt=None), None, "no createdAt timestamp"),
             "negative eventsSequence": (lines(eventsSequence=-1), None, "invalid eventsSequence"),

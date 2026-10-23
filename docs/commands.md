@@ -20,7 +20,7 @@ Bounds below are registry bounds; a dash means no bound is declared there,
 not that handler validation is unlimited. Permissions are Discord default
 member-permission bitfields, not a replacement for runtime authorization.
 
-Built-in commands: 50.
+Built-in commands: 51.
 
 ## `/access`
 
@@ -337,6 +337,31 @@ Show the bot's response latency
 - Available in DMs: false
 
 No options.
+
+## `/poll`
+
+Create a timed poll or close your poll
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `create` | subcommand | false | — | — | — | — | One changeable vote per member; up to 10 choices |
+| `create question` | string | true | — | — | 256 | — | Single poll question |
+| `create option1` | string | true | — | — | 80 | — | First choice |
+| `create option2` | string | true | — | — | 80 | — | Second choice |
+| `create duration-minutes` | integer | true | 1 | 10080 | — | — | Close after 1 minute to 7 days |
+| `create option3` | string | false | — | — | 80 | — | Additional choice |
+| `create option4` | string | false | — | — | 80 | — | Additional choice |
+| `create option5` | string | false | — | — | 80 | — | Additional choice |
+| `create option6` | string | false | — | — | 80 | — | Additional choice |
+| `create option7` | string | false | — | — | 80 | — | Additional choice |
+| `create option8` | string | false | — | — | 80 | — | Additional choice |
+| `create option9` | string | false | — | — | 80 | — | Additional choice |
+| `create option10` | string | false | — | — | 80 | — | Additional choice |
+| `close` | subcommand | false | — | — | — | — | Close your poll and publish results |
+| `close id` | string | true | — | — | 20 | — | Poll id shown in the poll message |
 
 ## `/position`
 

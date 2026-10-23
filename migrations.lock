@@ -465,6 +465,14 @@
       "sha256": "21775bde6ded22b7b0c8e025365b70ecab9bb1961a98b7d34eb26ab713dd6a1e",
       "justification": "Store-chain copy of the scheduled_events_tombstone delete layer (cutover 0452): one new table, IF NOT EXISTS, no writes to the existing mirror. Numbered 0453 because cutover owns 0452; global migration numbers remain unique across both chains."
     },
+    "crates/cutover/migrations/0458_timed_polls.sql": {
+      "sha256": "462059f0e80293eaf979dd9638343fa1b53a7f2c6ceb3692edd180edc5178cbf",
+      "justification": "Add bounded polls and one-vote-per-member poll_votes with guild-local keys, due indexes, immutable final count snapshots and durable results uncertainty fencing. Unconditional polls creation proves the table empty for transactional index builds and refuses untracked relations; SQLx ledger handles re-runs. Indexes are in this transaction because CONCURRENTLY deadlocked parallel SQLx advisory-lock waiters (40P01). Replaces only the unpublished 0459/0460 index migrations before first merge/deploy; published migrations remain unchanged. No existing rows changed. Roll back the binary without dropping rows or fences; preserve both tables in backup/deltas. Apply migrations and reviewed role inventory before the binary."
+    },
+    "crates/cutover/migrations/0461_poll_display_recovery.sql": {
+      "sha256": "5828a5677ecd6137c0d1142eac6c7a36c96a9ba0f49a9caa378fb4344d15ed5a",
+      "justification": "Durable dirty-display marker: commit accepted votes before the idempotent message edit and reconcile cancelled or failed edits on the bounded poll tick. Additive constant-default Boolean with IF NOT EXISTS; no data deletion or replay of creation/results. Apply before the runtime binary; binary rollback preserves rows and marker. Renumbered before merge after published admin registry migrations 0456/0457; SQL bytes unchanged, no deployed poll migration history."
+    },
     "crates/cutover/migrations/0454_sticky_delivery_uncertainty.sql": {
       "sha256": "c813acffc8d44d4f3175acab3aadd9c81a2e611f7962fbba1725a828c3cee4fc",
       "justification": "Uncertain-delivery fence for sticky re-posts: one NOT NULL DEFAULT FALSE column delivery_uncertain on sticky_messages, armed by the atomic claim and disarmed only by confirmed record, proven no-send, confirmed orphan absence, or administrator reconfigure. Additive, IF NOT EXISTS; numbered 0454 because main owns 0452 (scheduled tombstone) and 0453 (store copy); global migration numbers remain unique across both chains; rollback drops the column."

@@ -9,12 +9,15 @@
  * or event-driven exclusion in `src/alert-rules.ts` retires the coarse
  * fallback; a reasoned unknown-stale note alone does not. Unlisted future
  * labels ticket rather than staying silent in the meantime.
- * Reads the Rust sources as text; never compiles or runs anything.
+ * Reads the Rust sources as text; never compiles Rust or starts the bot.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
-import { JOB_INTERVAL_SECONDS, TICKER_STALE_JOBS, TICKER_STALE_SECONDS, UNKNOWN_STALE_EXCLUDED } from "../src/alert-rules.ts";
+import { EMPTY_STATE, evaluateMetrics, JOB_INTERVAL_SECONDS, JOB_RUNS_JOBS, parseExposition, TICKER_STALE_JOBS, TICKER_STALE_SECONDS, UNKNOWN_STALE_EXCLUDED } from "../src/alert-rules.ts";
+import { ALERT_INPUT_LABELS, parseAlertScrape } from "../src/metrics-scrape.ts";
+import { FORWARDED_FLAGS, forwardedFlagVars, NOT_FORWARDED } from "../src/container-env.ts";
+import { metricsBody, metricsLines } from "./fixtures/metrics.ts";
 
 const root = new URL("../../", import.meta.url);
 const read = (path: string) => readFileSync(new URL(path, root), "utf8");
@@ -25,6 +28,9 @@ const feedJobsRs = read("crates/bot/src/feed_jobs.rs");
 const selfRoleHandlersRs = read("crates/bot/src/self_role_handlers.rs");
 const memberRuntimeRs = read("crates/bot/src/member_runtime.rs");
 const automodGatewayRs = read("crates/bot/src/automod_gateway.rs");
+const pollJobsRs = read("crates/bot/src/poll_jobs.rs");
+const jobsRs = read("crates/bot/src/jobs.rs");
+const mainRs = read("crates/bot/src/main.rs");
 const metricsMd = read("docs/metrics.md");
 
 /** Labels with no fixed Worker cadence. `invite_snapshot`, `other`,
@@ -47,6 +53,7 @@ const UNKNOWN_STALE_JOBS = new Map<string, string>([
 /** 15 s tickers covered by `ticker_stale` (TICKER_STALE_SECONDS window), not `job_stale`. */
 const TICKER_COVERED = new Map<string, string>([
   ["scheduled_messages", "15 s ticker registered in scheduled_jobs.rs; covered by ticker_stale, not the website/community schedulers this catalog parses"],
+  ["polls", "15 s ticker registered in poll_jobs.rs with announcements and boot-identity gates; covered by ticker_stale with the shared 600 s window, not a precise job_stale cadence"],
   ["settings", "DB-only 15 s version poll registered in settings_jobs.rs, parked without DATABASE_URL; covered by ticker_stale, not the website/community schedulers this catalog parses"],
 ]);
 
@@ -196,13 +203,14 @@ const REGISTERED = [...new Set([
   ...directJobNames(selfRoleHandlersRs, "self_role_handlers.rs"),
   ...directJobNames(memberRuntimeRs, "member_runtime.rs"),
   ...directJobNames(automodGatewayRs, "automod_gateway.rs"),
+  ...directJobNames(pollJobsRs, "poll_jobs.rs"),
 ])];
 const real: Catalog = { jobs: JOBS, registered: REGISTERED, rust: RUST, worker: JOB_INTERVAL_SECONDS, ticker: TICKER_COVERED, exempt: UNKNOWN_STALE_JOBS };
 
 test("parses the full Rust job allowlist and every registered cadence", () => {
   assert.deepEqual(JOBS, [
     "invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events",
-    "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages",
+    "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "polls",
     "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "other",
   ]);
   // Rust *_INTERVAL_MS / 1000: community_snapshots.rs:45,47, scheduled_events.rs:26,
@@ -227,7 +235,7 @@ test("feed and self-role producers retain their real cadence and explicit unknow
 });
 
 test("unban sweep and automod expiry producers retain their real cadence and explicit unknown-stale entries", () => {
-  assert.deepEqual(REGISTERED, ["feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry"]);
+  assert.deepEqual(REGISTERED, ["feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "polls"]);
   assert.match(memberRuntimeRs, /UNBAN_SWEEP_INTERVAL_SECONDS/);
   assert.match(memberRuntimeRs, /Job\s*\{\s*name:\s*NAMES\[0\],\s*cadence,/);
   assert.match(automodGatewayRs, /const EXPIRY_CADENCE: Duration = Duration::from_secs\(60\);/);
@@ -240,7 +248,7 @@ test("unban sweep and automod expiry producers retain their real cadence and exp
 });
 
 test("a registered direct producer absent from JOBS fails the catalog", () => {
-  for (const [source, file] of [[feedJobsRs, "feed_jobs.rs"], [selfRoleHandlersRs, "self_role_handlers.rs"], [memberRuntimeRs, "member_runtime.rs"], [automodGatewayRs, "automod_gateway.rs"]]) {
+  for (const [source, file] of [[feedJobsRs, "feed_jobs.rs"], [selfRoleHandlersRs, "self_role_handlers.rs"], [memberRuntimeRs, "member_runtime.rs"], [automodGatewayRs, "automod_gateway.rs"], [pollJobsRs, "poll_jobs.rs"]]) {
     const mutated = source + '\nfn fixture() -> Job { Job { name: "fake_producer", cadence: Duration::from_secs(30), } }';
     const registered = directJobNames(mutated, file!);
     assert.ok(registered.includes("fake_producer"), "fixture did not inject a registered producer");
@@ -256,7 +264,7 @@ test("every Rust JOBS label has a matching staleness cadence, ticker coverage or
 
 test("the 15 s tickers are covered by ticker_stale with an explicit 10-minute window", () => {
   assert.equal(TICKER_STALE_SECONDS, 600);
-  assert.deepEqual([...TICKER_STALE_JOBS].sort(), ["scheduled_messages", "settings"]);
+  assert.deepEqual([...TICKER_STALE_JOBS].sort(), ["polls", "scheduled_messages", "settings"]);
   assert.deepEqual([...TICKER_COVERED.keys()].sort(), [...TICKER_STALE_JOBS].sort());
   for (const job of TICKER_STALE_JOBS) {
     assert.ok(JOBS.includes(job), `${job}: ticker_stale covers a label outside Rust JOBS`);
@@ -264,6 +272,72 @@ test("the 15 s tickers are covered by ticker_stale with an explicit 10-minute wi
     assert.ok(!UNKNOWN_STALE_JOBS.has(job), `${job}: covered by both ticker_stale and an unknown-stale entry`);
   }
   assert.ok(UNKNOWN_STALE_JOBS.has("audit_retry"), "audit_retry keeps its reasoned unknown-stale entry");
+});
+
+test("polls register a fixed 15 s producer only behind announcements and the boot identity", () => {
+  assert.deepEqual(directJobNames(pollJobsRs, "poll_jobs.rs"), ["polls"]);
+  assert.ok(REGISTERED.includes("polls"));
+  assert.match(mainRs, /^mod poll_jobs;$/m, "the producer must be compiled into the bot");
+  assert.match(pollJobsRs, /fn register\(context: Arc<Context>, activation: &BootActivation\) -> Option<Job>/);
+  assert.match(pollJobsRs, /let features = activation\.constrain_features\(FeatureGates::from_env\(\)\.ok\(\)\?\);\s*if !features\.announcements \{\s*return None;\s*\}/,
+    "invalid flags or a refused boot identity must park polls, not default them on");
+  assert.match(pollJobsRs, /let cadence = Duration::from_secs\(15\);\s*Some\(Job\s*\{\s*name: NAME,\s*cadence,\s*cadence_source: None,/);
+  assert.match(pollJobsRs, /runtime\s*\.tick_polls\(\)\s*\.await/,
+    "the registered action must execute timed polls, not a no-op success");
+});
+
+test("polls join the boot status map and the shared Skip-on-missed-ticks supervisor", () => {
+  assert.match(websiteJobsRs, /let activation = BootActivation::from_config\(config\);/);
+  assert.match(websiteJobsRs, /if let Some\(job\) = crate::poll_jobs::register\(context\.clone\(\), &activation\) \{\s*registered\.push\(job\);\s*\} else \{\s*parked\.push\(crate::poll_jobs::NAME\);\s*\}/,
+    "enabled polls must be supervised; refused polls must remain visibly parked");
+  assert.match(websiteJobsRs, /\.chain\(\[crate::poll_jobs::NAME\]\)/);
+  assert.match(websiteJobsRs, /serve_jobs\(registered, status, shutdown\.clone\(\), http\)\.await/);
+  assert.match(websiteJobsRs, /tokio::spawn\(jobs::supervise\(registered, status, shutdown\.0\.subscribe\(\)\)\)/);
+  assert.match(jobsRs, /for job in jobs \{[\s\S]*?tasks\.spawn\(run_job\(\s*job,/);
+  assert.match(jobsRs, /let mut cadence = job\.cadence;\s*let mut interval = cadence_interval\(first_deadline, cadence\);/);
+  assert.match(jobsRs, /fn cadence_interval\([^)]*\) -> tokio::time::Interval \{\s*let mut interval = tokio::time::interval_at\(first_tick, cadence\);\s*interval\.set_missed_tick_behavior\(MissedTickBehavior::Skip\);\s*interval\s*\}/,
+    "missed poll ticks must skip, never burst into catch-up writes");
+});
+
+test("poll alert inputs retain the full Rust job vocabulary and reject missing poll rows", () => {
+  assert.deepEqual([...JOB_RUNS_JOBS], JOBS);
+  for (const name of [
+    "two_bot_job_last_success_timestamp_seconds", "two_bot_job_consecutive_failures",
+    "two_bot_job_last_error_class", "two_bot_job_runs_total",
+  ]) {
+    assert.deepEqual(ALERT_INPUT_LABELS[name]?.job, JOBS, `${name}: polls must not be treated as an unknown future label`);
+  }
+  assert.ok(parseAlertScrape(metricsBody()), "the complete Rust scrape must validate");
+  const lines = metricsLines();
+  const pollRows = lines.filter((line) => /\{job="polls"[,}]/.test(line));
+  assert.equal(pollRows.length, 2 + ALERT_INPUT_LABELS.two_bot_job_last_error_class!.class!.length + 2);
+  for (const removed of pollRows) {
+    assert.equal(parseAlertScrape(lines.filter((line) => line !== removed).join("\n")), null,
+      `missing required poll row must fail the scrape: ${removed}`);
+  }
+});
+
+test("polls use only the 600 s ticker window, with parked and exact-boundary controls", () => {
+  const now = 1_000_000;
+  for (const [lastSuccess, expected] of [
+    [0, []], [now - 31, []], [now - 599, []], [now - 600, []],
+    [now - 601, ["ticker_stale:polls"]], [now - 7201, ["ticker_stale:polls"]],
+  ] as const) {
+    const samples = parseExposition(`two_bot_job_last_success_timestamp_seconds{job="polls"} ${lastSuccess}\n`);
+    assert.deepEqual(evaluateMetrics(samples, EMPTY_STATE, now).firing, expected, `last success ${lastSuccess}`);
+  }
+  const failures = parseExposition('two_bot_job_consecutive_failures{job="polls"} 3\n');
+  assert.deepEqual(evaluateMetrics(failures, EMPTY_STATE, now).firing, ["job_consecutive_failures:polls"]);
+});
+
+test("the poll acceptance switch is classified test-only and never forwarded as a runtime flag", () => {
+  const name = "TWO_POLL_RUNTIME_ACCEPTANCE";
+  assert.match(NOT_FORWARDED[name] ?? "", /test-only/);
+  assert.ok(!(FORWARDED_FLAGS as readonly string[]).includes(name));
+  for (const value of ["1", "0", "invalid"]) {
+    assert.deepEqual(forwardedFlagVars({ [name]: value }), {});
+    assert.deepEqual(forwardedFlagVars({ [name]: value, TWO_ANNOUNCEMENTS: "1" }), { TWO_ANNOUNCEMENTS: "1" });
+  }
 });
 
 test("event-driven exclusions stay inside the Rust allowlist and never overlap cadence or ticker coverage", () => {

@@ -109,6 +109,7 @@ mod onboarding_worker_failure_acceptance_tests;
 mod ops_audit_acceptance_tests;
 mod ops_backfill;
 mod ops_http;
+mod poll_jobs;
 mod preflight;
 mod privacy_command;
 mod raid_runtime;

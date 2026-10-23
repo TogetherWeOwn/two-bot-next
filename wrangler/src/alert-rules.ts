@@ -36,7 +36,7 @@ export const JOB_INTERVAL_SECONDS: Record<string, number> = {
 export const STALE_INTERVALS = 2;
 /**
  * Staleness window in seconds for the 15 s tickers (`scheduled_messages`,
- * `settings`). Ten minutes is 40 missed ticks: far above the keepalive scrape
+ * `polls`, `settings`). Ten minutes is 40 missed ticks: far above the keepalive scrape
  * cadence (~60 s, so ~10 consecutive missed scrapes must agree), the
  * supervisor startup jitter (up to 5 s), and the per-attempt timeouts
  * (`scheduled_messages` 120 s, `settings` 10 s), so one slow scrape or a
@@ -49,7 +49,7 @@ export const STALE_INTERVALS = 2;
  */
 export const TICKER_STALE_SECONDS = 600;
 /** Jobs covered by `ticker_stale` instead of `job_stale`. */
-export const TICKER_STALE_JOBS: readonly string[] = ["scheduled_messages", "settings"];
+export const TICKER_STALE_JOBS: readonly string[] = ["scheduled_messages", "polls", "settings"];
 /**
  * Fail-closed staleness window for jobs without a cadence entry
  * (`invite_snapshot`, `audit_retry`, `other`, and any future label the scrape
@@ -311,7 +311,7 @@ export const HANDLER_SATURATED_SHARE = 0.01;
 /** Consecutive saturated handler windows before the ticket. */
 export const HANDLER_SATURATED_SAMPLES = 3;
 /** Fixed job labels for `two_bot_job_runs_total`, pinned to Rust `JOBS`. */
-export const JOB_RUNS_JOBS: readonly string[] = ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "other"];
+export const JOB_RUNS_JOBS: readonly string[] = ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "polls", "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "other"];
 /** Fixed outcomes for `two_bot_job_runs_total`, pinned to Rust `JOB_OUTCOMES`. */
 export const JOB_RUNS_OUTCOMES: readonly string[] = ["success", "failure"];
 /** Failed runs must exceed this share of a judged window... */

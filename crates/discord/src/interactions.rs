@@ -236,6 +236,9 @@ impl InteractionRuntime {
         };
         let interaction = interaction.as_ref();
         let routed = route_interaction(&self.router, interaction, None);
+        if crate::polls::owns(&routed) {
+            return crate::polls::handle(&self.pool, &self.executor, interaction).await;
+        }
         if matches!(
             &routed,
             RoutedInteraction::Slash {
@@ -367,6 +370,7 @@ impl InteractionRuntime {
                 self.0
             }
         }
+        router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::Poll)));
         router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::Lfg)));
         router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::LfgClose)));
         Self {
@@ -378,6 +382,18 @@ impl InteractionRuntime {
             bot_user_id: std::sync::atomic::AtomicU64::new(bot_user_id),
             application_id: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Bounded guild-local poll close/recovery, shared by the supervised job.
+    pub async fn tick_polls(&self) -> Result<(), crate::DiscordError> {
+        let gates = self.router.gates();
+        if !gates.announcements {
+            return Ok(());
+        }
+        let Some(guild) = gates.configured_guild else {
+            return Ok(());
+        };
+        crate::polls::tick(&self.pool, &self.executor, &guild.to_string()).await
     }
 
     pub fn set_bot_user_id(&self, id: u64) {

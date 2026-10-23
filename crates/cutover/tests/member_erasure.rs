@@ -54,6 +54,113 @@ async fn audit_count(pool: &PgPool) -> i64 {
 }
 
 #[tokio::test]
+async fn timed_poll_voter_erasure_preserves_other_authors_frozen_result() {
+    let Some(db) = database().await else { return };
+    sqlx::query("INSERT INTO polls (guild_id,id,question,options_json,channel_id,message_id,created_by,ends_at,status,closed_at,counts_json,winner_index,results_posted_at,results_message_id) VALUES ($1,'frozen','fixture poll','[\"one\",\"two\"]','3333','99',$2,now(),'closed',now(),'[1,0]',0,now(),'100')")
+        .bind(GUILD).bind(OTHER).execute(db.pool()).await.unwrap();
+    sqlx::query(
+        "INSERT INTO poll_votes (guild_id,poll_id,user_id,option_index) VALUES ($1,'frozen',$2,0)",
+    )
+    .bind(GUILD)
+    .bind(USER)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let erased = erase_member(
+        db.pool(),
+        GUILD,
+        USER,
+        ErasureMode::Execute { actor: ACTOR },
+    )
+    .await
+    .expect("real member erasure");
+    let frozen: (String,bool,String)=sqlx::query_as("SELECT counts_json::text,results_posted_at IS NOT NULL,results_message_id FROM polls WHERE guild_id=$1 AND id='frozen'")
+        .bind(GUILD).fetch_one(db.pool()).await.unwrap();
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM poll_votes WHERE guild_id=$1 AND poll_id='frozen'",
+    )
+    .bind(GUILD)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    db.close().await.expect("drop fixture");
+    assert_eq!(
+        erased
+            .iter()
+            .find(|row| row.table == "poll_votes")
+            .unwrap()
+            .rows,
+        1
+    );
+    assert_eq!(remaining, 0);
+    assert_eq!(frozen, ("[1, 0]".to_owned(), true, "100".to_owned()));
+}
+
+#[test]
+fn timed_poll_backup_inventory_keeps_parent_before_votes() {
+    let tables = two_bot_core::backup::DUMP_TABLES;
+    let parent = tables
+        .iter()
+        .position(|table| *table == "polls")
+        .expect("backup must preserve poll questions and durable delivery fences");
+    let votes = tables
+        .iter()
+        .position(|table| *table == "poll_votes")
+        .expect("backup must preserve changeable member votes");
+    assert!(parent < votes, "restore the poll before its FK child votes");
+}
+
+#[tokio::test]
+async fn timed_poll_rollback_measures_and_exports_only_post_fence_rows() {
+    let Some(db) = database().await else { return };
+    for (id, stamp) in [
+        ("old", "2026-09-30T00:00:00Z"),
+        ("new", "2026-10-02T00:00:00Z"),
+    ] {
+        sqlx::query("INSERT INTO polls (guild_id,id,question,options_json,channel_id,message_id,created_by,ends_at,created_at,updated_at) VALUES ($1,$2,'fixture poll','[\"one\",\"two\"]','3333','99',$3,$4::text::timestamptz,$4::text::timestamptz,$4::text::timestamptz)")
+            .bind(GUILD).bind(id).bind(USER).bind(stamp).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO poll_votes (guild_id,poll_id,user_id,option_index,voted_at) VALUES ($1,$2,$3,0,$4::text::timestamptz)")
+            .bind(GUILD).bind(id).bind(USER).bind(stamp).execute(db.pool()).await.unwrap();
+    }
+    let report = two_bot_cutover::rollback_delta::report(db.pool(), "2026-10-01T00:00:00Z")
+        .await
+        .expect("read-only rollback report");
+    let mut lines = Vec::new();
+    let exported = two_bot_cutover::rollback_delta::export_delta(
+        db.pool(),
+        "2026-10-01T00:00:00Z",
+        &mut |line| {
+            lines.push(line);
+            Ok(())
+        },
+    )
+    .await;
+    db.close().await.expect("drop fixture");
+    exported.expect("rollback export includes both poll tables");
+    let rows: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    for table in ["polls", "poll_votes"] {
+        let entry = report
+            .tables
+            .iter()
+            .find(|entry| entry.table == table)
+            .expect("poll table must never silently disappear from rollback");
+        assert_eq!(entry.status, "measured");
+        assert_eq!(
+            entry.count,
+            Some(1),
+            "{table}: old row excluded, new row retained"
+        );
+        let matching: Vec<_> = rows.iter().filter(|row| row["table"] == table).collect();
+        assert_eq!(matching.len(), 1, "{table}: exact post-fence export");
+        let key = if table == "polls" { "id" } else { "poll_id" };
+        assert_eq!(matching[0]["row"][key], "new");
+    }
+}
+
+#[tokio::test]
 async fn migrated_schema_requires_every_member_column_and_detects_a_new_migration() {
     let Some(db) = database().await else { return };
     let mut conn = db.pool().acquire().await.unwrap();

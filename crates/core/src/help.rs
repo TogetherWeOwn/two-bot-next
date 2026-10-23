@@ -76,6 +76,12 @@ const HELP_GROUPS: &[HelpGroup] = &[
         anchor: None,
     },
     HelpGroup {
+        title: "Polls (2–10 choices; 1 minute–7 days; author closes early)",
+        requires: None,
+        commands: &["poll"],
+        anchor: None,
+    },
+    HelpGroup {
         title: "RSVPs",
         requires: None,
         commands: &["rsvp", "rsvp-attendance"],
@@ -269,12 +275,12 @@ mod tests {
                 "{token} appears exactly once"
             );
         }
-        // 28 legacy builtins plus the Next-only help and privacy commands,
+        // Legacy builtins plus the Next-only help, privacy and poll commands,
         // plus the 21 gated voice commands (voice `kick` loses first-wins
         // to moderation `/kick`; `/templateassistant` stays unpublished
         // until its slice lands): matches the regenerated `docs/commands.md`
         // total.
-        assert!(text.contains("**Server commands** (50 live)"));
+        assert!(text.contains("**Server commands** (51 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"
@@ -395,10 +401,10 @@ mod tests {
             .flat_map(|g| g.commands.iter().copied())
             .collect();
         // 27 legacy builtins plus the Next-only help command and the
-        // Next-only privacy command, then the 21 voice names (voice `kick`
+        // Next-only privacy and poll commands, then the 21 voice names (voice `kick`
         // shares the Kick group). `/templateassistant` stays out until its
         // slice lands.
-        assert_eq!(grouped.len(), 50);
+        assert_eq!(grouped.len(), 51);
         for name in [
             "rank",
             "leaderboard",
@@ -413,6 +419,7 @@ mod tests {
             "lfg",
             "lfg-close",
             "feed-add",
+            "poll",
             "ban",
             "tempban",
             "kick",

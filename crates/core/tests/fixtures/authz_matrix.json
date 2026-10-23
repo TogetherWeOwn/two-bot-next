@@ -19,6 +19,7 @@
     {"name": "help", "allow": "*"},
     {"name": "privacy", "allow": "*"},
     {"name": "rsvp", "allow": "*"},
+    {"name": "poll", "allow": "*"},
     {"name": "rsvp-attendance", "allow": "*"},
     {"name": "ban", "allow": ["ban_members", "all_bits"], "deny": "ModerationPermission(Ban)"},
     {"name": "tempban", "allow": ["ban_members", "all_bits"], "deny": "ModerationPermission(TempBan)"},

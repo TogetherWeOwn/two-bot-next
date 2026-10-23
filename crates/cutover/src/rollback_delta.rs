@@ -161,6 +161,8 @@ pub const TABLE_SPECS: &[TableSpec] = &[
         measure: TableMeasure::Unmeasurable("no timestamp column; child rows are created and updated with the parent lfg_posts row", DISPOSITION_ACCEPT_WITH_REASON),
     },
     TableSpec { table: "lfg_signups", measure: TableMeasure::Columns(&["joined_at"]) },
+    TableSpec { table: "polls", measure: TableMeasure::Columns(&["updated_at"]) },
+    TableSpec { table: "poll_votes", measure: TableMeasure::Columns(&["voted_at"]) },
     TableSpec { table: "member_catchup_cursors", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "member_catchup_members", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "member_erasure_audit", measure: TableMeasure::Columns(&["erased_at"]) },

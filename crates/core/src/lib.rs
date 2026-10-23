@@ -109,6 +109,9 @@ pub mod onboarding;
 #[cfg(feature = "db")]
 pub mod onboarding_store;
 pub mod ops_fetch;
+#[cfg(feature = "db")]
+pub mod poll_store;
+pub mod polls;
 pub mod presence;
 #[cfg(feature = "db")]
 pub mod presence_store;
