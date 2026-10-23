@@ -1278,6 +1278,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                     *name,
                     "sticky"
                         | "sticky-remove"
+                        | "sticky-status"
                         | "feed-add"
                         | "feed-remove"
                         | "feed-list"

@@ -221,7 +221,9 @@ pub fn delivery_state(
 /// mention-wrapped legacy values without echoing them.
 #[must_use]
 pub fn valid_snowflake(id: &str) -> bool {
-    id.parse::<u64>().is_ok_and(|n| n != 0)
+    !id.is_empty()
+        && id.bytes().all(|b| b.is_ascii_digit())
+        && id.parse::<u64>().is_ok_and(|n| n != 0)
 }
 
 /// Historical link from validated current guild/channel plus a stored message
@@ -976,6 +978,31 @@ mod tests {
         );
         // BMP characters occupy one UTF-16 unit regardless of UTF-8 width.
         assert!(validate_body(&"é".repeat(2000)).is_ok());
+    }
+
+    #[test]
+    fn snowflake_validation_rejects_non_decimal_and_zero_ids() {
+        assert!(valid_snowflake("4444"));
+        assert!(valid_snowflake("18446744073709551615"));
+        for bad in [
+            "",
+            "0",
+            "+4444",
+            "-4444",
+            " 4444",
+            "4444 ",
+            "44.44",
+            "٤٤٤٤",
+            "18446744073709551616",
+            "4444?x=1",
+            "<@4444>",
+        ] {
+            assert!(!valid_snowflake(bad), "{bad:?} must not validate");
+            assert!(
+                status_link("111", "222", bad).is_none(),
+                "{bad:?} must not build a link"
+            );
+        }
     }
 
     #[test]
