@@ -518,6 +518,7 @@ fn is_secret_key(key: &str) -> bool {
         "SECRET",
         "DATABASE_URL",
         "ACCESS_KEY",
+        "API_KEY",
         "PSEUDONYM_KEY",
     ]
     .iter()

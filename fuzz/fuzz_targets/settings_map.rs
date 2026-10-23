@@ -57,6 +57,7 @@ const MAX_ENTRIES: usize = 32;
 /// `DISCORD_*` dashboard names the core parsers never read) must be ignored;
 /// the harness asserts full-map and filtered-map outcomes match.
 const KNOWN_KEYS: &[&str] = &[
+    "TWO_ASSISTANT_API_KEY",
     "TWO_ASSISTANT_ENDPOINT",
     "TWO_ASSISTANT_MODEL",
     "TWO_AUTOMATIONS",
