@@ -1,6 +1,6 @@
 {
   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
-  "count": 30,
+  "count": 31,
   "dm_permission_all_false": true,
   "commands": [
     {
@@ -146,6 +146,18 @@
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Next-only member self-serve with no legacy counterpart; the purge-plus-suppression-plus-receipt path is pinned by the gateway dispatch tests on a disposable database rather than the live smoke five."
+    },
+    {
+      "name": "game-mix",
+      "description": "Show this server's aggregate game activity.",
+      "family": "core",
+      "gate": "always",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Next-only private staff aggregate; seeded game activity and failure cases are pinned by disposable-database gateway acceptance, outside the live smoke five."
     },
     {
       "name": "attendance",

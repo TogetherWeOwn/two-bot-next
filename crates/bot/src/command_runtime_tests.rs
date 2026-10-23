@@ -734,7 +734,7 @@ async fn activation_boot_resumed_uses_current_clearance_and_checks_identity() {
                 .collect();
             assert_eq!(
                 names,
-                vec!["rank", "leaderboard", "help", "privacy"],
+                vec!["rank", "leaderboard", "help", "privacy", "game-mix"],
                 "unrelated core commands remain; uncleared surfaces are replaced"
             );
         }
@@ -848,7 +848,10 @@ async fn activation_boot_from_env_fixture() {
     let defs = runtime.router().publish_set(&[]).unwrap();
     let names: Vec<_> = defs.iter().map(|def| def.name.as_str()).collect();
     if expected == "narrowed" {
-        assert_eq!(names, ["rank", "leaderboard", "help", "privacy"]);
+        assert_eq!(
+            names,
+            ["rank", "leaderboard", "help", "privacy", "game-mix"]
+        );
         assert!(!runtime.router().gates().moderation);
         assert!(!runtime.router().gates().automations);
         assert!(!runtime.router().gates().announcements);
@@ -1295,6 +1298,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "leaderboard"
                         | "help"
                         | "privacy"
+                        | "game-mix"
                 )
             })
             .collect();
@@ -1302,6 +1306,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
         assert!(!unwired.contains(&"leaderboard"));
         assert!(!unwired.contains(&"help"));
         assert!(!unwired.contains(&"privacy"));
+        assert!(!unwired.contains(&"game-mix"));
         if router_gates.announcements {
             assert!(unwired.contains(&"rsvp"), "enabled unwired announcement");
         }
@@ -3373,7 +3378,14 @@ async fn ready_publish_carries_the_voice_set_only_while_voice_is_live() {
             );
         }
         // The non-voice registry is untouched either way.
-        for expected in ["rank", "leaderboard", "sticky", "rsvp", "feed-list"] {
+        for expected in [
+            "rank",
+            "leaderboard",
+            "game-mix",
+            "sticky",
+            "rsvp",
+            "feed-list",
+        ] {
             assert!(names.contains(&expected), "{expected} must still publish");
         }
         mock.shutdown().await;
@@ -3398,6 +3410,7 @@ fn production_router_matches_composed_production_wiring() {
             HandlerId::Leaderboard,
             HandlerId::Help,
             HandlerId::Privacy,
+            HandlerId::GameMix,
             HandlerId::ScorecardAttendance,
             HandlerId::AutomationAdmin,
             HandlerId::AutomationCustom,
