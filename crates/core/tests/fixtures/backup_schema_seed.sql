@@ -254,6 +254,19 @@ VALUES ('100000000000000001', '2026-08-01T10:00:00.000Z'),
 INSERT INTO scheduled_events_tombstone (guild_id, event_id, deleted_at)
 VALUES ('100000000000000001', '100000000000000012', '2026-08-01T10:00:00.000Z'),
        ('100000000000000002', '100000000000000013', '2026-08-01T11:00:00.000Z');
+-- Event voice pair (0455, v13): one claimed instance plus one closed and one
+-- open presence span, so the roundtrip covers the nullable lease/left_at.
+INSERT INTO event_voice_channels
+    (event_id, instance_starts_at, starts_at, ends_at, status, owner_tick_lease,
+     voice_channel_id, created_at, updated_at)
+VALUES ('100000000000000011', '2026-08-02T18:00:00.000Z', '2026-08-02T18:00:00.000Z',
+        '2026-08-02T20:00:00.000Z', 'creating', 'tick-seed', '100000000000000003',
+        '2026-08-01T10:00:00.000Z', '2026-08-01T10:00:00.000Z');
+INSERT INTO event_voice_presence (event_id, instance, user_id, joined_at, left_at)
+VALUES ('100000000000000011', '2026-08-02T18:00:00.000Z', '100000000000000002',
+        '2026-08-02T18:01:00.000Z', '2026-08-02T19:00:00.000Z'),
+       ('100000000000000011', '2026-08-02T18:00:00.000Z', '100000000000000004',
+        '2026-08-02T18:05:00.000Z', NULL);
 INSERT INTO counter_snapshots
     (guild_id, human_member_count, human_member_count_at, online_count, online_count_at)
 VALUES ('100000000000000001', 123, '2026-08-01T09:00:00.000Z', 13, '2026-08-01T09:01:00.000Z');
@@ -322,12 +335,27 @@ VALUES (79, '100000000000000001', 'TWO_STICKY_ENABLED', NULL,
         '100000000000000002', '2026-08-01T10:00:00.123456Z'),
        (91, '100000000000000001', 'TWO_FEEDS_ENABLED', 'false', NULL,
         '100000000000000004', '2026-08-01T10:01:00Z');
--- V12 voice configuration audit (0455): gapped explicit versions leave the
+-- V14 voice configuration audit (0458): gapped explicit versions leave the
 -- BIGSERIAL revision allocator behind the rows, like every other seeded
 -- serial above. Attribution is exact; no historical actor is guessed.
 INSERT INTO voice_settings_audit (version, guild_id, actor, at)
 VALUES (6, '100000000000000001', 'discord:limit', '2026-08-03T10:00:00.123456Z'),
        (14, '100000000000000001', 'dashboard:admin-session', '2026-08-03T10:05:00Z');
+-- Admin API token registry (0456/0457): one live read token and one revoked
+-- read+moderate token. Hashes are hash-shaped seed data (md5 doubled to 64
+-- hex), never real secrets; the sha256 property is pinned by the slice-0
+-- acceptance suite, not the backup roundtrip.
+INSERT INTO admin_api_tokens
+    (token_id, secret_hash, scopes, guild_ids, label, issued_by,
+     issued_at, expires_at, revoked_at, last_used_at)
+VALUES ('adm_1000000000000001', repeat(md5('backup:admin-api-tokens:1'), 2),
+        '{read}', '{100000000000000001}', 'backup reader', 'backup operator',
+        '2026-08-01T10:00:00Z', '2026-10-30T10:00:00Z', NULL, NULL),
+       ('adm_1000000000000002', repeat(md5('backup:admin-api-tokens:2'), 2),
+        '{read,moderate}', '{100000000000000001,100000000000000002}',
+        'backup moderator', 'backup operator',
+        '2026-08-01T10:00:00Z', '2026-10-30T10:00:00Z',
+        '2026-08-15T10:00:00Z', '2026-08-02T10:00:00Z');
 INSERT INTO audit_kill_switch (id, engaged_at, engaged_by)
 VALUES (1, '2026-08-01T10:00:00Z', '100000000000000002');
 

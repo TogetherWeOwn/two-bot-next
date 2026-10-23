@@ -171,8 +171,11 @@ fn key_label_echoes_only_configured_ids() {
 
 #[test]
 fn action_label_echoes_only_catalog_names() {
-    // The card's 19-name catalog, pinned so a quiet addition is a loud diff.
-    assert_eq!(IMPLEMENTED_ACTIONS.len(), 19);
+    // The 21-name catalog includes both voice configuration actions.
+    assert_eq!(IMPLEMENTED_ACTIONS.len(), 21);
+    for name in ["voice.config.get", "voice.config.set"] {
+        assert!(IMPLEMENTED_ACTIONS.contains(&name));
+    }
     for name in IMPLEMENTED_ACTIONS {
         assert_eq!(ActionLabel::new(Some(name)), ActionLabel::Known(name));
         assert_eq!(ActionLabel::new(Some(name)).as_str(), name);
@@ -191,6 +194,18 @@ fn action_label_echoes_only_catalog_names() {
 fn from_body_extracts_only_catalog_actions() {
     let raw_known = br#"{"action":"role.assign","guild_id":"123"}"#;
     assert_eq!(ActionLabel::from_body(raw_known), known("role.assign"));
+    for (body, action) in [
+        (
+            br#"{"action":"voice.config.get","guild_id":"123"}"#.as_slice(),
+            "voice.config.get",
+        ),
+        (
+            br#"{"action":"voice.config.set","guild_id":"123"}"#.as_slice(),
+            "voice.config.set",
+        ),
+    ] {
+        assert_eq!(ActionLabel::from_body(body), known(action));
+    }
     for raw in [
         br#"{"action":"moderation.nuke"}"#.as_slice(),
         br#"{"action":42}"#,
@@ -477,7 +492,7 @@ fn bound_holds_across_windows() {
                 Rejection::new(
                     ErrorCode::Replayed,
                     configured("web"),
-                    ActionLabel::new(Some(IMPLEMENTED_ACTIONS[i % 19])),
+                    ActionLabel::new(Some(IMPLEMENTED_ACTIONS[i % IMPLEMENTED_ACTIONS.len()])),
                 ),
                 now_ms,
             )

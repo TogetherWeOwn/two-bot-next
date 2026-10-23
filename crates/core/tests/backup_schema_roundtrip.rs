@@ -303,7 +303,7 @@ async fn triggers(pool: &PgPool) -> Vec<(String, String, String, String)> {
 }
 
 /// Every migrated settings trigger, in catalog order: the CAS allocator and
-/// two guards (0330/0331) plus the v12 voice writer contract (0455) — one
+/// two guards (0330/0331) plus the v14 voice writer contract (0458) — one
 /// append-only audit guard and thirteen stamp triggers, one per versioned
 /// voice configuration table. Restore suspends guards while loading rows;
 /// the CAS allocator stays enabled so restored rows receive fresh tokens.
@@ -1532,10 +1532,10 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v12-source.ndjson.gz");
+    let current_path = directory.path("v14-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 12);
+    assert_eq!(old.manifest.version, 14);
     for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -1582,11 +1582,18 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v12-source.ndjson.gz");
+    let current_path = directory.path("v14-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 12);
-    for name in ["scheduled_events_claim", "scheduled_events_tombstone"] {
+    assert_eq!(old.manifest.version, 14);
+    for name in [
+        "scheduled_events_claim",
+        "scheduled_events_tombstone",
+        "event_voice_channels",
+        "event_voice_presence",
+        "admin_api_tokens",
+        "voice_settings_audit",
+    ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
         old.manifest.tables.retain(|table| table.name != name);
@@ -1599,14 +1606,28 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     assert_eq!(inspected.manifest.version, 9);
     assert_eq!(
         inspected.manifest.missing_tables(),
-        ["scheduled_events_claim", "scheduled_events_tombstone"]
+        [
+            "scheduled_events_claim",
+            "scheduled_events_tombstone",
+            "event_voice_channels",
+            "event_voice_presence",
+            "admin_api_tokens",
+            "voice_settings_audit"
+        ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
     forget_moderation_history(pool).await;
     forget_voice_audit_history(pool).await;
     let report = restore(pool, &old_path).await.unwrap();
     assert!(report.ok);
-    for name in ["scheduled_events_claim", "scheduled_events_tombstone"] {
+    for name in [
+        "scheduled_events_claim",
+        "scheduled_events_tombstone",
+        "event_voice_channels",
+        "event_voice_presence",
+        "admin_api_tokens",
+        "voice_settings_audit",
+    ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
             identifier(name)
@@ -1632,20 +1653,24 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v12-source.ndjson.gz");
+    let current_path = directory.path("v14-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 12);
+    assert_eq!(old.manifest.version, 14);
     // Frozen claim-only v10 shape: the merged v10 writer carried the
-    // epoch-claim guard but predates the delete tombstones.
-    let rows = old.buffers.remove("scheduled_events_tombstone").unwrap();
-    assert!(
-        !rows.is_empty(),
-        "fixture must populate newer scheduled_events_tombstone"
-    );
-    old.manifest
-        .tables
-        .retain(|table| table.name != "scheduled_events_tombstone");
+    // epoch-claim guard but predates the delete tombstones, token registry,
+    // event voice pair and voice audit.
+    for name in [
+        "scheduled_events_tombstone",
+        "event_voice_channels",
+        "event_voice_presence",
+        "admin_api_tokens",
+        "voice_settings_audit",
+    ] {
+        let rows = old.buffers.remove(name).unwrap();
+        assert!(!rows.is_empty(), "fixture must populate newer {name}");
+        old.manifest.tables.retain(|table| table.name != name);
+    }
     old.manifest.version = 10;
     old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
     let old_path = directory.path("pre-tombstone-v10.ndjson.gz");
@@ -1654,24 +1679,35 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
     assert_eq!(inspected.manifest.version, 10);
     assert_eq!(
         inspected.manifest.missing_tables(),
-        ["scheduled_events_tombstone"]
+        [
+            "scheduled_events_tombstone",
+            "event_voice_channels",
+            "event_voice_presence",
+            "admin_api_tokens",
+            "voice_settings_audit"
+        ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
     forget_moderation_history(pool).await;
     forget_voice_audit_history(pool).await;
     let report = restore(pool, &old_path).await.unwrap();
     assert!(report.ok);
-    let count: i64 = sqlx::query_scalar(audited(format!(
-        "SELECT COUNT(*) FROM {}",
-        identifier("scheduled_events_tombstone")
-    )))
-    .fetch_one(pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        count, 0,
-        "v10 restore clears newer scheduled_events_tombstone target rows"
-    );
+    for name in [
+        "scheduled_events_tombstone",
+        "event_voice_channels",
+        "event_voice_presence",
+        "admin_api_tokens",
+        "voice_settings_audit",
+    ] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(name)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "v10 restore clears newer {name} target rows");
+    }
     let claims: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scheduled_events_claim")
         .fetch_one(pool)
         .await
@@ -1688,7 +1724,224 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
     db.close().await.unwrap();
 }
 
-/// V12 voice configuration audit (0455): the archive carries every audit row
+#[tokio::test]
+async fn v11_archive_restores_and_clears_newer_registry() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    seed(pool).await;
+    let directory = ArchiveDirectory::new();
+    let current_path = directory.path("v14-source.ndjson.gz");
+    dump(pool, &current_path).await.unwrap();
+    let mut old = inspect(&current_path).unwrap();
+    assert_eq!(old.manifest.version, 14);
+    // Frozen tombstone-only v11 shape: the merged v11 writer carried the
+    // delete tombstones but predates the token registry, event voice pair
+    // and voice audit.
+    for name in [
+        "event_voice_channels",
+        "event_voice_presence",
+        "admin_api_tokens",
+        "voice_settings_audit",
+    ] {
+        let rows = old.buffers.remove(name).unwrap();
+        assert!(!rows.is_empty(), "fixture must populate newer {name}");
+        old.manifest.tables.retain(|table| table.name != name);
+    }
+    old.manifest.version = 11;
+    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
+    let old_path = directory.path("pre-registry-v11.ndjson.gz");
+    write_archive(&old_path, &old);
+    let inspected = inspect(&old_path).expect("pre-change v11 archive remains readable");
+    assert_eq!(inspected.manifest.version, 11);
+    assert_eq!(
+        inspected.manifest.missing_tables(),
+        [
+            "event_voice_channels",
+            "event_voice_presence",
+            "admin_api_tokens",
+            "voice_settings_audit"
+        ]
+    );
+    // This test deliberately replaces a reused isolated rehearsal target.
+    forget_moderation_history(pool).await;
+    forget_voice_audit_history(pool).await;
+    let report = restore(pool, &old_path).await.unwrap();
+    assert!(report.ok);
+    for name in [
+        "event_voice_channels",
+        "event_voice_presence",
+        "admin_api_tokens",
+        "voice_settings_audit",
+    ] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(name)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "v11 restore clears newer {name} target rows");
+    }
+    let tombstones: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scheduled_events_tombstone")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(
+        tombstones > 0,
+        "the v11 delete tombstones are restored, not discarded"
+    );
+    let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(members > 0, "older covered data is restored, not discarded");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v12_archive_restores_and_clears_newer_event_voice() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    seed(pool).await;
+    let directory = ArchiveDirectory::new();
+    let current_path = directory.path("v14-source.ndjson.gz");
+    dump(pool, &current_path).await.unwrap();
+    let mut old = inspect(&current_path).unwrap();
+    assert_eq!(old.manifest.version, 14);
+    // Frozen token-registry v12 shape: the v12 writer carried the token
+    // registry but predates the event voice pair and voice audit.
+    for table in [
+        "event_voice_channels",
+        "event_voice_presence",
+        "voice_settings_audit",
+    ] {
+        let rows = old.buffers.remove(table).unwrap();
+        assert!(!rows.is_empty(), "fixture must populate newer {table}");
+        old.manifest.tables.retain(|info| info.name != table);
+    }
+    old.manifest.version = 12;
+    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
+    let old_path = directory.path("pre-event-voice-v12.ndjson.gz");
+    write_archive(&old_path, &old);
+    let inspected = inspect(&old_path).expect("pre-change v12 archive remains readable");
+    assert_eq!(inspected.manifest.version, 12);
+    assert_eq!(
+        inspected.manifest.missing_tables(),
+        [
+            "event_voice_channels",
+            "event_voice_presence",
+            "voice_settings_audit"
+        ]
+    );
+    // This test deliberately replaces a reused isolated rehearsal target.
+    forget_moderation_history(pool).await;
+    forget_voice_audit_history(pool).await;
+    let report = restore(pool, &old_path).await.unwrap();
+    assert!(report.ok);
+    for table in [
+        "event_voice_channels",
+        "event_voice_presence",
+        "voice_settings_audit",
+    ] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(table)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "v12 restore clears newer {table} target rows");
+    }
+    let tokens: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_api_tokens")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(
+        tokens > 0,
+        "the v12 token registry is restored, not discarded"
+    );
+    let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(members > 0, "older covered data is restored, not discarded");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v13_archive_restores_and_clears_newer_voice_audit() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    seed(pool).await;
+    let directory = ArchiveDirectory::new();
+    let current_path = directory.path("v14-source.ndjson.gz");
+    dump(pool, &current_path).await.unwrap();
+    let mut old = inspect(&current_path).unwrap();
+    assert_eq!(old.manifest.version, 14);
+    // Frozen event-voice v13 shape: the v13 writer carried the token registry
+    // and event voice pair but predates the voice audit (0458).
+    let rows = old.buffers.remove("voice_settings_audit").unwrap();
+    assert!(
+        !rows.is_empty(),
+        "fixture must populate newer voice_settings_audit"
+    );
+    old.manifest
+        .tables
+        .retain(|table| table.name != "voice_settings_audit");
+    old.manifest.version = 13;
+    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
+    let old_path = directory.path("pre-voice-audit-v13.ndjson.gz");
+    write_archive(&old_path, &old);
+    let inspected = inspect(&old_path).expect("pre-change v13 archive remains readable");
+    assert_eq!(inspected.manifest.version, 13);
+    assert_eq!(
+        inspected.manifest.missing_tables(),
+        ["voice_settings_audit"]
+    );
+    // This test deliberately replaces a reused isolated rehearsal target.
+    forget_moderation_history(pool).await;
+    forget_voice_audit_history(pool).await;
+    let report = restore(pool, &old_path).await.unwrap();
+    assert!(report.ok);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM voice_settings_audit")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "v13 restore clears newer voice_settings_audit target rows"
+    );
+    let tokens: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_api_tokens")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(
+        tokens > 0,
+        "the v13 token registry is restored, not discarded"
+    );
+    let presence: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event_voice_presence")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(
+        presence > 0,
+        "the v13 event voice presence is restored, not discarded"
+    );
+    let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(members > 0, "older covered data is restored, not discarded");
+    db.close().await.unwrap();
+}
+
+/// V14 voice configuration audit (0458): the archive carries every audit row
 /// plus the revision allocator's mark, a fresh target resumes the revision
 /// sequence past the archived rows, and a destination holding audit history
 /// the archive would forget refuses without changing anything.
@@ -1708,7 +1961,7 @@ async fn voice_audit_history_roundtrips_into_fresh_target_and_fences_newer_desti
     let tables = covered_tables(pool).await;
     assert!(
         tables.contains(&"voice_settings_audit".to_owned()),
-        "v12 backup covers the voice configuration audit"
+        "v14 backup covers the voice configuration audit"
     );
     let before = snapshot(pool, &tables).await;
     assert!(
@@ -1730,14 +1983,14 @@ async fn voice_audit_history_roundtrips_into_fresh_target_and_fences_newer_desti
     let guard_before = triggers(pool).await;
     assert_expected_triggers(&guard_before);
     let directory = ArchiveDirectory::new();
-    let path = directory.path("voice-audit-v12.ndjson.gz");
+    let path = directory.path("voice-audit-v14.ndjson.gz");
     let manifest = dump(pool, &path).await.unwrap();
-    assert_eq!(manifest.version, 12);
+    assert_eq!(manifest.version, 14);
     let entry = manifest
         .tables
         .iter()
         .find(|table| table.name == "voice_settings_audit")
-        .expect("voice audit rides the v12 manifest");
+        .expect("voice audit rides the v14 manifest");
     assert_eq!(
         entry.columns.iter().map(String::as_str).collect::<Vec<_>>(),
         ["version", "guild_id", "actor", "at"],
