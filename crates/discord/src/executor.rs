@@ -3820,9 +3820,39 @@ impl ActionExecutor {
         interaction_token: &str,
         content: &str,
     ) -> Result<(), DiscordError> {
+        self.edit_response_inner(application_id, interaction_token, content, true)
+            .await
+    }
+
+    /// Complete an acknowledged interaction without mention neutralization.
+    /// Only for ephemeral management views (saved-response inspection) whose
+    /// mention safety comes from this edit's explicit empty `allowed_mentions`
+    /// — the admin must see the saved text exactly as stored. Every other
+    /// completion must keep using [`Self::edit_interaction_response`].
+    pub async fn edit_interaction_response_without_mention_neutralization(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        content: &str,
+    ) -> Result<(), DiscordError> {
+        self.edit_response_inner(application_id, interaction_token, content, false)
+            .await
+    }
+
+    async fn edit_response_inner(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        content: &str,
+        neutralize_mentions: bool,
+    ) -> Result<(), DiscordError> {
         let application = Id::<ApplicationMarker>::new_checked(application_id)
             .ok_or_else(|| DiscordError::Rejected("bad application id".to_owned()))?;
-        let content = two_bot_core::message_safety::content(content);
+        let content = if neutralize_mentions {
+            two_bot_core::message_safety::content(content)
+        } else {
+            two_bot_core::message_safety::content_without_mention_neutralization(content)
+        };
         let mentions = AllowedMentions::default();
         let req = Self::request_of(
             self.inner
@@ -3853,6 +3883,26 @@ impl ActionExecutor {
         self.retry_admission_blocked(|_| async {
             self.edit_interaction_response(application_id, interaction_token, content)
                 .await
+        })
+        .await
+    }
+
+    /// [`Self::edit_interaction_response_without_mention_neutralization`] with
+    /// the same bounded contention tolerance as
+    /// [`Self::edit_interaction_response_with_blocked_retry`].
+    pub async fn edit_interaction_response_without_mention_neutralization_with_blocked_retry(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        content: &str,
+    ) -> Result<(), DiscordError> {
+        self.retry_admission_blocked(|_| async {
+            self.edit_interaction_response_without_mention_neutralization(
+                application_id,
+                interaction_token,
+                content,
+            )
+            .await
         })
         .await
     }

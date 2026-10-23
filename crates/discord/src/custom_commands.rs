@@ -261,13 +261,19 @@ impl CustomCommandRuntime {
             } if management => {
                 self.defer(interaction, true, received).await?;
                 let reply = self.manage(interaction, data, &guild, guild_name).await;
-                self.complete(
-                    interaction,
-                    reply
-                        .as_deref()
-                        .unwrap_or("Custom-command operation failed. Please try again."),
-                )
-                .await?;
+                let body = reply
+                    .as_deref()
+                    .unwrap_or("Custom-command operation failed. Please try again.");
+                // Inspect views show saved text exactly as stored: mention
+                // safety comes from the reply's explicit empty
+                // allowed_mentions, never from rewriting `@everyone`/`@here`.
+                // Every other completion keeps the neutralizing path.
+                if data.name == "command-inspect" {
+                    self.complete_without_mention_neutralization(interaction, body)
+                        .await?;
+                } else {
+                    self.complete(interaction, body).await?;
+                }
                 reply?;
                 Ok(true)
             }
@@ -562,6 +568,25 @@ impl CustomCommandRuntime {
         .await
         .map_err(|_| CustomCommandError::DeliveryUnknown)?
         .map_err(delivery_error)
+    }
+
+    /// Inspect-view completion: same retry/error contract as [`Self::complete`],
+    /// without mention neutralization — the ephemeral reply's explicit empty
+    /// `allowed_mentions` is the mention safety, and the admin must see the
+    /// saved text exactly as stored.
+    async fn complete_without_mention_neutralization(
+        &self,
+        interaction: &Interaction,
+        content: &str,
+    ) -> Result<(), CustomCommandError> {
+        self.executor
+            .edit_interaction_response_without_mention_neutralization_with_blocked_retry(
+                self.application_id,
+                &interaction.token,
+                content,
+            )
+            .await
+            .map_err(delivery_error)
     }
 
     async fn complete(
