@@ -336,13 +336,27 @@ fn assert_refused_with(exit: &SpawnedExit, expected: &str) {
         "refusal must keep its fatal message; logs: {}",
         exit.logs
     );
-    let field = format!("error_class=\"{expected}\"");
-    assert!(
-        exit.logs.contains(&field),
-        "refusal must carry {field}; logs: {}",
+    let refusals: Vec<serde_json::Value> = exit
+        .logs
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["message"] == "eventsub startup refused")
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        1,
+        "boot must emit exactly one JSON fatal refusal; logs: {}",
         exit.logs
     );
-    // Exactly one class on the line: no sibling cause and no legacy class.
+    let class = refusals[0]["error_class"]
+        .as_str()
+        .expect("fatal refusal must carry a scalar error_class");
+    assert_eq!(
+        class, expected,
+        "refusal must carry the cause-specific class; logs: {}",
+        exit.logs
+    );
+    // Exactly one class on the fatal event: no sibling cause or legacy class.
     for other in PENNED_CLASSES
         .iter()
         .chain(std::iter::once(&LEGACY_SHARED_CLASS))
@@ -350,11 +364,32 @@ fn assert_refused_with(exit: &SpawnedExit, expected: &str) {
         if *other == expected {
             continue;
         }
-        let other_field = format!("error_class=\"{other}\"");
-        assert!(
-            !exit.logs.contains(&other_field),
-            "refusal must not carry {other_field}; logs: {}",
+        assert_ne!(
+            class, *other,
+            "refusal must not carry {other}; logs: {}",
             exit.logs
+        );
+    }
+}
+
+#[test]
+fn refusal_assertion_reads_the_class_from_the_json_fatal_event() {
+    // Characterize the actual JSON log boundary: a correct class must pass,
+    // while a sibling or legacy class must not satisfy the same assertion.
+    let exit = SpawnedExit {
+        code: Some(1),
+        logs: concat!(
+            "{\"message\":\"live activation refused\",\"level\":\"warn\"}\n",
+            "{\"error_class\":\"receiver_store_missing\",",
+            "\"message\":\"eventsub startup refused\",\"level\":\"error\"}\n",
+        )
+        .to_owned(),
+    };
+    assert_refused_with(&exit, "receiver_store_missing");
+    for wrong in ["receiver_token_missing", "receiver_prerequisites_invalid"] {
+        assert!(
+            std::panic::catch_unwind(|| assert_refused_with(&exit, wrong)).is_err(),
+            "the JSON refusal assertion must reject {wrong}"
         );
     }
 }
