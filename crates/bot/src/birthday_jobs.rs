@@ -101,7 +101,7 @@ async fn roles(
     member: &str,
 ) -> Result<Option<HashSet<String>>, ErrorClass> {
     let Some(value) = rest
-        .get_json_checked(&format!("/guilds/{guild}/members/{member}"))
+        .get_json_strict(&format!("/guilds/{guild}/members/{member}"))
         .await
         .map_err(|_| ErrorClass::Rest)?
     else {
@@ -165,10 +165,12 @@ pub(crate) async fn sweep(
         .map(|p| p.member_id.as_str())
         .collect();
     let mut failure = None;
+    let mut role_invalid = false;
     let role = match settings.role_id.as_deref() {
         Some(role) => match safe_role(rest, guild, role).await {
             Ok(true) => Some(role),
             Ok(false) => {
+                role_invalid = true;
                 failure = Some(ErrorClass::Configuration);
                 None
             }
@@ -183,8 +185,11 @@ pub(crate) async fn sweep(
         .await
         .map_err(|_| ErrorClass::Database)?;
     for grant in grants {
+        // Unavailable permission evidence is not proof of an unsafe role.
+        // Expiry, opt-out and explicit replacement still authorize cleanup.
         if grant.celebration_date != date
-            || role != Some(grant.role_id.as_str())
+            || settings.role_id.as_deref() != Some(grant.role_id.as_str())
+            || role_invalid
             || !celebrants.contains(grant.member_id.as_str())
         {
             if let Err(error) = revoke(pool, rest, guild, &grant.member_id, &grant.role_id).await {
@@ -291,6 +296,12 @@ pub(crate) async fn sweep(
                         .await
                         .map_err(|_| ErrorClass::Database)?;
                     tracing::info!(guild_id = guild, member_id = member, "birthday.cheer");
+                }
+                Err(error) if error.proves_no_effect() || error.is_admission_blocked() => {
+                    store::release_cheer(pool, guild, member, date, &nonce)
+                        .await
+                        .map_err(|_| ErrorClass::Database)?;
+                    failure = Some(ErrorClass::Rest);
                 }
                 Err(_) => {
                     // The fence stays, including on an unknown wire outcome.

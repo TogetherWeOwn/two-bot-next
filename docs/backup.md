@@ -1,7 +1,7 @@
 # Backups, restore drills, and sealed guild-config snapshots (TOG-9881)
 
 Rust port of the legacy `two-bot` cutover-data surface (frozen source
-`two-bot` `main @ d5d11793`): v13 dump format with v3/v4/v5/v6/v7/v8/v9/v10/v11/v12 read compatibility,
+`two-bot` `main @ d5d11793`): v14 dump format with v3–v13 read compatibility,
 SigV4 off-box upload, retention
 math, sealed guild-config snapshot + restore planner, and the three timer
 equivalents. Code: `crates/core/src/backup/`, CLI: `two-bot backup |
@@ -102,17 +102,18 @@ upload command; argv and child output never echoed):
 ## The format
 
 Gzipped NDJSON, one object per line: `manifest` / `row` / `end`. New dumps
-write **v13** (including durable voice-create reservations, the retention
+write **v14** (including durable voice-create reservations, the retention
 queues, the seasonal XP projection, the event store: voice capture plus
 presence capture plus member-capture deltas plus message/reaction capture
 plus thread lifecycle plus stage/interaction-observe/audit-log capture plus
 invite/scheduled-event capture, the stream go-live ledger, guild game-activity
 aggregates, the assistant monthly-cap ledger, the scheduled-event
 epoch-claim guard, the scheduled-event delete tombstones and the admin API
-token registry and event voice pair); the reader also accepts
+token registry, event voice pair and all four birthday tables); the reader also accepts
 frozen **v3**, pre-reservation **v4**, pre-v6-tables **v5**, pre-seasonal **v6**,
 pre-stream-ledger **v7**, pre-guild-counters **v8**, pre-epoch-claim **v9**,
-pre-tombstone **v10**, pre-registry **v11** and pre-event-voice **v12**.
+pre-tombstone **v10**, pre-registry **v11**, pre-event-voice **v12** and
+pre-birthday **v13**.
 Other versions refuse.
 The manifest carries per-table `{name, columns, column_types, count}` taken
 inside one `REPEATABLE READ` transaction, the `events` high-water mark, the
@@ -145,10 +146,10 @@ unsupported. A failed write or validation leaves existing published recovery
 points untouched; a crash may leave a temporary file, but retention and drill
 selectors ignore it.
 
-### Coverage and recovery semantics (v4, v5, v6, v7, v8, v9, v10, v11, v12 and v13)
+### Coverage and recovery semantics (v4–v14)
 
 `DUMP_TABLES` in `crates/core/src/backup/dump_file.rs` is the single ordered
-inventory for both dump and restore. It includes **101 durable tables from the
+inventory for both dump and restore. It includes **105 durable tables from the
 current cutover migrations**, including the bot-owned website-contract backing
 tables, the member-moderation ledger, the self-role send receipts
 (`self_role_exchanges`) plus their uncertainty baselines
@@ -172,13 +173,16 @@ monthly-cap ledger (`assistant_monthly_builds`: 0446/0447), the
 scheduled-event epoch-claim guard (`scheduled_events_claim`: 0450/0451) and
 its delete tombstones (`scheduled_events_tombstone`: 0452/0453) and the
 admin API token registry (`admin_api_tokens`: 0456/0457) and the event
-voice pair (`event_voice_channels`, `event_voice_presence`: 0455).
+voice pair (`event_voice_channels`, `event_voice_presence`: 0455) and the
+birthday profiles, configuration, cheer fences and role intents (0458).
 `OPTIONAL_LEGACY_TABLES` is empty: the coverage
 test fails if a covered table is not migrated. A dump from a fresh Rust schema
-has 101 table entries. A missing current table refuses a dump/restore: migrate
+has 105 table entries. A missing current table refuses a dump/restore: migrate
 the target first.
 Each readable version requires its historical inventory and waives only
-versioned additions introduced later:
+versioned additions introduced later. Every v3–v13 archive also waives
+`V14_ADDED_TABLES` (`birthday_profiles`, `birthday_config`, `birthday_cheers`,
+`birthday_role_grants`); the remaining waivers are listed below:
 
 | Version | Tables it may omit |
 | --- | --- |
@@ -191,7 +195,8 @@ versioned additions introduced later:
 | v10 | `V11_ADDED_TABLES`, `V12_ADDED_TABLES`: `scheduled_events_tombstone`, `admin_api_tokens`, `V13_ADDED_TABLES` (event voice pair) |
 | v11 | `V12_ADDED_TABLES`: `admin_api_tokens`, `V13_ADDED_TABLES` (event voice pair) |
 | v12 | `V13_ADDED_TABLES`: `event_voice_channels`, `event_voice_presence` |
-| v13 | None: the full current inventory is required |
+| v13 | Only the four birthday tables named above |
+| v14 | None: the full current inventory is required |
 
 These are narrow waivers, not permission to omit arbitrary tables. An
 incomplete new archive refuses at inspection. The frozen 85-table v4 fixture
@@ -210,9 +215,15 @@ be re-issued, since secrets are shown once and cannot be re-derived. Use a
 v12 recovery point to preserve the monthly cap, both mirror fences and the
 issued tokens. Restoring v12 without the event voice pair clears both
 tables; the next tick re-claims open instances, but archived presence spans
-are lost. Use a v13 recovery point to preserve claims and spans. Current
-v13 archives must include the monthly cap, both mirror-fence tables, the
-registry and event voice pair, so routine restores retain their archived state. Tombstone `deleted_at` cells must be real dates in
+are lost. Use a v13 or later recovery point to preserve claims and spans.
+Current v14 archives must also include all four birthday tables, so opt-ins,
+configuration and send/role recovery witnesses survive together. Before any
+restore, stop workers and disable new birthday delivery. A pre-v14 archive
+cannot recover birthday state; a v14 snapshot also cannot know Discord effects
+after its snapshot. Inspect channels and cosmetic roles, preserve/reconcile
+post-snapshot witnesses, and do not re-enable delivery until duplicate-cheer
+and stranded-role risks are resolved. No birthday effect is automatically
+replayed by the restore command. Tombstone `deleted_at` cells must be real dates in
 exact `YYYY-MM-DDTHH:MM:SS.sssZ` form: inspection refuses missing, null,
 non-string or noncanonical values before restore opens a write transaction.
 Rollback-delta import enforces the same rule during parsing and revalidates the

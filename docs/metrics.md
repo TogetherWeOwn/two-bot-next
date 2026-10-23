@@ -134,9 +134,11 @@ The supervisor records all three job metrics centrally after each completed
 attempt. Individual periodic jobs need no instrumentation. The current scheduled
 labels are `counter`, `rank`, `scheduled_events`, `presence_probe`,
 `community_scorecard`, `inactivity`, `audit_retry`, `self_role_recovery`, `feeds`,
-`member_unban_sweep`, `automod_expiry`, `settings` and `scheduled_messages`
+`member_unban_sweep`, `automod_expiry`, `birthdays`, `settings` and `scheduled_messages`
 (the two 15 s tickers). The community, audit, recovery, feed, unban-sweep,
-automod-expiry and ticker names may be parked by configuration.
+automod-expiry, birthday and ticker names may be parked by configuration or
+boot identity. On an allowed staging identity, disabling new birthday delivery
+keeps its tracked-role cleanup tick registered.
 All allowlisted series are exposed from process startup at zero, even before the
 first run. A zero success timestamp does not distinguish a parked, never-started,
 still-running or always-failing job; use `/readyz` job status for that distinction.
@@ -266,17 +268,20 @@ as dynamic labels.
   `two_bot_job_consecutive_failures{job}` — `job` is one of
   `invite_snapshot`, `session_checkpoint`, `counter`, `rank`,
   `scheduled_events`, `settings`, `presence_probe`, `community_scorecard`,
-  `inactivity`, `audit_retry`, `scheduled_messages`, `feeds`, `self_role_recovery`,
-  `member_unban_sweep`, `automod_expiry`, `other`; `outcome` is `success` or `failure`.
+  `inactivity`, `audit_retry`, `scheduled_messages`, `feeds`, `birthdays`,
+  `self_role_recovery`, `member_unban_sweep`, `automod_expiry`, `other`;
+  `outcome` is `success` or `failure`.
   `session_checkpoint` records successful durable gateway commits; zero means
   never run. `audit_retry` is the audit supervisor's 30 s retry sweep.
   `member_unban_sweep` is the 30 s unban sweep. `automod_expiry` is the 60 s
   repeat-history expiry tick (real work only when `TWO_AUTOMOD=1`).
   `settings` is the DB-only 15 s `guild_settings` version poll.
+  `birthdays` is the staging-fenced 300 s reconciliation tick, with a 180 s
+  deadline and compensation-only work while new announcements are disabled.
 - `two_bot_job_last_error_class{job,class}` — `job` uses the list above;
   `class` is one of `database`, `rest`, `configuration`, `timeout`, `panic`,
   `feed` or `recovery_required` (the fixed `ErrorClass` variants). Each of the
-  16 jobs has one series per class (112 total); exactly the latest failure's class
+  17 jobs has one series per class (119 total); exactly the latest failure's class
   is `1`, and every class is `0` before a failure or after success. Unknown job
   names fold into `other`; class labels are fixed enum names, never error text.
 - `two_bot_voice_operations_total{op,outcome}` — `op` is `create`, `move`

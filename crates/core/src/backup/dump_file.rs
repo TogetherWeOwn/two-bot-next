@@ -1,4 +1,4 @@
-//! The v13 backup envelope (also reads v3/v4/v5/v6/v7/v8/v9/v10/v11/v12): manifest / rows / end marker, gzipped NDJSON.
+//! The v14 backup envelope (also reads v3–v13): manifest / rows / end marker, gzipped NDJSON.
 //!
 //! Port of the file half of legacy `src/store/dump.ts`. The writer side lives
 //! in [`super::dump`]; everything here touches no database, so every refusal
@@ -145,6 +145,13 @@ pub const DUMP_TABLES: &[&str] = &[
     // (secrets are shown once at issuance and cannot be re-derived); see
     // [`V12_ADDED_TABLES`]. No foreign keys, so order here is free.
     "admin_api_tokens",
+    // Birthday opt-ins/config and pre-wire effect witnesses (0458, v14).
+    // Recovery rows must travel with profiles: omitting them could duplicate a
+    // cheer or strand a cosmetic role after restoring a backup.
+    "birthday_profiles",
+    "birthday_config",
+    "birthday_cheers",
+    "birthday_role_grants",
     "audit_kill_switch",
     "internal_nonces",
     "internal_clock_high_water",
@@ -288,6 +295,16 @@ pub const V12_ADDED_TABLES: &[&str] = &["admin_api_tokens"];
 /// registry requirement and waives only this new pair.
 pub const V13_ADDED_TABLES: &[&str] = &["event_voice_channels", "event_voice_presence"];
 
+/// Tables first covered by v14 (private birthday opt-ins, configuration and
+/// durable cheer/role recovery witnesses). Earlier archives remain readable;
+/// reconcile Discord effects before enabling delivery after an old restore.
+pub const V14_ADDED_TABLES: &[&str] = &[
+    "birthday_profiles",
+    "birthday_config",
+    "birthday_cheers",
+    "birthday_role_grants",
+];
+
 /// Covered tables not created by the current cutover migration set, if any.
 /// Keep legacy data when such tables exist, but do not require nonexistent
 /// legacy subsystems. A table created by migrations must leave this list
@@ -363,8 +380,8 @@ pub fn is_destination_owned(table: &str, column: &str) -> bool {
         .any(|(owned_table, owned_column)| *owned_table == table && *owned_column == column)
 }
 
-/// Write complete v13 coverage; the reader also accepts frozen v3/v4/v5/v6/v7/v8/v9/v10/v11/v12 coverage.
-pub const DUMP_VERSION: u32 = 13;
+/// Write complete v14 coverage; the reader also accepts frozen v3–v13 coverage.
+pub const DUMP_VERSION: u32 = 14;
 
 /// A table name in the dump, validated against [`DUMP_TABLES`].
 pub type DumpTable = String;
@@ -919,10 +936,11 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                     && version != 10
                     && version != 11
                     && version != 12
+                    && version != 13
                     && version != u64::from(DUMP_VERSION)
                 {
                     return Err(refuse(format!(
-                        "dump version {version}, this build reads 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 and {DUMP_VERSION}"
+                        "dump version {version}, this build reads 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 and {DUMP_VERSION}"
                     )));
                 }
                 retain_within_cap(&mut retained, &obj, limits.retained)?;
@@ -1206,15 +1224,16 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
         let _ = count;
     }
     // Historical inventories are pinned by fixtures. Each old version waives
-    // only tables first covered by a later version. New v13 archives require
+    // only tables first covered by a later version. New v14 archives require
     // the full inventory, including both guild counters (0441/0442/0446/0447),
-    // the epoch-claim guard (0450/0451), the delete tombstones (0452/0453)
-    // the token registry (0456/0457) and the event voice pair (0455).
+    // the epoch-claim guard (0450/0451), the delete tombstones (0452/0453),
+    // the token registry (0456/0457), event voice pair (0455) and birthdays (0458).
     let version = obj.get("version").and_then(Value::as_u64);
     let missing: Vec<&str> = DUMP_TABLES
         .iter()
         .copied()
         .enumerate()
+        .filter(|(_, name)| version.is_none_or(|v| v >= 14) || !V14_ADDED_TABLES.contains(name))
         .filter(|(index, name)| match version {
             Some(3) => *index < 22,
             Some(4) => {

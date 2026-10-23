@@ -187,6 +187,8 @@ pub(crate) async fn execute(
     let Some(input) = decode(interaction) else {
         return Ok("Invalid birthday input. Use month/day only, never a year; show/remove take no options. Cheer text must be mention-safe and at most 200 characters.".to_owned());
     };
+    let log_set = matches!(&input, Input::Set(..));
+    let log_remove = matches!(&input, Input::Remove);
     let guild = interaction.guild_id.ok_or(ErrorClass::Rest)?.to_string();
     let member = interaction
         .member
@@ -195,12 +197,15 @@ pub(crate) async fn execute(
         .ok_or(ErrorClass::Rest)?
         .id
         .to_string();
-    let _guard = store::lock(pool, &guild)
+    // Command writes share the lock's transaction/connection. A cancelled
+    // statement rolls back before the lock releases; it cannot commit later
+    // on a separate pool connection and resurrect a removed opt-in.
+    let mut transaction = store::lock(pool, &guild)
         .await
         .map_err(|_| ErrorClass::Database)?;
-    match input {
+    let content: Result<String, ErrorClass> = match input {
         Input::Set(month, day) => {
-            if !store::set(pool, &guild, &member, month, day)
+            if !store::set(&mut transaction, &guild, &member, month, day)
                 .await
                 .map_err(|_| ErrorClass::Database)?
             {
@@ -209,14 +214,13 @@ pub(crate) async fn execute(
                         .to_owned(),
                 );
             }
-            tracing::info!(guild_id = %guild, member_id = %member, "birthday.set");
             Ok(format!(
                 "Birthday saved: {} (UTC). No year is stored. Use /birthday remove to delete it.",
                 display_date(month, day)
             ))
         }
         Input::Show => {
-            let row = store::show(pool, &guild, &member)
+            let row = store::show(&mut transaction, &guild, &member)
                 .await
                 .map_err(|_| ErrorClass::Database)?;
             Ok(row.map_or_else(
@@ -230,10 +234,9 @@ pub(crate) async fn execute(
             ))
         }
         Input::Remove => {
-            store::remove(pool, &guild, &member)
+            store::remove(&mut transaction, &guild, &member)
                 .await
                 .map_err(|_| ErrorClass::Database)?;
-            tracing::info!(guild_id = %guild, member_id = %member, "birthday.remove");
             Ok("Birthday removed. Any birthday role is removed by the next sweep.".to_owned())
         }
         Input::Configure(settings) => {
@@ -250,10 +253,21 @@ pub(crate) async fn execute(
                     return Ok("Invalid birthday role: choose an unmanaged cosmetic role with no permissions or channel access grants.".to_owned());
                 }
             }
-            store::configure(pool, &guild, &settings)
+            store::configure(&mut transaction, &guild, &settings)
                 .await
                 .map_err(|_| ErrorClass::Database)?;
             Ok("Birthday configuration saved. UTC birthdays have silent cheers and an optional cosmetic role.".to_owned())
         }
+    };
+    let content = content?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| ErrorClass::Database)?;
+    if log_set {
+        tracing::info!(guild_id = %guild, member_id = %member, "birthday.set");
+    } else if log_remove {
+        tracing::info!(guild_id = %guild, member_id = %member, "birthday.remove");
     }
+    Ok(content)
 }

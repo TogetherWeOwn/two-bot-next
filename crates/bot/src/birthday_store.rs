@@ -1,6 +1,6 @@
 //! Guild-scoped birthday persistence. Never log rows: month/day are private.
 
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use time::Date;
 
 pub(crate) const MEMBER_CAP: i64 = 100;
@@ -30,7 +30,8 @@ pub(crate) struct Grant {
 /// Commands and sweeps take the same guild lock. A dropped transaction releases
 /// it on cancellation; no session lock can leak into the connection pool.
 /// The sweep uses this transaction only as a lock holder, committing its effect
-/// intents on other connections BEFORE the wire. The lock holder writes no rows.
+/// intents on other connections BEFORE the wire. Commands instead write through
+/// this transaction so cancelled SQL cannot commit after releasing its lock.
 pub(crate) async fn lock(
     pool: &PgPool,
     guild: &str,
@@ -56,18 +57,18 @@ pub(crate) async fn settings(pool: &PgPool, guild: &str) -> Result<Settings, sql
 }
 
 pub(crate) async fn configure(
-    pool: &PgPool,
+    connection: &mut PgConnection,
     guild: &str,
     settings: &Settings,
 ) -> Result<(), sqlx::Error> {
     sqlx::query("INSERT INTO birthday_config (guild_id, channel_id, role_id, cheer) VALUES ($1,$2,$3,$4) ON CONFLICT (guild_id) DO UPDATE SET channel_id = COALESCE(EXCLUDED.channel_id, birthday_config.channel_id), role_id = COALESCE(EXCLUDED.role_id, birthday_config.role_id), cheer = COALESCE(EXCLUDED.cheer, birthday_config.cheer)")
         .bind(guild).bind(&settings.channel_id).bind(&settings.role_id).bind(&settings.cheer)
-        .execute(pool).await?;
+        .execute(connection).await?;
     Ok(())
 }
 
 pub(crate) async fn set(
-    pool: &PgPool,
+    connection: &mut PgConnection,
     guild: &str,
     member: &str,
     month: i16,
@@ -77,25 +78,29 @@ pub(crate) async fn set(
     // members already enrolled can still correct their date at capacity.
     let changed = sqlx::query("INSERT INTO birthday_profiles (guild_id, member_id, birth_month, birth_day) SELECT $1,$2,$3,$4 WHERE (SELECT count(*) FROM birthday_profiles WHERE guild_id = $1) < $5 OR EXISTS (SELECT 1 FROM birthday_profiles WHERE guild_id = $1 AND member_id = $2) ON CONFLICT (guild_id, member_id) DO UPDATE SET birth_month = EXCLUDED.birth_month, birth_day = EXCLUDED.birth_day")
         .bind(guild).bind(member).bind(month).bind(day).bind(MEMBER_CAP)
-        .execute(pool).await?.rows_affected();
+        .execute(connection).await?.rows_affected();
     Ok(changed == 1)
 }
 
 pub(crate) async fn show(
-    pool: &PgPool,
+    connection: &mut PgConnection,
     guild: &str,
     member: &str,
 ) -> Result<Option<Profile>, sqlx::Error> {
     sqlx::query_as("SELECT member_id, birth_month, birth_day FROM birthday_profiles WHERE guild_id = $1 AND member_id = $2")
-        .bind(guild).bind(member).fetch_optional(pool).await
+        .bind(guild).bind(member).fetch_optional(connection).await
 }
 
-pub(crate) async fn remove(pool: &PgPool, guild: &str, member: &str) -> Result<(), sqlx::Error> {
+pub(crate) async fn remove(
+    connection: &mut PgConnection,
+    guild: &str,
+    member: &str,
+) -> Result<(), sqlx::Error> {
     // Replay receipts and pending grants deliberately outlive the opt-in row.
     sqlx::query("DELETE FROM birthday_profiles WHERE guild_id = $1 AND member_id = $2")
         .bind(guild)
         .bind(member)
-        .execute(pool)
+        .execute(connection)
         .await?;
     Ok(())
 }
@@ -152,6 +157,20 @@ pub(crate) async fn claim_cheer(
     Ok(sqlx::query("INSERT INTO birthday_cheers (guild_id, member_id, celebration_date, channel_id, nonce) SELECT $1,$2,$3,$4,$5 WHERE (SELECT count(*) FROM birthday_cheers WHERE guild_id = $1 AND celebration_date = $3) < $6 ON CONFLICT (guild_id, member_id, celebration_date) DO NOTHING")
         .bind(guild).bind(member).bind(date).bind(channel).bind(nonce).bind(CHEER_CAP)
         .execute(pool).await?.rows_affected() == 1)
+}
+
+/// Only the caller holding the guild lock may release its own proven-no-effect
+/// attempt. Unknown outcomes never use this path or become eligible by age.
+pub(crate) async fn release_cheer(
+    pool: &PgPool,
+    guild: &str,
+    member: &str,
+    date: Date,
+    nonce: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM birthday_cheers WHERE guild_id = $1 AND member_id = $2 AND celebration_date = $3 AND nonce = $4 AND message_id IS NULL")
+        .bind(guild).bind(member).bind(date).bind(nonce).execute(pool).await?;
+    Ok(())
 }
 
 pub(crate) async fn has_uncertain(pool: &PgPool, guild: &str) -> Result<bool, sqlx::Error> {

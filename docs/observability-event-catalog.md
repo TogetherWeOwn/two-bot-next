@@ -289,8 +289,10 @@ Each label owns independent `two_bot_job_runs_total{job,outcome}`,
 `two_bot_job_consecutive_failures{job}` and
 `two_bot_job_last_error_class{job,class}` series (see the job allowlist
 `JOBS` in `metrics.rs`). Success in one label never clears another label's
-streak. None of these four has a `JOB_INTERVAL_SECONDS` cadence entry, so
-staleness tickets via `job_unknown_stale` below instead of `job_stale`.
+streak. The feed, self-role, unban and automod labels have no
+`JOB_INTERVAL_SECONDS` cadence entry, so staleness tickets via
+`job_unknown_stale` below instead of `job_stale`. Birthdays has a 300-second
+cadence entry and uses `job_stale`.
 
 | Job label | Producer (stable anchor) | Meaning |
 | --- | --- | --- |
@@ -298,6 +300,7 @@ staleness tickets via `job_unknown_stale` below instead of `job_stale`.
 | `self_role_recovery` | `self_role_handlers.rs` (`recovery_job`) | Self-role repair sweep every 30 s; a successful sweep need not settle every pending repair; failure-only alerting, no `job_stale` paging |
 | `member_unban_sweep` | `member_runtime.rs` (`sweep_job`) | Member unban sweep every 30 s with an attempt timeout that may outlive its cadence; a successful sweep need not complete any unban; failure-only alerting |
 | `automod_expiry` | `automod_gateway.rs` (`expiry_job`) | Automod repeat-history expiry tick every 60 s; a gateway without built activation is a no-op success, and real expiry work runs only with the automod gate on; failure-only alerting |
+| `birthdays` | `birthday_jobs.rs` (`register`) | Staging-fenced UTC birthday reconciliation every 300 s; disabling announcements stops new cheers/grants but retains role cleanup; uncertain sends return `recovery_required` |
 
 ## Alert rules
 
