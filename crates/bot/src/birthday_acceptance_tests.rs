@@ -117,7 +117,7 @@
 //! two-bot birthday_acceptance`.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -429,6 +429,7 @@ struct DiscoState {
     guild_channels: Mutex<Vec<Value>>,
     uncertain_post: AtomicBool,
     rejected_post: AtomicBool,
+    member_get_status: AtomicU16,
     hold_role_put: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
@@ -515,6 +516,13 @@ async fn start_stateful(state: Arc<DiscoState>) -> MockRest {
                 return response;
             }
             if req.method == "GET" && seg.len() == 6 {
+                let status = state.member_get_status.load(Ordering::SeqCst);
+                if status != 0 {
+                    return ScriptedResponse::json(
+                        status,
+                        json!({"code": if status == 404 { 10007 } else { 50013 }, "message": "synthetic member lookup refusal"}),
+                    );
+                }
                 let map = state.roles.lock().expect("roles lock");
                 let list: Vec<&str> = map
                     .get(&member)
@@ -1787,6 +1795,138 @@ async fn sweep_posts_exactly_one_cheer_per_celebrant() {
 
     mock.shutdown().await;
     db.close().await.expect("drop test database");
+}
+
+/// A forbidden member read is not confirmed absence: retain the role cleanup
+/// intent after opt-out, while a real 404 may safely retire an absent member.
+#[tokio::test]
+async fn forbidden_member_lookup_preserves_cleanup_intent_until_recovery() {
+    let Some(url) = db_url() else { return };
+    let db = test_db(&url).await;
+    let pool = db.pool().clone();
+    let state = Arc::new(DiscoState::default());
+    let mock = start_stateful(Arc::clone(&state)).await;
+    let executor = executor_for(&mock);
+    let runtime = runtime_for(pool.clone(), executor.clone());
+    let config = dispatch_callback(
+        &runtime,
+        &mock,
+        &config_ix(None, Some(8130), None, ALICE, Permissions::MANAGE_GUILD),
+    )
+    .await;
+    assert_ephemeral(&config, "role-only config");
+    let saved = dispatch_set(&runtime, &mock, ALICE, 5, 1).await;
+    assert!(content_of(&saved).contains("May"));
+    sweep(&pool, &executor, utc_ms("2026-05-01T12:00:00.000Z")).await;
+    assert!(member_roles(&state, &ALICE.to_string()).contains(ROLE_ID));
+    let removed = dispatch_callback(&runtime, &mock, &remove_ix(ALICE)).await;
+    assert_ephemeral(&removed, "opt-out");
+
+    state.member_get_status.store(403, Ordering::SeqCst);
+    let first_delete = role_ops(&mock.requests(), "DELETE").len();
+    let forbidden = MemberRuntime::run_birthday_sweep(
+        &pool,
+        &executor,
+        GUILD_S,
+        utc_ms("2026-05-02T12:00:00.000Z"),
+    )
+    .await;
+    let grants_after_403: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM birthday_role_grants WHERE guild_id = $1 AND member_id = $2",
+    )
+    .bind(GUILD_S)
+    .bind(ALICE.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("inspect pending cleanup");
+    let held_after_403 = member_roles(&state, &ALICE.to_string()).contains(ROLE_ID);
+    let deletes_after_403 = role_ops(&mock.requests(), "DELETE").len();
+
+    state.member_get_status.store(0, Ordering::SeqCst);
+    let restarted = db.independent_pool().await.expect("fresh cleanup pool");
+    let recovered = MemberRuntime::run_birthday_sweep(
+        &restarted,
+        &executor,
+        GUILD_S,
+        utc_ms("2026-05-02T12:00:00.000Z"),
+    )
+    .await;
+    let held_after_recovery = member_roles(&state, &ALICE.to_string()).contains(ROLE_ID);
+    let alice_deletes = role_ops(&mock.requests(), "DELETE")
+        .into_iter()
+        .filter(|(member, role)| member == &ALICE.to_string() && role == ROLE_ID)
+        .count();
+
+    // A genuinely departed member is different: successful absence retires
+    // their witness without issuing a pointless DELETE or failing forever.
+    let saved = dispatch_set(&runtime, &mock, BRUNO, 5, 2).await;
+    assert!(content_of(&saved).contains("May"));
+    sweep(&restarted, &executor, utc_ms("2026-05-02T12:00:00.000Z")).await;
+    let removed = dispatch_callback(&runtime, &mock, &remove_ix(BRUNO)).await;
+    assert_ephemeral(&removed, "departed opt-out");
+    state
+        .roles
+        .lock()
+        .expect("roles lock")
+        .remove(&BRUNO.to_string());
+    state.member_get_status.store(404, Ordering::SeqCst);
+    let before_404 = role_ops(&mock.requests(), "DELETE").len();
+    let absent = MemberRuntime::run_birthday_sweep(
+        &restarted,
+        &executor,
+        GUILD_S,
+        utc_ms("2026-05-03T12:00:00.000Z"),
+    )
+    .await;
+    let after_404 = role_ops(&mock.requests(), "DELETE").len();
+    let grants_after_404: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM birthday_role_grants WHERE guild_id = $1 AND member_id = $2",
+    )
+    .bind(GUILD_S)
+    .bind(BRUNO.to_string())
+    .fetch_one(&restarted)
+    .await
+    .expect("inspect absent member cleanup");
+    restarted.close().await;
+    mock.shutdown().await;
+    db.close().await.expect("drop test database");
+
+    assert_eq!(
+        grants_after_403, 1,
+        "403 must retain the cleanup intent, not pretend the member is absent"
+    );
+    assert_eq!(
+        forbidden,
+        Err(ErrorClass::Rest),
+        "failed cleanup remains observable"
+    );
+    assert!(
+        held_after_403,
+        "forbidden lookup cannot prove the role was removed"
+    );
+    assert_eq!(
+        deletes_after_403, first_delete,
+        "no mutation without resolved membership"
+    );
+    assert_eq!(recovered, Ok(()));
+    assert!(
+        !held_after_recovery,
+        "the preserved intent revokes the held role after repair and restart"
+    );
+    assert_eq!(alice_deletes, 1, "one confirmed cleanup after recovery");
+    assert_eq!(
+        absent,
+        Ok(()),
+        "404 stays a confirmed departure, not a permanent failure"
+    );
+    assert_eq!(
+        grants_after_404, 0,
+        "confirmed absence safely retires its intent"
+    );
+    assert_eq!(
+        after_404, before_404,
+        "a departed member needs no role DELETE"
+    );
 }
 
 /// Missing role-safety evidence is not proof that a valid same-day grant is
