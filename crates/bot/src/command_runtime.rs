@@ -25,9 +25,11 @@
 //!   over the TOG-10081 domain and store): validate → guild-scoped CRUD →
 //!   `automation_audit_log` row → ephemeral completion. The handlers live in
 //!   [`crate::schedule_runtime`]; the runtime only registers and dispatches.
-//! - leveling (`/rank [member]`, `/leaderboard`): one immediate callback,
-//!   ephemeral rank and public mention-suppressed top ten. The ordered gateway
-//!   award path shares this runtime's pool, executor and onboarding gates.
+//! - leveling (`/rank [member]`, `/leaderboard`): defer first (ephemeral rank,
+//!   public mention-suppressed top ten), then one completion edit; an
+//!   acknowledged store failure completes with a sanitized unavailable reply.
+//!   The ordered gateway award path shares this runtime's pool, executor and
+//!   onboarding gates.
 //! - discovery (`/help`): one immediate ephemeral callback rendered from the
 //!   live publish set, grouped with permission hints; never deferred, never
 //!   stored.
@@ -1308,8 +1310,8 @@ impl CommandRuntime {
     /// Route slash commands and LFG selects once through the shared router. An
     /// injected self-role service handles only its owned component surface.
     /// Refusals get the existing ephemeral text; LFG/sticky/feed/schedule defer
-    /// before I/O; leveling sends its own immediate callback. Channel commands
-    /// own their defer/audit lifecycle. Unwired builtins
+    /// before I/O; leveling defers, then completes with one edit. Channel
+    /// commands own their defer/audit lifecycle. Unwired builtins
     /// get an unavailable reply; router Ignore (unknown/guild) stays silent.
     pub(crate) async fn on_interaction(&self, interaction: &Interaction) {
         let application_id = self.application_id.load(Ordering::Relaxed);
@@ -1425,8 +1427,13 @@ impl CommandRuntime {
             return;
         };
         if matches!(handler, HandlerId::Rank | HandlerId::Leaderboard) {
-            // Leveling owns its immediate rank-ephemeral/leaderboard-public
-            // callback. Never send the generic ephemeral defer as well.
+            // Leveling owns its defer-then-edit lifecycle: an ephemeral defer
+            // for rank, a public defer for leaderboard, each completed by one
+            // original-response edit (a sanitized unavailable reply when the
+            // acknowledged store read fails). Never send the generic ephemeral
+            // defer as well, and never answer here: a failed or uncertain
+            // defer already returned with zero reads and nothing further to
+            // send, so this branch only logs the sanitized cause.
             if let Err(error) = self.leveling.handle_interaction(interaction, handler).await {
                 warn!(interaction_id = %interaction.id.get(), command = %name, reason = leveling_class(&error), "leveling interaction failed");
             }
