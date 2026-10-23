@@ -128,7 +128,7 @@ fn panels(message: &str, reaction_message: &str) -> Vec<SelfRolePanel> {
         {
             "id":"reaction-games", "channelId":"100000000000000007", "messageId":reaction_message,
             "mode":"reaction", "exclusive":false,
-            "options":[{"key":"new", "label":"New", "roleId":"100000000000000004", "permissions":"0", "emoji":"b"}]
+            "options":[{"key":"new", "label":"New", "roleId":"100000000000000005", "permissions":"0", "emoji":"b"}]
         }
     ]).to_string()).unwrap()
 }
