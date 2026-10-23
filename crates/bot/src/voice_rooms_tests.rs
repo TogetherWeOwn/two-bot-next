@@ -7470,35 +7470,64 @@ async fn access_changed_refreshes_a_loaded_worker() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn access_changed_delivers_past_a_full_inbox() {
-    // Control-plane exception to the inbox gate: the store write already
-    // succeeded and the administrator saw "Saved", so a creation-policy
-    // update must reach the worker even when fire-and-forget sends refuse.
-    let trace = Trace::default();
-    let runtime = test_runtime(trace);
-    assert!(
-        runtime.publish_snapshot(GUILD, snapshot(&[], vec![])),
-        "snapshot must spawn the guild actor on an empty inbox"
-    );
-    let actor = runtime.ensure_actor(GUILD).expect("live actor");
-    // Fill the gate synchronously (no yield): on the current-thread flavor
-    // the actor task cannot drain mid-burst, so the first refusal is exact.
-    let mut refused = false;
-    for member in 0..10_000u64 {
-        if !actor.try_send_command(ActorCommand::Display {
-            member_id: 900_000 + member,
-            display: "x".to_owned(),
-        }) {
-            refused = true;
-            break;
+    // Mutation: dropping runtime.access_changed, or making its send lossy,
+    // leaves the worker enforcing the opposite policy after a saved update.
+    for (before, after) in [(false, true), (true, false)] {
+        let (live, store, http, trace) = fixture();
+        *store.access.lock().unwrap() = AccessControls {
+            room_creation_enabled: before,
+            ..AccessControls::default()
+        };
+        let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+        let runtime = test_runtime(trace);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        runtime.actors.lock().unwrap().insert(
+            GUILD,
+            GuildActor {
+                live: worker.live.clone(),
+                tx,
+                backpressure: ActorInboxBackpressure::default(),
+            },
+        );
+        let actor = runtime.ensure_actor(GUILD).expect("registered actor");
+        // Hold the receiver: all sends below are synchronous and the ledger
+        // is exactly full before the sole policy update enters the channel.
+        for member in 0..VOICE_ACTOR_INBOX_CAP {
+            assert!(actor.try_send_command(ActorCommand::Display {
+                member_id: 900_000 + member as u64,
+                display: "x".to_owned(),
+            }));
         }
+        assert_eq!(actor.inbox_depth(), VOICE_ACTOR_INBOX_CAP);
+        assert!(!actor.try_send_command(ActorCommand::Reconcile));
+        let dropped = actor.inbox_overflow_dropped();
+        runtime.access_changed(
+            GUILD,
+            AccessControls {
+                room_creation_enabled: after,
+                ..AccessControls::default()
+            },
+        );
+        assert_eq!(actor.inbox_overflow_dropped(), dropped);
+        // Drain through the real worker command handler; send success alone
+        // cannot satisfy this test, nor can an earlier direct lossless send.
+        while let Ok(command) = rx.try_recv() {
+            actor.backpressure.release_for(&command);
+            apply_command(&mut worker, command, 0, &actor.backpressure);
+        }
+        assert_eq!(actor.inbox_depth(), 0);
+        let ticket = worker
+            .live
+            .voice_update(MEMBER, Some(CREATOR), Some(false))
+            .expect("fresh creator join");
+        assert_eq!(
+            worker.accept_join(ticket, "new room", 7, NOW.to_owned()),
+            after,
+            "join acceptance must use the policy delivered through runtime.access_changed"
+        );
+        assert_eq!(worker.queue.pending_counts(GUILD), (usize::from(after), 0));
+        runtime.remove_guild(GUILD);
     }
-    assert!(refused, "burst must fill the inbox gate to refusal");
-    assert!(
-        actor.send_command_lossless(ActorCommand::AccessChanged(AccessControls::default())),
-        "creation-policy update must bypass a full inbox"
-    );
-    runtime.access_changed(GUILD, AccessControls::default());
-    runtime.remove_guild(GUILD);
 }
 
 #[tokio::test(flavor = "current_thread")]

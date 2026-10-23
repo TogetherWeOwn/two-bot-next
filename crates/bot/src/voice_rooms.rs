@@ -7651,6 +7651,7 @@ impl ActorInboxBackpressure {
         if self.in_flight.fetch_add(1, Ordering::AcqRel) >= VOICE_ACTOR_INBOX_CAP {
             self.in_flight.fetch_sub(1, Ordering::AcqRel);
             self.overflow_dropped.fetch_add(1, Ordering::Relaxed);
+            metrics::global().voice_inbox_overflow_dropped();
             return false;
         }
         true
@@ -7892,9 +7893,10 @@ enum ActorCommand {
 
 impl ActorCommand {
     /// True for fire-and-forget state that can wait for the worker:
-    /// snapshots, voice frames and config swaps apply in arrival order
-    /// once it loads. Anything else carries a one-shot reply no worker
-    /// exists to answer yet (status, room commands, vote-kick, test
+    /// snapshots, voice frames, config swaps and public ballot message
+    /// references apply in arrival order once it loads. Anything else carries
+    /// a one-shot reply no worker exists to answer yet (status, room commands,
+    /// vote-kick start/ballot/room queries, test
     /// probes), so [`load_actor_worker`] drops it while initialization is
     /// pending: the caller sees `None` and takes the existing "syncing,
     /// try again shortly" path instead of hanging until recovery.
@@ -7913,6 +7915,7 @@ impl ActorCommand {
                 | ActorCommand::CreatorAdded(_)
                 | ActorCommand::RefreshCreators
                 | ActorCommand::AccessChanged(_)
+                | ActorCommand::KickMessage { .. }
         )
     }
 }
@@ -8821,16 +8824,13 @@ where
 
     fn kick_message(&self, guild: Snowflake, vote_id: Snowflake, message: MessageRef) -> bool {
         let queued = self.live_actor(guild).is_some_and(|actor| {
-            actor
-                .tx
-                .send(ActorCommand::KickMessage { vote_id, message })
-                .is_ok()
+            actor.try_send_command(ActorCommand::KickMessage { vote_id, message })
         });
         if !queued {
             warn!(
                 guild = guild.to_string(),
                 vote_id = vote_id.to_string(),
-                "voice ballot reference not queued: actor unavailable"
+                "voice ballot reference not queued: actor unavailable or inbox full"
             );
         }
         queued

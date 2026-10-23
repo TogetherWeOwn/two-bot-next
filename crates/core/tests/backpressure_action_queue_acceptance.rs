@@ -43,7 +43,7 @@
 //! (`RenameRoom` / `RespaceChannels` overwrite a pending entry and return its
 //! id): coalescing is not refusal and must not bump the overflow counter.
 
-use two_bot_core::voice_rooms::{ActionQueue, RoomAction};
+use two_bot_core::voice_rooms::{ActionQueue, RoomAction, MAX_QUEUE_PENDING_PER_GUILD};
 
 /// Ceiling on one guild's total pending actions (urgent + deferred). The
 /// Builder may choose a smaller cap; the burst tests assert lower bounds so
@@ -250,6 +250,109 @@ fn queue_healthy_mixed_burst_has_no_refusal_under_cap() {
         queue.overflow_dropped(),
         0,
         "no refusal may be counted when everything fits under the cap"
+    );
+}
+
+fn assert_coalescing_preserves_full_queue(original: RoomAction, newest: RoomAction) {
+    // `enqueue` deliberately constructs the over-cap case: lifecycle and
+    // accepted-user writes still must admit. This is a try_enqueue control,
+    // not a claim that production's entire action queue has a global cap.
+    for excess in [0, 7] {
+        let queue = ActionQueue::new();
+        let existing_id = queue.enqueue(GUILD, original.clone());
+        let mut urgent = Vec::new();
+        let mut deferred = vec![(existing_id, newest.clone())];
+        let mut last_id = existing_id;
+        for index in 1..MAX_QUEUE_PENDING_PER_GUILD + excess {
+            let channel = 1_000_000 + index as u64;
+            let action = if index % 2 == 0 {
+                delete(channel)
+            } else {
+                rename(channel)
+            };
+            last_id = queue.enqueue(GUILD, action.clone());
+            if index % 2 == 0 {
+                urgent.push((last_id, action));
+            } else {
+                deferred.push((last_id, action));
+            }
+        }
+        let counts = (urgent.len(), deferred.len());
+        assert_eq!(queue.pending_counts(GUILD), counts);
+        assert_eq!(pending_total(&queue), MAX_QUEUE_PENDING_PER_GUILD + excess);
+        let oldest = queue.oldest_pending_at(GUILD).expect("pending age");
+        assert_eq!(queue.overflow_dropped(), 0);
+        for _ in 0..2 {
+            // Mutation: checking capacity before coalescing returns None,
+            // increments overflow, or allocates a second id at/past the cap.
+            assert_eq!(queue.try_enqueue(GUILD, newest.clone()), Some(existing_id));
+            assert_eq!(queue.pending_counts(GUILD), counts);
+            assert_eq!(queue.oldest_pending_at(GUILD), Some(oldest));
+            assert_eq!(queue.overflow_dropped(), 0);
+        }
+        if let RoomAction::RenameRoom { channel_id, name } = &newest {
+            assert_eq!(
+                queue.queued_rename_for(GUILD, *channel_id),
+                Some(name.clone())
+            );
+        }
+        // A truly new action in either lane is refused, exactly once per
+        // call. Neither refusal may change any retained action or its id.
+        for (index, rejected) in [delete(2_000_000), rename(2_000_001)]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(queue.try_enqueue(GUILD, rejected), None);
+            assert_eq!(queue.overflow_dropped(), index as u64 + 1);
+            assert_eq!(queue.pending_counts(GUILD), counts);
+            assert_eq!(queue.oldest_pending_at(GUILD), Some(oldest));
+        }
+        // Coalescing and refusals allocate no id. Another guild remains
+        // healthy even when this one is above the opt-in intake threshold.
+        assert_eq!(
+            queue.try_enqueue(GUILD + 1, delete(3_000_000)),
+            Some(last_id + 1)
+        );
+        assert_eq!(queue.overflow_dropped(), 2);
+        urgent.extend(deferred);
+        let mut actual = Vec::new();
+        while let Some(action) = queue.pop_due(GUILD, 0) {
+            actual.push((action.id, action.action.clone()));
+            assert!(queue.mark_succeeded(&action));
+        }
+        assert_eq!(
+            actual, urgent,
+            "both lanes retain their FIFO positions and ids"
+        );
+        assert_eq!(queue.pending_counts(GUILD), (0, 0));
+        assert_eq!(queue.oldest_pending_at(GUILD), None);
+        assert_eq!(queue.overflow_dropped(), 2);
+    }
+}
+
+#[test]
+fn queue_rename_coalesces_at_and_beyond_capacity_without_refusal_or_id_allocation() {
+    assert_coalescing_preserves_full_queue(
+        RoomAction::RenameRoom {
+            channel_id: 800_000,
+            name: "previous name".to_owned(),
+        },
+        RoomAction::RenameRoom {
+            channel_id: 800_000,
+            name: "newest name".to_owned(),
+        },
+    );
+}
+
+#[test]
+fn queue_respace_coalesces_at_and_beyond_capacity_without_refusal_or_id_allocation() {
+    assert_coalescing_preserves_full_queue(
+        RoomAction::RespaceChannels {
+            room_channel_id: 800_000,
+        },
+        RoomAction::RespaceChannels {
+            room_channel_id: 800_000,
+        },
     );
 }
 

@@ -50,14 +50,15 @@ pub const QUEUE_MAX_ATTEMPTS: u32 = 10;
 /// [`ActionQueue::failed_dropped`]. Bounds `/setup` recent-failures memory
 /// when a guild-wide outage dead-letters every write.
 pub const MAX_FAILED_ACTIONS: usize = 100;
-/// Cap on one guild's total pending actions (urgent + deferred) admitted
-/// through [`ActionQueue::try_enqueue`]. Past the cap new work is refused
-/// (never evicted: the oldest admitted action still pops first) and counted
-/// by [`ActionQueue::overflow_dropped`]. The inbox gate bounds the inbound
-/// burst feeding the queue, not cumulative production under a stalled drain:
-/// must-admit producers (accepted user commands, room lifecycle writes) keep
-/// [`ActionQueue::enqueue`]; wiring sheddable producers to the bounded
-/// intake is follow-up work.
+/// Opt-in cap for future sheddable producers using [`ActionQueue::try_enqueue`],
+/// NOT a production queue-memory bound. All current production producers use
+/// the must-admit [`ActionQueue::enqueue`] path, so a stalled drain can still
+/// accumulate more than this many actions. Wiring sheddable producers is future
+/// work; the actor inbox gate bounds bursts, not cumulative queue growth.
+///
+/// For callers opting in, the cap covers one guild's pending urgent + deferred
+/// actions. New work past capacity is refused (never evicted: the oldest admitted
+/// action still pops first) and counted by [`ActionQueue::overflow_dropped`].
 pub const MAX_QUEUE_PENDING_PER_GUILD: usize = 1024;
 
 // --- creator channels -------------------------------------------------------
@@ -1066,9 +1067,10 @@ impl ActionQueue {
         Self::default()
     }
 
-    /// Enqueue a write; returns its id. Always admits: must-admit producers
-    /// (accepted user commands, room lifecycle writes) use this, while
-    /// sheddable producers use [`Self::try_enqueue`].
+    /// Enqueue a write; returns its id. Always admits, with no pending cap.
+    /// All current production producers use this path to preserve accepted
+    /// commands and lifecycle writes. [`Self::try_enqueue`] is an opt-in API
+    /// for future sheddable producers, not an enforced production queue bound.
     pub fn enqueue(&self, guild_id: Snowflake, action: RoomAction) -> u64 {
         let mut inner = self.inner.lock().expect("queue lock");
         if let Some(id) = Self::coalesce_pending(&mut inner, guild_id, &action) {
@@ -1094,6 +1096,7 @@ impl ActionQueue {
             + inner.deferred.get(&guild_id).map_or(0, VecDeque::len);
         if pending >= MAX_QUEUE_PENDING_PER_GUILD {
             inner.overflow_dropped = inner.overflow_dropped.saturating_add(1);
+            crate::metrics::global().voice_queue_overflow_dropped();
             return None;
         }
         Some(Self::insert_pending(&mut inner, guild_id, action))

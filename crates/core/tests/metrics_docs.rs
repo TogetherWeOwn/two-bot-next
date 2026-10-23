@@ -279,6 +279,8 @@ const KNOWN_COUNTERS: &[&str] = &[
     "two_bot_voice_halt_recoveries_total",
     "two_bot_voice_actor_inbox_turns_total",
     "two_bot_voice_actor_dispatch_turns_total",
+    "two_bot_voice_inbox_overflow_dropped_total",
+    "two_bot_voice_queue_overflow_dropped_total",
     "two_bot_voice_live_self_heal_total",
     "two_bot_db_errors_total",
     "two_bot_containment_store_errors_total",
