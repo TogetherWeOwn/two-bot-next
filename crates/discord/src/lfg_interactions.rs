@@ -269,12 +269,35 @@ impl LfgInteractions {
                     created_at: at.clone(),
                     closed_at: None,
                 });
-                // A swept orphan keeps its durable ID as a replay fence.
-                // Replaying creation must not send a replacement for a closed
-                // row, even when no accepted message ID could be recovered.
+                // A closed row is a replay fence, never permission to resend.
+                // Still recover an accepted message so a closed post does not
+                // retain stale signup controls after an uncertain delivery.
                 if post.status != LfgStatus::Open {
+                    if post.message_id.is_none() && bot_user_id != 0 {
+                        if let Some(message_id) = executor
+                            .recover_message_by_nonce(
+                                &post.channel_id,
+                                &lfg::lfg_nonce(&id),
+                                bot_user_id,
+                            )
+                            .await
+                            .map_err(|_| LfgError::Uncertain)?
+                        {
+                            store::save_lfg_message_id(&self.pool, guild_id, &id, &message_id)
+                                .await?;
+                        }
+                    }
+                    let reply = "This LFG is already closed; create a new post with /lfg.";
+                    // A prior recovery may have saved the ID before its edit
+                    // failed. Retry that edit too, without changing the result.
+                    let reply = match self.refresh(executor, guild_id, &id).await {
+                        Ok(()) => reply.into(),
+                        Err(_) => format!(
+                            "{reply} Message refresh failed; the saved result above still applies."
+                        ),
+                    };
                     guard.commit().await?;
-                    return Ok("This LFG is already closed; create a new post with /lfg.".into());
+                    return Ok(reply);
                 }
                 if fresh {
                     store::put_lfg(&self.pool, &post, &roles, true).await?;

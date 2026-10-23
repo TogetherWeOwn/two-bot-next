@@ -138,6 +138,23 @@ Scalar gateway series pair with the labels above:
 | `two_bot_presence_capture_total{outcome}` | Presence-update capture decisions on the hot path; `outcome` is `inserted` (first delivery stored a row), `duplicate` (same-key retry absorbed by the dedup key) or `rejected` (refused before the insert). Deliberately unconsumed: no production callsite records the family yet |
 | `two_bot_automod_decisions_total{outcome}` | Terminal automod inspection outcomes; `outcome` is `accepted`, `already_processed`, `dry_run`, `protected`, `deleted`, `warned`, `timed_out` or `sanction_refused`. Recorded once per committed `StoredOutcome` by the shared activation; replays and retained claims never count. Fixed eight series from process start; no message text, excerpts or user IDs become labels. `sanction_refused` is consumed by `automod_sanction_refused` (tickets on any increase); the other seven outcomes are policy working as designed |
 
+## Raid and join-risk observer drops
+
+Source: `RaidRuntime::observe_join` in `crates/bot/src/raid_runtime.rs` and
+`JoinRiskRuntime::observe_join` in `crates/bot/src/join_risk_runtime.rs`.
+The fixed `JoinQueueDropReason` vocabulary and exposition live in
+`crates/core/src/metrics.rs` (`raid_dropped_join`, `join_risk_dropped_join`,
+`render_with_rest_guard`).
+
+| Series | Meaning |
+| --- | --- |
+| `two_bot_raid_dropped_joins_total{reason}` | Joins not enqueued for raid observation: `queue_full` (WARN, no wait) or `queue_closed` (ERROR with `error_class="raid_queue_closed"`). Each dropped join counts once; both series render zero initially and reset on process restart |
+| `two_bot_join_risk_dropped_joins_total{reason}` | Joins not enqueued for risk scoring: the same fixed reasons; Closed logs ERROR with `error_class="join_risk_queue_closed"`. Each dropped join counts once; both series render zero initially and reset on process restart |
+
+No guild/member/error-text labels or alert rules are added. Observer drops
+happen after gateway persistence and are not retried. See
+[queue triage](runbook-observability.md#raid-and-join-risk-queue-drops).
+
 ## Automod facts read warnings
 
 Source: `RestAutomodFacts::get` in `crates/discord/src/automod_activation.rs`.
@@ -239,6 +256,25 @@ outcomes. See `docs/metrics.md` for the full label table.
 | Series | Meaning |
 | --- | --- |
 | `two_bot_moderation_enforcements_total{verb,outcome}` | Terminal moderation enforcements by bounded verb and outcome. `discord_error`/`storage_error` are consumed by `moderation_enforcement_failures` (tickets on any summed increase); `success`, `refused` and `other` stay quiet |
+
+## Ticket lifecycle series
+
+Counter emitted by the ticket runtime in `crates/bot/src/ticket_runtime.rs`
+(`emit_lifecycle` and `purge`) and rendered by
+`crates/core/src/metrics.rs`. Every retire, abandon, purge and successful
+staff-button claim/close executed through the button path counts once with
+a fixed-vocabulary cause; the purge pass counts one per deleted transcript
+body and reports a `db_cause` outcome when its storage write fails.
+Recovery completions and the open-path controls-post rollback are not
+instrumented. No member text, channel name, ticket id or error string ever
+becomes a label. No alert rule consumes this family yet; read it alongside
+the `ticket_lifecycle` log lines. Full series, label and cause vocabularies
+live in `docs/ticket-lifecycle-observability.md` and
+`docs/metrics.md`.
+
+| Series | Meaning |
+| --- | --- |
+| `two_bot_ticket_lifecycle_total{event,outcome}` | Terminal ticket lifecycle events by bounded event (`retire`, `abandon`, `purge`, `claim`, `close`) and outcome (success outcomes plus `db_cause` classes) |
 
 ## Retention replay series
 

@@ -18,7 +18,8 @@ mod offline;
 mod parser_acceptance;
 pub use offline::postgres;
 pub use offline::{
-    lfg_store, query, query_scalar, rsvp_store, ActionExecutor, DiscordError, Error, PgPool,
+    lfg_store, query, query_as, query_scalar, rsvp_store, ActionExecutor, DiscordError, Error,
+    PgPool,
 };
 #[path = "../src/lfg_interactions.rs"]
 pub mod subject;

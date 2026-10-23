@@ -15,6 +15,7 @@ use two_bot_core::{
     lfg_store as store,
 };
 use two_bot_discord::{
+    interactions::InteractionRuntime,
     lfg_interactions::{LfgError, LfgInteractions, LfgRequest},
     ActionExecutor,
 };
@@ -345,6 +346,10 @@ async fn create_replay_cannot_repost_or_reopen_an_orphan_closed_by_the_sweep() {
     let requests = f.finish().await;
     assert_eq!(swept.expect("close orphan"), 1);
     assert_eq!(before.status, LfgStatus::Closed);
+    assert!(
+        replay.is_ok(),
+        "terminal Create replay must reply successfully: {replay:?}"
+    );
     assert_eq!(
         after, before,
         "Create replay cannot mutate the terminal row"
@@ -352,5 +357,271 @@ async fn create_replay_cannot_repost_or_reopen_an_orphan_closed_by_the_sweep() {
     assert!(
         !requests[request_count..].iter().any(|r| r.method == "POST"),
         "Create replay must not send a closed orphan to Discord: {replay:?}"
+    );
+}
+
+#[tokio::test]
+async fn runtime_create_replay_of_a_swept_orphan_replies_without_reposting_or_mutating() {
+    let f = Fixture::new(|request| {
+        if request.path.starts_with("/api/v10/interactions/") {
+            ScriptedResponse::status(204)
+        } else {
+            ok_rest(request)
+        }
+    })
+    .await;
+    f.seed(&post("lfg-48002", FUTURE, None, OLD)).await;
+    let swept = f.sweep(BOT, clock(), 20).await;
+    let before = f.saved("lfg-48002").await;
+    let roles_before = store::list_lfg_roles(f.db.pool(), &before.id)
+        .await
+        .expect("roles before");
+    let signups_before = store::list_lfg_signups(f.db.pool(), &before.id)
+        .await
+        .expect("signups before");
+    let request_count = f.rest.requests().len();
+    let runtime = replay_runtime(&f);
+    let replay = runtime.handle(&create_replay(48002)).await;
+    let after = f.saved("lfg-48002").await;
+    let roles_after = store::list_lfg_roles(f.db.pool(), &before.id)
+        .await
+        .expect("roles after");
+    let signups_after = store::list_lfg_signups(f.db.pool(), &before.id)
+        .await
+        .expect("signups after");
+    drop(runtime);
+    let requests = f.finish().await;
+
+    assert_eq!(swept.expect("close orphan"), 1);
+    assert_eq!(before.status, LfgStatus::Closed);
+    assert_eq!(before.message_id, None, "history proved nonce absent");
+    assert!(
+        matches!(replay, Ok(true)),
+        "Create replay must succeed, not fail receipt validation: {replay:?}"
+    );
+    assert_eq!(after, before, "terminal post must remain byte-identical");
+    assert_eq!(roles_after, roles_before);
+    assert_eq!(signups_after, signups_before);
+    let replay_requests = &requests[request_count..];
+    assert!(
+        !replay_requests
+            .iter()
+            .any(|r| { r.method == "POST" && r.path.starts_with("/api/v10/channels/") }),
+        "terminal Create replay must never repost"
+    );
+    assert_eq!(
+        replay_requests
+            .iter()
+            .filter(|r| { r.method == "POST" && r.path.starts_with("/api/v10/interactions/") })
+            .count(),
+        1,
+        "acknowledge the replay once"
+    );
+    let replies: Vec<_> = replay_requests
+        .iter()
+        .filter(|r| r.method == "PATCH" && r.path.starts_with("/api/v10/webhooks/"))
+        .collect();
+    assert_eq!(
+        replies.len(),
+        1,
+        "finish the deferred interaction successfully"
+    );
+    let reply: Value = serde_json::from_slice(&replies[0].body).expect("reply JSON");
+    let content = reply["content"].as_str().expect("reply content");
+    assert!(!content.is_empty(), "a successful replay must have a reply");
+    assert!(!content.contains("invalid mutation receipt"), "{content}");
+}
+
+fn replay_runtime(f: &Fixture) -> InteractionRuntime {
+    InteractionRuntime::new(
+        two_bot_core::RouterGates {
+            configured_guild: Some(2222),
+            announcements: true,
+            scorecard: false,
+            automations: false,
+            moderation: false,
+            voice: false,
+            voice_assistant: false,
+            tickets: false,
+            self_roles: false,
+            onboarding_picker: false,
+            session_picker: false,
+        },
+        f.db.pool().clone(),
+        f.executor.clone(),
+        BOT,
+        two_bot_core::ClassifierConfig::default(),
+    )
+}
+
+fn create_replay(id: u64) -> twilight_model::application::interaction::Interaction {
+    serde_json::from_value(json!({
+        "id": id.to_string(), "application_id": BOT.to_string(), "type": 2,
+        "guild_id": GUILD, "channel": {"id": CHANNEL, "type": 0},
+        "member": {
+            "user": {"id": OWNER, "username": "member", "discriminator": "0", "avatar": null},
+            "roles": [], "joined_at": null, "deaf": false, "mute": false, "flags": 0,
+            "permissions": two_bot_core::commands::PERM_MANAGE_EVENTS.to_string()
+        },
+        "token": "offline-lfg-replay-token", "version": 1, "entitlements": [],
+        "authorizing_integration_owners": {},
+        "data": {"id": "1", "name": "lfg", "type": 1, "options": [
+            {"type": 3, "name": "title", "value": "Offline raid"},
+            {"type": 3, "name": "starts-at", "value": FUTURE},
+            {"type": 3, "name": "roles", "value": "tank:Tank:1"}
+        ]}
+    }))
+    .expect("wire Create replay")
+}
+
+#[tokio::test]
+async fn runtime_closed_recovery_retries_failed_refresh_without_reposting_or_losing_saved_state() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let visible = Arc::new(AtomicBool::new(false));
+    let patches = Arc::new(AtomicUsize::new(0));
+    let history_visible = visible.clone();
+    let channel_patches = patches.clone();
+    let f = Fixture::new(move |request| {
+        if request.method == "GET" && history_visible.load(Ordering::SeqCst) {
+            ScriptedResponse::json(
+                200,
+                json!([{
+                    "id": "5003", "channel_id": CHANNEL,
+                    "author": {"id": BOT.to_string(), "bot": true},
+                    "nonce": lfg::lfg_nonce("lfg-48003")
+                }]),
+            )
+        } else if request.method == "PATCH" && request.path.starts_with("/api/v10/channels/") {
+            if channel_patches.fetch_add(1, Ordering::SeqCst) == 0 {
+                ScriptedResponse::status(500)
+            } else {
+                ScriptedResponse::json(200, json!({"id": "5003"}))
+            }
+        } else if request.path.starts_with("/api/v10/interactions/") {
+            ScriptedResponse::status(204)
+        } else {
+            ok_rest(request)
+        }
+    })
+    .await;
+    f.seed(&post("lfg-48003", FUTURE, None, OLD)).await;
+    store::signup_lfg(f.db.pool(), GUILD, "lfg-48003", "tank", "3334", OLD)
+        .await
+        .expect("retained signup");
+    let swept = f.sweep(BOT, clock(), 20).await;
+    let before = f.saved("lfg-48003").await;
+    let roles_before = store::list_lfg_roles(f.db.pool(), &before.id)
+        .await
+        .expect("roles before");
+    let signups_before = store::list_lfg_signups(f.db.pool(), &before.id)
+        .await
+        .expect("signups before");
+    let audits_before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM announcements_audit_log WHERE target_key = $1")
+            .bind(&before.id)
+            .fetch_one(f.db.pool())
+            .await
+            .expect("audits before");
+    let request_count = f.rest.requests().len();
+    visible.store(true, Ordering::SeqCst);
+    let first_runtime = replay_runtime(&f);
+    let first = first_runtime.handle(&create_replay(48003)).await;
+    let recovered = f.saved("lfg-48003").await;
+    drop(first_runtime);
+    // Restart excludes an in-memory response cache as evidence of retry safety.
+    let restarted = replay_runtime(&f);
+    let second = restarted.handle(&create_replay(48003)).await;
+    let after = f.saved("lfg-48003").await;
+    let roles_after = store::list_lfg_roles(f.db.pool(), &before.id)
+        .await
+        .expect("roles after");
+    let signups_after = store::list_lfg_signups(f.db.pool(), &before.id)
+        .await
+        .expect("signups after");
+    let audits_after: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM announcements_audit_log WHERE target_key = $1")
+            .bind(&before.id)
+            .fetch_one(f.db.pool())
+            .await
+            .expect("audits after");
+    drop(restarted);
+    let requests = f.finish().await;
+
+    assert_eq!(swept.expect("close orphan"), 1);
+    assert_eq!(before.status, LfgStatus::Closed);
+    assert_eq!(before.message_id, None);
+    assert!(
+        matches!(first, Ok(true)),
+        "saved recovery must return its truthful outcome: {first:?}"
+    );
+    assert!(
+        matches!(second, Ok(true)),
+        "replayed refresh must succeed: {second:?}"
+    );
+    let mut expected = before;
+    expected.message_id = Some("5003".into());
+    assert_eq!(
+        recovered, expected,
+        "only authoritative nonce binding may change"
+    );
+    assert_eq!(
+        after, recovered,
+        "refresh retry cannot reopen or rewrite the post"
+    );
+    assert_eq!(roles_after, roles_before);
+    assert_eq!(signups_before.len(), 1, "nonempty retention control");
+    assert_eq!(signups_after, signups_before);
+    assert_eq!(
+        audits_after, audits_before,
+        "no audit duplication on replay"
+    );
+    assert_eq!(
+        patches.load(Ordering::SeqCst),
+        2,
+        "retry must refresh the already-known message"
+    );
+    let replay_requests = &requests[request_count..];
+    assert!(!replay_requests
+        .iter()
+        .any(|r| r.method == "POST" && r.path.starts_with("/api/v10/channels/")));
+    let refreshes: Vec<_> = replay_requests
+        .iter()
+        .filter(|r| r.method == "PATCH" && r.path.starts_with("/api/v10/channels/"))
+        .collect();
+    assert_eq!(refreshes.len(), 2);
+    for refresh in refreshes {
+        assert_eq!(refresh.path, "/api/v10/channels/4444/messages/5003");
+        let body: Value = serde_json::from_slice(&refresh.body).expect("refresh JSON");
+        assert_eq!(
+            body["components"],
+            json!([]),
+            "closed messages have no signup controls"
+        );
+        assert_eq!(body["allowed_mentions"]["parse"], json!([]));
+    }
+    let replies: Vec<Value> = replay_requests
+        .iter()
+        .filter(|r| r.method == "PATCH" && r.path.starts_with("/api/v10/webhooks/"))
+        .map(|r| serde_json::from_slice(&r.body).expect("reply JSON"))
+        .collect();
+    assert_eq!(replies.len(), 2, "both deferred interactions must finish");
+    let first_reply = replies[0]["content"].as_str().expect("first content");
+    assert!(
+        first_reply.to_lowercase().contains("closed"),
+        "{first_reply}"
+    );
+    assert!(
+        first_reply.contains("Message refresh failed; the saved result above still applies."),
+        "{first_reply}"
+    );
+    let second_reply = replies[1]["content"].as_str().expect("second content");
+    assert!(
+        second_reply.to_lowercase().contains("closed"),
+        "{second_reply}"
+    );
+    assert!(
+        !second_reply.contains("Message refresh failed"),
+        "{second_reply}"
     );
 }

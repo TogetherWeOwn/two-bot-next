@@ -49,6 +49,7 @@ on:
       - .github/pull_request_template.md
       - .github/CODEOWNERS
       - .github/dependabot.yml
+      - 'ops/**' # generated delivery evidence (weekly DORA files); never runtime
   workflow_dispatch:
     inputs:
       release_fence:

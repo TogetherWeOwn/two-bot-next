@@ -61,6 +61,9 @@ JOB_INVENTORY = {
     "staging-container-drill.yml": {"container-drill"},
     # Manual read-only staging events read for the B2 soak; pinned shape below.
     "staging-events-read.yml": {"read"},
+    # Manual read-only staging privacy verification read for one fixture
+    # pair (six tables, guild alias); pinned shape below.
+    "staging-privacy-verify-read.yml": {"read"},
     # Manual read-only staging event-store retention census (counts, digests
     # and timestamps only, log only); pinned shape below.
     "staging-retention-census.yml": {"census"},
@@ -110,6 +113,10 @@ JOB_INVENTORY = {
     # Advisory PR-size labels (org reusable, advisory only, never required):
     # thin caller to the central labeller + weekly tally.
     "pr-size.yml": {"pr-size", "pr-size-weekly"},
+    # Weekly DORA delivery metrics (docs/dora-metrics.md): reads 30 days of
+    # production Deployments and commits one JSON file plus a markdown
+    # summary to ops/metrics/ on the automation branch with the job token.
+    "dora-metrics.yml": {"metrics"},
 }
 # Reusable-workflow calls are allowed only to these non-deploy workflows.
 # TOG-10893 registers the read-only sbom.yml calls alongside the benchmark one.
@@ -401,6 +408,7 @@ NON_RUNTIME_PATHS = (
     "CONTRIBUTING.md", "LICENSE", ".editorconfig", ".gitignore", ".gitleaks.toml",
     ".gitleaksignore", ".github/ISSUE_TEMPLATE/bug_report.yml",
     ".github/pull_request_template.md", ".github/CODEOWNERS", ".github/dependabot.yml",
+    "ops/metrics/dora-2026-W43.json", "ops/metrics/dora-2026-W43.md",
 )
 
 
@@ -1703,6 +1711,108 @@ def staging_events_read_errors(workflow):
     if not str(upload.get("uses", "")).startswith("actions/upload-artifact@") or upload.get("with") != {
             "name": "staging-events-read-${{ github.run_id }}",
             "path": "staging-events-read-${{ github.run_id }}.json",
+            "if-no-files-found": "error", "retention-days": "14"}:
+        errors.append(f"{name}:read: must upload only the run's json for 14 days and fail if absent")
+    return errors
+
+
+PRIVACY_VERIFY_READ_ENV = {
+    "TWO_BOT_STAGING_PRIVACY_RO_DATABASE_URL": "${{ secrets.TWO_BOT_STAGING_PRIVACY_RO_DATABASE_URL }}",
+    "STAGING_PRIVACY_VERIFY_EXPECTED_HOST": "${{ secrets.STAGING_PRIVACY_VERIFY_EXPECTED_HOST }}",
+    "STAGING_FIXTURE_MEMBER_ID": "${{ secrets.STAGING_FIXTURE_MEMBER_ID }}",
+    "STAGING_PRIVACY_VERIFY_H_GUILD_ID": "${{ secrets.STAGING_PRIVACY_VERIFY_H_GUILD_ID }}",
+    "GUILD": "${{ inputs.guild }}",
+    "RUN_ID": "${{ github.run_id }}",
+}
+PRIVACY_VERIFY_READ_COMMAND = ('python3 scripts/staging_privacy_verify_read.py --guild "$GUILD" '
+                               '--output "staging-privacy-verify-read-$RUN_ID.json"')
+
+
+def staging_privacy_verify_read_errors(workflow):
+    """Manual staging-only read-only privacy verification read for one fixture pair.
+
+    Dispatch-only with exactly one required choice input, the guild alias
+    (`g` or `h`, no default). The fixture member is never an input and never
+    a variable (a step's env block prints variable values on the public run
+    page); the H guild pin is likewise a secret, never a variable. The
+    read-only database login, the independently pinned staging host, the
+    fixture member and the H pin are environment secrets. One job runs only
+    from main through the `staging-privacy-verify-read` environment, on the
+    routed runner for job `read`, with its own non-cancelling concurrency
+    group and a 5 minute timeout. Exactly three unconditional steps: pinned
+    checkout without persisted credentials, one Run step that passes the
+    input through the environment (never an inline expression) to the
+    reviewed script, and the 14 day artifact upload of the sanitized file.
+    All four environment secrets are scoped to that Run step alone. No
+    wrangler, no production path, no `set -x`.
+    """
+    name = "staging-privacy-verify-read.yml"
+    errors = []
+    if "env" in workflow:
+        errors.append(f"{name}: workflow-level env must stay absent; secrets belong only on the Run step")
+    on = workflow.get("on") or {}
+    if set(on) != {"workflow_dispatch"}:
+        errors.append(f"{name}: must be dispatch-only (no push/pull_request/schedule)")
+    dispatch = on.get("workflow_dispatch") or {}
+    inputs = dispatch.get("inputs") or {}
+    if set(dispatch) != {"inputs"} or set(inputs) != {"guild"}:
+        errors.append(f"{name}: workflow_dispatch must carry exactly the guild alias input")
+    else:
+        guild = inputs.get("guild") or {}
+        if (guild.get("type") != "choice" or set(guild.get("options") or []) != {"g", "h"}
+                or str(guild.get("required")).lower() != "true" or "default" in guild):
+            errors.append(f"{name}: guild must be a required g/h choice with no default")
+    if workflow.get("permissions") != {}:
+        errors.append(f"{name}: top-level permissions must stay empty")
+    if workflow.get("concurrency") != {"group": "staging-privacy-verify-read", "cancel-in-progress": "false"}:
+        errors.append(f"{name}: must use its own staging-privacy-verify-read group without cancelling")
+    jobs = workflow.get("jobs") or {}
+    if set(jobs) != {"read"}:
+        errors.append(f"{name}: jobs must be exactly read")
+        return errors
+    job = jobs["read"]
+    if job.get("environment") != "staging-privacy-verify-read":
+        errors.append(f"{name}:read: must read the staging-privacy-verify-read Environment bindings")
+    if job.get("if") != "github.ref == 'refs/heads/main'":
+        errors.append(f"{name}:read: must run only from main")
+    if job.get("permissions") != {"contents": "read"}:
+        errors.append(f"{name}:read: must keep contents:read only")
+    if job.get("timeout-minutes") != "5":
+        errors.append(f"{name}:read: timeout must stay 5 minutes")
+    if not runner_allowed("read", job.get("runs-on")):
+        errors.append(f"{name}:read: must use the routed runner expression for job 'read'")
+    for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
+        if key in job:
+            errors.append(f"{name}:read: must not set {key} (bindings stay on the single Run step)")
+    text = str(job).lower().replace(" ", "")
+    for marker in ("wrangler", "production", "tojson(secrets", "secrets[", "set-x", "setx", "xtrace",
+                   "vars.staging_fixture_member_id", "vars.staging_privacy_verify_h_guild_id",
+                   "inputs.member", "inputs.fixture"):
+        if marker in text:
+            errors.append(f"{name}:read: must not contain {marker!r}")
+    secrets = set(re.findall(r"secrets\.([a-z0-9_]+)", text))
+    if secrets != {"two_bot_staging_privacy_ro_database_url", "staging_privacy_verify_expected_host",
+                   "staging_fixture_member_id", "staging_privacy_verify_h_guild_id"}:
+        errors.append(f"{name}:read: must read exactly the four privacy-verify secrets")
+    if set(re.findall(r"inputs\.([a-z0-9_]+)", text)) != {"guild"}:
+        errors.append(f"{name}:read: may reference only the guild input")
+    steps = job.get("steps") or []
+    if len(steps) != 3 or any(key in step for step in steps for key in ("if", "continue-on-error")):
+        errors.append(f"{name}:read: must run exactly checkout, the read and the upload, unconditionally")
+        return errors
+    checkout, run, upload = steps
+    # Checkout defaults to this workflow's immutable head. No ref, repository,
+    # path or other override may replace the reviewed code before secrets bind.
+    if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
+            or checkout.get("with") != {"persist-credentials": "false", "fetch-depth": "1"}:
+        errors.append(f"{name}:read: checkout must be shallow, non-persisting and use the workflow head")
+    if run.get("env") != PRIVACY_VERIFY_READ_ENV:
+        errors.append(f"{name}:read: Run step must bind exactly the four secrets, the guild and the run id")
+    if run.get("run") != PRIVACY_VERIFY_READ_COMMAND or "uses" in run or "shell" in run:
+        errors.append(f"{name}:read: Run step must call the script with the input via the environment only")
+    if not str(upload.get("uses", "")).startswith("actions/upload-artifact@") or upload.get("with") != {
+            "name": "staging-privacy-verify-read-${{ github.run_id }}",
+            "path": "staging-privacy-verify-read-${{ github.run_id }}.json",
             "if-no-files-found": "error", "retention-days": "14"}:
         errors.append(f"{name}:read: must upload only the run's json for 14 days and fail if absent")
     return errors
@@ -3590,6 +3700,12 @@ def workflow_policy_errors(workflows):
             # environment scan below would flag its Environment binding.
             errors.extend(staging_events_read_errors(workflow))
             continue
+        if name == "staging-privacy-verify-read.yml":
+            # Manual read-only privacy verification read: pinned shape above;
+            # the generic environment scan below would flag its Environment
+            # binding.
+            errors.extend(staging_privacy_verify_read_errors(workflow))
+            continue
         if name == "staging-retention-census.yml":
             # Manual read-only retention census: pinned shape above; the
             # generic environment scan below would flag its Environment
@@ -4558,7 +4674,7 @@ class WorkflowTests(unittest.TestCase):
             ignored_sweep,
         )
         guarded = [run for run in cov_runs if "llvm-cov --no-report -p " in run]
-        self.assertEqual(len(guarded), 15)
+        self.assertEqual(len(guarded), 16)
         for run in guarded:
             with self.subTest(guarded=run):
                 self.assertIn("--test-threads=1", run)
@@ -4567,7 +4683,8 @@ class WorkflowTests(unittest.TestCase):
                 # Deliberate: a guard panic in a guarded suite fails the step.
                 self.assertNotIn("--ignore-run-fail", run)
         # needle -> carries `--features db` (core/discord suites need the db
-        # feature to build their guarded targets; cutover suites do not).
+        # feature to build their guarded targets; cutover and store suites do
+        # not).
         guarded_needles = {
             "--test stream_live_store": True,
             "--test mutation_429_proves_no_effect_channel": True,
@@ -4583,6 +4700,9 @@ class WorkflowTests(unittest.TestCase):
             "--test reengagement_list_db": False,
             "--test game_activity_report_db": False,
             "--test member_moderation_db": True,
+            "--test starboard_store": False,
+            "--test starboard_api": False,
+            "--test starboard_config_updated_at": False,
         }
         for needle, wants_db_feature in guarded_needles.items():
             with self.subTest(needle=needle):
@@ -6587,6 +6707,122 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
 
+    def test_staging_privacy_verify_checkout_cannot_retarget_the_reviewed_head(self):
+        self.assertEqual(workflow_policy_errors(self.workflows), [])
+        for key, value in (("ref", "unreviewed-branch"),
+                           ("repository", "example/unreviewed"),
+                           ("path", "other-checkout"),
+                           ("sparse-checkout", "unreviewed"),
+                           ("fetch-depth", "0")):
+            with self.subTest(override=key):
+                workflows = deepcopy(self.workflows)
+                checkout = workflows["staging-privacy-verify-read.yml"]["jobs"]["read"]["steps"][0]
+                checkout["with"][key] = value
+                self.assertTrue(workflow_policy_errors(workflows),
+                                "the secret-bearing read must use the reviewed workflow head")
+
+    def test_staging_privacy_verify_suite_is_required_in_worker(self):
+        jobs = self.workflows["check.yml"]["jobs"]
+        command = "PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_privacy_verify_read.py -v"
+        steps = [step for step in jobs["worker"]["steps"] if step.get("run") == command]
+        self.assertEqual(len(steps), 1, "worker must run the collector suite exactly once")
+        self.assertNotIn("if", steps[0])
+        self.assertNotIn("continue-on-error", steps[0])
+        self.assertIn("worker", jobs["ci-ok"]["needs"])
+        aggregate = next(step for step in jobs["ci-ok"]["steps"]
+                         if step.get("name") == "Aggregate CI verdict")
+        self.assertEqual(aggregate["env"]["WORKER_RESULT"], "${{ needs.worker.result }}")
+        self.assertIn('(\"worker\", \"WORKER_RESULT\", \"WORKER_SELECTED\")', aggregate["run"])
+
+    def test_staging_privacy_verify_read_shape_is_pinned(self):
+        workflows = self.workflows
+        self.assertEqual(staging_privacy_verify_read_errors(workflows["staging-privacy-verify-read.yml"]), [])
+
+        def mutate(change):
+            copy = deepcopy(workflows["staging-privacy-verify-read.yml"])
+            change(copy)
+            return staging_privacy_verify_read_errors(copy)
+
+        def job(copy):
+            return copy["jobs"]["read"]
+
+        def guild(copy):
+            return copy["on"]["workflow_dispatch"]["inputs"]["guild"]
+
+        changes = {
+            "push trigger": lambda w: w["on"].update({"push": {"branches": ["main"]}}),
+            "schedule trigger": lambda w: w["on"].update({"schedule": [{"cron": "0 * * * *"}]}),
+            "member input": lambda w: w["on"]["workflow_dispatch"]["inputs"].update(
+                {"fixture_member": {"type": "string", "required": "true"}}),
+            "window input": lambda w: w["on"]["workflow_dispatch"]["inputs"].update(
+                {"window_start": {"type": "string", "required": "true"}}),
+            "dropped guild input": lambda w: w["on"]["workflow_dispatch"]["inputs"].pop("guild"),
+            "guild string type": lambda w: guild(w).update({"type": "string"}),
+            "guild raw id option": lambda w: guild(w).update({"options": ["g", "h", "1545644954272137297"]}),
+            "guild dropped h": lambda w: guild(w).update({"options": ["g"]}),
+            "guild default": lambda w: guild(w).update({"default": "g"}),
+            "optional guild": lambda w: guild(w).update({"required": "false"}),
+            "top-level permissions": lambda w: w.update({"permissions": {"contents": "read"}}),
+            "workflow-level secret": lambda w: w.update(
+                {"env": {"T": "${{ secrets.TWO_BOT_STAGING_PRIVACY_RO_DATABASE_URL }}"}}),
+            "cancelling concurrency": lambda w: w["concurrency"].update({"cancel-in-progress": "true"}),
+            "shared concurrency group": lambda w: w["concurrency"].update({"group": "deploy-staging"}),
+            "second job": lambda w: w["jobs"].update({"again": deepcopy(job(w))}),
+            "wrong environment": lambda w: job(w).update({"environment": "staging"}),
+            "production environment": lambda w: job(w).update({"environment": "production"}),
+            "no environment": lambda w: job(w).pop("environment"),
+            "branch condition removed": lambda w: job(w).pop("if"),
+            "any branch": lambda w: job(w).update({"if": "github.ref != ''"}),
+            "write grant": lambda w: job(w).update({"permissions": {"contents": "write"}}),
+            "longer timeout": lambda w: job(w).update({"timeout-minutes": "30"}),
+            "unrouted runner": lambda w: job(w).update({"runs-on": "ubuntu-latest"}),
+            "other job's routing": lambda w: job(w).update(
+                {"runs-on": ROUTED_RUNNER.format(job="check")}),
+            "job-level secret": lambda w: job(w).update(
+                {"env": {"T": "${{ secrets.TWO_BOT_STAGING_PRIVACY_RO_DATABASE_URL }}"}}),
+            "container": lambda w: job(w).update({"container": {"image": "postgres"}}),
+            "step condition": lambda w: job(w)["steps"][1].update({"if": "always()"}),
+            "continue on error": lambda w: job(w)["steps"][1].update({"continue-on-error": "true"}),
+            "extra step": lambda w: job(w)["steps"].append({"run": "echo done"}),
+            "persisted credentials": lambda w: job(w)["steps"][0]["with"].update(
+                {"persist-credentials": "true"}),
+            "extra secret": lambda w: job(w)["steps"][1]["env"].update(
+                {"X": "${{ secrets.TWO_BOT_STAGING_MIGRATOR_DATABASE_URL }}"}),
+            "dropped login secret": lambda w: job(w)["steps"][1]["env"].pop(
+                "TWO_BOT_STAGING_PRIVACY_RO_DATABASE_URL"),
+            "dropped host pin": lambda w: job(w)["steps"][1]["env"].pop(
+                "STAGING_PRIVACY_VERIFY_EXPECTED_HOST"),
+            "dropped h pin": lambda w: job(w)["steps"][1]["env"].pop(
+                "STAGING_PRIVACY_VERIFY_H_GUILD_ID"),
+            "blanket secrets": lambda w: job(w)["steps"][1]["env"].update({"ALL": "${{ toJSON(secrets) }}"}),
+            "member as variable": lambda w: job(w)["steps"][1]["env"].update(
+                {"STAGING_FIXTURE_MEMBER_ID": "${{ vars.STAGING_FIXTURE_MEMBER_ID }}"}),
+            "member as input": lambda w: job(w)["steps"][1]["env"].update(
+                {"STAGING_FIXTURE_MEMBER_ID": "${{ inputs.member }}"}),
+            "h pin as variable": lambda w: job(w)["steps"][1]["env"].update(
+                {"STAGING_PRIVACY_VERIFY_H_GUILD_ID": "${{ vars.STAGING_PRIVACY_VERIFY_H_GUILD_ID }}"}),
+            "inline expression": lambda w: job(w)["steps"][1].update(
+                {"run": 'python3 scripts/staging_privacy_verify_read.py --guild "${{ inputs.guild }}" '
+                        '--output "staging-privacy-verify-read-$RUN_ID.json"'}),
+            "shell trace": lambda w: job(w)["steps"][1].update({"run": "set -x\n" + PRIVACY_VERIFY_READ_COMMAND}),
+            "other script": lambda w: job(w)["steps"][1].update(
+                {"run": PRIVACY_VERIFY_READ_COMMAND.replace("staging_privacy_verify_read", "other")}),
+            "wrangler action": lambda w: job(w)["steps"].insert(
+                1, {"uses": "cloudflare/wrangler-action@pinned"}),
+            "upload other file": lambda w: job(w)["steps"][2]["with"].update({"path": "*.json"}),
+            "upload without retention": lambda w: job(w)["steps"][2]["with"].pop("retention-days"),
+            "upload longer retention": lambda w: job(w)["steps"][2]["with"].update({"retention-days": "90"}),
+            "upload may be empty": lambda w: job(w)["steps"][2]["with"].update({"if-no-files-found": "warn"}),
+        }
+        for label, change in changes.items():
+            with self.subTest(change=label):
+                self.assertTrue(mutate(change))
+        # The inventory pin fails closed if the workflow disappears or gains a job.
+        missing = deepcopy(workflows)
+        del missing["staging-privacy-verify-read.yml"]
+        self.assertTrue(workflow_policy_errors(missing))
+        self.assertEqual(workflow_policy_errors(workflows), [])
+
     def test_staging_retention_census_shape_is_pinned(self):
         workflows = self.workflows
         self.assertEqual(staging_retention_census_errors(workflows["staging-retention-census.yml"]), [])
@@ -7869,6 +8105,13 @@ class WorkflowTests(unittest.TestCase):
                         # the one tracking issue per firing key (fixture
                         # proofs under the test label).
                         expected = {"contents": "read", "issues": "write"}
+                    elif (name, job_id) == ("dora-metrics.yml", "metrics"):
+                        # Weekly DORA file: commits the JSON and summary to
+                        # the automation branch, reads the production
+                        # Deployments history and verifies each recorded
+                        # deploy's Actions run.
+                        expected = {"contents": "write", "deployments": "read",
+                                    "actions": "read"}
                     self.assertEqual(job["permissions"], expected)
                     for step in job.get("steps", []):
                         if step.get("uses", "").startswith("actions/checkout@"):
