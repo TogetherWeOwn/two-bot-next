@@ -16,8 +16,8 @@ separate forward migration.
 `admin_api_tokens` has twelve columns: `token_id`, `secret_hash`, `scopes`,
 `guild_ids`, `label`, `issued_by`, `issued_at`, `expires_at`, `revoked_at`,
 `last_used_at`, `holder_id`, `holder_kind`. The existing primary key and
-`(revoked_at, expires_at)` lookup index are unchanged. No grants or new tables
-are added.
+`(revoked_at, expires_at)` lookup index are unchanged. No grants or persistent
+tables are added.
 
 - `holder_id` is required, has no default and must contain a non-whitespace
   character. It names an operator-selected principal, not a caller override or
@@ -53,8 +53,20 @@ registry before inspecting the catalog and refuses any existing `holder_id` or
 `holder_kind` default, even on an empty partial schema. It never drops defaults
 or silently repairs fallback authority. Compatible partial schemas without
 defaults may upgrade: missing columns are added without defaults, made NOT NULL,
-and checked with validated constraints. Guarded constraint creation lets either
-chain run first and the other repeat the same DDL without changing valid rows.
+and checked with validated constraints. Before any registry DDL, all four named
+authority constraints are compared with canonical CHECK expressions parsed on
+that server using an empty transaction-local reference table (dropped on commit).
+A same-name constraint with a different expression, a different constraint kind
+or NO INHERIT refuses atomically; VALIDATE alone cannot strengthen a weak CHECK.
+Exact canonical pre-existing checks are accepted, including NOT VALID checks
+that are then validated. Equivalent but noncanonical expressions may refuse
+conservatively rather than silently replacing authority. Guarded creation lets
+either chain run first and the other repeat the DDL without changing valid rows,
+existing constraint identities or migration history. Creating the empty reference
+requires the migration principal's existing TEMPORARY privilege on the database;
+a missing privilege refuses the migration, not permission to grant it here. Run
+each file through SQLx's normal per-file transaction, not both files inside one
+ad hoc outer transaction with the same temporary reference still present.
 
 Any existing historical row lacks a named holder. The upgrade therefore aborts
 atomically, preserving the original rows, schema and migration history. It does

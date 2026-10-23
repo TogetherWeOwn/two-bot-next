@@ -20,6 +20,42 @@ BEGIN
   END IF;
 END $$;
 
+-- Parse the canonical checks on this server instead of trusting a constraint
+-- name or hard-coding PostgreSQL's deparser spelling. This empty reference is
+-- transaction-local; no credential data or persistent table is created.
+CREATE TEMP TABLE pg_temp.admin_api_token_authority_contract (
+  holder_id TEXT,
+  holder_kind TEXT,
+  scopes TEXT[],
+  issued_at TIMESTAMPTZ,
+  expires_at TIMESTAMPTZ,
+  CONSTRAINT admin_api_tokens_holder_named
+    CHECK (holder_id ~ '[^[:space:]]'),
+  CONSTRAINT admin_api_tokens_holder_kind_closed
+    CHECK (holder_kind IN ('human', 'ai_agent')),
+  CONSTRAINT admin_api_tokens_admin_human
+    CHECK (holder_kind = 'human' OR NOT ('admin' = ANY(scopes))),
+  CONSTRAINT admin_api_tokens_lifetime_bounded
+    CHECK (isfinite(issued_at) AND isfinite(expires_at)
+           AND expires_at > issued_at
+           AND EXTRACT(EPOCH FROM expires_at) - EXTRACT(EPOCH FROM issued_at) <= 7776000)
+) ON COMMIT DROP;
+
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint actual
+    JOIN pg_constraint canonical ON canonical.conname = actual.conname
+    WHERE actual.conrelid = 'admin_api_tokens'::regclass
+      AND canonical.conrelid = 'pg_temp.admin_api_token_authority_contract'::regclass
+      AND (actual.contype <> 'c' OR actual.connoinherit
+           OR pg_get_expr(actual.conbin, actual.conrelid)
+              IS DISTINCT FROM pg_get_expr(canonical.conbin, canonical.conrelid))
+  ) THEN
+    RAISE EXCEPTION 'admin_api_tokens authority constraints must match canonical inheritable CHECKs';
+  END IF;
+END $$;
+
 ALTER TABLE admin_api_tokens ADD COLUMN IF NOT EXISTS holder_id TEXT;
 ALTER TABLE admin_api_tokens ADD COLUMN IF NOT EXISTS holder_kind TEXT;
 ALTER TABLE admin_api_tokens ALTER COLUMN holder_id SET NOT NULL;
