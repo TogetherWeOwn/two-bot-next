@@ -10,7 +10,9 @@ use sqlx::PgPool;
 use std::{sync::Arc, time::Duration};
 use twilight_model::{application::interaction::Interaction, gateway::event::Event};
 use two_bot_core::{
-    leveling::{leaderboard_reply_for_season, rank_text, season_id_for_ms, LevelRoleReward},
+    leveling::{
+        leaderboard_reply_for_season, rank_text_with_rewards, season_id_for_ms, LevelRoleReward,
+    },
     leveling_store as store, HandlerId, MemStore, OnboardingGates, OnboardingMode,
 };
 use two_bot_discord::leveling_runtime::LevelingRuntimeError;
@@ -208,8 +210,16 @@ async fn routed_rank_optional_member_and_fixed_public_top_ten_match_legacy() {
         .iter()
         .map(|r| serde_json::from_slice(&r.body).unwrap())
         .collect();
-    assert_eq!(body[0]["content"], rank_text("Global name", 0, None, 0, 0));
-    assert_eq!(body[1]["content"], rank_text("username", 0, None, 0, 0));
+    // Empty reward ladder: the same lifetime values plus the explicit
+    // end-of-ladder line.
+    assert_eq!(
+        body[0]["content"],
+        rank_text_with_rewards("Global name", 0, None, 0, 0, &[])
+    );
+    assert_eq!(
+        body[1]["content"],
+        rank_text_with_rewards("username", 0, None, 0, 0, &[])
+    );
     assert_eq!(
         body[2]["content"],
         leaderboard_reply_for_season(&[], &season).content

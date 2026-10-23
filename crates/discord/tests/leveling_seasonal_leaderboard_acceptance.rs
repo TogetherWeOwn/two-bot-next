@@ -44,7 +44,8 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use twilight_model::application::interaction::Interaction;
 use two_bot_core::leveling::{
-    leaderboard_reply_for_season, level_for_xp, rank_text, season_id_for_ms, LeaderboardEntry,
+    leaderboard_reply_for_season, level_for_xp, rank_text_with_rewards, season_id_for_ms,
+    LeaderboardEntry,
 };
 use two_bot_core::{HandlerId, OnboardingGates, OnboardingMode};
 use two_bot_discord::{ActionExecutor, LevelingRuntime};
@@ -388,7 +389,9 @@ async fn routed_rank_stays_lifetime_and_foreign_guild_stays_fenced() {
     // whatever the seasonal board shows.
     assert_eq!(
         bodies[1]["content"],
-        rank_text("Global name", level_for_xp(9_000), Some(2), 6, 9_000),
+        // Empty reward ladder: lifetime values plus the explicit
+        // end-of-ladder line, still lifetime totals.
+        rank_text_with_rewards("Global name", level_for_xp(9_000), Some(2), 6, 9_000, &[]),
         "/rank must keep reading lifetime totals"
     );
     mock.shutdown().await;

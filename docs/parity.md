@@ -35,7 +35,7 @@ Original registry surface: `CORE_COMMAND_DATA` (always published) = leveling onl
 | # | Command | Options | Permissions | Map |
 |---|---|---|---|---|
 | 1 | `/rank` | `member` User opt | everyone | **S4** (`/rank` is also the S2 prototype vehicle) |
-| 2 | `/leaderboard` | none | everyone | **S4** |
+| 2 | `/leaderboard` | `page` Int opt 1–1000 (1-based), `mine` Bool opt | everyone | **S4** |
 | 3 | `/ban` | `target` User req, `reason` String req ≤512 | `BanMembers` + hierarchy/protected-role policy | **S4** (moderation LAST) |
 | 4 | `/tempban` | `target` req, `duration_seconds` Int req ≥60, `reason` req | `BanMembers` | **S4** |
 | 5 | `/kick` | `target` req, `reason` req | `KickMembers` | **S4** |
@@ -117,6 +117,7 @@ golden exception or a claim of whole-baseline registry parity.
 | `feed-remove` | docs/parity.md §1 #29 caps | Advertise only `max_length` 128 on `id`; every other field stays legacy-identical. |
 | `schedule-list` | docs/parity.md §1 #19 page | Add the Next-only optional integer `page` (`min_value` 1, default 1) so every configured id through the first 50 rows stays discoverable within Discord's 2,000-unit cap (guild list reads at most 25 earliest rows per window; over-cap guilds page past the overflow line to reach hidden rows); command name, description and permissions stay legacy-identical. |
 | `feed-list` | docs/parity.md §1 #30 page | Add the Next-only optional integer `page` (`min_value` 1, default 1) so every stored relay id stays discoverable as deterministic whole rows within Discord's 2,000-unit cap (each page packs whole relay rows with source context; invalid or out-of-range pages refuse without mutation); command name, description and permissions stay legacy-identical. |
+| `leaderboard` | docs/parity.md §1 #2 page | Add the Next-only optional integer `page` (`min_value` 1, `max_value` 1000, default top ten) and optional boolean `mine` so every seasonal position stays reachable with absolute ranks; malformed options refuse with a correction before any store read. Command name, description and permissions stay legacy-identical. |
 
 These are the complete registry exceptions, mirrored by the test allowlist.
 Only equivalent guild-API representation defaults are canonicalized: omitted

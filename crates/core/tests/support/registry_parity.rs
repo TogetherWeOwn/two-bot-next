@@ -8,6 +8,7 @@ use two_bot_core::custom_commands::{
     MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_TEMPLATE_CHARS, MAX_TEXT_TRIGGER_CHARS,
 };
 use two_bot_core::feeds_http::MAX_FEED_SOURCE_BYTES;
+use two_bot_core::leveling::LEADERBOARD_PAGE_MAX;
 use two_bot_core::lfg::{MAX_ROLE_SPEC_CHARS, MAX_TITLE_CHARS};
 use two_bot_core::router::{InteractionRouter, RouterGates};
 use two_bot_core::scheduled::MAX_BODY_CHARS;
@@ -37,6 +38,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("feed-list", "docs/parity.md §1 #30 page"),
     ("privacy", "docs/parity.md §1 privacy"),
     ("command-list", "docs/parity.md §1 #16 page"),
+    ("leaderboard", "docs/parity.md §1 #2 page"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -444,6 +446,44 @@ pub fn expected_registry() -> Value {
         )
         .expect("page option serializes");
         command["options"] = json!([page]);
+    }
+    // Seasonal-board paging changes ONLY the missing option list: the
+    // Next-only additive `page` integer and `mine` boolean page the seasonal
+    // standings and jump to the invoker's own page. The command name,
+    // description and permissions stay legacy-identical.
+    {
+        let _ = INTENTIONAL_DIFFERENCES
+            .iter()
+            .find(|(command, _)| *command == "leaderboard")
+            .expect("page has a documented command exception");
+        let command = commands
+            .iter_mut()
+            .find(|command| command["name"] == "leaderboard")
+            .expect("docs/parity.md §1 #2 page");
+        assert!(
+            command["options"].is_null()
+                || command["options"]
+                    .as_array()
+                    .expect("command options array")
+                    .is_empty(),
+            "legacy leaderboard has no options"
+        );
+        let page = serde_json::to_value(
+            CommandOption::new(
+                "page",
+                "Page of the seasonal standings (1-based)",
+                CommandOptionType::Integer,
+            )
+            .int_range(1, LEADERBOARD_PAGE_MAX),
+        )
+        .expect("page option serializes");
+        let mine = serde_json::to_value(CommandOption::new(
+            "mine",
+            "Show your own page of the seasonal standings",
+            CommandOptionType::Boolean,
+        ))
+        .expect("mine option serializes");
+        command["options"] = json!([page, mine]);
     }
     canonical_registry(json!(commands))
 }

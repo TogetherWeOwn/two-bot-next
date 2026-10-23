@@ -40,7 +40,8 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use twilight_model::application::interaction::Interaction;
 use two_bot_core::leveling::{
-    leaderboard_reply_for_season, level_for_xp, rank_text, season_id_for_ms, LeaderboardEntry,
+    leaderboard_reply_for_season, level_for_xp, rank_text_with_rewards, season_id_for_ms,
+    LeaderboardEntry,
 };
 use two_bot_core::{parse_iso_millis, HandlerId, OnboardingGates, OnboardingMode};
 use two_bot_discord::{ActionExecutor, LevelingRuntime};
@@ -229,7 +230,9 @@ async fn routed_leaderboard_selected_season_flips_at_the_quarter_boundary() {
     let body: Value = serde_json::from_slice(&requests[before + 1].body).unwrap();
     assert_eq!(
         body["content"],
-        rank_text("Global name", level_for_xp(100), Some(2), 2, 100),
+        // Empty reward ladder: lifetime values plus the explicit
+        // end-of-ladder line, still lifetime-based.
+        rank_text_with_rewards("Global name", level_for_xp(100), Some(2), 2, 100, &[]),
         "/rank must stay lifetime-based at the season boundary"
     );
     mock.shutdown().await;
