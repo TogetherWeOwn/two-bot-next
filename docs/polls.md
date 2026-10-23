@@ -38,9 +38,15 @@ before deploying the binary; follow [migration recovery](migrations.md) on error
 Creation quotas share a guild advisory lock. A vote and its dirty-display marker
 commit before the live edit, so cancellation cannot undo a displayed vote.
 The edit re-reads durable counts under the same row lock as close, rather than
-sending a stale pre-close snapshot. Failed/cancelled edits remain dirty and the
-next tick retries only the idempotent message PATCH. The vote's live edit
-completes before the acknowledgement settles. The
+sending a stale pre-close snapshot. Uncertain/cancelled edits, rate limits and
+local guards remain dirty; the next tick retries only the idempotent message
+PATCH. A definitive rejection clears the dirty marker to avoid endless retries.
+Both successful and definitively rejected display settlements advance `updated_at`
+for rollback-delta measurement. Once committed, a vote receives a saved-vote
+acknowledgement even if its display update fails; the handler still reports the
+error. A failed vote transaction never claims a saved ballot.
+Each tick attempts all selected polls and returns the first error, so one failed
+refresh or close does not veto progress on its selected peers. The
 closed row freezes final counts so erasing a voter later does not rewrite the
 published aggregate. Member erasure removes that member's votes and authored
 polls (including their question/options); author deletion removes dependent
@@ -52,6 +58,9 @@ not an anonymous poll service: member IDs are stored for vote changes.
 A restart automatically closes due polls and recovers closed polls that have
 not yet started results delivery. Competing recoverers share the same durable
 fence. Creation reservations and results send fences commit **before** sending.
+A definitive rejection of the closing display PATCH (for example a deleted
+message) does not suppress the single permitted results POST. Other closing
+edit failures retain the no-replay fence and send no results automatically.
 A confirmed result receipt atomically records `results_posted_at` and clears
 the in-flight fence. Stable Discord nonces also suppress immediate duplicates,
 but their short lifetime is not durable replay safety.

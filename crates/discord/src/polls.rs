@@ -87,6 +87,20 @@ fn create_input(args: &[CommandDataOption]) -> Option<PollInput> {
     PollInput::parse(string(args, "question")?, &options, minutes)
 }
 
+struct PollFailure {
+    error: DiscordError,
+    vote_saved: bool,
+}
+
+impl From<DiscordError> for PollFailure {
+    fn from(error: DiscordError) -> Self {
+        Self {
+            error,
+            vote_saved: false,
+        }
+    }
+}
+
 pub(crate) async fn handle(
     pool: &PgPool,
     rest: &ActionExecutor,
@@ -101,6 +115,8 @@ pub(crate) async fn handle(
     let reply = execute(pool, rest, interaction).await;
     let content = match &reply {
         Ok(s) => s.as_str(),
+        Err(failure) if failure.vote_saved =>
+            "Vote saved, but the poll display could not be confirmed. Check the poll message later.",
         Err(_) => "Poll operation could not be confirmed. Do not retry creation; check the poll message first.",
     };
     rest.edit_interaction_response_with_blocked_retry(
@@ -109,14 +125,14 @@ pub(crate) async fn handle(
         content,
     )
     .await?;
-    reply.map(|_| true)
+    reply.map(|_| true).map_err(|failure| failure.error)
 }
 
 async fn execute(
     pool: &PgPool,
     rest: &ActionExecutor,
     interaction: &Interaction,
-) -> Result<String, DiscordError> {
+) -> Result<String, PollFailure> {
     let refused = || {
         "Invalid poll request. Use /poll create with 2–10 choices and 1–10080 minutes, or /poll close id.".to_owned()
     };
@@ -187,7 +203,9 @@ async fn execute(
                     if args.len() != 1 {
                         return Ok(refused());
                     }
-                    close(pool, rest, &guild, id, Some(&user.id.to_string())).await
+                    close(pool, rest, &guild, id, Some(&user.id.to_string()))
+                        .await
+                        .map_err(Into::into)
                 }
                 _ => Ok(refused()),
             }
@@ -223,7 +241,12 @@ async fn execute(
             // A displayed vote must already be durable. A failed or cancelled
             // PATCH leaves the dirty marker committed for the next tick.
             tx.commit().await.map_err(db_error)?;
-            refresh_display(pool, rest, &guild, &poll.id).await?;
+            refresh_display(pool, rest, &guild, &poll.id)
+                .await
+                .map_err(|error| PollFailure {
+                    error,
+                    vote_saved: true,
+                })?;
             Ok("Vote saved. Click another choice to change it.".into())
         }
         _ => Ok(refused()),
@@ -248,19 +271,30 @@ async fn refresh_display(
     let counts = poll_store::counts(&mut tx, guild, &poll)
         .await
         .map_err(db_error)?;
-    rest.write_poll_message(
-        &poll.channel,
-        Some(message),
-        render(&poll, &counts, false, false),
-    )
-    .await?;
-    sqlx::query("UPDATE polls SET display_dirty=false WHERE guild_id=$1 AND id=$2")
-        .bind(guild)
-        .bind(id)
-        .execute(&mut *tx)
+    let rejected = match rest
+        .write_poll_message(
+            &poll.channel,
+            Some(message),
+            render(&poll, &counts, false, false),
+        )
         .await
-        .map_err(db_error)?;
-    tx.commit().await.map_err(db_error)
+    {
+        Ok(_) => None,
+        // Stop retrying a definitively rejected display; retain the ballot.
+        // Guards, rate limits and uncertain edits remain dirty for recovery.
+        Err(error @ DiscordError::Rejected(_)) => Some(error),
+        Err(error) => return Err(error),
+    };
+    sqlx::query(
+        "UPDATE polls SET display_dirty=false,updated_at=now() WHERE guild_id=$1 AND id=$2",
+    )
+    .bind(guild)
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+    rejected.map_or(Ok(()), Err)
 }
 
 /// Shared manual/scheduled close. The durable send fence is committed before
@@ -305,12 +339,20 @@ async fn close(
     let Some(message) = poll.message.as_deref() else {
         return Ok("Poll closed; creation receipt still requires confirmation.".into());
     };
-    rest.write_poll_message(
-        &poll.channel,
-        Some(message),
-        render(&poll, &counts, true, false),
-    )
-    .await?;
+    if let Err(error) = rest
+        .write_poll_message(
+            &poll.channel,
+            Some(message),
+            render(&poll, &counts, true, false),
+        )
+        .await
+    {
+        // A confirmed rejection of the display edit cannot duplicate results.
+        // Every other failure retains the existing no-replay fence.
+        if !matches!(error, DiscordError::Rejected(_)) {
+            return Err(error);
+        }
+    }
     let receipt = rest
         .write_poll_message(&poll.channel, None, render(&poll, &counts, true, true))
         .await?;
@@ -325,10 +367,13 @@ pub(crate) async fn tick(
     rest: &ActionExecutor,
     guild: &str,
 ) -> Result<(), DiscordError> {
+    let mut first_error = None;
     for id in poll_store::due(pool, guild).await.map_err(db_error)? {
-        close(pool, rest, guild, &id, None).await?;
+        if let Err(error) = close(pool, rest, guild, &id, None).await {
+            first_error.get_or_insert(error);
+        }
     }
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 fn inert(text: &str) -> String {
