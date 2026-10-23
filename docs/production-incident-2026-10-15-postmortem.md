@@ -22,12 +22,27 @@ skipped; schema gap, nothing to cancel` with `error_code=42P01`, and returns
 `crates/bot/src/main.rs:861`). The observable #978-era signal for the
 retention trigger is that schema-gap skip line with `error_code=42P01`. The
 section's second trigger (XP awards inserting into `member_season_xp` via the
-leveling drain) can still log `gateway_failed` on #978+: a failed drain maps
-to `leveling_dispatch_failure()` (`crates/bot/src/gateway.rs:905-915`,
-`InvalidArgument` at `:344`), surfaces as a `gateway_run` step failure
-(`crates/bot/src/main.rs:700`), and `publish_gateway_failure`
-(`crates/bot/src/main.rs:861`) logs it with `failed_step=gateway_run` and
-`error_code=none` — narrowing the step but not the SQLSTATE. A
+leveling drain) still discarded its SQLSTATE in the #978-era implementation:
+`leveling_dispatch_failure()` synthesized `InvalidArgument`, and the outer
+error arm replaced even a checkpoint deadline with the same literal. The
+`gateway_run` failure therefore carried `error_code=none`.
+
+**Dispatch-cause fix receipt (2026-10-23):** `apply_dispatch` now extracts the
+underlying database error from both store and post-award role-store failures.
+Only `42P01`/`42501` auxiliary drains skip, with the fixed warning
+`gateway leveling dispatch skipped; schema gap`, `drain=leveling`, a bounded
+`cause`, the SQLSTATE and `two_bot_gateway_drain_skips_total`. Non-gap errors
+retain their source through `run_shard` into `StepFailure.error`;
+`publish_gateway_failure` can report that SQLSTATE through the existing
+`error_code` field. Deadline failures keep their own bounded reason. The three
+non-database dispatch failures keep their distinct fixed literals and
+`error_code=none` (dropped interaction completion, invalid onboarding job,
+missing ingress ticket; only the last is post-commit). Protected regressions
+in `crates/bot/src/gateway_tests/dispatch_cause.rs` fault-inject real `42P01`,
+`42501` and `23514`, verify checkpoint advance/hold and sanitized logs, and keep
+a healthy XP-write control. Retention behavior is unchanged. This is a code
+and regression receipt, **not** a production observation or an RCA confirmation;
+no production migration, restore or alert deployment is performed. A
 `gateway_failed` confirmation of the retention trigger would need a pre-#978
 build or a staging restore. Update this section when such a line is captured;
 do not treat the hypothesis as proven before then.

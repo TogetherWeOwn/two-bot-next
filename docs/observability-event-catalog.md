@@ -35,6 +35,7 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 | `cold resume committed; requesting voice snapshot via identify` | `crates/bot/src/gateway.rs` (`run_shard`) | Cold voice RESUME committed; reception IDENTIFies for a fresh voice snapshot |
 | `gateway ready; checkpoint committed` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Dispatch committed and shard marked Connected |
 | `gateway leveling dispatch failed` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Leveling funnel drain failed inside the checkpoint deadline |
+| `gateway leveling dispatch skipped; schema gap` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Auxiliary XP drain hit `42P01`/`42501`; warns with `drain=leveling`, bounded cause and SQLSTATE, counts `two_bot_gateway_drain_skips_total`, and permits checkpoint advance without promising award replay |
 | `gateway community facts dispatch failed` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Community facts drain failed; worker continues and the scorecard fails closed on missing coverage |
 | `gateway community facts dispatch timed out` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Community facts drain missed the checkpoint deadline; worker continues and the scorecard fails closed on missing coverage |
 | `gateway onboarding job invalid` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Dispatch-worker durable onboarding payload failed to serialize; recorded as a typed error, checkpoint unchanged |
@@ -131,6 +132,7 @@ Scalar gateway series pair with the labels above:
 | `two_bot_gateway_reconnects_total` | New HELLOs after the first in the running loop |
 | `two_bot_gateway_resumes_total` | Received RESUMED dispatches |
 | `two_bot_gateway_disconnects_total` | Transport losses through the shard supervisor; each must pair with a later RESUME or fresh READY |
+| `two_bot_gateway_drain_skips_total` | Label-free auxiliary leveling drain skips for missing tables/grants; the `gateway_drain_skips` ticket consumes any increase. First sample and resets baseline, missing/invalid family is no window; see [bounded response](runbook.md#alert-gateway-drain-skips). No deployment is claimed |
 | `two_bot_gateway_missed_events_total` | Sequence gaps inside one session; any nonzero increase fails the zero-missed-events acceptance |
 | `two_bot_gateway_latency_seconds` | Last heartbeat ACK round-trip; `NaN` until measured |
 | `two_bot_gateway_prefix_trigger_refused_total{reason="verdict"}` | In-scope prefix candidates refused by the automod verdict; the worker records candidates even when its capture-only gate prevents detached dispatch. Unmatched content, scope mismatches, bot/webhook messages and disabled text-command gates never increment it |

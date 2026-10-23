@@ -999,6 +999,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "moderation_enforcement_failures",
     "voice_rest_stuck",
     "voice_global_backoff_capped",
+    "gateway_drain_skips",
   ]);
   assert.equal(packetFilename("job_stale:rank", window), `evidence-job_stale-${window}.json`);
   assert.equal(packetFilename("job_consecutive_failures:counter", window), `evidence-job_consecutive_failures-${window}.json`);
@@ -1283,6 +1284,7 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
   firing.push(...ev(["two_bot_voice_queue_oldest_age_seconds 121"]).firing);
   for (const series of [
     "two_bot_retention_replay_needed_total",
+    "two_bot_gateway_drain_skips_total",
     "two_bot_voice_dispatch_timeouts_total",
     "two_bot_voice_watchdog_stucks_total",
     "two_bot_voice_halt_recoveries_total",
