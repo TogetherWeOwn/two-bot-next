@@ -1044,6 +1044,34 @@ mod tests {
         assert_eq!(chains.len(), 1, "stale leave keeps the fresh chain");
     }
 
+    // Acceptance: chain retirement counts in-section users, not outstanding
+    // `Arc` clones. A finished frame's `Arc` drops only when its `handle`
+    // frame returns, after it released the chain mutex, so counting clones
+    // lets a stale clone win the race against the unblocked waiter and leak
+    // the entry until the idle prune.
+    #[test]
+    fn stale_clone_does_not_keep_chain_alive() {
+        let chains = VoiceChains::default();
+        let chain = chains.lock_for(GUILD, 41, 0);
+        drop(chain.lock()); // frame leaves the critical section
+        let _stale = chain.clone(); // finished frame's Arc outlives its section
+        chains.remove_after_leave(GUILD, 41, &chain);
+        assert_eq!(chains.len(), 0, "stale clone must not keep the chain alive");
+    }
+
+    // Guard: an active in-section user still blocks removal. Passes both
+    // before and after the fix (clone counting can only retire late, never
+    // early); it pins the no-early-retire side of the contract.
+    #[test]
+    fn active_insection_user_keeps_chain_alive() {
+        let chains = VoiceChains::default();
+        let chain = chains.lock_for(GUILD, 42, 0);
+        let _other = chains.lock_for(GUILD, 42, 0); // another frame queued on the chain
+        drop(chain.lock()); // this frame leaves the critical section
+        chains.remove_after_leave(GUILD, 42, &chain);
+        assert_eq!(chains.len(), 1, "active in-section user keeps the chain");
+    }
+
     fn lifecycle_voice(guild: u64, member: u64, channel: u64) -> Event {
         Event::VoiceStateUpdate(Box::new(
             serde_json::from_value(serde_json::json!({
