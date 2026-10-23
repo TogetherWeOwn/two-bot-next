@@ -4,11 +4,11 @@
 //! Each tick claims at most [`TICKER_BATCH_LIMIT`] due rows, one per
 //! `claim_due` call with a fresh claim token. The claim parks `next_run_at`
 //! at the 60 s lease horizon, so a second ticker (or a restarted process)
-//! sees the row as not due until the lease expires. The post carries the
-//! row's stable occurrence nonce with `enforce_nonce`, so a post retried after
-//! an ambiguous failure or an expired lease cannot create a second message.
-//! The supervisor never overlaps attempts of one job, which replaces the
-//! legacy re-entrancy guard.
+//! sees the row as not due until the lease expires. Before POST, a durable
+//! uncertainty fence is armed under the claim token. Reclaimed fenced rows
+//! never POST or advance: Discord's short nonce window is not replay safety.
+//! Only proven no effect or confirmed cleanup permits a new attempt. The
+//! supervisor never overlaps attempts of one job.
 //!
 //! Every claimed occurrence attempts one `scheduled.run` audit write (ids and
 //! outcomes only, never the body), including when recording or re-queuing the
@@ -18,12 +18,12 @@ use std::{sync::Arc, time::Duration};
 
 use sqlx::PgPool;
 use two_bot_core::{
-    activation::LiveCapability, audit_scheduled, claim_due, clamp_retry_delay_ms, complete_run,
-    format_iso_ms, lease_until_ms, neutralize_scheduled_body, post_failure_retryable,
-    retry_scheduled, FeatureGates, OccurrenceOutcome, ScheduledAuditInput, ScheduledMessageRow,
-    ScheduledStoreError, SCHEDULER_TICK_MS, TICKER_BATCH_LIMIT,
+    activation::LiveCapability, audit_scheduled, begin_scheduled_delivery, claim_due,
+    clamp_retry_delay_ms, complete_run, format_iso_ms, lease_until_ms, neutralize_scheduled_body,
+    post_failure_retryable, retry_scheduled, FeatureGates, OccurrenceOutcome, ScheduledAuditInput,
+    ScheduledMessageRow, ScheduledStoreError, SCHEDULER_TICK_MS, TICKER_BATCH_LIMIT,
 };
-use two_bot_discord::executor::{ActionExecutor, ChannelCall, ChannelCallOutcome, DiscordError};
+use two_bot_discord::executor::{ActionExecutor, DiscordError};
 
 use crate::{
     activation::BootActivation,
@@ -48,6 +48,10 @@ mod acceptance_tests;
 #[cfg(test)]
 #[path = "scheduled_store_failure_audit_acceptance_tests.rs"]
 mod store_failure_acceptance_tests;
+
+#[cfg(test)]
+#[path = "scheduled_confirmed_cleanup_tests.rs"]
+mod confirmed_cleanup_tests;
 
 /// The supervised ticker for the configured guild, or `None` while
 /// `TWO_AUTOMATIONS` is off (legacy only started the scheduler when automations
@@ -180,11 +184,95 @@ pub(crate) async fn tick(
             Step::Stop => return Err(ErrorClass::Database),
         }
     }
+    remind_event_attendees(pool, rest, guild, &clock).await?;
     if audit_failed {
         Err(ErrorClass::Database)
     } else {
         Ok(())
     }
+}
+
+/// Event reminders share this supervised, activation-fenced ticker, but are
+/// optional one-attempt effects. Never recycle their pre-wire audit fence,
+/// including after a definitive refusal, rendering failure or lost receipt.
+async fn remind_event_attendees(
+    pool: &PgPool,
+    rest: &ActionExecutor,
+    guild: &str,
+    clock: &impl Fn() -> u64,
+) -> Result<(), ErrorClass> {
+    use two_bot_core::event_reminder_store::{begin_event_reminder_delivery, due_event_reminders};
+
+    for event in due_event_reminders(pool, guild, clock())
+        .await
+        .map_err(database)?
+    {
+        let now = clock();
+        if !begin_event_reminder_delivery(pool, guild, &event, now)
+            .await
+            .map_err(database)?
+        {
+            continue;
+        }
+        let (outcome, reason) = if let Some(content) = event_reminder_content(&event) {
+            match rest
+                .post_message_confirmed(&event.channel_id, &content, &random_nonce())
+                .await
+            {
+                Ok(_) => ("posted", None),
+                Err(error) => (
+                    if error.proves_no_effect() || error.is_admission_blocked() {
+                        "failed"
+                    } else {
+                        "delivery_uncertain"
+                    },
+                    Some(discord_error_name(&error)),
+                ),
+            }
+        } else {
+            ("failed", Some("invalid_or_oversized_reminder"))
+        };
+        // Only the result is appended; the attempt fact remains immutable.
+        // No attendee ids, names or rendered content enter diagnostics/audits.
+        let input = ScheduledAuditInput {
+            guild_id: guild.to_owned(),
+            actor_id: None,
+            action: "rsvp.reminder".to_owned(),
+            target_key: Some(event.event_id),
+            outcome: outcome.to_owned(),
+            reason: reason.map(str::to_owned),
+        };
+        audit_scheduled(pool, &input, &format_iso_ms(now), &random_id())
+            .await
+            .map_err(database)?;
+    }
+    Ok(())
+}
+
+fn event_reminder_content(
+    event: &two_bot_core::event_reminder_store::EventReminder,
+) -> Option<String> {
+    use two_bot_core::message_safety::{text_len, truncate, CONTENT_LIMIT};
+    use two_bot_core::rsvp::{is_snowflake, MAX_RSVPS_PER_EVENT};
+
+    if event.attendees.is_empty()
+        || event.attendees.len() > MAX_RSVPS_PER_EVENT as usize
+        || !is_snowflake(&event.event_id)
+        || !is_snowflake(&event.channel_id)
+        || event.attendees.iter().any(|id| !is_snowflake(id))
+    {
+        return None;
+    }
+    let name = truncate(&neutralize_scheduled_body(&event.name), 200);
+    let attendees = event
+        .attendees
+        .iter()
+        .map(|id| format!("<@{id}>"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let content = format!("Event reminder: {name} starts soon.\n{attendees}");
+    // Do not split into a burst or truncate halfway through an attendee list.
+    (text_len(&content) <= CONTENT_LIMIT).then_some(content)
 }
 
 struct Occurrence<'a> {
@@ -198,31 +286,70 @@ struct Occurrence<'a> {
 
 impl Occurrence<'_> {
     async fn run(&self, audit_failed: &mut bool) -> Result<Step, ErrorClass> {
-        // Defuse rows written before any validate-side screen on the way to
-        // the channel; benign bodies pass through byte-identical and the
-        // shared send path keeps the closed mention policy. The neutralized
-        // body is truncated to the message ceiling (surrogate-safe) so a
-        // legacy row at the old pre-neutralize limit still posts instead of
-        // failing permanent on the send-path length check.
-        let call = ChannelCall::PostMessage {
-            channel_id: self.row.channel_id.clone(),
-            content: two_bot_core::message_safety::truncate(
-                &neutralize_scheduled_body(&self.row.body),
-                two_bot_core::message_safety::CONTENT_LIMIT,
-            ),
-            nonce: self.row.occurrence_nonce.clone(),
-        };
-        let posted = match self.rest.execute_channel(&call).await {
-            Ok(ChannelCallOutcome::Posted { message_id }) => {
-                Ok(Some(message_id).filter(|id| !id.is_empty()))
+        if self.row.delivery_uncertain {
+            // A reclaimed nonce is not permission to POST beyond Discord's
+            // short deduplication window. No history/absence heuristic is used.
+            self.warn_uncertain();
+            self.audit(
+                &OccurrenceOutcome::DeliveryUncertain,
+                Some("scheduled_delivery_uncertain"),
+                audit_failed,
+            )
+            .await;
+            return Ok(Step::Next);
+        }
+        match begin_scheduled_delivery(
+            self.pool,
+            &self.row.guild_id,
+            &self.row.id,
+            self.claim_token,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                self.audit(&OccurrenceOutcome::StaleCompletion, None, audit_failed)
+                    .await;
+                return Ok(Step::Next);
             }
-            Ok(_) => Ok(None),
-            Err(error) => Err(error),
-        };
-        match posted {
-            Ok(message_id) => self.record_post(message_id, audit_failed).await,
+            Err(error) => {
+                self.audit(
+                    &OccurrenceOutcome::DeliveryUncertain,
+                    Some("database"),
+                    audit_failed,
+                )
+                .await;
+                return Err(database(error));
+            }
+        }
+        // Defuse legacy bodies, preserve benign text and the closed mention
+        // policy, and truncate surrogate-safely after neutralization.
+        let content = two_bot_core::message_safety::truncate(
+            &neutralize_scheduled_body(&self.row.body),
+            two_bot_core::message_safety::CONTENT_LIMIT,
+        );
+        match self
+            .rest
+            .post_message_confirmed(
+                &self.row.channel_id,
+                &content,
+                self.row.occurrence_nonce.as_deref().unwrap_or_default(),
+            )
+            .await
+        {
+            Ok(message_id) => self.record_post(Some(message_id), audit_failed).await,
             Err(error) => self.record_failure(&error, audit_failed).await,
         }
+    }
+
+    fn warn_uncertain(&self) {
+        tracing::warn!(
+            guild = %self.row.guild_id,
+            schedule = %self.row.id,
+            code = "scheduled_delivery_uncertain",
+            next_action = "inspect_channel_before_cancel_or_replace",
+            "scheduled occurrence held; no automatic resend or advancement"
+        );
     }
 
     async fn record_post(
@@ -282,13 +409,13 @@ impl Occurrence<'_> {
                     Some(message_id) => self.delete(message_id).await.is_ok(),
                     None => false,
                 };
-                // Keep the nonce when the message survives so the re-run
-                // dedupes against it instead of posting a second copy. The
-                // unrecorded outcome is audited even when the claim was lost
-                // (the re-queue retains nothing): a posted message must never
-                // vanish without an audit row. A lost claim keeps no nonce,
-                // so a surviving orphan has no idempotent retry: report it
-                // as stale, not retry-idempotent.
+                // Only confirmed cleanup disarms the occurrence. Otherwise
+                // preserve both identity and the pre-wire fence, including if
+                // this retry write fails. Always attempt the audit even when
+                // storage fails or a changed generation rejects the write.
+                if !cleaned {
+                    self.warn_uncertain();
+                }
                 let retained = match retry_scheduled(
                     self.pool,
                     &self.row.guild_id,
@@ -327,36 +454,35 @@ impl Occurrence<'_> {
         audit_failed: &mut bool,
     ) -> Result<Step, ErrorClass> {
         let reason = discord_error_name(error);
-        if post_failure_retryable(failure_status(error)) {
+        let uncertain = !error.proves_no_effect() && !error.is_admission_blocked();
+        if uncertain {
+            self.warn_uncertain();
+        }
+        if uncertain || post_failure_retryable(failure_status(error)) {
             let retry_at_ms = self.now.saturating_add(clamp_retry_delay_ms(None));
+            let outcome = if uncertain {
+                OccurrenceOutcome::DeliveryUncertain
+            } else {
+                OccurrenceOutcome::Retryable { retry_at_ms }
+            };
             let retained = match retry_scheduled(
                 self.pool,
                 &self.row.guild_id,
                 &self.row.id,
                 self.claim_token,
                 &format_iso_ms(retry_at_ms),
-                true,
+                uncertain,
             )
             .await
             {
                 Ok(retained) => retained,
                 Err(error) => {
-                    self.audit(
-                        &OccurrenceOutcome::Retryable { retry_at_ms },
-                        Some(reason),
-                        audit_failed,
-                    )
-                    .await;
+                    self.audit(&outcome, Some(reason), audit_failed).await;
                     return Err(database(error));
                 }
             };
             if retained {
-                self.audit(
-                    &OccurrenceOutcome::Retryable { retry_at_ms },
-                    Some(reason),
-                    audit_failed,
-                )
-                .await;
+                self.audit(&outcome, Some(reason), audit_failed).await;
             } else {
                 // The claim went stale (the definition was replaced or
                 // cancelled while the retryable post was in flight): the
@@ -420,7 +546,7 @@ impl Occurrence<'_> {
 
     async fn delete(&self, message_id: &str) -> Result<(), DiscordError> {
         self.rest
-            .delete_message(&self.row.channel_id, message_id, ORPHAN_REASON)
+            .delete_message_confirmed(&self.row.channel_id, message_id, ORPHAN_REASON)
             .await
     }
 

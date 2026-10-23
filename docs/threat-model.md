@@ -36,7 +36,7 @@ ingress "staging-only, dark by default" (`wrangler/src/index.ts:882-883`).
 The historical contract has **18 actions**. The current core allowlist has
 **19** (rechecked 2026-10-10): those 18 plus `event.read`
 (`crates/core/src/internal_actions.rs:653`; nine moderation verbs at `:703`,
-14 idempotency-bound at `:680`). All 19 are assessed below. `docs/parity.md:221`
+14 idempotency-bound at `:680`). All 19 are assessed below. `docs/parity.md:226`
 records the same 19 actions with `event.read` and the `settings.set`
 compare-and-set (`expected_version`); the core constants above are
 authoritative. The legacy `docs/INTERNAL_ACTIONS.md` is not in this checkout;
@@ -105,8 +105,8 @@ ingress gate below admits them.
   an additional inbound HTTP webhook. The runtime commits funnel effects and
   gateway checkpoints; detached dispatch now fans MessageCreate/
   InteractionCreate events (including tickets) to the shared command runtime
-  without awaiting REST or store writes (`crates/bot/src/gateway.rs:320`,
-  `crates/bot/src/command_runtime.rs:257`, tickets supervisor start/shutdown
+  without awaiting REST or store writes (`crates/bot/src/gateway.rs:1542-1550`,
+  `crates/bot/src/command_runtime.rs:956-995`, tickets supervisor start/shutdown
   at `gateway.rs:180`, `:192-193`). The gateway loop still does not invoke the
   internal-action executor; the ticket runtime shares `ActionExecutor`
   transport through its own guild-fenced handlers
@@ -171,14 +171,14 @@ was verified here.
 4. **Discord gateway → Container:** authenticated upstream does not make members'
    payloads trusted. DMs are dropped from message processing; foreign-guild
    event/activity batches are refused at persistence, and effects/checkpoints
-   commit together (`crates/bot/src/gateway.rs:326`,
+   commit together (`crates/bot/src/gateway.rs:1132-1136`,
    `crates/cutover/src/gateway_session.rs:63`). Dispatch to the command runtime
    (including tickets) is detached per event and never awaits REST or store
    writes; ticket button admission is bounded (10-second lane, 120-second
    cumulative, supervisor-bounded recovery per #155) and ticket/message-content
    intents apply only when automod or tickets are configured
    (`crates/bot/src/gateway.rs:89-90`). The mock-gateway override accepts
-   literal loopback sockets only (`:364`). Do not infer full
+   literal loopback sockets only (`:2003`). Do not infer full
    slash-command/moderation deployment from libraries.
 5. **Worker/Container → Neon:** the Container connects using `DATABASE_URL`
    (`crates/cutover/src/db.rs:18-43`). Pool default is five connections

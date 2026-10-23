@@ -323,6 +323,86 @@ pub struct MessageRef {
 /// the call returns RateLimited so the action queue backs off tick-driven
 /// (visible in gauges) instead of sleeping silently inside the worker loop.
 const GLOBAL_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// Upward spread for one sub-cap global-429 wait: the shared deadline plus
+/// up to this much, hard-capped at [`GLOBAL_BACKOFF_MAX`].
+const GLOBAL_BACKOFF_SPREAD: Duration = Duration::from_secs(5);
+
+/// Deterministic 64-bit mixer (splitmix64) for seeded jitter without a
+/// global RNG: the same `seed` always yields the same draw, on every
+/// platform, with no clock and no `rand` dependency.
+fn jitter_draw(seed: u64) -> u64 {
+    let mut z = seed.wrapping_add(0x9E3779B97F4A7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+/// Total sleep for a sub-cap global-429 `wait` (the remaining shared-deadline
+/// wait, at most `GLOBAL_BACKOFF_MAX`): the deadline plus a deterministic
+/// upward spread in `[wait, (wait + GLOBAL_BACKOFF_SPREAD).min(GLOBAL_BACKOFF_MAX)]`,
+/// so guild actors sharing one global limit stop waking on the same instant.
+/// Never below `wait` (waking early only earns another 429) and never above
+/// the cap, so the cap and the `RateLimited` queue-handoff behavior hold by
+/// construction. A zero wait stays zero (no deadline, no sleep); at exactly
+/// the cap the spread window is empty and the sleep equals the wait. The same
+/// `seed` replays the same sleep, so tests pin ranges without a clock or RNG;
+/// production passes `two_bot_core::action_outcomes::jitter_seed()`.
+#[must_use]
+pub fn jitter_sub_cap_wait(wait: Duration, seed: u64) -> Duration {
+    if wait.is_zero() {
+        return Duration::ZERO;
+    }
+    let ceiling = wait
+        .saturating_add(GLOBAL_BACKOFF_SPREAD)
+        .min(GLOBAL_BACKOFF_MAX);
+    let window_nanos = ceiling.saturating_sub(wait).as_nanos();
+    // `span` is at least 1, so the remainder below never divides by zero.
+    let span = window_nanos.saturating_add(1).min(u128::from(u64::MAX)) as u64;
+    wait.saturating_add(Duration::from_nanos(jitter_draw(seed) % span))
+}
+
+#[cfg(test)]
+mod jitter_sub_cap_wait_tests {
+    use super::{jitter_sub_cap_wait, Duration, GLOBAL_BACKOFF_MAX, GLOBAL_BACKOFF_SPREAD};
+
+    #[test]
+    fn sub_cap_sleep_covers_the_deadline_with_bounded_spread() {
+        for secs in [1u64, 10, 25, 29] {
+            let wait = Duration::from_secs(secs);
+            let ceiling = (wait + GLOBAL_BACKOFF_SPREAD).min(GLOBAL_BACKOFF_MAX);
+            for seed in 0..8u64 {
+                let sleep = jitter_sub_cap_wait(wait, seed);
+                assert!(
+                    sleep >= wait && sleep <= ceiling,
+                    "wait {wait:?} seed {seed}: {sleep:?} outside [{wait:?}, {ceiling:?}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_and_capped_waits_are_unjittered() {
+        assert_eq!(jitter_sub_cap_wait(Duration::ZERO, 42), Duration::ZERO);
+        assert_eq!(
+            jitter_sub_cap_wait(GLOBAL_BACKOFF_MAX, 42),
+            GLOBAL_BACKOFF_MAX
+        );
+    }
+
+    #[test]
+    fn sub_cap_sleep_spreads_wake_times_across_seeds() {
+        use std::collections::HashSet;
+        // A 10 s shared wait wakes every guild actor on the same instant today.
+        let distinct: HashSet<Duration> = (0..32u64)
+            .map(|seed| jitter_sub_cap_wait(Duration::from_secs(10), seed))
+            .collect();
+        assert!(
+            distinct.len() >= 8,
+            "only {} distinct wake times across 32 seeds",
+            distinct.len()
+        );
+    }
+}
 
 /// In-flight voice REST attempts, for the in-flight-age gauge.
 #[derive(Debug, Default)]
@@ -353,9 +433,13 @@ impl InFlightRest {
 /// process-global gauge, which is last-writer-wins and flakes when another
 /// test's begin/drop lands between the publish and the read.
 fn oldest_age_secs(slots: &Arc<Mutex<InFlightRest>>) -> u64 {
+    // Silent recovery: the `InFlightGuard` drop body owns the poison
+    // counter emission, and this only observes a poisoned lock through
+    // that drop path (`begin` locks before publishing, so it never
+    // reaches here on a poisoned lock).
     slots
         .lock()
-        .expect("in-flight lock")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .live
         .values()
         .map(|started| started.elapsed().as_secs())
@@ -378,7 +462,9 @@ struct InFlightGuard {
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         if let Some(slots) = self.slots.take() {
-            slots.lock().expect("in-flight lock").live.remove(&self.id);
+            two_bot_core::metrics::recover_drop_poison(slots.lock(), "in_flight_guard")
+                .live
+                .remove(&self.id);
             publish_rest_age(&slots);
         }
     }
@@ -505,7 +591,10 @@ impl RoomHttp {
                     if wait > Duration::from_secs(1) {
                         tracing::info!(wait_secs = wait.as_secs(), "voice global backoff wait");
                     }
-                    tokio::time::sleep_until(until).await;
+                    // Spread the shared-deadline wake: every guild actor
+                    // sleeping until `until` wakes on the same instant today.
+                    let seed = two_bot_core::action_outcomes::jitter_seed();
+                    tokio::time::sleep(jitter_sub_cap_wait(wait, seed)).await;
                     if !still_valid() {
                         return Err(RoomHttpError::Cancelled);
                     }
@@ -615,6 +704,31 @@ impl RoomHttp {
         .await
         .map_err(|_| RoomHttpError::UnknownOutcome)??;
         Ok(())
+    }
+
+    /// Read the original callback message without retaining the interaction
+    /// token. One bounded GET, no bot authentication or callback retry.
+    pub async fn interaction_message(
+        &self,
+        application: Id<ApplicationMarker>,
+        token: &str,
+    ) -> Result<MessageRef, RoomHttpError> {
+        let request = self
+            .http
+            .interaction(application)
+            .response(token)
+            .try_into_request()
+            .map_err(classify_http_error)?;
+        let body = self.send_request(request, || true, false).await?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|_| RoomHttpError::InvalidRequest)?;
+        let channel_id = value
+            .get("channel_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|id| id.parse::<u64>().ok())
+            .filter(|id| *id != 0)
+            .ok_or(RoomHttpError::InvalidRequest)?;
+        parse_posted_message(channel_id, &body)
     }
 
     /// Complete the deferred response, never a second initial response.
@@ -1726,3 +1840,7 @@ mod tests {
         publish_rest_age(&slots);
     }
 }
+
+#[cfg(test)]
+#[path = "voice_rooms_poison_acceptance.rs"]
+mod in_flight_poison_acceptance;

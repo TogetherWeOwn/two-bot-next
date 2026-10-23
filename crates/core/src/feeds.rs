@@ -351,6 +351,160 @@ pub fn feed_list_text(feeds: &[FeedRelay]) -> String {
     truncate_utf16(&id_only, DISCORD_MESSAGE_CONTENT_LIMIT)
 }
 
+impl FeedRelay {
+    /// Pack whole relay rows into bounded page bodies in input order.
+    ///
+    /// Each body holds as many whole rows as fit in `content_budget` UTF-16
+    /// units, joined with `\n`; rows are never split and ids never dropped,
+    /// so paging — not per-row shrinking — absorbs capacity. The caller
+    /// reserves its own footer/navigation overhead before choosing the
+    /// budget. An empty guild yields the useful first page
+    /// (`No feed relays configured.`). Bodies carry no footer; see
+    /// [`feed_list_page`] for the composed reply.
+    pub fn list_pages(rows: &[FeedRelay], content_budget: usize) -> Vec<String> {
+        if rows.is_empty() {
+            return vec![feed_list_text(rows)];
+        }
+        let rendered: Vec<String> = rows
+            .iter()
+            .map(|feed| feed_list_page_row(feed, content_budget))
+            .collect();
+        let mut pages: Vec<String> = Vec::new();
+        let mut current = String::new();
+        let mut current_units = 0usize;
+        for row in &rendered {
+            let row_units = row.encode_utf16().count();
+            if !current.is_empty() && current_units + 1 + row_units > content_budget {
+                pages.push(std::mem::take(&mut current));
+                current_units = 0;
+            }
+            if !current.is_empty() {
+                current.push('\n');
+                current_units += 1;
+            }
+            current.push_str(row);
+            current_units += row_units;
+        }
+        pages.push(current);
+        pages
+    }
+}
+
+/// One page-body row: the exact 128-unit legacy rendering when it fits the
+/// page budget, so short lists stay byte-identical to [`feed_list_text`]. A
+/// single row wider than the budget keeps its whole fixed frame (exact id,
+/// kind, channel mention) and middle-elides the source with an explicit `…`.
+/// When even the frame cannot fit, the exact id alone stays reachable within
+/// the budget instead of hiding trailing rows.
+fn feed_list_page_row(feed: &FeedRelay, content_budget: usize) -> String {
+    let full = feed_list_row_with_budget(feed, MAX_FEED_LIST_SOURCE_UNITS);
+    if full.encode_utf16().count() <= content_budget {
+        return full;
+    }
+    let frame_units = format!(
+        "`{}` {} → <#{}> ",
+        feed.id,
+        feed.kind.as_str(),
+        feed.channel_id
+    )
+    .encode_utf16()
+    .count();
+    if frame_units > content_budget {
+        // Defensive: reachable for restored/legacy rows whose fixed frame
+        // (an overlong channel id) exceeds the page budget. A tiny caller
+        // budget must still keep the removal id reachable, never drop the row.
+        return truncate_utf16(&format!("`{}`", feed.id), content_budget);
+    }
+    feed_list_row_distinguishing(feed, content_budget - frame_units)
+}
+
+/// Full `/feed-list` reply for one 1-based page over already-fetched rows.
+///
+/// The bounded guild read stays the caller's; this composes bodies from
+/// [`FeedRelay::list_pages`] after reserving footer overhead, so every reply
+/// including navigation fits Discord's 2,000 UTF-16 units. A single page
+/// keeps the exact legacy bytes with no footer; every page of a multi-page
+/// list ends with [`feed_list_page_footer`]. Nonpositive and out-of-range
+/// pages refuse shortly with usable navigation and list no rows.
+#[must_use]
+pub fn feed_list_page(feeds: &[FeedRelay], page: i64) -> String {
+    if page < 1 {
+        return feed_list_page_underflow_text().to_owned();
+    }
+    if feeds.is_empty() {
+        if page > 1 {
+            return feed_list_page_out_of_range_text(page, 1);
+        }
+        return feed_list_text(feeds);
+    }
+    // Converge on the page count: the footer length depends on the total,
+    // and the total depends on the reserved footer overhead. Rows re-render
+    // per budget, so packing is NOT monotonic in the budget: a smaller
+    // budget can collapse frame-inflated rows to tiny id-only rows and
+    // shrink the page count. Accept fewer bodies than guessed instead of
+    // looping: the reserved overhead upper-bounds the actual footer (its
+    // length only grows with the total), and a single body packed under
+    // budget fits without one. The guess only ever increases and is bounded
+    // by one page per row, so this always terminates.
+    let mut total_guess: usize = 1;
+    loop {
+        let overhead = if total_guess <= 1 {
+            0
+        } else {
+            feed_list_page_footer(total_guess as i64, total_guess as i64)
+                .encode_utf16()
+                .count()
+                + 1 // joining newline
+        };
+        let budget = DISCORD_MESSAGE_CONTENT_LIMIT.saturating_sub(overhead);
+        let bodies = FeedRelay::list_pages(feeds, budget);
+        if bodies.len() <= total_guess {
+            let total = bodies.len() as i64;
+            if page > total {
+                return feed_list_page_out_of_range_text(page, total);
+            }
+            if bodies.len() == 1 {
+                return bodies[0].clone();
+            }
+            return format!(
+                "{}\n{}",
+                bodies[(page - 1) as usize],
+                feed_list_page_footer(page, total)
+            );
+        }
+        // Bodies outnumber the guess, so the guess strictly increases.
+        total_guess = bodies.len();
+    }
+}
+
+/// `Page n of total` footer with usable navigation for multi-page lists.
+/// Stays off single-page replies so short lists keep their legacy shape.
+#[must_use]
+pub fn feed_list_page_footer(current: i64, total: i64) -> String {
+    format!("Page {current} of {total}. Run /feed-list page:<number> for another page.")
+}
+
+/// `/feed-list` refusal for `page < 1` (Discord's registry minimum is 1,
+/// but the runtime still refuses a bypassed value with this exact text).
+#[must_use]
+pub fn feed_list_page_underflow_text() -> &'static str {
+    "Page must be at least 1. Use /feed-list page:1 to start."
+}
+
+/// `/feed-list` refusal for a present-but-unusable `page` option (a wrong
+/// wire type): it must refuse, never silently list the default page.
+#[must_use]
+pub fn feed_list_page_invalid_text() -> &'static str {
+    "Invalid page. Use /feed-list page:<number> with a whole number from 1."
+}
+
+/// `/feed-list` refusal for `page > total`. Lists no rows and never
+/// overflows on extreme page values.
+#[must_use]
+pub fn feed_list_page_out_of_range_text(page: i64, total: i64) -> String {
+    format!("Page {page} is out of range: use /feed-list page:<n> with n from 1 to {total}.")
+}
+
 pub fn feed_removed_text(removed: bool) -> &'static str {
     if removed {
         "Feed relay removed."

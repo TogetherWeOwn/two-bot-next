@@ -60,13 +60,21 @@ export const ALERT_INPUT_LABELS: Record<string, Record<string, readonly string[]
  * queue oldest age) is optional for the same reason: an older container
  * without it must still scrape, with the stall rules held rather than every
  * rule silenced. Queue depth (`two_bot_voice_queue_pending{lane}`) stays
- * unvalidated: no rule consumes it (see the catalog deferral). The safety
- * family below (retention purge-skip counter, voice dispatch-timeout,
- * watchdog-stuck and halt-recovery counters, breaker opens and global-pause
- * counters) is optional for the same reason, with the safety-series tickets
- * held. Breaker closes (`two_bot_rest_guard_breaker_closes_total`) stays
- * unvalidated: no rule consumes it (see the catalog deferral). The
- * evaluator already tolerates their absence.
+ * unvalidated: no rule consumes it (see the catalog deferral). The guard
+ * health inputs (token latch, invalid/refused totals, pending global bodies)
+ * are optional for the same reason: an older container without them must
+ * still scrape, with the token/surge/stuck rules held rather than every rule
+ * silenced. The safety family below (retention purge-skip counter, voice
+ * dispatch-timeout, watchdog-stuck and halt-recovery counters, breaker opens
+ * and global-pause counters) is optional for the same reason, with the
+ * safety-series tickets held. Breaker closes
+ * (`two_bot_rest_guard_breaker_closes_total`) stays unvalidated: no rule
+ * consumes it (see the catalog deferral). The domain-outcome family below
+ * (feed-fetch errors, EventSub received and reconcile errors, automod
+ * decisions, moderation enforcements, voice REST in-flight age and
+ * global-backoff caps) is optional for the same reason: an older container
+ * without it must still scrape, with the domain-outcome tickets held rather
+ * than every rule silenced. The evaluator already tolerates their absence.
  */
 export const ALERT_OPTIONAL_INPUT_LABELS: Record<string, Record<string, readonly string[]>> = {
   two_bot_gateway_prefix_trigger_refused_total: { reason: ["verdict", "other"] },
@@ -74,6 +82,10 @@ export const ALERT_OPTIONAL_INPUT_LABELS: Record<string, Record<string, readonly
   two_bot_voice_creator_map_generation: {},
   two_bot_voice_creator_map_age_seconds: {},
   two_bot_rest_guard_breaker_open: {},
+  two_bot_rest_guard_token_invalid: {},
+  two_bot_rest_guard_invalid_requests_total: {},
+  two_bot_rest_guard_rejected_requests_total: {},
+  two_bot_rest_guard_pending_global_responses: {},
   // Older containers may omit the halt gauge; absence holds its active ticket.
   two_bot_audit_delivery_halt: {},
   two_bot_community_facts_drain_failures_total: { reason: ["error", "timeout", "other"] },
@@ -94,6 +106,17 @@ export const ALERT_OPTIONAL_INPUT_LABELS: Record<string, Record<string, readonly
   two_bot_voice_halt_recoveries_total: {},
   two_bot_rest_guard_breaker_opens_total: {},
   two_bot_rest_guard_global_pauses_total: {},
+  // Domain-outcome and voice-liveness family; old containers may omit the whole family.
+  two_bot_feed_fetch_errors_total: { error_class: ["invalid_source", "non_public_address", "redirect_refused", "too_large", "invalid_encoding", "unsupported_content_type", "unsupported_encoding", "resolve", "transport", "deadline", "http_error", "other"] },
+  two_bot_eventsub_received_total: {},
+  two_bot_eventsub_reconcile_errors_total: { error_class: ["reconcile_action_failed", "reconcile_prior_failed", "reconcile_unhealthy", "reconcile_failed", "other"] },
+  two_bot_automod_decisions_total: { outcome: ["accepted", "already_processed", "dry_run", "protected", "deleted", "warned", "timed_out", "sanction_refused"] },
+  two_bot_moderation_enforcements_total: {
+    verb: ["ban", "tempban", "kick", "timeout", "warn", "purge", "slowmode", "lockdown", "unlock"],
+    outcome: ["success", "refused", "discord_error", "storage_error", "other"],
+  },
+  two_bot_voice_rest_in_flight_age_seconds: {},
+  two_bot_voice_global_backoff_capped_total: {},
   // Same-scrape lifecycle evidence; old containers may omit the whole family.
   two_bot_process_incarnation: { part: ["0", "1", "2", "3"] },
 };
@@ -164,7 +187,7 @@ export function parseAlertScrape(text: string): Sample[] | null {
       } else if (Object.keys(labels).length !== Object.keys(axes).length
         || Object.keys(axes).some((axis) => !labels[axis])
         || !Number.isFinite(value) || !Number.isInteger(value) || value < 0 || value > 18446744073709551615
-        || ((name === "two_bot_db_pool_configured" || name === "two_bot_audit_delivery_halt" || name === "two_bot_rest_guard_breaker_open" || name === "two_bot_voice_worker_halted") && value !== 0 && value !== 1)) return null;
+        || ((name === "two_bot_db_pool_configured" || name === "two_bot_audit_delivery_halt" || name === "two_bot_rest_guard_breaker_open" || name === "two_bot_voice_worker_halted" || name === "two_bot_rest_guard_token_invalid") && value !== 0 && value !== 1)) return null;
       // Per-family state uses plain objects in the evaluator. Future families
       // are welcome, but never allow inherited object properties as subjects.
       if (name === "two_bot_internal_actions_total" && labels["family"]! in Object.prototype) return null;

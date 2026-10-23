@@ -43,6 +43,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use two_bot_core::join_risk_store::{JoinRiskClaim, JoinRiskStore};
+use two_bot_core::metrics::{self, JoinQueueDropReason};
 use two_bot_core::onboarding::MentionPolicy;
 use two_bot_core::raid::{
     JoinRiskInput, JoinRiskPolicy, DEFAULT_JOIN_RISK_THRESHOLD, DEFAULT_JOIN_RISK_WINDOW_SECONDS,
@@ -293,6 +294,7 @@ impl SettingsSource for StoreSettings {
                     !matches!(&self.last, Some(Err(previous)) if previous.key() == refusal.key());
                 if changed {
                     error!(
+                        error_class = "join_risk_tuning_refused",
                         key = refusal.key(),
                         "join_risk_tuning_refused: present-but-unusable tuning; scoring disabled"
                     );
@@ -345,18 +347,39 @@ struct JoinRiskWorker<S> {
     store: JoinRiskStore,
     delivery: RaidDelivery,
     joins: mpsc::Receiver<JoinObservation>,
+    shutdown: Arc<crate::raid_runtime::WorkerShutdown>,
 }
 
 impl<S: SettingsSource> JoinRiskWorker<S> {
     async fn run(mut self) {
-        while let Some(join) = self.joins.recv().await {
-            // An internal failure must never end scoring: log it and carry on.
-            if AssertUnwindSafe(self.handle(join))
-                .catch_unwind()
-                .await
-                .is_err()
-            {
-                error!("join_risk_failed: observation panicked");
+        loop {
+            tokio::select! {
+                biased;
+                () = self.shutdown.notified() => {
+                    let dropped = crate::raid_runtime::drain_queued(&mut self.joins);
+                    self.shutdown.note_dropped(dropped);
+                    crate::raid_runtime::worker_shutdown_drain(self.shutdown.finished(), dropped);
+                    return;
+                }
+                msg = self.joins.recv() => {
+                    let Some(join) = msg else {
+                        // Unlatched sender-drop: every buffered join already
+                        // yielded above, so the legacy full drain exits here.
+                        return;
+                    };
+                    // An internal failure must never end scoring: log it and carry on.
+                    if AssertUnwindSafe(self.handle(join))
+                        .catch_unwind()
+                        .await
+                        .is_err()
+                    {
+                        error!(
+                            error_class = "join_risk_failed",
+                            "join_risk_failed: observation panicked"
+                        );
+                    }
+                    self.shutdown.note_finished();
+                }
             }
         }
     }
@@ -389,7 +412,10 @@ impl<S: SettingsSource> JoinRiskWorker<S> {
         ) {
             Ok(policy) => policy,
             Err(_) => {
-                error!("join_risk_policy_rejected: live tuning unusable");
+                error!(
+                    error_class = "join_risk_policy_rejected",
+                    "join_risk_policy_rejected: live tuning unusable"
+                );
                 return;
             }
         };
@@ -399,7 +425,11 @@ impl<S: SettingsSource> JoinRiskWorker<S> {
         let Some(created_at_ms) =
             snowflake_to_date_ms(&join.member_id.to_string()).map(|ms| ms as i64)
         else {
-            error!(member_id = join.member_id, "join_risk_no_account_age");
+            error!(
+                error_class = "join_risk_no_account_age",
+                member_id = join.member_id,
+                "join_risk_no_account_age"
+            );
             return;
         };
         let input = JoinRiskInput {
@@ -420,7 +450,10 @@ impl<S: SettingsSource> JoinRiskWorker<S> {
         {
             Ok(claim) => claim,
             Err(_) => {
-                error!("join_risk_store_failed: claim not recorded");
+                error!(
+                    error_class = "join_risk_store_failed",
+                    "join_risk_store_failed: claim not recorded"
+                );
                 return;
             }
         };
@@ -435,6 +468,7 @@ impl<S: SettingsSource> JoinRiskWorker<S> {
         };
         // Always log first. If the post fails the evidence still exists.
         error!(
+            error_class = "join_risk_evidence",
             member_id = %evidence.observation.member_id,
             score = evidence.score,
             join_count,
@@ -451,7 +485,10 @@ impl<S: SettingsSource> JoinRiskWorker<S> {
         // The shared executor always sends empty allowed mentions; refuse a
         // proposal that asks for anything else rather than widen that boundary.
         if message.mentions != MentionPolicy::None {
-            error!(channel, "join_risk_refused: mention policy is not empty");
+            error!(
+                error_class = "join_risk_refused",
+                channel, "join_risk_refused: mention policy is not empty"
+            );
             return;
         }
         match self
@@ -465,10 +502,14 @@ impl<S: SettingsSource> JoinRiskWorker<S> {
                 "join_risk_posted"
             ),
             Delivery::Undeliverable => error!(
+                error_class = "join_risk_undeliverable",
                 channel,
                 "join_risk_undeliverable: channel missing, not text, or bot lacks View/Send"
             ),
-            Delivery::Failed => error!(channel, "join_risk_post_failed"),
+            Delivery::Failed => error!(
+                error_class = "join_risk_post_failed",
+                channel, "join_risk_post_failed"
+            ),
         }
     }
 }
@@ -476,17 +517,48 @@ impl<S: SettingsSource> JoinRiskWorker<S> {
 /// The pipeline-facing half: queue only, never block.
 pub struct JoinRiskRuntime {
     joins: mpsc::Sender<JoinObservation>,
+    shutdown: Arc<crate::raid_runtime::WorkerShutdown>,
+}
+
+impl JoinRiskRuntime {
+    /// Latch the bounded shutdown drain: the worker finishes its in-flight
+    /// join, drops the queued inbox with a count, logs
+    /// `worker_shutdown_drain`, and exits so its handle joins.
+    pub fn shutdown(&self) {
+        self.shutdown.latch();
+    }
+
+    /// Dequeued joins handled to completion, caught panics included.
+    #[cfg(test)]
+    pub fn finished(&self) -> u64 {
+        self.shutdown.finished()
+    }
+
+    /// Queued joins dropped without starting after a latched shutdown.
+    #[cfg(test)]
+    pub fn dropped_shutdown(&self) -> u64 {
+        self.shutdown.dropped()
+    }
 }
 
 impl JoinObserver for JoinRiskRuntime {
     fn observe_join(&self, join: JoinObservation) {
         match self.joins.try_send(join) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(join)) => warn!(
-                member_id = join.member_id,
-                "join-risk queue full; join not scored"
-            ),
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Full(join)) => {
+                metrics::global().join_risk_dropped_join(JoinQueueDropReason::QueueFull);
+                warn!(
+                    member_id = join.member_id,
+                    "join-risk queue full; join not scored"
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                metrics::global().join_risk_dropped_join(JoinQueueDropReason::QueueClosed);
+                error!(
+                    error_class = "join_risk_queue_closed",
+                    "join-risk queue closed; join not scored"
+                );
+            }
         }
     }
 }
@@ -505,7 +577,10 @@ impl JoinObserver for Fanout {
     }
 }
 
-/// Spawn the worker. It ends when the last [`JoinRiskRuntime`] reference drops.
+/// Spawn the worker. [`JoinRiskRuntime::shutdown`] latches the bounded drain
+/// (finish the in-flight join, drop the queue with a count); an unlatched
+/// worker ends when the last [`JoinRiskRuntime`] reference drops, draining
+/// fully as before.
 pub fn start<S: SettingsSource>(
     guild_id: u64,
     settings: S,
@@ -513,15 +588,20 @@ pub fn start<S: SettingsSource>(
     executor: ActionExecutor,
 ) -> (Arc<JoinRiskRuntime>, JoinHandle<()>) {
     let (sender, receiver) = mpsc::channel(QUEUE_CAPACITY);
+    let shutdown = Arc::new(crate::raid_runtime::WorkerShutdown::default());
     let worker = JoinRiskWorker {
         guild_id,
         settings,
         store,
         delivery: RaidDelivery::new(executor, guild_id),
         joins: receiver,
+        shutdown: Arc::clone(&shutdown),
     };
     (
-        Arc::new(JoinRiskRuntime { joins: sender }),
+        Arc::new(JoinRiskRuntime {
+            joins: sender,
+            shutdown,
+        }),
         tokio::spawn(worker.run()),
     )
 }
@@ -529,13 +609,18 @@ pub fn start<S: SettingsSource>(
 /// Production wiring: the raid watch always, plus join-risk delivery only
 /// inside the anti-nuke fences. Cold reads (`TWO_ANTI_NUKE`,
 /// `TWO_ANTI_NUKE_DRY_RUN`, `TWO_ONBOARDING_MODE`) come from the deployment
-/// environment; Hot tuning comes from the settings store.
+/// environment; Hot tuning comes from the settings store. The service
+/// shutdown receiver latches the risk worker drain through a bounded
+/// supervisor that holds the worker handle and joins-or-aborts it; the
+/// supervisor handle is returned for the `main` shutdown join (`None` when
+/// the fences refuse and no risk worker spawns) and must not be detached.
 pub fn chain_from_env(
     pool: PgPool,
     executor: ActionExecutor,
     guild_id: u64,
     raid: Arc<RaidRuntime>,
-) -> Arc<dyn JoinObserver> {
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> (Arc<dyn JoinObserver>, Option<JoinHandle<()>>) {
     let vars: HashMap<String, String> = std::env::vars().collect();
     let fences = AntiNukeFences::from_vars(&vars, guild_id);
     if !fences.enabled {
@@ -544,7 +629,8 @@ pub fn chain_from_env(
             staging_guild = guild_id.to_string() == STAGING_GUILD_ID,
             "join_risk_disabled: chain is the raid watch alone"
         );
-        return raid;
+        let observer: Arc<dyn JoinObserver> = raid;
+        return (observer, None);
     }
     info!(
         armed = fences.armed,
@@ -560,16 +646,26 @@ pub fn chain_from_env(
                 .map(|value| ((*key).to_owned(), value.clone()))
         })
         .collect();
-    let (risk, _worker) = start(
+    let (risk, worker) = start(
         guild_id,
         StoreSettings::new(pool.clone(), guild_id, deployment),
         JoinRiskStore::from_pool(pool),
         executor,
     );
-    Arc::new(Fanout {
+    let supervisor = crate::raid_runtime::join_on_shutdown(
+        worker,
+        shutdown,
+        crate::raid_runtime::WORKER_JOIN_BUDGET,
+        {
+            let risk = Arc::clone(&risk);
+            move || risk.shutdown()
+        },
+    );
+    let observer: Arc<dyn JoinObserver> = Arc::new(Fanout {
         first: raid,
         second: risk,
-    })
+    });
+    (observer, Some(supervisor))
 }
 
 #[cfg(test)]

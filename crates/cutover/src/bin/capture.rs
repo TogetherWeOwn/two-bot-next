@@ -14,22 +14,43 @@
 
 use std::collections::BTreeMap;
 use twilight_model::id::Id;
-use two_bot_cutover::cli::{now_iso, open_db, Args};
+use two_bot_cutover::cli::{now_iso, open_db, parse_env_guild, Args, DB_POOL_HELP};
+use two_bot_cutover::rest::RestError;
 use two_bot_cutover::{
     attribute_joins, invite_growth, mark_bot, record_event, FunnelWrite, InviteState, RestClient,
 };
+
+/// Fold a guild read into vanity-URL presence. A refused read is lost
+/// access, not an absent vanity URL: the error propagates so the run
+/// stops instead of baselining against an unreadable guild.
+fn vanity_presence(code: Result<Option<String>, RestError>) -> Result<bool, RestError> {
+    code.map(|code| code.is_some())
+}
 
 #[tokio::main]
 async fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let args = Args::parse(&argv);
+    if args.has("help") {
+        println!(
+            "Usage: capture [--dry-run] [--discord-base <url>] [--allow-live-guild]\n\
+             Env: DISCORD_TOKEN (or DISCORD_BOT_TOKEN), DISCORD_GUILD_ID, TWO_DATABASE_URL.\n\
+             {DB_POOL_HELP}"
+        );
+        return;
+    }
     let dry_run = args.has("dry-run");
 
     let token = std::env::var("DISCORD_TOKEN")
         .or_else(|_| std::env::var("DISCORD_BOT_TOKEN"))
         .unwrap_or_default();
     let guild_id = std::env::var("DISCORD_GUILD_ID").unwrap_or_default();
-    if token.is_empty() || guild_id.is_empty() {
+    let guild: Id<twilight_model::id::marker::GuildMarker> =
+        Id::new(parse_env_guild(&guild_id).unwrap_or_else(|error| {
+            eprintln!("input error: {error}");
+            std::process::exit(2);
+        }));
+    if token.is_empty() {
         eprintln!("Missing DISCORD_BOT_TOKEN or DISCORD_GUILD_ID.");
         std::process::exit(2);
     }
@@ -61,7 +82,6 @@ async fn main() {
             std::process::exit(1);
         });
     let db = open_db(&args, false).await;
-    let guild: Id<twilight_model::id::marker::GuildMarker> = Id::new(guild_id.parse().unwrap_or(0));
 
     println!(
         "\nTWO capture{}",
@@ -128,13 +148,19 @@ async fn main() {
         eprintln!("Read zero members. That is Server Members Intent being OFF.");
         std::process::exit(1);
     }
-    let has_vanity = rest
+    // A refused guild read is lost access, not an absent vanity URL: refuse
+    // to baseline against an unreadable guild.
+    let code = rest
         .guild(guild)
         .await
-        .ok()
-        .flatten()
-        .and_then(|g| g.vanity_url_code)
-        .is_some();
+        .map(|guild| guild.and_then(|g| g.vanity_url_code));
+    let has_vanity = match vanity_presence(code) {
+        Ok(present) => present,
+        Err(error) => {
+            eprintln!("Guild read refused ({error}); capture stopped.");
+            std::process::exit(1);
+        }
+    };
 
     let mut new_joins: Vec<(String, String)> = Vec::new();
     let mut bots = 0usize;
@@ -282,7 +308,7 @@ async fn store_counters(
         .iter()
         .map(|inv| two_bot_cutover::invite_store::CounterRow {
             code: inv.code.clone(),
-            uses: inv.uses.unwrap_or(0) as i64,
+            uses: inv.uses.unwrap_or(0),
             inviter_id: inv.inviter.as_ref().map(|u| u.id.get().to_string()),
             channel_id: inv.channel.as_ref().map(|c| c.id.get().to_string()),
         })
@@ -293,4 +319,31 @@ async fn store_counters(
             eprintln!("invite snapshot write failed: {e}");
             std::process::exit(1);
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vanity_presence_distinguishes_absence_from_refusal() {
+        // `RestError` is not `PartialEq` (it wraps transport errors), so the
+        // readable cases assert on the unwrapped bool, not the `Result`.
+        assert!(
+            vanity_presence(Ok(Some("two".to_owned()))).expect("present code must read"),
+            "a vanity code reads present"
+        );
+        assert!(
+            !vanity_presence(Ok(None)).expect("genuine absence must read"),
+            "genuine absence reads absent"
+        );
+        assert!(
+            vanity_presence(Err(RestError::Refused { status: 403 })).is_err(),
+            "lost access refuses instead of reading as absent"
+        );
+        assert!(
+            vanity_presence(Err(RestError::Wire("HTTP 5xx retry exhausted".to_owned()))).is_err(),
+            "a spent retry budget refuses instead of reading as absent"
+        );
+    }
 }

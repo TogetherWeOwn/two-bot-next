@@ -37,6 +37,18 @@ def env(url=PROD_URL, host=PROD_HOST, database=PROD_DB, branch=""):
     }
 
 
+def plan_report(**fields):
+    manifest = {
+        "runner_version": 1, "mode": "plan", "migration_target": "production",
+        "source_sha": SHA, "role": "two_bot_migrator_ro",
+        "target": {"host": PROD_HOST, "database": PROD_DB, "branch_id": ""},
+        "applied_count": 0, "applied_store_count": 0,
+        "pending_before": [], "pending_store_before": [],
+    }
+    manifest.update(fields)
+    return manifest
+
+
 class PinsFromUrlTests(unittest.TestCase):
     def test_direct_url_yields_lowercase_host_and_database(self):
         host, database, branch = pins_from_url(
@@ -255,17 +267,19 @@ class MainTests(unittest.TestCase):
 
     def test_main_forwards_branch_pin_from_env(self):
         seen = []
+        host, database, branch = "myapp.pg.psdb.cloud", "postgres", "cnlmx96ec5kw"
 
         def capture(*args):
             seen.append(args)
-            return {"pending_before": [], "pending_store_before": []}
+            return plan_report(target={"host": host, "database": database, "branch_id": branch})
 
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "manifest.json"
             self.assertEqual(
                 main(["--binary", "bin", "--source-sha", SHA, "--mode", "deploy",
                       "--manifest-out", str(out)],
-                     env=env(branch="cnlmx96ec5kw"), run=capture), 0)
+                     env=env(url=f"postgresql://two-bot-migrator-ro.{branch}:pw@{host}/{database}",
+                             host=host, database=database, branch=branch), run=capture), 0)
             self.assertEqual(seen[0][-1], "cnlmx96ec5kw")
 
     def test_clean_plan_passes(self):
@@ -274,7 +288,7 @@ class MainTests(unittest.TestCase):
             self.assertEqual(
                 self.run_main(["--binary", "bin", "--source-sha", SHA,
                                "--mode", "deploy"],
-                              lambda *args: {"pending_before": [], "pending_store_before": []}, out), 0)
+                              lambda *args: plan_report(), out), 0)
             manifest = json.loads(out.read_text())
             self.assertEqual(manifest["pending_before"], [])
             self.assertEqual(manifest["pending_store_before"], [])
@@ -284,7 +298,7 @@ class MainTests(unittest.TestCase):
             out = Path(tmp) / "manifest.json"
             result = self.run_main(
                 ["--binary", "bin", "--source-sha", SHA, "--mode", "deploy"],
-                lambda *args: {"pending_before": [], "pending_store_before": [400, 401]}, out)
+                lambda *args: plan_report(pending_store_before=[400, 401]), out)
             self.assertEqual(result, 1)
             self.assertEqual(
                 json.loads(out.read_text())["pending_store_before"], [400, 401])
@@ -296,10 +310,7 @@ class MainTests(unittest.TestCase):
                 with self.assertRaises(Refused):
                     self.run_main(
                         ["--binary", "bin", "--source-sha", SHA, "--mode", "deploy"],
-                        lambda *args: {
-                            "pending_before": [],
-                            "pending_store_before": store_pending,
-                        }, out)
+                        lambda *args: plan_report(pending_store_before=store_pending), out)
 
     def test_drift_fails_with_the_pending_list(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -307,7 +318,7 @@ class MainTests(unittest.TestCase):
             self.assertEqual(
                 self.run_main(["--binary", "bin", "--source-sha", SHA,
                                "--mode", "deploy"],
-                              lambda *args: {"pending_before": [424, 425], "pending_store_before": []}, out), 1)
+                              lambda *args: plan_report(pending_before=[424, 425]), out), 1)
 
     def test_refused_binding_exits_unusable(self):
         def refuse(*args):
@@ -339,7 +350,7 @@ class MainTests(unittest.TestCase):
             with self.assertRaises(Refused):
                 self.run_main(["--binary", "bin", "--source-sha", "abc",
                                "--mode", "deploy"],
-                              lambda *args: {"pending_before": [], "pending_store_before": []}, out)
+                              lambda *args: plan_report(), out)
 
 
 class PendingVersionsTests(unittest.TestCase):

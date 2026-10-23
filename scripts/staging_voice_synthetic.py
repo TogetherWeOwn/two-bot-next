@@ -95,6 +95,15 @@ FALLBACK = re.compile(r"^.+['’]s room$")
 # marker means a previous run did not restore, and the rename is skipped.
 RENAME_MARKER = " (synthetic)"
 
+# Fixed vocabulary for an attempted user_limit write without a verified
+# read-back (lost/ambiguous probe response, failed read, mismatch, or a
+# non-2xx status other than 403/429). The limit check FAILs with this reason
+# even when the bounded cleanup restores the original value, so an uncertain
+# write never reads as green. A verified cleanup names the room, the original
+# value and `re-run`; a failed/unverified cleanup names the room, the
+# original value, `restore` and `manually`.
+LIMIT_UNCERTAIN = "room user_limit write was not verified"
+
 # Body-cap refusal contract (same shape as staging_probe.py MAX_BODY_BYTES and
 # the contract probe BODY_CAP): every response read takes at most
 # MAX_BODY_BYTES+1 bytes so a hidden suffix is detected. Any body longer than
@@ -343,11 +352,20 @@ def evaluate(obs):
     out.append(check("name", bool(name) and not FALLBACK.match(name),
                      f"created name {name!r} (fallback pattern <display>'s room must not match)"))
     order = [c["id"] for c in voice_order(obs.get("channels", []), creator.get("parent_id"))]
-    block = [r for r in creator_block(obs.get("channels_before", []), creator) if r != room_id]
+    live = set(order)
+    before_block = [r for r in creator_block(obs.get("channels_before", []), creator) if r != room_id]
+    # A snapshotted predecessor the empty-room sweep deleted mid-run is not a
+    # misplacement: the expected slot follows the predecessors still present
+    # when the room's position is read, and the detail names the swept ones.
+    block = [r for r in before_block if r in live]
     after = block[-1] if block else creator["id"]
     ok = room_id in order and after in order and order.index(room_id) == order.index(after) + 1
-    out.append(check("position", ok, f"category voice order {order}; room must follow {after} "
-                                     f"(creator {creator['id']}, its existing rooms {block})"))
+    detail = (f"category voice order {order}; room must follow {after} "
+              f"(creator {creator['id']}, its existing rooms {block})")
+    swept = [r for r in before_block if r not in live]
+    if swept:
+        detail += f"; swept since the snapshot: {swept}"
+    out.append(check("position", ok, detail))
     mine = [o for o in created.get("permission_overwrites", [])
             if o.get("type") == 1 and o.get("id") == obs["me"]]
     allow = int(mine[0]["allow"]) if mine else 0
@@ -871,32 +889,46 @@ def run_live(args, token):
             else:
                 obs["rename_note"] = f"rename PATCH answered {status}; rename skipped"
         obs["channels_before"] = rest(token, f"/guilds/{args.guild}/channels")
+        pre_existing_ids = {c.get("id") for c in obs["channels_before"]
+                            if isinstance(c.get("id"), str)}
         s.voice(args.guild, args.creator)
         joined = True
         mark = len(s.events)
         parent = creator.get("parent_id")
 
-        def created_room(after):
-            # The room the bot created for us: a voice channel in the creator's
-            # category that appeared after `after` (the create can arrive before
-            # or after our own move).
-            return next((e["d"] for e in s.events[after:] if e["t"] == "CHANNEL_CREATE"
-                         and e["d"].get("type") == 2 and e["d"].get("parent_id") == parent), None)
+        def created_room(after, expected_id):
+            # The room the bot created for us: the same-window CHANNEL_CREATE
+            # that corroborates our own move destination (same id, configured
+            # guild, voice type, creator's category). A first-arriving
+            # unrelated CREATE never authorizes a probe.
+            return next((e["d"] for e in s.events[after:]
+                         if e["t"] == "CHANNEL_CREATE"
+                         and e["d"].get("id") == expected_id
+                         and e["d"].get("guild_id") == args.guild
+                         and e["d"].get("type") in VOICE_TYPES
+                         and e["d"].get("parent_id") == parent), None)
 
         def landed(exclude):
-            return lambda e: (e["t"] == "VOICE_STATE_UPDATE" and e["d"].get("user_id") == s.me
+            return lambda e: (e["t"] == "VOICE_STATE_UPDATE"
+                              and e["d"].get("guild_id") == args.guild
+                              and e["d"].get("user_id") == s.me
                               and e["d"].get("channel_id") not in (None, args.creator, *exclude))
 
         moved = s.pump(landed(()), time.monotonic() + args.create_within)
         obs["moved_to"] = moved["d"]["channel_id"] if moved else None
-        obs["room_created"] = created_room(mark)
-        room_id = (obs["room_created"] or {}).get("id") or obs["moved_to"]
+        # Let the status line, any follow-up writes and a late CREATE land
+        # before correlating: the create can arrive before or after our move.
+        s.pump(lambda e: False, time.monotonic() + args.settle)
+        moved_to = obs["moved_to"]
+        if moved_to is None or moved_to == args.creator or moved_to in pre_existing_ids:
+            obs["room_created"] = None
+            room_id = None
+        else:
+            obs["room_created"] = created_room(mark, moved_to)
+            room_id = moved_to if obs["room_created"] is not None else None
         obs["room_id"] = room_id
+        rejoin_mark = None
         if room_id:
-            # Let the status line and any follow-up writes land, collecting events.
-            s.pump(lambda e: False, time.monotonic() + args.settle)
-            if obs["room_created"] is None:
-                obs["room_created"] = rest(token, f"/channels/{room_id}")
             obs["channels"] = rest(token, f"/guilds/{args.guild}/channels")
             obs["statuses"] = [e["d"].get("status") for e in s.events
                                if e["t"] == "VOICE_CHANNEL_STATUS_UPDATE" and e["d"].get("id") == room_id]
@@ -911,31 +943,96 @@ def run_live(args, token):
             # was lost after creation); a limit 429 is allowed to SKIP.
             obs["limit_forbidden"] = obs["limit_rate_limited"] = False
             obs["limit_set_ok"] = obs["limit_restored"] = False
+            # Set before the probe PATCH: a request Discord applies but whose
+            # response is lost (timeout, failed read-back, mismatch) must still
+            # be restored, like the creator rename above.
+            obs["limit_attempted"] = False
             try:
                 seen = rest(token, f"/channels/{room_id}")
                 initial = int(seen.get("user_limit") or 0)
                 probed = 3 if initial == 2 else 2
                 obs["limit_initial"], obs["limit_probed"] = initial, probed
-                status, _ = rest_patch(token, f"/channels/{room_id}", {"user_limit": probed})
-                if status == 403:
-                    obs["limit_forbidden"] = True
-                elif status == 429:
-                    obs["limit_rate_limited"] = True
-                    obs["limit_note"] = ("room user_limit PATCH answered 429 "
-                                         "(rate limit); limit skipped")
-                elif status is not None and 200 <= status < 300:
-                    if int(rest(token, f"/channels/{room_id}").get("user_limit") or 0) == probed:
-                        obs["limit_set_ok"] = True
+
+                def restore_uncertain_limit():
+                    # Bounded, exception-safe cleanup for an attempted write
+                    # without a verified read-back: at most one restore PATCH
+                    # to the original value plus one verification read. The
+                    # limit check still FAILs with the fixed reason, so an
+                    # uncertain write never reads as green.
+                    verified = False
+                    try:
                         back, _ = rest_patch(token, f"/channels/{room_id}",
                                              {"user_limit": initial})
-                        if (back is not None and 200 <= back < 300
-                                and int(rest(token, f"/channels/{room_id}")
-                                        .get("user_limit") or 0) == initial):
-                            obs["limit_restored"] = True
+                        if back is not None and 200 <= back < 300:
+                            try:
+                                final = int(rest(token, f"/channels/{room_id}")
+                                            .get("user_limit") or 0)
+                            except Exception:
+                                verified = False
+                            else:
+                                verified = final == initial
+                    except Exception:
+                        verified = False
+                    if verified:
+                        obs["limit_note"] = (
+                            f"{LIMIT_UNCERTAIN} (room {room_id} restored "
+                            f"to {initial}); re-run the synthetic to confirm")
+                    else:
+                        obs["limit_note"] = (
+                            f"{LIMIT_UNCERTAIN} (room {room_id} may still be "
+                            f"{probed}, original {initial}); restore "
+                            f"user_limit to {initial} manually")
+
+                obs["limit_attempted"] = True
+                try:
+                    status, _ = rest_patch(token, f"/channels/{room_id}",
+                                           {"user_limit": probed})
+                except Exception:
+                    restore_uncertain_limit()
                 else:
-                    obs["limit_note"] = f"room user_limit PATCH answered {status}; limit skipped"
+                    if status == 403:
+                        obs["limit_forbidden"] = True
+                    elif status == 429:
+                        obs["limit_rate_limited"] = True
+                        obs["limit_note"] = ("room user_limit PATCH answered 429 "
+                                             "(rate limit); limit skipped")
+                    elif status is not None and 200 <= status < 300:
+                        try:
+                            current = int(rest(token, f"/channels/{room_id}")
+                                          .get("user_limit") or 0)
+                        except Exception:
+                            restore_uncertain_limit()
+                        else:
+                            if current != probed:
+                                restore_uncertain_limit()
+                            else:
+                                try:
+                                    back, _ = rest_patch(
+                                        token, f"/channels/{room_id}",
+                                        {"user_limit": initial})
+                                except Exception:
+                                    obs["limit_set_ok"] = True
+                                else:
+                                    if back is not None and 200 <= back < 300:
+                                        try:
+                                            final = int(rest(
+                                                token, f"/channels/{room_id}")
+                                                .get("user_limit") or 0)
+                                        except Exception:
+                                            obs["limit_set_ok"] = True
+                                        else:
+                                            if final == initial:
+                                                obs["limit_set_ok"] = True
+                                                obs["limit_restored"] = True
+                                            else:
+                                                obs["limit_set_ok"] = True
+                                    else:
+                                        obs["limit_set_ok"] = True
+                    else:
+                        restore_uncertain_limit()
             except Exception as exc:
-                obs["limit_note"] = f"{type(exc).__name__} during the limit round-trip"
+                if "limit_note" not in obs:
+                    obs["limit_note"] = f"{type(exc).__name__} during the limit round-trip"
             try:
                 room = rest(token, f"/channels/{room_id}")
                 roles = rest(token, f"/guilds/{args.guild}/roles")
@@ -957,10 +1054,23 @@ def run_live(args, token):
             except Exception as exc:
                 obs["panel_note"] = f"{type(exc).__name__} reading the room name for the panel"
             # Hop from our own room straight back into the creator: a member
-            # doing this must get a new room, not stay in the lobby.
+            # doing this must get a new room, not stay in the lobby. The hop
+            # counts only when the landing channel is corroborated by a
+            # same-window CHANNEL_CREATE for that id (neither the creator,
+            # the first room, nor a pre-existing channel); a foreign-guild
+            # update, a move into a pre-existing room or an unrelated channel
+            # without a CREATE never counts.
+            rejoin_mark = len(s.events)
             s.voice(args.guild, args.creator)
             again = s.pump(landed((room_id,)), time.monotonic() + args.create_within)
-            obs["rejoin_room_id"] = again["d"]["channel_id"] if again else None
+            rejoin_to = again["d"]["channel_id"] if again else None
+            if (rejoin_to is None or rejoin_to == args.creator
+                    or rejoin_to == room_id or rejoin_to in pre_existing_ids):
+                obs["rejoin_room_id"] = None
+            else:
+                # Provisional: the delete wait below collects a late CREATE,
+                # and the verdict is finalized after it.
+                obs["rejoin_room_id"] = rejoin_to
         rooms = [r for r in (room_id, obs.get("rejoin_room_id")) if r]
         s.voice(args.guild, None)
         joined = False
@@ -973,6 +1083,9 @@ def run_live(args, token):
             gone |= {e["d"]["id"] for e in s.events if e["t"] == "CHANNEL_DELETE"}
             obs["deleted"] = set(rooms) <= gone
             obs["delete_seconds"] = round(time.monotonic() - left, 1)
+        if room_id and obs.get("rejoin_room_id") and rejoin_mark is not None:
+            if created_room(rejoin_mark, obs["rejoin_room_id"]) is None:
+                obs["rejoin_room_id"] = None
     finally:
         if joined:
             try:

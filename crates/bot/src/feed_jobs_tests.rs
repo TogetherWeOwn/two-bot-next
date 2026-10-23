@@ -433,7 +433,7 @@ async fn supervisor_applies_a_hot_reloaded_feed_interval_without_restart() {
         "increase defers the next run"
     );
     stop.send(true).unwrap();
-    task.await.unwrap();
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test(start_paused = true)]
@@ -560,7 +560,7 @@ async fn immediate_nonoverlap_and_supervisor_cancels_and_joins() {
     tokio::task::yield_now().await;
     assert_eq!(starts.load(Ordering::SeqCst), 1, "busy tick skipped");
     stop.send_replace(true);
-    owner.await.unwrap();
+    owner.await.unwrap().unwrap();
     assert_eq!(active.load(Ordering::SeqCst), 0, "active action joined");
     assert!(!status.read().await[NAME].running);
     tokio::time::advance(Duration::from_secs(600)).await;
@@ -643,7 +643,7 @@ async fn supervisor_timeout_finishes_schedule_and_later_tick_runs() {
     assert!(status.read().await[NAME].last_success.is_some());
     assert_eq!(status.read().await[NAME].consecutive_failures, 0);
     stop.send_replace(true);
-    owner.await.unwrap();
+    owner.await.unwrap().unwrap();
 }
 
 #[tokio::test]

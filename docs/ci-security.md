@@ -173,6 +173,43 @@ process list, runs every statement in a `READ ONLY` transaction, never echoes
 the client's error text, and writes only an ordinal, `event_type` and
 `recorded_at` per row.
 
+## Staging privacy verify read (manual)
+
+`staging-privacy-verify-read.yml` is a manual, staging-only, read-only
+workflow that gives the privacy fixture its purge-verification counts
+([privacy.md](privacy.md) staging section) without handing any agent a
+database credential. The regression pins it as `workflow_dispatch`-only
+with exactly one required choice input (`guild`: `g` or `h`, no member,
+window or default). Its single `read` job runs only from `main`, in the
+`staging-privacy-verify-read` environment, on the routed runner for job
+`read`, with `contents: read`, a 5-minute timeout and its own
+non-cancelling concurrency group. It has exactly three unconditional steps:
+pinned checkout without persisted credentials, one Run step that passes the
+input through the environment (never an inline expression) to
+`scripts/staging_privacy_verify_read.py`, and the 14-day upload of
+`staging-privacy-verify-read-<run_id>.json`. Its four secrets are
+`TWO_BOT_STAGING_PRIVACY_RO_DATABASE_URL` (role
+`two_bot_privacy_verify_ro`, column-limited `SELECT` on exactly six
+tables), `STAGING_PRIVACY_VERIFY_EXPECTED_HOST` (independently pinned
+staging endpoint hostname), `STAGING_FIXTURE_MEMBER_ID`, and
+`STAGING_PRIVACY_VERIFY_H_GUILD_ID` (second-guild pin, unset until
+recorded and verified not-live), scoped to that Run step. The pins and
+member are secrets rather than variables because a step's `env` block
+prints variable values on the public run page. No `set -x`, no wrangler,
+no production path.
+
+The script refuses before connecting unless the guild alias is `g` or `h`
+(`h` refuses until its pin is bound, well-formed, distinct from staging and
+not the live guild), the login names role `two_bot_privacy_verify_ro` on
+database `two_bot`, and the URL host exactly matches the independent
+staging-host pin. It forces libpq `sslmode=verify-full` with the runner's
+system CA bundle, so the server certificate must authenticate that host. It
+keeps the password out of the process list, runs every statement in a
+`READ ONLY` transaction, never echoes the client's error text, and writes
+only the guild alias, all-time pair counts, sweep counts, receipt actors
+and timestamps. The 15-minute events-smoke window does not apply; counts
+above one million fail closed.
+
 ## Staging retention census (manual)
 
 `staging-retention-census.yml` is a manual, staging-only, read-only workflow
@@ -208,6 +245,63 @@ activates Execute. The ledger scope is exactly the two expiry migrations
 (444/445); both cohort captures reuse one server-anchored window, so the
 bounds cannot move between them. An empty cohort or empty family is a
 reported limitation, never a pass.
+
+### Agent observation contract
+
+The default text report and optional `--json` output project the same admitted
+result. JSON is exactly one document (no progress prose): `schema_version: 1`,
+`status`, `observations`, `limitations`, `error`. Each observation has a stable
+`id`, `code`, typed `value` and `next_action`; limitations omit `value`. IDs are
+`observed_before`, `observed_after`, `migrations`, `indexes`, `counts`,
+`cohort_before`, `cohort_after`, optional `digest_match`, `mode` and `counters`.
+Codes are `observed` or `unobserved`; mode/counters always have null values.
+Limitation IDs/codes are `empty_cohort`, `pgcrypto_absent` and `empty_families`.
+Empty cohorts and absent pgcrypto suppress `digest_match`; a mismatch is observed
+data, not a read failure. None of these observations proves retention execution.
+
+Database timestamps accept ISO dates with space/T, up to six fractional digits,
+and explicit Z or signed HH, HHMM, HH:MM or HH:MM:SS zones (hours 00–15,
+minutes/seconds 00–59). Calendar-invalid, infinite, unzoned or suffixed values
+fail closed. Output is UTC `YYYY-MM-DD HH:MM:SS[.ffffff]+00`; bounds are compared
+as instants and every cohort count must be 0–1000, in both digest variants.
+Capture clocks retain millisecond RFC3339. SQL and the frozen window are unchanged.
+
+`observed` exits 0, including limitations. `refused` exits 2; `read_failed` and
+`publication_failed` exit 1. Failed JSON documents contain no observations and
+an error with only `code`, boolean `retryable` and fixed `next_action`. Text-mode
+failures prefix the structured line with the fixed refusal or read cause. Summary
+write failures are protected too: no raw OS/exception text, traceback or success
+marker. On success `GITHUB_STEP_SUMMARY` receives the same text projection even
+in JSON mode; read/refusal failures do not append a partial census.
+
+Verify offline, without database/network access or a real interval sleep:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_staging_retention_census.py' -v
+```
+
+## Staging fixture census (manual)
+
+`staging-fixture-census.yml` is the point-in-time companion: it runs the
+same script in `fixture-scope` mode over the seven fixture tables the
+read-only role can `SELECT` (per-table totals plus fixture-marker
+counts with the two pinned auxiliaries, and the anonymous per-table
+guild inventory). The regression pins the same shape as the retention
+census: `workflow_dispatch`-only with no inputs, one `fixture-census`
+job from `main` only, the existing no-reviewer `staging-migrate-plan`
+environment, the routed runner for job `fixture-census`,
+`contents: read`, exactly two unconditional steps, log only with no
+artifact, and no `set -x`, wrangler, apply, seed or purge route. The
+only deliberate differences are its own non-cancelling concurrency
+group, a 10-minute timeout (no in-job sleep), and the exact `fixture-scope`
+command. Both fixture query groups share one psql session and one
+`REPEATABLE READ, READ ONLY` transaction, so the evidence has a single
+database snapshot despite concurrent staging writes. The report timestamp
+records runner-clock capture completion. The identity, role, timeout and
+output fences are the shared ones above; the marker prefix is fixed in
+the queries, so no per-run value ever crosses the dispatch boundary.
+Do not dispatch until the security review for the fixture queries is
+recorded. Procedure: `docs/staging-fixture-census.md`.
 
 ## Production route
 

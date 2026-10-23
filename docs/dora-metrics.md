@@ -1,9 +1,10 @@
 # Weekly DORA metrics
 
 Every Monday at 07:17 UTC the `dora-metrics` workflow computes four delivery
-numbers over the trailing 30 days and commits them to `ops/metrics/` as
-`dora-YYYY-Www.json` plus a short `dora-YYYY-Www.md` summary. The files are
-generated evidence; do not edit them by hand.
+numbers over the trailing 30 days and commits them to `ops/metrics/` on the
+`automation/dora-metrics` branch as `dora-YYYY-Www.json` plus a short
+`dora-YYYY-Www.md` summary. The files are generated evidence; do not edit
+them by hand.
 
 ## The four numbers
 
@@ -39,6 +40,16 @@ Every input ID (deployment IDs, SHAs, run IDs, verdicts) lands in the JSON
   failure rate and is counted beside it.
 - An unreadable commit date or compare count becomes a null field plus an
   `unresolved_*` count; percentiles cover only resolved values.
+- The first success in the window compares against the first canonical
+  deploy-ID row before the window only when that predecessor's latest status
+  is success and its SHA is present. Older automatic environment rows are
+  skipped when finding that predecessor. A failed, statusless or in-flight
+  predecessor leaves the first compare unresolved rather than scoring a
+  build that never served; the scan remains subject to the page cap.
+- A successful redeploy of the previous successful SHA has a known zero
+  commits-per-deploy count, including when it matches the successful boundary
+  SHA. That zero stays in the mean and maximum without a compare API read;
+  it is not an enrichment gap.
 - An empty window reports nulls, never zeros.
 
 ## Operating the job
@@ -46,8 +57,17 @@ Every input ID (deployment IDs, SHAs, run IDs, verdicts) lands in the JSON
 - Dispatch `dora-metrics` with `dry_run` from any branch to run the real
   computation and upload the files as an artifact without committing.
 - A live dispatch (or the Monday schedule) on `main` commits straight to
-  `main` with the job token; the checkout stays credentialless and the push
-  authenticates per command. A refused or conflicting push fails the run
-  closed; the artifact still preserves that week's numbers.
-- `ops/**` is in `deploy-staging`'s push ignore list, so the weekly commit
-  restarts nothing and promotes nothing.
+  the `automation/dora-metrics` branch with the job token: `main` only
+  accepts pull requests, and the automation branch carries no rulesets. The
+  checkout stays credentialless. Fetch and push use command-scoped Git HTTPS
+  Basic authentication (`x-access-token` with the existing job token), not the
+  API's bearer scheme. The base64 credential is masked before network use and
+  never stored in Git config; base64 is encoding, not encryption. The
+  checked-out code computes the report; a separate temporary worktree publishes
+  only its JSON and Markdown on the automation branch's existing tree (the
+  current checkout is the first-run fallback). Same-week reruns replace that
+  week's report while preserving older weeks. A refused or conflicting push
+  fails the run closed; the original outputs remain available for the artifact.
+- The weekly side-branch push triggers no deploys; `ops/**` is also in
+  `deploy-staging`'s push ignore list, so any future main-side delivery
+  evidence restarts and promotes nothing.

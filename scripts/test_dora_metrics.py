@@ -264,6 +264,330 @@ class ResolveTests(unittest.TestCase):
         self.assertIsNone(found["status_at"])
 
 
+def deployment(deployment_id, created_at="2026-10-20T07:00:00Z", **changes):
+    row = {"id": deployment_id, "sha": "a" * 40,
+           "description": f"2026.10.20.{deployment_id}+aaaaaaa", "created_at": created_at}
+    row.update(changes)
+    return row
+
+
+def status_response(state, at="2026-10-20T07:10:00Z", **changes):
+    row = {"state": state, "created_at": at, "log_url": ""}
+    row.update(changes)
+    return [row]
+
+
+class DeploymentListingApiTests(unittest.TestCase):
+    def test_only_canonical_ids_score_and_window_start_is_inclusive(self):
+        start = dora_metrics.parse_moment(window()["start"])
+        newest = deployment(9)
+        at_start = deployment(2, window()["start"])
+        boundary = deployment(1, "2026-09-22T07:16:59Z")
+        automatic = [deployment(8, description=None), deployment(7, description=""),
+                     deployment(6, description="Production deploy"),
+                     deployment(5, description="2026.10.20.1+not-hex"),
+                     deployment(4, description="prefix 2026.10.20.1+aaaaaaa")]
+        with patch.object(dora_metrics, "gh_api_get",
+                          return_value=[newest, *automatic, at_start, boundary]) as api:
+            rows, excluded, predecessor = dora_metrics.list_production_deployments("o/r", start)
+        self.assertEqual(rows, [newest, at_start])
+        self.assertEqual(excluded, len(automatic))
+        self.assertEqual(predecessor, boundary)
+        api.assert_called_once_with("repos/o/r/deployments", environment="production",
+                                    per_page=dora_metrics.DEPLOYMENTS_PER_PAGE, page=1)
+
+    def test_old_automatic_rows_do_not_hide_canonical_predecessor_across_pages(self):
+        newest = deployment(5)
+        old_auto = deployment(4, "2026-09-22T07:16:59Z", description="")
+        older_auto = deployment(3, "2026-09-22T07:16:58Z", description=None)
+        boundary = deployment(2, "2026-09-22T07:16:57Z")
+        with patch.object(dora_metrics, "DEPLOYMENTS_PER_PAGE", 2), \
+             patch.object(dora_metrics, "gh_api_get",
+                          side_effect=[[newest, old_auto], [older_auto, boundary]]) as api:
+            rows, excluded, predecessor = dora_metrics.list_production_deployments(
+                "o/r", dora_metrics.parse_moment(window()["start"]))
+        self.assertEqual(rows, [newest])
+        self.assertEqual(excluded, 0)
+        self.assertEqual(predecessor, boundary)
+        self.assertEqual([c.kwargs for c in api.call_args_list],
+                         [{"environment": "production", "per_page": 2, "page": 1},
+                          {"environment": "production", "per_page": 2, "page": 2}])
+
+    def test_stops_at_first_canonical_pre_window_row(self):
+        newest = deployment(3)
+        boundary = deployment(2, "2026-09-22T07:16:59Z")
+        older = deployment(1, "2026-09-21T07:00:00Z")
+        with patch.object(dora_metrics, "DEPLOYMENTS_PER_PAGE", 2), \
+             patch.object(dora_metrics, "gh_api_get",
+                          side_effect=[[newest, boundary], [older]]) as api:
+            rows, excluded, predecessor = dora_metrics.list_production_deployments(
+                "o/r", dora_metrics.parse_moment(window()["start"]))
+        self.assertEqual((rows, excluded, predecessor), ([newest], 0, boundary))
+        api.assert_called_once_with("repos/o/r/deployments", environment="production",
+                                    per_page=2, page=1)
+
+    def test_pagination_cap_fails_closed_instead_of_returning_partial_metrics(self):
+        with patch.object(dora_metrics, "DEPLOYMENTS_PER_PAGE", 2), \
+             patch.object(dora_metrics, "DEPLOYMENTS_MAX_PAGES", 2), \
+             patch.object(dora_metrics, "gh_api_get",
+                          return_value=[deployment(2), deployment(1)]) as api:
+            with self.assertRaises(dora_metrics.DoraError):
+                dora_metrics.list_production_deployments(
+                    "o/r", dora_metrics.parse_moment(window()["start"]))
+        self.assertEqual([c.kwargs["page"] for c in api.call_args_list], [1, 2])
+
+    def test_malformed_list_rows_and_timestamps_fail_closed(self):
+        for response in (None, {}, [None], ["row"], [deployment(1, None)],
+                         [deployment(1, "not a timestamp")],
+                         [deployment(1, "2026-10-20T07:00:00")]):
+            with self.subTest(response=response), \
+                 patch.object(dora_metrics, "gh_api_get", return_value=response):
+                with self.assertRaises(dora_metrics.DoraError):
+                    dora_metrics.list_production_deployments(
+                        "o/r", dora_metrics.parse_moment(window()["start"]))
+
+
+class StatusApiTests(unittest.TestCase):
+    def test_empty_status_list_is_unknown(self):
+        with patch.object(dora_metrics, "gh_api_get", return_value=[]) as api:
+            self.assertIsNone(dora_metrics.latest_status("o/r", 17))
+        api.assert_called_once_with("repos/o/r/deployments/17/statuses", per_page=1)
+
+    def test_success_failure_and_in_flight_states_are_not_rewritten(self):
+        for state in ("success", "failure", "error", "pending", "in_progress", "queued"):
+            with self.subTest(state=state), patch.object(
+                    dora_metrics, "gh_api_get", return_value=status_response(
+                        state, "2026-10-20T09:10:00+02:00",
+                        log_url="https://github.com/o/r/actions/runs/111")):
+                self.assertEqual(dora_metrics.latest_status("o/r", 17),
+                                 (state, datetime(2026, 10, 20, 7, 10, tzinfo=timezone.utc),
+                                  "https://github.com/o/r/actions/runs/111"))
+
+    def test_non_string_log_url_is_not_a_run_link(self):
+        with patch.object(dora_metrics, "gh_api_get",
+                          return_value=status_response("success", log_url=123)):
+            self.assertEqual(dora_metrics.latest_status("o/r", 17)[2], "")
+
+    def test_malformed_status_list_state_and_timestamp_raise_dora_error(self):
+        for response in (None, {}, "statuses", [{}], status_response(None),
+                         status_response(""), status_response(1),
+                         status_response("success", None),
+                         status_response("success", "not a timestamp"),
+                         status_response("success", "2026-10-20T07:10:00")):
+            with self.subTest(response=response), \
+                 patch.object(dora_metrics, "gh_api_get", return_value=response):
+                with self.assertRaises(dora_metrics.DoraError):
+                    dora_metrics.latest_status("o/r", 17)
+
+    def test_non_dict_first_status_row_is_malformed_not_unknown(self):
+        for first in (None, "success", 1, []):
+            with self.subTest(first=first), \
+                 patch.object(dora_metrics, "gh_api_get", return_value=[first]):
+                with self.assertRaises(dora_metrics.DoraError):
+                    dora_metrics.latest_status("o/r", 17)
+
+    def test_status_read_failure_does_not_turn_into_unknown(self):
+        with patch.object(dora_metrics, "gh_api_get",
+                          side_effect=dora_metrics.DoraError("github api refused the read")):
+            with self.assertRaises(dora_metrics.DoraError):
+                dora_metrics.latest_status("o/r", 17)
+
+
+class EnrichmentApiTests(unittest.TestCase):
+    def test_rollback_reads_dict_and_json_string_booleans_honestly(self):
+        for rollback in (False, True):
+            for payload in ({"rollback": rollback}, json.dumps({"rollback": rollback})):
+                with self.subTest(payload=payload), patch.object(
+                        dora_metrics, "gh_api_get", return_value={"payload": payload}) as api:
+                    self.assertIs(dora_metrics.fetch_is_rollback("o/r", 17), rollback)
+                api.assert_called_once_with("repos/o/r/deployments/17")
+
+    def test_missing_rollback_payload_is_false_not_a_rollback(self):
+        for response in ({}, {"payload": None}, {"payload": {}},
+                         {"payload": {"rollback": "true"}}, {"payload": {"rollback": 1}}):
+            with self.subTest(response=response), \
+                 patch.object(dora_metrics, "gh_api_get", return_value=response):
+                self.assertIs(dora_metrics.fetch_is_rollback("o/r", 17), False)
+
+    def test_unreadable_rollback_shape_or_payload_is_unverified(self):
+        for response in (None, [], "deployment", {"payload": "garbage"},
+                         {"payload": "[]"}, {"payload": "true"},
+                         {"payload": "null"}, {"payload": []}, {"payload": 1}):
+            with self.subTest(response=response), \
+                 patch.object(dora_metrics, "gh_api_get", return_value=response):
+                self.assertIsNone(dora_metrics.fetch_is_rollback("o/r", 17))
+
+    def test_compare_accepts_only_nonnegative_integer_counts(self):
+        for ahead in (0, 4, 16):
+            with self.subTest(ahead=ahead), patch.object(
+                    dora_metrics, "gh_api_get", return_value={"ahead_by": ahead}) as api:
+                self.assertEqual(dora_metrics.fetch_ahead_by("o/r", "b" * 40, "a" * 40), ahead)
+            api.assert_called_once_with("repos/o/r/compare/" + "b" * 40 + "..." + "a" * 40)
+        for response in (None, [], 4, {}, {"ahead_by": None}, {"ahead_by": -1},
+                         {"ahead_by": True}, {"ahead_by": False},
+                         {"ahead_by": "4"}, {"ahead_by": 4.0}, {"ahead_by": 3.5},
+                         {"ahead_by": []}, {"ahead_by": {"count": 4}}):
+            with self.subTest(response=response), \
+                 patch.object(dora_metrics, "gh_api_get", return_value=response):
+                self.assertIsNone(dora_metrics.fetch_ahead_by("o/r", "base", "head"))
+
+    def test_run_preserves_conclusion_and_head_sha(self):
+        for conclusion in ("success", "failure", "cancelled"):
+            with self.subTest(conclusion=conclusion), patch.object(
+                    dora_metrics, "gh_api_get",
+                    return_value={"conclusion": conclusion, "head_sha": "b" * 40}) as api:
+                self.assertEqual(dora_metrics.fetch_run("o/r", 111), (conclusion, "b" * 40))
+            api.assert_called_once_with("repos/o/r/actions/runs/111")
+
+    def test_malformed_or_incomplete_run_is_unverified(self):
+        for response in (None, [], "run", {}, {"conclusion": "success"},
+                         {"conclusion": None, "head_sha": "b" * 40},
+                         {"conclusion": 1, "head_sha": "b" * 40},
+                         {"conclusion": "success", "head_sha": None},
+                         {"conclusion": "success", "head_sha": 123}):
+            with self.subTest(response=response), \
+                 patch.object(dora_metrics, "gh_api_get", return_value=response):
+                self.assertIsNone(dora_metrics.fetch_run("o/r", 111))
+
+    def test_commit_date_reads_nested_committer_and_normalizes_timezone(self):
+        response = {"commit": {"committer": {"date": "2026-10-20T08:50:00+02:00"}}}
+        with patch.object(dora_metrics, "gh_api_get", return_value=response) as api:
+            self.assertEqual(dora_metrics.fetch_commit_at("o/r", "a" * 40),
+                             datetime(2026, 10, 20, 6, 50, tzinfo=timezone.utc))
+        api.assert_called_once_with("repos/o/r/commits/" + "a" * 40)
+
+    def test_malformed_commit_nesting_or_date_is_unresolved(self):
+        for response in (None, [], "commit", {}, {"commit": []}, {"commit": {}},
+                         {"commit": {"committer": []}}, {"commit": {"committer": {}}},
+                         {"commit": {"committer": {"date": None}}},
+                         {"commit": {"committer": {"date": "garbage"}}},
+                         {"commit": {"committer": {"date": "2026-10-20T06:50:00"}}}):
+            with self.subTest(response=response), \
+                 patch.object(dora_metrics, "gh_api_get", return_value=response):
+                self.assertIsNone(dora_metrics.fetch_commit_at("o/r", "a" * 40))
+
+    def test_enrichment_read_failures_remain_null(self):
+        helpers = [(dora_metrics.fetch_is_rollback, ("o/r", 17)),
+                   (dora_metrics.fetch_ahead_by, ("o/r", "base", "head")),
+                   (dora_metrics.fetch_run, ("o/r", 111)),
+                   (dora_metrics.fetch_commit_at, ("o/r", "a" * 40))]
+        for helper, args in helpers:
+            with self.subTest(helper=helper.__name__), patch.object(
+                    dora_metrics, "gh_api_get",
+                    side_effect=dora_metrics.DoraError("github api refused the read")):
+                self.assertIsNone(helper(*args))
+
+
+class ResolutionApiTests(unittest.TestCase):
+    def test_run_url_without_a_readable_run_never_sets_run_verified(self):
+        responses = {
+            "repos/o/r/deployments/1/statuses": status_response(
+                "success", log_url="https://github.com/o/r/actions/runs/111"),
+            "repos/o/r/commits/" + "a" * 40:
+                {"commit": {"committer": {"date": "2026-10-20T06:50:00Z"}}},
+        }
+
+        def read(path, **fields):
+            if path == "repos/o/r/actions/runs/111":
+                raise dora_metrics.DoraError("github api refused the read")
+            return responses[path]
+
+        with patch.object(dora_metrics, "gh_api_get", side_effect=read) as api:
+            [found] = dora_metrics.resolve_deployments("o/r", [deployment(1)])
+        self.assertEqual(found["run_id"], 111)
+        self.assertFalse(found["run_verified"])
+        self.assertIsNone(found["run_conclusion"])
+        self.assertIsNone(found["run_head_sha"])
+        self.assertEqual(found["lead_minutes"], 20.0)
+        self.assertIn("repos/o/r/actions/runs/111", [c.args[0] for c in api.call_args_list])
+
+    def test_g2_counts_failure_unknown_and_in_flight_through_real_resolution(self):
+        states = ["success", "failure", "error", None, "pending", "in_progress"]
+        responses = {f"repos/o/r/deployments/{i}/statuses":
+                     status_response(state) if state is not None else []
+                     for i, state in enumerate(states, 1)}
+        responses["repos/o/r/commits/" + "a" * 40] = {
+            "commit": {"committer": {"date": "2026-10-20T06:50:00Z"}}}
+        with patch.object(dora_metrics, "gh_api_get",
+                          side_effect=lambda path, **fields: responses[path]):
+            records = dora_metrics.resolve_deployments(
+                "o/r", [deployment(i) for i in range(len(states), 0, -1)])
+        self.assertEqual([r["state"] for r in records],
+                         ["success", "failure", "error", "unknown", "pending", "in_progress"])
+        self.assertEqual([r["id"] for r in records], list(range(1, 7)))
+        self.assertIsNone(records[3]["status_at"])
+        report = dora_metrics.build_report("o/r", records, 2, window(), ([], [], 0), 0,
+                                           "2026-10-22T07:17:01Z", generator())
+        g2 = report["g2_change_failure_rate"]
+        self.assertEqual((g2["failed"], g2["total"], g2["rate"]), (2, 3, 0.6667))
+        self.assertEqual((g2["unknown_state"], g2["in_flight"]), (1, 2))
+        self.assertEqual(g2["excluded_automatic_rows"], 2)
+        self.assertFalse(g2["pass"])
+
+
+class BoundaryApiTests(unittest.TestCase):
+    def run_boundary_report(self, boundary_state, boundary_sha="b" * 40):
+        boundary = deployment(1, "2026-09-22T07:16:59Z", sha=boundary_sha)
+        first = deployment(2)
+        responses = {
+            "repos/o/r/deployments": [first, boundary],
+            "repos/o/r/deployments/2/statuses": status_response("success"),
+            "repos/o/r/deployments/1/statuses": (
+                [] if boundary_state is None else
+                status_response(boundary_state, "2026-09-22T07:16:59Z")),
+            "repos/o/r/commits/" + "a" * 40:
+                {"commit": {"committer": {"date": "2026-10-20T06:50:00Z"}}},
+        }
+        compares = []
+
+        def read(path, **fields):
+            if path.startswith("repos/o/r/compare/"):
+                compares.append(path)
+                return {"ahead_by": 4}
+            return responses[path]
+
+        with tempfile.TemporaryDirectory() as out, \
+             patch.object(dora_metrics, "gh_api_get", side_effect=read), \
+             patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(dora_metrics.main([
+                "--repo", "o/r", "--out-dir", out, "--now", window()["end"]]), 0)
+            report = json.loads(Path(out, "dora-2026-W43.json").read_text())
+        self.assertEqual([r["id"] for r in report["deployments"]], [2])
+        return report, compares
+
+    def assert_unresolved_boundary(self, state, sha="b" * 40):
+        report, compares = self.run_boundary_report(state, sha)
+        self.assertIsNone(report["deployments"][0]["commits_since_prev"])
+        self.assertEqual(report["g5_throughput"]["commits_per_deploy"]["unresolved"], 1)
+        self.assertEqual(compares, [])
+
+    def test_failed_or_error_boundary_is_not_a_successful_predecessor(self):
+        for state in ("failure", "error"):
+            with self.subTest(state=state):
+                self.assert_unresolved_boundary(state)
+
+    def test_unknown_or_statusless_boundary_is_not_a_successful_predecessor(self):
+        for state in ("unknown", None):
+            with self.subTest(state=state):
+                self.assert_unresolved_boundary(state)
+
+    def test_pending_or_in_flight_boundary_is_not_a_successful_predecessor(self):
+        for state in ("pending", "in_progress", "queued"):
+            with self.subTest(state=state):
+                self.assert_unresolved_boundary(state)
+
+    def test_successful_boundary_requires_a_nonempty_string_sha(self):
+        for sha in (None, "", 0, 42, [], {}):
+            with self.subTest(sha=sha):
+                self.assert_unresolved_boundary("success", sha)
+
+    def test_successful_boundary_compares_the_expected_shas(self):
+        report, compares = self.run_boundary_report("success")
+        self.assertEqual(compares, ["repos/o/r/compare/" + "b" * 40 + "..." + "a" * 40])
+        self.assertEqual(report["deployments"][0]["commits_since_prev"], 4)
+        self.assertEqual(report["g5_throughput"]["commits_per_deploy"]["unresolved"], 0)
+
+
 class RenderTests(unittest.TestCase):
     def test_summary_names_every_verdict_and_note(self):
         records = [record(1, "success", "2026-10-20T07:10:00Z",
@@ -280,6 +604,10 @@ class RenderTests(unittest.TestCase):
         self.assertIn("deployment 9", text)
         self.assertIn("carry no status yet", text)
         self.assertIn("`dora-2026-W43.json`", text)
+        # G5 deploys/day has no target, so no verdict, but the computed
+        # value still renders: one success over 30 days reads 0.03, not n/a.
+        self.assertIn("| G5 deploys/day | 0.03 | >=1/hour when green work exists | n/a |",
+                      text)
 
     def test_empty_week_renders_n_a_without_a_false_pass(self):
         report = dora_metrics.build_report("o/r", [], 0, window(),

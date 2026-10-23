@@ -135,6 +135,18 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
 ```
 
+The ops-override DB acceptance test mutates process environment. With the test
+DB configured, run it separately from parallel workspace tests (CI does this in
+both the unit-test and coverage lanes):
+
+```sh
+cargo test --workspace --features two-bot-core/db --locked -- --skip settings_jobs::tests::ops_overrides_acceptance_tests::
+cargo test -p two-bot --bin two-bot --features two-bot-core/db --locked settings_jobs::tests::ops_overrides_acceptance_tests:: -- --test-threads=1
+```
+
+Nextest already isolates each test in its own process. On the controller, use the
+bounded cache wrapper for both compiling commands, as required by `AGENTS.md`.
+
 ### Pre-push checklist
 
 Run this before every push. It mirrors the CI `check` job's fail-fast order:
@@ -227,8 +239,29 @@ internal actions, and leveling are migrated; older suites retain their existing
 explicit opt-ins until migrated separately.
 
 The `wrangler/` Worker/DO wrapper has its own `npm ci`, `npm run typecheck`
-and `npm test`. Never commit secrets, `.env` files or `target/`. See
-[README.md](README.md) for the full service reference.
+and `npm test`. The `worker check` lane in `.github/workflows/check.yml` also
+runs `npm audit --audit-level=high --include=dev --json` from `wrangler/` before
+installation whenever worker inputs are selected (including full main and
+scheduled runs). It audits the committed lockfile, including dev tooling, and
+prints npm's machine-readable JSON report directly in the CI step log. High or
+critical advisories and registry errors fail the lane and therefore `ci-ok`;
+low/moderate advisories remain visible but do not fail it. There are no audit
+suppressions. Fix new high/critical findings before merging; any proposed
+exception needs an explicit tracking note and expiry, not a silent ignore.
+
+Rerun the audit and its offline pass/failure fixtures from the repository root
+with the existing npm and Python CI tools (no new local prerequisites):
+
+```sh
+npm --prefix wrangler audit --audit-level=high --include=dev --json
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_worker_npm_audit.py' -v
+```
+
+The offline fixtures stub npm and check the actual workflow command's exit-status
+and JSON-log propagation; the native audit above queries the registry's current
+advisories. Audits detect known advisories, not every supply-chain compromise.
+Never commit secrets, `.env` files or `target/`. See [README.md](README.md) for
+the full service reference.
 
 ### Secret-scan allowlists
 

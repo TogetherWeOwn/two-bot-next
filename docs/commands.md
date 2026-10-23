@@ -54,7 +54,7 @@ Start new rooms from one creator as private
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `channel` | channel | true | — | — | — | — | Creator voice channel to configure |
-| `enabled` | boolean | false | — | — | — | — | Start new rooms private (default on) |
+| `enabled` | boolean | false | — | — | — | — | Start new rooms private (required: choose on or off) |
 
 ## `/attendance`
 
@@ -101,7 +101,9 @@ List this server's custom commands
 - Default permissions: ManageGuild (`32`)
 - Available in DMs: false
 
-No options.
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `page` | integer | false | 1 | — | — | — | Page of the custom-command list (1-based) |
 
 ## `/command-remove`
 
@@ -165,7 +167,9 @@ List this server's feed relays
 - Default permissions: ManageGuild (`32`)
 - Available in DMs: false
 
-No options.
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `page` | integer | false | 1 | — | — | — | Page of the feed relay list (1-based) |
 
 ## `/feed-remove`
 
@@ -188,7 +192,7 @@ Toggle shared numbering per category for one creator channel
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `channel` | channel | true | — | — | — | — | Creator voice channel to configure |
-| `enabled` | boolean | false | — | — | — | — | Share numbering across the category (default on) |
+| `enabled` | boolean | false | — | — | — | — | Share numbering across the category (required: choose on or off) |
 
 ## `/help`
 
@@ -538,7 +542,7 @@ Toggle companion text channels for one creator channel
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `channel` | channel | true | — | — | — | — | Creator voice channel to configure |
-| `enabled` | boolean | false | — | — | — | — | Turn companion text channels on or off (default on) |
+| `enabled` | boolean | false | — | — | — | — | Turn companion text channels on or off (leave empty to keep the stored value) |
 | `name` | string | false | — | — | 100 | — | Companion channel name (default voice-chat) |
 | `viewer-role` | role | false | — | — | — | — | Extra role that may view companions (@everyone for all) |
 

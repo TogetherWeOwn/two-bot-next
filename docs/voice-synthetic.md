@@ -14,7 +14,7 @@ creator) and asserts:
 | create | a new room appears in the creator's category |
 | moved | the test bot lands in that new room after joining the creator |
 | name | the room is created already carrying a template name, not the `<display>'s room` fallback |
-| position | the room is directly below its creator, or below the creator's existing rooms when some are open (matching the placement planner) |
+| position | the room is directly below its creator, or below the creator's existing rooms still open when the slot is read — a predecessor the empty-room sweep deleted mid-run does not anchor the slot (matching the placement planner) |
 | owner | the room has a member overwrite for the joiner allowing View, Connect and Manage Channels |
 | status | a voice-channel status line is set on the room |
 | rejoin | the test bot hops from that room straight back into the creator, and a second new room appears and it is moved into that room (a member must never stay in the lobby) |
@@ -80,8 +80,9 @@ malformed`, and fails the run the same way: a `run` FAIL with that message,
 evidence uploaded, exit 1. No traceback reaches the output and no wire bytes
 are echoed. Valid frames, hellos and dispatches behave byte-identically.
 
-The offline suites (`scripts/test_staging_voice_synthetic.py` and
-`scripts/test_staging_voice_synthetic_gateway_intake_acceptance.py`) pin the
+The offline suites (`scripts/test_staging_voice_synthetic.py`,
+`scripts/test_staging_voice_synthetic_gateway_intake_acceptance.py` and
+`scripts/test_staging_voice_synthetic_owned_room_acceptance.py`) pin the
 caps, the exact-cap passes, the cap-plus-one refusals on every path and the
 fixed messages.
 
@@ -93,8 +94,9 @@ fixed messages.
 - Every 6 hours (`voice-synthetic.yml` schedule) to catch drift. A failed run on
   main is re-run once by the host flake ledger and opens a `[main-red]` card if
   it fails again.
-- On pull requests only the offline suites (`scripts/test_staging_voice_synthetic.py`
-  and `scripts/test_staging_voice_synthetic_gateway_intake_acceptance.py`)
+- On pull requests only the offline suites (`scripts/test_staging_voice_synthetic.py`,
+  `scripts/test_staging_voice_synthetic_gateway_intake_acceptance.py` and
+  `scripts/test_staging_voice_synthetic_owned_room_acceptance.py`)
   run, and only when voice inputs change (`scripts/job-inputs.py` `voice`). A
   PR's code is not deployed to staging before merge, so a live run would test
   main, not the PR.
@@ -179,6 +181,29 @@ Grants and SKIP conditions, mirroring the rename case:
   failure names its staging role.
 - `name_panel` is read-only and needs no grant: it FAILs when the
   post-rename room name is missing or the `<display>'s room` fallback.
+
+## Owned-room binding and uncertain writes
+
+Every room probe targets exactly the test bot's observed destination in the
+staging guild, and only when a same-window `CHANNEL_CREATE` with that same
+id, a voice type and the creator's category corroborates it. A concurrent
+unrelated create, a foreign-guild event, a move into a pre-existing room or a
+missing move refuses before any `PATCH`: `room_id` is `None`, `create` FAILs
+and no room write is sent. The rejoin verdict needs the same corroboration
+for its own id (neither the creator, the first room nor a pre-existing
+channel).
+
+An attempted `user_limit` write without a verified read-back (lost response,
+failed read, mismatch, or a non-2xx status other than 403/429) enters one
+bounded cleanup — a single restore `PATCH` plus one verification read — and
+the `limit` check still FAILs with `room user_limit write was not verified`,
+the room id, the original value and a next action (`re-run` when verified,
+`restore ... manually` otherwise). A 403 still FAILs and a 429 still SKIPs,
+both without a restore.
+
+`scripts/test_staging_voice_synthetic_owned_room_acceptance.py` pins the
+binding, the rejoin correlation, the cleanup bound and the fixed vocabulary
+with offline fake-gateway/REST fixtures.
 
 ## Run it by hand
 

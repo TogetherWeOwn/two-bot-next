@@ -3,9 +3,11 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import worker, { type Env } from "../src/index.ts";
 import {
-  EMPTY_STATE, JOB_ERROR_CLASSES, JOB_RUNS_JOBS, PROMOTION_ERROR_GATE_RULES, RULES, RUNBOOK_BASE_URL, evaluateMetrics, evaluatePromotionGate, packetFilename, parseExposition, ruleFor, runbookUrl, transitionMessages,
+  EMPTY_STATE, JOB_ERROR_CLASSES, JOB_RUNS_JOBS, PROMOTION_ERROR_GATE_RULES, REST_PENDING_STUCK_SAMPLES, REST_REFUSAL_SURGE_MIN, RULES, RUNBOOK_BASE_URL, evaluateMetrics, evaluatePromotionGate, interruptDispatchDrops, packetFilename, parseExposition, ruleFor, runbookUrl, transitionMessages,
   type MetricsAlertState,
 } from "../src/alert-rules.ts";
+import { ALERT_INPUT_LABELS, ALERT_OPTIONAL_INPUT_LABELS, parseAlertScrape } from "../src/metrics-scrape.ts";
+import { metricsBody } from "./fixtures/metrics.ts";
 
 const NOW = 1_000_000;
 function body(extra: string[]): string {
@@ -987,6 +989,16 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "gateway_reconnect_flapping",
     "handler_duration_saturated",
     "job_failure_share",
+    "rest_token_invalid",
+    "rest_refusal_surge",
+    "rest_global_responses_stuck",
+    "feed_fetch_failures",
+    "eventsub_receive_gap",
+    "eventsub_reconcile_prior_failed",
+    "automod_sanction_refused",
+    "moderation_enforcement_failures",
+    "voice_rest_stuck",
+    "voice_global_backoff_capped",
   ]);
   assert.equal(packetFilename("job_stale:rank", window), `evidence-job_stale-${window}.json`);
   assert.equal(packetFilename("job_consecutive_failures:counter", window), `evidence-job_consecutive_failures-${window}.json`);
@@ -1031,6 +1043,16 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("gateway_reconnect_flapping", window), `evidence-gateway_reconnect_flapping-${window}.json`);
   assert.equal(packetFilename("handler_duration_saturated", window), `evidence-handler_duration_saturated-${window}.json`);
   assert.equal(packetFilename("job_failure_share:counter", window), `evidence-job_failure_share-${window}.json`);
+  assert.equal(packetFilename("rest_token_invalid", window), `evidence-rest_token_invalid-${window}.json`);
+  assert.equal(packetFilename("rest_refusal_surge", window), `evidence-rest_refusal_surge-${window}.json`);
+  assert.equal(packetFilename("rest_global_responses_stuck", window), `evidence-rest_global_responses_stuck-${window}.json`);
+  assert.equal(packetFilename("feed_fetch_failures", window), `evidence-feed_fetch_failures-${window}.json`);
+  assert.equal(packetFilename("eventsub_receive_gap", window), `evidence-eventsub_receive_gap-${window}.json`);
+  assert.equal(packetFilename("eventsub_reconcile_prior_failed", window), `evidence-eventsub_reconcile_prior_failed-${window}.json`);
+  assert.equal(packetFilename("automod_sanction_refused", window), `evidence-automod_sanction_refused-${window}.json`);
+  assert.equal(packetFilename("moderation_enforcement_failures", window), `evidence-moderation_enforcement_failures-${window}.json`);
+  assert.equal(packetFilename("voice_rest_stuck", window), `evidence-voice_rest_stuck-${window}.json`);
+  assert.equal(packetFilename("voice_global_backoff_capped", window), `evidence-voice_global_backoff_capped-${window}.json`);
   // Unknown keys get no filename rather than a misleading one; hostile
   // window stamps stay filename-safe.
   assert.equal(packetFilename("no_such_rule", window), undefined);
@@ -1300,6 +1322,56 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
     ]),
   ];
   firing.push(...ev(jobLines(8, 2, "0.012"), ev(jobLines(0, 0, "0.011")).state).firing);
+  firing.push(...ev(["two_bot_rest_guard_token_invalid 1"]).firing);
+  firing.push(
+    ...ev(
+      [
+        `two_bot_rest_guard_invalid_requests_total 10`,
+        `two_bot_rest_guard_rejected_requests_total 0`,
+      ],
+      ev([
+        `two_bot_rest_guard_invalid_requests_total 0`,
+        `two_bot_rest_guard_rejected_requests_total 0`,
+      ]).state,
+    ).firing,
+  );
+  let stuck = ev(["two_bot_rest_guard_pending_global_responses 2"]);
+  stuck = ev(["two_bot_rest_guard_pending_global_responses 2"], stuck.state);
+  stuck = ev(["two_bot_rest_guard_pending_global_responses 1"], stuck.state);
+  firing.push(...stuck.firing);
+  const feedErrors = (transport: number) => [
+    "invalid_source", "non_public_address", "redirect_refused", "too_large", "invalid_encoding", "unsupported_content_type", "unsupported_encoding", "resolve", "transport", "deadline", "http_error", "other",
+  ].map((c) => `two_bot_feed_fetch_errors_total{error_class="${c}"} ${c === "transport" ? transport : 0}`);
+  firing.push(...ev(feedErrors(1), ev(feedErrors(0)).state).firing);
+  const gapLines = (received: number, classified: number) => [
+    `two_bot_eventsub_received_total ${received}`,
+    ...["challenge", "notification", "revocation", "tampered", "ignored", "other"].map((k) =>
+      `two_bot_eventsub_classified_total{kind="${k}"} ${k === "notification" ? classified : 0}`),
+  ];
+  let gap = ev(gapLines(100, 100));
+  for (const n of [101, 102, 103]) gap = ev(gapLines(n, 100), gap.state);
+  firing.push(...gap.firing);
+  const priorFailed = (n: number) => [
+    `two_bot_eventsub_reconcile_errors_total{error_class="reconcile_prior_failed"} ${n}`,
+    ...reconcilePasses(n, 0, 0),
+  ];
+  firing.push(...ev(priorFailed(1), ev(priorFailed(0)).state).firing);
+  const sanctionRefused = (n: number) => [`two_bot_automod_decisions_total{outcome="sanction_refused"} ${n}`];
+  firing.push(...ev(sanctionRefused(1), ev(sanctionRefused(0)).state).firing);
+  const enforcements = (kickDiscord: number) => {
+    const lines: string[] = [];
+    for (const verb of ["ban", "tempban", "kick", "timeout", "warn", "purge", "slowmode", "lockdown", "unlock"]) {
+      for (const outcome of ["discord_error", "storage_error"]) {
+        lines.push(`two_bot_moderation_enforcements_total{verb="${verb}",outcome="${outcome}"} ${verb === "kick" && outcome === "discord_error" ? kickDiscord : 0}`);
+      }
+    }
+    return lines;
+  };
+  firing.push(...ev(enforcements(1), ev(enforcements(0)).state).firing);
+  let voiceStuck = ev(["two_bot_voice_rest_in_flight_age_seconds 0"]);
+  for (const n of [61, 75, 90]) voiceStuck = ev([`two_bot_voice_rest_in_flight_age_seconds ${n}`], voiceStuck.state);
+  firing.push(...voiceStuck.firing);
+  firing.push(...ev(["two_bot_voice_global_backoff_capped_total 1"], ev(["two_bot_voice_global_backoff_capped_total 0"]).state).firing);
   assert.equal(firing.length, RULES.length, `expected one firing key per rule, got: ${firing.join(", ")}`);
   const packets = transitionMessages([], firing);
   assert.equal(packets.length, RULES.length);
@@ -1432,4 +1504,302 @@ test("slow-burn ticket resolves on a covered quiet short window while the long w
     !current.firing.includes("error_budget_slow_burn"),
     "covered quiet 15 min window must resolve the ticket even with the 2 h window unknown",
   );
+});
+
+const TOKEN_INVALID = "two_bot_rest_guard_token_invalid";
+const GUARD_INVALID = "two_bot_rest_guard_invalid_requests_total";
+const GUARD_REJECTED = "two_bot_rest_guard_rejected_requests_total";
+const GUARD_PENDING = "two_bot_rest_guard_pending_global_responses";
+const TOKEN_RULE = "rest_token_invalid";
+const SURGE_RULE = "rest_refusal_surge";
+const STUCK_RULE = "rest_global_responses_stuck";
+
+test("rest token invalid pages immediately on the latch and resolves on a valid clear", () => {
+  assert.equal(ruleFor(TOKEN_RULE)?.severity, undefined, "credential death pages");
+  // The latch defaults to 0 at boot, so a 1 is never a boot artifact: even
+  // the first valid sample fires.
+  const fired = ev([`${TOKEN_INVALID} 1`]);
+  assert.deepEqual(fired.firing, [TOKEN_RULE]);
+  assert.deepEqual(ev([`${TOKEN_INVALID} 0`]).firing, []);
+  // A valid clear resolves once: only a new process without the latch reads 0.
+  const resolved = ev([`${TOKEN_INVALID} 0`], fired.state);
+  assert.deepEqual(resolved.firing, []);
+  const messages = transitionMessages(fired.firing, resolved.firing);
+  assert.equal(messages.length, 1);
+  assert.match(messages[0]!, new RegExp(`RESOLVED ${TOKEN_RULE}\\.`));
+  // Staying latched holds the page without re-notifying.
+  const held = ev([`${TOKEN_INVALID} 1`], fired.state);
+  assert.deepEqual(held.firing, [TOKEN_RULE]);
+  assert.deepEqual(transitionMessages(fired.firing, held.firing), []);
+});
+
+test("rest token invalid holds across malformed samples without manufacturing recovery", () => {
+  const firing = ev([`${TOKEN_INVALID} 1`]);
+  const invalidSamples: Record<string, string[]> = {
+    "missing family": [],
+    "non-boolean 2": [`${TOKEN_INVALID} 2`],
+    negative: [`${TOKEN_INVALID} -1`],
+    fractional: [`${TOKEN_INVALID} 0.5`],
+    NaN: [`${TOKEN_INVALID} NaN`],
+    "labeled row": [`${TOKEN_INVALID}{route="other"} 1`],
+    "duplicate rows": [`${TOKEN_INVALID} 1`, `${TOKEN_INVALID} 1`],
+  };
+  for (const [name, lines] of Object.entries(invalidSamples)) {
+    assert.deepEqual(ev(lines, firing.state).firing, [TOKEN_RULE], `${name} holds the page`);
+    assert.deepEqual(ev(lines).firing, [], `${name} never fires on its own`);
+  }
+  assert.deepEqual(ev([`${TOKEN_INVALID} 0`], ev([`${TOKEN_INVALID} 2`], firing.state).state).firing, [],
+    "a valid clear after the gap still resolves once");
+});
+
+test("rest refusal surge pages on a combined burst and ignores baselines, trickles and restarts", () => {
+  assert.equal(ruleFor(SURGE_RULE)?.severity, undefined, "a refusal surge pages");
+  assert.equal(REST_REFUSAL_SURGE_MIN, 10);
+  const surge = (invalid: number, rejected: number) =>
+    [`${GUARD_INVALID} ${invalid}`, `${GUARD_REJECTED} ${rejected}`];
+  // The first valid sample only stores a baseline, even with nonzero
+  // lifetime counts predating the deploy.
+  const base = ev(surge(100, 50));
+  assert.deepEqual(base.firing, []);
+  assert.equal(base.state.restRefusalSeen, true);
+  // Either family can surge alone, or both together.
+  assert.deepEqual(ev(surge(110, 50), base.state).firing, [SURGE_RULE], "invalid-only burst");
+  assert.deepEqual(ev(surge(100, 60), base.state).firing, [SURGE_RULE], "rejected-only burst");
+  assert.deepEqual(ev(surge(105, 56), base.state).firing, [SURGE_RULE], "combined burst");
+  // Nine new refusals in a window is a trickle, not a surge.
+  assert.deepEqual(ev(surge(104, 55), base.state).firing, []);
+  // A quiet window after a burst resolves; the burst re-fires on new growth.
+  const fired = ev(surge(110, 50), base.state);
+  const quiet = ev(surge(110, 50), fired.state);
+  assert.deepEqual(quiet.firing, []);
+  assert.deepEqual(ev(surge(120, 50), quiet.state).firing, [SURGE_RULE]);
+  // Both counters backwards means the process restarted: re-baseline both
+  // quietly and resolve instead of firing.
+  const restart = ev(surge(5, 5), fired.state);
+  assert.deepEqual(restart.firing, []);
+  assert.equal(restart.state.restRefusalInvalid, 5);
+  assert.deepEqual(ev(surge(15, 5), restart.state).firing, [SURGE_RULE]);
+});
+
+test("rest refusal surge survives a 429 retraction on the invalid counter", () => {
+  const surge = (invalid: number, rejected: number) =>
+    [`${GUARD_INVALID} ${invalid}`, `${GUARD_REJECTED} ${rejected}`];
+  // The invalid family is not monotonic: a 429 tallied at headers is
+  // withdrawn when its body shows shared scope (`retract_invalid`), so one
+  // backwards step on invalid beside rejected growth is a retraction beside
+  // a surge, not a restart.
+  const base = ev(surge(12, 0));
+  assert.deepEqual(ev(surge(11, 15), base.state).firing, [SURGE_RULE],
+    "a retraction beside a rejected burst still pages");
+  // A retraction straddling a firing window neither resolves the page nor
+  // drops the surge: the backwards counter contributes zero growth and
+  // re-baselines only itself.
+  const firingBase = ev(surge(100, 50));
+  const fired = ev(surge(110, 50), firingBase.state);
+  assert.deepEqual(fired.firing, [SURGE_RULE]);
+  const held = ev(surge(109, 70), fired.state);
+  assert.deepEqual(held.firing, [SURGE_RULE], "retraction plus rejected growth stays firing");
+  assert.equal(held.state.restRefusalInvalid, 109);
+  assert.equal(held.state.restRefusalRejected, 70);
+  // A lone retraction with no growth anywhere stays quiet and re-baselines.
+  const lone = ev(surge(11, 0), base.state);
+  assert.deepEqual(lone.firing, []);
+  assert.equal(lone.state.restRefusalInvalid, 11);
+});
+
+test("rest refusal surge holds across malformed samples without manufacturing evidence", () => {
+  const surge = (invalid: number, rejected: number) =>
+    [`${GUARD_INVALID} ${invalid}`, `${GUARD_REJECTED} ${rejected}`];
+  const base = ev(surge(100, 50));
+  const fired = ev(surge(110, 50), base.state);
+  assert.deepEqual(fired.firing, [SURGE_RULE]);
+  const invalidSamples: Record<string, string[]> = {
+    "missing family": [],
+    "missing rejected row": [`${GUARD_INVALID} 120`],
+    NaN: [...surge(120, 50).slice(0, 1), `${GUARD_REJECTED} NaN`],
+    negative: [`${GUARD_INVALID} -1`, `${GUARD_REJECTED} 50`],
+    fractional: [`${GUARD_INVALID} 120.5`, `${GUARD_REJECTED} 50`],
+    "labeled row": [`${GUARD_INVALID}{route="other"} 120`, `${GUARD_REJECTED} 50`],
+    "duplicate rows": [...surge(120, 50), `${GUARD_INVALID} 120`],
+  };
+  for (const [name, lines] of Object.entries(invalidSamples)) {
+    const held = ev(lines, fired.state);
+    assert.deepEqual(held.firing, [SURGE_RULE], `${name} holds the page`);
+    assert.deepEqual(transitionMessages(fired.firing, held.firing), [], `${name} does not re-notify`);
+    assert.deepEqual(ev(lines, base.state).firing, [], `${name} never fires on its own`);
+  }
+  // The gap keeps the previous baseline: the next valid burst still fires.
+  const afterGap = ev(surge(120, 50), ev([], fired.state).state);
+  assert.deepEqual(afterGap.firing, [SURGE_RULE]);
+});
+
+test("rest global responses stuck pages on the third consecutive nonzero sample", () => {
+  assert.equal(ruleFor(STUCK_RULE)?.severity, undefined, "stuck admission pages");
+  assert.equal(REST_PENDING_STUCK_SAMPLES, 3);
+  const pending = (n: number) => [`${GUARD_PENDING} ${n}`];
+  const one = ev(pending(2));
+  const two = ev(pending(2), one.state);
+  assert.deepEqual([one.firing, two.firing], [[], []], "brief stalls stay quiet");
+  assert.equal(two.state.restPendingStuckStreak, 2);
+  const fired = ev(pending(1), two.state);
+  assert.deepEqual(fired.firing, [STUCK_RULE], "any nonzero count sustains the streak");
+  assert.deepEqual(ev(pending(3), fired.state).firing, [STUCK_RULE]);
+  // Drained bodies prove recovery and resolve once.
+  const resolved = ev(pending(0), fired.state);
+  assert.deepEqual(resolved.firing, []);
+  assert.equal(resolved.state.restPendingStuckStreak, 0);
+  const messages = transitionMessages(fired.firing, resolved.firing);
+  assert.equal(messages.length, 1);
+  assert.match(messages[0]!, new RegExp(`RESOLVED ${STUCK_RULE}\\.`));
+  // Zero from the start never fires, however often it is sampled.
+  assert.deepEqual(ev(pending(0), ev(pending(0), ev(pending(0)).state).state).firing, []);
+  // Legacy DO storage without the streak reads as no streak, never as firing.
+  const legacy = { ...EMPTY_STATE };
+  delete legacy.restPendingStuckStreak;
+  const l1 = ev(pending(1), legacy);
+  const l2 = ev(pending(1), l1.state);
+  assert.deepEqual([l1.firing, l2.firing], [[], []]);
+  assert.deepEqual(ev(pending(1), l2.state).firing, [STUCK_RULE]);
+});
+
+test("rest global responses stuck breaks on gaps but holds firing tickets", () => {
+  const pending = (n: number) => [`${GUARD_PENDING} ${n}`];
+  const partial = ev(pending(1), ev(pending(1)).state);
+  assert.equal(partial.state.restPendingStuckStreak, 2);
+  let fired = ev(pending(1));
+  fired = ev(pending(1), fired.state);
+  fired = ev(pending(1), fired.state);
+  assert.deepEqual(fired.firing, [STUCK_RULE]);
+  const invalidSamples: Record<string, string[]> = {
+    "missing family": [],
+    NaN: [`${GUARD_PENDING} NaN`],
+    negative: [`${GUARD_PENDING} -1`],
+    fractional: [`${GUARD_PENDING} 0.5`],
+    "labeled row": [`${GUARD_PENDING}{route="other"} 1`],
+    "duplicate rows": [`${GUARD_PENDING} 1`, `${GUARD_PENDING} 1`],
+  };
+  for (const [name, lines] of Object.entries(invalidSamples)) {
+    const broken = ev(lines, partial.state);
+    assert.deepEqual(broken.firing, [], `${name} breaks the pending streak`);
+    assert.equal(broken.state.restPendingStuckStreak, 0);
+    const held = ev(lines, fired.state);
+    assert.deepEqual(held.firing, [STUCK_RULE], `${name} holds the page`);
+    assert.deepEqual(ev(pending(0), held.state).firing, [], `${name} still resolves on a valid drain`);
+  }
+  // A failed scrape breaks the streak through the shared interrupt, never the alert.
+  const interrupted = interruptDispatchDrops({ ...partial, firing: [] });
+  assert.equal(interrupted.restPendingStuckStreak, 0);
+  assert.deepEqual(ev(pending(1), interrupted).firing, []);
+  const heldFiring = interruptDispatchDrops(fired.state);
+  assert.equal(heldFiring.restPendingStuckStreak, 0);
+  assert.deepEqual(ev(pending(1), heldFiring).firing, [STUCK_RULE]);
+  assert.deepEqual(ev(pending(0), heldFiring).firing, []);
+});
+
+test("paused and remaining gauges never fire the stuck rule on their own", () => {
+  // No rule consumes the paused/remaining gauges: a live global deadline is
+  // healthy Discord backpressure, and the remaining countdown derives from a
+  // monotonic deadline that cannot wedge high. Only stuck bodies page.
+  const paused = (remaining: number) => [
+    "two_bot_rest_guard_global_paused 1",
+    `two_bot_rest_guard_global_pause_remaining_seconds ${remaining}`,
+    `${GUARD_PENDING} 0`,
+  ];
+  let state = EMPTY_STATE;
+  for (const remaining of [600, 450, 300, 150, 1]) {
+    const next = ev(paused(remaining), state);
+    assert.deepEqual(next.firing, [], `a draining pause stays quiet at ${remaining}s remaining`);
+    state = next.state;
+  }
+  // A pending body holds admission even at zero remaining: the stuck rule
+  // reads pending alone, never the countdown.
+  let stuck = ev([...paused(0).slice(0, 2), `${GUARD_PENDING} 2`]);
+  stuck = ev([...paused(0).slice(0, 2), `${GUARD_PENDING} 2`], stuck.state);
+  stuck = ev([...paused(0).slice(0, 2), `${GUARD_PENDING} 2`], stuck.state);
+  assert.deepEqual(stuck.firing, [STUCK_RULE]);
+});
+
+test("guard health inputs validate as optional-when-present label-free series", () => {
+  for (const family of [TOKEN_INVALID, GUARD_INVALID, GUARD_REJECTED, GUARD_PENDING]) {
+    assert.deepEqual(ALERT_OPTIONAL_INPUT_LABELS[family], {},
+      `${family} is an optional input with no labels`);
+    assert.equal(Object.hasOwn(ALERT_INPUT_LABELS, family), false,
+      `${family} must never become a required input (rollback containers lack it)`);
+  }
+  const valid = metricsBody(3);
+  for (const family of [TOKEN_INVALID, GUARD_INVALID, GUARD_REJECTED, GUARD_PENDING]) {
+    assert.ok(valid.includes(`${family} 0`), `fixture carries ${family} at zero`);
+  }
+  assert.ok(parseAlertScrape(valid));
+  assert.ok(parseAlertScrape(valid.replace(`${TOKEN_INVALID} 0`, `${TOKEN_INVALID} 1`)));
+  assert.ok(parseAlertScrape(valid
+    .replace(`${GUARD_INVALID} 0`, `${GUARD_INVALID} 12`)
+    .replace(`${GUARD_REJECTED} 0`, `${GUARD_REJECTED} 3`)
+    .replace(`${GUARD_PENDING} 0`, `${GUARD_PENDING} 2`)));
+  // Older exposition without the families still scrapes and still evaluates
+  // every pre-existing rule.
+  const older = valid.split("\n").filter((line) =>
+    ![TOKEN_INVALID, GUARD_INVALID, GUARD_REJECTED, GUARD_PENDING].some((family) => line.startsWith(family))).join("\n");
+  const olderSamples = parseAlertScrape(older);
+  assert.ok(olderSamples, "rollback container without the guard health families must still scrape");
+  assert.ok(evaluateMetrics(olderSamples, EMPTY_STATE, NOW).firing
+    .includes("job_consecutive_failures:rank"));
+  // Present but malformed fails the whole scrape, like every validated input:
+  // a bad health series must never silently hold its rule off or on.
+  for (const value of ["2", "-1", "0.5", "NaN", "+Inf"]) {
+    assert.equal(parseAlertScrape(valid.replace(`${TOKEN_INVALID} 0`, `${TOKEN_INVALID} ${value}`)), null,
+      `token latch ${value}`);
+  }
+  for (const family of [GUARD_INVALID, GUARD_REJECTED, GUARD_PENDING]) {
+    for (const value of ["-1", "0.5", "NaN", "+Inf"]) {
+      assert.equal(parseAlertScrape(valid.replace(`${family} 0`, `${family} ${value}`)), null,
+        `${family} ${value}`);
+    }
+    assert.equal(parseAlertScrape(valid.replace(`${family} 0`, `${family}{route="other"} 1`)), null,
+      `a labeled ${family} row is not the label-free series`);
+    assert.equal(parseAlertScrape(`${valid}${family} 1\n`), null, `duplicate ${family} rows are rejected`);
+  }
+  assert.equal(parseAlertScrape(valid.replace(`${TOKEN_INVALID} 0`, `${TOKEN_INVALID}{route="other"} 1`)), null,
+    "a labeled latch row is not the label-free gauge");
+  assert.equal(parseAlertScrape(`${valid}${TOKEN_INVALID} 1\n`), null, "duplicate latch rows are rejected");
+});
+
+test("guard-health pages never fail a promotion stage", () => {
+  // The canary gate stays 5xx-only: token/surge/stuck pages diagnose the
+  // guard, they never roll back a promotion by themselves.
+  for (const rule of [TOKEN_RULE, SURGE_RULE, STUCK_RULE]) {
+    assert.deepEqual(evaluatePromotionGate([rule]), { fail: false, reasons: [] });
+  }
+  assert.deepEqual(
+    evaluatePromotionGate([TOKEN_RULE, SURGE_RULE, STUCK_RULE, "rest_429_rate"]),
+    { fail: false, reasons: [] },
+  );
+});
+
+test("runbook and metrics docs explain the guard-health pages and the paused deferral", () => {
+  const runbook = readFileSync(new URL("../../docs/runbook.md", import.meta.url), "utf8");
+  const section = (heading: string) => {
+    const start = runbook.indexOf(heading);
+    assert.ok(start >= 0, `runbook must carry ${heading}`);
+    return runbook.slice(start, runbook.indexOf("\n#### ", start + heading.length));
+  };
+  const token = section("#### Alert: REST token invalid");
+  assert.match(token, /credential|fatal/i);
+  assert.match(token, /First response/);
+  const surge = section("#### Alert: REST refusal surge");
+  assert.match(surge, /First response/);
+  assert.match(surge, /budget|loop|abuse/i);
+  const stuck = section("#### Alert: REST global responses stuck");
+  assert.match(stuck, /First response/);
+  assert.match(stuck, /pending/i);
+  assert.match(stuck, /healthy Discord backpressure/i, "the stuck section records why paused/remaining stay out");
+  const metrics = readFileSync(new URL("../../docs/metrics.md", import.meta.url), "utf8");
+  for (const rule of [TOKEN_RULE, SURGE_RULE, STUCK_RULE]) {
+    assert.match(metrics, new RegExp(`\\| \`${rule}\`[^\\n]*\\|`, "i"),
+      `metrics.md alert table must list ${rule}`);
+  }
+  const catalog = readFileSync(new URL("../../docs/observability-event-catalog.md", import.meta.url), "utf8");
+  for (const rule of [TOKEN_RULE, SURGE_RULE, STUCK_RULE]) {
+    assert.ok(catalog.includes(`| \`${rule}\` |`), `catalog must carry an alert-rule row for ${rule}`);
+  }
 });

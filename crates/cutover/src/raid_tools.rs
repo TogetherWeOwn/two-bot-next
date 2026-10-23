@@ -6,7 +6,7 @@ use sqlx::{PgPool, Row};
 use std::{
     collections::HashSet,
     fs::{File, OpenOptions},
-    io::{Read, Write},
+    io::Write,
     path::Path,
 };
 use two_bot_core::{
@@ -201,10 +201,24 @@ impl RemovalRecord {
     }
 }
 
+/// Cap for the cross-run audit replay: 8 MiB, matching the capped cutover
+/// siblings (`ghost_cleanup`, `raid-remove`). The replay goes through
+/// `cli::read_text_capped`, so an over-cap log is refused without ever
+/// buffering it whole; the boundary is strict `>`. The audit file is
+/// append-only across runs, so the writer enforces the same cap: the tool
+/// never writes a file it would then refuse to reopen.
+const MAX_AUDIT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Upper bound for one serialized audit record plus its newline (a worst-case
+/// record is about 280 bytes; pinned by a unit test). Used to refuse a run
+/// that cannot fit its records before any removal happens.
+const MAX_RECORD_BYTES: usize = 320;
+
 /// Lifetime inode lock and fsync-per-record. Never truncate prior evidence.
 pub struct FileAudit {
     file: File,
     pub done: HashSet<String>,
+    len: usize,
 }
 impl FileAudit {
     pub fn open(path: &Path, guild: &str) -> Result<Self, String> {
@@ -228,16 +242,20 @@ impl FileAudit {
             // the descriptor-level regular-file check can reject it.
             opts.mode(0o600).custom_flags(libc::O_NONBLOCK);
         }
-        let mut file = opts.open(path).map_err(|_| "cannot open audit file")?;
+        let file = opts.open(path).map_err(|_| "cannot open audit file")?;
         let metadata = file.metadata().map_err(|_| "cannot inspect audit file")?;
         if !metadata.is_file() {
             return Err("audit must be a regular file".into());
         }
         file.try_lock()
             .map_err(|_| "audit lock unavailable; inspect concurrent run")?;
-        let mut text = String::new();
-        file.read_to_string(&mut text)
-            .map_err(|_| "cannot read audit file")?;
+        let mut file = file;
+        // Fail closed: returning here drops `file`, which releases the lock.
+        // The refusal keeps the existing repair-evidence style and names the
+        // role and the cap.
+        let text = crate::cli::read_text_capped(&mut file, MAX_AUDIT_BYTES)
+            .map_err(|_| "cannot read audit file")?
+            .ok_or("audit file exceeds 8 MiB; repair evidence before resuming")?;
         if !text.is_empty() && !text.ends_with('\n') {
             return Err("unterminated audit record; repair evidence before resuming".into());
         }
@@ -276,16 +294,42 @@ impl FileAudit {
         let directory = File::open(parent).map_err(|_| "cannot open audit parent directory")?;
         sync(&file).map_err(|_| "audit initialization file fsync failed")?;
         sync(&directory).map_err(|_| "audit initialization directory fsync failed")?;
-        Ok(Self { file, done })
+        Ok(Self {
+            file,
+            done,
+            len: text.len(),
+        })
+    }
+    /// Refuse before any removal when `pending` more records cannot fit under
+    /// the audit cap. The remedy is a smaller cohort or a new audit file; the
+    /// evidence itself is not damaged.
+    pub fn ensure_capacity(&self, pending: usize) -> Result<(), String> {
+        if pending
+            .checked_mul(MAX_RECORD_BYTES)
+            .and_then(|bytes| bytes.checked_add(self.len))
+            .is_none_or(|total| total > MAX_AUDIT_BYTES)
+        {
+            return Err(
+                "audit file would exceed 8 MiB; split the cohort or use a new audit file".into(),
+            );
+        }
+        Ok(())
     }
     pub fn append(&mut self, record: &RemovalRecord) -> Result<(), String> {
         record.validate()?;
         let mut bytes = serde_json::to_vec(record).map_err(|_| "cannot encode audit record")?;
         bytes.push(b'\n');
+        // Hard backstop for `ensure_capacity`: never grow the file past what
+        // `open` will replay.
+        if self.len + bytes.len() > MAX_AUDIT_BYTES {
+            return Err("audit file would exceed 8 MiB; stopped before next target".into());
+        }
         self.file
             .write_all(&bytes)
             .and_then(|()| self.file.sync_all())
-            .map_err(|_| "audit write/fsync failed; stopped before next target".into())
+            .map_err(|_| "audit write/fsync failed; stopped before next target")?;
+        self.len += bytes.len();
+        Ok(())
     }
 }
 
@@ -568,6 +612,78 @@ mod tests {
                 _ => unreachable!(),
             }
         }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn scratch_audit(tag: &str) -> std::path::PathBuf {
+        let root = std::env::var_os("PAPERCLIP_RUN_SCRATCH_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        root.join(format!("raid-cap-{tag}-{}.jsonl", std::process::id()))
+    }
+
+    #[test]
+    fn worst_case_record_fits_the_per_record_budget() {
+        let record = RemovalRecord {
+            v: 1,
+            ts: "2026-10-21T08:22:08.382Z".into(),
+            run_id: format!("2026-10-21T08:22:08.382Z-{}", u32::MAX),
+            guild_id: "18446744073709551615".into(),
+            member_id: "18446744073709551615".into(),
+            mode: RemovalMode::Execute,
+            action: "kick".into(),
+            outcome: RemovalOutcome::AlreadyGone,
+            status: Some(u16::MAX),
+            attempts: u32::MAX,
+        };
+        let line = serde_json::to_vec(&record).unwrap().len() + 1;
+        assert!(line <= MAX_RECORD_BYTES, "record is {line} bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_capacity_refuses_a_run_the_audit_cannot_hold() {
+        let path = scratch_audit("capacity");
+        let audit = FileAudit::open(&path, "100000000000000010").unwrap();
+        let fits = MAX_AUDIT_BYTES / MAX_RECORD_BYTES;
+        assert!(audit.ensure_capacity(fits).is_ok());
+        let err = audit.ensure_capacity(fits + 1).unwrap_err();
+        assert!(
+            err.contains("8 MiB") && err.contains("new audit file"),
+            "{err}"
+        );
+        assert!(audit.ensure_capacity(usize::MAX).is_err());
+        drop(audit);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_never_grows_the_audit_past_what_open_replays() {
+        let path = scratch_audit("append");
+        let mut audit = FileAudit::open(&path, "100000000000000010").unwrap();
+        let record = RemovalRecord {
+            v: 1,
+            ts: "2026-10-21T08:22:08.382Z".into(),
+            run_id: "test".into(),
+            guild_id: "100000000000000010".into(),
+            member_id: "100000000000000011".into(),
+            mode: RemovalMode::DryRun,
+            action: "kick".into(),
+            outcome: RemovalOutcome::WouldKick,
+            status: None,
+            attempts: 0,
+        };
+        audit.len = MAX_AUDIT_BYTES;
+        let err = audit.append(&record).unwrap_err();
+        assert!(err.contains("8 MiB"), "{err}");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        audit.len = 0;
+        audit.append(&record).unwrap();
+        drop(audit);
+        let reopened = FileAudit::open(&path, "100000000000000010").unwrap();
+        assert!(reopened.len > 0);
+        drop(reopened);
         std::fs::remove_file(path).unwrap();
     }
 

@@ -88,11 +88,15 @@ def week_label(moment):
 
 def gh_api_get(path, **fields):
     """One read-only `gh api` call; the parsed JSON, or a fixed refusal."""
-    args = ["gh", "api", "--method", "GET", path]
+    field_args = []
     for key, value in fields.items():
-        args += ["-f", f"{key}={value}"]
+        field_args += ["-f", f"{key}={value}"]
     try:
-        result = subprocess.run(args, capture_output=True, text=True, timeout=GH_TIMEOUT)
+        # Keep the executable/method fixed and the endpoint out of option parsing.
+        result = subprocess.run(
+            ["gh", "api", "--method", "GET", *field_args, "--", path],
+            shell=False, capture_output=True, text=True, timeout=GH_TIMEOUT,
+        )
     except (OSError, subprocess.SubprocessError):
         raise DoraError("github api unavailable") from None
     if result.returncode != 0:
@@ -106,9 +110,9 @@ def gh_api_get(path, **fields):
 def list_production_deployments(repo, start):
     """Deploy-ID production rows at or after `start`, newest first.
 
-    Stops at the first row older than the window (the API returns newest
-    first) and keeps that boundary row when it carries a deploy ID, so the
-    earliest in-window deploy still has a predecessor for commits-per-deploy.
+    Stops at the first deploy-ID row older than the window (the API returns
+    newest first), skipping automatic rows to find the boundary predecessor.
+    The caller must verify its success before using it for commits-per-deploy.
     Automatic `environment:` rows (no deploy ID) are counted, never scored.
     """
     rows, automatic, boundary = [], 0, None
@@ -126,9 +130,9 @@ def list_production_deployments(repo, start):
             except DoraError:
                 raise DoraError("production deployments unreadable") from None
             if created < start:
-                if boundary is None and build_identity.is_deploy_id_shape(row.get("description")):
-                    boundary = row
-                return rows, automatic, boundary
+                if build_identity.is_deploy_id_shape(row.get("description")):
+                    return rows, automatic, row
+                continue
             if build_identity.is_deploy_id_shape(row.get("description")):
                 rows.append(row)
             else:
@@ -148,8 +152,10 @@ def latest_status(repo, deployment_id):
     statuses = gh_api_get(f"repos/{repo}/deployments/{deployment_id}/statuses", per_page=1)
     if not isinstance(statuses, list):
         raise DoraError("deployment statuses unreadable")
-    if not statuses or not isinstance(statuses[0], dict):
+    if not statuses:
         return None
+    if not isinstance(statuses[0], dict):
+        raise DoraError("deployment statuses unreadable")
     first = statuses[0]
     state = first.get("state")
     if not isinstance(state, str) or not state:
@@ -297,16 +303,16 @@ def score_throughput(repo, records, boundary_sha):
     for record in records:
         if record["state"] != "success":
             continue
-        if prev_sha is None or prev_sha == record["sha"]:
-            if prev_sha != record["sha"]:
-                unresolved += 1
-            prev_sha = record["sha"]
-            continue
-        ahead = fetch_ahead_by(repo, prev_sha, record["sha"])
-        if ahead is None:
+        if prev_sha is None:
             unresolved += 1
+        elif prev_sha == record["sha"]:
+            record["commits_since_prev"] = 0
         else:
-            record["commits_since_prev"] = ahead
+            ahead = fetch_ahead_by(repo, prev_sha, record["sha"])
+            if ahead is None:
+                unresolved += 1
+            else:
+                record["commits_since_prev"] = ahead
         prev_sha = record["sha"]
     return unresolved
 
@@ -417,8 +423,10 @@ def build_report(repo, records, automatic, window, recovery, throughput_unresolv
 
 def verdict_line(name, value, target, passed):
     """One markdown table row; nulls read as `n/a`, never as passing."""
-    if value is None or passed is None:
+    if value is None:
         return f"| {name} | n/a | {target} | n/a |"
+    if passed is None:
+        return f"| {name} | {value} | {target} | n/a |"
     mark = "pass" if passed else "FAIL"
     return f"| {name} | {value} | {target} | {mark} |"
 
@@ -512,7 +520,12 @@ def main(argv=None):
 
         rows, automatic, boundary = list_production_deployments(repo, start)
         records = resolve_deployments(repo, rows)
-        boundary_sha = boundary.get("sha") if isinstance(boundary, dict) else None
+        boundary_sha = None
+        if isinstance(boundary, dict):
+            boundary_status = latest_status(repo, boundary.get("id"))
+            sha = boundary.get("sha")
+            if boundary_status and boundary_status[0] == "success" and isinstance(sha, str) and sha:
+                boundary_sha = sha
         throughput_unresolved = score_throughput(repo, records, boundary_sha)
         incidents, unrecovered, unverified = score_recovery(repo, records)
 

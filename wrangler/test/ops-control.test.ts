@@ -431,8 +431,7 @@ const DO_FENCES = { automation: true, automod: false, publish: false, gateway_pa
 // every DO harness in this file.
 const doDatabase = new DatabaseSync(":memory:");
 
-function doHarness(env: Record<string, unknown>) {
-  const storage = memoryStorage();
+function doHarness(env: Record<string, unknown>, storage = memoryStorage()) {
   storage.map.set(OWNER_KEY, DO_OWNER);
   const backing = storage as unknown as Record<string, unknown>;
   const ctx = {
@@ -614,4 +613,299 @@ test("DO serves the full state machine: PUT, GET, kill-switch and audit", async 
   assert.equal(audit.status, 200);
   const rows = await audit.json() as { rows: { action: string; epoch: number }[] };
   assert.deepEqual(rows.rows.map((r) => r.action), ["kill_switch", "config_put"]);
+});
+
+// ------------------------------------------------ protected audit acceptance
+// Offline contract: GET /ops/audit returns {deploymentId, rows, truncated}.
+// Rows expose only {id, actor, action, epoch, timestamp, detail}; id is the
+// existing append-only storage key, never a stored/forged id. Detail projects
+// only matching overrides/fences. Unknown row/detail fields are not echoed.
+// The 64 KiB budget covers the entire UTF-8 JSON body, not only rows. Return
+// the longest newest-first prefix of whole rows, with truncated=true whenever
+// history is incomplete (including a newest row too large to fit by itself).
+// Storage refusals keep reason and code stable, with machine next_action:
+// storage_invalid -> escalate_storage; storage_unavailable -> retry_read.
+// These are read-only tests: no repair, delete, enforcement or new permission.
+// Run: node --import ./test/cloudflare-loader.mjs --test test/ops-control.test.ts
+const AUDIT_RESPONSE_BYTES = 64 * 1024;
+const AUDIT_PREFIX = "two-bot:ops-audit:v1:";
+const AUDIT_SENTINEL = "SYNTHETIC_PRIVATE_AUDIT_SENTINEL";
+const auditKey = (sequence: number) => `${AUDIT_PREFIX}${String(sequence).padStart(16, "0")}`;
+const encodedBytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).byteLength;
+
+type AuditFixture = {
+  actor: string;
+  action: "config_put" | "kill_switch";
+  epoch: number;
+  timestamp: string;
+  detail: Record<string, unknown>;
+};
+type AuditProjection = AuditFixture & { id: string };
+type AuditHistory = { deploymentId: string; rows: AuditProjection[]; truncated: boolean };
+
+function configAudit(overrides: Record<string, string> = { TWO_AUTOMATIONS: "0" }): AuditFixture {
+  return {
+    actor: "fixture-operator",
+    action: "config_put",
+    epoch: 1,
+    timestamp: "2026-10-03T00:00:00.000Z",
+    detail: { overrides },
+  };
+}
+
+function fenceAudit(): AuditFixture {
+  return {
+    actor: "fixture-operator",
+    action: "kill_switch",
+    epoch: 1,
+    timestamp: "2026-10-03T00:00:00.000Z",
+    detail: { fences: { ...DO_FENCES } },
+  };
+}
+
+function auditReadHarness(entries: [string, unknown][], listFailure = false) {
+  const storage = memoryStorage();
+  for (const [key, row] of entries) storage.map.set(key, structuredClone(row));
+  if (listFailure) storage.list = (async () => {
+    throw new Error(`${AUDIT_SENTINEL}: rejected storage list ${"\\\"\t".repeat(4096)}`);
+  }) as DurableObjectStorage["list"];
+  const writes: string[] = [];
+  const originalPut = storage.put;
+  storage.put = (async (...args: unknown[]) => {
+    writes.push("put");
+    return Reflect.apply(originalPut, storage, args);
+  }) as DurableObjectStorage["put"];
+  const h = doHarness(doEnv({ OPS_CONFIG_WRITES_ENABLED: "0", OPS_KILLSWITCH_ENABLED: "0" }), storage);
+  const snapshot = structuredClone([...storage.map]);
+  const set = storage.map.set.bind(storage.map);
+  const del = storage.map.delete.bind(storage.map);
+  const clear = storage.map.clear.bind(storage.map);
+  storage.map.set = (key, value) => { writes.push("set"); return set(key, value); };
+  storage.map.delete = (key) => { writes.push("delete"); return del(key); };
+  storage.map.clear = () => { writes.push("clear"); clear(); };
+  return {
+    ...h,
+    async read(request = doRequest(OPS_AUDIT_PATH)) {
+      const logs: string[] = [];
+      const originals = { warn: console.warn, error: console.error, log: console.log };
+      const capture = (...args: unknown[]) => { logs.push(args.map(String).join(" ")); };
+      console.warn = console.error = console.log = capture;
+      try {
+        const response = await h.bot.fetch(request);
+        const text = await response.text();
+        return { response, text, body: JSON.parse(text), bytes: new TextEncoder().encode(text).byteLength, logs };
+      } finally {
+        Object.assign(console, originals);
+        assert.deepEqual(writes, [], "audit reads must never put, repair, delete or clear storage");
+        assert.deepEqual([...storage.map], snapshot, "including nested row values and audit sequence");
+      }
+    },
+  };
+}
+
+function assertAuditRefusal(result: Awaited<ReturnType<ReturnType<typeof auditReadHarness>["read"]>>,
+  reason: "storage_invalid" | "storage_unavailable") {
+  assert.equal(result.response.status, 503);
+  assert.match(result.response.headers.get("content-type") ?? "", /^application\/json/);
+  assert.equal(result.response.headers.get("cache-control"), "no-store");
+  assert.ok(result.bytes <= 1024, "refusal is fixed and bounded, not truncated hostile content");
+  assert.equal(result.body.error, "ops_unavailable");
+  assert.equal(result.body.reason, reason);
+  assert.equal(result.body.code, reason);
+  assert.equal(result.body.next_action, reason === "storage_invalid" ? "escalate_storage" : "retry_read");
+  assert.equal("rows" in result.body, false, "a malformed listing must never look like partial success");
+  assert.ok(!result.text.includes(AUDIT_SENTINEL));
+  assert.ok(!result.logs.join("\n").includes(AUDIT_SENTINEL));
+}
+
+test("audit acceptance control: supported writer shapes include escaped override values", () => {
+  for (const row of [configAudit(), configAudit({}), configAudit({ TWO_AUTOMATIONS: "\\\"\t".repeat(1000) }), fenceAudit()]) {
+    const change = { ...row.detail, actor: row.actor, expectedEpoch: 0 };
+    assert.ok(row.action === "config_put" ? parseConfigPut(change) : parseKillswitchPost(change));
+    assert.ok(Number.isFinite(Date.parse(row.timestamp)));
+  }
+});
+
+test("audit acceptance: empty history explicitly reports complete without enabling writes", async () => {
+  const result = await auditReadHarness([]).read();
+  assert.equal(result.response.status, 200);
+  assert.deepEqual(result.body, { deploymentId: DO_ID, rows: [], truncated: false });
+  assert.ok(result.bytes <= AUDIT_RESPONSE_BYTES);
+});
+
+for (const clean of [configAudit(), fenceAudit()]) {
+  test(`audit acceptance: ${clean.action} projection drops hostile fields and ignores forged ids`, async () => {
+    const hostile = {
+      ...clean,
+      id: AUDIT_SENTINEL,
+      token: AUDIT_SENTINEL,
+      enforcement: "active",
+      payload: { nested: AUDIT_SENTINEL },
+      detail: { ...clean.detail, debug: AUDIT_SENTINEL, headers: { authorization: AUDIT_SENTINEL } },
+    };
+    const h = auditReadHarness([[auditKey(1), hostile]]);
+    const first = await h.read();
+    assert.equal(first.response.status, 200);
+    assert.ok(!first.text.includes(AUDIT_SENTINEL), "unknown fields must never reach successful JSON");
+    assert.deepEqual(first.body, { deploymentId: DO_ID, rows: [{ id: auditKey(1), ...clean }], truncated: false });
+    assert.deepEqual((await h.read()).body, first.body, "stable key-derived ids across repeated reads");
+  });
+}
+
+test("audit acceptance: valid config/fence rows use append-key order, not epochs or timestamps", async () => {
+  const config = configAudit({ TWO_AUTOMATIONS: "", TWO_AUTOMOD: "0" });
+  config.epoch = 9;
+  const fences = fenceAudit();
+  fences.timestamp = "2026-10-02T00:00:00.000Z";
+  const result = await auditReadHarness([[auditKey(2), fences], [auditKey(1), config]]).read();
+  assert.equal(result.response.status, 200);
+  assert.deepEqual(result.body, {
+    deploymentId: DO_ID,
+    rows: [{ id: auditKey(2), ...fences }, { id: auditKey(1), ...config }],
+    truncated: false,
+  });
+});
+
+const malformedAuditRows: [string, unknown][] = [
+  ["null row", null],
+  ["array row", []],
+  ["primitive row", AUDIT_SENTINEL],
+  ["missing actor", { ...configAudit(), actor: undefined }],
+  ["empty actor", { ...configAudit(), actor: "" }],
+  ["non-string actor", { ...configAudit(), actor: 7 }],
+  ["oversized actor", { ...configAudit(), actor: "a".repeat(129) }],
+  ["hostile actor", { ...configAudit(), actor: `${AUDIT_SENTINEL}\n` }],
+  ["unknown action", { ...configAudit(), action: AUDIT_SENTINEL }],
+  ["missing action", { ...configAudit(), action: undefined }],
+  ["string epoch", { ...configAudit(), epoch: "1" }],
+  ["zero epoch", { ...configAudit(), epoch: 0 }],
+  ["negative epoch", { ...configAudit(), epoch: -1 }],
+  ["fractional epoch", { ...configAudit(), epoch: 1.5 }],
+  ["unsafe epoch", { ...configAudit(), epoch: Number.MAX_SAFE_INTEGER + 1 }],
+  ["missing epoch", { ...configAudit(), epoch: undefined }],
+  ["invalid timestamp", { ...configAudit(), timestamp: AUDIT_SENTINEL }],
+  ["non-string timestamp", { ...configAudit(), timestamp: 0 }],
+  ["missing timestamp", { ...configAudit(), timestamp: undefined }],
+  ["missing detail", { ...configAudit(), detail: undefined }],
+  ["null detail", { ...configAudit(), detail: null }],
+  ["array detail", { ...configAudit(), detail: [] }],
+  ["config with fence detail", { ...configAudit(), detail: fenceAudit().detail }],
+  ["kill-switch with config detail", { ...fenceAudit(), detail: configAudit().detail }],
+  ["unknown override key", configAudit({ DISCORD_TOKEN: AUDIT_SENTINEL })],
+  ["non-string override", { ...configAudit(), detail: { overrides: { TWO_AUTOMATIONS: true } } }],
+  ["oversized override", configAudit({ TWO_AUTOMATIONS: "x".repeat(4097) })],
+  ["control override", configAudit({ TWO_AUTOMATIONS: `${AUDIT_SENTINEL}\n` })],
+  ["array overrides", { ...configAudit(), detail: { overrides: [] } }],
+  ["partial fences", { ...fenceAudit(), detail: { fences: { automation: true } } }],
+  ["non-boolean fences", { ...fenceAudit(), detail: { fences: { ...DO_FENCES, automation: "true" } } }],
+];
+for (const [name, row] of malformedAuditRows) {
+  test(`audit acceptance: ${name} refuses the entire listing as storage_invalid`, async () => {
+    // The bad row sits behind a good one: skipping it or returning a successful
+    // prefix would falsely claim validated history. Stored content is untouched.
+    const result = await auditReadHarness([[auditKey(1), row], [auditKey(2), configAudit()]]).read();
+    assertAuditRefusal(result, "storage_invalid");
+  });
+}
+
+test("audit acceptance: storage.list rejection has stable safe code and next_action", async () => {
+  assertAuditRefusal(await auditReadHarness([], true).read(), "storage_unavailable");
+});
+
+// Independent wire oracle. Four 4096-character override values per row are
+// writer-valid; backslashes double when encoded. Change some backslashes to
+// ASCII to put the *whole envelope* at the requested byte boundary.
+function auditBoundaryFixture(targetBytes: number) {
+  const values = {
+    TWO_AUTOMATIONS: "\\".repeat(4096),
+    TWO_AUTOMOD: "\\".repeat(4096),
+    // TWO_DEPLOY_ENV, not TWO_MODERATION: fixtures must stay PUT-writable,
+    // and both names are 14 characters so the byte tuning is unchanged.
+    TWO_DEPLOY_ENV: "\\".repeat(4096),
+    TWO_TEXT_COMMANDS: "\\".repeat(4096),
+  };
+  const rows: AuditProjection[] = [
+    { id: auditKey(2), ...configAudit({ ...values }) },
+    { id: auditKey(1), ...configAudit({ ...values }) },
+  ];
+  const expected: AuditHistory = { deploymentId: DO_ID, rows, truncated: false };
+  const reduction = encodedBytes(expected) - targetBytes;
+  assert.ok(reduction >= 0 && reduction <= 4096, "fixture has enough one-byte adjustments");
+  const oldest = rows[1]!.detail.overrides as Record<string, string>;
+  oldest.TWO_TEXT_COMMANDS = "\\".repeat(4096 - reduction) + "a".repeat(reduction);
+  assert.equal(encodedBytes(expected), targetBytes);
+  const entries: [string, unknown][] = rows.map(({ id, ...row }) => [id, row]);
+  return { entries, expected };
+}
+
+test("audit acceptance control: boundary fixtures parse as writer-supported changes", async () => {
+  for (const offset of [-1, 0, 1]) {
+    const { expected } = auditBoundaryFixture(AUDIT_RESPONSE_BYTES + offset);
+    for (const row of expected.rows) {
+      assert.ok(parseConfigPut({ ...row.detail, actor: row.actor, expectedEpoch: 0 }));
+    }
+    // Fixture-only control: confirm our independent size oracle agrees with
+    // the platform serializer before using it to judge the real DO response.
+    const wire = await Response.json(expected).text();
+    assert.equal(new TextEncoder().encode(wire).byteLength, AUDIT_RESPONSE_BYTES + offset);
+    assert.deepEqual(JSON.parse(wire), expected);
+  }
+});
+
+for (const offset of [-1, 0, 1]) {
+  test(`audit acceptance: escape-heavy whole JSON at cap${offset >= 0 ? "+" : ""}${offset} bytes`, async () => {
+    const { entries, expected } = auditBoundaryFixture(AUDIT_RESPONSE_BYTES + offset);
+    const result = await auditReadHarness(entries).read();
+    assert.equal(result.response.status, 200);
+    assert.ok(result.bytes <= AUDIT_RESPONSE_BYTES, `actual DO body is ${result.bytes} bytes`);
+    assert.match(result.response.headers.get("content-type") ?? "", /^application\/json/);
+    assert.equal(result.response.headers.get("cache-control"), "no-store");
+    if (offset <= 0) {
+      assert.deepEqual(result.body, expected, "whole history at/below the cap is not needlessly dropped");
+      assert.equal(result.bytes, AUDIT_RESPONSE_BYTES + offset);
+    } else {
+      assert.deepEqual(result.body, { ...expected, rows: [expected.rows[0]], truncated: true },
+        "one-byte overflow returns only the newest whole row, never a clipped value or JSON fragment");
+    }
+  });
+}
+
+test("audit acceptance: oversized newest row never skips ahead to an older small row", async () => {
+  const large = configAudit({
+    TWO_AUTOMATIONS: "\t".repeat(4096), TWO_AUTOMOD: "\t".repeat(4096),
+    TWO_DEPLOY_ENV: "\t".repeat(4096), TWO_TEXT_COMMANDS: "\t".repeat(4096),
+    TWO_ANNOUNCEMENTS: "\t".repeat(4096), TWO_VOICE: "\t".repeat(4096),
+    TWO_ANTI_NUKE: "\t".repeat(4096), TWO_TEMP_VOICE: "\t".repeat(4096),
+  });
+  assert.ok(parseConfigPut({ ...large.detail, actor: large.actor, expectedEpoch: 0 }));
+  assert.ok(encodedBytes({ deploymentId: DO_ID, rows: [{ id: auditKey(2), ...large }], truncated: false }) > AUDIT_RESPONSE_BYTES);
+  const result = await auditReadHarness([[auditKey(1), configAudit()], [auditKey(2), large]]).read();
+  assert.equal(result.response.status, 200);
+  assert.ok(result.bytes <= AUDIT_RESPONSE_BYTES);
+  assert.deepEqual(result.body, { deploymentId: DO_ID, rows: [], truncated: true });
+});
+
+for (const count of [99, 100, 101]) {
+  test(`audit acceptance: ${count} small rows explicitly distinguish complete from row-limit truncation`, async () => {
+    const entries: [string, unknown][] = Array.from({ length: count }, (_, i) => [auditKey(i + 1), configAudit()]);
+    const result = await auditReadHarness(entries).read();
+    assert.equal(result.response.status, 200);
+    assert.ok(result.bytes <= AUDIT_RESPONSE_BYTES);
+    const expectedIds = Array.from({ length: Math.min(count, 100) }, (_, i) => auditKey(count - i));
+    assert.deepEqual(result.body.rows.map((row: AuditProjection) => row.id), expectedIds);
+    assert.equal(result.body.truncated, count > 100, "100 returned rows alone do not prove history complete");
+  });
+}
+
+test("audit acceptance control: audit GET still rechecks auth and deployment with write switches dark", async () => {
+  const h = auditReadHarness([[auditKey(1), configAudit()]]);
+  // These refusals have existing non-audit envelopes; inspect them directly,
+  // since an unauthenticated response need not be JSON.
+  const wrong = await h.bot.fetch(doRequest(OPS_AUDIT_PATH, { headers: { authorization: "Bearer wrong" } }));
+  assert.equal(wrong.status, 401);
+  await wrong.text();
+  const fenced = await h.bot.fetch(doRequest(OPS_AUDIT_PATH, {}, "different-deployment"));
+  assert.equal(fenced.status, 503);
+  assert.equal((await fenced.json() as { reason: string }).reason, "deployment_mismatch");
+  assert.equal((await h.read()).response.status, 200);
 });

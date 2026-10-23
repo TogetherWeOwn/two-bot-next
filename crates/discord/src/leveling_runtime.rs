@@ -12,9 +12,7 @@ use twilight_model::{
     application::interaction::{
         application_command::CommandOptionValue, Interaction, InteractionData,
     },
-    channel::message::{AllowedMentions, MessageFlags},
     gateway::event::Event,
-    http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
 };
 use two_bot_core::{
     classify,
@@ -23,8 +21,8 @@ use two_bot_core::{
         voice_ended_fact, voice_started_fact, CommunityStoreError, FactWrite, MessageFactInput,
     },
     leveling::{
-        leaderboard_reply_for_season, plan_reward_roles, rank_reply, season_id_for_ms, XpAward,
-        LEADERBOARD_DEFAULT_LIMIT,
+        leaderboard_reply_for_season, plan_reward_roles, rank_reply, season_id_for_ms,
+        RewardPlanError, XpAward, LEADERBOARD_DEFAULT_LIMIT,
     },
     leveling_store::{self, LevelingStoreError},
     ClassifierConfig, ClassifyInput, FactsSink, FunnelHandlers, FunnelStore, HandlerId,
@@ -49,6 +47,62 @@ pub enum LevelingRuntimeError {
     Discord(#[from] DiscordError),
     #[error("invalid leveling interaction")]
     InvalidInteraction,
+    /// The award committed but applying its level-up roles failed. The XP and
+    /// the computed level-up are durable; `awards` carries them so the caller
+    /// never reports the level-up as failed.
+    #[error("leveling role application failed after the XP award committed: {cause}")]
+    RoleApplication {
+        cause: RoleApplicationError,
+        awards: Vec<XpAward>,
+    },
+}
+
+impl LevelingRuntimeError {
+    /// Awards committed before the error. Only a role-application failure
+    /// carries any; every other error returns an empty slice.
+    #[must_use]
+    pub fn committed_awards(&self) -> &[XpAward] {
+        match self {
+            Self::RoleApplication { awards, .. } => awards,
+            _ => &[],
+        }
+    }
+
+    /// Put awards committed earlier in the same drain ahead of the ones this
+    /// error already carries; non-role errors are unchanged.
+    fn with_prior_awards(mut self, mut prior: Vec<XpAward>) -> Self {
+        if let Self::RoleApplication { awards, .. } = &mut self {
+            prior.append(awards);
+            *awards = prior;
+        }
+        self
+    }
+}
+
+/// Why a committed level-up's role application failed. Display carries role
+/// ids and fixed refusal evidence only: no SQL, tokens or response bodies.
+#[derive(Debug, thiserror::Error)]
+pub enum RoleApplicationError {
+    #[error("role rewards could not be read")]
+    Store(#[from] LevelingStoreError),
+    /// A read or a pre-mutation refusal: no role was written.
+    #[error("role application Discord operation failed")]
+    Discord(#[from] DiscordError),
+    /// The plan hit the per-list role-write cap: no role was written.
+    #[error(transparent)]
+    Plan(#[from] RewardPlanError),
+    /// The first refused write aborted the rest. Earlier roles stay applied.
+    #[error(
+        "role {role_id} refused: {reason} ({} applied, {} skipped)",
+        applied.len(),
+        skipped.len()
+    )]
+    Refused {
+        role_id: String,
+        reason: String,
+        applied: Vec<String>,
+        skipped: Vec<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -492,6 +546,26 @@ impl FactsSink for DeferredCommunityFacts {
     }
 }
 
+/// Sanitized completion for an acknowledged `/rank` store failure: bounded,
+/// actionable, leaking no store detail. Mirrors the repo's "; try again."
+/// recovery convention; the store error still propagates for the caller's log.
+const RANK_UNAVAILABLE_REPLY: &str = "Rank is unavailable right now; try again.";
+/// Sanitized completion for an acknowledged `/leaderboard` store failure:
+/// same shape as [`RANK_UNAVAILABLE_REPLY`].
+const LEADERBOARD_UNAVAILABLE_REPLY: &str = "Leaderboard is unavailable right now; try again.";
+
+/// Validated store read awaiting its acknowledgement: built from the
+/// interaction alone (no store touch) so the defer can precede the read.
+enum PendingRead {
+    Rank {
+        member_id: String,
+        display_name: String,
+    },
+    Leaderboard {
+        season: String,
+    },
+}
+
 /// Award/reply slice of the shared command runtime; no private router or client.
 #[derive(Clone)]
 pub struct LevelingRuntime {
@@ -552,19 +626,45 @@ impl LevelingRuntime {
             && !self.onboarding.dry_run
             && two_bot_core::onboarding::level_role_writes_allowed(self.onboarding.mode)
         {
-            let rewards = leveling_store::role_rewards(&self.pool, &guild).await?;
-            if !rewards.is_empty() {
-                let held = self
-                    .executor
-                    .member_role_ids(request.guild_id, request.member_id)
-                    .await?;
-                let plan = plan_reward_roles(result.level, &rewards, &held, true, false);
-                self.executor
-                    .execute_reward_roles(request.guild_id, request.member_id, &plan, None)
-                    .await?;
-            }
+            self.apply_level_roles(&request, &guild, result.level)
+                .await
+                .map_err(|cause| LevelingRuntimeError::RoleApplication {
+                    cause,
+                    awards: vec![result],
+                })?;
         }
         Ok(Some(result))
+    }
+
+    /// Plan and apply the level-up roles after the award committed.
+    async fn apply_level_roles(
+        &self,
+        request: &AwardRequest,
+        guild: &str,
+        level: u64,
+    ) -> Result<(), RoleApplicationError> {
+        let rewards = leveling_store::role_rewards(&self.pool, guild).await?;
+        if rewards.is_empty() {
+            return Ok(());
+        }
+        let held = self
+            .executor
+            .member_role_ids(request.guild_id, request.member_id)
+            .await?;
+        let plan = plan_reward_roles(level, &rewards, &held, true, false)?;
+        let (applied, failed, skipped) = self
+            .executor
+            .execute_reward_roles(request.guild_id, request.member_id, &plan, None)
+            .await?;
+        match failed {
+            None => Ok(()),
+            Some((role_id, reason)) => Err(RoleApplicationError::Refused {
+                role_id,
+                reason,
+                applied,
+                skipped,
+            }),
+        }
     }
 
     /// Execute only the shared router's accepted leveling handler. The guild
@@ -584,6 +684,17 @@ impl LevelingRuntime {
     /// fallback. `/rank` stays lifetime-based at every instant. Shaped like
     /// the pipeline's existing `handle_at` ISO-millis convention; the season
     /// convention itself is unchanged.
+    ///
+    /// Defer-then-edit lifecycle: the initial acknowledgement (ephemeral for
+    /// rank, public for leaderboard) precedes either store read, so a slow
+    /// database cannot exhaust Discord's initial-response deadline. A failed
+    /// or uncertain acknowledgement returns here with zero store reads and no
+    /// further sends — only provably pre-wire Blocked contention is retried
+    /// inside the executor, and that retry cannot double-acknowledge. A
+    /// successful acknowledgement is completed by exactly one original-response
+    /// edit: the rendered reply on success, one sanitized actionable
+    /// unavailable reply on store failure (the store error still propagates
+    /// so the caller logs the real cause). Never a second initial callback.
     pub async fn handle_interaction_at(
         &self,
         interaction: &Interaction,
@@ -600,7 +711,10 @@ impl LevelingRuntime {
             .ok_or(LevelingRuntimeError::InvalidInteraction)?
             .get()
             .to_string();
-        let response = match handler {
+        // Pure validation before the acknowledgement: resolving the rank
+        // target and the leaderboard season touches no store.
+        let ephemeral = matches!(handler, HandlerId::Rank);
+        let read = match handler {
             HandlerId::Rank => {
                 let Some(InteractionData::ApplicationCommand(data)) = interaction.data.as_ref()
                 else {
@@ -619,37 +733,16 @@ impl LevelingRuntime {
                         .or(interaction.user.as_ref())
                 }
                 .ok_or(LevelingRuntimeError::InvalidInteraction)?;
-                let profile =
-                    leveling_store::profile(&self.pool, &guild, &user.id.get().to_string()).await?;
-                let reply = rank_reply(&profile, user.global_name.as_deref().unwrap_or(&user.name));
-                InteractionResponse {
-                    kind: InteractionResponseType::ChannelMessageWithSource,
-                    data: Some(InteractionResponseData {
-                        content: Some(reply.content),
-                        flags: Some(MessageFlags::EPHEMERAL),
-                        ..Default::default()
-                    }),
+                PendingRead::Rank {
+                    member_id: user.id.get().to_string(),
+                    display_name: user.global_name.as_deref().unwrap_or(&user.name).to_owned(),
                 }
             }
             HandlerId::Leaderboard => {
                 let at_ms = two_bot_core::parse_iso_millis(at)
                     .ok_or(LevelingRuntimeError::InvalidInteraction)?;
-                let season = season_id_for_ms(at_ms);
-                let entries = leveling_store::seasonal_leaderboard(
-                    &self.pool,
-                    &guild,
-                    &season,
-                    LEADERBOARD_DEFAULT_LIMIT,
-                )
-                .await?;
-                let reply = leaderboard_reply_for_season(&entries, &season);
-                InteractionResponse {
-                    kind: InteractionResponseType::ChannelMessageWithSource,
-                    data: Some(InteractionResponseData {
-                        content: Some(reply.content),
-                        allowed_mentions: Some(AllowedMentions::default()),
-                        ..Default::default()
-                    }),
+                PendingRead::Leaderboard {
+                    season: season_id_for_ms(at_ms),
                 }
             }
             _ => unreachable!(),
@@ -658,10 +751,59 @@ impl LevelingRuntime {
             .answer_interaction_with_blocked_retry(
                 interaction.id.get(),
                 &interaction.token,
-                &response,
+                &super::interactions::deferred_response(ephemeral),
             )
             .await?;
-        Ok(true)
+        let content = match read {
+            PendingRead::Rank {
+                member_id,
+                display_name,
+            } => leveling_store::profile(&self.pool, &guild, &member_id)
+                .await
+                .map(|profile| rank_reply(&profile, &display_name).content),
+            PendingRead::Leaderboard { season } => leveling_store::seasonal_leaderboard(
+                &self.pool,
+                &guild,
+                &season,
+                LEADERBOARD_DEFAULT_LIMIT,
+            )
+            .await
+            .map(|entries| leaderboard_reply_for_season(&entries, &season).content),
+        };
+        let application_id = interaction.application_id.get();
+        match content {
+            Ok(content) => {
+                self.executor
+                    .edit_interaction_response_with_blocked_retry(
+                        application_id,
+                        &interaction.token,
+                        &content,
+                    )
+                    .await?;
+                Ok(true)
+            }
+            Err(store) => {
+                let unavailable = if ephemeral {
+                    RANK_UNAVAILABLE_REPLY
+                } else {
+                    LEADERBOARD_UNAVAILABLE_REPLY
+                };
+                // Best-effort completion: attempt the edit, then report the
+                // store failure regardless. The store error is the root cause
+                // the caller must log; a simultaneous edit failure must not
+                // hide it (same precedence as the channel slice's
+                // Persistence-over-Edit return).
+                let _edit = self
+                    .executor
+                    .edit_interaction_response_with_blocked_retry(
+                        application_id,
+                        &interaction.token,
+                        unavailable,
+                    )
+                    .await;
+                Err(LevelingRuntimeError::Store(store))
+            }
+        }
     }
 }
 
@@ -806,8 +948,10 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
         let mut results = Vec::with_capacity(requests.len());
         if let Some(runtime) = &self.runtime {
             for request in requests {
-                if let Some(award) = runtime.award(request).await? {
-                    results.push(award);
+                match runtime.award(request).await {
+                    Ok(Some(award)) => results.push(award),
+                    Ok(None) => {}
+                    Err(error) => return Err(error.with_prior_awards(results)),
                 }
             }
         }
@@ -866,6 +1010,248 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{body::Body, http::Method, http::Response, http::Uri, Router};
+    use serde_json::{json, Value};
+    use std::collections::VecDeque;
+
+    struct RoleRest {
+        executor: Arc<ActionExecutor>,
+        requests: Arc<Mutex<Vec<(Method, String)>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for RoleRest {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    impl RoleRest {
+        async fn start(script: Vec<(u16, Value)>) -> Self {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let script = Arc::new(Mutex::new(VecDeque::from(script)));
+            let recorded = Arc::clone(&requests);
+            let app = Router::new().fallback(move |method: Method, uri: Uri| {
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push((method, uri.path().to_owned()));
+                let (status, body) = script
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or((500, Value::Null));
+                async move {
+                    Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(if status == 204 {
+                            Body::empty()
+                        } else {
+                            Body::from(body.to_string())
+                        })
+                        .unwrap()
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let executor = Arc::new(
+                ActionExecutor::with_proxy("mock-only-token".into(), Some(origin)).unwrap(),
+            );
+            Self {
+                executor,
+                requests,
+                task,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_role_refusal_preserves_prior_committed_awards_in_order() {
+        let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
+            eprintln!("SKIP drain award preservation: TWO_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let db = two_bot_testsupport::TestDatabase::create(
+            &url,
+            &sqlx::migrate!("../cutover/migrations"),
+        )
+        .await
+        .expect("create disposable test database");
+        for (member, xp) in [(200_u64, 99_i64), (201, 250)] {
+            sqlx::query("INSERT INTO member_levels (guild_id,member_id,xp,imported_xp,updated_at) VALUES ('100',$1,$2,$2,NOW())")
+                .bind(member.to_string())
+                .bind(xp)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        leveling_store::replace_role_rewards(
+            db.pool(),
+            "100",
+            &[two_bot_core::leveling::LevelRoleReward {
+                level: 1,
+                role_id: "555555555555555555".into(),
+            }],
+        )
+        .await
+        .unwrap();
+        let rest = RoleRest::start(vec![
+            (200, json!({"roles": []})),
+            (204, Value::Null),
+            (200, json!({"roles": []})),
+            (
+                403,
+                json!({"code": 50013, "message": "Missing Permissions"}),
+            ),
+        ])
+        .await;
+        let runtime = LevelingRuntime::new(
+            db.pool().clone(),
+            Arc::clone(&rest.executor),
+            100,
+            two_bot_core::OnboardingGates {
+                mode: two_bot_core::OnboardingMode::Legacy,
+                dry_run: false,
+            },
+        );
+        let pipeline = OrderedLevelingPipeline::new(two_bot_core::MemStore::new(), Some(runtime));
+        let requests = [200, 201]
+            .into_iter()
+            .map(|member_id| AwardRequest {
+                guild_id: 100,
+                member_id,
+                channel_id: 300,
+                at: "2026-08-15T00:00:00.000Z".into(),
+                duration: None,
+                content_length: Some(30),
+                has_embed_or_attachment: false,
+            })
+            .collect();
+        let result = pipeline.drain(requests).await;
+        let persisted: Vec<(String, i64)> =
+            sqlx::query_as("SELECT member_id,xp FROM member_levels ORDER BY member_id")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        db.close().await.expect("drop disposable test database");
+
+        let error = result.expect_err("second member's role write must be refused");
+        assert_eq!(
+            error.committed_awards(),
+            &[
+                XpAward {
+                    awarded: 15,
+                    total_xp: 114,
+                    level: 1,
+                    previous_level: 0,
+                    leveled_up: true
+                },
+                XpAward {
+                    awarded: 15,
+                    total_xp: 265,
+                    level: 2,
+                    previous_level: 1,
+                    leveled_up: true
+                },
+            ]
+        );
+        assert!(matches!(error, LevelingRuntimeError::RoleApplication {
+            cause: RoleApplicationError::Refused { role_id, reason, applied, skipped }, ..
+        } if role_id == "555555555555555555" && reason.contains("403") && applied.is_empty() && skipped.is_empty()));
+        assert_eq!(persisted, vec![("200".into(), 114), ("201".into(), 265)]);
+        assert_eq!(
+            *rest.requests.lock().unwrap(),
+            vec![
+                (Method::GET, "/api/v10/guilds/100/members/200".into()),
+                (
+                    Method::PUT,
+                    "/api/v10/guilds/100/members/200/roles/555555555555555555".into()
+                ),
+                (Method::GET, "/api/v10/guilds/100/members/201".into()),
+                (
+                    Method::PUT,
+                    "/api/v10/guilds/100/members/201/roles/555555555555555555".into()
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_revoke_refusal_reports_exact_roles_after_successful_grants() {
+        use crate::executor::StagingRevokeFence;
+        use two_bot_core::leveling::RewardRolePlan;
+
+        const GUILD: u64 = 1545644954272137297;
+        const PRODUCTION: u64 = 326474832151838730;
+        let rest = RoleRest::start(vec![
+            (200, json!({"id": "4444"})),
+            (200, json!({"roles": ["8888"]})),
+            (
+                200,
+                json!([
+                    {"id": GUILD.to_string(), "permissions": "0", "position": 0, "managed": false},
+                    {"id": "8888", "permissions": "268435456", "position": 10, "managed": false},
+                    {"id": "6666", "permissions": "0", "position": 1, "managed": false},
+                    {"id": "7777", "permissions": "0", "position": 2, "managed": false},
+                ]),
+            ),
+            (204, Value::Null),
+            (204, Value::Null),
+            (
+                403,
+                json!({"code": 50013, "message": "Missing Permissions"}),
+            ),
+        ])
+        .await;
+        let plan = RewardRolePlan {
+            grant: vec!["5555".into(), "5556".into()],
+            revoke: vec!["6666".into(), "7777".into()],
+            grant_reason: "TWO leveling: reached level 1".into(),
+            revoke_reason: Some("TWO leveling: below level thresholds at level 1".into()),
+        };
+        let (applied, failed, skipped) = rest
+            .executor
+            .execute_reward_roles(
+                GUILD,
+                3333,
+                &plan,
+                Some(StagingRevokeFence::new(GUILD, PRODUCTION).unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(applied, vec!["5555", "5556"]);
+        assert_eq!(
+            failed,
+            Some((
+                "6666".into(),
+                "discord refused the request: Discord refused the request with 403".into()
+            ))
+        );
+        assert_eq!(skipped, vec!["7777"]);
+        assert_eq!(
+            *rest.requests.lock().unwrap(),
+            vec![
+                (Method::GET, "/api/v10/users/@me".into()),
+                (Method::GET, format!("/api/v10/guilds/{GUILD}/members/4444")),
+                (Method::GET, format!("/api/v10/guilds/{GUILD}/roles")),
+                (
+                    Method::PUT,
+                    format!("/api/v10/guilds/{GUILD}/members/3333/roles/5555")
+                ),
+                (
+                    Method::PUT,
+                    format!("/api/v10/guilds/{GUILD}/members/3333/roles/5556")
+                ),
+                (
+                    Method::DELETE,
+                    format!("/api/v10/guilds/{GUILD}/members/3333/roles/6666")
+                ),
+            ]
+        );
+    }
 
     fn gate<'a>(
         member_id: Snowflake,

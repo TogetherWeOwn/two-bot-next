@@ -51,11 +51,16 @@ claim. Staging deploys from `main`; production deploys through the manual
 
 - [Commands](docs/commands.md): built-ins, options, registry bounds and default
   Discord permissions, rendered from the compiled all-enabled registry.
+- [Event help and attendee reminders](docs/event-reminders.md): fixed 15-minute,
+  channel-only reminders, delivery limits and restart-safe failure behavior.
+- [Sticky delivery recovery](docs/sticky-debounce-acceptance.md#uncertain-delivery-recovery):
+  inspect uncertain re-posts before resetting the durable delivery fence.
 - [Configuration](docs/configuration.md): all catalog keys/classes, known parsed
   defaults and descriptions. Classes are legacy-catalog labels only: gateway
   boot reads a fixed set of process-environment keys, and the Container's
-  `guild_settings` poll (`crates/bot/src/website_jobs.rs:207`) publishes a
-  snapshot every 15 s through `settings_jobs::live`
+  `guild_settings` job (`crates/bot/src/website_jobs.rs:207`) polls every 15 s
+  and publishes a snapshot only when the revision or row count changes
+  (`crates/bot/src/settings_jobs.rs:146-160`), exposed through `settings_jobs::live`
   (`crates/bot/src/settings_jobs.rs:53`); the live-snapshot consumer table in
   the reference names every reader — automod, feed, audit, ticket, gateway
   classifier and voice — alongside the per-runtime store and per-event
@@ -157,7 +162,8 @@ fail-closed retention auditing, `/home` available-byte alarms and the Operator r
   writes on rollback. Planned tools are explicitly marked; this is not cutover approval.
 - [Staging soak](docs/staging-soak.md) and [gateway recovery](docs/gateway-recovery.md).
 - [Weekly DORA metrics](docs/dora-metrics.md): change failure rate, recovery
-  time, merge-to-prod lead time and throughput, committed to `ops/metrics/`.
+  time, merge-to-prod lead time and throughput, committed to `ops/metrics/`
+  on the `automation/dora-metrics` branch.
 
 Migration changes must pass the [numbering and checksum guard](docs/migrations.md).
 Add new SQL files and their `migrations.lock` entries together; existing migration

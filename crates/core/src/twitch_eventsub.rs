@@ -84,6 +84,8 @@ pub enum EventSubError {
     StaleTimestamp,
     #[error("Body is not a valid EventSub message.")]
     InvalidBody,
+    #[error("Body contains a duplicate JSON object key.")]
+    DuplicateKeys,
     #[error("Message is not for the stream.online v1 subscription.")]
     WrongSubscription,
     #[error("Verification challenge is invalid.")]
@@ -267,6 +269,9 @@ pub fn classify(message_type: &str, body: &[u8]) -> Result<Delivery, EventSubErr
     }
     let value: serde_json::Value =
         serde_json::from_slice(body).map_err(|_| EventSubError::InvalidBody)?;
+    // Second pass over bytes that already parsed: syntax and nesting depth
+    // are proven, so the only refusal left is a repeated key.
+    crate::duplicate_keys::reject_duplicate_keys(body).map_err(|_| EventSubError::DuplicateKeys)?;
     let subscription = value
         .get("subscription")
         .ok_or(EventSubError::InvalidBody)?;

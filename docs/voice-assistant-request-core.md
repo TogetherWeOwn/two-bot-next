@@ -53,6 +53,7 @@ The V12a cap ledger (`voice_assistant_cap`) owns the 200-builds-per-month limit.
 | --- | --- |
 | body over 64 KiB, before parsing | `Oversize { len }` |
 | body is not JSON | `NotJson` |
+| envelope or content repeats an object key | `DuplicateKeys` |
 | top-level `error` object without `choices` | `EndpointError` |
 | no `choices[0].message.content` string | `WrongShape { at }` |
 | content (after one optional Markdown code fence) is not JSON | `ContentNotJson` |

@@ -98,6 +98,25 @@ live-SHA takeover redeploy serve no new schema and skip this gate job
 (guard-validated modes only; the production job accepts exactly those),
 so recovery never waits on it.
 
+For a new build, `production_schema_gate.py` accepts only the existing
+`runner_version=1` read-only `mode=plan` report for `migration_target=production`,
+the exact canonical lowercase 40-hex requested SHA and `role=two_bot_migrator_ro`,
+with strict integer zero apply counts. Returned host/database/branch fields
+must match independently verified, normalized environment pins; neither the
+manifest nor raw untrimmed variables are a replacement identity oracle. Both
+pending arrays must be strictly increasing positive i64 integers. Minimal,
+malformed or contradictory evidence refuses before publication. Valid clean
+and drift reports are saved atomically; errors publish no new evidence.
+
+The terminal stdout line is JSON with stable `verdict`, `code` and `next_action`:
+`schema_clean` exits 0, `schema_drift` exits 1, input/binding/manifest refusals
+exit 2, and subprocess/execution/output errors exit 3. The script's existing
+recovery-only invocation returns `recovery_waived` (not `clean`) without a DB
+read. Connection warnings remain advisory. See the shared
+[code/action and evidence contract](runbook.md#schema-gate-evidence-and-terminal-results)
+for exact remediation tokens; no raw child stderr, rejected values, exception
+text or traceback is relayed. No apply path, target scope or waiver is added.
+
 Before step 2, a role gate also runs the read-only `two-bot db roles verify`
 on the same `production-migrate-plan` binding and refuses a new build whose
 grants lag the migrations. Migrations create tables but grant nothing: the
@@ -505,8 +524,9 @@ fields, and the gate fails without being a rollback signal. In rollback mode
    ownership Durable Object keeps running the previous code until
    Cloudflare's deferred update reaches it (up to about 300 s, observed on
    2026-10-10 after both a deploy and a secret change). A mismatch that outlasts the window, and every other refusal or a
-   running container, is NO-GO and the run stops before any POST. The full
-   response is tee'd to the run log as the P2 receipt.
+   running container, is NO-GO and the run stops before any POST. The validated,
+   supported-field response is tee'd to the run log as the P2 receipt; arbitrary
+   remote fields are discarded (see the [control response contract](cutover.md#authenticated-control-contract)).
 4. P3 `Take over production ownership at the read epoch`: one POST with
    exactly `{"action":"takeover","expectedEpoch":<P2 epoch>,"actor":...}`.
    The actor is `github-actions:<run id>:<guarded SHA>` (audit label only;

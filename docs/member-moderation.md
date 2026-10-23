@@ -41,9 +41,11 @@ executor merged.
   across several guilds but still scopes every sweep to its supplied guild.
 - Drive `run_due_unbans(guild_id)` every `UNBAN_SWEEP_INTERVAL_SECONDS` (30),
   with at most 25 jobs per sweep. Each is claimed immediately before processing,
-  not in a bulk reservation before the first Discord await. A failure stops the
-  sweep; a definite rejection is requeued under the member queue for the next
-  tick, never retried within this sweep. Undispatched later jobs stay pending.
+  not in a bulk reservation before the first Discord await. A per-job Discord
+  failure is recorded with its bounded cause and the sweep continues; a
+  definite rejection is requeued under the member queue for the next tick,
+  never retried within this sweep. Only unknown bot identity and store
+  failures stop the sweep. Undispatched later jobs stay pending.
   The policy must carry the resolved `bot_user_id`: without it the sweep returns
   `BotIdentityUnknown` before claiming any job, so no unban runs unattributed.
 - Surface prepared/uncertain ban intents and `running` jobs for reconciliation.
@@ -131,9 +133,12 @@ the idempotency key, so redelivery of that same interaction still reaches durabl
 replay instead of consuming a new cooldown or moderating twice.
 
 Operator reconciliation ships as `two-bot reconcile-member`
-(`crates/bot/src/member_cli.rs`): `--list` surfaces prepared ban intents,
-running dispatches and quarantined imports via the read-only
-`surface_uncertain` store seam; `--confirm-ban`, `--reject-ban`,
+(`crates/bot/src/member_cli.rs`): `--list [--limit <n>]` surfaces prepared
+ban intents, running dispatches and quarantined imports via the read-only
+bounded `surface_uncertain_limited` store seam (25 rows by default, at most
+100; a capped listing ends with a `showing <shown> of <total> rows`
+truncation receipt, naming the ceiling past 100 rows since no `--limit`
+rerun converges there); `--confirm-ban`, `--reject-ban`,
 `--resolve-unban` and `--accept-historical` resolve one exact attempt with
 authoritative exact-intent evidence. Mutations are dry-run by default
 (`--execute` writes), staging-guild only, and claim tokens never print.
@@ -218,7 +223,7 @@ transition may make that one job uncertain, but does not strand the remaining
 batch. No running claim is reclaimed by age. `claim_due_unbans` acquires member
 queues internally; do not wrap it in another `serialize_member` callback.
 
-A definite DELETE refusal still ends that tick without automatically retrying it.
+A definite DELETE refusal is recorded and the sweep continues without automatically retrying it until the next tick.
 Migration 0113 adds a nullable `retry_generation` queue ticket. Exact-token requeue
 allocates the next value from the existing ban-generation sequence, then clears
 only the safe dispatch claim. Due jobs sort by that ticket (or their original
@@ -268,6 +273,33 @@ with only a fixed `action` and `cause` (`discord_rejected`,
 store error. Such a line means one caller-supplied key will keep answering
 `in_progress`; the signal does
 not name it, and no code expires or takes over the row.
+
+### Refused and incomplete request audits
+
+All five member verbs audit reason/duration validation refusals as `denied`
+with `stage: validation`; key mismatches use `stage: claim`. Denials retain
+only fixed reason copy, not rejected input. Their `:denied` request identity
+keeps a corrected retry's plain success row available.
+
+Discord failures and store errors attempt a best-effort audit with the original
+request ID in metadata and the original idempotency key in its dedicated field.
+A proven no-effect failure whose key was released writes `:failed` / `failed`;
+an uncertain effect, claim or failed release writes `:in_progress` /
+`in_progress`. The stage distinguishes `discord`, `store` and `claim`. An
+in-flight redelivery uses the same suffix and does not duplicate that row. If
+the plain accepted-effect row already exists, it remains the authoritative
+observation and no redundant in-progress row is inserted. A completed replay
+writes no audit. Audit loss cannot change release/fence decisions or the
+original effect error; no failure adds an automatic retry.
+
+Channel moderation's four verbs attempt a best-effort missing-context refusal
+row before replying. Known interaction IDs are preserved; unavailable guild or
+actor IDs are empty text and an unavailable channel is null, with
+`stage: validation` / `cause: missing_context` metadata. No principal is
+inferred and no claim or Discord write occurs. Held channel claims write a
+separate `:in_progress` row with `stage: claim`, preserving both the original
+uncertain dispatch row and its key. Further redelivery deduplicates that row;
+completed channel replays still write none. Successful rows are unchanged.
 
 ## Verification
 

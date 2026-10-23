@@ -16,14 +16,19 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 use futures_util::FutureExt as _;
 use sqlx::PgPool;
-use tokio::sync::{mpsc, OnceCell};
+use tokio::sync::futures::Notified;
+use tokio::sync::{mpsc, Notify, OnceCell};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
+use two_bot_core::metrics::{self, JoinQueueDropReason};
 use two_bot_core::onboarding::MentionPolicy;
 use two_bot_core::settings::SettingsCache;
 use two_bot_core::{
@@ -37,7 +42,7 @@ use two_bot_discord::{ActionExecutor, JoinObservation, JoinObserver};
 /// dispatch writer must never wait on this runtime.
 pub(crate) const QUEUE_CAPACITY: usize = 2048;
 /// Bound on one alert's bot lookup, permission reads and post.
-const DELIVERY_MAX: Duration = Duration::from_secs(12);
+pub(crate) const DELIVERY_MAX: Duration = Duration::from_secs(12);
 /// The live settings are re-checked at most this often (legacy 15 s poll).
 const SETTINGS_MAX_AGE: Duration = Duration::from_secs(15);
 const SETTINGS_READ_MAX: Duration = Duration::from_millis(1500);
@@ -238,6 +243,7 @@ impl StoreSettings {
             Err(refusal) => {
                 if !matches!(&self.last, Some(Err(previous)) if previous.key() == refusal.key()) {
                     error!(
+                        error_class = "raid_tuning_refused",
                         key = refusal.key(),
                         "raid_tuning_refused: observations disabled"
                     );
@@ -310,6 +316,7 @@ impl RaidDelivery {
     async fn announce(&self, alert: &RaidAlert, channel: Option<&str>) {
         // Always log first. If the post fails the evidence still exists.
         error!(
+            error_class = "raid_alert",
             guild_id = %alert.guild_id,
             count = alert.count,
             span_seconds = alert.span_seconds,
@@ -328,16 +335,23 @@ impl RaidDelivery {
         // The shared executor always sends empty allowed mentions; refuse a
         // proposal that asks for anything else rather than widen that boundary.
         if message.mentions != MentionPolicy::None {
-            error!(channel, "raid_alert_refused: mention policy is not empty");
+            error!(
+                error_class = "raid_alert_refused",
+                channel, "raid_alert_refused: mention policy is not empty"
+            );
             return;
         }
         match self.post_staff_message(channel, &message.content).await {
             Delivery::Posted => info!(channel, count = alert.count, "raid_alert_posted"),
             Delivery::Undeliverable => error!(
+                error_class = "raid_alert_undeliverable",
                 channel,
                 "raid_alert_undeliverable: channel missing, not text, or bot lacks View/Send"
             ),
-            Delivery::Failed => error!(channel, "raid_alert_post_failed"),
+            Delivery::Failed => error!(
+                error_class = "raid_alert_post_failed",
+                channel, "raid_alert_post_failed"
+            ),
         }
     }
 
@@ -377,24 +391,195 @@ impl RaidDelivery {
     }
 }
 
+/// Supervised-worker shutdown latch plus drain counters, shared between the
+/// pipeline-facing runtime and its worker task. `start()` builds one per
+/// worker; containment and join-risk reuse this core instead of duplicating
+/// the latch. Latching selects the bounded drain (finish the in-flight item,
+/// drop the queued inbox with a count) while an unlatched sender-drop keeps
+/// the legacy full drain.
+#[derive(Default)]
+pub(crate) struct WorkerShutdown {
+    wake: Notify,
+    latched: AtomicBool,
+    finished: AtomicU64,
+    dropped: AtomicU64,
+}
+
+impl WorkerShutdown {
+    /// Latch the bounded drain and wake a worker parked in `recv()`.
+    /// `notify_one` stores its permit when nobody is parked, so a latch that
+    /// lands mid-item still wakes the worker's next `select!`.
+    pub(crate) fn latch(&self) {
+        self.latched.store(true, Ordering::SeqCst);
+        self.wake.notify_one();
+    }
+
+    /// Poll side of the latch: a worker mid-item checks this between sequential
+    /// steps and stops starting new work, so the post-latch drain stays one
+    /// in-flight step plus the outcome persist instead of the whole plan.
+    pub(crate) fn is_latched(&self) -> bool {
+        self.latched.load(Ordering::SeqCst)
+    }
+
+    /// Wait side of the latch: the worker selects this against inbox receives.
+    pub(crate) fn notified(&self) -> Notified<'_> {
+        self.wake.notified()
+    }
+
+    /// One dequeued item handled to completion, caught panics included.
+    pub(crate) fn note_finished(&self) {
+        self.finished.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Queued items dropped without starting after a latched shutdown.
+    pub(crate) fn note_dropped(&self, dropped: u64) {
+        self.dropped.store(dropped, Ordering::SeqCst);
+    }
+
+    pub(crate) fn finished(&self) -> u64 {
+        self.finished.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::SeqCst)
+    }
+}
+
+/// Fixed-vocabulary shutdown-drain event. Every supervised worker that drains
+/// normally logs exactly one per latched shutdown with the finished/dropped
+/// counts. A worker aborted as wedged never reaches its drain, so the abort
+/// path intentionally reports nothing here; the supervisor logs the abort
+/// itself with the budget it outlived.
+pub(crate) fn worker_shutdown_drain(finished: u64, dropped: u64) {
+    info!(
+        event = "worker_shutdown_drain",
+        finished = finished,
+        dropped = dropped,
+        "worker shutdown drain; in-flight item finished, queued inbox dropped"
+    );
+}
+
+/// Drop the queued inbox without starting any item. The inbox is closed first
+/// so sends racing the drain fail closed at the observer boundary (the same
+/// `Closed` arm as a dropped receiver) instead of landing in a dead channel
+/// uncounted. The caller reports the count via `WorkerShutdown::note_dropped`
+/// and `worker_shutdown_drain`.
+pub(crate) fn drain_queued<T>(receiver: &mut mpsc::Receiver<T>) -> u64 {
+    receiver.close();
+    let mut dropped = 0;
+    while receiver.try_recv().is_ok() {
+        dropped += 1;
+    }
+    dropped
+}
+
+/// Bound for one latched worker drain (finish the in-flight item, drop the
+/// queue) before the supervisor aborts it. The floor is the slowest latched
+/// drain: a containment worker starts no new step once latched, so at most one
+/// in-flight Discord call (`MODERATION_TIMEOUT_MS`, 5 s) plus the settings tail
+/// (`SETTINGS_READ_MAX`, 1.5 s) and one bounded staff post (`DELIVERY_MAX`,
+/// 12 s) remain — 18.5 s, with the rest as headroom for pacing and the outcome
+/// persist. The raid and join-risk items fit the same floor with a single
+/// trailing post. A worker still running past this bound is parked in a wait
+/// no in-deadline budget can cover (a 429-clamped retry sleep, a hung store)
+/// and is treated as wedged and aborted; the drain normally finishes in
+/// milliseconds.
+pub(crate) const WORKER_JOIN_BUDGET: Duration = Duration::from_secs(20);
+
+/// Abort the owned worker when the supervisor future is dropped. Aborting (or
+/// dropping) a supervisor `JoinHandle` detaches its task in Tokio; without
+/// this guard the nested worker would keep running — Discord writes, store
+/// writes, staff posts — after the service join logged its drain as cut
+/// short. Aborting an already-finished worker is a harmless no-op, so the
+/// guard needs no disarm on the healthy paths.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Hold a production worker handle and join-or-abort it on service shutdown,
+/// after `eventsub_reconcile::join`: latch the worker drain first so the join
+/// normally succeeds, and abort only a worker that outlives `budget`. The
+/// returned supervisor handle must itself be retained and joined (production
+/// constructors return it to `main` for the shutdown join); a detached
+/// supervisor is aborted with the runtime and its drain guarantee is lost.
+pub(crate) fn join_on_shutdown(
+    mut worker: JoinHandle<()>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    budget: Duration,
+    on_shutdown: impl FnOnce() + Send + 'static,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        // An aborted supervisor must not leave a detached worker behind.
+        // This binding keeps the abort handle (it must not be named like a
+        // discarded handle: the supervision acceptance suite scans these
+        // sources for one).
+        let _abort_guard = AbortOnDrop(worker.abort_handle());
+        let _ = shutdown.wait_for(|latched| *latched).await;
+        on_shutdown();
+        match tokio::time::timeout(budget, &mut worker).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                error!(
+                    panicked = error.is_panic(),
+                    "worker task ended abnormally during shutdown drain"
+                );
+            }
+            Err(_) => {
+                error!(
+                    budget_ms = budget.as_millis() as u64,
+                    "worker did not finish within the shutdown drain; aborting it, so a wedged in-flight item is dropped and its queued inbox is discarded uncounted"
+                );
+                worker.abort();
+                let _ = worker.await;
+            }
+        }
+    })
+}
+
 struct RaidWorker<S> {
     guild_id: u64,
     settings: S,
     delivery: RaidDelivery,
     watch: RaidWatch,
     joins: mpsc::Receiver<JoinObservation>,
+    shutdown: Arc<WorkerShutdown>,
 }
 
 impl<S: CheckedSettingsSource> RaidWorker<S> {
     async fn run(mut self) {
-        while let Some(join) = self.joins.recv().await {
-            // An internal failure must never end the watch: log it and carry on.
-            if AssertUnwindSafe(self.handle(join))
-                .catch_unwind()
-                .await
-                .is_err()
-            {
-                error!("raid_watch_failed: observation panicked");
+        loop {
+            tokio::select! {
+                biased;
+                () = self.shutdown.notified() => {
+                    let dropped = drain_queued(&mut self.joins);
+                    self.shutdown.note_dropped(dropped);
+                    worker_shutdown_drain(self.shutdown.finished(), dropped);
+                    return;
+                }
+                msg = self.joins.recv() => {
+                    let Some(join) = msg else {
+                        // Unlatched sender-drop: every buffered item already
+                        // yielded above, so the legacy full drain exits here.
+                        return;
+                    };
+                    // An internal failure must never end the watch: log it and carry on.
+                    if AssertUnwindSafe(self.handle(join))
+                        .catch_unwind()
+                        .await
+                        .is_err()
+                    {
+                        error!(
+                            error_class = "raid_watch_failed",
+                            "raid_watch_failed: observation panicked"
+                        );
+                    }
+                    self.shutdown.note_finished();
+                }
             }
         }
     }
@@ -426,44 +611,91 @@ impl<S: CheckedSettingsSource> RaidWorker<S> {
 /// The pipeline-facing half: queue only, never block.
 pub struct RaidRuntime {
     joins: mpsc::Sender<JoinObservation>,
+    shutdown: Arc<WorkerShutdown>,
+}
+
+impl RaidRuntime {
+    /// Latch the bounded shutdown drain: the worker finishes its in-flight
+    /// item, drops the queued inbox with a count, logs
+    /// `worker_shutdown_drain`, and exits so its handle joins.
+    pub fn shutdown(&self) {
+        self.shutdown.latch();
+    }
+
+    /// Dequeued items handled to completion, caught panics included.
+    #[cfg(test)]
+    pub fn finished(&self) -> u64 {
+        self.shutdown.finished()
+    }
+
+    /// Queued items dropped without starting after a latched shutdown.
+    #[cfg(test)]
+    pub fn dropped_shutdown(&self) -> u64 {
+        self.shutdown.dropped()
+    }
 }
 
 impl JoinObserver for RaidRuntime {
     fn observe_join(&self, join: JoinObservation) {
         match self.joins.try_send(join) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(join)) => warn!(
-                member_id = join.member_id,
-                "raid watch queue full; join not observed"
-            ),
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Full(join)) => {
+                metrics::global().raid_dropped_join(JoinQueueDropReason::QueueFull);
+                warn!(
+                    member_id = join.member_id,
+                    "raid watch queue full; join not observed"
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                metrics::global().raid_dropped_join(JoinQueueDropReason::QueueClosed);
+                error!(
+                    error_class = "raid_queue_closed",
+                    "raid watch queue closed; join not observed"
+                );
+            }
         }
     }
 }
 
-/// Spawn the worker. It ends when the last [`RaidRuntime`] reference drops.
+/// Spawn the worker. [`RaidRuntime::shutdown`] latches the bounded drain
+/// (finish the in-flight item, drop the queue with a count); an unlatched
+/// worker ends when the last [`RaidRuntime`] reference drops, draining fully
+/// as before.
 pub fn start<S: CheckedSettingsSource>(
     guild_id: u64,
     settings: S,
     executor: ActionExecutor,
 ) -> (Arc<RaidRuntime>, JoinHandle<()>) {
     let (sender, receiver) = mpsc::channel(QUEUE_CAPACITY);
+    let shutdown = Arc::new(WorkerShutdown::default());
     let worker = RaidWorker {
         guild_id,
         settings,
         delivery: RaidDelivery::new(executor, guild_id),
         watch: RaidWatch::default(),
         joins: receiver,
+        shutdown: Arc::clone(&shutdown),
     };
     (
-        Arc::new(RaidRuntime { joins: sender }),
+        Arc::new(RaidRuntime {
+            joins: sender,
+            shutdown,
+        }),
         tokio::spawn(worker.run()),
     )
 }
 
 /// Production wiring: deployment values from the environment, hot rows from the
-/// settings store. Always on, as legacy raid watch was (TWO-56).
-pub fn start_from_env(pool: PgPool, executor: ActionExecutor, guild_id: u64) -> Arc<RaidRuntime> {
+/// settings store. Always on, as legacy raid watch was (TWO-56). The service
+/// shutdown receiver latches the worker drain through a bounded supervisor
+/// that holds the worker handle and joins-or-aborts it; the supervisor handle
+/// is returned for the `main` shutdown join and must not be detached.
+pub fn start_from_env(
+    pool: PgPool,
+    executor: ActionExecutor,
+    guild_id: u64,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> (Arc<RaidRuntime>, JoinHandle<()>) {
     let deployment = SETTING_KEYS
         .iter()
         .filter_map(|key| {
@@ -472,12 +704,16 @@ pub fn start_from_env(pool: PgPool, executor: ActionExecutor, guild_id: u64) -> 
                 .map(|value| ((*key).to_owned(), value))
         })
         .collect();
-    let (runtime, _worker) = start(
+    let (runtime, worker) = start(
         guild_id,
         StoreSettings::new(pool, guild_id, deployment),
         executor,
     );
-    runtime
+    let supervisor = join_on_shutdown(worker, shutdown, WORKER_JOIN_BUDGET, {
+        let runtime = Arc::clone(&runtime);
+        move || runtime.shutdown()
+    });
+    (runtime, supervisor)
 }
 
 #[cfg(test)]

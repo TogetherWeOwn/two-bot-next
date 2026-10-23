@@ -54,6 +54,10 @@ export const RUST_ALERT_AXES: Record<string, Record<string, string | readonly st
   two_bot_dispatch_drops_total: { lane: "DISPATCH_LANES" },
   two_bot_internal_actions_total: { family: "INTERNAL_ACTION_FAMILIES", outcome: "INTERNAL_ACTION_OUTCOMES" },
   two_bot_rest_guard_breaker_open: {},
+  two_bot_rest_guard_token_invalid: {},
+  two_bot_rest_guard_invalid_requests_total: {},
+  two_bot_rest_guard_rejected_requests_total: {},
+  two_bot_rest_guard_pending_global_responses: {},
   two_bot_community_facts_drain_failures_total: { reason: "COMMUNITY_FACTS_DRAIN_REASONS" },
   two_bot_eventsub_posts_total: { outcome: "EVENTSUB_POST_OUTCOMES" },
   two_bot_eventsub_reconcile_passes_total: { outcome: "EVENTSUB_RECONCILE_OUTCOMES" },
@@ -72,6 +76,13 @@ export const RUST_ALERT_AXES: Record<string, Record<string, string | readonly st
   // literal here, pinned against the validator and the rule below.
   two_bot_handler_duration_seconds_bucket: { le: ["0.001", "0.005", "0.01", "0.05", "0.1", "0.5", "1", "5", "+Inf"] },
   two_bot_job_runs_total: { job: "JOBS", outcome: "JOB_OUTCOMES" },
+  two_bot_feed_fetch_errors_total: { error_class: "FEED_FETCH_ERROR_CLASSES" },
+  two_bot_eventsub_received_total: {},
+  two_bot_eventsub_reconcile_errors_total: { error_class: "EVENTSUB_RECONCILE_ERROR_CLASSES" },
+  two_bot_automod_decisions_total: { outcome: "AUTOMOD_DECISION_OUTCOMES" },
+  two_bot_moderation_enforcements_total: { verb: "MODERATION_VERBS", outcome: "MODERATION_ENFORCEMENT_OUTCOMES" },
+  two_bot_voice_rest_in_flight_age_seconds: {},
+  two_bot_voice_global_backoff_capped_total: {},
 };
 
 /** Complete consumed-input fixture generated from the Rust label contract, not the validator. */
