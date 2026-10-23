@@ -438,7 +438,7 @@
               "required": true,
               "min_value": null,
               "max_value": null,
-              "max_length": 2000,
+              "max_length": 200,
               "choices": []
             },
             {

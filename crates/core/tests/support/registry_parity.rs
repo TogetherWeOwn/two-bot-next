@@ -251,7 +251,7 @@ pub fn expected_registry() -> Value {
                         CommandOptionType::String,
                     )
                     .required()
-                    .max_length(2000),
+                    .max_length(200),
                     CommandOption::new(
                         "duration",
                         "Entry window in minutes (1–43200)",

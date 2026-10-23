@@ -96,7 +96,7 @@ fn diff_detects_each_kind_of_unlisted_drift_including_exception_bodies() {
         ("giveaway", "/default_member_permissions", json!("0")),
         ("giveaway", "/dm_permission", json!(true)),
         ("giveaway", "/description", json!("Changed copy")),
-        ("giveaway", "/options/0/options/0/max_length", json!(200)),
+        ("giveaway", "/options/0/options/0/max_length", json!(201)),
         ("giveaway", "/options/0/options/1/min_value", json!(0)),
         ("giveaway", "/options/0/options/1/max_value", json!(43201)),
         ("giveaway", "/options/0/options/2/max_value", json!(101)),
