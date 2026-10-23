@@ -2088,6 +2088,141 @@ mod database {
         async fn store_no_temp_weak_named_check_refuses_atomically() {
             exercise("store", 457, "weak same-name CHECK", None).await;
         }
+        // Break caught: deriving the reference from search_path/public instead
+        // of the locked registry namespace, misquoting that namespace, or
+        // replacing a preexisting helper on collision. The original no-TEMP
+        // matrix above independently covers limited-role success/refusal/mirrors.
+        async fn quoted_namespace_reference(chain: &str, shipped: i64, collision: bool) {
+            let Some(url) = bootstrap() else { return };
+            let (prefix, latest) = pre_repair_migrators(chain, shipped).await;
+            let db = TestDatabase::create(&url, &prefix)
+                .await
+                .expect("create isolated reference-namespace fixture");
+            sqlx::raw_sql(
+                r#"CREATE SCHEMA "authority ""fixture";
+                   ALTER TABLE public.admin_api_tokens SET SCHEMA "authority ""fixture";
+                   CREATE TABLE public.admin_api_token_authority_contract (marker TEXT);
+                   INSERT INTO public.admin_api_token_authority_contract VALUES ('public-decoy');"#,
+            )
+            .execute(db.pool())
+            .await
+            .expect("prepare quoted registry namespace and unrelated public decoy");
+            let pool = PgPoolOptions::new()
+                .max_connections(1)
+                .after_connect(|connection, _| {
+                    Box::pin(async move {
+                        sqlx::query(r#"SET search_path TO "authority ""fixture", public"#)
+                            .execute(connection)
+                            .await?;
+                        Ok(())
+                    })
+                })
+                .connect_with((*db.pool().connect_options()).clone())
+                .await
+                .expect("connect only to owned disposable fixture");
+            if collision {
+                sqlx::raw_sql(
+                    r#"CREATE TABLE "authority ""fixture".admin_api_token_authority_contract (marker TEXT);
+                       INSERT INTO "authority ""fixture".admin_api_token_authority_contract VALUES ('existing-helper');"#,
+                ).execute(&pool).await.expect("prepare existing schema-local helper");
+            }
+            partial_authority_columns(&pool).await;
+            insert(&pool, &row())
+                .await
+                .expect("seed explicit named holder");
+            let before_rows = registry_rows(&pool).await;
+            let before_helpers = no_helper_inventory(&pool)
+                .await
+                .expect("before reference inventory");
+            let namespace_catalog = || {
+                sqlx::query_scalar::<_, Value>(
+                "SELECT jsonb_build_object(
+                 'columns', (SELECT jsonb_agg(jsonb_build_array(a.attname,a.atttypid,a.atttypmod,a.attcollation,a.attnotnull,a.atthasdef,pg_get_expr(d.adbin,d.adrelid)) ORDER BY a.attnum) FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='admin_api_tokens'::regclass AND a.attnum>0 AND NOT a.attisdropped),
+                 'constraints', (SELECT jsonb_agg(jsonb_build_array(conname,pg_get_constraintdef(oid),convalidated) ORDER BY conname) FROM pg_constraint WHERE conrelid='admin_api_tokens'::regclass),
+                 'indexes', (SELECT jsonb_agg(pg_get_indexdef(indexrelid) ORDER BY indexrelid) FROM pg_index WHERE indrelid='admin_api_tokens'::regclass),
+                 'migrations', (SELECT jsonb_agg(to_jsonb(m) ORDER BY version) FROM _sqlx_migrations m))",
+            )
+            };
+            let before_catalog = namespace_catalog()
+                .fetch_one(&pool)
+                .await
+                .expect("before namespace catalog");
+            let result = latest.run(&pool).await;
+            let after_catalog = namespace_catalog()
+                .fetch_one(&pool)
+                .await
+                .expect("after namespace catalog");
+            let after_rows = registry_rows(&pool).await;
+            let mut failures = Vec::new();
+            if after_rows != before_rows {
+                failures.push("migration changed explicit holder data".to_owned());
+            }
+            if collision {
+                if result.as_ref().err().map(|e| sqlstate(e)).as_deref() != Some("42P07") {
+                    failures.push("helper collision must refuse duplicate_table 42P07".to_owned());
+                }
+                if before_catalog != after_catalog {
+                    failures
+                        .push("collision changed registry catalog or migration history".to_owned());
+                }
+                let markers: Vec<String> = sqlx::query_scalar(
+                    r#"SELECT marker FROM "authority ""fixture".admin_api_token_authority_contract"#,
+                ).fetch_all(&pool).await.expect("existing helper must not disappear");
+                if markers != ["existing-helper"] {
+                    failures
+                        .push("collision replaced or changed preexisting helper rows".to_owned());
+                }
+            } else if result.is_err() {
+                failures.push(format!(
+                    "quoted registry namespace must migrate: {:?}",
+                    result.as_ref().err().map(|e| sqlstate(e))
+                ));
+            } else {
+                failures.extend(check_behavior(&pool).await);
+            }
+            if no_helper_inventory(&pool)
+                .await
+                .expect("after reference inventory")
+                != before_helpers
+            {
+                failures.push(
+                    "reference leaked a relation/schema/function or consumed an unrelated object"
+                        .to_owned(),
+                );
+            }
+            let decoys: Vec<String> =
+                sqlx::query_scalar("SELECT marker FROM public.admin_api_token_authority_contract")
+                    .fetch_all(&pool)
+                    .await
+                    .expect("unrelated public helper must remain");
+            if decoys != ["public-decoy"] {
+                failures.push("reference touched unrelated public helper data".to_owned());
+            }
+            pool.close().await;
+            db.close().await.expect("drop reference-namespace fixture");
+            assert!(
+                failures.is_empty(),
+                "{chain}/collision={collision}: {failures:#?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn cutover_reference_uses_quoted_registry_namespace_not_public_decoy() {
+            quoted_namespace_reference("cutover", 456, false).await;
+        }
+        #[tokio::test]
+        async fn store_reference_uses_quoted_registry_namespace_not_public_decoy() {
+            quoted_namespace_reference("store", 457, false).await;
+        }
+        #[tokio::test]
+        async fn cutover_reference_collision_preserves_existing_object_and_registry() {
+            quoted_namespace_reference("cutover", 456, true).await;
+        }
+        #[tokio::test]
+        async fn store_reference_collision_preserves_existing_object_and_registry() {
+            quoted_namespace_reference("store", 457, true).await;
+        }
+
         #[tokio::test]
         async fn cutover_then_store_no_temp_mirror_is_idempotent() {
             exercise("cutover", 456, "named canonical", Some(("store", 457))).await;
