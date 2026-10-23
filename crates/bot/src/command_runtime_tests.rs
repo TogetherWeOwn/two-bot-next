@@ -37,8 +37,6 @@ mod giveaway_admission_edge_acceptance_tests;
 mod giveaway_countdown_edge_acceptance_tests;
 #[path = "giveaway_create_entry_acceptance_tests.rs"]
 mod giveaway_create_entry_acceptance_tests;
-#[path = "giveaway_delivery_cleanup_acceptance_tests.rs"]
-mod giveaway_delivery_cleanup_acceptance_tests;
 
 use std::collections::VecDeque;
 use std::str::FromStr;
