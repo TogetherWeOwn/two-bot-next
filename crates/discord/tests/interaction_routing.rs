@@ -275,7 +275,7 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
         .iter()
         .filter(|row| row.surface == CommandSurface::BuiltinSlash && row.required_permissions != 0)
         .collect();
-    assert_eq!(restricted.len(), 23);
+    assert_eq!(restricted.len(), 24);
     tracing::subscriber::with_default(audit.clone(), || {
         for row in &restricted {
             for permissions in [None, Some(0), Some(!row.required_permissions)] {
@@ -358,11 +358,11 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
 fn twilight_publication_permissions_equal_the_runtime_matrix() {
     use two_bot_core::command_permissions::{command_permission, COMMAND_PERMISSIONS};
 
-    assert_eq!(COMMAND_PERMISSIONS.len(), 32);
+    assert_eq!(COMMAND_PERMISSIONS.len(), 33);
     let router = InteractionRouter::new(all_on());
     let defs = router.publish_set(&[]).unwrap();
     let commands = publish_commands(&defs);
-    assert_eq!(commands.len(), 29);
+    assert_eq!(commands.len(), 30);
     for command in commands {
         let row = command_permission(&command.name).unwrap();
         assert_eq!(
