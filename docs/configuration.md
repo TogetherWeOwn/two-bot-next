@@ -164,7 +164,7 @@ gates (`feature_commands.rs`), moderation (`moderation.rs`), onboarding
 (`onboarding.rs`), automod (`automod.rs`), scorecard and classifier
 (`community.rs`). An empty ID list never contains a live ID.
 
-Catalog entries: 134.
+Catalog entries: 135.
 
 | Key | Class | Parsed default | Application | Description |
 | --- | --- | --- | --- | --- |
@@ -237,6 +237,7 @@ Catalog entries: 134.
 | `TWO_EVENTSUB_BIND` | env_only | Not specified in Next | environment only | Canonical combined IP and port for the private EventSub receiver; a wildcard bind requires the Worker-set container marker, otherwise a specific private IP. |
 | `TWO_EVENTSUB_DELIVERY` | env_only | Not specified in Next | environment only | Delivery gate for EventSub go-live posts; exactly 1 requires the announcements channel, invite URL and broadcaster allowlist, any other enabled state refuses startup. |
 | `TWO_EVENTSUB_INVITE_URL` | env_only | Not specified in Next | environment only | Discord invite URL rendered into the go-live post; validated with the renderer's rule while TWO_EVENTSUB_DELIVERY is exactly 1. |
+| `TWO_EVENT_VOICE_CATEGORY_ID` | env_only | Not specified in Next | environment only | Category for auto-created event voice channels; required, with no default: while unset the feature stays inactive. |
 | `TWO_FEED_POLL_SECONDS` | hot | `300` | stored, applied live by runtime refresh (reload-report hot) | Feed polling interval (validated from 60 to 86400 seconds). |
 | `TWO_GUILD_INVITE_CODE` | hot | Not specified in Next | stored, applied live by runtime refresh (reload-report hot) | Stored per-guild invite code; wins over the gateway vanity code on the /invite path, invalid rows fail closed to the fallback. |
 | `TWO_HEALTH_BIND_HOST` | env_only | Not specified in Next | environment only | Legacy health listener interface; environment-only network bind. |

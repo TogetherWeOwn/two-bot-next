@@ -2963,11 +2963,12 @@ mod tests {
         // TWO_COMMUNITY_SCORECARD, TWO_COMMUNITY_RECOMMENDATIONS,
         // TWO_COMMUNITY_CORRECTION_CYCLES, TWO_PRESENCE_PROBE and
         // TWO_INACTIVITY_DAYS from cold to hot, shifting five entries
-        // between those classes.
+        // between those classes. The required event-voice category slice
+        // adds one env-only key (TWO_EVENT_VOICE_CATEGORY_ID).
         for (class, expected) in [
             (SettingClass::Hot, 49),
             (SettingClass::Cold, 21),
-            (SettingClass::EnvOnly, 64),
+            (SettingClass::EnvOnly, 65),
         ] {
             assert_eq!(
                 SETTING_CLASSES.iter().filter(|(_, c)| *c == class).count(),
