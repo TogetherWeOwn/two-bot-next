@@ -968,6 +968,20 @@ async fn healthy_instances_continue_after_an_unrelated_instance_is_poisoned() {
     let damaged = pipeline();
     poison(Arc::clone(&damaged.pending.0));
     poison(Arc::clone(&damaged.facts.0));
+    // Drive detection, not just poisoning: a broken global latch would only
+    // activate when one of these real hooks/drains first observes the fault.
+    // The refusal assertions live in the RED cases; this is the independent
+    // healthy control and must stay green even on the unfixed runtime.
+    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        damaged.pending.award_voice(GUILD, MEMBER, 120, AT, CHANNEL)
+    }));
+    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        damaged.facts.record_member_join(join())
+    }));
+    let _ = AssertUnwindSafe(damaged.drain(Vec::new()))
+        .catch_unwind()
+        .await;
+    let _ = AssertUnwindSafe(damaged.drain_facts()).catch_unwind().await;
     let healthy = pipeline();
     healthy.facts.record_rules_accepted(rules());
     healthy.facts.record_member_join(join());
