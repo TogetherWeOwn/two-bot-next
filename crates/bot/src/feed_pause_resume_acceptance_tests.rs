@@ -261,8 +261,8 @@ async fn lifecycle_commands_refuse_insufficient_permissions_foreign_guilds_and_u
 #[tokio::test]
 async fn runtime_list_includes_paused_ids_and_status_without_cross_guild_reads_or_writes() {
     let db = fixture().await;
-    let active = feed("visible-enabled");
-    let mut paused = feed("visible-paused");
+    let active = feed("visible-alpha");
+    let mut paused = feed("visible-beta");
     paused.enabled = false;
     let mut foreign = feed("foreign-private-relay");
     foreign.guild_id = "9999".into();
