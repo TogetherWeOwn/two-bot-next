@@ -1,6 +1,14 @@
 {
   "version": 1,
   "migrations": {
+    "crates/store/migrations/0460_starboard_replay.sql": {
+      "sha256": "87bcf963c1c70fec65d1432a0e252746001a28c346f7b7e29b3485ed2793b193",
+      "justification": "Persist reaction sequence high-water marks across starboard worker completion and restart."
+    },
+    "crates/cutover/migrations/0461_starboard_replay.sql": {
+      "sha256": "87bcf963c1c70fec65d1432a0e252746001a28c346f7b7e29b3485ed2793b193",
+      "justification": "Mirror durable starboard replay admission in the deployed chain."
+    },
     "crates/store/migrations/0458_starboard.sql": {
       "sha256": "ef1013d4b13d1fbdcbfbfc5eeee9dda23bde54e58d6f0472c2d8f32272e0f7fc",
       "justification": "Add inert starboard configuration, distinct starrers and unique post records to the store chain."

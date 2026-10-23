@@ -1227,7 +1227,7 @@ async fn complete_request(
 fn guild_purge_predicate(table: &str) -> String {
     match table {
         // Starboard uses BIGINT IDs; the retention queue supplies decimal text.
-        "starboard_starrers" => "guild_id = $1::bigint".to_owned(),
+        "starboard_starrers" | "starboard_reaction_cursors" => "guild_id = $1::bigint".to_owned(),
         "lfg_signups" | "lfg_roles" => {
             "lfg_id IN (SELECT id FROM lfg_posts WHERE guild_id = $1)".to_owned()
         }

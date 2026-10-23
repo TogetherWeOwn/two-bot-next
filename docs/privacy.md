@@ -85,6 +85,12 @@ are outside this implementation's scope.
   (result recorded) are erased with the member; an unsettled claim (in flight,
   started, counted or released without a result) is a replay guard and makes
   erasure refuse until it settles, so a gateway retry cannot sanction twice.
+- Starboard reactions store guild, source-message and starrer IDs, plus per-user
+  gateway-session hashes and sequence high-water marks (`starboard_starrers`,
+  `starboard_reaction_cursors`). Remove tombstones prevent replay resurrection;
+  both tables are covered by member erasure and departed-guild purges. No message
+  text, author names or avatar URLs are persisted by the highlights runtime.
+  Erasure removes the erased member's replay watermark along with their stars.
 - Self-role audit and panel claims store member IDs, role effects, lease/recovery
   state and outcomes. Settled member records are covered; unresolved role effects
   or active leases refuse erasure rather than discard reconciliation evidence.

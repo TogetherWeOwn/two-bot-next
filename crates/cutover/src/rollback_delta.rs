@@ -248,6 +248,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
         measure: TableMeasure::Columns(&["created_at", "completed_at", "retired_at"]),
     },
     TableSpec { table: "self_role_panel_claims", measure: TableMeasure::Columns(&["processing_expires_at"]) },
+    TableSpec { table: "starboard_reaction_cursors", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "starboard_config", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "starboard_starrers", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec { table: "starboard_posts", measure: TableMeasure::Columns(&["created_at", "updated_at"]) },

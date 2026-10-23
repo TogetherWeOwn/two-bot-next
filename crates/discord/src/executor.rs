@@ -2892,7 +2892,7 @@ impl ActionExecutor {
     ) -> Result<String, DiscordError> {
         let channel: Id<ChannelMarker> = snowflake(channel_id)?;
         let mut body = serde_json::json!({
-            "embeds": [embed], "nonce": nonce, "enforce_nonce": true,
+            "embeds": [embed], "nonce": format!("sb:{nonce}"), "enforce_nonce": true,
             "allowed_mentions": {"parse": []}
         });
         crate::message_safety::sanitize_message(&mut body);
@@ -4225,6 +4225,17 @@ fn raw_get_route(path: &str) -> Result<Route<'static>, String> {
     };
     // Route borrows nothing here (u64/bool fields); the 'static bound is
     // satisfied because no borrowed variant is constructed.
+    if let Some(id) = base.strip_prefix("/users/") {
+        let user_id = id
+            .parse::<u64>()
+            .ok()
+            .filter(|id| *id != 0)
+            .ok_or_else(err)?;
+        if !query.is_empty() {
+            return Err(err());
+        }
+        return Ok(Route::GetUser { user_id });
+    }
     if let Some(id) = base.strip_prefix("/guilds/") {
         let (guild_part, rest) = match id.split_once('/') {
             Some((g, r)) => (g, Some(r)),

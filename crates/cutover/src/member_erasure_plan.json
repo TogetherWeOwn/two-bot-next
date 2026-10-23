@@ -1,6 +1,11 @@
 {
   "tables": [
     {
+      "table": "starboard_reaction_cursors",
+      "columns": ["user_id"],
+      "predicate": "guild_id = $1::bigint AND user_id = $2::bigint"
+    },
+    {
       "table": "starboard_starrers",
       "columns": ["user_id"],
       "predicate": "guild_id = $1::bigint AND user_id = $2::bigint"
