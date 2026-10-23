@@ -430,3 +430,177 @@ async fn cancelling_a_claim_clears_ownership_and_stale_completion_cannot_resurre
         .is_empty());
     db.close().await.expect("drop disposable DB");
 }
+
+// Direct API regressions: removing put's guard or delete's guard independently
+// must fail its own test, even if the slash-command namespace screen remains.
+async fn reserved_rows(db: &TestDatabase) -> Vec<ScheduledWrite> {
+    let completed = row("remind-direct-completed");
+    assert_eq!(
+        remind_store::create(db.pool(), &completed)
+            .await
+            .expect("seed completed"),
+        Admission::Created
+    );
+    assert_eq!(
+        scheduled_store::claim_due(db.pool(), GUILD, NOW, "direct-claim", LATER, "direct-nonce")
+            .await
+            .expect("claim completed seed")
+            .len(),
+        1
+    );
+    assert!(scheduled_store::complete_run(
+        db.pool(),
+        GUILD,
+        &completed.id,
+        NOW,
+        Some("9003"),
+        "direct-claim"
+    )
+    .await
+    .expect("complete seed")
+    .is_some());
+    let cancelled = row("remind-direct-cancelled");
+    assert_eq!(
+        remind_store::create(db.pool(), &cancelled)
+            .await
+            .expect("seed cancelled"),
+        Admission::Created
+    );
+    assert!(
+        remind_store::cancel(db.pool(), GUILD, OWNER, &cancelled.id, LATER)
+            .await
+            .expect("cancel seed")
+    );
+    let pending = row("remind-direct-pending");
+    assert_eq!(
+        remind_store::create(db.pool(), &pending)
+            .await
+            .expect("seed pending"),
+        Admission::Created
+    );
+    // Populate ownership and fence columns too: preserving only the definition
+    // fields while disturbing a pending delivery is not namespace isolation.
+    assert_eq!(
+        scheduled_store::claim_due(
+            db.pool(),
+            GUILD,
+            NOW,
+            "pending-claim",
+            LATER,
+            "pending-nonce"
+        )
+        .await
+        .expect("claim pending seed")
+        .len(),
+        1
+    );
+    assert!(scheduled_store::begin_scheduled_delivery(
+        db.pool(),
+        GUILD,
+        &pending.id,
+        "pending-claim"
+    )
+    .await
+    .expect("arm pending seed"));
+    vec![pending, completed, cancelled]
+}
+
+async fn persisted_columns(db: &TestDatabase, id: &str) -> Option<serde_json::Value> {
+    let json: Option<String> = sqlx::query_scalar(
+        "SELECT row_to_json(s)::text FROM scheduled_messages s WHERE guild_id = $1 AND id = $2",
+    )
+    .bind(GUILD)
+    .bind(id)
+    .fetch_optional(db.pool())
+    .await
+    .expect("snapshot every persisted column");
+    json.map(|json| serde_json::from_str(&json).expect("row JSON"))
+}
+
+#[tokio::test]
+async fn direct_put_refuses_reserved_pending_completed_and_cancelled_ids_without_any_column_change()
+{
+    let Some(db) = fixture().await else {
+        return;
+    };
+    let rows = reserved_rows(&db).await;
+    let mut observations = Vec::new();
+    for original in rows {
+        let before = persisted_columns(&db, &original.id)
+            .await
+            .expect("seed exists");
+        let mut replacement = original.clone();
+        replacement.channel_id = "4444".to_owned();
+        replacement.body = "staff overwrite must not resurrect personal reminder".to_owned();
+        replacement.next_run_at = LATER.to_owned();
+        replacement.interval_seconds = Some(60);
+        replacement.enabled = true;
+        replacement.created_by = "882002002002".to_owned();
+        replacement.created_at = LATER.to_owned();
+        replacement.updated_by = "882002002002".to_owned();
+        replacement.updated_at = LATER.to_owned();
+        let accepted = scheduled_store::put_scheduled(db.pool(), &replacement)
+            .await
+            .expect("direct reserved put returns refusal, not store error");
+        let after = persisted_columns(&db, &original.id).await;
+        let replay = remind_store::create(db.pool(), &original)
+            .await
+            .expect("replay after direct put");
+        observations.push((original.id, accepted, before, after, replay));
+    }
+    db.close()
+        .await
+        .expect("drop disposable DB before assertions");
+    for (id, accepted, before, after, replay) in observations {
+        assert!(!accepted, "direct put must reject reserved id {id}");
+        assert_eq!(
+            after,
+            Some(before),
+            "direct put preserves every persisted column for {id}"
+        );
+        assert_eq!(
+            replay,
+            Admission::Existing,
+            "direct put retains replay identity for {id}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn direct_delete_refuses_reserved_pending_completed_and_cancelled_ids_without_erasing_replay()
+{
+    let Some(db) = fixture().await else {
+        return;
+    };
+    let rows = reserved_rows(&db).await;
+    let mut observations = Vec::new();
+    for original in rows {
+        let before = persisted_columns(&db, &original.id)
+            .await
+            .expect("seed exists");
+        let deleted = scheduled_store::delete_scheduled(db.pool(), GUILD, &original.id)
+            .await
+            .expect("direct reserved delete returns refusal, not store error");
+        let after = persisted_columns(&db, &original.id).await;
+        let replay = remind_store::create(db.pool(), &original)
+            .await
+            .expect("replay after direct delete");
+        observations.push((original.id, deleted, before, after, replay));
+    }
+    db.close()
+        .await
+        .expect("drop disposable DB before assertions");
+    for (id, deleted, before, after, replay) in observations {
+        assert!(!deleted, "direct delete must reject reserved id {id}");
+        assert_eq!(
+            after,
+            Some(before),
+            "direct delete preserves every persisted column for {id}"
+        );
+        assert_eq!(
+            replay,
+            Admission::Existing,
+            "direct delete retains replay identity for {id}"
+        );
+    }
+}

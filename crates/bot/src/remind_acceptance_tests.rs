@@ -104,7 +104,7 @@ fn wall_ms() -> u64 {
 }
 
 fn remind_me(member: u64, minutes: i64, text: &str) -> Interaction {
-    from_member(
+    let mut interaction = from_member(
         slash(
             "remind",
             Some(CHANNEL),
@@ -117,8 +117,16 @@ fn remind_me(member: u64, minutes: i64, text: &str) -> Interaction {
             )],
         ),
         member,
-        Permissions::empty(),
-    )
+        Permissions::VIEW_CHANNEL
+            | Permissions::USE_APPLICATION_COMMANDS
+            | Permissions::SEND_MESSAGES,
+    );
+    // Fixture-only authorization correction; all original assertions stay frozen.
+    interaction.channel = Some(
+        serde_json::from_value(serde_json::json!({"id": CHANNEL_S, "type": 0}))
+            .expect("resolved ordinary text channel"),
+    );
+    interaction
 }
 
 fn remind_list(member: u64) -> Interaction {

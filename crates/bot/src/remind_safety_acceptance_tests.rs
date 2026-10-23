@@ -55,7 +55,18 @@ fn command(
             vec![option(name, CommandOptionValue::SubCommand(options))],
         ),
         member,
-        Permissions::empty(),
+        if name == "me" {
+            Permissions::VIEW_CHANNEL
+                | Permissions::USE_APPLICATION_COMMANDS
+                | Permissions::SEND_MESSAGES
+        } else {
+            Permissions::empty()
+        },
+    );
+    // Test-author fixture correction: successful creates have real posting authority.
+    interaction.channel = Some(
+        serde_json::from_value(serde_json::json!({"id": CHANNEL_S, "type": 0}))
+            .expect("resolved ordinary text channel"),
     );
     interaction.id = Id::new(invocation);
     interaction
@@ -613,4 +624,403 @@ async fn restart_from_armed_before_send_state_holds_without_any_post_beyond_nonc
     peer.close().await;
     mock.shutdown().await;
     db.close().await.expect("drop disposable DB");
+}
+
+// Review regressions: permission bypass, hard-coded delay, and success-shaped
+// store errors. Expectations come from the command contract, not its handler.
+const STORE_FAILURE: &str = "Reminder command failed; try again.";
+
+fn readable_command_permissions() -> Permissions {
+    Permissions::VIEW_CHANNEL | Permissions::USE_APPLICATION_COMMANDS
+}
+
+fn resolved_channel(interaction: &mut Interaction, kind: u8) {
+    interaction.channel = Some(
+        serde_json::from_value(serde_json::json!({"id": CHANNEL_S, "type": kind}))
+            .expect("resolved invoking channel"),
+    );
+}
+
+async fn stored_snapshot(db: &TestDatabase) -> Vec<Value> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT row_to_json(s)::text FROM scheduled_messages s ORDER BY guild_id, id",
+    )
+    .fetch_all(db.pool())
+    .await
+    .expect("all persisted columns, including delivery fences");
+    rows.into_iter()
+        .map(|row| serde_json::from_str(&row).expect("stored row JSON"))
+        .collect()
+}
+
+async fn posting_authority_case(kind: Option<u8>, permissions: Option<Permissions>, allowed: bool) {
+    let Some(db) = fixture().await else {
+        return;
+    };
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime(&db, &origin).await;
+    let mut interaction = create(701, "posting authority sentinel");
+    if let Some(kind) = kind {
+        resolved_channel(&mut interaction, kind);
+    } else {
+        interaction.channel = None;
+    }
+    interaction.member.as_mut().expect("requester").permissions = permissions;
+    // Bot posting authority must never substitute for the requester's authority.
+    interaction.app_permissions = Some(
+        readable_command_permissions()
+            | Permissions::SEND_MESSAGES
+            | Permissions::SEND_MESSAGES_IN_THREADS,
+    );
+    let texts = invoke(&runtime, &mock, &interaction).await;
+    let stored = stored_snapshot(&db).await;
+    let immediate = post_count(&mock);
+    let executor = executor_at(origin);
+    let due = two_bot_core::scheduled::parse_iso_ms("2098-01-01T00:00:00.000Z")
+        .expect("injected future clock");
+    tick(db.pool(), &executor, GUILD_S, || due)
+        .await
+        .expect("tick after admission decision");
+    let posts = post_count(&mock);
+    mock.shutdown().await;
+    db.close()
+        .await
+        .expect("drop disposable DB before RED assertion");
+
+    assert_eq!(immediate, 0, "create never posts immediately");
+    assert_eq!(
+        stored.len(),
+        usize::from(allowed),
+        "requester posting authority must be checked before inserting any row; kind={kind:?}, permissions={permissions:?}, replies={texts:?}, posts_after_tick={posts}"
+    );
+    assert_eq!(
+        posts,
+        usize::from(allowed),
+        "a refused create never becomes deliverable"
+    );
+    assert!(
+        texts.iter().all(|text| text != STORE_FAILURE),
+        "permission decisions are not database failures"
+    );
+}
+
+#[tokio::test]
+async fn create_refuses_readable_command_accessible_but_read_only_text_channel() {
+    posting_authority_case(Some(0), Some(readable_command_permissions()), false).await;
+}
+
+#[tokio::test]
+async fn create_refuses_public_thread_with_only_ordinary_send_permission() {
+    posting_authority_case(
+        Some(11),
+        Some(readable_command_permissions() | Permissions::SEND_MESSAGES),
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn create_refuses_private_thread_with_only_ordinary_send_permission() {
+    posting_authority_case(
+        Some(12),
+        Some(readable_command_permissions() | Permissions::SEND_MESSAGES),
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn create_refuses_text_channel_with_only_thread_send_permission() {
+    posting_authority_case(
+        Some(0),
+        Some(readable_command_permissions() | Permissions::SEND_MESSAGES_IN_THREADS),
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn create_refuses_missing_resolved_requester_permissions() {
+    posting_authority_case(Some(0), None, false).await;
+}
+
+#[tokio::test]
+async fn create_refuses_missing_resolved_channel_metadata() {
+    posting_authority_case(
+        None,
+        Some(readable_command_permissions() | Permissions::SEND_MESSAGES),
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn create_accepts_ordinary_send_without_thread_send_permission() {
+    posting_authority_case(
+        Some(0),
+        Some(readable_command_permissions() | Permissions::SEND_MESSAGES),
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn create_accepts_thread_send_without_ordinary_send_permission() {
+    for kind in [10, 11, 12] {
+        posting_authority_case(
+            Some(kind),
+            Some(readable_command_permissions() | Permissions::SEND_MESSAGES_IN_THREADS),
+            true,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn create_accepts_discord_administrator_in_text_and_thread_channels() {
+    for kind in [0, 10, 11, 12] {
+        posting_authority_case(Some(kind), Some(Permissions::ADMINISTRATOR), true).await;
+    }
+}
+
+#[tokio::test]
+async fn list_and_cancel_remain_available_without_resolved_posting_permissions() {
+    let Some(db) = fixture().await else {
+        return;
+    };
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime(&db, &origin).await;
+    for (index, permissions) in [Some(Permissions::empty()), None].into_iter().enumerate() {
+        let invocation = 720 + 10 * index as u64;
+        let text = format!("permissionless cancellation {index}");
+        invoke(&runtime, &mock, &create(invocation, &text)).await;
+        let mut list = command(OWNER, invocation + 1, "list", vec![]);
+        list.member.as_mut().expect("requester").permissions = permissions;
+        let listed = invoke(&runtime, &mock, &list).await;
+        assert!(
+            listed.iter().any(|reply| reply.contains(&text)),
+            "lost posting authority must not hide existing reminders"
+        );
+        let mut cancel = command(
+            OWNER,
+            invocation + 2,
+            "cancel",
+            vec![option("target", CommandOptionValue::String(text))],
+        );
+        cancel.member.as_mut().expect("requester").permissions = permissions;
+        invoke(&runtime, &mock, &cancel).await;
+        assert!(remind_store::list(db.pool(), GUILD_S, &OWNER.to_string())
+            .await
+            .expect("pending after permissionless cancel")
+            .is_empty());
+    }
+    let retained = stored_snapshot(&db).await;
+    assert_eq!(
+        retained.len(),
+        2,
+        "both cancellations retain replay tombstones"
+    );
+    assert!(retained.iter().all(|row| row["enabled"] == false));
+    let executor = executor_at(origin);
+    tick(db.pool(), &executor, GUILD_S, || 4_039_372_800_000)
+        .await
+        .expect("post-cancel tick");
+    assert_eq!(post_count(&mock), 0, "cancelled reminders never post");
+    mock.shutdown().await;
+    db.close().await.expect("drop disposable DB");
+}
+
+async fn exact_minute_delay(minutes: i64, expected_delta_ms: u64) {
+    let Some(db) = fixture().await else {
+        return;
+    };
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime(&db, &origin).await;
+    let interaction = command(
+        OWNER,
+        751,
+        "me",
+        vec![
+            option("in", CommandOptionValue::Integer(minutes)),
+            option(
+                "text",
+                CommandOptionValue::String("exact due sentinel".to_owned()),
+            ),
+        ],
+    );
+    invoke(&runtime, &mock, &interaction).await;
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT created_at, next_run_at FROM scheduled_messages WHERE guild_id = $1",
+    )
+    .bind(GUILD_S)
+    .fetch_all(db.pool())
+    .await
+    .expect("runtime-persisted schedule");
+    assert_eq!(rows.len(), 1, "non-vacuous runtime admission");
+    let created = two_bot_core::scheduled::parse_iso_ms(&rows[0].0).expect("created_at");
+    let due = two_bot_core::scheduled::parse_iso_ms(&rows[0].1).expect("next_run_at");
+    let immediate = post_count(&mock);
+    let executor = executor_at(origin);
+    tick(db.pool(), &executor, GUILD_S, || due - 1)
+        .await
+        .expect("one millisecond before actual due");
+    let before_due = post_count(&mock);
+    tick(db.pool(), &executor, GUILD_S, || due)
+        .await
+        .expect("exact persisted due");
+    let at_due = post_count(&mock);
+    tick(db.pool(), &executor, GUILD_S, || due + 1)
+        .await
+        .expect("one millisecond after actual due");
+    let after_due = post_count(&mock);
+    mock.shutdown().await;
+    db.close()
+        .await
+        .expect("drop disposable DB before assertions");
+    assert_eq!(
+        due.checked_sub(created),
+        Some(expected_delta_ms),
+        "requested {minutes} minutes must be persisted exactly, not a constant delay"
+    );
+    assert_eq!(
+        (immediate, before_due, at_due, after_due),
+        (0, 0, 1, 1),
+        "delivery is due-inclusive and exactly once"
+    );
+}
+
+#[tokio::test]
+async fn thirty_minutes_is_persisted_and_fires_only_at_the_actual_due_boundary() {
+    exact_minute_delay(30, 1_800_000).await;
+}
+
+#[tokio::test]
+async fn sixty_minutes_is_persisted_and_fires_only_at_the_actual_due_boundary() {
+    exact_minute_delay(60, 3_600_000).await;
+}
+
+async fn runtime_store_failure(operation: &str) {
+    let Some(db) = fixture().await else {
+        return;
+    };
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let healthy = runtime(&db, &origin).await;
+    let sentinel = "healthy reminder survives store failure";
+    invoke(&healthy, &mock, &create(801, sentinel)).await;
+    let before = stored_snapshot(&db).await;
+    assert_eq!(before.len(), 1, "seeded healthy reminder");
+
+    let mut closed_pool = None;
+    let interaction = match operation {
+        "create" | "cancel" => {
+            // Only the database owned by TestDatabase is faulted. The failure
+            // occurs at the real INSERT/UPDATE, after normal runtime admission.
+            sqlx::query(
+                "CREATE FUNCTION reminder_acceptance_fail() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture reminder store failure'; END; $$",
+            )
+            .execute(db.pool())
+            .await
+            .expect("install isolated failure function");
+            let trigger = if operation == "create" {
+                "CREATE TRIGGER reminder_acceptance_failure BEFORE INSERT ON scheduled_messages FOR EACH ROW EXECUTE FUNCTION reminder_acceptance_fail()"
+            } else {
+                "CREATE TRIGGER reminder_acceptance_failure BEFORE UPDATE ON scheduled_messages FOR EACH ROW EXECUTE FUNCTION reminder_acceptance_fail()"
+            };
+            sqlx::query(trigger)
+                .execute(db.pool())
+                .await
+                .expect("install targeted store failure");
+            if operation == "create" {
+                create(802, "failed create must not be stored")
+            } else {
+                command(
+                    OWNER,
+                    803,
+                    "cancel",
+                    vec![option(
+                        "target",
+                        CommandOptionValue::String(sentinel.to_owned()),
+                    )],
+                )
+            }
+        }
+        "list" => {
+            let pool = db.independent_pool().await.expect("guarded list pool");
+            pool.close().await;
+            closed_pool = Some(pool);
+            command(OWNER, 804, "list", vec![])
+        }
+        _ => panic!("unknown fixture operation"),
+    };
+    let failing = if let Some(pool) = closed_pool.as_ref() {
+        CommandRuntime::new(
+            pool.clone(),
+            executor_at(origin.clone()),
+            router_with_commands(gates()),
+            GUILD,
+            true,
+        )
+    } else {
+        healthy.clone()
+    };
+    let replies = invoke(&failing, &mock, &interaction).await;
+    let after_failure = stored_snapshot(&db).await;
+    let posts_during_failure = post_count(&mock);
+    if operation != "list" {
+        sqlx::query("DROP TRIGGER reminder_acceptance_failure ON scheduled_messages")
+            .execute(db.pool())
+            .await
+            .expect("restore healthy insert/update");
+        sqlx::query("DROP FUNCTION reminder_acceptance_fail()")
+            .execute(db.pool())
+            .await
+            .expect("remove fixture failure function");
+    }
+    let recovered_list = invoke(&healthy, &mock, &command(OWNER, 805, "list", vec![])).await;
+    if operation == "create" {
+        invoke(&healthy, &mock, &interaction).await;
+    }
+    let executor = executor_at(origin);
+    tick(db.pool(), &executor, GUILD_S, || 4_039_372_800_000)
+        .await
+        .expect("healthy delivery after restored store");
+    let recovered_posts = post_count(&mock);
+    mock.shutdown().await;
+    db.close()
+        .await
+        .expect("drop disposable DB before assertions");
+
+    assert_eq!(replies, vec![STORE_FAILURE.to_owned()], "{operation} must report exactly the store-failure reply, never created/empty-list/cancelled success");
+    assert_eq!(
+        after_failure, before,
+        "{operation} failure preserves every persisted column"
+    );
+    assert_eq!(
+        posts_during_failure, 0,
+        "store failures never cause an immediate post"
+    );
+    assert!(
+        recovered_list.iter().any(|text| text.contains(sentinel)),
+        "healthy list still exposes the preserved reminder"
+    );
+    assert_eq!(
+        recovered_posts,
+        if operation == "create" { 2 } else { 1 },
+        "restored store delivers existing rows and permits retry after failed admission"
+    );
+}
+
+#[tokio::test]
+async fn create_insert_failure_returns_exact_failure_text_and_preserves_healthy_delivery() {
+    runtime_store_failure("create").await;
+}
+
+#[tokio::test]
+async fn list_pool_failure_returns_exact_failure_text_without_false_empty_list() {
+    runtime_store_failure("list").await;
+}
+
+#[tokio::test]
+async fn cancel_update_failure_returns_exact_failure_text_and_preserves_healthy_delivery() {
+    runtime_store_failure("cancel").await;
 }
