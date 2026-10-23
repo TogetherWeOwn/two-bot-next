@@ -162,6 +162,7 @@ class PublisherHttpsTests(unittest.TestCase):
         self.server = HTTPServer(("127.0.0.1", 0), SmartHttpsHandler)
         self.server.fixture = self
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(cert, key)
         self.server.socket = context.wrap_socket(self.server.socket, server_side=True)
         thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -261,6 +262,10 @@ class PublisherHttpsTests(unittest.TestCase):
         hook.write_text("#!/bin/sh\necho 'synthetic push refusal' >&2\nexit 1\n")
         hook.chmod(0o700)
         self.git(self.remote, "config", "core.hooksPath", str(hooks))
+
+    def test_fixture_requires_tls_1_2_or_newer(self):
+        self.assertGreaterEqual(self.server.socket.context.minimum_version,
+                                ssl.TLSVersion.TLSv1_2)
 
     def test_fixture_accepts_basic_for_real_fetch_and_push(self):
         checkout, _ = self.prepare()
