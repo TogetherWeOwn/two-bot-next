@@ -452,7 +452,7 @@
     },
     {
       "name": "rsvp-attendance",
-      "description": "Show RSVP totals for a scheduled event",
+      "description": "Show RSVP totals and your saved response for an event",
       "family": "announcements",
       "gate": "announcements",
       "default_member_permissions": null,
