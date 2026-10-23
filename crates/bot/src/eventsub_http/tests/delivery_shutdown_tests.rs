@@ -864,15 +864,19 @@ async fn receiver_shutdown_joins_admitted_child_before_serve_returns() {
         "the delivery must start before shutdown latches"
     );
 
-    // Latch shutdown, then let the HTTP budget expire and close the client.
-    shutdown_tx.send_replace(true);
+    // Expire the request BEFORE shutdown: the 20 s request timeout must not
+    // consume the receiver's shared 4.5 s HTTP-drain/child-join budget. Closing
+    // the client removes the HTTP drain as a reason for serve to keep waiting.
     let (status, body) =
         read_raw_paused(&mut client, REQUEST_TIMEOUT + Duration::from_secs(5)).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE.as_u16());
     assert_eq!(error_code(&body), "upstream_timeout");
     drop(client);
 
-    // Serve must still be joining the blocked child, not done already.
+    let shutdown_started = tokio::time::Instant::now();
+    shutdown_tx.send_replace(true);
+    // Yield without advancing time so shutdown can latch and HTTP can drain.
+    // Serve must then wait for the child, not just the cancelled HTTP owner.
     for _ in 0..1_000 {
         assert!(
             !serve.is_finished(),
@@ -880,9 +884,20 @@ async fn receiver_shutdown_joins_admitted_child_before_serve_returns() {
         );
         tokio::task::yield_now().await;
     }
+    tokio::time::advance(Duration::from_secs(1)).await;
+    for _ in 0..1_000 {
+        assert!(
+            !serve.is_finished(),
+            "serve returned before settlement inside the shutdown budget"
+        );
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(sender.completed.load(Ordering::SeqCst), 0);
+    assert_eq!(ledger.delivered.load(Ordering::SeqCst), 0);
+    assert_eq!(ledger.releases.load(Ordering::SeqCst), 0);
 
-    // Release the child: it settles, records its terminal metric, and only
-    // then does serve return.
+    // Release inside the SAME shutdown budget: it settles, records its terminal
+    // metric, and only then does serve return. No additional drain is allowed.
     sender.release.add_permits(1);
     assert!(
         wait_until(|| serve.is_finished()).await,
@@ -893,6 +908,12 @@ async fn receiver_shutdown_joins_admitted_child_before_serve_returns() {
         result.is_ok(),
         "a joined shutdown must succeed, got {result:?}"
     );
+    assert!(
+        shutdown_started.elapsed() < Duration::from_millis(4_500),
+        "valid completion must join within the shared receiver shutdown budget"
+    );
+    assert_eq!(sender.completed.load(Ordering::SeqCst), 1);
+    assert_eq!(ledger.releases.load(Ordering::SeqCst), 0);
     assert_eq!(sender.calls().len(), 1, "no second send across shutdown");
     assert_eq!(
         ledger.delivered.load(Ordering::SeqCst),
