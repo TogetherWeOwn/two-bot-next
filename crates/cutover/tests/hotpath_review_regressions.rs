@@ -14,7 +14,7 @@ use two_bot_cutover::voice_rooms::PgRoomStore;
 use two_bot_store::PgFunnelStore;
 use two_bot_testsupport::TestDatabase;
 
-const GUILD: &str = "111";
+const GUILD: &str = "111111111111111111";
 const MEMBER: &str = "222";
 const T0: i64 = 1_800_000_000;
 
@@ -38,11 +38,13 @@ async fn event(pool: &sqlx::PgPool, kind: &str, second: i32, source: &str) {
 
 fn projection(store: &PgFunnelStore, want: Membership) {
     assert_eq!(
-        store.membership(111, 222),
+        store.membership(111_111_111_111_111_111, 222),
         Some(want.clone()),
         "trait must fold later decisive evidence"
     );
-    let page = store.membership_paged(111, 222).unwrap();
+    let page = store
+        .membership_paged(111_111_111_111_111_111, 222)
+        .unwrap();
     assert!(page.truncated, "fixture crosses the first page");
     assert_eq!(
         page.membership, want,
@@ -100,14 +102,16 @@ async fn membership_actual_fetches_never_materialize_more_than_26_rows() {
     }
     let store = PgFunnelStore::new(db.pool().clone());
     // Observe each public entry point separately: either may accidentally bypass paging.
-    let (result, receipts) = Queries::capture_sync(|| store.membership_paged(111, 222));
+    let (result, receipts) =
+        Queries::capture_sync(|| store.membership_paged(111_111_111_111_111_111, 222));
     assert!(result.unwrap().truncated);
     assert_fetch_bound(
         &receipts,
         |q| q.contains("from events") && q.contains("event_type"),
         26,
     );
-    let (result, receipts) = Queries::capture_sync(|| store.membership(111, 222));
+    let (result, receipts) =
+        Queries::capture_sync(|| store.membership(111_111_111_111_111_111, 222));
     assert!(result.is_some());
     assert_fetch_bound(
         &receipts,
@@ -158,7 +162,8 @@ async fn burst_actual_fetch_is_bounded_independently_of_output_cap() {
             .execute(db.pool()).await.unwrap();
     }
     let store = PgRoomStore::new(db.pool().clone());
-    let (page, receipts) = Queries::capture(store.burst_history_page(111, T0 + 30)).await;
+    let (page, receipts) =
+        Queries::capture(store.burst_history_page(111_111_111_111_111_111, T0 + 30)).await;
     let page = page.unwrap();
     assert_eq!(page.reservations.len(), 25);
     assert!(page.truncated);
