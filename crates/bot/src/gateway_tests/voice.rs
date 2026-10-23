@@ -120,6 +120,10 @@ impl VoiceEventSink for RecordingVoice {
         self.disconnects.fetch_add(1, Ordering::Relaxed);
         self.runtime.disconnect();
     }
+    fn disconnect_from_drop(&self) {
+        self.disconnects.fetch_add(1, Ordering::Relaxed);
+        self.runtime.disconnect_from_drop();
+    }
     fn needs_bootstrap(&self, cache: &twilight_cache_inmemory::DefaultInMemoryCache) -> bool {
         self.runtime.needs_bootstrap(cache)
     }

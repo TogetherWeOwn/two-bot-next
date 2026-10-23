@@ -16,14 +16,15 @@ use std::collections::BTreeSet;
 // them to. The message string (last argument to the `tracing` macro) is the
 // event name; fields such as `sequence` or `guild_id` are context, not names.
 
-/// `crates/bot/src/gateway.rs`: all twenty traced in the file are cataloged.
-const GATEWAY_RS_EVENTS: [&str; 20] = [
+/// `crates/bot/src/gateway.rs`: all twenty-one traced in the file are cataloged.
+const GATEWAY_RS_EVENTS: [&str; 21] = [
     "cold resume committed; requesting voice snapshot via identify",
     "gateway reconnect failed; Twilight will retry",
     "gateway shard loop started",
     "gateway leveling dispatch failed",
     "gateway community facts dispatch failed",
     "gateway community facts dispatch timed out",
+    "gateway dispatch refused: duplicate JSON key",
     "gateway onboarding job invalid",
     "gateway ready; checkpoint committed",
     "onboarding interaction interrupted; member must reselect",
@@ -199,8 +200,9 @@ const MAIN_RS_ADJACENT: [&str; 14] = [
 
 // `crates/bot/src/voice_rooms.rs`: per-command voice UX receipts, not gateway
 // session events.
-const VOICE_RS_ADJACENT: [&str; 25] = [
+const VOICE_RS_ADJACENT: [&str; 26] = [
     "voice succession refused",
+    "voice succession handed the room to the longest-present member",
     "voice actor load failed; retrying with capped backoff",
     "voice actor load failed; credential refused, not retrying",
     "voice notice settings unreadable",

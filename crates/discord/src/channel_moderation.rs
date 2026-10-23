@@ -237,9 +237,10 @@ impl ChannelModerationRuntime {
             return Ok(None);
         };
         let Some(mut request) = request(interaction, action) else {
-            return Ok(Some(ChannelReply::refused(
-                "A guild member and channel are required.",
-            )));
+            let reply = ChannelReply::refused("A guild member and channel are required.");
+            self.audit_missing_context(interaction, action, &reply)
+                .await;
+            return Ok(Some(reply));
         };
         // Router authorization is authoritative, including for replays. A stale
         // command cannot replay success to an actor who has since lost permission.
@@ -281,7 +282,19 @@ impl ChannelModerationRuntime {
                 reply.replayed = true;
                 return Ok(Some(reply));
             }
-            ChannelClaim::InFlight => return Ok(Some(ChannelReply::uncertain())),
+            ChannelClaim::InFlight => {
+                let reply = ChannelReply::uncertain();
+                // The first uncertain dispatch uses the plain interaction id.
+                // This refusal is distinct, but still deduplicates redelivery.
+                request.row.request_id.push_str(":in_progress");
+                request.row.metadata_json = json!({
+                    "stage": "claim",
+                    "request_id": interaction.id.to_string(),
+                })
+                .to_string();
+                self.audit_refusal(&mut request, &reply).await?;
+                return Ok(Some(reply));
+            }
             ChannelClaim::Mismatch => {
                 let reply = ChannelReply::refused(
                     "This request id is already used or retired; use a new request id.",
@@ -544,6 +557,44 @@ impl ChannelModerationRuntime {
         Ok(Ok(prepared))
     }
 
+    async fn audit_missing_context(
+        &self,
+        interaction: &Interaction,
+        action: ModerationAction,
+        reply: &ChannelReply,
+    ) {
+        // Preserve every known binding without inventing a member or channel.
+        // The shared schema uses non-null text for guild/actor; empty means
+        // unavailable here, never an authorization principal.
+        let row = ChannelAuditRow {
+            request_id: interaction.id.to_string(),
+            guild_id: interaction
+                .guild_id
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
+            actor_id: interaction
+                .author_id()
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
+            action: action.action_name().to_owned(),
+            channel_id: invoking_channel_id(interaction),
+            reason: reply.text.clone(),
+            outcome: reply.outcome.clone(),
+            idempotency_key: interaction.id.to_string(),
+            metadata_json: json!({"stage": "validation", "cause": "missing_context"}).to_string(),
+            created_at: time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("UTC formats"),
+        };
+        if self.store.record_audit(&row).await.is_err() {
+            // Incomplete context still gets its fixed refusal if storage fails.
+            tracing::error!(
+                action = action.action_name(),
+                "channel_refusal_audit_failed"
+            );
+        }
+    }
+
     async fn audit_refusal(
         &self,
         request: &mut Request,
@@ -617,13 +668,17 @@ fn channel_enforcement_outcome(
 }
 
 #[allow(deprecated)]
-fn request(interaction: &Interaction, action: ModerationAction) -> Option<Request> {
-    let guild_id = interaction.guild_id?.to_string();
-    let channel_id = interaction
+fn invoking_channel_id(interaction: &Interaction) -> Option<String> {
+    interaction
         .channel
         .as_ref()
         .map(|channel| channel.id.to_string())
-        .or_else(|| interaction.channel_id.map(|id| id.to_string()))?;
+        .or_else(|| interaction.channel_id.map(|id| id.to_string()))
+}
+
+fn request(interaction: &Interaction, action: ModerationAction) -> Option<Request> {
+    let guild_id = interaction.guild_id?.to_string();
+    let channel_id = invoking_channel_id(interaction)?;
     let actor_id = interaction.member.as_ref()?.user.as_ref()?.id.to_string();
     let Some(InteractionData::ApplicationCommand(data)) = interaction.data.as_ref() else {
         return None;

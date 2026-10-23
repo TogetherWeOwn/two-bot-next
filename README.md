@@ -53,6 +53,8 @@ Browse the [documentation map](docs/README.md) for every guide, contract and evi
 
 - [Commands](docs/commands.md): built-ins, options, registry bounds and default
   Discord permissions, rendered from the compiled all-enabled registry.
+- [Sticky delivery recovery](docs/sticky-debounce-acceptance.md#uncertain-delivery-recovery):
+  inspect uncertain re-posts before resetting the durable delivery fence.
 - [Configuration](docs/configuration.md): all catalog keys/classes, known parsed
   defaults and descriptions. Classes are legacy-catalog labels only: gateway
   boot reads a fixed set of process-environment keys, and the Container's
@@ -159,6 +161,9 @@ fail-closed retention auditing, `/home` available-byte alarms and the Operator r
   data and command-registry checks, 48-hour watch and preservation of Next-window
   writes on rollback. Planned tools are explicitly marked; this is not cutover approval.
 - [Staging soak](docs/staging-soak.md) and [gateway recovery](docs/gateway-recovery.md).
+- [Weekly DORA metrics](docs/dora-metrics.md): change failure rate, recovery
+  time, merge-to-prod lead time and throughput, committed to `ops/metrics/`
+  on the `automation/dora-metrics` branch.
 
 Migration changes must pass the [numbering and checksum guard](docs/migrations.md).
 Add new SQL files and their `migrations.lock` entries together; existing migration

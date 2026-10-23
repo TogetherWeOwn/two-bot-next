@@ -560,9 +560,12 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
             ack(id)
         }
         // Deterministic planning errors: acknowledge with 2xx so Twitch does
-        // not retry what will never succeed. Unknown/future classification
-        // errors remain retryable through the fallback below.
-        Err(EventSubError::WrongSubscription) | Err(EventSubError::InvalidBody) => {
+        // not retry what will never succeed. A refused duplicate-key body is
+        // permanent too: the retry carries the same bytes. Unknown/future
+        // classification errors remain retryable through the fallback below.
+        Err(EventSubError::WrongSubscription)
+        | Err(EventSubError::InvalidBody)
+        | Err(EventSubError::DuplicateKeys) => {
             two_bot_core::metrics::global().eventsub_classified("ignored");
             tracing::info!(
                 event = "eventsub_receiver",
@@ -898,6 +901,30 @@ mod tests {
                 "POST",
                 EVENTSUB_PATH,
                 Some("synthetic-delivery-0009"),
+                Some(&timestamp),
+                Some(&signature),
+                Some("notification"),
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn duplicate_key_body_is_acknowledged_without_retry() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
+        // Valid signature over a notification body that repeats a key: the
+        // refusal is deterministic (a retry carries the same bytes), so the
+        // receiver answers 2xx and plans nothing from it.
+        let body = r#"{"subscription":{"id":"synthetic-sub-0031","status":"enabled","type":"stream.online","version":"1","condition":{"broadcaster_user_id":"123456"}},"subscription":{"id":"synthetic-sub-0031","status":"enabled","type":"stream.online","version":"1","condition":{"broadcaster_user_id":"123456"}},"event":{"id":"9001","broadcaster_user_id":"123456","broadcaster_user_login":"synthetic_user","broadcaster_user_name":"Synthetic_User","type":"live","started_at":"2026-10-13T00:00:00Z"}}"#;
+        let timestamp = fresh_timestamp();
+        let signature = sign("synthetic-delivery-0031", &timestamp, body.as_bytes());
+        let response = app()
+            .oneshot(request(
+                "POST",
+                EVENTSUB_PATH,
+                Some("synthetic-delivery-0031"),
                 Some(&timestamp),
                 Some(&signature),
                 Some("notification"),
@@ -1545,11 +1572,11 @@ mod tests {
             ),
             (
                 "Ok(Delivery::Ignored)",
-                "Err(EventSubError::WrongSubscription) | Err(EventSubError::InvalidBody)",
+                "Err(EventSubError::WrongSubscription)",
                 "ignored",
             ),
             (
-                "Err(EventSubError::WrongSubscription) | Err(EventSubError::InvalidBody)",
+                "Err(EventSubError::WrongSubscription)",
                 "Err(EventSubError::InvalidChallenge)",
                 "ignored",
             ),

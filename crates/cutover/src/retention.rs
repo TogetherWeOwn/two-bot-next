@@ -1226,6 +1226,8 @@ async fn complete_request(
 /// the reviewed embedded plan, never caller input. Binds $1 = guild.
 fn guild_purge_predicate(table: &str) -> String {
     match table {
+        // Starboard uses BIGINT IDs; the retention queue supplies decimal text.
+        "starboard_starrers" => "guild_id = $1::bigint".to_owned(),
         "lfg_signups" | "lfg_roles" => {
             "lfg_id IN (SELECT id FROM lfg_posts WHERE guild_id = $1)".to_owned()
         }
@@ -1234,6 +1236,11 @@ fn guild_purge_predicate(table: &str) -> String {
         }
         "self_role_exchanges" => {
             "event_id IN (SELECT event_id FROM self_role_audit WHERE guild_id = $1)".to_owned()
+        }
+        // Presence spans carry no guild column: scope through the
+        // scheduled-event mirror, mirroring the erasure-plan predicate.
+        "event_voice_presence" => {
+            "event_id IN (SELECT event_id FROM scheduled_events WHERE guild_id = $1)".to_owned()
         }
         // Keep the operator-released replay fence: only executions whose
         // parent idempotency row is itself purged go here.

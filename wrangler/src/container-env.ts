@@ -96,6 +96,10 @@ export const FORWARDED_FLAGS = [
   // Staging-only synthetic voice test identities (docs/voice-synthetic.md).
   "TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS",
   "TWO_TEMP_VOICE_SWEEP_SECONDS",
+  // Event voice channels (per-event create + after-party handoff): required
+  // category id. Non-secret runtime flag; the bot fails closed (inactive,
+  // TBD `no_category`) until a usable category exists.
+  "TWO_EVENT_VOICE_CATEGORY_ID",
   // Staging-only music voice-node spike (docs/music-voice-node-spike.md):
   // attaches the Lavalink voice-update forwarder. Staging vars only, same
   // treatment as TWO_VOICE; the node password travels as its own Container
@@ -374,6 +378,13 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   // settings snapshot, never from the process environment, so there is
   // nothing to forward.
   TWO_GUILD_INVITE_CODE: "store-only guild setting; read from the live settings snapshot, never from the process environment",
+  // /ops override enforcement (Slice 0a): the Rust settings poll GETs this
+  // URL on every tick for the DO ops record. URL-shaped values are never
+  // flags (the allowlist test rejects `_URL`), so it travels only here.
+  TWO_OPS_CONFIG_URL: "ops-record fetch URL; reaches the Container only through an explicit containerEnvVars line when the Operator sets it, never this flag allowlist",
+  // Bearer the container sends on that fetch: the ops control token's value,
+  // forwarded only while the fetch URL is set, on its own secret line.
+  TWO_OPS_CONFIG_TOKEN: SECRET,
 };
 
 /**

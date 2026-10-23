@@ -467,6 +467,10 @@ fn malformed_replies_get_typed_errors_without_echo() {
             Err(ReplyError::NotJson),
         ),
         (vec![0xff, 0xfe, b'{'], Err(ReplyError::NotJson)),
+        (
+            format!("{{\"id\":\"{leak}\",\"id\":\"b\",\"choices\":[]}}").into_bytes(),
+            Err(ReplyError::DuplicateKeys),
+        ),
         (json!([leak]).to_string().into_bytes(), wrong_shape("body")),
         (
             json!({"error": {"message": leak}}).to_string().into_bytes(),
