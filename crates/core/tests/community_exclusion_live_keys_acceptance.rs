@@ -843,11 +843,13 @@ fn new_generations_classify_new_facts_without_rewriting_history() {
 // (10) capture and award rules preserved (controls via the funnel seam).
 // ---------------------------------------------------------------------------
 
+type RecordedMessage = (u64, u64, bool, Option<u64>, bool);
+
 #[derive(Debug, Clone, Default)]
-struct RecordingSink(Arc<Mutex<Vec<(u64, u64, bool, Option<u64>, bool)>>>);
+struct RecordingSink(Arc<Mutex<Vec<RecordedMessage>>>);
 
 impl RecordingSink {
-    fn recorded(&self) -> Vec<(u64, u64, bool, Option<u64>, bool)> {
+    fn recorded(&self) -> Vec<RecordedMessage> {
         self.0.lock().expect("recorded lock").clone()
     }
 }
