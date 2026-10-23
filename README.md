@@ -53,6 +53,8 @@ Browse the [documentation map](docs/README.md) for every guide, contract and evi
 
 - [Commands](docs/commands.md): built-ins, options, registry bounds and default
   Discord permissions, rendered from the compiled all-enabled registry.
+- [Event help and attendee reminders](docs/event-reminders.md): fixed 15-minute,
+  channel-only reminders, delivery limits and restart-safe failure behavior.
 - [Sticky delivery recovery](docs/sticky-debounce-acceptance.md#uncertain-delivery-recovery):
   inspect uncertain re-posts before resetting the durable delivery fence.
 - [Configuration](docs/configuration.md): all catalog keys/classes, known parsed

@@ -1505,7 +1505,7 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
             .required(),
             CommandOption::new(
                 "enabled",
-                "Turn companion text channels on or off (default on)",
+                "Turn companion text channels on or off (leave empty to keep the stored value)",
                 CommandOptionType::Boolean,
             ),
             CommandOption::new(
@@ -1718,7 +1718,7 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
             .required(),
             CommandOption::new(
                 "enabled",
-                "Share numbering across the category (default on)",
+                "Share numbering across the category (required: choose on or off)",
                 CommandOptionType::Boolean,
             ),
         ]),
@@ -1791,7 +1791,7 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
             .required(),
             CommandOption::new(
                 "enabled",
-                "Start new rooms private (default on)",
+                "Start new rooms private (required: choose on or off)",
                 CommandOptionType::Boolean,
             ),
         ]),
