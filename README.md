@@ -63,7 +63,7 @@ claim. Staging deploys from `main`; production deploys through the manual
   the reference names every reader — automod, feed, audit, ticket, gateway
   classifier and voice — alongside the per-runtime store and per-event
   refresh paths (re-checked at `1643438`).
-- [Hot-path read bounds](docs/hotpath-read-bounds.md): scoped settings, 25-row
+- [Hot-path read bounds](docs/store-cutover.md#hot-path-store-read-bounds): scoped settings, 25-row
   decay/retention passes, burst inspection and complete paged membership.
 - [Feed supervisor](docs/feed-supervisor.md): running feed delivery —
   source configuration, fetch cadence as-coded, failure signals and triage,
