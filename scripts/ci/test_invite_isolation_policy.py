@@ -14,7 +14,7 @@ class InviteIsolationPolicyTests(unittest.TestCase):
         self.case = policy.WorkflowTests()
         self.case.setUp()
 
-    def policy_result(self, name):
+    def policy_result(self, name, allow_errors=False):
         # TestCase.run records failures inside subTest; calling the method
         # directly can miss them when an outer runner already owns the result.
         case = policy.WorkflowTests(name)
@@ -23,7 +23,8 @@ class InviteIsolationPolicyTests(unittest.TestCase):
         with patch.object(case, "setUp"):
             case.run(result)
         self.assertEqual(result.testsRun, 1)
-        self.assertEqual(result.errors, [], result.errors)
+        if not allow_errors:
+            self.assertEqual(result.errors, [], result.errors)
         return result
 
     def assert_isolation_rejected(
@@ -96,6 +97,7 @@ class InviteIsolationPolicyTests(unittest.TestCase):
         attributes = (
             "#[tokio::test]",
             '#[::tokio::test(flavor = "multi_thread", worker_threads = 2)]',
+            "#[tokio :: test]",
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -130,6 +132,84 @@ class InviteIsolationPolicyTests(unittest.TestCase):
                                     "saturation_skip='unskipped_future_fixture'",
                                     result.failures[0][0].id(),
                                 )
+
+
+    def test_unmarked_tokio_spellings_fail_closed_in_both_lanes(self):
+        source_path = policy.ROOT / "crates/store/tests/invite_uses_saturation_acceptance.rs"
+        original = source_path.read_text(encoding="utf-8")
+        declarations = (
+            # Renamed import: the attribute carries no tokio::test token.
+            (
+                "renamed-import",
+                "use tokio::test as renamed_test;\n"
+                "#[renamed_test]\n"
+                "async fn unskipped_future_fixture() {}\n",
+            ),
+            # Plain import: #[test] resolves to the imported tokio macro.
+            (
+                "plain-import",
+                "use tokio::test;\n"
+                "#[test]\n"
+                "async fn unskipped_future_fixture() {}\n",
+            ),
+            # cfg_attr hides the path from the line-start mark regex.
+            (
+                "cfg-attr",
+                "#[cfg_attr(all(), tokio::test)]\n"
+                "async fn unskipped_future_fixture() {}\n",
+            ),
+            # Crate rename: no tokio::test token anywhere in the file.
+            (
+                "crate-rename",
+                "use tokio as tk;\n"
+                "#[tk::test]\n"
+                "async fn unskipped_future_fixture() {}\n",
+            ),
+            # Visibility-qualified rename: the fence scans from the keyword.
+            (
+                "pub-use-rename",
+                "pub(crate) use tokio as tk;\n"
+                "#[tk::test]\n"
+                "async fn unskipped_future_fixture() {}\n",
+            ),
+            # Extern-crate rename: not a use item at all.
+            (
+                "extern-crate-rename",
+                "extern crate tokio as tk;\n"
+                "#[tk::test]\n"
+                "async fn unskipped_future_fixture() {}\n",
+            ),
+            # Macro-generated: the token sits mid-line inside the macro body.
+            (
+                "macro-generated",
+                "macro_rules! gen_saturation {\n"
+                "    ($n:ident) => { #[tokio::test] async fn $n() {} };\n"
+                "}\n"
+                "gen_saturation!(unskipped_future_fixture);\n",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / source_path.relative_to(policy.ROOT)
+            source.parent.mkdir(parents=True)
+            for spelling, declaration in declarations:
+                with self.subTest(spelling=spelling):
+                    source.write_text(original + "\n" + declaration, encoding="utf-8")
+                    real_read = Path.read_text
+
+                    def read_text(path, *args, **kwargs):
+                        return real_read(source if path == source_path else path, *args, **kwargs)
+
+                    with patch.object(Path, "read_text", read_text):
+                        for name in (
+                            "test_invite_saturation_isolation_in_both_lanes",
+                            "test_patch_coverage_runs_with_db_and_includes_ignored_tests",
+                        ):
+                            with self.subTest(policy=name):
+                                result = self.policy_result(name, allow_errors=True)
+                                self.assertEqual(result.failures, [], result.failures)
+                                self.assertEqual(len(result.errors), 1, result.errors)
+                                self.assertIn("tokio", result.errors[0][1])
 
 
 if __name__ == "__main__":
