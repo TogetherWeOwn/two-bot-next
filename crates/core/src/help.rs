@@ -958,6 +958,42 @@ mod tests {
     }
 
     #[test]
+    fn wide_rendered_detail_fits_single_embed_description() {
+        use crate::commands::{CommandChoice, CommandOption, CommandOptionType};
+
+        let options = (0..25)
+            .map(|n| {
+                CommandOption::new(
+                    &format!("option{n:02}"),
+                    &format!("Argument {n:02}"),
+                    CommandOptionType::String,
+                )
+                .choices(
+                    (0..25)
+                        .map(|c| CommandChoice {
+                            name: format!("Label {c:02} {}", "😀".repeat(40)),
+                            value: format!("value_{c:02}"),
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        let def = CommandDefinition::new("maximum", "Valid wide definition").options(options);
+        let text = def.help_detail_text();
+        let units = text.encode_utf16().count();
+        assert!(
+            units > message_safety::CONTENT_LIMIT,
+            "exercise the embed path"
+        );
+        assert!(
+            units <= message_safety::EMBED_DESCRIPTION_LIMIT,
+            "rendered detail exceeds one embed description: {units} UTF-16 units"
+        );
+        assert!(text.ends_with("\n…(detail truncated; /help lists every confirmed command.)\n"));
+        assert_eq!(text, def.help_detail_text(), "deterministic truncation");
+    }
+
+    #[test]
     fn declared_min_length_renders_alongside_max_length() {
         let mut option = crate::commands::CommandOption::new(
             "label",

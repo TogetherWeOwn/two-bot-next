@@ -997,6 +997,53 @@ mod help_response_tests {
     }
 
     #[test]
+    fn wide_rendered_detail_preserves_its_complete_notice_through_the_adapter() {
+        use two_bot_core::commands::{CommandChoice, CommandOption, CommandOptionType};
+
+        let options = (0..25)
+            .map(|n| {
+                CommandOption::new(
+                    &format!("option{n:02}"),
+                    &format!("Argument {n:02}"),
+                    CommandOptionType::String,
+                )
+                .choices(
+                    (0..25)
+                        .map(|c| CommandChoice {
+                            name: format!("Label {c:02} {}", "😀".repeat(40)),
+                            value: format!("value_{c:02}"),
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        let detail = CommandDefinition::new("maximum", "Valid wide definition")
+            .options(options)
+            .help_detail_text();
+        assert!(text_len(&detail) > CONTENT_LIMIT, "exercise the embed path");
+        assert!(
+            text_len(&detail) <= EMBED_DESCRIPTION_LIMIT,
+            "the renderer must fit without the adapter's fallback"
+        );
+        assert!(detail.ends_with("\n…(detail truncated; /help lists every confirmed command.)\n"));
+        let response = help_detail_response(detail.clone());
+        let safe =
+            crate::message_safety::interaction_response(&response).expect("sanitized detail reply");
+        for reply in [response, safe] {
+            let wire = serde_json::to_value(reply).expect("serializes");
+            assert_eq!(wire["type"], 4);
+            assert_eq!(wire["data"]["flags"], 64);
+            assert_eq!(
+                wire["data"]["allowed_mentions"]["parse"],
+                serde_json::json!([])
+            );
+            assert!(wire["data"]["content"].is_null());
+            assert_eq!(wire["data"]["embeds"].as_array().expect("embeds").len(), 1);
+            assert_eq!(wire["data"]["embeds"][0]["description"], detail);
+        }
+    }
+
+    #[test]
     fn overlong_detail_moves_to_a_bounded_embed_description() {
         let detail = "x".repeat(EMBED_DESCRIPTION_LIMIT + 500);
         let wire = serde_json::to_value(help_detail_response(detail)).expect("serializes");
