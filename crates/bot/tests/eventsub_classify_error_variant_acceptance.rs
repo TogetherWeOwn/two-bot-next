@@ -11,7 +11,7 @@
 //! own bounded `eventsub_classified_total{kind}` series on the classify-error
 //! path, plus a sampled `warn!` carrying `error_variant`. The HTTP behavior
 //! per arm is unchanged: deterministic errors stay 2xx-acknowledged
-//! (`WrongSubscription`, `InvalidBody`) or 400-`malformed`
+//! (`WrongSubscription`, `InvalidBody`, `DuplicateKeys`) or 400-`malformed`
 //! (`InvalidChallenge`), and the catch-all stays a retryable 503
 //! `unavailable`. Flood-safety: hostile bursts are counted in counters, never
 //! per-request error logs (sampled warn only).
@@ -28,6 +28,7 @@
 //! | `InvalidTimestamp` | `invalid_timestamp` |
 //! | `StaleTimestamp` | `stale_timestamp` |
 //! | `InvalidBody` | `invalid_body` |
+//! | `DuplicateKeys` | `duplicate_keys` |
 //! | `WrongSubscription` | `wrong_subscription` |
 //! | `InvalidChallenge` | `invalid_challenge` |
 //! | `InvalidCallback` | `invalid_callback` |
@@ -155,7 +156,7 @@ fn fixture_callback() -> CallbackUrl {
 }
 
 /// The contract: the bounded metric label for each [`EventSubError`] variant.
-/// Exhaustive, so a future thirteenth variant fails this file to compile until
+/// Exhaustive, so a future fourteenth variant fails this file to compile until
 /// the Test Author extends the contract — the vocabulary can never silently
 /// grow through `bounded_index` collapse.
 fn expected_label(error: &EventSubError) -> &'static str {
@@ -167,6 +168,7 @@ fn expected_label(error: &EventSubError) -> &'static str {
         EventSubError::InvalidTimestamp => "invalid_timestamp",
         EventSubError::StaleTimestamp => "stale_timestamp",
         EventSubError::InvalidBody => "invalid_body",
+        EventSubError::DuplicateKeys => "duplicate_keys",
         EventSubError::WrongSubscription => "wrong_subscription",
         EventSubError::InvalidChallenge => "invalid_challenge",
         EventSubError::InvalidCallback => "invalid_callback",
@@ -175,7 +177,7 @@ fn expected_label(error: &EventSubError) -> &'static str {
     }
 }
 
-fn all_variants() -> [EventSubError; 12] {
+fn all_variants() -> [EventSubError; 13] {
     [
         EventSubError::InvalidSecret,
         EventSubError::InvalidHeader,
@@ -184,6 +186,7 @@ fn all_variants() -> [EventSubError; 12] {
         EventSubError::InvalidTimestamp,
         EventSubError::StaleTimestamp,
         EventSubError::InvalidBody,
+        EventSubError::DuplicateKeys,
         EventSubError::WrongSubscription,
         EventSubError::InvalidChallenge,
         EventSubError::InvalidCallback,
@@ -225,8 +228,8 @@ fn each_variant_records_its_own_bounded_series() {
     sorted.dedup();
     assert_eq!(
         sorted.len(),
-        12,
-        "the contract itself must define 12 distinct labels"
+        13,
+        "the contract itself must define 13 distinct labels"
     );
     let metrics = Metrics::default();
     for &label in &labels {
@@ -416,6 +419,45 @@ fn corpus_malformed_bodies_are_invalid_body() {
 }
 
 #[test]
+fn corpus_signed_duplicate_keys_record_their_own_variant() {
+    let valid: serde_json::Value =
+        serde_json::from_str(&live_notification_body()).expect("valid notification fixture");
+    let subscription = &valid["subscription"];
+    let event = &valid["event"];
+    let escaped_key = format!("{}u0073ubscription", char::from(92));
+    // Identical values are still duplicates; escaped keys compare decoded,
+    // and duplicate keys in unknown nested fields are refused too.
+    let bodies = [
+        format!(
+            r#"{{"subscription":{subscription},"subscription":{subscription},"event":{event}}}"#
+        ),
+        format!(
+            r#"{{"subscription":{subscription},"{escaped_key}":{subscription},"event":{event}}}"#
+        ),
+        format!(r#"{{"subscription":{subscription},"event":{event},"extra":{{"x":1,"x":2}}}}"#),
+    ];
+    let now = now_ms();
+    let timestamp = format_iso_millis(now);
+    for (i, body) in bodies.iter().enumerate() {
+        let message_id = format!("synthetic-delivery-duplicate-{i}");
+        let signature = hmac_sign(&message_id, &timestamp, body.as_bytes());
+        let delivered = headers(&message_id, &timestamp, &signature, "notification");
+        verify_delivery(&test_secret(), &delivered, body.as_bytes(), now)
+            .expect("signed duplicate-key bytes must reach classification");
+        let error = classify("notification", body.as_bytes()).unwrap_err();
+        assert_eq!(error, EventSubError::DuplicateKeys, "corpus item {i}");
+        assert_variant_label_records_distinctly(&error);
+
+        // Verification still owns forgeries: adding even whitespace after
+        // signing must fail before any duplicate-key classification.
+        let tampered = format!("{body} ");
+        let error =
+            verify_delivery(&test_secret(), &delivered, tampered.as_bytes(), now).unwrap_err();
+        assert_eq!(error, EventSubError::BadSignature, "tampered item {i}");
+    }
+}
+
+#[test]
 fn corpus_foreign_subscription_is_wrong_subscription() {
     let body = json!({
         "subscription": subscription_fixture("stream.offline"),
@@ -536,7 +578,7 @@ fn contains_mapping_arm(sources: &str, variant: &str, label: &str) -> bool {
     false
 }
 
-const VARIANT_DEBUG_NAMES: [&str; 12] = [
+const VARIANT_DEBUG_NAMES: [&str; 13] = [
     "InvalidSecret",
     "InvalidHeader",
     "BodyTooLarge",
@@ -544,6 +586,7 @@ const VARIANT_DEBUG_NAMES: [&str; 12] = [
     "InvalidTimestamp",
     "StaleTimestamp",
     "InvalidBody",
+    "DuplicateKeys",
     "WrongSubscription",
     "InvalidChallenge",
     "InvalidCallback",
@@ -581,7 +624,7 @@ fn classify_error_arms_record_the_variant_not_other() {
         assert!(
             contains_mapping_arm(&mapping_sources, variant, label),
             "RED: no `{variant} => \"{label}\"` mapping arm in bot/core non-test sources; \
-             the Builder adds a total EventSubError-to-label mapping (12 arms) in either crate \
+             the Builder adds a total EventSubError-to-label mapping (13 arms) in either crate \
              and uses it at the classify-error call sites"
         );
     }
@@ -697,6 +740,7 @@ fn retryable_503_envelope_unchanged_on_the_catch_all() {
     for marker in [
         "WrongSubscription",
         "InvalidBody",
+        "DuplicateKeys",
         "InvalidChallenge",
         "ack(",
         "BAD_REQUEST",
@@ -707,6 +751,60 @@ fn retryable_503_envelope_unchanged_on_the_catch_all() {
             "deterministic classify arms must keep their routing and answers: {marker}"
         );
     }
+}
+
+#[test]
+fn duplicate_keys_keep_the_deterministic_ack_path() {
+    let http =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/eventsub_http.rs"))
+            .expect("eventsub_http.rs must be readable");
+    let (http, _) = http.split_once("#[cfg(test)]").expect("test module");
+    let region = http
+        .split_once("match classify(")
+        .expect("classify match")
+        .1;
+    let duplicate = region
+        .find("EventSubError::DuplicateKeys")
+        .expect("duplicate-key arm");
+    let start = region[..duplicate]
+        .rfind("Err(")
+        .expect("classify-error arm");
+    let body = region[start..].split_once("=>").expect("arm body").1;
+    let end = body.find("Err(").expect("next classify-error arm");
+    let body = &body[..end];
+    assert!(
+        body.contains("eventsub_error_label(&e)") && body.contains("eventsub_classified(variant)"),
+        "duplicate keys must record the bounded variant, not invalid_body, ignored or other"
+    );
+    assert!(
+        body.contains("sampled_classify_warn(") && body.contains("StatusCode::OK"),
+        "duplicate keys must use the shared sampled classification warning at status 200"
+    );
+    assert!(
+        !body.contains("warn!"),
+        "the duplicate-key arm must not warn unconditionally per delivery"
+    );
+    let sampled_warn = http
+        .split_once("fn sampled_classify_warn(")
+        .expect("shared classification warning")
+        .1
+        .split_once("\n}\n")
+        .expect("shared classification warning end")
+        .0;
+    assert!(
+        sampled_warn.contains("if sampled_refusal_warn_emits()")
+            && sampled_warn.contains("tracing::warn!")
+            && sampled_warn.contains("error_variant = error_variant"),
+        "the shared warning must sample and carry the bounded duplicate-key error_variant"
+    );
+    assert!(
+        body.contains("ack("),
+        "duplicate keys must retain the 200 ack"
+    );
+    assert!(
+        !body.contains("SERVICE_UNAVAILABLE") && !body.contains("\"unavailable\""),
+        "duplicate keys are deterministic, never a retryable 503"
+    );
 }
 
 // --- Flood: a forgery burst is counted in counters, never per-request logs ---
