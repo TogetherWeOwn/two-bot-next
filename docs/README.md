@@ -23,6 +23,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Legacy baseline](b1-baseline.md)
 - [Process history](process-history-contract.md)
 - [Read-only MCP tools](mcp.md)
+- [Admin token registry contract](admin-registry.md)
 
 ## Operations and observability
 
@@ -122,6 +123,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Scheduled queue order](schedule-queue-order.md)
 - [Scheduled skip tests](scheduled-events-skip-acceptance.md)
 - [Scheduled event reminders](event-reminders.md)
+- [Proposed RSVP seats and opt-in waitlist (design only)](rsvp-capacity-spec.md)
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
 - [Ticket runtime](tickets.md)
 - [Ticket lifecycle observability](ticket-lifecycle-observability.md)

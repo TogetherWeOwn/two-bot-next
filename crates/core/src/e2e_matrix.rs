@@ -122,7 +122,7 @@ const fn row(
 //   staff protection, bot hierarchy, actor hierarchy, in that order.
 // - `Valid:<FIELD>:<BOUNDS>` — option validation before any side effect.
 
-/// The 30-row contract in publish order (core, scorecard, automation,
+/// The 31-row contract in publish order (core, scorecard, automation,
 /// announcement, moderation). The coverage test asserts this is exactly the
 /// all-gates-on [`crate::router::InteractionRouter::publish_set`].
 #[must_use]
@@ -173,7 +173,7 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
         ),
         row(
             "reopen",
-            33,
+            34,
             E2eGate::Always,
             0,
             "Everyone",
@@ -234,6 +234,22 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             "AutomationAdmin",
             "Ephemeral text list of this server's custom commands.",
             &["Gate:AutomationsDisabled", "Perm:ManageServerRequired"],
+        ),
+        row(
+            "command-inspect",
+            33,
+            E2eGate::Automations,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "AutomationAdmin",
+            "Ephemeral defer then one private content-only view: metadata summary by default, saved template, or rendered preview with sample arguments. No channel send, registration, cooldown, mutation or run audit.",
+            &[
+                "Gate:AutomationsDisabled",
+                "Perm:ManageServerRequired",
+                "Valid:name:required",
+                "Valid:view:choices",
+                "Valid:arguments:utf16<=500",
+            ],
         ),
         row(
             "schedule",

@@ -56,8 +56,10 @@ async fn actor_init_second_persistence_load_uses_each_guilds_jittered_offset() {
     // Keep senders alive: a closed actor inbox is cancellation, not a retry.
     let (_early_tx, mut early_rx) = mpsc::unbounded_channel();
     let (_late_tx, mut late_rx) = mpsc::unbounded_channel();
-    let early = load_actor_worker(&make_early, early_live, &mut early_rx);
-    let late = load_actor_worker(&make_late, late_live, &mut late_rx);
+    let early_backpressure = ActorInboxBackpressure::default();
+    let late_backpressure = ActorInboxBackpressure::default();
+    let early = load_actor_worker(&make_early, early_live, &mut early_rx, &early_backpressure);
+    let late = load_actor_worker(&make_late, late_live, &mut late_rx, &late_backpressure);
     tokio::pin!(early, late);
     let started = Instant::now();
     // Poll both real loads to their first failed persistence read and arm
