@@ -61,6 +61,7 @@ use twilight_model::{
     gateway::GatewayReaction,
     http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
 };
+use two_bot::voice_rooms::voice_claims_custom_id;
 use two_bot_core::{
     automod_runtime::FunnelDisposition,
     commands::PERM_MANAGE_GUILD,
@@ -72,6 +73,7 @@ use two_bot_core::{
     feeds_store::{add_feed, list_feeds, remove_feed, write_audit, FeedAudit, FeedRemoval},
     funnel::now_millis_for_test,
     moderation::ModerationAction,
+    router::replies::EXPIRED_COMPONENT_REPLY,
     sticky::{
         activity_eligible, decide_activity, normalize_debounce, sticky_removed_reply,
         sticky_set_reply, store, validate_body, ActivityDecision, ActivityOutcome, PutSticky,
@@ -1130,6 +1132,13 @@ impl CommandRuntime {
             return;
         };
         let Some(input) = service.component_input(interaction) else {
+            // Stale reference (removed panel, replaced source message, or
+            // removed option): one expired-control reply, zero mutation.
+            // Malformed input stays silent.
+            if service.stale_component(interaction) {
+                self.answer(interaction, ephemeral(EXPIRED_COMPONENT_REPLY))
+                    .await;
+            }
             return;
         };
         if !self.defer(interaction, "self-role").await {
@@ -1137,6 +1146,38 @@ impl CommandRuntime {
         }
         let result = service.handle(&input).await;
         self.finish(interaction, result.reply(input.panel.color))
+            .await;
+    }
+
+    /// One expired-control reply for genuinely unowned, in-scope components
+    /// and modal submits. The router has already fenced the guild (foreign
+    /// and missing guilds route `Ignore`) and the surface gates (known ids on
+    /// disabled surfaces route `Ignore`), so `Unknown` here means unowned,
+    /// not merely unserved. Voice-owned controls belong to the voice sink,
+    /// which answers each exactly once; bot authors stay silent.
+    async fn answer_stale_control(&self, interaction: &Interaction, routed: &RoutedInteraction) {
+        let custom_id = match routed {
+            RoutedInteraction::Component {
+                custom_id,
+                outcome: ComponentOutcome::Unknown,
+                ..
+            }
+            | RoutedInteraction::Modal {
+                custom_id,
+                outcome: ComponentOutcome::Unknown,
+            } => custom_id,
+            _ => return,
+        };
+        // Ownership is the sink's own predicate: bare `two:voice:` ids,
+        // epoch-suffixed runtime join buttons, and `votekick:` ballots. A bare
+        // prefix never claims ownership on its own.
+        if voice_claims_custom_id(custom_id) {
+            return;
+        }
+        if author_is_bot(interaction) {
+            return;
+        }
+        self.answer(interaction, ephemeral(EXPIRED_COMPONENT_REPLY))
             .await;
     }
 
@@ -1343,8 +1384,12 @@ impl CommandRuntime {
             }
             return;
         }
-        let RoutedInteraction::Slash { name, outcome } = routed else {
-            return;
+        let (name, outcome) = match routed {
+            RoutedInteraction::Slash { name, outcome } => (name, outcome),
+            other => {
+                self.answer_stale_control(interaction, &other).await;
+                return;
+            }
         };
         // V4 `kick` collision: this router is the only answerer. The guild
         // fence, the moderation gate and the Kick Members check run first, and
@@ -2460,6 +2505,17 @@ pub(crate) fn ephemeral(text: impl Into<String>) -> InteractionResponse {
             ..Default::default()
         }),
     }
+}
+
+/// Bot-authored interactions stay silent: guild presses carry the author on
+/// the member, DMs on the top-level user.
+fn author_is_bot(interaction: &Interaction) -> bool {
+    interaction.user.as_ref().is_some_and(|user| user.bot)
+        || interaction
+            .member
+            .as_ref()
+            .and_then(|member| member.user.as_ref())
+            .is_some_and(|user| user.bot)
 }
 
 /// Invoker id: guild member's user, else the DM user (legacy reads
