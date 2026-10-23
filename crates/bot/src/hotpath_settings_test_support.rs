@@ -17,14 +17,24 @@ pub async fn database(key: &str) -> TestDatabase {
         .await
         .unwrap();
     let store = SettingsStore::new(db.pool());
+    let (foreign_value, target_value) = if key == "TWO_ONBOARDING_DRY_RUN" {
+        (json!("1"), json!("0"))
+    } else {
+        (json!(9), json!(3))
+    };
     for index in 0..30 {
         store
-            .set(&format!("{}", 300 + index), key, Some(json!(9)), "fixture")
+            .set(
+                &format!("{}", 300 + index),
+                key,
+                Some(foreign_value.clone()),
+                "fixture",
+            )
             .await
             .unwrap();
     }
     store
-        .set("22", key, Some(json!(3)), "fixture")
+        .set("22", key, Some(target_value), "fixture")
         .await
         .unwrap();
     store
