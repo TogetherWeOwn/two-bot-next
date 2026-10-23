@@ -88,16 +88,20 @@ not permission to share seats across occurrences. Source message identity is
 `(guild_id, channel_id, message_id)` bound to that same event and bot/application.
 Multiple valid views share **one** allocation, not separate capacity per post.
 
-A finite capacity is an integer `1..=existing maximum RSVP rows per event`;
-`null` is unlimited organizer capacity. Only the existing event-management
-principal, freshly authorized for this guild/event, may configure it. This does
-not grant arbitrary members or the event creator new management permission.
+A finite capacity is an integer `1..=1,000` (the current all-answer row cap);
+`null` is unlimited organizer capacity. Configuration requires the existing
+**Manage Events** permission check, freshly evaluated for this guild, plus a
+matching live event and valid post binding. Event creation/ownership alone is
+not authorization. This reuses the current staff-event permission boundary,
+not a new organizer role or an event-creator exception.
 Enabling on an existing event counts existing Going rows as held; reject a
 capacity below that count. Never evict or silently demote existing attendees.
 Capacity decrease below held count is rejected; increase schedules FIFO drain.
 Disabling a finite limit is allowed only with an empty waitlist; otherwise
 return `WAITLIST_NOT_EMPTY`, with increase/cancel/close as explicit alternatives.
-Neither an edit nor a reschedule silently enrolls or dequeues a person.
+An edit/reschedule never silently enrolls or changes FIFO priority. The explicit
+lifecycle exceptions below can expire/close waiting; show that result through
+the existing post and My status, without a new ping or re-consent workflow.
 
 | Action | Durable result |
 | --- | --- |
@@ -118,8 +122,20 @@ No `Going/waiting`, `Declined/waiting` or second active row is legal. Keep the
 three existing choice values; waiting is an explicit allocation state, not a
 new synonym for Interested. Legacy reads see waiting as Interested, never Going.
 The actor can change their mind without organizer approval. A successful
-self-cancel must not require new cursor/quota allocation or event visibility;
-authenticated same-guild self-removal still cannot enroll or reveal the event.
+self-cancel must not require new cursor/quota allocation or event visibility.
+The named fallback is existing `/rsvp event-id:<known-id> status:interested`
+(or `declined`), after common configured-guild/authenticated-actor/current-member
+gates. For an existing seat-mode row, this is a **withdraw-only** branch before
+live event/access lookup: remove only the actor's seat/wait fields, update choice
+on that existing row and apply ordinary budgets. It never inserts a new RSVP,
+reveals event/current-state data or grants access. Unknown/unbound/foreign or
+absent own row produces the same ephemeral `No seat or waitlist entry is kept
+by this request` (UNCHANGED); unauthenticated/departed/unknown membership fails
+the existing membership gate without a row lookup/disclosure. Positive enrollment
+and My status still need full live event/access gates. Component Cancel uses
+this same reducer after validating its persisted binding. Pending-slot/rate
+refusal is retryable, not false success. Admission flag-off preserves withdrawal;
+this is not a broader enrollment or event-read permission.
 
 ### Lifecycle
 
@@ -140,7 +156,10 @@ closure gets a fresh sequence/consent. No auto-requeue after access loss.
 
 Confirmed member departure or loss of required channel/event access removes a
 waiting entry after matching-revision validation; next eligible waiter may run.
-Unknown access preserves position and reserves the vacancy. Confirmed loss for
+Unknown access preserves position and reserves the vacancy until eligibility
+recovers or the already defined start/consent deadline closes it. Backoff caps
+load, not wait duration; expose a bounded `ELIGIBILITY_UNKNOWN` diagnostic for
+staff to repair access or explicitly close the event. Never evict by retry count. Confirmed loss for
 a held member, when observed by existing lifecycle reconciliation, releases the
 seat to Interested and schedules drain; unobserved loss is not continuously
 policed, and no voice participant is disconnected. A later new Going request
@@ -160,14 +179,34 @@ gaps are harmless. Rejoin after cancel/expiry/new consent receives a new value.
 
 Add one event capacity row keyed by the native guild/event key: nullable limit,
 `next_wait_seq`, `revision`, terminal status/reason, last authoritative start,
-non-subject `action_not_before` and policy generation. Hold persisted post
-bindings separately, at most **3 per event**. Add one guild allocation-policy
+non-subject `action_not_before` and policy generation. Hold proposed `event_rsvp_post_bindings`
+separately, at most **3 per event**: native event key, application/bot author,
+channel/message IDs, binding revision and 404 tombstone. Populate only from a
+verified existing bot-owned post receipt, never a user-supplied message ID or
+newly manufactured announcement. Projection owns binding tombstones. This table
+is proposed, not evidence that an existing producer/receipt has been found. Add one guild allocation-policy
 row, missing/default means dark. Disabling admission/promotion increments its
 generation atomically; self-cancel, closure, expiry and reads remain available.
 A rollout must fence every writer of enabled events, including direct store,
 internal action and shared-database consumers. If an unchanged writer can still
 create Going without allocation, **do not enable**. Do not assert cross-repo
 compatibility without enumerating and proving the real writers.
+
+Local writer inventory to cover before enabling:
+
+- `rsvp_store.rs:68,91,195`: `put_rsvp`, `put_rsvp_with_audit` and their shared
+  upsert; `discord/src/rsvp.rs:260,338` is the verified runtime producer.
+- `rsvp_store.rs:555-569`: compensation UPDATE/DELETE; preserve predecessor and
+  newer-write fences in the event-slot protocol, not just ordinary upserts.
+- `rsvp_store.rs:699`: `prune_rsvp_history` deletes; apply existing retention
+  without bypassing per-event serialization/reservations, and mark any surviving
+  event's vacancy/projection work only after cleanup commits.
+- `crates/cutover/src/member_erasure.rs:235-313`: `erase_member`, manifest-driven
+  deletion; `crates/cutover/src/retention.rs:1165-1209`: `complete_request`, used
+  by `run_retention`/`fulfill_user_deletion`. These remain first-class writers.
+- Internal-action reachability and external shared-DB writers are **not verified**
+  by this inventory. S1/S4 must trace/prove them or exclude enabled-event writes;
+  the assigned repository is not evidence about another repository's behavior.
 
 Add bounded per-event/member action cursors (latest authenticated interaction
 snowflake, action fingerprint, constant result code, updated time), and one
@@ -181,9 +220,17 @@ quota lock, then **existing event → user-minute-budget → full identity** ord
 All direct/compensation writers must obey that order; no event writer may acquire
 the new guild lock after its event lock. Inventory/test actual callers before
 activation. Preserve rate-before-row-cap refusal and the existing audit ledger;
-automatic promotion consumes the same member write budget, deferring the head
-when exhausted. Do not count new audit labels in place of `event.rsvp` and
-accidentally bypass the 20/minute guard. Bounded transition reason is metadata
+automatic promotion is the consenting waiter's RSVP write: audit
+`action=event.rsvp`, `actor_id=that user_id`, with bounded `seat_promoted` reason
+marking automatic initiation, not falsely claiming a fresh human click. It
+consumes that member's same minute budget. At 20 writes, preserve head/vacancy
+and retry no earlier than the next UTC-minute boundary, still before consent
+expiry; a deferral writes no RSVP audit. This explicit <=one-minute quota delay
+is not unknown-access eviction or permission for a later waiter to overtake.
+Worker audit ID is deterministic per accepted enrollment sequence, e.g.
+`rsvp:seat:<guild>:<event>:<wait_seq>`; recovery reuses the slot/ID and never
+manufactures a Discord interaction. Do not count new action labels instead
+and bypass the existing ledger. Bounded transition reason is metadata
 on the existing privacy-scoped audit, not a forever subject history. Only the
 new seat-mode duplicate/no-op path avoids another write/audit; legacy is unchanged.
 
@@ -192,16 +239,29 @@ commit outcome is resolved from durable operation/cursor/state, not blind retry.
 **Preserve the existing post-write recheck/compensation gate**, including for
 automatic promotion. An event has at most one durable pending validation slot
 (operation ID, actor, exact predecessor/attempt revisions and queue fields).
-Reserve both predecessor and attempted held occupancy until validation settles;
-do not expose a provisional release to a drain or report provisional success.
-Other seat changes return RETRY_LATER while that slot is occupied. Outside SQL,
-perform the existing live postcheck; finalize only on success, otherwise restore
+**The slot alone is the reservation representation**, not an independent counter
+or second membership. Occupancy is `held rows excluding the slot actor +
+max(predecessor_is_held, attempted_is_held)`, with each boolean 0/1. With no slot,
+use ordinary held count. All occupancy readers use that same rule. Restore only
+the matching attempt; clear the slot once, atomically with finalize/compensate.
+No drain or other seat mutation can start another pending operation for that
+event while a slot exists (return `RETRY_LATER`); overlapping holder-release and
+waiter-promotion slots are therefore impossible. Queue/read projection reports
+the predecessor and pending result, never provisional success or a provisional
+vacancy. Same-operation recovery is the only permitted resolver. Outside SQL,
+perform the existing live postcheck; finalize only on success plus matching
+operation/revisions/generation and fresh DB-time open/deadline checks, otherwise restore
 the exact predecessor and remove only that attempt's audit under the same locks.
 Restoration cannot overbook because the reservation was never spendable. A
 restarted worker resolves the slot before other event work; a failed compensation
 keeps its reservation and reports failure, never succeeds or retries the effect.
-Close/erasure may preempt a slot, invalidate its generation and apply terminal/
-subject-removal rules: a stale resolver cannot restore waiting or erased data.
+Finalize is the success linearization point, not the provisional SQL write.
+Close may preempt a slot: restore the matching predecessor/audit first under
+locks, then apply closure/queue expiry in that transaction and advance generation.
+Erasure instead deletes the slot/subject and advances the cutoff; it never
+restores the erased predecessor. A stale resolver cannot finalize/restore after
+either preemption. Thus close before finalize yields no promotion; finalize
+before close yields historical Going followed by closure.
 The slot is subject-bearing, participates in export/erasure/backup, and is cleared
 on settlement; it is not an unbounded history. No SQL lock spans Discord HTTP.
 Tests must prove both release→compensate and promote→compensate races; a simple
@@ -217,12 +277,17 @@ precheck-only allocator is not compatible with the current security contract.
    outside SQL checks current human membership, effective channel/event access,
    bot permission and live event status/start through the existing REST gates.
    A candidate check has a **3-second** wall budget; proofs expire after
-   **5 seconds** and carry locally observed permission-generation stamps.
+   **5 seconds**. A proposed process-local guild validation epoch advances on
+   observed member/channel/role/guild changes and gateway reconnect. Snapshot
+   before REST, compare before commit/postcheck; restart discards every proof.
+   Epochs are an additional invalidation seam to implement, not a current or
+   cross-process authorization source; fresh REST/postcheck remains mandatory.
 3. Reacquire locks; re-read DB time, open state/deadline, latest start, policy
    generation, event/member revision, erasure cutoff, head sequence and vacancy.
    Any mismatch invalidates proof and restarts from current state. A matching
    proof changes that one waiting row to Going/held, clears queue fields,
-   advances revision and records audit/projection in one transaction.
+   advances revision and records provisional audit/work in one transaction.
+   Complete §4's durable postcheck/finalize protocol before success/projection.
 4. A verified member 404 or successfully computed access denial removes only
    that matching waiter; a bot/API 403, 429, 5xx, timeout or incomplete permission
    evidence means **unknown**, not ineligible. Preserve head and vacancy with
@@ -237,8 +302,11 @@ success or quiet post edit is not a new proof of current membership.
 
 Authenticated action context must match application, guild, event, bound
 channel/message and actor. Reject malformed/foreign/bot/system requests before
-mutation. For seat-mode actions admit interaction times only in `[now-15 min,
-now+30 sec]`. Cursor same ID/same fingerprint returns its bounded prior result
+mutation. Fingerprint canonical typed application/guild/event/actor IDs, action,
+normalized choice/capacity input and origin channel/message (null for slash);
+never hash a display label or arbitrary JSON field order. For seat-mode actions
+admit interaction times only in `[now-15 min, now+30 sec]`.
+Cursor same ID/same fingerprint returns its bounded prior result
 plus **current** own state after authorization; same ID/different action refuses;
 older IDs refuse; newer actions supersede older desired state. Cursors survive
 Cancel/Declined so a delayed Join cannot resurrect waiting. A rejected full
@@ -246,8 +314,14 @@ Going request also needs a cursor, so later duplicate delivery cannot claim a
 newly vacant seat as though it were a fresh request. Pruning after 24 hours
 is safe only with the 15-minute intake fence still enforced.
 
-Both direct erasure and retention-driven erasure must, within existing guarded
-transactions, advance **all configured events in the guild** to a non-subject
+`erase_member` (`crates/cutover/src/member_erasure.rs:235-313`) and retention
+`complete_request` (`crates/cutover/src/retention.rs:1165-1209`) must hook after
+schema/guard checks and before manifest deletion in their existing transaction.
+`member_erasure::plan()`/`schema_gaps` and
+`crates/cutover/src/member_erasure_plan.json:144-146` already cover `event_rsvps`;
+extend manifest coverage to cursors/pending-slot subject data and test both
+executors plus dry-run. Within those guarded transactions, advance **all
+configured events in the guild** (<=1,000 rows) to a non-subject
 `action_not_before = max(old, DB now + 30 sec)`, invalidate proofs/work revisions,
 and delete subject RSVP/cursor/audit data through the privacy manifest. Reject
 interaction timestamps at or before cutoff before cursor lookup. This covers
@@ -290,7 +364,11 @@ and only acknowledges the revision sent. Failed/uncertain edits never roll back
 seat truth or allocate again. An old in-flight Discord edit can land after a
 newer acknowledgement; therefore repair even apparently clean bound posts via
 bounded GET/compare/re-render, targeting every **10 healthy minutes**, until
-terminal time + **24 hours**. Store hashes/revisions, not fetched member content.
+terminal time + **24 hours**. Hash the canonical bot-owned rendered text and
+component fields per binding (not ephemeral queue position, full remote message
+or unrelated content). Byte-identical canonical render is visually clean even
+if DB revision advanced; acknowledge that current revision. Retain periodic GET
+verification regardless of hash/revision equality; never store fetched content.
 A prolonged outage or stale edit after that repair window has no convergence
 guarantee. Every component still checks authoritative DB state. 404 of a bound
 message tombstones the binding; 403/unknown preserves it with backoff.
@@ -322,12 +400,12 @@ Existing normal RSVP quotas and rate accounting still apply to waiting writes.
 
 | Resource | Hard bound / overload behavior |
 | --- | --- |
-| Capacity-enabled open events | 20/guild; refuse new configuration, not cancellation/closure |
+| Capacity records / open events | 1,000/guild including retained terminal records / 20 open; refuse new configuration, not cancellation/closure |
 | Waiting | 100/event, 2,000/guild, 5 events/member/guild; atomically reserve quota |
 | Total RSVP rows / write budgets | Existing 1,000/event across all answers, 20 writes/member/guild/UTC minute unchanged, including waiting |
 | Action cursors | 1,000/event, 50,000/guild; refuse new seat-mode actors at cap, preserve existing self-cancel/close/erasure |
 | Work | One row/event; 1,000/guild including retained terminal work; refuse new configuration at cap |
-| Worker | One globally; 10 due events/pass, 5 head decisions/event/pass; fair rotation, durable continuation |
+| Worker | One DB-leased global leader (30s generation-fenced lease, renewed before further work); 10 due events/pass, 5 head decisions/event/pass; crash/restart discards proofs; per-event compare-and-commit still mandatory |
 | Reads | Own state O(1), position count over at most 100 waiters; any authorized page <=25; event work scans <=10 |
 | Discord | Global 60 eligibility HTTP requests/minute and 10 candidate validations/minute/guild, counting every REST call/retry; existing stricter/shared limits win |
 | Projection | <=12 edits/minute globally; <=12 verification GETs/minute; retries count; <=3 bindings/event |
@@ -360,13 +438,20 @@ notification queue, whole-guild member scan or per-member perpetual timer.
 
 Keep ordinary Interested reminder semantics unchanged. **Waiting Interested is
 not a held attendee**: exclude it from attendee reminder targets. Promoted Going
-may receive the ordinary still-due reminder, but no catch-up DM/message is sent
+may receive the ordinary still-due reminder (future scheduled mirror, inside its T-15 window, no existing
+attempt fence), but no catch-up DM/message is sent
 just because promotion occurred after the reminder decision. The current seam
 (`core/src/event_reminder_store.rs:15-112`, `bot/src/scheduled_jobs.rs:195-275`)
 rechecks saved recipients and mirrored event fields, **not live membership**.
-Extend that DB dispatch check with current allocation/erasure/pending-validation
-state; exclude provisional recipients. Do not add per-attendee REST enumeration
-or claim fresher membership than the mirror/store actually knows. Respect the
+Use **the identical filtered recipient predicate** in due scan, EXISTS and
+atomic dispatch-array comparison: ordinary Going/Interested, excluding waiting,
+erased and provisional actors. Retain matching mirror fields/time and whole
+sorted-array equality. A mismatch inserts **no attempt fence**; a later tick may
+rescan/retry while still due. Only a committed attempt consumes the one-shot
+allowance, including subsequent render/send failure. The exclusion guarantee is
+at that DB admission snapshot, not after-the-fact recall of HTTP already in
+flight. Do not add per-attendee REST enumeration or claim fresher membership
+than the mirror/store actually knows. Respect the
 immutable **one automatic attempt/guild/event** fence, including render failure,
 2,000-UTF-16-unit whole-list limit and 10,000 retained attempts/guild. No reset
 on reschedule, late promotion, refusal or uncertainty; no extra reminder/retry.
@@ -420,6 +505,10 @@ Future runnable acceptance check, once slice S1's named target exists:
 python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --test rsvp_capacity_contract -- --test-threads=1
 ```
 
+Admission remains dark through S1–S3; only a later separately authorized
+activation after S4's compatibility/worker proofs can admit anything. Every
+admission/finalize independently checks DB time, not just a periodic closer.
+
 The Test Author must create `crates/core/tests/rsvp_capacity_contract.rs` and
 make this command fail for missing capacity behavior before implementation.
 A zero-tests/ignored run is not acceptance. Add corresponding runtime targets
@@ -449,10 +538,18 @@ Do not fold changes into the running attendee-reminder or event-voice cards.
 
 CEO/spec reviewer decides whether to accept: finite capacity only on existing
 posts; auto-promotion consent (no claim timeout); quiet projection with no DM
-or ping guarantee; ordinary Interested reminders retained but waiting excluded;
+or ping guarantee; ordinary Interested reminders retained but waiting excluded at dispatch admission;
 close at start, <=7-day waiting consent and no reopen; unknown head deliberately
-blocks a vacant seat; the proposed caps/cost/slices; and unverified TWO demand.
-Engineering recommendations above are not claimed to be owner decisions.
+blocks a vacant seat until deadline; automatic writes attributed to the consenting
+member with next-minute budget deferral; the withdrawal-only permission branch;
+the proposed caps/cost/slices; and unverified TWO demand.
+Also explicitly review the guild-wide erasure cutoff: at most 1,000 configured
+events are invalidated per guild; a burst of erasures may repeatedly require
+fresh clicks. Cutoff refusals happen before cursor/audit/rate consumption. A
+per-subject tombstone would narrow that blast radius but retain erased identity
+and still miss never-seen callbacks; it is deliberately rejected here. Existing
+memberships remain saved. Engineering recommendations above are not claimed
+to be owner decisions.
 
 Before build carding, host intent alignment must resolve: whether a durable
 existing RSVP-post binding actually exists or the scope should be deferred;
