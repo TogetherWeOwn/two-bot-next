@@ -4,7 +4,7 @@
 //! of replacement, cached-at-ack settings, empty/delete confusion, guild bleed.
 #![cfg(test)]
 
-use super::{isolated, BOOT, FOREIGN, GUILD, KEY, STORED};
+use super::{isolated, isolated_with_env, BOOT, FOREIGN, GUILD, KEY, STORED};
 use crate::discord_test_common::{MockRest, ScriptedResponse};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -64,7 +64,14 @@ fn checkin_responses(actor: &str) -> Vec<ScriptedResponse> {
     ]
 }
 
-async fn live_attendance(split_completion: bool) {
+#[derive(Clone, Copy)]
+enum CheckinPath {
+    Direct,
+    CommandOrdered,
+    BootOrdered,
+}
+
+async fn live_attendance(path: CheckinPath) {
     let url = std::env::var("TWO_TEST_DATABASE_URL")
         .expect("disposable test bootstrap required; no fallback");
     let fixture = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
@@ -118,37 +125,61 @@ async fn live_attendance(split_completion: bool) {
     let executor =
         ActionExecutor::with_proxy("synthetic-test-token".to_owned(), Some(mock.origin()))
             .expect("loopback REST executor");
-    let leveling = LevelingRuntime::new(
-        fixture.pool().clone(),
-        Arc::new(executor.clone()),
-        GUILD,
-        OnboardingGates {
-            mode: OnboardingMode::Legacy,
-            dry_run: false,
-        },
-    );
-    // This is the production builder, not a test-local provider or overlay.
-    // Removing its live-provider wiring must fail these tests even if the
-    // lower-level InteractionRuntime supports live settings perfectly.
-    let commands = crate::command_runtime::CommandRuntime::build(
-        fixture.pool().clone(),
-        executor,
-        router(),
-        None,
-        leveling,
-        GUILD,
-        None,
-        None,
-        None,
-    );
-    let runtime = commands.test_interactions();
+    let onboarding = OnboardingGates {
+        mode: OnboardingMode::Legacy,
+        dry_run: false,
+    };
+    // Keep the command constructor's regressions independent of the separate
+    // production constructor used by ordered gateway completion.
+    let commands = (!matches!(path, CheckinPath::BootOrdered)).then(|| {
+        let leveling = LevelingRuntime::new(
+            fixture.pool().clone(),
+            Arc::new(executor.clone()),
+            GUILD,
+            onboarding,
+        );
+        crate::command_runtime::CommandRuntime::build(
+            fixture.pool().clone(),
+            executor.clone(),
+            router(),
+            None,
+            leveling,
+            GUILD,
+            None,
+            None,
+            None,
+        )
+    });
+    let ordered = matches!(path, CheckinPath::BootOrdered).then(|| {
+        // Same permitted synthetic identity as the composition fixtures; all
+        // HTTP still goes exclusively to MockRest, never to that guild.
+        let activation = crate::activation::BootActivation::from_token(
+            Some(1545644954272137297),
+            Some("MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature"),
+        );
+        crate::build_interaction_runtime(
+            fixture.pool(),
+            GUILD,
+            &onboarding,
+            executor.clone(),
+            &activation,
+        )
+        .expect("valid boot activation and feature gates build ordered runtime")
+    });
+    let runtime = ordered.as_deref().unwrap_or_else(|| {
+        commands
+            .as_ref()
+            .expect("command-path fixture")
+            .test_interactions()
+    });
     let mut expected = Vec::new();
+    let mut expected_identities = Vec::new();
     for (index, (label, actor, stored, classification, rule)) in cases.into_iter().enumerate() {
         let occurrence = format!("{EVENT}:{label}");
         let interaction = attendance(8000 + index as u64, actor, &occurrence);
         // For the ordered gateway path acknowledge BEFORE the poll, so a
         // classifier frozen by prepare() is observably too early.
-        let prepared = if split_completion {
+        let prepared = if !matches!(path, CheckinPath::Direct) {
             Some(
                 runtime
                     .prepare(interaction.clone())
@@ -158,6 +189,13 @@ async fn live_attendance(split_completion: bool) {
         } else {
             None
         };
+        if prepared.is_some() {
+            let requests = mock.requests();
+            assert_eq!(requests.len(), index * 6 + 1, "ack precedes execution");
+            let ack: Value =
+                serde_json::from_slice(&requests[index * 6].body).expect("acknowledgement JSON");
+            assert_eq!(ack["type"], 5, "real deferred acknowledgement before poll");
+        }
         store
             .set(&GUILD.to_string(), KEY, stored.clone(), "synthetic-test")
             .await
@@ -196,6 +234,11 @@ async fn live_attendance(split_completion: bool) {
                 .expect("real direct check-in")
         };
         assert!(handled, "registered attendance must execute");
+        expected_identities.push((
+            GUILD.to_string(),
+            actor.to_owned(),
+            format!("event:{occurrence}"),
+        ));
         expected.push((
             format!("{occurrence}:{actor}"),
             classification.to_owned(),
@@ -207,11 +250,16 @@ async fn live_attendance(split_completion: bool) {
     let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
         "SELECT source_event_id, classification, matched_rule, classifier_version, metadata FROM community_facts WHERE event_type = 'event_attended' ORDER BY id"
     ).fetch_all(fixture.pool()).await.expect("persisted runtime attendance verdicts");
+    let identities: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT guild_id, actor_id, source FROM community_facts WHERE event_type = 'event_attended' ORDER BY id"
+    ).fetch_all(fixture.pool()).await.expect("persisted attendance guild, actor and source");
     let audits: i64 = sqlx::query_scalar("SELECT count(*) FROM announcements_audit_log WHERE action = 'event.checkin' AND outcome = 'recorded'")
         .fetch_one(fixture.pool()).await.expect("required host-checkin audit rows");
     let requests = mock.requests();
     mock.shutdown().await;
+    drop(ordered);
     drop(commands);
+    drop(executor);
     drop(poll);
     fixture
         .close()
@@ -262,19 +310,42 @@ async fn live_attendance(split_completion: bool) {
             )
         })
         .collect();
+    assert_eq!(
+        identities, expected_identities,
+        "exact attendance attribution"
+    );
     assert_eq!(actual, expected, "check-in execution uses published replacement/empty/delete fallback and no foreign-guild overlay");
 }
 
 #[tokio::test]
 async fn direct_checkin_uses_published_live_exclusions() {
     if !isolated("attendance::direct_checkin_uses_published_live_exclusions") {
-        live_attendance(false).await;
+        live_attendance(CheckinPath::Direct).await;
     }
 }
 
 #[tokio::test]
 async fn ordered_checkin_resolves_exclusions_after_acknowledgement() {
     if !isolated("attendance::ordered_checkin_resolves_exclusions_after_acknowledgement") {
-        live_attendance(true).await;
+        live_attendance(CheckinPath::CommandOrdered).await;
+    }
+}
+
+// Break caught: remove only build_interaction_runtime's provider installation.
+// CommandRuntime::build is deliberately not constructed on this path.
+#[tokio::test]
+async fn production_ordered_checkin_resolves_exclusions_after_acknowledgement() {
+    if !isolated_with_env(
+        "attendance::production_ordered_checkin_resolves_exclusions_after_acknowledgement",
+        &[
+            ("TWO_COMMUNITY_SCORECARD", "1"),
+            ("TWO_ANNOUNCEMENTS", "1"),
+            ("TWO_AUTOMATIONS", "0"),
+            ("TWO_MODERATION", "0"),
+            ("TWO_MODERATION_PROTECTED_ROLE_IDS", ""),
+            ("TWO_FEED_POLL_SECONDS", "300"),
+        ],
+    ) {
+        live_attendance(CheckinPath::BootOrdered).await;
     }
 }

@@ -194,6 +194,10 @@ overlay_case!(
 // Re-exec only this test to isolate both, without mutating a parallel suite's
 // environment. Inherited LLVM_PROFILE_FILE is intentionally preserved.
 fn isolated(name: &str) -> bool {
+    isolated_with_env(name, &[])
+}
+
+fn isolated_with_env(name: &str, vars: &[(&str, &str)]) -> bool {
     const CHILD: &str = "TWO_TEST_LIVE_EXCLUSIONS_CHILD";
     if std::env::var(CHILD).as_deref() == Ok(name) {
         return false;
@@ -210,6 +214,7 @@ fn isolated(name: &str) -> bool {
         .env(KEY, BOOT.join(","))
         .env("TWO_DATABASE_TLS", "local-only")
         .env_remove("TWO_OPS_CONFIG_URL")
+        .envs(vars.iter().copied())
         .output()
         .expect("isolated acceptance process");
     let text = format!(
@@ -398,4 +403,269 @@ async fn rules_update_refreshes_exclusions_without_messages() {
     if !isolated("rules_update_refreshes_exclusions_without_messages") {
         message_free_refresh(Stream::Rules).await;
     }
+}
+
+// Break caught: delete only MemberRemove from the production refresh match.
+// Every voice session opens BEFORE the poll; no other gateway event can refresh
+// the shared classifier between publication and MemberRemove's end fact.
+#[tokio::test]
+async fn member_remove_closes_voice_with_fresh_exclusions() {
+    if isolated("member_remove_closes_voice_with_fresh_exclusions") {
+        return;
+    }
+    const CHANNEL: &str = "300000000000000021";
+    let url = std::env::var("TWO_TEST_DATABASE_URL")
+        .expect("disposable test bootstrap required; no fallback");
+    let fixture = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+        .await
+        .expect("create migrated disposable fixture");
+    let origin = url.rsplit_once('/').expect("guarded bootstrap URL").0;
+    let poll = crate::settings_jobs::job(&format!("{origin}/{}", fixture.name()));
+    (poll.action)().await.expect("initial real settings poll");
+    let live = crate::settings_jobs::live().expect("registered live reader");
+    let store = two_bot_cutover::settings::SettingsStore::new(fixture.pool());
+    let pipeline = build_pipeline(vec![], None);
+    pipeline.enable_community_facts(fixture.pool().clone());
+    let mut expected = Vec::new();
+    let mut inserted = 0;
+
+    // Literal start/end verdicts deliberately differ for every transition
+    // under test. Neighbor rows never supply the event guild's exclusions.
+    let cases = [
+        (
+            "stored-only",
+            GUILD,
+            STORED[0],
+            None,
+            Some(json!([STORED[0]])),
+            None,
+            "eligible_human",
+            "test",
+        ),
+        (
+            "replace-boot",
+            GUILD,
+            BOOT[0],
+            None,
+            Some(json!([STORED[0]])),
+            None,
+            "test",
+            "eligible_human",
+        ),
+        (
+            "update-old",
+            GUILD,
+            STORED[1],
+            Some(json!([STORED[1]])),
+            Some(json!([STORED[2]])),
+            None,
+            "test",
+            "eligible_human",
+        ),
+        (
+            "update-new",
+            GUILD,
+            STORED[2],
+            Some(json!([STORED[1]])),
+            Some(json!([STORED[2]])),
+            None,
+            "eligible_human",
+            "test",
+        ),
+        (
+            "empty",
+            GUILD,
+            BOOT[1],
+            None,
+            Some(json!([])),
+            None,
+            "test",
+            "eligible_human",
+        ),
+        (
+            "delete-boot",
+            GUILD,
+            BOOT[2],
+            Some(json!([])),
+            None,
+            None,
+            "eligible_human",
+            "test",
+        ),
+        (
+            "delete-stored",
+            GUILD,
+            STORED[3],
+            Some(json!([STORED[3]])),
+            None,
+            None,
+            "test",
+            "eligible_human",
+        ),
+        (
+            "foreign-only",
+            FOREIGN,
+            STORED[0],
+            None,
+            None,
+            Some(json!([STORED[0]])),
+            "eligible_human",
+            "eligible_human",
+        ),
+        (
+            "own-after-foreign",
+            GUILD,
+            "900000000000002005",
+            None,
+            Some(json!(["900000000000002005"])),
+            Some(json!([])),
+            "eligible_human",
+            "test",
+        ),
+        (
+            "foreign-boot",
+            FOREIGN,
+            BOOT[0],
+            None,
+            None,
+            Some(json!([])),
+            "test",
+            "test",
+        ),
+        (
+            "ordinary-control",
+            GUILD,
+            "900000000000009999",
+            None,
+            Some(json!([STORED[0]])),
+            Some(json!(["900000000000009999"])),
+            "eligible_human",
+            "eligible_human",
+        ),
+    ];
+    // Each guild/member pair is new: retained gateway voice-cache entries from
+    // an earlier departure must not turn a later open into a same-channel noop.
+    let mut members = HashSet::new();
+    for (index, (label, guild, actor, before, after, neighbor, start_class, end_class)) in
+        cases.into_iter().enumerate()
+    {
+        assert!(
+            members.insert((guild, actor)),
+            "{label}: fresh session actor"
+        );
+        let other_guild = if guild == GUILD { FOREIGN } else { GUILD };
+        store
+            .set(&guild.to_string(), KEY, before, "synthetic-test")
+            .await
+            .expect("pre-open own-guild setting");
+        store
+            .set(
+                &other_guild.to_string(),
+                KEY,
+                neighbor.clone(),
+                "synthetic-test",
+            )
+            .await
+            .expect("independent neighbor setting");
+        (poll.action)().await.expect("publish pre-open snapshot");
+        let started = format!("2026-10-20T12:{index:02}:00.000Z");
+        let ended = format!("2026-10-20T12:{index:02}:30.000Z");
+        let join = Stream::Voice.event(guild, actor);
+        refresh_channel_classifier_from_poller(&pipeline, &join);
+        let requests = pipeline.collect_at(
+            &join,
+            &started,
+            two_bot_discord::MessageEligibility::default(),
+        );
+        pipeline
+            .drain(requests)
+            .await
+            .expect("open fresh real voice session");
+        inserted += pipeline.drain_facts().await.expect("persist start fact");
+
+        store
+            .set(&guild.to_string(), KEY, after.clone(), "synthetic-test")
+            .await
+            .expect("post-open replacement, empty or deletion");
+        (poll.action)().await.expect("publish changed exclusions");
+        assert_eq!(
+            live.get(&guild.to_string(), KEY),
+            after,
+            "{label}: own snapshot"
+        );
+        assert_eq!(
+            live.get(&other_guild.to_string(), KEY),
+            neighbor,
+            "{label}: neighbor snapshot"
+        );
+
+        let leave = Event::MemberRemove(
+            serde_json::from_value(json!({"guild_id":guild.to_string(),"user":user(actor)}))
+                .expect("real MemberRemove payload"),
+        );
+        refresh_channel_classifier_from_poller(&pipeline, &leave);
+        let requests = pipeline.collect_at(
+            &leave,
+            &ended,
+            two_bot_discord::MessageEligibility::default(),
+        );
+        pipeline
+            .drain(requests)
+            .await
+            .expect("ordered member-removal drain");
+        inserted += pipeline
+            .drain_facts()
+            .await
+            .expect("persist voice end fact");
+
+        let key = format!("{guild}:{actor}:{started}:{CHANNEL}");
+        for (event_type, at, class, metadata) in [
+            (
+                "voice_session_started",
+                &started,
+                start_class,
+                json!({"sessionKey":key,"channelId":CHANNEL}),
+            ),
+            (
+                "voice_session_ended",
+                &ended,
+                end_class,
+                json!({"sessionKey":key,"channelId":CHANNEL,"startedAt":started,
+                    "durationSeconds":30,"startKnown":true}),
+            ),
+        ] {
+            expected.push(json!({
+                "guild_id":guild.to_string(),"actor_id":actor,"event_type":event_type,
+                "source_event_id":key,"source":format!("channel:{CHANNEL}"),"occurred_at":at,
+                "classification":class,"classifier_version":"community-v1",
+                "matched_rule":if class == "test" { "configured_test_actor" } else { "no_exclusion_matched" },
+                "metadata":metadata
+            }));
+        }
+    }
+    // Include starts and ends: departure notifications alone cannot satisfy this
+    // oracle, nor can an end without its correct session key and known duration.
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT jsonb_build_object(
+            'guild_id', guild_id, 'actor_id', actor_id, 'event_type', event_type,
+            'source_event_id', source_event_id, 'source', source, 'occurred_at', occurred_at,
+            'classification', classification, 'classifier_version', classifier_version,
+            'matched_rule', matched_rule, 'metadata', metadata::jsonb)::text
+         FROM community_facts ORDER BY id",
+    )
+    .fetch_all(fixture.pool())
+    .await
+    .expect("read persisted voice verdicts");
+    drop(pipeline);
+    drop(poll);
+    fixture
+        .close()
+        .await
+        .expect("teardown before intended RED assertion");
+    let actual: Vec<Value> = rows
+        .iter()
+        .map(|row| serde_json::from_str(row).expect("stored fact JSON"))
+        .collect();
+    assert_eq!(inserted, 22, "one fresh start and one durable end per case");
+    assert_eq!(actual, expected, "MemberRemove itself refreshes end classification across replacement/update/empty/delete and guild switches");
 }
