@@ -40,7 +40,12 @@ lint-only `check` lane.
   Shard uploads overwrite the same shard's earlier artifact on a failed-job
   re-run. Measurement also uses
   `--ignore-run-fail` to preserve LCOV output when tests invoked by llvm-cov fail.
-  A build or report-generation failure fails this gate.
+  A build or report-generation failure fails this gate. Each shard probes the
+  compiler cache before measurement with a 30-second limit. If its backend cannot
+  start, the shard warns and clears `RUSTC_WRAPPER` so the same coverage commands
+  compile directly; no test or report is skipped. Cache installation and checksum
+  verification remain mandatory. Cache statistics are advisory and unavailable
+  on this fallback path, not a zero-percent hit-rate measurement.
 - Dependency advisories (HARD): the `cargo-deny` step (`check all`, which
   includes advisories) runs on every PR, not only Rust-selected ones.
 - Request-path unwrap (HARD): the local `sgconfig.yml` runs the request-path

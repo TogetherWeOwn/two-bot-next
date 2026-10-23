@@ -1231,6 +1231,26 @@ jobs:
 
       - name: Start sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          # The action installs the binary, but its post step starts the server
+          # again to collect stats. Use the guarded advisory stats below instead.
+          disable_annotations: 'true'
+
+      - name: Check compiler cache availability
+        id: sccache_ready
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Exercise the same startup path as llvm-cov's compiler probe. A GHA
+          # cache outage must not prevent measurement; installation/checksum,
+          # compilation and report failures remain mandatory checks.
+          if timeout 30s sccache rustc --print cfg >/dev/null 2>&1; then
+            printf 'enabled=true\n' >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::compiler cache unavailable; coverage will compile without sccache"
+            printf 'RUSTC_WRAPPER=\n' >> "$GITHUB_ENV"
+            printf 'enabled=false\n' >> "$GITHUB_OUTPUT"
+          fi
 
       # Per-shard entries: the instrumented llvm-cov graph never builds in
       # `rust-tests`, so each shard saves its own dependency cache on push
@@ -1587,8 +1607,12 @@ jobs:
           retention-days: 14
 
       - name: sccache stats (advisory speed evidence)
+        if: steps.sccache_ready.outputs.enabled == 'true'
         shell: bash
-        run: sccache --show-stats
+        run: |
+          if ! timeout 10s sccache --show-stats; then
+            echo "::warning::compiler cache statistics unavailable"
+          fi
 
       # Post-suite storage evidence: max_wal_size is a soft target, so the
       # pre-suite report cannot show peak WAL. This always-runs report brackets
