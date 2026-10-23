@@ -272,12 +272,11 @@ mod tests {
                 "{token} appears exactly once"
             );
         }
-        // 28 legacy builtins plus the Next-only help and privacy commands,
-        // plus the 21 gated voice commands (voice `kick` loses first-wins
-        // to moderation `/kick`; `/templateassistant` stays unpublished
-        // until its slice lands): matches the regenerated `docs/commands.md`
-        // total.
-        assert!(text.contains("**Server commands** (50 live)"));
+        // 30 non-voice commands (4 core + 17 feature + 9 moderation),
+        // including giveaway, plus 21 additional voice commands (voice
+        // `kick` loses first-wins to moderation `/kick`).
+        // `/templateassistant` stays unpublished until its slice lands.
+        assert!(text.contains("**Server commands** (51 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"
@@ -294,6 +293,7 @@ mod tests {
         for (group, perm) in [
             ("Automations", "Manage Server"),
             ("Feed relays", "Manage Server"),
+            ("Giveaways", "Manage Server"),
             ("Bans", "Ban Members"),
             ("Message cleanup", "Manage Messages"),
             ("Voice room admin", "Manage Channels"),
@@ -305,6 +305,7 @@ mod tests {
             );
         }
         for line in [
+            "**Giveaways** — needs Manage Server\n/giveaway\n",
             "**Voice rooms**\n/setup · /ping · /invite · /reclaim · /transfer · /name · /private · /public · /limit · /unlimit\n",
             "**Voice room admin** — needs Manage Channels\n/create · /textchannels · /access · /logging · /position · /group · /inheritpermissions · /defaultlimit · /alwaysprivate\n",
             "**Voice room settings** — needs Manage Server\n/export · /import\n",
@@ -333,6 +334,8 @@ mod tests {
         assert!(text.contains("/rank"));
         assert!(text.contains("/help"));
         assert!(!text.contains("Automations"));
+        assert!(!text.contains("Giveaways"));
+        assert!(!text.contains("/giveaway"));
         assert!(!text.contains("/ban"));
         assert!(!text.contains("Custom"));
     }
@@ -397,11 +400,10 @@ mod tests {
             .iter()
             .flat_map(|g| g.commands.iter().copied())
             .collect();
-        // 27 legacy builtins plus the Next-only help command and the
-        // Next-only privacy command, then the 21 voice names (voice `kick`
-        // shares the Kick group). `/templateassistant` stays out until its
-        // slice lands.
-        assert_eq!(grouped.len(), 50);
+        // 30 non-voice names, including giveaway, plus 21 additional voice
+        // names (voice `kick` shares the Kick group). `/templateassistant`
+        // stays out until its slice lands.
+        assert_eq!(grouped.len(), 51);
         for name in [
             "rank",
             "leaderboard",
@@ -413,6 +415,7 @@ mod tests {
             "sticky-remove",
             "rsvp",
             "rsvp-attendance",
+            "giveaway",
             "lfg",
             "lfg-close",
             "feed-add",
