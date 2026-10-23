@@ -1,6 +1,6 @@
--- 0460_admin_api_token_authority: named holders and bounded credential authority.
--- 0458/0459 remain reserved for the audit/confirmation slice. Never rewrite
--- shipped 0456/0457. Mirrored in store 0461; both chains may run on one schema.
+-- 0462_admin_api_token_authority: named holders and bounded credential authority.
+-- 0458/0459 are starboard; 0460/0461 are giveaways. Never rewrite
+-- shipped 0456/0457. Mirrored in store 0463; both chains may run on one schema.
 -- SQLx runs this entire file in one transaction. Existing rows have no named
 -- holder: SET NOT NULL must abort the upgrade, leaving data and DDL untouched.
 -- No invented holder/default, deletion, expiry truncation or token issuance.
@@ -26,6 +26,16 @@ BEGIN
                AND NOT attisdropped
                AND (atttypid <> 'pg_catalog.text'::regtype OR atttypmod <> -1)) THEN
     RAISE EXCEPTION 'admin_api_tokens holder columns must use plain pg_catalog.text';
+  END IF;
+  -- Deterministic collations break equality ties by bytes. Nondeterministic
+  -- equality can admit HUMAN as human; never silently rewrite that authority.
+  IF EXISTS (SELECT 1 FROM pg_attribute a
+             LEFT JOIN pg_collation c ON c.oid = a.attcollation
+             WHERE a.attrelid = 'admin_api_tokens'::regclass
+               AND a.attname IN ('holder_id', 'holder_kind')
+               AND NOT a.attisdropped
+               AND c.collisdeterministic IS DISTINCT FROM TRUE) THEN
+    RAISE EXCEPTION 'admin_api_tokens holder columns must use deterministic collations';
   END IF;
 END $$;
 

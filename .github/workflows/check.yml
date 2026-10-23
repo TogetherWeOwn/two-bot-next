@@ -318,6 +318,10 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_stdout_read_acceptance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_stdout_read_duplicate_key_acceptance.py' -v
 
+      - name: weekly DORA metrics scoring and publication (offline)
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_dora_*.py' -v
+
       - name: cutover rollback-readiness probe and freeze drill (offline)
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_rollback_readiness_probe.py' -v
@@ -3075,6 +3079,9 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: wrangler/package-lock.json
+      - name: Audit Worker dependencies (high/critical gate)
+        if: needs.job-inputs.outputs.worker != 'false'
+        run: npm audit --audit-level=high --include=dev --json
       - run: npm ci
         if: needs.job-inputs.outputs.worker != 'false'
       - run: npm run typecheck
@@ -3217,6 +3224,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_events_read.py -v
       - name: Verify staging event evidence semantics (offline fixtures, no database)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_events_read_acceptance.py -v
+      - name: Verify staging privacy verify read (offline fixtures, no database)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_privacy_verify_read.py -v
       - name: Verify cutover acceptance probes (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_qa_cutover_probes.py -v
       - name: Verify cutover probe bounded redacted verdicts (offline fixtures)

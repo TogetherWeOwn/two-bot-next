@@ -477,6 +477,10 @@ mod tests {
             let mut env = vars();
             env.insert("TWO_VOICE".into(), voice.into());
             env.insert("TWO_ASSISTANT_ENDPOINT".into(), endpoint.into());
+            env.insert(
+                "TWO_ASSISTANT_API_KEY".into(),
+                "fixture-assistant-credential".into(),
+            );
             let definitions = desired_definitions(2222, &env).unwrap();
             let names: Vec<_> = definitions.iter().map(|def| def.name.as_str()).collect();
             for definition in two_bot_core::voice_rooms::voice_commands() {

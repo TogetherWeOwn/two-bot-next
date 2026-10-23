@@ -8,9 +8,10 @@ security gates still apply.
 ## Authority contract
 
 The historical table is created by cutover `0456` / store `0457`; the forward
-repair is cutover `0460_admin_api_token_authority.sql` and its store `0461`
+repair is cutover `0462_admin_api_token_authority.sql` and its store `0463`
 mirror. Applied historical SQL and checksums are immutable. The starboard
-foundation uses store `0458` / cutover `0459`; the holder repair remains a
+foundation uses store `0458` / cutover `0459`; giveaways use cutover `0460` /
+store `0461`. The holder repair remains a
 separate forward migration.
 
 `admin_api_tokens` has twelve columns: `token_id`, `secret_hash`, `scopes`,
@@ -55,7 +56,11 @@ column must have the exact built-in `pg_catalog.text` type with no type modifier
 Domains (with or without defaults), varchar and other types refuse before DDL:
 a domain default can fabricate authority on an omitted-column INSERT even when
 no column default exists. The migration never coerces types, rewrites domains,
-drops defaults or silently repairs fallback authority. Compatible plain-TEXT
+drops defaults or silently repairs fallback authority. Existing holders must also
+use deterministic collations: nondeterministic case-insensitive equality can
+otherwise accept `HUMAN` as the closed kind `human`. Both holder columns are
+checked under the same lock before DDL. Deterministic database-default and `C`
+collations remain compatible; collations are never rewritten. Compatible plain-TEXT
 partial schemas without defaults may upgrade: missing columns are added without
 defaults, made NOT NULL, and checked with validated constraints. Before any registry DDL, all four named
 authority constraints are compared with canonical CHECK expressions parsed on
@@ -92,8 +97,8 @@ not the repair's operational backout. Keep migration history intact.
 
 ## Backup, rollback and privacy
 
-Backup discovers live columns dynamically. The current v14 inventory includes the
-event voice pair and starboard tables; this holder repair adds no table or archive
+Backup discovers live columns dynamically. The current v15 inventory includes the
+event voice pair, starboard and giveaway tables; this holder repair adds no table or archive
 version. New archives
 include both holder columns. Populated pre-holder archives cannot restore valid
 authority: missing holder columns hit NOT NULL and roll back the restore
@@ -119,7 +124,8 @@ Independent acceptance lives in `admin_registry_repair_acceptance` and
 `admin_token_registry_acceptance`. Both real migration chains are exercised on
 the guarded disposable test service, including atomic refusal of a populated
 historical schema, empty/populated column- and domain-default refusal, noncanonical
-holder-type refusal with raw type/domain/catalog/history preservation, compatible
+holder-type and nondeterministic-collation refusal with raw type/domain/catalog/history
+preservation, uppercase-kind admin INSERT probes, compatible
 plain-TEXT no-default upgrades, actual admin-scope omitted-holder INSERTs,
 exact 90-day positives, malformed authority, AI admin, invalid updates and
 nonfinite/overlong lifetimes. Existing backup roundtrip, erasure
