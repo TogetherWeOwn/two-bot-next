@@ -2245,6 +2245,10 @@ mod drop_poison_acceptance_tests;
 mod drop_poison_counter_acceptance_tests;
 
 #[cfg(test)]
+#[path = "gateway_live_exclusions_acceptance_tests.rs"]
+mod live_exclusions_acceptance_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
