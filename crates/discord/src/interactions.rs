@@ -450,11 +450,16 @@ impl InteractionRuntime {
         interaction: &Interaction,
     ) -> Result<bool, crate::DiscordError> {
         use twilight_model::application::interaction::application_command::CommandOptionValue;
-        let (Some(guild), Some(channel), Some(InteractionData::ApplicationCommand(data))) = (
-            interaction.guild_id,
-            interaction.channel.as_ref(),
-            interaction.data.as_ref(),
-        ) else {
+        // Accept both Discord's partial channel and the older channel_id
+        // representation already used by gateway interactions in this runtime.
+        let channel_id = interaction
+            .channel
+            .as_ref()
+            .map(|channel| channel.id)
+            .or(interaction.channel_id);
+        let (Some(guild), Some(channel_id), Some(InteractionData::ApplicationCommand(data))) =
+            (interaction.guild_id, channel_id, interaction.data.as_ref())
+        else {
             return Ok(false);
         };
         let cursor = match data.options.iter().find(|option| option.name == "cursor") {
@@ -470,7 +475,7 @@ impl InteractionRuntime {
                 crate::lfg_list::list(
                     &self.pool,
                     &guild.to_string(),
-                    &channel.id.to_string(),
+                    &channel_id.to_string(),
                     cursor,
                 ),
             )
