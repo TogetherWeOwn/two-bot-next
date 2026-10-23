@@ -8830,7 +8830,7 @@ where
             warn!(
                 guild = guild.to_string(),
                 vote_id = vote_id.to_string(),
-                "voice ballot reference not queued: actor unavailable or inbox full"
+                "voice ballot reference not queued: actor unavailable"
             );
         }
         queued
