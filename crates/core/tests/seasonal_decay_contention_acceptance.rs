@@ -19,6 +19,8 @@ const OLD: &str = "2026-08-15T00:00:00.000Z";
 const TICK: &str = "2026-09-20T00:00:00.000Z";
 const AWARD_GATE: i64 = 7_348_057;
 
+type Audit = (String, String, i32, Option<String>, bool);
+
 fn member(index: usize) -> String {
     format!("610000000000{index:06}")
 }
@@ -87,10 +89,12 @@ async fn rendezvous(pool: &PgPool, blocker: i32, name: &str) -> String {
     .expect("worker never reached the intended database lock barrier")
 }
 
-#[tokio::test]
-async fn no_op_prefix_does_not_block_a_fresh_member_award() {
+async fn no_op_prefix_award(target: usize) {
     let db = database().await;
     seed(db.pool(), 0, 1000, 0, TICK).await; // active
+
+    // Both old targets independently pass a watermark-0 age cutoff (36d).
+    // Only the watermark excludes member 1; only zero XP excludes member 2.
     seed(db.pool(), 1, 900, 1, OLD).await; // already decayed at this tick
     seed(db.pool(), 2, 0, 0, OLD).await; // no XP to decay
     seed(db.pool(), 3, 1000, 0, OLD).await; // eligible suffix / rendezvous
@@ -111,7 +115,7 @@ async fn no_op_prefix_does_not_block_a_fresh_member_award() {
     let mut award_worker = {
         let pool = award_pool.clone();
         tokio::spawn(async move {
-            store::award_message(&pool, GUILD, &member(0), TICK, None, None, false).await
+            store::award_message(&pool, GUILD, &member(target), TICK, None, None, false).await
         })
     };
     // Either the real award completes while decay is parked, or PostgreSQL
@@ -128,26 +132,116 @@ async fn no_op_prefix_does_not_block_a_fresh_member_award() {
             tokio::task::yield_now().await;
         }
     })
-    .await
-    .expect("award neither completed nor reached an observable lock wait");
+    .await;
+    // Release even on the blocked mutant or a bounded rendezvous failure.
+    // Join both workers and explicitly close the fixture before asserting.
     held.rollback().await.unwrap();
-    let (was_blocked, award) = match early {
-        Ok(result) => (false, result.unwrap().unwrap()),
-        Err(_) => (true, award_worker.await.unwrap().unwrap()),
+    let (completed_early, blocked_query, award) = match early {
+        Ok(Ok(result)) => (true, None, result),
+        Ok(Err(query)) => (false, Some(query), award_worker.await),
+        Err(_) => (false, None, award_worker.await),
     };
-    let decayed = decay_worker.await.unwrap().unwrap();
+    let decayed = decay_worker.await;
     decay_pool.close().await;
     award_pool.close().await;
     let prefix: Vec<(i64, i32)> = sqlx::query_as("SELECT seasonal_xp, decayed_weeks FROM member_season_xp WHERE member_id < $1 ORDER BY member_id")
         .bind(member(3)).fetch_all(db.pool()).await.unwrap();
+    let timestamps: Vec<bool> = sqlx::query_scalar(
+        "SELECT updated_at = (CASE WHEN member_id = $1 OR member_id = $2
+                                  THEN $3 ELSE $4 END)::text::timestamptz
+         FROM member_season_xp ORDER BY member_id",
+    )
+    .bind(member(target))
+    .bind(member(0))
+    .bind(TICK)
+    .bind(OLD)
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    let suffix: (i64, i32) = sqlx::query_as(
+        "SELECT seasonal_xp, decayed_weeks FROM member_season_xp WHERE member_id = $1",
+    )
+    .bind(member(3))
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let lifetime: Vec<(i64, i64, i64, i64, bool)> = sqlx::query_as(
+        "SELECT xp, message_xp, voice_xp, imported_xp,
+                updated_at = (CASE WHEN member_id = $1 THEN $2 ELSE $3 END)::text::timestamptz
+         FROM member_levels ORDER BY member_id",
+    )
+    .bind(member(target))
+    .bind(TICK)
+    .bind(OLD)
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    let drain = store::apply_seasonal_decay(db.pool(), GUILD, SEASON, TICK).await;
+    let audits: Vec<Audit> = sqlx::query_as(
+        "SELECT member_id, source, xp, decision, occurred_at = $1::text::timestamptz
+         FROM xp_awards ORDER BY member_id, source",
+    )
+    .bind(TICK)
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
     db.close().await.unwrap();
     assert!(
-        !was_blocked,
-        "no-op decay read held a row lock that blocked a fresh-member award"
+        completed_early,
+        "no-op decay read held a row lock or award failed to rendezvous; target {target}, blocked SQL: {blocked_query:?}"
     );
+    let award = award.unwrap().unwrap();
     assert_eq!(award.awarded, 15);
-    assert_eq!(decayed, 1);
-    assert_eq!(prefix, vec![(1015, 0), (900, 1), (0, 0)]);
+    assert_eq!(award.total_xp, 1015);
+    assert_eq!(decayed.unwrap().unwrap(), 1);
+    let mut expected_prefix = vec![(1000, 0), (900, 1), (0, 0)];
+    expected_prefix[target].0 += 15;
+    expected_prefix[target].1 = 0; // A real award resets the inactivity watermark.
+    assert_eq!(
+        prefix, expected_prefix,
+        "no stale decay overwrites a live award"
+    );
+    assert_eq!(timestamps, vec![true; 4]);
+    assert_eq!(suffix, (900, 1));
+    let mut expected_lifetime = vec![(1000, 0, 0, 1000, true); 4];
+    expected_lifetime[target] = (1015, 15, 0, 1000, true);
+    assert_eq!(lifetime, expected_lifetime);
+    assert_eq!(
+        drain.unwrap(),
+        0,
+        "zero is a truthful drain marker after the overlap"
+    );
+    assert_eq!(
+        audits,
+        vec![
+            (member(target), "message".into(), 15, None, true),
+            (
+                member(3),
+                "decay".into(),
+                100,
+                Some("seasonal_decay".into()),
+                true
+            ),
+        ],
+        "one real award and one suffix decay only; no no-op or duplicate drain audit"
+    );
+}
+
+#[tokio::test]
+async fn no_op_prefix_does_not_block_a_fresh_member_award() {
+    no_op_prefix_award(0).await;
+}
+
+/// Removing only SQL `AND seasonal_xp > 0` must block this aged zero-XP award.
+#[tokio::test]
+async fn no_op_prefix_does_not_block_an_old_zero_xp_member_award() {
+    no_op_prefix_award(2).await;
+}
+
+/// Replacing only the SQL watermark with zero must block this positive-XP award.
+#[tokio::test]
+async fn no_op_prefix_does_not_block_an_old_already_decayed_member_award() {
+    no_op_prefix_award(1).await;
 }
 
 #[tokio::test]
