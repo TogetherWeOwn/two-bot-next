@@ -166,7 +166,16 @@ is the serving version (same id as `wrangler deployments status --env staging`),
 and if they differ redeploy the intended SHA through the workflow first (full rule
 in `docs/production-deploy.md`).
 
-1. Merge this change. `deploy-staging` deploys it dark; `/health` and `/readyz` are unchanged.
+For a binary containing voice configuration actions, the authorized migration
+executor must apply `0458_voice_settings_versions.sql` and the reviewed role
+plan **before** that binary can serve, including with the receiver or voice
+capability dark. Existing Discord writers use the new audit schema regardless
+of those gates. The original receiver enablement sequence below is not a
+voice deployment authorization; its merge-first step does not waive required
+pre-merge staging evidence. Keep the additive voice schema and audit on rollback;
+never drop voice columns or delete audit history.
+
+1. Merge the original receiver change only after its applicable gates pass. `deploy-staging` deploys it dark; `/health` and `/readyz` are unchanged.
 2. Operator stages `TWO_INTERNAL_CALLERS` and `TWO_INTERNAL_CHANNEL_KEYS` (plain values), only under the separately authorized enablement contract; no role keys or optional capability gates travel through this Worker.
 3. Operator generates the key on the Operator host and stages `TWO_INTERNAL_KEYS`, and sets the website's `staging` environment secret `BOT_SHARED_SECRET` to the same value, without printing it.
 4. Operator applies migrations `0423` (settings CAS) and `0424` (event outcome) first (the bot does not apply migrations; an enabled receiver's finish fails without the columns), then stages `TWO_INTERNAL_ACTIONS` as `1` **last**, deploys the version, and transfers ownership. The container restart applies the settings: an invalid combination exits the process (the receiver boots all-or-nothing) and keeps staging red until step 5.
@@ -265,7 +274,7 @@ validates configuration values/reference syntax and fixes the target guild; it
 trusted inventory from submitted IDs. Signing keys remain trusted control-plane
 capabilities. Do not enable a dashboard client without those caller-side checks.
 
-Apply migration `0455_voice_settings_versions.sql` through the authorized
+Apply migration `0458_voice_settings_versions.sql` through the authorized
 migration executor **before** deploying this binary: existing Discord
 configuration writers also use the new revision/audit transaction. It adds
 `version`/`updated_by`/`updated_at` to voice configuration tables, an append-only
@@ -482,6 +491,8 @@ Success (`200` only, `result` always an object, no `error` key):
 | event.upsert/cancel | `{outcome, event_id}` | `outcome` replayed from the stored receipt |
 | event.read | full observed event | behind its allowlist flag |
 | settings.get/set | `{key, ...}` plus top-level integer `version` | `version` beside `result`, never inside |
+| voice.config.get | `{config, logging_settings, updated_by, updated_at}` plus top-level integer `version` | Receiver-only; opaque CAS token beside `result`, not a forwarded capability |
+| voice.config.set | `{outcome:"saved"}` plus top-level integer `version` | Receiver-only; first committed token retained on replay, capability not forwarded |
 | automations.export/import | command document / `{imported, skipped, conflicts}` | |
 | role.assign / guild.add_member | `{outcome}` | `assigned`/`already_held`, `added`/`already_member` |
 | moderation.\* | `{outcome[, affected]}` | |

@@ -1,4 +1,4 @@
-//! The v12 backup envelope (also reads v3/v4/v5/v6/v7/v8/v9/v10/v11): manifest / rows / end marker, gzipped NDJSON.
+//! The v14 backup envelope (also reads v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13): manifest / rows / end marker, gzipped NDJSON.
 //!
 //! Port of the file half of legacy `src/store/dump.ts`. The writer side lives
 //! in [`super::dump`]; everything here touches no database, so every refusal
@@ -122,6 +122,9 @@ pub const DUMP_TABLES: &[&str] = &[
     // in-flight fetch resurrect rows); see [`V11_ADDED_TABLES`]. No foreign
     // keys, so order beside the mirror is free.
     "scheduled_events_tombstone",
+    // Event voice claims and attendance spans (0455, v13) survive recovery.
+    "event_voice_channels",
+    "event_voice_presence",
     "counter_snapshots",
     "member_exclusions",
     "presence_probe",
@@ -133,6 +136,8 @@ pub const DUMP_TABLES: &[&str] = &[
     "guild_settings_revision",
     "guild_settings",
     "guild_settings_audit",
+    // Hash-only issued admin token registry (0456/0457, v12).
+    "admin_api_tokens",
     "audit_kill_switch",
     "internal_nonces",
     "internal_clock_high_water",
@@ -262,8 +267,16 @@ pub const V10_ADDED_TABLES: &[&str] = &["scheduled_events_claim"];
 /// written by the merged v10 writer stay readable and clear the tombstones.
 pub const V11_ADDED_TABLES: &[&str] = &["scheduled_events_tombstone"];
 
-/// Voice configuration revision and actor history, first archived in v12.
-pub const V12_ADDED_TABLES: &[&str] = &["voice_settings_audit"];
+/// Issued admin API token registry (0456/0457), first archived in v12.
+/// Older archives may omit it; restore clears the destination registry.
+pub const V12_ADDED_TABLES: &[&str] = &["admin_api_tokens"];
+
+/// Event voice claims and attendance spans (0455), first archived in v13.
+/// Older archives may omit both; new archives must retain the complete pair.
+pub const V13_ADDED_TABLES: &[&str] = &["event_voice_channels", "event_voice_presence"];
+
+/// Voice configuration revision and actor history (0458), first archived in v14.
+pub const V14_ADDED_TABLES: &[&str] = &["voice_settings_audit"];
 
 /// Covered tables not created by the current cutover migration set, if any.
 /// Keep legacy data when such tables exist, but do not require nonexistent
@@ -340,8 +353,8 @@ pub fn is_destination_owned(table: &str, column: &str) -> bool {
         .any(|(owned_table, owned_column)| *owned_table == table && *owned_column == column)
 }
 
-/// Write complete v12 coverage; the reader also accepts frozen v3 through v11 coverage.
-pub const DUMP_VERSION: u32 = 12;
+/// Write complete v14 coverage; the reader also accepts frozen v3 through v13 coverage.
+pub const DUMP_VERSION: u32 = 14;
 
 /// A table name in the dump, validated against [`DUMP_TABLES`].
 pub type DumpTable = String;
@@ -895,10 +908,12 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                     && version != 9
                     && version != 10
                     && version != 11
+                    && version != 12
+                    && version != 13
                     && version != u64::from(DUMP_VERSION)
                 {
                     return Err(refuse(format!(
-                        "dump version {version}, this build reads 3, 4, 5, 6, 7, 8, 9, 10, 11 and {DUMP_VERSION}"
+                        "dump version {version}, this build reads 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 and {DUMP_VERSION}"
                     )));
                 }
                 retain_within_cap(&mut retained, &obj, limits.retained)?;
@@ -1182,15 +1197,18 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
         let _ = count;
     }
     // Historical inventories are pinned by fixtures. Each old version waives
-    // only tables first covered by a later version. New v12 archives require
+    // only tables first covered by a later version. New v14 archives require
     // the full inventory, including both guild counters (0441/0442/0446/0447),
-    // the epoch-claim guard (0450/0451) and the delete tombstones (0452/0453).
+    // the epoch-claim guard (0450/0451), delete tombstones (0452/0453), token
+    // registry (0456/0457), event voice pair (0455) and voice audit (0458).
     let version = obj.get("version").and_then(Value::as_u64);
     let missing: Vec<&str> = DUMP_TABLES
         .iter()
         .copied()
         .enumerate()
         .filter(|(_, name)| version.is_some_and(|v| v >= 12) || !V12_ADDED_TABLES.contains(name))
+        .filter(|(_, name)| version.is_some_and(|v| v >= 13) || !V13_ADDED_TABLES.contains(name))
+        .filter(|(_, name)| version.is_some_and(|v| v >= 14) || !V14_ADDED_TABLES.contains(name))
         .filter(|(index, name)| match version {
             Some(3) => *index < 22,
             Some(4) => {
