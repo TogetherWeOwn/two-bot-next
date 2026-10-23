@@ -255,7 +255,8 @@ pub const PERM_MANAGE_EVENTS: u64 = 8589934592;
 /// Always-published core commands (two-bot `CORE_COMMAND_DATA` = leveling,
 /// plus the Next-only `/help` discovery surface — legacy has no help command,
 /// see the `help` row in the registry golden exceptions — plus the Next-only
-/// `/privacy` member self-serve for analytics privacy and deletion requests).
+/// `/privacy` member self-serve for analytics privacy and deletion requests,
+/// and the Next-only `/game-mix` private staff aggregate read).
 #[must_use]
 pub fn core_commands() -> Vec<CommandDefinition> {
     vec![
