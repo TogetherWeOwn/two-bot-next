@@ -110,9 +110,10 @@ fn automations_off_withholds_automation_builtins_and_all_dynamics() {
         enabled: true,
     };
     let names = published_names(&router, &[faq]);
-    // 29 all-on builtins minus the 8 automation admin commands, and the
-    // stored dynamic row stays unpublished: every such invocation refuses
-    // at dispatch while gated off, so publishing would burn the ceiling.
+    // 30 all-on builtins minus the 9 automation-gated commands (the 8
+    // automation admin commands plus the Next-only `/giveaway` timed entry),
+    // and the stored dynamic row stays unpublished: every such invocation
+    // refuses at dispatch while gated off, so publishing would burn the ceiling.
     assert_eq!(names.len(), 21, "automations-off staging set: {names:?}");
     assert!(
         !names.iter().any(|name| name == "faq"),
@@ -127,6 +128,7 @@ fn automations_off_withholds_automation_builtins_and_all_dynamics() {
         "schedule-list",
         "sticky",
         "sticky-remove",
+        "giveaway",
     ] {
         assert!(
             !names.contains(&gated.to_owned()),

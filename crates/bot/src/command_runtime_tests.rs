@@ -31,6 +31,8 @@ mod sticky_uncertain_acceptance_tests;
 #[path = "custom_command_list_pages_acceptance.rs"]
 mod custom_command_list_pages_acceptance;
 
+#[path = "giveaway_admission_edge_acceptance_tests.rs"]
+mod giveaway_admission_edge_acceptance_tests;
 #[path = "giveaway_create_entry_acceptance_tests.rs"]
 mod giveaway_create_entry_acceptance_tests;
 
@@ -3261,6 +3263,7 @@ async fn ready_publishes_the_complete_merged_registry_once() {
         "schedule-list",
         "sticky",
         "sticky-remove",
+        "giveaway",
         "rsvp",
         "rsvp-attendance",
         "lfg",

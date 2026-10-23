@@ -183,6 +183,24 @@ fn parity_builtins_route_to_their_handlers() {
     }
 }
 
+/// The Next-only `/giveaway` timed entry routes to its registered handler.
+/// No direct `HandlerId::Giveaway` reference: the variant does not exist at
+/// baseline, so the pin matches the handler's `Debug` name. This compiles on
+/// the pre-slice router and fails behaviorally (`Unknown`) until the
+/// giveaway slice registers its handler.
+#[test]
+fn giveaway_routes_to_its_handler_by_debug_name() {
+    let router = InteractionRouter::new(parity_gates());
+    match router.route_slash(&ctx("giveaway")) {
+        SlashOutcome::Handled { handler } => assert_eq!(
+            format!("{handler:?}"),
+            "Giveaway",
+            "/giveaway routes to its handler"
+        ),
+        other => panic!("/giveaway must route to its handler, got {other:?}"),
+    }
+}
+
 /// CONTROL (green before and after): the staging E2E matrix still equals the
 /// voice-off publish set. The builder's unpublish must not disturb it.
 #[test]
@@ -199,5 +217,5 @@ fn e2e_matrix_still_matches_the_publish_set() {
         matrix_names, published_names,
         "matrix drift: the fix must not change the parity publish set"
     );
-    assert_eq!(matrix.len(), 29, "contract covers the 29 built-in commands");
+    assert_eq!(matrix.len(), 30, "contract covers the 30 built-in commands");
 }
