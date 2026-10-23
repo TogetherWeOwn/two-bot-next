@@ -162,12 +162,14 @@ const FAILURE_CLASSES: [&str; 12] = [
 /// Startup `error_class` values logged before fatal exits (see
 /// `docs/startup-diagnostics.md`): inline literals in `main.rs`, so pinned by
 /// presence, not by an enum.
-const STARTUP_ERROR_CLASSES: [&str; 8] = [
+const STARTUP_ERROR_CLASSES: [&str; 10] = [
     "listener_bind_failed",
     "gateway_override_invalid",
     "database_connect_failed",
     "receiver_config_invalid",
     "receiver_prerequisites_invalid",
+    "receiver_token_missing",
+    "receiver_store_missing",
     "receiver_bind_failed",
     "moderation_disable_unknown",
     "container_service_failed",
@@ -451,10 +453,26 @@ fn catalog_entries_appear_at_their_documented_files() {
             "catalog drain outcome missing from main.rs: {error}"
         );
     }
+    let catalog = observability_catalog_doc();
     for class in STARTUP_ERROR_CLASSES {
         assert!(
             main.contains(class),
             "startup error class missing from main.rs: {class}"
+        );
+        assert!(
+            catalog.contains(&format!("`{class}`")),
+            "startup error class missing from the catalog: {class}"
+        );
+    }
+    let delivery = include_str!("eventsub_delivery.rs");
+    for class in EVENTSUB_DELIVERY_ERROR_CLASSES {
+        assert!(
+            delivery.contains(&format!("\"{class}\"")),
+            "startup error class missing from eventsub_delivery.rs: {class}"
+        );
+        assert!(
+            catalog.contains(&format!("`{class}`")),
+            "startup error class missing from the catalog: {class}"
         );
     }
 }
@@ -547,6 +565,14 @@ const EVENTSUB_TEST_ONLY_EMISSIONS: [&str; 1] = [
 /// The receiver's startup diagnostic in `main.rs` (also in
 /// `MAIN_RS_ADJACENT` for the scanned-source pin above).
 const EVENTSUB_STARTUP_EVENT: &str = "eventsub startup refused";
+
+/// Dependency-construction classes propagated unchanged to the fatal startup
+/// event; unlike the token/store literals, these live outside `main.rs`.
+const EVENTSUB_DELIVERY_ERROR_CLASSES: [&str; 3] = [
+    "receiver_identity_refused",
+    "receiver_admission_rejected",
+    "receiver_proxy_invalid",
+];
 
 /// Bounded `event` field value every receiver emission carries.
 const EVENTSUB_EVENT_FIELD: &str = "eventsub_receiver";

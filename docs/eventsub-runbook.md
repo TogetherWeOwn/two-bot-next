@@ -501,8 +501,12 @@ missing or invalid, or delivery requested without the receiver —
 refuses container startup (`eventsub startup refused`); it never
 degrades to ack-only. An enabled delivery on a boot identity where
 Announcements is not cleared (live or unknown identity) refuses startup
-the same way, like every other bot-identity posting job. Because a bad value
-crash-loops the container, set
+the same way, like every other bot-identity posting job. The single fatal
+line's scalar `error_class` distinguishes `receiver_token_missing`,
+`receiver_store_missing`, `receiver_identity_refused`,
+`receiver_admission_rejected` and `receiver_proxy_invalid`; see the
+[EventSub startup class catalog](observability-event-catalog.md#eventsub-startup-classes)
+for each meaning and next action. Because a bad value crash-loops the container, set
 the three inputs first, redeploy, and flip the gate last. Enable on
 staging first and keep the posted go-live as enablement evidence;
 production enablement is its own rollout decision. To stop posting
