@@ -40,11 +40,11 @@ gateway closure):
 | feed | `feed_jobs.rs:235-237` | `TWO_FEED_POLL_SECONDS` (`:207`) | supervisor cadence + per-tick gate (`:246-289`) |
 | audit | `audit_runtime.rs:308`, `:438` | 3 mirror destinations (`:60-63`) | every record (`:483`) and sweep (`:497`), once installed |
 | ticket | `ticket_runtime.rs:457`, `:981` | 3 ticket destinations (`:172-175`) | every execute/recovery and purge |
-| gateway classifier | `gateway.rs:834-853`, `:978` | human/welcome channel sets (`:860-877`) | every guild message; classifier + facts sink swap together (`leveling_runtime.rs:908-911`) |
+| gateway classifier | `gateway.rs:834-853`, `:984` | channel + exclusion sets (`:860-883`) | every guild message; classifier + facts sink swap together (`leveling_runtime.rs:908-911`) |
 | community | `community_jobs.rs:181-183` | 5 scorecard/presence/inactivity keys (`:170-176`) | every tick: probe (`:396`), scorecard (`:548`), sweep (`:634`) |
-| voice | `gateway.rs:2204-2206` closure | empty grace (`voice_rooms.rs:9932`), invite code (`:9980`) | spawn (`:8097-8099`), maintenance (`:3421-3423`), `/invite` (`:13942-13943`) |
+| voice | `gateway.rs:2210-2212` closure | empty grace (`voice_rooms.rs:9932`), invite code (`:9980`) | spawn (`:8097-8099`), maintenance (`:3421-3423`), `/invite` (`:13942-13943`) |
 
-The forty-one keys in `STORE_READ_KEYS`
+The forty-six keys in `STORE_READ_KEYS`
 (`crates/core/tests/reference_docs.rs`) say “applied live by runtime refresh”
 instead of “stored unwired”: containment applies `TWO_ANTI_NUKE_WINDOW_SECONDS`,
 `TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS`, `TWO_ANTI_NUKE_HEAT_THRESHOLD` and
@@ -82,13 +82,16 @@ operations apply
 `DISCORD_TICKET_STAFF_ROLE_ID` from the snapshot on every execute, recovery
 and purge (`crates/bot/src/ticket_runtime.rs:172-175`, `:457`, `:981`), where a
 malformed row keeps the last good destinations like the audit mirror; the gateway funnel applies
-`TWO_COMMUNITY_HUMAN_CHANNEL_IDS` and `TWO_COMMUNITY_WELCOME_CHANNEL_IDS`
-from the snapshot on every guild message, refreshing the channel classifier
-and the community-facts sink together before the message's channel class is
-stamped (`crates/bot/src/gateway.rs:834-853`, `:978`, `crates/discord/src/leveling_runtime.rs:908-911`), with malformed entries filtered silently so a wholly-malformed row applies as the empty set (`crates/core/src/community.rs:252-260`); the voice sweep applies `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` from the snapshot on spawn and every maintenance refresh, so a stored per-guild grace reaches the deletion sweep without a restart (`crates/bot/src/voice_rooms.rs:8097-8099`, `:3421-3423`), and the invite responder applies `TWO_GUILD_INVITE_CODE` per `/invite` interaction (`crates/bot/src/voice_rooms.rs:13942-13943`), falling back to the live vanity code when the row is absent or invalid (`:9985-9990`); the community jobs apply `TWO_COMMUNITY_SCORECARD`, `TWO_COMMUNITY_RECOMMENDATIONS`, `TWO_COMMUNITY_CORRECTION_CYCLES`, `TWO_PRESENCE_PROBE` and `TWO_INACTIVITY_DAYS` from the snapshot on every tick, layering stored rows over the boot gates with boot fallback for absent or unparsable counts (`crates/bot/src/community_jobs.rs:170-268`), where a stored `0` on either enable gate skips that tick while the sweep re-reads its horizon per run. Five boot-only edges
+`TWO_COMMUNITY_HUMAN_CHANNEL_IDS`, `TWO_COMMUNITY_WELCOME_CHANNEL_IDS` and
+the five actor/staging exclusion sets (`TWO_COMMUNITY_AUTOMATION_ACTOR_IDS`,
+`TWO_COMMUNITY_RAID_ACTOR_IDS`, `TWO_COMMUNITY_STAGING_ACTOR_IDS`,
+`TWO_COMMUNITY_STAGING_GUILD_IDS`, `TWO_COMMUNITY_TEST_ACTOR_IDS`) from the
+snapshot on every guild message, refreshing the classifier and the
+community-facts sink together before the message's channel class is
+stamped (`crates/bot/src/gateway.rs:834-853`, `:984`, `crates/discord/src/leveling_runtime.rs:908-911`), with malformed entries filtered silently so a wholly-malformed row applies as the empty set (`crates/core/src/community.rs:252-260`); the voice sweep applies `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` from the snapshot on spawn and every maintenance refresh, so a stored per-guild grace reaches the deletion sweep without a restart (`crates/bot/src/voice_rooms.rs:8097-8099`, `:3421-3423`), and the invite responder applies `TWO_GUILD_INVITE_CODE` per `/invite` interaction (`crates/bot/src/voice_rooms.rs:13942-13943`), falling back to the live vanity code when the row is absent or invalid (`:9985-9990`); the community jobs apply `TWO_COMMUNITY_SCORECARD`, `TWO_COMMUNITY_RECOMMENDATIONS`, `TWO_COMMUNITY_CORRECTION_CYCLES`, `TWO_PRESENCE_PROBE` and `TWO_INACTIVITY_DAYS` from the snapshot on every tick, layering stored rows over the boot gates with boot fallback for absent or unparsable counts (`crates/bot/src/community_jobs.rs:170-268`), where a stored `0` on either enable gate skips that tick while the sweep re-reads its horizon per run. Five boot-only edges
 remain: the voice room-name policy is
 built once at boot from the process environment
-(`crates/bot/src/gateway.rs:2203`); gateway intents plus ticket command
+(`crates/bot/src/gateway.rs:2209`); gateway intents plus ticket command
 publication read the ticket destination keys once at boot
 (`crates/bot/src/gateway.rs:150`, `crates/bot/src/command_runtime.rs:448`), so a stored ticket
 destination reaches already-published commands only through the per-operation
@@ -220,16 +223,16 @@ Catalog entries: 136.
 | `TWO_BACKUP_S3_REGION` | env_only | Not specified in Next | environment only | Backup object-store region; environment-only destination boundary. |
 | `TWO_BACKUP_S3_SECRET_ACCESS_KEY` | env_only | Not rendered (secret) | environment only | Backup object-store secret credential; never rendered. |
 | `TWO_BULK_JOIN_WINDOW_UNTIL` | hot | Not specified in Next | stored, applied live by runtime refresh | End of the temporary bulk-join window. |
-| `TWO_COMMUNITY_AUTOMATION_ACTOR_IDS` | hot | `[]` | stored unwired | Automation actors excluded from human community activity. |
+| `TWO_COMMUNITY_AUTOMATION_ACTOR_IDS` | hot | `[]` | stored, applied live by runtime refresh (reload-report hot) | Automation actors excluded from human community activity. |
 | `TWO_COMMUNITY_CLASSIFIER_VERSION` | hot | `"community-v1"` | stored unwired | Version label for community classification. |
 | `TWO_COMMUNITY_CORRECTION_CYCLES` | hot | `0` | stored, applied live by runtime refresh (reload-report hot) | Non-negative count of operator scorecard corrections. |
 | `TWO_COMMUNITY_HUMAN_CHANNEL_IDS` | hot | `[]` | stored, applied live by runtime refresh (reload-report hot) | Channels considered for human community activity. |
-| `TWO_COMMUNITY_RAID_ACTOR_IDS` | hot | `[]` | stored unwired | Known raid actors excluded from human activity classification. |
+| `TWO_COMMUNITY_RAID_ACTOR_IDS` | hot | `[]` | stored, applied live by runtime refresh (reload-report hot) | Known raid actors excluded from human activity classification. |
 | `TWO_COMMUNITY_RECOMMENDATIONS` | hot | `true` | stored, applied live by runtime refresh (reload-report hot) | Permit scorecard recommendations unless explicitly disabled with 0. |
 | `TWO_COMMUNITY_SCORECARD` | hot | `false` | stored, applied live by runtime refresh (reload-report hot) | Enable the weekly scorecard job. Live fact capture covers event_attended, voice_session_started, voice_session_ended, message_created, rules_accepted and member_joined. |
-| `TWO_COMMUNITY_STAGING_ACTOR_IDS` | hot | `[]` | stored unwired | Staging actors excluded from human community activity. |
-| `TWO_COMMUNITY_STAGING_GUILD_IDS` | hot | `[]` | stored unwired | Staging guilds excluded from human community activity. |
-| `TWO_COMMUNITY_TEST_ACTOR_IDS` | hot | `[]` | stored unwired | Test actors excluded from human community activity. |
+| `TWO_COMMUNITY_STAGING_ACTOR_IDS` | hot | `[]` | stored, applied live by runtime refresh (reload-report hot) | Staging actors excluded from human community activity. |
+| `TWO_COMMUNITY_STAGING_GUILD_IDS` | hot | `[]` | stored, applied live by runtime refresh (reload-report hot) | Staging guilds excluded from human community activity. |
+| `TWO_COMMUNITY_TEST_ACTOR_IDS` | hot | `[]` | stored, applied live by runtime refresh (reload-report hot) | Test actors excluded from human community activity. |
 | `TWO_COMMUNITY_WELCOME_CHANNEL_IDS` | hot | `[]` | stored, applied live by runtime refresh (reload-report hot) | Welcome-channel classification for community analytics. |
 | `TWO_DATABASE_URL` | env_only | Not rendered (secret) | environment only | Administrative/shared admission database credential required for live preflight, cutover and guild-config; must reach the same database as Container DATABASE_URL for the same token. |
 | `TWO_DB_POOL_MAX` | env_only | Not specified in Next | environment only | Legacy database pool maximum read before the settings store exists. |

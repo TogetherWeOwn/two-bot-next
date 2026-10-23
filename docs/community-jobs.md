@@ -288,6 +288,14 @@ write verb; bind that job to a capability in `BootActivation` before it ships.
   ```
 
   A staging apply-check stays a rollout step, not a test gate.
+- The stored actor/staging exclusion live-apply pins run fully offline too
+  (in-memory `live_channel` plus the real pipeline seam, no database):
+
+  ```sh
+  python3 scripts/cargo_cache.py run -- test -p two-bot-core --test community_exclusion_live_keys_acceptance
+  python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test community_exclusion_pipeline_acceptance
+  ```
+
 - The production-call-site regressions in `community_live_tick_tests.rs`
   additionally require the disposable test database. Each uses a child process
   to register the real settings poll, publish committed overrides and run the

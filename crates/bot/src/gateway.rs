@@ -826,11 +826,11 @@ fn event_guild_id(event: &Event) -> String {
     }
 }
 
-/// Per-message channel-classifier refresh from the poller-published
-/// snapshot: the deployment environment is the base, stored human/welcome
-/// channel sets overlay it (both are `HOT_WIRED`, so only they can arrive
-/// from the snapshot). Parked or pre-first-poll readers layer nothing and
-/// the refresh is a no-op once the config compares equal.
+/// Per-message classifier refresh from the poller-published snapshot: the
+/// deployment environment is the base, stored channel and exclusion sets
+/// overlay it (all seven are `HOT_WIRED`, so only they can arrive from the
+/// snapshot). Parked or pre-first-poll readers layer nothing and the
+/// refresh is a no-op once the config compares equal.
 fn refresh_channel_classifier_from_poller<I: InviteSource>(
     pipeline: &GatewayPipeline<I>,
     event: &Event,
@@ -852,11 +852,11 @@ fn refresh_channel_classifier_from_poller<I: InviteSource>(
     ));
 }
 
-/// Classifier config with one guild's stored channel sets layered over
-/// the deployment environment: stored rows win, deleted rows fall back
-/// to the boot value (the automod `layered_vars` shape). Only the two
-/// channel keys overlay, so the paired facts-sink config keeps its
-/// environment values for every other field.
+/// Classifier config with one guild's stored channel and exclusion sets
+/// layered over the deployment environment: stored rows win, deleted rows
+/// fall back to the boot value (the automod `layered_vars` shape). Only
+/// the seven classifier keys overlay, so the paired facts-sink config
+/// keeps its environment values for every other field.
 fn classifier_config_from_live(
     deployment: &HashMap<String, String>,
     guild_id: &str,
@@ -869,7 +869,13 @@ fn classifier_config_from_live(
             .filter(|(key, _)| {
                 matches!(
                     key.as_str(),
-                    "TWO_COMMUNITY_HUMAN_CHANNEL_IDS" | "TWO_COMMUNITY_WELCOME_CHANNEL_IDS"
+                    "TWO_COMMUNITY_HUMAN_CHANNEL_IDS"
+                        | "TWO_COMMUNITY_WELCOME_CHANNEL_IDS"
+                        | "TWO_COMMUNITY_AUTOMATION_ACTOR_IDS"
+                        | "TWO_COMMUNITY_RAID_ACTOR_IDS"
+                        | "TWO_COMMUNITY_STAGING_ACTOR_IDS"
+                        | "TWO_COMMUNITY_STAGING_GUILD_IDS"
+                        | "TWO_COMMUNITY_TEST_ACTOR_IDS"
                 )
             }),
     );
@@ -973,7 +979,7 @@ fn apply_dispatch<I: InviteSource>(
             &dispatch.observed_at,
             checkpoint.sequence,
         );
-        // Stored human/welcome channel sets reclassify live: refresh
+        // Stored channel and exclusion sets reclassify live: refresh
         // before the funnel stamps this message's channel class.
         refresh_channel_classifier_from_poller(pipeline, &dispatch.event);
         // Exactly one funnel call per dispatch, then drain deferred
