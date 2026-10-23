@@ -5,6 +5,8 @@
 mod connect_acceptance;
 #[path = "onboarding_durable_picker_rejoin_acceptance_tests.rs"]
 mod durable_picker_rejoin_acceptance;
+#[path = "welcome_preview_acceptance_tests.rs"]
+mod welcome_preview_acceptance;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
