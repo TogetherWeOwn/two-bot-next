@@ -864,12 +864,16 @@ async fn guild_purge_covers_every_plan_table_and_preserves_receipts() {
             .fetch_one(pool)
             .await
             .unwrap()
-        } else if entry.table == "starboard_starrers" {
+        } else if matches!(
+            entry.table.as_str(),
+            "starboard_starrers" | "starboard_reaction_cursors"
+        ) {
             // BIGINT snowflake column against a decimal TEXT bind: cast the
             // bind, never the indexed column (same as the erasure predicate).
-            sqlx::query_scalar(sqlx::AssertSqlSafe(
-                "SELECT count(*) FROM starboard_starrers WHERE guild_id = $1::bigint".to_owned(),
-            ))
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT count(*) FROM {} WHERE guild_id = $1::bigint",
+                entry.table
+            )))
             .bind(FIX_OTHER)
             .fetch_one(pool)
             .await
@@ -958,12 +962,16 @@ async fn guild_purge_covers_every_plan_table_and_preserves_receipts() {
             .fetch_one(pool)
             .await
             .unwrap()
-        } else if entry.table == "starboard_starrers" {
+        } else if matches!(
+            entry.table.as_str(),
+            "starboard_starrers" | "starboard_reaction_cursors"
+        ) {
             // BIGINT snowflake column against a decimal TEXT bind: cast the
             // bind, never the indexed column (same as the erasure predicate).
-            sqlx::query_scalar(sqlx::AssertSqlSafe(
-                "SELECT count(*) FROM starboard_starrers WHERE guild_id = $1::bigint".to_owned(),
-            ))
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT count(*) FROM {} WHERE guild_id = $1::bigint",
+                entry.table
+            )))
             .bind(FIX_GONE)
             .fetch_one(pool)
             .await
@@ -1063,12 +1071,15 @@ async fn guild_purge_covers_every_plan_table_and_preserves_receipts() {
             .fetch_one(pool)
             .await
             .unwrap()
-        } else if table == "starboard_starrers" {
+        } else if matches!(
+            table.as_str(),
+            "starboard_starrers" | "starboard_reaction_cursors"
+        ) {
             // BIGINT snowflake column against a decimal TEXT bind: cast the
             // bind, never the indexed column (same as the erasure predicate).
-            sqlx::query_scalar(sqlx::AssertSqlSafe(
-                "SELECT count(*) FROM starboard_starrers WHERE guild_id = $1::bigint".to_owned(),
-            ))
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT count(*) FROM {table} WHERE guild_id = $1::bigint"
+            )))
             .bind(FIX_OTHER)
             .fetch_one(pool)
             .await

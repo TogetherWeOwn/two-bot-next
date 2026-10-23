@@ -173,6 +173,12 @@ BEGIN
       INSERT INTO starboard_starrers
         (guild_id, source_channel_id, source_message_id, user_id)
         VALUES (g::bigint, 155000000000000001, 156000000000000001, u::bigint);
+      -- Replay cursors are member data too: one selected row and three
+      -- survivors across the same two-guild/two-member isolation matrix.
+      INSERT INTO starboard_reaction_cursors
+        (guild_id, source_message_id, user_id, session_key, event_order, updated_at)
+        VALUES (g::bigint, 156000000000000001, u::bigint, 'fixture-session', '1',
+          '2026-10-01T00:00:00Z');
       INSERT INTO voice_vote_kick_audit
         (guild_id, vote_id, event, room_id, initiator_id, target_id, outcome, occurred_at)
         VALUES (g, 'vk-' || k, 'vote_started', 'v-' || k, u, u, 'started', '2026-10-01T00:00:00Z');
