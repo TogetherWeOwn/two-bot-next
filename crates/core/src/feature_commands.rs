@@ -752,9 +752,13 @@ mod tests {
         assert_eq!(json[0]["default_member_permissions"], "8589934592");
         assert_eq!(json[0]["options"][0]["name"], "event-occurrence");
         assert_eq!(json[0]["options"][0]["max_length"], 128);
-        assert_eq!(json[10]["name"], "rsvp-attendance");
-        assert!(json[10].get("default_member_permissions").is_none());
-        assert_eq!(json[10]["options"][0]["name"], "event-id");
+        // Saved-response inspection publishes after `command-list`, shifting
+        // the announcement slice one index later.
+        assert_eq!(json[4]["name"], "command-inspect");
+        assert_eq!(json[4]["options"][2]["max_length"], 500);
+        assert_eq!(json[11]["name"], "rsvp-attendance");
+        assert!(json[11].get("default_member_permissions").is_none());
+        assert_eq!(json[11]["options"][0]["name"], "event-id");
     }
 
     #[test]
