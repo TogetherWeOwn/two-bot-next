@@ -38,6 +38,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("privacy", "docs/parity.md §1 privacy"),
     ("command-list", "docs/parity.md §1 #16 page"),
     ("command-inspect", "docs/parity.md §1 command-inspect"),
+    ("game-mix", "docs/parity.md §1 game-mix"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -231,6 +232,18 @@ pub fn expected_registry() -> Value {
     )
     .expect("privacy serializes");
     commands.insert(3, privacy);
+    // Next-only private staff aggregate, immediately after privacy. Keep the
+    // legacy snapshot frozen and pin the whole additive definition literally.
+    commands.insert(
+        4,
+        json!({
+            "name": "game-mix",
+            "description": "Show this server's aggregate game activity.",
+            "dm_permission": false,
+            "default_member_permissions": "32",
+            "options": []
+        }),
+    );
     // Next-only saved-response inspection. This independent literal pins the
     // whole publication contract; never manufacture it from production shapes.
     let inspect = json!({
