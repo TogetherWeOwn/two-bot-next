@@ -167,7 +167,7 @@ fn decode_reason(header: &str) -> String {
 
 // Role failures must not suppress celebrations, announce an uncommitted level,
 // move the post to another channel, or enable member/reply notifications.
-fn assert_celebration(request: &RestRequest, level: u64) {
+fn assert_celebration(request: &RestRequest, member: u64, level: u64) {
     assert_eq!(request.method, "POST");
     assert_eq!(
         request.path,
@@ -175,6 +175,16 @@ fn assert_celebration(request: &RestRequest, level: u64) {
     );
     let body: Value = serde_json::from_slice(&request.body).unwrap();
     let content = body["content"].as_str().expect("celebration text");
+    assert!(
+        content.contains(&format!("<@{member}>")),
+        "copy identifies the exact earning member: {content:?}"
+    );
+    assert!(
+        content
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '/' && c != '_')
+            .any(|token| token == "/rank"),
+        "copy points to the /rank command, not another command: {content:?}"
+    );
     let lower = content.to_ascii_lowercase();
     let announced_level = lower
         .split_once("level ")
@@ -289,7 +299,7 @@ async fn grant_refusal_preserves_committed_xp_and_level_up() {
     assert!(requests[1].path.ends_with("/roles/400000000000000001"));
     assert_eq!(requests[2].method, "PUT");
     assert!(requests[2].path.ends_with("/roles/400000000000000002"));
-    assert_celebration(&requests[3], 3);
+    assert_celebration(&requests[3], MEMBER, 3);
     for request in &requests[1..3] {
         let reason = decode_reason(request.header("x-audit-log-reason").unwrap_or_default());
         assert!(
@@ -381,7 +391,7 @@ async fn over_cap_ladder_preserves_committed_xp_and_reports_the_cap() {
         "an over-cap ladder performs no PUT or DELETE: {}",
         requests.len()
     );
-    assert_celebration(&requests[1], 11);
+    assert_celebration(&requests[1], MEMBER, 11);
     mock.shutdown().await;
     db.close().await;
 }
@@ -428,7 +438,7 @@ async fn successful_grants_apply_and_report_the_level_up() {
     );
     assert_eq!(requests[1].method, "PUT");
     assert!(requests[1].path.ends_with("/roles/400000000000000001"));
-    assert_celebration(&requests[2], 1);
+    assert_celebration(&requests[2], MEMBER, 1);
     let reason = decode_reason(requests[1].header("x-audit-log-reason").unwrap_or_default());
     assert!(
         reason.contains("reached level 1"),

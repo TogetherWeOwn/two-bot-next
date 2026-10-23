@@ -102,7 +102,7 @@ fn channel_posts(requests: &[common::RestRequest]) -> Vec<&common::RestRequest> 
 }
 
 /// Pin the announcement copy contract: names `level {n}`, concise, silent.
-fn assert_announcement(request: &common::RestRequest, channel: u64, level: u64) {
+fn assert_announcement(request: &common::RestRequest, channel: u64, member: u64, level: u64) {
     assert_eq!(
         request.path,
         format!("/api/v10/channels/{channel}/messages"),
@@ -110,6 +110,16 @@ fn assert_announcement(request: &common::RestRequest, channel: u64, level: u64) 
     );
     let body: Value = serde_json::from_slice(&request.body).unwrap();
     let content = body["content"].as_str().expect("text content");
+    assert!(
+        content.contains(&format!("<@{member}>")),
+        "copy identifies the exact earning member: {content:?}"
+    );
+    assert!(
+        content
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '/' && c != '_')
+            .any(|token| token == "/rank"),
+        "copy points to the /rank command, not another command: {content:?}"
+    );
     assert!(
         content.to_lowercase().contains(&format!("level {level}")),
         "copy names the new level: {content:?}"
@@ -202,7 +212,7 @@ async fn message_level_up_posts_exactly_one_mention_safe_announcement_in_source_
     let requests = mock.requests();
     let posts = channel_posts(&requests);
     assert_eq!(posts.len(), 1, "exactly one celebration post");
-    assert_announcement(posts[0], CHANNEL, 1);
+    assert_announcement(posts[0], CHANNEL, MEMBER, 1);
     assert_eq!(
         mock.requests().len(),
         1,
@@ -245,7 +255,7 @@ async fn role_grant_reconciliation_adds_no_extra_message_and_rank_composes() {
         1,
         "role reconciliation adds no channel message of its own"
     );
-    assert_announcement(posts[0], CHANNEL, 1);
+    assert_announcement(posts[0], CHANNEL, MEMBER, 1);
     // /rank composes: the same award answers ephemerally without a second post.
     assert!(runtime
         .handle_interaction(&interaction("rank"), HandlerId::Rank)
@@ -289,6 +299,9 @@ async fn multi_level_burst_in_one_drain_collapses_to_single_highest_level_messag
     // 90 + 75 + 25 + 75 = 265 crosses level 1, then level 2, in one drain.
     let mut stamps: Vec<(i64, u64)> = (0..10).map(|i| (i * 120, CHANNEL + i as u64)).collect();
     stamps.extend((0..5).map(|j| (68_000 + j * 120, CHANNEL + 10 + j as u64)));
+    // The highest crossing is CHANNEL + 14, not the last request channel:
+    // this eligible 5-XP tail cannot replace its delivery provenance.
+    stamps.push((68_600, CHANNEL + 15));
     let mut batch = Vec::new();
     for (seconds, channel) in &stamps {
         batch.extend(pipeline.collect_at(
@@ -297,9 +310,9 @@ async fn multi_level_burst_in_one_drain_collapses_to_single_highest_level_messag
             MessageEligibility::default(),
         ));
     }
-    assert_eq!(batch.len(), 15, "every message queues one award request");
+    assert_eq!(batch.len(), 16, "every message queues one award request");
     let awards = pipeline.drain(batch).await.unwrap();
-    let expected: Vec<u64> = [15, 15, 15, 15, 15, 5, 5, 5, 5, 5, 15, 15, 15, 15, 15].into();
+    let expected: Vec<u64> = [15, 15, 15, 15, 15, 5, 5, 5, 5, 5, 15, 15, 15, 15, 15, 5].into();
     let actual: Vec<u64> = awards.iter().map(|a| a.awarded).collect();
     assert_eq!(actual, expected, "ladder, caps and days all behave");
     assert_eq!(
@@ -308,7 +321,10 @@ async fn multi_level_burst_in_one_drain_collapses_to_single_highest_level_messag
         "the burst crosses two floors"
     );
     let last = awards.last().unwrap();
-    assert_eq!((last.total_xp, last.level), (265, 2));
+    assert_eq!((last.total_xp, last.level), (270, 2));
+    assert!(!last.leveled_up, "the tail earns but crosses no level");
+    assert_eq!(awards[14].total_xp, 265);
+    assert!(awards[14].leveled_up);
     let requests = mock.requests();
     let posts = channel_posts(&requests);
     assert_eq!(
@@ -329,16 +345,13 @@ async fn multi_level_burst_in_one_drain_collapses_to_single_highest_level_messag
         "the collapsed copy stays concise and silent: {content:?}"
     );
     assert_eq!(body["allowed_mentions"]["parse"], json!([]));
-    let channels: Vec<u64> = stamps.iter().map(|(_, c)| *c).collect();
-    let posted = posts[0]
-        .path
-        .trim_start_matches("/api/v10/channels/")
-        .trim_end_matches("/messages")
-        .parse::<u64>()
-        .expect("numeric channel in the post path");
-    assert!(
-        channels.contains(&posted),
-        "the survivor posts in one of the burst's source channels"
+    assert_announcement(posts[0], CHANNEL + 14, MEMBER, 2);
+    let profile = store::profile(&db.pool, &GUILD.to_string(), &MEMBER.to_string())
+        .await
+        .unwrap();
+    assert_eq!(
+        (profile.xp, profile.message_xp, profile.level),
+        (270, 180, 2)
     );
     mock.shutdown().await;
     db.close().await;
@@ -380,6 +393,7 @@ async fn announcement_post_failure_keeps_award() {
         1,
         "one bounded post attempt, swallowed on failure"
     );
+    assert_announcement(posts[0], CHANNEL, MEMBER, 1);
     mock.shutdown().await;
     db.close().await;
 }
