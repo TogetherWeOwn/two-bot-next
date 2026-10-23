@@ -233,6 +233,11 @@ fn assert_picker(gates: RouterGates) {
     let definitions = router_with_commands(gates)
         .publish_set(&[])
         .expect("publish set");
+    let definition = definitions
+        .iter()
+        .find(|command| command.name == COMMAND)
+        .expect("game-mix core definition publishes");
+    assert!(!definition.dm_permission, "guild-only core definition");
     let published = two_bot_discord::publish_commands(&definitions);
     let matches: Vec<_> = published
         .iter()
@@ -249,7 +254,13 @@ fn assert_picker(gates: RouterGates) {
         wire["default_member_permissions"], "32",
         "Manage Guild default"
     );
-    assert_eq!(wire["dm_permission"], false, "no DM picker entry");
+    // Publication uses the guild endpoint, which supplies the guild-only
+    // scope. Twilight omits this deprecated field; runtime DM denial is
+    // exercised separately below, not inferred from an absent wire field.
+    assert!(
+        wire.get("dm_permission").is_none(),
+        "deprecated DM field stays unset for guild publication"
+    );
     assert!(
         wire.get("options")
             .is_none_or(|options| options.as_array().is_some_and(Vec::is_empty)),
