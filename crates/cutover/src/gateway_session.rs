@@ -400,13 +400,46 @@ impl GatewaySessionStore {
             {
                 continue;
             }
-            let inserted: Option<(i64,)> = sqlx::query_as(
+            let key = idempotency_key(&event);
+            let mut inserted: Option<(i64,)> = sqlx::query_as(
                 "INSERT INTO events (event_type, member_id, guild_id, occurred_at, source, metadata, idempotency_key)
                  VALUES ($1, $2, $3, $4::timestamptz, $5, $6, $7)
                  ON CONFLICT (idempotency_key) DO NOTHING RETURNING id",
             ).bind(&write.event_type).bind(&write.member_id).bind(&write.guild_id)
                 .bind(&write.occurred_at).bind(&write.source).bind(&write.metadata)
-                .bind(idempotency_key(&event)).fetch_optional(&mut *tx).await?;
+                .bind(&key).fetch_optional(&mut *tx).await?;
+            // A leave/rejoin can share a timestamp with the preceding join.
+            // Preserve the legacy key and event dedupe unless the latest durable
+            // membership is the opposite boundary. Only then append a distinct
+            // transition with this delivery's stable key. The locked checkpoint
+            // above still rejects replay before effects.
+            if inserted.is_none()
+                && event.dedupe_token.is_none()
+                && matches!(
+                    event.event_type,
+                    EventType::MemberJoin | EventType::MemberLeave
+                )
+            {
+                let delivery_key = format!(
+                    "{key}:gateway:{}:{}:{sequence}",
+                    self.shard_id, session.session_id
+                );
+                inserted = sqlx::query_as(
+                    "INSERT INTO events (event_type, member_id, guild_id, occurred_at, source, metadata, idempotency_key)
+                     SELECT $1, $2, $3, $4::timestamptz, $5, $6, $7
+                     WHERE EXISTS (
+                         SELECT 1 FROM (
+                             SELECT event_type FROM events
+                             WHERE guild_id = $3 AND member_id = $2
+                               AND event_type IN ('member_join', 'member_leave')
+                             ORDER BY occurred_at DESC, id DESC LIMIT 1
+                         ) AS latest WHERE event_type <> $1
+                     )
+                     ON CONFLICT (idempotency_key) DO NOTHING RETURNING id",
+                ).bind(&write.event_type).bind(&write.member_id).bind(&write.guild_id)
+                    .bind(&write.occurred_at).bind(&write.source).bind(&write.metadata)
+                    .bind(delivery_key).fetch_optional(&mut *tx).await?;
+            }
             // Conflict losers inserted no row, so they journal nothing.
             if let Some((event_row_id,)) = inserted {
                 project_event(&mut tx, &write).await?;

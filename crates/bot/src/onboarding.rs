@@ -627,6 +627,24 @@ impl OnboardingRuntime {
         if config.gates.mode == OnboardingMode::Anchor {
             content = content.replace(SUNDAY_SQUAD.channel_id, &channel);
         }
+        // Read attribution after eligibility, before claiming the prompt. Store
+        // failures retain the durable job; unknown membership adds no inviter.
+        let inviter = tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::invites_command::current_inviter(&self.pool, config.guild_id, member_id),
+        )
+        .await
+        .map_err(|_| RuntimeError::Store)?
+        .map_err(|_| RuntimeError::Store)?;
+        if let Some(inviter) = inviter {
+            let name = tokio::time::timeout(
+                Duration::from_secs(5),
+                crate::invites_command::member_name(&self.executor, config.guild_id, &inviter),
+            )
+            .await
+            .unwrap_or_else(|_| format!("Member {inviter}"));
+            content.push_str(&format!("\n\nInvited by {name}."));
+        }
         let Some(guard) = begin_prompt(&self.pool, &guild, &member)
             .await
             .map_err(|_| RuntimeError::Store)?

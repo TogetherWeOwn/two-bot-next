@@ -75,6 +75,7 @@ mod interaction_admission;
 #[cfg(test)]
 mod interaction_composition_tests;
 mod internal_action_http;
+mod invites_command;
 #[cfg(test)]
 mod job_emission_conformance_tests;
 mod jobs;

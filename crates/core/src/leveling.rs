@@ -345,7 +345,7 @@ pub const RANK_DISPLAY_NAME_LIMIT: usize = 512;
 /// vote-reason markdown set, and cap the escaped output at
 /// [`RANK_DISPLAY_NAME_LIMIT`] characters. Plain names pass through
 /// byte-identical.
-fn sanitize_rank_name(display_name: &str) -> String {
+pub fn sanitize_rank_name(display_name: &str) -> String {
     let mut single_line = String::with_capacity(display_name.len());
     for chunk in display_name.split(['\r', '\n']) {
         if !single_line.is_empty() {

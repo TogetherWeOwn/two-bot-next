@@ -47,8 +47,8 @@ Original registry surface: `CORE_COMMAND_DATA` (always published) = leveling onl
 | 30 | `/feed-list` | `page` opt ≥1 (1-based, default 1) | `ManageGuild` | **S4** |
 
 Runtime permission contract: `crates/core/src/command_permissions.rs` represents
-all 32 rows (29 retained builtins — the 27 legacy ones plus the Next-only
-`/help` and `/privacy` — the dropped rota command, custom slash commands,
+all 33 rows (30 retained builtins — the 27 legacy ones plus the Next-only
+`/help`, `/privacy` and `/invites` — the dropped rota command, custom slash commands,
 and prefix triggers). The router checks the invoking interaction's resolved
 `member.permissions`, not bot permissions or command-picker defaults, before
 returning a builtin handler. Missing restricted bits produce an ephemeral refusal
@@ -81,6 +81,7 @@ golden exception or a claim of whole-baseline registry parity.
 | `rota-acknowledge` | docs/parity.md §1 #13 / §9 drop 1 | Remove the staging-only command; no replacement. |
 | `help` | docs/parity.md §1 help | Add the Next-only `/help` discovery command (no legacy counterpart): always published, open to everyone, guild-only, no options. Answers from the live publish set with grouped permission hints. |
 | `privacy` | docs/parity.md §1 privacy | Add the Next-only `/privacy` member self-serve (no legacy counterpart): always published, open to everyone and guild-only. It includes analytics `opt-out` / `opt-in` / `status` plus deletion `delete` / `deletion-status` / `deletion-receipt`; the two read subcommands take a request id only. The subject is always the authenticated invoker (no target option). The opt-out audit actor remains the fixed `member:self-serve` label, never a subject ID. |
+| `invites` | docs/parity.md §1 invites | Add the Next-only `/invites` command fifth in core order (no legacy counterpart): always published, open to everyone, guild-only, with one optional User `member` target. Description: Show attributed invites and the server's top inviters. It reports current attributed membership and a public, mention-suppressed top-inviters board; unknown, expired and ambiguous joins never guess an inviter. |
 | `attendance` | docs/parity.md §1 #12 copy | Picker copy only: description names the scorecard check-in, and `event-occurrence` states the trusted occurrence rule (bare event id binds that event, other text anchors as `{event_id}:{label}`, bare slugs refuse) with an example. Options and permissions stay legacy-identical except for its separately listed `max_length` bound. |
 | `rsvp` | docs/parity.md §1 #24 copy | Picker copy only: `event-id` says where to find the id with an example. Options, bounds and permissions stay legacy-identical. |
 | `rsvp-attendance` | docs/parity.md §1 #25 copy | Picker copy only: description drops the legacy bot name, and `event-id` says where to find the id with an example. Options, bounds and permissions stay legacy-identical. |

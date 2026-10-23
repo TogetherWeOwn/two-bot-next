@@ -51,6 +51,8 @@ claim. Staging deploys from `main`; production deploys through the manual
 
 - [Commands](docs/commands.md): built-ins, options, registry bounds and default
   Discord permissions, rendered from the compiled all-enabled registry.
+- [Invite attribution](docs/invites.md): `/invites [member]`, net counts,
+  top inviters, welcome attribution and missing invite-read access.
 - [Sticky delivery recovery](docs/sticky-debounce-acceptance.md#uncertain-delivery-recovery):
   inspect uncertain re-posts before resetting the durable delivery fence.
 - [Configuration](docs/configuration.md): all catalog keys/classes, known parsed

@@ -243,10 +243,31 @@ fn open_commands_serve_members_without_special_bits() {
 }
 
 #[test]
+fn invites_serves_members_without_special_bits() {
+    let router = InteractionRouter::new(all_on());
+    for permissions in [None, Some(0)] {
+        let RoutedInteraction::Slash { outcome, .. } =
+            route_interaction(&router, &slash("invites", permissions), None)
+        else {
+            panic!("invites must route as slash");
+        };
+        assert!(
+            matches!(outcome, SlashOutcome::Handled { .. }),
+            "invites serves ordinary members with permissions {permissions:?}: {outcome:?}"
+        );
+        assert_eq!(
+            response_for_slash(&outcome),
+            None,
+            "the command runtime, not a router refusal, owns the invite count reply"
+        );
+    }
+}
+
+#[test]
 fn disabled_features_refuse_with_documented_copy() {
     let off = InteractionRouter::new(all_off());
     // Always-on core keeps routing while every feature is off.
-    for name in ["rank", "leaderboard", "help", "privacy"] {
+    for name in ["rank", "leaderboard", "help", "privacy", "invites"] {
         assert!(
             matches!(slash_outcome(&off, name), SlashOutcome::Handled { .. }),
             "/{name} stays live while features are off",
@@ -379,7 +400,15 @@ fn guild_fence_holds_for_all_five_and_help() {
     let router = InteractionRouter::new(all_on());
     // Foreign and missing guilds are fenced everywhere except moderation,
     // which answers with its documented guild-restriction refusal.
-    for name in ["rank", "leaderboard", "help", "privacy", "rsvp", "lfg"] {
+    for name in [
+        "rank",
+        "leaderboard",
+        "help",
+        "privacy",
+        "invites",
+        "rsvp",
+        "lfg",
+    ] {
         for guild in [Some(FOREIGN_GUILD_ID), None] {
             let interaction = slash_in(name, Some(u64::MAX), guild);
             assert_eq!(

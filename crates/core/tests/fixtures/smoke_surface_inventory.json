@@ -1,6 +1,6 @@
 {
   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
-  "count": 29,
+  "count": 30,
   "dm_permission_all_false": true,
   "commands": [
     {
@@ -146,6 +146,29 @@
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Next-only member self-serve with no legacy counterpart; the purge-plus-suppression-plus-receipt path is pinned by the gateway dispatch tests on a disposable database rather than the live smoke five."
+    },
+    {
+      "name": "invites",
+      "description": "Show attributed invites and the server's top inviters.",
+      "family": "core",
+      "gate": "always",
+      "default_member_permissions": null,
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "member",
+          "description": "Show another member.",
+          "type": "user",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Next-only attributed-invite counts and net leaderboard are pinned by offline gateway acceptance on a disposable database; the live smoke five remain unchanged."
     },
     {
       "name": "attendance",

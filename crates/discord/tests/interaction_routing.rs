@@ -10,7 +10,7 @@
 //!    refusal-response wire shape.
 //! 2. `publish_*` — the router's complete set through the real
 //!    `twilight_http` bulk-set endpoint against the mock Discord double in
-//!    `common`: one request, all 30 names, guild-only, permission bits as
+//!    `common`: one request, all 31 names, guild-only, permission bits as
 //!    decimal strings. The REST executor ([TOG-10076]) owns the production
 //!    call; this proves the payload it will send.
 //!
@@ -358,11 +358,11 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
 fn twilight_publication_permissions_equal_the_runtime_matrix() {
     use two_bot_core::command_permissions::{command_permission, COMMAND_PERMISSIONS};
 
-    assert_eq!(COMMAND_PERMISSIONS.len(), 32);
+    assert_eq!(COMMAND_PERMISSIONS.len(), 33);
     let router = InteractionRouter::new(all_on());
     let defs = router.publish_set(&[]).unwrap();
     let commands = publish_commands(&defs);
-    assert_eq!(commands.len(), 29);
+    assert_eq!(commands.len(), 30);
     for command in commands {
         let row = command_permission(&command.name).unwrap();
         assert_eq!(
@@ -1057,7 +1057,7 @@ async fn followup_requires_a_valid_message_identity_without_retrying() {
 #[tokio::test]
 async fn publish_sends_the_complete_merged_set_once() {
     // Publish-once against the mock double through the real bulk-set
-    // endpoint: one request, all 30 names, no partial view.
+    // endpoint: one request, all 31 names, no partial view.
     let router = InteractionRouter::new(all_on());
     let defs = router
         .publish_set(&[CustomCommand {
@@ -1068,8 +1068,8 @@ async fn publish_sends_the_complete_merged_set_once() {
         .expect("full set assembles");
     assert_eq!(
         defs.len(),
-        30,
-        "4 core + 16 slice-2 + 9 moderation + 1 custom"
+        31,
+        "5 core + 16 slice-2 + 9 moderation + 1 custom"
     );
     let commands = publish_commands(&defs);
 
@@ -1101,12 +1101,13 @@ async fn publish_sends_the_complete_merged_set_once() {
         .iter()
         .map(|c| c["name"].as_str().expect("command has a name"))
         .collect();
-    assert_eq!(names.len(), 30, "no partial view");
+    assert_eq!(names.len(), 31, "no partial view");
     for expected in [
         "rank",
         "leaderboard",
         "help",
         "privacy",
+        "invites",
         "attendance",
         "command",
         "schedule-list",
