@@ -78,7 +78,7 @@ jobs:
           # derived credential before use; keep it out of persistent config.
           basic_auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
           printf '::add-mask::%s\n' "$basic_auth"
-          auth=(-c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${basic_auth}")
+          auth=(-c "http.https://github.com/.extraheader=AUTHORIZATION: Basic ${basic_auth}")
           git "${auth[@]}" fetch origin
           base=HEAD
           if git rev-parse --verify -q "origin/${branch}" >/dev/null; then
