@@ -85,6 +85,8 @@ mod join_risk_runtime_tests;
 mod join_risk_tuning_refusal_tests;
 mod lfg_jobs;
 #[cfg(test)]
+mod lfg_jobs_tests;
+#[cfg(test)]
 mod lfg_lifecycle_jobs_acceptance;
 #[cfg(test)]
 mod lifecycle_tests;

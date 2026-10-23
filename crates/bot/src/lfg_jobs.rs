@@ -18,6 +18,18 @@ const CADENCE: Duration = Duration::from_secs(60);
 /// owns cadence, single-flight, timeout and shutdown; no private task is spawned.
 pub(crate) fn register(context: Arc<Context>, activation: &BootActivation) -> Option<Job> {
     let gates = FeatureGates::from_env().ok()?;
+    register_fenced(gates, context, activation)
+}
+
+/// Identity can only narrow the env gate: the sweep refreshes posts under the
+/// token's identity, exactly like the announcement verbs the router refuses
+/// there. Split from [`register`] so tests pin the fence without racing the
+/// process environment.
+pub(crate) fn register_fenced(
+    gates: FeatureGates,
+    context: Arc<Context>,
+    activation: &BootActivation,
+) -> Option<Job> {
     if !activation.constrain_features(gates).announcements {
         return None;
     }
