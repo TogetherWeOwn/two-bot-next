@@ -93,6 +93,10 @@ pub const BOOT_BLOCKED_RETRY_SLEEP_MS: u64 = 250;
 /// Bound response-body collection, including the otherwise untimed GET/kick
 /// lanes, so a stalled global response cannot retain pending admission forever.
 pub const RESPONSE_BODY_TIMEOUT_MS: u64 = 5_000;
+/// Extra time for a governed read to settle storage after its wire deadline.
+/// This never extends the wire attempt or authorizes another request. If
+/// completion cannot be confirmed within the bound, admission stays occupied.
+const READ_SETTLEMENT_GRACE_MS: u64 = 1_000;
 /// Wire marker for a stalled response body: headers arrived but the body never
 /// completed within [`RESPONSE_BODY_TIMEOUT_MS`]. The executor seam maps this
 /// to [`DiscordError::Timeout`] (never `Unavailable`) so the publish wire
@@ -714,8 +718,48 @@ impl HyperTransport {
     /// `deadline` is the caller's absolute attempt instant: admission,
     /// headers and body together stay inside it. The unadmitted loopback path
     /// passes `None` (headers unbounded, body at the fixed
-    /// [`RESPONSE_BODY_TIMEOUT_MS`]).
+    /// [`RESPONSE_BODY_TIMEOUT_MS`]). Governed GETs own their bounded attempt
+    /// independently of the caller: cancelling a fetch must not abandon its
+    /// admission or 429 body accounting. No caller continuation or retry lives
+    /// in that owner. Mutations retain their cancellation/uncertainty fences.
     pub async fn send_request(
+        &self,
+        request: &Request,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<(RawResponse, bool), String> {
+        if self.admission.is_some() && request.method() == Method::Get {
+            let transport = self.clone();
+            let request = request.clone();
+            let deadline = deadline.unwrap_or_else(|| {
+                tokio::time::Instant::now() + Duration::from_millis(RESPONSE_BODY_TIMEOUT_MS)
+            });
+            // The inner phase timers retain the original wire deadline. The
+            // later watchdog leaves time for their storage cleanup, but also
+            // bounds a stuck completion. Dropping the join handle detaches
+            // only this one read, never a retry loop or a mutation.
+            let owner = tokio::spawn(async move {
+                let settled_by = deadline + Duration::from_millis(READ_SETTLEMENT_GRACE_MS);
+                match tokio::time::timeout_at(
+                    settled_by,
+                    transport.send_request_inner(&request, Some(deadline)),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        tracing::warn!("Discord read settlement timed out; lane held");
+                        Err("Discord read settlement timed out".to_owned())
+                    }
+                }
+            });
+            return owner
+                .await
+                .map_err(|_| "Discord read owner unavailable".to_owned())?;
+        }
+        self.send_request_inner(request, deadline).await
+    }
+
+    async fn send_request_inner(
         &self,
         request: &Request,
         deadline: Option<tokio::time::Instant>,
