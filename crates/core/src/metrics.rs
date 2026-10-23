@@ -2295,7 +2295,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_actor_inbox_turn_bound",
             "gauge",
-            "At most this many consecutive guild-actor inbox turns before a ready dispatch, timer or maintenance branch runs; 0 until the first actor publishes.",
+            "Max consecutive guild inbox turns before ready dispatch/timer/maintenance runs; 0 until first actor report.",
         );
         writeln!(
             out,
@@ -2319,7 +2319,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_vote_kick_total",
             "counter",
-            "Vote-kick starts, refusals by refusal code and terminal enforcements by enforcement code; vote results are audit-only.",
+            "Vote-kick starts, coded refusals/enforcements; vote results are audit-only.",
         );
         for (outcome, count) in VOICE_VOTE_KICK_OUTCOMES.iter().zip(values.voice_vote_kick) {
             writeln!(
@@ -2348,7 +2348,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_names_total",
             "counter",
-            "Automatic room-name decisions: created with the template name, template renders by outcome, and queued renames sent or dropped at dispatch.",
+            "Template-named creates, render outcomes and queued rename sends/drops at dispatch.",
         );
         for (outcome, count) in VOICE_NAME_OUTCOMES.iter().zip(values.voice_names) {
             writeln!(
@@ -2687,7 +2687,8 @@ impl Metrics {
                 guard.global_pauses_total,
             ),
         ] {
-            scalar(&mut out, name, "counter", count);
+            header(&mut out, name, "counter", "Process-local health metric.");
+            writeln!(out, "{name} {count}").unwrap();
         }
         for (name, value) in [
             (
@@ -2713,7 +2714,8 @@ impl Metrics {
                 ),
             ),
         ] {
-            scalar(&mut out, name, "gauge", value);
+            header(&mut out, name, "gauge", "Process-local health metric.");
+            writeln!(out, "{name} {value}").unwrap();
         }
         header(
             &mut out,
