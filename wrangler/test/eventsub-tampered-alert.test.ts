@@ -19,7 +19,7 @@ import {
  */
 
 const RULE = "eventsub_tampered";
-const KINDS = ["challenge", "notification", "revocation", "tampered", "ignored", "other"] as const;
+const KINDS = ["challenge", "notification", "revocation", "tampered", "ignored", "invalid_secret", "invalid_header", "body_too_large", "bad_signature", "invalid_timestamp", "stale_timestamp", "invalid_body", "duplicate_keys", "wrong_subscription", "invalid_challenge", "invalid_callback", "invalid_broadcaster_id", "too_many_broadcasters", "other"] as const;
 const TICK_SECONDS = 60;
 const T0 = 1_000_000;
 

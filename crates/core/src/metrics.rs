@@ -494,15 +494,30 @@ pub const INTERNAL_ACTION_OUTCOMES: &[&str] = &[
 /// `error` when the facts writer failed, `timeout` when the drain missed the
 /// dispatch deadline. Both warn and continue; `other` absorbs unknown reasons.
 pub const COMMUNITY_FACTS_DRAIN_REASONS: &[&str] = &["error", "timeout", "other"];
-/// Verified EventSub deliveries by bounded receiver classification. `other`
-/// captures unknown/future classification errors; no header, body, broadcaster,
-/// subscription, or secret data reaches the label.
-pub const EVENTSUB_DELIVERY_KINDS: [&str; 6] = [
+/// Verified EventSub deliveries by bounded receiver classification. The
+/// thirteen `EventSubError` snake_case labels record classify errors by
+/// variant ([`crate::twitch_eventsub::eventsub_error_label`]); `other` stays
+/// the trailing entry absorbing unknown/future strings. No header, body,
+/// broadcaster, subscription, or secret data reaches the label.
+pub const EVENTSUB_DELIVERY_KINDS: [&str; 19] = [
     "challenge",
     "notification",
     "revocation",
     "tampered",
     "ignored",
+    "invalid_secret",
+    "invalid_header",
+    "body_too_large",
+    "bad_signature",
+    "invalid_timestamp",
+    "stale_timestamp",
+    "invalid_body",
+    "duplicate_keys",
+    "wrong_subscription",
+    "invalid_challenge",
+    "invalid_callback",
+    "invalid_broadcaster_id",
+    "too_many_broadcasters",
     "other",
 ];
 /// Go-live post attempts by bounded outcome. The outcome vocabulary is fixed;
@@ -1805,7 +1820,7 @@ impl Metrics {
             &mut out,
             "two_bot_process_incarnation",
             "gauge",
-            "Opaque process-lifetime identity in four exact unsigned 32-bit parts.",
+            "Opaque process-lifetime identity: four exact u32 parts.",
         );
         for (part, value) in incarnation.iter().enumerate() {
             writeln!(
@@ -1855,7 +1870,7 @@ impl Metrics {
             &mut out,
             "two_bot_presence_capture_total",
             "counter",
-            "Presence-update capture outcomes by bounded outcome; fixed three series.",
+            "Presence-update capture outcomes.",
         );
         for (outcome, count) in PRESENCE_CAPTURE_OUTCOMES
             .iter()
@@ -1871,7 +1886,7 @@ impl Metrics {
             &mut out,
             "two_bot_feed_fetches_total",
             "counter",
-            "Feed fetch attempts by bounded outcome; per-outcome, never per-feed.",
+            "Feed fetch attempts by outcome, not feed.",
         );
         for (outcome, count) in FEED_FETCH_OUTCOMES.iter().zip(values.feed_fetch) {
             writeln!(
@@ -1884,7 +1899,7 @@ impl Metrics {
             &mut out,
             "two_bot_feed_fetch_errors_total",
             "counter",
-            "Failed feed fetches by bounded error class; successes record nothing here.",
+            "Failed feed fetches by error class.",
         );
         for (error_class, count) in FEED_FETCH_ERROR_CLASSES
             .iter()
@@ -1900,7 +1915,7 @@ impl Metrics {
             &mut out,
             "two_bot_automod_decisions_total",
             "counter",
-            "Terminal automod inspection outcomes by bounded CompletionKind; fixed eight series.",
+            "Terminal automod inspection outcomes.",
         );
         for (outcome, count) in AUTOMOD_DECISION_OUTCOMES
             .iter()
@@ -1935,13 +1950,13 @@ impl Metrics {
         values.voice_join_to_move.render(
             &mut out,
             "two_bot_voice_join_to_move_seconds",
-            "Creator join gateway receipt to successful member move in seconds.",
+            "Seconds from creator join receipt to successful move.",
         );
         header(
             &mut out,
             "two_bot_voice_join_occupancy_total",
             "counter",
-            "VOICE_STATE_UPDATE joins by humans already present in the target channel (7+ caps the tail).",
+            "Human joins by prior channel occupancy; tail capped at 7+.",
         );
         for (bucket, count) in VOICE_JOIN_OCCUPANCY_BUCKETS
             .iter()
@@ -1957,7 +1972,7 @@ impl Metrics {
             &mut out,
             "two_bot_rest_requests_total",
             "counter",
-            "Adapter-visible REST attempts by route template and result, including retries.",
+            "REST attempts by route template and result, including retries.",
         );
         for (route, results) in REST_ROUTES.iter().zip(values.rest) {
             for (result, count) in RESULTS.iter().zip(results) {
@@ -2015,7 +2030,7 @@ impl Metrics {
             &mut out,
             "two_bot_job_last_error_class",
             "gauge",
-            "One-hot last failed-completion class by bounded job; zero before failure and after success.",
+            "Last job error class, one-hot; cleared on success.",
         );
         for (job, current) in JOBS.iter().zip(&values.jobs) {
             for class in JOB_ERROR_CLASSES {
@@ -2032,7 +2047,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_operations_total",
             "counter",
-            "Finished room lifecycle outcomes by bounded operation and outcome; retries are not outcomes.",
+            "Terminal room outcomes by operation; excludes retries.",
         );
         for (op, outcomes) in VOICE_OPERATIONS.iter().zip(values.voice_ops) {
             for (outcome, count) in VOICE_OUTCOMES.iter().zip(outcomes) {
@@ -2047,7 +2062,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_reconcile_actions_total",
             "counter",
-            "Reconcile transitions and new enqueues by bounded action.",
+            "Reconcile transitions/new enqueues by action.",
         );
         for (action, count) in VOICE_RECONCILE_ACTIONS.iter().zip(values.voice_reconcile) {
             writeln!(
@@ -2060,7 +2075,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_dead_letters_total",
             "counter",
-            "Queue writes that exhausted QUEUE_MAX_ATTEMPTS by bounded family.",
+            "Queue writes exhausting QUEUE_MAX_ATTEMPTS by family.",
         );
         for (action, count) in VOICE_DEAD_ACTIONS.iter().zip(values.voice_dead) {
             writeln!(
@@ -2073,14 +2088,14 @@ impl Metrics {
             &mut out,
             "two_bot_voice_tracked_rooms",
             "gauge",
-            "Rooms tracked in memory; compare with live Discord channels for ghosts.",
+            "In-memory rooms; compare live channels for ghosts.",
         );
         writeln!(out, "two_bot_voice_tracked_rooms {}", values.voice_tracked).unwrap();
         header(
             &mut out,
             "two_bot_voice_compensation_pending",
             "gauge",
-            "Tracked rooms awaiting compensating delete after a failed write.",
+            "Rooms awaiting delete after failed write.",
         );
         writeln!(
             out,
@@ -2104,7 +2119,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_join_refused_total",
             "counter",
-            "Actor-received creator joins refused before queueing, by bounded reason.",
+            "Actor creator-join refusals before queueing by reason.",
         );
         for (reason, count) in VOICE_JOIN_REFUSAL_REASONS
             .iter()
@@ -2133,14 +2148,14 @@ impl Metrics {
             &mut out,
             "two_bot_voice_worker_halted",
             "gauge",
-            "Guild-actor halt latch: 1 while any guild actor is halted (CredentialRefused halted join processing).",
+            "1 while any guild actor is halted.",
         );
         writeln!(out, "two_bot_voice_worker_halted {voice_halted}").unwrap();
         header(
             &mut out,
             "two_bot_voice_queue_pending",
             "gauge",
-            "Queued (not in-flight) voice actions by lane, summed across guild actors.",
+            "Queued voice actions by lane, summed across guild actors.",
         );
         for (lane, count) in VOICE_QUEUE_LANES.iter().zip(voice_queue_pending) {
             writeln!(
@@ -2153,7 +2168,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_queue_oldest_age_seconds",
             "gauge",
-            "Age of the oldest queued voice action in seconds, maximum across guild actors; 0 when empty.",
+            "Max queued voice-action age in seconds; 0 if empty.",
         );
         writeln!(
             out,
@@ -2164,7 +2179,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_live_not_ready_seconds",
             "gauge",
-            "Seconds a guild live voice view has been not ready while the gateway is connected (creator joins are dropped meanwhile), maximum across guild actors; 0 when every view is ready or the gateway is down.",
+            "Max connected voice-unready seconds; 0 if ready/disconnected.",
         );
         writeln!(
             out,
@@ -2181,7 +2196,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_rest_in_flight_age_seconds",
             "gauge",
-            "Age of the oldest in-flight voice REST attempt in seconds; 0 when idle.",
+            "Oldest in-flight voice REST age, seconds; 0 if idle.",
         );
         writeln!(
             out,
@@ -2193,7 +2208,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_creator_map_generation",
             "gauge",
-            "Last merged creator-map generation; 0 before the first merge.",
+            "Creator-map generation; 0 before first merge.",
         );
         writeln!(
             out,
@@ -2205,7 +2220,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_creator_map_age_seconds",
             "gauge",
-            "Seconds since the last successful creator-map merge; 0 when never merged.",
+            "Seconds since creator-map merge; 0 if never merged.",
         );
         writeln!(
             out,
@@ -2241,7 +2256,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_actor_inbox_turn_bound",
             "gauge",
-            "At most this many consecutive guild-actor inbox turns before a ready dispatch, timer or maintenance branch runs; 0 until the first actor publishes.",
+            "Max inbox turns before other ready work; 0 if unpublished.",
         );
         writeln!(
             out,
@@ -2265,7 +2280,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_vote_kick_total",
             "counter",
-            "Vote-kick starts, refusals by refusal code and terminal enforcements by enforcement code; vote results are audit-only.",
+            "Vote-kick starts/refusals/enforcements; votes audit-only.",
         );
         for (outcome, count) in VOICE_VOTE_KICK_OUTCOMES.iter().zip(values.voice_vote_kick) {
             writeln!(
@@ -2278,7 +2293,7 @@ impl Metrics {
             &mut out,
             "two_bot_event_voice_tick_total",
             "counter",
-            "Event-voice T-15 ticks that stayed TBD, by website reason; backoff-skipped ticks count too.",
+            "T-15 TBD ticks by website reason, including backoff skips.",
         );
         for (outcome, count) in EVENT_VOICE_TICK_OUTCOMES
             .iter()
@@ -2294,7 +2309,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_names_total",
             "counter",
-            "Automatic room-name decisions: created with the template name, template renders by outcome, and queued renames sent or dropped at dispatch.",
+            "Name-template creation/renders and rename dispatches/drops.",
         );
         for (outcome, count) in VOICE_NAME_OUTCOMES.iter().zip(values.voice_names) {
             writeln!(
@@ -2307,7 +2322,7 @@ impl Metrics {
             &mut out,
             "two_bot_db_errors_total",
             "counter",
-            "Storage-layer failures by bounded operation; pool gauges are pressure, this is errors.",
+            "Storage failures by operation.",
         );
         for (op, count) in DB_ERROR_OPS.iter().zip(values.db_errors) {
             writeln!(out, "two_bot_db_errors_total{{op=\"{op}\"}} {count}").unwrap();
@@ -2316,7 +2331,7 @@ impl Metrics {
             &mut out,
             "two_bot_containment_store_errors_total",
             "counter",
-            "Containment-store failures by bounded operation; a failed completion also surfaces as outcome-unknown in the staff alert.",
+            "Containment-store failures by operation.",
         );
         for (op, count) in CONTAINMENT_STORE_OPS
             .iter()
@@ -2332,7 +2347,7 @@ impl Metrics {
             &mut out,
             "two_bot_send_admissions_total",
             "counter",
-            "Send-admission admit() decisions by bounded terminal outcome.",
+            "Terminal admit() decisions by outcome.",
         );
         for (outcome, count) in SEND_ADMISSION_OUTCOMES.iter().zip(values.send_admissions) {
             writeln!(
@@ -2345,7 +2360,7 @@ impl Metrics {
             &mut out,
             "two_bot_gateway_prefix_trigger_refused_total",
             "counter",
-            "Prefix candidates refused by the automod verdict before any trigger lookup, by bounded reason.",
+            "Prefix candidates refused by automod before lookup, by reason.",
         );
         for (reason, count) in PREFIX_TRIGGER_REFUSED_REASONS
             .iter()
@@ -2361,7 +2376,7 @@ impl Metrics {
             &mut out,
             "two_bot_dispatch_drops_total",
             "counter",
-            "Dispatch-lane saturation drops by bounded lane (reactions lane also counts per-member fairness refusals); logs sample one warn per 60 s per runtime.",
+            "Dispatch saturation or reaction fairness drops by lane.",
         );
         for (lane, count) in DISPATCH_LANES.iter().zip(values.dispatch_drops) {
             writeln!(
@@ -2384,7 +2399,7 @@ impl Metrics {
                 &mut out,
                 name,
                 "counter",
-                "Joins dropped before worker observation by bounded queue reason; no retry.",
+                "Joins lost before observation by queue reason; no retry.",
             );
             for (reason, index) in JOIN_QUEUE_DROP_REASONS {
                 writeln!(
@@ -2399,7 +2414,7 @@ impl Metrics {
             &mut out,
             "two_bot_gateway_checkpoint_failures_total",
             "counter",
-            "Failed gateway checkpoint commits by bounded stage; every failure stops the dispatch worker.",
+            "Checkpoint failures by stage; each stops dispatch.",
         );
         for (stage, count) in CHECKPOINT_FAILURE_STAGES
             .iter()
@@ -2415,7 +2430,7 @@ impl Metrics {
             &mut out,
             "two_bot_drop_poison_total",
             "counter",
-            "Poisoned locks recovered by drop guards instead of panicking inside drop (which aborts during unwinding); every recovery also logs one warn with the guard name.",
+            "Poisoned-lock recoveries by drop guard; each logs a warning.",
         );
         let drop_poisons = self
             .1
@@ -2432,7 +2447,7 @@ impl Metrics {
             &mut out,
             "two_bot_internal_actions_total",
             "counter",
-            "Signed website-action receiver executions by bounded family and outcome; refusals share the warn-summary classes.",
+            "Signed website-action executions by family and outcome.",
         );
         for (family, outcomes) in INTERNAL_ACTION_FAMILIES.iter().zip(values.internal_actions) {
             for (outcome, count) in INTERNAL_ACTION_OUTCOMES.iter().zip(outcomes) {
@@ -2447,7 +2462,7 @@ impl Metrics {
             &mut out,
             "two_bot_moderation_enforcements_total",
             "counter",
-            "Moderation enforcement terminal outcomes by bounded verb and outcome; retries and rate-limit backoffs are not outcomes.",
+            "Terminal moderation by verb; no retries/backoffs.",
         );
         for (verb, outcomes) in MODERATION_VERBS.iter().zip(values.moderation_enforcements) {
             for (outcome, count) in MODERATION_ENFORCEMENT_OUTCOMES.iter().zip(outcomes) {
@@ -2462,7 +2477,7 @@ impl Metrics {
             &mut out,
             "two_bot_community_facts_drain_failures_total",
             "counter",
-            "Community-facts drain failures by bounded reason; the worker warns and continues, so each failed dispatch counts once.",
+            "Drain failures by reason; once per failed dispatch.",
         );
         for (reason, count) in COMMUNITY_FACTS_DRAIN_REASONS
             .iter()
@@ -2478,7 +2493,7 @@ impl Metrics {
             &mut out,
             "two_bot_audit_delivery_halt",
             "gauge",
-            "Audit mirror delivery halt; 1 while the persistent kill switch is engaged, 0 otherwise. Set once per readable audit_retry sweep; an unreadable halt keeps the last reported state.",
+            "Audit delivery halt: 1 if engaged, 0 if clear; unchanged on read failure.",
         );
         writeln!(
             out,
@@ -2502,7 +2517,7 @@ impl Metrics {
             &mut out,
             "two_bot_event_store_consumer_lag_seconds",
             "gauge",
-            "Event-store consumer lag in seconds (received_at minus event_time for the newest observed capture row); 0 when unobserved. Single label-free series.",
+            "Newest capture received_at minus event_time in seconds; 0 if unobserved.",
         );
         writeln!(
             out,
@@ -2549,7 +2564,7 @@ impl Metrics {
             &mut out,
             "two_bot_eventsub_reconcile_passes_total",
             "counter",
-            "EventSub reconcile passes by bounded outcome; alert when failed rises across scrapes.",
+            "Reconcile passes by outcome; alert on failure deltas.",
         );
         for (outcome, count) in EVENTSUB_RECONCILE_OUTCOMES
             .iter()
@@ -2565,7 +2580,7 @@ impl Metrics {
             &mut out,
             "two_bot_eventsub_reconcile_actions_total",
             "counter",
-            "Successful EventSub reconcile mutations by bounded action.",
+            "Successful reconcile mutations by action.",
         );
         for (action, count) in EVENTSUB_RECONCILE_ACTIONS
             .iter()
@@ -2581,7 +2596,7 @@ impl Metrics {
             &mut out,
             "two_bot_eventsub_reconcile_errors_total",
             "counter",
-            "EventSub reconcile failure sites by bounded log error_class; no response bytes in labels.",
+            "EventSub reconcile failures by error_class.",
         );
         for (error_class, count) in EVENTSUB_RECONCILE_ERROR_CLASSES
             .iter()
@@ -2597,7 +2612,7 @@ impl Metrics {
             &mut out,
             "two_bot_ticket_lifecycle_total",
             "counter",
-            "Terminal ticket lifecycle events by bounded event and outcome; purge counts one per deleted transcript body.",
+            "Terminal ticket events by event and outcome; purge counts deleted bodies.",
         );
         for (event, outcomes) in TICKET_LIFECYCLE_EVENTS.iter().zip(values.ticket_lifecycle) {
             for (outcome, count) in TICKET_LIFECYCLE_OUTCOMES.iter().zip(outcomes) {
@@ -2665,7 +2680,7 @@ impl Metrics {
             &mut out,
             "two_bot_rest_guard_global_pause_remaining_seconds",
             "gauge",
-            "Remaining global cooldown; pending response bodies may still hold admission at zero.",
+            "Global cooldown seconds; pending bodies can hold admission at zero.",
         );
         // Duration is nonnegative and its entire u64-seconds range is finite in f64.
         writeln!(
@@ -2708,7 +2723,7 @@ fn header(out: &mut String, name: &str, kind: &str, help: &str) {
 }
 
 fn scalar(out: &mut String, name: &str, kind: &str, value: u64) {
-    header(out, name, kind, "Process-local health metric.");
+    header(out, name, kind, "Process-local.");
     writeln!(out, "{name} {value}").unwrap();
 }
 
@@ -2781,6 +2796,53 @@ mod tests {
     }
 
     #[test]
+    fn eventsub_classification_growth_fits_the_scrape_byte_budget() {
+        let metrics = Metrics::default();
+        let baseline = metrics.render(None);
+        {
+            let mut values = metrics.0.lock().unwrap();
+            values.eventsub_received = u64::MAX;
+            values.eventsub_classified.fill(u64::MAX);
+        }
+        let full = metrics.render_with_rest_guard(
+            Some((u32::MAX, usize::MAX, u32::MAX)),
+            RestGuardSnapshot {
+                invalid_requests_in_window: usize::MAX,
+                invalid_requests_total: u64::MAX,
+                rejected_requests_total: u64::MAX,
+                breaker_opens_total: u64::MAX,
+                breaker_closes_total: u64::MAX,
+                global_pauses_total: u64::MAX,
+                breaker_open: true,
+                token_invalid: true,
+                global_pause_remaining: Duration::MAX,
+                pending_global_responses: usize::MAX,
+            },
+        );
+        // Leave room for other counters to grow without relaxing any consumer's
+        // 64 KiB cap. This fixture saturates EventSub, pool and guard samples,
+        // not every process metric simultaneously.
+        assert!(
+            full.len() < 65_536 - 1_024,
+            "{} bytes leaves less than 1 KiB of scrape headroom",
+            full.len()
+        );
+        let series = |text: &str| -> Vec<String> {
+            text.lines()
+                .filter(|line| !line.starts_with('#'))
+                .map(|line| line.rsplit_once(' ').unwrap().0.to_owned())
+                .collect()
+        };
+        assert_eq!(series(&full), series(&baseline));
+        for kind in EVENTSUB_DELIVERY_KINDS {
+            assert!(full.contains(&format!(
+                "two_bot_eventsub_classified_total{{kind=\"{kind}\"}} {}\n",
+                u64::MAX
+            )));
+        }
+    }
+
+    #[test]
     fn exposition_has_cumulative_histogram_and_unique_series() {
         let metrics = Metrics::default();
         metrics.handler_duration(Duration::from_millis(5));
@@ -2840,7 +2902,9 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
         assert!(text.contains("two_bot_gateway_events_total{event=\"other\"} 10000\n"));
         assert!(
             text.contains("two_bot_rest_requests_total{route=\"other\",result=\"429\"} 10000\n")
@@ -3110,7 +3174,9 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
     }
 
     #[test]
@@ -3218,7 +3284,9 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
     }
 
     #[test]
@@ -3349,7 +3417,9 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
         assert!(text.contains("two_bot_gateway_checkpoint_failures_total{stage=\"commit\"} 100\n"));
     }
 
@@ -3448,7 +3518,9 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
         assert!(text.contains("two_bot_drop_poison_total{guard=\"voice_connection_guard\"} 100\n"));
     }
 
@@ -3523,7 +3595,9 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
     }
 
     #[test]
@@ -3566,7 +3640,9 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
     }
 
     #[test]
@@ -3600,7 +3676,9 @@ mod tests {
         assert!(
             text.contains("two_bot_community_facts_drain_failures_total{reason=\"other\"} 100\n")
         );
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
     }
 
     #[test]
@@ -3934,7 +4012,9 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
         assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"failed\"} 100\n"));
         assert!(text.contains("two_bot_eventsub_reconcile_actions_total{action=\"delete\"} 100\n"));
         assert!(
@@ -4035,7 +4115,9 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
         assert!(text
             .contains("two_bot_ticket_lifecycle_total{event=\"close\",outcome=\"query\"} 100\n"));
     }
@@ -4179,7 +4261,9 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
         assert!(text.contains("two_bot_feed_fetches_total{outcome=\"failure\"} 100\n"));
         assert!(text.contains("two_bot_feed_fetch_errors_total{error_class=\"other\"} 100\n"));
     }
@@ -4255,7 +4339,9 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
         assert!(
             text.contains("two_bot_automod_decisions_total{outcome=\"sanction_refused\"} 100\n")
         );
