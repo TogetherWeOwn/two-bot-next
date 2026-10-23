@@ -390,8 +390,7 @@ mod tests {
                 ROLE_TIMEOUT_MS,
             )
             .await
-            .err()
-            .expect("oversized request must fail before dispatch");
+            .expect_err("oversized request must fail before dispatch");
         let MemberError::Action(error) = error else {
             panic!("invalid request must not reach admission");
         };
