@@ -44,16 +44,14 @@ fn claim_does_not_reset_cooldown_or_allow_a_second_active_ticket() {
     let mut ticket = open_ticket();
     ticket.claim("501").unwrap();
     assert_eq!(ticket.created_at, 0);
-    assert_eq!(
+    assert!(matches!(
         decide_open(Some(&ticket), Some(0), 300_000, COOLDOWN_SECONDS),
-        OpenDecision::Existing {
-            channel_id: Some("600".into())
-        }
-    );
-    assert_eq!(
+        OpenDecision::Existing { channel_id: Some(channel), .. } if channel == "600"
+    ));
+    assert!(matches!(
         decide_open(None, Some(0), 299_999, COOLDOWN_SECONDS),
-        OpenDecision::Cooldown
-    );
+        OpenDecision::Cooldown { .. }
+    ));
     assert_eq!(
         decide_open(None, Some(0), 300_000, COOLDOWN_SECONDS),
         OpenDecision::Reserve

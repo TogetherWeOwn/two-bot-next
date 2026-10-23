@@ -1295,7 +1295,7 @@ async fn ticket_copy_duplicate_and_cooldown_refusals_are_pinned() {
         !cooldown_lower.contains("reserv") && !cooldown_lower.contains("guarantee"),
         "a next-try hint is not a reservation or guarantee: {cooldown}"
     );
-    let expected_seconds = ((now + 300_000) / 1000) as u64;
+    let expected_seconds = ((now + 300_000 + 999) / 1000) as u64;
     assert!(
         cooldown.contains(&format!("<t:{expected_seconds}:")),
         "next-eligible is last creation + cooldown: {cooldown}"

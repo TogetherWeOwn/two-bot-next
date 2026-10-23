@@ -612,10 +612,10 @@ async fn cooldown_names_bounded_next_try_time() {
     );
     let (seconds, _) = discord_timestamp(&reply)
         .unwrap_or_else(|| panic!("cooldown carries a Discord timestamp: {reply}"));
-    let expected = ((created + 300_000) / 1000) as u64;
+    let expected = ((created + 300_000 + 999) / 1000) as u64;
     assert_eq!(
         seconds, expected,
-        "next-eligible is last creation + cooldown: {reply}"
+        "display rounds last creation + cooldown upward, never earlier: {reply}"
     );
     let now_seconds = (now_millis_for_test() / 1000).max(0) as u64;
     assert!(
@@ -625,11 +625,72 @@ async fn cooldown_names_bounded_next_try_time() {
     assert!(reply.len() < 1000, "concise refusal: {reply}");
 }
 
-// Future stored timestamps and maximum configured cooldown stay
-// overflow-safe: no panic, no wraparound to the past, no misleading
+// Fixed future creation avoids a wall-clock race: a floor renderer always
+// prints 4102445101 instead of 4102445102, not just in 999/1000 runs.
+#[tokio::test]
+async fn cooldown_subsecond_display_rounds_up_without_delaying_admission() {
+    let Some(db) = database().await else { return };
+    let mock = refusal_mock().await;
+    let tickets = runtime(db.pool().clone(), &mock);
+    let created = 4_102_444_801_001; // 2100-01-01T00:00:01.001Z
+    setup_closed_at(
+        &tickets,
+        db.pool(),
+        "ex-subsecond",
+        "500",
+        "623",
+        created,
+        created + 1,
+    )
+    .await;
+    let before_tickets = ticket_count(db.pool()).await;
+    let before_transcripts = transcript_count(db.pool()).await;
+    let before = tickets
+        .store
+        .reserve("ex-before", "500", 4_102_445_101_000, COOLDOWN_SECONDS)
+        .await
+        .unwrap();
+    let reply = member_reply(
+        tickets
+            .execute(&open_button("500"), TicketAction::Open)
+            .await,
+    );
+    let requests = mock.requests();
+    let after_tickets = ticket_count(db.pool()).await;
+    let after_transcripts = transcript_count(db.pool()).await;
+    // Admission at the exact millisecond must not wait for the rounded display.
+    let at = tickets
+        .store
+        .reserve("ex-at", "500", 4_102_445_101_001, COOLDOWN_SECONDS)
+        .await
+        .unwrap();
+    db.close().await.unwrap();
+    mock.shutdown().await;
+
+    assert!(matches!(
+        before,
+        OpenResult::Refused(OpenDecision::Cooldown { .. })
+    ));
+    assert!(matches!(at, OpenResult::Created(_)));
+    assert_eq!(after_tickets, before_tickets, "refusals create no row");
+    assert_eq!(
+        after_transcripts, before_transcripts,
+        "refusals capture nothing"
+    );
+    assert_only_category_get(&requests);
+    let (seconds, _) = discord_timestamp(&reply)
+        .unwrap_or_else(|| panic!("subsecond cooldown carries a timestamp: {reply}"));
+    assert_eq!(seconds, 4_102_445_102, "round display upward: {reply}");
+    assert!(
+        seconds * 1000 >= 4_102_445_101_001,
+        "display is not an earlier, falsely eligible instant: {reply}"
+    );
+}
+
+// Future stored creation stays in the future, without a misleading
 // already-eligible timestamp. RED on baseline (no timestamp at all).
 #[tokio::test]
-async fn cooldown_future_and_max_inputs_stay_safe() {
+async fn cooldown_future_input_stays_safe() {
     let Some(db) = database().await else { return };
 
     // Future stored creation: last is ahead of the real clock.
@@ -653,22 +714,29 @@ async fn cooldown_future_and_max_inputs_stay_safe() {
             .await,
     );
     let future_requests = mock.requests();
+    db.close().await.unwrap();
     mock.shutdown().await;
 
     assert_only_category_get(&future_requests);
     let (future_seconds, _) = discord_timestamp(&future_reply)
         .unwrap_or_else(|| panic!("future cooldown carries a timestamp: {future_reply}"));
-    let expected_future = ((future_created + 300_000) / 1000) as u64;
+    let expected_future = ((future_created + 300_000 + 999) / 1000) as u64;
     assert_eq!(
         future_seconds, expected_future,
-        "future last + cooldown, no clamp to now: {future_reply}"
+        "future last + cooldown rounds upward, no clamp to now: {future_reply}"
     );
     assert!(
         future_seconds > (now / 1000).max(0) as u64,
         "future next-eligible stays in the future: {future_reply}"
     );
+}
 
-    // Maximum configured cooldown: saturating math, still a future timestamp.
+// Maximum cooldown exceeds a bounded display date. A clamped timestamp
+// must be labeled as a lower bound, never passed off as exact eligibility.
+// Independent from the future-date case so an earlier RED cannot hide this.
+#[tokio::test]
+async fn cooldown_max_input_has_honest_bounded_display() {
+    let Some(db) = database().await else { return };
     let mock = refusal_mock().await;
     let max_tickets = runtime_with_cooldown(db.pool().clone(), &mock, u64::MAX);
     let max_created = now_millis_for_test();
@@ -682,32 +750,71 @@ async fn cooldown_future_and_max_inputs_stay_safe() {
         max_created + 1,
     )
     .await;
+    let before_tickets = ticket_count(db.pool()).await;
+    let before_transcripts = transcript_count(db.pool()).await;
     let max_reply = member_reply(
         max_tickets
             .execute(&open_button("501"), TicketAction::Open)
             .await,
     );
     let max_requests = mock.requests();
+    let after_tickets = ticket_count(db.pool()).await;
+    let after_transcripts = transcript_count(db.pool()).await;
     db.close().await.unwrap();
     mock.shutdown().await;
 
-    assert_only_category_get(&max_requests);
-    let (max_seconds, _) = discord_timestamp(&max_reply)
-        .unwrap_or_else(|| panic!("max cooldown carries a timestamp: {max_reply}"));
-    let now_seconds = (now_millis_for_test() / 1000).max(0) as u64;
-    assert!(
-        max_seconds > now_seconds,
-        "max cooldown is future, never wrapped to the past: {max_reply}"
+    assert_eq!(after_tickets, before_tickets, "max cooldown creates no row");
+    assert_eq!(
+        after_transcripts, before_transcripts,
+        "max cooldown captures nothing"
     );
+    assert_only_category_get(&max_requests);
+    let lower = max_reply.to_lowercase();
+    let unrepresentable = lower.contains("too far")
+        || lower.contains("unrepresentable")
+        || (lower.contains("cannot") && lower.contains("display"))
+        || (lower.contains("outside") && lower.contains("range"));
+    if let Some((max_seconds, _)) = discord_timestamp(&max_reply) {
+        let now_seconds = (now_millis_for_test() / 1000).max(0) as u64;
+        assert!(
+            max_seconds > now_seconds,
+            "max cooldown is future, never wrapped to the past: {max_reply}"
+        );
+        // At most the ECMAScript Date range (8.64e15 milliseconds).
+        // Smaller conservative display bounds are also valid; none is the
+        // mathematical deadline for this saturated-duration fixture.
+        assert!(
+            max_seconds <= 8_640_000_000_000,
+            "bounded display: {max_reply}"
+        );
+        assert!(
+            unrepresentable
+                || lower.contains("at least")
+                || lower.contains("no earlier than")
+                || lower.contains("not before")
+                || lower.contains("beyond")
+                || lower.contains("after"),
+            "a clipped date needs honest lower-bound wording: {max_reply}"
+        );
+    } else {
+        assert!(
+            unrepresentable,
+            "an omitted date must explain that eligibility is beyond display range: {max_reply}"
+        );
+    }
     assert!(
         !max_reply.contains("1970"),
         "no epoch wraparound: {max_reply}"
     );
-    let lower = max_reply.to_lowercase();
     assert!(
         !lower.contains("reserv") && !lower.contains("guarantee"),
         "max cooldown is still a hint, not a reservation: {max_reply}"
     );
+    assert!(
+        lower.contains("next") && lower.contains("try"),
+        "next-try guidance: {max_reply}"
+    );
+    assert!(max_reply.len() < 1000, "concise refusal: {max_reply}");
 }
 
 // Reserve decisions are unchanged: cooldown boundary is exact and an active
