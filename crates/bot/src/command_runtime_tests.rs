@@ -33,6 +33,8 @@ mod custom_command_list_pages_acceptance;
 
 #[path = "giveaway_admission_edge_acceptance_tests.rs"]
 mod giveaway_admission_edge_acceptance_tests;
+#[path = "giveaway_countdown_edge_acceptance_tests.rs"]
+mod giveaway_countdown_edge_acceptance_tests;
 #[path = "giveaway_create_entry_acceptance_tests.rs"]
 mod giveaway_create_entry_acceptance_tests;
 
