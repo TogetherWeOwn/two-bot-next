@@ -2000,6 +2000,12 @@ mod tests {
                     && !V10_ADDED_TABLES.contains(name)
                     && !V11_ADDED_TABLES.contains(name)
                     && !V12_ADDED_TABLES.contains(name)
+                    && ![
+                        "event_voice_channels",
+                        "event_voice_presence",
+                        "voice_settings_audit",
+                    ]
+                    .contains(name)
             })
             .collect();
         assert_eq!(names, expected);
@@ -2015,6 +2021,9 @@ mod tests {
                 "member_season_xp",
                 "scheduled_events_claim",
                 "scheduled_events_tombstone",
+                "event_voice_channels",
+                "event_voice_presence",
+                "admin_api_tokens",
                 "stream_live_claims",
                 "voice_create_reservations",
                 "retention_guild_purge_queue",
@@ -2063,7 +2072,7 @@ mod tests {
         assert_eq!(contents.manifest.missing_tables(), ["event_store"]);
         // The same inventory at the current version refuses: new archives must
         // cover the event store.
-        assert_eq!(DUMP_VERSION, 12);
+        assert_eq!(DUMP_VERSION, 14);
         let mut current = v5;
         current["version"] = serde_json::json!(DUMP_VERSION);
         assert!(validate_manifest(&current)
@@ -2149,7 +2158,7 @@ mod tests {
             .contains("event_store"));
         let mut current = v5;
         current["version"] = serde_json::json!(DUMP_VERSION);
-        assert_eq!(DUMP_VERSION, 12, "frozen v5 test pins the v12 bump");
+        assert_eq!(DUMP_VERSION, 14, "frozen v5 test pins the v14 bump");
         assert!(validate_manifest(&current)
             .unwrap_err()
             .to_string()
@@ -2167,7 +2176,7 @@ mod tests {
         // A v6 recovery point written before the seasonal XP projection (0100)
         // declares every covered table except member_season_xp and stays
         // readable; promoting it to v7 without the table is refused. This is
-        // the frozen-manifest guard for the v7 bump (now pinned at v11):
+        // the frozen-manifest guard for the v7 bump (now pinned at v14):
         // building the old manifest from today's inventory (as the v5 tests
         // do) would silently include the new table and miss the refusal.
         let mut v6 = manifest(without(
@@ -2200,7 +2209,7 @@ mod tests {
             "member_season_xp",
         ));
         assert_eq!(v7_gap["version"], serde_json::json!(DUMP_VERSION));
-        assert_eq!(DUMP_VERSION, 12, "frozen v6 test pins the v12 bump");
+        assert_eq!(DUMP_VERSION, 14, "frozen v6 test pins the v14 bump");
         assert!(validate_manifest(&v7_gap)
             .unwrap_err()
             .to_string()
@@ -2267,8 +2276,8 @@ mod tests {
         let mut v7_gap = v6.clone();
         v7_gap["version"] = serde_json::json!(DUMP_VERSION);
         assert_eq!(
-            DUMP_VERSION, 12,
-            "frozen pre-retention test pins the v12 bump"
+            DUMP_VERSION, 14,
+            "frozen pre-retention test pins the v14 bump"
         );
         let err = validate_manifest(&v7_gap).unwrap_err().to_string();
         assert!(err.contains("retention_guild_purge_queue"), "{err}");
@@ -2320,7 +2329,7 @@ mod tests {
             "stream_live_claims",
         ));
         assert_eq!(v8_gap["version"], serde_json::json!(DUMP_VERSION));
-        assert_eq!(DUMP_VERSION, 12, "frozen v7 test pins the v12 bump");
+        assert_eq!(DUMP_VERSION, 14, "frozen v7 test pins the v14 bump");
         assert!(validate_manifest(&v8_gap)
             .unwrap_err()
             .to_string()
@@ -2361,13 +2370,13 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 12, "new dumps require both guild counters");
+        assert_eq!(DUMP_VERSION, 14, "new dumps require both guild counters");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v11 archive inspects");
+        .expect("complete v14 archive inspects");
         for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
             let mut gap = current.clone();
             gap["tables"]
@@ -2415,13 +2424,13 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 12, "new dumps require the epoch-claim guard");
+        assert_eq!(DUMP_VERSION, 14, "new dumps require the epoch-claim guard");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v11 archive inspects");
+        .expect("complete v14 archive inspects");
         let mut gap = current.clone();
         gap["tables"]
             .as_array_mut()
@@ -2438,13 +2447,19 @@ mod tests {
 
     #[test]
     fn v10_archives_read_without_tombstone_but_v11_requires_it() {
-        // Literal name, not V11_ADDED_TABLES: this reproduces the pre-change
+        // Literal names, not V11_ADDED_TABLES: this reproduces the pre-change
         // inventory even if the version waiver is accidentally removed. This
         // is the frozen claim-only v10 shape written by the merged v10 writer:
-        // the epoch-claim guard is present, the delete tombstones are absent.
+        // the epoch-claim guard is present, the delete tombstones and v13
+        // event voice pair are absent. The v12 token registry rides along:
+        // a present table needs no waiver.
         let tables = complete_tables(&BTreeMap::new())
             .into_iter()
-            .filter(|table| table["name"] != "scheduled_events_tombstone")
+            .filter(|table| {
+                table["name"] != "scheduled_events_tombstone"
+                    && table["name"] != "event_voice_channels"
+                    && table["name"] != "event_voice_presence"
+            })
             .collect();
         let mut old = manifest(tables);
         for version in 4..=10 {
@@ -2457,7 +2472,11 @@ mod tests {
             assert_eq!(contents.manifest.version, version);
             assert_eq!(
                 contents.manifest.missing_tables(),
-                ["scheduled_events_tombstone"]
+                [
+                    "scheduled_events_tombstone",
+                    "event_voice_channels",
+                    "event_voice_presence"
+                ]
             );
             let mut gap = old.clone();
             gap["tables"]
@@ -2469,13 +2488,13 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 12, "new dumps require the delete tombstones");
+        assert_eq!(DUMP_VERSION, 14, "new dumps require the delete tombstones");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v11 archive inspects");
+        .expect("complete v14 archive inspects");
         let mut gap = current.clone();
         gap["tables"]
             .as_array_mut()
@@ -2488,6 +2507,186 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("scheduled_events_tombstone"), "{error}");
+    }
+
+    #[test]
+    fn v11_archives_read_without_registry_but_v12_requires_it() {
+        // Literal name, not V12_ADDED_TABLES: this reproduces the pre-change
+        // inventory even if the version waiver is accidentally removed. This
+        // is the frozen tombstone-only v11 shape written by the merged v11
+        // writer: the delete tombstones are present, the token registry is
+        // absent, as is the v13 event voice pair.
+        let tables = complete_tables(&BTreeMap::new())
+            .into_iter()
+            .filter(|table| {
+                table["name"] != "admin_api_tokens"
+                    && table["name"] != "event_voice_channels"
+                    && table["name"] != "event_voice_presence"
+            })
+            .collect();
+        let mut old = manifest(tables);
+        for version in 4..=11 {
+            old["version"] = serde_json::json!(version);
+            let contents = inspect_bytes(&gzip_lines(&[
+                old.clone(),
+                serde_json::json!({"kind":"end","rows":0}),
+            ]))
+            .expect("old archives without the v12 token registry stay readable");
+            assert_eq!(contents.manifest.version, version);
+            assert_eq!(
+                contents.manifest.missing_tables(),
+                [
+                    "event_voice_channels",
+                    "event_voice_presence",
+                    "admin_api_tokens"
+                ]
+            );
+            let mut gap = old.clone();
+            gap["tables"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|table| table["name"] != "events");
+            assert!(validate_manifest(&gap)
+                .unwrap_err()
+                .to_string()
+                .contains("missing tables: events"));
+        }
+        let mut v12_gap = old.clone();
+        v12_gap["version"] = serde_json::json!(12);
+        assert!(validate_manifest(&v12_gap)
+            .unwrap_err()
+            .to_string()
+            .contains("admin_api_tokens"));
+        assert_eq!(DUMP_VERSION, 14, "new dumps require the token registry");
+        let current = manifest(complete_tables(&BTreeMap::new()));
+        inspect_bytes(&gzip_lines(&[
+            current.clone(),
+            serde_json::json!({"kind":"end","rows":0}),
+        ]))
+        .expect("complete v14 archive inspects");
+        let mut gap = current.clone();
+        gap["tables"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|table| table["name"] != "admin_api_tokens");
+        let error = inspect_bytes(&gzip_lines(&[
+            gap,
+            serde_json::json!({"kind":"end","rows":0}),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("admin_api_tokens"), "{error}");
+    }
+
+    #[test]
+    fn v12_archives_read_without_event_voice_but_v13_requires_it() {
+        // Literal names, not V13_ADDED_TABLES: this reproduces the pre-change
+        // inventory even if the version waiver is accidentally removed.
+        let tables = complete_tables(&BTreeMap::new())
+            .into_iter()
+            .filter(|table| {
+                table["name"] != "event_voice_channels" && table["name"] != "event_voice_presence"
+            })
+            .collect();
+        let mut old = manifest(tables);
+        for version in 4..=12 {
+            old["version"] = serde_json::json!(version);
+            let contents = inspect_bytes(&gzip_lines(&[
+                old.clone(),
+                serde_json::json!({"kind":"end","rows":0}),
+            ]))
+            .expect("old archives without the v13 event voice pair stay readable");
+            assert_eq!(contents.manifest.version, version);
+            assert_eq!(
+                contents.manifest.missing_tables(),
+                ["event_voice_channels", "event_voice_presence"]
+            );
+            let mut gap = old.clone();
+            gap["tables"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|table| table["name"] != "events");
+            assert!(validate_manifest(&gap)
+                .unwrap_err()
+                .to_string()
+                .contains("missing tables: events"));
+        }
+        let mut v13_gap = old.clone();
+        v13_gap["version"] = serde_json::json!(13);
+        let error = validate_manifest(&v13_gap).unwrap_err().to_string();
+        assert!(error.contains("event_voice_channels"), "{error}");
+        assert!(error.contains("event_voice_presence"), "{error}");
+        assert_eq!(DUMP_VERSION, 14, "new dumps require the event voice pair");
+        let current = manifest(complete_tables(&BTreeMap::new()));
+        inspect_bytes(&gzip_lines(&[
+            current.clone(),
+            serde_json::json!({"kind":"end","rows":0}),
+        ]))
+        .expect("complete v14 archive inspects");
+        for name in ["event_voice_channels", "event_voice_presence"] {
+            let mut gap = current.clone();
+            gap["tables"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|table| table["name"] != name);
+            let error = inspect_bytes(&gzip_lines(&[
+                gap,
+                serde_json::json!({"kind":"end","rows":0}),
+            ]))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(name), "{error}");
+        }
+    }
+
+    #[test]
+    fn v13_archives_read_without_voice_audit_but_v14_requires_it() {
+        // Literal table name: a missing-table waiver must not hide itself by
+        // changing the production version inventory used to build this fixture.
+        let tables = complete_tables(&BTreeMap::new())
+            .into_iter()
+            .filter(|table| table["name"] != "voice_settings_audit")
+            .collect();
+        let mut old = manifest(tables);
+        for version in 4..=13 {
+            old["version"] = serde_json::json!(version);
+            let contents = inspect_bytes(&gzip_lines(&[
+                old.clone(),
+                serde_json::json!({"kind":"end","rows":0}),
+            ]))
+            .expect("pre-v14 archives without voice revision history stay readable");
+            assert_eq!(contents.manifest.version, version);
+            assert_eq!(contents.manifest.missing_tables(), ["voice_settings_audit"]);
+            let mut gap = old.clone();
+            gap["tables"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|table| table["name"] != "events");
+            assert!(validate_manifest(&gap)
+                .unwrap_err()
+                .to_string()
+                .contains("missing tables: events"));
+        }
+        assert_eq!(DUMP_VERSION, 14, "new dumps require voice revision history");
+        let current = manifest(complete_tables(&BTreeMap::new()));
+        assert!(current["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|table| table["name"] == "voice_settings_audit"));
+        inspect_bytes(&gzip_lines(&[
+            current,
+            serde_json::json!({"kind":"end","rows":0}),
+        ]))
+        .expect("complete v14 archive inspects");
+        old["version"] = serde_json::json!(14);
+        let error = inspect_bytes(&gzip_lines(&[
+            old,
+            serde_json::json!({"kind":"end","rows":0}),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("voice_settings_audit"), "{error}");
     }
 
     #[test]
@@ -2553,7 +2752,7 @@ mod tests {
         let message = inspect_bytes(&gzip_lines(&future)).unwrap_err().to_string();
         assert!(
             message.contains(&format!(
-                "reads 3, 4, 5, 6, 7, 8, 9, 10, 11 and {DUMP_VERSION}"
+                "reads 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 and {DUMP_VERSION}"
             )),
             "unknown versions are refused with the readable list: {message}"
         );
