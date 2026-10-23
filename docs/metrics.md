@@ -134,9 +134,9 @@ The supervisor records all three job metrics centrally after each completed
 attempt. Individual periodic jobs need no instrumentation. The current scheduled
 labels are `counter`, `rank`, `scheduled_events`, `presence_probe`,
 `community_scorecard`, `inactivity`, `audit_retry`, `self_role_recovery`, `feeds`,
-`member_unban_sweep`, `automod_expiry`, `settings` and `scheduled_messages`
+`member_unban_sweep`, `automod_expiry`, `lfg_sweep`, `settings` and `scheduled_messages`
 (the two 15 s tickers). The community, audit, recovery, feed, unban-sweep,
-automod-expiry and ticker names may be parked by configuration.
+automod-expiry, LFG lifecycle and ticker names may be parked by configuration.
 All allowlisted series are exposed from process startup at zero, even before the
 first run. A zero success timestamp does not distinguish a parked, never-started,
 still-running or always-failing job; use `/readyz` job status for that distinction.
@@ -158,13 +158,13 @@ not a scheduled-job count and its failures are not instrumented here.
 job names share the `other` counters, timestamp and failure streak; an unknown
 success resets that shared streak, and `other` is now an unknown-name-only
 fallback: every registered producer has its own label.
-`feeds`, `self_role_recovery`, `member_unban_sweep` and `automod_expiry` have
+`feeds`, `self_role_recovery`, `member_unban_sweep`, `automod_expiry` and `lfg_sweep` have
 independent counters, timestamps and streaks: success in any one cannot clear
 failures or change last-success in another or in `other`. Add new scheduled
 names to the compile-time allowlist, never to a dynamic label map. The
 supervisor fixture checks the current website/community, audit,
-scheduled-message, feed, self-role recovery, unban-sweep and automod-expiry
-names against that allowlist.
+scheduled-message, feed, self-role recovery, unban-sweep, automod-expiry and
+LFG lifecycle names against that allowlist.
 
 No scheduler or registration gate changes are implied by these labels. Feed
 supervisor cadence follows the live interval (boot default 300 s, range
