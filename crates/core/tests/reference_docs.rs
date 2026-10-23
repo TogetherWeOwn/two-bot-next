@@ -226,7 +226,7 @@ const BOOT_ENV: &[&str] = &[
 /// (`audit_runtime.rs:308`, `:438`), ticket's per-operation refresh
 /// (`ticket_runtime.rs:457`, `:981`), the gateway classifier's per-message
 /// refresh (`gateway.rs:834-853`, `:978`), voice grace/invite through the
-/// gateway closure (`gateway.rs:2204-2206`), containment
+/// gateway closure (`gateway.rs:2211-2213`), containment
 /// (`containment_runtime.rs:61-67`, `:278-286`), join-risk
 /// (`join_risk_runtime.rs:66-70`, `:239-249`), raid
 /// (`raid_runtime.rs:45-48`, `:194-202`) and onboarding's per-event
