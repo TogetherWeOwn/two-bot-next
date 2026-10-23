@@ -144,7 +144,7 @@ struct JobCap {
 
 /// One row per `metrics::JOBS` entry, in the same order. The hourly
 /// presence probe parks first; the durable checkpoint marker never sheds.
-const JOB_CAPS: [JobCap; 16] = [
+const JOB_CAPS: [JobCap; 17] = [
     JobCap {
         job: "invite_snapshot",
         shed_order: None,
@@ -203,6 +203,10 @@ const JOB_CAPS: [JobCap; 16] = [
     },
     JobCap {
         job: "automod_expiry",
+        shed_order: None,
+    },
+    JobCap {
+        job: "lfg_sweep",
         shed_order: None,
     },
     JobCap {
