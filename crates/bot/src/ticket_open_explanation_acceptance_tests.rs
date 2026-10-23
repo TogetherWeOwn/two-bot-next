@@ -437,7 +437,7 @@ async fn open_states_are_distinct_and_only_open_is_usable() {
     );
 
     // All four replies are distinct.
-    let mut distinct = [
+    let mut distinct = vec![
         creating.as_str(),
         open.as_str(),
         closing.as_str(),
