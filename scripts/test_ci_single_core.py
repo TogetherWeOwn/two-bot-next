@@ -86,7 +86,7 @@ class SingleCoreValidationTests(unittest.TestCase):
 
     def test_every_native_test_lane_carries_the_same_pin(self):
         # The opt-in flake validation must cover every lane that runs native
-        # test binaries: rust-tests, patch-coverage and both database lanes,
+        # test binaries: rust-tests, coverage-shard and both database lanes,
         # and nothing else.
         steps = pin_steps()
         self.assertEqual(len(steps), 4)

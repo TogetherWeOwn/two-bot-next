@@ -19,7 +19,7 @@ NEXTEST_WORKFLOW = (
     Path(__file__).resolve().parents[1] / ".github/workflows/reusable-rust-nextest.yml"
 )
 NEXTEST_WORKFLOW_TEXT = NEXTEST_WORKFLOW.read_text()
-# The four Rust test lanes (rust-tests, patch-coverage, ignored-db-stores,
+# The four Rust test lanes (rust-tests, coverage-shard, ignored-db-stores,
 # ignored-db-runtime) each run their own copy of this service; the first one
 # in the file is the reference and the others must match it exactly.
 SERVICES = [part.split("    steps:\n", 1)[0] for part in WORKFLOW_TEXT.split("      agent-testdb:\n")[1:]]
@@ -37,12 +37,12 @@ NEXTEST_VERIFY_TAILS = NEXTEST_WORKFLOW_TEXT.split("      - name: Verify disposa
 NEXTEST_SCRIPT = textwrap.dedent(
     NEXTEST_VERIFY_TAILS[0].split("python3 - <<'PY'\n", 1)[1].split("\n          PY", 1)[0]
 )
-POSTGRES_LANES = ("rust-tests", "patch-coverage", "ignored-db-stores", "ignored-db-runtime")
-# Coverage replay needs earlier checkpoints on the same 1 GiB tmpfs. Only
+POSTGRES_LANES = ("rust-tests", "coverage-shard", "ignored-db-stores", "ignored-db-runtime")
+# Coverage legs need earlier checkpoints on the same 1 GiB tmpfs. Only
 # its WAL targets differ; all five probes must enforce the same safety checks.
 WAL_BUDGETS = {
     "rust-tests": ("128MB", "32MB"),
-    "patch-coverage": ("128MB", "32MB"),
+    "coverage-shard": ("128MB", "32MB"),
     "ignored-db-stores": ("512MB", "64MB"),
     "ignored-db-runtime": ("512MB", "64MB"),
     "nextest": ("512MB", "64MB"),

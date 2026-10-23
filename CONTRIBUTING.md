@@ -55,8 +55,10 @@ exact head commit. Never bypass or weaken a check.
 
 `check.yml` runs its Rust work as parallel lanes that all start once `job-inputs`
 finishes: `check` (lint: offline guards, cargo-deny, fmt, clippy), `rust tests`
-(unit, integration and doc tests), `patch coverage` (the HARD patch-coverage
-measurement, split out of `rust tests` so the two signals fail independently),
+(unit, integration and doc tests), the sharded `patch coverage` measurement
+(`coverage-plan` selects the legs, the `coverage-shard` matrix runs them,
+`patch-coverage` merges and gates, so the unit-test signal and the coverage
+verdict fail independently),
 `rust nextest` (workspace lib/bins under
 cargo-nextest with one retry, JUnit and a flake ledger) and two database lanes,
 `ignored db (stores)` and `ignored db (runtime)`. The single `ci-ok` aggregate waits on both selectors
@@ -72,10 +74,11 @@ the SBOM job. The legacy `required-checks` aggregate is removed.
 Deterministic quality gates (per-PR advisories HARD, ast-grep and Semgrep
 HARD, required voice synthetic, test-target inventory HARD) run as steps of
 the `check` lane on the existing routed runner; see
-[`docs/quality-gates.md`](docs/quality-gates.md). Patch coverage (HARD) runs in
-`patch-coverage` with the disposable Postgres service and ignored database-backed
-tests. New checks start in WARN (report, never fail) and flip to HARD only with
-their backlog burned down.
+[`docs/quality-gates.md`](docs/quality-gates.md). Patch coverage (HARD) runs
+sharded across `coverage-plan`, the `coverage-shard` matrix (with per-shard
+disposable Postgres services and ignored database-backed tests) and the
+`patch-coverage` merge. New checks start in WARN (report, never fail) and flip
+to HARD only with their backlog burned down.
 
 Every Rust setup step in `check.yml` installs the exact version from
 `rust-toolchain.toml`, including fmt/clippy components where required. Do not use
