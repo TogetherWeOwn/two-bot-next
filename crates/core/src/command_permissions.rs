@@ -77,9 +77,9 @@ use PolicyHook::{
 /// plus the Next-only `/help` discovery command (parity row 31 — legacy has
 /// no help command), the Next-only `/privacy` member self-serve
 /// (parity row 32) and the Next-only management-only `/command-inspect`
-/// (parity row 33).
+/// (parity row 33), plus `/lfg-edit`, a Next-only companion sharing LFG row 26.
 /// No Administrator-only exception: preserve the legacy resolved-bit check.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 33] = [
+pub const COMMAND_PERMISSIONS: [CommandPermission; 34] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),

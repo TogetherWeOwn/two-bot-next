@@ -85,7 +85,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
     HelpGroup {
         title: "Looking for group",
         requires: Some("Manage Events"),
-        commands: &["lfg", "lfg-close"],
+        commands: &["lfg", "lfg-close", "lfg-edit"],
         anchor: None,
     },
     HelpGroup {
