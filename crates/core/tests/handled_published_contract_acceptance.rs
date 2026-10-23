@@ -181,6 +181,25 @@ fn parity_builtins_route_to_their_handlers() {
             "{name} routes to its handler",
         );
     }
+    // Next-only `/lfg-list`: name-based so the baseline still compiles before
+    // the production `HandlerId::LfgList` arm lands. Resolves via the publish
+    // registry when available instead of naming the enum.
+    let defs = router.publish_set(&[]).expect("parity set assembles");
+    let lfg_list = defs
+        .iter()
+        .find(|d| d.name == "lfg-list")
+        .expect("lfg-list is published right after lfg-close");
+    assert_eq!(
+        lfg_list.description.as_str(),
+        "List open game posts in this channel"
+    );
+    assert!(
+        matches!(
+            router.route_slash(&ctx("lfg-list")),
+            SlashOutcome::Handled { .. }
+        ),
+        "lfg-list routes to its handler"
+    );
 }
 
 /// CONTROL (green before and after): the staging E2E matrix still equals the
@@ -199,5 +218,5 @@ fn e2e_matrix_still_matches_the_publish_set() {
         matrix_names, published_names,
         "matrix drift: the fix must not change the parity publish set"
     );
-    assert_eq!(matrix.len(), 29, "contract covers the 29 built-in commands");
+    assert_eq!(matrix.len(), 30, "contract covers the 30 built-in commands");
 }
