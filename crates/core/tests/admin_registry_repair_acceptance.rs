@@ -667,6 +667,390 @@ mod database {
         assert!(failures.is_empty(), "{chain}: compatible partial schemas without defaults must migrate, preserve named data and refuse every omitted-holder INSERT with NOT NULL SQLSTATE 23502: {failures:#?}");
     }
 
+    const AUTHORITY_CHECKS: [(&str, &str); 4] = [
+        ("admin_api_tokens_holder_named", "holder_id <> ''"),
+        ("admin_api_tokens_holder_kind_closed", "holder_kind <> ''"),
+        ("admin_api_tokens_admin_human", "cardinality(scopes) > 0"),
+        (
+            "admin_api_tokens_lifetime_bounded",
+            "expires_at > issued_at",
+        ),
+    ];
+
+    async fn authority_checks(pool: &PgPool) -> Vec<(String, String)> {
+        // Capture the exact deployed spelling ONLY for the compatibility
+        // fixture. Independent write probes below decide whether it enforces
+        // the approved contract; its own SQL is never an enforcement oracle.
+        sqlx::query_as(
+            "SELECT conname::text, pg_get_expr(conbin, conrelid)
+             FROM pg_constraint WHERE conrelid='admin_api_tokens'::regclass
+               AND conname IN ('admin_api_tokens_holder_named',
+                   'admin_api_tokens_holder_kind_closed',
+                   'admin_api_tokens_admin_human',
+                   'admin_api_tokens_lifetime_bounded') AND contype='c'
+             ORDER BY conname",
+        )
+        .fetch_all(pool)
+        .await
+        .expect("read canonical authority CHECK expressions")
+    }
+
+    async fn canonical_authority_checks(url: &str, chain: &str) -> Vec<(String, String)> {
+        let db = TestDatabase::create(url, &migrator(chain).await)
+            .await
+            .expect("create fresh canonical compatibility fixture");
+        let checks = authority_checks(db.pool()).await;
+        db.close()
+            .await
+            .expect("drop canonical compatibility fixture");
+        assert_eq!(checks.len(), 4, "{chain}: all four authority CHECKs exist");
+        checks
+    }
+
+    async fn partial_authority_columns(pool: &PgPool) {
+        // Deliberately nullable: refusal must roll back SET NOT NULL as well as
+        // any earlier ADD CONSTRAINT/VALIDATE in the repair transaction.
+        sqlx::query(
+            "ALTER TABLE admin_api_tokens ADD COLUMN holder_id text, ADD COLUMN holder_kind text",
+        )
+        .execute(pool)
+        .await
+        .expect("install named columns without defaults");
+    }
+
+    fn invalid_authority_rows() -> Vec<(&'static str, Value)> {
+        let mut cases = Vec::new();
+        for (name, field, value) in [
+            ("blank holder", "holder_id", json!("")),
+            ("whitespace holder", "holder_id", json!(" \t\r\n")),
+            ("unknown kind", "holder_kind", json!("robot")),
+            ("AI admin", "scopes", json!(["admin"])),
+            (
+                "over ninety days",
+                "expires_at",
+                json!("2026-11-30T00:00:00.000001Z"),
+            ),
+            ("zero lifetime", "expires_at", json!(ISSUED)),
+            (
+                "negative lifetime",
+                "expires_at",
+                json!("2026-08-31T23:59:59Z"),
+            ),
+            ("infinite expiry", "expires_at", json!("infinity")),
+            ("infinite issue", "issued_at", json!("-infinity")),
+        ] {
+            let mut invalid = row();
+            invalid[field] = value;
+            cases.push((name, invalid));
+        }
+        cases
+    }
+
+    async fn authority_write_probes(pool: &PgPool) -> Vec<String> {
+        let mut failures = Vec::new();
+        clear(pool).await;
+        // Positive boundaries prove that blanket refusal is not enforcement.
+        for (kind, scopes, expires) in [
+            ("human", json!(["moderate", "admin"]), NINETY_DAYS),
+            ("ai_agent", json!(["read", "moderate"]), NINETY_DAYS),
+            ("human", json!(["admin"]), "2026-09-01T00:00:00.000001Z"),
+        ] {
+            let mut valid = row();
+            valid["holder_kind"] = json!(kind);
+            valid["scopes"] = scopes;
+            valid["expires_at"] = json!(expires);
+            if insert(pool, &valid).await.is_err() {
+                failures.push(format!("valid {kind} boundary INSERT refused"));
+            } else {
+                // Postgres normalizes timestamp spelling, so compare authority
+                // fields and exact lifetime separately instead of JSON dates.
+                let actual = snapshot(pool).await;
+                if actual["holder_id"] != valid["holder_id"]
+                    || actual["holder_kind"] != valid["holder_kind"]
+                    || actual["scopes"] != valid["scopes"]
+                {
+                    failures.push(format!("valid {kind} authority changed"));
+                }
+                let seconds: f64 = sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM (expires_at - issued_at))::double precision FROM admin_api_tokens WHERE token_id=$1")
+                    .bind(TOKEN).fetch_one(pool).await.expect("read accepted lifetime boundary");
+                let expected = if expires == NINETY_DAYS {
+                    7_776_000.0
+                } else {
+                    0.000001
+                };
+                if seconds != expected {
+                    failures.push(format!("valid {kind} lifetime changed: {seconds}"));
+                }
+            }
+            clear(pool).await;
+        }
+        for (name, invalid) in invalid_authority_rows() {
+            if !refused(pool, &invalid, "23514").await {
+                failures.push(format!("{name} INSERT accepted or wrong SQLSTATE"));
+            }
+        }
+        for (name, statement) in [
+            ("whitespace holder", "UPDATE admin_api_tokens SET holder_id=' \t\r\n' WHERE token_id=$1"),
+            ("unknown kind", "UPDATE admin_api_tokens SET holder_kind='robot' WHERE token_id=$1"),
+            ("AI admin", "UPDATE admin_api_tokens SET scopes='{admin}' WHERE token_id=$1"),
+            ("over ninety days", "UPDATE admin_api_tokens SET expires_at=issued_at + interval '90 days 0.000001 seconds' WHERE token_id=$1"),
+            ("zero lifetime", "UPDATE admin_api_tokens SET expires_at=issued_at WHERE token_id=$1"),
+            ("negative lifetime", "UPDATE admin_api_tokens SET expires_at=issued_at - interval '1 second' WHERE token_id=$1"),
+            ("infinite expiry", "UPDATE admin_api_tokens SET expires_at='infinity' WHERE token_id=$1"),
+            ("infinite issue", "UPDATE admin_api_tokens SET issued_at='-infinity' WHERE token_id=$1"),
+        ] {
+            insert(pool, &row()).await.expect("insert valid update control");
+            let before = snapshot(pool).await;
+            let result = sqlx::query(statement).bind(TOKEN).execute(pool).await;
+            let after = snapshot(pool).await;
+            let rejected = result.err().is_some_and(|error| {
+                error.as_database_error().and_then(|error| error.code()).as_deref() == Some("23514")
+            });
+            if !rejected || after != before {
+                failures.push(format!("{name} UPDATE: refused={rejected}, row_preserved={}", after == before));
+            }
+            clear(pool).await;
+        }
+        failures
+    }
+
+    async fn incompatible_same_name_checks_refuse_atomically(chain: &str, shipped: i64) {
+        let Some(url) = bootstrap() else { return };
+        let (prefix, latest) = pre_repair_migrators(chain, shipped).await;
+        let canonical = canonical_authority_checks(&url, chain).await;
+        let mut failures = Vec::new();
+        for (name, weak) in AUTHORITY_CHECKS {
+            for variant in ["weak", "always true", "wrong kind", "NO INHERIT"] {
+                for populated in [false, true] {
+                    let db = TestDatabase::create(&url, &prefix)
+                        .await
+                        .expect("create incompatible same-name fixture");
+                    partial_authority_columns(db.pool()).await;
+                    let exact = &canonical
+                        .iter()
+                        .find(|(n, _)| n == name)
+                        .expect("canonical compatibility expression")
+                        .1;
+                    let definition = match variant {
+                        "weak" => format!("CHECK ({weak}) NOT VALID"),
+                        "always true" => "CHECK (true) NOT VALID".to_owned(),
+                        "wrong kind" => "UNIQUE (token_id)".to_owned(),
+                        "NO INHERIT" => format!("CHECK ({exact}) NO INHERIT"),
+                        _ => unreachable!("literal fixture variant"),
+                    };
+                    sqlx::query(sqlx::AssertSqlSafe(format!(
+                        "ALTER TABLE admin_api_tokens ADD CONSTRAINT {name} {definition}"
+                    )))
+                    .execute(db.pool())
+                    .await
+                    .expect("install conflicting authority constraint");
+                    if name == "admin_api_tokens_holder_named" && variant == "weak" {
+                        let mut whitespace = row();
+                        whitespace["holder_id"] = json!(" \t\r\n");
+                        insert(db.pool(), &whitespace).await.expect(
+                            "reported holder_id <> '' fixture permits whitespace authority",
+                        );
+                        clear(db.pool()).await;
+                    }
+                    if populated {
+                        insert(db.pool(), &row()).await.expect(
+                            "compatible named AI moderate row satisfies partial constraints",
+                        );
+                    }
+                    let before_rows = registry_rows(db.pool()).await;
+                    let before_catalog = catalog(db.pool()).await;
+                    let result = latest.run(db.pool()).await;
+                    let after_rows = registry_rows(db.pool()).await;
+                    let after_catalog = catalog(db.pool()).await;
+                    let bypasses = if result.is_ok() {
+                        authority_write_probes(db.pool()).await
+                    } else {
+                        Vec::new()
+                    };
+                    db.close()
+                        .await
+                        .expect("drop incompatible same-name fixture");
+                    if result.is_ok()
+                        || after_rows != before_rows
+                        || after_catalog != before_catalog
+                    {
+                        failures.push(format!(
+                            "{name}, {variant}, populated={populated}: refused={}, rows_preserved={}, catalog_and_history_preserved={}, bypasses={bypasses:?}",
+                            result.is_err(), after_rows == before_rows, after_catalog == before_catalog
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{chain}: incompatible same-name authority constraints must refuse atomically, not be trusted, replaced or partially validated; preserve nullability/defaults/constraints/indexes/rows/history: {failures:#?}");
+    }
+
+    async fn compatible_authority_checks_upgrade(chain: &str, shipped: i64) {
+        let Some(url) = bootstrap() else { return };
+        let (prefix, latest) = pre_repair_migrators(chain, shipped).await;
+        let canonical = canonical_authority_checks(&url, chain).await;
+        let mut failures = Vec::new();
+        for preexisting in [false, true] {
+            for populated in [false, true] {
+                let db = TestDatabase::create(&url, &prefix)
+                    .await
+                    .expect("create compatible authority CHECK fixture");
+                partial_authority_columns(db.pool()).await;
+                if preexisting {
+                    for (name, expression) in &canonical {
+                        sqlx::query(sqlx::AssertSqlSafe(format!(
+                            "ALTER TABLE admin_api_tokens ADD CONSTRAINT {name} CHECK ({expression})"
+                        ))).execute(db.pool()).await.expect("install exact canonical existing CHECK");
+                    }
+                }
+                if populated {
+                    insert(db.pool(), &row())
+                        .await
+                        .expect("insert compatible named authority row");
+                }
+                let before_rows = registry_rows(db.pool()).await;
+                let result = latest.run(db.pool()).await;
+                let after_rows = registry_rows(db.pool()).await;
+                let checks = authority_checks(db.pool()).await;
+                let enforced: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM pg_constraint WHERE conrelid='admin_api_tokens'::regclass
+                     AND conname IN ('admin_api_tokens_holder_named', 'admin_api_tokens_holder_kind_closed',
+                     'admin_api_tokens_admin_human', 'admin_api_tokens_lifetime_bounded')
+                     AND contype='c' AND convalidated AND NOT connoinherit",
+                ).fetch_one(db.pool()).await.expect("count validated inheritable authority CHECKs");
+                let probes = if result.is_ok() {
+                    authority_write_probes(db.pool()).await
+                } else {
+                    Vec::new()
+                };
+                db.close()
+                    .await
+                    .expect("drop compatible authority CHECK fixture");
+                if result.is_err()
+                    || before_rows != after_rows
+                    || checks != canonical
+                    || enforced != 4
+                    || !probes.is_empty()
+                {
+                    failures.push(format!("preexisting={preexisting}, populated={populated}: migrated={}, rows_preserved={}, exact_checks={}, enforced={enforced}, probes={probes:?}", result.is_ok(), before_rows == after_rows, checks == canonical));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{chain}: absent or exact canonical CHECKs must migrate, preserve named rows and enforce real INSERT/UPDATE authority boundaries: {failures:#?}");
+    }
+
+    async fn mirrored_authority_repairs_converge(
+        first: &str,
+        shipped: i64,
+        second: &str,
+        other_shipped: i64,
+    ) {
+        let Some(url) = bootstrap() else { return };
+        let db = TestDatabase::create(&url, &migrator(first).await)
+            .await
+            .expect("create first-chain repaired database");
+        insert(db.pool(), &row())
+            .await
+            .expect("insert compatible mirrored control");
+        let before_rows = registry_rows(db.pool()).await;
+        let mut before_catalog = catalog(db.pool()).await;
+        // Run only the other chain's actual forward repairs, not its unrelated
+        // and differently numbered predecessors. Existing history is retained.
+        let (other_prefix, other_latest) = pre_repair_migrators(second, other_shipped).await;
+        let mut mirror = Migrator::with_migrations(
+            other_latest
+                .iter()
+                .filter(|m| !other_prefix.iter().any(|old| old.version == m.version))
+                .cloned()
+                .collect(),
+        );
+        mirror.set_ignore_missing(true);
+        let result = mirror.run(db.pool()).await;
+        let after_rows = registry_rows(db.pool()).await;
+        let mut after_catalog = catalog(db.pool()).await;
+        let before_history = before_catalog["migrations"]
+            .as_array()
+            .expect("before history");
+        let after_history = after_catalog["migrations"]
+            .as_array()
+            .expect("after history");
+        let original_history: Vec<_> = after_history
+            .iter()
+            .filter(|entry| {
+                before_history
+                    .iter()
+                    .any(|old| old["version"] == entry["version"])
+            })
+            .collect();
+        let history_preserved = original_history == before_history.iter().collect::<Vec<_>>();
+        let mirror_history_recorded = mirror.iter().all(|migration| {
+            after_history.iter().any(|entry| {
+                entry["version"].as_i64() == Some(migration.version)
+                    && entry["success"] == json!(true)
+            })
+        });
+        before_catalog
+            .as_object_mut()
+            .expect("catalog object")
+            .remove("migrations");
+        after_catalog
+            .as_object_mut()
+            .expect("catalog object")
+            .remove("migrations");
+        let probes = if result.is_ok() {
+            authority_write_probes(db.pool()).await
+        } else {
+            Vec::new()
+        };
+        db.close().await.expect("drop mirrored authority fixture");
+        assert!(
+            result.is_ok(),
+            "{first}/{shipped} -> {second}: mirrored authority repair must succeed"
+        );
+        assert!(
+            history_preserved,
+            "mirror preserves every prior migration history row"
+        );
+        assert!(
+            mirror_history_recorded,
+            "mirror records its actual forward repair as successful"
+        );
+        assert_eq!(
+            after_rows, before_rows,
+            "mirror preserves named authority rows"
+        );
+        assert_eq!(
+            after_catalog, before_catalog,
+            "mirror converges without duplicate/replaced constraints or other schema drift"
+        );
+        assert!(probes.is_empty(), "{first} -> {second}: converged schema must enforce real INSERT/UPDATE controls: {probes:?}");
+    }
+
+    #[tokio::test]
+    async fn cutover_incompatible_same_name_authority_checks_refuse_atomically() {
+        incompatible_same_name_checks_refuse_atomically("cutover", 456).await;
+    }
+    #[tokio::test]
+    async fn store_incompatible_same_name_authority_checks_refuse_atomically() {
+        incompatible_same_name_checks_refuse_atomically("store", 457).await;
+    }
+    #[tokio::test]
+    async fn cutover_absent_and_exact_authority_checks_upgrade() {
+        compatible_authority_checks_upgrade("cutover", 456).await;
+    }
+    #[tokio::test]
+    async fn store_absent_and_exact_authority_checks_upgrade() {
+        compatible_authority_checks_upgrade("store", 457).await;
+    }
+    #[tokio::test]
+    async fn cutover_then_store_authority_repairs_converge() {
+        mirrored_authority_repairs_converge("cutover", 456, "store", 457).await;
+    }
+    #[tokio::test]
+    async fn store_then_cutover_authority_repairs_converge() {
+        mirrored_authority_repairs_converge("store", 457, "cutover", 456).await;
+    }
+
     #[tokio::test]
     async fn cutover_partial_holder_defaults_refuse_atomically() {
         partial_holder_defaults_refuse_atomically("cutover", 456).await;
