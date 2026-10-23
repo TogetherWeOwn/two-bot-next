@@ -2,9 +2,8 @@
 
 //! Protected RED acceptance: staff-gated purge preview + channel-restriction inspect.
 //!
-//! Paired acceptance card TOG-38632 for the build card's item-4 scope. The Builder
-//! builds on this commit and MUST NOT edit this file; report an incorrect test
-//! back to the acceptance card instead of working around it.
+//! The implementation builds on this commit and must preserve these acceptance
+//! assertions. Report an incorrect test to its author instead of working around it.
 //!
 //! Normative contract under test (the Builder implements exactly this):
 //!
@@ -61,13 +60,12 @@ mod common;
 
 use common::{aged_message_id, fresh_message_id, MockRest, ScriptedResponse};
 use serde_json::{json, Value};
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
-use sqlx::PgPool;
 use twilight_model::application::interaction::Interaction;
 use two_bot_core::{ChannelModerationStore, InteractionRouter, RouterGates};
 use two_bot_discord::{
     register_channel_handlers, ActionExecutor, ChannelModerationRuntime, ChannelReply,
 };
+use two_bot_testsupport::TestDatabase;
 
 const GUILD: &str = "111111111111111111";
 const CHANNEL: &str = "222222222222222222";
@@ -79,67 +77,18 @@ const MANAGE_MESSAGES_ONLY: u64 = 1 << 13;
 
 struct Database {
     store: ChannelModerationStore,
-    admin: PgPool,
-    schema: String,
+    fixture: TestDatabase,
 }
 
 impl Database {
     async fn open() -> Self {
         let url = std::env::var("TWO_TEST_DATABASE_URL")
             .expect("explicit isolated test service required");
-        let ci = std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true");
-        let host = if url == "postgres://agent_test@agent-testdb:5432/agent_test"
-            || url == "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci"
-        {
-            "agent-testdb"
-        } else if ci
-            && (url == "postgres://agent_test@127.0.0.1:5432/agent_test"
-                || url == "postgres://agent_test:@127.0.0.1:5432/two_bot_test_ci")
-        {
-            "127.0.0.1"
-        } else {
-            panic!("non-test database refused")
-        };
-        assert!(std::env::var_os("PGOPTIONS").is_none());
-        let options = PgConnectOptions::new_without_pgpass()
-            .host(host)
-            .port(5432)
-            .username("agent_test")
-            .password("")
-            .database("agent_test")
-            .ssl_mode(PgSslMode::Disable);
-        let admin = PgPoolOptions::new()
-            .max_connections(1)
-            .connect_with(options.clone())
+        let fixture = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
             .await
-            .unwrap();
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let schema = format!(
-            "cm_preview_inspect_{}_{}_{}",
-            std::process::id(),
-            nonce,
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
-            .execute(&admin)
-            .await
-            .unwrap();
-        let pool = PgPoolOptions::new()
-            .max_connections(4)
-            .connect_with(options.options([("search_path", schema.clone())]))
-            .await
-            .unwrap();
-        let store = ChannelModerationStore::from_pool(pool);
-        store.migrate().await.unwrap();
-        Self {
-            store,
-            admin,
-            schema,
-        }
+            .expect("create migrated disposable fixture");
+        let store = ChannelModerationStore::from_pool(fixture.pool().clone());
+        Self { store, fixture }
     }
 
     async fn count(&self, table: &str) -> i64 {
@@ -167,15 +116,7 @@ impl Database {
     }
 
     async fn close(self) {
-        self.store.pool().close().await;
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP SCHEMA {} CASCADE",
-            self.schema
-        )))
-        .execute(&self.admin)
-        .await
-        .unwrap();
-        self.admin.close().await;
+        self.fixture.close().await.expect("verify fixture teardown");
     }
 }
 
@@ -278,15 +219,15 @@ fn assert_no_channel_writes(mock: &MockRest) {
         if request.method == "GET" {
             continue;
         }
+        let callback = request.method == "POST"
+            && request.path.starts_with("/api/v10/interactions/")
+            && request.path.ends_with("/callback");
+        let edit = request.method == "PATCH"
+            && request.path.starts_with("/api/v10/webhooks/")
+            && request.path.ends_with("/messages/@original");
         assert!(
-            request.path.contains("/webhooks/"),
-            "non-GET outside the interaction webhook is a mutation: {} {}",
-            request.method,
-            request.path
-        );
-        assert!(
-            request.method == "POST" || request.method == "PATCH",
-            "unexpected webhook method: {} {}",
+            callback || edit,
+            "non-GET outside the interaction reply lifecycle is a mutation: {} {}",
             request.method,
             request.path
         );
@@ -448,7 +389,6 @@ fn accepts_channel_inspect_command() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or CI service"]
 async fn preview_counts_match_deletable_set_with_pin_and_age_exclusions() {
     let db = Database::open().await;
     let (fresh_a, fresh_b, fresh_c) = (
@@ -527,7 +467,6 @@ async fn preview_counts_match_deletable_set_with_pin_and_age_exclusions() {
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or CI service"]
 async fn preview_excludes_own_bot_posts_and_counts_system_messages() {
     let db = Database::open().await;
     let (own, other_bot, system, reply_msg, plain) = (
@@ -627,7 +566,6 @@ async fn preview_excludes_own_bot_posts_and_counts_system_messages() {
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or CI service"]
 async fn preview_empty_channel_reports_zero_without_error() {
     let db = Database::open().await;
     let mock = MockRest::start(
@@ -653,7 +591,6 @@ async fn preview_empty_channel_reports_zero_without_error() {
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or CI service"]
 async fn preview_lone_recent_message_plans_a_single_delete() {
     let db = Database::open().await;
     let only = fresh_message_id(21);
@@ -690,7 +627,6 @@ async fn preview_lone_recent_message_plans_a_single_delete() {
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or CI service"]
 async fn preview_history_failure_refuses_with_retry_and_zero_effects() {
     let db = Database::open().await;
     for (id, history) in [
@@ -721,7 +657,6 @@ async fn preview_history_failure_refuses_with_retry_and_zero_effects() {
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or CI service"]
 async fn preview_rejects_out_of_range_counts_without_http_or_writes() {
     let db = Database::open().await;
     let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
@@ -750,7 +685,6 @@ async fn preview_rejects_out_of_range_counts_without_http_or_writes() {
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or CI service"]
 async fn preview_refuses_non_staff_without_http_or_writes() {
     let db = Database::open().await;
     let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
@@ -771,7 +705,6 @@ async fn preview_refuses_non_staff_without_http_or_writes() {
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or CI service"]
 async fn preview_rejects_wrong_guild_without_http_or_writes() {
     let db = Database::open().await;
     let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
@@ -790,7 +723,6 @@ async fn preview_rejects_wrong_guild_without_http_or_writes() {
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or CI service"]
 async fn preview_respond_is_ephemeral_without_mentions_or_hostile_echo() {
     let db = Database::open().await;
     // Hostile content must never echo: counts and bounded metadata only.
@@ -862,7 +794,6 @@ async fn preview_respond_is_ephemeral_without_mentions_or_hostile_echo() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or CI service"]
 async fn inspect_reports_lockdown_and_slowmode_when_set() {
     let db = Database::open().await;
     seed_lockdown(&db, "raid drill", "2026-10-01T00:00:00.000Z").await;
@@ -908,7 +839,6 @@ async fn inspect_reports_lockdown_and_slowmode_when_set() {
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or CI service"]
 async fn inspect_after_real_lockdown_reports_setter_from_audit() {
     let db = Database::open().await;
     let mut script = vec![overwrite("3072", "8192"), ScriptedResponse::status(204)];
@@ -963,7 +893,6 @@ async fn inspect_after_real_lockdown_reports_setter_from_audit() {
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or CI service"]
 async fn inspect_cleared_lockdown_and_missing_slowmode_render_none() {
     let db = Database::open().await;
     let mut script = vec![
@@ -1021,7 +950,6 @@ async fn inspect_cleared_lockdown_and_missing_slowmode_render_none() {
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or CI service"]
 async fn inspect_channel_read_failure_reports_slowmode_unknown_with_retry() {
     let db = Database::open().await;
     seed_lockdown(&db, "raid drill", "2026-10-01T00:00:00.000Z").await;
@@ -1057,7 +985,6 @@ async fn inspect_channel_read_failure_reports_slowmode_unknown_with_retry() {
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or CI service"]
 async fn inspect_store_outage_refuses_with_retry_and_zero_effects() {
     let db = Database::open().await;
     seed_lockdown(&db, "raid drill", "2026-10-01T00:00:00.000Z").await;
@@ -1084,7 +1011,6 @@ async fn inspect_store_outage_refuses_with_retry_and_zero_effects() {
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or CI service"]
 async fn inspect_refuses_non_staff_without_http_or_writes() {
     let db = Database::open().await;
     let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
@@ -1105,7 +1031,6 @@ async fn inspect_refuses_non_staff_without_http_or_writes() {
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or CI service"]
 async fn inspect_rejects_wrong_guild_without_http_or_writes() {
     let db = Database::open().await;
     let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
@@ -1124,7 +1049,6 @@ async fn inspect_rejects_wrong_guild_without_http_or_writes() {
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or CI service"]
 async fn disabled_reads_refuse_without_http_or_writes() {
     let db = Database::open().await;
     let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
@@ -1145,7 +1069,6 @@ async fn disabled_reads_refuse_without_http_or_writes() {
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or CI service"]
 async fn inspect_respond_is_ephemeral_with_inert_reason_echo() {
     let db = Database::open().await;
     // Staff-authored reasons echo verbatim; allowed_mentions keeps them inert.
