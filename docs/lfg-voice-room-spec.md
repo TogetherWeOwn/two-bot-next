@@ -121,7 +121,9 @@ request that includes all settings, in the configured category:
 - Parent: the configured category only. Never the post's channel category, never
   inferred. No overwrites are sent, so the room is category-synced and the
   organizer's staff controls the audience. No @everyone or per-member deny.
-- User limit: `min(sum of role slots, 99)` (at least 1); preview may set 0-99.
+- User limit: default `min(sum of role slots, 99)`, floored at 1; preview may
+  set 0-99 where 0 means unlimited (Discord semantics). Confirm persists the
+  preview value unchanged; an explicit 0 is stored as 0, never normalized.
 - No bitrate, region or topic changes beyond Discord defaults.
 
 **Join policy.** Explicit join only. After confirm the existing post gets one quiet
@@ -142,12 +144,21 @@ value is treated as **held**: nothing is deleted or edited.
 `(guild_id, post_id)` claim in `creating` **before** the Discord call, make one
 create request (never retried after an uncertain result), validate the receipt
 (nonzero id, same guild, voice type, exact parent), then bind `active` and edit
-the post. A concurrent second confirm returns the same room. A bodyless,
-malformed or contradictory 2xx or a timeout leaves the claim `creating`/`held`;
-the room worker may **adopt** only when the live snapshot shows exactly one channel
-in the configured category with the reserved exact name created after the claim
-instant. Zero or several candidates stay `held`, never repost and never delete;
-staff are told to check the category. No lock is held across HTTP.
+the post. If the post edit fails, the binding stays `active` (room live and
+counted); the one-minute sweep re-attempts the edit until it succeeds or the post
+closes, with a staff-visible link-pending flag, and the confirm reply uses the
+link-pending copy (§6), never asserting the link was added. A concurrent second
+confirm returns the same room. A bodyless, malformed or contradictory 2xx or a
+timeout leaves the claim `creating`/`held`; the room worker may **adopt** only when
+the live snapshot shows exactly one channel in the configured category with the
+reserved exact name created after the claim instant. Zero or several candidates
+stay `held`, never repost and never delete; staff are told to check the category.
+No lock is held across HTTP. A close (explicit, expiry or delete) arriving while
+`creating` is outstanding records a pending-close on the claim; the in-flight
+Discord request is not cancelled. When the response arrives, a validated channel
+is bound then immediately moved through the close path for that event; an unknown
+outcome stays `held` with the close still pending, and adopt-or-hold applies the
+close after adoption.
 
 **Wind-down** is driven by post state, never by channel guesses:
 
@@ -218,7 +229,10 @@ from caller-supplied IDs, titles or links. Foreign or unreadable evidence collap
 to one generic `UNAVAILABLE`.
 
 **Bounds** (tighten, never replace, existing limits): one room/post lifetime; **5
-live rooms/guild** (below the 20-open-post cap); 20 creates per guild per UTC day;
+live rooms/guild** (below the 20-open-post cap), where live means a binding in
+`creating`, `active`, `winding_down`, `locked` or `held` (`deleted` and `gone` are
+terminal and do not count, for both admission and recovery); 20 creates per guild
+per UTC day (refused as `CAP_DAILY`);
 one confirm per actor per 60 s (replay and refusal exempt); one in-flight
 execution through the existing LFG queue/pool bounds; creates, edits and deletes go
 through the per-guild voice queue with retry-after honored, one write at a time.
@@ -232,7 +246,8 @@ title, no occupancy, no join history**. Spent rows live as long as their post ro
 Organizer and actor IDs appear only in audit rows, which must be deleted by member
 erasure in both executors, per the existing audit coverage (to be re-verified at
 build, not asserted here). A post erased with its creator ends the room through the
-close path. A new table is a schema tripwire: it must be declared in the erasure
+close path. Erasure of a non-creator leaves the room lifecycle unchanged; only
+audit identity is removed. A new table is a schema tripwire: it must be declared in the erasure
 plan as having no member columns, in the backup table lists, in the role plan and
 in rollback notes. Restored snapshots can resurrect rows whose channel is gone;
 the first 404 marks them `gone`. No claim is made about Discord-side data.
@@ -275,9 +290,11 @@ tests.
 
 1. Preview: "Create a voice room for <post>? Name <name>, category <category>,
    limit <n>. Opens now, ends when the post ends. Nobody is moved or pinged."
-2. Confirm: "Room created: <channel>. A link was added to the post. It is deleted
+2. Confirm (link added): "Room created: <channel>. A link was added to the post. It is deleted
    shortly after the post ends and the room is empty."
-3. Status: the room, state, "locked/overdue" and how to end it early.
+3. Confirm (link pending): "Room created: <channel>. The post link could not be added; staff have been told. It is deleted
+   shortly after the post ends and the room is empty."
+4. Status: the room, state, "locked/overdue" and how to end it early.
 
 **Failure corrections** are specific and actionable, and each names who acts next:
 
@@ -292,9 +309,11 @@ tests.
 | `POST_CLOSED` / `POST_EXPIRED` / `POST_MISSING` | "This post is closed/expired/gone." | false / `create_new_post` |
 | `ROOM_EXISTS` | "This post already has a room." | false / `use_existing_room` |
 | `CAP_GUILD` | "This server has the maximum number of LFG rooms." | true / `wait_or_end_other_room` |
+| `CAP_DAILY` | "This server has used today's LFG room creates." | true / `retry_tomorrow` |
 | `CATEGORY_FULL` | "The category is full." | false / `staff_free_category_slot` |
 | `RATE_LIMITED` | "Try again shortly." | true / `retry_after_backoff` |
 | `UNKNOWN_OUTCOME` | "Discord did not confirm the room; do not retry." | false / `staff_check_category` |
+| `LINK_PENDING` | "Room created, but the post link could not be added." | false / `staff_check_post` |
 | `UNAVAILABLE` | "That post is not available here." (collapses missing/foreign/denied) | false / `verify_post_id` |
 | `STORE_UNAVAILABLE` | "Could not save; nothing changed." | true / `retry_after_backoff` |
 
@@ -304,7 +323,8 @@ map](README.md). Stable envelope: `schema=lfg.voice_room.v1`, `guild_id`,
 `post_id`, `room_channel_id` (null unless bound and visible to the actor), `state`,
 `reason`, `retryable`, `next_action`, `dry_run`, `window{opens,closes}`, `name`
 (preview only), `category_id`, `user_limit`, `caps{live,live_cap}`, `moved=0`.
-Preview is the dry run. Denied replies omit channel and window. No raw SQL or
+Preview is the dry run. Denied replies keep the same envelope with `room_channel_id`
+and `window` set to null, never omitted. No raw SQL or
 Discord errors. Stable room/post IDs are the only identity.
 
 This design's offline check has no environment selector, credentials, network,
@@ -337,10 +357,14 @@ require zero DMs, zero mentions and zero other-guild data.
 | post_deleted | Post row absent -> POST_MISSING |
 | foreign_guild | Interaction guild `g2` for `p1` -> UNAVAILABLE |
 | foreign_post | Post owned by `g2` -> UNAVAILABLE |
-| guild_cap | 5 live rooms -> CAP_GUILD |
+| guild_cap | 5 live rooms (creating/active/winding_down/locked/held) -> CAP_GUILD |
+| daily_cap | 20 creates used today, fewer than 5 live -> CAP_DAILY, no create |
+| held_counts | Held claim plus 4 live rooms -> CAP_GUILD on next create (held counts) |
 | category_full | `c1` has 50 channels -> CATEGORY_FULL |
 | rate_limited | Second confirm by actor within 60 s -> RATE_LIMITED |
 | unknown_outcome | Create returns bodyless 2xx -> UNKNOWN_OUTCOME, claim held, no repost |
+| edit_failed | Create succeeds, post edit fails -> LINK_PENDING, room active and counted, sweep re-edits |
+| close_during_create | Close arrives with create in flight -> HELD, close pends, no repost, no delete |
 | no_auto_create | Post created or edited -> NOOP, no create |
 | signup_no_move | Member signs up while room live -> NOOP, no move |
 | never_occupied | Open post, room empty past 60 s -> NOOP, room kept |
@@ -358,7 +382,8 @@ require zero DMs, zero mentions and zero other-guild data.
 | restart_claim | Restart with fresh `creating` claim -> HELD, no second create |
 | unknown_state | Row has unknown state value (version skew) -> HELD, no write |
 | flag_off_cleanup | Flag turned off with live room, post closed -> DELETED after grace |
-| erasure | Organizer erased -> UNCHANGED, room lifecycle continues, no identity left |
+| erasure_actor | Non-creator organizer erased, post survives -> UNCHANGED, audit identity removed |
+| erasure_creator | Creator erased, post hard-deleted -> DELETED after grace (close path) |
 | store_outage | Store fails before transaction -> STORE_UNAVAILABLE, never assumed created |
 
 Runnable offline document check (Python stdlib; from repo root):
@@ -398,9 +423,13 @@ implementation task is created by this proposal.
 ...     ("foreign_guild", "UNAVAILABLE") + Z,
 ...     ("foreign_post", "UNAVAILABLE") + Z,
 ...     ("guild_cap", "CAP_GUILD") + Z,
+...     ("daily_cap", "CAP_DAILY") + Z,
+...     ("held_counts", "CAP_GUILD") + Z,
 ...     ("category_full", "CATEGORY_FULL") + Z,
 ...     ("rate_limited", "RATE_LIMITED") + Z,
 ...     ("unknown_outcome", "UNKNOWN_OUTCOME") + Z,
+...     ("edit_failed", "LINK_PENDING", 1, 0, 0, 0),
+...     ("close_during_create", "HELD") + Z,
 ...     ("no_auto_create", "NOOP") + Z,
 ...     ("signup_no_move", "NOOP") + Z,
 ...     ("never_occupied", "NOOP") + Z,
@@ -418,7 +447,8 @@ implementation task is created by this proposal.
 ...     ("restart_claim", "HELD") + Z,
 ...     ("unknown_state", "HELD") + Z,
 ...     ("flag_off_cleanup", "DELETED", 0, 0, 1, 0),
-...     ("erasure", "UNCHANGED") + Z,
+...     ("erasure_actor", "UNCHANGED") + Z,
+...     ("erasure_creator", "DELETED", 0, 0, 1, 0),
 ...     ("store_outage", "STORE_UNAVAILABLE") + Z,
 ... ]
 >>> _lines = pathlib.Path("docs/lfg-voice-room-spec.md").read_text().splitlines()
@@ -429,22 +459,27 @@ implementation task is created by this proposal.
 ...         break
 ...     _matrix.append(_l.split("|")[1].strip())
 >>> assert _matrix == [row[0] for row in oracle], set(_matrix) ^ {row[0] for row in oracle}
->>> assert len({row[0] for row in oracle}) == len(oracle) == 40
+>>> assert len({row[0] for row in oracle}) == len(oracle) == 45
 >>> assert all(row[5] == 0 for row in oracle)  # never moves a member
 >>> assert all(row[2] <= 1 for row in oracle)  # at most one create
->>> assert all((row[2] == 1) == (row[1] == "CREATED") for row in oracle)
+>>> assert all((row[2] == 1) == (row[1] in ("CREATED", "LINK_PENDING")) for row in oracle)
 >>> assert all(row[3] + row[4] <= 1 for row in oracle)  # lock xor delete per snapshot
->>> assert all(row[2:] == Z for row in oracle if row[1] in ("UNAVAILABLE", "NO_CATEGORY", "PERM_MISSING", "CAP_GUILD", "UNKNOWN_OUTCOME", "STORE_UNAVAILABLE", "HELD"))
+>>> assert all(row[2:] == Z for row in oracle if row[1] in ("UNAVAILABLE", "NO_CATEGORY", "PERM_MISSING", "CAP_GUILD", "CAP_DAILY", "UNKNOWN_OUTCOME", "STORE_UNAVAILABLE", "HELD"))
 >>> assert sum(1 for row in oracle if row[0].startswith("foreign_")) == 3
 >>> assert all(row[1] == "UNAVAILABLE" for row in oracle if row[0] in ("foreign_guild", "foreign_post"))
 >>> assert dict((row[0], row[1]) for row in oracle)["flag_off_cleanup"] == "DELETED"
 >>> assert dict((row[0], row[1]) for row in oracle)["expire_occupied"] == "WINDING_DOWN"
+>>> _cc_rooms = {"caller_a": "ch_9f3a", "caller_b": "ch_9f3a"}  # concurrent_confirm: both callers get the same room
+>>> assert _cc_rooms["caller_a"] == _cc_rooms["caller_b"]
+>>> assert dict((row[0], row[2]) for row in oracle)["concurrent_confirm"] == 1
+>>> assert dict((row[0], row[1]) for row in oracle)["erasure_actor"] == "UNCHANGED"
+>>> assert dict((row[0], row[1]) for row in oracle)["erasure_creator"] == "DELETED"
 >>> starts = 1_000_000
 >>> opens, closes, overdue = starts - 3600, starts + 900, starts + 6 * 3600
 >>> assert closes - opens == 4500  # a never-occupied room lives at most 75 minutes
 >>> assert opens < starts < closes < overdue
 >>> print(json.dumps({"schema": "lfg.voice_room.oracle.v1", "fixtures": len(oracle), "status": "pass"}, sort_keys=True))
-{"fixtures": 40, "schema": "lfg.voice_room.oracle.v1", "status": "pass"}
+{"fixtures": 45, "schema": "lfg.voice_room.oracle.v1", "status": "pass"}
 
 ```
 
@@ -466,7 +501,7 @@ room; the 5 live room / 20 per day caps; and the separate binding table without
 member identity. On any material revision, bind a fresh review request and
 alignment to that revision.
 
-By 2026-10-31, metric is **all 40 fixture-matrix rows have agreed or explicitly
+By 2026-10-31, metric is **all 45 fixture-matrix rows have agreed or explicitly
 rejected outcomes, and the three blocking findings have written disposition**.
 This measures design completeness, not engagement. Keep this proposal only if the
 fixtures show a bounded lifecycle with no unsolicited moves and no new spend;
