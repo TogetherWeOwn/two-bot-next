@@ -1097,7 +1097,7 @@ async fn access_post_save_acknowledgements_stay_short_and_point_at_the_read_view
     // Invalid mutations and save failures keep their honest copy with no ack.
     for sub in [
         sub_option("restrict", vec![command_option("command", "kik")]),
-        sub_option("unrestrict", vec![command_option("command", "kick")]),
+        sub_option("unrestrict", vec![command_option("command", "limit")]),
         sub_option("bogus", vec![]),
     ] {
         let before = shared.lock().unwrap().clone();
