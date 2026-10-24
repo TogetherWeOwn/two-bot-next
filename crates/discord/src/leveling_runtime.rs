@@ -5,7 +5,10 @@
 //! tasks or std mutex held over an await. The single-shard runner thus preserves
 //! member order (including READY/RESUMED barriers) with bounded backpressure.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 use sqlx::PgPool;
 use twilight_model::{
@@ -703,7 +706,7 @@ impl LevelingRuntime {
         }
     }
 
-    async fn award(&self, request: AwardRequest) -> Result<Option<XpAward>, LevelingRuntimeError> {
+    async fn award(&self, request: &AwardRequest) -> Result<Option<XpAward>, LevelingRuntimeError> {
         if self.configured_guild != request.guild_id {
             return Ok(None);
         }
@@ -739,7 +742,7 @@ impl LevelingRuntime {
             && !self.onboarding.dry_run
             && two_bot_core::onboarding::level_role_writes_allowed(self.onboarding.mode)
         {
-            self.apply_level_roles(&request, &guild, result.level)
+            self.apply_level_roles(request, &guild, result.level)
                 .await
                 .map_err(|cause| LevelingRuntimeError::RoleApplication {
                     cause,
@@ -747,6 +750,30 @@ impl LevelingRuntime {
                 })?;
         }
         Ok(Some(result))
+    }
+
+    /// Best-effort celebrations never change the committed award or retry an
+    /// uncertain send. The shared executor suppresses all mention parsing.
+    async fn announce_level_ups(&self, announcements: BTreeMap<Snowflake, (Snowflake, u64)>) {
+        if self.onboarding.dry_run
+            || !two_bot_core::onboarding::level_role_writes_allowed(self.onboarding.mode)
+        {
+            return;
+        }
+        for (member, (channel, level)) in announcements {
+            let content =
+                format!("🎉 <@{member}> reached level {level}! Check /rank for your progress.");
+            if let Err(error) = self
+                .executor
+                .post_message(&channel.to_string(), &content, None)
+                .await
+            {
+                tracing::warn!(
+                    cause = error.cause(),
+                    "level-up announcement delivery failed"
+                );
+            }
+        }
     }
 
     /// Plan and apply the level-up roles after the award committed.
@@ -1073,13 +1100,31 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
         self.pending.check_healthy()?;
         let mut results = Vec::with_capacity(requests.len());
         if let Some(runtime) = &self.runtime {
+            let mut announcements = BTreeMap::new();
             for request in requests {
-                match runtime.award(request).await {
+                let outcome = runtime.award(&request).await;
+                // A role failure still carries this request's committed XP.
+                // Only fresh message crossings can create a celebration;
+                // voice, decay and reconciliation never enter this path.
+                let committed = match &outcome {
+                    Ok(award) => award.as_ref(),
+                    Err(error) => error.committed_awards().first(),
+                };
+                if let Some(award) = committed.filter(|award| {
+                    request.duration.is_none() && award.awarded > 0 && award.leveled_up
+                }) {
+                    announcements.insert(request.member_id, (request.channel_id, award.level));
+                }
+                match outcome {
                     Ok(Some(award)) => results.push(award),
                     Ok(None) => {}
-                    Err(error) => return Err(error.with_prior_awards(results)),
+                    Err(error) => {
+                        runtime.announce_level_ups(announcements).await;
+                        return Err(error.with_prior_awards(results));
+                    }
                 }
             }
+            runtime.announce_level_ups(announcements).await;
         }
         Ok(results)
     }
@@ -1317,6 +1362,8 @@ mod tests {
                     Method::PUT,
                     "/api/v10/guilds/100/members/201/roles/555555555555555555".into()
                 ),
+                (Method::POST, "/api/v10/channels/300/messages".into()),
+                (Method::POST, "/api/v10/channels/300/messages".into()),
             ]
         );
     }

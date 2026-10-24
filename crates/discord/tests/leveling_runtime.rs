@@ -56,6 +56,20 @@ fn runtime(pool: PgPool, mock: &MockRest, mode: OnboardingMode) -> LevelingRunti
         },
     )
 }
+fn assert_celebration(request: &common::RestRequest) {
+    assert_eq!(request.method, "POST");
+    assert_eq!(
+        request.path,
+        format!("/api/v10/channels/{CHANNEL}/messages")
+    );
+    let body: Value = serde_json::from_slice(&request.body).unwrap();
+    let content = body["content"].as_str().expect("celebration text");
+    assert!(content.to_lowercase().contains("level 1"));
+    assert!(content.chars().count() <= 200);
+    assert!(!content.contains("@everyone") && !content.contains("@here"));
+    assert_eq!(body["allowed_mentions"]["parse"], json!([]));
+}
+
 fn message(seconds: i64) -> Event {
     Event::MessageCreate(Box::new(serde_json::from_value(json!({
         "id":(4_000_000_000_000_000_000_u64 + seconds as u64).to_string(),"guild_id":GUILD.to_string(),"channel_id":CHANNEL.to_string(),"author":user(MEMBER),"content":"hello there","timestamp":at(seconds).replace('Z', "+00:00"),"edited_timestamp":null,"tts":false,"mention_everyone":false,"mentions":[],"mention_roles":[],"attachments":[],"embeds":[],"pinned":false,"type":0,"components":[]
@@ -243,6 +257,7 @@ async fn ordered_gateway_concurrent_sources_award_once_and_read_back_rewards() {
         vec![
             ScriptedResponse::json(200, json!({"roles":[]})),
             ScriptedResponse::status(204),
+            ScriptedResponse::json(200, json!({"id":"900000000000000001"})),
         ],
         ScriptedResponse::status(500),
     )
@@ -301,10 +316,15 @@ async fn ordered_gateway_concurrent_sources_award_once_and_read_back_rewards() {
         .unwrap();
     assert_eq!(awards, 2);
     let requests = mock.requests();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
     assert_eq!(requests[0].method, "GET");
+    assert_eq!(
+        requests[0].path,
+        format!("/api/v10/guilds/{GUILD}/members/{MEMBER}")
+    );
     assert_eq!(requests[1].method, "PUT");
     assert!(requests[1].path.ends_with(&format!("/roles/{ROLE}")));
+    assert_celebration(&requests[2]);
     // Fresh member-role readback produces no grants after the first plan applied.
     let ladder = store::role_rewards(&db.pool, &GUILD.to_string())
         .await
@@ -440,8 +460,11 @@ async fn slow_reward_reads_yield_tokio_and_do_not_reorder_later_member_events() 
     let db = TestDb::new().await;
     db.seed(90).await;
     let mock = MockRest::start(
-        vec![ScriptedResponse::json(200, json!({"roles":[ROLE]}))
-            .delayed(Duration::from_millis(300))],
+        vec![
+            ScriptedResponse::json(200, json!({"roles":[ROLE]}))
+                .delayed(Duration::from_millis(300)),
+            ScriptedResponse::json(200, json!({"id":"900000000000000001"})),
+        ],
         ScriptedResponse::status(500),
     )
     .await;
@@ -471,7 +494,14 @@ async fn slow_reward_reads_yield_tokio_and_do_not_reorder_later_member_events() 
     .await
     .unwrap();
     assert_eq!(rows[1] - rows[0], 60);
-    assert_eq!(mock.requests().len(), 1);
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].method, "GET");
+    assert_eq!(
+        requests[0].path,
+        format!("/api/v10/guilds/{GUILD}/members/{MEMBER}")
+    );
+    assert_celebration(&requests[1]);
     mock.shutdown().await;
     db.close().await;
 }
@@ -503,7 +533,25 @@ async fn gateway_reward_and_interaction_executor_errors_propagate() {
         .handle_interaction(&interaction("rank", false), HandlerId::Rank)
         .await
         .is_err());
-    assert_eq!(mock.requests().len(), 2);
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].method, "GET");
+    assert_eq!(
+        requests[0].path,
+        format!("/api/v10/guilds/{GUILD}/members/{MEMBER}")
+    );
+    assert_celebration(&requests[1]);
+    assert_eq!(requests[2].method, "POST");
+    assert_eq!(
+        requests[2].path,
+        "/api/v10/interactions/7/mock-callback/callback"
+    );
+    let callback: Value = serde_json::from_slice(&requests[2].body).unwrap();
+    assert_eq!(callback["data"]["flags"], 64);
+    let profile = store::profile(&db.pool, &GUILD.to_string(), &MEMBER.to_string())
+        .await
+        .unwrap();
+    assert_eq!((profile.xp, profile.message_xp), (105, 15));
     mock.shutdown().await;
     db.close().await;
 }
