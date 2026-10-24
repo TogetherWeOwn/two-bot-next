@@ -124,7 +124,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Scheduled queue order](schedule-queue-order.md)
 - [Scheduled skip tests](scheduled-events-skip-acceptance.md)
 - [Scheduled event reminders](event-reminders.md)
-- [Proposed member reminder quiet hours (design only)](event-reminder-preferences-spec.md)
+- [Reminder preference baseline and stop recommendation (design only)](event-reminder-preferences-spec.md)
 - [Proposed RSVP seats and opt-in waitlist (design only)](rsvp-capacity-spec.md)
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
 - [Ticket runtime](tickets.md)
