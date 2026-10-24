@@ -6,8 +6,9 @@
 //! Contract for `two_bot_core::metrics`, following the existing fixed-size,
 //! allowlist pattern (`presence_capture`, `internal_action`):
 //!
-//! - `EVENTSUB_DELIVERY_KINDS` is exactly
-//!   `["challenge", "notification", "revocation", "tampered", "ignored", "other"]`.
+//! - `EVENTSUB_DELIVERY_KINDS` is exactly the five outcome kinds, then one
+//!   snake_case label per `EventSubError` variant (13), then the trailing
+//!   `other` absorbing unknown strings.
 //! - `EVENTSUB_POST_OUTCOMES` is exactly
 //!   `["attempted", "succeeded", "failed", "other"]`.
 //! - `Metrics::eventsub_received()` increments the label-free counter
@@ -44,6 +45,19 @@ fn stream_metrics_eventsub_vocabularies_are_exactly_the_allowlists() {
             "revocation",
             "tampered",
             "ignored",
+            "invalid_secret",
+            "invalid_header",
+            "body_too_large",
+            "bad_signature",
+            "invalid_timestamp",
+            "stale_timestamp",
+            "invalid_body",
+            "duplicate_keys",
+            "wrong_subscription",
+            "invalid_challenge",
+            "invalid_callback",
+            "invalid_broadcaster_id",
+            "too_many_broadcasters",
             "other"
         ]
     );
@@ -137,6 +151,18 @@ fn stream_metrics_eventsub_counters_increment_on_each_delivery_kind() {
         assert!(series.insert(key), "duplicate series: {key}");
         assert!(value.parse::<f64>().is_ok(), "bad sample: {line}");
     }
+}
+
+#[test]
+fn stream_metrics_duplicate_keys_increment_without_collapsing_to_other() {
+    let metrics = Metrics::default();
+    metrics.eventsub_classified("duplicate_keys");
+    metrics.eventsub_classified("duplicate_keys");
+    let text = metrics.render(None);
+    assert!(text.contains("two_bot_eventsub_classified_total{kind=\"duplicate_keys\"} 2\n"));
+    assert!(text.contains("two_bot_eventsub_classified_total{kind=\"invalid_body\"} 0\n"));
+    assert!(text.contains("two_bot_eventsub_classified_total{kind=\"ignored\"} 0\n"));
+    assert!(text.contains("two_bot_eventsub_classified_total{kind=\"other\"} 0\n"));
 }
 
 #[test]

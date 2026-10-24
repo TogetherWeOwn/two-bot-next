@@ -309,15 +309,12 @@ class StaticGuardTests(unittest.TestCase):
         self.assertEqual(value(unstaged["required"]), "false")
         self.assertEqual(value(unstaged["type"]), "boolean")
         self.assertEqual(value(unstaged["default"]), "false")
-        # The error-rate drill switch stays declared only so a dispatch that
-        # names it reaches the guard's refusal (pointing to staging) instead
-        # of a bare unexpected-input error.
-        drill = children(inputs["inject_error_rate_spike"][1:], 8)
-        self.assertEqual(value(drill["required"]), "false")
-        self.assertEqual(value(drill["type"]), "boolean")
-        self.assertEqual(value(drill["default"]), "false")
-        self.assertIn("REFUSED on production", value(drill["description"]))
-        self.assertIn("deploy-staging", value(drill["description"]))
+        # Unknown inputs are rejected by GitHub before a production run.
+        self.assertEqual(set(inputs), {"sha", "rollback", "image", "allow_unstaged", "takeover", "cutover_hold"})
+        self.assertNotIn("inject_error_rate_spike", "\n".join(LINES))
+        self.assertNotIn("INJECT_ERROR_RATE_SPIKE", "\n".join(LINES))
+        self.assertNotIn("inject_gateway_failure", "\n".join(LINES))
+        self.assertNotIn("--rehearsal-firing", "\n".join(LINES))
         text = "\n".join(TOP["on"])
         for trigger in ("push", "pull_request", "pull_request_target", "workflow_call"):
             self.assertNotRegex(text, rf"(?m)^\s*{trigger}:", trigger)
@@ -423,11 +420,9 @@ class StaticGuardTests(unittest.TestCase):
                                        "IMAGE: ${{ inputs.image }}",
                                        "ALLOW_UNSTAGED: ${{ inputs.allow_unstaged }}",
                                        "TAKEOVER: ${{ inputs.takeover }}",
-                                       "CUTOVER_HOLD: ${{ inputs.cutover_hold }}",
-                                       "INJECT_ERROR_RATE_SPIKE: ${{ inputs.inject_error_rate_spike }}"])
+                                       "CUTOVER_HOLD: ${{ inputs.cutover_hold }}"])
         production = "\n".join(JOBS["production"])
-        # No production step reads any input: the drill switch reaches the
-        # guard only, which refuses it (failure injection is staging-only).
+        # No production step reads any raw input or fault switch.
         self.assertEqual([line for line in production.splitlines() if "inputs." in line], [])
         self.assertNotIn("INJECT_ERROR_RATE_SPIKE", production)
         self.assertNotIn("--rehearsal-firing", production)
@@ -685,14 +680,12 @@ class StaticGuardTests(unittest.TestCase):
                 self.assertIn(name, env)
                 self.assertEqual(value(env[name]), "${{ github.event.workflow_run." + field + " }}")
 
-    def test_drill_switch_reaches_only_the_guard_which_refuses_it(self):
-        # Failure injection never runs against production (10-20 20:54Z):
-        # the guard receives the switch only to refuse it, and the error-rate
-        # gate step has no rehearsal path left to arm.
-        guard_job = "\n".join(JOBS["guard"])
-        self.assertIn("INJECT_ERROR_RATE_SPIKE: ${{ inputs.inject_error_rate_spike }}", guard_job)
-        self.assertIn("failure injection never runs against production", GUARD)
-        self.assertIn("dispatch deploy-staging with inject_error_rate_spike true", GUARD)
+    def test_drill_switch_is_absent_and_production_gate_is_live_only(self):
+        workflow = "\n".join(LINES)
+        self.assertNotIn("inject_error_rate_spike", workflow)
+        self.assertNotIn("INJECT_ERROR_RATE_SPIKE", workflow)
+        self.assertNotIn("--rehearsal-firing", workflow)
+        self.assertNotIn('os.environ.get("INJECT_', GUARD)
         run = inline_script("Gate promotion on REST 5xx error rate")
         for needle in ('--metrics-url "$PRODUCTION_URL"', "--evidence",
                        '--sha "$SHA"', '--user-agent "two-bot-next-production-rollout/1.0"'):
@@ -1708,31 +1701,26 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(outputs["skip"].startswith("held until"), outputs)
 
-    # Rule 1 (10-20 20:54Z): failure injection never runs against
-    # production, in any mode or combination; the refusal points to staging.
-    def test_drill_spike_is_refused_in_every_production_combination(self):
-        for label, kwargs in {
-            "deploy with takeover (the 20:54Z drill)": {"takeover": "true"},
-            "deploy without takeover": {"takeover": "false"},
-            "deploy with cutover hold": {"cutover_hold": "true"},
-            "rollback": {"takeover": "true", "rollback": VERSION},
-            "live-SHA cure": {"takeover": "true", "allow_unstaged": "true"},
-            "automatic run": {"event": "schedule", "sha": ""},
-        }.items():
-            with self.subTest(label):
-                result = self.guard(spike="true", **kwargs)
-                self.assertRefused(result, "failure injection never runs against production")
-                self.assertRefused(result, "dispatch deploy-staging with inject_error_rate_spike true")
-                # Refused before any GitHub or production read.
-                self.assertFalse([c for c in result[3] if c[0] != f"repos/{REPO}/actions/workflows/deploy-staging.yml/runs"])
+    # The removed environment variable cannot arm anything, even if inherited
+    # from a stale runner. Input absence itself is pinned against raw YAML.
+    def test_removed_drill_environment_cannot_change_guard_decisions(self):
+        for kwargs in ({"takeover": "true"}, {"takeover": "false"}, {"cutover_hold": "true"},
+                       {"event": "schedule", "sha": ""}):
+            baseline = self.guard(**kwargs)
+            for spike in ("true", "false", "yes"):
+                with self.subTest(kwargs=kwargs, spike=spike):
+                    result = self.guard(spike=spike, **kwargs)
+                    self.assertEqual(result[0], baseline[0])
+                    self.assertEqual(result[1], baseline[1])
+                    self.assertEqual(result[3], baseline[3])
 
-    def test_drill_spike_false_or_absent_still_deploys(self):
-        for spike in ("", "false"):
-            with self.subTest(spike=spike):
-                code, outputs, _, _, _ = self.guard(spike=spike)
-                self.assertEqual(code, 0)
-                self.assertEqual(outputs["skip"], "")
-        self.assertRefused(self.guard(spike="yes"), "inject_error_rate_spike must be true or false")
+    def test_removed_drill_input_has_no_guard_or_gate_reader(self):
+        workflow = "\n".join(LINES)
+        self.assertNotIn("inject_error_rate_spike", workflow.lower())
+        self.assertNotIn("--rehearsal-firing", workflow)
+        self.assertNotIn("inject_gateway_failure", workflow)
+        self.assertNotIn("spike =", GUARD)
+        self.assertNotIn("INJECT_ERROR_RATE_SPIKE", GUARD)
 
     # Rule 2 (10-20 13:31Z): a manual deploy can never leave production
     # fenced. Deploy mode takes over by default; only cutover_hold skips it.
