@@ -74,10 +74,18 @@ check still applies after substitution and still refuses the whole render.
 option named `arguments` with `max_length: 500` (a client UX hint only; the
 server-side unit count is authoritative). The option is read strictly with
 `single_string_option` semantics: Missing → absent; duplicate or forged
-non-string type → malformed. Validation precedes the definition lookup
-(inspect precedent), so malformed/overflow input costs no store read. Absent
-and empty-string values substitute the empty string — templates without
-`{args}` behave byte-identically, and there is no "required args" concept.
+non-string type → malformed. Precedence is fence, routing/gating, per-guild
+definition lookup, then argument validation: unknown, deleted, disabled or
+other-guild rows keep their existing silent/miss behavior and arguments are
+never read for them (the custom slash path looks up before deferring so
+unknown commands stay silent). Only for a known enabled row are arguments
+read and validated; malformed/overflow input then receives the ephemeral
+correction in §5 after one scoped store read. The inspect before-lookup
+validation does not transfer here: inspect runs only after routing has
+enforced guild/ManageGuild/feature gates for a known management command.
+Absent and empty-string values substitute the empty string — templates
+without `{args}` behave byte-identically, and there is no "required args"
+concept.
 
 **Prefix capture.** Remainder after the first token: `trigger_word` locates
 the trigger, one run of leading ASCII whitespace after that token is skipped,
@@ -107,8 +115,10 @@ stay quiet, as render failures do today). Preview: the existing
   so `{args}`, `{user}` or braces inside arguments render literally. No
   nesting, no second placeholder, no template-language expansion.
 - New invariant for the build: run paths validate the template immediately
-  before render, so version skew fails closed (see §6) instead of leaking a
-  literal placeholder.
+  before render, so a template that fails the new validation is refused
+  instead of rendering a literal placeholder (for example imported or
+  corrupt rows). Old binaries lack this check; their skew behavior is
+  defined in §6.
 - Channel-bound output (slash completion, prefix POST) keeps the existing
   double defense unchanged: `neutralize_mentions` over the rendered content
   plus `allowed_mentions: { parse: [] }` at the REST boundary. Arguments
@@ -132,7 +142,7 @@ carries member content.
 | Path | Condition | Member-visible result | Audit | `next_action` |
 | --- | --- | --- | --- | --- |
 | Slash | duplicate/forged `arguments` | Ephemeral `Invalid arguments: expected a single text value. Example: /quote arguments:hello` | none | `send_one_text_arguments_option` |
-| Slash | args over 500 units | Ephemeral `Arguments must be at most 500 characters. Shorten them and retry.` | none | `shorten_arguments_and_retry` |
+| Slash | args over 500 units | Ephemeral `Arguments must be at most 500 UTF-16 units. Shorten them and retry.` | none | `shorten_arguments_and_retry` |
 | Prefix | args over 500 units | silence (no POST) | `command.run` failed, `args_too_long` | `shorten_and_resend` (documented; not posted) |
 | Preview | malformed/over sample | existing `invalid_inspect_option_reply` text | never `command.run` | `fix_sample_and_preview` |
 | Any run | rendered output over 2,000 units | existing render-failure behavior (`render_failed`) | existing failed fact | `shorten_template_or_arguments` |
@@ -143,10 +153,13 @@ other refusal reuses the existing vocabulary.
 ## 6. Guild isolation, restart and version behavior
 
 - Guild isolation is unchanged: the configured-guild fence, per-guild row
-  lookup and same-guild preview read all precede argument handling, and
-  arguments never influence lookup scope. One guild's arguments can never
-  render into another guild's channel; unknown, other-guild-only and deleted
-  rows keep their existing silent/miss behavior before arguments are read.
+  lookup and same-guild preview read all precede argument handling (§3
+  precedence: fence, routing/gating, lookup, then argument validation),
+  and arguments never influence lookup scope. One guild's arguments can
+  never render into another guild's channel; unknown, other-guild-only,
+  deleted and disabled rows keep their existing silent/miss behavior
+  before arguments are read, including for malformed or over-long
+  arguments (no validation correction for rows that miss).
 - Arguments are request-scoped and never stored: no new table, column, queue
   or log field. A restart drops in-flight arguments; slash replay keeps
   first-write-wins audit (`custom:run:<interaction_id>`); prefix redelivery
@@ -154,9 +167,11 @@ other refusal reuses the existing vocabulary.
   state means no new replay rule.
 - Version: validation, render, publish and preview changes ship in one
   build. A new `{args}` template on an old binary renders the literal text
-  `{args}` (old binaries ignore slash options and never read prefix
-  arguments): no member content is involved, so the skew leaks nothing.
-  Old templates on a new binary behave byte-identically. Downgrade removes
+  `{args}` (old binaries lack the §4 pre-render validation check, ignore
+  slash options and never read prefix arguments): no member content is
+  involved, so the skew leaks nothing. Old templates (valid under the old
+  four-key placeholder set) on a new binary behave byte-identically.
+  Downgrade removes
   the slash option at the next full-registry republish; a stale client that
   still sends `arguments` is ignored by option-less binaries. No
   mixed-version fleet claim is made — see the unverified assumptions in §10.
@@ -189,9 +204,9 @@ approval and alignment.
 | --- | --- | --- |
 | ARG-01 | slash, `arguments` absent | `{args}` renders as empty; template without `{args}` byte-identical to today |
 | ARG-02 | slash, `arguments` empty string | same as ARG-01 |
-| ARG-03 | slash, duplicate/forged `arguments` | ephemeral malformed correction; no audit row; no store read |
+| ARG-03 | slash, duplicate/forged `arguments` on a known enabled row | one scoped lookup precedes the refusal; ephemeral malformed correction; no audit row |
 | ARG-04 | slash, exactly 500 units | renders; single delivery; `command.run` ok |
-| ARG-05 | slash, 501 units | ephemeral overflow correction; no audit row |
+| ARG-05 | slash, 501 units on a known enabled row | one scoped lookup precedes the refusal; ephemeral overflow correction; no audit row |
 | ARG-06 | slash, 250 emoji (500 units) vs 251 (502) | boundary obeys UTF-16 counting, not char count |
 | ARG-07 | hostile mass mentions (`@everyone`, `@here`, zero-width-split forms) | byte-identical mention treatment to the same text via existing template inputs; no ping |
 | ARG-08 | pills and links (`<@id>`, `<@&id>`, `<#id>`, `https://…`) | inert text under `parse: []`; URL embeds at most as a member message would |
@@ -203,8 +218,9 @@ approval and alignment.
 | ARG-14 | preview sample over 500 / malformed | existing inspect correction; no `command.run`; no send |
 | ARG-15 | preview renders `{args}` from sample | ephemeral escaped preview shows substituted sample; dry-run only |
 | ARG-16 | slash replay, same interaction id | first-write-wins audit preserved; re-entry returns its own delivery outcome |
-| ARG-17 | foreign guild / unknown row with args | existing silence/miss; arguments never read across guilds |
+| ARG-17 | foreign guild / unknown / deleted / disabled row with well-formed, malformed and over-long args | existing silence/miss in all three; arguments never read; no validation correction |
 | ARG-18 | `{args}` repeated in one template | every occurrence receives the same value in one pass |
+| ARG-19 | slash, unknown row plus duplicate `arguments` option | existing silence/miss; no ephemeral correction; no audit row |
 
 Runnable check now (no new target exists yet):
 
@@ -220,7 +236,7 @@ acceptance.
 
 ## 9. Agent and adapter contract (future)
 
-- Stable fixture IDs `ARG-01…ARG-18`; closed reason codes
+- Stable fixture IDs `ARG-01…ARG-19`; closed reason codes
   (`args_malformed`, `args_too_long`, plus existing vocabulary);
   `next_action` strings from §5.
 - Dry-run preview: `/command-inspect name:<name> view:preview
