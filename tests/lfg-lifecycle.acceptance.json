@@ -1,0 +1,80 @@
+{
+  "schema": "two-bot.acceptance.v1",
+  "title": "Dead and orphaned LFG lifecycle",
+  "base_sha": "fffae20366719cbfdb79a4ed934d88416847c8df",
+  "protected_files": [
+    {
+      "path": "crates/discord/tests/lfg_lifecycle_acceptance.rs",
+      "sha256": "dd3315ae6059d2d13f39c9b6610869a1d1d474781ec0af4da24d34db374eff1b"
+    },
+    {
+      "path": "crates/bot/src/lfg_lifecycle_jobs_acceptance.rs",
+      "sha256": "2ff5ddf9f94b9dca1c0a988a03ae1f7951578503e7fffa10dd376b037b000624"
+    }
+  ],
+  "ownership": "Test Author owns corrections. Builder must not edit the protected corpus or this manifest; consume the immutable acceptance head and make the combined change green.",
+  "test_target": "lfg_lifecycle_acceptance",
+  "supervisor_target": "two-bot bin unit lfg_lifecycle_jobs_acceptance",
+  "new_acceptance_tests": 16,
+  "registration": "The existing workspace --test '*' integration lane runs the non-ignored db-feature discord target (15 cases) with TWO_TEST_DATABASE_URL. The supervised-job case lives in the bot crate (registered via #[cfg(test)] mod in main.rs, the backfill-acceptance precedent) and runs in the workspace lib/bins unit lane with the same disposable-DB env. A source-path include of the binary's jobs.rs cannot compile: its #[cfg(test)] jobs_tests module resolves crate:: paths against the including test crate.",
+  "commands": {
+    "controller": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test lfg_lifecycle_acceptance -- --test-threads=1 --nocapture",
+    "hosted_ci": "cargo test -p two-bot-discord --features db --locked --test lfg_lifecycle_acceptance -- --test-threads=1 --nocapture",
+    "controller_supervisor": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot -- lfg_lifecycle_jobs_acceptance --test-threads=1 --nocapture",
+    "hosted_ci_supervisor": "cargo test -p two-bot --locked --bin two-bot -- lfg_lifecycle_jobs_acceptance --test-threads=1 --nocapture",
+    "offline": [
+      "cargo fmt --all -- --check",
+      "python3 scripts/ci/check-floor-guard.py --base-ref origin/main",
+      "python3 scripts/ci/check-test-inventory.py",
+      "python3 scripts/check-secret-debug.py",
+      "git diff --check"
+    ]
+  },
+  "safety": {
+    "database": "TestDatabase::create with cutover migrations, the shared disposable-DB guard, and explicit close before behavioral assertions. No fallback URL and no skipped DB setup failures.",
+    "discord": "Loopback MockRest only, using the real ActionExecutor proxy seam. No live Discord, staging, production or deployment.",
+    "red_delivery": "Branch handoff only. Do not merge a deliberately red test-only PR. Builder owns the combined implementation PR."
+  },
+  "baseline_adapter": {
+    "type": "LfgInteractions",
+    "method": "async fn sweep_lifecycle(&self, executor: &ActionExecutor, guild_id: &str, bot_user_id: u64, now: time::OffsetDateTime, limit: usize) -> Result<usize, LfgError>",
+    "meaning": "The baseline has no sweep. A private test-local trait returns zero and performs no work, representing that absence while keeping the corpus compilable. A production inherent method automatically takes precedence. These adapter-driven cases are not evidence that a production sweep ran on the baseline.",
+    "count_contract": "Count eligible rows processed, at most limit in one invocation. Zero limit does nothing. A settled repeat returns zero. A count alone cannot pass because real retained rows, restored IDs, freed capacity and HTTP edits are asserted independently.",
+    "compatibility": "The explicitly qualified baseline method reference keeps the fallback trait live under clippy after the production inherent method is introduced."
+  },
+  "acceptance": {
+    "stale_posts": [
+      "expired_posts_are_closed_and_their_messages_have_no_signup_controls",
+      "twenty_expired_posts_eventually_free_the_unchanged_twenty_post_cap",
+      "a_past_start_signup_is_refused_without_writing_membership"
+    ],
+    "orphans": [
+      "aged_orphan_recovers_the_bot_nonce_without_reposting",
+      "aged_orphan_without_a_recoverable_message_closes_and_frees_capacity",
+      "a_foreign_author_cannot_rescue_an_orphan_with_a_matching_nonce",
+      "one_failed_message_refresh_does_not_stall_later_rows"
+    ],
+    "truthful_member_copy": [
+      "posted_message_exposes_the_identifier_needed_to_close_it",
+      "committed_signup_refresh_failure_does_not_claim_state_is_unchanged",
+      "committed_close_refresh_failure_does_not_claim_state_is_unchanged"
+    ],
+    "unchanged_controls": [
+      "sweep_preserves_future_posts_young_orphans_and_other_guilds",
+      "zero_budget_does_no_work_even_with_expired_rows",
+      "future_signup_replay_retains_one_membership_and_one_audit",
+      "creation_and_close_still_require_manage_events_at_the_router"
+    ],
+    "jobs_and_observability": [
+      "lifecycle_work_runs_under_the_existing_supervised_job_seam",
+      "lifecycle_job_attempts_have_their_own_counter_not_the_other_bucket"
+    ]
+  },
+  "defaults_and_limits": [
+    "Choose the visible post identifier alternative of the spec (rendered member-visible text), not message-link parsing. The test never treats hidden component custom_id as discoverability.",
+    "Use the bounded job name lfg_sweep so its success/failure counters do not silently enter other.",
+    "Grace and orphan-age policy values remain builder-owned and must be documented. Fixtures deliberately use unequivocally old rows and just-created/future rows rather than invent an unspecified minute threshold.",
+    "The supervisor test is a bot-crate unit test executing the real crate::jobs supervisor and real LFG action against a disposable database. It proves the scheduling seam's behavior; it does not prove production boot registration or exclude a second ad-hoc scheduler. Builder must include boot-wiring evidence and keep the existing jobs seam as the only production scheduler.",
+    "No GREEN prototype, production source change, whole-workspace test run, runtime activation or deployment is part of this Test Author handoff."
+  ]
+}

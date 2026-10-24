@@ -18,7 +18,8 @@ mod offline;
 mod parser_acceptance;
 pub use offline::postgres;
 pub use offline::{
-    lfg_store, query, query_scalar, rsvp_store, ActionExecutor, DiscordError, Error, PgPool,
+    lfg_store, query, query_as, query_scalar, rsvp_store, ActionExecutor, DiscordError, Error,
+    PgPool,
 };
 #[path = "../src/lfg_interactions.rs"]
 pub mod subject;
@@ -390,7 +391,7 @@ async fn refresh_failure_keeps_the_existing_honest_saved_state_suffix() {
         .expect("saved signup");
     assert_eq!(
         reply,
-        "LFG joined. Message refresh failed; the saved state is unchanged."
+        "LFG joined. Message refresh failed; the saved result above still applies."
     );
     assert_eq!(pool.signup_role("post-a", "2").as_deref(), Some("tank"));
     assert_eq!(pool.audits().len(), 1);

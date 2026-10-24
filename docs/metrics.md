@@ -51,7 +51,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_job_runs_total{job,outcome}` | Completed attempts; outcome is `success` or `failure` (including returned errors, timeouts and isolated panics) |
 | `two_bot_job_last_success_timestamp_seconds{job}` | Last successful completion time in Unix seconds; zero means no success recorded |
 | `two_bot_job_consecutive_failures{job}` | Failed completions since the last success; resets to zero on success |
-| `two_bot_job_last_error_class{job,class}` | One-hot class of the last failed completion; clears on success; fixed 16 × 7 = 112 series |
+| `two_bot_job_last_error_class{job,class}` | One-hot class of the last failed completion; clears on success; fixed 17 × 7 = 119 series |
 | `two_bot_voice_operations_total{op,outcome}` | Finished room create/move/delete outcomes; `op` is `create`, `move` or `delete`, `outcome` is `success`, `category_full`, `discord`, `persistence`, `cancelled` or `refused` (create admission refused: cap or rolling burst); retries and 429 backoffs are not outcomes |
 | `two_bot_voice_reconcile_actions_total{action}` | Reconcile changes: newly queued deletes/ownership handoffs and actual access-state transitions; `action` is `delete_enqueued`, `suspended`, `resumed` or `succession_enqueued`. Repeated unchanged passes do not increment these counters |
 | `two_bot_voice_dead_letters_total{action}` | Queue writes that exhausted `QUEUE_MAX_ATTEMPTS` (10); `action` is `create`, `move`, `delete`, `companion`, `ownership`, `kick`, `rename`, `limit` or `other` |
@@ -166,9 +166,9 @@ The supervisor records all three job metrics centrally after each completed
 attempt. Individual periodic jobs need no instrumentation. The current scheduled
 labels are `counter`, `rank`, `scheduled_events`, `presence_probe`,
 `community_scorecard`, `inactivity`, `audit_retry`, `self_role_recovery`, `feeds`,
-`member_unban_sweep`, `automod_expiry`, `settings` and `scheduled_messages`
+`member_unban_sweep`, `automod_expiry`, `lfg_sweep`, `settings` and `scheduled_messages`
 (the two 15 s tickers). The community, audit, recovery, feed, unban-sweep,
-automod-expiry and ticker names may be parked by configuration.
+automod-expiry, LFG lifecycle and ticker names may be parked by configuration.
 All allowlisted series are exposed from process startup at zero, even before the
 first run. A zero success timestamp does not distinguish a parked, never-started,
 still-running or always-failing job; use `/readyz` job status for that distinction.
@@ -190,13 +190,13 @@ not a scheduled-job count and its failures are not instrumented here.
 job names share the `other` counters, timestamp and failure streak; an unknown
 success resets that shared streak, and `other` is now an unknown-name-only
 fallback: every registered producer has its own label.
-`feeds`, `self_role_recovery`, `member_unban_sweep` and `automod_expiry` have
+`feeds`, `self_role_recovery`, `member_unban_sweep`, `automod_expiry` and `lfg_sweep` have
 independent counters, timestamps and streaks: success in any one cannot clear
 failures or change last-success in another or in `other`. Add new scheduled
 names to the compile-time allowlist, never to a dynamic label map. The
 supervisor fixture checks the current website/community, audit,
-scheduled-message, feed, self-role recovery, unban-sweep and automod-expiry
-names against that allowlist.
+scheduled-message, feed, self-role recovery, unban-sweep, automod-expiry and
+LFG lifecycle names against that allowlist.
 
 No scheduler or registration gate changes are implied by these labels. Feed
 supervisor cadence follows the live interval (boot default 300 s, range
@@ -308,16 +308,19 @@ as dynamic labels.
   `invite_snapshot`, `session_checkpoint`, `counter`, `rank`,
   `scheduled_events`, `settings`, `presence_probe`, `community_scorecard`,
   `inactivity`, `audit_retry`, `scheduled_messages`, `feeds`, `self_role_recovery`,
-  `member_unban_sweep`, `automod_expiry`, `other`; `outcome` is `success` or `failure`.
+  `member_unban_sweep`, `automod_expiry`, `lfg_sweep`, `other`; `outcome` is `success` or `failure`.
   `session_checkpoint` records successful durable gateway commits; zero means
   never run. `audit_retry` is the audit supervisor's 30 s retry sweep.
   `member_unban_sweep` is the 30 s unban sweep. `automod_expiry` is the 60 s
   repeat-history expiry tick (real work only when `TWO_AUTOMOD=1`).
+  `lfg_sweep` is the 60 s bounded LFG lifecycle pass (at most 20 candidates,
+  announcements and boot identity gates required); row failures continue the
+  batch with a warning. See [LFG lifecycle](lfg-port.md#bounded-lifecycle-maintenance).
   `settings` is the DB-only 15 s `guild_settings` version poll.
 - `two_bot_job_last_error_class{job,class}` — `job` uses the list above;
   `class` is one of `database`, `rest`, `configuration`, `timeout`, `panic`,
   `feed` or `recovery_required` (the fixed `ErrorClass` variants). Each of the
-  16 jobs has one series per class (112 total); exactly the latest failure's class
+  17 jobs has one series per class (119 total); exactly the latest failure's class
   is `1`, and every class is `0` before a failure or after success. Unknown job
   names fold into `other`; class labels are fixed enum names, never error text.
 - `two_bot_voice_operations_total{op,outcome}` — `op` is `create`, `move`
@@ -635,7 +638,10 @@ labels reach exposition. REST paths are matched to templates, never copied as
 labels: no guild/member/channel IDs, tokens, query strings, visitor data or message
 content. Unknown routes/events/jobs collapse to `other`. Histograms have eight
 fixed finite buckets and `+Inf`, sum and count. A scrape allocates a bounded-size
-text response; observations retain no input string.
+text response; observations retain no input string. Wire `HELP` descriptions stay
+concise to preserve the 64 KiB scrape budget as fixed series are added; the catalog
+above retains the detailed semantics. Shortening `HELP` prose does not change
+metric names, types, labels, values or series counts.
 
 `crates/core/examples/metrics_rss.rs` fills every series, submits 100,000 unique
 unknown labels, then renders 10,000 scrapes. It reports Linux `/proc/self/status`
