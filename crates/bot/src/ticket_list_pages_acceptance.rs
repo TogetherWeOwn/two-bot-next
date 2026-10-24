@@ -63,6 +63,7 @@ use twilight_model::application::interaction::application_command::{
 };
 use twilight_model::application::interaction::{Interaction, InteractionData, InteractionType};
 use twilight_model::guild::{MemberFlags, PartialMember, Permissions};
+use twilight_model::id::marker::RoleMarker;
 use twilight_model::id::{AnonymizableId, Id};
 use twilight_model::oauth::ApplicationIntegrationMap;
 use twilight_model::user::User;
@@ -83,6 +84,7 @@ const FOREIGN_GUILD: &str = "999";
 const FOREIGN_GUILD_ID: u64 = 999;
 const CHANNEL_BASE: u64 = 600;
 const STAFF_ROLE: &str = "300";
+const STAFF_ROLE_ID: u64 = 300;
 const BOT_ID: u64 = 400;
 const APP_ID: u64 = 400;
 
@@ -158,11 +160,12 @@ fn user(id: u64) -> User {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(deprecated)]
 fn slash(
     name: &str,
     guild_id: u64,
     member_id: u64,
-    roles: Vec<String>,
+    roles: Vec<Id<RoleMarker>>,
     permissions: Permissions,
     options: Vec<CommandDataOption>,
     interaction_id: u64,
@@ -241,7 +244,7 @@ fn staff_slash(
         name,
         GUILD_ID,
         staff_id,
-        vec![STAFF_ROLE.to_owned()],
+        vec![Id::new(STAFF_ROLE_ID)],
         Permissions::empty(),
         options,
         interaction_id,
