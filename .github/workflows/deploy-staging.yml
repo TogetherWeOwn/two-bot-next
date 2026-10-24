@@ -1,4 +1,7 @@
 name: deploy-staging
+# Expected-red rehearsals are not staging certification runs. Production excludes
+# this identity only after independently verifying the failure/restore step chain.
+run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.inject_error_rate_spike && 'staging rollback proof' || github.workflow }}
 
 # Staging only. Accept the intended new rollout + serving image, never an old
 # healthy singleton. Production deploys remain manual and cutover-owned.
@@ -89,7 +92,8 @@ jobs:
   # armed, push deploys must not redeploy it. A held push fails fast here with
   # a deferral message instead of reporting success without deploying (the
   # production guard accepts a successful staging run as staging history, so a
-  # quiet skip would void that leg). Dispatches (arm/disarm) always proceed.
+  # quiet skip would void that leg). Explicit arm/disarm dispatches proceed;
+  # error-rate rehearsals (including the daily automated proof) honor the hold.
   # Reads only the Operator-owned repo variable STAGING_SOAK_HOLD_UNTIL (an
   # ISO-8601 UTC deadline, at most 4h out): unset or empty means no hold, a
   # past deadline fails open, and an unparsable or over-long value fails closed
@@ -109,9 +113,10 @@ jobs:
         env:
           HOLD_UNTIL: ${{ vars.STAGING_SOAK_HOLD_UNTIL }}
           EVENT: ${{ github.event_name }}
+          REHEARSAL: ${{ github.event_name == 'workflow_dispatch' && inputs.inject_error_rate_spike && 'true' || 'false' }}
         run: |
           set -euo pipefail
-          if [ "$EVENT" = "workflow_dispatch" ]; then
+          if [ "$EVENT" = "workflow_dispatch" ] && [ "${REHEARSAL:-false}" = "false" ]; then
             exit 0
           fi
           if [ -z "$HOLD_UNTIL" ]; then

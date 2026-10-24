@@ -55,6 +55,9 @@ Browse the [documentation map](docs/README.md) for every guide, contract and evi
   Discord permissions, rendered from the compiled all-enabled registry.
 - [Event help and attendee reminders](docs/event-reminders.md): fixed 15-minute,
   channel-only reminders, delivery limits and restart-safe failure behavior.
+- [Proposed RSVP seats and waitlist](docs/rsvp-capacity-spec.md): design only;
+  optional Going capacity, explicit queue consent, race/privacy contracts and
+  unresolved existing-post assumptions. Not an enabled feature.
 - [Sticky delivery recovery](docs/sticky-debounce-acceptance.md#uncertain-delivery-recovery):
   inspect uncertain re-posts before resetting the durable delivery fence.
 - [Configuration](docs/configuration.md): all catalog keys/classes, known parsed

@@ -33,7 +33,8 @@ use two_bot_core::{AutomodPolicy, ComponentStatus, Config, InviteState, Snowflak
 use two_bot_cutover::gateway_session::{GatewayJob, GatewaySessionStore};
 use two_bot_cutover::{db::connect_voice, DB_POOL_MAX_DEFAULT};
 use two_bot_discord::{
-    gateway_intents, needs_message_content, InviteSource, LevelingRuntime, OrderedLevelingPipeline,
+    gateway_intents, needs_message_content, AwardRequest, CommunityFactsError, InviteSource,
+    LevelingRuntime, LevelingRuntimeError, OrderedLevelingPipeline,
 };
 
 /// Install the process-wide rustls crypto provider (ring) unless one is set.
@@ -462,6 +463,25 @@ fn leveling_dispatch_failure() -> sqlx::Error {
     sqlx::Error::InvalidArgument("leveling gateway dispatch failed; checkpoint unchanged".into())
 }
 
+fn leveling_poison_failure() -> sqlx::Error {
+    sqlx::Error::InvalidArgument(
+        "leveling buffer poisoned (deferred_leveling_poisoned); supervisor_restart_inspection; checkpoint unchanged"
+            .into(),
+    )
+}
+
+/// A poisoned community-facts buffer holds the cursor like any other
+/// pre-commit failure: the buffer never heals in place, so warn-and-continue
+/// would recur forever while silently losing capture. The reason code and
+/// next action match the discord-crate contract verbatim
+/// (`docs/deferred-capture-poison.md`).
+fn community_facts_poison_failure() -> sqlx::Error {
+    sqlx::Error::InvalidArgument(
+        "community facts buffer poisoned (deferred_community_facts_poisoned); supervisor_restart_inspection; checkpoint unchanged"
+            .into(),
+    )
+}
+
 fn interaction_drain_failure() -> sqlx::Error {
     sqlx::Error::InvalidArgument("interaction drain failed; checkpoint unchanged".into())
 }
@@ -771,6 +791,56 @@ fn count_community_facts_drain_failure<T, E>(
     metrics.community_facts_drain_failure(reason);
 }
 
+/// Split a funnel collection into drainable award requests. A poisoned
+/// buffer refuses typed instead of an empty batch: log the sanitized
+/// refusal and hold the cursor, so the worker stops and the supervisor
+/// surfaces the failure instead of committing past lost capture. The
+/// first held failure wins, like every other pre-commit error.
+fn requests_or_hold_cursor(
+    collected: Result<Vec<AwardRequest>, LevelingRuntimeError>,
+    dispatch_error: &mut Option<sqlx::Error>,
+) -> Vec<AwardRequest> {
+    match collected {
+        Ok(requests) => requests,
+        Err(error) => {
+            // Runtime Display is sanitized; never log its SQL/HTTP source.
+            tracing::warn!(
+                error = %error,
+                committed_awards = error.committed_awards().len(),
+                "gateway leveling collect failed"
+            );
+            if dispatch_error.is_none() {
+                *dispatch_error = Some(match error {
+                    LevelingRuntimeError::LevelingPoisoned => leveling_poison_failure(),
+                    LevelingRuntimeError::CommunityFactsPoisoned => {
+                        community_facts_poison_failure()
+                    }
+                    _ => leveling_dispatch_failure(),
+                });
+            }
+            Vec::new()
+        }
+    }
+}
+
+/// Hold the cursor on a poisoned facts buffer; ordinary store failures
+/// keep their warn-and-continue precedent and return `false` so the
+/// caller logs them on the existing line. Returns `true` when the
+/// poison refusal was recorded.
+fn hold_cursor_on_facts_poison(
+    error: &CommunityFactsError,
+    dispatch_error: &mut Option<sqlx::Error>,
+) -> bool {
+    if !error.is_poison() {
+        return false;
+    }
+    tracing::warn!(error = %error, "gateway community facts buffer poisoned");
+    if dispatch_error.is_none() {
+        *dispatch_error = Some(community_facts_poison_failure());
+    }
+    true
+}
+
 /// Serial retention lifecycle for one gateway dispatch, ahead of the
 /// checkpoint commit. A real `GUILD_DELETE` queues a guild-data purge with
 /// the dispatch's `unavailable` flag preserved (`None`/available queues,
@@ -885,7 +955,11 @@ fn refresh_channel_classifier_from_poller<I: InviteSource>(
         return;
     };
     let deployment: HashMap<String, String> = std::env::vars().collect();
-    pipeline.refresh_classifier_config(classifier_config_from_live(
+    // A refused refresh changes neither the sink nor the classifier, and the
+    // same dispatch already surfaces the poison typed at collection and at
+    // the facts drain (cursor held); a warn here would repeat once per
+    // message while the buffer stays poisoned.
+    let _ = pipeline.refresh_classifier_config(classifier_config_from_live(
         &deployment,
         &guild_id.get().to_string(),
         &live,
@@ -1020,18 +1094,21 @@ fn apply_dispatch<I: InviteSource>(
         // XP awards through the leveling runtime under the
         // checkpoint deadline before the cursor commits. Without a
         // leveling runtime the drain is a no-op.
-        let requests = match disposition {
-            Some(verdict) => pipeline.collect_at_with_message_disposition(
-                &dispatch.event,
-                &dispatch.observed_at,
-                verdict.funnel,
-            ),
-            None => pipeline.collect_at(
-                &dispatch.event,
-                &dispatch.observed_at,
-                two_bot_discord::MessageEligibility::default(),
-            ),
-        };
+        let requests = requests_or_hold_cursor(
+            match disposition {
+                Some(verdict) => pipeline.collect_at_with_message_disposition(
+                    &dispatch.event,
+                    &dispatch.observed_at,
+                    verdict.funnel,
+                ),
+                None => pipeline.collect_at(
+                    &dispatch.event,
+                    &dispatch.observed_at,
+                    two_bot_discord::MessageEligibility::default(),
+                ),
+            },
+            &mut dispatch_error,
+        );
         // Voice after the cache update, so snapshots are complete.
         // Handling never blocks (actor inbox). A transport loss seen
         // at reception after this dispatch must still win over any
@@ -1115,10 +1192,17 @@ fn apply_dispatch<I: InviteSource>(
         count_community_facts_drain_failure(two_bot_core::metrics::global(), &drained);
         match drained {
             Ok(Ok(_)) => {}
-            Ok(Err(error)) => tracing::warn!(
-                error = %error,
-                "gateway community facts dispatch failed"
-            ),
+            Ok(Err(error)) => {
+                // Poison holds the cursor (the buffer never heals, so
+                // warn-and-continue would recur forever); ordinary write
+                // failures keep the audit precedent below.
+                if !hold_cursor_on_facts_poison(&error, &mut dispatch_error) {
+                    tracing::warn!(
+                        error = %error,
+                        "gateway community facts dispatch failed"
+                    );
+                }
+            }
             Err(_) => {
                 tracing::warn!("gateway community facts dispatch timed out");
             }
@@ -2309,6 +2393,10 @@ mod drop_poison_acceptance_tests;
 mod drop_poison_counter_acceptance_tests;
 
 #[cfg(test)]
+#[path = "gateway_deferred_poison_acceptance_tests.rs"]
+mod deferred_poison_acceptance;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3208,6 +3296,114 @@ mod tests {
         );
     }
 
+    /// A poisoned collection refuses typed instead of an empty batch: no
+    /// requests reach the drain and the cursor holds, so the supervisor
+    /// surfaces the failure instead of committing past lost capture. A
+    /// healthy collection passes through untouched, and the first held
+    /// failure wins.
+    #[test]
+    fn gateway_poisoned_collect_holds_checkpoint_without_requests() {
+        for (poison, reason) in [
+            (
+                LevelingRuntimeError::LevelingPoisoned,
+                "deferred_leveling_poisoned",
+            ),
+            (
+                LevelingRuntimeError::CommunityFactsPoisoned,
+                "deferred_community_facts_poisoned",
+            ),
+        ] {
+            let mut held = None;
+            let requests = requests_or_hold_cursor(Err(poison), &mut held);
+            assert!(requests.is_empty(), "poison must not yield requests");
+            assert!(
+                matches!(&held, Some(sqlx::Error::InvalidArgument(_))),
+                "poison must hold the cursor as a typed checkpoint refusal, got {held:?}"
+            );
+            let terminal = crate::db_log::failure_reason(held.as_ref().expect("held poison"));
+            assert!(
+                terminal.contains(reason),
+                "final supervisor reason lost {reason}: {terminal}"
+            );
+            assert!(terminal.contains("supervisor_restart_inspection"));
+            assert!(terminal.contains("checkpoint unchanged"));
+            assert!(terminal.len() <= 256);
+            assert!(!terminal.contains("leveling gateway dispatch failed"));
+        }
+        let mut held = None;
+        let requests = requests_or_hold_cursor(Ok(Vec::new()), &mut held);
+        assert!(requests.is_empty());
+        assert!(held.is_none(), "healthy collect must not hold the cursor");
+        let requests =
+            requests_or_hold_cursor(Err(LevelingRuntimeError::InvalidInteraction), &mut held);
+        assert!(requests.is_empty(), "non-poison failure still refuses work");
+        assert_eq!(
+            crate::db_log::failure_reason(held.as_ref().expect("non-poison failure holds cursor")),
+            "leveling gateway dispatch failed; checkpoint unchanged"
+        );
+        let mut held = Some(leveling_dispatch_failure());
+        let requests =
+            requests_or_hold_cursor(Err(LevelingRuntimeError::LevelingPoisoned), &mut held);
+        assert!(requests.is_empty());
+        assert!(
+            matches!(
+                &held,
+                Some(sqlx::Error::InvalidArgument(message))
+                    if message.as_str()
+                        == "leveling gateway dispatch failed; checkpoint unchanged"
+            ),
+            "first held failure must win, got {held:?}"
+        );
+    }
+
+    /// A poisoned facts drain holds the cursor with the stable reason code
+    /// and next action: the buffer never heals, so warn-and-continue would
+    /// recur forever. Ordinary store failures return `false` so the caller
+    /// keeps the audit precedent, and the first held failure wins.
+    #[test]
+    fn gateway_facts_poison_holds_cursor_while_store_failures_continue() {
+        let mut held = None;
+        assert!(
+            hold_cursor_on_facts_poison(&CommunityFactsError::Poisoned, &mut held),
+            "poison must be recorded"
+        );
+        assert!(
+            matches!(
+                &held,
+                Some(sqlx::Error::InvalidArgument(message))
+                    if message.as_str().contains("deferred_community_facts_poisoned")
+                        && message.as_str().contains("supervisor_restart_inspection")
+                        && message.as_str().contains("checkpoint unchanged")
+            ),
+            "poison failure must carry reason, action and contract, got {held:?}"
+        );
+        let mut held = None;
+        assert!(
+            !hold_cursor_on_facts_poison(
+                &CommunityFactsError::Store(
+                    two_bot_core::community_store::CommunityStoreError::Build("boom".into())
+                ),
+                &mut held
+            ),
+            "store failures must keep warn-and-continue"
+        );
+        assert!(held.is_none());
+        let mut held = Some(leveling_dispatch_failure());
+        assert!(hold_cursor_on_facts_poison(
+            &CommunityFactsError::Poisoned,
+            &mut held
+        ));
+        assert!(
+            matches!(
+                &held,
+                Some(sqlx::Error::InvalidArgument(message))
+                    if message.as_str()
+                        == "leveling gateway dispatch failed; checkpoint unchanged"
+            ),
+            "first held failure must win, got {held:?}"
+        );
+    }
+
     /// A dropped interaction completion is a typed recorded error holding the
     /// cursor, never a worker panic that discards accepted commands.
     #[tokio::test]
@@ -3510,6 +3706,7 @@ mod tests {
                     &two_bot_core::now_iso(),
                     two_bot_discord::MessageEligibility::default(),
                 )
+                .expect("healthy collect")
                 .is_empty(),
             "fixture message must queue a leveling award"
         );
@@ -3981,7 +4178,9 @@ mod tests {
             .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
             .expect("lazy pool");
         let pipeline = build_pipeline(vec![], None);
-        pipeline.enable_community_facts(broken);
+        pipeline
+            .enable_community_facts(broken)
+            .expect("healthy fixture arming");
         // Gate-clearing join: `pending: false` buffers two facts, one
         // `member_joined` via `on_join` plus one `rules_accepted` via
         // `on_gate_cleared`, so the drain has work to fail on. A
@@ -4037,12 +4236,16 @@ mod tests {
         // path instead of the failure site.
         {
             let scratch = build_pipeline(vec![], None);
-            scratch.enable_community_facts(pool.clone());
-            scratch.collect_at(
-                &join(),
-                &two_bot_core::now_iso(),
-                two_bot_discord::MessageEligibility::default(),
-            );
+            scratch
+                .enable_community_facts(pool.clone())
+                .expect("healthy scratch arming");
+            scratch
+                .collect_at(
+                    &join(),
+                    &two_bot_core::now_iso(),
+                    two_bot_discord::MessageEligibility::default(),
+                )
+                .expect("scratch collect");
             assert_eq!(
                 scratch.drain_facts().await.expect("scratch drain"),
                 2,
