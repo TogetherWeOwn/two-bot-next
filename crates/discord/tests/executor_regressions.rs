@@ -10,6 +10,9 @@
 #[allow(dead_code)]
 mod common;
 
+#[path = "support/reopen_components_review_acceptance.rs"]
+mod reopen_components_review_acceptance;
+
 use common::{aged_message_id, fresh_message_id, MockRest, ScriptedResponse};
 use two_bot_core::{ActionOutcome, ModerationAction, ModerationExecution, PurgeStopReason};
 use two_bot_discord::{ActionExecutor, ChannelCall, DiscordError};
