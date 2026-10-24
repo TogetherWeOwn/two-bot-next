@@ -352,6 +352,38 @@ class AutomatedVerificationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, f"^row: no test matching '{ghost}'"):
                     check_verification("row", WRAPPED + "-p demo " + ghost, self.root)
 
+    def test_thread_counts_must_be_ascii_digits(self):
+        # str.isdigit is Unicode-aware, but libtest parses an ASCII
+        # integer; non-ASCII digits must fail with INVALID_VALUE, never
+        # pass or escape as a bare int() error.
+        for threads in ("٣", "²", "2²"):
+            with self.subTest(threads=threads):
+                with self.assertRaisesRegex(ValueError, "^row: INVALID_VALUE"):
+                    check_verification(
+                        "row", WRAPPED + "-p demo --lib -- --test-threads " + threads,
+                        self.root)
+
+    def test_cargo_value_options_reject_flag_like_values(self):
+        # Cargo value options never take option-like values: a following
+        # flag (or `--`) is a missing value, not a consumed token.
+        # `--features --no-run` must fail here, not vanish into the
+        # discarded feature list while NOEXEC never fires. The libtest
+        # branch intentionally differs: getopts permits dash-prefixed
+        # --skip patterns, so only the Cargo side rejects them.
+        for command in (
+            WRAPPED + "-p demo --features --no-run --lib tests::unit",
+            WRAPPED + "-p demo --features --lib tests::unit",
+            WRAPPED + "-p demo --features --",
+            WRAPPED + "-p demo --test --lib tests::unit",
+            WRAPPED + "-p --lib tests::unit",
+        ):
+            with self.subTest(command=command):
+                with self.assertRaisesRegex(ValueError, "^row: MISSING_VALUE"):
+                    check_verification("row", command, self.root)
+        # A real value still resolves.
+        check_verification(
+            "row", WRAPPED + "-p demo --features db --lib tests::unit", self.root)
+
 
 class DeltaChecklistTests(unittest.TestCase):
     """Parity §12 additions and §13 non-dropped ledger rows (B4 gate)."""

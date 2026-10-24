@@ -1,5 +1,28 @@
 #!/usr/bin/env python3
-"""Offline parity/checklist coverage and rendered-document guard (stdlib only)."""
+"""Offline parity/checklist coverage and rendered-document guard (stdlib only).
+
+Supported automated verification runs Cargo through the controller cache
+wrapper only: `python3 scripts/cargo_cache.py run -- test -p <package>
+[--lib | --test <target> | --tests] [filter] [-- <libtest>]`. The supported
+option vocabulary is bounded: Cargo side `-p`/`--package`, `--test`,
+`--lib`, `--tests`, `--all-targets`, `--features`; libtest side (after `--`)
+`--exact`, `--ignored`, `--include-ignored`, `--skip <pattern>`
+(repeatable), `--test-threads <n>`. Cargo `--no-run` and libtest `--list`
+never execute tests and are refused as automated coverage, as are unknown
+flags, missing or invalid option values, and known options in the wrong
+position. Cargo accepts at most one positional filter before `--`; pass
+additional filters after `--` where libtest accepts several. Effective
+selection is the union of positive filters (exact when `--exact`, else
+substring) under ignore-mode filtering (default excludes `#[ignore]`,
+`--ignored` selects only ignored, `--include-ignored` selects all matched)
+minus `--skip` patterns, read offline from source and never run; it must be
+nonempty. Static executable selection is not an execution verdict: attach
+actual run evidence separately.
+
+Offline regression: `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py`
+plus `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p
+'test_soak_checklist.py' -v` and `-p 'test_soak_checklist_noexec_acceptance.py' -v`.
+"""
 
 import argparse
 from collections import Counter
@@ -23,13 +46,17 @@ CARD = re.compile(r"\bTOG-\d+\b")
 SCRIPT_REF = re.compile(r"(?<![\w/.-])((?:\.{1,2}/)*(?:\.github/)?scripts/[\w./-]+\.\w+)")
 # Automated rows run Cargo through the controller cache wrapper only.
 WRAPPER = ("python3", "scripts/cargo_cache.py", "run", "--")
-CARGO_VALUE_OPTIONS = ("-p", "--package", "--test", "-F", "--features", "--target",
-                       "--target-dir", "--manifest-path", "-j", "--jobs", "--profile",
-                       "--message-format", "--color", "--config", "-Z")
-LIBTEST_VALUE_OPTIONS = ("--test-threads", "--skip", "--format", "--color", "--logfile",
-                         "--shuffle-seed", "-Z")
+CARGO_VALUE_OPTIONS = ("-p", "--package", "--test", "--features")
+CARGO_FLAG_OPTIONS = ("--lib", "--tests", "--all-targets")
+LIBTEST_VALUE_OPTIONS = ("--skip", "--test-threads")
+LIBTEST_FLAG_OPTIONS = ("--exact", "--ignored", "--include-ignored")
+# Cargo --no-run and libtest --list never execute tests; both are refused
+# as automated coverage wherever they appear.
+NOEXEC_OPTIONS = ("--no-run", "--list")
 UNSUPPORTED_TARGETS = ("--bin", "--bins", "--example", "--examples", "--bench",
                        "--benches", "--doc")
+CARGO_KNOWN = CARGO_VALUE_OPTIONS + CARGO_FLAG_OPTIONS + UNSUPPORTED_TARGETS
+LIBTEST_KNOWN = LIBTEST_VALUE_OPTIONS + LIBTEST_FLAG_OPTIONS
 RUST_TOKEN = re.compile(r"""
     (?P<space>\s+|//[^\n]*)
   | (?P<block>/\*)
@@ -237,19 +264,26 @@ def is_test_attribute(tokens):
             and tokens[end + 1:end + 2] in ([], [("punct", "(")]))
 
 
-def libtest_names(path, mod_rs=True, prefix=(), seen=None):
-    """Libtest names (`module::fn`) of test fns reachable from a target root.
+def is_ignore_attribute(tokens):
+    """`#[ignore]` and `#[ignore = "..."]` attributes."""
+    return bool(tokens) and tokens[0] == ("ident", "ignore")
+
+
+def _libtest_entries(path, mod_rs=True, prefix=(), seen=None):
+    """`(name, ignored)` pairs of test fns reachable from a target root.
 
     Follows `mod name;` (including `#[path]`) and inline `mod name { }` like
     rustc, ignoring cfg: a renamed or removed test leaves no name behind.
     Frames hold a module name, "" for a macro body or None for other blocks.
+    Ignored identity comes from `#[ignore]` on the test fn; inline, external
+    file and integration targets all preserve it.
     """
     seen = set() if seen is None else seen
     if path.resolve() in seen:
         return []
     seen.add(path.resolve())
     tokens = rust_tokens(path.read_text())
-    names = []
+    entries = []
     frames = []
     attributes = []
     i = 0
@@ -299,20 +333,37 @@ def libtest_names(path, mod_rs=True, prefix=(), seen=None):
                     candidates = ((base / f"{name}.rs", False), (base / name / "mod.rs", True))
                 for child, child_mod_rs in candidates:
                     if child.is_file():
-                        names += libtest_names(child, child_mod_rs,
-                                               (*prefix, *inline, name), seen)
+                        entries += _libtest_entries(child, child_mod_rs,
+                                                    (*prefix, *inline, name), seen)
                         break
         elif (token == ("ident", "fn") and following and following[0][0] == "ident"
               and None not in frames and any(map(is_test_attribute, attributes))):
-            names.append("::".join((*prefix, *inline, following[0][1])))
+            name = "::".join((*prefix, *inline, following[0][1]))
+            entries.append((name, any(map(is_ignore_attribute, attributes))))
         i += 1
-    return names
+    return entries
+
+
+def libtest_names(path, mod_rs=True, prefix=(), seen=None):
+    """Libtest names (`module::fn`) of test fns reachable from a target root.
+
+    Follows `mod name;` (including `#[path]`) and inline `mod name { }` like
+    rustc, ignoring cfg: a renamed or removed test leaves no name behind.
+    Frames hold a module name, "" for a macro body or None for other blocks.
+    """
+    return [name for name, _ in _libtest_entries(path, mod_rs, prefix, seen)]
 
 
 @cache
 def target_tests(root):
     """Test names of one target root; sources are fixed for a process."""
     return frozenset(libtest_names(root))
+
+
+@cache
+def target_ignored_tests(root):
+    """Ignored test names of one target root; sources are fixed for a process."""
+    return frozenset(name for name, ignored in _libtest_entries(root) if ignored)
 
 
 def workspace_packages(root):
@@ -362,31 +413,143 @@ def check_cargo_test(args, root, packages):
     """Fail unless `cargo test` args name a real package, target and tests."""
     if args[:1] != ["test"]:
         raise ValueError(f"automated verification must be `cargo test`: {' '.join(args)}")
-    names, selectors, filters, exact, libtest = [], [], [], False, False
+    names, selectors, filters, skips = [], [], [], []
+    exact, ignored_only, include_ignored, libtest = False, False, False, False
+    test_threads_seen = False
+    pre_filters = 0
     words = iter(args[1:])
     for word in words:
         option, has_value, value = word.partition("=")
         if libtest:
-            if word == "--exact":
-                exact = True
-            elif option in LIBTEST_VALUE_OPTIONS and not has_value:
-                next(words, None)
+            if option in NOEXEC_OPTIONS:
+                raise ValueError(
+                    f"NOEXEC: refusing non-executing mode {option!r} as automated coverage; "
+                    f"next: remove {option} so the command actually runs tests")
+            if option in LIBTEST_VALUE_OPTIONS:
+                if option == "--test-threads" and test_threads_seen:
+                    raise ValueError(
+                        f"UNSUPPORTED: libtest option '--test-threads' is single-use "
+                        f"but was repeated; next: pass --test-threads at most once")
+                if has_value:
+                    if not value:
+                        raise ValueError(
+                            f"INVALID_VALUE: option {option!r} got an empty value after `=`; "
+                            f"next: give a nonempty value or drop `=value`")
+                else:
+                    value = next(words, None)
+                    if value is None:
+                        raise ValueError(
+                            f"MISSING_VALUE: option {option!r} needs a value but none followed; "
+                            f"next: add a value, e.g. `{option} <value>` or `{option}=<value>`")
+                if option == "--test-threads":
+                    # ASCII only: str.isdigit is Unicode-aware, but libtest
+                    # parses an ASCII integer (and int() raises on some
+                    # digit-like codepoints instead of returning a count).
+                    if not value.isascii() or not value.isdigit() or int(value) <= 0:
+                        raise ValueError(
+                            f"INVALID_VALUE: option '--test-threads' needs a positive integer "
+                            f"but got {value!r}; next: pass a positive integer like "
+                            f"`--test-threads 2`")
+                    test_threads_seen = True
+                else:
+                    skips.append(value)
+            elif option in LIBTEST_FLAG_OPTIONS:
+                if has_value:
+                    raise ValueError(
+                        f"INVALID_VALUE: flag {option!r} takes no value but got {value!r}; "
+                        f"next: drop `={value}` and pass {option} alone")
+                if option == "--exact":
+                    if exact:
+                        raise ValueError(
+                            f"UNSUPPORTED: libtest option '--exact' is single-use "
+                            f"but was repeated; next: pass --exact at most once")
+                    exact = True
+                elif option == "--ignored":
+                    if ignored_only:
+                        raise ValueError(
+                            f"UNSUPPORTED: libtest option '--ignored' is single-use "
+                            f"but was repeated; next: pass --ignored at most once")
+                    if include_ignored:
+                        raise ValueError(
+                            f"UNSUPPORTED: conflicting ignore modes '--ignored' and "
+                            f"'--include-ignored' cannot combine; next: pass at most "
+                            f"one of --ignored, --include-ignored")
+                    ignored_only = True
+                elif option == "--include-ignored":
+                    if include_ignored:
+                        raise ValueError(
+                            f"UNSUPPORTED: libtest option '--include-ignored' is single-use "
+                            f"but was repeated; next: pass --include-ignored at most once")
+                    if ignored_only:
+                        raise ValueError(
+                            f"UNSUPPORTED: conflicting ignore modes '--ignored' and "
+                            f"'--include-ignored' cannot combine; next: pass at most "
+                            f"one of --ignored, --include-ignored")
+                    include_ignored = True
+            elif option in CARGO_KNOWN:
+                raise ValueError(
+                    f"UNSUPPORTED: known Cargo option {option!r} after `--`; "
+                    f"next: move Cargo options before `--` and libtest options after it")
             elif not word.startswith("-"):
                 filters.append(word)
+            else:
+                raise ValueError(
+                    f"UNKNOWN_OPTION: unsupported flag {word!r} after `--`; "
+                    f"next: use only --exact, --ignored, --include-ignored, --skip, --test-threads")
         elif word == "--":
             libtest = True
+        elif option in NOEXEC_OPTIONS:
+            raise ValueError(
+                f"NOEXEC: refusing non-executing mode {option!r} as automated coverage; "
+                f"next: remove {option} so the command actually runs tests")
         elif option in UNSUPPORTED_TARGETS:
             raise ValueError(f"unsupported target selector {option}")
+        elif option in LIBTEST_KNOWN:
+            raise ValueError(
+                f"UNSUPPORTED: known libtest option {option!r} before `--`; "
+                f"next: move libtest options after `--`")
         elif option in CARGO_VALUE_OPTIONS:
-            value = value if has_value else next(words, "")
+            if has_value:
+                if not value:
+                    raise ValueError(
+                        f"INVALID_VALUE: option {option!r} got an empty value after `=`; "
+                        f"next: give a nonempty value or drop `=value`")
+            else:
+                value = next(words, None)
+                # Cargo value options never take option-like values: a
+                # following flag (or `--`) is a missing value, not a
+                # consumed token. Scoped to the Cargo side only: the
+                # libtest branch must keep accepting dash-prefixed
+                # --skip patterns, which getopts permits.
+                if value is None or value.startswith("-"):
+                    raise ValueError(
+                        f"MISSING_VALUE: option {option!r} needs a value but none followed; "
+                        f"next: add a value, e.g. `{option} <value>` or `{option}=<value>`")
             if option in ("-p", "--package"):
                 names.append(value)
             elif option == "--test":
                 selectors.append(("test", value))
-        elif word in ("--lib", "--tests", "--all-targets"):
-            selectors.append((word, None))
+        elif option in CARGO_FLAG_OPTIONS:
+            if has_value:
+                raise ValueError(
+                    f"INVALID_VALUE: flag {option!r} takes no value but got {value!r}; "
+                    f"next: drop `={value}` and pass {option} alone")
+            selectors.append((option, None))
         elif not word.startswith("-"):
+            # Pinned Cargo 1.98.1 takes a single [TESTNAME] before `--` and
+            # rejects a second positional with unexpected-argument, running
+            # nothing. Libtest after `--` accepts several filters.
+            if pre_filters >= 1:
+                raise ValueError(
+                    f"UNSUPPORTED: Cargo accepts at most one positional filter before "
+                    f"`--` but got second filter {word!r}; next: move extra filters "
+                    f"after `--` where libtest accepts several")
             filters.append(word)
+            pre_filters += 1
+        else:
+            raise ValueError(
+                f"UNKNOWN_OPTION: unsupported flag {word!r} before `--`; "
+                f"next: use only -p/--package, --test, --lib, --tests, --all-targets, --features")
     if len(names) != 1:
         raise ValueError(f"name exactly one -p package, got {names}")
     if names[0] not in packages:
@@ -410,10 +573,37 @@ def check_cargo_test(args, root, packages):
     tests = frozenset().union(*map(target_tests, roots))
     if not tests:
         raise ValueError(f"no tests in the selected targets of {names[0]}")
+    ignored = frozenset().union(*map(target_ignored_tests, roots)) & tests
     for pattern in filters:
         if not (pattern in tests if exact else any(pattern in name for name in tests)):
             raise ValueError(
                 f"no test {'named' if exact else 'matching'} {pattern!r} in the selected targets")
+    if filters:
+        matched = {candidate for candidate in tests
+                   if any(candidate == pattern if exact else pattern in candidate
+                          for pattern in filters)}
+    else:
+        matched = set(tests)
+    # Libtest ignore semantics: default runs matched minus ignored,
+    # --ignored runs matched intersect ignored, --include-ignored runs all
+    # matched. An ignored-only default match or a nonignored-only --ignored
+    # match executes zero tests and cannot satisfy coverage.
+    if include_ignored:
+        executable = set(matched)
+    elif ignored_only:
+        executable = set(matched) & set(ignored)
+    else:
+        executable = set(matched) - set(ignored)
+    if skips:
+        executable -= {candidate for candidate in executable
+                       if any(candidate == skip if exact else skip in candidate
+                              for skip in skips)}
+    if not executable:
+        raise ValueError(
+            f"EMPTY_SELECTION: no effective tests remain after filters {filters!r} with "
+            f"--exact={exact}, --ignored={ignored_only}, --include-ignored={include_ignored} "
+            f"and --skip {skips!r}; next: narrow --skip, adjust ignore mode, or add a "
+            f"positive filter that selects a real executable test")
 
 
 def check_verification(entry_id, verification, root=ROOT):
