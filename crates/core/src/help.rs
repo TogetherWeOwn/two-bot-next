@@ -736,9 +736,13 @@ mod tests {
             .publish_set(&[])
             .expect("full set assembles");
         let text = help_text(&defs);
+        // The RSVP note carries a copyable event-link example whose slashes
+        // tokenize as path fragments, not commands; exclude it from the
+        // exact-once command count.
+        let without_example = text.replace("https://discord.com/events/<server-id>/<event-id>", "");
         // Exact slash tokens: a substring count would triple-count `/command`
         // inside `/command-remove` and `/command-list`.
-        let tokens: Vec<&str> = text
+        let tokens: Vec<&str> = without_example
             .split(|c: char| !(c.is_ascii_alphanumeric() || c == '/' || c == '-' || c == '_'))
             .filter(|t| t.starts_with('/') && t.len() > 1)
             .collect();
