@@ -34,7 +34,7 @@ Help is ephemeral and does not execute the selected command. The command picker
 hides gated commands you cannot use; help explains published requirements but
 does not evaluate every effective Discord permission or guarantee authorization.
 
-Built-in commands: 51.
+Built-in commands: 52.
 
 ## `/access`
 
@@ -447,6 +447,17 @@ Take back ownership of your temporary voice room
 - Available in DMs: false
 
 No options.
+
+## `/reopen`
+
+Reopen your games or session picker in a private menu.
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `kind` | string | true | — | — | — | Games = `"games"`; Session = `"session"` | Which picker to reopen. |
 
 ## `/rsvp`
 

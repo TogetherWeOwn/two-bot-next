@@ -1,6 +1,6 @@
 {
   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
-  "count": 30,
+  "count": 31,
   "dm_permission_all_false": true,
   "commands": [
     {
@@ -157,6 +157,38 @@
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Next-only member self-serve with no legacy counterpart; the purge-plus-suppression-plus-receipt path is pinned by the gateway dispatch tests on a disposable database rather than the live smoke five."
+    },
+    {
+      "name": "reopen",
+      "description": "Reopen your games or session picker in a private menu.",
+      "family": "core",
+      "gate": "always",
+      "default_member_permissions": null,
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "kind",
+          "description": "Which picker to reopen.",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [
+            {
+              "name": "Games",
+              "value": "games"
+            },
+            {
+              "name": "Session",
+              "value": "session"
+            }
+          ]
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Next-only self-service picker recovery with no legacy counterpart; the defer-first menu open and zero-mutation contract are pinned by the onboarding disposable-database acceptance tests rather than the live smoke five."
     },
     {
       "name": "attendance",
