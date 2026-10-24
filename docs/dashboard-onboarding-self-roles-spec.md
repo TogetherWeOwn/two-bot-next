@@ -31,7 +31,7 @@ read-only until its wiring card lands.
 
 - **One store.** `guild_settings(guild_id,key,value,version,cas_version,
   updated_at,updated_by)` with append-only `guild_settings_audit` and a
-  transactional poll revision (`crates/cutover/migrations/0330`-`0334`). The
+  transactional poll revision (`crates/cutover/migrations/0330_guild_settings.sql`-`crates/cutover/migrations/0334_guild_settings_cas.sql`). The
   writer is `SettingsStore::set_if_version` (`crates/cutover/src/settings.rs`):
   CAS compare `:203-209`, self-role drain check `:214-241`, audit insert
   `:277-288`, all in one transaction.
@@ -84,7 +84,7 @@ Findings the matrix exposes, all evidenced above:
    breaks every welcome job and picker until corrected. Mode-dependent
    requirements (session mode needs both session channels) are invisible to the
    page because the mode is environment-only.
-3. **Five onboarding keys report "restart required" while applying live.** The
+3. **Four onboarding keys report "restart required" while applying live.** The
    poll reports non-`HOT_WIRED` hot keys as cold (`settings.rs:648-690`), logging
    `settings_restart_required`, yet onboarding reads them per event. Operators
    reading logs would be misled; this is wiring card W3.
@@ -240,7 +240,7 @@ Preview shape (pure, deterministic, offline):
 | --- | --- | --- |
 | W1 | Refuse malformed onboarding channel IDs at write time, using the runtime's own `channel_ids` parser, with typed `settings_value_invalid` | Page writes the five channel keys |
 | W2 | Apply `TWO_SELF_ROLE_DRY_RUN` live: store-first per-operation read, boot fallback, last-good on a bad row, plus pins | Making the dry-run toggle writable |
-| W3 | Report the five non-wired onboarding keys as live, not restart-required, without widening the /ops overlay | Honest operator logs; not a page blocker |
+| W3 | Report the four non-wired onboarding keys as live, not restart-required, without widening the /ops overlay | Honest operator logs; not a page blocker |
 | W4 | Return `updated_by` and `updated_at` from `settings.get` (value-free metadata); shared with the moderation page | Showing the previous editor |
 
 Build order if accepted: W1 and W2 first (parallel), then one web page card.
@@ -255,7 +255,7 @@ in section 3, not only `settings.get`. All rows require zero Discord calls.
 
 | Id | Case | Expected |
 | --- | --- | --- |
-| F01-F07 | Write-then-read-live per writable key: set a valid value, `get`, then read through the runtime reader; then unset | `SAVED`; runtime sees the value; unset returns deployment value; exactly 2 audit rows |
+| F01-F07 | Write-then-read-live per writable key: set a valid value, `get`, advance the injected clock through one 15 s poll for the panel catalogue, then read through the runtime reader; then unset | `SAVED`; runtime sees the value; unset returns deployment value; exactly 2 audit rows |
 | F08 | `TWO_ONBOARDING_DRY_RUN` set to `"true"` | `INVALID_VALUE`; 0 rows, 0 audit |
 | F09 | `TWO_SELF_ROLE_DRY_RUN` via the page | `NOT_WIRED`, nothing signed; a directly stored row leaves `dry_run` unchanged (flips when W2 lands) |
 | F10 | EnvOnly refusal: mode, guild ID, each rota key, set and get | `REFUSED_ENV_ONLY`; 0 rows, 0 audit |
@@ -283,9 +283,10 @@ python3 scripts/check_docs_index.py --json
 ```
 
 The doctest reads the manifest from this file and checks it against
-`crates/core/src/settings.rs`: every key's class and hot-wired flag, state and
-class consistency, and fixture coverage. It does **not** run the bot, a database,
-a dashboard, or any apply path. Future protected acceptance tests must implement
+`crates/core/src/settings.rs`: every key's class and hot-wired flag, state,
+gate and apply consistency, and reason/next_action presence. It checks no
+fixture row and does **not** run the bot, a database, a dashboard, or any apply
+path. Future protected acceptance tests must implement
 the oracle against real callers in a disposable database; zero tests is not
 proof.
 
