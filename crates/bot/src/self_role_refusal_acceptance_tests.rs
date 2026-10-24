@@ -702,7 +702,17 @@ async fn recovered_pending_evidence_is_not_a_definitive_refusal_unchanged() -> T
             (Some("bravo".into()), true)
         );
         let reply = fx.first_reply();
-        assert!(reply.contains("unresolved"));
+        // The re-press meets the still-claimed event, so dispatch keeps the
+        // existing in-flight acknowledgement instead of a fresh verdict. The
+        // reply must never relabel unknown evidence as a definitive refusal.
+        assert!(
+            reply.contains("already being handled"),
+            "re-press of pending evidence keeps the in-flight acknowledgement, got: {reply}"
+        );
+        assert!(
+            !reply.contains("could not be applied"),
+            "pending evidence must not read as a definitive refusal, got: {reply}"
+        );
         assert!(!reply.contains("hierarchy is wrong"));
         fx.mock.shutdown().await;
         Ok(())
