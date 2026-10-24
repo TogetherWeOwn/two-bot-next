@@ -355,7 +355,6 @@ async fn ledger_rows(pool: &PgPool) -> i64 {
 
 /// Pin the strict refusal: no reads, no mutations, no stored rows, one private
 /// completion naming the offending option with a `/verb` correction.
-#[allow(clippy::too_many_arguments)]
 async fn assert_strict_refusal(
     pool: &PgPool,
     rest: &StrictRest,
