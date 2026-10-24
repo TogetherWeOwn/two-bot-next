@@ -1136,7 +1136,7 @@ async fn publish_sends_the_complete_merged_set_once() {
         .iter()
         .map(|c| c["name"].as_str().expect("command has a name"))
         .collect();
-    assert_eq!(names.len(), 35, "no partial view");
+    assert_eq!(names.len(), 37, "no partial view");
     for expected in [
         "rank",
         "leaderboard",
@@ -1154,6 +1154,8 @@ async fn publish_sends_the_complete_merged_set_once() {
         "lfg-close",
         "feed-add",
         "feed-list",
+        "feed-pause",
+        "feed-resume",
         "ban",
         "purge",
         "lockdown",
