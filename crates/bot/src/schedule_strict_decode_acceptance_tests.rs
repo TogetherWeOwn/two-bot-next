@@ -939,3 +939,242 @@ async fn schedule_list_decode_failures_and_page_matrix() {
     mock.shutdown().await;
     db.close().await;
 }
+
+// Inspect/edit were added after the original create/remove/list handoff. These
+// regressions are GREEN at their implementation baseline; lenient dispatch and
+// first-wins mutants must turn them RED through the real gateway runtime.
+const MANAGEMENT_ID: &str = "aabbccdd001122334455667788990001";
+const MANAGEMENT_BODY: &str = "private-decode-replacement-sentinel";
+type ManagementDecodeCase = (Vec<CommandDataOption>, String);
+
+fn management_decode_cases(command: &str, revision: &str) -> Vec<ManagementDecodeCase> {
+    let (fields, invocation) = match command {
+        "schedule-inspect" => (
+            vec![("id", MANAGEMENT_ID), ("view", "metadata")],
+            "/schedule-inspect id:<schedule-id> view:<metadata|body>",
+        ),
+        "schedule-edit" => (
+            vec![
+                ("id", MANAGEMENT_ID),
+                ("revision", revision),
+                ("body", MANAGEMENT_BODY),
+            ],
+            "/schedule-edit id:<schedule-id> revision:<revision> body:<text>",
+        ),
+        _ => panic!("only the two management commands belong in this matrix"),
+    };
+    let valid = || {
+        fields
+            .iter()
+            .map(|(name, value)| option(name, CommandOptionValue::String((*value).to_owned())))
+            .collect::<Vec<_>>()
+    };
+    let mut cases = Vec::new();
+    for (index, (name, _)) in fields.iter().enumerate() {
+        for wrong in [
+            CommandOptionValue::Integer(7),
+            CommandOptionValue::Boolean(true),
+            CommandOptionValue::Number(2.5),
+        ] {
+            let mut options = valid();
+            options[index].value = wrong;
+            cases.push((options, format!("Invalid {name} option. Use {invocation}.")));
+        }
+        // All-string duplicates must refuse, even when first-wins would be a
+        // valid operation. Mixed-type duplicates pin name-count before type.
+        for (first, second) in [
+            (
+                CommandOptionValue::String(fields[index].1.to_owned()),
+                CommandOptionValue::String("@everyone @here duplicate-input-sentinel".to_owned()),
+            ),
+            (
+                CommandOptionValue::String(fields[index].1.to_owned()),
+                CommandOptionValue::Integer(9),
+            ),
+            (
+                CommandOptionValue::Boolean(false),
+                CommandOptionValue::String(fields[index].1.to_owned()),
+            ),
+        ] {
+            let mut options = valid();
+            options[index].value = first;
+            options.push(option(name, second));
+            cases.push((
+                options,
+                format!("Duplicate {name} option. Use {invocation}."),
+            ));
+        }
+    }
+    if command == "schedule-inspect" {
+        for view in [
+            "",
+            "BODY",
+            "summary",
+            "@everyone @here unknown-view-sentinel",
+        ] {
+            let mut options = valid();
+            options[1].value = CommandOptionValue::String(view.to_owned());
+            cases.push((
+                options,
+                "Unknown view. Use /schedule-inspect id:<schedule-id> view:<metadata|body>."
+                    .to_owned(),
+            ));
+        }
+    }
+    cases
+}
+
+async fn management_decode_refusals(
+    pool: &PgPool,
+    command: &str,
+    cases: Vec<ManagementDecodeCase>,
+) {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = CommandRuntime::new(
+        pool.clone(),
+        executor_at(origin),
+        router_with_commands(gates(true, true)),
+        GUILD,
+        true,
+    );
+    let guard = runtime.dispatch_guard();
+    let before = if pool.is_closed() {
+        None
+    } else {
+        Some(snapshot_schedule_store(pool).await)
+    };
+    for (index, (options, expected)) in cases.iter().enumerate() {
+        assert!(runtime.dispatch(&interaction_event(slash(
+            command,
+            Some(CHANNEL),
+            options.clone()
+        ))));
+        wait_for(
+            || (0..6).all(|lane| runtime.lane_in_flight(lane) == 0),
+            "management decode settles",
+        )
+        .await;
+        let replies = completion_edit_bodies(&mock, index + 1).await;
+        let reply = &replies[index];
+        assert_eq!(
+            reply["content"], *expected,
+            "{command} case {index}: {options:?}"
+        );
+        assert_ne!(
+            reply["content"], STORE_FAILURE_TEXT,
+            "decode must precede the CLOSED pool"
+        );
+        assert_safe_refusal(reply);
+        assert_eq!(
+            reply["allowed_mentions"],
+            serde_json::json!({"parse":[],"roles":[],"users":[],"replied_user":false})
+        );
+        let requests = mock.requests();
+        assert!(
+            requests[index * 2].path.ends_with("/callback"),
+            "defer before completion"
+        );
+        assert!(requests[index * 2 + 1]
+            .path
+            .starts_with("/api/v10/webhooks/1111/"));
+        assert!(requests[index * 2 + 1]
+            .path
+            .ends_with("/messages/@original"));
+        if let Some(before) = &before {
+            assert_eq!(
+                &snapshot_schedule_store(pool).await,
+                before,
+                "{command} case {index} changes no schedule, audit or command row"
+            );
+        }
+    }
+    drop(guard);
+    drop(runtime);
+    mock.shutdown().await;
+}
+
+async fn closed_management_pool() -> PgPool {
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+        .expect("never-connected parser fixture, no DB credentials");
+    pool.close().await;
+    assert!(pool.is_closed());
+    pool
+}
+
+#[tokio::test]
+async fn schedule_inspect_strict_decode_refuses_before_closed_pool_access() {
+    let pool = closed_management_pool().await;
+    management_decode_refusals(
+        &pool,
+        "schedule-inspect",
+        management_decode_cases("schedule-inspect", "unused-revision"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn schedule_edit_strict_decode_refuses_before_closed_pool_access() {
+    let pool = closed_management_pool().await;
+    management_decode_refusals(
+        &pool,
+        "schedule-edit",
+        management_decode_cases("schedule-edit", "unused-revision"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn schedule_management_strict_decode_preserves_real_store_per_invocation() {
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("explicit disposable test bootstrap");
+    let db =
+        two_bot_testsupport::TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+            .await
+            .expect("guarded migrated disposable database");
+    sqlx::query("INSERT INTO scheduled_messages (id,guild_id,channel_id,body,next_run_at,enabled,created_by,created_at,updated_by,updated_at) VALUES ($1,$2,'3333','existing-private-body-sentinel','2030-01-01T00:00:00.000Z',TRUE,'77','2026-10-01T00:00:00.000Z','77','2026-10-01T00:00:00.000Z')")
+        .bind(MANAGEMENT_ID).bind(GUILD_S).execute(db.pool()).await.expect("seed valid target so first-wins would really edit it");
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = CommandRuntime::new(
+        db.pool().clone(),
+        executor_at(origin),
+        router_with_commands(gates(true, true)),
+        GUILD,
+        true,
+    );
+    runtime
+        .on_interaction(&slash(
+            "schedule-inspect",
+            Some(CHANNEL),
+            vec![option(
+                "id",
+                CommandOptionValue::String(MANAGEMENT_ID.to_owned()),
+            )],
+        ))
+        .await;
+    let metadata = completion_edit_bodies(&mock, 1).await;
+    let token = metadata[0]["content"]
+        .as_str()
+        .expect("metadata text")
+        .lines()
+        .find_map(|line| line.strip_prefix("Revision: "))
+        .expect("valid current revision")
+        .to_owned();
+    assert!(!token.is_empty());
+    drop(runtime);
+    mock.shutdown().await;
+    let before = snapshot_schedule_store(db.pool()).await;
+    management_decode_refusals(
+        db.pool(),
+        "schedule-inspect",
+        management_decode_cases("schedule-inspect", &token),
+    )
+    .await;
+    management_decode_refusals(
+        db.pool(),
+        "schedule-edit",
+        management_decode_cases("schedule-edit", &token),
+    )
+    .await;
+    assert_eq!(snapshot_schedule_store(db.pool()).await, before);
+    db.close().await.expect("drop own fixture");
+}

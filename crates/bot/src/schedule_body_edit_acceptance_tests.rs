@@ -320,6 +320,140 @@ async fn schedule_body_edit_inspect_exposes_full_definition_in_separate_private_
     db.close().await.expect("drop own fixture");
 }
 
+// Legacy SQL rows can predate creation-time mention neutralization. Only this
+// body-view oracle permits raw mentions: private_text keeps its refusal guard.
+async fn assert_legacy_body_verbatim(tail: &str) {
+    let db = database().await;
+    seed(db.pool(), GUILD_S, ID, Some(3600)).await;
+    let padding = 2000 - tail.encode_utf16().count();
+    let body = format!(
+        "{}{}{tail}",
+        "😀".repeat(padding / 2),
+        "界".repeat(padding % 2)
+    );
+    assert_eq!(body.encode_utf16().count(), 2000);
+    sqlx::query("UPDATE scheduled_messages SET body=$1 WHERE id=$2")
+        .bind(&body)
+        .bind(ID)
+        .execute(db.pool())
+        .await
+        .expect("seed legacy body directly, bypassing creation normalization");
+    let before = rows(db.pool()).await;
+    let audit_before = audits(db.pool()).await;
+    let requests = invoke(db.pool(), inspect(ID, "body")).await;
+    let after = rows(db.pool()).await;
+    let audit_after = audits(db.pool()).await;
+    db.close()
+        .await
+        .expect("drop own fixture even on a rendering RED");
+
+    assert_eq!(after, before, "body inspection changes no schedule field");
+    assert_eq!(audit_after, audit_before, "body inspection writes no audit");
+    assert_eq!(
+        requests.len(),
+        2,
+        "one defer and one original-response edit only"
+    );
+    assert_eq!(requests[0].method, "POST");
+    assert!(requests[0].path.ends_with("/callback"));
+    let defer: Value = serde_json::from_slice(&requests[0].body).expect("defer JSON");
+    assert_eq!(defer["type"], 5);
+    assert_eq!(defer["data"]["flags"], 64, "body remains private");
+    assert_eq!(requests[1].method, "PATCH");
+    assert!(requests[1].path.starts_with("/api/v10/webhooks/1111/"));
+    assert!(requests[1].path.ends_with("/messages/@original"));
+    let reply: Value = serde_json::from_slice(&requests[1].body).expect("body JSON");
+    assert_eq!(
+        reply["allowed_mentions"],
+        json!({"parse":[],"roles":[],"users":[],"replied_user":false}),
+        "explicit empty allowed_mentions, not body rewriting, prevents pings"
+    );
+    let content = reply["content"].as_str().expect("body view text");
+    assert_eq!(content.encode_utf16().count(), 2000);
+    assert_eq!(
+        content, body,
+        "legacy body must be verbatim, including its tail"
+    );
+}
+
+#[tokio::test]
+async fn schedule_body_edit_inspect_legacy_raw_everyone_tail_is_verbatim() {
+    assert_legacy_body_verbatim("@everyone").await;
+}
+
+#[tokio::test]
+async fn schedule_body_edit_inspect_legacy_raw_here_tail_is_verbatim() {
+    assert_legacy_body_verbatim("@here").await;
+}
+
+#[tokio::test]
+async fn schedule_body_edit_inspect_legacy_disguised_everyone_tail_is_verbatim() {
+    assert_legacy_body_verbatim("@every\u{200b}one").await;
+}
+
+#[tokio::test]
+async fn schedule_body_edit_inspect_legacy_disguised_here_tail_is_verbatim() {
+    assert_legacy_body_verbatim("@he\u{200d}re").await;
+}
+
+// Break caught: the saved reply reuses the inspected pre-edit revision, leaving
+// the administrator with a token that cannot authorize the very next edit.
+#[tokio::test]
+async fn schedule_body_edit_saved_reply_revision_authorizes_the_next_edit() {
+    const SECOND: &str = "Second correction: Wednesday at eight.";
+    let db = database().await;
+    seed(db.pool(), GUILD_S, ID, Some(3600)).await;
+    seed(db.pool(), GUILD_S, OTHER, None).await;
+    let untouched = row(db.pool(), OTHER).await;
+    let before = row(db.pool(), ID).await;
+    let inspected = inspect_revision(db.pool(), ID).await;
+    let first_reply = private_text(&invoke(db.pool(), edit(ID, &inspected, NEW)).await);
+    saved(&first_reply);
+    let first_revision = revision(&first_reply);
+    let first_row = row(db.pool(), ID).await;
+    let first_audits = mutation_audits(db.pool()).await;
+    // Use exactly the reply token, without re-inspecting or reading a token
+    // from the store; a fresh inspect would hide the stale-reply regression.
+    let second_reply = private_text(&invoke(db.pool(), edit(ID, &first_revision, SECOND)).await);
+    let second_row = row(db.pool(), ID).await;
+    let all_audits = audits(db.pool()).await;
+    let edits = mutation_audits(db.pool()).await;
+    let untouched_after = row(db.pool(), OTHER).await;
+    db.close()
+        .await
+        .expect("drop own fixture even on a stale-revision RED");
+
+    assert_ne!(
+        first_revision, inspected,
+        "saved reply must carry the new revision"
+    );
+    saved(&second_reply);
+    let second_revision = revision(&second_reply);
+    assert_ne!(second_revision, first_revision);
+    unchanged_except_body_and_updater(&before, &first_row, NEW);
+    // Millisecond timestamps may legitimately tie for immediately chained
+    // edits; identity/fences must still match the original saved definition.
+    unchanged_except_body_and_updater(&before, &second_row, SECOND);
+    assert_eq!(
+        untouched_after, untouched,
+        "never update a sibling schedule"
+    );
+    assert_eq!(first_audits.len(), 1, "one edit audit for the first save");
+    assert_eq!(edits.len(), 2, "one edit audit per successful save");
+    assert_eq!(
+        all_audits.as_array().expect("audit rows").len(),
+        2,
+        "no extra audit writes"
+    );
+    for audit in &edits {
+        assert_eq!(audit["target_key"], ID);
+        assert_eq!(audit["guild_id"], GUILD_S);
+        assert_eq!(audit["actor_id"], "88");
+    }
+    assert_content_free_audits(&all_audits);
+    assert!(!all_audits.to_string().contains(SECOND));
+}
+
 // Break caught: using put_scheduled or allocating a fresh schedule silently
 // resets timing, creator/last-run facts or delivery fencing metadata.
 #[tokio::test]
