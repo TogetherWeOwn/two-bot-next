@@ -20,7 +20,7 @@ mechanism and data handling were not inspected.
 | Option | Value and cost | Disposition |
 | --- | --- | --- |
 | No build; current time tag | `/rsvp-attendance` already shows the member's saved time as a Discord-localized tag; members copy it by hand | Safe default; retain unless the boundary below is accepted |
-| One-event RFC 5545 `.ics` attachment | One ephemeral file, any calendar app imports it, nothing leaves the reply except the file; needs a **file-in-reply seam this repo lacks** (section 2) | Smallest private handoff that meets the constraints; recommend for **spec review**, not build |
+| One-event RFC 5545 `.ics` attachment | One ephemeral file, expected to import in common calendar apps (unverified hypothesis; section 7), nothing leaves the reply except the file; needs a **file-in-reply seam this repo lacks** (section 2) | Smallest private handoff that meets the constraints; recommend for **spec review**, not build |
 | Add-to-calendar link | No file, but needs a vendor URL carrying title and time in a query string, one vendor per link, and (for the vendor URL shape this author knows) an end time that TWO does not have; a TWO-hosted link would be a new public endpoint | Do not add; vendor URL behavior was **not verified** here |
 
 Out of scope and not proposed: OAuth or calendar APIs, subscriptions, a feed
@@ -138,8 +138,9 @@ earlier import with the same `UID` is **importer-dependent and unverified**.
 Rules the generator must satisfy (reference oracle in section 6):
 
 - `SUMMARY` is text-escaped per RFC 5545 section 3.3.11 (`\`, `;`, `,`); C0/C1
-  controls (including CR, LF, TAB), U+2028/U+2029 and Unicode bidi controls are
-  **removed**, not translated, so a title can never start a new property line.
+  controls (including CR, LF, TAB), U+2028/U+2029 and Unicode bidi controls
+  (U+061C, U+200E/U+200F, U+202A-U+202E, U+2066-U+2069) are **removed**, not
+  translated, so a title can never start a new property line.
   An empty result is `FIELD_UNSAFE`: no placeholder title is invented.
 - Lines are CRLF-terminated and folded at 75 octets without splitting a UTF-8
   sequence; the file is UTF-8, at most **2,048 bytes** (a 100-character title of
@@ -182,7 +183,9 @@ events.calendar.v1`, `guild_id`, self-only `member_id`, `event_id`, `reason`,
 `retryable`, `next_action`, and, for `PREVIEW`/`EXPORTED` only, `summary`,
 `starts_at_epoch`, `snapshot_at`, `file_bytes`. Denied replies omit all of them.
 Raw SQL or Discord errors never appear. Preview is idempotent; repeating an
-export yields identical bytes.
+export yields identical bytes. Byte identity is serialization determinism, not
+delivery deduplication: if an acknowledgement is lost, a retry may show the
+member a duplicate attachment (see `UPLOAD_UNCERTAIN`).
 
 | reason | retryable / next_action |
 | --- | --- |
@@ -195,7 +198,7 @@ export yields identical bytes.
 | `UNAVAILABLE` | false / `check_event_id_and_rsvp` (identical for every denial) |
 | `STORE_UNAVAILABLE` | true / `retry_after_backoff` |
 | `VERIFICATION_UNKNOWN` | true / `retry_after_backoff` |
-| `UPLOAD_UNCERTAIN` | true / `retry_export` (idempotent bytes make retry safe) |
+| `UPLOAD_UNCERTAIN` | true / `retry_export` (bytes are deterministic; delivery is not deduplicated, so a retry may show a duplicate attachment) |
 
 The check has no environment selector, credentials, network, database, Discord
 client or side effect, and no production path. It is a stdlib reference oracle
@@ -210,14 +213,16 @@ python3 scripts/check_docs_index.py --json
 Import-validation expectations the doctest enforces on every generated file:
 UTF-8; CRLF line ends and a final CRLF; every physical line at most 75 octets;
 unfolded properties are exactly the allowlist in order; one `VEVENT`;
-`DTSTART` and `DTSTAMP` match `\d{8}T\d{6}Z`; `DTSTART` round-trips to the
-mirror instant; no `DTEND`/`DURATION`; same inputs give the same SHA-256.
+`DTSTART` and `DTSTAMP` match `\d{8}T\d{6}Z`; `DTSTART` equals the mirror
+instant truncated to whole seconds (RFC 5545 date-times carry no fraction);
+no `DTEND`/`DURATION`; same inputs give the same SHA-256.
 
 ```pycon
 >>> import datetime as dt, hashlib, re
->>> STRIP = re.compile("[\x00-\x1f\x7f\x80-\x9f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+>>> STRIP = re.compile("[\x00-\x1f\x7f\x80-\x9f\u061c\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 >>> def basic(iso):
 ...     t = dt.datetime.strptime(iso, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=dt.timezone.utc)
+...     # Truncate sub-second: RFC 5545 date-time carries whole seconds only.
 ...     return t.strftime("%Y%m%dT%H%M%SZ"), int(t.timestamp())
 >>> def esc(text):
 ...     return STRIP.sub("", text).replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,")
@@ -264,6 +269,9 @@ mirror instant; no `DTEND`/`DURATION`; same inputs give the same SHA-256.
 >>> # dst_eu: 2026-10-25 01:00Z is the EU fallback; the instants straddling it are 3600 s apart
 >>> a, b = basic("2026-10-25T00:30:00.000Z"), basic("2026-10-25T01:30:00.000Z")
 >>> assert (a[1], b[1]) == (1792888200, 1792891800) and b[1] - a[1] == 3600
+>>> # subsecond: the mirror carries millis; DTSTART truncates to whole seconds
+>>> assert basic("2026-11-07T19:00:00.500Z")[0] == "20261107T190000Z"
+>>> assert check(render(G, E, "Game night", "2026-11-07T19:00:00.500Z", T))["DTSTART"] == "20261107T190000Z"
 >>> # edit: UID is stable; DTSTAMP and DTSTART follow the mirror; the digest differs (stale preview)
 >>> edited = render(G, E, "Game night", "2026-11-07T20:00:00.000Z", "2026-10-25T09:00:00.000Z")
 >>> fe = check(edited)
@@ -275,8 +283,8 @@ mirror instant; no `DTEND`/`DURATION`; same inputs give the same SHA-256.
 >>> fh = check(hostile)
 >>> assert b"\r\nBEGIN:VALARM" not in hostile and b"\r\nATTENDEE" not in hostile
 >>> assert fh["SUMMARY"].startswith("RaidBEGIN:VALARMACTION:PROCEDUREATTENDEE:mailto:x@y.z")
->>> # inject_bidi: bidi controls and line separators are removed
->>> assert check(render(G, E, "a\u202eb\u2028c\u200f d", "2026-11-07T19:00:00.000Z", T))["SUMMARY"] == "abc d"
+>>> # inject_bidi: bidi controls (including U+061C) and line separators are removed
+>>> assert check(render(G, E, "a\u202eb\u2028c\u200f\u061c d", "2026-11-07T19:00:00.000Z", T))["SUMMARY"] == "abc d"
 >>> # escape: backslash, semicolon, comma
 >>> assert check(render(G, E, "A, B; C\\D", "2026-11-07T19:00:00.000Z", T))["SUMMARY"] == "A\\, B\\; C\\\\D"
 >>> # fold: 100 four-byte characters fold at 75 octets, never mid-sequence, unfold losslessly, stay under the cap
