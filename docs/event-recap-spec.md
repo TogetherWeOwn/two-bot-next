@@ -60,7 +60,24 @@ Inspected repository head: `89b26ae050ffba9fb409622ffd54d31cdc79e7fc`.
 - `announcements_audit_log` (`0160_rsvp.sql:36-45`) has `id TEXT PRIMARY KEY` and
   `rsvp_store::write_audit` inserts with `ON CONFLICT DO NOTHING`; the LFG
   signup path already uses deterministic audit IDs as a replay fence. Audit
-  retention is `AUDIT_RETENTION_DAYS = 365` (`rsvp.rs:456`).
+  retention is `AUDIT_RETENTION_DAYS = 365` (`rsvp.rs:456`), a floor on the
+  cutoff, not a sweeper: `prune_rsvp_history` (`rsvp_store.rs:686-715`)
+  deletes audit rows only `WHERE action IN (event.rsvp, event.checkin)`.
+- RSVP reads are keyed by bare snowflake: `validate_event_id`
+  (`rsvp.rs:94-100`) accepts snowflakes only, and `list_rsvps`
+  (`rsvp_store.rs:234`) selects by `(guild_id, event_id)`. Check-in facts use
+  `source = checkin_source(canonical)` (`rsvp.rs:351-353`), which includes a
+  label for labeled occurrences. The two stores share a recap key only for
+  bare event IDs, hence the §3 restriction.
+- Component IDs are capped at 100 chars (`MAX_VOICE_CUSTOM_ID_CHARS`,
+  `voice_custom_id.rs:39-40`), with a 16-lowercase-hex content-hash precedent
+  (`IMPORT_HASH_CHARS`, `:69-70`); occurrence IDs run to 128 chars
+  (`OCCURRENCE_ID_MAX_CHARS`, `commands.rs:59`), so a labeled occurrence
+  cannot be bound literally and the recap binds bare IDs only (§7).
+- Public sends pass through the shared `message_safety::content`
+  neutralizer (`crates/core/src/message_safety.rs:104-106`), and LFG titles
+  are bounded to 100 UTF-16 units (`MAX_TITLE_CHARS`, `lfg.rs:36`); the
+  recap title contract (§4) reuses both.
 
 No live guild, permission, deployment or host workflow was inspected. If a
 once-only fence needs a new table or the counts cannot stay bounded, stop at A.
@@ -73,9 +90,12 @@ one command taking an occurrence (scheduled event ID, as `/attendance` does),
 answering with an **ephemeral preview** and a Publish button (§7). Nothing is
 posted by running the command.
 
-**Identity.** `(guild_id, canonical_occurrence_id)` from
-`parse_attendance_occurrence`; never a title or a caller-supplied name. A
-labeled repeat is its own occurrence. Series rollups are out of scope.
+**Identity.** `(guild_id, event_id)` where `event_id` is a bare scheduled-event
+snowflake; never a title or a caller-supplied name. Labeled
+`{id}:{label}` input is refused as LABELED_UNSUPPORTED: RSVP rows are keyed
+by bare ID while labeled check-ins live under a labeled source, so no single
+read key covers a labeled occurrence, and a labeled ID cannot fit the §7
+component binding either. Series rollups are out of scope.
 
 **Authorization**, re-evaluated on **both** the command and the button click,
 from the interaction payload only: configured guild, feature enabled, a human
@@ -83,19 +103,25 @@ member holding fresh Manage Events, and that member is the one the preview was
 issued to. A role change between preview and click refuses. Missing or unknown
 evidence fails closed. No cached grant, no role or permission change here.
 
-**Event state**, from the live read: eligible when status is Completed, or Active
-and started (the organizer is closing it). Canceled is refused. Scheduled with a
-future start (rescheduled) is refused as not ended. Unknown or foreign IDs
-collapse to one unavailable answer with no existence oracle.
+**Event state**, from the live read, as an explicit allowlist. Eligible: status
+Completed, or Active and started (the organizer is closing it). Canceled is
+refused as EVENT_CANCELED. Any other known status (Scheduled at any start
+time, Active but not started) is refused as NOT_ENDED. An unknown status, or
+an unknown or foreign ID, collapses to one UNAVAILABLE answer with no
+existence oracle.
 
 ## 4. Content bounds, destination and edit/delete
 
-**B content (recommended).** One message: event title (neutralized, truncated),
-`Going N · Interested M · Checked in C`, and `Snapshot <t:epoch:f>`. Counts only.
-Declined is never published. Counts come from existing rows: RSVP statuses
-Going/Interested, and `eligible_human` check-in facts for the occurrence, each
-at most 1,000 by the existing caps. **Zero** mentions and zero member IDs; the
-send sets `allowed_mentions: {parse: []}`. A recap with 0/0/0 is EMPTY and
+**B content (recommended).** One message: event title, `Going N · Interested M
+· Checked in C`, and `Snapshot <t:epoch:f>`. Counts only. Declined is never
+published. The title contract is exact: trim, pass through the shared
+`message_safety::content` neutralizer (breaks `@everyone`/`@here` and other
+mention parses), then truncate to 100 UTF-16 units with an ellipsis; the send
+sets `allowed_mentions: {parse: []}` as a second layer, not the definition.
+Counts come from existing rows read by the bare event ID: RSVP statuses
+Going/Interested via `list_rsvps`, and `eligible_human` check-in facts via
+`checkin_source` of that same bare ID, each at most 1,000 by the existing
+caps. **Zero** mentions and zero member IDs. A recap with 0/0/0 is EMPTY and
 cannot be published.
 
 **C content (specified only to be rejected).** Adds at most 25 display names per
@@ -115,10 +141,13 @@ TWO neither detects nor repairs that. Fresh counts need a new event occurrence.
 
 **Retention and erasure.** No recap store, no export, no preview history. B
 contains no personal data, so erasure has nothing to recall; the only retained
-rows are the two audit rows (§6), which follow the existing 365-day audit
-retention and the existing actor-based erasure. Eligibility is limited to
-events that started within 30 days, so an expired audit fence cannot reopen an
-old event.
+rows are the §6 audit rows under actions `event.recap.claim`,
+`event.recap.posted` and `event.recap.failed`. Those actions are outside the
+current prune scope (§2), so a build MUST extend the prune to cover them at
+the same 365-day floor, under the existing actor-based erasure; until it
+does, the retention claim is a build requirement, not a property. Eligibility
+is limited to events that started within 30 days, so an expired audit fence
+cannot reopen an old event.
 
 ## 5. Privacy, opt-outs and guild isolation
 
@@ -126,8 +155,9 @@ old event.
   read must return the same ID and guild.
 - Opted-out members: their check-in facts are purged and future writes are
   suppressed, so they are absent from C. Their `event_rsvps` rows persist, so
-  the Going/Interested counts must anti-join `privacy_opt_outs` at read time; a
-  count that includes them fails the fixture matrix.
+  the Going and Interested counts must each anti-join `privacy_opt_outs` at
+  read time, with a separate exclusion per status; a count in either status
+  that includes them fails the fixture matrix.
 - Members who left: RSVP rows persist after departure, and no bounded
   local current-membership source was verified. B counts are therefore labeled
   as **recorded** responses and may include departed members (counts identify
@@ -145,13 +175,19 @@ No new table. At-most-once uses `announcements_audit_log` with deterministic IDs
 and `ON CONFLICT DO NOTHING`, plus a per-recap advisory lock
 `recap:{guild}:{occurrence}` like the LFG locks.
 
-1. Under the lock, insert `event.recap.claim:{guild}:{occurrence}` (actor =
-   organizer, outcome `claimed`). A conflict means a prior claim exists: return
-   ALREADY_PUBLISHED, or COMMIT_UNKNOWN when no `posted` row exists.
+1. Under the lock, insert id `event.recap.claim:{guild}:{occurrence}` with
+   action `event.recap.claim` (actor = organizer, outcome `claimed`). A
+   conflict means a prior claim exists: return ALREADY_PUBLISHED when a
+   `posted` row exists, else COMMIT_UNKNOWN.
 2. Send once with a nonce derived from the claim and mentions suppressed.
-3. On accepted send, insert `event.recap.posted:{guild}:{occurrence}` with the
-   message ID. On a definite pre-send rejection, record `failed` and release the
-   claim only through the same lock, never after an ambiguous send.
+3. On accepted send, insert id `event.recap.posted:{guild}:{occurrence}` with
+   action `event.recap.posted` and the message ID. On a definite pre-send
+   rejection (permission refused before any send), still under the same lock:
+   insert id `event.recap.failed:{guild}:{occurrence}` with action
+   `event.recap.failed` (outcome `failed`, reason SEND_REJECTED), DELETE the
+   claim row to release the fence, and return SEND_REJECTED. A later retry
+   then claims fresh and posts at most once. Never release after an ambiguous
+   send: that stays COMMIT_UNKNOWN.
 
 A restart between 1 and 3 leaves a claim without a `posted` row: that state is
 **unknown, not absent**. The runtime may run one bounded recovery scan (at most 3
@@ -170,9 +206,13 @@ the cost is one more counts-only line (open finding 3).
 
 Preview (ephemeral, only the organizer): the exact text that will post, the
 destination channel, "Nobody is pinged", "Posts once", and the snapshot time.
-Buttons: Publish and Cancel. The Publish `custom_id` binds guild, occurrence,
-organizer, template version and a digest of the rendered text. On click the
-service re-authorizes, re-reads the event, re-renders, and refuses
+Buttons: Publish and Cancel. The Publish `custom_id` is exactly
+`recap:v1:{guild}:{event}:{organizer}:{digest12}`, all fields literal:
+20-digit-max snowflakes and a 12-lowercase-hex digest of SHA-256 over guild,
+occurrence, organizer, template version and rendered text. Worst case is 84
+chars, inside the 100-char component cap, and the occurrence is recovered by
+splitting on `:` with no preview store (bare snowflakes contain no `:`). On
+click the service re-authorizes, re-reads the event, re-renders, and refuses
 PREVIEW_STALE if the digest differs; nothing is posted on a mismatch. A Cancel
 or an ignored preview writes nothing. Failure replies name the reason and the
 next action, never raw SQL or Discord errors.
@@ -191,12 +231,14 @@ posted message ID.
 | `POSTED` | false / `none` |
 | `EMPTY` | false / `nothing_to_publish` |
 | `DENIED` | false / `ask_event_manager` |
-| `UNAVAILABLE` | false / `verify_event` (missing, foreign or unreadable) |
+| `UNAVAILABLE` | false / `verify_event` (missing, foreign, unreadable or unknown status) |
 | `EVENT_CANCELED` | false / `none` |
 | `NOT_ENDED` | false / `retry_after_event_ends` |
+| `LABELED_UNSUPPORTED` | false / `use_bare_event_id` |
 | `ALREADY_PUBLISHED` | false / `none` |
 | `PREVIEW_STALE` | false / `run_preview_again` |
 | `COMMIT_UNKNOWN` | true / `inspect_channel` |
+| `SEND_REJECTED` | true / `restore_permission_and_retry` |
 | `STORE_UNAVAILABLE` | true / `retry_after_backoff` |
 
 ## 8. Findings, acceptance boundary, review metric and undo
@@ -215,7 +257,7 @@ pilot. Route the brief through the President/COO to the CEO and the existing hos
 intent path; a queue receipt is not alignment. Nothing goes directly to the owner
 or an invented executor. A material revision needs a fresh review request.
 
-By 2026-10-31 the metric is **all 14 fixture rows have agreed or explicitly
+By 2026-10-31 the metric is **all 20 fixture rows have agreed or explicitly
 rejected outcomes and the four findings have written disposition**. This measures
 design completeness, not engagement. **Keep only if** content is provably bounded
 to already-held data with opt-outs honored; otherwise the answer is **no-build**
@@ -241,16 +283,22 @@ one posted message. Counts are `going/interested/checked_in`.
 | no_checkins | 5 RSVPs, 0 check-ins -> PREVIEW 3/2/0 |
 | empty | 0/0/0 -> EMPTY, publish refused |
 | opted_out | 1 Going member opted out -> PREVIEW 2/2/2, not counted |
+| opted_out_interested | 1 Interested member opted out -> PREVIEW 3/1/2, not counted |
 | left | 1 Going member left -> PREVIEW 3/2/2 labeled recorded (finding 2) |
+| labeled | `{id}:{label}` input -> LABELED_UNSUPPORTED, 0 posts |
 | canceled | Event Canceled -> EVENT_CANCELED, 0 posts |
 | rescheduled | Scheduled, future start -> NOT_ENDED, 0 posts |
+| not_started | Active, not started -> NOT_ENDED, 0 posts |
+| unknown_status | Unknown status -> UNAVAILABLE, no oracle |
 | denied | Organizer lost Manage Events before click -> DENIED, 0 posts |
 | foreign | Event in guild `g2` -> UNAVAILABLE, no oracle |
 | duplicate | Publish twice -> POSTED then ALREADY_PUBLISHED, 1 post |
 | concurrent | Two clicks at once -> one POSTED, one ALREADY_PUBLISHED, 1 post |
 | restart | Claim row, no posted row -> COMMIT_UNKNOWN, no resend |
+| send_rejected | Definite pre-send rejection -> SEND_REJECTED, claim released, 0 posts; retry may post once |
 | stale | Counts change between preview and click -> PREVIEW_STALE, 0 posts |
 | version | `recap.v1` preview clicked under `recap.v2` -> PREVIEW_STALE |
+| custom_id_max | 20-digit guild/event/organizer + 12-hex digest -> custom_id 84 chars, occurrence literal |
 
 Runnable offline document check (Python stdlib; from repo root):
 
@@ -267,51 +315,77 @@ is not proof. No acceptance or implementation task is created here.
 
 ```pycon
 >>> import json
->>> def recap(going=3, interested=2, checked=2, opted_out=0, status="completed",
-...           future=False, manager=True, same_guild=True, posted=0, claimed=False,
-...           stale=False, version="v1"):
+>>> def recap(going=3, interested=2, checked=2, opted_out_going=0,
+...           opted_out_interested=0, status="completed", started=True,
+...           manager=True, same_guild=True, labeled=False, posted=0,
+...           claimed=False, send_rejected=False, stale=False, version="v1"):
 ...     """Reference model: returns (reason, going, interested, checked, posts)."""
 ...     if not same_guild:
 ...         return ("UNAVAILABLE", 0, 0, 0, 0)
 ...     if not manager:
 ...         return ("DENIED", 0, 0, 0, 0)
+...     if labeled:
+...         return ("LABELED_UNSUPPORTED", 0, 0, 0, 0)
 ...     if status == "canceled":
 ...         return ("EVENT_CANCELED", 0, 0, 0, 0)
-...     if future:
+...     if status != "completed" and not (status == "active" and started):
+...         if status not in ("scheduled", "active"):
+...             return ("UNAVAILABLE", 0, 0, 0, 0)
 ...         return ("NOT_ENDED", 0, 0, 0, 0)
 ...     if version != "v1" or stale:
 ...         return ("PREVIEW_STALE", 0, 0, 0, 0)
 ...     if claimed and not posted:
 ...         return ("COMMIT_UNKNOWN", 0, 0, 0, 0)
-...     g, i = going - opted_out, interested
+...     g, i = going - opted_out_going, interested - opted_out_interested
 ...     if (g, i, checked) == (0, 0, 0):
 ...         return ("EMPTY", 0, 0, 0, 0)
+...     if send_rejected:
+...         return ("SEND_REJECTED", g, i, checked, 0)
 ...     return ("ALREADY_PUBLISHED" if posted else "PREVIEW", g, i, checked, posted)
 >>> cases = {
 ...     "no_signups": (dict(going=0, interested=0), ("PREVIEW", 0, 0, 2, 0)),
 ...     "no_checkins": (dict(checked=0), ("PREVIEW", 3, 2, 0, 0)),
 ...     "empty": (dict(going=0, interested=0, checked=0), ("EMPTY", 0, 0, 0, 0)),
-...     "opted_out": (dict(opted_out=1), ("PREVIEW", 2, 2, 2, 0)),
+...     "opted_out": (dict(opted_out_going=1), ("PREVIEW", 2, 2, 2, 0)),
+...     "opted_out_interested": (dict(opted_out_interested=1), ("PREVIEW", 3, 1, 2, 0)),
 ...     "left": ({}, ("PREVIEW", 3, 2, 2, 0)),
+...     "labeled": (dict(labeled=True), ("LABELED_UNSUPPORTED", 0, 0, 0, 0)),
 ...     "canceled": (dict(status="canceled"), ("EVENT_CANCELED", 0, 0, 0, 0)),
-...     "rescheduled": (dict(future=True), ("NOT_ENDED", 0, 0, 0, 0)),
+...     "rescheduled": (dict(status="scheduled", started=False), ("NOT_ENDED", 0, 0, 0, 0)),
+...     "not_started": (dict(status="active", started=False), ("NOT_ENDED", 0, 0, 0, 0)),
+...     "unknown_status": (dict(status="unknown"), ("UNAVAILABLE", 0, 0, 0, 0)),
 ...     "denied": (dict(manager=False), ("DENIED", 0, 0, 0, 0)),
 ...     "foreign": (dict(same_guild=False), ("UNAVAILABLE", 0, 0, 0, 0)),
 ...     "duplicate": (dict(posted=1), ("ALREADY_PUBLISHED", 3, 2, 2, 1)),
 ...     "restart": (dict(claimed=True), ("COMMIT_UNKNOWN", 0, 0, 0, 0)),
+...     "send_rejected": (dict(send_rejected=True), ("SEND_REJECTED", 3, 2, 2, 0)),
 ...     "stale": (dict(stale=True), ("PREVIEW_STALE", 0, 0, 0, 0)),
 ...     "version": (dict(version="v2"), ("PREVIEW_STALE", 0, 0, 0, 0)),
 ... }
 >>> for name, (kwargs, expected) in cases.items():
 ...     assert recap(**kwargs) == expected, name
->>> # concurrent: one claim wins under the unique audit id, the other conflicts
->>> claims = {}
+>>> # scheduled-but-started is also not ended; unknown fails closed either way
+>>> assert recap(status="scheduled", started=True)[0] == "NOT_ENDED"
+>>> assert recap(status="unknown", started=False)[0] == "UNAVAILABLE"
+>>> # concurrent: one claim wins under the unique audit id, the other conflicts;
+>>> # posted state is separate, so a repeat click by the winner is refused too
+>>> claims, posted_state = {}, {}
 >>> def click(who):
-...     return "POSTED" if claims.setdefault("e1", who) == who else "ALREADY_PUBLISHED"
+...     if posted_state.get("e1"):
+...         return "ALREADY_PUBLISHED"
+...     if claims.setdefault("e1", who) != who:
+...         return "ALREADY_PUBLISHED"
+...     posted_state["e1"] = True
+...     return "POSTED"
 >>> assert sorted([click("o1"), click("o2")]) == ["ALREADY_PUBLISHED", "POSTED"]
->>> assert len(cases) + 1 == 14
+>>> claims, posted_state = {}, {}
+>>> assert [click("o"), click("o")] == ["POSTED", "ALREADY_PUBLISHED"]
+>>> # custom_id_max: worst-case binding stays inside the 100-char component cap
+>>> worst = "recap:v1:%s:%s:%s:%s" % ("9" * 20, "9" * 20, "9" * 20, "a" * 12)
+>>> assert len(worst) == 84 <= 100, len(worst)
+>>> assert len(cases) + 2 == 20
 >>> assert all(p <= 1 for _, (_, e) in cases.items() for p in e[4:])
->>> print(json.dumps({"schema": "events.recap.oracle.v1", "fixtures": 14, "status": "pass"}, sort_keys=True))
-{"fixtures": 14, "schema": "events.recap.oracle.v1", "status": "pass"}
+>>> print(json.dumps({"schema": "events.recap.oracle.v1", "fixtures": 20, "status": "pass"}, sort_keys=True))
+{"fixtures": 20, "schema": "events.recap.oracle.v1", "status": "pass"}
 
 ```
