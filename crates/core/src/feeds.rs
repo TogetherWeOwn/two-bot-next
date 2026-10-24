@@ -411,10 +411,17 @@ fn sanitize_source_segment(segment: &str) -> (String, bool) {
 /// distinguishable by their non-secret parameters.
 fn redact_source_query(raw: &str, reasons: &mut Vec<&'static str>) -> String {
     let mut query = String::new();
-    for (index, pair) in raw.split('&').enumerate() {
-        if index > 0 {
-            query.push('&');
-        }
+    // Some origins (Rack/Rails, Perl CGI) treat `;` as a pair separator too;
+    // splitting only on `&` would leave a credential pair hidden inside a
+    // safe-looking value. Preserve the original separator in the projection.
+    for chunk in raw.split_inclusive(|c| c == '&' || c == ';') {
+        let (pair, separator) = if let Some(stripped) = chunk.strip_suffix('&') {
+            (stripped, "&")
+        } else if let Some(stripped) = chunk.strip_suffix(';') {
+            (stripped, ";")
+        } else {
+            (chunk, "")
+        };
         let (name, value) = pair
             .split_once('=')
             .map_or((pair, None), |(n, v)| (n, Some(v)));
@@ -442,6 +449,7 @@ fn redact_source_query(raw: &str, reasons: &mut Vec<&'static str>) -> String {
                 query.push_str(&safe_value);
             }
         }
+        query.push_str(separator);
     }
     query
 }
