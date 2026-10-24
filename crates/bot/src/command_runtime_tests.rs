@@ -1294,6 +1294,8 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "feed-remove"
                         | "feed-list"
                         | "purge"
+                        | "purge-preview"
+                        | "channel-inspect"
                         | "slowmode"
                         | "lockdown"
                         | "unlock"
@@ -3557,6 +3559,8 @@ fn production_router_matches_composed_production_wiring() {
             HandlerId::FeedAdd,
             HandlerId::FeedRemove,
             HandlerId::FeedList,
+            HandlerId::PurgePreview,
+            HandlerId::ChannelInspect,
         ];
         ids.extend(ModerationAction::ALL.map(HandlerId::Moderation));
         ids
