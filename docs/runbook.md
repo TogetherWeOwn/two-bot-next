@@ -3631,7 +3631,8 @@ lanes), `worker check`, `pr-lint`, and `gitleaks`; a docs test is not a waiver.
 `/giveaway create|list|cancel|end|pause|resume|extend|reroll` requires Manage
 Server; entry buttons are open to human members with per-interaction role and
 age checks. Limits: prize 1–200 characters, duration 1–43200 minutes,
-winners 1–100, 10 active giveaways per guild, 10000 entrants each. Entry
+winners 1–100, 10 active giveaways per guild, 1000 entrants each (one paced
+membership re-check per entrant must fit the 300 s draw run). Entry
 attempts have a bounded process-local 10/minute member budget, and successful
 entries share a durable 10/minute guild/member budget across giveaways and
 restarts. Duplicates collapse to one row. `gw:<id>` carries only the opaque

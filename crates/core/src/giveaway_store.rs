@@ -599,6 +599,49 @@ pub async fn insert_draw(
     .await
 }
 
+/// Insert one reroll round and reopen the announce marker in the same
+/// transaction. A crash after the round exists therefore always leaves the
+/// giveaway in the unannounced sweep (`drawn AND announced_at IS NULL`), so the
+/// reroll is announced and audited from the stored row and never lost behind
+/// the previous round's `announced_at`. Collides on the draw PK exactly like
+/// [`insert_draw`] (23505 for the losing racer).
+pub async fn insert_reroll_draw(
+    pool: &Pool<Postgres>,
+    input: &NewDraw,
+) -> Result<GiveawayDrawRow, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let draw = sqlx::query_as::<_, GiveawayDrawRow>(
+        "INSERT INTO giveaway_draws
+           (guild_id, giveaway_id, draw_no, drawn_at, eligible_count,
+            eligible_hash, seed, winner_ids, reroll_kind)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         RETURNING guild_id, giveaway_id, draw_no, drawn_at, eligible_count,
+                   eligible_hash, seed, winner_ids, reroll_kind",
+    )
+    .bind(&input.guild_id)
+    .bind(&input.giveaway_id)
+    .bind(input.draw_no)
+    .bind(input.drawn_at)
+    .bind(input.eligible_count)
+    .bind(&input.eligible_hash)
+    .bind(&input.seed)
+    .bind(&input.winner_ids)
+    .bind(input.reroll_kind.as_deref())
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE giveaways SET announced_at = NULL, updated_at = $3
+          WHERE guild_id = $1 AND id = $2 AND status = 'drawn'",
+    )
+    .bind(&input.guild_id)
+    .bind(&input.giveaway_id)
+    .bind(input.drawn_at)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(draw)
+}
+
 /// List every draw row of a giveaway in round order. Rerolls append rows;
 /// the first draw row is never updated.
 pub async fn get_draws(
@@ -657,8 +700,11 @@ pub async fn list_unannounced(
 
 /// Bound active definitions and every list/ticker batch for one guild.
 pub const MAX_OPEN_GIVEAWAYS: i64 = 10;
-/// Maximum number of distinct members admitted to one giveaway.
-pub const MAX_GIVEAWAY_ENTRIES: i32 = 10_000;
+/// Maximum number of distinct members admitted to one giveaway. The draw
+/// re-validates every entrant with one paced membership read inside a single
+/// 300 s job run, so the cap is sized to what one run can finish
+/// (`two-bot-bot` pins the arithmetic against the pacing floor and timeout).
+pub const MAX_GIVEAWAY_ENTRIES: i32 = 1_000;
 
 /// Create and audit atomically, under a guild-scoped quota lock. An interaction
 /// id used as the opaque id also makes duplicate create deliveries harmless.

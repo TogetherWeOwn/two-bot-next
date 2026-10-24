@@ -425,6 +425,33 @@ pub fn single_reroll_keep(
     }
 }
 
+/// The full winner set after replacing one winner: the latest winners in
+/// order, with `replaced_user_id` swapped for the drawn replacement (or simply
+/// removed when nobody was drawn). Kept winners always survive and no member
+/// holds two seats, even when the full-house fallback of
+/// [`single_reroll_keep`] re-picked an existing winner.
+#[must_use]
+pub fn single_reroll_winners(
+    latest_winner_ids: &[String],
+    replaced_user_id: &str,
+    replacement_ids: &[String],
+) -> Vec<String> {
+    let mut next: Vec<String> = Vec::with_capacity(latest_winner_ids.len());
+    for winner in latest_winner_ids {
+        let slot = if winner == replaced_user_id {
+            replacement_ids
+        } else {
+            std::slice::from_ref(winner)
+        };
+        for id in slot {
+            if !next.contains(id) {
+                next.push(id.clone());
+            }
+        }
+    }
+    next
+}
+
 /// Render the `reroll_kind` for replacing one winner: `single:<user id>`.
 #[must_use]
 pub fn reroll_kind_single(user_id: &str) -> String {
@@ -954,6 +981,36 @@ mod tests {
         assert_eq!(keep, vec![alice.clone()]);
         assert!(single_reroll_pool(&solo, &keep).is_empty());
         assert!(draw(&single_reroll_pool(&solo, &keep), VECTOR_SEED_1, 1).is_empty());
+    }
+
+    #[test]
+    fn single_reroll_winners_keep_the_full_set_without_duplicates() {
+        let ids: Vec<String> = (1..=4).map(|n| format!("10000000000000000{n}")).collect();
+        let (a, b, c, d) = (&ids[0], &ids[1], &ids[2], &ids[3]);
+        let latest = vec![a.clone(), b.clone()];
+        // Replacing A with fresh C keeps B and seats C in A's slot.
+        assert_eq!(
+            single_reroll_winners(&latest, a, std::slice::from_ref(c)),
+            vec![c.clone(), b.clone()]
+        );
+        // A kept winner stays targetable on the next round.
+        let next = single_reroll_winners(&latest, a, std::slice::from_ref(c));
+        assert_eq!(
+            single_reroll_winners(&next, b, std::slice::from_ref(d)),
+            vec![c.clone(), d.clone()]
+        );
+        // Nobody drawn: the replaced winner is removed, the rest survive.
+        assert_eq!(single_reroll_winners(&latest, a, &[]), vec![b.clone()]);
+        // Full-house fallback re-picked an existing winner: no double seat,
+        // whichever side of the target the duplicate sits on.
+        assert_eq!(
+            single_reroll_winners(&latest, a, std::slice::from_ref(b)),
+            vec![b.clone()]
+        );
+        assert_eq!(
+            single_reroll_winners(&latest, b, std::slice::from_ref(a)),
+            vec![a.clone()]
+        );
     }
 
     #[test]

@@ -33,7 +33,7 @@ use two_bot_core::{
     },
 };
 
-use crate::ActionExecutor;
+use crate::{ActionExecutor, DiscordError};
 
 const FAILURE: &str = "Giveaway unavailable; try again later.";
 const INVALID: &str = "Invalid giveaway options. Use a prize up to 200 characters, 1–43200 minutes and 1–100 winners.";
@@ -89,10 +89,12 @@ struct ClaimReport {
     failed: bool,
 }
 
-/// Draw-phase failure, before any commit. Every exit releases the claim, so a
-/// transient failure retries on the next tick instead of stalling to lease
-/// expiry. Corrupt stored data fails the row (loudly, every tick) instead of
-/// voiding the giveaway or drawing from guessed inputs.
+/// Draw-phase failure, before any commit. Every transient exit releases the
+/// claim, so a failure retries on the next tick instead of stalling to lease
+/// expiry. Corrupt stored data fails the row loudly instead of voiding the
+/// giveaway or drawing from guessed inputs, and keeps its claim until the
+/// lease expires: releasing it would hand the same row back to the very next
+/// claim and starve every later-due giveaway in the tick.
 #[derive(Debug, thiserror::Error)]
 enum DrawError {
     #[error("giveaway draw database failure")]
@@ -421,8 +423,10 @@ impl GiveawayRuntime {
 
     /// Append one reroll round: a full redraw, or the replacement of one named
     /// winner. History is immutable: the new row carries `draw_no + 1` and the
-    /// old rows are never touched. A failed audit or announcement reopens the
-    /// announce marker, so the tick heals both from the stored row.
+    /// old rows are never touched. The insert reopens the announce marker in
+    /// the same transaction, so a failed or interrupted audit or announcement
+    /// leaves the row in the unannounced sweep and the tick heals both from
+    /// the stored row.
     async fn reroll(
         &self,
         guild: &str,
@@ -474,8 +478,11 @@ impl GiveawayRuntime {
             Some(target) => {
                 let keep = giveaway::single_reroll_keep(&eligible, &latest_winners, target);
                 let pool = giveaway::single_reroll_pool(&eligible, &keep);
+                let replacement = giveaway::draw(&pool, &seed, 1);
+                // The round stores the whole next winner set, so kept winners
+                // survive and stay targetable by the next reroll.
                 (
-                    giveaway::draw(&pool, &seed, 1),
+                    giveaway::single_reroll_winners(&latest_winners, target, &replacement),
                     giveaway::reroll_kind_single(target),
                 )
             }
@@ -492,7 +499,7 @@ impl GiveawayRuntime {
                 .map_err(|_| sqlx::Error::Protocol("invalid giveaway winners".into()))?,
             reroll_kind: Some(reroll_kind),
         };
-        let draw = match store::insert_draw(&self.pool, &input).await {
+        let draw = match store::insert_reroll_draw(&self.pool, &input).await {
             Ok(draw) => draw,
             Err(error) if is_unique_violation(&error) => {
                 return Ok("Giveaway reroll collided; try again.".into());
@@ -507,13 +514,11 @@ impl GiveawayRuntime {
                 giveaway_id = id,
                 "giveaway reroll audit failed; details withheld"
             );
-            let _ = store::unmark_announced(&self.pool, guild, id, now).await;
             return Err(error);
         }
         if self.announce(&row, &draw).await {
             Ok("Giveaway rerolled.".into())
         } else {
-            let _ = store::unmark_announced(&self.pool, guild, id, now).await;
             Ok("Giveaway rerolled; its announcement will retry shortly.".into())
         }
     }
@@ -701,7 +706,13 @@ impl GiveawayRuntime {
             // Idempotent heal: a crash between draw and audit left the row
             // without its audit, and the deterministic id makes the rewrite
             // a no-op instead of a conflict.
-            heal_draw_audit(&self.pool, guild, &row.id, latest, now).await;
+            if heal_draw_audit(&self.pool, guild, &row.id, latest, now)
+                .await
+                .is_err()
+            {
+                failed = true;
+                continue;
+            }
             if self.announce(&row, latest).await {
                 summary.announced += 1;
             } else {
@@ -740,7 +751,13 @@ impl GiveawayRuntime {
             )
             .await;
         };
-        let draws = store::get_draws(&self.pool, &row.guild_id, &row.id).await?;
+        let draws = match store::get_draws(&self.pool, &row.guild_id, &row.id).await {
+            Ok(draws) => draws,
+            Err(error) => {
+                release().await;
+                return Err(DrawError::Database(error));
+            }
+        };
         if let Some(latest) = draws.last() {
             // Crash recovery: the draw row exists but the flip or the announce
             // never landed. Complete the flip, heal the audit, announce.
@@ -758,7 +775,14 @@ impl GiveawayRuntime {
                 return Ok(settled(DrawKind::Skipped, false, false));
             }
             let now = OffsetDateTime::now_utc();
-            heal_draw_audit(&self.pool, &row.guild_id, &row.id, latest, now).await;
+            if heal_draw_audit(&self.pool, &row.guild_id, &row.id, latest, now)
+                .await
+                .is_err()
+            {
+                // Never announce past a missing audit: the row stays
+                // unannounced, so the sweep retries both from the stored row.
+                return Ok(settled(DrawKind::Skipped, false, true));
+            }
             let announced = self.announce(row, latest).await;
             return Ok(settled(DrawKind::Skipped, announced, !announced));
         }
@@ -771,11 +795,16 @@ impl GiveawayRuntime {
                     giveaway_id = row.id.as_str(),
                     "giveaway requirements are damaged; leaving the row for an operator"
                 );
-                release().await;
                 return Err(DrawError::Data);
             }
         };
-        let entries = store::list_entries(&self.pool, &row.guild_id, &row.id).await?;
+        let entries = match store::list_entries(&self.pool, &row.guild_id, &row.id).await {
+            Ok(entries) => entries,
+            Err(error) => {
+                release().await;
+                return Err(DrawError::Database(error));
+            }
+        };
         let eligible = match self
             .eligible_entrants(&row.guild_id, &requirements, &entries, now)
             .await
@@ -792,16 +821,12 @@ impl GiveawayRuntime {
                 giveaway_id = row.id.as_str(),
                 "giveaway draw nonce is damaged; leaving the row for an operator"
             );
-            release().await;
             return Err(DrawError::Data);
         };
         let winners = giveaway::draw(&eligible, &seed, row.winners_count.max(0) as usize);
         let winner_ids = match serde_json::to_value(&winners) {
             Ok(ids) => ids,
-            Err(_) => {
-                release().await;
-                return Err(DrawError::Data);
-            }
+            Err(_) => return Err(DrawError::Data),
         };
         let input = NewDraw {
             guild_id: row.guild_id.clone(),
@@ -887,16 +912,19 @@ impl GiveawayRuntime {
     }
 
     /// One membership read: roles plus guild age in days. `None` means absent
-    /// or unproven (403/404, or an unreadable body): excluded, fail closed.
+    /// (403/404) or a non-object body: excluded. Transport, rate-limit and
+    /// upstream failures are errors, never absence.
     async fn member_evidence(
         &self,
         guild: &str,
         user_id: &str,
         now: OffsetDateTime,
     ) -> Result<Option<MemberEvidence>, String> {
+        // Checked read: only 403/404 mean absent. A 429/5xx/unreadable answer
+        // is an error, so an outage aborts the draw instead of shrinking it.
         let member = self
             .executor
-            .get_json(&format!("/guilds/{guild}/members/{user_id}"))
+            .get_json_checked(&format!("/guilds/{guild}/members/{user_id}"))
             .await?
             .filter(|value| value.is_object());
         let Some(member) = member else {
@@ -949,23 +977,39 @@ impl GiveawayRuntime {
         };
         let mut shown = row.clone();
         shown.status = "drawn".to_owned();
-        if self
-            .executor
-            .edit_message_with_components(
-                &row.channel_id,
-                &row.message_id,
-                &render(&shown, count),
-                &components(&shown),
-            )
-            .await
-            .is_err()
-        {
-            tracing::warn!(
-                guild_id = row.guild_id.as_str(),
-                giveaway_id = row.id.as_str(),
-                "giveaway announce edit failed; details withheld"
-            );
-            return false;
+        // The message edit is cosmetic: a row whose message never confirmed
+        // (`pending`) has nothing to edit, and a definitive refusal (deleted
+        // message, lost access) can never succeed on retry. Neither may hold
+        // the winners post hostage. Transient failures still retry the tick,
+        // keeping edit-before-post order whenever the message exists.
+        if row.message_id != "pending" {
+            match self
+                .executor
+                .edit_message_with_components(
+                    &row.channel_id,
+                    &row.message_id,
+                    &render(&shown, count),
+                    &components(&shown),
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(DiscordError::Rejected(_)) => {
+                    tracing::warn!(
+                        guild_id = row.guild_id.as_str(),
+                        giveaway_id = row.id.as_str(),
+                        "giveaway announce edit refused; posting winners anyway"
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        guild_id = row.guild_id.as_str(),
+                        giveaway_id = row.id.as_str(),
+                        "giveaway announce edit failed; details withheld"
+                    );
+                    return false;
+                }
+            }
         }
         let winners: Vec<String> = match serde_json::from_value(draw.winner_ids.clone()) {
             Ok(winners) => winners,
@@ -1060,7 +1104,7 @@ async fn heal_draw_audit(
     giveaway_id: &str,
     draw: &GiveawayDrawRow,
     now: OffsetDateTime,
-) {
+) -> Result<(), sqlx::Error> {
     let healed = if draw.reroll_kind.is_none() {
         store::audit_draw(pool, guild, giveaway_id, draw.draw_no, None, now).await
     } else {
@@ -1073,6 +1117,7 @@ async fn heal_draw_audit(
             "giveaway audit heal failed; details withheld"
         );
     }
+    healed.map(|_| ())
 }
 
 /// True for a PostgreSQL unique violation (23505): the lost side of a raced

@@ -114,3 +114,32 @@ pub(crate) fn register_draw(
         }),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::DRAW_TIMEOUT_SECS;
+    use two_bot_core::giveaway_store::MAX_GIVEAWAY_ENTRIES;
+    use two_bot_discord::{giveaway::CLAIM_LEASE_SECS, PACE_INTERVAL_MS};
+
+    /// Allowance for one membership GET's own latency on top of the paced
+    /// dispatch floor.
+    const READ_LATENCY_ALLOWANCE_MS: u64 = 90;
+
+    /// The draw re-validates every entrant with one sequential paced
+    /// membership read inside a single job run. The cap must fit that run
+    /// (the old 10,000 cap needed over 1,000 s against the 300 s timeout), and
+    /// the claim lease must outlive the run so a live draw is never reclaimed.
+    #[test]
+    fn entry_cap_revalidates_inside_one_draw_timeout() {
+        let per_read_ms = PACE_INTERVAL_MS + READ_LATENCY_ALLOWANCE_MS;
+        let worst_case_ms = u64::try_from(MAX_GIVEAWAY_ENTRIES).unwrap() * per_read_ms;
+        assert!(
+            worst_case_ms <= DRAW_TIMEOUT_SECS * 1_000,
+            "{MAX_GIVEAWAY_ENTRIES} entrants need {worst_case_ms} ms of paced reads, over the {DRAW_TIMEOUT_SECS} s draw timeout"
+        );
+        assert!(
+            i64::try_from(DRAW_TIMEOUT_SECS).unwrap() < CLAIM_LEASE_SECS,
+            "the claim lease must outlive the draw timeout"
+        );
+    }
+}
