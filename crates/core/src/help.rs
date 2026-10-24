@@ -94,6 +94,12 @@ const HELP_GROUPS: &[HelpGroup] = &[
         anchor: None,
     },
     HelpGroup {
+        title: "Giveaways",
+        requires: Some("Manage Server"),
+        commands: &["giveaway"],
+        anchor: None,
+    },
+    HelpGroup {
         title: "RSVPs",
         requires: None,
         commands: &["rsvp", "rsvp-attendance"],
@@ -756,13 +762,13 @@ mod tests {
                 "{token} appears exactly once"
             );
         }
-        // 27 legacy builtins plus Next-only help, privacy, command-inspect,
-        // reopen, welcome-preview, purge-preview and channel-inspect
-        // commands, plus the 21 gated voice commands (voice `kick` loses
-        // first-wins to moderation `/kick`; `/templateassistant` stays
-        // unpublished until its slice lands): matches the regenerated
-        // `docs/commands.md` total.
-        assert!(text.contains("**Server commands** (55 live)"));
+        // 35 non-voice commands (6 core + 18 feature + 9 moderation + 2 reads),
+        // including inspection, reopen, welcome-preview, giveaway,
+        // purge-preview and channel-inspect, plus 21 additional voice
+        // commands (voice `kick` loses first-wins to moderation `/kick`).
+        // `/templateassistant` stays unpublished until its slice lands:
+        // matches the regenerated `docs/commands.md` total.
+        assert!(text.contains("**Server commands** (56 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"
@@ -779,6 +785,7 @@ mod tests {
         for (group, perm) in [
             ("Automations", "Manage Server"),
             ("Feed relays", "Manage Server"),
+            ("Giveaways", "Manage Server"),
             ("Bans", "Ban Members"),
             ("Message cleanup", "Manage Messages"),
             ("Voice room admin", "Manage Channels"),
@@ -790,6 +797,7 @@ mod tests {
             );
         }
         for line in [
+            "**Giveaways** — needs Manage Server\n/giveaway\n",
             "**Message cleanup** — needs Manage Messages\n/purge · /purge-preview\n",
             "**Channel slowmode and locks** — needs Manage Channels\n/slowmode · /lockdown · /unlock · /channel-inspect\n",
             "**Voice rooms**\n/setup · /ping · /invite · /reclaim · /transfer · /name · /private · /public · /limit · /unlimit\n",
@@ -820,6 +828,8 @@ mod tests {
         assert!(text.contains("/rank"));
         assert!(text.contains("/help"));
         assert!(!text.contains("Automations"));
+        assert!(!text.contains("Giveaways"));
+        assert!(!text.contains("/giveaway"));
         assert!(!text.contains("/ban"));
         assert!(!text.contains("Custom"));
     }
@@ -884,10 +894,11 @@ mod tests {
             .iter()
             .flat_map(|g| g.commands.iter().copied())
             .collect();
-        // 27 legacy builtins plus seven Next-only commands, then the 21
+        // 35 non-voice names, including inspection, reopen, welcome-preview,
+        // giveaway, purge-preview and channel-inspect, plus 21 additional
         // voice names (voice `kick` shares the Kick group).
         // `/templateassistant` stays out until its slice lands.
-        assert_eq!(grouped.len(), 55);
+        assert_eq!(grouped.len(), 56);
         for name in [
             "rank",
             "leaderboard",
@@ -897,10 +908,12 @@ mod tests {
             "welcome-preview",
             "attendance",
             "command",
+            "command-inspect",
             "schedule-list",
             "sticky-remove",
             "rsvp",
             "rsvp-attendance",
+            "giveaway",
             "lfg",
             "lfg-close",
             "feed-add",
