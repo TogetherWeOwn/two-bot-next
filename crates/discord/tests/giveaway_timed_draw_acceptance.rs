@@ -1468,16 +1468,15 @@ async fn draw_excludes_departed_and_role_stripped_entrants() {
     enter(fixture.pool(), &mock, 721, ALICE, &gid).await;
     enter(fixture.pool(), &mock, 722, BOB, &gid).await;
     enter(fixture.pool(), &mock, 723, CAROL, &gid).await;
-    sqlx::query("UPDATE giveaways SET requirements_json = $1 WHERE guild_id = $2 AND id = $3")
-        .bind(
-            json!({"roles": [ROLE], "min_account_age_days": 0, "min_guild_age_days": 0})
-                .to_string(),
-        )
-        .bind(GUILD)
-        .bind(&gid)
-        .execute(fixture.pool())
-        .await
-        .expect("set role requirement");
+    sqlx::query(
+        "UPDATE giveaways SET requirements_json = $1::jsonb WHERE guild_id = $2 AND id = $3",
+    )
+    .bind(json!({"roles": [ROLE], "min_account_age_days": 0, "min_guild_age_days": 0}).to_string())
+    .bind(GUILD)
+    .bind(&gid)
+    .execute(fixture.pool())
+    .await
+    .expect("set role requirement");
     assert!(giveaway_row(fixture.pool(), &gid)
         .await
         .requirements
