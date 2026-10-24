@@ -78,9 +78,10 @@ use PolicyHook::{
 /// no help command), the Next-only `/privacy` member self-serve
 /// (parity row 32), management-only `/command-inspect` (parity row 33),
 /// `/reopen` picker recovery (parity row 34), plus `/lfg-edit`, a Next-only
-/// companion sharing LFG row 26.
+/// companion sharing LFG row 26, plus the private moderation reads
+/// `/purge-preview` (row 35) and `/channel-inspect` (row 36).
 /// No Administrator-only exception: preserve the legacy resolved-bit check.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 35] = [
+pub const COMMAND_PERMISSIONS: [CommandPermission; 37] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),
@@ -125,6 +126,20 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 35] = [
     row(9, "slowmode", BuiltinSlash, PERM_MANAGE_CHANNELS, None),
     row(10, "lockdown", BuiltinSlash, PERM_MANAGE_CHANNELS, None),
     row(11, "unlock", BuiltinSlash, PERM_MANAGE_CHANNELS, None),
+    row(
+        35,
+        "purge-preview",
+        BuiltinSlash,
+        PERM_MANAGE_MESSAGES,
+        None,
+    ),
+    row(
+        36,
+        "channel-inspect",
+        BuiltinSlash,
+        PERM_MANAGE_CHANNELS,
+        None,
+    ),
     row(12, "attendance", BuiltinSlash, PERM_MANAGE_EVENTS, None),
     row(
         13,

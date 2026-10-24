@@ -131,7 +131,7 @@ fn help_lists_only_handled_commands() {
     );
 }
 
-/// Registry compatibility: all 32 parity and Next-only builtins route to
+/// Registry compatibility: all 34 parity and Next-only builtins route to
 /// their handlers. The templateassistant unpublish remains covered.
 #[test]
 fn parity_builtins_route_to_their_handlers() {
@@ -157,6 +157,8 @@ fn parity_builtins_route_to_their_handlers() {
             HandlerId::Moderation(ModerationAction::Lockdown),
         ),
         ("unlock", HandlerId::Moderation(ModerationAction::Unlock)),
+        ("purge-preview", HandlerId::PurgePreview),
+        ("channel-inspect", HandlerId::ChannelInspect),
         ("attendance", HandlerId::ScorecardAttendance),
         ("command", HandlerId::AutomationAdmin),
         ("command-remove", HandlerId::AutomationAdmin),
@@ -178,8 +180,8 @@ fn parity_builtins_route_to_their_handlers() {
     ];
     assert_eq!(
         cases.len(),
-        32,
-        "all 32 parity and Next-only builtins covered"
+        34,
+        "all 34 parity and Next-only builtins covered"
     );
     for (name, handler) in cases {
         assert_eq!(
@@ -206,5 +208,5 @@ fn e2e_matrix_still_matches_the_publish_set() {
         matrix_names, published_names,
         "matrix drift: the fix must not change the parity publish set"
     );
-    assert_eq!(matrix.len(), 32, "contract covers the 32 built-in commands");
+    assert_eq!(matrix.len(), 34, "contract covers the 34 built-in commands");
 }
