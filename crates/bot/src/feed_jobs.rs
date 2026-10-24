@@ -434,6 +434,20 @@ async fn poll_relay(
     feed: &FeedRelay,
     fetch: &dyn FeedFetch,
 ) -> Result<(), ErrorClass> {
+    // A paused or removed relay stays silent even when this pass polled a
+    // stale enabled snapshot: re-read live lifecycle state before any fetch,
+    // recovery, high-water or audit write. Claim admission revalidates too,
+    // so a fetch admitted before a racing pause still cannot post after it.
+    let live: Option<bool> =
+        sqlx::query_scalar("SELECT enabled FROM feed_relays WHERE guild_id = $1 AND id = $2")
+            .bind(&feed.guild_id)
+            .bind(&feed.id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|_| ErrorClass::Database)?;
+    if live != Some(true) {
+        return Ok(());
+    }
     let mut error = None;
     let mut stats = PollStats::default();
     let mut recovery = RecoveryBudget {

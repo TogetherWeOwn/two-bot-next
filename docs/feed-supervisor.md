@@ -11,20 +11,24 @@ change reschedules the next run without a restart.
 
 ## Source configuration
 
-Three slash commands, all guild-only, all requiring ManageGuild (`32`), none
+Five slash commands, all guild-only, all requiring ManageGuild (`32`), none
 available in DMs (`docs/commands.md`):
 
 | Command | Options | Notes |
 | --- | --- | --- |
 | `/feed-add` | `kind` (required choice: `"rss"`, `"youtube"`, `"twitch"`), `source` (required string, max 2048 chars) | Posts into the invoking channel. At most 2,048 input bytes total. |
-| `/feed-list` | `page` (optional integer, min 1, default 1) | Ephemeral text; whole relay rows packed into bounded pages within the 2,000-unit message cap so every relay id stays discoverable, multi-page replies carrying a `Page N of M` footer with `/feed-list page:<n>` navigation; short lists keep the exact legacy single reply (`crates/core/src/feeds.rs`). |
-| `/feed-remove` | `id` (required string, max 128 chars) | Replies `Feed relay removed.`, `No feed relay with that id.` (`crates/core/src/feeds.rs:503-509`) or, while a delivery is still pending recovery, `Feed relay kept: unresolved deliveries are still pending recovery.` (`crates/core/src/feeds.rs:511-515`). Guild-scoped delete. |
+| `/feed-list` | `page` (optional integer, min 1, default 1) | Ephemeral text; whole relay rows packed into bounded pages within the 2,000-unit message cap so every relay id stays discoverable, multi-page replies carrying a `Page N of M` footer with `/feed-list page:<n>` navigation; short lists keep the exact legacy single reply (`crates/core/src/feeds.rs`). Every row labels its own `enabled`/`paused` state. |
+| `/feed-remove` | `id` (required string, max 128 chars) | Replies `Feed relay removed.`, `No feed relay with that id.` or, while a delivery is still pending recovery, `Feed relay kept: unresolved deliveries are still pending recovery.` Guild-scoped delete. |
+| `/feed-pause` | `id` (required string, max 128 chars) | Pauses one relay without deleting its history: URL, destination, seen-item state and delivery evidence are preserved. Replies ``Feed relay paused: `<id>`.``, ``Feed relay is already paused: `<id>`.``, `No feed relay with that id.`, or — while a delivery is still pending recovery — `Feed relay kept enabled: deliveries are still pending recovery. Retry after recovery settles.` (relay stays enabled; already-admitted work is not cancelled). |
+| `/feed-resume` | `id` (required string, max 128 chars) | Resumes one paused relay with its history intact. Replies ``Feed relay resumed: `<id>`.``, ``Feed relay is already enabled: `<id>`.``, or `No feed relay with that id.` Catch-up keeps the existing 20-posts-per-pass budget; accepted items are never reposted. |
 
 Source rules (`crates/core/src/feeds.rs:168-184`, `docs/feeds-port.md`):
 
 - RSS and Twitch sources are HTTPS feed URLs. New HTTPS sources must use
   port 443; existing enabled relays on other ports stay stored but fail
-  validation whenever polling runs. Disabled relays are not polled.
+  validation whenever polling runs. Paused (disabled) relays are not polled,
+  fetch nothing, and admit no fresh post claims; they stay listed with their
+  stable ids so `/feed-resume` or `/feed-remove` can address them later.
 - YouTube also accepts a 20–32-character channel ID (`[A-Za-z0-9_-]`),
   expanded to `https://www.youtube.com/feeds/videos.xml?channel_id=<id>`.
   Twitch is **not** a Helix API integration and needs no Twitch credential.
@@ -34,7 +38,10 @@ Source rules (`crates/core/src/feeds.rs:168-184`, `docs/feeds-port.md`):
   the relay). While any delivery is still pending recovery, removal is
   refused and keeps the relay and its ledger; let recovery settle it, then
   remove again (`docs/feeds-port.md`). Do not remove and re-add a relay to
-  "fix" it unless resetting its delivery history is intended.
+  "fix" it unless resetting its delivery history is intended — use
+  `/feed-pause` to silence a relay temporarily (history preserved) and
+  `/feed-resume` to restore it. Pause is likewise refused while pending
+  recovery exists; retry after recovery settles.
 
 Gates (both must hold or the poller parks):
 

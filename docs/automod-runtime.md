@@ -223,7 +223,7 @@ otherwise the loop is unchanged.
   (automod inactive) or `Accept` (`crates/bot/src/automod_gateway.rs:343-347`,
   `crates/bot/src/gateway.rs:56-70`). The hook carries
   the trigger verdict into the trigger handler, where a missing verdict fails
-  closed (`crates/bot/src/command_runtime.rs:979-999`, `crates/bot/src/gateway_commands.rs:89-100`). Per outcome class
+  closed (`crates/bot/src/command_runtime.rs:983-1003`, `crates/bot/src/gateway_commands.rs:89-100`). Per outcome class
   (`ActivationOutcome` in `crates/discord/src/automod_activation.rs:74-86`):
 
   | Outcome | `funnel` | `trigger` | Text automations run? |

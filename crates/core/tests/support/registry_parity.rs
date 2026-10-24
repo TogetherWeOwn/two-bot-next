@@ -41,6 +41,8 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("reopen", "docs/parity.md §1 reopen"),
     ("command-inspect", "docs/parity.md §1 command-inspect"),
     ("giveaway", "docs/parity.md §1 giveaway"),
+    ("feed-pause", "docs/parity.md §1 feed-pause"),
+    ("feed-resume", "docs/parity.md §1 feed-resume"),
     ("purge-preview", "docs/parity.md §1 purge-preview"),
     ("channel-inspect", "docs/parity.md §1 channel-inspect"),
 ];
@@ -358,6 +360,37 @@ pub fn expected_registry() -> Value {
     )
     .expect("giveaway serializes");
     commands.insert(15, giveaway);
+    // Next-only feed lifecycle pair. These independent literals pin the whole
+    // publication contract; never manufacture them from production shapes.
+    // The feed-remove lookup stays dynamic so the giveaway insert above does
+    // not shift the pair's expected position.
+    let pause = json!({
+        "name": "feed-pause",
+        "description": "Pause a feed relay without deleting its history",
+        "dm_permission": false,
+        "default_member_permissions": "32",
+        "options": [
+            {"name": "id", "description": "Feed id", "type": 3,
+             "required": true, "max_length": 128}
+        ]
+    });
+    let resume = json!({
+        "name": "feed-resume",
+        "description": "Resume a paused feed relay",
+        "dm_permission": false,
+        "default_member_permissions": "32",
+        "options": [
+            {"name": "id", "description": "Feed id", "type": 3,
+             "required": true, "max_length": 128}
+        ]
+    });
+    let after_remove = commands
+        .iter()
+        .position(|command| command["name"] == "feed-remove")
+        .expect("legacy feed-remove remains published")
+        + 1;
+    commands.insert(after_remove, pause);
+    commands.insert(after_remove + 1, resume);
     // Next-only read surfaces follow the nine historical mutations. Literal
     // payloads keep the frozen snapshot intact and compare every read field.
     let after_unlock = commands

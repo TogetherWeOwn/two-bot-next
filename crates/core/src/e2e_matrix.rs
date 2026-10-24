@@ -9,7 +9,7 @@
 //! the denial order (guild fence → feature gate → permission bits →
 //! policy/validation).
 //!
-//! Scope: the 32 non-voice built-in slash commands in `docs/commands.md` (core +
+//! Scope: the 36 non-voice built-in slash commands in `docs/commands.md` (core +
 //! scorecard + automation + announcement + moderation). Out of scope on
 //! purpose: voice commands (`voice_commands`, separate slice with its own
 //! `TWO_VOICE` gate and a `kick` name collision resolved first-wins in favour
@@ -122,7 +122,7 @@ const fn row(
 //   staff protection, bot hierarchy, actor hierarchy, in that order.
 // - `Valid:<FIELD>:<BOUNDS>` — option validation before any side effect.
 
-/// The 34-row contract in publish order (core, scorecard, automation,
+/// The 36-row contract in publish order (core, scorecard, automation,
 /// announcement, moderation). The coverage test asserts this is exactly the
 /// all-gates-on [`crate::router::InteractionRouter::publish_set`].
 #[must_use]
@@ -409,6 +409,34 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             "ManageGuild",
             "FeedRemove",
             "Ephemeral confirmation after removal (removed/missing outcome) plus audit row.",
+            &[
+                "Gate:AnnouncementsDisabled",
+                "Perm:ManageServerRequired",
+                "Valid:id:required",
+            ],
+        ),
+        row(
+            "feed-pause",
+            38,
+            E2eGate::Announcements,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "FeedPause",
+            "Ephemeral confirmation after pause (paused/already-paused/missing outcome) plus audit row; refused while pending recovery exists.",
+            &[
+                "Gate:AnnouncementsDisabled",
+                "Perm:ManageServerRequired",
+                "Valid:id:required",
+            ],
+        ),
+        row(
+            "feed-resume",
+            39,
+            E2eGate::Announcements,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "FeedResume",
+            "Ephemeral confirmation after resume (resumed/already-resumed/missing outcome) plus audit row.",
             &[
                 "Gate:AnnouncementsDisabled",
                 "Perm:ManageServerRequired",

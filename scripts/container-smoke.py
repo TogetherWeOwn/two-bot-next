@@ -72,6 +72,11 @@ IMAGE_MAX_BYTES = 112 * MIB
 # e07140dd repairs) measures 17,854,776 bytes (17.03 MiB) in hosted CI
 # (run 40094727805), 28,984 over 17 MiB. 18 MiB stands on merged-tree
 # evidence with no new dependencies and no release-profile change.
+# 2026-10-24: the feed pause/resume slice (~24,800 bytes of command, store
+# and poller code, no new dependencies, same minimal release profile)
+# measured 17,831,440 bytes (5,648 over 17 MiB) on its pre-giveaway base
+# (CI run 40099776675 job 120889388251). The giveaway+feed union below the
+# 18 MiB ceiling is confirmed by this merge's own container-smoke run.
 BINARY_MAX_BYTES = 18 * MIB
 # CLI refusal bounds (not budget policy): --image-max-bytes/--binary-max-bytes
 # outside 1..cap are unusable — a non-positive budget can never pass and a

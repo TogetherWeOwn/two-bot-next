@@ -34,7 +34,7 @@ Help is ephemeral and does not execute the selected command. The command picker
 hides gated commands you cannot use; help explains published requirements but
 does not evaluate every effective Discord permission or guarantee authorization.
 
-Built-in commands: 55.
+Built-in commands: 57.
 
 ## `/access`
 
@@ -207,9 +207,31 @@ List this server's feed relays
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `page` | integer | false | 1 | — | — | — | Page of the feed relay list (1-based) |
 
+## `/feed-pause`
+
+Pause a feed relay without deleting its history
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `id` | string | true | — | — | 128 | — | Feed id |
+
 ## `/feed-remove`
 
 Remove a feed relay
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `id` | string | true | — | — | 128 | — | Feed id |
+
+## `/feed-resume`
+
+Resume a paused feed relay
 
 - Default permissions: ManageGuild (`32`)
 - Available in DMs: false

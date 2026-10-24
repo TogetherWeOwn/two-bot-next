@@ -135,18 +135,160 @@ pub enum FeedRemoval {
     RecoveryRequired,
 }
 
-/// Serialize relay removal against delivery admission for one guild/feed.
+/// Outcome of an attempted relay pause. Only the `enabled`/`updated_at`
+/// columns ever change: URL, destination, seen-item/high-water state and the
+/// delivery/nonce ledger are preserved verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedPauseOutcome {
+    /// The relay was enabled and is now paused.
+    Paused,
+    /// The relay was already paused; no columns changed.
+    AlreadyPaused,
+    /// No relay with that id exists in this guild; nothing changed.
+    Missing,
+    /// The relay stays enabled because unresolved pending delivery evidence
+    /// exists. Pausing would strand recovery behind disabled discovery
+    /// (`pending_deliveries` only reads enabled relays), so the member
+    /// retries after recovery settles. Already-admitted work is untouched.
+    RecoveryRequired,
+}
+
+/// Outcome of an attempted relay resume. Only the `enabled`/`updated_at`
+/// columns ever change.
 ///
-/// Both sides hold this transaction-scoped advisory lock only across short
+/// Bounded catch-up policy: resume re-enables polling with the existing
+/// per-poll budget (`MAX_FEED_POSTS_PER_POLL` attempts); it never reposts an
+/// accepted nonce, never drains an unbounded backlog, and never rewrites
+/// seen-item/high-water or delivery history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedResumeOutcome {
+    /// The relay was paused and is now enabled.
+    Resumed,
+    /// The relay was already enabled; no columns changed.
+    AlreadyResumed,
+    /// No relay with that id exists in this guild; nothing changed.
+    Missing,
+}
+
+/// Pause one relay without deleting its history.
+///
+/// Serialized against delivery admission under the same per-relay fence as
+/// removal and fresh claims: either an in-flight claim lands first and this
+/// pause sees its pending row (refusal), or this pause commits first and
+/// later admission finds a disabled relay (no claim, no POST).
+/// Already-admitted work is never cancelled.
+pub async fn pause_feed(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    id: &str,
+    now_ms: i64,
+) -> Result<FeedPauseOutcome, FeedStoreError> {
+    let mut tx = pool.begin().await?;
+    lock_feed_delivery(&mut tx, guild_id, id).await?;
+    // Under the fence: refuse while unresolved pending delivery evidence
+    // remains, so recovery stays discoverable behind the enabled relay.
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM feed_deliveries d JOIN feed_relays f ON f.id = d.feed_id
+         WHERE d.feed_id = $1 AND f.guild_id = $2 AND d.state = 'pending'",
+    )
+    .bind(id)
+    .bind(guild_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if pending > 0 {
+        tx.rollback().await?;
+        return Ok(FeedPauseOutcome::RecoveryRequired);
+    }
+    let current: Option<bool> =
+        sqlx::query_scalar("SELECT enabled FROM feed_relays WHERE guild_id = $1 AND id = $2")
+            .bind(guild_id)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    match current {
+        None => {
+            tx.rollback().await?;
+            Ok(FeedPauseOutcome::Missing)
+        }
+        Some(false) => {
+            tx.rollback().await?;
+            Ok(FeedPauseOutcome::AlreadyPaused)
+        }
+        Some(true) => {
+            sqlx::query(
+                "UPDATE feed_relays SET enabled = false,
+                 updated_at = to_timestamp($3::bigint::double precision / 1000)
+                 WHERE guild_id = $1 AND id = $2",
+            )
+            .bind(guild_id)
+            .bind(id)
+            .bind(now_ms)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok(FeedPauseOutcome::Paused)
+        }
+    }
+}
+
+/// Resume one paused relay, preserving its seen-item/high-water and
+/// nonce/dedup history. Resume never refuses on pending evidence: pending
+/// recovery requires the enabled relay to stay discoverable.
+pub async fn resume_feed(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    id: &str,
+    now_ms: i64,
+) -> Result<FeedResumeOutcome, FeedStoreError> {
+    let mut tx = pool.begin().await?;
+    lock_feed_delivery(&mut tx, guild_id, id).await?;
+    let current: Option<bool> =
+        sqlx::query_scalar("SELECT enabled FROM feed_relays WHERE guild_id = $1 AND id = $2")
+            .bind(guild_id)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    match current {
+        None => {
+            tx.rollback().await?;
+            Ok(FeedResumeOutcome::Missing)
+        }
+        Some(true) => {
+            tx.rollback().await?;
+            Ok(FeedResumeOutcome::AlreadyResumed)
+        }
+        Some(false) => {
+            sqlx::query(
+                "UPDATE feed_relays SET enabled = true,
+                 updated_at = to_timestamp($3::bigint::double precision / 1000)
+                 WHERE guild_id = $1 AND id = $2",
+            )
+            .bind(guild_id)
+            .bind(id)
+            .bind(now_ms)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok(FeedResumeOutcome::Resumed)
+        }
+    }
+}
+
+/// Serialize relay removal and pause/resume against delivery admission for
+/// one guild/feed.
+///
+/// Every side holds this transaction-scoped advisory lock only across short
 /// database statements — never across network IO. Removal's pending check
-/// plus delete run atomically under it; a fresh claim's relay-existence
-/// revalidation runs under it too. The lock orders the two: either the
-/// claim lands first and removal sees its pending row (refusal), or removal
-/// deletes first and admission finds no relay (no claim, no POST). A held
-/// send can therefore never outlive a confirmed removal, and removal can
-/// never cascade away a pending claim's recovery evidence. Takeover of an
-/// existing pending row and token-fenced settlement need no lock: a pending
-/// row already forces refusal, and settlement only flips such a row.
+/// plus delete run atomically under it; pause's pending check plus disable
+/// does too; a fresh claim's relay-existence revalidation runs under it as
+/// well. The lock orders them: either the claim lands first and removal or
+/// pause sees its pending row (refusal), or removal/pause commits first and
+/// admission finds no enabled relay (no claim, no POST). A held send can
+/// therefore never outlive a confirmed removal, removal can never cascade
+/// away a pending claim's recovery evidence, and no fresh post claim may
+/// begin after a successful pause. Takeover of an existing pending row and
+/// token-fenced settlement need no lock: a pending row already forces
+/// refusal, and settlement only flips such a row.
 ///
 /// `lock_timeout`/`statement_timeout` mirror the cutover retention `SET
 /// LOCAL` precedent: a stuck holder fails this attempt fast as an isolated

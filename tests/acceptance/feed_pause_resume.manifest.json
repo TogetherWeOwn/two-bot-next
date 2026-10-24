@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Protected test-only handoff for pausing and resuming one feed relay without losing history",
+  "baseCommit": "c92e049ac1e44979f49a886460795df89e1f297a",
+  "branch": "test/feed-pause-resume-acceptance",
+  "protectedFiles": [
+    {
+      "path": "crates/core/tests/feed_pause_resume_acceptance.rs",
+      "sha256": "616578e9c03fa125d23d2bae9276fcd1278147232d2e3c9475e4b0b2b45cbf8a",
+      "tests": 4
+    },
+    {
+      "path": "crates/bot/src/feed_pause_resume_acceptance_tests.rs",
+      "sha256": "4d61905890bd2afca761f69da9a1a0d840d357e643a8c1bba7bf2133fc53ecf1",
+      "tests": 17
+    },
+    {
+      "path": "crates/bot/src/feed_jobs_tests.rs",
+      "sha256": "a5596c115585a546bdc66de1c08169a8cacfa79ce21004df55820edecef0ee1e",
+      "change": "Three-line test-only child-module registration; all existing tests/assertions unchanged"
+    }
+  ],
+  "commands": {
+    "discovery": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test feed_pause_resume_acceptance --test feeds --test feeds_connector --locked -- --nocapture",
+    "runtime": "python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot --locked feed_jobs::tests::pause_resume_acceptance_tests:: -- --nocapture --test-threads=1",
+    "pollerControls": "python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot --locked feed_jobs::tests:: -- --include-ignored --nocapture --test-threads=1"
+  },
+  "database": {
+    "environment": "TWO_TEST_DATABASE_URL",
+    "fixture": "two_bot_testsupport::TestDatabase with cutover migrations and independent pools",
+    "missingEnvironment": "Fails explicitly; no acceptance test is ignored or silently skipped",
+    "ciRoute": "check.yml normal unit/binary step supplies the guarded disposable DB URL; normal integration step discovers the core target",
+    "boundaries": "Only disposable DB and loopback REST doubles; never live Discord or staging/production databases"
+  },
+  "contract": {
+    "authorization": "The same guild-management authority as add/remove; stable relay IDs remain guild-scoped",
+    "preservation": "Only lifecycle state changes; preserve URL, destination, seen-item/high-water and delivery/nonce history",
+    "pause": "Serialize against relay fetch/send admission; refuse while pending recovery exists, keep enabled and explain retry after recovery; admitted work is not cancelled",
+    "resume": "Persist across restart, do not repost accepted items, and retain a bounded documented catch-up policy",
+    "list": "Expose enabled/paused state, every stable ID and source identity with bounded whole-row pages",
+    "controls": "Existing source-address SSRF, URL, mention and pending/uncertain-send settlement fences stay intact"
+  },
+  "handoff": [
+    "Do not merge the deliberately failing test-only branch by itself.",
+    "Consume the pinned handoff commit read-only in an isolated Builder workspace. Do not edit protected tests; return corrections to the test author.",
+    "The Builder owns the implementation, registration/help/lifecycle docs and exact-head GREEN in one combined implementation PR.",
+    "Observed RED/control/cache-refusal results are recorded on the acceptance card, never inferred from this manifest."
+  ]
+}
