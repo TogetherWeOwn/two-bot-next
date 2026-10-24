@@ -23,6 +23,18 @@ use crate::{
     interactions::{response_for_slash, route_interaction, RoutedInteraction},
 };
 
+/// Resolves attendance classification immediately before the fact write, not
+/// when an interaction is acknowledged. Static callers can pass their config.
+pub trait ClassifierProvider: std::fmt::Debug + Send + Sync {
+    fn config_for_guild(&self, guild_id: &str) -> ClassifierConfig;
+}
+
+impl ClassifierProvider for ClassifierConfig {
+    fn config_for_guild(&self, _guild_id: &str) -> ClassifierConfig {
+        self.clone()
+    }
+}
+
 /// Acknowledgement is separate from ordered effects: the gateway prepares
 /// queued commands immediately, then completes them in dispatch order. The
 /// private deferred fields can only be constructed after a successful callback.
@@ -124,7 +136,7 @@ pub async fn complete_rsvp_interaction(
     prepared: PreparedRsvp,
     pool: &Pool<Postgres>,
     executor: &ActionExecutor,
-    classifier: &ClassifierConfig,
+    classifier: &dyn ClassifierProvider,
 ) -> Result<bool, DiscordError> {
     let Some((handler, interaction)) = prepared.deferred else {
         return Ok(prepared.handled);
@@ -148,7 +160,7 @@ pub async fn handle_rsvp_interaction(
     router: &InteractionRouter,
     pool: &Pool<Postgres>,
     executor: &ActionExecutor,
-    classifier: &ClassifierConfig,
+    classifier: &dyn ClassifierProvider,
     interaction: &Interaction,
 ) -> Result<bool, DiscordError> {
     let prepared = prepare_rsvp_interaction(router, executor, interaction.clone()).await?;
@@ -261,7 +273,7 @@ async fn execute(
     handler: HandlerId,
     pool: &Pool<Postgres>,
     executor: &ActionExecutor,
-    classifier: &ClassifierConfig,
+    classifier: &dyn ClassifierProvider,
     interaction: &Interaction,
 ) -> Result<String, String> {
     // Fail closed: only the RSVP handlers execute here. A foreign handler id
@@ -526,8 +538,9 @@ async fn execute(
                     .as_bool()
                     .ok_or("Unable to verify attendance member.")?,
             };
+            let config = classifier.config_for_guild(&guild_id);
             let verdict = classify(
-                classifier,
+                &config,
                 &ClassifyInput {
                     guild_id: guild_id.clone(),
                     actor_id: member_id_str.clone(),

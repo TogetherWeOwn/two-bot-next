@@ -15,6 +15,7 @@
 - [Secret inventory: names only](#secret-inventory-names-only)
 - [Legacy review and deliberately unported operations](#legacy-review-and-deliberately-unported-operations)
 - [Keep the runbook honest](#keep-the-runbook-honest)
+- [Giveaways](#giveaways)
 
 **Alert anchors**
 
@@ -3624,3 +3625,28 @@ command existence, **not authorization, successful deployment, backup custody,
 Discord effects, or a live rollback**. Required exact-head merge gates remain
 `ci-ok` (the full verdict over lint, worker checks and all selected Rust/DB test
 lanes), `worker check`, `pr-lint`, and `gitleaks`; a docs test is not a waiver.
+
+## Giveaways
+
+`/giveaway create|list|cancel` requires Manage Server; entry buttons are open
+to human members with per-interaction role and age checks. Limits: prize
+1–200 characters, duration 1–43200 minutes, winners 1–100, 25 active
+giveaways per guild, 10000 entrants each. Entry attempts have a bounded
+process-local 10/minute member budget, and successful entries share a
+durable 10/minute guild/member budget across giveaways and restarts.
+Duplicates collapse to one row. `gw:<id>` carries only the opaque id; the
+server resolves guild, message, deadline, status, requirements and capacity.
+
+The giveaway row is recorded before its message posts. If sending or the
+message-id attachment fails, never blindly re-post: inspect the channel for
+a delivered message and cancel the recorded id if needed. An unconfirmed
+definition holds an active slot and takes no entries.
+
+`giveaway_countdown` ticks every 15 seconds; durable claims permit at most
+one cosmetic refresh at each 1h, 10min, 1min and ending-soon threshold
+through the shared REST pacing guard. Count edits are best-effort; the
+entry row stays authoritative when a display edit fails.
+
+This slice does not draw winners or send winner DMs; entry closes at the
+stored deadline. Staging smoke: create, enter from two test members, verify
+two rows plus ephemeral replies, cancel, and verify a later entry is refused.

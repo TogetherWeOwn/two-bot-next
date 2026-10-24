@@ -121,9 +121,11 @@ pub enum HandlerId {
     Leaderboard,
     Help,
     Privacy,
+    Reopen,
     ScorecardAttendance,
     AutomationAdmin,
     AutomationCustom,
+    Giveaway,
     Rsvp,
     RsvpAttendance,
     Lfg,
@@ -132,6 +134,8 @@ pub enum HandlerId {
     FeedRemove,
     FeedList,
     Moderation(ModerationAction),
+    PurgePreview,
+    ChannelInspect,
 }
 
 /// Which feature slice owns a routed component / modal submit (parity §2).
@@ -142,6 +146,7 @@ pub enum ComponentHandler {
     SelfRole,
     Tickets,
     LfgSignup,
+    GiveawayEntry,
 }
 
 /// Contract feature slices implement so the router can hand a routed
@@ -268,6 +273,8 @@ pub enum RouterRefusal {
     ManageEventsRequired,
     GuildRestricted,
     ModerationPermission(ModerationAction),
+    PurgePreviewPermission,
+    ChannelInspectPermission,
 }
 
 impl RouterRefusal {
@@ -283,6 +290,8 @@ impl RouterRefusal {
             Self::ManageServerRequired => MANAGE_SERVER_REQUIRED.to_owned(),
             Self::ManageEventsRequired => MANAGE_EVENTS_REQUIRED.to_owned(),
             Self::GuildRestricted => GUILD_RESTRICTED_REPLY.to_owned(),
+            Self::PurgePreviewPermission => "You need the Manage Messages permission to use /purge-preview. Ask a server moderator or admin to grant it.".to_owned(),
+            Self::ChannelInspectPermission => "You need the Manage Channels permission to use /channel-inspect. Ask a server moderator or admin to grant it.".to_owned(),
             // Names the Discord permission (Ban Members, …) and the slash
             // command, not the internal `moderation.ban` action id.
             Self::ModerationPermission(action) => {
@@ -390,11 +399,14 @@ impl InteractionRouter {
             {
                 register(HandlerId::Moderation(action));
             }
+            register(HandlerId::PurgePreview);
+            register(HandlerId::ChannelInspect);
         }
         if gates.automations {
             // Sticky/admin plus custom rows (`CustomCommandRuntime::register`).
             register(HandlerId::AutomationAdmin);
             register(HandlerId::AutomationCustom);
+            register(HandlerId::Giveaway);
         }
         if gates.announcements {
             for id in [
@@ -415,6 +427,7 @@ impl InteractionRouter {
             HandlerId::Leaderboard,
             HandlerId::Help,
             HandlerId::Privacy,
+            HandlerId::Reopen,
         ] {
             register(id);
         }
@@ -549,10 +562,26 @@ impl InteractionRouter {
         actor_permissions: Option<u64>,
     ) -> Option<SlashOutcome> {
         // Moderation carries its own guild fence (refusal, not silence).
-        if let Some(action) = ModerationAction::ALL
-            .iter()
-            .find(|a| a.command_name() == name)
-        {
+        let moderation = match name {
+            "purge-preview" => Some((
+                HandlerId::PurgePreview,
+                RouterRefusal::PurgePreviewPermission,
+            )),
+            "channel-inspect" => Some((
+                HandlerId::ChannelInspect,
+                RouterRefusal::ChannelInspectPermission,
+            )),
+            _ => ModerationAction::ALL
+                .iter()
+                .find(|a| a.command_name() == name)
+                .map(|action| {
+                    (
+                        HandlerId::Moderation(*action),
+                        RouterRefusal::ModerationPermission(*action),
+                    )
+                }),
+        };
+        if let Some((handler, permission_refusal)) = moderation {
             if !self.guild_ok(guild_id) {
                 return Some(SlashOutcome::Refuse {
                     refusal: RouterRefusal::GuildRestricted,
@@ -565,12 +594,10 @@ impl InteractionRouter {
             }
             if !Self::permission_allowed(name, guild_id, actor_permissions) {
                 return Some(SlashOutcome::Refuse {
-                    refusal: RouterRefusal::ModerationPermission(*action),
+                    refusal: permission_refusal,
                 });
             }
-            return Some(SlashOutcome::Handled {
-                handler: HandlerId::Moderation(*action),
-            });
+            return Some(SlashOutcome::Handled { handler });
         }
 
         /// Which feature gate a builtin row needs.
@@ -635,6 +662,17 @@ impl InteractionRouter {
                 gate: RowGate::Always,
                 permission_refusal: None,
             },
+            // Self-service picker recovery: always on, open to everyone.
+            // The subject is always the invoker (a `kind` choice, no target
+            // option), so no permission gate applies; an unavailable kind
+            // gets private no-effect guidance from the handler after the
+            // defer, where the kind is visible — the router never sees
+            // options, so kind-level enablement cannot live here.
+            "reopen" => Row {
+                handler: HandlerId::Reopen,
+                gate: RowGate::Always,
+                permission_refusal: None,
+            },
             // Scorecard check-in gates `ManageEvents` both in the published
             // definition (`feature_commands.rs`) and at dispatch (`rsvp.rs`
             // `require_manage_events`): Discord picker hiding is not
@@ -647,6 +685,11 @@ impl InteractionRouter {
             "command" | "command-remove" | "command-list" | "command-inspect" | "schedule"
             | "schedule-remove" | "schedule-list" | "sticky" | "sticky-remove" => Row {
                 handler: HandlerId::AutomationAdmin,
+                gate: RowGate::Automations,
+                permission_refusal: Some(RouterRefusal::ManageServerRequired),
+            },
+            "giveaway" => Row {
+                handler: HandlerId::Giveaway,
                 gate: RowGate::Automations,
                 permission_refusal: Some(RouterRefusal::ManageServerRequired),
             },
@@ -742,6 +785,11 @@ impl InteractionRouter {
                 return ComponentOutcome::Ignore;
             }
             ComponentHandler::SelfRole
+        } else if custom_id.starts_with("gw:") {
+            if !self.gates.automations || !self.guild_ok(guild_id) {
+                return ComponentOutcome::Ignore;
+            }
+            ComponentHandler::GiveawayEntry
         } else {
             return if self.guild_ok(guild_id) {
                 ComponentOutcome::Unknown
@@ -851,7 +899,7 @@ impl InteractionRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::PERM_MANAGE_EVENTS;
+    use crate::commands::{PERM_MANAGE_EVENTS, PERM_MANAGE_GUILD};
     use std::collections::HashMap;
 
     const GUILD: u64 = 2222;
@@ -903,6 +951,7 @@ mod tests {
             ("leaderboard", HandlerId::Leaderboard),
             ("help", HandlerId::Help),
             ("privacy", HandlerId::Privacy),
+            ("reopen", HandlerId::Reopen),
             ("ban", HandlerId::Moderation(ModerationAction::Ban)),
             ("tempban", HandlerId::Moderation(ModerationAction::TempBan)),
             ("kick", HandlerId::Moderation(ModerationAction::Kick)),
@@ -918,6 +967,8 @@ mod tests {
                 HandlerId::Moderation(ModerationAction::Lockdown),
             ),
             ("unlock", HandlerId::Moderation(ModerationAction::Unlock)),
+            ("purge-preview", HandlerId::PurgePreview),
+            ("channel-inspect", HandlerId::ChannelInspect),
             ("attendance", HandlerId::ScorecardAttendance),
             ("command", HandlerId::AutomationAdmin),
             ("command-remove", HandlerId::AutomationAdmin),
@@ -928,6 +979,7 @@ mod tests {
             ("schedule-list", HandlerId::AutomationAdmin),
             ("sticky", HandlerId::AutomationAdmin),
             ("sticky-remove", HandlerId::AutomationAdmin),
+            ("giveaway", HandlerId::Giveaway),
             ("rsvp", HandlerId::Rsvp),
             ("rsvp-attendance", HandlerId::RsvpAttendance),
             ("lfg", HandlerId::Lfg),
@@ -936,7 +988,7 @@ mod tests {
             ("feed-remove", HandlerId::FeedRemove),
             ("feed-list", HandlerId::FeedList),
         ];
-        assert_eq!(cases.len(), 30, "all 30 handler-owned builtins covered");
+        assert_eq!(cases.len(), 34, "all 34 handler-owned builtins covered");
         for (name, handler) in cases {
             assert_eq!(
                 r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
@@ -1027,6 +1079,8 @@ mod tests {
             ("feed-list", RouterRefusal::AnnouncementsDisabled),
             ("ban", RouterRefusal::ModerationDisabled),
             ("purge", RouterRefusal::ModerationDisabled),
+            ("purge-preview", RouterRefusal::ModerationDisabled),
+            ("channel-inspect", RouterRefusal::ModerationDisabled),
         ] {
             assert_eq!(
                 r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
@@ -1103,6 +1157,48 @@ mod tests {
     }
 
     #[test]
+    fn private_read_permissions_name_the_invoked_command_and_never_fall_through() {
+        let r = router();
+        for (name, required, handler, refusal, expected) in [
+            ("purge-preview", 8192, HandlerId::PurgePreview, RouterRefusal::PurgePreviewPermission,
+             "You need the Manage Messages permission to use /purge-preview. Ask a server moderator or admin to grant it."),
+            ("channel-inspect", 16, HandlerId::ChannelInspect, RouterRefusal::ChannelInspectPermission,
+             "You need the Manage Channels permission to use /channel-inspect. Ask a server moderator or admin to grant it."),
+        ] {
+            assert_eq!(refusal.message(), expected);
+            for permissions in [None, Some(0), Some(8), Some(!required)] {
+                assert_eq!(
+                    r.route_slash(&SlashContext { custom_row: Some(true), ..ctx(name, Some(GUILD), permissions) }),
+                    SlashOutcome::Refuse { refusal },
+                    "/{name} cannot borrow custom-command or administrator-only authority"
+                );
+            }
+            assert_eq!(
+                r.route_slash(&ctx(name, Some(GUILD), Some(required))),
+                SlashOutcome::Handled { handler }
+            );
+            for guild in [None, Some(9999)] {
+                assert_eq!(
+                    r.route_slash(&ctx(name, guild, Some(u64::MAX))),
+                    SlashOutcome::Refuse { refusal: RouterRefusal::GuildRestricted }
+                );
+            }
+            let unconfigured = InteractionRouter::new(RouterGates { configured_guild: None, ..all_on() });
+            assert_eq!(
+                unconfigured.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
+                SlashOutcome::Refuse { refusal: RouterRefusal::GuildRestricted }
+            );
+            let off = InteractionRouter::new(RouterGates { moderation: false, ..all_on() });
+            assert_eq!(
+                off.route_slash(&SlashContext { custom_row: Some(true), ..ctx(name, Some(GUILD), Some(u64::MAX)) }),
+                SlashOutcome::Refuse { refusal: RouterRefusal::ModerationDisabled }
+            );
+            let set = off.publish_set(&[CustomCommand { name: name.to_owned(), description: "shadow".to_owned(), enabled: true }]).expect("assembles");
+            assert!(!set.iter().any(|definition| definition.name == name));
+        }
+    }
+
+    #[test]
     fn permission_checks_match_legacy() {
         let r = router();
         // Automation admin without ManageGuild.
@@ -1146,6 +1242,69 @@ mod tests {
             r.route_slash(&ctx("rank", None, None)),
             SlashOutcome::Ignore
         );
+    }
+
+    #[test]
+    fn giveaway_requires_manage_guild_for_its_dedicated_handler() {
+        let r = router();
+        for permissions in [None, Some(0), Some(PERM_MANAGE_EVENTS)] {
+            assert_eq!(
+                r.route_slash(&ctx("giveaway", Some(GUILD), permissions)),
+                SlashOutcome::Refuse {
+                    refusal: RouterRefusal::ManageServerRequired
+                },
+                "giveaway refuses without Manage Guild: {permissions:?}",
+            );
+        }
+        assert_eq!(
+            r.route_slash(&ctx("giveaway", Some(GUILD), Some(PERM_MANAGE_GUILD))),
+            SlashOutcome::Handled {
+                handler: HandlerId::Giveaway
+            }
+        );
+    }
+
+    #[test]
+    fn giveaway_automation_gate_precedes_its_permission_check() {
+        let off = InteractionRouter::new(RouterGates {
+            automations: false,
+            ..all_on()
+        });
+        for permissions in [None, Some(0), Some(PERM_MANAGE_GUILD), Some(u64::MAX)] {
+            assert_eq!(
+                off.route_slash(&ctx("giveaway", Some(GUILD), permissions)),
+                SlashOutcome::Refuse {
+                    refusal: RouterRefusal::AutomationsDisabled
+                },
+                "disabled giveaway refuses before checking permissions: {permissions:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn giveaway_guild_fence_precedes_its_feature_and_permission_gates() {
+        for (configured_guild, guild_id) in [
+            (Some(GUILD), None),
+            (Some(GUILD), Some(9999)),
+            (None, None),
+            (None, Some(GUILD)),
+            (None, Some(9999)),
+        ] {
+            for automations in [false, true] {
+                let r = InteractionRouter::new(RouterGates {
+                    configured_guild,
+                    automations,
+                    ..all_on()
+                });
+                for permissions in [None, Some(u64::MAX)] {
+                    assert_eq!(
+                        r.route_slash(&ctx("giveaway", guild_id, permissions)),
+                        SlashOutcome::Ignore,
+                        "giveaway stays fenced: configured={configured_guild:?}, guild={guild_id:?}, automations={automations}, permissions={permissions:?}",
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1411,23 +1570,33 @@ mod tests {
         }];
         let set = r.publish_set(&custom).expect("full set assembles");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        // 4 core + 1 scorecard + 9 automation + 7 announcement + 9 moderation
-        // + 1 custom = 31, in legacy publish order, guild-only throughout.
-        assert_eq!(set.len(), 31);
+        // 5 core + 1 scorecard + 10 automation + 7 announcement + 9 moderation
+        // + 2 reads + 1 custom = 35, in publish order, guild-only throughout.
+        assert_eq!(set.len(), 35);
         assert_eq!(
-            &names[..5],
-            ["rank", "leaderboard", "help", "privacy", "attendance"]
+            &names[..6],
+            [
+                "rank",
+                "leaderboard",
+                "help",
+                "privacy",
+                "reopen",
+                "attendance"
+            ]
         );
+        assert_eq!(names[9], "command-inspect");
+        assert_eq!(&names[14..17], ["sticky-remove", "giveaway", "rsvp"]);
         assert!(names.contains(&"rsvp-attendance"));
         assert_eq!(names.iter().filter(|n| **n == "attendance").count(), 1);
         assert_eq!(
-            &names[21..30],
+            &names[23..32],
             [
                 "ban", "tempban", "kick", "timeout", "warn", "purge", "slowmode", "lockdown",
                 "unlock",
             ]
         );
-        assert_eq!(names[30], "faq");
+        assert_eq!(&names[32..34], ["purge-preview", "channel-inspect"]);
+        assert_eq!(names[34], "faq");
         assert!(set.iter().all(|c| !c.dm_permission));
     }
 
@@ -1442,7 +1611,7 @@ mod tests {
         });
         let set = off.publish_set(&[]).expect("core-only set");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["rank", "leaderboard", "help", "privacy"]);
+        assert_eq!(names, ["rank", "leaderboard", "help", "privacy", "reopen"]);
     }
 
     #[test]
@@ -1463,7 +1632,7 @@ mod tests {
         // invocation refuses at dispatch, so publishing burns the ceiling.
         let set = off.publish_set(&[row()]).expect("core-only set");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["rank", "leaderboard", "help", "privacy"]);
+        assert_eq!(names, ["rank", "leaderboard", "help", "privacy", "reopen"]);
         // Over-limit stored catalogs no longer fail the publish either.
         let crowded: Vec<_> = (0..99)
             .map(|i| CustomCommand {
@@ -1473,7 +1642,7 @@ mod tests {
             })
             .collect();
         let set = off.publish_set(&crowded).expect("core-only set");
-        assert_eq!(set.len(), 4);
+        assert_eq!(set.len(), 5);
     }
 
     #[test]
@@ -1590,7 +1759,7 @@ mod tests {
     fn voice_set_publishes_after_moderation_only_while_gated() {
         let off = published(all_on());
         let off_names: Vec<_> = off.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(off.len(), 30);
+        assert_eq!(off.len(), 34);
         for name in VOICE_NAMES.iter().filter(|name| **name != "kick") {
             assert!(
                 !off_names.contains(name),
@@ -1600,16 +1769,16 @@ mod tests {
 
         let on = published(voice_on());
         let on_names: Vec<_> = on.iter().map(|c| c.name.as_str()).collect();
-        // 30 builtins keep their order; the 21 voice names that survive
+        // 34 builtins keep their order; the 21 voice names that survive
         // first-wins follow in voice order. `kick` is already moderation's.
-        assert_eq!(on.len(), 51);
-        assert_eq!(on_names[..30], off_names[..]);
+        assert_eq!(on.len(), 55);
+        assert_eq!(on_names[..34], off_names[..]);
         let expected: Vec<_> = VOICE_NAMES
             .iter()
             .copied()
             .filter(|name| *name != "kick")
             .collect();
-        assert_eq!(on_names[30..], expected[..]);
+        assert_eq!(on_names[34..], expected[..]);
         assert!(!on_names.contains(&"templateassistant"));
         assert!(on.iter().all(|c| !c.dm_permission));
     }
@@ -1670,13 +1839,13 @@ mod tests {
                 "voice={voice} assistant={assistant}"
             );
         }
-        // Both gates on is the full voice set without the assistant: 30
+        // Both gates on is the full voice set without the assistant: 34
         // builtins plus the 21 surviving voice names.
         let both = published(RouterGates {
             voice_assistant: true,
             ..voice_on()
         });
-        assert_eq!(both.len(), 51);
+        assert_eq!(both.len(), 55);
     }
 
     #[test]

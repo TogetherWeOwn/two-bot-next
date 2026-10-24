@@ -125,7 +125,10 @@ remain mandatory.
 
 All five member verbs share a process-local, per-guild actor cooldown: one new
 interaction per actor every 5 seconds, reserved before role REST reads. It applies
-to failed attempts too, uses a monotonic clock and stores at most 1024 unexpired
+to failed attempts too, except malformed invocations: strict option decode runs
+before cooldown admission, so a wrong-typed, duplicated, missing, unknown or
+invalid option refuses with a `/verb` correction and never consumes the actor
+cooldown. The limiter uses a monotonic clock and stores at most 1024 unexpired
 actors; capacity exhaustion refuses rather than evicting active cooldowns. Different
 actors remain independent; restart clears this local limiter. This does not replace
 shared interaction-lane admission or a durable rate limiter. The interaction id is
@@ -276,10 +279,15 @@ not name it, and no code expires or takes over the row.
 
 ### Refused and incomplete request audits
 
-All five member verbs audit reason/duration validation refusals as `denied`
-with `stage: validation`; key mismatches use `stage: claim`. Denials retain
-only fixed reason copy, not rejected input. Their `:denied` request identity
-keeps a corrected retry's plain success row available.
+Policy refusals (hierarchy, protected and self targets, permission checks)
+audit as `denied` with `stage: validation`; key mismatches use `stage: claim`.
+Denials retain only fixed reason copy, not rejected input. Their `:denied`
+request identity keeps a corrected retry's plain success row available.
+Option-level reason/duration validation never reaches this audit: wrong-typed,
+duplicated, missing, unknown and invalid options refuse at strict decode,
+before any read, claim or audit write, with a private `/verb` correction and
+zero stored rows, so a corrected retry under the same idempotency key lands
+exactly one accepted audit.
 
 Discord failures and store errors attempt a best-effort audit with the original
 request ID in metadata and the original idempotency key in its dedicated field.

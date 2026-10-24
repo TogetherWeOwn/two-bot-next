@@ -20,7 +20,7 @@
   "DISCORD_VOICE_LOG_CHANNEL_ID": "Destination for voice-session logs.",
   "LOG_LEVEL": "Container two_bot tracing level when RUST_LOG is unset (info default); RUST_LOG overrides.",
   "TEMP_VOICE_ENABLED": "Legacy temporary-voice enable flag; classification does not imply runtime wiring.",
-  "TWO_ANNOUNCEMENTS": "Enable announcement command publication and routing.",
+  "TWO_ANNOUNCEMENTS": "Enable announcement command publication and routing; stored rows apply live to the feed poller while the command surface reads boot.",
   "TWO_ANTI_NUKE": "Enable anti-nuke protection.",
   "TWO_ANTI_NUKE_DRY_RUN": "Observe anti-nuke decisions without executing protective writes.",
   "TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS": "Maximum age of anti-nuke events considered for action.",
