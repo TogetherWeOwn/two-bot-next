@@ -256,6 +256,7 @@ pub struct InteractionRuntime {
     pub pool: sqlx::Pool<sqlx::Postgres>,
     pub executor: crate::ActionExecutor,
     pub classifier: two_bot_core::ClassifierConfig,
+    classifier_provider: Option<std::sync::Arc<dyn crate::rsvp::ClassifierProvider>>,
     lfg: crate::lfg_interactions::LfgInteractions,
     bot_user_id: std::sync::atomic::AtomicU64,
     application_id: std::sync::atomic::AtomicU64,
@@ -316,7 +317,7 @@ impl InteractionRuntime {
             &self.router,
             &self.pool,
             &self.executor,
-            &self.classifier,
+            self.classifier_provider(),
             interaction,
         )
         .await
@@ -383,7 +384,7 @@ impl InteractionRuntime {
             prepared,
             &self.pool,
             &self.executor,
-            &self.classifier,
+            self.classifier_provider(),
         )
         .await
     }
@@ -450,10 +451,27 @@ impl InteractionRuntime {
             pool: pool.clone(),
             executor,
             classifier,
+            classifier_provider: None,
             lfg: crate::lfg_interactions::LfgInteractions::new(pool),
             bot_user_id: std::sync::atomic::AtomicU64::new(bot_user_id),
             application_id: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Both direct and ordered attendance execution resolve this provider after
+    /// acknowledgement and live membership checks. Other features are unchanged.
+    pub fn with_classifier_provider(
+        mut self,
+        provider: std::sync::Arc<dyn crate::rsvp::ClassifierProvider>,
+    ) -> Self {
+        self.classifier_provider = Some(provider);
+        self
+    }
+
+    fn classifier_provider(&self) -> &dyn crate::rsvp::ClassifierProvider {
+        self.classifier_provider
+            .as_deref()
+            .unwrap_or(&self.classifier)
     }
 
     pub fn set_bot_user_id(&self, id: u64) {
