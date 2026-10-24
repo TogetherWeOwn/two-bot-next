@@ -17,6 +17,9 @@
 
 #![cfg(test)]
 
+#[path = "reopen_dispatch_review_acceptance_tests.rs"]
+mod reopen_dispatch_review_acceptance_tests;
+
 #[path = "leveling_ack_ordering_acceptance_tests.rs"]
 mod leveling_ack_ordering_acceptance_tests;
 #[path = "leveling_ack_visibility_acceptance_tests.rs"]
@@ -734,7 +737,14 @@ async fn activation_boot_resumed_uses_current_clearance_and_checks_identity() {
                 .collect();
             assert_eq!(
                 names,
-                vec!["rank", "leaderboard", "help", "privacy", "welcome-preview"],
+                vec![
+                    "rank",
+                    "leaderboard",
+                    "help",
+                    "privacy",
+                    "reopen",
+                    "welcome-preview"
+                ],
                 "unrelated core commands remain; uncleared surfaces are replaced"
             );
         }
@@ -850,7 +860,14 @@ async fn activation_boot_from_env_fixture() {
     if expected == "narrowed" {
         assert_eq!(
             names,
-            ["rank", "leaderboard", "help", "privacy", "welcome-preview"]
+            [
+                "rank",
+                "leaderboard",
+                "help",
+                "privacy",
+                "reopen",
+                "welcome-preview"
+            ]
         );
         assert!(!runtime.router().gates().moderation);
         assert!(!runtime.router().gates().automations);
@@ -1298,6 +1315,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "leaderboard"
                         | "help"
                         | "privacy"
+                        | "reopen"
                         | "welcome-preview"
                 )
             })
@@ -1306,6 +1324,8 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
         assert!(!unwired.contains(&"leaderboard"));
         assert!(!unwired.contains(&"help"));
         assert!(!unwired.contains(&"privacy"));
+        assert!(!unwired.contains(&"reopen"));
+        assert!(!unwired.contains(&"welcome-preview"));
         if router_gates.announcements {
             assert!(unwired.contains(&"rsvp"), "enabled unwired announcement");
         }
@@ -1971,6 +1991,24 @@ async fn foreign_non_moderation_commands_remain_silent() {
         }
     }
     assert!(mock.requests().is_empty(), "router Ignore stays silent");
+    mock.shutdown().await;
+}
+
+/// `/reopen` routes `Handled` but executes in the onboarding worker, not
+/// here: this runtime must stay silent (no unavailable reply, no defer),
+/// exactly like it does for the picker components, so the single initial
+/// callback belongs to the onboarding owner.
+#[tokio::test]
+async fn reopen_stays_silent_for_the_onboarding_owner() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime
+        .on_interaction(&slash("reopen", Some(CHANNEL), Vec::new()))
+        .await;
+    assert!(
+        mock.requests().is_empty(),
+        "the onboarding worker owns /reopen; this runtime answers nothing"
+    );
     mock.shutdown().await;
 }
 
@@ -3429,6 +3467,7 @@ fn production_router_matches_composed_production_wiring() {
             HandlerId::Leaderboard,
             HandlerId::Help,
             HandlerId::Privacy,
+            HandlerId::Reopen,
             HandlerId::WelcomePreview,
             HandlerId::ScorecardAttendance,
             HandlerId::AutomationAdmin,

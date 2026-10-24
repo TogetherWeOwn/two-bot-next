@@ -605,6 +605,7 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
                 "leaderboard",
                 "help",
                 "privacy",
+                "reopen",
                 "welcome-preview",
                 "attendance"
             ],

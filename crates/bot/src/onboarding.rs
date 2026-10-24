@@ -1,15 +1,19 @@
 //! Onboarding orchestration; S3 retains ownership of join/gate/leave facts.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use sqlx::PgPool;
-use twilight_model::application::interaction::Interaction;
+use twilight_model::application::interaction::application_command::CommandOptionValue;
+use twilight_model::application::interaction::{Interaction, InteractionData};
 use twilight_model::gateway::event::Event;
 use two_bot_core::onboarding::*;
 use two_bot_core::onboarding_store::*;
 use two_bot_core::settings::SettingsCache;
-use two_bot_core::{ComponentHandler, ComponentOutcome, InteractionRouter, RouterGates};
+use two_bot_core::{
+    ComponentHandler, ComponentOutcome, HandlerId, InteractionRouter, RouterGates, SlashOutcome,
+};
 use two_bot_cutover::settings::SettingsStore;
 use two_bot_discord::onboarding_config::OnboardingConfig;
 use two_bot_discord::onboarding_messages::{defer_ephemeral, picker_components};
@@ -348,15 +352,9 @@ impl OnboardingRuntime {
                     member_id: Some(member.user.id.get()),
                 })
             }
-            Event::InteractionCreate(interaction) if self.accepts_interaction(&interaction.0) => {
-                // Retain the canonical interaction for execution: downstream
-                // ownership checks must see the registered name, not the raw
-                // payload name.
-                self.executor
-                    .command_identities()
-                    .resolve_interaction(&interaction.0)
-                    .map(|resolved| OnboardingJob::Interaction(Box::new(resolved.into_owned())))
-            }
+            Event::InteractionCreate(interaction) => self
+                .resolve_interaction(&interaction.0)
+                .map(|resolved| OnboardingJob::Interaction(Box::new(resolved.into_owned()))),
             _ => None,
         }
     }
@@ -364,20 +362,30 @@ impl OnboardingRuntime {
     /// Ingress eligibility uses only immutable identity and the shared router,
     /// never settings SQL. Stale/disabled mode submissions get an honest edit
     /// after defer; hot configuration cannot delay the initial acknowledgement.
+    /// The `/reopen` self-service slash rides the same capture so a member
+    /// whose welcome is lost can open a fresh menu through the same
+    /// defer-first pipeline as the picker components, as does the admin
+    /// `/welcome-preview` rendering (including its private refusal, which
+    /// must defer before any authorization guidance).
+    #[cfg(test)]
     pub fn accepts_interaction(&self, interaction: &Interaction) -> bool {
-        // Resolve the registered slash identity exactly like shared dispatch
-        // (resolve_interaction before its onboarding yield), so both
-        // consumers agree on who owns a slash even when the payload name is
-        // stale. Unresolvable slashes stay silent on both sides; components
-        // pass through unchanged.
-        let Some(resolved) = self
+        self.resolve_interaction(interaction).is_some()
+    }
+
+    /// Use the executor's confirmed slash identity before taking ownership, and
+    /// retain the canonical payload for ingress and post-commit processing.
+    /// Component payloads pass through the shared resolver unchanged.
+    /// Unresolvable slashes stay silent here exactly like shared dispatch, so
+    /// both consumers agree on who owns a slash even when the payload name is
+    /// stale.
+    pub(crate) fn resolve_interaction<'a>(
+        &self,
+        interaction: &'a Interaction,
+    ) -> Option<Cow<'a, Interaction>> {
+        let interaction = self
             .executor
             .command_identities()
-            .resolve_interaction(interaction)
-        else {
-            return false;
-        };
-        let interaction = resolved.as_ref();
+            .resolve_interaction(interaction)?;
         let router = InteractionRouter::new(RouterGates {
             configured_guild: Some(self.guild_id),
             scorecard: false,
@@ -391,16 +399,16 @@ impl OnboardingRuntime {
             onboarding_picker: true,
             session_picker: true,
         });
-        interaction
+        let eligible = interaction
             .member
             .as_ref()
             .and_then(|member| member.user.as_ref())
             .is_some_and(|user| !user.bot)
-            && (if owns_welcome_preview(interaction) {
+            && (if owns_welcome_preview(&interaction) {
                 // Refusals belong here too: defer before private authorization
                 // guidance, but never read settings for a non-admin.
                 !matches!(
-                    route_interaction(&router, interaction, None),
+                    route_interaction(&router, &interaction, None),
                     RoutedInteraction::Slash {
                         outcome: two_bot_core::SlashOutcome::Ignore,
                         ..
@@ -408,15 +416,21 @@ impl OnboardingRuntime {
                 )
             } else {
                 matches!(
-                    route_interaction(&router, interaction, None),
+                    route_interaction(&router, &interaction, None),
                     RoutedInteraction::Component {
                         outcome: ComponentOutcome::Handled {
                             handler: ComponentHandler::GamePicker | ComponentHandler::SessionPicker
                         },
                         ..
+                    } | RoutedInteraction::Slash {
+                        outcome: SlashOutcome::Handled {
+                            handler: HandlerId::Reopen
+                        },
+                        ..
                     }
                 )
-            })
+            });
+        eligible.then_some(interaction)
     }
 
     pub async fn acknowledge(
@@ -464,6 +478,10 @@ impl OnboardingRuntime {
         interaction: &Interaction,
         now_ms: i64,
     ) -> Result<(), RuntimeError> {
+        let Some(interaction) = self.resolve_interaction(interaction) else {
+            return Ok(());
+        };
+        let interaction = interaction.as_ref();
         if owns_welcome_preview(interaction) {
             return self.welcome_preview(interaction, now_ms).await;
         }
@@ -490,9 +508,9 @@ impl OnboardingRuntime {
 
     pub async fn handle(&self, job: OnboardingJob, now_ms: i64) -> Result<(), RuntimeError> {
         if let OnboardingJob::Interaction(interaction) = job {
-            if !self.accepts_interaction(&interaction) {
+            let Some(interaction) = self.resolve_interaction(&interaction) else {
                 return Ok(());
-            }
+            };
             return if self
                 .acknowledge(&interaction, tokio::time::Instant::now())
                 .await
@@ -721,11 +739,23 @@ impl OnboardingRuntime {
             onboarding_picker: config.gates.mode != OnboardingMode::Session,
             session_picker: config.gates.mode == OnboardingMode::Session,
         });
+        let routed = route_interaction(&router, interaction, None);
+        if matches!(
+            routed,
+            RoutedInteraction::Slash {
+                outcome: SlashOutcome::Handled {
+                    handler: HandlerId::Reopen
+                },
+                ..
+            }
+        ) {
+            return self.reopen_menu(config, interaction).await;
+        }
         let RoutedInteraction::Component {
             values,
             outcome: ComponentOutcome::Handled { handler },
             ..
-        } = route_interaction(&router, interaction, None)
+        } = routed
         else {
             return self
                 .reply(interaction, "This menu is no longer enabled. No selection was applied. Please open the current menu and try again.")
@@ -793,6 +823,101 @@ impl OnboardingRuntime {
             return self.reply(interaction, content).await;
         }
         Ok(())
+    }
+
+    /// Open a fresh self-only picker menu for a `/reopen` slash invocation.
+    ///
+    /// Read-only: the menu is built from the member's CURRENT roles and the
+    /// CURRENT configured picks through the existing `picker_components`
+    /// renderer, and opening it performs zero role, channel, funnel, invite
+    /// or voice effects. The menu's own select feeds the existing component
+    /// handler, so a later selection keeps its authorization, dry-run,
+    /// replay and role semantics — this is a menu opener, never a second
+    /// mutation writer. Disabled kinds, malformed invocations and failed
+    /// lookups get exactly one private guidance edit, never a menu and
+    /// never a success claim.
+    async fn reopen_menu(
+        &self,
+        config: &OnboardingConfig,
+        interaction: &Interaction,
+    ) -> Result<(), RuntimeError> {
+        let Some(user) = interaction
+            .member
+            .as_ref()
+            .and_then(|member| member.user.as_ref())
+        else {
+            return Ok(());
+        };
+        if user.bot {
+            return Ok(());
+        }
+        let Some(kind) = reopen_kind(interaction) else {
+            return self
+                .reply(
+                    interaction,
+                    "I couldn't tell which picker to open. No selection was applied. Use /reopen again and choose `games` or `session`, then try again.",
+                )
+                .await;
+        };
+        // Mirror the component gates: the games menu lives where the game
+        // picker is live (legacy/anchor), the session menu where the session
+        // picker is live (session mode). The router cannot see the kind
+        // option, so this check runs here, after the defer.
+        let live = match kind {
+            PickerKind::Games => game_picker_allowed(config.gates.mode),
+            PickerKind::Session => config.gates.mode == OnboardingMode::Session,
+        };
+        if !live {
+            let label = match kind {
+                PickerKind::Games => "games",
+                PickerKind::Session => "session",
+            };
+            return self
+                .reply(
+                    interaction,
+                    &format!(
+                        "The {label} picker isn't enabled right now. No selection was applied. Please try again once it is enabled."
+                    ),
+                )
+                .await;
+        }
+        // Games defaults reflect the member's current roles, so every open
+        // re-reads them — a stale snapshot from an earlier open must not
+        // leak into a later one. A failed lookup guides privately instead
+        // of failing the job: the defer is already confirmed, so the member
+        // is owed exactly one finished edit, not a retried job.
+        let member_roles: Vec<String> = match kind {
+            PickerKind::Games => {
+                match MemberAccess::load(&self.executor, config.guild_id, user.id.get()).await {
+                    Ok(Some(access)) => access.role_ids,
+                    Ok(None) | Err(_) => {
+                        return self
+                            .reply(
+                                interaction,
+                                "I couldn't load your current roles. No selection was applied. Please open the menu and try again.",
+                            )
+                            .await;
+                    }
+                }
+            }
+            PickerKind::Session => Vec::new(),
+        };
+        let role_refs: Vec<&str> = member_roles.iter().map(String::as_str).collect();
+        let session_picks: &[SessionPick] = match kind {
+            PickerKind::Games => &[],
+            PickerKind::Session => &config.session_picks,
+        };
+        let components = picker_components(Some(kind), &role_refs, session_picks);
+        let caption = match kind {
+            PickerKind::Games => {
+                "Here's your games picker — only you can see this menu. Pick what you play, then submit."
+            }
+            PickerKind::Session => {
+                "Here's your session picker — only you can see this menu. Choose what to do, then submit."
+            }
+        };
+        self.reply_with_menu(interaction, caption, &components)
+            .await
     }
 
     async fn process_selection(
@@ -1039,6 +1164,42 @@ impl OnboardingRuntime {
         .await
         .map_err(|_| RuntimeError::Discord)?
         .map_err(|_| RuntimeError::Discord)
+    }
+
+    async fn reply_with_menu(
+        &self,
+        interaction: &Interaction,
+        content: &str,
+        components: &[twilight_model::channel::message::Component],
+    ) -> Result<(), RuntimeError> {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            self.executor
+                .edit_interaction_response_with_components_and_blocked_retry(
+                    interaction.application_id.get(),
+                    &interaction.token,
+                    content,
+                    components,
+                ),
+        )
+        .await
+        .map_err(|_| RuntimeError::Discord)?
+        .map_err(|_| RuntimeError::Discord)
+    }
+}
+
+/// Extract the `kind` option of a `/reopen` slash invocation. `None` covers
+/// a missing option, a non-string value and an unknown kind: all three get
+/// the same private guidance naming both valid choices.
+fn reopen_kind(interaction: &Interaction) -> Option<PickerKind> {
+    let InteractionData::ApplicationCommand(data) = interaction.data.as_ref()? else {
+        return None;
+    };
+    let value = data.options.iter().find(|option| option.name == "kind")?;
+    match &value.value {
+        CommandOptionValue::String(kind) if kind == "games" => Some(PickerKind::Games),
+        CommandOptionValue::String(kind) if kind == "session" => Some(PickerKind::Session),
+        _ => None,
     }
 }
 

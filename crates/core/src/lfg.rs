@@ -455,8 +455,16 @@ pub fn lfg_content(post: &LfgPost, roles: &[LfgRole], signups: &[LfgSignup]) -> 
         }
         lines.push(line);
     }
-    let content = lines.join("\n");
-    crate::message_safety::content(&content)
+    // Reserve the footer before truncating a full roster: the close identifier
+    // must remain discoverable even when the member list fills the message.
+    let footer = crate::message_safety::content(&format!(
+        "\nLFG id: `{}` — close with `/lfg-close`",
+        truncate_utf16(&post.id, crate::commands::MAX_RESOURCE_ID_CHARS)
+    ));
+    let content = crate::message_safety::neutralize_mentions(&lines.join("\n"));
+    let budget = crate::message_safety::CONTENT_LIMIT
+        .saturating_sub(crate::message_safety::text_len(&footer));
+    format!("{}{footer}", truncate_utf16(&content, budget))
 }
 
 /// One signup-select option (plain data; the adapter maps this to the

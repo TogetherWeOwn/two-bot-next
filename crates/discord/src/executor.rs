@@ -3831,50 +3831,8 @@ impl ActionExecutor {
         interaction_token: &str,
         content: &str,
     ) -> Result<(), DiscordError> {
-        self.edit_response_inner(application_id, interaction_token, content, true, None)
+        self.edit_response_inner(application_id, interaction_token, content, true)
             .await
-    }
-
-    /// Render a private visual sample with the same components as the live
-    /// message. The initial callback owns ephemerality; all mentions are off.
-    /// One attempt, including on ambiguous failure: this never retries an ACK.
-    pub async fn edit_interaction_response_with_components(
-        &self,
-        application_id: u64,
-        interaction_token: &str,
-        content: &str,
-        components: &[twilight_model::channel::message::Component],
-    ) -> Result<(), DiscordError> {
-        self.edit_response_inner(
-            application_id,
-            interaction_token,
-            content,
-            true,
-            Some(components),
-        )
-        .await
-    }
-
-    /// [`Self::edit_interaction_response_with_components`] with the same
-    /// bounded contention tolerance as
-    /// [`Self::edit_interaction_response_with_blocked_retry`].
-    pub async fn edit_interaction_response_with_components_and_blocked_retry(
-        &self,
-        application_id: u64,
-        interaction_token: &str,
-        content: &str,
-        components: &[twilight_model::channel::message::Component],
-    ) -> Result<(), DiscordError> {
-        self.retry_admission_blocked(|_| async {
-            self.edit_interaction_response_with_components(
-                application_id,
-                interaction_token,
-                content,
-                components,
-            )
-            .await
-        })
-        .await
     }
 
     /// Complete an acknowledged interaction without mention neutralization.
@@ -3888,7 +3846,7 @@ impl ActionExecutor {
         interaction_token: &str,
         content: &str,
     ) -> Result<(), DiscordError> {
-        self.edit_response_inner(application_id, interaction_token, content, false, None)
+        self.edit_response_inner(application_id, interaction_token, content, false)
             .await
     }
 
@@ -3898,7 +3856,6 @@ impl ActionExecutor {
         interaction_token: &str,
         content: &str,
         neutralize_mentions: bool,
-        components: Option<&[twilight_model::channel::message::Component]>,
     ) -> Result<(), DiscordError> {
         let application = Id::<ApplicationMarker>::new_checked(application_id)
             .ok_or_else(|| DiscordError::Rejected("bad application id".to_owned()))?;
@@ -3908,18 +3865,70 @@ impl ActionExecutor {
             two_bot_core::message_safety::content_without_mention_neutralization(content)
         };
         let mentions = AllowedMentions::default();
-        let client = self.inner.factory.interaction(application);
-        let update = client
-            .update_response(interaction_token)
-            .content(Some(&content))
-            .allowed_mentions(Some(&mentions));
-        let update = match components {
-            Some(components) if !components.is_empty() => update.components(Some(components)),
-            _ => update,
-        };
-        let req = Self::request_of(update)?;
+        let req = Self::request_of(
+            self.inner
+                .factory
+                .interaction(application)
+                .update_response(interaction_token)
+                .content(Some(&content))
+                .allowed_mentions(Some(&mentions)),
+        )?;
         let req = Self::explicit_mentions(req, &mentions)?;
         let mut res = self.call_once_raw(req, &[200]).await?;
+        mutation_receipt_id(&res.body)?;
+        res.complete().await;
+        Ok(())
+    }
+
+    /// Complete an acknowledged interaction by editing its original response,
+    /// replacing the message content and its components (a reopened picker
+    /// menu). Same single-attempt, unpaced, receipt-checked contract as
+    /// [`ActionExecutor::edit_interaction_response`]: a lost menu edit must
+    /// not repeat already-committed store effects, and the interaction token
+    /// never appears in a returned error. The original callback decides
+    /// ephemerality; edits retain it.
+    pub async fn edit_interaction_response_with_components(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        content: &str,
+        components: &[twilight_model::channel::message::Component],
+    ) -> Result<(), DiscordError> {
+        self.edit_interaction_response_with_components_with_timeout(
+            application_id,
+            interaction_token,
+            content,
+            components,
+            self.inner.moderation_timeout,
+        )
+        .await
+    }
+
+    async fn edit_interaction_response_with_components_with_timeout(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        content: &str,
+        components: &[twilight_model::channel::message::Component],
+        timeout: Duration,
+    ) -> Result<(), DiscordError> {
+        let application = Id::<ApplicationMarker>::new_checked(application_id)
+            .ok_or_else(|| DiscordError::Rejected("bad application id".to_owned()))?;
+        let content = two_bot_core::message_safety::content(content);
+        let mentions = AllowedMentions::default();
+        let req = Self::request_of(
+            self.inner
+                .factory
+                .interaction(application)
+                .update_response(interaction_token)
+                .content(Some(&content))
+                .components(Some(components))
+                .allowed_mentions(Some(&mentions)),
+        )?;
+        let req = Self::explicit_mentions(req, &mentions)?;
+        let mut res = self
+            .call_once_raw_lane_for(&req, &[200], None, timeout)
+            .await?;
         mutation_receipt_id(&res.body)?;
         res.complete().await;
         Ok(())
@@ -3939,6 +3948,30 @@ impl ActionExecutor {
         self.retry_admission_blocked(|_| async {
             self.edit_interaction_response(application_id, interaction_token, content)
                 .await
+        })
+        .await
+    }
+
+    /// [`ActionExecutor::edit_interaction_response_with_components`] with the
+    /// same bounded contention tolerance as
+    /// [`ActionExecutor::edit_interaction_response_with_blocked_retry`]:
+    /// re-attempts ONLY admission-Blocked failures that never reached the
+    /// wire, so retrying cannot repeat an accepted menu edit.
+    pub async fn edit_interaction_response_with_components_and_blocked_retry(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        content: &str,
+        components: &[twilight_model::channel::message::Component],
+    ) -> Result<(), DiscordError> {
+        self.retry_admission_blocked(|timeout| {
+            self.edit_interaction_response_with_components_with_timeout(
+                application_id,
+                interaction_token,
+                content,
+                components,
+                timeout,
+            )
         })
         .await
     }

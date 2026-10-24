@@ -1281,7 +1281,7 @@ async fn failed_refresh_patch_keeps_saved_signup_and_audit_with_warning_and_no_p
     // The existing saved-state warning is returned unchanged.
     assert_eq!(
         last_reply(&mock),
-        "LFG joined. Message refresh failed; the saved state is unchanged."
+        "LFG joined. Message refresh failed; the saved result above still applies."
     );
     // Saved signup plus exactly one audit, visible from an independent pool.
     let fresh = db.fresh_pool().await;

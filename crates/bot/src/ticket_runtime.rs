@@ -348,17 +348,24 @@ async fn maintenance_loop(
     }
 }
 
-/// Destination keys served from the live settings snapshot. The cooldown stays
-/// cold (boot-time): only destinations move without a restart.
+/// Destination keys served from the live settings snapshot. The ticket cooldown
+/// rides the same snapshot through [`COOLDOWN_KEY`]; it stays out of this list
+/// because `TicketConfig::from_env` treats the entries here as
+/// required-for-warning while the cooldown is optional (boot default).
 pub(crate) const LIVE_KEYS: [&str; 3] = [
     "DISCORD_TICKET_CATEGORY_ID",
     "DISCORD_TICKET_PANEL_CHANNEL_ID",
     "DISCORD_TICKET_STAFF_ROLE_ID",
 ];
 
+/// The ticket cooldown key served from the live settings snapshot alongside
+/// the destinations.
+pub(crate) const COOLDOWN_KEY: &str = "TWO_TICKET_COOLDOWN_SECONDS";
+
 /// Layer the live snapshot over the boot deployment (store-first, like the
 /// raid/join-risk/containment runtimes): stored rows win, deleted rows fall
-/// back to the boot value. Only the three destinations are read.
+/// back to the boot value. Only the three destinations and the cooldown are
+/// read.
 pub(crate) fn layered_vars(
     deployment: &HashMap<String, String>,
     guild_id: &str,
@@ -369,7 +376,7 @@ pub(crate) fn layered_vars(
         vars.extend(
             live.env_snapshot(Some(guild_id))
                 .into_iter()
-                .filter(|(key, _)| LIVE_KEYS.contains(&key.as_str())),
+                .filter(|(key, _)| LIVE_KEYS.contains(&key.as_str()) || key == COOLDOWN_KEY),
         );
     }
     vars
@@ -434,15 +441,15 @@ impl TicketConfig {
 pub(crate) struct TicketRuntime {
     store: TicketStore,
     executor: ActionExecutor,
-    /// Current destinations (boot, then live). The cooldown inside stays the
-    /// boot value; only the three destination keys move on refresh.
+    /// Current destinations and cooldown (boot, then live). Both move on
+    /// refresh when the snapshot carries them.
     config: TaskMutex<TicketConfig>,
-    /// Boot deployment values for the three destinations; the live snapshot
-    /// layers over these on every refresh.
+    /// Boot deployment values for the three destinations and the cooldown; the
+    /// live snapshot layers over these on every refresh.
     deployment: HashMap<String, String>,
-    /// Published snapshot revision the destinations were last resolved from;
-    /// `None` before any live reader exists.
-    live_revision: TaskMutex<Option<i64>>,
+    /// Last effective input, including ops. Suppress repeated parsing/logging
+    /// without conflating the guild revision with an effective publication.
+    live_vars: TaskMutex<Option<HashMap<String, String>>>,
     bot_id: AtomicU64,
     // Ready, buttons and recovery share this lane. Purge has its own lane so
     // slow Discord I/O cannot postpone the privacy ceiling.
@@ -708,12 +715,19 @@ impl TicketRuntime {
         config: TicketConfig,
         deployment: HashMap<String, String>,
     ) -> std::result::Result<Self, StoreError> {
+        // The layered refresh needs a complete boot fallback, including
+        // destinations already resolved in config but omitted from deployment.
+        // Preserve explicit deployment destinations and the effective boot
+        // cooldown so ops-only updates and deleted rows can rebuild config.
+        // Keep this normalization separate from later live snapshot layering.
+        let deployment = boot_deployment(&config, deployment);
+        // Live settings are layered over these boot defaults at each refresh.
         Ok(Self {
             store: TicketStore::new(pool, config.guild_id.clone())?,
             executor,
             config: TaskMutex::new(config),
+            live_vars: TaskMutex::new(None),
             deployment,
-            live_revision: TaskMutex::new(None),
             bot_id: AtomicU64::new(0),
             lane: Mutex::new(()),
             purge_lane: Mutex::new(()),
@@ -876,25 +890,29 @@ impl TicketRuntime {
         self.bot_id.store(id, Ordering::Release);
     }
 
-    /// Re-resolve destinations when the published snapshot moved. A malformed
-    /// stored row keeps the last good config rather than disabling tickets.
-    /// Pure apart from the process-wide live reader; production passes the
-    /// poller's snapshot, tests pass an explicit pair.
+    /// Re-resolve the effective destinations and cooldown, not just the DB
+    /// revision: ops publications, clearing and expiry do not move that revision.
+    /// Serialize the read/compare/apply so concurrent refreshes cannot overwrite
+    /// a newer config with an earlier read. Malformed values keep the last good.
     pub(crate) fn refresh_config_with(&self, live: Option<&LiveSettings>) {
-        let revision = live.map(LiveSettings::revision);
-        if *self.live_revision.lock().expect("ticket live revision") == revision {
-            return;
-        }
-        *self.live_revision.lock().expect("ticket live revision") = revision;
-        let current = self.config.lock().expect("ticket config").clone();
+        let mut current = self.config.lock().expect("ticket config");
         let Ok(guild_id) = current.guild_id.parse::<u64>() else {
             return;
         };
         let vars = layered_vars(&self.deployment, &current.guild_id, live);
-        match TicketConfig::from_vars(&vars, guild_id, current.cooldown_seconds) {
-            Some(next) if next != current => {
-                tracing::info!("setting_changed: ticket destinations");
-                *self.config.lock().expect("ticket config") = next;
+        let mut previous = self.live_vars.lock().expect("ticket effective vars");
+        if previous.as_ref() == Some(&vars) {
+            return;
+        }
+        *previous = Some(vars.clone());
+        let cooldown_seconds = vars
+            .get(COOLDOWN_KEY)
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(current.cooldown_seconds);
+        match TicketConfig::from_vars(&vars, guild_id, cooldown_seconds) {
+            Some(next) if next != *current => {
+                tracing::info!("setting_changed: ticket config");
+                *current = next;
             }
             Some(_) => {}
             None => {
@@ -903,9 +921,9 @@ impl TicketRuntime {
         }
     }
 
-    /// Destinations for this operation: refresh from the live snapshot, then
-    /// clone the current config. Revision-gated, so steady-state calls cost
-    /// two mutex reads.
+    /// Config for this operation: refresh from the live snapshot, then clone
+    /// the current config. Effective values include the independently
+    /// published ops layer as well as guild rows.
     fn live_config(&self) -> TicketConfig {
         self.refresh_config_with(crate::settings_jobs::live().as_ref());
         self.config.lock().expect("ticket config").clone()
@@ -1070,15 +1088,39 @@ impl TicketRuntime {
             .await?
         {
             OpenResult::Created(ticket) => ticket,
-            OpenResult::Refused(OpenDecision::Existing { channel_id }) => {
-                return Ok(match channel_id {
-                    Some(channel) => format!("You already have a ticket: <#{channel}>."),
-                    None => "Your ticket is still being created or recovered.".into(),
+            OpenResult::Refused(OpenDecision::Existing { status, channel_id }) => {
+                return Ok(match (status, channel_id) {
+                    (TicketStatus::Creating, _) => {
+                        "Your ticket is still being created or recovered.".into()
+                    }
+                    (TicketStatus::Open, Some(channel)) => {
+                        format!("You already have a ticket: <#{channel}>.")
+                    }
+                    (TicketStatus::Open, None) => {
+                        "Your ticket is open, but its channel is unavailable. Ask staff for help."
+                            .into()
+                    }
+                    (TicketStatus::Closing, _) => {
+                        "Your ticket is closing while its transcript is captured. Please wait; ask staff for help if it stays stuck.".into()
+                    }
+                    (TicketStatus::CleanupPending, _) => {
+                        "Your ticket is awaiting cleanup before another can open. Please wait; ask staff for help if it stays stuck.".into()
+                    }
+                    (TicketStatus::Closed, _) => return Err(Failure::InvalidEvidence),
                 })
             }
-            OpenResult::Refused(_) => {
-                return Ok("Please wait before opening another ticket.".into())
+            OpenResult::Refused(OpenDecision::Cooldown { next_try_at_ms }) => {
+                // Round only the display, never eligibility. Restrict dates to
+                // years 1970–9999 rather than overflowing Discord's renderer.
+                let seconds = next_try_at_ms.div_euclid(1000)
+                    + i128::from(next_try_at_ms.rem_euclid(1000) != 0);
+                return Ok(if (0..=253_402_300_799).contains(&seconds) {
+                    format!("Please wait before opening another ticket. Next time to try: <t:{seconds}:F> (<t:{seconds}:R>).")
+                } else {
+                    "Please wait before opening another ticket. The next time to try is outside the display range; ask staff to check the cooldown.".into()
+                });
             }
+            OpenResult::Refused(OpenDecision::Reserve) => return Err(Failure::InvalidEvidence),
         };
         let channel = match self
             .executor
@@ -1954,6 +1996,23 @@ fn panels_with_isolation(messages: Vec<Value>) -> Result<(Vec<PanelMessage>, u64
     Ok((out, skipped))
 }
 
+fn boot_deployment(
+    config: &TicketConfig,
+    mut deployment: HashMap<String, String>,
+) -> HashMap<String, String> {
+    for (key, value) in [
+        ("DISCORD_TICKET_CATEGORY_ID", &config.category_id),
+        ("DISCORD_TICKET_PANEL_CHANNEL_ID", &config.panel_channel_id),
+        ("DISCORD_TICKET_STAFF_ROLE_ID", &config.staff_role_id),
+    ] {
+        deployment
+            .entry(key.to_owned())
+            .or_insert_with(|| value.clone());
+    }
+    deployment.insert(COOLDOWN_KEY.to_owned(), config.cooldown_seconds.to_string());
+    deployment
+}
+
 #[cfg(test)]
 #[path = "ticket_runtime_tests.rs"]
 mod tests;
@@ -2025,3 +2084,7 @@ mod capture_cap_acceptance_tests;
 #[cfg(test)]
 #[path = "ticket_capture_cap_boundary_tests.rs"]
 mod capture_cap_boundary_tests;
+
+#[cfg(test)]
+#[path = "ticket_open_explanation_acceptance_tests.rs"]
+mod open_explanation_acceptance_tests;

@@ -63,7 +63,7 @@ impl OnboardingRuntime {
     ) -> Result<(), RuntimeError> {
         // Recheck the capture fence at the executor boundary. Refuse before SQL
         // and never resolve either the fixture's or the invoker's member state.
-        if !self.accepts_interaction(interaction) {
+        if self.resolve_interaction(interaction).is_none() {
             return Ok(());
         }
         let permissions = interaction

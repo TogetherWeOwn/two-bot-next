@@ -5,8 +5,8 @@
 //! the write guard, and the refresh partition by its declared class. Pure and
 //! offline: no database, no network, and no process-environment reads. Key
 //! names come only from the catalog constants, and loader defaults come from
-//! empty-map calls. This file carries no key string literals, so the
-//! container-env drift scanner keeps passing without reclassification.
+//! empty-map calls, except the single self-role panels probe below (an
+//! already-classified name, so the container-env drift scanner is unaffected).
 
 use std::collections::{HashMap, HashSet};
 
@@ -45,8 +45,35 @@ fn first_key(class: SettingClass) -> &'static str {
         .expect("catalog carries every class")
 }
 
+/// First class member without per-key value validation: the generic probes
+/// below feed arbitrary values (`json!(3)`, escaped text), which keys with
+/// their own shapes (gates, cooldown, panels) refuse by design. Those shapes
+/// are pinned by the live-keys acceptance, not here. The probe is an opaque
+/// string no per-key shape accepts, so only unvalidated keys match.
+fn first_plain_key(class: SettingClass) -> &'static str {
+    SETTING_CLASSES
+        .iter()
+        .find(|(key, c)| {
+            *c == class && validate_write(GUILD, key, Some(json!("synthetic")), ACTOR).is_ok()
+        })
+        .map(|(key, _)| *key)
+        .expect("catalog carries a class member without per-key validation")
+}
+
 fn prefix_probe(suffix: &str) -> String {
     format!("{}{suffix}", ENV_ONLY_KEY_PREFIXES[0])
+}
+
+/// A write value in the key's own shape: `json!(1)` satisfies every storable
+/// key except the self-role panel catalogue, which takes only a JSON array
+/// (the live-keys acceptance pins the refusal); the empty array parses as
+/// feature-off without embedding live IDs.
+fn probe_value(key: &str) -> Value {
+    if key == "TWO_SELF_ROLE_PANELS" {
+        json!([])
+    } else {
+        json!(1)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -129,7 +156,8 @@ fn assert_storable_key_refuses_env_only_and_unknown() {
 fn validate_write_decides_per_key_class() {
     let prefix: &str = ENV_ONLY_KEY_PREFIXES[0];
     for (key, class) in SETTING_CLASSES {
-        let result = validate_write(GUILD, key, Some(json!(1)), ACTOR);
+        let probe = probe_value(key);
+        let result = validate_write(GUILD, key, Some(probe.clone()), ACTOR);
         if *class == SettingClass::EnvOnly || key.starts_with(prefix) {
             assert!(
                 matches!(result, Err(WriteRefusal::EnvOnly(_))),
@@ -138,7 +166,7 @@ fn validate_write_decides_per_key_class() {
         } else {
             let write = result.unwrap_or_else(|_| panic!("storable key refused: {key}"));
             assert_eq!(write.class, *class, "{key}");
-            assert_eq!(write.action, WriteAction::Upsert(json!(1)), "{key}");
+            assert_eq!(write.action, WriteAction::Upsert(probe), "{key}");
             assert_eq!(write.guild_id, GUILD, "{key}");
             assert_eq!(write.key.as_str(), *key);
             assert_eq!(write.actor, ACTOR, "{key}");
@@ -148,7 +176,7 @@ fn validate_write_decides_per_key_class() {
 
 #[test]
 fn validate_write_outcome_matrix() {
-    let hot = first_key(SettingClass::Hot);
+    let hot = first_plain_key(SettingClass::Hot);
     let cold = first_key(SettingClass::Cold);
     let env_only = first_key(SettingClass::EnvOnly);
 
