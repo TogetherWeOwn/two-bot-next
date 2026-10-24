@@ -102,7 +102,7 @@ fn preview_core_contract_normalizes_input_and_renders_the_creation_body() {
     let roles = lfg::spec_roles(&post.id, &specs);
     assert_eq!(
         lfg::lfg_content(&post, &roles, &[]),
-        "**Friday raid** — Open\nStarts <t:4092840000:F>\n**Tank** 0/2\n**Healer** 0/1"
+        "**Friday raid** — Open\nStarts <t:4092840000:F>\n**Tank** 0/2\n**Healer** 0/1\nLFG id: `fixture-only` — close with `/lfg-close`"
     );
 }
 

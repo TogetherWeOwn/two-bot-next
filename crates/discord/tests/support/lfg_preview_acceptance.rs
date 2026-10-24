@@ -149,6 +149,10 @@ fn assert_preview(response: &Value, id: u64) -> &str {
         !text.contains(&format!("lfg-{id}")),
         "synthetic persisted identity leaked"
     );
+    assert!(
+        !text.contains("LFG id:"),
+        "preview must not carry the persisted-post identity footer"
+    );
     assert!(!text.contains("custom_id") && !text.contains("__leave__"));
     text
 }
