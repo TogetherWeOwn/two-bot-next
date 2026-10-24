@@ -102,7 +102,13 @@ const HELP_GROUPS: &[HelpGroup] = &[
     HelpGroup {
         title: "Feed relays",
         requires: Some("Manage Server"),
-        commands: &["feed-add", "feed-remove", "feed-list"],
+        commands: &[
+            "feed-add",
+            "feed-remove",
+            "feed-pause",
+            "feed-resume",
+            "feed-list",
+        ],
         anchor: None,
     },
     HelpGroup {
@@ -878,7 +884,7 @@ mod tests {
         // 27 legacy builtins plus Next-only help, privacy, command-inspect and reopen
         // commands, then the 21 voice names (voice `kick` shares the Kick
         // group). `/templateassistant` stays out until its slice lands.
-        assert_eq!(grouped.len(), 52);
+        assert_eq!(grouped.len(), 54);
         for name in [
             "rank",
             "leaderboard",

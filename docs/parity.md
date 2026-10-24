@@ -66,8 +66,9 @@ Original registry surface: `CORE_COMMAND_DATA` (always published) = leveling onl
 | 30 | `/feed-list` | `page` opt ≥1 (1-based, default 1) | `ManageGuild` | **S4** |
 
 Runtime permission contract: `crates/core/src/command_permissions.rs` represents
-all 34 rows (31 retained builtins — the 27 legacy ones plus the Next-only
-`/help`, `/privacy`, `/command-inspect` and `/reopen` — the dropped rota command, custom slash commands,
+all 36 rows (33 retained builtins — the 27 legacy ones plus the Next-only
+`/help`, `/privacy`, `/command-inspect`, `/reopen`, `/feed-pause` and `/feed-resume`
+— the dropped rota command, custom slash commands,
 and prefix triggers). The router checks the invoking interaction's resolved
 `member.permissions`, not bot permissions or command-picker defaults, before
 returning a builtin handler. Missing restricted bits produce an ephemeral refusal
@@ -119,6 +120,8 @@ golden exception or a claim of whole-baseline registry parity.
 | `schedule-list` | docs/parity.md §1 #19 page | Add the Next-only optional integer `page` (`min_value` 1, default 1) so every configured id through the first 50 rows stays discoverable within Discord's 2,000-unit cap (guild list reads at most 25 earliest rows per window; over-cap guilds page past the overflow line to reach hidden rows); command name, description and permissions stay legacy-identical. |
 | `feed-list` | docs/parity.md §1 #30 page | Add the Next-only optional integer `page` (`min_value` 1, default 1) so every stored relay id stays discoverable as deterministic whole rows within Discord's 2,000-unit cap (each page packs whole relay rows with source context; invalid or out-of-range pages refuse without mutation); command name, description and permissions stay legacy-identical. |
 | `command-inspect` | docs/parity.md §1 command-inspect | Add the Next-only `/command-inspect` management command (no legacy counterpart): automation-gated, guild-only, `ManageGuild`-gated, published after `command-list`. Required `name` (≤32), optional `view` choice (summary/template/preview, summary by default) and optional `arguments` sample (≤500 UTF-16 units, ignored by the four-variable template language). One private ephemeral content-only view per call — metadata summary, saved template, or rendered preview — with Markdown-escaped untrusted text and explicit truncation markers; never a channel send, registration, cooldown/claim touch, definition mutation or `command.run` fact. |
+| `feed-pause` | docs/parity.md §1 feed-pause | Add the Next-only `/feed-pause` lifecycle command (no legacy counterpart): announcements-gated, guild-only, `ManageGuild`-gated, published after `feed-remove`. Required stable relay `id` (≤128). Pauses one relay without deleting its history: only lifecycle state changes, pending recovery refuses with a retry-after-recovery reply, and no fresh post claim may begin after a successful pause. |
+| `feed-resume` | docs/parity.md §1 feed-resume | Add the Next-only `/feed-resume` lifecycle command (no legacy counterpart): announcements-gated, guild-only, `ManageGuild`-gated, published after `feed-pause`. Required stable relay `id` (≤128). Resumes one paused relay preserving seen-item and delivery history; catch-up keeps the existing per-poll post budget and never reposts an accepted item. |
 
 These are the complete registry exceptions, mirrored by the test allowlist.
 Only equivalent guild-API representation defaults are canonicalized: omitted

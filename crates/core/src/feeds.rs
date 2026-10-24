@@ -95,6 +95,12 @@ pub enum FeedCommand {
         id: String,
     },
     List,
+    Pause {
+        id: String,
+    },
+    Resume {
+        id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +108,8 @@ pub enum FeedCommandPlan {
     Add(FeedRelay),
     Remove { guild_id: String, id: String },
     List { guild_id: String },
+    Pause { guild_id: String, id: String },
+    Resume { guild_id: String, id: String },
 }
 
 pub struct FeedCommandContext<'a> {
@@ -150,6 +158,20 @@ pub fn plan_command(
         FeedCommand::List => Ok(FeedCommandPlan::List {
             guild_id: context.guild_id.into(),
         }),
+        FeedCommand::Pause { id } => {
+            validate_id(&id)?;
+            Ok(FeedCommandPlan::Pause {
+                guild_id: context.guild_id.into(),
+                id,
+            })
+        }
+        FeedCommand::Resume { id } => {
+            validate_id(&id)?;
+            Ok(FeedCommandPlan::Resume {
+                guild_id: context.guild_id.into(),
+                id,
+            })
+        }
     }
 }
 
@@ -197,12 +219,24 @@ fn truncate_feed_list_source_with_budget(source: &str, budget: usize) -> String 
     }
 }
 
+/// Lifecycle state word for list rows: every stable-ID row carries its own
+/// `enabled`/`paused` label so a paused relay stays discoverable with its
+/// resume/remove ID, kind, channel and source on one whole row.
+fn feed_list_state(feed: &FeedRelay) -> &'static str {
+    if feed.enabled {
+        "enabled"
+    } else {
+        "paused"
+    }
+}
+
 fn feed_list_row_with_budget(feed: &FeedRelay, source_budget: usize) -> String {
     let source = truncate_feed_list_source_with_budget(&feed.source, source_budget);
     format!(
-        "`{}` {} → <#{}> {source}",
+        "`{}` {} {} → <#{}> {source}",
         feed.id,
         feed.kind.as_str(),
+        feed_list_state(feed),
         feed.channel_id
     )
 }
@@ -262,6 +296,13 @@ fn truncate_feed_list_source_distinguishing(source: &str, budget: usize) -> Stri
     if budget == 1 {
         return "…".to_string();
     }
+    // Below three units there is no room for both a truncation marker and a
+    // distinguishing tail, so the tail wins: same-host relays stay mappable
+    // to their sources at capacity (the row's fixed frame still carries the
+    // exact id, kind, state and channel).
+    if budget == 2 {
+        return truncate_utf16_tail(compact, 2);
+    }
     // Tail-biased split: the tail carries the id/path that differs.
     let remaining = budget - 1;
     let head_units = remaining / 3;
@@ -274,9 +315,10 @@ fn truncate_feed_list_source_distinguishing(source: &str, budget: usize) -> Stri
 fn feed_list_row_distinguishing(feed: &FeedRelay, source_budget: usize) -> String {
     let source = truncate_feed_list_source_distinguishing(&feed.source, source_budget);
     format!(
-        "`{}` {} → <#{}> {source}",
+        "`{}` {} {} → <#{}> {source}",
         feed.id,
         feed.kind.as_str(),
+        feed_list_state(feed),
         feed.channel_id
     )
 }
@@ -308,9 +350,10 @@ pub fn feed_list_text(feeds: &[FeedRelay]) -> String {
         .iter()
         .map(|feed| {
             format!(
-                "`{}` {} → <#{}> ",
+                "`{}` {} {} → <#{}> ",
                 feed.id,
                 feed.kind.as_str(),
+                feed_list_state(feed),
                 feed.channel_id
             )
             .encode_utf16()
@@ -402,9 +445,10 @@ fn feed_list_page_row(feed: &FeedRelay, content_budget: usize) -> String {
         return full;
     }
     let frame_units = format!(
-        "`{}` {} → <#{}> ",
+        "`{}` {} {} → <#{}> ",
         feed.id,
         feed.kind.as_str(),
+        feed_list_state(feed),
         feed.channel_id
     )
     .encode_utf16()
@@ -518,6 +562,35 @@ pub fn feed_removed_text(removed: bool) -> &'static str {
 /// for nonce reconciliation. The member waits for recovery; no repost.
 pub const FEED_REMOVAL_RECOVERY_REQUIRED_TEXT: &str =
     "Feed relay kept: unresolved deliveries are still pending recovery.";
+
+/// Fixed reply when pause is refused: the relay stays enabled so its pending
+/// delivery recovery remains discoverable. Already-admitted work is not
+/// cancelled; the member retries after recovery settles.
+pub const FEED_PAUSE_RECOVERY_REQUIRED_TEXT: &str =
+    "Feed relay kept enabled: deliveries are still pending recovery. Retry after recovery settles.";
+
+/// Pause/resume confirmations. The relay id is interpolated by the caller so
+/// the member can copy the stable id back into `/feed-resume`, `/feed-remove`
+/// or `/feed-list page:<n>`.
+#[must_use]
+pub fn feed_paused_text(id: &str) -> String {
+    format!("Feed relay paused: `{id}`.")
+}
+
+#[must_use]
+pub fn feed_already_paused_text(id: &str) -> String {
+    format!("Feed relay is already paused: `{id}`.")
+}
+
+#[must_use]
+pub fn feed_resumed_text(id: &str) -> String {
+    format!("Feed relay resumed: `{id}`.")
+}
+
+#[must_use]
+pub fn feed_already_resumed_text(id: &str) -> String {
+    format!("Feed relay is already enabled: `{id}`.")
+}
 
 const MAX_XML_DEPTH: usize = 64;
 const MAX_XML_ELEMENT_ATTRIBUTES: usize = 64;

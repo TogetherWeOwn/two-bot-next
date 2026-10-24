@@ -39,6 +39,8 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("command-list", "docs/parity.md §1 #16 page"),
     ("reopen", "docs/parity.md §1 reopen"),
     ("command-inspect", "docs/parity.md §1 command-inspect"),
+    ("feed-pause", "docs/parity.md §1 feed-pause"),
+    ("feed-resume", "docs/parity.md §1 feed-resume"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -288,6 +290,35 @@ pub fn expected_registry() -> Value {
         .expect("legacy command-list remains published")
         + 1;
     commands.insert(after_list, inspect);
+    // Next-only feed lifecycle pair. These independent literals pin the whole
+    // publication contract; never manufacture them from production shapes.
+    let pause = json!({
+        "name": "feed-pause",
+        "description": "Pause a feed relay without deleting its history",
+        "dm_permission": false,
+        "default_member_permissions": "32",
+        "options": [
+            {"name": "id", "description": "Feed id", "type": 3,
+             "required": true, "max_length": 128}
+        ]
+    });
+    let resume = json!({
+        "name": "feed-resume",
+        "description": "Resume a paused feed relay",
+        "dm_permission": false,
+        "default_member_permissions": "32",
+        "options": [
+            {"name": "id", "description": "Feed id", "type": 3,
+             "required": true, "max_length": 128}
+        ]
+    });
+    let after_remove = commands
+        .iter()
+        .position(|command| command["name"] == "feed-remove")
+        .expect("legacy feed-remove remains published")
+        + 1;
+    commands.insert(after_remove, pause);
+    commands.insert(after_remove + 1, resume);
     // Picker-copy exceptions (registry golden exceptions table): command and
     // option descriptions intentionally differ from legacy. Pointers mirror
     // the published option order.

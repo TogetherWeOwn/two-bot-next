@@ -9,7 +9,7 @@
 //! the denial order (guild fence → feature gate → permission bits →
 //! policy/validation).
 //!
-//! Scope: the 28 non-voice built-in slash commands in `docs/commands.md` (core +
+//! Scope: the 30 non-voice built-in slash commands in `docs/commands.md` (core +
 //! scorecard + automation + announcement + moderation). Out of scope on
 //! purpose: voice commands (`voice_commands`, separate slice with its own
 //! `TWO_VOICE` gate and a `kick` name collision resolved first-wins in favour
@@ -393,6 +393,34 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             "ManageGuild",
             "FeedRemove",
             "Ephemeral confirmation after removal (removed/missing outcome) plus audit row.",
+            &[
+                "Gate:AnnouncementsDisabled",
+                "Perm:ManageServerRequired",
+                "Valid:id:required",
+            ],
+        ),
+        row(
+            "feed-pause",
+            35,
+            E2eGate::Announcements,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "FeedPause",
+            "Ephemeral confirmation after pause (paused/already-paused/missing outcome) plus audit row; refused while pending recovery exists.",
+            &[
+                "Gate:AnnouncementsDisabled",
+                "Perm:ManageServerRequired",
+                "Valid:id:required",
+            ],
+        ),
+        row(
+            "feed-resume",
+            36,
+            E2eGate::Announcements,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "FeedResume",
+            "Ephemeral confirmation after resume (resumed/already-resumed/missing outcome) plus audit row.",
             &[
                 "Gate:AnnouncementsDisabled",
                 "Perm:ManageServerRequired",

@@ -205,5 +205,5 @@ fn e2e_matrix_still_matches_the_publish_set() {
         matrix_names, published_names,
         "matrix drift: the fix must not change the parity publish set"
     );
-    assert_eq!(matrix.len(), 31, "contract covers the 31 built-in commands");
+    assert_eq!(matrix.len(), 33, "contract covers the 33 built-in commands");
 }

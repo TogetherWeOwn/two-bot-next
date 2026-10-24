@@ -225,7 +225,7 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
 /// Announcement commands (parity #24–#30): RSVP, LFG signups, feed relays.
 ///
 /// `/rsvp` and `/rsvp-attendance` are open to everyone; `/lfg` pair requires
-/// `ManageEvents`; `/feed-*` trio requires `ManageGuild`. All guild-only.
+/// `ManageEvents`; the five `/feed-*` commands require `ManageGuild`. All guild-only.
 #[must_use]
 pub fn announcement_commands() -> Vec<CommandDefinition> {
     vec![
@@ -325,6 +325,27 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
             .max_length(MAX_FEED_SOURCE_BYTES as u32),
         ]),
         CommandDefinition::new("feed-remove", "Remove a feed relay")
+            .permissions(PERM_MANAGE_GUILD)
+            .options(vec![CommandOption::new(
+                "id",
+                "Feed id",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(MAX_RESOURCE_ID_CHARS as u32)]),
+        CommandDefinition::new(
+            "feed-pause",
+            "Pause a feed relay without deleting its history",
+        )
+        .permissions(PERM_MANAGE_GUILD)
+        .options(vec![CommandOption::new(
+            "id",
+            "Feed id",
+            CommandOptionType::String,
+        )
+        .required()
+        .max_length(MAX_RESOURCE_ID_CHARS as u32)]),
+        CommandDefinition::new("feed-resume", "Resume a paused feed relay")
             .permissions(PERM_MANAGE_GUILD)
             .options(vec![CommandOption::new(
                 "id",
@@ -480,6 +501,8 @@ mod tests {
                 "lfg-close",
                 "feed-add",
                 "feed-remove",
+                "feed-pause",
+                "feed-resume",
                 "feed-list",
             ]
         );
@@ -488,8 +511,8 @@ mod tests {
     #[test]
     fn no_collision_with_leveling_core_or_within_slice() {
         let merged = merge_commands(&[feature_commands()], &[]).expect("slice 2 merges cleanly");
-        // 5 core + 1 scorecard + 9 automation + 7 announcement.
-        assert_eq!(merged.len(), 22);
+        // 5 core + 1 scorecard + 9 automation + 9 announcement.
+        assert_eq!(merged.len(), 24);
         assert_eq!(
             &names(&merged)[..6],
             [
@@ -532,7 +555,13 @@ mod tests {
         }
         assert_eq!(is(&ann, "lfg"), manage_events);
         assert_eq!(is(&ann, "lfg-close"), manage_events);
-        for name in ["feed-add", "feed-remove", "feed-list"] {
+        for name in [
+            "feed-add",
+            "feed-remove",
+            "feed-pause",
+            "feed-resume",
+            "feed-list",
+        ] {
             assert_eq!(is(&ann, name), manage_guild, "{name} gates ManageGuild");
         }
         // Open to everyone: no permission gate.
@@ -598,6 +627,8 @@ mod tests {
             ("lfg-close", 0, 128),
             ("feed-add", 1, 2048),
             ("feed-remove", 0, 128),
+            ("feed-pause", 0, 128),
+            ("feed-resume", 0, 128),
         ] {
             assert_eq!(
                 get(&ann, command).options[option].max_length,

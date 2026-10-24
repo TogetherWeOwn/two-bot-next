@@ -1228,7 +1228,7 @@ fn commands_require_enabled_configured_guild_and_manage_guild() {
     assert_eq!(feed_list_text(&[]), "No feed relays configured.");
     assert_eq!(
         feed_list_text(&[feed]),
-        "`feed-1` rss → <#channel-1> https://example.org/feed.xml"
+        "`feed-1` rss enabled → <#channel-1> https://example.org/feed.xml"
     );
 }
 
