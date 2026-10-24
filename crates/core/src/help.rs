@@ -756,12 +756,12 @@ mod tests {
                 "{token} appears exactly once"
             );
         }
-        // 27 legacy builtins plus Next-only help, privacy, command-inspect and reopen
+        // 29 legacy builtins plus Next-only help, privacy, command-inspect and reopen
         // commands, plus the 21 gated voice commands (voice `kick` loses
         // first-wins to moderation `/kick`; `/templateassistant` stays
         // unpublished until its slice lands): matches the regenerated
         // `docs/commands.md` total.
-        assert!(text.contains("**Server commands** (52 live)"));
+        assert!(text.contains("**Server commands** (54 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"
@@ -881,7 +881,7 @@ mod tests {
             .iter()
             .flat_map(|g| g.commands.iter().copied())
             .collect();
-        // 27 legacy builtins plus Next-only help, privacy, command-inspect and reopen
+        // 29 legacy builtins plus Next-only help, privacy, command-inspect and reopen
         // commands, then the 21 voice names (voice `kick` shares the Kick
         // group). `/templateassistant` stays out until its slice lands.
         assert_eq!(grouped.len(), 54);

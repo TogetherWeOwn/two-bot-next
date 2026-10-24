@@ -1286,6 +1286,8 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "sticky-remove"
                         | "feed-add"
                         | "feed-remove"
+                        | "feed-pause"
+                        | "feed-resume"
                         | "feed-list"
                         | "purge"
                         | "slowmode"
