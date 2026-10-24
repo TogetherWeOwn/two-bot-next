@@ -6,3 +6,14 @@
 .wrangler/
 node_modules/
 __pycache__/
+# Slow-burn tracker runtime outputs (scripts/slow_burn_tracker.py writes these
+# to the working directory): cache-restored ring/coverage, driver snapshot,
+# evidence, exposition, and gh comment/body files. Never commit: a checked-in
+# coverage seed defeats the fresh-install warm-up on cache miss.
+/slow-burn-ring.json
+/slow-burn-coverage.json
+/slow-burn-ring-prev.json
+/slow-burn-tracker-evidence.json
+/slow-burn-exposition.prom
+/tracker-refresh-body.md
+/tracker-issue-body.md
