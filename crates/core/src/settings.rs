@@ -299,6 +299,11 @@ pub const HOT_WIRED: &[&str] = &[
     "TWO_FEED_POLL_SECONDS",
     "TWO_COMMUNITY_HUMAN_CHANNEL_IDS",
     "TWO_COMMUNITY_WELCOME_CHANNEL_IDS",
+    "TWO_COMMUNITY_AUTOMATION_ACTOR_IDS",
+    "TWO_COMMUNITY_RAID_ACTOR_IDS",
+    "TWO_COMMUNITY_STAGING_ACTOR_IDS",
+    "TWO_COMMUNITY_STAGING_GUILD_IDS",
+    "TWO_COMMUNITY_TEST_ACTOR_IDS",
     "TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS",
     "TWO_GUILD_INVITE_CODE",
     "TWO_TICKET_COOLDOWN_SECONDS",
@@ -1353,7 +1358,7 @@ mod tests {
 
     #[test]
     fn hot_wired_is_a_hot_subset() {
-        assert_eq!(HOT_WIRED.len(), 34);
+        assert_eq!(HOT_WIRED.len(), 39);
         for key in HOT_WIRED {
             assert_eq!(classify_key(key), Some(SettingClass::Hot), "{key}");
         }

@@ -95,17 +95,17 @@ fn all_30_rows_equal_parity_section1() {
     // (parity row 31 — legacy has no help command), the Next-only
     // `/privacy` member self-serve (parity row 32), `/command-inspect`
     // management inspection (parity row 33), `/reopen` picker recovery
-    // (parity row 34) and `/lfg-list` current-channel list (parity row 35).
-    // No Next-only row appears in
-    // the legacy §1 table above; the registry-equality test below covers
-    // every published builtin instead.
-    assert_eq!(COMMAND_PERMISSIONS.len(), 35);
+    // (parity row 34), `/purge-preview` (35), `/channel-inspect` (36) and
+    // `/lfg-list` current-channel list (parity row 37).
+    // No Next-only row appears in the legacy §1 table above; the
+    // registry-equality test below covers every published builtin instead.
+    assert_eq!(COMMAND_PERMISSIONS.len(), 37);
     assert_eq!(
         COMMAND_PERMISSIONS
             .iter()
             .map(|row| row.parity_row)
             .collect::<HashSet<_>>(),
-        (1..=35).collect::<HashSet<_>>(),
+        (1..=37).collect::<HashSet<_>>(),
         "every permission row has a distinct parity identity"
     );
     assert_eq!(
@@ -114,10 +114,10 @@ fn all_30_rows_equal_parity_section1() {
             .map(|row| row.command)
             .collect::<HashSet<_>>()
             .len(),
-        35
+        37
     );
     for (name, parity_row, required_permissions) in
-        [("command-inspect", 33, 1 << 5), ("lfg-list", 35, 1 << 33)]
+        [("command-inspect", 33, 1 << 5), ("lfg-list", 37, 1 << 33)]
     {
         let row = command_permission(name).expect("Next-only command has a permission row");
         assert_eq!(row.parity_row, parity_row, "{name}");
@@ -133,6 +133,20 @@ fn all_30_rows_equal_parity_section1() {
 }
 
 #[test]
+fn next_only_read_permission_rows_do_not_become_mutation_policy_hooks() {
+    for (name, number, bits) in [("purge-preview", 35, 8192), ("channel-inspect", 36, 16)] {
+        let row = command_permission(name).expect("read has a permission row");
+        assert_eq!(row.parity_row, number);
+        assert_eq!(row.required_permissions, bits);
+        assert_eq!(row.surface, CommandSurface::BuiltinSlash);
+        assert_eq!(row.policy_hook, None);
+        assert!(!ModerationAction::ALL
+            .iter()
+            .any(|action| action.command_name() == name));
+    }
+}
+
+#[test]
 fn permission_table_equals_the_complete_published_registry() {
     let router = InteractionRouter::new(all_on());
     let custom = CustomCommand {
@@ -145,7 +159,7 @@ fn permission_table_equals_the_complete_published_registry() {
         .iter()
         .filter(|row| row.surface == CommandSurface::BuiltinSlash)
         .collect();
-    assert_eq!(builtins.len(), 32);
+    assert_eq!(builtins.len(), 34);
     assert_eq!(published.len(), builtins.len() + 1);
     for row in builtins {
         let definition = published
@@ -269,7 +283,7 @@ fn every_routed_builtin_name_has_a_permission_row() {
             other => panic!("{name} is published or retained but does not route: {other:?}"),
         }
     }
-    assert_eq!(routed, 32, "every retained builtin routes");
+    assert_eq!(routed, 34, "every retained builtin routes");
 }
 
 #[test]
