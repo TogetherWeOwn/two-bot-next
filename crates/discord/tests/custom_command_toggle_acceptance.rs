@@ -996,7 +996,7 @@ async fn toggle_publication_failure_reports_saved_state_not_sync_and_does_not_re
             "honest partial outcome: {text}"
         );
         assert!(
-            ["retry", "resync", "restart", "reconcil", "try again"]
+            ["resync", "restart", "reconcil"]
                 .iter()
                 .any(|action| text.contains(action)),
             "safe next action for unsynchronized picker: {text}"
