@@ -128,6 +128,41 @@ pub fn sign(secret: &[u8], timestamp: &str, nonce: &str, raw: &[u8]) -> String {
     format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
 }
 
+/// Domain-separated scope-claim canonical. Idempotency remains outside the MAC.
+#[must_use]
+pub fn canonical_scoped(
+    timestamp: &str,
+    nonce: &str,
+    raw: &[u8],
+    scope: &str,
+    guild: &str,
+) -> String {
+    format!(
+        "two-internal-action/scope-claim/v1\n{}\n{scope}\n{guild}",
+        canonical_string(timestamp, nonce, raw)
+    )
+}
+
+/// The scope/guild pair is indivisible: partial or off-grammar claims never
+/// select the legacy scheme. This is a narrowing claim, not bearer authority.
+#[derive(Clone, Copy, Debug)]
+pub struct ScopeClaim<'a> {
+    pub scope: &'a str,
+    pub guild: &'a str,
+}
+
+impl<'a> ScopeClaim<'a> {
+    #[must_use]
+    pub fn parse(scope: &'a str, guild: &'a str) -> Option<Self> {
+        (matches!(scope, "read" | "moderate" | "admin")
+            && !guild.is_empty()
+            && guild.len() <= 20
+            && guild.bytes().all(|b| b.is_ascii_digit())
+            && guild.parse::<u64>().is_ok_and(|id| id > 0))
+        .then_some(Self { scope, guild })
+    }
+}
+
 /// Constant-time compare of two `sha256=<hex>` strings.
 ///
 /// `timingSafeEqual` throws on a length mismatch, which would itself be a
@@ -152,6 +187,24 @@ pub fn signatures_match(a: &str, b: &str) -> bool {
 pub struct SigningKey {
     pub id: String,
     pub secret: crate::Secret<Vec<u8>>,
+}
+
+impl SigningKey {
+    /// Sign the exact payload and explicit claims; never normalize signed bytes.
+    #[must_use]
+    pub fn sign_scoped(
+        &self,
+        timestamp: &str,
+        nonce: &str,
+        raw: &[u8],
+        scope: &str,
+        guild: &str,
+    ) -> String {
+        let mut mac = Hmac::<Sha256>::new_from_slice(self.secret.expose())
+            .expect("HMAC accepts keys of any length");
+        mac.update(canonical_scoped(timestamp, nonce, raw, scope, guild).as_bytes());
+        format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    }
 }
 
 impl std::fmt::Debug for SigningKey {
@@ -299,6 +352,29 @@ impl KeyRing {
         // still refuses even if its decoy signature is presented.
         let matched = signatures_match(&expected, signature);
         secret.is_some() && matched
+    }
+
+    /// Verify both scope lines, with the same unknown-key decoy work as v1.
+    #[must_use]
+    pub fn verify_scoped(
+        &self,
+        headers: &AuthHeaders<'_>,
+        raw: &[u8],
+        scope: &str,
+        guild: &str,
+    ) -> bool {
+        let secret = self.keys.get(headers.key_id);
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(secret.map_or(self.decoy.expose().as_slice(), |key| {
+                key.expose().as_slice()
+            }))
+            .expect("HMAC accepts keys of any length");
+        mac.update(
+            canonical_scoped(headers.timestamp, headers.nonce, raw, scope, guild).as_bytes(),
+        );
+        let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        let matched = signatures_match(&expected, headers.signature);
+        secret.is_some() && matched && ScopeClaim::parse(scope, guild).is_some()
     }
 }
 
@@ -1678,6 +1754,7 @@ pub struct AuthenticatedRequest<'a> {
     skew_seconds: u64,
     nonce: &'a str,
     raw: &'a [u8],
+    scope_claim: Option<ScopeClaim<'a>>,
     guarded_ms: u64,
 }
 
@@ -1704,6 +1781,19 @@ impl<'a> AuthenticatedRequest<'a> {
         now_ms: u64,
         clock: &mut ClockGuard,
     ) -> Result<Self, ActionError> {
+        Self::verify_scoped(headers, raw, keys, skew_seconds, now_ms, clock, None)
+    }
+
+    /// Select the scoped scheme explicitly; a failed scope MAC never retries v1.
+    pub fn verify_scoped(
+        headers: &AuthHeaders<'a>,
+        raw: &'a [u8],
+        keys: &KeyRing,
+        skew_seconds: u64,
+        now_ms: u64,
+        clock: &mut ClockGuard,
+        scope_claim: Option<ScopeClaim<'a>>,
+    ) -> Result<Self, ActionError> {
         if headers.key_id.is_empty()
             || headers.timestamp.is_empty()
             || headers.nonce.is_empty()
@@ -1714,13 +1804,17 @@ impl<'a> AuthenticatedRequest<'a> {
         if !valid_nonce_format(headers.nonce) {
             return Err(auth_failure("bad_nonce_format"));
         }
-        if !keys.verify(
-            headers.key_id,
-            headers.signature,
-            headers.timestamp,
-            headers.nonce,
-            raw,
-        ) {
+        let signature_valid = match scope_claim {
+            Some(claim) => keys.verify_scoped(headers, raw, claim.scope, claim.guild),
+            None => keys.verify(
+                headers.key_id,
+                headers.signature,
+                headers.timestamp,
+                headers.nonce,
+                raw,
+            ),
+        };
+        if !signature_valid {
             return Err(auth_failure("bad_signature"));
         }
         // Authenticate before touching the guard: a forged request cannot move
@@ -1751,6 +1845,7 @@ impl<'a> AuthenticatedRequest<'a> {
             skew_seconds,
             nonce: headers.nonce,
             raw,
+            scope_claim,
             guarded_ms,
         })
     }
@@ -1892,6 +1987,12 @@ fn authorize_burned(
     }
 
     let body = parse_body_object(verified.raw)?;
+    // A bearer-bearing request can never fall into the legacy execution path.
+    // Its body must travel with the scope-claim scheme, even when the sender
+    // also possesses a valid v1 service key.
+    if verified.scope_claim.is_none() && body.contains_key("admin_bearer") {
+        return Err(auth_failure("unsigned_admin_claim"));
+    }
     let action = match body.get("action").and_then(Value::as_str) {
         Some(a) if !a.is_empty() => a.to_owned(),
         _ => {

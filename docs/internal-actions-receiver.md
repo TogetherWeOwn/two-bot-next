@@ -211,8 +211,12 @@ before commit never authorizes; cancellation after commit may burn an attempt
 without executing it. The existing in-memory `authorize` uses the same stages
 with its cache burn, preserving its ClockGuard and TTL-coverage checks.
 
-This is still the legacy v1 signing contract. The [v2 specification](internal-action-signing-v2.md)
-is not an implemented verifier. No unsigned caller/audience header is trusted.
+Unscoped callers retain the legacy v1 signing contract. The [closed admin
+gateway](admin-api.md) adds a separate, domain-separated scope/guild scheme via
+`AuthenticatedRequest::verify_scoped`; it never falls back to v1 and cannot
+execute a verb. The complete [v2 specification](internal-action-signing-v2.md)
+remains unimplemented (including its idempotency-key MAC change). No unsigned
+caller/audience header is trusted.
 Stable caller mapping, idempotency claim, action validation, outbound admission,
 execution and durable finalization remain receiver responsibilities; this
 capability does not itself permit a Discord effect.
