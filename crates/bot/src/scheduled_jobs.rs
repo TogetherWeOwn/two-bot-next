@@ -264,18 +264,22 @@ fn event_reminder_content(
         return None;
     }
     // Do not split into a burst or truncate halfway through an attendee list:
-    // an oversized but otherwise valid roster falls back to one bounded,
-    // mention-free notice instead of silence.
+    // an oversized but otherwise valid reminder falls back to one bounded,
+    // mention-free notice instead of silence. Size the full rendering with the
+    // untruncated name: a huge name forces the fallback path even when a
+    // truncated name plus the roster would fit.
     if event.attendees.len() <= MAX_RSVPS_PER_EVENT as usize {
-        let name = truncate(&neutralize_scheduled_body(&event.name), 200);
+        let neutral = neutralize_scheduled_body(&event.name);
         let attendees = event
             .attendees
             .iter()
             .map(|id| format!("<@{id}>"))
             .collect::<Vec<_>>()
             .join(" ");
-        let content = format!("Event reminder: {name} starts soon.\n{attendees}");
-        if text_len(&content) <= CONTENT_LIMIT {
+        let full = format!("Event reminder: {neutral} starts soon.\n{attendees}");
+        if text_len(&full) <= CONTENT_LIMIT {
+            let name = truncate(&neutral, 200);
+            let content = format!("Event reminder: {name} starts soon.\n{attendees}");
             return Some(content);
         }
     }
