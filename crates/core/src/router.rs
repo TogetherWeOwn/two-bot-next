@@ -1472,13 +1472,13 @@ mod tests {
         assert!(names.contains(&"rsvp-attendance"));
         assert_eq!(names.iter().filter(|n| **n == "attendance").count(), 1);
         assert_eq!(
-            &names[22..31],
+            &names[23..32],
             [
                 "ban", "tempban", "kick", "timeout", "warn", "purge", "slowmode", "lockdown",
                 "unlock",
             ]
         );
-        assert_eq!(names[31], "faq");
+        assert_eq!(names[32], "faq");
         assert!(set.iter().all(|c| !c.dm_permission));
     }
 
@@ -1661,7 +1661,7 @@ mod tests {
             .copied()
             .filter(|name| *name != "kick")
             .collect();
-        assert_eq!(on_names[31..], expected[..]);
+        assert_eq!(on_names[32..], expected[..]);
         assert!(!on_names.contains(&"templateassistant"));
         assert!(on.iter().all(|c| !c.dm_permission));
     }
@@ -1722,13 +1722,13 @@ mod tests {
                 "voice={voice} assistant={assistant}"
             );
         }
-        // Both gates on is the full voice set without the assistant: 31
+        // Both gates on is the full voice set without the assistant: 32
         // builtins plus the 21 surviving voice names.
         let both = published(RouterGates {
             voice_assistant: true,
             ..voice_on()
         });
-        assert_eq!(both.len(), 52);
+        assert_eq!(both.len(), 53);
     }
 
     #[test]
