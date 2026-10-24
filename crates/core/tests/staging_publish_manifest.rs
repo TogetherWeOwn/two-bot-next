@@ -110,7 +110,7 @@ fn automations_off_withholds_automation_builtins_and_all_dynamics() {
         enabled: true,
     };
     let names = published_names(&router, &[faq]);
-    // 30 all-on builtins minus the 9 automation admin commands, and the
+    // 32 all-on builtins minus the 11 automation admin commands, and the
     // stored dynamic row stays unpublished: every such invocation refuses
     // at dispatch while gated off, so publishing would burn the ceiling.
     assert_eq!(names.len(), 21, "automations-off staging set: {names:?}");
@@ -123,6 +123,8 @@ fn automations_off_withholds_automation_builtins_and_all_dynamics() {
         "command-remove",
         "command-list",
         "command-inspect",
+        "command-disable",
+        "command-enable",
         "schedule",
         "schedule-remove",
         "schedule-list",

@@ -38,6 +38,8 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("privacy", "docs/parity.md §1 privacy"),
     ("command-list", "docs/parity.md §1 #16 page"),
     ("command-inspect", "docs/parity.md §1 command-inspect"),
+    ("command-disable", "docs/parity.md §1 command-disable"),
+    ("command-enable", "docs/parity.md §1 command-enable"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -257,6 +259,29 @@ pub fn expected_registry() -> Value {
         .expect("legacy command-list remains published")
         + 1;
     commands.insert(after_list, inspect);
+    // Saved-response lifecycle is intentionally independent of replacement.
+    for (offset, name, description) in [
+        (
+            1,
+            "command-disable",
+            "Pause a saved custom command without deleting it",
+        ),
+        (2, "command-enable", "Resume a saved custom command"),
+    ] {
+        commands.insert(
+            after_list + offset,
+            json!({
+                "name": name,
+                "description": description,
+                "dm_permission": false,
+                "default_member_permissions": "32",
+                "options": [
+                    {"name": "name", "description": "Saved command name, a-z 0-9 _ -", "type": 3,
+                     "required": true, "max_length": 32}
+                ]
+            }),
+        );
+    }
     // Picker-copy exceptions (registry golden exceptions table): command and
     // option descriptions intentionally differ from legacy. Pointers mirror
     // the published option order.
