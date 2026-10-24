@@ -358,11 +358,11 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
 fn twilight_publication_permissions_equal_the_runtime_matrix() {
     use two_bot_core::command_permissions::{command_permission, COMMAND_PERMISSIONS};
 
-    assert_eq!(COMMAND_PERMISSIONS.len(), 33);
+    assert_eq!(COMMAND_PERMISSIONS.len(), 35);
     let router = InteractionRouter::new(all_on());
     let defs = router.publish_set(&[]).unwrap();
     let commands = publish_commands(&defs);
-    assert_eq!(commands.len(), 30);
+    assert_eq!(commands.len(), 32);
     for command in commands {
         let row = command_permission(&command.name).unwrap();
         assert_eq!(
@@ -424,6 +424,8 @@ fn every_section1_row_routes_to_its_registered_handler() {
         ("command-remove", HandlerId::AutomationAdmin),
         ("command-list", HandlerId::AutomationAdmin),
         ("command-inspect", HandlerId::AutomationAdmin),
+        ("command-disable", HandlerId::AutomationAdmin),
+        ("command-enable", HandlerId::AutomationAdmin),
         ("schedule", HandlerId::AutomationAdmin),
         ("schedule-remove", HandlerId::AutomationAdmin),
         ("schedule-list", HandlerId::AutomationAdmin),
@@ -437,7 +439,7 @@ fn every_section1_row_routes_to_its_registered_handler() {
         ("feed-remove", HandlerId::FeedRemove),
         ("feed-list", HandlerId::FeedList),
     ];
-    assert_eq!(cases.len(), 30, "all 30 handler-owned builtins covered");
+    assert_eq!(cases.len(), 32, "all 32 handler-owned builtins covered");
     for (_, id) in cases {
         router.register(Box::new(Stub(*id)));
     }
@@ -1069,8 +1071,8 @@ async fn publish_sends_the_complete_merged_set_once() {
         .expect("full set assembles");
     assert_eq!(
         defs.len(),
-        31,
-        "4 core + 17 feature + 9 moderation + 1 custom"
+        33,
+        "4 core + 19 feature + 9 moderation + 1 custom"
     );
     let commands = publish_commands(&defs);
 
@@ -1102,7 +1104,7 @@ async fn publish_sends_the_complete_merged_set_once() {
         .iter()
         .map(|c| c["name"].as_str().expect("command has a name"))
         .collect();
-    assert_eq!(names.len(), 31, "no partial view");
+    assert_eq!(names.len(), 33, "no partial view");
     for expected in [
         "rank",
         "leaderboard",
@@ -1111,6 +1113,8 @@ async fn publish_sends_the_complete_merged_set_once() {
         "attendance",
         "command",
         "command-inspect",
+        "command-disable",
+        "command-enable",
         "schedule-list",
         "sticky-remove",
         "rsvp",
