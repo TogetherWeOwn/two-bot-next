@@ -275,10 +275,13 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
         .iter()
         .filter(|row| row.surface == CommandSurface::BuiltinSlash && row.required_permissions != 0)
         .collect();
+    // 23 legacy restricted rows plus management-only command-inspect and
+    // giveaway, plus lfg-edit, purge-preview and channel-inspect. Discord
+    // defaults never replace any runtime permission gate.
     assert_eq!(
         restricted.len(),
-        27,
-        "24 prior restricted builtins plus lfg-edit, purge-preview and channel-inspect"
+        28,
+        "25 prior restricted builtins plus lfg-edit, purge-preview and channel-inspect"
     );
     tracing::subscriber::with_default(audit.clone(), || {
         for row in &restricted {
@@ -362,11 +365,11 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
 fn twilight_publication_permissions_equal_the_runtime_matrix() {
     use two_bot_core::command_permissions::{command_permission, COMMAND_PERMISSIONS};
 
-    assert_eq!(COMMAND_PERMISSIONS.len(), 37);
+    assert_eq!(COMMAND_PERMISSIONS.len(), 38);
     let router = InteractionRouter::new(all_on());
     let defs = router.publish_set(&[]).unwrap();
     let commands = publish_commands(&defs);
-    assert_eq!(commands.len(), 34);
+    assert_eq!(commands.len(), 35);
     for command in commands {
         let row = command_permission(&command.name).unwrap();
         assert_eq!(
@@ -445,7 +448,11 @@ fn every_section1_row_routes_to_its_registered_handler() {
         ("feed-remove", HandlerId::FeedRemove),
         ("feed-list", HandlerId::FeedList),
     ];
-    assert_eq!(cases.len(), 34, "all 34 handler-owned builtins covered");
+    assert_eq!(
+        cases.len(),
+        34,
+        "all 34 non-giveaway handlers covered (reopen and lfg-edit included; giveaway has its own test)"
+    );
     for (_, id) in cases {
         router.register(Box::new(Stub(*id)));
     }
@@ -461,6 +468,24 @@ fn every_section1_row_routes_to_its_registered_handler() {
             "/{name} has its registered stub",
         );
     }
+}
+
+/// The Next-only `/giveaway` timed entry routes to its registered handler.
+/// No direct `HandlerId::Giveaway` reference: the variant does not exist at
+/// baseline, so the pin matches the handler's `Debug` name. This compiles on
+/// the pre-slice router and fails behaviorally (`Unknown`) until the
+/// giveaway slice registers its handler.
+#[test]
+fn giveaway_routes_to_its_registered_handler() {
+    let router = InteractionRouter::new(all_on());
+    let SlashOutcome::Handled { handler } = slash_outcome(&router, "giveaway") else {
+        panic!("/giveaway must route to its handler");
+    };
+    assert_eq!(
+        format!("{handler:?}"),
+        "Giveaway",
+        "/giveaway routes to its handler"
+    );
 }
 
 #[test]
@@ -1110,7 +1135,7 @@ async fn publish_sends_the_complete_merged_set_once() {
         .iter()
         .map(|c| c["name"].as_str().expect("command has a name"))
         .collect();
-    assert_eq!(names.len(), 35, "no partial view");
+    assert_eq!(names.len(), 36, "no partial view");
     for expected in [
         "rank",
         "leaderboard",
@@ -1121,6 +1146,7 @@ async fn publish_sends_the_complete_merged_set_once() {
         "command-inspect",
         "schedule-list",
         "sticky-remove",
+        "giveaway",
         "rsvp",
         "rsvp-attendance",
         "lfg",
