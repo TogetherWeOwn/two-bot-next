@@ -28,6 +28,26 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  rollback-proof-watch:
+    name: alert on a missing daily staging rollback proof
+    if: github.ref == 'refs/heads/main' && inputs.dry_run != true
+    permissions:
+      contents: read
+      actions: read
+    environment: synthetic-alerts
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'rollback-proof-watch') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Check daily rollback proof freshness independently of the digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SYNTHETIC_ALERT_WEBHOOK_URL: ${{ secrets.SYNTHETIC_ALERT_WEBHOOK_URL }}
+        run: python3 scripts/rollback_proof.py watch
+
   digest:
     name: cut the daily digest tag and release
     permissions:

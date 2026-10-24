@@ -294,14 +294,13 @@ container image). Live enforcement needs the `PRODUCTION_METRICS_SCRAPE_TOKEN`
 secret (a `production` environment secret, 32+ chars); without it the step
 records a skip, never a pass. The gate does not run in rollback mode (after
 a restore there is nothing to roll back to). **Failure injection never runs
-against production**: the guard refuses any run with
-`inject_error_rate_spike: true`, in every mode, and points to staging
-(`gh workflow run deploy-staging.yml --ref main -f inject_error_rate_spike=true`,
-see [staging-rollout-gate.md](staging-rollout-gate.md)). The production gate
-step has no rehearsal path left to arm. On 10-20 20:54Z a forced production
-drill deployed, failed the ownership read, and its auto-rollback refused on
-image provenance, leaving production degraded until the next automatic
-deploy.
+against production**: the production workflow has no drill/fault input, guard
+binding or rehearsal flag. The workflow-policy suite pins the exact six
+production inputs and greps for the retired switch so it cannot return, even
+as an unarmed default. Recovery proofs run on staging only (see below).
+On 10-20 20:54Z a forced production drill deployed, failed the ownership read,
+and its auto-rollback refused on image provenance, leaving production degraded
+until the next automatic deploy. Never repeat that drill on production.
 
 ## Build identity and the `/readyz` gate
 
@@ -364,12 +363,78 @@ automatically when the deploy and pre-deploy snapshot succeeded; without a
 takeover or snapshot the run just fails (see below).
 
 A failed gate after a takeover rolls back automatically
-(`scripts/worker_container_rollback.py`): the job restores the pre-deploy
-snapshot's Worker version AND container image with takeover, requires the
-same stable gate on the restored build, uploads the evidence artifact, and
-still fails the run red. The rollback restores service; it never certifies
-the build. Without a takeover nothing moved, so there is nothing to restore;
-without a deploy or a snapshot the run just fails for the operator.
+(`scripts/worker_container_rollback.py`): the `production` job's `snapshot`
+step records the serving state **before** `deploy`. Its `auto_rollback` step
+runs on `failure()` only when deploy mode, takeover, successful deploy and
+successful snapshot all hold. It restores that local receipt's Worker version
+AND container image with takeover, requires the stable gate on the restored
+build and uploads `production-auto-rollback-evidence`. This is in-job recovery:
+**no dispatch, new job or reviewer is needed**. The original gate has no
+`continue-on-error`, so the run stays red after a successful restore. The
+rollback restores service; it never certifies the failed build. The workflow
+policy pins this ordering, condition, local snapshot command and red outcome.
+Without a takeover or a successful deploy/snapshot the run fails for the
+operator; a failed restore is never a reason to wait for the next deployment.
+
+### Daily staging proof
+
+`staging-rollback-drill.yml` runs daily at **03:17 UTC** on `main`. With no manual
+`target_version`, its `proof` job calls `scripts/rollback_proof.py run`, which:
+
+1. Dispatches only `deploy-staging.yml` on `main`, with the existing staging
+   error-rate gate rehearsal enabled. No production dispatch or traffic fault
+   is involved. The GitHub REST `2026-03-10` dispatch response provides the exact
+   child run ID; a missing ID refuses without redispatch or guessing "latest".
+2. Waits at most 70 minutes for that run. The snapshot, deploy and rollout
+   readiness steps must pass, the injected error-rate gate must fail, and the
+   in-job auto-rollback and evidence upload must succeed. The child **must remain
+   red**; a green child does not prove recovery.
+3. Checks `staging-rollout-evidence`: the restore must name the exact pre-deploy
+   Worker version and image digest, with takeover and the stable 200/gateway-ready
+   gate. It uploads a sanitized `staging-rollback-proof` artifact (`proof.json`)
+   containing the child run ID/SHA and restored members, retained for 14 days.
+   The wrapper is green only after that proof is validated and uploaded.
+
+The child is named `staging rollback proof`, not a staging certification run.
+Production excludes it from latest-certification history only after re-reading
+its same-repository main dispatch, exact first attempt, and all six expected
+step outcomes above. A name alone, a failed/missing restore, or a running proof
+never excuses a red staging run; a proof never certifies a commit for promotion.
+
+The child honors `STAGING_SOAK_HOLD_UNTIL` before the schema gates or deploy:
+an armed/invalid hold fails the proof without changing the observed staging
+build. Inspect the hold and resume the proof after the observation window;
+do not clear a hold to make a proof green. Explicit arm/disarm dispatches without
+the error-rate switch retain their exception.
+
+The wrapper uses separate `staging-rollback-proof-schedule` and
+`staging-rollback-proof-workflow_dispatch` groups, **not** `deploy-staging`:
+a later manual dispatch cannot replace the pending scheduled wrapper, and its
+child can acquire the staging deploy lane. The optional manual Worker-only
+drill still holds `deploy-staging` while it runs and now uploads its separate
+evidence artifact; it does not count as the daily automatic proof.
+
+A failed wrapper posts one finding through the existing `synthetic-alerts`
+Discord line. Independently, the **06:23 UTC** `daily-digest` workflow's
+`rollback-proof-watch` job checks the newest scheduled drill and its artifact,
+even if the digest fails. Missing, failed, cancelled, stuck, unreadable or
+older-than-30-hour proof alerts and fails the watcher. An older successful proof
+cannot hide a newer failed one. Healthy checks post nothing. This independent
+schedule catches a missed drill trigger; an outage of GitHub Actions itself is
+outside these two scheduled checks.
+
+For a reviewed on-demand proof after a repair:
+
+```sh
+# No network, dispatch or mutation:
+python3 scripts/rollback_proof.py run --dry-run
+# Staging only; use the merged main workflow, never a production drill:
+gh workflow run staging-rollback-drill.yml --ref main
+```
+
+Inspect the exact child run and staging state before retrying a failed/timed-out
+proof. The dispatcher never cancels or blindly reruns a mutating child. A manual
+proof is useful evidence, but the freshness watcher requires a scheduled proof.
 
 Both gate curls enforce `--max-filesize 65536` (64 KiB). Any transfer
 failure counts as `000`, even if curl reports HTTP 200 and leaves a valid

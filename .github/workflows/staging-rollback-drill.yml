@@ -1,37 +1,83 @@
 name: staging-rollback-drill
 
-# Manual, staging-only Worker-version rollback drill (docs/runbook.md
-# "Worker-version rollback"). Never runs automatically and has no production
-# path. The reviewed script fences the staging singleton, moves the Worker to
-# the named version (which must already have served staging traffic), hands
-# ownership to it, times the first /readyz 200, then restores the original
-# version the same way. It reads only the `staging` environment's existing
-# ownership-control pair and Cloudflare token; it creates or changes no
-# credential and never prints a body or a secret. Shares the deploy-staging
-# concurrency group so a push-triggered deploy cannot interleave with a drill.
+# Daily automatic recovery proof, staging only. The dispatcher never holds the
+# deploy-staging lock while waiting for its child. A manual target retains the
+# original Worker-only backout/restore drill, serialized in the staging lane.
 on:
+  schedule:
+    - cron: "17 3 * * *"
   workflow_dispatch:
     inputs:
       target_version:
-        description: Worker version id (UUID) that already served staging traffic and is compatible with the current schema; never "latest"
+        description: Optional previously served staging Worker UUID for the manual Worker-only drill; empty runs the automatic rollback proof
         type: string
-        required: true
+        required: false
+        default: ""
 
 permissions: {}
 
 concurrency:
-  group: deploy-staging
+  # A later manual dispatch cannot replace the pending scheduled proof.
+  group: staging-rollback-proof-${{ github.event_name }}
   cancel-in-progress: false
 
 jobs:
+  proof:
+    name: daily staging automatic rollback proof
+    if: github.ref == 'refs/heads/main' && inputs.target_version == ''
+    permissions:
+      contents: read
+      actions: write # Fixed deploy-staging dispatch, then read that exact run and its artifacts.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'proof') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Prove the staging failure-to-restore chain
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/rollback_proof.py run --evidence "$RUNNER_TEMP/proof.json"
+      - name: Upload the daily rollback proof
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: staging-rollback-proof
+          path: ${{ runner.temp }}/proof.json
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  alert:
+    name: alert on a failed staging rollback proof
+    needs: proof
+    if: ${{ !cancelled() && needs.proof.result == 'failure' }}
+    permissions:
+      contents: read
+    environment: synthetic-alerts
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'alert') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Alert the ops channel about the failed proof
+        env:
+          SYNTHETIC_ALERT_WEBHOOK_URL: ${{ secrets.SYNTHETIC_ALERT_WEBHOOK_URL }}
+        run: python3 scripts/rollback_proof.py alert
+
   drill:
     name: staging worker rollback drill
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.target_version != ''
     permissions:
-      contents: read # checkout only; the drill authenticates with `staging` environment secrets
+      contents: read # checkout only; the drill authenticates with staging environment secrets
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'drill') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     environment: staging
+    concurrency:
+      group: deploy-staging
+      cancel-in-progress: false
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -50,3 +96,12 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           TARGET_VERSION: ${{ inputs.target_version }}
         run: python3 scripts/staging_rollback_drill.py --target-version "$TARGET_VERSION" --evidence "$RUNNER_TEMP/staging-rollback-drill-evidence.json"
+      - name: Upload the manual Worker drill evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: staging-worker-rollback-drill
+          path: ${{ runner.temp }}/staging-rollback-drill-evidence.json
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
