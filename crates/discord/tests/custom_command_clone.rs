@@ -86,7 +86,7 @@ fn prefix_message(id: u64, content: &str, actor: &str) -> Message {
     serde_json::from_value(json!({
         "id": id.to_string(), "guild_id": GUILD, "channel_id": "4444",
         "author": {"id": actor, "username": "tester", "discriminator": "0000", "avatar": null, "bot": false},
-        "content": content, "timestamp": "2026-10-01T00:00:00Z", "edited_timestamp": null,
+        "content": content, "timestamp": "2026-10-01T00:00:00.000000+00:00", "edited_timestamp": null,
         "tts": false, "mention_everyone": false, "mentions": [], "mention_roles": [],
         "attachments": [], "embeds": [], "pinned": false, "type": 0
     }))
