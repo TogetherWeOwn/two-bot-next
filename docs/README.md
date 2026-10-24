@@ -19,11 +19,11 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Settings reference](configuration.md)
 - [Parity ledger](parity.md)
 - [Containment boundaries](containment.md)
-- [Prototype measurements](s2-prototype.md)
+- [Prototype metrics](s2-prototype.md)
 - [Legacy baseline](b1-baseline.md)
 - [Process history](process-history-contract.md)
-- [Read-only MCP tools](mcp.md)
-- [Admin token registry contract](admin-registry.md)
+- [Read-only MCP](mcp.md)
+- [Admin token registry](admin-registry.md)
 
 ## Operations and observability
 
@@ -109,7 +109,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Onboarding page (design only)](dashboard-onboarding-self-roles-spec.md)
 - [Settings parser tests](internal-settings-acceptance.md)
 - [Settings refresh tests](settings-catalog-acceptance.md)
-- [Settings live-keys tests](ticket-feed-self-role-live-keys-acceptance.md)
+- [Live-keys tests](ticket-feed-self-role-live-keys-acceptance.md)
 - [Community jobs](community-jobs.md)
 - [Snapshot edges](community-snapshot-edges.md)
 - [Member journey tests](member-journey-parity.md)
@@ -118,9 +118,9 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Leveling domain](leveling-port.md)
 - [LFG domain](lfg-port.md)
 - [LFG input contract](lfg-interaction-contract.md)
-- [Opt-in ready check (design only)](lfg-ready-check-spec.md)
+- [Ready check (design only)](lfg-ready-check-spec.md)
 - [Backup-host handoff (design only)](lfg-backup-host-spec.md)
-- [LFG title/role reuse (design only)](lfg-reuse-spec.md)
+- [LFG reuse (design only)](lfg-reuse-spec.md)
 - [LFG voice room (design only)](lfg-voice-room-spec.md)
 - [Feed operations](feed-supervisor.md)
 - [Feed domain](feeds-port.md)
@@ -132,12 +132,13 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Scheduled skip tests](scheduled-events-skip-acceptance.md)
 - [Scheduled event reminders](event-reminders.md)
 - [Reminder baseline and stop (design only)](event-reminder-preferences-spec.md)
-- [RSVP seats and opt-in waitlist (design only)](rsvp-capacity-spec.md)
+- [RSVP seats and waitlist (design only)](rsvp-capacity-spec.md)
 - [Private event agenda (design only)](event-agenda-spec.md)
+- [Calendar handoff (design only)](event-calendar-handoff-spec.md)
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
 - [Ticket runtime](tickets.md)
 - [Ticket lifecycle](ticket-lifecycle-observability.md)
-- [Suggestions triage spec](suggestions-triage-box.md)
+- [Suggestions triage](suggestions-triage-box.md)
 
 ## Voice
 

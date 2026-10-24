@@ -1,5 +1,5 @@
 {
-  "_comment": "Expected staging publish manifest (offline carve), including the protected saved-response inspection contract. Regenerate by reading InteractionRouter::publish_set with all publish gates on: TWO_AUTOMATIONS=1, TWO_ANNOUNCEMENTS=1, TWO_MODERATION=1 (plus its protected-user/role validation), TWO_COMMUNITY_SCORECARD=1. The drift test (staging_publish_manifest.rs) fails if the router-advertised set differs from this file. This fixture never touches a guild and carries no secrets: guild IDs, tokens and live publish stay in the live-publish workflow (docs/command-publish.md). Dynamic DB-backed custom commands are additive and automation-gated; the pinned 'faq' row below is a representative example so the test can prove the gating, not a claim about staging database contents.",
+  "_comment": "Expected staging publish manifest (offline carve), preserving saved-command inspection and current-channel discovery. Verify against InteractionRouter::publish_set with all publish gates on: TWO_AUTOMATIONS=1, TWO_ANNOUNCEMENTS=1, TWO_MODERATION=1 (plus its protected-user/role validation), TWO_COMMUNITY_SCORECARD=1. The drift test (staging_publish_manifest.rs) fails if the router-advertised set differs from this file. This fixture never touches a guild and carries no secrets: guild IDs, tokens and live publish stay in the live-publish workflow (docs/command-publish.md). Dynamic DB-backed custom commands are additive and automation-gated; the pinned 'faq' row below is a representative example so the test can prove the gating, not a claim about staging database contents.",
   "gates": {
     "automations": true,
     "announcements": true,
@@ -22,10 +22,12 @@
     "schedule-list",
     "sticky",
     "sticky-remove",
+    "giveaway",
     "rsvp",
     "rsvp-attendance",
     "lfg",
     "lfg-close",
+    "lfg-list",
     "feed-add",
     "feed-remove",
     "feed-list",
@@ -60,10 +62,12 @@
     "schedule-list",
     "sticky",
     "sticky-remove",
+    "giveaway",
     "rsvp",
     "rsvp-attendance",
     "lfg",
     "lfg-close",
+    "lfg-list",
     "feed-add",
     "feed-remove",
     "feed-list",
@@ -81,7 +85,7 @@
     "faq"
   ],
   "voice": {
-    "_comment": "Voice set published beside the 33 builtins when TWO_VOICE=1 (RouterGates::voice), in publish order after moderation, default_member_permissions as Discord decimal bitfields (null = no default gate). The voice vote-kick `kick` is the 17th voice definition but loses first-wins to moderation /kick, so it is listed under shadowed_by_first_wins instead. /templateassistant stays unpublished in every gate state until its slice lands with a handler; the `assistant` section below keeps its name and intended default gate so the slice re-activates against the same shape. The drift tests (staging_publish_manifest.rs) fail if InteractionRouter::publish_set differs; regenerate from publish_set output, never hand-edit names. Live publish read-back stays on the staging cards.",
+    "_comment": "Voice set published beside the 34 builtins when TWO_VOICE=1 (RouterGates::voice), in publish order after moderation, default_member_permissions as Discord decimal bitfields (null = no default gate). The voice vote-kick `kick` is the 17th voice definition but loses first-wins to moderation /kick, so it is listed under shadowed_by_first_wins instead. /templateassistant stays unpublished in every gate state until its slice lands with a handler; the `assistant` section below keeps its name and intended default gate so the slice re-activates against the same shape. The drift tests (staging_publish_manifest.rs) fail if InteractionRouter::publish_set differs; regenerate from publish_set output, never hand-edit names. Live publish read-back stays on the staging cards.",
     "gates": {
       "voice": true,
       "voice_assistant": true
