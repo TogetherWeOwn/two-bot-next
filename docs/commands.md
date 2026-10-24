@@ -20,7 +20,7 @@ Bounds below are registry bounds; a dash means no bound is declared there,
 not that handler validation is unlimited. Permissions are Discord default
 member-permission bitfields, not a replacement for runtime authorization.
 
-Built-in commands: 51.
+Built-in commands: 53.
 
 ## `/access`
 
@@ -93,6 +93,28 @@ Define or replace a custom command
 | `template` | string | true | — | — | 2000 | — | What the bot replies; {user} {username} {server} {channel} |
 | `description` | string | false | — | — | 100 | — | Shown in the command picker |
 | `text-trigger` | string | false | — | — | 33 | — | Optional !trigger form, e.g. !faq |
+
+## `/command-disable`
+
+Pause a saved custom command without deleting it
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `name` | string | true | — | — | 32 | — | Saved command name, a-z 0-9 _ - |
+
+## `/command-enable`
+
+Resume a saved custom command
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `name` | string | true | — | — | 32 | — | Saved command name, a-z 0-9 _ - |
 
 ## `/command-inspect`
 
