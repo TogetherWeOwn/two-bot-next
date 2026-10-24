@@ -637,8 +637,8 @@ mod tests {
     fn full_registry_merges_without_collision() {
         let merged = merge_commands(&[feature_commands(), moderation_commands()], &[])
             .expect("slices 1-3 merge cleanly");
-        // 5 core + 18 slice-2 + 9 moderation mutations + 2 private reads.
-        assert_eq!(merged.len(), 34);
+        // 5 core + 19 slice-2 + 9 moderation mutations + 2 private reads.
+        assert_eq!(merged.len(), 35);
         let names: Vec<_> = merged.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(
             &names[..6],

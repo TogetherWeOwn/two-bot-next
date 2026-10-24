@@ -288,7 +288,7 @@ pub fn giveaway_command() -> CommandDefinition {
 
 /// Announcement commands (parity #24–#30): RSVP, LFG signups, feed relays.
 ///
-/// `/rsvp` and `/rsvp-attendance` are open to everyone; `/lfg` pair requires
+/// `/rsvp` and `/rsvp-attendance` are open to everyone; `/lfg` management requires
 /// `ManageEvents`; `/feed-*` trio requires `ManageGuild`. All guild-only.
 #[must_use]
 pub fn announcement_commands() -> Vec<CommandDefinition> {
@@ -358,6 +358,17 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
             )
             .required()
             .max_length(MAX_RESOURCE_ID_CHARS as u32)]),
+        CommandDefinition::new("lfg-list", "List open game posts in this channel")
+            .permissions(PERM_MANAGE_EVENTS)
+            .options(vec![CommandOption {
+                required: Some(false),
+                ..CommandOption::new(
+                    "cursor",
+                    "Continue a current-channel list",
+                    CommandOptionType::String,
+                )
+                .max_length(crate::lfg_list::MAX_CURSOR_LEN as u32)
+            }]),
         CommandDefinition::new(
             "feed-add",
             "Relay an RSS, YouTube, or Twitch feed into this channel",
@@ -544,6 +555,7 @@ mod tests {
                 "rsvp-attendance",
                 "lfg",
                 "lfg-close",
+                "lfg-list",
                 "feed-add",
                 "feed-remove",
                 "feed-list",
@@ -554,8 +566,8 @@ mod tests {
     #[test]
     fn no_collision_with_leveling_core_or_within_slice() {
         let merged = merge_commands(&[feature_commands()], &[]).expect("slice 2 merges cleanly");
-        // 5 core + 1 scorecard + 10 automation + 7 announcement.
-        assert_eq!(merged.len(), 23);
+        // 5 core + 1 scorecard + 10 automation + 8 announcement.
+        assert_eq!(merged.len(), 24);
         assert_eq!(
             &names(&merged)[..6],
             [
@@ -599,6 +611,7 @@ mod tests {
         }
         assert_eq!(is(&ann, "lfg"), manage_events);
         assert_eq!(is(&ann, "lfg-close"), manage_events);
+        assert_eq!(is(&ann, "lfg-list"), manage_events);
         for name in ["feed-add", "feed-remove", "feed-list"] {
             assert_eq!(is(&ann, name), manage_guild, "{name} gates ManageGuild");
         }
@@ -663,6 +676,7 @@ mod tests {
             ("lfg", 0, 100),
             ("lfg", 2, 2339),
             ("lfg-close", 0, 128),
+            ("lfg-list", 0, 512),
             ("feed-add", 1, 2048),
             ("feed-remove", 0, 128),
         ] {
