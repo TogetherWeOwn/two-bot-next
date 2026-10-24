@@ -513,7 +513,34 @@ mod tests {
             desired_definitions(2222, &env)
                 .expect("desired registry assembles")
                 .len(),
-            30
+            31
         );
+    }
+
+    #[test]
+    fn desired_registry_gates_lfg_edit_only_on_announcements() {
+        for (announcements, other_features, expected_count) in
+            [("0", "0", 0), ("0", "1", 0), ("1", "0", 1), ("1", "1", 1)]
+        {
+            let mut env = vars();
+            env.insert("TWO_ANNOUNCEMENTS".into(), announcements.into());
+            for gate in [
+                "TWO_AUTOMATIONS",
+                "TWO_COMMUNITY_SCORECARD",
+                "TWO_MODERATION",
+            ] {
+                env.insert(gate.into(), other_features.into());
+            }
+            env.insert("TWO_OWEN_USER_ID".into(), "123456789012345678".into());
+            let definitions = desired_definitions(2222, &env).expect("desired registry assembles");
+            assert_eq!(
+                definitions
+                    .iter()
+                    .filter(|definition| definition.name == "lfg-edit")
+                    .count(),
+                expected_count,
+                "announcements={announcements} other_features={other_features}"
+            );
+        }
     }
 }
