@@ -625,10 +625,10 @@ mod tests {
             ]
         );
         assert_eq!(
-            &names[22..27],
+            &names[23..28],
             ["ban", "tempban", "kick", "timeout", "warn"]
         );
-        assert_eq!(&names[27..], ["purge", "slowmode", "lockdown", "unlock"]);
+        assert_eq!(&names[28..], ["purge", "slowmode", "lockdown", "unlock"]);
         assert!(merged.iter().all(|d| !d.dm_permission));
     }
 
