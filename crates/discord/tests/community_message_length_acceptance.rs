@@ -53,6 +53,10 @@
 //! Run: `python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test community_message_length_acceptance`
 #![cfg(feature = "db")]
 
+#[path = "support/deferred_capture_compat.rs"]
+mod deferred_capture_compat;
+use deferred_capture_compat::Healthy;
+
 use serde_json::json;
 use twilight_model::{
     channel::Message,
@@ -75,7 +79,7 @@ fn armed_buffer() -> DeferredCommunityFacts {
     let pool = sqlx::postgres::PgPoolOptions::new()
         .connect_lazy("postgres://agent_test@agent-testdb/agent_test")
         .expect("lazy pool handle parses");
-    buffer.enable(pool);
+    buffer.enable(pool).healthy();
     buffer
 }
 
@@ -104,7 +108,7 @@ async fn gateway_sink_buffers_a_length_carrying_fact() {
     let buffer = armed_buffer();
     buffer.record_message(gateway_message("msg-gateway-1", Some(11)));
 
-    let writes = buffer.take_pending();
+    let writes = buffer.take_pending().healthy();
     assert_eq!(writes.len(), 1, "one armed message buffers one fact write");
     let write = &writes[0];
     assert_eq!(write.event_type, "message_created");
@@ -115,7 +119,7 @@ async fn gateway_sink_buffers_a_length_carrying_fact() {
         "the buffered gateway fact carries the measured length: {meta}"
     );
     assert!(
-        buffer.take_pending().is_empty(),
+        buffer.take_pending().healthy().is_empty(),
         "take_pending drains the buffer"
     );
 }
@@ -128,7 +132,7 @@ async fn gateway_sink_without_length_buffers_no_length_key() {
     let buffer = armed_buffer();
     buffer.record_message(gateway_message("msg-gateway-2", None));
 
-    let writes = buffer.take_pending();
+    let writes = buffer.take_pending().healthy();
     assert_eq!(writes.len(), 1, "the fact itself is still captured");
     let meta = metadata_of(&writes[0]);
     assert!(
@@ -191,7 +195,7 @@ async fn pipeline_message_create_records_scalar_count_not_bytes() {
         "2026-09-01T10:02:01.000Z",
     );
 
-    let writes = buffer.take_pending();
+    let writes = buffer.take_pending().healthy();
     assert_eq!(writes.len(), 3, "three gateway messages buffer three facts");
 
     let first = &writes[0];

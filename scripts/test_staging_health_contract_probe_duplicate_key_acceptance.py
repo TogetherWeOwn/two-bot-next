@@ -111,7 +111,9 @@ class DuplicateKeyAcceptanceTests(unittest.TestCase):
 
     # -- controls: valid bodies keep byte-identical verdicts -----------------
 
-    def test_valid_bodies_pass_byte_identical(self):
+    # Compare every receipt byte with the observation clock held constant.
+    @mock.patch.object(probe.time, "strftime", return_value="2026-10-24T03:11:40Z")
+    def test_valid_bodies_pass_byte_identical(self, _clock):
         first = self.drive(body({"status": "ok"}), body(ready_report()))
         code, results, summary, out, receipt_text, receipt = first
         self.assertEqual(code, 0)
@@ -126,6 +128,20 @@ class DuplicateKeyAcceptanceTests(unittest.TestCase):
         self.assertEqual(second[0], 0)
         self.assertEqual(second[3], out)
         self.assertEqual(second[4], receipt_text)
+
+    def test_receipts_keep_distinct_observation_seconds(self):
+        with mock.patch.object(probe.time, "strftime", side_effect=[
+                "2026-10-24T03:11:40Z", "2026-10-24T03:11:41Z"]):
+            first = self.drive(body({"status": "ok"}), body(ready_report()))
+            Path(self.evidence).unlink()
+            self.requested = []
+            second = self.drive(body({"status": "ok"}), body(ready_report()))
+        self.assertEqual(first[0], 0)
+        self.assertEqual(second[0], 0)
+        self.assertEqual(first[5]["utc"], "2026-10-24T03:11:40Z")
+        self.assertEqual(second[5]["utc"], "2026-10-24T03:11:41Z")
+        self.assertEqual(first[3], second[3])
+        self.assertNotEqual(first[4], second[4])
 
     def test_valid_parked_readyz_still_truthful(self):
         parked = ready_report()

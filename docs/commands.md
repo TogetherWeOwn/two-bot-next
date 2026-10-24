@@ -20,6 +20,20 @@ Bounds below are registry bounds; a dash means no bound is declared there,
 not that handler validation is unlimited. Permissions are Discord default
 member-permission bitfields, not a replacement for runtime authorization.
 
+## Private command help
+
+Use `/help` for the grouped index of this server's last confirmed publication.
+Use `/help command:rank` for a command's description, usage and optional member
+argument; `/help command:privacy` explains its subcommands and required inputs.
+The optional `command` selector trims surrounding whitespace, accepts one
+leading slash and compares ASCII case-insensitively. It does not expand aliases
+or name prefixes. Unknown or unpublished names return a correction to `/help`,
+never unpublished definitions. Custom commands appear only after publication
+is confirmed; failed or in-flight changes do not replace the confirmed help.
+Help is ephemeral and does not execute the selected command. The command picker
+hides gated commands you cannot use; help explains published requirements but
+does not evaluate every effective Discord permission or guarantee authorization.
+
 Built-in commands: 52.
 
 ## `/access`
@@ -223,7 +237,9 @@ Show this server's live commands, grouped by who can use them.
 - Default permissions: Everyone (no default permission gate)
 - Available in DMs: false
 
-No options.
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `command` | string | false | — | — | 32 | — | Command name (case-insensitive; optional leading /) |
 
 ## `/import`
 
