@@ -1506,10 +1506,19 @@ mod tests {
     }
 
     fn assert_strict_unit_refusal(reply: &str, verb: &str, offending: &str) {
+        // Pin the quoted naming segment, not the bare option token: the
+        // always-present Try usage lists every valid option name, so a bare
+        // `contains` would stay green if the refusal stopped naming the
+        // offending option.
+        let quoted = format!("option \"{offending}\"");
         assert!(
-            reply.contains(offending),
-            "{verb}: refusal names {offending:?}, got {reply:?}"
+            reply.contains(&quoted),
+            "{verb}: refusal names {quoted}, got {reply:?}"
         );
+        assert_strict_unit_refusal_shape(reply, verb);
+    }
+
+    fn assert_strict_unit_refusal_shape(reply: &str, verb: &str) {
         assert!(
             reply.contains(&format!("/{verb}")),
             "{verb}: refusal carries a /{verb} correction, got {reply:?}"
@@ -1847,7 +1856,9 @@ mod tests {
             .expect_err("wrong-typed target refuses");
         assert!(!refusal.reply.contains("exfiltrate-me"));
         assert_strict_unit_refusal(&refusal.reply, "ban", "target");
-        // A hostile unknown name is sanitized before it reaches the reply.
+        // A hostile unknown name is sanitized before it reaches the reply, so the
+        // raw name cannot be quoted back: pin the `option "` naming segment
+        // (absent from the Try usage) plus the shared refusal shape.
         let options = vec![
             strict_option("target", CommandOptionValue::User(Id::new(3333))),
             strict_option("reason", CommandOptionValue::String("wiring".to_owned())),
@@ -1855,7 +1866,17 @@ mod tests {
         ];
         let refusal = strict_decode_options(ModerationAction::Warn, &options)
             .expect_err("unknown option refuses");
-        assert_strict_unit_refusal(&refusal.reply, "warn", "option");
+        assert!(
+            refusal.reply.contains("option \""),
+            "warn: refusal names the sanitized unknown option, got {:?}",
+            refusal.reply
+        );
+        assert!(
+            !refusal.reply.contains("@everyone\n<@1>"),
+            "warn: refusal never echoes the raw hostile name, got {:?}",
+            refusal.reply
+        );
+        assert_strict_unit_refusal_shape(&refusal.reply, "warn");
         // The correction is a copyable invocation for the verb shape.
         let options = vec![strict_option(
             "reason",
