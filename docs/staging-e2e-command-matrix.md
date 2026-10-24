@@ -47,7 +47,7 @@ guild.`), all other builtins stay silent (`Ignore`); stale or unknown names
 | 19 | `/schedule-list` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral schedule list | `AutomationsDisabled`, `ManageServerRequired` |
 | 20 | `/sticky` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral defer then confirmation + audit row | `AutomationsDisabled`, `ManageServerRequired`, `body` required, `debounce` 1–300 |
 | 21 | `/sticky-remove` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral confirmation + audit row | `AutomationsDisabled`, `ManageServerRequired` |
-| 37 | `/giveaway` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral defer then confirmation + audit row; one-click member entry | `AutomationsDisabled`, `ManageServerRequired`, `prize` 1–200 chars, `duration` 1–43200 min, `winners` 1–100 |
+| 37 | `/giveaway` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral defer then confirmation + audit row; one-click member entry; timed draw + announce with reroll | `AutomationsDisabled`, `ManageServerRequired`, `prize` 1–200 chars, `duration` 1–43200 min, `winners` 1–100 |
 | 24 | `/rsvp` | `TWO_ANNOUNCEMENTS` | Everyone | Ephemeral `RSVP saved: <status>.` | `AnnouncementsDisabled`, `event-id` required, `status` going/interested/declined |
 | 25 | `/rsvp-attendance` | `TWO_ANNOUNCEMENTS` | Everyone | Ephemeral RSVP totals | `AnnouncementsDisabled`, `event-id` required |
 | 26 | `/lfg` | `TWO_ANNOUNCEMENTS` | ManageEvents | Ephemeral signup post + audit row | `AnnouncementsDisabled`, `ManageEventsRequired`, `title`/`starts-at`/`roles` required |

@@ -23,6 +23,8 @@ mod drop_poison_test_serial;
 pub mod executor;
 mod executor_metrics;
 pub mod funnel_invites;
+#[cfg(feature = "db")]
+pub mod giveaway;
 
 #[cfg(feature = "db")]
 pub use channel_moderation::{

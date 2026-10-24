@@ -47,6 +47,7 @@ pub struct GiveawayRow {
     pub draw_nonce: String,
     pub claim_token: Option<String>,
     pub claimed_at: Option<OffsetDateTime>,
+    pub paused_at: Option<OffsetDateTime>,
     pub announced_at: Option<OffsetDateTime>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
@@ -72,6 +73,7 @@ impl std::fmt::Debug for GiveawayRow {
                 &self.claim_token.as_ref().map(|_| "[REDACTED]"),
             )
             .field("claimed_at", &self.claimed_at)
+            .field("paused_at", &self.paused_at)
             .field("announced_at", &self.announced_at)
             .field("created_at", &self.created_at)
             .field("updated_at", &self.updated_at)
@@ -179,7 +181,7 @@ pub async fn create_giveaway<'e>(
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'open', $9, $10, $11, $12, $12)
          RETURNING guild_id, id, prize, channel_id, message_id, created_by,
                    winners_count, ends_at, status, requirements_json, max_entries,
-                   draw_nonce, claim_token, claimed_at, announced_at, created_at,
+                   draw_nonce, claim_token, claimed_at, paused_at, announced_at, created_at,
                    updated_at",
     )
     .bind(&input.guild_id)
@@ -207,7 +209,7 @@ pub async fn get_giveaway(
     sqlx::query_as::<_, GiveawayRow>(
         "SELECT guild_id, id, prize, channel_id, message_id, created_by, winners_count,
                 ends_at, status, requirements_json, max_entries, draw_nonce,
-                claim_token, claimed_at, announced_at, created_at, updated_at
+                claim_token, claimed_at, paused_at, announced_at, created_at, updated_at
            FROM giveaways WHERE guild_id = $1 AND id = $2",
     )
     .bind(guild_id)
@@ -347,10 +349,46 @@ pub async fn claim_due_giveaway(
             AND status = 'open' AND ends_at <= $2
          RETURNING guild_id, id, prize, channel_id, message_id, created_by,
                    winners_count, ends_at, status, requirements_json, max_entries,
-                   draw_nonce, claim_token, claimed_at, announced_at, created_at,
+                   draw_nonce, claim_token, claimed_at, paused_at, announced_at, created_at,
                    updated_at",
     )
     .bind(guild_id)
+    .bind(now)
+    .bind(reclaim_before)
+    .bind(claim_token)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Atomically lease one named giveaway for an explicit `/giveaway end`: the
+/// draw-now counterpart to [`claim_due_giveaway`]. Claims an `open` or
+/// `paused` row whose lease is free or expired, stamping a fresh token and
+/// `claimed_at = now`. The single `UPDATE` is the mutual exclusion: a
+/// concurrent claimer blocks on the row lock, then re-evaluates the lease
+/// predicate after the winner commits and matches nothing. Returns the leased
+/// row, or `None` when the giveaway is unknown, already closed, or mid-draw
+/// under a live claim.
+pub async fn claim_specific(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    giveaway_id: &str,
+    now: OffsetDateTime,
+    reclaim_before: OffsetDateTime,
+    claim_token: &str,
+) -> Result<Option<GiveawayRow>, sqlx::Error> {
+    sqlx::query_as::<_, GiveawayRow>(
+        "UPDATE giveaways
+            SET claim_token = $5, claimed_at = $3, updated_at = $3
+          WHERE guild_id = $1 AND id = $2
+            AND status IN ('open', 'paused')
+            AND (claim_token IS NULL OR claimed_at <= $4)
+         RETURNING guild_id, id, prize, channel_id, message_id, created_by,
+                   winners_count, ends_at, status, requirements_json, max_entries,
+                   draw_nonce, claim_token, claimed_at, paused_at, announced_at, created_at,
+                   updated_at",
+    )
+    .bind(guild_id)
+    .bind(giveaway_id)
     .bind(now)
     .bind(reclaim_before)
     .bind(claim_token)
@@ -426,6 +464,24 @@ pub async fn complete_draw(
     claim_token: &str,
     updated_at: OffsetDateTime,
 ) -> Result<Option<GiveawayDrawRow>, sqlx::Error> {
+    commit_draw_from(pool, input, claim_token, updated_at, "open").await
+}
+
+/// Complete the draw phase from an explicit prior status: insert the draw row
+/// and flip the claimed giveaway to `drawn` in one transaction, releasing the
+/// claim and clearing any pause marker. The ticker commits from `open` (see
+/// [`complete_draw`]); an explicit `/giveaway end` commits from `open` or
+/// `paused`. Returns the stored row on success, or `None` when the claim
+/// token is stale or the giveaway left `from_status`: the insert rolls back,
+/// so a superseded worker leaves no orphan draw row behind. A racing worker's
+/// 23505 on the draw PK still propagates as `Err`.
+pub async fn commit_draw_from(
+    pool: &Pool<Postgres>,
+    input: &NewDraw,
+    claim_token: &str,
+    updated_at: OffsetDateTime,
+    from_status: &str,
+) -> Result<Option<GiveawayDrawRow>, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let row = sqlx::query_as::<_, GiveawayDrawRow>(
         "INSERT INTO giveaway_draws
@@ -448,13 +504,15 @@ pub async fn complete_draw(
     .await?;
     let completed = sqlx::query(
         "UPDATE giveaways
-            SET status = 'drawn', claim_token = NULL, claimed_at = NULL, updated_at = $4
-          WHERE guild_id = $1 AND id = $2 AND claim_token = $3 AND status = 'open'",
+            SET status = 'drawn', claim_token = NULL, claimed_at = NULL,
+                paused_at = NULL, updated_at = $4
+          WHERE guild_id = $1 AND id = $2 AND claim_token = $3 AND status = $5",
     )
     .bind(&input.guild_id)
     .bind(&input.giveaway_id)
     .bind(claim_token)
     .bind(updated_at)
+    .bind(from_status)
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -489,6 +547,28 @@ pub async fn mark_announced(
     .await?
     .rows_affected();
     Ok(marked == 1)
+}
+
+/// Reopen the announcement owed marker after a failed reroll post, so the
+/// tick's unannounced sweep retries from the latest stored draw row. Only a
+/// `drawn` row with a stamp reopens: anything else returns `false`.
+pub async fn unmark_announced(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    giveaway_id: &str,
+    updated_at: OffsetDateTime,
+) -> Result<bool, sqlx::Error> {
+    let reopened = sqlx::query(
+        "UPDATE giveaways SET announced_at = NULL, updated_at = $3
+          WHERE guild_id = $1 AND id = $2 AND status = 'drawn' AND announced_at IS NOT NULL",
+    )
+    .bind(guild_id)
+    .bind(giveaway_id)
+    .bind(updated_at)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(reopened == 1)
 }
 
 /// Insert one draw row, returning it. A plain insert, so two workers racing
@@ -555,8 +635,28 @@ pub async fn latest_draw_no(
     .await
 }
 
+/// Every `drawn`-but-unannounced giveaway of a guild, oldest first, bounded:
+/// the tick's re-announce sweep. Announcing marks via [`mark_announced`], so a
+/// row leaves this set exactly once its winners post is durably recorded, and
+/// a re-announce replays the stored draw row instead of drawing again.
+pub async fn list_unannounced(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    limit: i64,
+) -> Result<Vec<GiveawayRow>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT * FROM giveaways
+          WHERE guild_id = $1 AND status = 'drawn' AND announced_at IS NULL
+          ORDER BY updated_at, id LIMIT $2",
+    )
+    .bind(guild_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
 /// Bound active definitions and every list/ticker batch for one guild.
-pub const MAX_OPEN_GIVEAWAYS: i64 = 25;
+pub const MAX_OPEN_GIVEAWAYS: i64 = 10;
 /// Maximum number of distinct members admitted to one giveaway.
 pub const MAX_GIVEAWAY_ENTRIES: i32 = 10_000;
 
@@ -740,6 +840,122 @@ pub async fn cancel_audited(
     Ok(row)
 }
 
+/// Millisecond epoch for the domain deadline math, clamped into `i64` so far
+/// out-of-range stamps saturate instead of wrapping the cast.
+fn epoch_ms(at: OffsetDateTime) -> i64 {
+    (at.unix_timestamp_nanos() / 1_000_000).clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+}
+
+/// Pause an open giveaway, stamping `paused_at` for the resume math. Only an
+/// unclaimed `open` row pauses: a draw in flight completes first, and a
+/// paused, drawn or cancelled row (or an unknown id) returns `false` instead
+/// of moving backwards. Paused rows leave the due scan until resumed.
+pub async fn pause_giveaway(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    giveaway_id: &str,
+    paused_at: OffsetDateTime,
+) -> Result<bool, sqlx::Error> {
+    let paused = sqlx::query(
+        "UPDATE giveaways SET status = 'paused', paused_at = $3, updated_at = $3
+          WHERE guild_id = $1 AND id = $2 AND status = 'open' AND claim_token IS NULL",
+    )
+    .bind(guild_id)
+    .bind(giveaway_id)
+    .bind(paused_at)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(paused == 1)
+}
+
+/// Resume a paused giveaway: the deadline moves forward by the paused span
+/// (see [`crate::giveaway::resume_deadline_ms`]), the pause marker clears,
+/// and entries reopen. Returns the new deadline, or `None` when the giveaway
+/// is unknown or not paused. The row lock serializes racing resumes; the
+/// second finds `open` and reports `None`.
+pub async fn resume_giveaway(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    giveaway_id: &str,
+    now: OffsetDateTime,
+) -> Result<Option<OffsetDateTime>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let row: Option<GiveawayRow> =
+        sqlx::query_as("SELECT * FROM giveaways WHERE guild_id = $1 AND id = $2 FOR UPDATE")
+            .bind(guild_id)
+            .bind(giveaway_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    if row.status != "paused" {
+        return Ok(None);
+    }
+    let paused_ms = row.paused_at.map_or(epoch_ms(now), epoch_ms);
+    let ends_ms =
+        crate::giveaway::resume_deadline_ms(epoch_ms(row.ends_at), paused_ms, epoch_ms(now));
+    let ends_at = OffsetDateTime::from_unix_timestamp_nanos(ends_ms as i128 * 1_000_000)
+        .unwrap_or(OffsetDateTime::MAX);
+    sqlx::query(
+        "UPDATE giveaways SET status = 'open', ends_at = $3, paused_at = NULL, updated_at = $4
+          WHERE guild_id = $1 AND id = $2 AND status = 'paused'",
+    )
+    .bind(guild_id)
+    .bind(giveaway_id)
+    .bind(ends_at)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Some(ends_at))
+}
+
+/// Extend an open or paused giveaway's deadline by `extra_seconds` (validated
+/// by the caller with [`crate::giveaway::extend_deadline_ms`]). Returns the
+/// new deadline, or `None` when the giveaway is unknown, drawn or cancelled.
+/// The row lock serializes racing extends against each other and the resume
+/// math above. Extending a paused row keeps it paused.
+pub async fn extend_giveaway(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    giveaway_id: &str,
+    extra_seconds: i64,
+    now: OffsetDateTime,
+) -> Result<Option<OffsetDateTime>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let row: Option<GiveawayRow> =
+        sqlx::query_as("SELECT * FROM giveaways WHERE guild_id = $1 AND id = $2 FOR UPDATE")
+            .bind(guild_id)
+            .bind(giveaway_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    if row.status != "open" && row.status != "paused" {
+        return Ok(None);
+    }
+    let Ok(ends_ms) = crate::giveaway::extend_deadline_ms(epoch_ms(row.ends_at), extra_seconds)
+    else {
+        return Ok(None);
+    };
+    let ends_at = OffsetDateTime::from_unix_timestamp_nanos(ends_ms as i128 * 1_000_000)
+        .unwrap_or(OffsetDateTime::MAX);
+    sqlx::query(
+        "UPDATE giveaways SET ends_at = $3, updated_at = $4 WHERE guild_id = $1 AND id = $2",
+    )
+    .bind(guild_id)
+    .bind(giveaway_id)
+    .bind(ends_at)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Some(ends_at))
+}
+
 /// One durable marker per countdown bucket. Claim before REST: a crash or
 /// rejected edit may miss a cosmetic refresh, but never causes an edit storm.
 pub async fn claim_refresh(
@@ -766,6 +982,74 @@ async fn surface_audit(
     Ok(())
 }
 
+/// Audit one committed draw round: ids and outcome only, never prize text.
+/// The id carries the round number and the insert is `ON CONFLICT DO
+/// NOTHING`, so a re-run (a re-announce healing a crash between draw and
+/// audit) never conflicts and never duplicates the row.
+pub async fn audit_draw(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    giveaway_id: &str,
+    draw_no: i32,
+    actor: Option<&str>,
+    at: OffsetDateTime,
+) -> Result<(), sqlx::Error> {
+    audit_round(
+        pool,
+        "giveaway.draw",
+        guild_id,
+        giveaway_id,
+        draw_no,
+        actor,
+        at,
+    )
+    .await
+}
+
+/// Audit one committed reroll round, with the same unique-per-write id shape
+/// as [`audit_draw`]: the round number distinguishes repeated rerolls. The
+/// actor is unknown when the tick heals a missing audit, so it is optional.
+pub async fn audit_reroll(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    giveaway_id: &str,
+    draw_no: i32,
+    actor: Option<&str>,
+    at: OffsetDateTime,
+) -> Result<(), sqlx::Error> {
+    audit_round(
+        pool,
+        "giveaway.reroll",
+        guild_id,
+        giveaway_id,
+        draw_no,
+        actor,
+        at,
+    )
+    .await
+}
+
+async fn audit_round(
+    pool: &Pool<Postgres>,
+    action: &str,
+    guild_id: &str,
+    giveaway_id: &str,
+    draw_no: i32,
+    actor: Option<&str>,
+    at: OffsetDateTime,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO automation_audit_log (id, guild_id, actor_id, action, target_key, outcome, created_at) VALUES ($1, $2, $3, $4, $5, 'ok', $6) ON CONFLICT (id) DO NOTHING")
+        .bind(format!("{action}:{guild_id}:{giveaway_id}:{draw_no}"))
+        .bind(guild_id)
+        .bind(actor)
+        .bind(action)
+        .bind(giveaway_id)
+        .bind(at)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -789,6 +1073,7 @@ mod tests {
             draw_nonce: NONCE.to_owned(),
             claim_token: Some(TOKEN.to_owned()),
             claimed_at: None,
+            paused_at: None,
             announced_at: None,
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,

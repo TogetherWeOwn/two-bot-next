@@ -408,6 +408,23 @@ pub fn single_reroll_pool(eligible_user_ids: &[String], keep_winner_ids: &[Strin
         .collect()
 }
 
+/// Winners to hold out of a single-winner reroll pool: every latest winner,
+/// so the replacement is always fresh. When that empties the pool (every
+/// entrant already won), hold out only the replaced member and re-pick among
+/// the rest; when even that is empty the caller draws nobody.
+#[must_use]
+pub fn single_reroll_keep(
+    eligible_user_ids: &[String],
+    latest_winner_ids: &[String],
+    replaced_user_id: &str,
+) -> Vec<String> {
+    if single_reroll_pool(eligible_user_ids, latest_winner_ids).is_empty() {
+        vec![replaced_user_id.to_owned()]
+    } else {
+        latest_winner_ids.to_vec()
+    }
+}
+
 /// Render the `reroll_kind` for replacing one winner: `single:<user id>`.
 #[must_use]
 pub fn reroll_kind_single(user_id: &str) -> String {
@@ -910,6 +927,33 @@ mod tests {
         );
         assert!(single_reroll_pool(&[], &kept).is_empty());
         assert_eq!(single_reroll_pool(&eligible(), &[]).len(), 10);
+    }
+
+    #[test]
+    fn single_reroll_keep_holds_every_winner_until_the_pool_runs_dry() {
+        let alice = "100000000000000001".to_owned();
+        let bob = "100000000000000002".to_owned();
+        let eligible = vec![alice.clone(), bob.clone()];
+        // Two entrants, one winner: keeping the replaced winner leaves the
+        // other member as the only candidate, so the replacement is fresh.
+        let keep = single_reroll_keep(&eligible, std::slice::from_ref(&alice), &alice);
+        assert_eq!(keep, vec![alice.clone()]);
+        let pool = single_reroll_pool(&eligible, &keep);
+        assert_eq!(pool, vec![bob.clone()]);
+        assert_eq!(draw(&pool, VECTOR_SEED_1, 1), vec![bob.clone()]);
+        // Full house: every entrant already won, so the fallback keeps only
+        // the replaced member out and the draw re-picks among the rest.
+        let winners = vec![alice.clone(), bob.clone()];
+        let keep = single_reroll_keep(&eligible, &winners, &alice);
+        assert_eq!(keep, vec![alice.clone()]);
+        let pool = single_reroll_pool(&eligible, &keep);
+        assert_eq!(pool, vec![bob.clone()]);
+        // Lone winner: nobody left to draw, so the reroll seats nobody.
+        let solo = vec![alice.clone()];
+        let keep = single_reroll_keep(&solo, std::slice::from_ref(&alice), &alice);
+        assert_eq!(keep, vec![alice.clone()]);
+        assert!(single_reroll_pool(&solo, &keep).is_empty());
+        assert!(draw(&single_reroll_pool(&solo, &keep), VECTOR_SEED_1, 1).is_empty());
     }
 
     #[test]
