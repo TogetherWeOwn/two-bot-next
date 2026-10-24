@@ -69,19 +69,24 @@ unsupported, not permission to merge commitments.
 
 Before disclosing anything, in order: configured guild from interaction
 context, Announcements enabled, and **current human membership verified live**,
-following the existing write-path rule. Unknown membership fails closed. This
-is stricter than per-event totals because an agenda discloses event existence
-across events, not one caller-named event's counts.
+following the existing write-path rule. Absent membership fails closed as
+`UNAVAILABLE`; a membership check that cannot complete (transport, timeout, or
+malformed evidence) fails closed as retryable `STORE_UNAVAILABLE`, never as a
+denial. This is stricter than per-event totals because an agenda discloses
+event existence across events, not one caller-named event's counts.
 
-Each listed row must then pass effective channel/event authorization against
-current state: the mirror row is Scheduled/Active with `starts_at` in the
-future, and the member can access that event's channel. Checks run only for
-rows on the requested page (at most 10), never a roster sweep, and each row
-fails closed independently: withheld rows are omitted, and the reply states
-that verification was applied without per-row reasons. Never infer channel
-visibility from RSVP ownership, and never disclose private event metadata for
-an unverified row, another member's response, an attendee roster, or canceled,
-completed, past, or deleted events as upcoming.
+Each listed row must then pass effective channel/event authorization: the
+mirror row is Scheduled/Active as of its poll time with `starts_at` in the
+future, and the member can access that event's channel, checked live for that
+row. Event status and location are mirror evidence, not live Discord reads, so
+a cancel or move after the last poll can still list until the next poll,
+labeled with the mirror time. Checks run only for rows on the requested page
+(at most 10), never a roster sweep, and each row fails closed independently:
+withheld rows are omitted, and the reply states that verification was applied
+without per-row reasons. Never infer channel visibility from RSVP ownership,
+and never disclose private event metadata for an unverified row, another
+member's response, an attendee roster, or events the mirror reports canceled,
+completed, past, or deleted as upcoming.
 
 ## 4. Proposed read contract
 
@@ -93,9 +98,10 @@ or channel message. Availability and saved facts stay separate:
   mirror rows that verify as upcoming. Declined is not a commitment and is
   excluded. Mirror statuses Canceled/Completed, past starts, and tombstoned or
   absent mirror rows are excluded from "upcoming".
-- Own rows with no matching current mirror row (deleted/moved events) surface
-  only as a metadata-free count such as "2 saved responses are not matched to
-  a current event", never with names or times.
+- Own Going/Interested rows with no matching current mirror row (deleted/moved
+  events) surface only as a metadata-free count such as "2 saved responses are
+  not matched to a current event", never with names or times. Declined rows
+  stay excluded even when their mirror row is missing.
 - Sort by `starts_at` ascending with `event_id` as the stable tiebreak. Page
   size is 10 with a 1-based page option. At most 100 own rows are considered;
   beyond that the reply says the list is truncated instead of silently cutting.
@@ -144,16 +150,16 @@ through the [documentation map](README.md); these are **proposed typed results**
 not commands to run on a guild. Stable envelope: `schema=events.agenda.v1`,
 `guild_id`, self-only `member_id`, `page`, `rows` of `(event_id, starts_at_epoch,
 own_status, verified)`, `unmatched_saved`, `withheld`, `mirror_as_of`, `reason`,
-`retryable`, `next_action`. Denied replies omit rows. No raw SQL/Discord errors.
+`retryable`, `next_action`. `UNAVAILABLE` replies omit rows. No raw SQL/Discord errors.
 
 | reason | retryable / next_action |
 | --- | --- |
 | `AGENDA` | false / `view_page` |
 | `EMPTY` | false / `keep_per_event_lookup` |
-| `UNAVAILABLE` | false / `verify_access` (collapse missing/foreign/denied) |
+| `UNAVAILABLE` | false / `verify_access` (collapse missing/foreign/admission-denied; per-row channel denial withholds the row instead) |
 | `TRUNCATED` | false / `narrow_with_per_event_lookup` |
 | `STALE` | false / `retry_after_next_poll` |
-| `STORE_UNAVAILABLE` | true / `retry_after_backoff` |
+| `STORE_UNAVAILABLE` | true / `retry_after_backoff` (also when the membership gate itself cannot complete) |
 | `COMMIT_UNKNOWN` | true / `inspect_per_event_state` |
 
 This design's offline check has no environment selector, credentials, network,
@@ -164,7 +170,8 @@ reached by combining flags on this check.
 The following deterministic **fixture oracle**, not an implementation, uses
 guild `g1`, member `a`, mirror time `T`, and UTC epoch starts. Each row resets
 that fixture; `shown` counts verified upcoming rows, `withheld` counts rows
-failing verification, `unmatched` counts own rows with no current mirror row.
+failing verification, `unmatched` counts own Going/Interested rows with no
+current mirror row.
 All rows require zero writes, zero notifications, and zero other-member data.
 
 | Case | Controlled event / expected assertion |
@@ -244,7 +251,7 @@ findings above must receive an independent boundary disposition, not a
 self-approved grant. No request should be sent directly to the owner or an
 invented host executor.
 
-The decision must accept or revise: ephemeral in-guild read only; live
+The decision must accept or revise: ephemeral in-guild read-only; live
 membership plus page-bounded per-row verification; Going/Interested only with
 Declined excluded; mirror staleness labeled with its poll time; a new
 per-member index with a proven bounded plan; and no DM, calendar, share, or

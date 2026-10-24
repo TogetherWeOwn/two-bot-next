@@ -94,6 +94,15 @@ Ban a member
 | `target` | user | true | — | — | — | — | Member to moderate |
 | `reason` | string | true | — | — | 512 | — | Mandatory audit reason |
 
+## `/channel-inspect`
+
+Privately inspect saved lockdown and live slowmode
+
+- Default permissions: ManageChannels (`16`)
+- Available in DMs: false
+
+No options.
+
 ## `/command`
 
 Define or replace a custom command
@@ -449,6 +458,17 @@ Delete recent messages
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `count` | integer | true | 1 | 100 | — | — | Messages to delete (1-100) |
 | `reason` | string | true | — | — | 512 | — | Mandatory audit reason |
+
+## `/purge-preview`
+
+Privately preview a purge without deleting messages
+
+- Default permissions: ManageMessages (`8192`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `count` | integer | true | 1 | 100 | — | — | Newest messages to sample (1-100) |
 
 ## `/rank`
 

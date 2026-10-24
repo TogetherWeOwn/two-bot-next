@@ -354,7 +354,8 @@ impl CommandRuntime {
             executor.clone(),
             0,
             two_bot_core::ClassifierConfig::from_env(),
-        );
+        )
+        .with_classifier_provider(Arc::new(crate::community_classifier::LiveClassifier));
         let channel = ChannelModerationRuntime::new(
             ChannelModerationStore::from_pool(pool.clone()),
             executor.clone(),

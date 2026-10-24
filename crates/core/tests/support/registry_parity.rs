@@ -41,6 +41,8 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("command-inspect", "docs/parity.md §1 command-inspect"),
     ("feed-pause", "docs/parity.md §1 feed-pause"),
     ("feed-resume", "docs/parity.md §1 feed-resume"),
+    ("purge-preview", "docs/parity.md §1 purge-preview"),
+    ("channel-inspect", "docs/parity.md §1 channel-inspect"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -319,6 +321,34 @@ pub fn expected_registry() -> Value {
         + 1;
     commands.insert(after_remove, pause);
     commands.insert(after_remove + 1, resume);
+    // Next-only read surfaces follow the nine historical mutations. Literal
+    // payloads keep the frozen snapshot intact and compare every read field.
+    let after_unlock = commands
+        .iter()
+        .position(|command| command["name"] == "unlock")
+        .expect("legacy unlock remains published")
+        + 1;
+    commands.insert(
+        after_unlock,
+        json!({
+            "name": "purge-preview",
+            "description": "Privately preview a purge without deleting messages",
+            "dm_permission": false,
+            "default_member_permissions": "8192",
+            "options": [{"name": "count", "description": "Newest messages to sample (1-100)",
+                "type": 4, "required": true, "min_value": 1, "max_value": 100}]
+        }),
+    );
+    commands.insert(
+        after_unlock + 1,
+        json!({
+            "name": "channel-inspect",
+            "description": "Privately inspect saved lockdown and live slowmode",
+            "options": [],
+            "dm_permission": false,
+            "default_member_permissions": "16"
+        }),
+    );
     // Picker-copy exceptions (registry golden exceptions table): command and
     // option descriptions intentionally differ from legacy. Pointers mirror
     // the published option order.

@@ -132,13 +132,13 @@ const HELP_GROUPS: &[HelpGroup] = &[
     HelpGroup {
         title: "Message cleanup",
         requires: Some("Manage Messages"),
-        commands: &["purge"],
+        commands: &["purge", "purge-preview"],
         anchor: None,
     },
     HelpGroup {
         title: "Channel slowmode and locks",
         requires: Some("Manage Channels"),
-        commands: &["slowmode", "lockdown", "unlock"],
+        commands: &["slowmode", "lockdown", "unlock", "channel-inspect"],
         anchor: None,
     },
     HelpGroup {
@@ -756,12 +756,13 @@ mod tests {
                 "{token} appears exactly once"
             );
         }
-        // 29 legacy builtins plus Next-only help, privacy, command-inspect and reopen
+        // 27 legacy builtins plus Next-only help, privacy, command-inspect,
+        // reopen, purge-preview, channel-inspect, feed-pause and feed-resume
         // commands, plus the 21 gated voice commands (voice `kick` loses
         // first-wins to moderation `/kick`; `/templateassistant` stays
         // unpublished until its slice lands): matches the regenerated
         // `docs/commands.md` total.
-        assert!(text.contains("**Server commands** (54 live)"));
+        assert!(text.contains("**Server commands** (56 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"
@@ -789,6 +790,8 @@ mod tests {
             );
         }
         for line in [
+            "**Message cleanup** — needs Manage Messages\n/purge · /purge-preview\n",
+            "**Channel slowmode and locks** — needs Manage Channels\n/slowmode · /lockdown · /unlock · /channel-inspect\n",
             "**Voice rooms**\n/setup · /ping · /invite · /reclaim · /transfer · /name · /private · /public · /limit · /unlimit\n",
             "**Voice room admin** — needs Manage Channels\n/create · /textchannels · /access · /logging · /position · /group · /inheritpermissions · /defaultlimit · /alwaysprivate\n",
             "**Voice room settings** — needs Manage Server\n/export · /import\n",
@@ -881,10 +884,10 @@ mod tests {
             .iter()
             .flat_map(|g| g.commands.iter().copied())
             .collect();
-        // 29 legacy builtins plus Next-only help, privacy, command-inspect and reopen
-        // commands, then the 21 voice names (voice `kick` shares the Kick
-        // group). `/templateassistant` stays out until its slice lands.
-        assert_eq!(grouped.len(), 54);
+        // 27 legacy builtins plus eight Next-only commands, then the 21
+        // voice names (voice `kick` shares the Kick group).
+        // `/templateassistant` stays out until its slice lands.
+        assert_eq!(grouped.len(), 56);
         for name in [
             "rank",
             "leaderboard",
@@ -909,6 +912,8 @@ mod tests {
             "slowmode",
             "lockdown",
             "unlock",
+            "purge-preview",
+            "channel-inspect",
         ]
         .into_iter()
         .chain(
