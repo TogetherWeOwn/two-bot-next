@@ -232,14 +232,17 @@ pub fn refusal_response(refusal: RouterRefusal) -> InteractionResponse {
 
 /// Wrong-type `preview` refusal, in the feed/sticky strict-decode style: name
 /// the option and show a copyable corrected invocation.
+#[cfg(feature = "db")]
 const LFG_INVALID_PREVIEW: &str = "Invalid preview. Use /lfg title:<title> starts-at:<iso-8601> roles:<role:Label:count> preview:true.";
 /// Duplicated `preview` refusal, same style as [`LFG_INVALID_PREVIEW`].
+#[cfg(feature = "db")]
 const LFG_DUPLICATE_PREVIEW: &str = "Duplicate preview. Use /lfg title:<title> starts-at:<iso-8601> roles:<role:Label:count> preview:true.";
 
 /// Strict `/lfg` `preview` decode: omitted means post, boolean `true`
 /// previews, anything else refuses before any store or channel effect.
 /// Duplicates win over wrong types, matching the feed/sticky/schedule
 /// strict decoders; unknown options stay ignored.
+#[cfg(feature = "db")]
 fn decode_lfg_preview(
     options: &[twilight_model::application::interaction::application_command::CommandDataOption],
 ) -> Result<bool, crate::lfg_interactions::LfgError> {
