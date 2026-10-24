@@ -60,6 +60,12 @@ const HELP_GROUPS: &[HelpGroup] = &[
         anchor: None,
     },
     HelpGroup {
+        title: "Pickers",
+        requires: None,
+        commands: &["reopen"],
+        anchor: None,
+    },
+    HelpGroup {
         title: "Community check-in",
         requires: Some("Manage Events"),
         commands: &["attendance"],
@@ -744,12 +750,12 @@ mod tests {
                 "{token} appears exactly once"
             );
         }
-        // 27 legacy builtins plus the Next-only help, privacy, feed-inspect
-        // and command-inspect commands, plus the 21 gated voice commands (voice
+        // 27 legacy builtins plus the Next-only help, privacy, command-inspect,
+        // reopen and feed-inspect commands, plus the 21 gated voice commands (voice
         // `kick` loses first-wins to moderation `/kick`; `/templateassistant`
         // stays unpublished until its slice lands): matches the regenerated
         // `docs/commands.md` total.
-        assert!(text.contains("**Server commands** (52 live)"));
+        assert!(text.contains("**Server commands** (53 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"
@@ -801,7 +807,7 @@ mod tests {
         });
         let defs = off.publish_set(&[]).expect("core-only set");
         let text = help_text(&defs);
-        assert!(text.contains("**Server commands** (4 live)"));
+        assert!(text.contains("**Server commands** (5 live)"));
         assert!(text.contains("/rank"));
         assert!(text.contains("/help"));
         assert!(!text.contains("Automations"));
@@ -869,16 +875,17 @@ mod tests {
             .iter()
             .flat_map(|g| g.commands.iter().copied())
             .collect();
-        // 27 legacy builtins plus the Next-only help, privacy, feed-inspect
-        // and command-inspect commands, then the 21 voice names (voice `kick`
+        // 27 legacy builtins plus the Next-only help, privacy, command-inspect,
+        // reopen and feed-inspect commands, then the 21 voice names (voice `kick`
         // shares the Kick group). `/templateassistant` stays out until its
         // slice lands.
-        assert_eq!(grouped.len(), 52);
+        assert_eq!(grouped.len(), 53);
         for name in [
             "rank",
             "leaderboard",
             "help",
             "privacy",
+            "reopen",
             "attendance",
             "command",
             "schedule-list",
