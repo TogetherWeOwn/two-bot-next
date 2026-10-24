@@ -904,7 +904,7 @@ impl CustomCommandRuntime {
             // and never a claim that a later no-op repaired the picker.
             tracing::error!("custom-command toggle committed but registry publication failed");
             return Ok(format!(
-                "{reply} The definition is saved but the command picker is not yet synchronized because registry publication failed. Restart the bot or retry after it recovers to resync."
+                "{reply} The definition is saved but the command picker is not yet synchronized because registry publication failed. Repeating this command will not resync it; restart the bot after Discord recovers to resync."
             ));
         }
         Ok(reply)
