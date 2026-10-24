@@ -616,22 +616,34 @@ async fn absent_uploader_refuses_import() {
     let bytes = serde_json::to_vec(&full_config()).unwrap();
     let (runtime, shared) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
     let inventory = config_inventory();
-    // No member/user facts: the uploader cannot be bound.
-    let mut upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
-    upload.member = None;
-    upload.user = None;
-    let (owned, response) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (_, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let (confirm_id, _) = preview_buttons(&preview.expect("preview"));
+
+    // A Confirm click with no invoker identity is not the uploader. The
+    // uploader check runs before the permission gate on clicks, so this
+    // reaches the real binding refusal instead of a Manage Server reply.
+    let mut anonymous = component_interaction(&confirm_id, manager(), UPLOADER);
+    anonymous.member = None;
+    anonymous.user = None;
+    let (owned, response) = handle_import_capture(&runtime, &anonymous, Some(&inventory)).await;
     assert!(owned);
     let response = response.expect("refusal");
     assert!(
-        response_text(&response).contains("who uploaded"),
+        response_text(&response).contains("Only the member"),
         "{:?}",
         response_text(&response)
     );
-    assert_no_buttons(&response);
     assert!(attachments_of(&response).is_none());
     assert_eq!(*shared.lock().unwrap(), empty_config());
     assert!(!applied(&trace));
+
+    // The refusal changed nothing: the real uploader can still confirm.
+    assert!(!runtime.pending_imports.lock().unwrap().is_empty());
+    let confirm = component_interaction(&confirm_id, manager(), UPLOADER);
+    let (_, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(response_text(&response.expect("applied")).starts_with("Import applied:"));
+    assert_eq!(*shared.lock().unwrap(), full_config());
 }
 
 #[tokio::test]
