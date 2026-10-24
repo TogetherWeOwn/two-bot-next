@@ -462,6 +462,7 @@ fn top_position(held: &[String], facts: &GuildFacts) -> Option<i64> {
 /// any cooldown admission, membership read, policy evaluation, mutation,
 /// audit write or idempotency claim; any `Err` is already the user-facing
 /// ephemeral refusal text, with zero stored effects.
+#[derive(Debug)]
 struct StrictOptions {
     target: Id<UserMarker>,
     reason: String,
@@ -470,6 +471,7 @@ struct StrictOptions {
 
 /// A strict-decode refusal: the private reply plus the fixed-vocabulary
 /// problem kind for logging (never a member-supplied string).
+#[derive(Debug)]
 struct StrictRefusal {
     reply: String,
     problem: &'static str,
