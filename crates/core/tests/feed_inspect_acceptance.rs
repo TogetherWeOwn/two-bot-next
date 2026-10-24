@@ -16,8 +16,8 @@
 //! Builder contract (one slice):
 //! - Register `feed-inspect` in the announcement set with a required string
 //!   `id` option (max 128), Manage Server permission, guild-only, no DMs.
-//!   Announcement count moves 7 to 8; the merged feature set and the publish
-//!   set each grow by one; help lists the new command under Feed relays.
+//!   The all-on union has 9 announcements, retaining current-channel LFG
+//!   discovery alongside feed inspection; help lists inspect under Feed relays.
 //! - Add `Inspect { id }` plan routing with the same enabled, configured-guild
 //!   and Manage Server gates as the existing trio, plus the same ID shape.
 //! - Render one bounded detail reply (at most 2000 UTF-16 units) with the
@@ -134,8 +134,8 @@ fn inspect_command_is_registered_with_stable_id_and_manage_guild() {
     let definitions = announcement_commands();
     assert_eq!(
         definitions.len(),
-        8,
-        "the feed management surface grows by exactly the inspect command"
+        9,
+        "the announcement union retains both feed inspection and current-channel LFG discovery"
     );
     let definition = definitions
         .iter()

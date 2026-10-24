@@ -102,7 +102,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
     HelpGroup {
         title: "Looking for group",
         requires: Some("Manage Events"),
-        commands: &["lfg", "lfg-close"],
+        commands: &["lfg", "lfg-close", "lfg-list"],
         anchor: None,
     },
     HelpGroup {
@@ -756,13 +756,13 @@ mod tests {
                 "{token} appears exactly once"
             );
         }
-        // 35 non-voice commands (5 core + 19 feature + 9 moderation + 2 reads),
-        // including inspection, reopen, giveaway, purge-preview,
+        // 36 non-voice commands (5 core + 20 feature + 9 moderation + 2 reads),
+        // including inspection, reopen, giveaway, lfg-list, purge-preview,
         // channel-inspect and feed-inspect, plus 21 additional voice commands
         // (voice `kick` loses first-wins to moderation `/kick`).
         // `/templateassistant` stays unpublished until its slice lands:
         // matches the regenerated `docs/commands.md` total.
-        assert!(text.contains("**Server commands** (56 live)"));
+        assert!(text.contains("**Server commands** (57 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"
@@ -888,11 +888,11 @@ mod tests {
             .iter()
             .flat_map(|g| g.commands.iter().copied())
             .collect();
-        // 35 non-voice names, including inspection, reopen, giveaway,
-        // purge-preview, channel-inspect and feed-inspect, plus 21 additional
-        // voice names (voice `kick` shares the Kick group).
+        // 36 non-voice names, including inspection, reopen, giveaway,
+        // lfg-list, purge-preview, channel-inspect and feed-inspect, plus 21
+        // additional voice names (voice `kick` shares the Kick group).
         // `/templateassistant` stays out until its slice lands.
-        assert_eq!(grouped.len(), 56);
+        assert_eq!(grouped.len(), 57);
         for name in [
             "rank",
             "leaderboard",
@@ -909,6 +909,7 @@ mod tests {
             "giveaway",
             "lfg",
             "lfg-close",
+            "lfg-list",
             "feed-add",
             "feed-inspect",
             "ban",

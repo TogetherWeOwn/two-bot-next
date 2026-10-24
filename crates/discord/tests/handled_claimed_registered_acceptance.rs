@@ -120,6 +120,20 @@ impl ProductionRegistrations for InteractionRouter {
         }
         router.register(Box::new(Stub(HandlerId::Lfg)));
         router.register(Box::new(Stub(HandlerId::LfgClose)));
+        // Next-only `/lfg-list`: name-based so the baseline still compiles
+        // before the production `HandlerId::LfgList` arm lands. Resolve the
+        // handler from the routing table when the builder lands it instead of
+        // naming the enum.
+        if let SlashOutcome::Handled { handler } =
+            InteractionRouter::new(gates).route_slash(&SlashContext {
+                name: "lfg-list",
+                guild_id: gates.configured_guild,
+                actor_permissions: Some(u64::MAX),
+                custom_row: None,
+            })
+        {
+            router.register(Box::new(Stub(handler)));
+        }
         router
     }
 
@@ -226,7 +240,7 @@ fn claiming_surfaces(
     if is_channel_claim(name, handler) && admitted {
         claims.push("channel");
     }
-    if matches!(handler, HandlerId::Lfg | HandlerId::LfgClose) && admitted {
+    if (matches!(handler, HandlerId::Lfg | HandlerId::LfgClose) || name == "lfg-list") && admitted {
         claims.push("lfg");
     }
     if matches!(handler, HandlerId::Rank | HandlerId::Leaderboard) && admitted {
@@ -243,6 +257,7 @@ fn claiming_surfaces(
             handler,
             HandlerId::Lfg | HandlerId::LfgClose | HandlerId::Rank | HandlerId::Leaderboard
         )
+        || name == "lfg-list"
         || (name == "help" && handler == HandlerId::Help)
         || owner_map(name, member_present) == Some(handler);
     if !is_rsvp_command(name) && custom_row.is_none() && !earlier_arm_matches {

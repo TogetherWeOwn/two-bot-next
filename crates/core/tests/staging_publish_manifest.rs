@@ -3,9 +3,9 @@
 //! Pins the command set expected on the staging guild — the all-gates-on
 //! [`InteractionRouter::publish_set`] output in legacy publish order — plus
 //! the automation-gating contract for dynamic DB-backed custom commands.
-//! Code-derived: the fixture (`fixtures/staging_published_commands.json`)
-//! is generated from the router, and this test fails on any drift between
-//! the router-advertised set and the manifest.
+//! The fixture (`fixtures/staging_published_commands.json`) independently
+//! preserves both saved-command inspection and current-channel discovery;
+//! this test fails on drift between the router-advertised set and the manifest.
 //!
 //! Offline carve only: no guild touch, no staging secrets, no database.
 //! The live diff/publish workflow stays in `docs/command-publish.md`.
@@ -110,12 +110,17 @@ fn automations_off_withholds_automation_builtins_and_all_dynamics() {
         enabled: true,
     };
     let names = published_names(&router, &[faq]);
-    // 35 all-on builtins minus 10 automation-gated commands, including
+    // 36 all-on builtins minus 10 automation-gated commands, including
     // command-inspect and giveaway; announcements-gated feed-inspect still
-    // publishes. The stored dynamic row stays unpublished: every such
+    // publishes and read-only current-channel discovery lfg-list stays
+    // published. The stored dynamic row stays unpublished: every such
     // invocation refuses at dispatch while gated off, so publishing would
     // burn the ceiling.
-    assert_eq!(names.len(), 25, "automations-off staging set: {names:?}");
+    assert_eq!(names.len(), 26, "automations-off staging set: {names:?}");
+    assert!(
+        names.iter().any(|name| name == "lfg-list"),
+        "read-only current-channel discovery stays published while automations are off"
+    );
     assert!(
         names.iter().any(|name| name == "reopen"),
         "reopen is core-always and survives automations-off: {names:?}"

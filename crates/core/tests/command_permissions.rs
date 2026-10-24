@@ -95,27 +95,36 @@ fn all_30_rows_equal_parity_section1() {
     // (parity row 31 — legacy has no help command), `/privacy` member
     // self-serve (row 32), management-only `/command-inspect` (row 33),
     // `/reopen` picker recovery (row 34), `/purge-preview` (35),
-    // `/channel-inspect` (36), `/giveaway` timed entry (row 37) and the
-    // Next-only `/feed-inspect` relay detail (parity row 38).
+    // `/channel-inspect` (36), `/giveaway` timed entry (row 37),
+    // `/lfg-list` current-channel list (parity row 38) and the Next-only
+    // `/feed-inspect` relay detail (parity row 39).
     // No Next-only row appears in the legacy §1 table above; the
     // registry-equality test below covers every published builtin instead.
-    assert_eq!(COMMAND_PERMISSIONS.len(), 38);
+    assert_eq!(COMMAND_PERMISSIONS.len(), 39);
     assert_eq!(
         COMMAND_PERMISSIONS
             .iter()
             .map(|row| row.command)
             .collect::<HashSet<_>>()
             .len(),
-        38
+        39
     );
     assert_eq!(
         COMMAND_PERMISSIONS
             .iter()
             .map(|row| row.parity_row)
             .collect::<HashSet<_>>(),
-        (1..=38).collect::<HashSet<_>>(),
-        "parity rows are contiguous 1..=38"
+        (1..=39).collect::<HashSet<_>>(),
+        "parity rows are contiguous 1..=39"
     );
+    for (name, parity_row, required_permissions) in
+        [("command-inspect", 33, 1 << 5), ("lfg-list", 38, 1 << 33)]
+    {
+        let row = command_permission(name).expect("Next-only command has a permission row");
+        assert_eq!(row.parity_row, parity_row, "{name}");
+        assert_eq!(row.required_permissions, required_permissions, "{name}");
+        assert_eq!(row.surface, CommandSurface::BuiltinSlash, "{name}");
+    }
     let help = command_permission("help").expect("help has a permission row");
     assert_eq!(help.required_permissions, 0);
     assert_eq!(help.surface, CommandSurface::BuiltinSlash);
@@ -136,7 +145,7 @@ fn all_30_rows_equal_parity_section1() {
     assert_eq!(giveaway.policy_hook, None);
     let feed_inspect =
         command_permission("feed-inspect").expect("feed-inspect has a permission row");
-    assert_eq!(feed_inspect.parity_row, 38);
+    assert_eq!(feed_inspect.parity_row, 39);
     assert_eq!(feed_inspect.required_permissions, 32, "ManageGuild bit");
     assert_eq!(feed_inspect.surface, CommandSurface::BuiltinSlash);
     assert_eq!(feed_inspect.policy_hook, None);
@@ -169,7 +178,7 @@ fn permission_table_equals_the_complete_published_registry() {
         .iter()
         .filter(|row| row.surface == CommandSurface::BuiltinSlash)
         .collect();
-    assert_eq!(builtins.len(), 35);
+    assert_eq!(builtins.len(), 36);
     assert_eq!(published.len(), builtins.len() + 1);
     for row in builtins {
         let definition = published
@@ -293,7 +302,7 @@ fn every_routed_builtin_name_has_a_permission_row() {
             other => panic!("{name} is published or retained but does not route: {other:?}"),
         }
     }
-    assert_eq!(routed, 35, "every retained builtin routes");
+    assert_eq!(routed, 36, "every retained builtin routes");
 }
 
 #[test]
