@@ -275,7 +275,7 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
         .iter()
         .filter(|row| row.surface == CommandSurface::BuiltinSlash && row.required_permissions != 0)
         .collect();
-    assert_eq!(restricted.len(), 24);
+    assert_eq!(restricted.len(), 26);
     tracing::subscriber::with_default(audit.clone(), || {
         for row in &restricted {
             for permissions in [None, Some(0), Some(!row.required_permissions)] {
