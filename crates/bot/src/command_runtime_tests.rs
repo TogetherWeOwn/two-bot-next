@@ -17,6 +17,8 @@
 
 #![cfg(test)]
 
+#[path = "feed_sticky_strict_decode_acceptance_tests.rs"]
+mod feed_sticky_strict_decode_acceptance_tests;
 #[path = "leveling_ack_ordering_acceptance_tests.rs"]
 mod leveling_ack_ordering_acceptance_tests;
 #[path = "leveling_ack_visibility_acceptance_tests.rs"]
