@@ -9125,6 +9125,118 @@ fn setup_many_pages_stay_bounded_and_cover_every_row_once() {
 }
 
 #[test]
+fn setup_worst_case_diagnostics_leave_room_for_rows_and_navigation() {
+    let channel_id = 1_844_674_407_370_955_615;
+    let failure = failure_line(&LifecycleFailure::MissingPermission {
+        write: RefusedWrite::Move,
+        channel_id,
+        findings: [
+            VoicePermission::ManageChannels,
+            VoicePermission::MoveMembers,
+            VoicePermission::ViewChannel,
+            VoicePermission::Connect,
+        ]
+        .into_iter()
+        .map(|permission| PermissionFinding {
+            permission,
+            scope: VoicePermissionScope::Channel,
+            category_id: None,
+            channel_id: Some(channel_id),
+        })
+        .collect(),
+    });
+    assert!(
+        text_len(&failure) > 400,
+        "production-shaped permission failure"
+    );
+    for creators in [
+        Vec::new(),
+        (0..120)
+            .map(|index| CreatorChannel::new(GUILD, channel_id + index))
+            .collect(),
+    ] {
+        for store_error in [None, Some(StoreError::Unavailable.to_string())] {
+            let summary = SetupSummary {
+                guild_id: GUILD,
+                creators: creators.clone(),
+                tracked_rooms: 7,
+                failures: vec![failure.clone(); 5],
+                halted: true,
+                store_error,
+            };
+            let total = setup_page_total(&summary);
+            let mut covered = Vec::new();
+            for number in 1..=total {
+                let panel = setup_panel_page(&summary, number);
+                let reply = format!("**{}**\n{}", panel.title, panel.description);
+                assert!(
+                    text_len(&reply) <= CONTENT_LIMIT,
+                    "page {number}: {} units",
+                    text_len(&reply)
+                );
+                assert!(reply.contains("paused"));
+                assert!(reply.contains("Tracked rooms: 7."));
+                assert!(reply.contains("Recent failures (5)"));
+                assert!(
+                    reply.contains(&failure),
+                    "retain complete actionable diagnostics"
+                );
+                let shown = reply.matches(&format!("- {failure}")).count();
+                assert!(shown < summary.failures.len(), "exercise diagnostic budget");
+                assert!(
+                    reply.contains(&format!(
+                        "Additional failure details not shown: {}.",
+                        summary.failures.len() - shown
+                    )),
+                    "disclose the exact omitted count"
+                );
+                if summary.store_error.is_some() {
+                    assert!(reply.contains("Could not load creator channels"));
+                    assert!(!reply.contains("No creator channels yet"));
+                }
+                if total > 1 {
+                    assert!(reply.contains(&format!("Page {number} of {total}")));
+                    if number < total {
+                        assert!(reply.ends_with(&format!("Next page: /setup page:{}", number + 1)));
+                    }
+                }
+                for line in panel.description.lines() {
+                    if let Some(rest) = line.strip_prefix("- <#") {
+                        let (id, _) = rest.split_once('>').expect("complete creator mention");
+                        covered.push(id.parse::<u64>().unwrap());
+                    }
+                }
+                assert_eq!(
+                    setup_panel_page(&summary, number).description,
+                    panel.description
+                );
+            }
+            let expected: Vec<_> = if summary.store_error.is_some() {
+                Vec::new()
+            } else {
+                creators.iter().map(|creator| creator.channel_id).collect()
+            };
+            assert_eq!(covered, expected);
+        }
+    }
+}
+
+#[test]
+fn setup_oversized_astral_failure_is_omitted_as_a_whole_line() {
+    let summary = SetupSummary {
+        failures: vec![format!("health: <#200> {}", "🐢".repeat(2000))],
+        ..empty_like_summary()
+    };
+    let panel = setup_panel(&summary);
+    let reply = format!("**{}**\n{}", panel.title, panel.description);
+    assert!(text_len(&reply) <= CONTENT_LIMIT);
+    assert!(reply.contains("Recent failures (1)"));
+    assert!(reply.contains("Additional failure details not shown: 1."));
+    assert!(!reply.contains("<#"), "never truncate a diagnostic mention");
+    assert!(!reply.contains('🐢'));
+}
+
+#[test]
 fn setup_empty_and_error_views_stay_single_page() {
     let empty = SetupSummary {
         guild_id: GUILD,
@@ -9205,6 +9317,69 @@ fn access_show_single_page_matches_the_legacy_summary() {
         access_show_page(&empty, 1),
         "Room creation: on\nRequired role: none\nRestricted commands: none"
     );
+}
+
+#[test]
+fn access_row_units_keep_exact_capacity_rows_whole() {
+    let roles = vec![7; 314];
+    let whole = format!("- /kick: {}", vec!["<@&7>"; 314].join(" "));
+    let length = text_len(&whole);
+    for capacity in [length, length + 1] {
+        assert_eq!(access_row_units("kick", &roles, capacity), [whole.clone()]);
+    }
+    let segments = access_row_units("kick", &roles, length - 1);
+    assert!(segments.len() > 1, "capacity+1 must split");
+    assert!(segments.iter().all(|segment| text_len(segment) < length));
+    assert_eq!(
+        segments
+            .iter()
+            .map(|segment| segment.matches("<@&7>").count())
+            .sum::<usize>(),
+        roles.len()
+    );
+}
+
+#[test]
+fn access_show_checks_the_whole_reply_before_reserving_page_chrome() {
+    let mut exact = vec![7; 322];
+    *exact.last_mut().unwrap() = 10;
+    let cases = [
+        vec![1_844_674_407_370_955_615; 79],
+        vec![1_844_674_407_370_955_615; 80],
+        vec![7; 314],
+        exact,
+    ];
+    let mut largest = 0;
+    for roles in cases {
+        let expected = format!(
+            "Room creation: on\nRequired role: none\nRestricted commands:\n- /kick: {}",
+            roles
+                .iter()
+                .map(|role| format!("<@&{role}>"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        assert!(text_len(&expected) <= CONTENT_LIMIT, "single-page fixture");
+        largest = largest.max(text_len(&expected));
+        let mut controls = AccessControls::default();
+        controls.command_roles.insert("kick".to_owned(), roles);
+        assert_eq!(access_show_total(&controls), 1);
+        assert_eq!(
+            access_show_page(&controls, 1),
+            expected,
+            "no continuation labels or extra pages for a fitting reply"
+        );
+    }
+    assert_eq!(largest, CONTENT_LIMIT, "cover the exact transport boundary");
+    let mut controls = AccessControls::default();
+    let mut roles = vec![7; 322];
+    *roles.last_mut().unwrap() = 100;
+    controls.command_roles.insert("kick".to_owned(), roles);
+    let total = access_show_total(&controls);
+    assert!(total > 1, "a 2001-unit reply really does need paging");
+    for number in 1..=total {
+        assert!(text_len(&access_show_page(&controls, number)) <= CONTENT_LIMIT);
+    }
 }
 
 #[test]

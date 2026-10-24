@@ -11493,6 +11493,54 @@ fn setup_suffix_lines(summary: &SetupSummary) -> Vec<String> {
     lines
 }
 
+/// Worst-case navigation cost: page numbers fit the creator count's digits.
+fn setup_page_chrome(row_total: usize) -> usize {
+    if row_total <= 1 {
+        return 0;
+    }
+    let wide = "9".repeat(row_total.to_string().len());
+    text_len(&format!("Page {wide} of {wide}"))
+        + 1
+        + text_len(&format!("Next page: /setup page:{wide}"))
+        + 1
+}
+
+/// Keep the fixed status and diagnostic lines within budget too. Prefer the
+/// unchanged single-page view when it fits; otherwise reserve navigation and
+/// one complete creator row before admitting whole diagnostic lines. Health
+/// findings come first from the caller; omitted diagnostics are counted,
+/// never clipped through an ID or mention token.
+fn setup_page_lines(summary: &SetupSummary, rows: &[String]) -> (Vec<String>, Vec<String>) {
+    let prefix = setup_prefix_lines(summary, rows.len());
+    let mut suffix = setup_suffix_lines(summary);
+    let units = |lines: &[String]| lines.iter().map(|line| text_len(line) + 1).sum::<usize>();
+    if units(&prefix) + units(&suffix) + units(rows) <= SETUP_DESCRIPTION_BOUND + 1 {
+        return (prefix, suffix);
+    }
+    let row = rows.iter().map(|row| text_len(row) + 1).max().unwrap_or(0);
+    let budget = SETUP_DESCRIPTION_BOUND
+        .saturating_sub(units(&prefix) + row + setup_page_chrome(rows.len()));
+    if !summary.failures.is_empty() {
+        loop {
+            let omitted = summary.failures.len().saturating_sub(suffix.len() - 2);
+            let notice = format!("Additional failure details not shown: {omitted}.");
+            let notice_units = if omitted > 0 {
+                text_len(&notice) + 1
+            } else {
+                0
+            };
+            if units(&suffix) + notice_units <= budget || suffix.len() == 2 {
+                if omitted > 0 {
+                    suffix.push(notice);
+                }
+                break;
+            }
+            suffix.pop();
+        }
+    }
+    (prefix, suffix)
+}
+
 /// Greedy row ranges that fit [`SETUP_DESCRIPTION_BOUND`] with worst-case
 /// page chrome reserved. Empty when there are no rows; otherwise every page
 /// holds at least one row, so packing always makes progress.
@@ -11501,8 +11549,7 @@ fn setup_row_pages(summary: &SetupSummary) -> Vec<(usize, usize)> {
     if rows.is_empty() {
         return Vec::new();
     }
-    let prefix = setup_prefix_lines(summary, rows.len());
-    let suffix = setup_suffix_lines(summary);
+    let (prefix, suffix) = setup_page_lines(summary, &rows);
     // Each line plus its joining newline; the one extra newline this counts
     // keeps every estimate conservative, never over the bound.
     let fixed: usize = prefix
@@ -11514,16 +11561,8 @@ fn setup_row_pages(summary: &SetupSummary) -> Vec<(usize, usize)> {
     if fixed + all_rows <= SETUP_DESCRIPTION_BOUND + 1 {
         return vec![(0, rows.len())];
     }
-    // Worst-case chrome over every page: the longest `Page` line and next
-    // hint this list could need (the page count never exceeds the row count,
-    // and every page number fits the row count's digits).
-    let wide = "9".repeat(rows.len().to_string().len());
-    let chrome = text_len(&format!("Page {wide} of {wide}"))
-        + 1
-        + text_len(&format!("Next page: /setup page:{wide}"))
-        + 1;
     let capacity = SETUP_DESCRIPTION_BOUND
-        .saturating_sub(fixed + chrome)
+        .saturating_sub(fixed + setup_page_chrome(rows.len()))
         .max(1);
     let mut pages = Vec::new();
     let mut start = 0;
@@ -11550,20 +11589,20 @@ pub fn setup_page_total(summary: &SetupSummary) -> usize {
 
 /// Render admin `/setup` page `page` (1-based). Out-of-range pages clamp to
 /// the nearest page; callers that must refuse past-end input check
-/// [`setup_page_total`] first. Single-page output is byte-identical to the
-/// legacy panel; page metadata and the next-page hint appear only when there
-/// is more than one page.
+/// [`setup_page_total`] first. A fitting single-page view keeps its diagnostic
+/// lines unchanged; oversized diagnostics omit whole tail lines with a count.
+/// Page metadata and the next-page hint appear only with multiple pages.
 #[must_use]
 pub fn setup_panel_page(summary: &SetupSummary, page: usize) -> SetupPanel {
     let rows = setup_sorted_rows(summary);
     let pages = setup_row_pages(summary);
     let total = pages.len().max(1);
     let page = page.clamp(1, total);
-    let mut lines = setup_prefix_lines(summary, rows.len());
+    let (mut lines, suffix) = setup_page_lines(summary, &rows);
     if let Some((start, end)) = pages.get(page - 1) {
         lines.extend(rows[*start..*end].iter().cloned());
     }
-    lines.extend(setup_suffix_lines(summary));
+    lines.extend(suffix);
     if total > 1 {
         lines.push(format!("Page {page} of {total}"));
         if page < total {
@@ -13103,7 +13142,7 @@ fn access_row(command: &str, roles: &[Snowflake]) -> String {
 /// mention token. Empty roles never split: the whole row is short.
 fn access_row_units(command: &str, roles: &[Snowflake], capacity: usize) -> Vec<String> {
     let whole = access_row(command, roles);
-    if roles.is_empty() || text_len(&whole) < capacity {
+    if roles.is_empty() || text_len(&whole) <= capacity {
         return vec![whole];
     }
     // Worst-case segment label over every segment (a segment holds at least
@@ -13143,9 +13182,9 @@ fn access_row_units(command: &str, roles: &[Snowflake], capacity: usize) -> Vec<
         .collect()
 }
 
-/// Row budget for one `/access show` page: the transport bound minus the
-/// fixed context lines and the worst-case page chrome (the page count never
-/// exceeds the unit count, and every page number fits its digits).
+/// Row budget for `/access show`: a fitting whole reply needs no navigation.
+/// Otherwise reserve fixed context and worst-case page chrome (the page count
+/// never exceeds the unit count, and every page number fits its digits).
 fn access_page_capacity(controls: &AccessControls) -> usize {
     let fixed: usize = access_context_lines(controls)
         .iter()
@@ -13153,6 +13192,16 @@ fn access_page_capacity(controls: &AccessControls) -> usize {
         .sum::<usize>()
         + text_len("Restricted commands:")
         + 1;
+    // Check the complete legacy reply before reserving navigation: chrome
+    // that will never be shown must not split a fitting restriction row.
+    let whole_rows: usize = controls
+        .command_roles
+        .iter()
+        .map(|(command, roles)| text_len(&access_row(command, roles)) + 1)
+        .sum();
+    if fixed + whole_rows <= CONTENT_LIMIT + 1 {
+        return CONTENT_LIMIT + 1 - fixed;
+    }
     let upper = (controls.command_roles.len()
         + controls.command_roles.values().map(Vec::len).sum::<usize>())
     .max(1);
