@@ -38,7 +38,7 @@ sample image named under Measured sample image.
 | R1 | `FROM gcr.io/distroless/cc-debian13:nonroot@sha256:e792…` | 21 base layers, 29,128,192 bytes (27.78 MiB) as saved-tar blobs | Debian trust bundle plus 14 documented OS packages; no shell, package manager, or OpenSSL CLI |
 | R2 | `LABEL org.opencontainers.image.revision`, `com.togetherweown.build-id` | Metadata only | Non-secret build provenance; zero bytes |
 | R3 | `USER 65532:65532`, `WORKDIR /home/nonroot` | One empty layer (no tar entries), 1,024 bytes as saved-tar blob; `USER` is config-only | Config; the layer is empty because `/home/nonroot` already exists in base layer 7 |
-| R4 | `COPY --from=builder --chown=65532:65532 /app/target/release/two-bot ./two-bot` | Yes, one file layer, 16,065,536 bytes (15.32 MiB) as saved-tar blob; file itself 16,062,800 bytes (15.32 MiB) | The only added file content: the stripped release binary (`opt-level=z`, LTO, stripped). Budget: 17 MiB per `scripts/container-smoke.py` (recalibrated 2026-10-17; the 2026-10-11 sample below predates it) |
+| R4 | `COPY --from=builder --chown=65532:65532 /app/target/release/two-bot ./two-bot` | Yes, one file layer, 16,065,536 bytes (15.32 MiB) as saved-tar blob; file itself 16,062,800 bytes (15.32 MiB) | The only added file content: the stripped release binary (`opt-level=z`, LTO, stripped). Budget: 18 MiB per `scripts/container-smoke.py` (recalibrated 2026-10-24; the 2026-10-11 sample below predates it) |
 | R5 | `EXPOSE 8080`, `ENV LISTEN_ADDR=0.0.0.0:8080 LOG_FORMAT=json` | Metadata only | Liveness/readiness port, bind address and JSON log format |
 | R6 | `HEALTHCHECK CMD ["/home/nonroot/two-bot", "--healthcheck"]` | Metadata only | Exec-form probe; needs no shell |
 | R7 | `ENTRYPOINT ["/home/nonroot/two-bot"]` | Metadata only | Exec form so PID 1 receives SIGTERM |
@@ -75,7 +75,7 @@ a sample of main, not the pinned cutover candidate.
   `16,777,216` bytes (16 MiB) — PASS. Headroom `714,416` bytes (0.68 MiB,
   4.3%). The binary exceeds the old 15 MiB ceiling by `334,160` bytes, so the
   16 MiB tripwire in `scripts/container-smoke.py` was required at the time
-  (recalibrated to 17 MiB on 2026-10-17).
+  (recalibrated to 18 MiB on 2026-10-24).
 - Cross-check: `sbom/runtime-image-evidence.json` (schema 2, `complete: true`)
   records the same source SHA, image ID, and binary size `16,062,800` with
   SHA-256 `4d41c4fb7fbfa1d7d6752a0503491a2b6672407a1d4488107fb8ead9b764116a`,
@@ -168,7 +168,7 @@ Before the deployment digest is pinned:
    names, `SHA256SUMS`, and both gate results under the Releases receipt of
    the B4 evidence manifest (`docs/cutover.md` B4). That receipt does not list
    SBOMs yet, so add them there.
-3. Re-measure on the candidate's image ID, and confirm the 112 MiB / 17 MiB
+3. Re-measure on the candidate's image ID, and confirm the 112 MiB / 18 MiB
    budgets pass. CI keeps the candidate image only as the
    `sbom-partial-<run_id>-<attempt>` artifact (`image.tar`, 1-day retention),
    so download it within that window. R1 and R4 are saved-tar layer-blob

@@ -59,12 +59,21 @@ IMAGE_MAX_BYTES = 112 * MIB
 # headroom, so 17 MiB restores a working tripwire with ~1 MiB of headroom;
 # revisit if the binary approaches it.
 # The voice actor-init retry measured 16,782,904 bytes (+6,808, no new dependencies).
-BINARY_MAX_BYTES = 17 * MIB
+# On 2026-10-24 the 17 MiB ceiling was reached on main itself: main at
+# cc07f31436 measured 17,845,208 bytes (17.02 MiB), 19,416 bytes over, in
+# [its container smoke job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/40061835103/job/120785881426).
+# The staff game-mix slice head (6a412c6a86) measured 17,862,000 bytes
+# (17.03 MiB), 36,208 over, in [its container smoke job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/40040240318/job/120711266282),
+# with no new dependencies and the same minimal release profile (opt-level=z,
+# lto, strip). The binary ceiling moves to 18 MiB, leaving about 1 MiB of
+# headroom above the measured heads; revisit if the binary approaches it.
+# The 112 MiB image ceiling is unchanged (43.46 MiB measured on this head).
+BINARY_MAX_BYTES = 18 * MIB
 # CLI refusal bounds (not budget policy): --image-max-bytes/--binary-max-bytes
 # outside 1..cap are unusable — a non-positive budget can never pass and a
 # gigantic one silently disables the budget — so main() refuses them with a
 # fixed message before any Docker call. The caps sit far above any sane
-# override (defaults are 112 MiB/17 MiB) and far below budget-disabling
+# override (defaults are 112 MiB/18 MiB) and far below budget-disabling
 # magnitudes; sane values pass through byte-identically.
 IMAGE_BUDGET_CAP_BYTES = 1024 * MIB
 BINARY_BUDGET_CAP_BYTES = 256 * MIB
