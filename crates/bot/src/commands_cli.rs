@@ -502,7 +502,7 @@ mod tests {
             desired_definitions(2222, &env)
                 .expect("desired registry assembles")
                 .len(),
-            4
+            5
         );
         env.insert("TWO_AUTOMATIONS".into(), "1".into());
         env.insert("TWO_ANNOUNCEMENTS".into(), "1".into());
@@ -513,7 +513,7 @@ mod tests {
             desired_definitions(2222, &env)
                 .expect("desired registry assembles")
                 .len(),
-            31
+            32
         );
     }
 

@@ -5,12 +5,12 @@
 //! Two layers, mirroring `funnel_replay.rs`:
 //!
 //! 1. `route_*` — in-memory twilight `Interaction`s through
-//!    [`route_interaction`]: all 29 builtins, gates-off refusals, permission
+//!    [`route_interaction`]: all 32 builtins, gates-off refusals, permission
 //!    refusals, custom rows, unknown names/ids, modal submits, and the
 //!    refusal-response wire shape.
 //! 2. `publish_*` — the router's complete set through the real
 //!    `twilight_http` bulk-set endpoint against the mock Discord double in
-//!    `common`: one request, all 30 names, guild-only, permission bits as
+//!    `common`: one request, all 32 names, guild-only, permission bits as
 //!    decimal strings. The REST executor ([TOG-10076]) owns the production
 //!    call; this proves the payload it will send.
 //!
@@ -362,7 +362,7 @@ fn twilight_publication_permissions_equal_the_runtime_matrix() {
     let router = InteractionRouter::new(all_on());
     let defs = router.publish_set(&[]).unwrap();
     let commands = publish_commands(&defs);
-    assert_eq!(commands.len(), 31);
+    assert_eq!(commands.len(), 32);
     for command in commands {
         let row = command_permission(&command.name).unwrap();
         assert_eq!(
@@ -404,6 +404,7 @@ fn every_section1_row_routes_to_its_registered_handler() {
         ("leaderboard", HandlerId::Leaderboard),
         ("help", HandlerId::Help),
         ("privacy", HandlerId::Privacy),
+        ("reopen", HandlerId::Reopen),
         ("ban", HandlerId::Moderation(ModerationAction::Ban)),
         ("tempban", HandlerId::Moderation(ModerationAction::TempBan)),
         ("kick", HandlerId::Moderation(ModerationAction::Kick)),
@@ -438,7 +439,7 @@ fn every_section1_row_routes_to_its_registered_handler() {
         ("feed-remove", HandlerId::FeedRemove),
         ("feed-list", HandlerId::FeedList),
     ];
-    assert_eq!(cases.len(), 31, "all 31 handler-owned builtins covered");
+    assert_eq!(cases.len(), 32, "all 32 handler-owned builtins covered");
     for (_, id) in cases {
         router.register(Box::new(Stub(*id)));
     }
@@ -1070,8 +1071,8 @@ async fn publish_sends_the_complete_merged_set_once() {
         .expect("full set assembles");
     assert_eq!(
         defs.len(),
-        32,
-        "4 core + 18 feature + 9 moderation + 1 custom"
+        33,
+        "5 core + 18 feature + 9 moderation + 1 custom"
     );
     let commands = publish_commands(&defs);
 
@@ -1103,7 +1104,7 @@ async fn publish_sends_the_complete_merged_set_once() {
         .iter()
         .map(|c| c["name"].as_str().expect("command has a name"))
         .collect();
-    assert_eq!(names.len(), 32, "no partial view");
+    assert_eq!(names.len(), 33, "no partial view");
     for expected in [
         "rank",
         "leaderboard",

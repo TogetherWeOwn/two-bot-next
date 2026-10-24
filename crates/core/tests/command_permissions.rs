@@ -92,12 +92,13 @@ fn all_30_rows_equal_parity_section1() {
     }
     assert_eq!(seen, (1..=30).collect::<HashSet<_>>());
     // The 30 legacy parity rows plus the Next-only `/help` discovery command
-    // (parity row 31 — legacy has no help command) and the Next-only
-    // `/privacy` member self-serve (parity row 32) and management-only
-    // `/command-inspect` (parity row 33), plus `/lfg-edit` sharing LFG row 26.
+    // (parity row 31 — legacy has no help command), the Next-only
+    // `/privacy` member self-serve (parity row 32), `/command-inspect`
+    // management inspection (parity row 33) and `/reopen` picker recovery
+    // (parity row 34), plus `/lfg-edit` sharing LFG row 26.
     // Next-only companions never replace the canonical legacy row above;
     // registry equality covers every published builtin.
-    assert_eq!(COMMAND_PERMISSIONS.len(), 34);
+    assert_eq!(COMMAND_PERMISSIONS.len(), 35);
     assert_eq!(
         COMMAND_PERMISSIONS
             .iter()
@@ -109,6 +110,9 @@ fn all_30_rows_equal_parity_section1() {
     let help = command_permission("help").expect("help has a permission row");
     assert_eq!(help.required_permissions, 0);
     assert_eq!(help.surface, CommandSurface::BuiltinSlash);
+    let reopen = command_permission("reopen").expect("reopen has a permission row");
+    assert_eq!(reopen.required_permissions, 0);
+    assert_eq!(reopen.surface, CommandSurface::BuiltinSlash);
 }
 
 #[test]
@@ -155,7 +159,7 @@ fn permission_table_equals_the_complete_published_registry() {
         .iter()
         .filter(|row| row.surface == CommandSurface::BuiltinSlash)
         .collect();
-    assert_eq!(builtins.len(), 31);
+    assert_eq!(builtins.len(), 32);
     assert_eq!(published.len(), builtins.len() + 1);
     for row in builtins {
         let definition = published
