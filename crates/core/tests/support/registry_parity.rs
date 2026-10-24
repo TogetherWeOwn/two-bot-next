@@ -381,10 +381,10 @@ pub fn expected_registry() -> Value {
         );
         option["max_length"] = json!(max_length);
     }
-    // Schedule-list pagination: the Next-only additive `page` option keeps
-    // every configured id discoverable within Discord's 2,000-unit cap.
-    // Legacy publishes no options on `schedule-list`; permissions and the
-    // command name stay legacy-identical.
+    // Schedule-list: preserve bounded page discovery and add the optional
+    // invoking-channel filter. Extend the existing additive-option exception;
+    // never rewrite the frozen legacy fixture or relax the strict comparator.
+    // Permissions and the command name stay legacy-identical.
     {
         let _ = INTENTIONAL_DIFFERENCES
             .iter()
@@ -410,7 +410,13 @@ pub fn expected_registry() -> Value {
             .min_value(1),
         )
         .expect("page option serializes");
-        command["options"] = json!([page]);
+        let here = serde_json::to_value(CommandOption::new(
+            "here",
+            "Only schedules in this channel (default: false)",
+            CommandOptionType::Boolean,
+        ))
+        .expect("here option serializes");
+        command["options"] = json!([page, here]);
     }
     // Feed-list pagination: the Next-only additive `page` option keeps every
     // stored relay id discoverable as whole rows within Discord's 2,000-unit

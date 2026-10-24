@@ -2,13 +2,12 @@
 //!
 //! A guild may hold 25 schedules, whose whole rows cannot fit in one
 //! 2,000 UTF-16 unit Discord message. The locked contract (behavior is
-//! pinned end-to-end in the bot crate's command-runtime tests) adds ONE
-//! additive option to the existing command — no new command name, no
-//! permission change — so staff can walk bounded pages and discover every
-//! configured schedule id:
+//! pinned end-to-end in the bot crate's command-runtime tests) preserves
+//! pagination and adds a channel filter — no new command name, no permission
+//! change — so staff can walk bounded pages and discover schedule ids:
 //!
 //! - option `page`, integer, optional (omitted means page 1), minimum 1;
-//! - it is the command's only option;
+//! - option `here`, boolean, optional (omitted/false means the whole server);
 //! - `ManageGuild` default permissions and guild-only shape are unchanged.
 //!
 //! Synthetic fixtures only: no Discord, network, or database.
@@ -24,7 +23,7 @@ const INTEGER_OPTION: u8 = 4;
 const MANAGE_GUILD: &str = "32";
 
 #[test]
-fn schedule_list_publishes_one_optional_page_option() {
+fn schedule_list_publishes_optional_page_and_here_without_relaxing_permissions() {
     let definitions = automation_commands();
     let schedule_list = definitions
         .iter()
@@ -43,8 +42,8 @@ fn schedule_list_publishes_one_optional_page_option() {
 
     assert_eq!(
         schedule_list.options.len(),
-        1,
-        "page is the only additive option; got {:?}",
+        2,
+        "keep page and add only here; got {:?}",
         schedule_list
             .options
             .iter()
@@ -72,5 +71,48 @@ fn schedule_list_publishes_one_optional_page_option() {
     assert!(
         !page.description.trim().is_empty(),
         "the published option carries a description"
+    );
+    let here = &schedule_list.options[1];
+    assert_eq!(here.name, "here");
+    assert_eq!(
+        here.kind, 5,
+        "here is a Discord boolean, not a caller-supplied channel"
+    );
+    assert_ne!(here.required, Some(true), "old invocations remain valid");
+    assert!(here.min_value.is_none() && here.max_value.is_none());
+    assert!(here.max_length.is_none() && here.choices.is_empty() && here.options.is_empty());
+    assert!(here
+        .description
+        .to_ascii_lowercase()
+        .contains("this channel"));
+}
+
+#[test]
+fn schedule_here_help_explains_scope_and_default_only_while_published() {
+    let mut definitions = automation_commands();
+    let active = two_bot_core::help_text(&definitions);
+    let lower = active.to_ascii_lowercase();
+    assert!(
+        lower.contains("here:true") && lower.contains("this channel"),
+        "discover the filter from live help: {active}"
+    );
+    assert!(
+        lower.contains("false") && lower.contains("server"),
+        "discover the server-wide default: {active}"
+    );
+    assert_eq!(
+        active.matches("/schedule-list").count(),
+        1,
+        "retain exact-once discovery"
+    );
+    assert!(
+        active.contains("Manage Server"),
+        "retain authorization hint"
+    );
+    definitions.retain(|definition| definition.name != "schedule-list");
+    let withheld = two_bot_core::help_text(&definitions);
+    assert!(
+        !withheld.contains("here:true"),
+        "unpublished feature has no stale help hint"
     );
 }
