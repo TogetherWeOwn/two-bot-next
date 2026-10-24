@@ -13121,6 +13121,30 @@ where
     H: RoomWrites + Send + 'static,
     F: Future<Output = ()> + Send,
 {
+    // Keep the command state machine shared across initial-response capture and
+    // deferred completion; only this small adapter depends on the callback type.
+    let reply: VoiceReply<'_> = Box::new(move |response| Box::pin(reply(response)));
+    handle_voice_interaction_shared(runtime, interaction, invite_code, inventory, names, reply)
+        .await
+}
+
+type VoiceReply<'a> = Box<
+    dyn FnOnce(InteractionResponse) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> + Send + 'a,
+>;
+
+#[inline(never)]
+async fn handle_voice_interaction_shared<S, H>(
+    runtime: &VoiceRuntime<S, H>,
+    interaction: &Interaction,
+    invite_code: Option<&str>,
+    inventory: Option<&GuildInventory>,
+    names: &NameDirectory,
+    reply: VoiceReply<'_>,
+) -> bool
+where
+    S: RoomPersistence + Send + 'static,
+    H: RoomWrites + Send + 'static,
+{
     let Some(guild_id) = interaction_guild(interaction) else {
         return false;
     };

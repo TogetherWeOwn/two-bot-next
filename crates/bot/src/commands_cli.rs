@@ -498,29 +498,29 @@ mod tests {
     #[test]
     fn desired_registry_uses_existing_feature_gates() {
         let mut env = vars();
-        assert_eq!(
-            desired_definitions(2222, &env)
-                .expect("desired registry assembles")
-                .len(),
-            4
+        let default = desired_definitions(2222, &env).expect("desired registry assembles");
+        assert_eq!(default.len(), 5);
+        assert!(
+            default.iter().any(|def| def.name == "reopen"),
+            "reopen is core-always in the default registry"
         );
         env.insert("TWO_AUTOMATIONS".into(), "1".into());
         env.insert("TWO_ANNOUNCEMENTS".into(), "1".into());
         env.insert("TWO_COMMUNITY_SCORECARD".into(), "1".into());
         env.insert("TWO_MODERATION".into(), "1".into());
         env.insert("TWO_OWEN_USER_ID".into(), "123456789012345678".into());
-        assert_eq!(
-            desired_definitions(2222, &env)
-                .expect("desired registry assembles")
-                .len(),
-            31
+        let all_on = desired_definitions(2222, &env).expect("desired registry assembles");
+        assert_eq!(all_on.len(), 32);
+        assert!(
+            all_on.iter().any(|def| def.name == "reopen"),
+            "reopen survives the all-on registry"
         );
         env.insert("TWO_VOICE".into(), "1".into());
-        assert_eq!(
-            desired_definitions(2222, &env)
-                .expect("desired registry assembles")
-                .len(),
-            52
+        let with_voice = desired_definitions(2222, &env).expect("desired registry assembles");
+        assert_eq!(with_voice.len(), 53);
+        assert!(
+            with_voice.iter().any(|def| def.name == "reopen"),
+            "reopen survives the voice registry"
         );
     }
 
@@ -551,6 +551,11 @@ mod tests {
                             "/{name}: automations={automations:?}, voice={voice}, other_features={other_features}"
                         );
                     }
+                    assert_eq!(
+                        definitions.iter().filter(|def| def.name == "reopen").count(),
+                        1,
+                        "/reopen always published: automations={automations:?}, voice={voice}, other_features={other_features}"
+                    );
                 }
             }
         }

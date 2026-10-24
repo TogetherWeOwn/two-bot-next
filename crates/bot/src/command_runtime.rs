@@ -74,6 +74,7 @@ use two_bot_core::{
     },
     feeds_store::{add_feed, list_feeds, remove_feed, write_audit, FeedAudit, FeedRemoval},
     funnel::now_millis_for_test,
+    help::{canonical_help_selector, unknown_help_correction},
     moderation::ModerationAction,
     router::replies::EXPIRED_COMPONENT_REPLY,
     sticky::{
@@ -87,9 +88,9 @@ use two_bot_core::{
     SlashOutcome, SurfaceFlags,
 };
 use two_bot_discord::{
-    help_response, publish_commands, register_channel_handlers, response_for_slash,
-    route_interaction, ActionExecutor, ChannelModerationRuntime, DiscordError, LevelingRuntime,
-    RoutedInteraction,
+    help_detail_response, help_response, publish_commands, register_channel_handlers,
+    response_for_slash, route_interaction, ActionExecutor, ChannelModerationRuntime, DiscordError,
+    LevelingRuntime, RoutedInteraction,
 };
 
 use crate::activation::BootActivation;
@@ -1006,10 +1007,20 @@ impl CommandRuntime {
                 else {
                     return true;
                 };
-                // The gateway also delivers these to the live voice sink. Yield
-                // before user-slot/lane admission so overload cannot answer a
-                // voice-owned command with the shared runtime's busy callback.
-                if self.voice_owns_interaction(&interaction) {
+                // The gateway also delivers these to their feature owners. Yield
+                // before user-slot/lane admission so overload cannot race the
+                // voice or onboarding defer with the shared busy callback.
+                if self.voice_owns_interaction(&interaction)
+                    || matches!(
+                        route_interaction(&self.interactions.router, &interaction, None),
+                        RoutedInteraction::Slash {
+                            outcome: SlashOutcome::Handled {
+                                handler: HandlerId::Reopen
+                            },
+                            ..
+                        }
+                    )
+                {
                     return true;
                 }
                 let runtime = Arc::clone(self);
@@ -1435,6 +1446,15 @@ impl CommandRuntime {
         let SlashOutcome::Handled { handler } = outcome else {
             return;
         };
+        if handler == HandlerId::Reopen {
+            // The onboarding worker owns `/reopen` end to end (ingress defer
+            // at reception plus the durable menu job through the same
+            // pipeline as the picker components). Answering here — even the
+            // unavailable terminal below — would race that owner for the
+            // single initial callback, so this runtime stays silent exactly
+            // like it does for the `GamePicker`/`SessionPicker` components.
+            return;
+        }
         if matches!(handler, HandlerId::Rank | HandlerId::Leaderboard) {
             // Leveling owns its defer-then-edit lifecycle: an ephemeral defer
             // for rank, a public defer for leaderboard, each completed by one
@@ -1451,8 +1471,18 @@ impl CommandRuntime {
         if handler == HandlerId::Help {
             // Read the actual confirmed publication, including DB-backed
             // custom rows and successful add/remove refreshes. No store wait.
+            // An omitted selector keeps the grouped index; a selector reads
+            // one confirmed definition, never an unconfirmed refresh.
             let response = match self.published_commands() {
-                Some(defs) => help_response(&defs),
+                Some(defs) => match help_command_selector(interaction) {
+                    None => help_response(&defs),
+                    Some(raw) => match canonical_help_selector(&raw).and_then(|name| {
+                        defs.iter().find(|def| def.name.eq_ignore_ascii_case(&name))
+                    }) {
+                        Some(def) => help_detail_response(def.help_detail_text()),
+                        None => help_detail_response(unknown_help_correction()),
+                    },
+                },
                 None => ephemeral("The command list is still refreshing. Try /help again shortly."),
             };
             self.answer(interaction, response).await;
@@ -2459,6 +2489,26 @@ pub(crate) fn feed_remove_option(interaction: &Interaction) -> Option<String> {
         })
 }
 
+/// `/help`'s optional `command` selector. Omitted means the grouped index.
+/// A present option with a non-string wire value is malformed and decodes
+/// to an empty selector, which answers the unknown-name correction rather
+/// than silently listing the index.
+pub(crate) fn help_command_selector(interaction: &Interaction) -> Option<String> {
+    let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
+        &interaction.data
+    else {
+        return None;
+    };
+    let option = data
+        .options
+        .iter()
+        .find(|option| option.name == "command")?;
+    match &option.value {
+        CommandOptionValue::String(value) => Some(value.clone()),
+        _ => Some(String::new()),
+    }
+}
+
 /// `/feed-list`'s optional 1-based `page` option, decoded by name first: an
 /// omitted option means page 1, while a present option with a non-integer
 /// wire value is unusable and must refuse rather than silently list page 1.
@@ -2529,6 +2579,12 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     // `/privacy` member self-serve is never activation-fenced either: every
     // member may opt out of analytics in any guild.
     router.register(Box::new(SliceHandler(HandlerId::Privacy)));
+    // `/reopen` picker recovery is never activation-fenced either: every
+    // member may reopen their own pickers in any gate state. Execution
+    // lives in the onboarding worker (`on_interaction` below stays silent
+    // for it, exactly like the picker components); this registration only
+    // advertises the ownership the router outcome names.
+    router.register(Box::new(SliceHandler(HandlerId::Reopen)));
     router
 }
 

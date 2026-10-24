@@ -9,14 +9,14 @@ verdicts in `docs/smoke-run-record.md`.
 
 - Registry: `InteractionRouter::publish_set` with all feature gates on
   (scorecard, automations, announcements, moderation), no custom rows.
-- Rendered reference: `docs/commands.md` — the 31 built-ins plus the voice set
-  (52 with the voice gates on), registry bounds,
+- Rendered reference: `docs/commands.md` — the 32 built-ins plus the voice set
+  (53 with the voice gates on), registry bounds,
   DMs false on every row (guild-only, legacy `setDMPermission(false)`).
 - Merge order (first definition wins, Discord 100-command ceiling):
   core → scorecard → automations → announcements → moderation.
 
-Counts: 4 core + 1 scorecard + 10 automations + 7 announcements +
-9 moderation = **31 built-ins**. Machine-readable mirror:
+Counts: 5 core + 1 scorecard + 10 automations + 7 announcements +
+9 moderation = **32 built-ins**. Machine-readable mirror:
 `crates/core/tests/fixtures/smoke_surface_inventory.json`, checked by
 `crates/core/tests/smoke_surface_inventory.rs` (registry shape in publish
 order, exactly-five-covered gate, handler routing for the five).
@@ -52,6 +52,7 @@ handler family with a covered command.
 | --- | --- | --- |
 | `/help` | core | Next-only discovery command with no legacy counterpart; answers from the live publish set with no store or network effect, so offline router and renderer tests pin it instead of the live smoke five. |
 | `/privacy` | core | Next-only member self-serve with no legacy counterpart; the purge-plus-suppression-plus-receipt path is pinned by the gateway dispatch tests on a disposable database rather than the live smoke five. |
+| `/reopen` | core | Next-only self-service picker recovery with no legacy counterpart; the defer-first menu open and zero-mutation contract are pinned by the onboarding disposable-database acceptance tests rather than the live smoke five. |
 | `/attendance` | scorecard | Needs a seeded event-occurrence plus a verified-human fixture; outside the one-per-family smoke budget. |
 | `/command` | automations | Mutating admin CRUD that creates live commands; the read-only smoke excludes state writes. |
 | `/command-remove` | automations | Destructive admin op; excluded from the read-only smoke. |
