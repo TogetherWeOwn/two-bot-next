@@ -23,12 +23,17 @@
 //! the definition changed or was cancelled mid-post the completion loses and
 //! the caller cleans up the orphan (legacy `stale_completion`).
 
+use sha2::{Digest, Sha256};
 use sqlx::{Pool, Postgres};
 
 use crate::automation_quota::{lock_quota, AutomationQuota, QuotaWriteError};
 use crate::scheduled::advance_next_run_iso;
 
 /// One scheduled message row (legacy `ScheduledMessageRow`).
+///
+/// `Debug` is manual: `claim_token` is the ticker lease capability, so it
+/// stays out of diagnostics while every other field remains available
+/// (same shape as [`crate::giveaway_store::GiveawayRow`]).
 #[derive(Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct ScheduledMessageRow {
     pub id: String,
@@ -49,6 +54,33 @@ pub struct ScheduledMessageRow {
     pub occurrence_nonce: Option<String>,
     /// Armed before POST; expiry/restart never proves the occurrence unsent.
     pub delivery_uncertain: bool,
+}
+
+impl std::fmt::Debug for ScheduledMessageRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScheduledMessageRow")
+            .field("id", &self.id)
+            .field("guild_id", &self.guild_id)
+            .field("channel_id", &self.channel_id)
+            .field("body", &self.body)
+            .field("next_run_at", &self.next_run_at)
+            .field("interval_seconds", &self.interval_seconds)
+            .field("enabled", &self.enabled)
+            .field("last_run_at", &self.last_run_at)
+            .field("last_message_id", &self.last_message_id)
+            .field("created_by", &self.created_by)
+            .field("created_at", &self.created_at)
+            .field("updated_by", &self.updated_by)
+            .field("updated_at", &self.updated_at)
+            .field(
+                "claim_token",
+                &self.claim_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("claimed_at", &self.claimed_at)
+            .field("occurrence_nonce", &self.occurrence_nonce)
+            .field("delivery_uncertain", &self.delivery_uncertain)
+            .finish()
+    }
 }
 
 /// A scheduled-message definition write (legacy `putScheduled` input row).
@@ -379,6 +411,219 @@ pub async fn put_scheduled(
     Ok(result.rows_affected() > 0)
 }
 
+/// Opaque optimistic-concurrency token for one saved definition: the hex
+/// SHA-256 over every field an edit must not silently overwrite — body,
+/// destination, due instant, recurrence, enabled state, creator/updater
+/// facts, last-run evidence and every claim/nonce/uncertainty fence.
+/// Length-prefixed parts keep field boundaries unambiguous; the 64 hex
+/// chars fit [`crate::scheduled::MAX_SCHEDULE_REVISION_CHARS`] and the
+/// ASCII-alphabet inspect contract. Derived, never stored: a restart
+/// keeps every token valid because the inputs are the row itself.
+#[must_use]
+pub fn schedule_revision_token(row: &ScheduledMessageRow) -> String {
+    let mut hasher = Sha256::new();
+    let mut part = |bytes: &[u8]| {
+        hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(bytes);
+    };
+    part(row.id.as_bytes());
+    part(row.guild_id.as_bytes());
+    part(row.channel_id.as_bytes());
+    part(row.body.as_bytes());
+    part(row.next_run_at.as_bytes());
+    match row.interval_seconds {
+        None => part(b"\0one-shot"),
+        Some(seconds) => part(seconds.to_string().as_bytes()),
+    }
+    part(if row.enabled { b"\x01" } else { b"\x00" });
+    match row.last_run_at.as_deref() {
+        None => part(b"\0none"),
+        Some(ran) => part(ran.as_bytes()),
+    }
+    match row.last_message_id.as_deref() {
+        None => part(b"\0none"),
+        Some(message) => part(message.as_bytes()),
+    }
+    part(row.created_by.as_bytes());
+    part(row.created_at.as_bytes());
+    part(row.updated_by.as_bytes());
+    part(row.updated_at.as_bytes());
+    match row.claim_token.as_deref() {
+        None => part(b"\0none"),
+        Some(token) => part(token.as_bytes()),
+    }
+    match row.claimed_at.as_deref() {
+        None => part(b"\0none"),
+        Some(claimed) => part(claimed.as_bytes()),
+    }
+    match row.occurrence_nonce.as_deref() {
+        None => part(b"\0none"),
+        Some(nonce) => part(nonce.as_bytes()),
+    }
+    part(if row.delivery_uncertain {
+        b"\x01"
+    } else {
+        b"\x00"
+    });
+    hex::encode(hasher.finalize())
+}
+
+/// Delivery fence that refuses a body-only correction: an unconsumed
+/// claim (live or expired — expiry never proves the occurrence unsent), a
+/// pending occurrence nonce, or armed/legacy-unknown delivery
+/// uncertainty. The caller renders the matching inspect/recovery
+/// instruction; the row stays untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyEditFence {
+    Claim,
+    Nonce,
+    Uncertain,
+}
+
+impl BodyEditFence {
+    /// Member-visible fence detail for the edit refusal.
+    #[must_use]
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::Claim => "a delivery claim is active",
+            Self::Nonce => "an occurrence nonce is still pending",
+            Self::Uncertain => "delivery is uncertain",
+        }
+    }
+}
+
+/// Outcome of [`try_update_scheduled_body`]: exactly one of these per
+/// call, decided under the row lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BodyEditOutcome {
+    /// The body, updater and timestamp changed and the `scheduled.edit`
+    /// audit committed in the same transaction; carries the saved row so
+    /// the caller can issue a fresh revision. Boxed: the row dwarfs the
+    /// other variants (`clippy::large_enum_variant`).
+    Saved { row: Box<ScheduledMessageRow> },
+    /// The inspected revision no longer matches the locked definition or
+    /// its delivery evidence: another writer (or the ticker) moved first.
+    Stale,
+    /// A delivery fence is armed; nothing changed.
+    Fenced { fence: BodyEditFence },
+    /// The replacement equals the stored body; no row, timestamp or audit
+    /// churn happened.
+    Unchanged,
+    /// The resolved id is already gone.
+    Missing,
+}
+
+/// One body-only correction attempt (the `/schedule-edit` write path).
+/// Never [`put_scheduled`]: that upsert clears claim/nonce/uncertainty
+/// fences, while this changes only `body`, `updated_by` and `updated_at`
+/// plus the content-free `scheduled.edit` / `ok` audit, atomically.
+///
+/// Linearization: the definition row is locked (`SELECT … FOR UPDATE`)
+/// before the revision is compared, so a concurrent ticker either claims
+/// the old body first (the edit then sees the armed fence and refuses) or
+/// skips the locked row (`SKIP LOCKED`) and posts exactly the committed
+/// new body. Two racing edits serialize on the same lock: the first
+/// committer moves the revision, the second reads stale and loses without
+/// touching the winner. `expected_revision` must come from
+/// [`schedule_revision_token`]; `body` must already be validated and
+/// neutralized ([`crate::scheduled::validate_schedule_body`]).
+pub async fn try_update_scheduled_body(
+    pool: &Pool<Postgres>,
+    edit: &BodyEdit<'_>,
+) -> Result<BodyEditOutcome, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let locked: Option<ScheduledMessageRow> = sqlx::query_as::<_, ScheduledMessageRow>(
+        "SELECT id, guild_id, channel_id, body, next_run_at, interval_seconds, enabled,
+                last_run_at, last_message_id, created_by, created_at, updated_by, updated_at,
+                claim_token, claimed_at, occurrence_nonce,
+                COALESCE(delivery_uncertain, TRUE) AS delivery_uncertain
+           FROM scheduled_messages WHERE guild_id = $1 AND id = $2 FOR UPDATE",
+    )
+    .bind(edit.guild_id)
+    .bind(edit.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(locked) = locked else {
+        tx.rollback().await?;
+        return Ok(BodyEditOutcome::Missing);
+    };
+    if schedule_revision_token(&locked) != edit.expected_revision {
+        tx.rollback().await?;
+        return Ok(BodyEditOutcome::Stale);
+    }
+    if let Some(fence) = edit_fence(&locked) {
+        tx.rollback().await?;
+        return Ok(BodyEditOutcome::Fenced { fence });
+    }
+    if locked.body == edit.body {
+        tx.rollback().await?;
+        return Ok(BodyEditOutcome::Unchanged);
+    }
+    let saved: ScheduledMessageRow = sqlx::query_as::<_, ScheduledMessageRow>(
+        "UPDATE scheduled_messages
+            SET body = $3, updated_by = $4, updated_at = $5
+          WHERE guild_id = $1 AND id = $2
+         RETURNING id, guild_id, channel_id, body, next_run_at, interval_seconds, enabled,
+                   last_run_at, last_message_id, created_by, created_at, updated_by, updated_at,
+                   claim_token, claimed_at, occurrence_nonce,
+                   COALESCE(delivery_uncertain, TRUE) AS delivery_uncertain",
+    )
+    .bind(edit.guild_id)
+    .bind(edit.id)
+    .bind(edit.body)
+    .bind(edit.actor)
+    .bind(edit.now_iso)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO automation_audit_log
+           (id, guild_id, actor_id, action, target_key, outcome, reason, created_at)
+         VALUES ($1, $2, $3, 'scheduled.edit', $4, 'ok', NULL, $5::TEXT::TIMESTAMPTZ)",
+    )
+    .bind(edit.audit_id)
+    .bind(edit.guild_id)
+    .bind(edit.actor)
+    .bind(edit.id)
+    .bind(edit.now_iso)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(BodyEditOutcome::Saved {
+        row: Box::new(saved),
+    })
+}
+
+/// One body-only correction: validated replacement plus the inspect
+/// revision it must still match. Bundled so the write path takes one
+/// argument instead of growing a new waiver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BodyEdit<'a> {
+    pub guild_id: &'a str,
+    pub id: &'a str,
+    pub expected_revision: &'a str,
+    pub body: &'a str,
+    pub actor: &'a str,
+    pub now_iso: &'a str,
+    pub audit_id: &'a str,
+}
+
+/// The armed delivery fence on a locked row, if any. Claim wins over
+/// uncertainty, uncertainty over a bare nonce — the same priority the
+/// inspect view reports, so the refusal always matches what inspect
+/// showed. Legacy NULL uncertainty reads fenced (the readers
+/// `COALESCE` it to TRUE): an unreadable fence fails closed.
+fn edit_fence(row: &ScheduledMessageRow) -> Option<BodyEditFence> {
+    if row.claim_token.is_some() {
+        Some(BodyEditFence::Claim)
+    } else if row.delivery_uncertain {
+        Some(BodyEditFence::Uncertain)
+    } else if row.occurrence_nonce.is_some() {
+        Some(BodyEditFence::Nonce)
+    } else {
+        None
+    }
+}
+
 /// Record a run and compute what happens next (legacy `markScheduledRun`).
 /// A one-shot disables itself; a recurring row advances `next_run_at` from
 /// the run instant so no catch-up burst fires after downtime. Only the claim
@@ -481,6 +726,103 @@ pub async fn audit_scheduled(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn idle_row() -> ScheduledMessageRow {
+        ScheduledMessageRow {
+            id: "aabbccdd001122334455667788990001".to_owned(),
+            guild_id: "2222".to_owned(),
+            channel_id: "3333".to_owned(),
+            body: "Original announcement.".to_owned(),
+            next_run_at: "2030-01-01T00:00:00.000Z".to_owned(),
+            interval_seconds: Some(3600),
+            enabled: true,
+            last_run_at: Some("2026-09-30T00:00:00.000Z".to_owned()),
+            last_message_id: Some("9000".to_owned()),
+            created_by: "77".to_owned(),
+            created_at: "2026-10-01T00:00:00.000Z".to_owned(),
+            updated_by: "77".to_owned(),
+            updated_at: "2026-10-01T00:00:00.000Z".to_owned(),
+            claim_token: None,
+            claimed_at: None,
+            occurrence_nonce: None,
+            delivery_uncertain: false,
+        }
+    }
+
+    #[test]
+    fn revision_token_is_opaque_bounded_and_binds_definition_and_fences() {
+        let token = schedule_revision_token(&idle_row());
+        assert_eq!(token.len(), 64);
+        assert!(token.bytes().all(|b| b.is_ascii_alphanumeric()));
+        assert_eq!(token, schedule_revision_token(&idle_row()));
+        // Every bound field moves the token: body, destination, timing,
+        // recurrence, enabled state, updater facts, last-run evidence and
+        // each delivery fence.
+        let mut moved = idle_row();
+        moved.body = "Corrected announcement.".to_owned();
+        moved.channel_id = "4444".to_owned();
+        moved.next_run_at = "2030-01-01T01:00:00.000Z".to_owned();
+        moved.interval_seconds = Some(7200);
+        moved.enabled = false;
+        moved.updated_by = "88".to_owned();
+        moved.updated_at = "2026-10-24T00:00:00.000Z".to_owned();
+        moved.last_run_at = Some("2026-10-02T00:00:00.000Z".to_owned());
+        moved.last_message_id = Some("9009".to_owned());
+        moved.claim_token = Some("live-claim".to_owned());
+        moved.claimed_at = Some("2030-01-01T00:00:00.000Z".to_owned());
+        moved.occurrence_nonce = Some("live-nonce".to_owned());
+        moved.delivery_uncertain = true;
+        assert_ne!(schedule_revision_token(&moved), token);
+        // One field at a time: no bound field is silently ignored.
+        let mutations: [fn(&mut ScheduledMessageRow); 10] = [
+            |row: &mut ScheduledMessageRow| row.body.push('!'),
+            |row: &mut ScheduledMessageRow| row.channel_id.push('4'),
+            |row: &mut ScheduledMessageRow| row.next_run_at.push('Z'),
+            |row: &mut ScheduledMessageRow| row.interval_seconds = None,
+            |row: &mut ScheduledMessageRow| row.enabled = false,
+            |row: &mut ScheduledMessageRow| row.updated_at.push('Z'),
+            |row: &mut ScheduledMessageRow| row.last_message_id = None,
+            |row: &mut ScheduledMessageRow| {
+                row.claim_token = Some("c".to_owned());
+            },
+            |row: &mut ScheduledMessageRow| {
+                row.occurrence_nonce = Some("n".to_owned());
+            },
+            |row: &mut ScheduledMessageRow| row.delivery_uncertain = true,
+        ];
+        for mutate in mutations {
+            let mut row = idle_row();
+            mutate(&mut row);
+            assert_ne!(
+                schedule_revision_token(&row),
+                token,
+                "revision must bind the mutated field"
+            );
+        }
+    }
+
+    #[test]
+    fn fence_details_name_the_armed_delivery_state() {
+        assert_eq!(BodyEditFence::Claim.detail(), "a delivery claim is active");
+        assert_eq!(
+            BodyEditFence::Nonce.detail(),
+            "an occurrence nonce is still pending"
+        );
+        assert_eq!(BodyEditFence::Uncertain.detail(), "delivery is uncertain");
+        assert!(edit_fence(&idle_row()).is_none());
+        let mut claimed = idle_row();
+        claimed.claim_token = Some("c".to_owned());
+        claimed.delivery_uncertain = true;
+        claimed.occurrence_nonce = Some("n".to_owned());
+        assert_eq!(edit_fence(&claimed), Some(BodyEditFence::Claim));
+        let mut uncertain = idle_row();
+        uncertain.delivery_uncertain = true;
+        uncertain.occurrence_nonce = Some("n".to_owned());
+        assert_eq!(edit_fence(&uncertain), Some(BodyEditFence::Uncertain));
+        let mut nonce = idle_row();
+        nonce.occurrence_nonce = Some("n".to_owned());
+        assert_eq!(edit_fence(&nonce), Some(BodyEditFence::Nonce));
+    }
 
     #[tokio::test]
     async fn empty_and_overlong_prefixes_refuse_before_database_access() {

@@ -78,10 +78,11 @@ use PolicyHook::{
 /// no help command), the Next-only `/privacy` member self-serve
 /// (parity row 32), management-only `/command-inspect` (parity row 33),
 /// `/reopen` picker recovery (parity row 34), the private moderation reads
-/// `/purge-preview` (row 35) and `/channel-inspect` (row 36), and `/giveaway`
-/// timed entry (parity row 37).
+/// `/purge-preview` (row 35) and `/channel-inspect` (row 36), `/giveaway`
+/// timed entry (parity row 37), and the private schedule management reads
+/// `/schedule-inspect` (row 38) and `/schedule-edit` (row 39).
 /// No Administrator-only exception: preserve the legacy resolved-bit check.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 37] = [
+pub const COMMAND_PERMISSIONS: [CommandPermission; 39] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),
@@ -156,6 +157,14 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 37] = [
     row(17, "schedule", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(18, "schedule-remove", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(19, "schedule-list", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(
+        38,
+        "schedule-inspect",
+        BuiltinSlash,
+        PERM_MANAGE_GUILD,
+        None,
+    ),
+    row(39, "schedule-edit", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(20, "sticky", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(21, "sticky-remove", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(22, "<custom>", DynamicSlash, 0, Some(AutomationsEnabled)),

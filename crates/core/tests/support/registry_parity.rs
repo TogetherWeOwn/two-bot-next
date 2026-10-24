@@ -43,6 +43,8 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("giveaway", "docs/parity.md §1 giveaway"),
     ("purge-preview", "docs/parity.md §1 purge-preview"),
     ("channel-inspect", "docs/parity.md §1 channel-inspect"),
+    ("schedule-inspect", "docs/parity.md §1 #19 inspect"),
+    ("schedule-edit", "docs/parity.md §1 #19 body correction"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -600,6 +602,55 @@ pub fn expected_registry() -> Value {
         )
         .expect("page option serializes");
         command["options"] = json!([page]);
+    }
+    // Additive management surface; never rewrite the frozen legacy payload or
+    // relax the comparison for any existing command or option.
+    let after_list = commands
+        .iter()
+        .position(|c| c["name"] == "schedule-list")
+        .expect("schedule-list remains published")
+        + 1;
+    let additions = [
+        CommandDefinition::new("schedule-inspect", "Inspect a saved scheduled message")
+            .permissions(32)
+            .options(vec![
+                CommandOption::new("id", "Scheduled message id", CommandOptionType::String)
+                    .required()
+                    .max_length(128),
+                CommandOption::new(
+                    "view",
+                    "metadata (default) or body",
+                    CommandOptionType::String,
+                )
+                .max_length(8),
+            ]),
+        CommandDefinition::new("schedule-edit", "Correct only a scheduled message body")
+            .permissions(32)
+            .options(vec![
+                CommandOption::new("id", "Scheduled message id", CommandOptionType::String)
+                    .required()
+                    .max_length(128),
+                CommandOption::new(
+                    "revision",
+                    "Revision from schedule-inspect",
+                    CommandOptionType::String,
+                )
+                .required()
+                .max_length(128),
+                CommandOption::new(
+                    "body",
+                    "Replacement message text",
+                    CommandOptionType::String,
+                )
+                .required()
+                .max_length(2000),
+            ]),
+    ];
+    for (offset, definition) in additions.into_iter().enumerate() {
+        commands.insert(
+            after_list + offset,
+            serde_json::to_value(definition).expect("management definition serializes"),
+        );
     }
     canonical_registry(json!(commands))
 }
