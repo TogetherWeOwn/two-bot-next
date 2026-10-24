@@ -78,16 +78,18 @@ use PolicyHook::{
 /// no help command), the Next-only `/privacy` member self-serve
 /// (parity row 32), management-only `/command-inspect` (parity row 33),
 /// `/reopen` picker recovery (parity row 34), the private moderation reads
-/// `/purge-preview` (row 35) and `/channel-inspect` (row 36), and `/giveaway`
-/// timed entry (parity row 37).
+/// `/purge-preview` (row 35) and `/channel-inspect` (row 36), `/giveaway`
+/// timed entry (parity row 37), and the `/welcome-preview` admin preview
+/// (parity row 38).
 /// No Administrator-only exception: preserve the legacy resolved-bit check.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 37] = [
+pub const COMMAND_PERMISSIONS: [CommandPermission; 38] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),
     row(32, "privacy", BuiltinSlash, 0, None),
     row(34, "reopen", BuiltinSlash, 0, None),
     row(37, "giveaway", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(38, "welcome-preview", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(
         3,
         "ban",

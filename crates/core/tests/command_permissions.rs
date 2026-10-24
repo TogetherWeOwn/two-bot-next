@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use two_bot_core::command_permissions::{
     command_permission, CommandSurface, PolicyHook, COMMAND_PERMISSIONS,
 };
+use two_bot_core::commands::PERM_MANAGE_GUILD;
 use two_bot_core::{
     CustomCommand, HandlerId, InteractionRouter, ModerationAction, RouterGates, SlashContext,
     SlashOutcome,
@@ -95,25 +96,26 @@ fn all_30_rows_equal_parity_section1() {
     // (parity row 31 — legacy has no help command), `/privacy` member
     // self-serve (row 32), management-only `/command-inspect` (row 33),
     // `/reopen` picker recovery (row 34), `/purge-preview` (35),
-    // `/channel-inspect` (36) and `/giveaway` timed entry (row 37).
-    // No Next-only row appears in the legacy §1 table above; the
-    // registry-equality test below covers every published builtin instead.
-    assert_eq!(COMMAND_PERMISSIONS.len(), 37);
+    // `/channel-inspect` (36), `/giveaway` timed entry (row 37) and admin
+    // `/welcome-preview` (row 38). No Next-only row appears in the legacy
+    // §1 table above; the registry-equality test below covers every
+    // published builtin instead.
+    assert_eq!(COMMAND_PERMISSIONS.len(), 38);
     assert_eq!(
         COMMAND_PERMISSIONS
             .iter()
             .map(|row| row.command)
             .collect::<HashSet<_>>()
             .len(),
-        37
+        38
     );
     assert_eq!(
         COMMAND_PERMISSIONS
             .iter()
             .map(|row| row.parity_row)
             .collect::<HashSet<_>>(),
-        (1..=37).collect::<HashSet<_>>(),
-        "parity rows are contiguous 1..=37"
+        (1..=38).collect::<HashSet<_>>(),
+        "parity rows are contiguous 1..=38"
     );
     let help = command_permission("help").expect("help has a permission row");
     assert_eq!(help.required_permissions, 0);
@@ -133,6 +135,11 @@ fn all_30_rows_equal_parity_section1() {
     assert_eq!(giveaway.required_permissions, 32, "ManageGuild bit");
     assert_eq!(giveaway.surface, CommandSurface::BuiltinSlash);
     assert_eq!(giveaway.policy_hook, None);
+    let preview =
+        command_permission("welcome-preview").expect("welcome-preview has a permission row");
+    assert_eq!(preview.parity_row, 38);
+    assert_eq!(preview.required_permissions, PERM_MANAGE_GUILD);
+    assert_eq!(preview.surface, CommandSurface::BuiltinSlash);
 }
 
 #[test]
@@ -162,7 +169,7 @@ fn permission_table_equals_the_complete_published_registry() {
         .iter()
         .filter(|row| row.surface == CommandSurface::BuiltinSlash)
         .collect();
-    assert_eq!(builtins.len(), 34);
+    assert_eq!(builtins.len(), 35);
     assert_eq!(published.len(), builtins.len() + 1);
     for row in builtins {
         let definition = published
@@ -286,7 +293,7 @@ fn every_routed_builtin_name_has_a_permission_row() {
             other => panic!("{name} is published or retained but does not route: {other:?}"),
         }
     }
-    assert_eq!(routed, 34, "every retained builtin routes");
+    assert_eq!(routed, 35, "every retained builtin routes");
 }
 
 #[test]

@@ -22,6 +22,10 @@ use two_bot_discord::{route_interaction, ActionExecutor, RoutedInteraction};
 
 use crate::gateway::GatewayPipeline;
 
+#[path = "welcome_preview.rs"]
+mod welcome_preview;
+pub(crate) use welcome_preview::{is_preview_control, owns_welcome_preview};
+
 const CONFIG_KEYS: &[&str] = &[
     "DISCORD_GUILD_ID",
     "TWO_ONBOARDING_MODE",
@@ -360,7 +364,9 @@ impl OnboardingRuntime {
     /// after defer; hot configuration cannot delay the initial acknowledgement.
     /// The `/reopen` self-service slash rides the same capture so a member
     /// whose welcome is lost can open a fresh menu through the same
-    /// defer-first pipeline as the picker components.
+    /// defer-first pipeline as the picker components, as does the admin
+    /// `/welcome-preview` rendering (including its private refusal, which
+    /// must defer before any authorization guidance).
     #[cfg(test)]
     pub fn accepts_interaction(&self, interaction: &Interaction) -> bool {
         self.resolve_interaction(interaction).is_some()
@@ -369,6 +375,9 @@ impl OnboardingRuntime {
     /// Use the executor's confirmed slash identity before taking ownership, and
     /// retain the canonical payload for ingress and post-commit processing.
     /// Component payloads pass through the shared resolver unchanged.
+    /// Unresolvable slashes stay silent here exactly like shared dispatch, so
+    /// both consumers agree on who owns a slash even when the payload name is
+    /// stale.
     pub(crate) fn resolve_interaction<'a>(
         &self,
         interaction: &'a Interaction,
@@ -395,20 +404,32 @@ impl OnboardingRuntime {
             .as_ref()
             .and_then(|member| member.user.as_ref())
             .is_some_and(|user| !user.bot)
-            && matches!(
-                route_interaction(&router, &interaction, None),
-                RoutedInteraction::Component {
-                    outcome: ComponentOutcome::Handled {
-                        handler: ComponentHandler::GamePicker | ComponentHandler::SessionPicker
-                    },
-                    ..
-                } | RoutedInteraction::Slash {
-                    outcome: SlashOutcome::Handled {
-                        handler: HandlerId::Reopen
-                    },
-                    ..
-                }
-            );
+            && (if owns_welcome_preview(&interaction) {
+                // Refusals belong here too: defer before private authorization
+                // guidance, but never read settings for a non-admin.
+                !matches!(
+                    route_interaction(&router, &interaction, None),
+                    RoutedInteraction::Slash {
+                        outcome: two_bot_core::SlashOutcome::Ignore,
+                        ..
+                    } | RoutedInteraction::Ignore
+                )
+            } else {
+                matches!(
+                    route_interaction(&router, &interaction, None),
+                    RoutedInteraction::Component {
+                        outcome: ComponentOutcome::Handled {
+                            handler: ComponentHandler::GamePicker | ComponentHandler::SessionPicker
+                        },
+                        ..
+                    } | RoutedInteraction::Slash {
+                        outcome: SlashOutcome::Handled {
+                            handler: HandlerId::Reopen
+                        },
+                        ..
+                    }
+                )
+            });
         eligible.then_some(interaction)
     }
 
@@ -437,6 +458,14 @@ impl OnboardingRuntime {
         &self,
         interaction: &Interaction,
     ) -> Result<(), RuntimeError> {
+        if owns_welcome_preview(interaction) {
+            return self
+                .preview_guidance(
+                    interaction,
+                    "I couldn't confirm this preview. Please try again. No delivery was attempted.",
+                )
+                .await;
+        }
         self.reply(
             interaction,
             "I couldn't confirm this interaction. Your selection may already have been processed, so I won't apply it again. Please open the menu and try again.",
@@ -453,6 +482,12 @@ impl OnboardingRuntime {
             return Ok(());
         };
         let interaction = interaction.as_ref();
+        if owns_welcome_preview(interaction) {
+            return self.welcome_preview(interaction, now_ms).await;
+        }
+        if welcome_preview::is_preview_control(interaction) {
+            return self.reply(interaction, "This menu is a preview, not a delivery. No selection was applied. Use the newcomer menu for real selections.").await;
+        }
         let occurred_at = two_bot_core::funnel::format_iso_millis(now_ms);
         // Configuration/settings failures are inside the post-defer boundary.
         // A successful error edit is terminal, with no role or success writes.

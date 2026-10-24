@@ -681,3 +681,12 @@ Record a warning for a member
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `target` | user | true | — | — | — | — | Member to moderate |
 | `reason` | string | true | — | — | 512 | — | Mandatory audit reason |
+
+## `/welcome-preview`
+
+Privately preview the current welcome for a synthetic newcomer. No delivery.
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+No options.

@@ -606,6 +606,7 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
                 "help",
                 "privacy",
                 "reopen",
+                "welcome-preview",
                 "attendance"
             ],
             "publish the narrowed shared registry exactly once, nothing withheld or extra"

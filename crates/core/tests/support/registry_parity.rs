@@ -41,6 +41,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("reopen", "docs/parity.md §1 reopen"),
     ("command-inspect", "docs/parity.md §1 command-inspect"),
     ("giveaway", "docs/parity.md §1 giveaway"),
+    ("welcome-preview", "docs/parity.md §1 welcome preview"),
     ("purge-preview", "docs/parity.md §1 purge-preview"),
     ("channel-inspect", "docs/parity.md §1 channel-inspect"),
 ];
@@ -266,6 +267,15 @@ pub fn expected_registry() -> Value {
     )
     .expect("reopen serializes");
     commands.insert(4, reopen);
+    let welcome_preview = serde_json::to_value(
+        CommandDefinition::new(
+            "welcome-preview",
+            "Privately preview the current welcome for a synthetic newcomer. No delivery.",
+        )
+        .permissions(32),
+    )
+    .expect("welcome preview serializes");
+    commands.insert(5, welcome_preview);
     // Next-only saved-response inspection. This independent literal pins the
     // whole publication contract; never manufacture it from production shapes.
     let inspect = json!({

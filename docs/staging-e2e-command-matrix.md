@@ -9,9 +9,9 @@ the harness slices define HOW it runs. Derived from code, not from a guild:
 The `e2e_matrix_coverage` integration test fails when a command ships without
 a matrix row and when this doc drops one.
 
-Scope: 34 built-in slash commands (core + scorecard + automation +
+Scope: 35 built-in slash commands (core + scorecard + automation +
 announcement + moderation — the commands `docs/commands.md` renders ahead of
-the voice set; with the voice gates on it renders 55). No guild was
+the voice set; with the voice gates on it renders 56). No guild was
 touched, no staging secrets used, no credentials created.
 
 Staging env the live suite needs: `TWO_COMMUNITY_SCORECARD=1`,
@@ -37,6 +37,7 @@ guild.`), all other builtins stay silent (`Ignore`); stale or unknown names
 | 31 | `/help` | always | Everyone | Immediate ephemeral list of the live published commands, grouped by audience with permission hints (no defer, no store read) | — |
 | 32 | `/privacy` | always | Everyone | Deferred ephemeral reply; analytics `opt-out` purges the invoker's guild rows plus suppression plus one audit receipt, `opt-in` clears suppression, `status` reports suppression plus guild switches; `delete` queues the invoker's erasure request (fresh requests acknowledge as pending; same-interaction retries reuse the request and direct the member to status), and deletion status/receipt reads bind to the same invoker and guild | subcommand required (`opt-out`/`opt-in`/`status`/`delete`/`deletion-status`/`deletion-receipt`); request id required for `deletion-status` and `deletion-receipt`; guild-only |
 | 34 | `/reopen` | always | Everyone | Deferred ephemeral reply; a fresh private games or session menu built from current roles and current configured picks, with zero role, channel or funnel writes | `kind` required (`games`/`session`); unavailable kinds and failed lookups get private no-effect guidance, guild-only |
+| 38 | `/welcome-preview` | always | ManageGuild | Deferred private configuration preview through the live renderer for roleless synthetic newcomer `765432109876543210`; no delivery or member lookup | `ManageServerRequired`; disabled or invalid configuration gets private no-effect/retry guidance |
 | 12 | `/attendance` | `TWO_COMMUNITY_SCORECARD` | ManageEvents | Ephemeral confirmation/refusal; records verified attendee | `ScorecardDisabled`, `ManageEventsRequired`, `event-occurrence` required ≤128, `member` required |
 | 14 | `/command` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral confirmation + audit row | `AutomationsDisabled`, `ManageServerRequired`, `name`/`template` required |
 | 15 | `/command-remove` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral confirmation + audit row | `AutomationsDisabled`, `ManageServerRequired`, `name` required |
@@ -76,7 +77,7 @@ unknown metadata never becomes a claim that no restriction exists.
 
 ## Voice slice: vote-kick, setup/import (CI-proven handlers; staging round-trip UNPROVEN)
 
-The `TWO_VOICE` slice stays out of the live 33-row suite above. Its handlers
+The `TWO_VOICE` slice stays out of the live 35-row suite above. Its handlers
 are proven deterministically in CI with constructed interaction inputs and no
 guild, network, or database. The user-originated staging round-trip is
 UNPROVEN: a bot token cannot invoke slash commands or click components, so no

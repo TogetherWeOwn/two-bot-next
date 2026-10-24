@@ -1,6 +1,6 @@
 {
   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
-  "count": 34,
+  "count": 35,
   "dm_permission_all_false": true,
   "commands": [
     {
@@ -189,6 +189,18 @@
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Next-only self-service picker recovery with no legacy counterpart; the defer-first menu open and zero-mutation contract are pinned by the onboarding disposable-database acceptance tests rather than the live smoke five."
+    },
+    {
+      "name": "welcome-preview",
+      "description": "Privately preview the current welcome for a synthetic newcomer. No delivery.",
+      "family": "core",
+      "gate": "always",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Next-only private fixture rendering, pinned against a real-join render and zero writes with a disposable database rather than the live smoke five."
     },
     {
       "name": "attendance",

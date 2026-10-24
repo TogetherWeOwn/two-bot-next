@@ -34,7 +34,8 @@ use crate::commands::{
 /// must set on staging for the command to be published at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum E2eGate {
-    /// Always published (`rank`, `leaderboard`, `help`, `privacy`, `reopen`).
+    /// Always published (`rank`, `leaderboard`, `help`, `privacy`, `reopen`,
+    /// `welcome-preview`).
     Always,
     /// `TWO_COMMUNITY_SCORECARD=1`.
     Scorecard,
@@ -122,7 +123,7 @@ const fn row(
 //   staff protection, bot hierarchy, actor hierarchy, in that order.
 // - `Valid:<FIELD>:<BOUNDS>` — option validation before any side effect.
 
-/// The 34-row contract in publish order (core, scorecard, automation,
+/// The 35-row contract in publish order (core, scorecard, automation,
 /// announcement, moderation). The coverage test asserts this is exactly the
 /// all-gates-on [`crate::router::InteractionRouter::publish_set`].
 #[must_use]
@@ -180,6 +181,16 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             "Reopen",
             "Deferred ephemeral reply; a fresh games or session menu edit for the invoker only, built from current roles and current configured picks with zero role, channel or funnel writes. Disabled kinds, malformed invocations and failed lookups get a private no-effect guidance edit instead of a menu.",
             &["Valid:kind:required,games|session"],
+        ),
+        row(
+            "welcome-preview",
+            38,
+            E2eGate::Always,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "WelcomePreview",
+            "Deferred private preview of the current welcome and picker for a fixed synthetic newcomer; no delivery, member lookup or state mutation. Disabled or invalid configuration returns private guidance.",
+            &["Perm:ManageServerRequired"],
         ),
         row(
             "attendance",
