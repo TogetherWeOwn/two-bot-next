@@ -63,6 +63,8 @@ mod ownership_receipt_acceptance;
 mod private;
 #[path = "voice_responder_admission_acceptance_tests.rs"]
 mod responder_admission_acceptance;
+#[path = "voice_setup_access_paging_acceptance_tests.rs"]
+mod setup_access_paging_acceptance;
 #[path = "voice_rooms_sink_tests.rs"]
 mod sink;
 #[path = "voice_snapshot_fence_acceptance_tests.rs"]
