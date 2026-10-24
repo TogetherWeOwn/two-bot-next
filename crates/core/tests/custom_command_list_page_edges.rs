@@ -79,6 +79,37 @@ fn list_page_exact_utf16_ceiling_keeps_the_entire_row_and_footer() {
 }
 
 #[test]
+fn list_page_two_whole_rows_at_exact_boundary_split_only_after_one_more_utf16_unit() {
+    // Two 987-unit names + two six-unit row frames + newline + 13-unit footer.
+    // The astral second name prevents substituting scalar or UTF-8 byte counts.
+    let first = "a".repeat(987);
+    let second = format!("{}x", "😀".repeat(493));
+    let exact = format!("/{first} — on\n/{second} — on\n\nPage 1 of 1");
+    assert_eq!(exact.encode_utf16().count(), 2000);
+    let mut rows = vec![
+        row(first.clone(), None, true),
+        row(second.clone(), None, true),
+    ];
+    assert_eq!(format_command_list_page(&rows, 1), Ok(exact));
+    assert!(format_command_list_page(&rows, 2).is_err());
+
+    rows[1].name.push('x');
+    let page_one = format_command_list_page(&rows, 1).expect("whole first row");
+    let page_two = format_command_list_page(&rows, 2).expect("whole second row");
+    assert_page_metadata(&page_one, 1, 2);
+    assert_page_metadata(&page_two, 2, 2);
+    assert_eq!(
+        page_one.split_once("\n\n").expect("footer").0,
+        format!("/{first} — on")
+    );
+    assert_eq!(
+        page_two.split_once("\n\n").expect("footer").0,
+        format!("/{second}x — on")
+    );
+    assert!(format_command_list_page(&rows, 3).is_err());
+}
+
+#[test]
 fn list_page_mixed_rows_survive_every_page_once_in_input_order() {
     let mut rows = Vec::new();
     let mut expected = Vec::new();
