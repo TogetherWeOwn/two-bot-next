@@ -1510,10 +1510,14 @@ mod tests {
         // always-present Try usage lists every valid option name, so a bare
         // `contains` would stay green if the refusal stopped naming the
         // offending option.
+        //
+        // Value refusals reuse the domain copy (`"reason" must be ...`), so
+        // the quoted name may lead the segment instead of `option`.
         let quoted = format!("option \"{offending}\"");
+        let domain = format!("\"{offending}\" must be");
         assert!(
-            reply.contains(&quoted),
-            "{verb}: refusal names {quoted}, got {reply:?}"
+            reply.contains(&quoted) || reply.contains(&domain),
+            "{verb}: refusal names {quoted} or {domain}, got {reply:?}"
         );
         assert_strict_unit_refusal_shape(reply, verb);
     }
