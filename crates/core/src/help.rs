@@ -136,6 +136,12 @@ const HELP_GROUPS: &[HelpGroup] = &[
         anchor: None,
     },
     HelpGroup {
+        title: "Game activity (private, live guild unavailable)",
+        requires: Some("Manage Server"),
+        commands: &["game-mix"],
+        anchor: None,
+    },
+    HelpGroup {
         title: "Voice rooms",
         requires: None,
         commands: &[
@@ -750,12 +756,13 @@ mod tests {
                 "{token} appears exactly once"
             );
         }
-        // 27 legacy builtins plus Next-only help, privacy, command-inspect,
-        // reopen, purge-preview and channel-inspect commands, plus the 21
-        // gated voice commands (voice `kick` loses first-wins to moderation
-        // `/kick`; `/templateassistant` stays unpublished until its slice
-        // lands): matches the regenerated `docs/commands.md` total.
-        assert!(text.contains("**Server commands** (54 live)"));
+        // 27 legacy builtins plus the Next-only help, privacy,
+        // command-inspect, reopen, game-mix, purge-preview and
+        // channel-inspect, plus the 21 gated voice commands (voice `kick`
+        // loses first-wins to moderation `/kick`; `/templateassistant`
+        // stays unpublished until its slice lands): matches the
+        // regenerated `docs/commands.md` total.
+        assert!(text.contains("**Server commands** (55 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"
@@ -809,7 +816,7 @@ mod tests {
         });
         let defs = off.publish_set(&[]).expect("core-only set");
         let text = help_text(&defs);
-        assert!(text.contains("**Server commands** (5 live)"));
+        assert!(text.contains("**Server commands** (6 live)"));
         assert!(text.contains("/rank"));
         assert!(text.contains("/help"));
         assert!(!text.contains("Automations"));
@@ -877,16 +884,18 @@ mod tests {
             .iter()
             .flat_map(|g| g.commands.iter().copied())
             .collect();
-        // 27 legacy builtins plus six Next-only commands, then the 21
-        // voice names (voice `kick` shares the Kick group).
+        // 27 legacy builtins plus seven Next-only commands (help, privacy,
+        // command-inspect, reopen, game-mix, purge-preview, channel-inspect),
+        // then the 21 voice names (voice `kick` shares the Kick group).
         // `/templateassistant` stays out until its slice lands.
-        assert_eq!(grouped.len(), 54);
+        assert_eq!(grouped.len(), 55);
         for name in [
             "rank",
             "leaderboard",
             "help",
             "privacy",
             "reopen",
+            "game-mix",
             "attendance",
             "command",
             "schedule-list",

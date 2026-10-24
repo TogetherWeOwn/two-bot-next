@@ -95,24 +95,31 @@ fn all_30_rows_equal_parity_section1() {
     // (parity row 31 — legacy has no help command), the Next-only
     // `/privacy` member self-serve (parity row 32), `/command-inspect`
     // management inspection (parity row 33), `/reopen` picker recovery
-    // (parity row 34), `/purge-preview` (35) and `/channel-inspect` (36).
-    // No Next-only row appears in the legacy §1 table above; the
-    // registry-equality test below covers every published builtin instead.
-    assert_eq!(COMMAND_PERMISSIONS.len(), 36);
+    // (parity row 34), `/purge-preview` (35), `/channel-inspect` (36) and
+    // staff-only `/game-mix` (row 37). No Next-only row appears in the
+    // legacy §1 table above; the registry-equality test below covers every
+    // published builtin instead.
+    assert_eq!(COMMAND_PERMISSIONS.len(), 37);
     assert_eq!(
         COMMAND_PERMISSIONS
             .iter()
             .map(|row| row.command)
             .collect::<HashSet<_>>()
             .len(),
-        36
+        37
     );
     let help = command_permission("help").expect("help has a permission row");
     assert_eq!(help.required_permissions, 0);
     assert_eq!(help.surface, CommandSurface::BuiltinSlash);
     let reopen = command_permission("reopen").expect("reopen has a permission row");
+    assert_eq!(reopen.parity_row, 34);
     assert_eq!(reopen.required_permissions, 0);
     assert_eq!(reopen.surface, CommandSurface::BuiltinSlash);
+    let game_mix = command_permission("game-mix").expect("game-mix has a permission row");
+    assert_eq!(game_mix.parity_row, 37);
+    assert_eq!(game_mix.required_permissions, 32);
+    assert_eq!(game_mix.surface, CommandSurface::BuiltinSlash);
+    assert_eq!(game_mix.policy_hook, None);
 }
 
 #[test]
@@ -142,7 +149,7 @@ fn permission_table_equals_the_complete_published_registry() {
         .iter()
         .filter(|row| row.surface == CommandSurface::BuiltinSlash)
         .collect();
-    assert_eq!(builtins.len(), 33);
+    assert_eq!(builtins.len(), 34);
     assert_eq!(published.len(), builtins.len() + 1);
     for row in builtins {
         let definition = published
@@ -187,9 +194,19 @@ fn every_retained_command_rechecks_resolved_permissions_before_returning_a_handl
             // Even a same-named enabled custom row cannot bypass a builtin.
             custom_row: Some(true),
         };
-        for permissions in [None, Some(0), Some(1 << 3), Some(!row.required_permissions)] {
+        for permissions in [
+            None,
+            Some(0),
+            Some(1 << 3),
+            Some(!row.required_permissions),
+            Some(!(row.required_permissions | (1 << 3))),
+        ] {
             let outcome = router.route_slash(&ctx(permissions));
-            if row.required_permissions == 0 {
+            // Only game-mix accepts Administrator without its advertised bit;
+            // every legacy command retains the same exact-bit runtime check.
+            let game_mix_admin =
+                row.command == "game-mix" && permissions.is_some_and(|bits| bits & (1 << 3) != 0);
+            if row.required_permissions == 0 || game_mix_admin {
                 assert!(
                     matches!(outcome, SlashOutcome::Handled { .. }),
                     "{}: {outcome:?}",
@@ -266,7 +283,7 @@ fn every_routed_builtin_name_has_a_permission_row() {
             other => panic!("{name} is published or retained but does not route: {other:?}"),
         }
     }
-    assert_eq!(routed, 33, "every retained builtin routes");
+    assert_eq!(routed, 34, "every retained builtin routes");
 }
 
 #[test]

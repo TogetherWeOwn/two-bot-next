@@ -71,7 +71,9 @@ fn matching_registry() -> Value {
         object.insert("guild_id".into(), json!(GUILD_ID.to_string()));
         object.insert("version".into(), json!("9876"));
         object.insert("nsfw".into(), json!(false));
-        object.insert("default_member_permissions".into(), Value::Null);
+        object
+            .entry("default_member_permissions")
+            .or_insert(Value::Null);
         object.insert("name_localizations".into(), json!({}));
         object.insert("description_localizations".into(), json!({}));
         object.entry("options").or_insert(json!([]));

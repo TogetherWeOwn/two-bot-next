@@ -283,7 +283,8 @@ pub const PERM_MANAGE_EVENTS: u64 = 8589934592;
 /// plus the Next-only `/help` discovery surface — legacy has no help command,
 /// see the `help` row in the registry golden exceptions — plus the Next-only
 /// `/privacy` member self-serve for analytics privacy and deletion requests,
-/// plus the Next-only `/reopen` self-service picker recovery).
+/// the Next-only `/reopen` self-service picker recovery, and the Next-only
+/// `/game-mix` private staff aggregate read).
 #[must_use]
 pub fn core_commands() -> Vec<CommandDefinition> {
     vec![
@@ -369,6 +370,11 @@ pub fn core_commands() -> Vec<CommandDefinition> {
                     },
                 ]),
         ]),
+        CommandDefinition::new(
+            "game-mix",
+            "Show this server's aggregate game activity.",
+        )
+        .permissions(PERM_MANAGE_GUILD),
     ]
 }
 
@@ -581,10 +587,10 @@ mod tests {
                 }
             }
             let actual = merge_commands(&[builtins, duplicates], &custom);
-            // 5 core (rank, leaderboard, help, privacy, reopen) plus the
+            // 6 core (rank, leaderboard, help, privacy, reopen, game-mix) plus the
             // generated builtins; the duplicated slice adds no new names.
-            if builtin_count + 5 > 100 {
-                prop_assert_eq!(actual, Err(RegistryError::BuiltinLimit(builtin_count + 5)));
+            if builtin_count + 6 > 100 {
+                prop_assert_eq!(actual, Err(RegistryError::BuiltinLimit(builtin_count + 6)));
             } else if expected.len() > 100 {
                 prop_assert_eq!(actual, Err(RegistryError::TotalLimit(expected.len())));
             } else {
@@ -622,6 +628,7 @@ mod tests {
                 "help",
                 "privacy",
                 "reopen",
+                "game-mix",
                 "rsvp",
                 "faq"
             ]
@@ -638,8 +645,8 @@ mod tests {
         )];
         let rsvp_totals = vec![CommandDefinition::new("attendance", "Show RSVP totals")];
         let merged = merge_commands(&[scorecard, rsvp_totals], &[]).expect("merges");
-        assert_eq!(merged.len(), 6); // rank, leaderboard, help, privacy, reopen, attendance×1
-        assert_eq!(merged[5].description, "Record a verified attendee");
+        assert_eq!(merged.len(), 7); // rank, leaderboard, help, privacy, reopen, game-mix, attendance×1
+        assert_eq!(merged[6].description, "Record a verified attendee");
     }
 
     #[test]
@@ -670,18 +677,26 @@ mod tests {
         let names: Vec<_> = merged.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
             names,
-            ["rank", "leaderboard", "help", "privacy", "reopen", "faq"]
+            [
+                "rank",
+                "leaderboard",
+                "help",
+                "privacy",
+                "reopen",
+                "game-mix",
+                "faq"
+            ]
         );
     }
 
     #[test]
     fn builtin_limit_enforced() {
-        // 5 core + 96 fillers = 101: one past the ceiling.
+        // 6 core + 96 fillers = 102: one past the ceiling.
         let extra: Vec<CommandDefinition> = (0..96)
             .map(|i| CommandDefinition::new(&format!("cmd-{i}"), "filler"))
             .collect();
         let err = merge_commands(&[extra], &[]).expect_err("must exceed 100");
-        assert!(matches!(err, RegistryError::BuiltinLimit(101)));
+        assert!(matches!(err, RegistryError::BuiltinLimit(102)));
     }
 
     #[test]

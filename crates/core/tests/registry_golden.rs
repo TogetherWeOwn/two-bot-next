@@ -102,6 +102,13 @@ fn diff_detects_each_kind_of_unlisted_drift_including_exception_bodies() {
         ("leaderboard", "/description", json!("Changed copy")),
         ("leaderboard", "/dm_permission", json!(true)),
         ("leaderboard", "/type", json!(2)),
+        ("game-mix", "/default_member_permissions", json!("8")),
+        ("game-mix", "/dm_permission", json!(true)),
+        (
+            "game-mix",
+            "/options",
+            json!([{"name": "guild", "type": 3}]),
+        ),
     ];
     for (name, pointer, replacement) in mutations {
         let mut actual = canonical_registry(next_registry());

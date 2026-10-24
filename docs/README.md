@@ -124,7 +124,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Feed domain](feeds-port.md)
 - [EventSub operations](eventsub-runbook.md)
 - [Stream funnel](stream-funnel.md)
-- [Game activity report](game-activity-report.md)
+- [Staff game mix report](game-activity-report.md)
 - [Redirect safety](redirect-configuration.md)
 - [Scheduled queue order](schedule-queue-order.md)
 - [Scheduled skip tests](scheduled-events-skip-acceptance.md)

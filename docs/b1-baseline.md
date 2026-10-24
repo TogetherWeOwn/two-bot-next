@@ -132,7 +132,7 @@ unpacked snapshots and is logged separately, not compared to that ceiling.
 See [Docker's store documentation](https://docs.docker.com/engine/storage/containerd/)
 and [Moby's layer-history implementation](https://github.com/moby/moby/blob/master/daemon/containerd/image_history.go).
 The 112 MiB image ceiling is unchanged. The binary budget was 15 MiB at the
-2026-10-01 calibration and is now 17 MiB (2026-10-17 recalibration below);
+2026-10-01 calibration and is now 18 MiB (2026-10-24 recalibration below);
 the 2026-10-10 measurements record the tighter tripwire it replaced.
 
 Measured on 2026-09-30 in [PR #78's hosted container job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36770739970/job/110076173793)
@@ -182,6 +182,18 @@ dependencies and the same minimal release profile. The budget is therefore
 rebumped to 17 MiB, leaving about 1 MiB of headroom above the measured heads;
 revisit if the binary approaches it. The 112 MiB image ceiling is unchanged.
 
+On 2026-10-24 the 17 MiB ceiling was reached on main itself: main at
+`cc07f31436` measured 17,845,208 bytes (17.02 MiB), 19,416 bytes over the
+ceiling, in [its container smoke
+job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/40061835103/job/120785881426).
+The staff game-mix slice head (`6a412c6a86`) measured 17,862,000 bytes
+(17.03 MiB), 36,208 over, in [its container smoke
+job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/40040240318/job/120711266282),
+with no new dependencies and the same minimal release profile (opt-level=z,
+lto, strip). The budget is therefore rebumped to 18 MiB, leaving about 1 MiB
+of headroom above the measured heads; revisit if the binary approaches it.
+The 112 MiB image ceiling is unchanged (43.46 MiB measured on this head).
+
 This branch's automation-only head separately measured 15,769,872 bytes
 (15.04 MiB) before the event-executor merge. This PR raises the binary
 ceiling to 17 MiB; the combined exact-head CI measurement is still
@@ -223,7 +235,7 @@ The unused streamed-archive helper and its archive-specific builders/tests
 have been removed in favor of main's history metric; the smoke/runtime
 contract fixtures remain.
 
-The 112 MiB image ceiling is unchanged; the release-binary ceiling is 17 MiB
+The 112 MiB image ceiling is unchanged; the release-binary ceiling is 18 MiB
 (see the current calibration above). CI on this PR's exact head must still
 record the corrected image size and pass the runtime contract and both
 one-byte-budget negative checks; fixture success alone cannot establish

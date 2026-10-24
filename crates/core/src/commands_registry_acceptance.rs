@@ -4,12 +4,13 @@
 #[test]
 fn core_commands_match_legacy_names() {
     let core = core_commands();
-    assert_eq!(core.len(), 5);
+    assert_eq!(core.len(), 6);
     assert_eq!(core[0].name, "rank");
     assert_eq!(core[1].name, "leaderboard");
     assert_eq!(core[2].name, "help");
     assert_eq!(core[3].name, "privacy");
     assert_eq!(core[4].name, "reopen");
+    assert_eq!(core[5].name, "game-mix");
     // Guild-only, DM off (legacy `setDMPermission(false)`).
     assert!(core.iter().all(|c| !c.dm_permission));
     // `rank` and `help` have optional selectors; `leaderboard` takes none.
@@ -63,4 +64,11 @@ fn core_commands_match_legacy_names() {
         .map(|choice| (choice.name.as_str(), choice.value.as_str()))
         .collect();
     assert_eq!(choices, [("Games", "games"), ("Session", "session")]);
+    // The Next-only `/game-mix` private staff aggregate read: no options,
+    // ManageGuild default, always published after `/reopen`.
+    assert!(core[5].options.is_empty());
+    assert_eq!(
+        core[5].default_member_permissions,
+        Some(PERM_MANAGE_GUILD.to_string())
+    );
 }
