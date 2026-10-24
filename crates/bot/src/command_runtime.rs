@@ -1510,7 +1510,12 @@ impl CommandRuntime {
                         )
                         .await;
                     }
-                    Err(_) => {
+                    Err(two_bot_core::game_activity_store::GameActivityStoreError::Db(err)) => {
+                        warn!(
+                            msg = "game_mix_aggregate_read_failed",
+                            reason = db_class(&err),
+                            "game-mix aggregate read failed",
+                        );
                         self.finish(
                             interaction,
                             "Game activity is unavailable right now. Please try again shortly.",

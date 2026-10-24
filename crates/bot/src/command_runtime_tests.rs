@@ -35,6 +35,10 @@ mod custom_command_list_pages_acceptance;
 mod game_mix_acceptance_tests;
 #[path = "game_mix_content_acceptance_tests.rs"]
 mod game_mix_content_acceptance_tests;
+// Builder-owned: pins the classified store-failure warn the protected
+// modules cannot cover without Test Author edits.
+#[path = "game_mix_store_error_log_tests.rs"]
+mod game_mix_store_error_log_tests;
 
 use std::collections::VecDeque;
 use std::str::FromStr;
