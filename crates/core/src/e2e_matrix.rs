@@ -9,7 +9,7 @@
 //! the denial order (guild fence → feature gate → permission bits →
 //! policy/validation).
 //!
-//! Scope: the 28 non-voice built-in slash commands in `docs/commands.md` (core +
+//! Scope: the 32 non-voice built-in slash commands in `docs/commands.md` (core +
 //! scorecard + automation + announcement + moderation). Out of scope on
 //! purpose: voice commands (`voice_commands`, separate slice with its own
 //! `TWO_VOICE` gate and a `kick` name collision resolved first-wins in favour
@@ -122,7 +122,7 @@ const fn row(
 //   staff protection, bot hierarchy, actor hierarchy, in that order.
 // - `Valid:<FIELD>:<BOUNDS>` — option validation before any side effect.
 
-/// The 31-row contract in publish order (core, scorecard, automation,
+/// The 34-row contract in publish order (core, scorecard, automation,
 /// announcement, moderation). The coverage test asserts this is exactly the
 /// all-gates-on [`crate::router::InteractionRouter::publish_set`].
 #[must_use]
@@ -315,6 +315,22 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             "AutomationAdmin",
             "Ephemeral confirmation after removal plus audit row.",
             &["Gate:AutomationsDisabled", "Perm:ManageServerRequired"],
+        ),
+        row(
+            "giveaway",
+            37,
+            E2eGate::Automations,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "Giveaway",
+            "Ephemeral defer then ephemeral confirmation after create/list/cancel plus audit row.",
+            &[
+                "Gate:AutomationsDisabled",
+                "Perm:ManageServerRequired",
+                "Valid:prize:required,1..=200",
+                "Valid:duration:1..=43200",
+                "Valid:winners:1..=100",
+            ],
         ),
         row(
             "rsvp",
@@ -556,6 +572,37 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
                 "Gate:ModerationDisabled",
                 "Perm:ModerationPermission(Unlock)",
                 "Valid:reason:required,1..=512",
+            ],
+        ),
+        row(
+            "purge-preview",
+            35,
+            E2eGate::Moderation,
+            PERM_MANAGE_MESSAGES,
+            "ManageMessages",
+            "PurgePreview",
+            "Deferred ephemeral sampled counts, candidate time span and exclusions; no delete, audit, claim or lane writes; sampling and race caveats remain explicit.",
+            &[
+                "Guild:GuildRestricted",
+                "Gate:ModerationDisabled",
+                "Perm:PurgePreviewPermission",
+                "Valid:count:required,1..=100",
+                "Valid:options:count-only",
+            ],
+        ),
+        row(
+            "channel-inspect",
+            36,
+            E2eGate::Moderation,
+            PERM_MANAGE_CHANNELS,
+            "ManageChannels",
+            "ChannelInspect",
+            "Deferred ephemeral saved-lockdown and live-slowmode snapshot; absent lockdown is none, unavailable metadata is unknown; no config, audit, claim or lane writes.",
+            &[
+                "Guild:GuildRestricted",
+                "Gate:ModerationDisabled",
+                "Perm:ChannelInspectPermission",
+                "Valid:options:none",
             ],
         ),
     ]

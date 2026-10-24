@@ -5,7 +5,7 @@
 //! `fixtures/smoke_surface_inventory.json` exactly, in publish order. The
 //! fixture additionally marks the five smoke-covered commands (one per
 //! routing family, matching `crates/discord/tests/top5_reply_fixtures.rs`)
-//! versus the 26 explicitly deferred, with a reason per deferral.
+//! versus the 28 explicitly deferred, with a reason per deferral.
 //!
 //! Offline only: no staging guild, no live Discord, no network, no database.
 
@@ -41,6 +41,7 @@ fn option_type_name(kind: u8) -> &'static str {
         3 => "string",
         4 => "integer",
         6 => "user",
+        8 => "role",
         other => panic!("document new command option type {other}"),
     }
 }
@@ -49,14 +50,14 @@ fn option_type_name(kind: u8) -> &'static str {
 fn inventory_matches_registry_output_in_publish_order() {
     let published = all_on_router().publish_set(&[]).expect("publish set");
     let fixture = fixture();
-    assert_eq!(fixture["count"], 31, "31 built-ins");
+    assert_eq!(fixture["count"], 34, "34 built-ins");
     assert_eq!(
         fixture["dm_permission_all_false"], true,
         "fixture claims guild-only"
     );
     let rows = fixture["commands"].as_array().expect("command rows");
     assert_eq!(published.len(), rows.len(), "registry row count matches");
-    assert_eq!(published.len(), 31, "31 built-ins in the registry");
+    assert_eq!(published.len(), 34, "34 built-ins in the registry");
 
     for (definition, row) in published.iter().zip(rows.iter()) {
         let name = row["name"].as_str().expect("row name");
@@ -202,7 +203,8 @@ fn exactly_five_covered_with_response_links_rest_deferred_with_reasons() {
     let covered: Vec<&Value> = rows.iter().filter(|r| r["smoke"] == "covered").collect();
     let deferred: Vec<&Value> = rows.iter().filter(|r| r["smoke"] == "deferred").collect();
     assert_eq!(covered.len(), 5, "exactly the top five");
-    assert_eq!(covered.len() + deferred.len(), 31, "every row marked");
+    assert_eq!(deferred.len(), 29, "every non-smoke row deferred");
+    assert_eq!(covered.len() + deferred.len(), 34, "every row marked");
 
     let mut covered_names: Vec<&str> = covered
         .iter()

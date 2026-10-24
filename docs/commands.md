@@ -34,7 +34,7 @@ Help is ephemeral and does not execute the selected command. The command picker
 hides gated commands you cannot use; help explains published requirements but
 does not evaluate every effective Discord permission or guarantee authorization.
 
-Built-in commands: 52.
+Built-in commands: 55.
 
 ## `/access`
 
@@ -93,6 +93,15 @@ Ban a member
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `target` | user | true | — | — | — | — | Member to moderate |
 | `reason` | string | true | — | — | 512 | — | Mandatory audit reason |
+
+## `/channel-inspect`
+
+Privately inspect saved lockdown and live slowmode
+
+- Default permissions: ManageChannels (`16`)
+- Available in DMs: false
+
+No options.
 
 ## `/command`
 
@@ -208,6 +217,26 @@ Remove a feed relay
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `id` | string | true | — | — | 128 | — | Feed id |
+
+## `/giveaway`
+
+Create, list or cancel a giveaway
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `create` | subcommand | false | — | — | — | — | Create a giveaway in this channel |
+| `create prize` | string | true | — | — | 200 | — | Prize text (up to 200 characters) |
+| `create duration` | integer | true | 1 | 43200 | — | — | Entry window in minutes (1–43200) |
+| `create winners` | integer | true | 1 | 100 | — | — | Number of winners |
+| `create required-role` | role | false | — | — | — | — | Role every entrant must hold |
+| `create min-account-age-days` | integer | false | 0 | 3650 | — | — | Minimum account age in days |
+| `create min-server-age-days` | integer | false | 0 | 3650 | — | — | Minimum time in this server in days |
+| `list` | subcommand | false | — | — | — | — | List open giveaways |
+| `cancel` | subcommand | false | — | — | — | — | Cancel an open or paused giveaway |
+| `cancel id` | string | true | — | — | 64 | — | Giveaway id |
 
 ## `/group`
 
@@ -427,6 +456,17 @@ Delete recent messages
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `count` | integer | true | 1 | 100 | — | — | Messages to delete (1-100) |
 | `reason` | string | true | — | — | 512 | — | Mandatory audit reason |
+
+## `/purge-preview`
+
+Privately preview a purge without deleting messages
+
+- Default permissions: ManageMessages (`8192`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `count` | integer | true | 1 | 100 | — | — | Newest messages to sample (1-100) |
 
 ## `/rank`
 
