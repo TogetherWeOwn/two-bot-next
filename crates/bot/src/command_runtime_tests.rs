@@ -76,8 +76,7 @@ use two_bot_discord::ActionExecutor;
 use crate::command_runtime::{
     actor_id, ephemeral, feed_add_options_strict, feed_list_page_request,
     feed_remove_option_strict, help_command_selector, new_id, router_with_commands,
-    sticky_options_strict, CommandRuntime,
-    FeedListPage, RegistrySyncError,
+    sticky_options_strict, CommandRuntime, FeedListPage, RegistrySyncError,
 };
 use crate::internal_action_http::MODERATION_METRICS_LOCK;
 use crate::member_runtime::{sweep_job, MemberRuntime};
@@ -3544,6 +3543,134 @@ async fn sticky_without_body_names_the_missing_option() {
     assert_eq!(
         mock.deferred_reply()["content"],
         "Missing body. Use /sticky body:<text> debounce:<seconds>."
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn feed_add_wrong_typed_source_names_the_option_at_dispatch() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime
+        .on_interaction(&slash(
+            "feed-add",
+            Some(CHANNEL),
+            vec![
+                option("kind", CommandOptionValue::String("rss".to_owned())),
+                option("source", CommandOptionValue::Integer(7)),
+            ],
+        ))
+        .await;
+    // Exact dispatch pin: a fixed-text regression (e.g. always replying the
+    // missing-kind text) must fail here even though the corrected invocation
+    // names both options.
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        "Invalid source. Use /feed-add kind:rss source:<https-url>."
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn feed_add_duplicated_kind_names_the_option_at_dispatch() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime
+        .on_interaction(&slash(
+            "feed-add",
+            Some(CHANNEL),
+            vec![
+                option("kind", CommandOptionValue::String("rss".to_owned())),
+                option("kind", CommandOptionValue::String("rss".to_owned())),
+                option(
+                    "source",
+                    CommandOptionValue::String("https://example.com/feed.xml".to_owned()),
+                ),
+            ],
+        ))
+        .await;
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        "Duplicate kind. Use /feed-add kind:rss source:<https-url>."
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn feed_remove_wrong_typed_id_names_the_option_at_dispatch() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime
+        .on_interaction(&slash(
+            "feed-remove",
+            Some(CHANNEL),
+            vec![option("id", CommandOptionValue::Integer(7))],
+        ))
+        .await;
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        "Invalid id. Use /feed-remove id:<relay-id>."
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn feed_remove_duplicated_id_names_the_option_at_dispatch() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime
+        .on_interaction(&slash(
+            "feed-remove",
+            Some(CHANNEL),
+            vec![
+                option("id", CommandOptionValue::String("feed-1".to_owned())),
+                option("id", CommandOptionValue::String("feed-1".to_owned())),
+            ],
+        ))
+        .await;
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        "Duplicate id. Use /feed-remove id:<relay-id>."
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn sticky_wrong_typed_body_names_the_option_at_dispatch() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime
+        .on_interaction(&slash(
+            "sticky",
+            Some(CHANNEL),
+            vec![option("body", CommandOptionValue::Integer(7))],
+        ))
+        .await;
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        "Invalid body. Use /sticky body:<text> debounce:<seconds>."
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn sticky_duplicated_debounce_names_the_option_at_dispatch() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime
+        .on_interaction(&slash(
+            "sticky",
+            Some(CHANNEL),
+            vec![
+                option("body", CommandOptionValue::String("remember".to_owned())),
+                option("debounce", CommandOptionValue::Integer(7)),
+                option("debounce", CommandOptionValue::Integer(7)),
+            ],
+        ))
+        .await;
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        "Duplicate debounce. Use /sticky body:<text> debounce:<seconds>."
     );
     mock.shutdown().await;
 }
