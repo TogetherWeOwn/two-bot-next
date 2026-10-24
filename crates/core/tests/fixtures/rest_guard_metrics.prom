@@ -28,6 +28,6 @@ two_bot_rest_guard_pending_global_responses 2
 # HELP two_bot_rest_guard_global_paused Local.
 # TYPE two_bot_rest_guard_global_paused gauge
 two_bot_rest_guard_global_paused 1
-# HELP two_bot_rest_guard_global_pause_remaining_seconds Global cooldown seconds; pending bodies can hold admission at zero.
+# HELP two_bot_rest_guard_global_pause_remaining_seconds Cooldown seconds; pending bodies may block at zero.
 # TYPE two_bot_rest_guard_global_pause_remaining_seconds gauge
 two_bot_rest_guard_global_pause_remaining_seconds 1.25
