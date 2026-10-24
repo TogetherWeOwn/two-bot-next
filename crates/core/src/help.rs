@@ -813,7 +813,7 @@ mod tests {
         });
         let defs = off.publish_set(&[]).expect("core-only set");
         let text = help_text(&defs);
-        assert!(text.contains("**Server commands** (5 live)"));
+        assert!(text.contains("**Server commands** (6 live)"));
         assert!(text.contains("/rank"));
         assert!(text.contains("/help"));
         assert!(!text.contains("Automations"));
