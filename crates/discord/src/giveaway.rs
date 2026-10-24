@@ -792,7 +792,7 @@ impl GiveawayRuntime {
                 giveaway_id = row.id.as_str(),
                 "giveaway draw nonce is damaged; leaving the row for an operator"
             );
-            release.await;
+            release().await;
             return Err(DrawError::Data);
         };
         let winners = giveaway::draw(&eligible, &seed, row.winners_count.max(0) as usize);

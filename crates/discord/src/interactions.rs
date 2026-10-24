@@ -515,7 +515,7 @@ impl InteractionRuntime {
         Self {
             router: std::sync::Arc::new(router),
             pool: pool.clone(),
-            executor,
+            executor: executor.clone(),
             classifier,
             classifier_provider: None,
             lfg: crate::lfg_interactions::LfgInteractions::new(pool.clone()),
