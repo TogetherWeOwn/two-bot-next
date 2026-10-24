@@ -1024,7 +1024,7 @@ async fn toggle_publication_failure_reports_saved_state_not_sync_and_does_not_re
 async fn toggle_audit_failure_rolls_back_state_and_never_publishes() {
     for enabled in [false, true] {
         let f = Fixture::new(!enabled).await;
-        sqlx::raw_sql("CREATE FUNCTION refuse_toggle_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture audit refusal'; END $$; CREATE TRIGGER refuse_toggle_audit BEFORE INSERT ON automation_audit_log FOR EACH ROW EXECUTE FUNCTION refuse_toggle_audit();")
+        sqlx::raw_sql("CREATE FUNCTION refuse_toggle_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture audit refusal'; END; $$; CREATE TRIGGER refuse_toggle_audit BEFORE INSERT ON automation_audit_log FOR EACH ROW EXECUTE FUNCTION refuse_toggle_audit();")
             .execute(f.db.pool()).await.expect("test-owned audit-failure injection");
         let before = definitions(f.db.pool()).await;
         let observed = f.observe(&toggle(901, enabled, "faq")).await;
