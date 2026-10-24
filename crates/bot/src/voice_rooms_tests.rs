@@ -5,6 +5,8 @@ use serde_json::json;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
 
+#[path = "voice_actor_inbox_backpressure_acceptance_tests.rs"]
+mod actor_inbox_backpressure_acceptance;
 #[path = "voice_admission_config_acceptance_tests.rs"]
 mod admission_config_acceptance;
 #[path = "voice_admission_spawn_tests.rs"]
@@ -13,6 +15,8 @@ mod admission_spawn;
 mod boot_settings_acceptance;
 #[path = "voice_cold_authority_tests.rs"]
 mod cold_authority;
+#[path = "voice_control_plane_overflow_acceptance_tests.rs"]
+mod control_plane_overflow_acceptance;
 #[path = "voice_creation_receipt_acceptance_tests.rs"]
 mod creation_receipt_acceptance;
 #[path = "voice_delete_guard_tests.rs"]
@@ -176,7 +180,7 @@ fn room(channel_id: u64) -> VoiceRoom {
 
 struct Store {
     trace: Trace,
-    creators: Mutex<Vec<CreatorChannel>>,
+    creators: Arc<Mutex<Vec<CreatorChannel>>>,
     rooms: Mutex<HashMap<u64, VoiceRoom>>,
     rooms_errors: Mutex<VecDeque<StoreError>>,
     /// One-shot hang for the next `rooms()` call, consumed when it
@@ -264,7 +268,7 @@ impl Store {
     fn new(trace: Trace) -> Self {
         Self {
             trace,
-            creators: Mutex::new(vec![CreatorChannel::new(GUILD, CREATOR)]),
+            creators: Arc::new(Mutex::new(vec![CreatorChannel::new(GUILD, CREATOR)])),
             rooms: Mutex::new(HashMap::new()),
             rooms_errors: Mutex::new(VecDeque::new()),
             rooms_delay: Mutex::new(None),
@@ -2509,6 +2513,7 @@ async fn actor_creator_added_command_feeds_creator_channels() {
         &mut worker,
         ActorCommand::CreatorAdded(CreatorChannel::new(GUILD, COMMANDED)),
         0,
+        &ActorInboxBackpressure::default(),
     );
     let (_, sample) = worker
         .live
@@ -2738,6 +2743,7 @@ async fn suspended_room_transfer_reports_finalizing_and_keeps_the_handoff_queued
             reply,
         },
         0,
+        &ActorInboxBackpressure::default(),
     );
     worker.drive_staged_ownership(0).await;
     assert_eq!(inbox.await.unwrap(), OWNERSHIP_FINALIZING);
@@ -2763,6 +2769,7 @@ async fn held_owner_grant_reports_finalizing_before_the_write_finishes() {
             reply,
         },
         0,
+        &ActorInboxBackpressure::default(),
     );
     let observe = async {
         gate.sent.notified().await;
@@ -2816,6 +2823,7 @@ async fn held_owner_grant_with_slow_store_still_commits_after_finalizing() {
             reply,
         },
         0,
+        &ActorInboxBackpressure::default(),
     );
     let observe = async {
         gate.sent.notified().await;
@@ -7449,6 +7457,7 @@ async fn access_changed_refreshes_a_loaded_worker() {
                 ..AccessControls::default()
             }),
             0,
+            &ActorInboxBackpressure::default(),
         );
         let ticket = worker
             .live
@@ -7459,6 +7468,174 @@ async fn access_changed_refreshes_a_loaded_worker() {
             after
         );
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn access_changed_delivers_past_a_full_inbox() {
+    // Mutation: dropping runtime.access_changed, or making its send lossy,
+    // leaves the worker enforcing the opposite policy after a saved update.
+    for (before, after) in [(false, true), (true, false)] {
+        let (live, store, http, trace) = fixture();
+        *store.access.lock().unwrap() = AccessControls {
+            room_creation_enabled: before,
+            ..AccessControls::default()
+        };
+        let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+        let runtime = test_runtime(trace);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        runtime.actors.lock().unwrap().insert(
+            GUILD,
+            GuildActor {
+                live: worker.live.clone(),
+                tx,
+                backpressure: ActorInboxBackpressure::default(),
+            },
+        );
+        let actor = runtime.ensure_actor(GUILD).expect("registered actor");
+        // Hold the receiver: all sends below are synchronous and the ledger
+        // is exactly full before the sole policy update enters the channel.
+        for member in 0..VOICE_ACTOR_INBOX_CAP {
+            assert!(actor.try_send_command(ActorCommand::Display {
+                member_id: 900_000 + member as u64,
+                display: "x".to_owned(),
+            }));
+        }
+        assert_eq!(actor.inbox_depth(), VOICE_ACTOR_INBOX_CAP);
+        assert!(!actor.try_send_command(ActorCommand::Reconcile));
+        let dropped = actor.inbox_overflow_dropped();
+        runtime.access_changed(
+            GUILD,
+            AccessControls {
+                room_creation_enabled: after,
+                ..AccessControls::default()
+            },
+        );
+        assert_eq!(actor.inbox_overflow_dropped(), dropped);
+        // Drain through the real worker command handler; send success alone
+        // cannot satisfy this test, nor can an earlier direct lossless send.
+        while let Ok(command) = rx.try_recv() {
+            actor.backpressure.release_for(&command);
+            apply_command(&mut worker, command, 0, &actor.backpressure);
+        }
+        assert_eq!(actor.inbox_depth(), 0);
+        let ticket = worker
+            .live
+            .voice_update(MEMBER, Some(CREATOR), Some(false))
+            .expect("fresh creator join");
+        assert_eq!(
+            worker.accept_join(ticket, "new room", 7, NOW.to_owned()),
+            after,
+            "join acceptance must use the policy delivered through runtime.access_changed"
+        );
+        assert_eq!(worker.queue.pending_counts(GUILD), (usize::from(after), 0));
+        runtime.remove_guild(GUILD);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_confirmed_import_hands_its_settings_to_the_worker_past_a_full_inbox() {
+    // Full-inbox sibling of `a_confirmed_import_hands_its_settings_to_the_worker`:
+    // `/import` already wrote the store and replied "Saved", so the saved
+    // settings must reach the worker even when fire-and-forget sends refuse.
+    let trace = Trace::default();
+    let bytes = serde_json::to_vec(&full_config()).unwrap();
+    let (runtime, _) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let (probe_store, _) = runtime.make_pair();
+    let reads = probe_store.config_reads.clone();
+    let initial_reads = reads.load(Ordering::Relaxed);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (_, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let (confirm_id, _) = preview_buttons(&preview.expect("preview"));
+    // Preview reads shared storage and ensure_actor only spawns. Await a
+    // worker-applied probe before the save, otherwise a lost notification
+    // escapes through the worker's first read of the NEW durable settings.
+    let (before, _) = runtime
+        .naming_probe(GUILD)
+        .await
+        .expect("loaded worker probe");
+    assert_eq!(before, NameSettings::from_config(&empty_config()));
+    assert_ne!(before, NameSettings::from_config(&full_config()));
+    // The first timer maintenance is also a read-through escape: let it
+    // finish on OLD state before the save. This harness has one preview
+    // read, one load read, then the first paced worker reload.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while reads.load(Ordering::Relaxed) < initial_reads + 3 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("old-state worker maintenance read before the save");
+    let (before, _) = runtime
+        .naming_probe(GUILD)
+        .await
+        .expect("warm worker probe");
+    assert_eq!(before, NameSettings::from_config(&empty_config()));
+    // Current-thread execution: there is no yield between filling this gate
+    // and the synchronous persistence/notification in the Confirm harness.
+    let actor = runtime.ensure_actor(GUILD).expect("live actor");
+    let mut refused = false;
+    for member in 0..10_000u64 {
+        if !actor.try_send_command(ActorCommand::Display {
+            member_id: 900_000 + member,
+            display: "x".to_owned(),
+        }) {
+            refused = true;
+            break;
+        }
+    }
+    assert!(refused, "burst must fill the inbox gate to refusal");
+    assert_eq!(actor.inbox_depth(), VOICE_ACTOR_INBOX_CAP);
+    let confirm = component_interaction(&confirm_id, manager(), UPLOADER);
+    let (_, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(response_text(&response.expect("applied")).starts_with("Import applied:"));
+    // The probe queues behind the flood and the saved update, so its answer
+    // proves the update applied despite the full gate.
+    let (settings, _) = runtime
+        .naming_probe(GUILD)
+        .await
+        .expect("probe answers after a full-gate save");
+    assert_eq!(settings, NameSettings::from_config(&full_config()));
+    runtime.remove_guild(GUILD);
+}
+
+#[tokio::test]
+async fn display_seed_batch_applies_every_entry() {
+    // Startup seeding travels as one batch so a guild with more cached
+    // members than inbox slots still seeds every name (owners included).
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    apply_command(
+        &mut worker,
+        ActorCommand::DisplaySeed(vec![
+            (MEMBER, "Alex".to_owned()),
+            (MEMBER + 1, "Blair".to_owned()),
+        ]),
+        0,
+        &ActorInboxBackpressure::default(),
+    );
+    assert!(
+        worker.name_directory.knows(MEMBER),
+        "seed batch must carry every entry"
+    );
+    assert!(
+        worker.name_directory.knows(MEMBER + 1),
+        "seed batch must carry every entry"
+    );
+}
+
+#[test]
+fn display_seed_buffers_while_actor_initializes() {
+    // The seed batch is fire-and-forget state: it must survive the init
+    // window instead of failing fast like reply-bearing commands.
+    let mut buffered = std::collections::VecDeque::new();
+    buffer_init_command(
+        &mut buffered,
+        ActorCommand::DisplaySeed(vec![(MEMBER, "Alex".to_owned())]),
+    );
+    assert_eq!(buffered.len(), 1, "seed batch must buffer during init");
+    purge_unanswerable_buffered(&mut buffered);
+    assert_eq!(buffered.len(), 1, "seed batch must survive a failure purge");
 }
 
 async fn wait_for_trace(trace: &Trace, entry: &str) -> bool {
@@ -8829,11 +9006,14 @@ fn stalled_worker_runtime() -> (
     let live = LiveGuild::new(GUILD);
     live.publish(command_snapshot());
     let (tx, rx) = mpsc::unbounded_channel();
-    runtime
-        .actors
-        .lock()
-        .unwrap()
-        .insert(GUILD, GuildActor { live, tx });
+    runtime.actors.lock().unwrap().insert(
+        GUILD,
+        GuildActor {
+            live,
+            tx,
+            backpressure: ActorInboxBackpressure::default(),
+        },
+    );
     (runtime, rx)
 }
 
@@ -9482,7 +9662,12 @@ async fn creator_edit_applies_to_new_rooms_only() {
     let mut edited = text_creator();
     edited.text_channel_name = Some("lounge".to_owned());
     edited.text_viewer_role_id = Some(42);
-    apply_command(&mut worker, ActorCommand::CreatorAdded(edited), now);
+    apply_command(
+        &mut worker,
+        ActorCommand::CreatorAdded(edited),
+        now,
+        &ActorInboxBackpressure::default(),
+    );
     assert_eq!(
         worker.companions[&500].settings, before,
         "the existing companion keeps its creation-time snapshot"
@@ -10548,10 +10733,12 @@ fn import_harness(
     let shared_config = Arc::new(Mutex::new(config));
     let shared_downloads = Arc::new(Mutex::new(downloads.into_iter().collect::<VecDeque<_>>()));
     let closure_config = shared_config.clone();
+    let config_reads = Arc::new(AtomicU64::new(0));
     let runtime = VoiceRuntime::new(
         move || {
             let mut store = Store::new(trace.clone());
             store.config = closure_config.clone();
+            store.config_reads = config_reads.clone();
             store.snapshot_uses_creator_rows = false;
             let mut http = Http::new(trace.clone());
             http.download_results = shared_downloads.clone();
@@ -12963,7 +13150,12 @@ async fn voice_name_settings_notification_invalidates_cached_renders() {
     settings
         .lists
         .insert("maps".to_owned(), vec!["new".to_owned()]);
-    apply_command(&mut worker, ActorCommand::NameSettingsChanged(settings), 1);
+    apply_command(
+        &mut worker,
+        ActorCommand::NameSettingsChanged(settings),
+        1,
+        &ActorInboxBackpressure::default(),
+    );
     worker.refresh_template_names(1);
     assert_eq!(worker.desired_names[&700], "new");
     assert!(
@@ -13001,6 +13193,7 @@ async fn voice_name_import_refreshes_creator_template_without_waiting_for_reload
         &mut worker,
         ActorCommand::NameSettingsChanged(settings),
         100_000,
+        &ActorInboxBackpressure::default(),
     );
     assert_eq!(
         worker.name_settings_read_ms, None,
@@ -13035,7 +13228,12 @@ async fn voice_name_creator_notification_invalidates_cached_renders() {
     dispatch(&mut worker, 0).await;
     let mut creator = worker.creators[&CREATOR].clone();
     creator.name_template = "new".to_owned();
-    apply_command(&mut worker, ActorCommand::CreatorAdded(creator), 1);
+    apply_command(
+        &mut worker,
+        ActorCommand::CreatorAdded(creator),
+        1,
+        &ActorInboxBackpressure::default(),
+    );
     worker.refresh_template_names(1);
     assert_eq!(worker.desired_names[&700], "new");
     assert!(!worker.dispatch_one(1).await);
@@ -13102,6 +13300,7 @@ async fn a_voice_display_update_reaches_the_owner_token() {
             display: "Sam".to_owned(),
         },
         0,
+        &ActorInboxBackpressure::default(),
     );
     worker.refresh_template_names(0);
     dispatch(&mut worker, 0).await;
@@ -13127,6 +13326,7 @@ async fn a_restarted_worker_waits_for_the_owner_name_instead_of_renaming_to_memb
             display: "Alex".to_owned(),
         },
         1,
+        &ActorInboxBackpressure::default(),
     );
     worker.refresh_template_names(1);
     dispatch(&mut worker, 1).await;
@@ -13143,6 +13343,7 @@ async fn written_settings_reach_automatic_names() {
         &mut worker,
         ActorCommand::NameSettingsChanged(NameSettings::from_config(&config)),
         5,
+        &ActorInboxBackpressure::default(),
     );
     assert_eq!(worker.name_settings.no_game_label, "Hangout");
     assert!(worker.name_settings_loaded);
@@ -14752,12 +14953,22 @@ async fn join_commands_count_received_on_accept_and_on_refusal() {
         .live
         .voice_update(MEMBER, Some(CREATOR), Some(false))
         .unwrap();
-    assert!(apply_command(&mut worker, join_command(ticket), 0));
+    assert!(apply_command(
+        &mut worker,
+        join_command(ticket),
+        0,
+        &ActorInboxBackpressure::default()
+    ));
     // Same ticket twice: the second delivery is refused as a duplicate, but
     // both deliveries count as received. Lower bounds, not exact diffs: these
     // counters are process-global and sink tests deliver joins through the
     // same Join arm concurrently, so concurrent runs can only add.
-    assert!(!apply_command(&mut worker, join_command(ticket), 1));
+    assert!(!apply_command(
+        &mut worker,
+        join_command(ticket),
+        1,
+        &ActorInboxBackpressure::default()
+    ));
     assert!(
         global_series("two_bot_voice_joins_received_total") >= received_before + 2,
         "both deliveries count as received"
@@ -15033,11 +15244,13 @@ async fn actor_join_revalidates_a_stale_creator_view() {
         .expect("ticket for a joined channel");
     let (tx, rx) = mpsc::unbounded_channel();
     let handle = tokio::spawn(async move {
+        let backpressure = ActorInboxBackpressure::default();
         run_actor_with_limits(
             &mut worker,
             rx,
             Duration::from_millis(100),
             ActorLimits::default(),
+            &backpressure,
         )
         .await;
         worker
@@ -15069,7 +15282,12 @@ async fn refresh_creators_command_flags_a_debounced_merge() {
     let (live, store, http, _) = fixture();
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     assert!(!worker.creators_refresh_due);
-    apply_command(&mut worker, ActorCommand::RefreshCreators, 0);
+    apply_command(
+        &mut worker,
+        ActorCommand::RefreshCreators,
+        0,
+        &ActorInboxBackpressure::default(),
+    );
     assert!(worker.creators_refresh_due);
 }
 
@@ -15086,11 +15304,13 @@ async fn maintenance_tick_runs_the_creator_refresh() {
     assert!(worker.creators_read_ms.is_none());
     let (tx, rx) = mpsc::unbounded_channel();
     let handle = tokio::spawn(async move {
+        let backpressure = ActorInboxBackpressure::default();
         run_actor_with_limits(
             &mut worker,
             rx,
             Duration::from_millis(100),
             ActorLimits::default(),
+            &backpressure,
         )
         .await;
         worker
@@ -15625,7 +15845,15 @@ async fn halt_reprobe_clears_the_credential_latch_without_a_restart() {
         ..ActorLimits::default()
     };
     let handle = tokio::spawn(async move {
-        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+        let backpressure = ActorInboxBackpressure::default();
+        run_actor_with_limits(
+            &mut worker,
+            rx,
+            Duration::from_millis(100),
+            limits,
+            &backpressure,
+        )
+        .await;
     });
     // Pump the actor once so its probe baseline starts at t=0 (a Status
     // round-trip also proves the halted actor is still alive to answer).
@@ -15675,7 +15903,15 @@ async fn halt_reprobe_keeps_a_discord_401_latch_set() {
         ..ActorLimits::default()
     };
     let handle = tokio::spawn(async move {
-        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+        let backpressure = ActorInboxBackpressure::default();
+        run_actor_with_limits(
+            &mut worker,
+            rx,
+            Duration::from_millis(100),
+            limits,
+            &backpressure,
+        )
+        .await;
     });
     // Pump the actor once so its probe baseline starts at t=0 (a Status
     // round-trip also proves the halted actor is still alive to answer).
@@ -15785,7 +16021,15 @@ async fn watchdog_fires_while_a_dispatch_is_hung_mid_write() {
         ..ActorLimits::default()
     };
     let handle = tokio::spawn(async move {
-        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+        let backpressure = ActorInboxBackpressure::default();
+        run_actor_with_limits(
+            &mut worker,
+            rx,
+            Duration::from_millis(100),
+            limits,
+            &backpressure,
+        )
+        .await;
     });
     // Drive the actor until the limit write is held mid-flight. The clock
     // only moves here, so the waiter must be registered before advancing.
@@ -15877,7 +16121,15 @@ async fn watchdog_sibling_exits_when_its_actor_dies() {
         ..ActorLimits::default()
     };
     let handle = tokio::spawn(async move {
-        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+        let backpressure = ActorInboxBackpressure::default();
+        run_actor_with_limits(
+            &mut worker,
+            rx,
+            Duration::from_millis(100),
+            limits,
+            &backpressure,
+        )
+        .await;
     });
     // Drive the actor until the panicking write kills it: the unwind drops
     // the inbox receiver, which closes the sender's side.
@@ -15938,7 +16190,15 @@ async fn actor_exit_on_inbox_close_retires_its_stall_contribution() {
         ..ActorLimits::default()
     };
     let handle = tokio::spawn(async move {
-        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+        let backpressure = ActorInboxBackpressure::default();
+        run_actor_with_limits(
+            &mut worker,
+            rx,
+            Duration::from_millis(100),
+            limits,
+            &backpressure,
+        )
+        .await;
     });
     // Drive ticks until the running actor's halted contribution lands.
     let mut contribution = None;
@@ -15997,7 +16257,15 @@ async fn actor_panic_unwind_retires_its_stall_contribution() {
         ..ActorLimits::default()
     };
     let handle = tokio::spawn(async move {
-        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+        let backpressure = ActorInboxBackpressure::default();
+        run_actor_with_limits(
+            &mut worker,
+            rx,
+            Duration::from_millis(100),
+            limits,
+            &backpressure,
+        )
+        .await;
     });
     let mut ticks = 0;
     while !tx.is_closed() {
@@ -16324,7 +16592,15 @@ async fn watchdog_fires_while_a_backed_off_queue_makes_no_progress() {
         ..ActorLimits::default()
     };
     let handle = tokio::spawn(async move {
-        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+        let backpressure = ActorInboxBackpressure::default();
+        run_actor_with_limits(
+            &mut worker,
+            rx,
+            Duration::from_millis(100),
+            limits,
+            &backpressure,
+        )
+        .await;
     });
     // Liveness first: the actor answers Status probes while stalled.
     let (reply, reply_rx) = oneshot::channel();

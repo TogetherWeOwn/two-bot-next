@@ -38,6 +38,10 @@
 //!
 //! No staging/prod data, no secrets, disposable seams only.
 
+#[path = "support/deferred_capture_compat.rs"]
+mod deferred_capture_compat;
+use deferred_capture_compat::Healthy;
+
 use std::str::FromStr;
 use std::sync::Mutex;
 
@@ -389,7 +393,7 @@ fn single_growth_join_credits_inviter_end_to_end() {
         Some(serde_json::json!({ "inviterId": INVITER.to_string() })),
         "funnel row persists the credited inviter"
     );
-    let joins = buffer.take_joins();
+    let joins = buffer.take_joins().healthy();
     let fact = joins
         .iter()
         .find(|w| w.member_id == B)
@@ -417,7 +421,7 @@ fn no_movement_join_files_vanity_or_unknown_never_an_invite() {
     let row = join_row(&vanity_pipeline, A);
     assert_eq!(row.source, "vanity");
     assert_eq!(row.metadata, None, "vanity credits no inviter");
-    assert_eq!(buffer.take_joins()[0].inviter_id, None);
+    assert_eq!(buffer.take_joins().healthy()[0].inviter_id, None);
     // RED: no per-edge log today.
     let line = attribution_line(&logs, "vanity", A);
     assert!(
@@ -466,7 +470,11 @@ fn deleted_before_check_files_unknown_never_stale_inviter() {
     attribution_line(&logs, "unknown", C);
 
     assert!(
-        buffer.take_joins().iter().all(|w| w.inviter_id.is_none()),
+        buffer
+            .take_joins()
+            .healthy()
+            .iter()
+            .all(|w| w.inviter_id.is_none()),
         "no join after the delete carries the stale inviter"
     );
 }
@@ -501,7 +509,7 @@ fn simultaneous_double_increment_files_sorted_ambiguous_without_inviter() {
     // RED: today the string follows read order ("ambiguous:b+a").
     assert_eq!(row.source, "ambiguous:a+b");
     assert_eq!(row.metadata, None, "ambiguous credits no inviter");
-    let joins = buffer.take_joins();
+    let joins = buffer.take_joins().healthy();
     assert_eq!(
         joins
             .iter()
@@ -531,7 +539,7 @@ fn pre_install_join_without_baseline_files_unknown() {
     let row = join_row(&pipeline, A);
     assert_eq!(row.source, "unknown");
     assert_eq!(row.metadata, None);
-    assert_eq!(buffer.take_joins()[0].inviter_id, None);
+    assert_eq!(buffer.take_joins().healthy()[0].inviter_id, None);
     // RED: no per-edge log today.
     attribution_line(&logs, "unknown", A);
 

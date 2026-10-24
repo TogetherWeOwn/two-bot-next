@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use two_bot_core::commands::{
     CommandDefinition, CommandOption, CommandOptionType, HELP_DESCRIPTION, MAX_RESOURCE_ID_CHARS,
-    OCCURRENCE_ID_MAX_CHARS, PERM_MANAGE_EVENTS, PRIVACY_DESCRIPTION,
+    OCCURRENCE_ID_MAX_CHARS, PRIVACY_DESCRIPTION,
 };
 use two_bot_core::custom_commands::{
     MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_TEMPLATE_CHARS, MAX_TEXT_TRIGGER_CHARS,
@@ -37,6 +37,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("feed-list", "docs/parity.md §1 #30 page"),
     ("privacy", "docs/parity.md §1 privacy"),
     ("command-list", "docs/parity.md §1 #16 page"),
+    ("command-inspect", "docs/parity.md §1 command-inspect"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -230,22 +231,44 @@ pub fn expected_registry() -> Value {
     )
     .expect("privacy serializes");
     commands.insert(3, privacy);
-    // Next-only `/lfg-list` current-channel list: no legacy counterpart. Insert
-    // at the publish position (after `lfg-close`, before `feed-add`) as the
-    // exact published definition, so parity pins its shape too. Data-driven on
-    // the command name so the baseline still compiles before the runtime
-    // `BuiltinHandler::LfgList` arm lands.
-    let lfg_list = serde_json::to_value(
-        CommandDefinition::new("lfg-list", "List open game posts in this channel")
-            .permissions(PERM_MANAGE_EVENTS)
-            .options(vec![CommandOption::new(
-                "cursor",
-                "Continue a current-channel list",
-                CommandOptionType::String,
-            )
-            .max_length(512)]),
-    )
-    .expect("lfg-list serializes");
+    // Next-only saved-response inspection. This independent literal pins the
+    // whole publication contract; never manufacture it from production shapes.
+    let inspect = json!({
+        "name": "command-inspect",
+        "description": "Inspect or privately preview a saved custom command",
+        "dm_permission": false,
+        "default_member_permissions": "32",
+        "options": [
+            {"name": "name", "description": "Saved command name, a-z 0-9 _ -", "type": 3,
+             "required": true, "max_length": 32},
+            {"name": "view", "description": "Private view (summary by default)", "type": 3,
+             "choices": [
+                 {"name": "Summary", "value": "summary"},
+                 {"name": "Saved template", "value": "template"},
+                 {"name": "Preview", "value": "preview"}
+             ]},
+            {"name": "arguments", "description": "Sample invocation arguments (ignored by current templates)",
+             "type": 3, "max_length": 500}
+        ]
+    });
+    let after_list = commands
+        .iter()
+        .position(|command| command["name"] == "command-list")
+        .expect("legacy command-list remains published")
+        + 1;
+    commands.insert(after_list, inspect);
+    // Next-only current-channel discovery has its own independent literal.
+    // No production constants or registry builders supply either expectation.
+    let lfg_list = json!({
+        "name": "lfg-list",
+        "description": "List open game posts in this channel",
+        "dm_permission": false,
+        "default_member_permissions": "8589934592",
+        "options": [
+            {"name": "cursor", "description": "Continue a current-channel list", "type": 3,
+             "max_length": 512}
+        ]
+    });
     let lfg_close_pos = commands
         .iter()
         .position(|c| c["name"] == "lfg-close")
@@ -273,7 +296,7 @@ pub fn expected_registry() -> Value {
         (
             "rsvp-attendance",
             "/description",
-            "Show RSVP totals for a scheduled event",
+            "Show RSVP totals and your saved response for an event",
         ),
         (
             "rsvp-attendance",

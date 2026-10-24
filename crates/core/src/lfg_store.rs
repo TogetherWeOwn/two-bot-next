@@ -238,7 +238,7 @@ pub async fn list_lfg_channel(
          FROM lfg_posts
          WHERE guild_id = $1 AND channel_id = $2 AND status = 'open'
            AND message_id ~ '^[1-9][0-9]{0,19}$'
-           AND (length(message_id) < 20 OR message_id COLLATE \"C\" <= '18446744073709551615')
+           AND (length(message_id) < 20 OR message_id COLLATE \"C\" <= $5)
            AND isfinite(created_at)
            AND ($3::timestamptz IS NULL OR (created_at, id) > ($3, $4))
          ORDER BY created_at ASC, id ASC LIMIT 6",
@@ -247,6 +247,7 @@ pub async fn list_lfg_channel(
     .bind(channel_id)
     .bind(after.map(|cursor| cursor.created_at))
     .bind(after.map(|cursor| cursor.id.as_str()))
+    .bind(u64::MAX.to_string())
     .fetch_all(pool)
     .await?;
     Ok(rows

@@ -702,7 +702,15 @@ async fn run(cli_args: &[String]) {
                     // facts sink only when the scorecard job is enabled, so a
                     // staging-gated rollout captures exactly while it scores.
                     if std::env::var("TWO_COMMUNITY_SCORECARD").is_ok_and(|v| v == "1") {
-                        pipeline.enable_community_facts(pool.clone());
+                        // A fresh pipeline cannot be poisoned yet, but the
+                        // refusal is typed so boot says so instead of panicking:
+                        // capture stays disabled, exactly like the flag being off.
+                        if let Err(error) = pipeline.enable_community_facts(pool.clone()) {
+                            tracing::warn!(
+                                reason = %error,
+                                "community facts arming refused; capture disabled"
+                            );
+                        }
                     }
                     // Join-burst watch is always on, as legacy raid watch was (TWO-56),
                     // and independent of the anti-nuke flags. It shares the command

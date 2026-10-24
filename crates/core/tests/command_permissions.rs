@@ -92,20 +92,36 @@ fn all_30_rows_equal_parity_section1() {
     }
     assert_eq!(seen, (1..=30).collect::<HashSet<_>>());
     // The 30 legacy parity rows plus the Next-only `/help` discovery command
-    // (parity row 31 — legacy has no help command), the Next-only
-    // `/privacy` member self-serve (parity row 32), and the Next-only
-    // `/lfg-list` current-channel list. None of the Next-only rows
-    // appears in the legacy §1 table above; the registry-equality test below
-    // covers every published builtin instead.
-    assert_eq!(COMMAND_PERMISSIONS.len(), 33);
+    // (parity row 31 — legacy has no help command), `/privacy` member
+    // self-serve (row 32), `/command-inspect` management inspection (row 33),
+    // and `/lfg-list` current-channel list (row 34). Next-only rows do not
+    // appear in the legacy §1 table above; registry equality covers every
+    // published builtin instead.
+    assert_eq!(COMMAND_PERMISSIONS.len(), 34);
+    assert_eq!(
+        COMMAND_PERMISSIONS
+            .iter()
+            .map(|row| row.parity_row)
+            .collect::<HashSet<_>>(),
+        (1..=34).collect::<HashSet<_>>(),
+        "every permission row has a distinct parity identity"
+    );
     assert_eq!(
         COMMAND_PERMISSIONS
             .iter()
             .map(|row| row.command)
             .collect::<HashSet<_>>()
             .len(),
-        33
+        34
     );
+    for (name, parity_row, required_permissions) in
+        [("command-inspect", 33, 1 << 5), ("lfg-list", 34, 1 << 33)]
+    {
+        let row = command_permission(name).expect("Next-only command has a permission row");
+        assert_eq!(row.parity_row, parity_row, "{name}");
+        assert_eq!(row.required_permissions, required_permissions, "{name}");
+        assert_eq!(row.surface, CommandSurface::BuiltinSlash, "{name}");
+    }
     let help = command_permission("help").expect("help has a permission row");
     assert_eq!(help.required_permissions, 0);
     assert_eq!(help.surface, CommandSurface::BuiltinSlash);
@@ -124,7 +140,7 @@ fn permission_table_equals_the_complete_published_registry() {
         .iter()
         .filter(|row| row.surface == CommandSurface::BuiltinSlash)
         .collect();
-    assert_eq!(builtins.len(), 30);
+    assert_eq!(builtins.len(), 31);
     assert_eq!(published.len(), builtins.len() + 1);
     for row in builtins {
         let definition = published
@@ -248,7 +264,7 @@ fn every_routed_builtin_name_has_a_permission_row() {
             other => panic!("{name} is published or retained but does not route: {other:?}"),
         }
     }
-    assert_eq!(routed, 30, "every retained builtin routes");
+    assert_eq!(routed, 31, "every retained builtin routes");
 }
 
 #[test]

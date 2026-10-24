@@ -75,10 +75,11 @@ use PolicyHook::{
 
 /// All 30 parity rows, including the three non-static-slash dispositions,
 /// plus the Next-only `/help` discovery command (parity row 31 — legacy has
-/// no help command) and the Next-only `/privacy` member self-serve
-/// (parity row 32) and channel LFG discovery (parity row 33).
+/// no help command), the Next-only `/privacy` member self-serve
+/// (parity row 32), management-only `/command-inspect` (parity row 33),
+/// and channel LFG discovery (parity row 34).
 /// No Administrator-only exception: preserve the legacy resolved-bit check.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 33] = [
+pub const COMMAND_PERMISSIONS: [CommandPermission; 34] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),
@@ -133,6 +134,7 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 33] = [
     row(14, "command", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(15, "command-remove", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(16, "command-list", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(33, "command-inspect", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(17, "schedule", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(18, "schedule-remove", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(19, "schedule-list", BuiltinSlash, PERM_MANAGE_GUILD, None),
@@ -144,7 +146,7 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 33] = [
     row(25, "rsvp-attendance", BuiltinSlash, 0, None),
     row(26, "lfg", BuiltinSlash, PERM_MANAGE_EVENTS, None),
     row(27, "lfg-close", BuiltinSlash, PERM_MANAGE_EVENTS, None),
-    row(33, "lfg-list", BuiltinSlash, PERM_MANAGE_EVENTS, None),
+    row(34, "lfg-list", BuiltinSlash, PERM_MANAGE_EVENTS, None),
     row(28, "feed-add", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(29, "feed-remove", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(30, "feed-list", BuiltinSlash, PERM_MANAGE_GUILD, None),
