@@ -1450,6 +1450,7 @@ impl ActionExecutor {
 
     /// One attempt bounded by `timeout`, borrowing the request so a caller can
     /// re-attempt it after a pre-wire refusal.
+    #[inline(never)]
     async fn call_once_raw_lane_for(
         &self,
         request: &Request,
