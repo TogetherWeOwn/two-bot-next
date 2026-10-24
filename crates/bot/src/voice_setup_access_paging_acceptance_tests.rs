@@ -153,7 +153,7 @@ fn access_role_ids(text: &str) -> Vec<u64> {
     let mut ids = Vec::new();
     let mut rest = text;
     while let Some(start) = rest.find("<@&") {
-        rest = &rest[start + "<@&>".len()..];
+        rest = &rest[start + "<@&".len()..];
         let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
         if digits.is_empty() {
             continue;
@@ -165,6 +165,18 @@ fn access_role_ids(text: &str) -> Vec<u64> {
         }
     }
     ids
+}
+
+#[test]
+fn access_role_ids_preserves_complete_ids() {
+    for (text, expected) in [
+        ("<@&18446744073709551615> <@&7>", vec![u64::MAX, 7]),
+        ("<@&18446744073709551615>", vec![u64::MAX]),
+        ("<@&7>", vec![7]),
+        ("", vec![]),
+    ] {
+        assert_eq!(access_role_ids(text), expected, "role IDs in {text:?}");
+    }
 }
 
 fn assert_bounded(text: &str, what: &str) {
@@ -753,7 +765,7 @@ async fn access_show_pages_cover_every_restriction_with_maximal_roles() {
                 let mut line_roles = Vec::new();
                 let mut rest = line;
                 while let Some(start) = rest.find("<@&") {
-                    rest = &rest[start + "<@&>".len()..];
+                    rest = &rest[start + "<@&".len()..];
                     let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
                     let id: u64 = digits.parse().expect("role digits");
                     assert!(
