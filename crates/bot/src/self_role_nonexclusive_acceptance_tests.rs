@@ -17,6 +17,9 @@
 
 #![cfg(test)]
 
+#[path = "self_role_refusal_acceptance_tests.rs"]
+mod refusal_acceptance;
+
 use super::*;
 use crate::discord_test_common::{MockRest, RestRequest, ScriptedResponse};
 use crate::self_role_handlers::SelfRoleService;
