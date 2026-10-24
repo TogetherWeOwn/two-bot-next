@@ -513,7 +513,9 @@ mod tests {
             desired_definitions(2222, &env)
                 .expect("desired registry assembles")
                 .len(),
-            30
+            // 30 legacy/all-gate builtins plus the moderation-gated reads
+            // `/purge-preview` and `/channel-inspect`; no new feature gate.
+            32
         );
     }
 }
