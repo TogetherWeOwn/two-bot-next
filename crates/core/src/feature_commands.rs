@@ -219,7 +219,71 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
             ]),
         CommandDefinition::new("sticky-remove", "Remove this channel's sticky message")
             .permissions(PERM_MANAGE_GUILD),
+        giveaway_command(),
     ]
+}
+
+/// Manage-Server-only giveaway administration; entry buttons remain open to members.
+#[must_use]
+pub fn giveaway_command() -> CommandDefinition {
+    CommandDefinition::new("giveaway", "Create, list or cancel a giveaway")
+        .permissions(PERM_MANAGE_GUILD)
+        .options(vec![
+            CommandOption::new(
+                "create",
+                "Create a giveaway in this channel",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![
+                CommandOption::new(
+                    "prize",
+                    "Prize text (up to 200 characters)",
+                    CommandOptionType::String,
+                )
+                .required()
+                .max_length(200),
+                CommandOption::new(
+                    "duration",
+                    "Entry window in minutes (1–43200)",
+                    CommandOptionType::Integer,
+                )
+                .required()
+                .int_range(1, 43200),
+                CommandOption::new("winners", "Number of winners", CommandOptionType::Integer)
+                    .required()
+                    .int_range(1, 100),
+                CommandOption::new(
+                    "required-role",
+                    "Role every entrant must hold",
+                    CommandOptionType::Role,
+                ),
+                CommandOption::new(
+                    "min-account-age-days",
+                    "Minimum account age in days",
+                    CommandOptionType::Integer,
+                )
+                .int_range(0, 3650),
+                CommandOption::new(
+                    "min-server-age-days",
+                    "Minimum time in this server in days",
+                    CommandOptionType::Integer,
+                )
+                .int_range(0, 3650),
+            ]),
+            CommandOption::new("list", "List open giveaways", CommandOptionType::SubCommand),
+            CommandOption::new(
+                "cancel",
+                "Cancel an open or paused giveaway",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![CommandOption::new(
+                "id",
+                "Giveaway id",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(64)]),
+        ])
 }
 
 /// Announcement commands (parity #24–#30): RSVP, LFG signups, feed relays.

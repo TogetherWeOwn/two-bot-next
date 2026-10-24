@@ -22,14 +22,17 @@
 //! boot runner applies, so neither copy can silently lose the constraint.
 
 use sqlx::types::time::OffsetDateTime;
+use two_bot_core::giveaway::MemberStanding;
 use two_bot_core::giveaway_store as store;
-use two_bot_core::giveaway_store::{NewDraw, NewGiveaway};
+use two_bot_core::giveaway_store::{EntryAdmission, NewDraw, NewGiveaway};
 use two_bot_testsupport::TestDatabase;
 
 const GUILD: &str = "1545644954272137297";
 const CHANNEL: &str = "200000000000000001";
 const MESSAGE: &str = "200000000000000002";
 const MOD: &str = "100000000000000099";
+const BUDGET_USER: &str = "100000000000000021";
+const BUDGET_OTHER: &str = "100000000000000022";
 const NONCE: &str = "9f2c4a7e1b5d8f03a6c9e2b4d7f1a83c";
 const SEED_0: &str = "fdab72cb4823dbf292f0ed3fea3abef20dc268169a90f6aea0a1cd4c1a8c15ab";
 const SEED_1: &str = "16688231019cd5f768dcb0e2a604881b365c0ba7b242433b3e7ff96bde0bdf88";
@@ -668,6 +671,102 @@ async fn store_chain_enforces_the_giveaway_foreign_keys() -> Result<(), sqlx::Er
         .expect_err("store-chain parent delete with live children must fail");
     assert_sqlstate(&refused, "23503");
     assert!(store::delete_giveaway(&pool, GUILD, "gw01h455k").await?);
+    fixture.close().await.expect("drop test database");
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_admitted_refuses_the_26th_active_giveaway() -> Result<(), sqlx::Error> {
+    let Some(fixture) = connect("create_admitted_refuses_the_26th_active_giveaway").await else {
+        return Ok(());
+    };
+    let pool = fixture.pool().clone();
+    for n in 0..25 {
+        let id = format!("gw_quota_{n:02}");
+        assert!(
+            store::create_admitted(&pool, &new_giveaway(&id, at(3_600)))
+                .await?
+                .is_some(),
+            "control create {n} of 25 succeeds"
+        );
+    }
+    assert_eq!(
+        store::create_admitted(&pool, &new_giveaway("gw_quota_26th", at(3_600))).await?,
+        None,
+        "the 26th active giveaway is refused"
+    );
+    let definitions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM giveaways WHERE guild_id = $1")
+        .bind(GUILD)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(
+        definitions, 25,
+        "the refused create inserts no definition row"
+    );
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM automation_audit_log WHERE guild_id = $1 AND action = 'giveaway.create'",
+    )
+    .bind(GUILD)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(audits, 25, "the refused create writes no audit row");
+    fixture.close().await.expect("drop test database");
+    Ok(())
+}
+
+#[tokio::test]
+async fn durable_entry_budget_refuses_the_11th_write_without_the_runtime() -> Result<(), sqlx::Error>
+{
+    let Some(fixture) =
+        connect("durable_entry_budget_refuses_the_11th_write_without_the_runtime").await
+    else {
+        return Ok(());
+    };
+    let pool = fixture.pool().clone();
+    // Direct store calls only: no runtime exists here, so the in-process
+    // budget cannot mask the durable arm. Removing the `writes >= 10` check
+    // must turn the refusal below red.
+    let now = at(100);
+    let standing = MemberStanding {
+        role_ids: Vec::new(),
+        account_age_days: 400,
+        guild_age_days: 400,
+    };
+    for n in 0..11 {
+        let id = format!("gw_budget_{n:02}");
+        assert!(
+            store::create_admitted(&pool, &new_giveaway(&id, at(3_600)))
+                .await?
+                .is_some(),
+            "setup create {n} of 11 succeeds"
+        );
+    }
+    for n in 0..10 {
+        let id = format!("gw_budget_{n:02}");
+        assert_eq!(
+            store::admit_entry(&pool, GUILD, &id, BUDGET_USER, &standing, now).await?,
+            EntryAdmission::Entered,
+            "entry {n} of 10 is admitted"
+        );
+    }
+    assert_eq!(
+        store::admit_entry(&pool, GUILD, "gw_budget_10", BUDGET_USER, &standing, now).await?,
+        EntryAdmission::RateLimited,
+        "the 11th write in the minute is refused by the durable budget"
+    );
+    let writes: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM giveaway_entries WHERE guild_id = $1 AND user_id = $2",
+    )
+    .bind(GUILD)
+    .bind(BUDGET_USER)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(writes, 10, "the refused entry inserts no row");
+    assert_eq!(
+        store::admit_entry(&pool, GUILD, "gw_budget_10", BUDGET_OTHER, &standing, now).await?,
+        EntryAdmission::Entered,
+        "a different member is unaffected by the per-user budget"
+    );
     fixture.close().await.expect("drop test database");
     Ok(())
 }

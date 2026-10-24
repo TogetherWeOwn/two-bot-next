@@ -125,6 +125,7 @@ pub enum HandlerId {
     ScorecardAttendance,
     AutomationAdmin,
     AutomationCustom,
+    Giveaway,
     Rsvp,
     RsvpAttendance,
     Lfg,
@@ -146,6 +147,7 @@ pub enum ComponentHandler {
     SelfRole,
     Tickets,
     LfgSignup,
+    GiveawayEntry,
 }
 
 /// Contract feature slices implement so the router can hand a routed
@@ -405,6 +407,7 @@ impl InteractionRouter {
             // Sticky/admin plus custom rows (`CustomCommandRuntime::register`).
             register(HandlerId::AutomationAdmin);
             register(HandlerId::AutomationCustom);
+            register(HandlerId::Giveaway);
         }
         if gates.announcements {
             for id in [
@@ -687,6 +690,11 @@ impl InteractionRouter {
                 gate: RowGate::Automations,
                 permission_refusal: Some(RouterRefusal::ManageServerRequired),
             },
+            "giveaway" => Row {
+                handler: HandlerId::Giveaway,
+                gate: RowGate::Automations,
+                permission_refusal: Some(RouterRefusal::ManageServerRequired),
+            },
             "rsvp" => Row {
                 handler: HandlerId::Rsvp,
                 gate: RowGate::Announcements,
@@ -784,6 +792,11 @@ impl InteractionRouter {
                 return ComponentOutcome::Ignore;
             }
             ComponentHandler::SelfRole
+        } else if custom_id.starts_with("gw:") {
+            if !self.gates.automations || !self.guild_ok(guild_id) {
+                return ComponentOutcome::Ignore;
+            }
+            ComponentHandler::GiveawayEntry
         } else {
             return if self.guild_ok(guild_id) {
                 ComponentOutcome::Unknown

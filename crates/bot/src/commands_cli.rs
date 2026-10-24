@@ -546,4 +546,41 @@ mod tests {
             "feed-inspect survives the voice registry"
         );
     }
+
+    #[test]
+    fn desired_registry_gates_inspection_and_giveaway_only_on_automations() {
+        for other_features in ["0", "1"] {
+            for voice in ["0", "1"] {
+                for automations in [None, Some("0"), Some("1")] {
+                    let mut env = vars();
+                    for flag in [
+                        "TWO_ANNOUNCEMENTS",
+                        "TWO_COMMUNITY_SCORECARD",
+                        "TWO_MODERATION",
+                    ] {
+                        env.insert(flag.into(), other_features.into());
+                    }
+                    env.insert("TWO_OWEN_USER_ID".into(), "123456789012345678".into());
+                    env.insert("TWO_VOICE".into(), voice.into());
+                    if let Some(value) = automations {
+                        env.insert("TWO_AUTOMATIONS".into(), value.into());
+                    }
+                    let definitions =
+                        desired_definitions(2222, &env).expect("desired registry assembles");
+                    for name in ["command-inspect", "giveaway"] {
+                        assert_eq!(
+                            definitions.iter().filter(|def| def.name == name).count(),
+                            usize::from(automations == Some("1")),
+                            "/{name}: automations={automations:?}, voice={voice}, other_features={other_features}"
+                        );
+                    }
+                    assert_eq!(
+                        definitions.iter().filter(|def| def.name == "reopen").count(),
+                        1,
+                        "/reopen always published: automations={automations:?}, voice={voice}, other_features={other_features}"
+                    );
+                }
+            }
+        }
+    }
 }

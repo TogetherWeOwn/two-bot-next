@@ -88,6 +88,12 @@ const HELP_GROUPS: &[HelpGroup] = &[
         anchor: None,
     },
     HelpGroup {
+        title: "Giveaways",
+        requires: Some("Manage Server"),
+        commands: &["giveaway"],
+        anchor: None,
+    },
+    HelpGroup {
         title: "RSVPs",
         requires: None,
         commands: &["rsvp", "rsvp-attendance"],
