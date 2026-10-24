@@ -124,9 +124,11 @@ Roles and a role below the bot; when those are missing the row is loud per the
 cleanup rule, never dropped. A member who left the guild needs no REST call.
 
 **Bounds.** At most one role per event and one active event per role; a role
-stays bound-or-draining until no non-terminal row remains (`granted`,
-`pending_grant` or `pending_revoke`: a pending add may already have reached
-Discord), and rebind while draining is refused (`ROLE_DRAINING`). Pool cap 5
+stays bound-or-draining until every row is terminal (`revoked`, `member_left`,
+`externally_removed`, `expired_unconfirmed`). The predicate is allowlist-shaped:
+a `pending_grant` may already have reached Discord, and an unknown future state
+blocks the drain (fail closed, per the inert rule in §4) instead of releasing
+the role. Rebind while draining is refused (`ROLE_DRAINING`). Pool cap 5
 roles per guild, so at most 5 active bindings and 5,000 non-terminal ledger
 rows (1,000 grants/event, the RSVP cap). Terminal rows are kept 90 days (§5),
 so total stored rows have no fixed bound without a limit on sequential events;
@@ -156,7 +158,9 @@ event draining alone (≤ 1,000 rows, otherwise empty ledger) finishes in ≤ 20
 ticks (≤ 20 min); under a full 5,000-row ledger any single event's rows can
 finish as late as tick ~100 (~100 min). Cancel, complete and expiry therefore
 land within one 10-minute mirror poll plus ≤ 20 min isolated, up to ~100 min
-under a full ledger. The sweep **only
+under a full ledger — when every revoke is executable. A row whose revoke
+cannot execute has no fixed completion bound; it stays visible via the
+`revoke_blocked` count and the 1 h overdue alert below. The sweep **only
 revokes**. It never grants and never re-grants a role a member or staff removed
 (`externally_removed` is terminal until a new explicit click). It retries
 `pending_revoke` rows: a crash between the row write and the REST remove must
@@ -210,10 +214,13 @@ disappears quietly.
   `pending_revoke` for the sweep to retry. Two write-time predicates back the
   §3 bounds: unique `(guild_id, role_id)` where bound-or-draining enforces one
   event per role until the drain completes, and unique `(guild_id, event_id)`
-  where bound-or-draining enforces one role per event. Binds take a
+  where bound-or-draining enforces one role per event. Both predicates use the
+  §3 allowlist definition: a row counts as settled only in a terminal state, so
+  an unknown state keeps the binding draining. Binds take a
   per-`(guild,event)` advisory lock before the preflight re-check and insert,
   so concurrent staff binds serialize instead of double-binding. An
-  unknown future state is inert: never granted, never revoked, never deleted.
+  unknown future state is inert: never granted, never revoked, never deleted,
+  and it blocks the drain.
 - Guild isolation: every key, lock and query carries `guild_id`; a role or event
   from another guild is `UNAVAILABLE`.
 
@@ -222,7 +229,7 @@ disappears quietly.
 | Condition | Behavior |
 | --- | --- |
 | Event rescheduled | Binding follows the event ID; expiry recomputed from the mirror; no grant, revoke or message |
-| Event canceled/completed | Revoke all `granted` rows within the sweep; worst-case latency is one 10-minute mirror poll plus ≤ 20 min isolated, up to ~100 min under a full ledger (§3), disclosed to staff |
+| Event canceled/completed | Revoke all `granted` rows within the sweep; worst-case latency is one 10-minute mirror poll plus ≤ 20 min isolated, up to ~100 min under a full ledger (§3), when each revoke is executable; blocked rows have no fixed bound and use the status/alert path, disclosed to staff |
 | Role deleted externally | Binding becomes `SUSPENDED_ROLE_MISSING`; no recreation, no grant; staff see it in status |
 | Role changes (permissions, overwrite presence, managed flag, hoist, hierarchy) | Change detection runs on every sweep tick and every grant; any change suspends the binding (`SUSPENDED_ROLE_CHANGED`); no new grants; revoke continues. Residual TOCTOU between the fresh read and the REST add is accepted |
 | Member left guild | Row becomes `member_left`; no REST call |
@@ -259,8 +266,8 @@ bot never mentions the role itself.
 | Attendance disclosure | Separate explicit opt-in; the control label itself names the visibility; role visibility is a new public marker the bot cannot hide |
 | Bot touching unrelated roles/members | Only allowlisted roles and only rows the bot granted; manual holders untouched |
 | Grant after consent withdrawn | Locked re-read before and after REST; compensating revoke; inline withdrawal with sweep backstop |
-| Stale cancel (up to 10 minutes plus drain) | Disclosed (≤ 10 min poll + ≤ 20 min isolated, up to ~100 min under a full ledger); mention of a canceled event's role may still reach holders |
-| Role rebound before the drain | Bound-or-draining uniqueness plus `ROLE_DRAINING`; rebind refused until no non-terminal row (`granted`, `pending_grant`, `pending_revoke`) remains |
+| Stale cancel (up to 10 minutes plus drain) | Disclosed (≤ 10 min poll + ≤ 20 min isolated, up to ~100 min under a full ledger, executable revokes only; blocked rows unbounded via status/alert); mention of a canceled event's role may still reach holders |
+| Role rebound before the drain | Bound-or-draining uniqueness plus `ROLE_DRAINING`; rebind refused until every row is terminal; unknown states block the drain |
 | Silent stuck revoke | Bounded retry, staff-visible `revoke_blocked` count, alert past 1 h overdue |
 | Cross-guild leakage | Guild-keyed rows and locks; foreign IDs collapse to `UNAVAILABLE` |
 
@@ -418,10 +425,11 @@ python3 scripts/check_docs_index.py --json
 ...     # staff-visible revoke health: blocked count plus 1 h overdue alert
 ...     blocked = [r for r in rows if r.get("revoke_blocked")]
 ...     return len(blocked), any(r.get("overdue_min", 0) > 60 for r in blocked)
->>> NONTERMINAL = ("granted", "pending_grant", "pending_revoke")
+>>> TERMINAL = ("revoked", "member_left", "externally_removed",
+...             "expired_unconfirmed")
 >>> def drained(rows):
-...     # bound-or-draining release: no row may still hold the role
-...     return not [r for r in rows if r.get("state") in NONTERMINAL]
+...     # bound-or-draining release: every row must be terminal; unknown states block
+...     return all(r.get("state") in TERMINAL for r in rows)
 >>> pre = [
 ...     ("ok", OK_INPUT, "OK"),
 ...     ("missing_evidence", {}, "UNAVAILABLE"),
@@ -514,17 +522,19 @@ python3 scripts/check_docs_index.py --json
 ...     ("granted_blocks", [{"state": "granted"}], False),
 ...     ("pending_grant_blocks", [{"state": "pending_grant"}], False),
 ...     ("pending_revoke_blocks", [{"state": "pending_revoke"}], False),
+...     ("future_state_blocks", [{"state": "v9_quarantine"}], False),
+...     ("missing_state_blocks", [{}], False),
 ... ]
 >>> for name, rows, want in dr:
 ...     assert drained(rows) == want, name
 >>> names = ([n for n, _, _ in pre] + [n for n, _, _ in gr] + [n for n, _, _ in sw]
 ...          + [n for n, _, _ in bl] + [n for n, _, _ in dr])
->>> assert len(pre) + len(gr) + len(sw) + len(bl) + len(dr) == 66
+>>> assert len(pre) + len(gr) + len(sw) + len(bl) + len(dr) == 68
 >>> assert 5 * 1000 == 5000 and 24 * 60 > 15
 >>> # 1200 s: one full event draining alone; 6000 s: any single event under a full ledger
 >>> assert 1000 // 50 * 60 == 1200 and 5000 // 50 * 60 == 6000
 >>> print(json.dumps({"schema": "events.attendee_role.oracle.v1", "fixtures": len(names), "status": "pass"}, sort_keys=True))
-{"fixtures": 66, "schema": "events.attendee_role.oracle.v1", "status": "pass"}
+{"fixtures": 68, "schema": "events.attendee_role.oracle.v1", "status": "pass"}
 
 ```
 
@@ -545,11 +555,12 @@ before any build card, protected test handoff or pilot. A queue/intake receipt
 is not alignment, and no request goes to the owner or an invented executor.
 The decision must accept or revise: option B with the allowlist, zero-permission
 role, explicit opt-in with disclosure, sweep-only-revokes, eventual revoke
-bounded by the mirror poll plus the stated drain, inline consent withdrawal,
+bounded by the mirror poll plus the stated drain for executable revokes
+(blocked rows surface via status and alert, §3), inline consent withdrawal,
 and no DM, ping, role creation or retroactive grant.
 Any material revision rebinds review to the new revision.
 
-By 2026-10-31 the metric is **all 66 fixtures have agreed or explicitly
+By 2026-10-31 the metric is **all 68 fixtures have agreed or explicitly
 rejected outcomes and the narrowing conditions and review findings have written
 disposition** (see §6 and the PR thread). This measures design completeness,
 not demand. Keep this proposal only if grants are provably scoped, revocable
