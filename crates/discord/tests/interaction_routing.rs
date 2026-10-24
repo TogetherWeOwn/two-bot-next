@@ -1060,7 +1060,7 @@ async fn followup_requires_a_valid_message_identity_without_retrying() {
 #[tokio::test]
 async fn publish_sends_the_complete_merged_set_once() {
     // Publish-once against the mock double through the real bulk-set
-    // endpoint: one request, all 32 names, no partial view.
+    // endpoint: one request, all 33 names, no partial view.
     let router = InteractionRouter::new(all_on());
     let defs = router
         .publish_set(&[CustomCommand {
@@ -1104,7 +1104,7 @@ async fn publish_sends_the_complete_merged_set_once() {
         .iter()
         .map(|c| c["name"].as_str().expect("command has a name"))
         .collect();
-    assert_eq!(names.len(), 32, "no partial view");
+    assert_eq!(names.len(), 33, "no partial view");
     for expected in [
         "rank",
         "leaderboard",
