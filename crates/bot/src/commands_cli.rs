@@ -512,11 +512,12 @@ mod tests {
         let all_on = desired_definitions(2222, &env).expect("desired registry assembles");
         assert_eq!(
             all_on.len(),
-            // 32 all-gate builtins (31 plus automations-gated `/giveaway`)
-            // plus the moderation-gated reads `/purge-preview` and
+            // 33 all-gate builtins (31 plus automations-gated `/giveaway`
+            // and announcement-gated `/lfg-list`) plus the
+            // moderation-gated reads `/purge-preview` and
             // `/channel-inspect` and the Next-only `/feed-inspect` relay
             // detail; no new feature gate.
-            35
+            36
         );
         assert!(
             all_on.iter().any(|def| def.name == "reopen"),
@@ -527,12 +528,16 @@ mod tests {
             "giveaway survives the all-on registry"
         );
         assert!(
+            all_on.iter().any(|def| def.name == "lfg-list"),
+            "lfg-list survives the all-on registry"
+        );
+        assert!(
             all_on.iter().any(|def| def.name == "feed-inspect"),
             "feed-inspect survives the all-on registry"
         );
         env.insert("TWO_VOICE".into(), "1".into());
         let with_voice = desired_definitions(2222, &env).expect("desired registry assembles");
-        assert_eq!(with_voice.len(), 56);
+        assert_eq!(with_voice.len(), 57);
         assert!(
             with_voice.iter().any(|def| def.name == "reopen"),
             "reopen survives the voice registry"
@@ -540,6 +545,10 @@ mod tests {
         assert!(
             with_voice.iter().any(|def| def.name == "giveaway"),
             "giveaway survives the voice registry"
+        );
+        assert!(
+            with_voice.iter().any(|def| def.name == "lfg-list"),
+            "lfg-list survives the voice registry"
         );
         assert!(
             with_voice.iter().any(|def| def.name == "feed-inspect"),
