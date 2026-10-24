@@ -102,7 +102,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
     HelpGroup {
         title: "Looking for group",
         requires: Some("Manage Events"),
-        commands: &["lfg", "lfg-close"],
+        commands: &["lfg", "lfg-close", "lfg-list"],
         anchor: None,
     },
     HelpGroup {
@@ -762,13 +762,13 @@ mod tests {
                 "{token} appears exactly once"
             );
         }
-        // 36 non-voice commands (5 core + 20 feature + 9 moderation + 2 reads),
-        // including inspection, reopen, giveaway, feed-pause, feed-resume,
-        // purge-preview and channel-inspect, plus 21 additional voice commands
-        // (voice `kick` loses first-wins to moderation `/kick`).
+        // 37 non-voice commands (5 core + 21 feature + 9 moderation + 2 reads),
+        // including inspection, reopen, giveaway, lfg-list, feed-pause,
+        // feed-resume, purge-preview and channel-inspect, plus 21 additional
+        // voice commands (voice `kick` loses first-wins to moderation `/kick`).
         // `/templateassistant` stays unpublished until its slice lands:
         // matches the regenerated `docs/commands.md` total.
-        assert!(text.contains("**Server commands** (57 live)"));
+        assert!(text.contains("**Server commands** (58 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"
@@ -894,11 +894,11 @@ mod tests {
             .iter()
             .flat_map(|g| g.commands.iter().copied())
             .collect();
-        // 36 non-voice names, including inspection, reopen, giveaway,
-        // feed-pause, feed-resume, purge-preview and channel-inspect, plus
-        // 21 additional voice names (voice `kick` shares the Kick group).
+        // 37 non-voice names, including inspection, reopen, giveaway,
+        // lfg-list, feed-pause, feed-resume, purge-preview and channel-inspect,
+        // plus 21 additional voice names (voice `kick` shares the Kick group).
         // `/templateassistant` stays out until its slice lands.
-        assert_eq!(grouped.len(), 57);
+        assert_eq!(grouped.len(), 58);
         for name in [
             "rank",
             "leaderboard",
@@ -915,6 +915,7 @@ mod tests {
             "giveaway",
             "lfg",
             "lfg-close",
+            "lfg-list",
             "feed-add",
             "ban",
             "tempban",

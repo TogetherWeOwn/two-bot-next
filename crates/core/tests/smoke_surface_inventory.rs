@@ -50,14 +50,14 @@ fn option_type_name(kind: u8) -> &'static str {
 fn inventory_matches_registry_output_in_publish_order() {
     let published = all_on_router().publish_set(&[]).expect("publish set");
     let fixture = fixture();
-    assert_eq!(fixture["count"], 36, "36 built-ins");
+    assert_eq!(fixture["count"], 37, "37 built-ins");
     assert_eq!(
         fixture["dm_permission_all_false"], true,
         "fixture claims guild-only"
     );
     let rows = fixture["commands"].as_array().expect("command rows");
     assert_eq!(published.len(), rows.len(), "registry row count matches");
-    assert_eq!(published.len(), 36, "36 built-ins in the registry");
+    assert_eq!(published.len(), 37, "37 built-ins in the registry");
 
     for (definition, row) in published.iter().zip(rows.iter()) {
         let name = row["name"].as_str().expect("row name");
@@ -203,8 +203,8 @@ fn exactly_five_covered_with_response_links_rest_deferred_with_reasons() {
     let covered: Vec<&Value> = rows.iter().filter(|r| r["smoke"] == "covered").collect();
     let deferred: Vec<&Value> = rows.iter().filter(|r| r["smoke"] == "deferred").collect();
     assert_eq!(covered.len(), 5, "exactly the top five");
-    assert_eq!(deferred.len(), 31, "every non-smoke row deferred");
-    assert_eq!(covered.len() + deferred.len(), 36, "every row marked");
+    assert_eq!(deferred.len(), 32, "every non-smoke row deferred");
+    assert_eq!(covered.len() + deferred.len(), 37, "every row marked");
 
     let mut covered_names: Vec<&str> = covered
         .iter()

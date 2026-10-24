@@ -9,7 +9,7 @@
 //! the denial order (guild fence → feature gate → permission bits →
 //! policy/validation).
 //!
-//! Scope: the 36 non-voice built-in slash commands in `docs/commands.md` (core +
+//! Scope: the 37 non-voice built-in slash commands in `docs/commands.md` (core +
 //! scorecard + automation + announcement + moderation). Out of scope on
 //! purpose: voice commands (`voice_commands`, separate slice with its own
 //! `TWO_VOICE` gate and a `kick` name collision resolved first-wins in favour
@@ -387,6 +387,20 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             ],
         ),
         row(
+            "lfg-list",
+            38,
+            E2eGate::Announcements,
+            PERM_MANAGE_EVENTS,
+            "ManageEvents",
+            "LfgList",
+            "Ephemeral current-channel open confirmed-post list; at most five whole rows and bounded cursor continuation, no mutations.",
+            &[
+                "Gate:AnnouncementsDisabled",
+                "Perm:ManageEventsRequired",
+                "Valid:cursor:optional,bound-to-guild-and-channel,max-512",
+            ],
+        ),
+        row(
             "feed-add",
             28,
             E2eGate::Announcements,
@@ -417,7 +431,7 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
         ),
         row(
             "feed-pause",
-            38,
+            39,
             E2eGate::Announcements,
             PERM_MANAGE_GUILD,
             "ManageGuild",
@@ -431,7 +445,7 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
         ),
         row(
             "feed-resume",
-            39,
+            40,
             E2eGate::Announcements,
             PERM_MANAGE_GUILD,
             "ManageGuild",

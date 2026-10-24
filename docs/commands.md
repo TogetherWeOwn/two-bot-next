@@ -34,7 +34,7 @@ Help is ephemeral and does not execute the selected command. The command picker
 hides gated commands you cannot use; help explains published requirements but
 does not evaluate every effective Discord permission or guarantee authorization.
 
-Built-in commands: 57.
+Built-in commands: 58.
 
 ## `/access`
 
@@ -360,6 +360,17 @@ Close a raid/LFG signup
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `id` | string | true | — | — | 128 | — | LFG id from the posted signup |
+
+## `/lfg-list`
+
+List open game posts in this channel
+
+- Default permissions: ManageEvents (`8589934592`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `cursor` | string | false | — | — | 512 | — | Continue a current-channel list |
 
 ## `/limit`
 
