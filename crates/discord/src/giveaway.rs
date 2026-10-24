@@ -318,7 +318,7 @@ impl GiveawayRuntime {
                 _ => return Ok(INVALID.into()),
             }
         }
-        let Some(channel) = interaction_channel(interaction) else {
+        let Some(channel) = super::channel_moderation::invoking_channel_id(interaction) else {
             return Ok(INVALID.into());
         };
         let actor = actor_id(interaction);
@@ -1089,18 +1089,6 @@ fn actor_id(interaction: &Interaction) -> String {
         .or(interaction.user.as_ref())
         .map(|user| user.id.get().to_string())
         .unwrap_or_default()
-}
-
-/// Invoking channel as a snowflake string. `channel_id` is deprecated on the
-/// wire but still the field Discord populates for guild slash commands; the
-/// replacement `channel` object carries the id plus a payload we never read.
-#[allow(deprecated)]
-fn interaction_channel(interaction: &Interaction) -> Option<String> {
-    interaction
-        .channel
-        .as_ref()
-        .map(|channel| channel.id.get().to_string())
-        .or_else(|| interaction.channel_id.map(|id| id.get().to_string()))
 }
 
 fn valid_id(id: &str) -> bool {
