@@ -119,6 +119,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [LFG input contract](lfg-interaction-contract.md)
 - [Proposed opt-in ready check (design only)](lfg-ready-check-spec.md)
 - [Proposed backup-host handoff (design only)](lfg-backup-host-spec.md)
+- [LFG thread (design)](lfg-thread-spec.md)
 - [Feed operations](feed-supervisor.md)
 - [Feed domain](feeds-port.md)
 - [EventSub operations](eventsub-runbook.md)
