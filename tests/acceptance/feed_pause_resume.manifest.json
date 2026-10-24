@@ -11,7 +11,7 @@
     },
     {
       "path": "crates/bot/src/feed_pause_resume_acceptance_tests.rs",
-      "sha256": "0b83a9e37ba5ef400982dd700230017ccbfbdbeca0fa39eaa9c72f6609f6f90d",
+      "sha256": "4d61905890bd2afca761f69da9a1a0d840d357e643a8c1bba7bf2133fc53ecf1",
       "tests": 17
     },
     {
