@@ -1451,6 +1451,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "unlock"
                         | "lfg"
                         | "lfg-close"
+                        | "lfg-list"
                         | "schedule"
                         | "schedule-remove"
                         | "schedule-list"
@@ -1468,6 +1469,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
         assert!(!unwired.contains(&"leaderboard"));
         assert!(!unwired.contains(&"help"));
         assert!(!unwired.contains(&"privacy"));
+        assert!(!unwired.contains(&"lfg-list"));
         assert!(!unwired.contains(&"reopen"));
         if router_gates.announcements {
             assert!(unwired.contains(&"rsvp"), "enabled unwired announcement");
@@ -2804,6 +2806,55 @@ async fn lfg_sticky_and_feed_routes_coexist_without_db() {
 }
 
 #[tokio::test]
+async fn lfg_list_store_failure_reaches_read_path_without_other_rest_effects() {
+    for automations in [false, true] {
+        let (mock, origin) = MockRest::start(Vec::new()).await;
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+            .expect("lazy pool");
+        // Fail reads immediately without connecting to any database.
+        pool.close().await;
+        let runtime = CommandRuntime::new(
+            pool,
+            executor_at(origin),
+            router_with_commands(gates(automations, true)),
+            GUILD,
+            automations,
+        );
+        let mut interaction = slash("lfg-list", Some(CHANNEL), Vec::new());
+        interaction.member.as_mut().unwrap().permissions = Some(Permissions::MANAGE_EVENTS);
+        tokio::time::timeout(Duration::from_secs(2), runtime.on_interaction(&interaction))
+            .await
+            .expect("unavailable list must finish with a bounded reply");
+
+        let requests = mock.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "only the callback; no identity, channel, history, defer/edit or mutation REST"
+        );
+        let callback = &requests[0];
+        assert_eq!(callback.method, "POST");
+        assert_eq!(
+            callback.path,
+            "/api/v10/interactions/7/sticky-test-token/callback"
+        );
+        let reply: serde_json::Value = serde_json::from_slice(&callback.body).unwrap();
+        assert_eq!(reply["type"], 4, "one immediate callback, not a defer");
+        assert_eq!(reply["data"]["flags"], 64, "ephemeral discovery reply");
+        assert_eq!(
+            reply["data"]["content"], "Unable to list game posts. Try /lfg-list again.",
+            "the real read path owns the command even with automations={automations}"
+        );
+        assert_eq!(
+            reply["data"]["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn lfg_commands_preserve_manage_events_and_disabled_refusals() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     for (announcements, permissions, expected) in [
@@ -4037,6 +4088,7 @@ fn production_router_matches_composed_production_wiring() {
             HandlerId::RsvpAttendance,
             HandlerId::Lfg,
             HandlerId::LfgClose,
+            HandlerId::LfgList,
             HandlerId::FeedAdd,
             HandlerId::FeedRemove,
             HandlerId::FeedList,
@@ -4049,7 +4101,7 @@ fn production_router_matches_composed_production_wiring() {
 
     // Composition mirrors production: the real `router_with_commands`, the
     // member verbs `CommandRuntime::build` adds while the member consumer
-    // exists, and the LFG pair `InteractionRuntime::with_router` adds. Only
+    // exists, and the LFG handlers `InteractionRuntime::with_router` adds. Only
     // `handler_for` presence is compared.
     fn composed(gates: RouterGates, member_present: bool) -> InteractionRouter {
         let mut router = router_with_commands(gates);
@@ -4066,6 +4118,7 @@ fn production_router_matches_composed_production_wiring() {
         }
         router.register(Box::new(Marker(HandlerId::Lfg)));
         router.register(Box::new(Marker(HandlerId::LfgClose)));
+        router.register(Box::new(Marker(HandlerId::LfgList)));
         router
     }
 
