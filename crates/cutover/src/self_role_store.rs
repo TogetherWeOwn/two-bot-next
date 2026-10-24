@@ -330,6 +330,8 @@ pub enum StoreError {
     Db(#[from] sqlx::Error),
     #[error("invalid persisted self-role intent: {0}")]
     Intent(#[from] serde_json::Error),
+    #[error("self-role catalogue changed before admission")]
+    CatalogueChanged,
     #[error("self-role event claim is stale or belongs to another event")]
     StaleClaim,
     #[error("self-role event and panel claim scopes differ")]
@@ -803,7 +805,7 @@ impl SelfRoleStore {
 
     /// Insert-first deduplication with an already computed immutable intent.
     pub async fn claim_audit(&self, row: &SelfRoleAudit) -> Result<Option<EventClaim>, StoreError> {
-        self.claim_audit_inner(row, true).await
+        self.claim_audit_inner(row, true, None).await
     }
 
     /// Runtime admission before lane acquisition and authoritative REST reads.
@@ -813,21 +815,53 @@ impl SelfRoleStore {
         &self,
         row: &SelfRoleAudit,
     ) -> Result<Option<EventClaim>, StoreError> {
+        self.claim_pending_inner(row, None).await
+    }
+
+    /// Fresh service admission shares the settings writer's revision lock.
+    /// A stale catalogue cannot insert work after a destructive edit commits;
+    /// if admission wins, its processing audit makes that edit refuse to drain.
+    /// Recovery uses the original claim path, never a new settings revision.
+    pub async fn claim_pending_audit_at_revision(
+        &self,
+        row: &SelfRoleAudit,
+        revision: i64,
+    ) -> Result<Option<EventClaim>, StoreError> {
+        self.claim_pending_inner(row, Some(revision)).await
+    }
+
+    async fn claim_pending_inner(
+        &self,
+        row: &SelfRoleAudit,
+        revision: Option<i64>,
+    ) -> Result<Option<EventClaim>, StoreError> {
         if !row.desired_role_ids.is_empty()
             || !row.pre_mutation_role_ids.is_empty()
             || row.effects != AuditEffects::default()
         {
             return Err(StoreError::StaleClaim);
         }
-        self.claim_audit_inner(row, false).await
+        self.claim_audit_inner(row, false, revision).await
     }
 
     async fn claim_audit_inner(
         &self,
         row: &SelfRoleAudit,
         initialized: bool,
+        expected_revision: Option<i64>,
     ) -> Result<Option<EventClaim>, StoreError> {
         let mut tx = self.pool.begin().await?;
+        if let Some(expected) = expected_revision {
+            let (current,): (i64,) = sqlx::query_as(
+                "SELECT revision FROM guild_settings_revision WHERE singleton=TRUE FOR SHARE",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            if current != expected {
+                tx.rollback().await?;
+                return Err(StoreError::CatalogueChanged);
+            }
+        }
         let now = self.now(&mut tx).await?;
         let expires = self.expiry(now)?;
         let created = now
