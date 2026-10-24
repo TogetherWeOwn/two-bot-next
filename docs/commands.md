@@ -327,6 +327,7 @@ Post a raid/LFG signup with role slots
 | `title` | string | true | — | — | 100 | — | Event or group title |
 | `starts-at` | string | true | — | — | — | — | ISO-8601 start time, e.g. 2026-10-04T18:00:00Z |
 | `roles` | string | true | — | — | 2339 | — | Role slots as role:Label:count, comma-separated, e.g. tank:Tank:2,dps:DPS:6 |
+| `preview` | boolean | false | — | — | — | — | Privately preview without posting |
 
 ## `/lfg-close`
 
