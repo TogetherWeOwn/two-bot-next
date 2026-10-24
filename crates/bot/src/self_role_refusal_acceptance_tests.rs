@@ -41,6 +41,14 @@ impl RefusalFixture {
         ))
         .execute(&pool)
         .await?;
+        // Service admission pins the settings revision before inserting durable
+        // work, and fails closed when the revision row is missing. Seed the
+        // settings store so full-dispatch tests admit against revision 0.
+        sqlx::raw_sql(include_str!(
+            "../../cutover/migrations/0330_guild_settings.sql"
+        ))
+        .execute(&pool)
+        .await?;
         let guild = Guild::new(&[ROLE_B, UNRELATED]);
         let state = guild.0.clone();
         let mock = MockRest::with_responder(move |request| {
