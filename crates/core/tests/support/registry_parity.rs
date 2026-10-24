@@ -303,9 +303,9 @@ pub fn expected_registry() -> Value {
         + 1;
     commands.insert(after_list, inspect);
     // Next-only `/giveaway` timed entry: no legacy counterpart. Insert at the
-    // publish position (index 15, after sticky-remove and the
-    // inspect/help/privacy/reopen inserts above) as the exact published
-    // definition, so parity pins its shape too.
+    // publish position (index 16, after sticky-remove and the
+    // inspect/help/privacy/reopen/welcome-preview inserts above) as the exact
+    // published definition, so parity pins its shape too.
     let giveaway = serde_json::to_value(
         CommandDefinition::new("giveaway", "Create, list or cancel a giveaway")
             .permissions(PERM_MANAGE_GUILD)
@@ -367,7 +367,7 @@ pub fn expected_registry() -> Value {
             ]),
     )
     .expect("giveaway serializes");
-    commands.insert(15, giveaway);
+    commands.insert(16, giveaway);
     // Next-only read surfaces follow the nine historical mutations. Literal
     // payloads keep the frozen snapshot intact and compare every read field.
     let after_unlock = commands
