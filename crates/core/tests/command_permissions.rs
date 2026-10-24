@@ -94,25 +94,26 @@ fn all_30_rows_equal_parity_section1() {
     // The 30 legacy parity rows plus the Next-only `/help` discovery command
     // (parity row 31 — legacy has no help command), `/privacy` member
     // self-serve (row 32), management-only `/command-inspect` (row 33),
-    // `/reopen` picker recovery (row 34) and `/giveaway` timed entry
-    // (row 35). Next-only rows do not appear in the legacy §1 table above;
-    // registry equality covers every builtin.
-    assert_eq!(COMMAND_PERMISSIONS.len(), 35);
+    // `/reopen` picker recovery (row 34), `/purge-preview` (35),
+    // `/channel-inspect` (36) and `/giveaway` timed entry (row 37).
+    // No Next-only row appears in the legacy §1 table above; the
+    // registry-equality test below covers every published builtin instead.
+    assert_eq!(COMMAND_PERMISSIONS.len(), 37);
     assert_eq!(
         COMMAND_PERMISSIONS
             .iter()
             .map(|row| row.command)
             .collect::<HashSet<_>>()
             .len(),
-        35
+        37
     );
     assert_eq!(
         COMMAND_PERMISSIONS
             .iter()
             .map(|row| row.parity_row)
             .collect::<HashSet<_>>(),
-        (1..=35).collect::<HashSet<_>>(),
-        "parity rows are contiguous 1..=35"
+        (1..=37).collect::<HashSet<_>>(),
+        "parity rows are contiguous 1..=37"
     );
     let help = command_permission("help").expect("help has a permission row");
     assert_eq!(help.required_permissions, 0);
@@ -128,10 +129,24 @@ fn all_30_rows_equal_parity_section1() {
     assert_eq!(reopen.surface, CommandSurface::BuiltinSlash);
     assert_eq!(reopen.policy_hook, None);
     let giveaway = command_permission("giveaway").expect("giveaway has a permission row");
-    assert_eq!(giveaway.parity_row, 35);
+    assert_eq!(giveaway.parity_row, 37);
     assert_eq!(giveaway.required_permissions, 32, "ManageGuild bit");
     assert_eq!(giveaway.surface, CommandSurface::BuiltinSlash);
     assert_eq!(giveaway.policy_hook, None);
+}
+
+#[test]
+fn next_only_read_permission_rows_do_not_become_mutation_policy_hooks() {
+    for (name, number, bits) in [("purge-preview", 35, 8192), ("channel-inspect", 36, 16)] {
+        let row = command_permission(name).expect("read has a permission row");
+        assert_eq!(row.parity_row, number);
+        assert_eq!(row.required_permissions, bits);
+        assert_eq!(row.surface, CommandSurface::BuiltinSlash);
+        assert_eq!(row.policy_hook, None);
+        assert!(!ModerationAction::ALL
+            .iter()
+            .any(|action| action.command_name() == name));
+    }
 }
 
 #[test]
@@ -147,7 +162,7 @@ fn permission_table_equals_the_complete_published_registry() {
         .iter()
         .filter(|row| row.surface == CommandSurface::BuiltinSlash)
         .collect();
-    assert_eq!(builtins.len(), 32);
+    assert_eq!(builtins.len(), 34);
     assert_eq!(published.len(), builtins.len() + 1);
     for row in builtins {
         let definition = published
@@ -271,7 +286,7 @@ fn every_routed_builtin_name_has_a_permission_row() {
             other => panic!("{name} is published or retained but does not route: {other:?}"),
         }
     }
-    assert_eq!(routed, 32, "every retained builtin routes");
+    assert_eq!(routed, 34, "every retained builtin routes");
 }
 
 #[test]
