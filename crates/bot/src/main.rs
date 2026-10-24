@@ -72,6 +72,7 @@ mod gateway_failure;
 mod gateway_metrics;
 #[cfg(test)]
 mod gateway_tests;
+mod giveaway_runtime;
 #[cfg(test)]
 mod hotpath_settings_test_support;
 mod interaction_admission;

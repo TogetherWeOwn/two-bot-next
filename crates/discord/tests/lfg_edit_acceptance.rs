@@ -69,6 +69,44 @@ fn edit(id: u64, post: &str, title: Option<&str>, starts_at: Option<&str>) -> In
     )
 }
 
+/// Variant of [`edit`] emitting an integer (type 4) `title` alongside a
+/// valid string `starts-at`, for the strict-decode refusal contract.
+fn edit_integer_title(id: u64, post: &str, starts_at: Option<&str>) -> Interaction {
+    let mut options = vec![
+        json!({"type": 3, "name": "id", "value": post}),
+        json!({"type": 4, "name": "title", "value": 7}),
+    ];
+    if let Some(starts_at) = starts_at {
+        options.push(json!({"type": 3, "name": "starts-at", "value": starts_at}));
+    }
+    invocation(
+        id,
+        3333,
+        PERM_MANAGE_EVENTS,
+        json!({"id": "1", "name": "lfg-edit", "type": 1, "options": options}),
+        2,
+    )
+}
+
+/// Variant of [`edit`] emitting an integer (type 4) `starts-at` alongside a
+/// valid string `title`, for the strict-decode refusal contract.
+fn edit_integer_starts_at(id: u64, post: &str, title: Option<&str>) -> Interaction {
+    let mut options = vec![
+        json!({"type": 3, "name": "id", "value": post}),
+        json!({"type": 4, "name": "starts-at", "value": 7}),
+    ];
+    if let Some(title) = title {
+        options.push(json!({"type": 3, "name": "title", "value": title}));
+    }
+    invocation(
+        id,
+        3333,
+        PERM_MANAGE_EVENTS,
+        json!({"id": "1", "name": "lfg-edit", "type": 1, "options": options}),
+        2,
+    )
+}
+
 fn select(id: u64, user: u64, role: &str) -> Interaction {
     invocation(
         id,
@@ -114,13 +152,17 @@ async fn database() -> (tokio::sync::SemaphorePermit<'static>, TestDatabase) {
 }
 
 async fn seed(pool: &sqlx::PgPool, id: &str, guild: &str) {
+    seed_starts_at(pool, id, guild, "2099-09-11T20:00:00.000Z").await;
+}
+
+async fn seed_starts_at(pool: &sqlx::PgPool, id: &str, guild: &str, starts_at: &str) {
     let post = lfg::LfgPost {
         id: id.into(),
         guild_id: guild.into(),
         channel_id: CHANNEL.into(),
         message_id: Some(MESSAGE.into()),
         title: "Original raid".into(),
-        starts_at: "2099-09-11T20:00:00.000Z".into(),
+        starts_at: starts_at.into(),
         status: lfg::LfgStatus::Open,
         created_by: "7777".into(),
         created_at: "2026-09-30T00:00:00.123456Z".into(),
@@ -1092,4 +1134,125 @@ async fn existing_signup_and_close_control_use_the_same_real_router_and_database
     assert_eq!(after["domain"]["posts"][0]["status"], "closed");
     assert_eq!(channel_requests(&requests).len(), 2);
     assert_safe(&requests);
+}
+
+#[tokio::test]
+async fn omitted_starts_at_keeps_full_microsecond_precision() {
+    const MICRO_TIME: &str = "2099-09-11T20:00:00.123456Z";
+    const MICRO_TEXT: &str = "2099-09-11T20:00:00.123456+00:00";
+    const CANONICAL_MILLIS: &str = "2099-09-11T20:00:00.123Z";
+    let (_serial, db) = database().await;
+    seed_starts_at(db.pool(), POST, GUILD, MICRO_TIME).await;
+    let before = snapshot(db.pool()).await;
+    assert_eq!(
+        before["domain"]["posts"][0]["starts_at"], MICRO_TEXT,
+        "seed must keep microsecond precision"
+    );
+    let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!({"id": MESSAGE}))).await;
+    let rt = runtime(db.pool().clone(), &mock, true);
+    let handled = rt
+        .handle(&edit(9102, POST, Some("Renamed raid"), None))
+        .await
+        .expect("edit transport");
+    let fresh = db.independent_pool().await.expect("independent reader");
+    let after = snapshot(&fresh).await;
+    let stored: String =
+        sqlx::query_scalar("SELECT starts_at::text FROM lfg_posts WHERE guild_id = $1 AND id = $2")
+            .bind(GUILD)
+            .bind(POST)
+            .fetch_one(&fresh)
+            .await
+            .expect("stored starts_at");
+    let requests = mock.requests();
+    mock.shutdown().await;
+    drop(rt);
+    fresh.close().await;
+    db.close().await.expect("fixture teardown");
+
+    assert_edit_handled(handled);
+    assert_metadata_only(&before, &after, "Renamed raid", MICRO_TEXT);
+    assert!(
+        stored.contains(".123456"),
+        "stored starts_at lost microsecond precision: {stored}"
+    );
+    let reply = reply(&requests).expect("private edit receipt");
+    assert!(
+        reply.contains(CANONICAL_MILLIS),
+        "reply must show the unchanged canonical time: {reply}"
+    );
+    assert!(
+        !reply.contains(NEW_TIME) && !reply.contains("4092923700"),
+        "reply must not show a new time: {reply}"
+    );
+    let edits = channel_requests(&requests);
+    assert_eq!(
+        edits.len(),
+        1,
+        "edit must refresh, never recreate the message"
+    );
+    assert_eq!(edits[0].method, "PATCH");
+    let content = body(edits[0])["content"]
+        .as_str()
+        .expect("rendered content")
+        .to_owned();
+    assert!(
+        content.contains("Starts <t:4092840000:F>"),
+        "refresh must show the unchanged instant: {content}"
+    );
+    let audits = after["audits"].as_array().expect("audit rows");
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0]["action"], "lfg.edit");
+    assert_eq!(audits[0]["outcome"], "updated");
+    assert_eq!(audits[0]["guild_id"], GUILD);
+    assert_eq!(audits[0]["actor_id"], "3333");
+    assert_eq!(audits[0]["target_key"], POST);
+    assert_safe(&requests);
+}
+
+async fn non_string_option_refuses(interaction: Interaction, expected: &str) {
+    let (_serial, db) = database().await;
+    seed(db.pool(), POST, GUILD).await;
+    let before = snapshot(db.pool()).await;
+    let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!({"id": MESSAGE}))).await;
+    let rt = runtime(db.pool().clone(), &mock, true);
+    let handled = rt.handle(&interaction).await.expect("refusal transport");
+    let after = snapshot(db.pool()).await;
+    let requests = mock.requests();
+    mock.shutdown().await;
+    drop(rt);
+    db.close().await.expect("fixture teardown");
+
+    assert_edit_handled(handled);
+    assert_eq!(
+        after, before,
+        "non-string option mutated domain rows, tuple versions or audit"
+    );
+    assert!(
+        channel_requests(&requests).is_empty(),
+        "refusal touched a channel"
+    );
+    let text = reply(&requests).expect("refusal reply");
+    assert!(
+        text.contains(expected),
+        "missing refusal {expected:?}: {text}"
+    );
+    assert_safe(&requests);
+}
+
+#[tokio::test]
+async fn integer_title_refuses_with_zero_effects() {
+    non_string_option_refuses(
+        edit_integer_title(9211, POST, Some(NEW_TIME)),
+        "title must be text.",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn integer_starts_at_refuses_with_zero_effects() {
+    non_string_option_refuses(
+        edit_integer_starts_at(9212, POST, Some("Do not save me")),
+        "starts-at must be text.",
+    )
+    .await;
 }

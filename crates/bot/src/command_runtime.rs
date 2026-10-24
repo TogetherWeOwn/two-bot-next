@@ -70,7 +70,7 @@ use two_bot_core::{
     feeds::{
         feed_list_page, feed_list_page_invalid_text, feed_list_page_underflow_text,
         feed_removed_text, plan_command, FeedCommand, FeedCommandContext, FeedCommandPlan,
-        FeedError, FeedKind, FEED_REMOVAL_RECOVERY_REQUIRED_TEXT,
+        FeedKind, FEED_REMOVAL_RECOVERY_REQUIRED_TEXT,
     },
     feeds_store::{add_feed, list_feeds, remove_feed, write_audit, FeedAudit, FeedRemoval},
     funnel::now_millis_for_test,
@@ -270,6 +270,7 @@ pub struct CommandRuntime {
     gateway_commands: tokio::sync::OnceCell<crate::gateway_commands::GatewayCommands>,
     channel: ChannelModerationRuntime,
     tasks: Mutex<DispatchTasks>,
+    giveaways: crate::giveaway_runtime::GiveawayRuntime,
     /// Interactions admitted per member; see [`crate::interaction_admission`].
     user_slots: UserSlots,
     /// Shared self-role surface; production boot stays parked pending acceptance.
@@ -355,7 +356,10 @@ impl CommandRuntime {
             ChannelModerationStore::from_pool(pool.clone()),
             executor.clone(),
         );
+        let giveaways =
+            crate::giveaway_runtime::GiveawayRuntime::new(pool.clone(), executor.clone());
         Arc::new(Self {
+            giveaways,
             pool,
             executor,
             interactions,
@@ -1383,6 +1387,11 @@ impl CommandRuntime {
         } = &routed
         {
             match handler {
+                ComponentHandler::GiveawayEntry => {
+                    if self.defer(interaction, "giveaway").await {
+                        self.giveaways.enter(interaction, custom_id).await;
+                    }
+                }
                 ComponentHandler::SelfRole => {
                     self.self_role_component(interaction).await;
                 }
@@ -1487,6 +1496,7 @@ impl CommandRuntime {
             "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list" => {
                 Some(HandlerId::AutomationAdmin)
             }
+            "giveaway" => Some(HandlerId::Giveaway),
             "feed-add" => Some(HandlerId::FeedAdd),
             "feed-remove" => Some(HandlerId::FeedRemove),
             "feed-list" => Some(HandlerId::FeedList),
@@ -1517,6 +1527,7 @@ impl CommandRuntime {
                 crate::privacy_command::privacy_command(&self.pool, &self.executor, interaction)
                     .await;
             }
+            "giveaway" => self.giveaways.command(interaction).await,
             "sticky" => self.sticky_set(interaction).await,
             "sticky-remove" => self.sticky_remove(interaction).await,
             "feed-add" => self.feed_add(interaction).await,
@@ -1853,6 +1864,8 @@ impl CommandRuntime {
     /// Rejected input still audits (`rejected`, Create vs Update by whether a
     /// row already exists — the read only names the audit action). A store
     /// failure audits that same refusal shape with the `db_class` token.
+    /// Malformed options refuse before any store read or audit via
+    /// [`sticky_options_strict`]: no row, no audit, one private correction.
     async fn sticky_set(&self, interaction: &Interaction) {
         let guild_id = self.guild_id.to_string();
         let Some(channel_id) = interaction_channel(interaction) else {
@@ -1860,8 +1873,13 @@ impl CommandRuntime {
             return;
         };
         let actor_id = actor_id(interaction);
-        let (body, debounce_option) = sticky_options(interaction);
-        let body = body.unwrap_or_default();
+        let (body, debounce_option) = match sticky_options_strict(interaction) {
+            Ok(decoded) => decoded,
+            Err(refusal) => {
+                self.finish(interaction, refusal).await;
+                return;
+            }
+        };
 
         let debounce = match validate_body(&body).and_then(|()| normalize_debounce(debounce_option))
         {
@@ -2009,18 +2027,22 @@ impl CommandRuntime {
     /// `randomUUID()`); plan errors reply with the domain text and write
     /// neither a row nor an audit (legacy parity). A store failure audits one
     /// `feed.create`/`rejected` refusal row, then replies safe. The relay
-    /// binds to the invoking channel.
+    /// binds to the invoking channel. Malformed options refuse before any
+    /// store read or audit via [`feed_add_options_strict`].
     async fn feed_add(&self, interaction: &Interaction) {
         let Some(channel_id) = interaction_channel(interaction) else {
             self.finish(interaction, NO_CHANNEL_REPLY).await;
             return;
         };
         let inputs = self.feed_inputs(interaction);
-        let (kind, source) = feed_add_options(interaction);
-        let kind = match kind
-            .as_deref()
-            .map_or(Err(FeedError::InvalidKind), FeedKind::parse)
-        {
+        let (kind, source) = match feed_add_options_strict(interaction) {
+            Ok(decoded) => decoded,
+            Err(refusal) => {
+                self.finish(interaction, refusal).await;
+                return;
+            }
+        };
+        let kind = match FeedKind::parse(&kind) {
             Ok(kind) => kind,
             Err(err) => {
                 self.finish(interaction, err.to_string()).await;
@@ -2031,7 +2053,7 @@ impl CommandRuntime {
         let command = FeedCommand::Add {
             id: new_id(),
             kind,
-            source: source.unwrap_or_default(),
+            source,
         };
         match plan_command(&context, command) {
             Ok(FeedCommandPlan::Add(relay)) => {
@@ -2066,16 +2088,22 @@ impl CommandRuntime {
     /// confirmation. A relay carrying unresolved pending delivery evidence is
     /// retained with a fixed recovery reply, never claimed removed. A store
     /// failure audits one `feed.remove`/`rejected` refusal row, then replies
-    /// safe.
+    /// safe. Malformed `id` options refuse before any store read or audit via
+    /// [`feed_remove_option_strict`].
     async fn feed_remove(&self, interaction: &Interaction) {
         // Remove does not bind to the invoking channel; `channel_id` is only
         // context the planner ignores for this command.
         let channel_id = interaction_channel(interaction).unwrap_or_default();
         let inputs = self.feed_inputs(interaction);
         let context = inputs.context(&channel_id);
-        let command = FeedCommand::Remove {
-            id: feed_remove_option(interaction).unwrap_or_default(),
+        let id = match feed_remove_option_strict(interaction) {
+            Ok(id) => id,
+            Err(refusal) => {
+                self.finish(interaction, refusal).await;
+                return;
+            }
         };
+        let command = FeedCommand::Remove { id };
         match plan_command(&context, command) {
             Ok(FeedCommandPlan::Remove { guild_id, id }) => {
                 match remove_feed(&self.pool, &guild_id, &id).await {
@@ -2391,7 +2419,7 @@ fn ticket_action_token(action: TicketAction) -> &'static str {
 /// wire but still the field Discord populates for guild slash commands; the
 /// replacement `channel` object carries the id plus a payload we never read.
 #[allow(deprecated)]
-fn interaction_channel(interaction: &Interaction) -> Option<String> {
+pub(crate) fn interaction_channel(interaction: &Interaction) -> Option<String> {
     interaction
         .channel
         .as_ref()
@@ -2442,41 +2470,98 @@ pub(crate) fn new_id() -> String {
     hex::encode(rand::random::<[u8; 16]>())
 }
 
-/// `/feed-add`'s options: `kind` (choice string) + `source` (string). A
-/// missing `kind` replies `InvalidKind`; a missing `source` plans against an
-/// empty string, which the SSRF guard rejects.
-pub(crate) fn feed_add_options(interaction: &Interaction) -> (Option<String>, Option<String>) {
-    let mut kind = None;
-    let mut source = None;
+/// Refusal literals for malformed `/feed-add` and `/feed-remove` options.
+/// Each names the offending option and carries a copyable corrected
+/// invocation, echoes no user input (mention-safe), and stays far under
+/// Discord's 2,000-unit cap (bounded). Handlers reply with these before any
+/// store read or audit write.
+const FEED_ADD_INVALID_KIND: &str = "Invalid kind. Use /feed-add kind:rss source:<https-url>.";
+const FEED_ADD_DUPLICATE_KIND: &str = "Duplicate kind. Use /feed-add kind:rss source:<https-url>.";
+const FEED_ADD_MISSING_KIND: &str = "Missing kind. Use /feed-add kind:rss source:<https-url>.";
+const FEED_ADD_INVALID_SOURCE: &str = "Invalid source. Use /feed-add kind:rss source:<https-url>.";
+const FEED_ADD_DUPLICATE_SOURCE: &str =
+    "Duplicate source. Use /feed-add kind:rss source:<https-url>.";
+const FEED_ADD_MISSING_SOURCE: &str = "Missing source. Use /feed-add kind:rss source:<https-url>.";
+const FEED_REMOVE_INVALID_ID: &str = "Invalid id. Use /feed-remove id:<relay-id>.";
+const FEED_REMOVE_DUPLICATE_ID: &str = "Duplicate id. Use /feed-remove id:<relay-id>.";
+const FEED_REMOVE_MISSING_ID: &str = "Missing id. Use /feed-remove id:<relay-id>.";
+
+/// Strictly decode `/feed-add`'s options: `kind` and `source` must each
+/// appear exactly once with a string value. Duplicates win over wrong types
+/// win over missing options, and `kind` wins over `source` within a phase;
+/// unknown names stay ignored. A non-command interaction carries no options,
+/// so it refuses as a missing `kind`. Valid invocations decode to the same
+/// `kind`/`source` values the previous lenient decoder extracted.
+pub(crate) fn feed_add_options_strict(
+    interaction: &Interaction,
+) -> Result<(String, String), &'static str> {
     let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
         &interaction.data
     else {
-        return (kind, source);
+        return Err(FEED_ADD_MISSING_KIND);
     };
+    let mut kinds: Vec<&CommandOptionValue> = Vec::new();
+    let mut sources: Vec<&CommandOptionValue> = Vec::new();
     for option in &data.options {
-        match (option.name.as_str(), &option.value) {
-            ("kind", CommandOptionValue::String(value)) => kind = Some(value.clone()),
-            ("source", CommandOptionValue::String(value)) => source = Some(value.clone()),
+        match option.name.as_str() {
+            "kind" => kinds.push(&option.value),
+            "source" => sources.push(&option.value),
             _ => {}
         }
     }
-    (kind, source)
+    if kinds.len() > 1 {
+        return Err(FEED_ADD_DUPLICATE_KIND);
+    }
+    if sources.len() > 1 {
+        return Err(FEED_ADD_DUPLICATE_SOURCE);
+    }
+    // Wrong-type phase: a present-but-unusable option refuses before any
+    // missing option is named, in declared order.
+    if !matches!(kinds.first(), None | Some(CommandOptionValue::String(_))) {
+        return Err(FEED_ADD_INVALID_KIND);
+    }
+    if !matches!(sources.first(), None | Some(CommandOptionValue::String(_))) {
+        return Err(FEED_ADD_INVALID_SOURCE);
+    }
+    let kind = match kinds.first() {
+        None => return Err(FEED_ADD_MISSING_KIND),
+        Some(CommandOptionValue::String(value)) => (*value).clone(),
+        Some(_) => return Err(FEED_ADD_INVALID_KIND),
+    };
+    let source = match sources.first() {
+        None => return Err(FEED_ADD_MISSING_SOURCE),
+        Some(CommandOptionValue::String(value)) => (*value).clone(),
+        Some(_) => return Err(FEED_ADD_INVALID_SOURCE),
+    };
+    Ok((kind, source))
 }
 
-/// `/feed-remove`'s `id` option; `None` plans against an empty id, which
-/// `validate_id` rejects with `InvalidId`.
-pub(crate) fn feed_remove_option(interaction: &Interaction) -> Option<String> {
+/// Strictly decode `/feed-remove`'s `id` option: it must appear exactly once
+/// with a string value. A duplicated name wins over a wrong wire type, which
+/// wins over a missing option; unknown names stay ignored. A non-command
+/// interaction carries no options, so it refuses as a missing `id`.
+/// Present-but-empty still decodes (the planner's `validate_id` owns that
+/// refusal), so valid invocations plan byte-identically to before.
+pub(crate) fn feed_remove_option_strict(interaction: &Interaction) -> Result<String, &'static str> {
     let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
         &interaction.data
     else {
-        return None;
+        return Err(FEED_REMOVE_MISSING_ID);
     };
-    data.options
-        .iter()
-        .find_map(|option| match (option.name.as_str(), &option.value) {
-            ("id", CommandOptionValue::String(value)) => Some(value.clone()),
-            _ => None,
-        })
+    let mut ids: Vec<&CommandOptionValue> = Vec::new();
+    for option in &data.options {
+        if option.name.as_str() == "id" {
+            ids.push(&option.value);
+        }
+    }
+    if ids.len() > 1 {
+        return Err(FEED_REMOVE_DUPLICATE_ID);
+    }
+    match ids.first() {
+        None => Err(FEED_REMOVE_MISSING_ID),
+        Some(CommandOptionValue::String(value)) => Ok((*value).clone()),
+        Some(_) => Err(FEED_REMOVE_INVALID_ID),
+    }
 }
 
 /// `/help`'s optional `command` selector. Omitted means the grouped index.
@@ -2535,6 +2620,7 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     }
     if gates.automations {
         router.register(Box::new(StickyHandler));
+        router.register(Box::new(SliceHandler(HandlerId::Giveaway)));
         // Custom commands are an automations capability: a refused identity
         // must not even resolve their handlers (4014 isolation depends on the
         // narrowed intent too). Dispatch refuses and publish withholds when
@@ -2615,25 +2701,71 @@ pub(crate) fn actor_id(interaction: &Interaction) -> String {
         .unwrap_or_default()
 }
 
-/// Extract `/sticky`'s options: `body` (required string) + `debounce`
-/// (optional integer). Missing `body` becomes `None` → validation rejects it
-/// with the legacy body-length text.
-pub(crate) fn sticky_options(interaction: &Interaction) -> (Option<String>, Option<i64>) {
-    let mut body = None;
-    let mut debounce = None;
+/// Refusal literals for malformed `/sticky` options. Each names the
+/// offending option and carries a copyable corrected invocation, echoes no
+/// user input (mention-safe), and stays far under Discord's 2,000-unit cap
+/// (bounded). Handlers reply with these before any store read or audit write.
+const STICKY_INVALID_BODY: &str = "Invalid body. Use /sticky body:<text> debounce:<seconds>.";
+const STICKY_DUPLICATE_BODY: &str = "Duplicate body. Use /sticky body:<text> debounce:<seconds>.";
+const STICKY_MISSING_BODY: &str = "Missing body. Use /sticky body:<text> debounce:<seconds>.";
+const STICKY_INVALID_DEBOUNCE: &str =
+    "Invalid debounce. Use /sticky body:<text> debounce:<seconds>.";
+const STICKY_DUPLICATE_DEBOUNCE: &str =
+    "Duplicate debounce. Use /sticky body:<text> debounce:<seconds>.";
+
+/// Strictly decode `/sticky`'s options: `body` must appear exactly once with
+/// a string value, while `debounce` stays optional (an omitted option means
+/// the default quiet window). Duplicates win over wrong types win over a
+/// missing `body`, and `body` wins over `debounce` within a phase; unknown
+/// names stay ignored. A non-command interaction carries no options, so it
+/// refuses as a missing `body`. Present-but-empty and out-of-range values
+/// still decode (validation owns those refusals), so valid invocations
+/// decode byte-identically to before.
+pub(crate) fn sticky_options_strict(
+    interaction: &Interaction,
+) -> Result<(String, Option<i64>), &'static str> {
     let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
         &interaction.data
     else {
-        return (body, debounce);
+        return Err(STICKY_MISSING_BODY);
     };
+    let mut bodies: Vec<&CommandOptionValue> = Vec::new();
+    let mut debounces: Vec<&CommandOptionValue> = Vec::new();
     for option in &data.options {
-        match (option.name.as_str(), &option.value) {
-            ("body", CommandOptionValue::String(value)) => body = Some(value.clone()),
-            ("debounce", CommandOptionValue::Integer(value)) => debounce = Some(*value),
+        match option.name.as_str() {
+            "body" => bodies.push(&option.value),
+            "debounce" => debounces.push(&option.value),
             _ => {}
         }
     }
-    (body, debounce)
+    if bodies.len() > 1 {
+        return Err(STICKY_DUPLICATE_BODY);
+    }
+    if debounces.len() > 1 {
+        return Err(STICKY_DUPLICATE_DEBOUNCE);
+    }
+    // Wrong-type phase: a present-but-unusable option refuses before a
+    // missing `body` is named, in declared order.
+    if !matches!(bodies.first(), None | Some(CommandOptionValue::String(_))) {
+        return Err(STICKY_INVALID_BODY);
+    }
+    if !matches!(
+        debounces.first(),
+        None | Some(CommandOptionValue::Integer(_))
+    ) {
+        return Err(STICKY_INVALID_DEBOUNCE);
+    }
+    let body = match bodies.first() {
+        None => return Err(STICKY_MISSING_BODY),
+        Some(CommandOptionValue::String(value)) => (*value).clone(),
+        Some(_) => return Err(STICKY_INVALID_BODY),
+    };
+    let debounce = match debounces.first() {
+        None => None,
+        Some(CommandOptionValue::Integer(value)) => Some(*value),
+        Some(_) => return Err(STICKY_INVALID_DEBOUNCE),
+    };
+    Ok((body, debounce))
 }
 
 #[cfg(test)]
