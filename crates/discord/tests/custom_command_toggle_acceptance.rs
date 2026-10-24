@@ -807,7 +807,7 @@ async fn toggle_refuses_reserved_or_invalid_saved_definition_without_reactivatio
         refusals.push(f.observe(&toggle(501 + index as u64, true, name)).await);
         checks.push((before, definitions(f.db.pool()).await));
     }
-    for (index, template, trigger) in [(0, "Unknown {args}", "!faq"), (1, TEMPLATE, "!help")] {
+    for (index, template, trigger) in [(0, "Unknown {args}", "!faq"), (1, TEMPLATE, "!rank")] {
         seed(f.db.pool(), "2222", "faq", trigger, template, false).await;
         let before = definitions(f.db.pool()).await;
         refusals.push(f.observe(&toggle(510 + index, true, "faq")).await);
@@ -841,7 +841,7 @@ async fn toggle_paused_trigger_remains_owned_and_existing_replacement_semantics_
             name: "rival".to_owned(),
             description: "Rival".to_owned(),
             template: "Rival body".to_owned(),
-            text_trigger: Some("!FAQ".to_owned()),
+            text_trigger: Some("!faq".to_owned()),
         },
         "rival-conflict",
         AT,
