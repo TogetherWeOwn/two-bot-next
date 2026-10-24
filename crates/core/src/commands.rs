@@ -511,6 +511,7 @@ mod tests {
                 ("tempban", "duration_seconds", 60, Some(31_536_000), true),
                 ("timeout", "duration_seconds", 60, Some(2_419_200), true),
                 ("purge", "count", 1, Some(100), true),
+                ("purge-preview", "count", 1, Some(100), true),
                 ("slowmode", "seconds", 0, Some(21_600), true),
                 ("schedule", "in-minutes", 1, Some(525_600), false),
                 ("schedule", "every-minutes", 60, Some(525_600), false),
@@ -531,9 +532,21 @@ mod tests {
                 }
             }
             for definition in crate::moderation::moderation_commands() {
-                let reason = definition.options.iter().find(|o| o.name == "reason").unwrap();
-                prop_assert_eq!(reason.required, Some(true));
-                prop_assert_eq!(reason.max_length, Some(512));
+                // Read-only inspection commands take no audit reason: there
+                // is nothing to audit. Every mutating moderation command
+                // still requires one.
+                if !matches!(
+                    definition.name.as_str(),
+                    "purge-preview" | "channel-inspect"
+                ) {
+                    let reason = definition
+                        .options
+                        .iter()
+                        .find(|o| o.name == "reason")
+                        .expect("mutating moderation commands require a reason option");
+                    prop_assert_eq!(reason.required, Some(true));
+                    prop_assert_eq!(reason.max_length, Some(512));
+                }
                 prop_assert!(!definition.dm_permission);
             }
         }

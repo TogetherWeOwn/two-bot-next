@@ -134,6 +134,8 @@ pub enum HandlerId {
     FeedList,
     FeedInspect,
     Moderation(ModerationAction),
+    PurgePreview,
+    ChannelInspect,
 }
 
 /// Which feature slice owns a routed component / modal submit (parity §2).
@@ -270,6 +272,8 @@ pub enum RouterRefusal {
     ManageEventsRequired,
     GuildRestricted,
     ModerationPermission(ModerationAction),
+    PurgePreviewPermission,
+    ChannelInspectPermission,
 }
 
 impl RouterRefusal {
@@ -285,6 +289,8 @@ impl RouterRefusal {
             Self::ManageServerRequired => MANAGE_SERVER_REQUIRED.to_owned(),
             Self::ManageEventsRequired => MANAGE_EVENTS_REQUIRED.to_owned(),
             Self::GuildRestricted => GUILD_RESTRICTED_REPLY.to_owned(),
+            Self::PurgePreviewPermission => "You need the Manage Messages permission to use /purge-preview. Ask a server moderator or admin to grant it.".to_owned(),
+            Self::ChannelInspectPermission => "You need the Manage Channels permission to use /channel-inspect. Ask a server moderator or admin to grant it.".to_owned(),
             // Names the Discord permission (Ban Members, …) and the slash
             // command, not the internal `moderation.ban` action id.
             Self::ModerationPermission(action) => {
@@ -392,6 +398,8 @@ impl InteractionRouter {
             {
                 register(HandlerId::Moderation(action));
             }
+            register(HandlerId::PurgePreview);
+            register(HandlerId::ChannelInspect);
         }
         if gates.automations {
             // Sticky/admin plus custom rows (`CustomCommandRuntime::register`).
@@ -553,10 +561,26 @@ impl InteractionRouter {
         actor_permissions: Option<u64>,
     ) -> Option<SlashOutcome> {
         // Moderation carries its own guild fence (refusal, not silence).
-        if let Some(action) = ModerationAction::ALL
-            .iter()
-            .find(|a| a.command_name() == name)
-        {
+        let moderation = match name {
+            "purge-preview" => Some((
+                HandlerId::PurgePreview,
+                RouterRefusal::PurgePreviewPermission,
+            )),
+            "channel-inspect" => Some((
+                HandlerId::ChannelInspect,
+                RouterRefusal::ChannelInspectPermission,
+            )),
+            _ => ModerationAction::ALL
+                .iter()
+                .find(|a| a.command_name() == name)
+                .map(|action| {
+                    (
+                        HandlerId::Moderation(*action),
+                        RouterRefusal::ModerationPermission(*action),
+                    )
+                }),
+        };
+        if let Some((handler, permission_refusal)) = moderation {
             if !self.guild_ok(guild_id) {
                 return Some(SlashOutcome::Refuse {
                     refusal: RouterRefusal::GuildRestricted,
@@ -569,12 +593,10 @@ impl InteractionRouter {
             }
             if !Self::permission_allowed(name, guild_id, actor_permissions) {
                 return Some(SlashOutcome::Refuse {
-                    refusal: RouterRefusal::ModerationPermission(*action),
+                    refusal: permission_refusal,
                 });
             }
-            return Some(SlashOutcome::Handled {
-                handler: HandlerId::Moderation(*action),
-            });
+            return Some(SlashOutcome::Handled { handler });
         }
 
         /// Which feature gate a builtin row needs.
@@ -939,6 +961,8 @@ mod tests {
                 HandlerId::Moderation(ModerationAction::Lockdown),
             ),
             ("unlock", HandlerId::Moderation(ModerationAction::Unlock)),
+            ("purge-preview", HandlerId::PurgePreview),
+            ("channel-inspect", HandlerId::ChannelInspect),
             ("attendance", HandlerId::ScorecardAttendance),
             ("command", HandlerId::AutomationAdmin),
             ("command-remove", HandlerId::AutomationAdmin),
@@ -958,7 +982,7 @@ mod tests {
             ("feed-list", HandlerId::FeedList),
             ("feed-inspect", HandlerId::FeedInspect),
         ];
-        assert_eq!(cases.len(), 32, "all 32 handler-owned builtins covered");
+        assert_eq!(cases.len(), 34, "all 34 handler-owned builtins covered");
         for (name, handler) in cases {
             assert_eq!(
                 r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
@@ -1049,6 +1073,8 @@ mod tests {
             ("feed-list", RouterRefusal::AnnouncementsDisabled),
             ("ban", RouterRefusal::ModerationDisabled),
             ("purge", RouterRefusal::ModerationDisabled),
+            ("purge-preview", RouterRefusal::ModerationDisabled),
+            ("channel-inspect", RouterRefusal::ModerationDisabled),
         ] {
             assert_eq!(
                 r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
@@ -1121,6 +1147,48 @@ mod tests {
                 !text.contains("moderation."),
                 "{action:?} must not leak the internal id: {text}"
             );
+        }
+    }
+
+    #[test]
+    fn private_read_permissions_name_the_invoked_command_and_never_fall_through() {
+        let r = router();
+        for (name, required, handler, refusal, expected) in [
+            ("purge-preview", 8192, HandlerId::PurgePreview, RouterRefusal::PurgePreviewPermission,
+             "You need the Manage Messages permission to use /purge-preview. Ask a server moderator or admin to grant it."),
+            ("channel-inspect", 16, HandlerId::ChannelInspect, RouterRefusal::ChannelInspectPermission,
+             "You need the Manage Channels permission to use /channel-inspect. Ask a server moderator or admin to grant it."),
+        ] {
+            assert_eq!(refusal.message(), expected);
+            for permissions in [None, Some(0), Some(8), Some(!required)] {
+                assert_eq!(
+                    r.route_slash(&SlashContext { custom_row: Some(true), ..ctx(name, Some(GUILD), permissions) }),
+                    SlashOutcome::Refuse { refusal },
+                    "/{name} cannot borrow custom-command or administrator-only authority"
+                );
+            }
+            assert_eq!(
+                r.route_slash(&ctx(name, Some(GUILD), Some(required))),
+                SlashOutcome::Handled { handler }
+            );
+            for guild in [None, Some(9999)] {
+                assert_eq!(
+                    r.route_slash(&ctx(name, guild, Some(u64::MAX))),
+                    SlashOutcome::Refuse { refusal: RouterRefusal::GuildRestricted }
+                );
+            }
+            let unconfigured = InteractionRouter::new(RouterGates { configured_guild: None, ..all_on() });
+            assert_eq!(
+                unconfigured.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
+                SlashOutcome::Refuse { refusal: RouterRefusal::GuildRestricted }
+            );
+            let off = InteractionRouter::new(RouterGates { moderation: false, ..all_on() });
+            assert_eq!(
+                off.route_slash(&SlashContext { custom_row: Some(true), ..ctx(name, Some(GUILD), Some(u64::MAX)) }),
+                SlashOutcome::Refuse { refusal: RouterRefusal::ModerationDisabled }
+            );
+            let set = off.publish_set(&[CustomCommand { name: name.to_owned(), description: "shadow".to_owned(), enabled: true }]).expect("assembles");
+            assert!(!set.iter().any(|definition| definition.name == name));
         }
     }
 
@@ -1433,9 +1501,9 @@ mod tests {
         }];
         let set = r.publish_set(&custom).expect("full set assembles");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        // 5 core + 1 scorecard + 9 automation + 8 announcement + 9 moderation
-        // + 1 custom = 33, in legacy publish order, guild-only throughout.
-        assert_eq!(set.len(), 33);
+        // 5 core + 1 scorecard + 9 automation + 8 announcement + 9 mutations
+        // + 2 reads + 1 custom = 35, in publish order, guild-only throughout.
+        assert_eq!(set.len(), 35);
         assert_eq!(
             &names[..6],
             [
@@ -1458,7 +1526,8 @@ mod tests {
                 "unlock",
             ]
         );
-        assert_eq!(names[32], "faq");
+        assert_eq!(&names[32..34], ["purge-preview", "channel-inspect"]);
+        assert_eq!(names[34], "faq");
         assert!(set.iter().all(|c| !c.dm_permission));
     }
 
@@ -1621,7 +1690,7 @@ mod tests {
     fn voice_set_publishes_after_moderation_only_while_gated() {
         let off = published(all_on());
         let off_names: Vec<_> = off.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(off.len(), 32);
+        assert_eq!(off.len(), 34);
         for name in VOICE_NAMES.iter().filter(|name| **name != "kick") {
             assert!(
                 !off_names.contains(name),
@@ -1631,16 +1700,16 @@ mod tests {
 
         let on = published(voice_on());
         let on_names: Vec<_> = on.iter().map(|c| c.name.as_str()).collect();
-        // 32 builtins keep their order; the 21 voice names that survive
+        // 34 builtins keep their order; the 21 voice names that survive
         // first-wins follow in voice order. `kick` is already moderation's.
-        assert_eq!(on.len(), 53);
-        assert_eq!(on_names[..32], off_names[..]);
+        assert_eq!(on.len(), 55);
+        assert_eq!(on_names[..34], off_names[..]);
         let expected: Vec<_> = VOICE_NAMES
             .iter()
             .copied()
             .filter(|name| *name != "kick")
             .collect();
-        assert_eq!(on_names[32..], expected[..]);
+        assert_eq!(on_names[34..], expected[..]);
         assert!(!on_names.contains(&"templateassistant"));
         assert!(on.iter().all(|c| !c.dm_permission));
     }
@@ -1701,13 +1770,13 @@ mod tests {
                 "voice={voice} assistant={assistant}"
             );
         }
-        // Both gates on is the full voice set without the assistant: 32
+        // Both gates on is the full voice set without the assistant: 34
         // builtins plus the 21 surviving voice names.
         let both = published(RouterGates {
             voice_assistant: true,
             ..voice_on()
         });
-        assert_eq!(both.len(), 53);
+        assert_eq!(both.len(), 55);
     }
 
     #[test]

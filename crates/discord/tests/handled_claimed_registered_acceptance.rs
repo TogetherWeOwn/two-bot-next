@@ -191,7 +191,10 @@ fn owner_map(name: &str, member_present: bool) -> Option<HandlerId> {
 fn is_channel_claim(name: &str, handler: HandlerId) -> bool {
     ModerationAction::ALL.into_iter().any(|a| {
         !a.targets_member() && a.command_name() == name && handler == HandlerId::Moderation(a)
-    })
+    }) || matches!(
+        (name, handler),
+        ("purge-preview", HandlerId::PurgePreview) | ("channel-inspect", HandlerId::ChannelInspect)
+    )
 }
 
 /// Surfaces claiming one `Handled` outcome, in production dispatch order. A
