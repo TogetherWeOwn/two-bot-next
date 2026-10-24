@@ -31,6 +31,7 @@ export const JOB_INTERVAL_SECONDS: Record<string, number> = {
   presence_probe: 3600,
   community_scorecard: 60,
   inactivity: 3600,
+  lfg_sweep: 60,
 };
 
 export const STALE_INTERVALS = 2;
@@ -311,7 +312,7 @@ export const HANDLER_SATURATED_SHARE = 0.01;
 /** Consecutive saturated handler windows before the ticket. */
 export const HANDLER_SATURATED_SAMPLES = 3;
 /** Fixed job labels for `two_bot_job_runs_total`, pinned to Rust `JOBS`. */
-export const JOB_RUNS_JOBS: readonly string[] = ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "other"];
+export const JOB_RUNS_JOBS: readonly string[] = ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "lfg_sweep", "other"];
 /** Fixed outcomes for `two_bot_job_runs_total`, pinned to Rust `JOB_OUTCOMES`. */
 export const JOB_RUNS_OUTCOMES: readonly string[] = ["success", "failure"];
 /** Failed runs must exceed this share of a judged window... */

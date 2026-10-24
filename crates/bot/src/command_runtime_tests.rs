@@ -30,6 +30,8 @@ mod sticky_uncertain_acceptance_tests;
 
 #[path = "custom_command_list_pages_acceptance.rs"]
 mod custom_command_list_pages_acceptance;
+#[path = "help_detail_acceptance.rs"]
+mod help_detail_acceptance;
 
 use std::collections::VecDeque;
 use std::str::FromStr;
@@ -67,8 +69,9 @@ use two_bot_core::{
 use two_bot_discord::ActionExecutor;
 
 use crate::command_runtime::{
-    actor_id, ephemeral, feed_add_options, feed_list_page_request, feed_remove_option, new_id,
-    router_with_commands, sticky_options, CommandRuntime, FeedListPage, RegistrySyncError,
+    actor_id, ephemeral, feed_add_options, feed_list_page_request, feed_remove_option,
+    help_command_selector, new_id, router_with_commands, sticky_options, CommandRuntime,
+    FeedListPage, RegistrySyncError,
 };
 use crate::internal_action_http::MODERATION_METRICS_LOCK;
 use crate::member_runtime::{sweep_job, MemberRuntime};
@@ -2940,6 +2943,33 @@ fn feed_list_page_request_defaults_and_refuses_unusable_values() {
     ] {
         let interaction = slash("feed-list", Some(CHANNEL), vec![option("page", value)]);
         assert_eq!(feed_list_page_request(&interaction), FeedListPage::Invalid);
+    }
+}
+
+#[test]
+fn help_command_selector_keeps_omitted_absent_and_malformed_present() {
+    // An omitted option means the grouped index.
+    let missing = slash("help", Some(CHANNEL), Vec::new());
+    assert_eq!(help_command_selector(&missing), None);
+    // A string selector passes through untouched.
+    let named = slash(
+        "help",
+        Some(CHANNEL),
+        vec![option(
+            "command",
+            CommandOptionValue::String("rank".to_owned()),
+        )],
+    );
+    assert_eq!(help_command_selector(&named), Some("rank".to_owned()));
+    // A present option with a non-string wire value is malformed: decode to
+    // an empty selector (the unknown-name correction), never the index.
+    for value in [
+        CommandOptionValue::Integer(1),
+        CommandOptionValue::Number(1.5),
+        CommandOptionValue::Boolean(true),
+    ] {
+        let interaction = slash("help", Some(CHANNEL), vec![option("command", value)]);
+        assert_eq!(help_command_selector(&interaction), Some(String::new()));
     }
 }
 

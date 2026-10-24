@@ -74,6 +74,7 @@ use two_bot_core::{
     },
     feeds_store::{add_feed, list_feeds, remove_feed, write_audit, FeedAudit, FeedRemoval},
     funnel::now_millis_for_test,
+    help::{canonical_help_selector, unknown_help_correction},
     moderation::ModerationAction,
     router::replies::EXPIRED_COMPONENT_REPLY,
     sticky::{
@@ -87,9 +88,9 @@ use two_bot_core::{
     SlashOutcome, SurfaceFlags,
 };
 use two_bot_discord::{
-    help_response, publish_commands, register_channel_handlers, response_for_slash,
-    route_interaction, ActionExecutor, ChannelModerationRuntime, DiscordError, LevelingRuntime,
-    RoutedInteraction,
+    help_detail_response, help_response, publish_commands, register_channel_handlers,
+    response_for_slash, route_interaction, ActionExecutor, ChannelModerationRuntime, DiscordError,
+    LevelingRuntime, RoutedInteraction,
 };
 
 use crate::activation::BootActivation;
@@ -1443,8 +1444,18 @@ impl CommandRuntime {
         if handler == HandlerId::Help {
             // Read the actual confirmed publication, including DB-backed
             // custom rows and successful add/remove refreshes. No store wait.
+            // An omitted selector keeps the grouped index; a selector reads
+            // one confirmed definition, never an unconfirmed refresh.
             let response = match self.published_commands() {
-                Some(defs) => help_response(&defs),
+                Some(defs) => match help_command_selector(interaction) {
+                    None => help_response(&defs),
+                    Some(raw) => match canonical_help_selector(&raw).and_then(|name| {
+                        defs.iter().find(|def| def.name.eq_ignore_ascii_case(&name))
+                    }) {
+                        Some(def) => help_detail_response(def.help_detail_text()),
+                        None => help_detail_response(unknown_help_correction()),
+                    },
+                },
                 None => ephemeral("The command list is still refreshing. Try /help again shortly."),
             };
             self.answer(interaction, response).await;
@@ -2447,6 +2458,26 @@ pub(crate) fn feed_remove_option(interaction: &Interaction) -> Option<String> {
             ("id", CommandOptionValue::String(value)) => Some(value.clone()),
             _ => None,
         })
+}
+
+/// `/help`'s optional `command` selector. Omitted means the grouped index.
+/// A present option with a non-string wire value is malformed and decodes
+/// to an empty selector, which answers the unknown-name correction rather
+/// than silently listing the index.
+pub(crate) fn help_command_selector(interaction: &Interaction) -> Option<String> {
+    let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
+        &interaction.data
+    else {
+        return None;
+    };
+    let option = data
+        .options
+        .iter()
+        .find(|option| option.name == "command")?;
+    match &option.value {
+        CommandOptionValue::String(value) => Some(value.clone()),
+        _ => Some(String::new()),
+    }
 }
 
 /// `/feed-list`'s optional 1-based `page` option, decoded by name first: an

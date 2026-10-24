@@ -213,6 +213,86 @@ pub fn query_scalar(sql: &str) -> Query {
     query(sql)
 }
 
+pub enum SweepBind {
+    Text(String),
+    Timestamp(time::OffsetDateTime),
+    Limit(i64),
+}
+impl From<&str> for SweepBind {
+    fn from(value: &str) -> Self {
+        Self::Text(value.into())
+    }
+}
+impl From<time::OffsetDateTime> for SweepBind {
+    fn from(value: time::OffsetDateTime) -> Self {
+        Self::Timestamp(value)
+    }
+}
+impl From<i64> for SweepBind {
+    fn from(value: i64) -> Self {
+        Self::Limit(value)
+    }
+}
+
+pub struct SweepQuery {
+    sql: String,
+    binds: Vec<SweepBind>,
+}
+pub fn query_as(sql: &str) -> SweepQuery {
+    SweepQuery {
+        sql: sql.into(),
+        binds: Vec::new(),
+    }
+}
+impl SweepQuery {
+    pub fn bind(mut self, value: impl Into<SweepBind>) -> Self {
+        self.binds.push(value.into());
+        self
+    }
+
+    pub async fn fetch_all(self, pool: &PgPool) -> Result<Vec<(String,)>, Error> {
+        assert_eq!(
+            self.sql.split_whitespace().collect::<Vec<_>>().join(" "),
+            "SELECT id FROM lfg_posts WHERE guild_id = $1 AND status = 'open' AND (starts_at <= $2 OR (message_id IS NULL AND created_at <= $3)) ORDER BY created_at, id LIMIT $4",
+            "unsupported offline row query"
+        );
+        let [SweepBind::Text(guild), SweepBind::Timestamp(expired), SweepBind::Timestamp(orphan), SweepBind::Limit(limit)] =
+            self.binds.as_slice()
+        else {
+            panic!("offline lifecycle scan requires guild, two timestamps and limit")
+        };
+        let mut state = pool.0.lock().expect("fixture state");
+        state.trace.push("sql.lifecycle_candidates");
+        if state.closed {
+            return Err(Error);
+        }
+        let timestamp = |at: &str| {
+            time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339)
+                .expect("fixture timestamp")
+        };
+        let mut rows: Vec<_> = state
+            .posts
+            .iter()
+            .filter(|post| {
+                post.guild_id == *guild
+                    && post.status == LfgStatus::Open
+                    && (timestamp(&post.starts_at) <= *expired
+                        || (post.message_id.is_none() && timestamp(&post.created_at) <= *orphan))
+            })
+            .collect();
+        rows.sort_by(|left, right| {
+            timestamp(&left.created_at)
+                .cmp(&timestamp(&right.created_at))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(rows
+            .into_iter()
+            .take(usize::try_from(*limit).expect("nonnegative fixture scan limit"))
+            .map(|post| (post.id.clone(),))
+            .collect())
+    }
+}
+
 impl Query {
     pub fn bind(mut self, value: impl ToString) -> Self {
         self.binds.push(value.to_string());
@@ -234,6 +314,22 @@ impl Query {
             .trace
             .push("sql.lock");
         Ok(())
+    }
+
+    pub async fn fetch_one<'a>(self, executor: impl Executor<'a>) -> Result<bool, Error> {
+        assert_eq!(
+            self.sql, "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))",
+            "unsupported offline scalar query"
+        );
+        assert_eq!(self.binds.len(), 1, "runtime lock must have one bound key");
+        let connection = executor.connection();
+        let mut state = connection.0 .0.lock().expect("fixture state");
+        state.trace.push("sql.try_lock");
+        if state.closed {
+            return Err(Error);
+        }
+        // Fixtures execute sequentially; the transaction owns the only lock.
+        Ok(true)
     }
 
     pub async fn fetch_optional(self, pool: &PgPool) -> Result<Option<String>, Error> {
