@@ -403,11 +403,11 @@ mod tests {
             .iter()
             .flat_map(|g| g.commands.iter().copied())
             .collect();
-        // 27 legacy builtins plus the Next-only help, privacy and
-        // command-inspect commands, then the 21 voice names (voice `kick`
-        // shares the Kick group). `/templateassistant` stays out until its
-        // slice lands.
-        assert_eq!(grouped.len(), 51);
+        // 27 legacy builtins plus the Next-only help, privacy,
+        // command-inspect and welcome-preview commands, then the 21 voice
+        // names (voice `kick` shares the Kick group). `/templateassistant`
+        // stays out until its slice lands.
+        assert_eq!(grouped.len(), 52);
         for name in [
             "rank",
             "leaderboard",
