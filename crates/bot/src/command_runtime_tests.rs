@@ -17,6 +17,9 @@
 
 #![cfg(test)]
 
+#[path = "reopen_dispatch_review_acceptance_tests.rs"]
+mod reopen_dispatch_review_acceptance_tests;
+
 #[path = "leveling_ack_ordering_acceptance_tests.rs"]
 mod leveling_ack_ordering_acceptance_tests;
 #[path = "leveling_ack_visibility_acceptance_tests.rs"]
@@ -30,6 +33,8 @@ mod sticky_uncertain_acceptance_tests;
 
 #[path = "custom_command_list_pages_acceptance.rs"]
 mod custom_command_list_pages_acceptance;
+#[path = "help_detail_acceptance.rs"]
+mod help_detail_acceptance;
 
 use std::collections::VecDeque;
 use std::str::FromStr;
@@ -67,8 +72,9 @@ use two_bot_core::{
 use two_bot_discord::ActionExecutor;
 
 use crate::command_runtime::{
-    actor_id, ephemeral, feed_add_options, feed_list_page_request, feed_remove_option, new_id,
-    router_with_commands, sticky_options, CommandRuntime, FeedListPage, RegistrySyncError,
+    actor_id, ephemeral, feed_add_options, feed_list_page_request, feed_remove_option,
+    help_command_selector, new_id, router_with_commands, sticky_options, CommandRuntime,
+    FeedListPage, RegistrySyncError,
 };
 use crate::internal_action_http::MODERATION_METRICS_LOCK;
 use crate::member_runtime::{sweep_job, MemberRuntime};
@@ -731,7 +737,7 @@ async fn activation_boot_resumed_uses_current_clearance_and_checks_identity() {
                 .collect();
             assert_eq!(
                 names,
-                vec!["rank", "leaderboard", "help", "privacy"],
+                vec!["rank", "leaderboard", "help", "privacy", "reopen"],
                 "unrelated core commands remain; uncleared surfaces are replaced"
             );
         }
@@ -845,7 +851,7 @@ async fn activation_boot_from_env_fixture() {
     let defs = runtime.router().publish_set(&[]).unwrap();
     let names: Vec<_> = defs.iter().map(|def| def.name.as_str()).collect();
     if expected == "narrowed" {
-        assert_eq!(names, ["rank", "leaderboard", "help", "privacy"]);
+        assert_eq!(names, ["rank", "leaderboard", "help", "privacy", "reopen"]);
         assert!(!runtime.router().gates().moderation);
         assert!(!runtime.router().gates().automations);
         assert!(!runtime.router().gates().announcements);
@@ -1292,6 +1298,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "leaderboard"
                         | "help"
                         | "privacy"
+                        | "reopen"
                 )
             })
             .collect();
@@ -1299,6 +1306,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
         assert!(!unwired.contains(&"leaderboard"));
         assert!(!unwired.contains(&"help"));
         assert!(!unwired.contains(&"privacy"));
+        assert!(!unwired.contains(&"reopen"));
         if router_gates.announcements {
             assert!(unwired.contains(&"rsvp"), "enabled unwired announcement");
         }
@@ -1964,6 +1972,24 @@ async fn foreign_non_moderation_commands_remain_silent() {
         }
     }
     assert!(mock.requests().is_empty(), "router Ignore stays silent");
+    mock.shutdown().await;
+}
+
+/// `/reopen` routes `Handled` but executes in the onboarding worker, not
+/// here: this runtime must stay silent (no unavailable reply, no defer),
+/// exactly like it does for the picker components, so the single initial
+/// callback belongs to the onboarding owner.
+#[tokio::test]
+async fn reopen_stays_silent_for_the_onboarding_owner() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime
+        .on_interaction(&slash("reopen", Some(CHANNEL), Vec::new()))
+        .await;
+    assert!(
+        mock.requests().is_empty(),
+        "the onboarding worker owns /reopen; this runtime answers nothing"
+    );
     mock.shutdown().await;
 }
 
@@ -2944,6 +2970,33 @@ fn feed_list_page_request_defaults_and_refuses_unusable_values() {
 }
 
 #[test]
+fn help_command_selector_keeps_omitted_absent_and_malformed_present() {
+    // An omitted option means the grouped index.
+    let missing = slash("help", Some(CHANNEL), Vec::new());
+    assert_eq!(help_command_selector(&missing), None);
+    // A string selector passes through untouched.
+    let named = slash(
+        "help",
+        Some(CHANNEL),
+        vec![option(
+            "command",
+            CommandOptionValue::String("rank".to_owned()),
+        )],
+    );
+    assert_eq!(help_command_selector(&named), Some("rank".to_owned()));
+    // A present option with a non-string wire value is malformed: decode to
+    // an empty selector (the unknown-name correction), never the index.
+    for value in [
+        CommandOptionValue::Integer(1),
+        CommandOptionValue::Number(1.5),
+        CommandOptionValue::Boolean(true),
+    ] {
+        let interaction = slash("help", Some(CHANNEL), vec![option("command", value)]);
+        assert_eq!(help_command_selector(&interaction), Some(String::new()));
+    }
+}
+
+#[test]
 fn new_id_is_unique_hex_that_validate_id_accepts() {
     let first = new_id();
     let second = new_id();
@@ -3395,6 +3448,7 @@ fn production_router_matches_composed_production_wiring() {
             HandlerId::Leaderboard,
             HandlerId::Help,
             HandlerId::Privacy,
+            HandlerId::Reopen,
             HandlerId::ScorecardAttendance,
             HandlerId::AutomationAdmin,
             HandlerId::AutomationCustom,
