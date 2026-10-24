@@ -1,6 +1,40 @@
 //! Join-risk runtime acceptance against the mock Discord double. The worker
 //! test is ignored and runs only on agent-testdb / the CI service container.
 
+use crate::hotpath_settings_test_support as hotpath_scope;
+
+#[tokio::test]
+async fn join_risk_runtime_hotpath_settings_reads_are_guild_scoped() {
+    use hotpath_scope::queries::Queries;
+    use two_bot_cutover::settings::SettingsStore;
+    let key = "TWO_JOIN_RISK_THRESHOLD";
+    let db = hotpath_scope::database(key).await;
+    let mut source =
+        join_risk_runtime::StoreSettings::new(db.pool().clone(), 22, vars(&[(key, "7")]));
+    let (cold, reads) = Queries::capture(source.current()).await;
+    assert_eq!(cold.unwrap().tuning.threshold(), 3.0);
+    hotpath_scope::assert_reads(&reads, Some(2), true);
+    source.expire_for_tests();
+    let (warm, reads) = Queries::capture(source.current()).await;
+    assert_eq!(warm.unwrap().tuning.threshold(), 3.0);
+    hotpath_scope::assert_reads(&reads, None, true);
+    let store = SettingsStore::new(db.pool());
+    store
+        .set("22", key, Some(serde_json::json!(5)), "fixture")
+        .await
+        .unwrap();
+    source.expire_for_tests();
+    let (changed, reads) = Queries::capture(source.current()).await;
+    assert_eq!(changed.unwrap().tuning.threshold(), 5.0);
+    hotpath_scope::assert_reads(&reads, Some(2), true);
+    store.set("22", key, None, "fixture").await.unwrap();
+    source.expire_for_tests();
+    let (fallback, reads) = Queries::capture(source.current()).await;
+    assert_eq!(fallback.unwrap().tuning.threshold(), 7.0);
+    hotpath_scope::assert_reads(&reads, Some(1), true);
+    db.close().await.unwrap();
+}
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;

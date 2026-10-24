@@ -2074,7 +2074,7 @@ impl InternalFlags {
     /// Whether a token holding `scopes` may run `action`.
     ///
     /// Higher scope implies lower for reads only: any held scope allows a
-    /// read verb, while a write needs its listed scope or admin. Scope
+    /// read verb, while a write needs its exact listed scope. Scope
     /// names are exact lowercase literals; unknown or empty scope sets
     /// allow nothing, and unmapped actions refuse even for admin.
     #[must_use]
@@ -2086,10 +2086,10 @@ impl InternalFlags {
                     || *scope == ADMIN_SCOPE_MODERATE
                     || *scope == ADMIN_SCOPE_ADMIN
             }),
-            // Writes: the listed scope or admin.
-            Some(required @ (ADMIN_SCOPE_MODERATE | ADMIN_SCOPE_ADMIN)) => scopes
-                .iter()
-                .any(|scope| *scope == ADMIN_SCOPE_ADMIN || *scope == required),
+            // Writes: only an explicit grant of the listed scope.
+            Some(required @ (ADMIN_SCOPE_MODERATE | ADMIN_SCOPE_ADMIN)) => {
+                scopes.contains(&required)
+            }
             // Unmapped actions — and any future scope the map has not named
             // yet — fail closed.
             Some(_) | None => false,
