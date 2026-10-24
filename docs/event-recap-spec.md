@@ -75,9 +75,11 @@ Inspected repository head: `89b26ae050ffba9fb409622ffd54d31cdc79e7fc`.
   (`OCCURRENCE_ID_MAX_CHARS`, `commands.rs:59`), so a labeled occurrence
   cannot be bound literally and the recap binds bare IDs only (§7).
 - Public sends pass through the shared `message_safety::content`
-  neutralizer (`crates/core/src/message_safety.rs:104-106`), and LFG titles
-  are bounded to 100 UTF-16 units (`MAX_TITLE_CHARS`, `lfg.rs:36`); the
-  recap title contract (§4) reuses both.
+  neutralizer (`crates/core/src/message_safety.rs:104-106`). It breaks mass
+  mentions only: user and role mentions are kept readable
+  (`message_safety.rs:36-37`, asserted at `:145-151`). LFG titles are bounded
+  to 100 UTF-16 units (`MAX_TITLE_CHARS`, `lfg.rs:36`). The recap title
+  contract (§4) reuses both and adds its own markup strip.
 
 No live guild, permission, deployment or host workflow was inspected. If a
 once-only fence needs a new table or the counts cannot stay bounded, stop at A.
@@ -108,16 +110,25 @@ Completed, or Active and started (the organizer is closing it). Canceled is
 refused as EVENT_CANCELED. Any other known status (Scheduled at any start
 time, Active but not started) is refused as NOT_ENDED. An unknown status, or
 an unknown or foreign ID, collapses to one UNAVAILABLE answer with no
-existence oracle.
+existence oracle. **Age:** an eligible event whose scheduled start is more than
+30 days (2,592,000 s) before the evaluation time is refused as EVENT_TOO_OLD;
+exactly 30 days is still eligible. The age is evaluated at preview **and**
+again at click, so an event that crosses 30 days between them refuses at click.
 
 ## 4. Content bounds, destination and edit/delete
 
 **B content (recommended).** One message: event title, `Going N · Interested M
 · Checked in C`, and `Snapshot <t:epoch:f>`. Counts only. Declined is never
-published. The title contract is exact: trim, pass through the shared
-`message_safety::content` neutralizer (breaks `@everyone`/`@here` and other
-mention parses), then truncate to 100 UTF-16 units with an ellipsis; the send
-sets `allowed_mentions: {parse: []}` as a second layer, not the definition.
+published. The title contract is exact, in this order: (1) trim; (2) pass through the
+shared `message_safety::content` neutralizer, which covers **mass mentions only**
+(`@everyone`/`@here`); (3) delete every Discord markup token matching
+`<[^<>]*>` whole (user `<@id>`, `<@!id>`, role `<@&id>`, channel `<#id>`,
+custom emoji, timestamps, slash-command and guild-navigation tokens), then
+delete any stray `<` or `>`, so no member, role or channel ID survives in the
+title; (4) collapse whitespace runs to one space and trim; (5) an empty result
+becomes the literal `Event`; (6) truncate to 100 UTF-16 units with an ellipsis.
+Plain markdown formatting characters are left as inert text. The send sets
+`allowed_mentions: {parse: []}` as a second layer, not the definition.
 Counts come from existing rows read by the bare event ID: RSVP statuses
 Going/Interested via `list_rsvps`, and `eligible_human` check-in facts via
 `checkin_source` of that same bare ID, each at most 1,000 by the existing
@@ -142,12 +153,13 @@ TWO neither detects nor repairs that. Fresh counts need a new event occurrence.
 **Retention and erasure.** No recap store, no export, no preview history. B
 contains no personal data, so erasure has nothing to recall; the only retained
 rows are the §6 audit rows under actions `event.recap.claim`,
-`event.recap.posted` and `event.recap.failed`. Those actions are outside the
+`event.recap.posted` and `event.recap.failed` (§6 keys the failed row by send
+nonce, so repeated rejections keep one row each). Those actions are outside the
 current prune scope (§2), so a build MUST extend the prune to cover them at
 the same 365-day floor, under the existing actor-based erasure; until it
 does, the retention claim is a build requirement, not a property. Eligibility
-is limited to events that started within 30 days, so an expired audit fence
-cannot reopen an old event.
+is limited to events that started within 30 days (§3, EVENT_TOO_OLD), so an
+expired audit fence cannot reopen an old event.
 
 ## 5. Privacy, opt-outs and guild isolation
 
@@ -172,22 +184,35 @@ cannot reopen an old event.
 ## 6. Once-only publish, audit and restarts
 
 No new table. At-most-once uses `announcements_audit_log` with deterministic IDs
-and `ON CONFLICT DO NOTHING`, plus a per-recap advisory lock
-`recap:{guild}:{occurrence}` like the LFG locks.
+and `ON CONFLICT DO NOTHING`, plus a per-recap **session-level** advisory lock
+`recap:{guild}:{occurrence}` (like the LFG locks) held from step 1 through
+step 3, so a concurrent clicker waits and then sees the outcome. The claim
+insert in step 1 commits on its own, before the send, so a crash leaves it
+visible.
 
-1. Under the lock, insert id `event.recap.claim:{guild}:{occurrence}` with
-   action `event.recap.claim` (actor = organizer, outcome `claimed`). A
-   conflict means a prior claim exists: return ALREADY_PUBLISHED when a
-   `posted` row exists, else COMMIT_UNKNOWN.
-2. Send once with a nonce derived from the claim and mentions suppressed.
+1. Under the lock, first check the rows: a `posted` row returns
+   ALREADY_PUBLISHED; a claim row without a `posted` row returns COMMIT_UNKNOWN
+   for **every** caller, including the organizer who made the claim. Otherwise
+   insert id `event.recap.claim:{guild}:{occurrence}` with action
+   `event.recap.claim` (actor = organizer, outcome `claimed`).
+2. Send once with a nonce derived from SHA-256 of the claim ID and the click's
+   interaction ID, and mentions suppressed.
 3. On accepted send, insert id `event.recap.posted:{guild}:{occurrence}` with
    action `event.recap.posted` and the message ID. On a definite pre-send
-   rejection (permission refused before any send), still under the same lock:
-   insert id `event.recap.failed:{guild}:{occurrence}` with action
-   `event.recap.failed` (outcome `failed`, reason SEND_REJECTED), DELETE the
-   claim row to release the fence, and return SEND_REJECTED. A later retry
-   then claims fresh and posts at most once. Never release after an ambiguous
-   send: that stays COMMIT_UNKNOWN.
+   rejection (permission refused before any send), run **one database
+   transaction** that inserts id `event.recap.failed:{guild}:{occurrence}:{nonce}`
+   with action `event.recap.failed` (outcome `failed`, reason SEND_REJECTED) and
+   DELETEs the claim row, commit it, release the lock and return SEND_REJECTED.
+   The two writes apply together or not at all. A later retry claims fresh and
+   posts at most once; each rejection leaves its own failed row because the
+   nonce differs per click. Never release after an ambiguous send: that stays
+   COMMIT_UNKNOWN.
+
+If the process dies inside that transaction it rolls back whole: the claim stays
+and no failed row exists, so the state is the restart state below
+(COMMIT_UNKNOWN, no resend). "Claim plus a failed row for the same nonce" cannot
+occur. The cost is one stuck event; the organizer posts a wrap-up by hand
+(option A).
 
 A restart between 1 and 3 leaves a claim without a `posted` row: that state is
 **unknown, not absent**. The runtime may run one bounded recovery scan (at most 3
@@ -207,13 +232,19 @@ the cost is one more counts-only line (open finding 3).
 Preview (ephemeral, only the organizer): the exact text that will post, the
 destination channel, "Nobody is pinged", "Posts once", and the snapshot time.
 Buttons: Publish and Cancel. The Publish `custom_id` is exactly
-`recap:v1:{guild}:{event}:{organizer}:{digest12}`, all fields literal:
-20-digit-max snowflakes and a 12-lowercase-hex digest of SHA-256 over guild,
-occurrence, organizer, template version and rendered text. Worst case is 84
-chars, inside the 100-char component cap, and the occurrence is recovered by
-splitting on `:` with no preview store (bare snowflakes contain no `:`). On
-click the service re-authorizes, re-reads the event, re-renders, and refuses
-PREVIEW_STALE if the digest differs; nothing is posted on a mismatch. A Cancel
+`recap:v1:{guild}:{event}:{organizer}:{snapshot_epoch}:{digest12}`, all fields
+literal: 20-digit-max snowflakes, a 10-digit Unix-seconds `snapshot_epoch` (the
+preview's clock reading, the **only** time source for the rendered
+`Snapshot <t:epoch:f>`), and a 12-lowercase-hex digest of SHA-256 over guild,
+occurrence, organizer, template version, `snapshot_epoch` and rendered text.
+Worst case is 95 chars, inside the 100-char component cap, and the occurrence
+and epoch are recovered by splitting on `:` with no preview store (bare
+snowflakes and epochs contain no `:`). On click the service re-authorizes,
+re-reads the event, re-renders with the **carried** epoch (never the click
+clock), and refuses PREVIEW_STALE if the digest differs, if the carried epoch is
+later than the click time, or if it is more than 900 s (15 min) old; nothing is
+posted on a mismatch. Time passing with unchanged data and an epoch inside 900 s
+posts, and the posted `Snapshot` equals the preview's. A Cancel
 or an ignored preview writes nothing. Failure replies name the reason and the
 next action, never raw SQL or Discord errors.
 
@@ -234,9 +265,10 @@ posted message ID.
 | `UNAVAILABLE` | false / `verify_event` (missing, foreign, unreadable or unknown status) |
 | `EVENT_CANCELED` | false / `none` |
 | `NOT_ENDED` | false / `retry_after_event_ends` |
+| `EVENT_TOO_OLD` | false / `none` (start more than 30 days ago, at preview or click) |
 | `LABELED_UNSUPPORTED` | false / `use_bare_event_id` |
 | `ALREADY_PUBLISHED` | false / `none` |
-| `PREVIEW_STALE` | false / `run_preview_again` |
+| `PREVIEW_STALE` | false / `run_preview_again` (digest, version, epoch in the future or older than 900 s) |
 | `COMMIT_UNKNOWN` | true / `inspect_channel` |
 | `SEND_REJECTED` | true / `restore_permission_and_retry` |
 | `STORE_UNAVAILABLE` | true / `retry_after_backoff` |
@@ -257,7 +289,7 @@ pilot. Route the brief through the President/COO to the CEO and the existing hos
 intent path; a queue receipt is not alignment. Nothing goes directly to the owner
 or an invented executor. A material revision needs a fresh review request.
 
-By 2026-10-31 the metric is **all 20 fixture rows have agreed or explicitly
+By 2026-10-31 the metric is **all 27 fixture rows have agreed or explicitly
 rejected outcomes and the four findings have written disposition**. This measures
 design completeness, not engagement. **Keep only if** content is provably bounded
 to already-held data with opt-outs honored; otherwise the answer is **no-build**
@@ -290,15 +322,22 @@ one posted message. Counts are `going/interested/checked_in`.
 | rescheduled | Scheduled, future start -> NOT_ENDED, 0 posts |
 | not_started | Active, not started -> NOT_ENDED, 0 posts |
 | unknown_status | Unknown status -> UNAVAILABLE, no oracle |
+| age_boundary | Completed, started exactly 30 days ago -> PREVIEW 3/2/2 |
+| too_old | Completed, started 30 days + 1 s ago -> EVENT_TOO_OLD, 0 posts |
+| age_crossing | Preview at 30 days passes; click 1 s later -> EVENT_TOO_OLD, 0 posts |
+| mention_title | Title `Finals <@123456789012345678> <@&5> <#9>` -> rendered `Finals`, no ID, no markup |
 | denied | Organizer lost Manage Events before click -> DENIED, 0 posts |
 | foreign | Event in guild `g2` -> UNAVAILABLE, no oracle |
 | duplicate | Publish twice -> POSTED then ALREADY_PUBLISHED, 1 post |
 | concurrent | Two clicks at once -> one POSTED, one ALREADY_PUBLISHED, 1 post |
-| restart | Claim row, no posted row -> COMMIT_UNKNOWN, no resend |
-| send_rejected | Definite pre-send rejection -> SEND_REJECTED, claim released, 0 posts; retry may post once |
+| restart | Claim row, no posted row: click by the claimant or another organizer -> COMMIT_UNKNOWN, no resend |
+| send_rejected | Definite pre-send rejection -> SEND_REJECTED, claim released, 0 posts; a retry posts once; a second rejection keeps its own failed row |
+| interrupted_cleanup | Crash inside the failed-insert + claim-delete transaction -> rolled back whole: claim stays, no failed row, next click COMMIT_UNKNOWN |
 | stale | Counts change between preview and click -> PREVIEW_STALE, 0 posts |
 | version | `recap.v1` preview clicked under `recap.v2` -> PREVIEW_STALE |
-| custom_id_max | 20-digit guild/event/organizer + 12-hex digest -> custom_id 84 chars, occurrence literal |
+| epoch_advance | Click 5 s after preview, data unchanged -> POSTED with the preview's `Snapshot`, 1 post |
+| preview_expired | Click 901 s after preview -> PREVIEW_STALE, 0 posts; future epoch -> PREVIEW_STALE |
+| custom_id_max | 20-digit guild/event/organizer + 10-digit epoch + 12-hex digest -> custom_id 95 chars, occurrence and epoch literal |
 
 Runnable offline document check (Python stdlib; from repo root):
 
@@ -314,11 +353,17 @@ and store/REST faults against actual callers in disposable fixtures; zero tests
 is not proof. No acceptance or implementation task is created here.
 
 ```pycon
->>> import json
+>>> import json, re
+>>> def render_title(raw):
+...     """Title contract steps 1, 3, 4, 5 (the Rust neutralizer, step 2, is not modeled)."""
+...     t = re.sub(r"<[^<>]*>", "", raw.strip())
+...     t = re.sub(r"[<>]", "", t)
+...     return re.sub(r"\s+", " ", t).strip() or "Event"
 >>> def recap(going=3, interested=2, checked=2, opted_out_going=0,
 ...           opted_out_interested=0, status="completed", started=True,
 ...           manager=True, same_guild=True, labeled=False, posted=0,
-...           claimed=False, send_rejected=False, stale=False, version="v1"):
+...           claimed=False, send_rejected=False, stale=False, version="v1",
+...           age_s=0, preview_age_s=0, epoch_in_future=False):
 ...     """Reference model: returns (reason, going, interested, checked, posts)."""
 ...     if not same_guild:
 ...         return ("UNAVAILABLE", 0, 0, 0, 0)
@@ -332,7 +377,9 @@ is not proof. No acceptance or implementation task is created here.
 ...         if status not in ("scheduled", "active"):
 ...             return ("UNAVAILABLE", 0, 0, 0, 0)
 ...         return ("NOT_ENDED", 0, 0, 0, 0)
-...     if version != "v1" or stale:
+...     if age_s > 30 * 86400:
+...         return ("EVENT_TOO_OLD", 0, 0, 0, 0)
+...     if version != "v1" or stale or preview_age_s > 900 or epoch_in_future:
 ...         return ("PREVIEW_STALE", 0, 0, 0, 0)
 ...     if claimed and not posted:
 ...         return ("COMMIT_UNKNOWN", 0, 0, 0, 0)
@@ -354,6 +401,8 @@ is not proof. No acceptance or implementation task is created here.
 ...     "rescheduled": (dict(status="scheduled", started=False), ("NOT_ENDED", 0, 0, 0, 0)),
 ...     "not_started": (dict(status="active", started=False), ("NOT_ENDED", 0, 0, 0, 0)),
 ...     "unknown_status": (dict(status="unknown"), ("UNAVAILABLE", 0, 0, 0, 0)),
+...     "age_boundary": (dict(age_s=30 * 86400), ("PREVIEW", 3, 2, 2, 0)),
+...     "too_old": (dict(age_s=30 * 86400 + 1), ("EVENT_TOO_OLD", 0, 0, 0, 0)),
 ...     "denied": (dict(manager=False), ("DENIED", 0, 0, 0, 0)),
 ...     "foreign": (dict(same_guild=False), ("UNAVAILABLE", 0, 0, 0, 0)),
 ...     "duplicate": (dict(posted=1), ("ALREADY_PUBLISHED", 3, 2, 2, 1)),
@@ -361,31 +410,66 @@ is not proof. No acceptance or implementation task is created here.
 ...     "send_rejected": (dict(send_rejected=True), ("SEND_REJECTED", 3, 2, 2, 0)),
 ...     "stale": (dict(stale=True), ("PREVIEW_STALE", 0, 0, 0, 0)),
 ...     "version": (dict(version="v2"), ("PREVIEW_STALE", 0, 0, 0, 0)),
+...     "epoch_advance": (dict(preview_age_s=5), ("PREVIEW", 3, 2, 2, 0)),
+...     "preview_expired": (dict(preview_age_s=901), ("PREVIEW_STALE", 0, 0, 0, 0)),
 ... }
 >>> for name, (kwargs, expected) in cases.items():
 ...     assert recap(**kwargs) == expected, name
+>>> assert recap(epoch_in_future=True)[0] == "PREVIEW_STALE"
+>>> # age_crossing: age is evaluated at preview and again at click
+>>> assert recap(age_s=30 * 86400)[0] == "PREVIEW"
+>>> assert recap(age_s=30 * 86400 + 1)[0] == "EVENT_TOO_OLD"
 >>> # scheduled-but-started is also not ended; unknown fails closed either way
 >>> assert recap(status="scheduled", started=True)[0] == "NOT_ENDED"
 >>> assert recap(status="unknown", started=False)[0] == "UNAVAILABLE"
->>> # concurrent: one claim wins under the unique audit id, the other conflicts;
->>> # posted state is separate, so a repeat click by the winner is refused too
->>> claims, posted_state = {}, {}
->>> def click(who):
-...     if posted_state.get("e1"):
-...         return "ALREADY_PUBLISHED"
-...     if claims.setdefault("e1", who) != who:
-...         return "ALREADY_PUBLISHED"
-...     posted_state["e1"] = True
-...     return "POSTED"
->>> assert sorted([click("o1"), click("o2")]) == ["ALREADY_PUBLISHED", "POSTED"]
->>> claims, posted_state = {}, {}
->>> assert [click("o"), click("o")] == ["POSTED", "ALREADY_PUBLISHED"]
+>>> # mention_title: markup tokens are removed whole, IDs included
+>>> assert render_title("Finals <@123456789012345678> <@&5> <#9>") == "Finals"
+>>> assert render_title("  a <@!7>b <  ") == "a b"
+>>> assert render_title("<@1>") == "Event"
+>>> # audit rows: a claim commits before the send; failed-insert + claim-delete is one txn
+>>> class Store:
+...     def __init__(self):
+...         self.rows = {}
+...     def click(self, who, interaction, send="ok", crash_in_cleanup=False):
+...         if "posted" in self.rows:
+...             return "ALREADY_PUBLISHED"
+...         if "claim" in self.rows:
+...             return "COMMIT_UNKNOWN"
+...         self.rows["claim"] = who
+...         if send == "rejected":
+...             if crash_in_cleanup:
+...                 return "CRASH"
+...             self.rows["failed:" + interaction] = who
+...             del self.rows["claim"]
+...             return "SEND_REJECTED"
+...         self.rows["posted"] = who
+...         return "POSTED"
+>>> # concurrent: the lock serializes; one click wins, the other sees the posted row
+>>> s = Store()
+>>> assert sorted([s.click("o1", "i1"), s.click("o2", "i2")]) == ["ALREADY_PUBLISHED", "POSTED"]
+>>> s = Store()
+>>> assert [s.click("o", "i1"), s.click("o", "i2")] == ["POSTED", "ALREADY_PUBLISHED"]
+>>> # restart: a claim without a posted row is unknown for the claimant and for others
+>>> s = Store()
+>>> s.rows["claim"] = "o"
+>>> assert [s.click("o", "i1"), s.click("o2", "i2")] == ["COMMIT_UNKNOWN", "COMMIT_UNKNOWN"]
+>>> # send_rejected: claim released, own failed row per rejection, then one post
+>>> s = Store()
+>>> assert [s.click("o", "i1", "rejected"), s.click("o", "i2", "rejected")] == ["SEND_REJECTED"] * 2
+>>> assert "claim" not in s.rows and sorted(s.rows) == ["failed:i1", "failed:i2"]
+>>> assert [s.click("o", "i3"), s.click("o", "i4")] == ["POSTED", "ALREADY_PUBLISHED"]
+>>> # interrupted_cleanup: the txn rolls back whole, so claim stays and no failed row exists
+>>> s = Store()
+>>> assert s.click("o", "i1", "rejected", crash_in_cleanup=True) == "CRASH"
+>>> assert s.rows == {"claim": "o"}
+>>> assert s.click("o", "i2") == "COMMIT_UNKNOWN"
 >>> # custom_id_max: worst-case binding stays inside the 100-char component cap
->>> worst = "recap:v1:%s:%s:%s:%s" % ("9" * 20, "9" * 20, "9" * 20, "a" * 12)
->>> assert len(worst) == 84 <= 100, len(worst)
->>> assert len(cases) + 2 == 20
+>>> worst = "recap:v1:%s:%s:%s:%s:%s" % ("9" * 20, "9" * 20, "9" * 20, "9" * 10, "a" * 12)
+>>> assert len(worst) == 95 <= 100, len(worst)
+>>> extra = ["concurrent", "mention_title", "age_crossing", "interrupted_cleanup", "custom_id_max"]
+>>> assert len(cases) + len(extra) == 27
 >>> assert all(p <= 1 for _, (_, e) in cases.items() for p in e[4:])
->>> print(json.dumps({"schema": "events.recap.oracle.v1", "fixtures": 20, "status": "pass"}, sort_keys=True))
-{"fixtures": 20, "schema": "events.recap.oracle.v1", "status": "pass"}
+>>> print(json.dumps({"schema": "events.recap.oracle.v1", "fixtures": 27, "status": "pass"}, sort_keys=True))
+{"fixtures": 27, "schema": "events.recap.oracle.v1", "status": "pass"}
 
 ```
