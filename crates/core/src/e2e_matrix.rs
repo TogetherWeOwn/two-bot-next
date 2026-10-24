@@ -9,7 +9,7 @@
 //! the denial order (guild fence → feature gate → permission bits →
 //! policy/validation).
 //!
-//! Scope: the 28 non-voice built-in slash commands in `docs/commands.md` (core +
+//! Scope: the 30 non-voice built-in slash commands in `docs/commands.md` (core +
 //! scorecard + automation + announcement + moderation). Out of scope on
 //! purpose: voice commands (`voice_commands`, separate slice with its own
 //! `TWO_VOICE` gate and a `kick` name collision resolved first-wins in favour
@@ -122,7 +122,7 @@ const fn row(
 //   staff protection, bot hierarchy, actor hierarchy, in that order.
 // - `Valid:<FIELD>:<BOUNDS>` — option validation before any side effect.
 
-/// The 31-row contract in publish order (core, scorecard, automation,
+/// The 32-row contract in publish order (core, scorecard, automation,
 /// announcement, moderation). The coverage test asserts this is exactly the
 /// all-gates-on [`crate::router::InteractionRouter::publish_set`].
 #[must_use]
@@ -408,6 +408,20 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             "FeedList",
             "Ephemeral guild-scoped relay list.",
             &["Gate:AnnouncementsDisabled", "Perm:ManageServerRequired"],
+        ),
+        row(
+            "feed-inspect",
+            35,
+            E2eGate::Announcements,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "FeedInspect",
+            "Ephemeral guild-scoped relay detail with safe source and last attempt; absent and invalid ids refuse distinctly without mutation.",
+            &[
+                "Gate:AnnouncementsDisabled",
+                "Perm:ManageServerRequired",
+                "Valid:id:required",
+            ],
         ),
         row(
             "ban",

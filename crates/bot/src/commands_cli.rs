@@ -513,7 +513,7 @@ mod tests {
             desired_definitions(2222, &env)
                 .expect("desired registry assembles")
                 .len(),
-            31
+            32
         );
     }
 }

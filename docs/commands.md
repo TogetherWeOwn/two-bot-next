@@ -34,7 +34,7 @@ Help is ephemeral and does not execute the selected command. The command picker
 hides gated commands you cannot use; help explains published requirements but
 does not evaluate every effective Discord permission or guarantee authorization.
 
-Built-in commands: 52.
+Built-in commands: 53.
 
 ## `/access`
 
@@ -186,6 +186,17 @@ Relay an RSS, YouTube, or Twitch feed into this channel
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `kind` | string | true | — | — | — | RSS = `"rss"`; YouTube = `"youtube"`; Twitch = `"twitch"` | Feed kind |
 | `source` | string | true | — | — | 2048 | — | HTTPS URL or YouTube channel id |
+
+## `/feed-inspect`
+
+Show a saved feed relay's source and last attempt
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `id` | string | true | — | — | 128 | — | Feed id |
 
 ## `/feed-list`
 

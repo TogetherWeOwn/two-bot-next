@@ -72,7 +72,7 @@ use two_bot_core::{
 use two_bot_discord::ActionExecutor;
 
 use crate::command_runtime::{
-    actor_id, ephemeral, feed_add_options, feed_list_page_request, feed_remove_option,
+    actor_id, ephemeral, feed_add_options, feed_id_option, feed_list_page_request,
     help_command_selector, new_id, router_with_commands, sticky_options, CommandRuntime,
     FeedListPage, RegistrySyncError,
 };
@@ -1285,6 +1285,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "feed-add"
                         | "feed-remove"
                         | "feed-list"
+                        | "feed-inspect"
                         | "purge"
                         | "slowmode"
                         | "lockdown"
@@ -2925,18 +2926,24 @@ fn feed_add_options_missing_values_decode_to_none() {
 }
 
 #[test]
-fn feed_remove_option_extracts_id() {
-    let interaction = slash(
-        "feed-remove",
-        Some(CHANNEL),
-        vec![option(
-            "id",
-            CommandOptionValue::String("feed-1".to_owned()),
-        )],
-    );
-    assert_eq!(feed_remove_option(&interaction), Some("feed-1".to_owned()));
-    let missing = slash("feed-remove", Some(CHANNEL), Vec::new());
-    assert_eq!(feed_remove_option(&missing), None);
+fn feed_id_option_extracts_id_for_remove_and_inspect() {
+    for name in ["feed-remove", "feed-inspect"] {
+        let interaction = slash(
+            name,
+            Some(CHANNEL),
+            vec![option(
+                "id",
+                CommandOptionValue::String("feed-1".to_owned()),
+            )],
+        );
+        assert_eq!(
+            feed_id_option(&interaction),
+            Some("feed-1".to_owned()),
+            "{name} decodes its id"
+        );
+        let missing = slash(name, Some(CHANNEL), Vec::new());
+        assert_eq!(feed_id_option(&missing), None, "{name} id may be absent");
+    }
 }
 
 #[test]
@@ -3054,19 +3061,19 @@ fn schedule_remove_option_extracts_id() {
 async fn feed_commands_refuse_ephemerally_while_announcements_off() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     // announcements OFF in the router gates → the shared router refuses all
-    // three feed commands; the runtime answers through the shared executor.
+    // four feed commands; the runtime answers through the shared executor.
     let runtime = runtime_without_db(gates(true, false), true, origin);
-    for name in ["feed-add", "feed-remove", "feed-list"] {
+    for name in ["feed-add", "feed-remove", "feed-list", "feed-inspect"] {
         runtime
             .on_interaction(&slash(name, Some(CHANNEL), Vec::new()))
             .await;
     }
     let requests = mock.requests();
     let callbacks = mock.posts_to("/callback").await;
-    assert_eq!(callbacks.len(), 3, "one ephemeral refusal per command");
+    assert_eq!(callbacks.len(), 4, "one ephemeral refusal per command");
     assert_eq!(
         requests.len(),
-        3,
+        4,
         "no defer, no edit, no publish: {requests:?}"
     );
     for callback in &callbacks {
@@ -3109,7 +3116,7 @@ async fn feed_add_without_manage_server_is_refused() {
 async fn feed_commands_from_other_guilds_are_silent() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     let runtime = runtime_without_db(gates(true, true), true, origin);
-    for name in ["feed-add", "feed-remove", "feed-list"] {
+    for name in ["feed-add", "feed-remove", "feed-list", "feed-inspect"] {
         let mut interaction = slash(name, Some(CHANNEL), Vec::new());
         interaction.guild_id = Some(Id::new(9999));
         runtime.on_interaction(&interaction).await;
@@ -3318,6 +3325,7 @@ async fn ready_publishes_the_complete_merged_registry_once() {
         "feed-add",
         "feed-remove",
         "feed-list",
+        "feed-inspect",
     ] {
         assert!(
             names.contains(&expected),
@@ -3358,7 +3366,14 @@ async fn ready_publish_withholds_gated_off_feed_commands() {
             "published set is missing {expected}"
         );
     }
-    for withheld in ["feed-add", "feed-remove", "feed-list", "rsvp", "lfg"] {
+    for withheld in [
+        "feed-add",
+        "feed-remove",
+        "feed-list",
+        "feed-inspect",
+        "rsvp",
+        "lfg",
+    ] {
         assert!(
             !names.contains(&withheld),
             "gated-off {withheld} must not publish"
@@ -3599,7 +3614,14 @@ async fn resumed_boot_synchronizes_current_gates_once_without_ready() {
         for name in ["rank", "leaderboard", "sticky", "sticky-remove"] {
             assert!(names.contains(&name), "resumed registry is complete");
         }
-        for name in ["feed-add", "feed-remove", "feed-list", "rsvp", "lfg"] {
+        for name in [
+            "feed-add",
+            "feed-remove",
+            "feed-list",
+            "feed-inspect",
+            "rsvp",
+            "lfg",
+        ] {
             assert_eq!(
                 names.contains(&name),
                 announcements,
@@ -6484,11 +6506,11 @@ async fn feed_store_failure_replies_generic_and_audits_nothing() {
 // Postgres message, which can carry statement or fixture detail).
 // `target_key` names the attempted relay: the fresh attempt id for adds,
 // the user-supplied id for removes. The user reply stays the existing
-// fixed store-failure text. Feed-list stays unaudited even on failure
-// (legacy parity): a failed list replies with the same safe text and
-// writes no audit row. A dead pool (the audit write itself impossible)
-// degrades to a warn log plus that same safe reply with no panic and no
-// leaked internals.
+// fixed store-failure text. Feed-list and feed-inspect stay unaudited even
+// on failure (legacy list parity): a failed read replies with the same safe
+// text and writes no audit row. A dead pool (the audit write itself
+// impossible) degrades to a warn log plus that same safe reply with no
+// panic and no leaked internals.
 
 const FEED_STORE_FAILURE_REPLY: &str = "Feed command failed; try again.";
 
@@ -6638,6 +6660,14 @@ fn feed_add_interaction() -> Interaction {
 fn feed_remove_interaction(id: &str) -> Interaction {
     slash(
         "feed-remove",
+        Some(CHANNEL),
+        vec![option("id", CommandOptionValue::String(id.to_owned()))],
+    )
+}
+
+fn feed_inspect_interaction(id: &str) -> Interaction {
+    slash(
+        "feed-inspect",
         Some(CHANNEL),
         vec![option("id", CommandOptionValue::String(id.to_owned()))],
     )
@@ -6837,6 +6867,142 @@ async fn feed_list_store_failure_writes_no_audit_row() {
     db.close().await;
 }
 
+/// Inspect is a pure guild-scoped read: the saved relay renders with exact
+/// id, kind, destination, enabled state, safe source and last attempt, while
+/// configuration and audit stay untouched. `deferred_reply` pins the
+/// ephemeral defer (type 5, flags 64) plus the mention-safe completion.
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn feed_inspect_shows_saved_relay_detail_without_mutation() {
+    let db = TestDb::new().await;
+    db.seed_feed(GUILD_S, "feed-own", "rss").await;
+    db.seed_feed("9999", "feed-foreign", "twitch").await;
+    let rows_before = db.feed_rows().await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&feed_inspect_interaction("feed-own"))
+        .await;
+
+    let json = mock.deferred_reply();
+    let content = json["content"].as_str().expect("inspect content");
+    assert!(content.contains("`feed-own`"), "exact id: {content}");
+    assert!(content.contains("rss"), "kind stays visible: {content}");
+    assert!(
+        content.contains(&format!("<#{CHANNEL_S}>")),
+        "destination stays visible: {content}"
+    );
+    assert!(
+        content.contains("enabled"),
+        "enabled state stays visible: {content}"
+    );
+    assert!(
+        content.contains("example.com"),
+        "safe source host stays visible: {content}"
+    );
+    assert!(
+        content.to_ascii_lowercase().contains("attempt"),
+        "last attempt stays visible: {content}"
+    );
+    assert!(
+        !content.contains("feed-foreign"),
+        "other guild's relay never leaks: {content}"
+    );
+    assert_eq!(
+        db.feed_rows().await,
+        rows_before,
+        "inspect leaves feed configuration unchanged"
+    );
+    assert!(
+        db.feed_audits().await.is_empty(),
+        "inspect writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+/// Absent and foreign-guild ids share one refusal: the guild-scoped read
+/// finds nothing either way, and the copy must not oracle foreign relays.
+/// Invalid ids and store failures refuse distinctly (see below).
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn feed_inspect_absent_and_foreign_ids_refuse_without_mutation() {
+    let db = TestDb::new().await;
+    db.seed_feed(GUILD_S, "feed-own", "rss").await;
+    db.seed_feed("9999", "feed-foreign", "twitch").await;
+    let rows_before = db.feed_rows().await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    for id in ["feed-missing", "feed-foreign"] {
+        runtime.on_interaction(&feed_inspect_interaction(id)).await;
+    }
+
+    let contents = patch_contents(&mock);
+    assert_eq!(contents.len(), 2, "one completion per invocation");
+    for content in &contents {
+        assert_eq!(content, "No feed relay with that id.");
+    }
+    assert_eq!(
+        db.feed_rows().await,
+        rows_before,
+        "refused inspect leaves feed configuration unchanged"
+    );
+    assert!(
+        db.feed_audits().await.is_empty(),
+        "refused inspect writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+/// Invalid ids refuse at plan time, before any store read: with the table
+/// dropped, every read would fail, so the invalid-id copy proves no read.
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn feed_inspect_invalid_id_refuses_before_any_store_read() {
+    let db = TestDb::new().await;
+    drop_feed_relays(&db).await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&feed_inspect_interaction("bad id"))
+        .await;
+
+    assert_eq!(mock.deferred_reply()["content"], "Invalid feed id.");
+    assert!(
+        db.feed_audits().await.is_empty(),
+        "an invalid inspect writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+/// Inspect stays unaudited even when its read fails — the same safe reply
+/// as the other feed commands, and still no audit row.
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn feed_inspect_store_failure_writes_no_audit_row() {
+    let db = TestDb::new().await;
+    drop_feed_relays(&db).await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&feed_inspect_interaction("feed-own"))
+        .await;
+
+    assert_eq!(mock.deferred_reply()["content"], FEED_STORE_FAILURE_REPLY);
+    assert!(
+        feed_audit_rows(&db).await.is_empty(),
+        "a failed inspect writes no audit row"
+    );
+    assert!(
+        db.feed_audits().await.is_empty(),
+        "a failed inspect writes no feed audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
 /// Dead-pool control: with a closed pool, the audit write is impossible by
 /// construction, so every feed command must still emit a warn for the
 /// operator and finish with the fixed safe reply — no panic, no hang, no
@@ -6868,11 +7034,14 @@ async fn feed_store_failures_on_dead_pool_warn_and_reply_safely() {
     runtime
         .on_interaction(&slash("feed-list", Some(CHANNEL), Vec::new()))
         .await;
+    runtime
+        .on_interaction(&feed_inspect_interaction("feed-xyz"))
+        .await;
 
-    let replies = feed_store_failure_replies(&mock, 3);
+    let replies = feed_store_failure_replies(&mock, 4);
     assert_eq!(
         replies,
-        vec![FEED_STORE_FAILURE_REPLY.to_owned(); 3],
+        vec![FEED_STORE_FAILURE_REPLY.to_owned(); 4],
         "dead pool degrades every feed command to the safe reply"
     );
     for reply in &replies {

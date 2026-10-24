@@ -131,8 +131,9 @@ fn help_lists_only_handled_commands() {
     );
 }
 
-/// Registry compatibility: all 31 parity and Next-only builtins route to
-/// their handlers. The templateassistant unpublish remains covered.
+/// Registry compatibility: all 32 parity and Next-only builtins, including
+/// both Next-only inspection commands and `/reopen` picker recovery, route
+/// to their handlers. The templateassistant unpublish remains covered.
 #[test]
 fn parity_builtins_route_to_their_handlers() {
     let router = InteractionRouter::new(parity_gates());
@@ -174,11 +175,12 @@ fn parity_builtins_route_to_their_handlers() {
         ("feed-add", HandlerId::FeedAdd),
         ("feed-remove", HandlerId::FeedRemove),
         ("feed-list", HandlerId::FeedList),
+        ("feed-inspect", HandlerId::FeedInspect),
     ];
     assert_eq!(
         cases.len(),
-        31,
-        "all 31 parity and Next-only builtins covered"
+        32,
+        "all 32 parity and Next-only builtins covered"
     );
     for (name, handler) in cases {
         assert_eq!(
@@ -205,5 +207,5 @@ fn e2e_matrix_still_matches_the_publish_set() {
         matrix_names, published_names,
         "matrix drift: the fix must not change the parity publish set"
     );
-    assert_eq!(matrix.len(), 31, "contract covers the 31 built-in commands");
+    assert_eq!(matrix.len(), 32, "contract covers the 32 built-in commands");
 }
