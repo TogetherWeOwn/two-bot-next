@@ -122,6 +122,20 @@ remaining gateway/accepted-prefix work:
    removable. `deregister_set` deduplicates that DB-derived set. Keep the
    in-flight refusal gate active during deregistration and surface incomplete
    REST deletes instead of declaring disable complete.
+8. `/command-inspect name:<name>` shows one private ephemeral view of a saved
+   definition without running it: `view:summary` (the default) carries the
+   saved description, enabled state, text trigger and correction examples;
+   `view:template` shows the saved template as stored; `view:preview` renders
+   it with the invoking member/channel and explicit bounded sample arguments
+   (`arguments`, at most 500 UTF-16 units — the four-variable language ignores
+   them, so no `{args}`). Untrusted text is Markdown-escaped, views that cannot
+   fit carry an explicit truncation marker, and invalid saved templates refuse
+   with a `/command name:<name> template:` correction. Inspection never sends
+   to the channel, republishes the registry, touches cooldowns/claims, mutates
+   the definition or records a `command.run` fact; disabled rows stay
+   inspectable. Unknown, other-guild-only and deleted names share one truthful
+   miss pointing at `/command-list`; lookup outages reuse the fixed
+   availability reply below.
 
 ## Slash-run audit replay
 

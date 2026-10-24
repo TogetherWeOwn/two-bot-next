@@ -54,12 +54,15 @@ pub mod rsvp;
 pub mod staging_slash_smoke;
 #[cfg(test)]
 mod test_clock;
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+pub mod test_wire;
 pub mod voice_rooms;
 
 #[cfg(feature = "db")]
 pub use leveling_runtime::{
-    CommunityFactsError, DeferredCommunityFacts, LevelingRuntime, OrderedLevelingPipeline,
-    RulesAcceptedWrite,
+    AwardRequest, CommunityFactsError, DeferredCommunityFacts, LevelingRuntime,
+    LevelingRuntimeError, OrderedLevelingPipeline, RulesAcceptedWrite,
 };
 
 pub use adapter::event_to_core;
