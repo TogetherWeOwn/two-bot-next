@@ -40,6 +40,8 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("command-list", "docs/parity.md §1 #16 page"),
     ("reopen", "docs/parity.md §1 reopen"),
     ("command-inspect", "docs/parity.md §1 command-inspect"),
+    ("command-disable", "docs/parity.md §1 command-disable"),
+    ("command-enable", "docs/parity.md §1 command-enable"),
     ("giveaway", "docs/parity.md §1 giveaway"),
     ("purge-preview", "docs/parity.md §1 purge-preview"),
     ("channel-inspect", "docs/parity.md §1 channel-inspect"),
@@ -292,10 +294,33 @@ pub fn expected_registry() -> Value {
         .expect("legacy command-list remains published")
         + 1;
     commands.insert(after_list, inspect);
+    // Saved-response lifecycle is intentionally independent of replacement.
+    for (offset, name, description) in [
+        (
+            1,
+            "command-disable",
+            "Pause a saved custom command without deleting it",
+        ),
+        (2, "command-enable", "Resume a saved custom command"),
+    ] {
+        commands.insert(
+            after_list + offset,
+            json!({
+                "name": name,
+                "description": description,
+                "dm_permission": false,
+                "default_member_permissions": "32",
+                "options": [
+                    {"name": "name", "description": "Saved command name, a-z 0-9 _ -", "type": 3,
+                     "required": true, "max_length": 32}
+                ]
+            }),
+        );
+    }
     // Next-only `/giveaway` timed entry: no legacy counterpart. Insert at the
-    // publish position (index 15, after sticky-remove and the
-    // inspect/help/privacy/reopen inserts above) as the exact published
-    // definition, so parity pins its shape too.
+    // publish position (index 17, after sticky-remove, the pause/resume
+    // lifecycle and the inspect/help/privacy/reopen inserts above) as the
+    // exact published definition, so parity pins its shape too.
     let giveaway = serde_json::to_value(
         CommandDefinition::new("giveaway", "Create, list or cancel a giveaway")
             .permissions(PERM_MANAGE_GUILD)
@@ -357,7 +382,7 @@ pub fn expected_registry() -> Value {
             ]),
     )
     .expect("giveaway serializes");
-    commands.insert(15, giveaway);
+    commands.insert(17, giveaway);
     // Next-only read surfaces follow the nine historical mutations. Literal
     // payloads keep the frozen snapshot intact and compare every read field.
     let after_unlock = commands

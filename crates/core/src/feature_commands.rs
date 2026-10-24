@@ -168,6 +168,33 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
             )
             .max_length(MAX_INSPECT_ARGUMENT_UNITS as u32),
         ]),
+        // Next-only saved-response lifecycle (parity rows 35-36): pause and
+        // resume one definition without deleting it. Published immediately
+        // after `command-inspect`; automation-gated and `ManageGuild`-gated
+        // like the other admin commands. Reserved builtin names, never
+        // dynamic fallthrough: a stored row under either name can neither
+        // execute nor be re-enabled, and `/command` cannot write them.
+        CommandDefinition::new(
+            "command-disable",
+            "Pause a saved custom command without deleting it",
+        )
+        .permissions(PERM_MANAGE_GUILD)
+        .options(vec![CommandOption::new(
+            "name",
+            "Saved command name, a-z 0-9 _ -",
+            CommandOptionType::String,
+        )
+        .required()
+        .max_length(MAX_COMMAND_NAME_CHARS as u32)]),
+        CommandDefinition::new("command-enable", "Resume a saved custom command")
+            .permissions(PERM_MANAGE_GUILD)
+            .options(vec![CommandOption::new(
+                "name",
+                "Saved command name, a-z 0-9 _ -",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(MAX_COMMAND_NAME_CHARS as u32)]),
         CommandDefinition::new("schedule", "Schedule a message, once or recurring")
             .permissions(PERM_MANAGE_GUILD)
             .options(vec![
@@ -525,7 +552,7 @@ mod tests {
 
     #[test]
     fn slice2_names_match_legacy_in_order() {
-        assert_eq!(automation_commands().len(), 10);
+        assert_eq!(automation_commands().len(), 12);
         assert_eq!(
             names(&feature_commands()),
             [
@@ -534,6 +561,8 @@ mod tests {
                 "command-remove",
                 "command-list",
                 "command-inspect",
+                "command-disable",
+                "command-enable",
                 "schedule",
                 "schedule-remove",
                 "schedule-list",
@@ -554,8 +583,8 @@ mod tests {
     #[test]
     fn no_collision_with_leveling_core_or_within_slice() {
         let merged = merge_commands(&[feature_commands()], &[]).expect("slice 2 merges cleanly");
-        // 5 core + 1 scorecard + 10 automation + 7 announcement.
-        assert_eq!(merged.len(), 23);
+        // 5 core + 1 scorecard + 12 automation + 7 announcement.
+        assert_eq!(merged.len(), 25);
         assert_eq!(
             &names(&merged)[..6],
             [
@@ -588,6 +617,8 @@ mod tests {
             "command-remove",
             "command-list",
             "command-inspect",
+            "command-disable",
+            "command-enable",
             "schedule",
             "schedule-remove",
             "schedule-list",
@@ -627,6 +658,8 @@ mod tests {
             ("command-remove", 0, 32),
             ("command-inspect", 0, 32),
             ("command-inspect", 2, 500),
+            ("command-disable", 0, 32),
+            ("command-enable", 0, 32),
             ("schedule", 0, 2000),
             ("schedule-remove", 0, 128),
             ("sticky", 0, 2000),
@@ -757,6 +790,13 @@ mod tests {
             option(&auto, "command-remove", "name").max_length,
             Some(MAX_COMMAND_NAME_CHARS as u32)
         );
+        for lifecycle in ["command-disable", "command-enable"] {
+            assert_eq!(
+                option(&auto, lifecycle, "name").max_length,
+                Some(MAX_COMMAND_NAME_CHARS as u32)
+            );
+            assert_eq!(option(&auto, lifecycle, "name").required, Some(true));
+        }
         // Pinned wire values: a silent advertisement change trips here too.
         assert_eq!(option(&auto, "command", "name").max_length, Some(32));
         assert_eq!(option(&auto, "command", "template").max_length, Some(2000));
@@ -769,6 +809,9 @@ mod tests {
             Some(33)
         );
         assert_eq!(option(&auto, "command-remove", "name").max_length, Some(32));
+        for lifecycle in ["command-disable", "command-enable"] {
+            assert_eq!(option(&auto, lifecycle, "name").max_length, Some(32));
+        }
 
         // Runtime agrees at the boundary: name shape, trigger shape, template
         // ceiling and description bounds.
@@ -829,15 +872,22 @@ mod tests {
         assert_eq!(json[0]["default_member_permissions"], "8589934592");
         assert_eq!(json[0]["options"][0]["name"], "event-occurrence");
         assert_eq!(json[0]["options"][0]["max_length"], 128);
-        // Inspection follows command-list; giveaway follows sticky-remove.
-        // Both shift the announcement slice without replacing any command.
+        // Saved-response inspection publishes after `command-list`, the
+        // pause/resume lifecycle immediately after inspection, and giveaway
+        // after sticky-remove; all three shift the announcement slice later.
         assert_eq!(json[4]["name"], "command-inspect");
         assert_eq!(json[4]["options"][2]["max_length"], 500);
-        assert_eq!(json[10]["name"], "giveaway");
-        assert_eq!(json[10]["default_member_permissions"], "32");
-        assert_eq!(json[12]["name"], "rsvp-attendance");
-        assert!(json[12].get("default_member_permissions").is_none());
-        assert_eq!(json[12]["options"][0]["name"], "event-id");
+        assert_eq!(json[5]["name"], "command-disable");
+        assert_eq!(json[5]["default_member_permissions"], "32");
+        assert_eq!(json[5]["options"].as_array().expect("options").len(), 1);
+        assert_eq!(json[6]["name"], "command-enable");
+        assert_eq!(json[6]["default_member_permissions"], "32");
+        assert_eq!(json[6]["options"].as_array().expect("options").len(), 1);
+        assert_eq!(json[12]["name"], "giveaway");
+        assert_eq!(json[12]["default_member_permissions"], "32");
+        assert_eq!(json[14]["name"], "rsvp-attendance");
+        assert!(json[14].get("default_member_permissions").is_none());
+        assert_eq!(json[14]["options"][0]["name"], "event-id");
     }
 
     #[test]

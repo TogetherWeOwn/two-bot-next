@@ -37,6 +37,8 @@ mod sticky_uncertain_acceptance_tests;
 
 #[path = "custom_command_list_pages_acceptance.rs"]
 mod custom_command_list_pages_acceptance;
+#[path = "custom_command_toggle_acceptance.rs"]
+mod custom_command_toggle_acceptance;
 #[path = "help_detail_acceptance.rs"]
 mod help_detail_acceptance;
 
@@ -392,11 +394,22 @@ pub(crate) fn slash(
             guild: Some(AnonymizableId::Id(Id::new(GUILD))),
             user: None,
         },
-        channel: None,
+        // Real Discord populates both for guild slash commands: the
+        // registration guild (identity resolution scopes guild receipts by
+        // it) and the channel object (template context needs it).
+        channel: channel.map(|id| {
+            serde_json::from_value::<twilight_model::channel::Channel>(serde_json::json!({
+                "id": id.to_string(),
+                "guild_id": GUILD.to_string(),
+                "type": 0,
+                "name": "commands",
+            }))
+            .expect("slash fixture channel")
+        }),
         channel_id: channel.map(Id::new),
         context: None,
         data: Some(InteractionData::ApplicationCommand(Box::new(CommandData {
-            guild_id: None,
+            guild_id: Some(Id::new(GUILD)),
             id: Id::new(1),
             name: name.to_owned(),
             kind: CommandType::ChatInput,
@@ -463,12 +476,41 @@ fn interaction_event(interaction: Interaction) -> Event {
 
 /// A router-refused command: the first thing it does is one REST callback, so
 /// a delayed mock reply holds its worker slot without any database.
+/// Move an interaction to another invocation guild. Real guild slash
+/// payloads carry the same guild in `data.guild_id`, so keep both aligned.
+fn set_guild(
+    interaction: &mut Interaction,
+    guild: Option<twilight_model::id::Id<twilight_model::id::marker::GuildMarker>>,
+) {
+    interaction.guild_id = guild;
+    if let Some(InteractionData::ApplicationCommand(command)) = interaction.data.as_mut() {
+        if command.guild_id.is_some() {
+            command.guild_id = guild;
+        }
+    }
+}
+
 fn open_command(member: u64) -> Event {
     interaction_event(from_member(
         slash("sticky-remove", Some(CHANNEL), Vec::new()),
         member,
         Permissions::empty(),
     ))
+}
+
+/// `open_command` as a global-registration payload (no registration guild).
+/// Scope-closure probes use it so a registry installed earlier in the test
+/// cannot swallow the invocation before the closed scope is consulted.
+fn open_command_global(member: u64) -> Event {
+    let mut interaction = from_member(
+        slash("sticky-remove", Some(CHANNEL), Vec::new()),
+        member,
+        Permissions::empty(),
+    );
+    if let Some(InteractionData::ApplicationCommand(command)) = interaction.data.as_mut() {
+        command.guild_id = None;
+    }
+    interaction_event(interaction)
 }
 
 /// `/timeout` from a member who holds `MODERATE_MEMBERS`; moderation is gated
@@ -2087,7 +2129,7 @@ async fn foreign_non_moderation_commands_remain_silent() {
     for name in ["not-a-command", "rank", "rsvp", "command", "schedule"] {
         for guild in [Some(Id::new(9999)), None] {
             let mut interaction = slash(name, Some(CHANNEL), Vec::new());
-            interaction.guild_id = guild;
+            set_guild(&mut interaction, guild);
             runtime.on_interaction(&interaction).await;
         }
     }
@@ -2128,7 +2170,7 @@ async fn leveling_interaction_fence_precedes_any_store_read() {
     ] {
         for guild in [Some(Id::new(9999)), None] {
             let mut interaction = slash(name, Some(CHANNEL), Vec::new());
-            interaction.guild_id = guild;
+            set_guild(&mut interaction, guild);
             let handled = leveling
                 .handle_interaction(&interaction, handler)
                 .await
@@ -2202,7 +2244,7 @@ async fn foreign_moderation_preserves_the_router_guild_refusal() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     let runtime = runtime_without_db(gates(false, false), false, origin);
     let mut interaction = slash("ban", Some(CHANNEL), Vec::new());
-    interaction.guild_id = Some(Id::new(9999));
+    set_guild(&mut interaction, Some(Id::new(9999)));
     runtime.on_interaction(&interaction).await;
     let callbacks = mock.posts_to("/callback").await;
     assert_eq!(callbacks.len(), 1);
@@ -2409,7 +2451,7 @@ async fn bounded_dispatch_keeps_publication_independent_and_cancels_on_gateway_e
     .await;
     let sent = mock.requests().len();
     assert!(
-        !runtime.dispatch(&open_command(500)),
+        !runtime.dispatch(&open_command_global(500)),
         "closed scope refuses new work"
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2843,13 +2885,13 @@ async fn consolidated_runtime_preserves_guild_fences_for_lfg_and_siblings() {
             "feed-list",
         ] {
             let mut interaction = slash(name, Some(CHANNEL), Vec::new());
-            interaction.guild_id = guild;
+            set_guild(&mut interaction, guild);
             interaction.member.as_mut().unwrap().permissions =
                 Some(Permissions::MANAGE_EVENTS | Permissions::MANAGE_GUILD);
             runtime.on_interaction(&interaction).await;
         }
         let mut interaction = lfg_select(Vec::new());
-        interaction.guild_id = guild;
+        set_guild(&mut interaction, guild);
         runtime.on_interaction(&interaction).await;
     }
     assert!(
@@ -2860,7 +2902,7 @@ async fn consolidated_runtime_preserves_guild_fences_for_lfg_and_siblings() {
     // Moderation's guild fence remains an explicit refusal, unlike the
     // announcement/automation routes above, even with its feature gate off.
     let mut interaction = slash("ban", Some(CHANNEL), Vec::new());
-    interaction.guild_id = Some(Id::new(9999));
+    set_guild(&mut interaction, Some(Id::new(9999)));
     runtime.on_interaction(&interaction).await;
     let requests = mock.requests();
     assert_eq!(requests.len(), 1, "only the moderation guild refusal");
@@ -3473,7 +3515,7 @@ async fn feed_commands_from_other_guilds_are_silent() {
     let runtime = runtime_without_db(gates(true, true), true, origin);
     for name in ["feed-add", "feed-remove", "feed-list"] {
         let mut interaction = slash(name, Some(CHANNEL), Vec::new());
-        interaction.guild_id = Some(Id::new(9999));
+        set_guild(&mut interaction, Some(Id::new(9999)));
         runtime.on_interaction(&interaction).await;
     }
     assert!(
@@ -3541,7 +3583,7 @@ async fn schedule_commands_from_other_guilds_are_silent() {
     let runtime = runtime_without_db(gates(true, true), true, origin);
     for name in ["schedule", "schedule-remove", "schedule-list"] {
         let mut interaction = slash(name, Some(CHANNEL), Vec::new());
-        interaction.guild_id = Some(Id::new(9999));
+        set_guild(&mut interaction, Some(Id::new(9999)));
         runtime.on_interaction(&interaction).await;
     }
     assert!(
@@ -4292,7 +4334,7 @@ async fn shared_runtime_routes_leveling_once_with_legacy_visibility_and_guild_fe
     runtime.on_interaction(&leaderboard).await;
     for name in ["rank", "leaderboard"] {
         let mut foreign = slash(name, Some(CHANNEL), Vec::new());
-        foreign.guild_id = Some(Id::new(9999));
+        set_guild(&mut foreign, Some(Id::new(9999)));
         runtime.on_interaction(&foreign).await;
     }
     let requests = mock.requests();
@@ -9624,7 +9666,7 @@ fn kick_as(permissions: Permissions, guild: u64) -> Interaction {
         vec![option("member", CommandOptionValue::User(Id::new(303)))],
     );
     interaction.member.as_mut().unwrap().permissions = Some(permissions);
-    interaction.guild_id = Some(Id::new(guild));
+    set_guild(&mut interaction, Some(Id::new(guild)));
     interaction
 }
 
@@ -10673,7 +10715,7 @@ fn privacy_interaction(member: u64, subcommand: Option<&str>) -> Interaction {
 /// purge. Callers pass real-shaped snowflake IDs for both.
 fn privacy_interaction_in(guild: u64, member: u64, subcommand: Option<&str>) -> Interaction {
     let mut interaction = privacy_interaction(member, subcommand);
-    interaction.guild_id = Some(Id::new(guild));
+    set_guild(&mut interaction, Some(Id::new(guild)));
     interaction
 }
 
@@ -10700,7 +10742,7 @@ fn privacy_request_interaction_in(
         member,
         Permissions::empty(),
     );
-    interaction.guild_id = Some(Id::new(guild));
+    set_guild(&mut interaction, Some(Id::new(guild)));
     interaction
 }
 

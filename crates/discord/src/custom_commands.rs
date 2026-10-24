@@ -28,7 +28,7 @@ use two_bot_core::{
         format_inspect_template, inspect_preview_context_unavailable, invalid_inspect_option_reply,
         invalid_inspect_view_reply, render_template, validate_inspect_name, AuditRecord,
         AutomationMessageAcceptance, InspectView, PutCommandInput, StoredCommand, TemplateContext,
-        INVALID_COMMAND_LIST_PAGE, MAX_INSPECT_ARGUMENT_UNITS,
+        ToggleOutcome, INVALID_COMMAND_LIST_PAGE, MAX_INSPECT_ARGUMENT_UNITS,
     },
     router::{replies::InteractionReply, InteractionHandler},
     HandlerId, InteractionRouter, SlashOutcome,
@@ -202,7 +202,12 @@ impl CustomCommandRuntime {
         };
         let management = matches!(
             data.name.as_str(),
-            "command" | "command-remove" | "command-list" | "command-inspect"
+            "command"
+                | "command-remove"
+                | "command-list"
+                | "command-inspect"
+                | "command-disable"
+                | "command-enable"
         );
         let builtin = builtin_command_names().contains(&data.name);
         if builtin && !management {
@@ -758,6 +763,13 @@ impl CustomCommandRuntime {
                 .map_err(|_| CustomCommandError::Storage)?;
             return Ok(format_command_list_page(&rows, page).unwrap_or_else(str::to_owned));
         }
+        if data.name == "command-disable" || data.name == "command-enable" {
+            // Routing already enforced guild/application, ManageGuild and the
+            // feature gate. The lifecycle takes exactly one text `name`:
+            // forged types, duplicates and extra options refuse before any
+            // store read or publication.
+            return self.toggle(interaction, data, guild).await;
+        }
         let Some(name) = string_option(data, "name") else {
             return Ok("A command name is required.".to_owned());
         };
@@ -826,6 +838,77 @@ impl CustomCommandRuntime {
         }
         Ok(reply)
     }
+
+    /// Pause or resume one saved definition without deleting it. Only the
+    /// enabled flag and update metadata change, and only on a real flip;
+    /// missing rows, current-state requests and validation refusals never
+    /// publish. The flip commits before the one full-set publication, so an
+    /// invocation racing a stale picker reads the saved state.
+    async fn toggle(
+        &self,
+        interaction: &Interaction,
+        data: &CommandData,
+        guild: &str,
+    ) -> Result<String, CustomCommandError> {
+        let target = data.name == "command-enable";
+        let raw = match single_string_option(data, "name") {
+            SingleOption::Missing => {
+                return Ok("A command name is required.".to_owned());
+            }
+            SingleOption::Malformed => return Ok(invalid_toggle_option(&data.name)),
+            SingleOption::Value(name) => name,
+        };
+        if data.options.iter().any(|option| option.name != "name") {
+            return Ok(invalid_toggle_option(&data.name));
+        }
+        let actor = interaction
+            .author_id()
+            .ok_or(CustomCommandError::Context)?
+            .to_string();
+        let name = raw.to_lowercase();
+        let audit_id = format!("custom:manage:{}", interaction.id);
+        let at = two_bot_core::now_iso();
+        let _guard = self.registry.lock().await;
+        let decision = service::set_enabled(
+            &self.pool,
+            self.router.gates().automations,
+            &service::ToggleRequest {
+                guild,
+                actor: &actor,
+                name: &name,
+                enabled: target,
+                audit_id: &audit_id,
+                at: &at,
+            },
+        )
+        .await;
+        let (reply, resync) = match decision {
+            Ok(decision) => {
+                let reply = match decision.outcome {
+                    ToggleOutcome::Missing => format!("No command /{name} found."),
+                    ToggleOutcome::Unchanged if target => {
+                        format!("/{name} is already enabled.")
+                    }
+                    ToggleOutcome::Unchanged => format!("/{name} is already disabled."),
+                    ToggleOutcome::Changed if target => format!("Enabled /{name}."),
+                    ToggleOutcome::Changed => format!("Disabled /{name}."),
+                };
+                (reply, decision.resync_registry)
+            }
+            Err(service::ServiceError::Storage(_)) => return Err(CustomCommandError::Storage),
+            Err(error) => return Ok(error.to_string()),
+        };
+        if resync && self.publish_locked().await.is_err() {
+            // The flip is committed. Report the saved-but-not-synchronized
+            // state with a safe next action: never a delete recommendation,
+            // and never a claim that a later no-op repaired the picker.
+            tracing::error!("custom-command toggle committed but registry publication failed");
+            return Ok(format!(
+                "{reply} The definition is saved but the command picker is not yet synchronized because registry publication failed. Repeating this command will not resync it; restart the bot after Discord recovers to resync."
+            ));
+        }
+        Ok(reply)
+    }
 }
 
 /// Proven pre-wire refusals and guard failures map to `Delivery`; anything
@@ -838,6 +921,12 @@ fn delivery_error(error: crate::DiscordError) -> CustomCommandError {
     } else {
         CustomCommandError::DeliveryUnknown
     }
+}
+
+/// Toggle-option refusal: the lifecycle commands take exactly one text
+/// `name`, never a replacement/editor option set.
+fn invalid_toggle_option(command: &str) -> String {
+    format!("Invalid name option: pass exactly one text name, e.g. /{command} name:faq.")
 }
 
 fn string_option<'a>(data: &'a CommandData, name: &str) -> Option<&'a str> {
