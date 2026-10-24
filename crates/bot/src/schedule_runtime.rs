@@ -638,16 +638,19 @@ async fn finish(executor: &ActionExecutor, interaction: &Interaction, content: i
     }
 }
 
+/// Decoded `/schedule` options: `body` (required string) + `in-minutes` /
+/// `every-minutes` (optional integers). Missing values decode to `None`.
+type ScheduleCreateOptions = (Option<String>, Option<i64>, Option<i64>);
+
 /// Extract `/schedule`'s options: `body` (required string) + `in-minutes` /
 /// `every-minutes` (optional integers). Missing values decode to `None`;
 /// validation owns the refusal text.
 ///
 /// Lenient legacy shape: wrong-typed and duplicated options are ignored or
-/// last-wins. Handlers use [`schedule_options_strict`] instead; this stays
-/// for the pinned unit tests and keeps its happy-path behavior.
-pub(crate) fn schedule_options(
-    interaction: &Interaction,
-) -> (Option<String>, Option<i64>, Option<i64>) {
+/// last-wins. Test-only: handlers use [`schedule_options_strict`] instead,
+/// and the pinned unit tests keep this compiling and GREEN.
+#[cfg(test)]
+pub(crate) fn schedule_options(interaction: &Interaction) -> ScheduleCreateOptions {
     let mut body = None;
     let mut in_minutes = None;
     let mut every_minutes = None;
@@ -671,7 +674,9 @@ pub(crate) fn schedule_options(
 /// refused before resolution, so they can never delete a schedule.
 ///
 /// Lenient legacy shape: wrong-typed values decode to absent and duplicates
-/// are first-wins. Handlers use [`schedule_remove_option_strict`] instead.
+/// are first-wins. Test-only: handlers use [`schedule_remove_option_strict`]
+/// instead, and the pinned unit tests keep this compiling and GREEN.
+#[cfg(test)]
 pub(crate) fn schedule_remove_option(interaction: &Interaction) -> Option<String> {
     let Some(InteractionData::ApplicationCommand(data)) = &interaction.data else {
         return None;
@@ -680,23 +685,6 @@ pub(crate) fn schedule_remove_option(interaction: &Interaction) -> Option<String
         .iter()
         .find_map(|option| match (option.name.as_str(), &option.value) {
             ("id", CommandOptionValue::String(value)) => Some(value.clone()),
-            _ => None,
-        })
-}
-
-/// `/schedule-list`'s optional 1-based `page` option; absent means page 1.
-///
-/// Lenient legacy shape: a mismatched wire type decodes to absent (page 1)
-/// and duplicates are first-wins. Handlers use
-/// [`schedule_list_page_option_strict`] instead.
-pub(crate) fn schedule_list_page_option(interaction: &Interaction) -> Option<i64> {
-    let Some(InteractionData::ApplicationCommand(data)) = &interaction.data else {
-        return None;
-    };
-    data.options
-        .iter()
-        .find_map(|option| match (option.name.as_str(), &option.value) {
-            ("page", CommandOptionValue::Integer(value)) => Some(*value),
             _ => None,
         })
 }
@@ -731,10 +719,10 @@ const SCHEDULE_LIST_DUPLICATE_PAGE: &str =
 /// that option; name-count wins over type-check, and `body` wins over
 /// `in-minutes` wins over `every-minutes`. Missing options decode to `None`
 /// (validation owns those refusals) and unknown names stay ignored, so valid
-/// invocations decode byte-identically to [`schedule_options`].
+/// invocations decode byte-identically to the lenient `schedule_options`.
 pub(crate) fn schedule_options_strict(
     interaction: &Interaction,
-) -> Result<(Option<String>, Option<i64>, Option<i64>), &'static str> {
+) -> Result<ScheduleCreateOptions, &'static str> {
     let Some(InteractionData::ApplicationCommand(data)) = &interaction.data else {
         return Ok((None, None, None));
     };
