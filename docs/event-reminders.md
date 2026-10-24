@@ -15,7 +15,10 @@ When the complete attendee list cannot fit in one 2,000-UTF-16-unit message, or
 the roster exceeds the RSVP bound, the channel still gets exactly one bounded
 fallback notice instead of silence: the event name, the attendee count, the
 start time and the event link, with no mentions and never a partial roster.
-The fallback counts as the event's one delivery attempt.
+The count covers all Going and Interested RSVPs, even when the stored roster
+exceeds the 1,001-member read cap; declined RSVPs do not count. The scheduler
+revalidates that total alongside the capped member list before admission. The
+fallback counts as the event's one delivery attempt.
 
 The existing activation-fenced automation scheduler must be enabled; its normal
 15-second cadence also handles these reminders, at most two events per tick.
