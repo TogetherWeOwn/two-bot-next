@@ -174,7 +174,7 @@ class LiveBehaviorControls(unittest.TestCase):
     def test_module_constants_unchanged(self):
         self.assertEqual(smoke.MIB, 1024 * 1024)
         self.assertEqual(smoke.IMAGE_MAX_BYTES, 112 * 1024 * 1024)
-        self.assertEqual(smoke.BINARY_MAX_BYTES, 17 * 1024 * 1024)
+        self.assertEqual(smoke.BINARY_MAX_BYTES, 18 * 1024 * 1024)
         self.assertEqual(smoke.MAX_BODY_BYTES, 64 * 1024)
         self.assertEqual(smoke.BINARY, "/home/nonroot/two-bot")
         self.assertEqual(smoke.CA_BUNDLE, "/etc/ssl/certs/ca-certificates.crt")

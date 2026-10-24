@@ -66,10 +66,11 @@ Original registry surface: `CORE_COMMAND_DATA` (always published) = leveling onl
 | 30 | `/feed-list` | `page` opt ≥1 (1-based, default 1) | `ManageGuild` | **S4** |
 
 Runtime permission contract: `crates/core/src/command_permissions.rs` represents
-all 38 rows (35 retained builtins — the 27 legacy ones plus the Next-only
+all 39 rows (36 retained builtins — the 27 legacy ones plus the Next-only
 `/help`, `/privacy`, `/command-inspect`, `/reopen`, `/purge-preview`,
-`/channel-inspect`, `/schedule-inspect` and `/schedule-edit` — the dropped
-rota command, custom slash commands, and prefix triggers). The router checks the invoking interaction's resolved
+`/channel-inspect`, `/giveaway`, `/schedule-inspect` and `/schedule-edit` —
+the dropped rota command, custom slash commands, and prefix triggers). The
+router checks the invoking interaction's resolved
 `member.permissions`, not bot permissions or command-picker defaults, before
 returning a builtin handler. Missing restricted bits produce an ephemeral refusal
 and a metadata-only `command_permission_denied` tracing audit event (command,
@@ -119,6 +120,7 @@ golden exception or a claim of whole-baseline registry parity.
 | `feed-remove` | docs/parity.md §1 #29 caps | Advertise only `max_length` 128 on `id`; every other field stays legacy-identical. |
 | `schedule-list` | docs/parity.md §1 #19 page | Add the Next-only optional integer `page` (`min_value` 1, default 1) so every configured id through the first 50 rows stays discoverable within Discord's 2,000-unit cap (guild list reads at most 25 earliest rows per window; over-cap guilds page past the overflow line to reach hidden rows); command name, description and permissions stay legacy-identical. |
 | `feed-list` | docs/parity.md §1 #30 page | Add the Next-only optional integer `page` (`min_value` 1, default 1) so every stored relay id stays discoverable as deterministic whole rows within Discord's 2,000-unit cap (each page packs whole relay rows with source context; invalid or out-of-range pages refuse without mutation); command name, description and permissions stay legacy-identical. |
+| `giveaway` | docs/parity.md §1 giveaway | Add the Next-only `/giveaway` timed-entry command (no legacy counterpart): automations-gated, ManageGuild, guild-only. `create` takes `prize` (required string, `max_length` 200, matching the domain cap), `duration` (1–43200 minutes) and `winners` (1–100) plus optional `required-role`, `min-account-age-days` and `min-server-age-days` (0–3650); `list` takes no options; `cancel` takes `id` (required string, `max_length` 64). |
 | `command-inspect` | docs/parity.md §1 command-inspect | Add the Next-only `/command-inspect` management command (no legacy counterpart): automation-gated, guild-only, `ManageGuild`-gated, published after `command-list`. Required `name` (≤32), optional `view` choice (summary/template/preview, summary by default) and optional `arguments` sample (≤500 UTF-16 units, ignored by the four-variable template language). One private ephemeral content-only view per call — metadata summary, saved template, or rendered preview — with Markdown-escaped untrusted text and explicit truncation markers; never a channel send, registration, cooldown/claim touch, definition mutation or `command.run` fact. |
 
 | `purge-preview` | docs/parity.md §1 purge-preview | Add the Next-only staff-private purge sample, appended after `unlock`: moderation-gated, guild-only, ManageMessages, one required integer `count` (1–100), no reason. Shares execution's pin/own-bot filtering and bulk/single age planner; never deletes or writes audit/claim/lease state. |

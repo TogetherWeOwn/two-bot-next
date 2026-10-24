@@ -498,26 +498,81 @@ mod tests {
     #[test]
     fn desired_registry_uses_existing_feature_gates() {
         let mut env = vars();
-        assert_eq!(
-            desired_definitions(2222, &env)
-                .expect("desired registry assembles")
-                .len(),
-            5
+        let default = desired_definitions(2222, &env).expect("desired registry assembles");
+        assert_eq!(default.len(), 5);
+        assert!(
+            default.iter().any(|def| def.name == "reopen"),
+            "reopen is core-always in the default registry"
         );
         env.insert("TWO_AUTOMATIONS".into(), "1".into());
         env.insert("TWO_ANNOUNCEMENTS".into(), "1".into());
         env.insert("TWO_COMMUNITY_SCORECARD".into(), "1".into());
         env.insert("TWO_MODERATION".into(), "1".into());
         env.insert("TWO_OWEN_USER_ID".into(), "123456789012345678".into());
+        let all_on = desired_definitions(2222, &env).expect("desired registry assembles");
         assert_eq!(
-            desired_definitions(2222, &env)
-                .expect("desired registry assembles")
-                .len(),
-            // 33 all-gate builtins (30 plus always-on `/reopen` plus the
-            // automation-gated `/schedule-inspect` and `/schedule-edit`)
-            // plus the moderation-gated reads `/purge-preview` and
-            // `/channel-inspect`; no new feature gate.
-            35
+            all_on.len(),
+            // 34 all-gate builtins (31 plus automations-gated `/giveaway`
+            // plus the automation-gated `/schedule-inspect` and
+            // `/schedule-edit`) plus the moderation-gated reads
+            // `/purge-preview` and `/channel-inspect`; no new feature gate.
+            36
         );
+        assert!(
+            all_on.iter().any(|def| def.name == "reopen"),
+            "reopen survives the all-on registry"
+        );
+        assert!(
+            all_on.iter().any(|def| def.name == "giveaway"),
+            "giveaway survives the all-on registry"
+        );
+        env.insert("TWO_VOICE".into(), "1".into());
+        let with_voice = desired_definitions(2222, &env).expect("desired registry assembles");
+        assert_eq!(with_voice.len(), 57);
+        assert!(
+            with_voice.iter().any(|def| def.name == "reopen"),
+            "reopen survives the voice registry"
+        );
+        assert!(
+            with_voice.iter().any(|def| def.name == "giveaway"),
+            "giveaway survives the voice registry"
+        );
+    }
+
+    #[test]
+    fn desired_registry_gates_inspection_and_giveaway_only_on_automations() {
+        for other_features in ["0", "1"] {
+            for voice in ["0", "1"] {
+                for automations in [None, Some("0"), Some("1")] {
+                    let mut env = vars();
+                    for flag in [
+                        "TWO_ANNOUNCEMENTS",
+                        "TWO_COMMUNITY_SCORECARD",
+                        "TWO_MODERATION",
+                    ] {
+                        env.insert(flag.into(), other_features.into());
+                    }
+                    env.insert("TWO_OWEN_USER_ID".into(), "123456789012345678".into());
+                    env.insert("TWO_VOICE".into(), voice.into());
+                    if let Some(value) = automations {
+                        env.insert("TWO_AUTOMATIONS".into(), value.into());
+                    }
+                    let definitions =
+                        desired_definitions(2222, &env).expect("desired registry assembles");
+                    for name in ["command-inspect", "giveaway"] {
+                        assert_eq!(
+                            definitions.iter().filter(|def| def.name == name).count(),
+                            usize::from(automations == Some("1")),
+                            "/{name}: automations={automations:?}, voice={voice}, other_features={other_features}"
+                        );
+                    }
+                    assert_eq!(
+                        definitions.iter().filter(|def| def.name == "reopen").count(),
+                        1,
+                        "/reopen always published: automations={automations:?}, voice={voice}, other_features={other_features}"
+                    );
+                }
+            }
+        }
     }
 }

@@ -46,6 +46,7 @@
     {"name": "schedule-edit", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
     {"name": "sticky", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
     {"name": "sticky-remove", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
+    {"name": "giveaway", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
     {"name": "feed-add", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
     {"name": "feed-remove", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
     {"name": "feed-list", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"}

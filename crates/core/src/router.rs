@@ -125,6 +125,7 @@ pub enum HandlerId {
     ScorecardAttendance,
     AutomationAdmin,
     AutomationCustom,
+    Giveaway,
     Rsvp,
     RsvpAttendance,
     Lfg,
@@ -145,6 +146,7 @@ pub enum ComponentHandler {
     SelfRole,
     Tickets,
     LfgSignup,
+    GiveawayEntry,
 }
 
 /// Contract feature slices implement so the router can hand a routed
@@ -404,6 +406,7 @@ impl InteractionRouter {
             // Sticky/admin plus custom rows (`CustomCommandRuntime::register`).
             register(HandlerId::AutomationAdmin);
             register(HandlerId::AutomationCustom);
+            register(HandlerId::Giveaway);
         }
         if gates.announcements {
             for id in [
@@ -686,6 +689,11 @@ impl InteractionRouter {
                 gate: RowGate::Automations,
                 permission_refusal: Some(RouterRefusal::ManageServerRequired),
             },
+            "giveaway" => Row {
+                handler: HandlerId::Giveaway,
+                gate: RowGate::Automations,
+                permission_refusal: Some(RouterRefusal::ManageServerRequired),
+            },
             "rsvp" => Row {
                 handler: HandlerId::Rsvp,
                 gate: RowGate::Announcements,
@@ -778,6 +786,11 @@ impl InteractionRouter {
                 return ComponentOutcome::Ignore;
             }
             ComponentHandler::SelfRole
+        } else if custom_id.starts_with("gw:") {
+            if !self.gates.automations || !self.guild_ok(guild_id) {
+                return ComponentOutcome::Ignore;
+            }
+            ComponentHandler::GiveawayEntry
         } else {
             return if self.guild_ok(guild_id) {
                 ComponentOutcome::Unknown
@@ -887,7 +900,7 @@ impl InteractionRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::PERM_MANAGE_EVENTS;
+    use crate::commands::{PERM_MANAGE_EVENTS, PERM_MANAGE_GUILD};
     use std::collections::HashMap;
 
     const GUILD: u64 = 2222;
@@ -969,6 +982,7 @@ mod tests {
             ("schedule-edit", HandlerId::AutomationAdmin),
             ("sticky", HandlerId::AutomationAdmin),
             ("sticky-remove", HandlerId::AutomationAdmin),
+            ("giveaway", HandlerId::Giveaway),
             ("rsvp", HandlerId::Rsvp),
             ("rsvp-attendance", HandlerId::RsvpAttendance),
             ("lfg", HandlerId::Lfg),
@@ -977,7 +991,7 @@ mod tests {
             ("feed-remove", HandlerId::FeedRemove),
             ("feed-list", HandlerId::FeedList),
         ];
-        assert_eq!(cases.len(), 35, "all 35 handler-owned builtins covered");
+        assert_eq!(cases.len(), 36, "all 36 handler-owned builtins covered");
         for (name, handler) in cases {
             assert_eq!(
                 r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
@@ -1233,6 +1247,69 @@ mod tests {
             r.route_slash(&ctx("rank", None, None)),
             SlashOutcome::Ignore
         );
+    }
+
+    #[test]
+    fn giveaway_requires_manage_guild_for_its_dedicated_handler() {
+        let r = router();
+        for permissions in [None, Some(0), Some(PERM_MANAGE_EVENTS)] {
+            assert_eq!(
+                r.route_slash(&ctx("giveaway", Some(GUILD), permissions)),
+                SlashOutcome::Refuse {
+                    refusal: RouterRefusal::ManageServerRequired
+                },
+                "giveaway refuses without Manage Guild: {permissions:?}",
+            );
+        }
+        assert_eq!(
+            r.route_slash(&ctx("giveaway", Some(GUILD), Some(PERM_MANAGE_GUILD))),
+            SlashOutcome::Handled {
+                handler: HandlerId::Giveaway
+            }
+        );
+    }
+
+    #[test]
+    fn giveaway_automation_gate_precedes_its_permission_check() {
+        let off = InteractionRouter::new(RouterGates {
+            automations: false,
+            ..all_on()
+        });
+        for permissions in [None, Some(0), Some(PERM_MANAGE_GUILD), Some(u64::MAX)] {
+            assert_eq!(
+                off.route_slash(&ctx("giveaway", Some(GUILD), permissions)),
+                SlashOutcome::Refuse {
+                    refusal: RouterRefusal::AutomationsDisabled
+                },
+                "disabled giveaway refuses before checking permissions: {permissions:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn giveaway_guild_fence_precedes_its_feature_and_permission_gates() {
+        for (configured_guild, guild_id) in [
+            (Some(GUILD), None),
+            (Some(GUILD), Some(9999)),
+            (None, None),
+            (None, Some(GUILD)),
+            (None, Some(9999)),
+        ] {
+            for automations in [false, true] {
+                let r = InteractionRouter::new(RouterGates {
+                    configured_guild,
+                    automations,
+                    ..all_on()
+                });
+                for permissions in [None, Some(u64::MAX)] {
+                    assert_eq!(
+                        r.route_slash(&ctx("giveaway", guild_id, permissions)),
+                        SlashOutcome::Ignore,
+                        "giveaway stays fenced: configured={configured_guild:?}, guild={guild_id:?}, automations={automations}, permissions={permissions:?}",
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1498,9 +1575,9 @@ mod tests {
         }];
         let set = r.publish_set(&custom).expect("full set assembles");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        // 5 core + 1 scorecard + 11 automation + 7 announcement + 9 mutations
-        // + 2 reads + 1 custom = 36, in publish order, guild-only throughout.
-        assert_eq!(set.len(), 36);
+        // 5 core + 1 scorecard + 12 automation + 7 announcement + 9 moderation
+        // + 2 reads + 1 custom = 37, in publish order, guild-only throughout.
+        assert_eq!(set.len(), 37);
         assert_eq!(
             &names[..6],
             [
@@ -1512,17 +1589,19 @@ mod tests {
                 "attendance"
             ]
         );
+        assert_eq!(names[9], "command-inspect");
+        assert_eq!(&names[16..19], ["sticky-remove", "giveaway", "rsvp"]);
         assert!(names.contains(&"rsvp-attendance"));
         assert_eq!(names.iter().filter(|n| **n == "attendance").count(), 1);
         assert_eq!(
-            &names[24..33],
+            &names[25..34],
             [
                 "ban", "tempban", "kick", "timeout", "warn", "purge", "slowmode", "lockdown",
                 "unlock",
             ]
         );
-        assert_eq!(&names[33..35], ["purge-preview", "channel-inspect"]);
-        assert_eq!(names[35], "faq");
+        assert_eq!(&names[34..36], ["purge-preview", "channel-inspect"]);
+        assert_eq!(names[36], "faq");
         assert!(set.iter().all(|c| !c.dm_permission));
     }
 
@@ -1685,7 +1764,7 @@ mod tests {
     fn voice_set_publishes_after_moderation_only_while_gated() {
         let off = published(all_on());
         let off_names: Vec<_> = off.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(off.len(), 35);
+        assert_eq!(off.len(), 36);
         for name in VOICE_NAMES.iter().filter(|name| **name != "kick") {
             assert!(
                 !off_names.contains(name),
@@ -1695,16 +1774,16 @@ mod tests {
 
         let on = published(voice_on());
         let on_names: Vec<_> = on.iter().map(|c| c.name.as_str()).collect();
-        // 35 builtins keep their order; the 21 voice names that survive
+        // 36 builtins keep their order; the 21 voice names that survive
         // first-wins follow in voice order. `kick` is already moderation's.
-        assert_eq!(on.len(), 56);
-        assert_eq!(on_names[..35], off_names[..]);
+        assert_eq!(on.len(), 57);
+        assert_eq!(on_names[..36], off_names[..]);
         let expected: Vec<_> = VOICE_NAMES
             .iter()
             .copied()
             .filter(|name| *name != "kick")
             .collect();
-        assert_eq!(on_names[35..], expected[..]);
+        assert_eq!(on_names[36..], expected[..]);
         assert!(!on_names.contains(&"templateassistant"));
         assert!(on.iter().all(|c| !c.dm_permission));
     }
@@ -1765,13 +1844,13 @@ mod tests {
                 "voice={voice} assistant={assistant}"
             );
         }
-        // Both gates on is the full voice set without the assistant: 35
+        // Both gates on is the full voice set without the assistant: 36
         // builtins plus the 21 surviving voice names.
         let both = published(RouterGates {
             voice_assistant: true,
             ..voice_on()
         });
-        assert_eq!(both.len(), 56);
+        assert_eq!(both.len(), 57);
     }
 
     #[test]

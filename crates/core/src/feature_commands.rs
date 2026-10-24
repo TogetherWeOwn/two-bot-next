@@ -259,7 +259,71 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
             ]),
         CommandDefinition::new("sticky-remove", "Remove this channel's sticky message")
             .permissions(PERM_MANAGE_GUILD),
+        giveaway_command(),
     ]
+}
+
+/// Manage-Server-only giveaway administration; entry buttons remain open to members.
+#[must_use]
+pub fn giveaway_command() -> CommandDefinition {
+    CommandDefinition::new("giveaway", "Create, list or cancel a giveaway")
+        .permissions(PERM_MANAGE_GUILD)
+        .options(vec![
+            CommandOption::new(
+                "create",
+                "Create a giveaway in this channel",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![
+                CommandOption::new(
+                    "prize",
+                    "Prize text (up to 200 characters)",
+                    CommandOptionType::String,
+                )
+                .required()
+                .max_length(200),
+                CommandOption::new(
+                    "duration",
+                    "Entry window in minutes (1–43200)",
+                    CommandOptionType::Integer,
+                )
+                .required()
+                .int_range(1, 43200),
+                CommandOption::new("winners", "Number of winners", CommandOptionType::Integer)
+                    .required()
+                    .int_range(1, 100),
+                CommandOption::new(
+                    "required-role",
+                    "Role every entrant must hold",
+                    CommandOptionType::Role,
+                ),
+                CommandOption::new(
+                    "min-account-age-days",
+                    "Minimum account age in days",
+                    CommandOptionType::Integer,
+                )
+                .int_range(0, 3650),
+                CommandOption::new(
+                    "min-server-age-days",
+                    "Minimum time in this server in days",
+                    CommandOptionType::Integer,
+                )
+                .int_range(0, 3650),
+            ]),
+            CommandOption::new("list", "List open giveaways", CommandOptionType::SubCommand),
+            CommandOption::new(
+                "cancel",
+                "Cancel an open or paused giveaway",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![CommandOption::new(
+                "id",
+                "Giveaway id",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(64)]),
+        ])
 }
 
 /// Announcement commands (parity #24–#30): RSVP, LFG signups, feed relays.
@@ -501,6 +565,7 @@ mod tests {
 
     #[test]
     fn slice2_names_match_legacy_in_order() {
+        assert_eq!(automation_commands().len(), 12);
         assert_eq!(
             names(&feature_commands()),
             [
@@ -516,6 +581,7 @@ mod tests {
                 "schedule-edit",
                 "sticky",
                 "sticky-remove",
+                "giveaway",
                 "rsvp",
                 "rsvp-attendance",
                 "lfg",
@@ -530,8 +596,8 @@ mod tests {
     #[test]
     fn no_collision_with_leveling_core_or_within_slice() {
         let merged = merge_commands(&[feature_commands()], &[]).expect("slice 2 merges cleanly");
-        // 5 core + 1 scorecard + 11 automation + 7 announcement.
-        assert_eq!(merged.len(), 24);
+        // 5 core + 1 scorecard + 12 automation + 7 announcement.
+        assert_eq!(merged.len(), 25);
         assert_eq!(
             &names(&merged)[..6],
             [
@@ -571,6 +637,7 @@ mod tests {
             "schedule-edit",
             "sticky",
             "sticky-remove",
+            "giveaway",
         ] {
             assert_eq!(is(&auto, name), manage_guild, "{name} gates ManageGuild");
         }
@@ -811,19 +878,22 @@ mod tests {
         assert_eq!(json[0]["default_member_permissions"], "8589934592");
         assert_eq!(json[0]["options"][0]["name"], "event-occurrence");
         assert_eq!(json[0]["options"][0]["max_length"], 128);
-        // Saved-response inspection publishes after `command-list`, shifting
-        // the announcement slice one index later.
+        // Inspection follows command-list; giveaway follows sticky-remove.
+        // Both shift the announcement slice without replacing any command.
         assert_eq!(json[4]["name"], "command-inspect");
         assert_eq!(json[4]["options"][2]["max_length"], 500);
         // Queue inspection and body-only correction publish after
-        // `schedule-list`, shifting the announcement slice two more.
+        // `schedule-list`; giveaway follows `sticky-remove`, shifting the
+        // announcement slice without replacing any command.
         assert_eq!(json[8]["name"], "schedule-inspect");
         assert_eq!(json[8]["options"][1]["max_length"], 8);
         assert_eq!(json[9]["name"], "schedule-edit");
         assert_eq!(json[9]["options"][2]["max_length"], 2000);
-        assert_eq!(json[13]["name"], "rsvp-attendance");
-        assert!(json[13].get("default_member_permissions").is_none());
-        assert_eq!(json[13]["options"][0]["name"], "event-id");
+        assert_eq!(json[12]["name"], "giveaway");
+        assert_eq!(json[12]["default_member_permissions"], "32");
+        assert_eq!(json[14]["name"], "rsvp-attendance");
+        assert!(json[14].get("default_member_permissions").is_none());
+        assert_eq!(json[14]["options"][0]["name"], "event-id");
     }
 
     #[test]
