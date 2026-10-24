@@ -8,7 +8,7 @@
 //! parsing is local; only the existing canonical Discord API reads may occur.
 
 use super::*;
-use common::RecordedRequest;
+use common::RestRequest;
 use two_bot_core::{put_rsvp, RsvpRecord, RsvpStatus};
 
 const FOREIGN: &str = "1545644954272137001";
@@ -99,7 +99,7 @@ async fn live_rest() -> MockRest {
 }
 
 /// Capture final wire text, not a private parser or a duplicated normalizer.
-fn reply(requests: &[RecordedRequest]) -> String {
+fn reply(requests: &[RestRequest]) -> String {
     let last = requests.last().expect("a private reply");
     let body: Value = serde_json::from_slice(&last.body).expect("reply JSON");
     if last.method == "PATCH" {
@@ -116,7 +116,7 @@ fn reply(requests: &[RecordedRequest]) -> String {
     }
 }
 
-fn private_effects_only(requests: &[RecordedRequest], allow_live_reads: bool) {
+fn private_effects_only(requests: &[RestRequest], allow_live_reads: bool) {
     let first: Value = serde_json::from_slice(&requests[0].body).expect("callback");
     assert_eq!(requests[0].method, "POST");
     assert!(requests[0].path.ends_with("/callback"));
