@@ -90,29 +90,58 @@ fn schedule_list_publishes_optional_page_and_here_without_relaxing_permissions()
 #[test]
 fn schedule_here_help_explains_scope_and_default_only_while_published() {
     let mut definitions = automation_commands();
-    let active = two_bot_core::help_text(&definitions);
-    let lower = active.to_ascii_lowercase();
+    let schedule_list = definitions
+        .iter()
+        .find(|definition| definition.name == "schedule-list")
+        .expect("schedule-list publishes");
+    // Option-level discovery lives in the confirmed-publication detail, not
+    // the name-only list: the detail renders usage, per-argument types and
+    // the declared permission from the published definition.
+    let active = schedule_list.help_detail_text();
     assert!(
-        lower.contains("here:true") && lower.contains("this channel"),
-        "discover the filter from live help: {active}"
+        active.contains("Usage: /schedule-list [page] [here]"),
+        "formable usage names the optional filter: {active}"
+    );
+    // `inert` strips markdown punctuation, so the detail drops the
+    // description's parentheses; scope and default survive verbatim.
+    assert!(
+        active
+            .contains("- here (boolean, optional): Only schedules in this channel default: false"),
+        "discover the boolean filter, its scope and its default: {active}"
     );
     assert!(
-        lower.contains("false") && lower.contains("server"),
-        "discover the server-wide default: {active}"
+        active.contains("- page (integer, optional, min 1): Page of the schedule list 1-based"),
+        "preserve the page argument: {active}"
     );
+    assert!(
+        active.contains("Permissions: Manage Server."),
+        "retain the authorization requirement: {active}"
+    );
+    // Name-only list controls: exact-once discovery and the group hint stay
+    // stable while options change underneath.
+    let listed = two_bot_core::help_text(&definitions);
     assert_eq!(
-        active.matches("/schedule-list").count(),
+        listed.matches("/schedule-list").count(),
         1,
         "retain exact-once discovery"
     );
     assert!(
-        active.contains("Manage Server"),
+        listed.contains("Manage Server"),
         "retain authorization hint"
     );
-    definitions.retain(|definition| definition.name != "schedule-list");
-    let withheld = two_bot_core::help_text(&definitions);
+    // Withheld feature, withheld hint: without the published option the
+    // detail never names the filter.
+    let mut bare = schedule_list.clone();
+    bare.options.pop();
+    let withheld = bare.help_detail_text();
     assert!(
-        !withheld.contains("here:true"),
-        "unpublished feature has no stale help hint"
+        !withheld.to_ascii_lowercase().contains("here"),
+        "unpublished feature has no stale help hint: {withheld}"
+    );
+    definitions.retain(|definition| definition.name != "schedule-list");
+    let unlisted = two_bot_core::help_text(&definitions);
+    assert!(
+        !unlisted.contains("/schedule-list"),
+        "unpublished command leaves the list"
     );
 }

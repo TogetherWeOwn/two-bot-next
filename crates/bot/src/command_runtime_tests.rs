@@ -37,10 +37,10 @@ mod sticky_uncertain_acceptance_tests;
 
 #[path = "custom_command_list_pages_acceptance.rs"]
 mod custom_command_list_pages_acceptance;
-#[path = "schedule_list_here_acceptance_tests.rs"]
-mod schedule_list_here_acceptance_tests;
 #[path = "help_detail_acceptance.rs"]
 mod help_detail_acceptance;
+#[path = "schedule_list_here_acceptance_tests.rs"]
+mod schedule_list_here_acceptance_tests;
 
 #[path = "giveaway_admission_edge_acceptance_tests.rs"]
 mod giveaway_admission_edge_acceptance_tests;
