@@ -1557,7 +1557,13 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
         CommandDefinition::new(
             "setup",
             "Show voice-room status, health and creator channels",
-        ),
+        )
+        .options(vec![CommandOption::new(
+            "page",
+            "Page of creator channels to show (starts at 1)",
+            CommandOptionType::Integer,
+        )
+        .min_value(1)]),
         CommandDefinition::new("ping", "Show the bot's response latency"),
         CommandDefinition::new("invite", "Show this server's invite link"),
         CommandDefinition::new(
@@ -1599,7 +1605,13 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
                 "show",
                 "Show the current voice-room access settings",
                 CommandOptionType::SubCommand,
-            ),
+            )
+            .sub_options(vec![CommandOption::new(
+                "page",
+                "Page of access settings to show (starts at 1)",
+                CommandOptionType::Integer,
+            )
+            .min_value(1)]),
             CommandOption::new(
                 "creation",
                 "Turn temporary room creation on or off",
