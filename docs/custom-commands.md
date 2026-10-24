@@ -136,6 +136,21 @@ remaining gateway/accepted-prefix work:
    inspectable. Unknown, other-guild-only and deleted names share one truthful
    miss pointing at `/command-list`; lookup outages reuse the fixed
    availability reply below.
+9. `/command-disable name:<name>` pauses one saved definition and
+   `/command-enable name:<name>` resumes it, without deleting anything.
+   Both take exactly one text `name` (a forged type, a duplicate or any
+   extra option refuses before any store read); names lowercase before
+   lookup. Only the enabled flag and update metadata change, and only on a
+   real flip, which commits with one content-free `command.disable` /
+   `command.enable` audit fact inside the guild lifecycle lock. Missing
+   rows, current-state requests and validation refusals are zero-write:
+   no audit fact, no timestamp touch, no republish. Resuming revalidates
+   the stored row against the write rules (a reserved or invalid saved
+   definition refuses without reactivating); pausing needs no content
+   check. The flip commits before the one full-set publication, so a
+   prefix or slash invocation racing a stale picker reads the saved
+   state. A failed publication reports saved-but-not-synchronized with a
+   safe next action; a repeated state never claims the picker repaired.
 
 ## Slash-run audit replay
 

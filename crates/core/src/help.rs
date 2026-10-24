@@ -68,6 +68,8 @@ const HELP_GROUPS: &[HelpGroup] = &[
             "command-remove",
             "command-list",
             "command-inspect",
+            "command-disable",
+            "command-enable",
             "schedule",
             "schedule-remove",
             "schedule-list",
@@ -273,12 +275,12 @@ mod tests {
                 "{token} appears exactly once"
             );
         }
-        // 28 legacy builtins plus the Next-only help, privacy and
-        // command-inspect commands, plus the 21 gated voice commands (voice
-        // `kick` loses first-wins to moderation `/kick`; `/templateassistant`
-        // stays unpublished until its slice lands): matches the regenerated
-        // `docs/commands.md` total.
-        assert!(text.contains("**Server commands** (51 live)"));
+        // 27 legacy builtins plus the Next-only help, privacy,
+        // command-inspect, command-disable and command-enable commands, plus
+        // the 21 gated voice commands (voice `kick` loses first-wins to
+        // moderation `/kick`; `/templateassistant` stays unpublished until
+        // its slice lands): matches the regenerated `docs/commands.md` total.
+        assert!(text.contains("**Server commands** (53 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"
@@ -398,11 +400,11 @@ mod tests {
             .iter()
             .flat_map(|g| g.commands.iter().copied())
             .collect();
-        // 27 legacy builtins plus the Next-only help, privacy and
-        // command-inspect commands, then the 21 voice names (voice `kick`
-        // shares the Kick group). `/templateassistant` stays out until its
-        // slice lands.
-        assert_eq!(grouped.len(), 51);
+        // 27 legacy builtins plus the Next-only help, privacy,
+        // command-inspect, command-disable and command-enable commands, then
+        // the 21 voice names (voice `kick` shares the Kick group).
+        // `/templateassistant` stays out until its slice lands.
+        assert_eq!(grouped.len(), 53);
         for name in [
             "rank",
             "leaderboard",
@@ -410,6 +412,8 @@ mod tests {
             "privacy",
             "attendance",
             "command",
+            "command-disable",
+            "command-enable",
             "schedule-list",
             "sticky-remove",
             "rsvp",

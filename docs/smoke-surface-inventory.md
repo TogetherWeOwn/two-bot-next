@@ -9,14 +9,14 @@ verdicts in `docs/smoke-run-record.md`.
 
 - Registry: `InteractionRouter::publish_set` with all feature gates on
   (scorecard, automations, announcements, moderation), no custom rows.
-- Rendered reference: `docs/commands.md` — the 30 built-ins plus the voice set
-  (51 with the voice gates on), registry bounds,
+- Rendered reference: `docs/commands.md` — the 32 built-ins plus the voice set
+  (53 with the voice gates on), registry bounds,
   DMs false on every row (guild-only, legacy `setDMPermission(false)`).
 - Merge order (first definition wins, Discord 100-command ceiling):
   core → scorecard → automations → announcements → moderation.
 
-Counts: 4 core + 1 scorecard + 9 automations + 7 announcements +
-9 moderation = **30 built-ins**. Machine-readable mirror:
+Counts: 4 core + 1 scorecard + 11 automations + 7 announcements +
+9 moderation = **32 built-ins**. Machine-readable mirror:
 `crates/core/tests/fixtures/smoke_surface_inventory.json`, checked by
 `crates/core/tests/smoke_surface_inventory.rs` (registry shape in publish
 order, exactly-five-covered gate, handler routing for the five).

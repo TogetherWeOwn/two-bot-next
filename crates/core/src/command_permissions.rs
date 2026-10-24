@@ -76,10 +76,11 @@ use PolicyHook::{
 /// All 30 parity rows, including the three non-static-slash dispositions,
 /// plus the Next-only `/help` discovery command (parity row 31 — legacy has
 /// no help command), the Next-only `/privacy` member self-serve
-/// (parity row 32) and the Next-only management-only `/command-inspect`
-/// (parity row 33).
+/// (parity row 32), the Next-only management-only `/command-inspect`
+/// (parity row 33) and the Next-only pause/resume `/command-disable` and
+/// `/command-enable` (parity rows 34 and 35).
 /// No Administrator-only exception: preserve the legacy resolved-bit check.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 33] = [
+pub const COMMAND_PERMISSIONS: [CommandPermission; 35] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),
@@ -135,6 +136,8 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 33] = [
     row(15, "command-remove", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(16, "command-list", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(33, "command-inspect", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(34, "command-disable", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(35, "command-enable", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(17, "schedule", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(18, "schedule-remove", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(19, "schedule-list", BuiltinSlash, PERM_MANAGE_GUILD, None),

@@ -66,8 +66,9 @@ Original registry surface: `CORE_COMMAND_DATA` (always published) = leveling onl
 | 30 | `/feed-list` | `page` opt ≥1 (1-based, default 1) | `ManageGuild` | **S4** |
 
 Runtime permission contract: `crates/core/src/command_permissions.rs` represents
-all 33 rows (30 retained builtins — the 27 legacy ones plus the Next-only
-`/help`, `/privacy` and `/command-inspect` — the dropped rota command, custom
+all 35 rows (32 retained builtins — the 27 legacy ones plus the Next-only
+`/help`, `/privacy`, `/command-inspect`, `/command-disable` and
+`/command-enable` — the dropped rota command, custom
 slash commands, and prefix triggers). The router checks the invoking interaction's resolved
 `member.permissions`, not bot permissions or command-picker defaults, before
 returning a builtin handler. Missing restricted bits produce an ephemeral refusal
@@ -118,6 +119,8 @@ golden exception or a claim of whole-baseline registry parity.
 | `schedule-list` | docs/parity.md §1 #19 page | Add the Next-only optional integer `page` (`min_value` 1, default 1) so every configured id through the first 50 rows stays discoverable within Discord's 2,000-unit cap (guild list reads at most 25 earliest rows per window; over-cap guilds page past the overflow line to reach hidden rows); command name, description and permissions stay legacy-identical. |
 | `feed-list` | docs/parity.md §1 #30 page | Add the Next-only optional integer `page` (`min_value` 1, default 1) so every stored relay id stays discoverable as deterministic whole rows within Discord's 2,000-unit cap (each page packs whole relay rows with source context; invalid or out-of-range pages refuse without mutation); command name, description and permissions stay legacy-identical. |
 | `command-inspect` | docs/parity.md §1 command-inspect | Add the Next-only `/command-inspect` management command (no legacy counterpart): automation-gated, guild-only, `ManageGuild`-gated, published after `command-list`. Required `name` (≤32), optional `view` choice (summary/template/preview, summary by default) and optional `arguments` sample (≤500 UTF-16 units, ignored by the four-variable template language). One private ephemeral content-only view per call — metadata summary, saved template, or rendered preview — with Markdown-escaped untrusted text and explicit truncation markers; never a channel send, registration, cooldown/claim touch, definition mutation or `command.run` fact. |
+| `command-disable` | docs/parity.md §1 command-disable | Add the Next-only `/command-disable` management command (no legacy counterpart): automation-gated, guild-only, `ManageGuild`-gated, published immediately after `command-inspect`. Required `name` (≤32); no other option. Pauses one saved definition without deleting it: only the enabled flag and update metadata change, one content-free `command.disable` audit fact records the transition, and the full registry republishes once. A repeated pause is an explicit no-op without republish; a failed publication reports saved-but-not-synchronized with a safe next action. |
+| `command-enable` | docs/parity.md §1 command-enable | Add the Next-only `/command-enable` management command (no legacy counterpart): automation-gated, guild-only, `ManageGuild`-gated, published immediately after `command-disable`. Required `name` (≤32); no other option. Resumes one saved definition through the existing full-set publication: only the enabled flag and update metadata change, one content-free `command.enable` audit fact records the transition. The stored definition must still pass the write rules or the request refuses without writing; a repeated resume is an explicit no-op without republish. |
 
 These are the complete registry exceptions, mirrored by the test allowlist.
 Only equivalent guild-API representation defaults are canonicalized: omitted

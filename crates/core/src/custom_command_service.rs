@@ -10,10 +10,12 @@ use sqlx::PgPool;
 use crate::automation_transfer::{diff_import, ImportOutcome, ParsedImport};
 use crate::custom_command_store as store;
 use crate::custom_commands::{
-    adjudicate_delete, adjudicate_put, check_capacity, error_code, require_automations_enabled,
-    reserved_command_names, validate_put_input, AuditRecord, CommandError, DeleteDecision,
-    PutCommandInput, PutDecision, StoredCommand,
+    adjudicate_delete, adjudicate_put, adjudicate_toggle, builtin_command_names, check_capacity,
+    error_code, require_automations_enabled, reserved_command_names, validate_put_input,
+    validate_toggle_enable, AuditRecord, CommandError, DeleteDecision, PutCommandInput,
+    PutDecision, StoredCommand, ToggleDecision,
 };
+use crate::leveling::valid_command_name;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
@@ -97,6 +99,88 @@ pub async fn delete(
     let deleted = store::delete_command(&mut *tx, guild, name).await?;
     let decision = adjudicate_delete(guild, actor, name, deleted);
     store::audit(&mut *tx, &decision.audit, audit_id, at).await?;
+    tx.commit().await?;
+    Ok(decision)
+}
+
+/// One pause/resume request: the lowercased admin name, the target state,
+/// and the audit identity the caller supplies (one interaction ID and one
+/// timestamp, like `put`).
+pub struct ToggleRequest<'a> {
+    pub guild: &'a str,
+    pub actor: &'a str,
+    pub name: &'a str,
+    pub enabled: bool,
+    pub audit_id: &'a str,
+    pub at: &'a str,
+}
+
+/// Pause (`enabled = false`) or resume (`enabled = true`) one saved
+/// definition without deleting it. Only the enabled flag and update metadata
+/// change, and only on a real flip. Missing rows and current-state requests
+/// are zero-write: no audit fact, no timestamp touch, no republish. Unlike
+/// `put`, validation refusals write no rejection audit — a malformed toggle
+/// must not mint facts about a definition it never touched. Only the flip
+/// and its content-free audit fact commit together, so a failed audit rolls
+/// the flip back. Callers publish after commit; a Discord failure must not
+/// claim the write rolled back.
+pub async fn set_enabled(
+    pool: &PgPool,
+    automations: bool,
+    request: &ToggleRequest<'_>,
+) -> Result<ToggleDecision, ServiceError> {
+    require_automations_enabled(automations)?;
+    if !valid_command_name(request.name) {
+        return Err(CommandError::InvalidName.into());
+    }
+    let mut tx = pool.begin().await?;
+    store::lock_command_capacity(&mut tx, request.guild).await?;
+    let existing = store::get_command(&mut *tx, request.guild, request.name).await?;
+    let Some(row) = existing.as_ref() else {
+        tx.rollback().await?;
+        return Ok(adjudicate_toggle(
+            request.guild,
+            request.actor,
+            request.name,
+            None,
+            request.enabled,
+        ));
+    };
+    if row.enabled == request.enabled {
+        tx.rollback().await?;
+        return Ok(adjudicate_toggle(
+            request.guild,
+            request.actor,
+            request.name,
+            Some(row),
+            request.enabled,
+        ));
+    }
+    if request.enabled {
+        // Resuming republishes the definition, so the stored row must still
+        // pass the write rules. Pausing only removes it from the set and
+        // needs no content check. Refusals stay zero-write: no audit fact.
+        validate_toggle_enable(row, &reserved_command_names(), &builtin_command_names())?;
+    }
+    store::set_command_enabled(
+        &mut *tx,
+        request.guild,
+        request.name,
+        request.enabled,
+        request.actor,
+        request.at,
+    )
+    .await?;
+    let decision = adjudicate_toggle(
+        request.guild,
+        request.actor,
+        request.name,
+        Some(row),
+        request.enabled,
+    );
+    // The guards above prove a real flip, which always audits.
+    let audit = decision.audit.as_ref().expect("changed toggle audits");
+    store::audit(&mut *tx, audit, request.audit_id, request.at).await?;
     tx.commit().await?;
     Ok(decision)
 }
