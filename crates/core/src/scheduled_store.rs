@@ -498,8 +498,9 @@ impl BodyEditFence {
 pub enum BodyEditOutcome {
     /// The body, updater and timestamp changed and the `scheduled.edit`
     /// audit committed in the same transaction; carries the saved row so
-    /// the caller can issue a fresh revision.
-    Saved { row: ScheduledMessageRow },
+    /// the caller can issue a fresh revision. Boxed: the row dwarfs the
+    /// other variants (`clippy::large_enum_variant`).
+    Saved { row: Box<ScheduledMessageRow> },
     /// The inspected revision no longer matches the locked definition or
     /// its delivery evidence: another writer (or the ticker) moved first.
     Stale,
@@ -587,7 +588,9 @@ pub async fn try_update_scheduled_body(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(BodyEditOutcome::Saved { row: saved })
+    Ok(BodyEditOutcome::Saved {
+        row: Box::new(saved),
+    })
 }
 
 /// One body-only correction: validated replacement plus the inspect
