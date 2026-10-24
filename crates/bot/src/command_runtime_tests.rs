@@ -28,6 +28,8 @@ mod leveling_ack_visibility_acceptance_tests;
 mod member_authority_cause_acceptance;
 #[path = "member_dispatch_authority_acceptance.rs"]
 mod member_dispatch_authority_acceptance;
+#[path = "member_strict_decode_acceptance.rs"]
+mod member_strict_decode_acceptance;
 #[path = "sticky_uncertain_acceptance_tests.rs"]
 mod sticky_uncertain_acceptance_tests;
 
@@ -35,6 +37,9 @@ mod sticky_uncertain_acceptance_tests;
 mod custom_command_list_pages_acceptance;
 #[path = "help_detail_acceptance.rs"]
 mod help_detail_acceptance;
+
+#[path = "schedule_strict_decode_acceptance_tests.rs"]
+mod schedule_strict_decode_acceptance_tests;
 
 use std::collections::VecDeque;
 use std::str::FromStr;
@@ -79,7 +84,10 @@ use crate::command_runtime::{
 use crate::internal_action_http::MODERATION_METRICS_LOCK;
 use crate::member_runtime::{sweep_job, MemberRuntime};
 use crate::privacy_command::{deletion_request_id, privacy_action, PrivacyAction};
-use crate::schedule_runtime::{schedule_options, schedule_remove_option};
+use crate::schedule_runtime::{
+    schedule_list_page_option_strict, schedule_options, schedule_options_strict,
+    schedule_remove_option, schedule_remove_option_strict,
+};
 
 const GUILD: u64 = 2222;
 const GUILD_S: &str = "2222";
@@ -1286,6 +1294,8 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "feed-remove"
                         | "feed-list"
                         | "purge"
+                        | "purge-preview"
+                        | "channel-inspect"
                         | "slowmode"
                         | "lockdown"
                         | "unlock"
@@ -1447,7 +1457,7 @@ async fn member_verbs_reach_executor_facts_then_fail_closed_with_audit() {
     for name in ["ban", "tempban", "kick", "timeout", "warn"] {
         let (mock, origin) = MockRest::start(vec![200, 500, 200]).await;
         let runtime = runtime_with_member(member_gates(), origin, db.pool().clone());
-        runtime.on_interaction(&member_slash(name)).await;
+        runtime.on_interaction(&timed_member_slash(name)).await;
         let requests = mock.requests();
         assert_eq!(requests.len(), 3, "{name}: defer, guild read, reply edit");
         assert_eq!(requests[1].method, "GET");
@@ -1499,7 +1509,7 @@ async fn member_verbs_refuse_unknown_bot_hierarchy_before_claim_or_mutation() {
         ])
         .await;
         let runtime = runtime_with_member(member_gates(), origin, db.pool().clone());
-        runtime.on_interaction(&member_slash(name)).await;
+        runtime.on_interaction(&timed_member_slash(name)).await;
         let requests = mock.requests();
         assert_eq!(
             requests.len(),
@@ -1538,7 +1548,7 @@ async fn member_verbs_share_actor_cooldown_before_role_reads() {
         .into_iter()
         .enumerate()
     {
-        let mut interaction = member_slash(name);
+        let mut interaction = timed_member_slash(name);
         interaction.id = Id::new(100 + index as u64);
         runtime.on_interaction(&interaction).await;
         let requests = mock.requests();
@@ -1594,7 +1604,7 @@ fn authority_reads(first_command: bool) -> Vec<RestResponse> {
 
 fn timed_member_slash(name: &str) -> Interaction {
     let mut interaction = member_slash(name);
-    if name == "timeout" {
+    if matches!(name, "tempban" | "timeout") {
         let Some(InteractionData::ApplicationCommand(data)) = &mut interaction.data else {
             panic!("command fixture")
         };
@@ -3059,6 +3069,96 @@ fn schedule_remove_option_extracts_id() {
     assert_eq!(schedule_remove_option(&missing), None);
 }
 
+// Exact value pins for the production strict decoders: the lenient helpers
+// above are test-only, so these are what catch a corrupted body, a scaled
+// delay or a swapped timing field on the path the handlers actually run.
+#[test]
+fn schedule_options_strict_decodes_exact_distinct_values() {
+    let interaction = slash(
+        "schedule",
+        Some(CHANNEL),
+        vec![
+            option("body", CommandOptionValue::String("hello".to_owned())),
+            option("in-minutes", CommandOptionValue::Integer(30)),
+            option("every-minutes", CommandOptionValue::Integer(90)),
+        ],
+    );
+    assert_eq!(
+        schedule_options_strict(&interaction),
+        Ok((Some("hello".to_owned()), Some(30), Some(90)))
+    );
+    // Option order must not change which value lands in which slot.
+    let reordered = slash(
+        "schedule",
+        Some(CHANNEL),
+        vec![
+            option("every-minutes", CommandOptionValue::Integer(90)),
+            option("in-minutes", CommandOptionValue::Integer(30)),
+            option("body", CommandOptionValue::String("hello".to_owned())),
+        ],
+    );
+    assert_eq!(
+        schedule_options_strict(&reordered),
+        Ok((Some("hello".to_owned()), Some(30), Some(90)))
+    );
+}
+
+#[test]
+fn schedule_options_strict_decodes_single_timing_and_missing() {
+    let only_in = slash(
+        "schedule",
+        Some(CHANNEL),
+        vec![
+            option("body", CommandOptionValue::String("ping".to_owned())),
+            option("in-minutes", CommandOptionValue::Integer(30)),
+        ],
+    );
+    assert_eq!(
+        schedule_options_strict(&only_in),
+        Ok((Some("ping".to_owned()), Some(30), None))
+    );
+    let only_every = slash(
+        "schedule",
+        Some(CHANNEL),
+        vec![
+            option("body", CommandOptionValue::String("ping".to_owned())),
+            option("every-minutes", CommandOptionValue::Integer(45)),
+        ],
+    );
+    assert_eq!(
+        schedule_options_strict(&only_every),
+        Ok((Some("ping".to_owned()), None, Some(45)))
+    );
+    let none = slash("schedule", Some(CHANNEL), Vec::new());
+    assert_eq!(schedule_options_strict(&none), Ok((None, None, None)));
+}
+
+#[test]
+fn schedule_remove_and_page_strict_decode_exact_values() {
+    let remove = slash(
+        "schedule-remove",
+        Some(CHANNEL),
+        vec![option(
+            "id",
+            CommandOptionValue::String("abc123".to_owned()),
+        )],
+    );
+    assert_eq!(
+        schedule_remove_option_strict(&remove),
+        Ok(Some("abc123".to_owned()))
+    );
+    let missing = slash("schedule-remove", Some(CHANNEL), Vec::new());
+    assert_eq!(schedule_remove_option_strict(&missing), Ok(None));
+    let page = slash(
+        "schedule-list",
+        Some(CHANNEL),
+        vec![option("page", CommandOptionValue::Integer(7))],
+    );
+    assert_eq!(schedule_list_page_option_strict(&page), Ok(Some(7)));
+    let no_page = slash("schedule-list", Some(CHANNEL), Vec::new());
+    assert_eq!(schedule_list_page_option_strict(&no_page), Ok(None));
+}
+
 #[tokio::test]
 async fn feed_commands_refuse_ephemerally_while_announcements_off() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
@@ -3478,6 +3578,8 @@ fn production_router_matches_composed_production_wiring() {
             HandlerId::FeedAdd,
             HandlerId::FeedRemove,
             HandlerId::FeedList,
+            HandlerId::PurgePreview,
+            HandlerId::ChannelInspect,
         ];
         ids.extend(ModerationAction::ALL.map(HandlerId::Moderation));
         ids

@@ -120,10 +120,10 @@ fn automations_off_withholds_automation_builtins_and_all_dynamics() {
         enabled: true,
     };
     let names = published_names(&router, &[faq]);
-    // 32 all-on builtins minus the 9 automation admin commands, and the
+    // 34 all-on builtins minus the 9 automation admin commands, and the
     // stored dynamic row stays unpublished: every such invocation refuses
     // at dispatch while gated off, so publishing would burn the ceiling.
-    assert_eq!(names.len(), 23, "automations-off compiled set: {names:?}");
+    assert_eq!(names.len(), 25, "automations-off compiled set: {names:?}");
     assert!(
         !names.iter().any(|name| name == "faq"),
         "dynamic rows must not publish while automations are off: {names:?}"
