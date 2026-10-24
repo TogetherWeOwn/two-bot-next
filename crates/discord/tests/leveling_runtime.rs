@@ -3,6 +3,10 @@
 #[allow(dead_code)]
 mod common;
 
+#[path = "support/deferred_capture_compat.rs"]
+mod deferred_capture_compat;
+use deferred_capture_compat::Healthy;
+
 use common::{MockRest, ScriptedResponse};
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
@@ -515,15 +519,17 @@ async fn gateway_reward_and_interaction_executor_errors_propagate() {
 async fn community_voice_fact_capture_round_trip() {
     let db = TestDb::new().await;
     let pipeline = OrderedLevelingPipeline::new(MemStore::new(), None);
-    pipeline.enable_community_facts(db.pool.clone());
+    pipeline.enable_community_facts(db.pool.clone()).healthy();
     const VOICE_CHANNEL: u64 = 300000000000000002;
 
     // Join: one start fact, and the durable session key travels with it.
-    let requests = pipeline.collect_at(
-        &voice(Some(VOICE_CHANNEL)),
-        &at(10),
-        MessageEligibility::default(),
-    );
+    let requests = pipeline
+        .collect_at(
+            &voice(Some(VOICE_CHANNEL)),
+            &at(10),
+            MessageEligibility::default(),
+        )
+        .healthy();
     pipeline.drain(requests).await.unwrap();
     assert_eq!(pipeline.drain_facts().await.unwrap(), 1);
     let (session_key, metadata): (String, String) = sqlx::query_as(
@@ -547,18 +553,22 @@ async fn community_voice_fact_capture_round_trip() {
     );
 
     // Leave 330 s later: one measured end with honest duration math.
-    let requests = pipeline.collect_at(&voice(None), &at(340), MessageEligibility::default());
+    let requests = pipeline
+        .collect_at(&voice(None), &at(340), MessageEligibility::default())
+        .healthy();
     pipeline.drain(requests).await.unwrap();
     assert_eq!(pipeline.drain_facts().await.unwrap(), 1);
 
     // Redelivered join at the original stamp reuses the same session key, so
     // the `voice-start:{session_key}` row dedupes to zero inserts (a
     // same-channel frame without a leave would never reach the sink at all).
-    let requests = pipeline.collect_at(
-        &voice(Some(VOICE_CHANNEL)),
-        &at(10),
-        MessageEligibility::default(),
-    );
+    let requests = pipeline
+        .collect_at(
+            &voice(Some(VOICE_CHANNEL)),
+            &at(10),
+            MessageEligibility::default(),
+        )
+        .healthy();
     pipeline.drain(requests).await.unwrap();
     assert_eq!(pipeline.drain_facts().await.unwrap(), 0);
     let row: (String, String, String) = sqlx::query_as(
@@ -594,10 +604,12 @@ async fn community_voice_fact_capture_round_trip() {
 async fn community_message_fact_capture_round_trip() {
     let db = TestDb::new().await;
     let pipeline = OrderedLevelingPipeline::new(MemStore::new(), None);
-    pipeline.enable_community_facts(db.pool.clone());
+    pipeline.enable_community_facts(db.pool.clone()).healthy();
 
     // Human message: one fact, and the classifier verdict travels with it.
-    let requests = pipeline.collect_at(&message(10), &at(10), MessageEligibility::default());
+    let requests = pipeline
+        .collect_at(&message(10), &at(10), MessageEligibility::default())
+        .healthy();
     pipeline.drain(requests).await.unwrap();
     assert_eq!(pipeline.drain_facts().await.unwrap(), 1);
     let row: (String, String) =
@@ -611,7 +623,9 @@ async fn community_message_fact_capture_round_trip() {
     assert!(!row.1.contains("hello there"), "no message content stored");
 
     // Duplicate delivery: the same message id dedupes to zero inserts.
-    let requests = pipeline.collect_at(&message(10), &at(10), MessageEligibility::default());
+    let requests = pipeline
+        .collect_at(&message(10), &at(10), MessageEligibility::default())
+        .healthy();
     pipeline.drain(requests).await.unwrap();
     assert_eq!(pipeline.drain_facts().await.unwrap(), 0);
 
@@ -620,7 +634,9 @@ async fn community_message_fact_capture_round_trip() {
     if let Event::MessageCreate(m) = &mut bot {
         m.author.bot = true;
     }
-    let requests = pipeline.collect_at(&bot, &at(11), MessageEligibility::default());
+    let requests = pipeline
+        .collect_at(&bot, &at(11), MessageEligibility::default())
+        .healthy();
     assert!(requests.is_empty(), "bots never funnel-count");
     pipeline.drain(requests).await.unwrap();
     assert_eq!(pipeline.drain_facts().await.unwrap(), 1);
@@ -630,7 +646,9 @@ async fn community_message_fact_capture_round_trip() {
     if let Event::MessageCreate(m) = &mut dm {
         m.guild_id = None;
     }
-    let requests = pipeline.collect_at(&dm, &at(12), MessageEligibility::default());
+    let requests = pipeline
+        .collect_at(&dm, &at(12), MessageEligibility::default())
+        .healthy();
     pipeline.drain(requests).await.unwrap();
     assert_eq!(pipeline.drain_facts().await.unwrap(), 0);
 

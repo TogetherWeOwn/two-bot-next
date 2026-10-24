@@ -668,6 +668,283 @@ pub fn format_command_list_page(
     Ok(reply)
 }
 
+/// `/command-inspect` sample-arguments bound in UTF-16 units, matching the
+/// published `max_length`. Samples are validated for size only: the
+/// four-variable template language ignores them, so accepting a sample must
+/// never introduce `{args}` or a second interpolation pass.
+pub const MAX_INSPECT_ARGUMENT_UNITS: usize = 500;
+
+/// Which private view `/command-inspect` renders. Summary never bundles the
+/// template body or a preview: two full 2,000-unit bodies plus metadata
+/// cannot fit one content-only response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InspectView {
+    Summary,
+    Template,
+    Preview,
+}
+
+impl InspectView {
+    /// Parse the `view` option. Anything else (including `execute`) refuses
+    /// with a correction example; the Discord layer defaults to summary.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "summary" => Some(Self::Summary),
+            "template" => Some(Self::Template),
+            "preview" => Some(Self::Preview),
+            _ => None,
+        }
+    }
+
+    /// Trusted plain-text heading, always the first line, always followed by
+    /// a newline before untrusted text.
+    #[must_use]
+    pub fn heading(self, name: &str) -> String {
+        let view = match self {
+            Self::Summary => "Summary",
+            Self::Template => "Saved template",
+            Self::Preview => "Preview",
+        };
+        format!("{view} /{name}")
+    }
+}
+
+/// Escape untrusted saved/description/rendered text for an inspect view body:
+/// fold line breaks (a view stays one paragraph after its trusted heading)
+/// and backslash-escape Markdown metacharacters. Mentions, pills, links and
+/// braces pass through literally — mention safety comes from the reply's
+/// explicit empty `allowed_mentions`, never from text mutation — so an admin
+/// sees the saved text as stored. Plain text passes through byte-identical.
+#[must_use]
+pub fn escape_inspect_text(value: &str) -> String {
+    // Folding newlines leaves only the initial non-whitespace prefix able to
+    // open a block. Escape its marker without changing mention/channel pills
+    // or punctuation elsewhere in the body.
+    let leading = value.trim_start_matches(char::is_whitespace);
+    let digits = leading.bytes().take_while(u8::is_ascii_digit).count();
+    let block_marker = if leading.starts_with(['#', '>', '-', '+']) {
+        Some(value.len() - leading.len())
+    } else if digits > 0 && leading[digits..].starts_with(['.', ')']) {
+        Some(value.len() - leading.len() + digits)
+    } else {
+        None
+    };
+    let mut escaped = String::with_capacity(value.len());
+    for (index, ch) in value.char_indices() {
+        if matches!(ch, '\r' | '\n') {
+            escaped.push(' ');
+        } else {
+            if Some(index) == block_marker
+                || matches!(ch, '\\' | '`' | '*' | '_' | '~' | '|' | '[' | ']')
+            {
+                escaped.push('\\');
+            }
+            escaped.push(ch);
+        }
+    }
+    escaped
+}
+
+/// Longest prefix within `limit` UTF-16 units, cut on an escape-pair
+/// boundary so a trailing lone backslash cannot eat the truncation marker.
+/// Only ever cuts escaped text, where every backslash starts a pair.
+fn truncate_escaped_units(value: &str, limit: usize) -> String {
+    let mut units = 0;
+    let mut end = 0;
+    for (index, ch) in value.char_indices() {
+        let width = ch.len_utf16();
+        if units + width > limit {
+            break;
+        }
+        units += width;
+        end = index + ch.len_utf8();
+    }
+    let mut prefix = value[..end].to_owned();
+    if prefix.bytes().rev().take_while(|b| *b == b'\\').count() % 2 == 1 {
+        prefix.pop();
+    }
+    prefix
+}
+
+/// Normalize and validate a saved-command name for inspection: the same
+/// shape rules as writes, but only dispatch-owned builtin names are excluded.
+/// Write-only reservations must not hide grandfathered saved rows. Lowercases
+/// first, like the management path.
+pub fn validate_inspect_name(
+    name: &str,
+    builtins: &HashSet<String>,
+) -> Result<String, CommandError> {
+    let name = name.to_lowercase();
+    if !valid_name(&name) {
+        return Err(CommandError::InvalidName);
+    }
+    if builtins.contains(&name) {
+        return Err(CommandError::ReservedName(name.clone()));
+    }
+    Ok(name)
+}
+
+/// Field-identifying validation refusal with a usable correction example.
+/// Validation always precedes store access, so these never carry outage copy
+/// and never look like a rendered preview.
+#[must_use]
+pub fn invalid_inspect_option_reply(field: &str, detail: &str) -> String {
+    format!("Invalid {field}: {detail} Example: /command-inspect name:faq view:preview")
+}
+
+/// `view`-option refusal. A `None` raw value means a forged type or a
+/// duplicate; otherwise the bounded escaped value is echoed for correction.
+#[must_use]
+pub fn invalid_inspect_view_reply(raw: Option<&str>) -> String {
+    match raw {
+        None => "Invalid view: expected a single text view. Expected one of: summary, template, preview. Example: /command-inspect name:faq view:preview".to_owned(),
+        Some(raw) => {
+            let shown = escape_inspect_text(raw);
+            let shown = if shown.encode_utf16().count() > 64 {
+                format!("{}…", truncate_escaped_units(&shown, 64))
+            } else {
+                shown
+            };
+            format!("Invalid view \"{shown}\": expected one of: summary, template, preview. Example: /command-inspect name:faq view:preview")
+        }
+    }
+}
+
+/// Truthful miss: unknown, other-guild-only and deleted definitions share
+/// one reply that names the correction path, never foreign text or outage
+/// copy.
+#[must_use]
+pub fn format_inspect_miss(name: &str) -> String {
+    format!("No command /{name} found in this server. List saved commands with /command-list.")
+}
+
+/// Private definition summary: saved description, existing enabled state,
+/// text trigger and usable template/preview/correction examples. Never the
+/// template body or a preview — those are their own views. Disabled rows
+/// stay inspectable; nothing here enables them.
+#[must_use]
+pub fn format_inspect_summary(row: &StoredCommand) -> String {
+    let heading = InspectView::Summary.heading(&row.name);
+    let status = if row.enabled { "Enabled" } else { "Disabled" };
+    let trigger = escape_inspect_text(row.text_trigger.as_deref().unwrap_or("none (slash-only)"));
+    let examples = format!(
+        "\nSaved template: /command-inspect name:{} view:template\nPrivate preview: /command-inspect name:{} view:preview\nReplace the definition: /command name:{} template:...",
+        row.name, row.name, row.name
+    );
+    // Fixed overhead first: only the escaped description is unbounded (raw
+    // rows predate validation), so only it can be cut — with an explicit
+    // marker, never a silent partial.
+    let fixed_units = heading.encode_utf16().count()
+        + "\nDescription: ".encode_utf16().count()
+        + "\nStatus: ".encode_utf16().count()
+        + status.encode_utf16().count()
+        + "\nText trigger: ".encode_utf16().count()
+        + trigger.encode_utf16().count()
+        + examples.encode_utf16().count();
+    let mut description = escape_inspect_text(&row.description);
+    let budget = MAX_RENDERED_CHARS.saturating_sub(fixed_units);
+    if description.encode_utf16().count() > budget {
+        const MARKER: &str = "…[truncated]";
+        let cut = truncate_escaped_units(
+            &description,
+            budget.saturating_sub(MARKER.encode_utf16().count()),
+        );
+        description = format!("{cut}{MARKER}");
+    }
+    let reply = format!("{heading}\nDescription: {description}\nStatus: {status}\nText trigger: {trigger}{examples}");
+    debug_assert!(reply.encode_utf16().count() <= MAX_RENDERED_CHARS);
+    reply
+}
+
+/// Heading plus full escaped body when it fits; otherwise the heading, the
+/// longest fitting escape-boundary prefix and an explicit truncation marker.
+/// Total stays within Discord's content ceiling.
+fn format_bounded_view(view: InspectView, name: &str, escaped: &str) -> String {
+    let heading = view.heading(name);
+    let head_units = heading.encode_utf16().count() + 1;
+    let total_units = escaped.encode_utf16().count();
+    if head_units + total_units <= MAX_RENDERED_CHARS {
+        return format!("{heading}\n{escaped}");
+    }
+    // Reserve marker space generously: the marker below never exceeds 60
+    // units (fixed text plus two bounded counts), so the prefix plus the
+    // exact marker always fits.
+    let budget = MAX_RENDERED_CHARS
+        .saturating_sub(head_units)
+        .saturating_sub(60);
+    let prefix = truncate_escaped_units(escaped, budget);
+    let shown = prefix.encode_utf16().count();
+    let reply = format!("{heading}\n{prefix}\n[truncated: showing {shown} of {total_units} units]");
+    debug_assert!(reply.encode_utf16().count() <= MAX_RENDERED_CHARS);
+    reply
+}
+
+/// Saved template as stored (escaped), or an explicit truncation marker —
+/// never a misleading silent partial body. Shown regardless of validity: an
+/// admin must see the broken template to fix it.
+#[must_use]
+pub fn format_inspect_template(row: &StoredCommand) -> String {
+    format_bounded_view(
+        InspectView::Template,
+        &row.name,
+        &escape_inspect_text(&row.template),
+    )
+}
+
+/// Private rendered preview with the invoking member/channel context, or a
+/// truthful refusal with a correction example. Invalid saved templates
+/// refuse without rendering; the sample arguments are never interpolated.
+#[must_use]
+pub fn format_inspect_preview(row: &StoredCommand, ctx: &TemplateContext) -> String {
+    if let Err(error) = validate_template(&row.template) {
+        let prefix = format!("Template for /{} is invalid: ", row.name);
+        let correction = format!(" Replace it with /command name:{} template:...", row.name);
+        let mut detail = escape_inspect_text(&error.to_string());
+        let budget = MAX_RENDERED_CHARS
+            .saturating_sub(prefix.encode_utf16().count() + correction.encode_utf16().count());
+        if detail.encode_utf16().count() > budget {
+            const MARKER: &str = "…[truncated]";
+            detail = format!(
+                "{}{MARKER}",
+                truncate_escaped_units(
+                    &detail,
+                    budget.saturating_sub(MARKER.encode_utf16().count())
+                )
+            );
+        }
+        return format!("{prefix}{detail}{correction}");
+    }
+    let rendered = match render_template(&row.template, ctx) {
+        Ok(rendered) => rendered,
+        Err(refusal @ TemplateError::RenderTooLong(_)) => {
+            return format!(
+                "Template for /{} renders too long to preview ({refusal}). Shorten it with /command name:{} template:...",
+                row.name, row.name
+            );
+        }
+        Err(error) => {
+            return format!(
+                "Template for /{} cannot be previewed: {error} Replace it with /command name:{} template:...",
+                row.name, row.name
+            );
+        }
+    };
+    format_bounded_view(
+        InspectView::Preview,
+        &row.name,
+        &escape_inspect_text(&rendered),
+    )
+}
+
+/// Preview refused for missing render context (no invoking member, channel
+/// or guild name): truthful, with no template-correction wording, since the
+/// saved definition is not at fault.
+#[must_use]
+pub fn inspect_preview_context_unavailable(name: &str) -> String {
+    format!("Preview for /{name} is unavailable: command context is missing. Please try again.")
+}
+
 /// DB-backed delete set for disable-time deregistration, sorted and deduped
 /// (legacy `removeDbBackedCommands`: scoped from the DATABASE — disabled rows
 /// included, since a row disabled *after* publication still has a live
@@ -1337,5 +1614,283 @@ mod tests {
             ["a".to_owned(), "b".to_owned()]
         );
         assert!(deregister_set(&[]).is_empty());
+    }
+
+    // --- inspect ------------------------------------------------------------
+
+    fn inspect_row() -> StoredCommand {
+        StoredCommand {
+            guild_id: GUILD.to_owned(),
+            name: "faq".to_owned(),
+            description: "Saved FAQ description".to_owned(),
+            template: "Hi {user} ({username}) in {server} {channel}".to_owned(),
+            text_trigger: Some("!faq".to_owned()),
+            enabled: true,
+        }
+    }
+
+    fn inspect_ctx() -> TemplateContext {
+        TemplateContext {
+            user: "<@3333>".to_owned(),
+            username: "tester".to_owned(),
+            server: "TWO".to_owned(),
+            channel: "<#4444>".to_owned(),
+        }
+    }
+
+    #[test]
+    fn inspect_view_parses_three_views_with_trusted_headings() {
+        assert_eq!(InspectView::parse("summary"), Some(InspectView::Summary));
+        assert_eq!(InspectView::parse("template"), Some(InspectView::Template));
+        assert_eq!(InspectView::parse("preview"), Some(InspectView::Preview));
+        assert_eq!(InspectView::parse("execute"), None);
+        assert_eq!(InspectView::parse("Preview"), None);
+        assert_eq!(InspectView::parse(""), None);
+        assert_eq!(InspectView::Summary.heading("faq"), "Summary /faq");
+        assert_eq!(InspectView::Template.heading("faq"), "Saved template /faq");
+        assert_eq!(InspectView::Preview.heading("faq"), "Preview /faq");
+    }
+
+    #[test]
+    fn inspect_escape_keeps_mentions_literal_and_breaks_markdown() {
+        assert_eq!(escape_inspect_text("plain"), "plain");
+        assert_eq!(
+            escape_inspect_text("**FORGED** ``` @everyone <@&8888> [x](y) a|b_c~d"),
+            "\\*\\*FORGED\\*\\* \\`\\`\\` @everyone <@&8888> \\[x\\](y) a\\|b\\_c\\~d"
+        );
+        assert_eq!(escape_inspect_text("a{b}c"), "a{b}c");
+        assert_eq!(escape_inspect_text("one\ntwo\rthree"), "one two three");
+        assert_eq!(escape_inspect_text("back\\slash"), "back\\\\slash");
+    }
+
+    #[test]
+    fn inspect_name_validation_matches_dispatch_rules_after_lowercasing() {
+        let reserved = builtin_command_names();
+        for name in ["setup", "export"] {
+            assert_eq!(validate_inspect_name(name, &reserved), Ok(name.to_owned()));
+        }
+        assert_eq!(
+            validate_inspect_name("FAQ", &reserved).expect("normalizes"),
+            "faq"
+        );
+        for bad in [
+            "",
+            " bad",
+            "bad name",
+            "f/aq",
+            "@everyone",
+            "../faq",
+            "世界",
+        ] {
+            assert_eq!(
+                validate_inspect_name(bad, &reserved),
+                Err(CommandError::InvalidName),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            validate_inspect_name(&"a".repeat(33), &reserved),
+            Err(CommandError::InvalidName)
+        );
+        assert_eq!(
+            validate_inspect_name("command-inspect", &reserved),
+            Err(CommandError::ReservedName("command-inspect".to_owned()))
+        );
+    }
+
+    #[test]
+    fn inspect_summary_bundles_metadata_examples_and_no_template_body() {
+        let summary = format_inspect_summary(&inspect_row());
+        let (heading, body) = summary.split_once('\n').expect("heading line");
+        assert_eq!(heading, "Summary /faq");
+        assert!(body.contains("Saved FAQ description"));
+        assert!(body.contains("Enabled"));
+        assert!(body.contains("!faq"));
+        assert!(body.contains("/command-inspect name:faq view:template"));
+        assert!(body.contains("/command-inspect name:faq view:preview"));
+        assert!(body.contains("/command name:faq template:"));
+        assert!(!summary.contains("Hi {user}"));
+        assert!(summary.encode_utf16().count() <= MAX_RENDERED_CHARS);
+    }
+
+    #[test]
+    fn inspect_summary_marks_disabled_rows_without_enabling_text() {
+        let mut row = inspect_row();
+        row.enabled = false;
+        row.text_trigger = None;
+        let summary = format_inspect_summary(&row);
+        assert!(summary.contains("Disabled"));
+        assert!(!summary.to_lowercase().contains("enabled"));
+        assert!(summary.contains("none (slash-only)"));
+    }
+
+    #[test]
+    fn inspect_template_shows_saved_text_or_an_explicit_marker() {
+        let view = format_inspect_template(&inspect_row());
+        assert_eq!(
+            view,
+            "Saved template /faq\nHi {user} ({username}) in {server} {channel}"
+        );
+        let mut row = inspect_row();
+        row.template = "x".repeat(2000);
+        let view = format_inspect_template(&row);
+        assert!(view.starts_with("Saved template /faq\n"));
+        assert!(view.to_lowercase().contains("truncated"));
+        assert!(view.encode_utf16().count() <= MAX_RENDERED_CHARS);
+        // Escaped-output expansion counts toward the bound, not the raw body.
+        row.template = "*".repeat(1990);
+        let view = format_inspect_template(&row);
+        assert!(view.to_lowercase().contains("truncated"));
+        assert!(view.encode_utf16().count() <= MAX_RENDERED_CHARS);
+        assert_eq!(
+            view,
+            format!(
+                "Saved template /faq\n{}\n[truncated: showing 1920 of 3980 units]",
+                "\\*".repeat(960)
+            )
+        );
+    }
+
+    #[test]
+    fn inspect_template_and_preview_escape_block_markdown_after_leading_whitespace() {
+        for (raw, escaped) in [
+            ("# Welcome", "\\# Welcome"),
+            ("  ## Welcome", "  \\## Welcome"),
+            ("-# small", "\\-# small"),
+            ("> Approved", "\\> Approved"),
+            ("\t>>> Approved", "\t\\>>> Approved"),
+            ("- item", "\\- item"),
+            ("  + item", "  \\+ item"),
+            ("1. item", "1\\. item"),
+            ("  123) item", "  123\\) item"),
+            ("\n # Welcome", "  \\# Welcome"),
+            ("plain - text # tag 1.0", "plain - text # tag 1.0"),
+            ("<@3333> <#4444> @everyone", "<@3333> <#4444> @everyone"),
+        ] {
+            let row = StoredCommand {
+                template: raw.to_owned(),
+                ..inspect_row()
+            };
+            assert_eq!(
+                format_inspect_template(&row),
+                format!("Saved template /faq\n{escaped}"),
+                "saved {raw:?}"
+            );
+            let row = StoredCommand {
+                template: "{username}".to_owned(),
+                ..row
+            };
+            let ctx = TemplateContext {
+                username: raw.to_owned(),
+                ..inspect_ctx()
+            };
+            assert_eq!(
+                format_inspect_preview(&row, &ctx),
+                format!("Preview /faq\n{escaped}"),
+                "rendered {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inspect_truncation_ends_on_a_complete_escape_pair_with_an_odd_budget() {
+        let row = StoredCommand {
+            name: "faqs".to_owned(),
+            template: "*".repeat(1990),
+            ..inspect_row()
+        };
+        assert_eq!(
+            format_inspect_template(&row),
+            format!(
+                "Saved template /faqs\n{}\n[truncated: showing 1918 of 3980 units]",
+                "\\*".repeat(959)
+            )
+        );
+    }
+
+    #[test]
+    fn inspect_long_invalid_template_preserves_bounded_detail_and_correction() {
+        let row = StoredCommand {
+            template: format!("{{{}}}", "a".repeat(1998)),
+            ..inspect_row()
+        };
+        let view = format_inspect_preview(&row, &inspect_ctx());
+        assert!(view.encode_utf16().count() <= MAX_RENDERED_CHARS);
+        assert!(view.starts_with("Template for /faq is invalid: Unknown placeholder"));
+        assert!(view.contains("…[truncated]"));
+        assert!(view.ends_with(" Replace it with /command name:faq template:..."));
+    }
+
+    #[test]
+    fn inspect_preview_renders_exactly_then_escapes() {
+        let view = format_inspect_preview(&inspect_row(), &inspect_ctx());
+        assert_eq!(view, "Preview /faq\nHi <@3333> (tester) in TWO <#4444>");
+        let mut row = inspect_row();
+        row.template = "{user}|{username}|{server}|{channel}|{{user}}".to_owned();
+        let view = format_inspect_preview(&row, &inspect_ctx());
+        assert_eq!(
+            view,
+            "Preview /faq\n<@3333>\\|tester\\|TWO\\|<#4444>\\|{<@3333>}"
+        );
+    }
+
+    #[test]
+    fn inspect_preview_refuses_invalid_templates_with_correction() {
+        for template in ["Hello {unknown}", "{args}", &"😀".repeat(1001)] {
+            let mut row = inspect_row();
+            row.template = template.to_owned();
+            let view = format_inspect_preview(&row, &inspect_ctx());
+            assert!(view.to_lowercase().contains("template"), "{view}");
+            assert!(!view.starts_with("Preview /faq\n"));
+            assert!(view.contains("/command name:faq template:"), "{view}");
+            assert!(!view.contains("temporarily unavailable"));
+        }
+        // Rendered overflow names the ceiling instead of a misleading body.
+        let mut row = inspect_row();
+        row.template = "{username}".repeat(200);
+        let ctx = TemplateContext {
+            username: "😀".repeat(32),
+            ..inspect_ctx()
+        };
+        let view = format_inspect_preview(&row, &ctx);
+        assert!(view.to_lowercase().contains("too long"), "{view}");
+        assert!(view.contains("/command name:faq template:"), "{view}");
+        assert!(!view.contains(&"😀".repeat(6400)));
+    }
+
+    #[test]
+    fn inspect_miss_and_validation_replies_identify_the_correction_path() {
+        let miss = format_inspect_miss("faq");
+        assert!(miss.contains("No command /faq"));
+        assert!(miss.contains("/command-list"));
+        assert!(!miss.contains("temporarily unavailable"));
+        for (field, reply) in [
+            (
+                "name",
+                invalid_inspect_option_reply("command name", "a saved command name is required."),
+            ),
+            ("view", invalid_inspect_view_reply(Some("execute"))),
+            ("view", invalid_inspect_view_reply(None)),
+            (
+                "arguments",
+                invalid_inspect_option_reply(
+                    "arguments",
+                    "sample arguments must be at most 500 characters.",
+                ),
+            ),
+        ] {
+            assert!(reply.to_lowercase().contains(field), "{reply}");
+            assert!(reply.contains("/command-inspect"), "{reply}");
+            assert!(!reply.contains("temporarily unavailable"));
+            assert!(!reply.contains("Preview /faq\n"));
+        }
+        assert!(invalid_inspect_view_reply(Some("execute")).contains("\"execute\""));
+        assert!(
+            invalid_inspect_view_reply(Some(&"v".repeat(200))).contains("…"),
+            "unbounded forgery is cut with a marker"
+        );
+        assert!(
+            inspect_preview_context_unavailable("faq").contains("Preview for /faq is unavailable")
+        );
     }
 }

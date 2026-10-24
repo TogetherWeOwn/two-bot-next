@@ -9,14 +9,14 @@ verdicts in `docs/smoke-run-record.md`.
 
 - Registry: `InteractionRouter::publish_set` with all feature gates on
   (scorecard, automations, announcements, moderation), no custom rows.
-- Rendered reference: `docs/commands.md` — the 30 built-ins plus the voice set
-  (51 with the voice gates on), registry bounds,
+- Rendered reference: `docs/commands.md` — the 31 built-ins plus the voice set
+  (52 with the voice gates on), registry bounds,
   DMs false on every row (guild-only, legacy `setDMPermission(false)`).
 - Merge order (first definition wins, Discord 100-command ceiling):
   core → scorecard → automations → announcements → moderation.
 
-Counts: 5 core + 1 scorecard + 8 automations + 7 announcements +
-9 moderation = **30 built-ins**. Machine-readable mirror:
+Counts: 5 core + 1 scorecard + 9 automations + 7 announcements +
+9 moderation = **31 built-ins**. Machine-readable mirror:
 `crates/core/tests/fixtures/smoke_surface_inventory.json`, checked by
 `crates/core/tests/smoke_surface_inventory.rs` (registry shape in publish
 order, exactly-five-covered gate, handler routing for the five).
@@ -57,6 +57,7 @@ handler family with a covered command.
 | `/command` | automations | Mutating admin CRUD that creates live commands; the read-only smoke excludes state writes. |
 | `/command-remove` | automations | Destructive admin op; excluded from the read-only smoke. |
 | `/command-list` | automations | Needs DB-backed custom rows, which the no-DB rule excludes; the list is empty in the smoke guild. |
+| `/command-inspect` | automations | Needs a named DB-backed custom row to inspect, which the no-DB rule excludes; read-only views are pinned by the disposable-database acceptance instead. |
 | `/schedule` | automations | Effect fires on a wall-clock delay the offline smoke cannot observe; needs a timed live-guild pass. |
 | `/schedule-remove` | automations | Destructive and needs a live scheduled-message id; sequenced after a schedule create, not standalone. |
 | `/schedule-list` | automations | Needs seeded scheduled rows (DB); the no-DB rule excludes it. |

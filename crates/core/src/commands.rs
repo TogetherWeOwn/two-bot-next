@@ -516,7 +516,7 @@ mod tests {
                 }
             }
             let actual = merge_commands(&[builtins, duplicates], &custom);
-            // 4 core (rank, leaderboard, help, privacy, welcome-preview) plus the generated
+            // 5 core (rank, leaderboard, help, privacy, welcome-preview) plus the generated
             // builtins; the duplicated slice adds no new names.
             if builtin_count + 5 > 100 {
                 prop_assert_eq!(actual, Err(RegistryError::BuiltinLimit(builtin_count + 5)));
@@ -629,7 +629,7 @@ mod tests {
         )];
         let rsvp_totals = vec![CommandDefinition::new("attendance", "Show RSVP totals")];
         let merged = merge_commands(&[scorecard, rsvp_totals], &[]).expect("merges");
-        assert_eq!(merged.len(), 6); // rank, leaderboard, help, privacy, attendance×1
+        assert_eq!(merged.len(), 6); // rank, leaderboard, help, privacy, welcome-preview, attendance×1
         assert_eq!(merged[5].description, "Record a verified attendee");
     }
 

@@ -802,6 +802,27 @@ async fn dirty_target(pool: &PgPool) {
     ).execute(pool).await.unwrap();
 }
 
+fn store_inventory_command() -> Command {
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/store_table_inventory.py");
+    let mut command = Command::new("python3");
+    command.env("PYTHONDONTWRITEBYTECODE", "1").arg(script);
+    command
+}
+
+#[test]
+fn store_inventory_parser_negative_controls_run_without_database() {
+    let output = store_inventory_command()
+        .arg("--self-test")
+        .output()
+        .expect("run actual store inventory controls");
+    assert!(
+        output.status.success(),
+        "store inventory controls failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[tokio::test]
 async fn migrated_tables_are_explicitly_classified_and_catalog_fks_are_parent_first() {
     let Some(db) = database().await else {
@@ -840,48 +861,36 @@ async fn migrated_tables_are_explicitly_classified_and_catalog_fks_are_parent_fi
             "migrated table {table} is neither DUMP_TABLES nor EXCLUDED_TABLES"
         );
     }
-    // The store chain (crates/store/migrations) shares the database (the
-    // operator applies both chains) but this guard migrates only the cutover
-    // chain. A pure text scan is enough, with no second database migration:
-    // every store-chain CREATE TABLE must be classified, so a new store
-    // table without a DUMP/EXCLUDED decision fails CI instead of silently
-    // leaving the backup.
+    // Both chains share the backup. Inventory every persistent store CREATE,
+    // plus the explicit quoted, same-file CREATE/DROP authority reference.
+    // The helper is not a persistent exclusion. Its runtime success/refusal
+    // cleanup is independently covered by admin_registry_repair_acceptance.
     let store_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../store/migrations");
-    let mut store_entries: Vec<_> = std::fs::read_dir(&store_dir)
-        .expect("store migrations directory")
-        .map(|entry| entry.expect("migration entry").path())
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sql"))
+    let output = store_inventory_command()
+        .arg(store_dir)
+        .args(DUMP_TABLES.iter().chain(EXCLUDED_TABLES.iter()).copied())
+        .output()
+        .expect("run store inventory");
+    assert!(
+        output.status.success(),
+        "store inventory failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let inventory: Value = serde_json::from_slice(&output.stdout).expect("store inventory JSON");
+    assert_eq!(
+        inventory["transaction_local"],
+        json!([{
+            "migration": "0463_admin_api_token_authority.sql",
+            "table": "admin_api_token_authority_contract"
+        }]),
+        "explicit reference accounting must not disappear or expand"
+    );
+    let store_tables: BTreeSet<String> = inventory["tables"]
+        .as_array()
+        .expect("persistent store tables")
+        .iter()
+        .map(|table| table.as_str().expect("table name").to_owned())
         .collect();
-    store_entries.sort();
-    assert!(!store_entries.is_empty(), "no store migrations found");
-    let mut store_tables = BTreeSet::new();
-    for path in &store_entries {
-        let sql = std::fs::read_to_string(path).expect("migration file readable");
-        for line in sql.lines() {
-            // Real DDL only: no store migration carries CREATE TABLE in a
-            // comment, and every statement names its bare table on the same
-            // line (verified: no qualified or quoted names in this directory).
-            let trimmed = line.trim_start();
-            let rest = match trimmed
-                .strip_prefix("CREATE TABLE IF NOT EXISTS")
-                .or_else(|| trimmed.strip_prefix("CREATE TABLE"))
-            {
-                Some(rest) => rest,
-                None => continue,
-            };
-            let name: String = rest
-                .trim_start()
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
-            assert!(
-                !name.is_empty(),
-                "unparsable CREATE TABLE in {}",
-                path.display()
-            );
-            store_tables.insert(name);
-        }
-    }
     assert!(
         store_tables.contains("rollback_journal") && store_tables.contains("rollback_watermarks"),
         "store-chain scan must see the journal tables: {store_tables:?}"
