@@ -9,7 +9,8 @@ const VERIFY: &str = include_str!("../../../sql/verify_database_roles.sql");
 /// Which plan to render. `Full` is the default: every allowlisted object must
 /// exist. `Bootstrap` skips relations and sequences absent from the database so
 /// a partially migrated database can transfer its existing objects first;
-/// functions stay strict in both phases.
+/// voice audit functions may be absent only before their audit table exists.
+/// Other functions stay strict in both phases.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     Full,

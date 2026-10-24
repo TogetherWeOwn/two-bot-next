@@ -350,6 +350,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     // Append-only vote-kick audit rows (migration 0417); `occurred_at` is the
     // event time, written once per row.
     TableSpec { table: "voice_vote_kick_audit", measure: TableMeasure::Columns(&["occurred_at"]) },
+    TableSpec { table: "voice_settings_audit", measure: TableMeasure::Columns(&["at"]) },
     TableSpec {
         table: "web_contract_meta",
         measure: TableMeasure::Unmeasurable("singleton contract row with no timestamp column", DISPOSITION_MANUAL_RECONCILE_REQUIRED),

@@ -285,13 +285,35 @@ pub fn validate_configuration(
     config: &VoiceConfiguration,
     inventory: &GuildInventory,
 ) -> Result<(), VoiceConfigError> {
+    validate_configuration_inner(config, Some(inventory))
+}
+
+/// Validate a signed configuration write without inventing a guild inventory.
+/// This checks values and reference syntax only, not Discord permissions or
+/// resource existence. The authenticated dashboard owns live guild authorization.
+pub fn validate_configuration_values(
+    config: &VoiceConfiguration,
+    guild_id: &str,
+) -> Result<(), VoiceConfigError> {
+    if config.guild_id != guild_id {
+        return Err(VoiceConfigError::GuildMismatch);
+    }
+    validate_configuration_inner(config, None)
+}
+
+fn validate_configuration_inner(
+    config: &VoiceConfiguration,
+    inventory: Option<&GuildInventory>,
+) -> Result<(), VoiceConfigError> {
     if config.version != VOICE_CONFIG_VERSION {
         return Err(VoiceConfigError::UnsupportedVersion(config.version));
     }
     snowflake(&config.guild_id, "guild_id")?;
-    snowflake(&inventory.guild_id, "inventory.guild_id")?;
-    if config.guild_id != inventory.guild_id {
-        return Err(VoiceConfigError::GuildMismatch);
+    if let Some(inventory) = inventory {
+        snowflake(&inventory.guild_id, "inventory.guild_id")?;
+        if config.guild_id != inventory.guild_id {
+            return Err(VoiceConfigError::GuildMismatch);
+        }
     }
 
     let mut channels = BTreeSet::new();
@@ -396,14 +418,14 @@ pub fn validate_configuration(
             &logging.mention_member_ids,
             "logging.mention_member_ids",
             "member",
-            &inventory.members,
+            inventory.map(|value| &value.members),
             inventory,
         )?;
         references(
             &logging.mention_role_ids,
             "logging.mention_role_ids",
             "role",
-            &inventory.roles,
+            inventory.map(|value| &value.roles),
             inventory,
         )?;
     }
@@ -419,7 +441,13 @@ pub fn validate_configuration(
         ("settings.command_role_id", &settings.command_role_id),
     ] {
         if let Some(id) = id {
-            reference(id, field, "role", &inventory.roles, inventory)?;
+            reference(
+                id,
+                field,
+                "role",
+                inventory.map(|value| &value.roles),
+                inventory,
+            )?;
         }
     }
     let mut commands = BTreeSet::new();
@@ -440,7 +468,7 @@ pub fn validate_configuration(
             &restriction.role_ids,
             &format!("{path}.role_ids"),
             "role",
-            &inventory.roles,
+            inventory.map(|value| &value.roles),
             inventory,
         )?;
     }
@@ -576,10 +604,13 @@ fn reference(
     id: &str,
     field: &str,
     kind: &'static str,
-    known: &BTreeMap<String, String>,
-    inventory: &GuildInventory,
+    known: Option<&BTreeMap<String, String>>,
+    inventory: Option<&GuildInventory>,
 ) -> Result<(), VoiceConfigError> {
     snowflake(id, field)?;
+    let (Some(known), Some(inventory)) = (known, inventory) else {
+        return Ok(());
+    };
     let guild = known
         .get(id)
         .ok_or_else(|| VoiceConfigError::UnknownReference {
@@ -599,8 +630,8 @@ fn references(
     ids: &[String],
     field: &str,
     kind: &'static str,
-    known: &BTreeMap<String, String>,
-    inventory: &GuildInventory,
+    known: Option<&BTreeMap<String, String>>,
+    inventory: Option<&GuildInventory>,
 ) -> Result<(), VoiceConfigError> {
     let mut seen = BTreeSet::new();
     for (i, id) in ids.iter().enumerate() {
@@ -614,10 +645,13 @@ fn references(
 fn channel(
     id: &str,
     field: &str,
-    inventory: &GuildInventory,
+    inventory: Option<&GuildInventory>,
     allowed: &[ChannelKind],
 ) -> Result<(), VoiceConfigError> {
     snowflake(id, field)?;
+    let Some(inventory) = inventory else {
+        return Ok(());
+    };
     let channel = inventory
         .channels
         .get(id)

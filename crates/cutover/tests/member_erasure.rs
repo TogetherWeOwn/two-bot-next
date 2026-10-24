@@ -1042,6 +1042,226 @@ async fn member_snowflake_idempotency_key_is_erased_from_audit_but_retained_for_
     db.close().await.unwrap();
 }
 
+/// Voice configuration attribution is classified and retained: every new
+/// `updated_by` actor column plus `voice_settings_audit.actor` is an
+/// explicitly reasoned erasure exception, and attributed audit/config rows
+/// survive erasure of the attributed member.
+#[tokio::test]
+async fn voice_configuration_attribution_is_classified_and_retained() {
+    const EXTRA_MEMBER: &str = "123456789012345680";
+    const EXTRA_CHANNEL: &str = "111111111111111111";
+    const EXTRA_ROLE: &str = "444444444444444444";
+    const VERSIONED_TABLES: [&str; 13] = [
+        "voice_creators",
+        "voice_access_controls",
+        "voice_logging_settings",
+        "voice_guild_settings",
+        "voice_channel_templates",
+        "voice_game_aliases",
+        "voice_random_lists",
+        "voice_random_list_choices",
+        "voice_logging",
+        "voice_logging_mention_members",
+        "voice_logging_mention_roles",
+        "voice_command_roles",
+        "voice_command_role_members",
+    ];
+    let Some(db) = database().await else { return };
+    seed(db.pool()).await;
+    // Independent literals: every versioned voice configuration table keeps
+    // its attribution column, and the append-only audit keeps its actor.
+    for table in VERSIONED_TABLES {
+        assert!(
+            plan().allowlist.iter().any(|entry| {
+                entry.table == table
+                    && entry.column == "updated_by"
+                    && !entry.reason.trim().is_empty()
+            }),
+            "{table}.updated_by must be a reasoned erasure exception"
+        );
+    }
+    assert!(
+        plan().allowlist.iter().any(|entry| {
+            entry.table == "voice_settings_audit"
+                && entry.column == "actor"
+                && !entry.reason.trim().is_empty()
+        }),
+        "voice_settings_audit.actor must be a reasoned erasure exception"
+    );
+    assert!(
+        plan()
+            .tables
+            .iter()
+            .all(|entry| entry.table != "voice_settings_audit"),
+        "voice_settings_audit must never be selected for erasure"
+    );
+    let mut conn = db.pool().acquire().await.unwrap();
+    assert!(schema_gaps(&mut conn).await.unwrap().is_empty());
+    drop(conn);
+    // Attribute retained rows to the member under erasure: audit rows plus
+    // one config row per versioned table, and a plan-table survivor whose
+    // allowlisted column carries the erased member.
+    sqlx::query("INSERT INTO voice_settings_audit (guild_id, actor) VALUES ($1, $2), ($1, $3)")
+        .bind(GUILD)
+        .bind(USER)
+        .bind(OTHER)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO voice_creators (guild_id, channel_id, updated_by) VALUES ($1, $2, $3)",
+    )
+    .bind(GUILD)
+    .bind(EXTRA_CHANNEL)
+    .bind(USER)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO voice_access_controls (guild_id, updated_by) VALUES ($1, $2)")
+        .bind(GUILD)
+        .bind(USER)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO voice_logging_settings (guild_id, updated_by) VALUES ($1, $2)")
+        .bind(GUILD)
+        .bind(USER)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO voice_guild_settings (guild_id, creation_enabled, unique_names,
+         no_game_label, force_single_game, count_members_without_activity, time_zone,
+         text_channel_name, updated_by)
+         VALUES ($1, TRUE, TRUE, 'none', FALSE, FALSE, 'UTC', 'text', $2)",
+    )
+    .bind(GUILD)
+    .bind(USER)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO voice_channel_templates (guild_id, channel_id, name_template, updated_by) VALUES ($1, $2, 'tpl', $3)")
+        .bind(GUILD)
+        .bind(EXTRA_CHANNEL)
+        .bind(USER)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO voice_game_aliases (guild_id, game, alias, updated_by) VALUES ($1, 'fixture-game', 'fixture-alias', $2)")
+        .bind(GUILD)
+        .bind(USER)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO voice_random_lists (guild_id, name, updated_by) VALUES ($1, 'fixture-list', $2)")
+        .bind(GUILD)
+        .bind(USER)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO voice_random_list_choices (guild_id, list_name, position, choice, updated_by) VALUES ($1, 'fixture-list', 0, 'fixture-choice', $2)")
+        .bind(GUILD)
+        .bind(USER)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO voice_logging (guild_id, channel_id, detail, updated_by) VALUES ($1, $2, 'errors', $3)")
+        .bind(GUILD)
+        .bind(EXTRA_CHANNEL)
+        .bind(USER)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO voice_logging_mention_roles (guild_id, role_id, updated_by) VALUES ($1, $2, $3)")
+        .bind(GUILD)
+        .bind(EXTRA_ROLE)
+        .bind(USER)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO voice_command_roles (guild_id, command, updated_by) VALUES ($1, 'limit', $2)",
+    )
+    .bind(GUILD)
+    .bind(USER)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO voice_command_role_members (guild_id, command, role_id, updated_by) VALUES ($1, 'limit', $2, $3)")
+        .bind(GUILD)
+        .bind(EXTRA_ROLE)
+        .bind(USER)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO voice_logging_mention_members (guild_id, member_id, updated_by) VALUES ($1, $2, $3)")
+        .bind(GUILD)
+        .bind(EXTRA_MEMBER)
+        .bind(USER)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    // The dry run selects the member's activity row but never the retained
+    // attribution: the extra survivor belongs to another member.
+    let dry = erase_member(db.pool(), GUILD, USER, ErasureMode::DryRun)
+        .await
+        .unwrap();
+    assert_eq!(
+        dry.iter()
+            .find(|row| row.table == "voice_logging_mention_members")
+            .unwrap()
+            .rows,
+        1
+    );
+    let mut retained = Vec::new();
+    for table in VERSIONED_TABLES
+        .iter()
+        .filter(|table| **table != "voice_logging_mention_members")
+        .chain(["voice_settings_audit"].iter())
+    {
+        retained.push((table, snapshot(db.pool(), table).await));
+    }
+    let audits_before = audit_count(db.pool()).await;
+    erase_member(
+        db.pool(),
+        GUILD,
+        USER,
+        ErasureMode::Execute { actor: ACTOR },
+    )
+    .await
+    .unwrap();
+    // The member's voice activity is gone, but every attributed audit and
+    // config row survives byte-for-byte, including the plan-table survivor
+    // that still names the erased member in its allowlisted column.
+    let gone: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM voice_rooms WHERE guild_id = $1 AND (owner_id = $2 OR original_creator_id = $2)",
+    )
+    .bind(GUILD)
+    .bind(USER)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(gone, 0);
+    for (table, expected) in retained {
+        assert_eq!(
+            snapshot(db.pool(), table).await,
+            expected,
+            "{table} retained rows changed"
+        );
+    }
+    let kept: String = sqlx::query_scalar(
+        "SELECT updated_by FROM voice_logging_mention_members WHERE guild_id = $1 AND member_id = $2",
+    )
+    .bind(GUILD)
+    .bind(EXTRA_MEMBER)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(kept, USER);
+    assert_eq!(audit_count(db.pool()).await, audits_before + 1);
+    db.close().await.unwrap();
+}
+
 /// Giveaway ids repeat across guilds, so the child predicates must scope on
 /// the child row's own guild: erasing USER in GUILD deletes the colliding
 /// A rows, the creator-owned rows, and the reroll round naming USER only in

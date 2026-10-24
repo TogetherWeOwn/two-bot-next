@@ -187,6 +187,15 @@ pub trait RoomPersistence: Send + Sync {
         &self,
         creator: &CreatorChannel,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
+    /// Persistent adapters can record the exact configuration command. Other
+    /// adapters retain their existing write-through behavior.
+    fn add_creator_attributed(
+        &self,
+        creator: &CreatorChannel,
+        _actor: &str,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        self.add_creator(creator)
+    }
     /// The creator row for one channel, if an admin marked it (V9d
     /// `/textchannels` edits this row through the [`Self::add_creator`]
     /// upsert; the settings snapshot on existing companions never changes).
@@ -454,6 +463,16 @@ impl RoomPersistence for PgRoomStore {
     async fn add_creator(&self, creator: &CreatorChannel) -> Result<(), StoreError> {
         self.add_creator(creator).await.map_err(store_error)?;
         Ok(())
+    }
+
+    async fn add_creator_attributed(
+        &self,
+        creator: &CreatorChannel,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        self.add_creator_with_actor(creator, actor)
+            .await
+            .map_err(store_error)
     }
 
     async fn creator_for(
@@ -13377,7 +13396,7 @@ where
                 Err(error) => format!("Could not read the creator channel ({error}). Try again."),
                 Ok(creator) => match decide_text_channels(creator, &request) {
                     TextChannelsPlan::Refuse { message } => message,
-                    TextChannelsPlan::Update(creator) => match store.add_creator(&creator).await {
+                    TextChannelsPlan::Update(creator) => match store.add_creator_attributed(&creator, "discord:textchannels").await {
                         Ok(()) => {
                             runtime.creator_updated(&creator);
                             text_channels_summary(&creator)
@@ -13409,7 +13428,7 @@ where
                 Err(error) => format!("Could not read the creator channel ({error}). Try again."),
                 Ok(creator) => match decide_position(creator, &request) {
                     PositionPlan::Refuse { message } => message,
-                    PositionPlan::Update(creator) => match store.add_creator(&creator).await {
+                    PositionPlan::Update(creator) => match store.add_creator_attributed(&creator, "discord:position").await {
                         Ok(()) => {
                             runtime.creator_updated(&creator);
                             position_summary(&creator)
@@ -13441,7 +13460,7 @@ where
                 Err(error) => format!("Could not read the creator channel ({error}). Try again."),
                 Ok(creator) => match decide_group(creator, &request) {
                     GroupPlan::Refuse { message } => message,
-                    GroupPlan::Update(creator) => match store.add_creator(&creator).await {
+                    GroupPlan::Update(creator) => match store.add_creator_attributed(&creator, "discord:group").await {
                         Ok(()) => {
                             runtime.creator_updated(&creator);
                             group_summary(&creator)
@@ -13487,7 +13506,7 @@ where
                 Err(error) => format!("Could not read the creator channel ({error}). Try again."),
                 Ok(creator) => match decide_inherit_permissions(creator, &request) {
                     InheritPermissionsPlan::Refuse { message } => message,
-                    InheritPermissionsPlan::Update(creator) => match store.add_creator(&creator).await {
+                    InheritPermissionsPlan::Update(creator) => match store.add_creator_attributed(&creator, "discord:inheritpermissions").await {
                         Ok(()) => {
                             runtime.creator_updated(&creator);
                             inherit_permissions_summary(&creator)
@@ -13519,7 +13538,7 @@ where
                 Err(error) => format!("Could not read the creator channel ({error}). Try again."),
                 Ok(creator) => match decide_default_limit(creator, &request) {
                     DefaultLimitPlan::Refuse { message } => message,
-                    DefaultLimitPlan::Update(creator) => match store.add_creator(&creator).await {
+                    DefaultLimitPlan::Update(creator) => match store.add_creator_attributed(&creator, "discord:defaultlimit").await {
                         Ok(()) => {
                             runtime.creator_updated(&creator);
                             default_limit_summary(&creator)
@@ -13551,7 +13570,7 @@ where
                 Err(error) => format!("Could not read the creator channel ({error}). Try again."),
                 Ok(creator) => match decide_always_private(creator, &request) {
                     AlwaysPrivatePlan::Refuse { message } => message,
-                    AlwaysPrivatePlan::Update(creator) => match store.add_creator(&creator).await {
+                    AlwaysPrivatePlan::Update(creator) => match store.add_creator_attributed(&creator, "discord:alwaysprivate").await {
                         Ok(()) => {
                             runtime.creator_updated(&creator);
                             always_private_summary(&creator)

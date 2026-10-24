@@ -609,8 +609,52 @@ impl InternalActionStore {
         claim: &ExecutionClaim,
         response: &TerminalResponse,
     ) -> Result<(), InternalStoreError> {
-        self.terminalize(&claim.identity, Some(claim.intent_id), response, None)
+        self.terminalize(&claim.identity, Some(claim.intent_id), response, None, None)
             .await
+    }
+
+    /// Persist the exact voice revision with its terminal receipt, so a replay
+    /// cannot accidentally report a later writer's token.
+    pub async fn finish_voice_config(
+        &self,
+        claim: &ExecutionClaim,
+        response: &TerminalResponse,
+        version: i64,
+    ) -> Result<(), InternalStoreError> {
+        if claim.identity.action != "voice.config.set"
+            || version <= 0
+            || !matches!(response, TerminalResponse::Success { .. })
+        {
+            return Err(InternalStoreError::InvalidInput);
+        }
+        self.terminalize(
+            &claim.identity,
+            Some(claim.intent_id),
+            response,
+            None,
+            Some(version),
+        )
+        .await
+    }
+
+    /// Read only a matching, completed voice intent's committed token. Missing
+    /// evidence is an error, never a fabricated token or permission to reapply.
+    pub async fn voice_config_version(
+        &self,
+        identity: &RequestIdentity,
+    ) -> Result<i64, InternalStoreError> {
+        let version: Option<Option<i64>> = sqlx::query_scalar(
+            "SELECT config_version FROM internal_idempotency
+             WHERE caller_hash = $1 AND key_hash = $2 AND action = 'voice.config.set'
+               AND action = $3 AND payload_hash = $4 AND state = 'completed' AND response_code = 'success'",
+        )
+        .bind(&identity.caller_hash).bind(&identity.key_hash)
+        .bind(&identity.action).bind(&identity.payload_hash)
+        .fetch_optional(&self.pool).await?;
+        version
+            .flatten()
+            .filter(|version| *version > 0)
+            .ok_or(InternalStoreError::TransitionRefused)
     }
 
     /// A timeout/crash path retains the intent; it never releases execution rights.
@@ -646,7 +690,7 @@ impl InternalActionStore {
         if !evidence.supports(response) {
             return Err(InternalStoreError::InvalidInput);
         }
-        self.terminalize(identity, None, response, Some(evidence))
+        self.terminalize(identity, None, response, Some(evidence), None)
             .await
     }
 
@@ -656,6 +700,7 @@ impl InternalActionStore {
         owner_id: Option<i64>,
         response: &TerminalResponse,
         evidence: Option<ReconciliationEvidence>,
+        config_version: Option<i64>,
     ) -> Result<(), InternalStoreError> {
         let mut tx = self.pool.begin().await?;
         let row = Self::lock_identity(&mut tx, identity).await?;
@@ -682,6 +727,13 @@ impl InternalActionStore {
         .bind(response.stop_reason())
         .execute(&mut *tx)
         .await?;
+        if let Some(version) = config_version {
+            sqlx::query("UPDATE internal_idempotency SET config_version = $2 WHERE intent_id = $1")
+                .bind(intent_id)
+                .bind(version)
+                .execute(&mut *tx)
+                .await?;
+        }
         Self::complete_locked(&mut tx, intent_id, response, evidence).await?;
         tx.commit().await?;
         Ok(())

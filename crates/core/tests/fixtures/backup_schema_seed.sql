@@ -349,6 +349,12 @@ VALUES (79, '100000000000000001', 'TWO_STICKY_ENABLED', NULL,
         '100000000000000002', '2026-08-01T10:00:00.123456Z'),
        (91, '100000000000000001', 'TWO_FEEDS_ENABLED', 'false', NULL,
         '100000000000000004', '2026-08-01T10:01:00Z');
+-- V16 voice configuration audit (0463): gapped explicit versions leave the
+-- BIGSERIAL revision allocator behind the rows, like every other seeded
+-- serial above. Attribution is exact; no historical actor is guessed.
+INSERT INTO voice_settings_audit (version, guild_id, actor, at)
+VALUES (6, '100000000000000001', 'discord:limit', '2026-08-03T10:00:00.123456Z'),
+       (14, '100000000000000001', 'dashboard:admin-session', '2026-08-03T10:05:00Z');
 -- Admin API token registry (0456/0457): one live read token and one revoked
 -- read+moderate token. Hashes are hash-shaped seed data (md5 doubled to 64
 -- hex), never real secrets; the sha256 property is pinned by the slice-0

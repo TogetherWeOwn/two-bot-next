@@ -10,7 +10,8 @@ channel-moderation executors, nonce-commit authentication capability and strict
 receiver configuration. It supports `announcement.post`, the keyless `event.read`
 (behind `TWO_INTERNAL_ALLOW_EVENT_READ`), `event.upsert` and `event.cancel`
 (cancel behind `TWO_INTERNAL_ALLOW_EVENT_CANCEL`), `settings.get`/`settings.set`
-(behind `TWO_INTERNAL_ALLOW_SETTINGS`), the automations pair
+(behind `TWO_INTERNAL_ALLOW_SETTINGS`), `voice.config.get`/`voice.config.set`
+(behind the separate `TWO_INTERNAL_ALLOW_VOICE_CONFIG` gate), the automations pair
 `automations.export` (keyless redacted read) / `automations.import` (claimed
 transactional import), the restrictive member verbs `moderation.ban`,
 `moderation.tempban`, `moderation.kick`, `moderation.warn` and
@@ -138,6 +139,7 @@ capabilities; this table is not an instruction to create or stage them.
 | `TWO_INTERNAL_ALLOW_EVENT_READ` | `event.read` stays gated off |
 | `TWO_INTERNAL_ALLOW_MODERATION` | Member/channel moderation stay gated off, even with `TWO_MODERATION=1` |
 | `TWO_INTERNAL_ALLOW_SETTINGS` | Settings get/set stay gated off |
+| `TWO_INTERNAL_ALLOW_VOICE_CONFIG` | Voice configuration get/set stay gated off |
 
 Fixed receiver port: **8091** (health stays on `BOT_PORT` 8080, and the two may
 not be equal while the receiver is enabled). While enabled, 8091 joins the
@@ -164,7 +166,16 @@ is the serving version (same id as `wrangler deployments status --env staging`),
 and if they differ redeploy the intended SHA through the workflow first (full rule
 in `docs/production-deploy.md`).
 
-1. Merge this change. `deploy-staging` deploys it dark; `/health` and `/readyz` are unchanged.
+For a binary containing voice configuration actions, the authorized migration
+executor must apply `0465_voice_settings_versions.sql` and the reviewed role
+plan **before** that binary can serve, including with the receiver or voice
+capability dark. Existing Discord writers use the new audit schema regardless
+of those gates. The original receiver enablement sequence below is not a
+voice deployment authorization; its merge-first step does not waive required
+pre-merge staging evidence. Keep the additive voice schema and audit on rollback;
+never drop voice columns or delete audit history.
+
+1. Merge the original receiver change only after its applicable gates pass. `deploy-staging` deploys it dark; `/health` and `/readyz` are unchanged.
 2. Operator stages `TWO_INTERNAL_CALLERS` and `TWO_INTERNAL_CHANNEL_KEYS` (plain values), only under the separately authorized enablement contract; no role keys or optional capability gates travel through this Worker.
 3. Operator generates the key on the Operator host and stages `TWO_INTERNAL_KEYS`, and sets the website's `staging` environment secret `BOT_SHARED_SECRET` to the same value, without printing it.
 4. Operator applies migrations `0423` (settings CAS) and `0424` (event outcome) first (the bot does not apply migrations; an enabled receiver's finish fails without the columns), then stages `TWO_INTERNAL_ACTIONS` as `1` **last**, deploys the version, and transfers ownership. The container restart applies the settings: an invalid combination exits the process (the receiver boots all-or-nothing) and keeps staging red until step 5.
@@ -216,6 +227,70 @@ is not an implemented verifier. No unsigned caller/audience header is trusted.
 Stable caller mapping, idempotency claim, action validation, outbound admission,
 execution and durable finalization remain receiver responsibilities; this
 capability does not itself permit a Discord effect.
+
+## Voice configuration contract
+
+Direct-container support only: `TWO_INTERNAL_ALLOW_VOICE_CONFIG=1` enables both
+verbs, independently of `TWO_INTERNAL_ALLOW_SETTINGS`. The shipped Worker does
+not forward this capability. Shipping this code does not enable a route or grant
+signing/secret authority. No staging apply-check or production enablement is
+implied by unit/database results.
+
+- `voice.config.get` is keyless. It returns
+  `{ok:true,result:{config,logging_settings,updated_by,updated_at},version,request_id}`.
+  `config` is the existing version-1 `VoiceConfiguration` export document,
+  including creators, channel templates, aliases, random lists and guild
+  settings. The envelope `version` is a separate, opaque signed integer
+  concurrency token; a never-configured guild has token `0`.
+- `voice.config.set` requires `Idempotency-Key`, the complete `config` document,
+  and `updated_by` (the dashboard actor's decimal Discord ID). Optional
+  `expected_version` compares against the last committed guild change. A stale
+  token yields non-retryable `409 version_conflict`, with no configuration or
+  voice-audit write. Omission is a blind write. Unknown request/document fields,
+  wrong-guild documents, malformed IDs, invalid templates and unsupported new
+  time zones are refused. The guild is server-selected, never body-selected.
+- A successful save returns `{outcome:"saved"}` under `result` and the committed
+  token beside it. Replays return that first committed token even if another
+  save landed later; they never reapply, bump the revision or append an audit
+  row. A database/receipt failure with uncertain outcome requires reconciliation,
+  never a new intent key.
+- `config.settings.creation_enabled`, `command_role_id` and `command_roles`
+  read/write the same access controls used by `/access` and the gateway.
+  Creator fields read/write the rows used by `/textchannels`, `/position`,
+  `/group`, `/inheritpermissions`, `/defaultlimit` and `/alwaysprivate`.
+- Runtime `/logging` uses `off`/`brief`/`full`, unlike the import document's
+  separate `logging` section (`errors`/`lifecycle`/`verbose`). It is therefore
+  exposed separately as `result.logging_settings` with `level`, nullable
+  `channel_id` and nullable `mention_role_id` (IDs are decimal strings). Supply
+  the same object as optional top-level `logging_settings` on set to update it
+  atomically. Omission preserves runtime logging; it never silently translates
+  between the two different logging models.
+
+Dashboard callers must authenticate the admin session, enforce its guild
+allowlist, verify live Discord Manage Server authority and validate referenced
+resources in that guild before signing, as for other settings actions. The bot
+validates configuration values/reference syntax and fixes the target guild; it
+**does not** treat `updated_by` as proof of a Discord permission or manufacture a
+trusted inventory from submitted IDs. Signing keys remain trusted control-plane
+capabilities. Do not enable a dashboard client without those caller-side checks.
+
+Apply migration `0465_voice_settings_versions.sql` through the authorized
+migration executor **before** deploying this binary: existing Discord
+configuration writers also use the new revision/audit transaction. It adds
+`version`/`updated_by`/`updated_at` to voice configuration tables, an append-only
+`voice_settings_audit`, and the exact first-save revision on durable internal
+receipts. Pre-migration rows retain unknown attribution and version zero; no
+historical actor is guessed. Discord writes remain write-through, record a
+`discord:<command>` actor, and invalidate any older dashboard token. Each
+successful store operation appends one voice audit row; invalid/stale writes and
+idempotent replays append none. Configuration replacement does not alter live
+rooms or text companions.
+
+Rollback: disable the voice capability and deploy the previous binary through
+the existing deployment contract. Keep the additive schema and audit evidence;
+do not delete audit rows or rewrite migration history. Staging deployment,
+capability forwarding and live Discord apply-checks are separate execution
+steps with their existing gates, not authorized by this reference.
 
 ## Automation import contract
 
@@ -416,6 +491,8 @@ Success (`200` only, `result` always an object, no `error` key):
 | event.upsert/cancel | `{outcome, event_id}` | `outcome` replayed from the stored receipt |
 | event.read | full observed event | behind its allowlist flag |
 | settings.get/set | `{key, ...}` plus top-level integer `version` | `version` beside `result`, never inside |
+| voice.config.get | `{config, logging_settings, updated_by, updated_at}` plus top-level integer `version` | Receiver-only; opaque CAS token beside `result`, not a forwarded capability |
+| voice.config.set | `{outcome:"saved"}` plus top-level integer `version` | Receiver-only; first committed token retained on replay, capability not forwarded |
 | automations.export/import | command document / `{imported, skipped, conflicts}` | |
 | role.assign / guild.add_member | `{outcome}` | `assigned`/`already_held`, `added`/`already_member` |
 | moderation.\* | `{outcome[, affected]}` | |

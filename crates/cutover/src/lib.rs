@@ -53,6 +53,7 @@ pub mod voice_config_store;
 pub mod voice_ghosts;
 pub mod voice_reconcile;
 pub mod voice_rooms;
+mod voice_settings_change;
 
 pub use backfill_plan::{
     event_metadata_json, plan_backfill_merge, BackfillMerge, ListedMember, PlannedEvent,

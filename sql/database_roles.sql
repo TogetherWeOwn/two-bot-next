@@ -1,8 +1,9 @@
 -- Print-only operator plan. Apply after bot migrations and sql/web_v1.sql.
 -- NOLOGIN groups only: passwords and login membership are provisioned separately.
 -- Rendered by `two-bot db roles plan [--phase full|bootstrap]`. The bootstrap
--- phase skips relations and sequences absent from the database; functions stay
--- strict in both phases. The full (default) phase raises on any absent object.
+-- phase skips relations and sequences absent from the database. Voice audit
+-- functions may also be absent before their audit table exists; other functions
+-- stay strict. The full (default) phase raises on any absent object.
 BEGIN;
 SET LOCAL search_path = pg_catalog, pg_temp;
 
@@ -138,6 +139,15 @@ BEGIN
         IF obj.kind = 'function' THEN
             target := to_regprocedure(obj.schema_name || '.' || obj.name)::text;
             IF target IS NULL THEN
+                -- Migration 0465 creates these functions with its audit table.
+                -- Bootstrap can precede that migration; a partial migration
+                -- with the table present must still fail closed. Full already
+                -- requires the audit table earlier in the reviewed matrix.
+                IF obj.schema_name = 'public'
+                   AND obj.name IN ('refuse_voice_audit_mutation()', 'stamp_voice_settings_change()')
+                   AND to_regclass('public.voice_settings_audit') IS NULL THEN
+                    CONTINUE;
+                END IF;
                 RAISE EXCEPTION 'missing function: %.%', obj.schema_name, obj.name;
             END IF;
             EXECUTE format('ALTER FUNCTION %s OWNER TO two_bot_migrator', target);
