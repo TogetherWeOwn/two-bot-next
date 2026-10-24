@@ -23,7 +23,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Legacy baseline](b1-baseline.md)
 - [Process history](process-history-contract.md)
 - [Read-only MCP tools](mcp.md)
-- [Admin token registry contract](admin-registry.md)
+- [Admin token registry](admin-registry.md)
 
 ## Operations and observability
 
@@ -46,12 +46,12 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Gateway event catalog](observability-event-catalog.md)
 - [Pool gauge ownership](pool-gauge-ownership.md)
 - [Ops dashboard](ops-dashboard.md)
-- [Keepalive-gap spec](keepalive-gap-detector.md)
+- [Keepalive-gap](keepalive-gap-detector.md)
 - [Gateway alert queries](worker-gateway-failure-alerts.md)
 - [EventSub health queries](eventsub-subscription-health-queries.md)
-- [October 1 tabletop](incident-tabletop-2026-10-01.md)
-- [October 6 tabletop](incident-tabletop-2026-10-06.md)
-- [Gateway incident review](production-incident-2026-10-15-postmortem.md)
+- [Oct 1 tabletop](incident-tabletop-2026-10-01.md)
+- [Oct 6 tabletop](incident-tabletop-2026-10-06.md)
+- [Incident review](production-incident-2026-10-15-postmortem.md)
 - [Ops audit reads](ops-control.md)
 
 ## Storage and internal actions
@@ -116,7 +116,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Onboarding domain](onboarding-port.md)
 - [Leveling domain](leveling-port.md)
 - [LFG domain](lfg-port.md)
-- [LFG input contract](lfg-interaction-contract.md)
+- [LFG inputs](lfg-interaction-contract.md)
 - [Opt-in ready check (design only)](lfg-ready-check-spec.md)
 - [Backup-host handoff (design only)](lfg-backup-host-spec.md)
 - [LFG title/role reuse (design only)](lfg-reuse-spec.md)
@@ -131,13 +131,13 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Scheduled skip tests](scheduled-events-skip-acceptance.md)
 - [Scheduled event reminders](event-reminders.md)
 - [Reminder baseline and stop (design only)](event-reminder-preferences-spec.md)
-- [RSVP seats and opt-in waitlist (design only)](rsvp-capacity-spec.md)
+- [RSVP seats and waitlist (design only)](rsvp-capacity-spec.md)
 - [Private event agenda (design only)](event-agenda-spec.md)
 - [Event recap (design only)](event-recap-spec.md)
 - [Sticky debounce tests](sticky-debounce-acceptance.md)
 - [Ticket runtime](tickets.md)
 - [Ticket lifecycle observability](ticket-lifecycle-observability.md)
-- [Community suggestions triage spec](suggestions-triage-box.md)
+- [Suggestions triage](suggestions-triage-box.md)
 
 ## Voice
 
