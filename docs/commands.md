@@ -220,7 +220,7 @@ Remove a feed relay
 
 ## `/giveaway`
 
-Create, list or cancel a giveaway
+Create, draw, reroll or cancel a giveaway
 
 - Default permissions: ManageGuild (`32`)
 - Available in DMs: false
@@ -237,6 +237,18 @@ Create, list or cancel a giveaway
 | `list` | subcommand | false | — | — | — | — | List open giveaways |
 | `cancel` | subcommand | false | — | — | — | — | Cancel an open or paused giveaway |
 | `cancel id` | string | true | — | — | 64 | — | Giveaway id |
+| `end` | subcommand | false | — | — | — | — | Draw now, before the deadline |
+| `end id` | string | true | — | — | 64 | — | Giveaway id |
+| `pause` | subcommand | false | — | — | — | — | Pause entry without drawing |
+| `pause id` | string | true | — | — | 64 | — | Giveaway id |
+| `resume` | subcommand | false | — | — | — | — | Resume a paused giveaway |
+| `resume id` | string | true | — | — | 64 | — | Giveaway id |
+| `extend` | subcommand | false | — | — | — | — | Add minutes to the deadline |
+| `extend id` | string | true | — | — | 64 | — | Giveaway id |
+| `extend duration-minutes` | integer | true | 1 | 43200 | — | — | Minutes to add (1–43200) |
+| `reroll` | subcommand | false | — | — | — | — | Redraw the winners |
+| `reroll id` | string | true | — | — | 64 | — | Giveaway id |
+| `reroll user` | user | false | — | — | — | — | Replace only this winner |
 
 ## `/group`
 
