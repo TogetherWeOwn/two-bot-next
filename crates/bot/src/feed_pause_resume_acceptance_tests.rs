@@ -29,6 +29,10 @@ async fn invoke(
     permission: u64,
     guild: &str,
 ) -> String {
+    invoke_interaction(pool, &slash(name, id, permission, guild)).await
+}
+
+async fn invoke_interaction(pool: &PgPool, interaction: &Interaction) -> String {
     let mock = MockRest::start(
         vec![ScriptedResponse::status(204)],
         ScriptedResponse::json(200, json!({"id":"9001"})),
@@ -53,9 +57,7 @@ async fn invoke(
         2222,
         true,
     );
-    runtime
-        .on_interaction(&slash(name, id, permission, guild))
-        .await;
+    runtime.on_interaction(interaction).await;
     let requests = mock.requests();
     let mut replies = Vec::new();
     for request in &requests {
@@ -863,4 +865,441 @@ async fn resume_catch_up_is_bounded_and_never_reposts_accepted_nonces_after_rest
         "retain the existing 20-attempt per-poll budget, not an unbounded resume drain"
     );
     db.close().await.unwrap();
+}
+
+fn slash_options(name: &str, options: Value) -> Interaction {
+    let mut wire = serde_json::to_value(slash(name, None, 32, GUILD)).unwrap();
+    wire["data"]["options"] = options;
+    serde_json::from_value(wire).expect("synthetic raw lifecycle options")
+}
+
+async fn audit_snapshot(pool: &PgPool) -> Value {
+    sqlx::query_scalar(
+        "SELECT coalesce(jsonb_agg(to_jsonb(a) ORDER BY guild_id, created_at, id), '[]'::jsonb)
+           FROM announcements_audit_log a",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("snapshot every announcements audit column")
+}
+
+async fn audit_triples(pool: &PgPool) -> Vec<(String, String, String)> {
+    sqlx::query_as(
+        "SELECT action, target_key, outcome FROM announcements_audit_log
+          WHERE guild_id = $1 ORDER BY action, target_key, outcome",
+    )
+    .bind(GUILD)
+    .fetch_all(pool)
+    .await
+    .expect("exact lifecycle audit outcomes")
+}
+
+async fn assert_audits(pool: &PgPool, expected: &[(&str, &str, &str)]) {
+    let mut expected: Vec<_> = expected
+        .iter()
+        .map(|(action, target, outcome)| {
+            (action.to_string(), target.to_string(), outcome.to_string())
+        })
+        .collect();
+    expected.sort();
+    assert_eq!(
+        audit_triples(pool).await,
+        expected,
+        "each invocation emits exactly its own action, relay target and outcome"
+    );
+}
+
+// A loose find_map accepts duplicated or mixed-typed ids and mutates these
+// targets. No pending row on either target can mask that bug with a recovery refusal.
+async fn strict_id_refusal(name: &str, options: Value) {
+    let db = fixture().await;
+    for id in ["strict-primary", "strict-secondary"] {
+        let relay = feed(id);
+        store::add_feed(db.pool(), &relay).await.unwrap();
+        accepted(db.pool(), &relay, 0).await;
+        if name == "feed-resume" {
+            sqlx::query("UPDATE feed_relays SET enabled = false WHERE id = $1")
+                .bind(id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+    }
+    let pending = feed("strict-unrelated-pending");
+    store::add_feed(db.pool(), &pending).await.unwrap();
+    seed_pending(db.pool(), &pending, 1).await;
+    // Preserve nonempty audit evidence too, rather than checking only an empty log.
+    command(db.pool(), "feed-resume", &pending.id).await;
+    let before = snapshot(db.pool(), true).await;
+    let audits = audit_snapshot(db.pool()).await;
+    let reply = invoke_interaction(db.pool(), &slash_options(name, options)).await;
+    let after = snapshot(db.pool(), true).await;
+    let after_audits = audit_snapshot(db.pool()).await;
+    db.close().await.unwrap();
+
+    assert_eq!(
+        after, before,
+        "malformed {name} changes no relay or delivery column"
+    );
+    assert_eq!(after_audits, audits, "malformed {name} emits no audit");
+    let corrected = format!("/{name} id:<relay-id>");
+    assert!(
+        reply.to_ascii_lowercase().contains("id") && reply.contains(&corrected),
+        "name the invalid id option and show the correct invocation {corrected}: {reply}"
+    );
+    assert!(reply.chars().count() <= 500, "bounded decode refusal");
+    for mention in ["@everyone", "@here", "<@"] {
+        assert!(!reply.contains(mention), "mention-safe refusal: {reply}");
+    }
+}
+
+#[tokio::test]
+async fn pause_rejects_two_distinct_string_ids_without_effects() {
+    strict_id_refusal(
+        "feed-pause",
+        json!([
+            {"name":"id","type":3,"value":"strict-primary"},
+            {"name":"id","type":3,"value":"strict-secondary"}
+        ]),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn resume_rejects_two_distinct_string_ids_without_effects() {
+    strict_id_refusal(
+        "feed-resume",
+        json!([
+            {"name":"id","type":3,"value":"strict-primary"},
+            {"name":"id","type":3,"value":"strict-secondary"}
+        ]),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn pause_rejects_integer_then_string_id_without_effects() {
+    strict_id_refusal(
+        "feed-pause",
+        json!([
+            {"name":"id","type":4,"value":42},
+            {"name":"id","type":3,"value":"strict-primary"}
+        ]),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn resume_rejects_integer_then_string_id_without_effects() {
+    strict_id_refusal(
+        "feed-resume",
+        json!([
+            {"name":"id","type":4,"value":42},
+            {"name":"id","type":3,"value":"strict-primary"}
+        ]),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn pause_rejects_string_then_integer_id_without_effects() {
+    strict_id_refusal(
+        "feed-pause",
+        json!([
+            {"name":"id","type":3,"value":"strict-primary"},
+            {"name":"id","type":4,"value":42}
+        ]),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn resume_rejects_string_then_integer_id_without_effects() {
+    strict_id_refusal(
+        "feed-resume",
+        json!([
+            {"name":"id","type":3,"value":"strict-primary"},
+            {"name":"id","type":4,"value":42}
+        ]),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn pause_rejects_a_lone_integer_id_without_effects() {
+    strict_id_refusal("feed-pause", json!([{"name":"id","type":4,"value":42}])).await;
+}
+
+#[tokio::test]
+async fn resume_rejects_a_lone_integer_id_without_effects() {
+    strict_id_refusal("feed-resume", json!([{"name":"id","type":4,"value":42}])).await;
+}
+
+#[tokio::test]
+async fn pause_rejects_missing_id_without_effects() {
+    strict_id_refusal("feed-pause", json!([])).await;
+}
+
+#[tokio::test]
+async fn resume_rejects_missing_id_without_effects() {
+    strict_id_refusal("feed-resume", json!([])).await;
+}
+
+#[tokio::test]
+async fn unknown_options_do_not_hide_a_valid_lifecycle_id() {
+    let db = fixture().await;
+    let relay = feed("unknown-option-control");
+    store::add_feed(db.pool(), &relay).await.unwrap();
+    accepted(db.pool(), &relay, 0).await;
+    let before = snapshot(db.pool(), false).await;
+    for (name, want_enabled) in [("feed-pause", false), ("feed-resume", true)] {
+        let reply = invoke_interaction(
+            db.pool(),
+            &slash_options(
+                name,
+                json!([
+                    {"name":"future-option","type":4,"value":42},
+                    {"name":"id","type":3,"value":relay.id},
+                    {"name":"another-option","type":3,"value":"ignored"}
+                ]),
+            ),
+        )
+        .await;
+        assert_eq!(enabled(db.pool(), &relay.id).await, want_enabled, "{reply}");
+        assert_eq!(snapshot(db.pool(), false).await, before);
+    }
+    assert_audits(
+        db.pool(),
+        &[
+            ("feed.pause", &relay.id, "paused"),
+            ("feed.resume", &relay.id, "resumed"),
+        ],
+    )
+    .await;
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn empty_string_id_reaches_planner_rejection_without_effects_not_decode_refusal() {
+    let db = fixture().await;
+    let relay = feed("empty-id-control");
+    store::add_feed(db.pool(), &relay).await.unwrap();
+    let before = snapshot(db.pool(), true).await;
+    let audits = audit_snapshot(db.pool()).await;
+    for name in ["feed-pause", "feed-resume"] {
+        let reply = command(db.pool(), name, "").await;
+        assert_eq!(snapshot(db.pool(), true).await, before);
+        assert_eq!(audit_snapshot(db.pool()).await, audits);
+        assert!(
+            reply.to_ascii_lowercase().contains("id"),
+            "planner InvalidId: {reply}"
+        );
+        assert!(
+            !reply.contains(&format!("/{name} id:<relay-id>")),
+            "a correctly typed empty value is not a malformed option: {reply}"
+        );
+    }
+    assert_audits(db.pool(), &[]).await;
+    db.close().await.unwrap();
+}
+
+// Restored data may be paused with pending evidence even though new pauses
+// refuse enabled+pending. Repeating pause must report the persisted state.
+async fn restored_paused_pending(expired: bool, tokenless: bool) {
+    let db = fixture().await;
+    let relay = feed("restored-paused-pending");
+    store::add_feed(db.pool(), &relay).await.unwrap();
+    let post = seed_pending(db.pool(), &relay, 0).await;
+    if expired {
+        expire(db.pool()).await;
+    }
+    if tokenless {
+        sqlx::query(
+            "UPDATE feed_deliveries SET claim_token = NULL, claimed_at = NULL WHERE feed_id = $1",
+        )
+        .bind(&relay.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+    sqlx::query("UPDATE feed_relays SET enabled = false WHERE id = $1")
+        .bind(&relay.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let before = snapshot(db.pool(), true).await;
+    let history = snapshot(db.pool(), false).await;
+    let peer = db.independent_pool().await.unwrap();
+    let mut replies = Vec::new();
+    for _ in 0..2 {
+        replies.push(command(&peer, "feed-pause", &relay.id).await);
+        assert_eq!(
+            snapshot(&peer, true).await,
+            before,
+            "no lease, nonce, timestamp or lifecycle changes"
+        );
+        assert!(!enabled(&peer, &relay.id).await);
+    }
+    let pause_audits = audit_triples(&peer).await;
+    let reply = command(&peer, "feed-resume", &relay.id).await;
+    assert!(enabled(&peer, &relay.id).await, "{reply}");
+    assert_eq!(snapshot(&peer, false).await, history);
+    let listed = store::list_feeds(&peer, GUILD, true).await.unwrap();
+    assert_eq!(
+        listed.len(),
+        1,
+        "resumed pending recovery is enabled-discoverable"
+    );
+    assert_eq!(listed[0].id, relay.id);
+    // Read eligibility after the existing lease window without rewriting a lease
+    // or settling anything: current, expired and tokenless evidence must survive.
+    let pending = store::pending_deliveries(&peer, &listed[0], now_millis_for_test() + 120_000, 20)
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].item_key, post.item_key);
+    assert_eq!(pending[0].nonce, post.nonce);
+    assert_eq!(
+        states(&peer).await,
+        (0, 1),
+        "resume does not settle pending delivery"
+    );
+    assert_eq!(
+        snapshot(&peer, false).await,
+        history,
+        "discovery does not rewrite delivery evidence"
+    );
+    assert_audits(
+        &peer,
+        &[
+            ("feed.pause", &relay.id, "already_paused"),
+            ("feed.pause", &relay.id, "already_paused"),
+            ("feed.resume", &relay.id, "resumed"),
+        ],
+    )
+    .await;
+    peer.close().await;
+    db.close().await.unwrap();
+    for reply in replies {
+        let lower = reply.to_ascii_lowercase();
+        assert!(
+            lower.contains("already") && lower.contains("paused"),
+            "truthful restored no-op: {reply}"
+        );
+        assert!(
+            !lower.contains("kept enabled"),
+            "never claim a paused relay is enabled: {reply}"
+        );
+    }
+    assert_eq!(
+        pause_audits,
+        vec![
+            (
+                "feed.pause".into(),
+                relay.id.clone(),
+                "already_paused".into()
+            ),
+            (
+                "feed.pause".into(),
+                relay.id.clone(),
+                "already_paused".into()
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn already_paused_current_pending_relay_preserves_state_and_resumes_discovery() {
+    restored_paused_pending(false, false).await;
+}
+
+#[tokio::test]
+async fn already_paused_expired_pending_relay_preserves_state_and_resumes_discovery() {
+    restored_paused_pending(true, false).await;
+}
+
+#[tokio::test]
+async fn already_paused_tokenless_pending_relay_preserves_state_and_resumes_discovery() {
+    restored_paused_pending(false, true).await;
+}
+
+#[tokio::test]
+async fn lifecycle_audit_triples_cover_success_noop_missing_and_enabled_pending_refusal() {
+    let db = fixture().await;
+    let relay = feed("audit-lifecycle");
+    store::add_feed(db.pool(), &relay).await.unwrap();
+    let pending = feed("audit-enabled-pending");
+    store::add_feed(db.pool(), &pending).await.unwrap();
+    seed_pending(db.pool(), &pending, 0).await;
+    let mut expected = Vec::new();
+    for (name, target, action, outcome) in [
+        ("feed-pause", relay.id.as_str(), "feed.pause", "paused"),
+        (
+            "feed-pause",
+            relay.id.as_str(),
+            "feed.pause",
+            "already_paused",
+        ),
+        ("feed-pause", "audit-missing", "feed.pause", "missing"),
+        ("feed-resume", relay.id.as_str(), "feed.resume", "resumed"),
+        (
+            "feed-resume",
+            relay.id.as_str(),
+            "feed.resume",
+            "already_resumed",
+        ),
+        ("feed-resume", "audit-missing", "feed.resume", "missing"),
+    ] {
+        command(db.pool(), name, target).await;
+        expected.push((action, target, outcome));
+        assert_audits(db.pool(), &expected).await;
+    }
+    let before = snapshot(db.pool(), true).await;
+    let reply = command(db.pool(), "feed-pause", &pending.id).await;
+    recovery_reply(&reply);
+    assert!(enabled(db.pool(), &pending.id).await);
+    assert_eq!(snapshot(db.pool(), true).await, before);
+    expected.push(("feed.pause", &pending.id, "recovery_required"));
+    assert_audits(db.pool(), &expected).await;
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn controlled_store_failure_is_rejected_and_audited_for_each_lifecycle_command() {
+    let db = fixture().await;
+    let relay = feed("audit-store-failure");
+    store::add_feed(db.pool(), &relay).await.unwrap();
+    let before = snapshot(db.pool(), true).await;
+    // Fixture-local, reversible SQL failure. The independent audit relation stays
+    // available; no credentials, network fault or production dependency is used.
+    sqlx::query("ALTER TABLE feed_relays RENAME TO fixture_unavailable_feed_relays")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let mut replies = Vec::new();
+    for name in ["feed-pause", "feed-resume"] {
+        replies.push(command(db.pool(), name, &relay.id).await);
+    }
+    sqlx::query("ALTER TABLE fixture_unavailable_feed_relays RENAME TO feed_relays")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(snapshot(db.pool(), true).await, before);
+    assert_audits(
+        db.pool(),
+        &[
+            ("feed.pause", &relay.id, "rejected"),
+            ("feed.resume", &relay.id, "rejected"),
+        ],
+    )
+    .await;
+    db.close().await.unwrap();
+    for reply in replies {
+        let lower = reply.to_ascii_lowercase();
+        assert!(
+            lower.contains("could not") || lower.contains("unable") || lower.contains("failed"),
+            "truthful store refusal: {reply}"
+        );
+        assert!(!lower.starts_with("paused") && !lower.starts_with("resumed"));
+    }
 }
