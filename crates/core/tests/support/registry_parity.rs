@@ -1,8 +1,9 @@
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use two_bot_core::commands::{
-    CommandChoice, CommandDefinition, CommandOption, CommandOptionType, HELP_DESCRIPTION,
-    MAX_RESOURCE_ID_CHARS, OCCURRENCE_ID_MAX_CHARS, PRIVACY_DESCRIPTION, REOPEN_DESCRIPTION,
+    CommandChoice, CommandDefinition, CommandOption, CommandOptionType, EVENT_REFERENCE_MAX_CHARS,
+    HELP_DESCRIPTION, MAX_RESOURCE_ID_CHARS, OCCURRENCE_ID_MAX_CHARS, PRIVACY_DESCRIPTION,
+    REOPEN_DESCRIPTION,
 };
 use two_bot_core::custom_commands::{
     MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_TEMPLATE_CHARS, MAX_TEXT_TRIGGER_CHARS,
@@ -41,6 +42,8 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("command-inspect", "docs/parity.md §1 command-inspect"),
     ("purge-preview", "docs/parity.md §1 purge-preview"),
     ("channel-inspect", "docs/parity.md §1 channel-inspect"),
+    ("rsvp", "docs/parity.md §1 #24 caps"),
+    ("rsvp-attendance", "docs/parity.md §1 #25 caps"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -330,12 +333,12 @@ pub fn expected_registry() -> Value {
         (
             "attendance",
             "/options/0/description",
-            "Bare event id binds that event; else {event_id}:{label}. Bare slugs refuse, e.g. 12345:weekly",
+            "Event id, event link or {event_id}:{label}; bare slugs refuse, e.g. 12345:weekly",
         ),
         (
             "rsvp",
             "/options/0/description",
-            "Discord scheduled event id (number in the event URL), e.g. 12345",
+            "Scheduled event id or pasted event link, e.g. 12345",
         ),
         (
             "rsvp-attendance",
@@ -345,7 +348,7 @@ pub fn expected_registry() -> Value {
         (
             "rsvp-attendance",
             "/options/0/description",
-            "Discord scheduled event id (number in the event URL), e.g. 12345",
+            "Scheduled event id or pasted event link, e.g. 12345",
         ),
         (
             "lfg",
@@ -420,6 +423,18 @@ pub fn expected_registry() -> Value {
             "id",
             MAX_RESOURCE_ID_CHARS,
             "docs/parity.md §1 #29 caps",
+        ),
+        (
+            "rsvp",
+            "event-id",
+            EVENT_REFERENCE_MAX_CHARS,
+            "docs/parity.md §1 #24 caps",
+        ),
+        (
+            "rsvp-attendance",
+            "event-id",
+            EVENT_REFERENCE_MAX_CHARS,
+            "docs/parity.md §1 #25 caps",
         ),
     ] {
         let _ = INTENTIONAL_DIFFERENCES

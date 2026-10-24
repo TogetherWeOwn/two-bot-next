@@ -79,7 +79,7 @@ Check in a verified human attendee for a scheduled event (scorecard)
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `event-occurrence` | string | true | — | — | 128 | — | Bare event id binds that event; else {event_id}:{label}. Bare slugs refuse, e.g. 12345:weekly |
+| `event-occurrence` | string | true | — | — | 128 | — | Event id, event link or {event_id}:{label}; bare slugs refuse, e.g. 12345:weekly |
 | `member` | user | true | — | — | — | — | Human member who attended. |
 
 ## `/ban`
@@ -488,7 +488,7 @@ RSVP to a Discord scheduled event
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `event-id` | string | true | — | — | — | — | Discord scheduled event id (number in the event URL), e.g. 12345 |
+| `event-id` | string | true | — | — | 128 | — | Scheduled event id or pasted event link, e.g. 12345 |
 | `status` | string | true | — | — | — | Going = `"going"`; Interested = `"interested"`; Declined = `"declined"` | Your response |
 
 ## `/rsvp-attendance`
@@ -500,7 +500,7 @@ Show RSVP totals and your saved response for an event
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `event-id` | string | true | — | — | — | — | Discord scheduled event id (number in the event URL), e.g. 12345 |
+| `event-id` | string | true | — | — | 128 | — | Scheduled event id or pasted event link, e.g. 12345 |
 
 ## `/schedule`
 

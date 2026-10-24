@@ -323,10 +323,10 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             0,
             "Everyone",
             "Rsvp",
-            "Ephemeral `RSVP saved: <status>.` confirmation.",
+            "Ephemeral `RSVP saved: <status>.` confirmation (pasted links append the event id).",
             &[
                 "Gate:AnnouncementsDisabled",
-                "Valid:event-id:required",
+                "Valid:event-id:required,max128",
                 "Valid:status:going|interested|declined",
             ],
         ),
@@ -338,7 +338,7 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             "Everyone",
             "RsvpAttendance",
             "Ephemeral RSVP totals for the scheduled event.",
-            &["Gate:AnnouncementsDisabled", "Valid:event-id:required"],
+            &["Gate:AnnouncementsDisabled", "Valid:event-id:required,max128"],
         ),
         row(
             "lfg",

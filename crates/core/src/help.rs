@@ -208,6 +208,7 @@ pub fn help_text(defs: &[CommandDefinition]) -> String {
         out.push_str(&names.join(" · "));
         out.push('\n');
         if group.commands.contains(&"rsvp-attendance") && live.contains("rsvp-attendance") {
+            out.push_str("Paste the event id or its link, e.g. https://discord.com/events/<server-id>/<event-id>.\n");
             out.push_str("Totals include your saved response and saved time; live event availability is not checked.\n");
         }
     }
