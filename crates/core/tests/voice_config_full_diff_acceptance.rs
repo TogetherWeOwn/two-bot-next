@@ -106,8 +106,11 @@ fn preview_clips_long_and_astral_values() {
     assert!(!preview.contains(&long), "{preview:?}");
 
     // Astral-heavy value: complete in the diff, clipped in the preview.
+    // 85 chars, over the 80-char per-value clip; astral scalars exercise
+    // multi-byte counting on both sides of the clip.
     let mut incoming = current.clone();
-    let astral = format!("{}🎮", "🚀".repeat(60));
+    let astral = format!("{}🎮🎮🎮🎮🎮🎮🎮🎮🎮🎮", "🚀".repeat(75));
+    assert_eq!(astral.chars().count(), 85);
     incoming.aliases.push(alias("astral-game", &astral));
     let diff = diff_configuration(&current, &incoming, &inventory);
     let preview = render_preview(&diff, usize::MAX);
