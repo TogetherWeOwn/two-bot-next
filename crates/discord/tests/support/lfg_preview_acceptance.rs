@@ -462,6 +462,7 @@ async fn preview_preserves_guild_permission_feature_and_application_admission() 
 }
 
 #[tokio::test]
+#[ignore = "needs TWO_TEST_DATABASE_URL disposable database"]
 async fn preview_omitted_and_false_each_publish_once_with_real_renderer_and_audit() {
     let db = durable_select_db().await;
     let mock = rest().await;
@@ -512,6 +513,7 @@ async fn preview_omitted_and_false_each_publish_once_with_real_renderer_and_audi
 }
 
 #[tokio::test]
+#[ignore = "needs TWO_TEST_DATABASE_URL disposable database"]
 async fn preview_at_open_post_quota_changes_no_rows_or_audits_and_reserves_no_slot() {
     let db = durable_select_db().await;
     for n in 0..20 {
