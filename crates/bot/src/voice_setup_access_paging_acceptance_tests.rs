@@ -141,9 +141,7 @@ fn access_command_names(text: &str) -> Vec<String> {
         let Some(rest) = trimmed.strip_prefix("- /") else {
             continue;
         };
-        let end = rest
-            .find(|c| c == ':' || c == ' ' || c == '(')
-            .unwrap_or(rest.len());
+        let end = rest.find([':', ' ', '(']).unwrap_or(rest.len());
         if end > 0 {
             names.push(rest[..end].to_owned());
         }
