@@ -34,7 +34,7 @@ Help is ephemeral and does not execute the selected command. The command picker
 hides gated commands you cannot use; help explains published requirements but
 does not evaluate every effective Discord permission or guarantee authorization.
 
-Built-in commands: 54.
+Built-in commands: 56.
 
 ## `/access`
 
@@ -514,6 +514,31 @@ Schedule a message, once or recurring
 | `body` | string | true | — | — | 2000 | — | Message text |
 | `in-minutes` | integer | false | 1 | 525600 | — | — | Fire this many minutes from now |
 | `every-minutes` | integer | false | 60 | 525600 | — | — | Recur at this interval (60 min minimum) |
+
+## `/schedule-edit`
+
+Correct only a scheduled message body
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `id` | string | true | — | — | 128 | — | Scheduled message id |
+| `revision` | string | true | — | — | 128 | — | Revision from schedule-inspect |
+| `body` | string | true | — | — | 2000 | — | Replacement message text |
+
+## `/schedule-inspect`
+
+Inspect a saved scheduled message
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `id` | string | true | — | — | 128 | — | Scheduled message id |
+| `view` | string | false | — | — | 8 | — | metadata (default) or body |
 
 ## `/schedule-list`
 

@@ -21,9 +21,10 @@
 //! - channel moderation (`/purge`, `/slowmode`, `/lockdown`, `/unlock`): shared
 //!   router authorization → ephemeral defer → durable claim/lane → REST effect →
 //!   atomic result/audit → original-response edit. Ambiguity retains the lane.
-//! - schedules (`/schedule`, `/schedule-remove`, `/schedule-list`; TOG-12237
-//!   over the TOG-10081 domain and store): validate → guild-scoped CRUD →
-//!   `automation_audit_log` row → ephemeral completion. The handlers live in
+//! - schedules (`/schedule`, `/schedule-remove`, `/schedule-list`,
+//!   `/schedule-inspect`, `/schedule-edit`; TOG-12237 over the TOG-10081
+//!   domain and store): validate → guild-scoped CRUD → `automation_audit_log`
+//!   row → ephemeral completion. The handlers live in
 //!   [`crate::schedule_runtime`]; the runtime only registers and dispatches.
 //! - leveling (`/rank [member]`, `/leaderboard`): defer first (ephemeral rank,
 //!   public mention-suppressed top ten), then one completion edit; an
@@ -1484,9 +1485,8 @@ impl CommandRuntime {
         // first, so an owner-map entry could never execute.
         let owner = match name.as_str() {
             "privacy" => Some(HandlerId::Privacy),
-            "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list" => {
-                Some(HandlerId::AutomationAdmin)
-            }
+            "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list"
+            | "schedule-inspect" | "schedule-edit" => Some(HandlerId::AutomationAdmin),
             "feed-add" => Some(HandlerId::FeedAdd),
             "feed-remove" => Some(HandlerId::FeedRemove),
             "feed-list" => Some(HandlerId::FeedList),
@@ -1542,6 +1542,24 @@ impl CommandRuntime {
             }
             "schedule-list" => {
                 crate::schedule_runtime::schedule_list(
+                    &self.pool,
+                    &self.executor,
+                    &self.guild_id.to_string(),
+                    interaction,
+                )
+                .await;
+            }
+            "schedule-inspect" => {
+                crate::schedule_runtime::schedule_inspect(
+                    &self.pool,
+                    &self.executor,
+                    &self.guild_id.to_string(),
+                    interaction,
+                )
+                .await;
+            }
+            "schedule-edit" => {
+                crate::schedule_runtime::schedule_edit(
                     &self.pool,
                     &self.executor,
                     &self.guild_id.to_string(),

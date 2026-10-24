@@ -42,6 +42,8 @@
     {"name": "schedule", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
     {"name": "schedule-remove", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
     {"name": "schedule-list", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
+    {"name": "schedule-inspect", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
+    {"name": "schedule-edit", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
     {"name": "sticky", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
     {"name": "sticky-remove", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},
     {"name": "feed-add", "allow": ["manage_guild", "all_bits"], "deny": "ManageServerRequired"},

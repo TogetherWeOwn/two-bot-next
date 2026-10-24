@@ -171,9 +171,8 @@ fn ctx(name: &str, custom_row: Option<bool>) -> SlashContext<'_> {
 fn owner_map(name: &str, member_present: bool) -> Option<HandlerId> {
     match name {
         "privacy" => Some(HandlerId::Privacy),
-        "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list" => {
-            Some(HandlerId::AutomationAdmin)
-        }
+        "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list"
+        | "schedule-inspect" | "schedule-edit" => Some(HandlerId::AutomationAdmin),
         "feed-add" => Some(HandlerId::FeedAdd),
         "feed-remove" => Some(HandlerId::FeedRemove),
         "feed-list" => Some(HandlerId::FeedList),

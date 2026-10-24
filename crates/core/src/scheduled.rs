@@ -40,6 +40,13 @@ pub const EVERY_MINUTES_MIN: i64 = 60;
 pub const EVERY_MINUTES_MAX: i64 = 525_600;
 /// Admin-authored message body ceiling (legacy `MAX_BODY`, Discord's ceiling).
 pub const MAX_BODY_CHARS: usize = 2000;
+/// `/schedule-inspect` view selector ceiling: `metadata` (8 units) is the
+/// longest accepted value, so the registry bound doubles as the parser bound.
+pub const MAX_INSPECT_VIEW_CHARS: usize = 8;
+/// `/schedule-edit` revision token ceiling: the inspect-issued optimistic
+/// concurrency token is an opaque ASCII string that must fit a bounded
+/// option. Tokens are content-derived (see `scheduled_store`), never stored.
+pub const MAX_SCHEDULE_REVISION_CHARS: usize = 128;
 /// Store `interval_seconds` bounds (legacy `scheduled_messages_interval`:
 /// 60 s to 365 days; `NULL` = one-shot).
 pub const INTERVAL_SECONDS_MIN: i64 = 60;
@@ -171,14 +178,47 @@ fn find_invite_host(text: &str) -> Option<(usize, usize, usize)> {
 /// Validate a `/schedule` invocation (legacy `putScheduled` checks plus the
 /// handler's one-of rule). Count UTF-16 units and require sendable text after
 /// the shared outbound rendering, preserving the original body for storage.
-pub fn validate_schedule(input: &ScheduleInput<'_>) -> Result<ValidatedSchedule, ScheduleError> {
-    let body = input.body;
+/// Raw body shape: UTF-16 ceiling plus sendable text after the shared
+/// outbound rendering. Shared by creation and body-only correction so the
+/// two can never drift apart.
+fn check_body_shape(body: &str) -> Result<(), ScheduleError> {
     if crate::message_safety::text_len(body) > MAX_BODY_CHARS {
         return Err(ScheduleError::BodyTooLong);
     }
     if !crate::message_safety::has_message_text(&crate::message_safety::content(body)) {
         return Err(ScheduleError::BodyEmpty);
     }
+    Ok(())
+}
+
+/// Defuse mass mentions and invite pills before storage; benign bodies pass
+/// through byte-identical. A neutralization that grows the text past the
+/// ceiling refuses instead of handing storage a body the wire would reject,
+/// and a neutralization with no sendable text left refuses too.
+fn neutralize_and_recheck(body: &str) -> Result<String, ScheduleError> {
+    let neutralized = neutralize_scheduled_body(body);
+    if crate::message_safety::text_len(&neutralized) > MAX_BODY_CHARS {
+        return Err(ScheduleError::BodyTooLong);
+    }
+    if !crate::message_safety::has_message_text(&neutralized) {
+        return Err(ScheduleError::BodyEmpty);
+    }
+    Ok(neutralized)
+}
+
+/// Validate a replacement schedule body through the exact creation policy:
+/// raw shape, then neutralization, then the ceiling and text checks again
+/// on the stored shape. Returns the neutralized body. `/schedule-edit`
+/// shares this with creation so a correction can never store what creation
+/// would refuse.
+pub fn validate_schedule_body(body: &str) -> Result<String, ScheduleError> {
+    check_body_shape(body)?;
+    neutralize_and_recheck(body)
+}
+
+pub fn validate_schedule(input: &ScheduleInput<'_>) -> Result<ValidatedSchedule, ScheduleError> {
+    let body = input.body;
+    check_body_shape(body)?;
     if let Some(in_minutes) = input.in_minutes {
         if !(IN_MINUTES_MIN..=IN_MINUTES_MAX).contains(&in_minutes) {
             return Err(ScheduleError::InMinutesOutOfRange(in_minutes));
@@ -189,17 +229,7 @@ pub fn validate_schedule(input: &ScheduleInput<'_>) -> Result<ValidatedSchedule,
             return Err(ScheduleError::EveryMinutesOutOfRange(every_minutes));
         }
     }
-    // Defuse mass mentions and invite pills before storage; benign bodies
-    // pass through byte-identical. A neutralization that grows the text past
-    // the ceiling refuses instead of handing storage a body the wire would
-    // reject, and a neutralization with no sendable text left refuses too.
-    let neutralized = neutralize_scheduled_body(body);
-    if crate::message_safety::text_len(&neutralized) > MAX_BODY_CHARS {
-        return Err(ScheduleError::BodyTooLong);
-    }
-    if !crate::message_safety::has_message_text(&neutralized) {
-        return Err(ScheduleError::BodyEmpty);
-    }
+    let neutralized = neutralize_and_recheck(body)?;
     match (input.in_minutes, input.every_minutes) {
         (Some(in_minutes), _) => Ok(ValidatedSchedule {
             body: neutralized,
@@ -442,6 +472,160 @@ pub fn schedule_cancelled_text() -> &'static str {
 #[must_use]
 pub fn no_such_schedule_text(id: &str) -> String {
     format!("No scheduled message `{id}`.")
+}
+
+/// `/schedule-inspect` / `/schedule-edit` refusal for an empty, overlong,
+/// unknown, foreign-guild or ambiguous id. Unlike
+/// [`no_unique_match_text`] this never echoes the attempted value: inspect
+/// and edit refusals must stay mention-safe and body-free even for hostile
+/// input, and the fixed text still names the canonical-id source.
+#[must_use]
+pub fn schedule_unknown_id_text() -> &'static str {
+    "No unique scheduled message matches that id. Use the full id from /schedule-list."
+}
+
+/// `/schedule-inspect` private views. `Metadata` reports identity, timing
+/// and delivery state plus the edit revision; `Body` renders the whole
+/// saved definition verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InspectView {
+    Metadata,
+    Body,
+}
+
+/// Parse `/schedule-inspect`'s optional `view` selector. Missing selects
+/// metadata; anything but the two exact lowercase values refuses with the
+/// corrected invocation (echoes nothing).
+pub fn parse_inspect_view(view: Option<&str>) -> Result<InspectView, &'static str> {
+    match view {
+        None | Some("metadata") => Ok(InspectView::Metadata),
+        Some("body") => Ok(InspectView::Body),
+        Some(_) => {
+            Err("Unknown view. Use /schedule-inspect id:<schedule-id> view:<metadata|body>.")
+        }
+    }
+}
+
+/// Truthful one-line delivery state for `/schedule-inspect` metadata. A
+/// live claim wins over uncertainty, uncertainty over a bare pending
+/// nonce, and any fence over the enabled flag — but a disabled row always
+/// says so, so a fenced disabled row names both facts.
+#[must_use]
+pub fn schedule_delivery_state_word(
+    claimed: bool,
+    nonce_pending: bool,
+    uncertain: bool,
+    enabled: bool,
+) -> String {
+    let word = if claimed {
+        "claim active"
+    } else if uncertain {
+        "delivery uncertain"
+    } else if nonce_pending {
+        "nonce pending"
+    } else if enabled {
+        "idle"
+    } else {
+        "disabled"
+    };
+    if enabled || word == "disabled" {
+        word.to_owned()
+    } else {
+        format!("{word} (disabled)")
+    }
+}
+
+/// One-shot/recurrence fragment for `/schedule-inspect` metadata. Renders
+/// the raw stored seconds so hand-written sub-minute intervals stay
+/// truthful (unlike the list line, which floors to whole minutes).
+#[must_use]
+pub fn schedule_inspect_cadence_text(interval_seconds: Option<i64>) -> String {
+    match interval_seconds {
+        None => "one-shot".to_owned(),
+        Some(seconds) => format!("every {seconds}s"),
+    }
+}
+
+/// Historical last-run evidence for `/schedule-inspect` metadata: the run
+/// instant plus the posted message id when both are known, never a claim
+/// about a future delivery.
+#[must_use]
+pub fn schedule_inspect_last_run_text(
+    last_run_at: Option<&str>,
+    last_message_id: Option<&str>,
+) -> String {
+    match (last_run_at, last_message_id) {
+        (Some(ran), Some(message)) => format!("{ran} (message {message})"),
+        (Some(ran), None) => ran.to_owned(),
+        (None, _) => "never".to_owned(),
+    }
+}
+
+/// `/schedule-inspect` metadata view: canonical id, saved destination, due
+/// instant, cadence, truthful delivery state, last-run evidence and the
+/// opaque edit revision. Never the body — the separate body view renders
+/// that verbatim, so a maximum-length definition loses no tail to headers.
+#[must_use]
+pub fn schedule_inspect_metadata_text(
+    id: &str,
+    channel_id: &str,
+    next_run_at: &str,
+    cadence: &str,
+    state: &str,
+    last_run: &str,
+    revision: &str,
+) -> String {
+    format!(
+        "`{id}` in `<#{channel_id}>` — due {next_run_at} ({cadence})\n\
+         State: {state}\n\
+         Last run: {last_run}\n\
+         Revision: {revision}"
+    )
+}
+
+/// `/schedule-edit` success: the persisted state only — a fresh revision
+/// for chained corrections, never a promise of future delivery.
+#[must_use]
+pub fn schedule_edit_saved_text(id: &str, revision: &str) -> String {
+    format!("Saved the corrected body for `{id}`.\nRevision: {revision}")
+}
+
+/// `/schedule-edit` idempotent no-op: the stored body already matches, so
+/// no row, timestamp, revision or audit churn happened.
+#[must_use]
+pub fn schedule_edit_unchanged_text() -> &'static str {
+    "Body unchanged: the stored text already matches."
+}
+
+/// `/schedule-edit` refusal for a missing, empty or overlong revision
+/// option: without a token the edit cannot name the inspected state, so
+/// it refuses before any store read. Carries no id — the caller has not
+/// resolved one yet.
+#[must_use]
+pub fn schedule_edit_revision_required_text() -> &'static str {
+    "That edit is missing its Revision token. Run /schedule-inspect for the schedule, then retry /schedule-edit with the fresh Revision."
+}
+
+/// `/schedule-edit` refusal for a missing, malformed, forged or stale
+/// revision: the definition or its delivery evidence moved since the
+/// inspect, so the edit cannot prove what it would overwrite.
+#[must_use]
+pub fn schedule_edit_stale_text(id: &str) -> String {
+    format!(
+        "That schedule changed since you inspected it. Run /schedule-inspect \
+         id:`{id}` for a fresh Revision, then retry /schedule-edit."
+    )
+}
+
+/// `/schedule-edit` refusal while a delivery fence is armed. Names the
+/// fence truthfully and points back at inspect: this slice corrects idle
+/// bodies only and never clears claims, nonces or uncertainty.
+#[must_use]
+pub fn schedule_edit_fenced_text(id: &str, fence: &str) -> String {
+    format!(
+        "Cannot correct `{id}` while {fence}. Run /schedule-inspect id:`{id}` \
+         to review its delivery state, then retry /schedule-edit with a fresh Revision."
+    )
 }
 
 /// One `/schedule-list` row (legacy: `` `id` `<#channel>` `next` `[every Xm]`
@@ -1356,5 +1540,169 @@ mod tests {
             OccurrenceOutcome::PostedUnrecorded { cleaned: false }.audit_outcome(),
             "persistence_failed_uncertain"
         );
+    }
+
+    #[test]
+    fn body_only_correction_shares_the_creation_policy() {
+        // Ceilings pass byte-identical; one past any ceiling refuses.
+        assert_eq!(
+            validate_schedule_body(&"x".repeat(2000)).expect("ceiling ok"),
+            "x".repeat(2000)
+        );
+        assert_eq!(
+            validate_schedule_body(&"😀".repeat(1000)).expect("emoji ceiling ok"),
+            "😀".repeat(1000)
+        );
+        for invalid in [
+            "".to_owned(),
+            " \n\t\u{200b}".to_owned(),
+            "x".repeat(2001),
+            "😀".repeat(1001),
+            format!("{}@everyone", "x".repeat(1991)),
+        ] {
+            assert!(
+                validate_schedule_body(&invalid).is_err(),
+                "{invalid:?} refuses like creation"
+            );
+        }
+        // Same neutralization creation stores: mentions split, invites
+        // delinkified, already-neutral text untouched.
+        assert_eq!(
+            validate_schedule_body("@everyone @here discord.gg/abc").expect("neutralizes"),
+            "@\u{200b}everyone @\u{200b}here discord.\u{200b}gg/abc"
+        );
+        // Byte-identical refusal text: the handler replies with it.
+        assert_eq!(
+            validate_schedule_body("").expect_err("empty").to_string(),
+            "Message body must be between 1 and 2000 characters."
+        );
+        assert_eq!(
+            validate_schedule_body(&"x".repeat(2001))
+                .expect_err("long")
+                .to_string(),
+            "Message body must be between 1 and 2000 characters."
+        );
+    }
+
+    #[test]
+    fn inspect_view_defaults_to_metadata_and_names_corrections() {
+        assert_eq!(parse_inspect_view(None), Ok(InspectView::Metadata));
+        assert_eq!(
+            parse_inspect_view(Some("metadata")),
+            Ok(InspectView::Metadata)
+        );
+        assert_eq!(parse_inspect_view(Some("body")), Ok(InspectView::Body));
+        for unknown in [
+            "",
+            "METADATA",
+            "summary",
+            "metadata ",
+            "body ",
+            "x".repeat(9),
+        ] {
+            let refusal = parse_inspect_view(Some(&unknown)).expect_err("unknown view");
+            assert!(
+                refusal.contains("/schedule-inspect") && refusal.contains("view:<metadata|body>"),
+                "{unknown:?} corrects: {refusal}"
+            );
+            assert!(!refusal.contains(&unknown) || unknown.is_empty());
+        }
+    }
+
+    #[test]
+    fn inspect_state_words_are_truthful_and_always_name_disabled() {
+        // (claimed, nonce, uncertain, enabled) -> state word.
+        for (fences, word) in [
+            ((false, false, false, true), "idle"),
+            ((false, false, false, false), "disabled"),
+            ((true, true, false, true), "claim active"),
+            ((true, false, true, true), "claim active"),
+            ((false, true, false, true), "nonce pending"),
+            ((false, true, true, true), "delivery uncertain"),
+            ((false, false, true, true), "delivery uncertain"),
+            ((true, false, false, false), "claim active (disabled)"),
+            ((false, true, true, false), "delivery uncertain (disabled)"),
+        ] {
+            let (claimed, nonce, uncertain, enabled) = fences;
+            assert_eq!(
+                schedule_delivery_state_word(claimed, nonce, uncertain, enabled),
+                word,
+                "{fences:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inspect_fragments_render_raw_stored_facts() {
+        assert_eq!(schedule_inspect_cadence_text(None), "one-shot");
+        assert_eq!(schedule_inspect_cadence_text(Some(3600)), "every 3600s");
+        assert_eq!(schedule_inspect_cadence_text(Some(90)), "every 90s");
+        assert_eq!(
+            schedule_inspect_last_run_text(Some("2026-09-30T00:00:00.000Z"), Some("9000")),
+            "2026-09-30T00:00:00.000Z (message 9000)"
+        );
+        assert_eq!(
+            schedule_inspect_last_run_text(Some("2026-09-30T00:00:00.000Z"), None),
+            "2026-09-30T00:00:00.000Z"
+        );
+        assert_eq!(schedule_inspect_last_run_text(None, None), "never");
+        assert_eq!(schedule_inspect_last_run_text(None, Some("9000")), "never");
+    }
+
+    #[test]
+    fn inspect_and_edit_replies_carry_guidance_without_promises() {
+        let metadata = schedule_inspect_metadata_text(
+            "abc",
+            "3333",
+            "2030-01-01T00:00:00.000Z",
+            "every 3600s",
+            "idle",
+            "2026-09-30T00:00:00.000Z (message 9000)",
+            "rev",
+        );
+        for fact in [
+            "abc",
+            "3333",
+            "2030-01-01T00:00:00.000Z",
+            "3600",
+            "idle",
+            "9000",
+            "2026-09-30",
+            "Revision: rev",
+        ] {
+            assert!(metadata.contains(fact), "metadata keeps {fact}: {metadata}");
+        }
+        let saved = schedule_edit_saved_text("abc", "rev2");
+        assert!(saved.to_ascii_lowercase().contains("saved"));
+        assert!(saved.contains("rev2"));
+        for promise in [
+            "will be delivered",
+            "will be posted",
+            "delivery guaranteed",
+            "sent successfully",
+        ] {
+            assert!(!saved.to_ascii_lowercase().contains(promise));
+        }
+        assert!(schedule_edit_unchanged_text()
+            .to_ascii_lowercase()
+            .contains("unchanged"));
+        for refusal in [
+            schedule_edit_stale_text("abc"),
+            schedule_edit_fenced_text("abc", "a delivery claim is active"),
+            schedule_edit_revision_required_text().to_owned(),
+            schedule_unknown_id_text().to_owned(),
+        ] {
+            assert!(
+                refusal.contains("/schedule-inspect") || refusal.contains("/schedule-list"),
+                "guidance: {refusal}"
+            );
+            assert!(
+                !refusal.to_ascii_lowercase().contains("saved"),
+                "refusal is not a save: {refusal}"
+            );
+        }
+        assert!(schedule_edit_stale_text("abc").contains("`abc`"));
+        // The unknown-id text never echoes hostile input.
+        assert!(!schedule_unknown_id_text().contains("@everyone"));
     }
 }

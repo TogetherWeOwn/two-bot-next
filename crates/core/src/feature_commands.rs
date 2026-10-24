@@ -44,7 +44,7 @@ use super::custom_commands::{
 };
 use super::feeds_http::MAX_FEED_SOURCE_BYTES;
 use super::lfg::{MAX_ROLE_SPEC_CHARS, MAX_TITLE_CHARS};
-use super::scheduled::MAX_BODY_CHARS;
+use super::scheduled::{MAX_BODY_CHARS, MAX_INSPECT_VIEW_CHARS, MAX_SCHEDULE_REVISION_CHARS};
 
 /// Scorecard check-in command (parity #12). Keeps the `attendance` name; the
 /// RSVP-totals variant is the one that renames.
@@ -204,6 +204,46 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
                 CommandOptionType::Integer,
             )
             .min_value(1)]),
+        // Next-only queue inspection and body-only correction (parity rows
+        // 37–38): inspect the saved definition privately, or correct its
+        // body without replacing the stable schedule. Published after
+        // `schedule-list`; automation-gated and `ManageGuild`-gated like
+        // the other admin commands. The edit surface is body-only: no
+        // timing, destination or recurrence option exists.
+        CommandDefinition::new("schedule-inspect", "Inspect a saved scheduled message")
+            .permissions(PERM_MANAGE_GUILD)
+            .options(vec![
+                CommandOption::new("id", "Scheduled message id", CommandOptionType::String)
+                    .required()
+                    .max_length(MAX_RESOURCE_ID_CHARS as u32),
+                CommandOption::new(
+                    "view",
+                    "metadata (default) or body",
+                    CommandOptionType::String,
+                )
+                .max_length(MAX_INSPECT_VIEW_CHARS as u32),
+            ]),
+        CommandDefinition::new("schedule-edit", "Correct only a scheduled message body")
+            .permissions(PERM_MANAGE_GUILD)
+            .options(vec![
+                CommandOption::new("id", "Scheduled message id", CommandOptionType::String)
+                    .required()
+                    .max_length(MAX_RESOURCE_ID_CHARS as u32),
+                CommandOption::new(
+                    "revision",
+                    "Revision from schedule-inspect",
+                    CommandOptionType::String,
+                )
+                .required()
+                .max_length(MAX_SCHEDULE_REVISION_CHARS as u32),
+                CommandOption::new(
+                    "body",
+                    "Replacement message text",
+                    CommandOptionType::String,
+                )
+                .required()
+                .max_length(MAX_BODY_CHARS as u32),
+            ]),
         CommandDefinition::new("sticky", "Set this channel's sticky message")
             .permissions(PERM_MANAGE_GUILD)
             .options(vec![
@@ -472,6 +512,8 @@ mod tests {
                 "schedule",
                 "schedule-remove",
                 "schedule-list",
+                "schedule-inspect",
+                "schedule-edit",
                 "sticky",
                 "sticky-remove",
                 "rsvp",
@@ -488,8 +530,8 @@ mod tests {
     #[test]
     fn no_collision_with_leveling_core_or_within_slice() {
         let merged = merge_commands(&[feature_commands()], &[]).expect("slice 2 merges cleanly");
-        // 5 core + 1 scorecard + 9 automation + 7 announcement.
-        assert_eq!(merged.len(), 22);
+        // 5 core + 1 scorecard + 11 automation + 7 announcement.
+        assert_eq!(merged.len(), 24);
         assert_eq!(
             &names(&merged)[..6],
             [
@@ -525,6 +567,8 @@ mod tests {
             "schedule",
             "schedule-remove",
             "schedule-list",
+            "schedule-inspect",
+            "schedule-edit",
             "sticky",
             "sticky-remove",
         ] {
@@ -562,6 +606,11 @@ mod tests {
             ("command-inspect", 2, 500),
             ("schedule", 0, 2000),
             ("schedule-remove", 0, 128),
+            ("schedule-inspect", 0, 128),
+            ("schedule-inspect", 1, 8),
+            ("schedule-edit", 0, 128),
+            ("schedule-edit", 1, 128),
+            ("schedule-edit", 2, 2000),
             ("sticky", 0, 2000),
         ] {
             assert_eq!(
@@ -766,9 +815,15 @@ mod tests {
         // the announcement slice one index later.
         assert_eq!(json[4]["name"], "command-inspect");
         assert_eq!(json[4]["options"][2]["max_length"], 500);
-        assert_eq!(json[11]["name"], "rsvp-attendance");
-        assert!(json[11].get("default_member_permissions").is_none());
-        assert_eq!(json[11]["options"][0]["name"], "event-id");
+        // Queue inspection and body-only correction publish after
+        // `schedule-list`, shifting the announcement slice two more.
+        assert_eq!(json[8]["name"], "schedule-inspect");
+        assert_eq!(json[8]["options"][1]["max_length"], 8);
+        assert_eq!(json[9]["name"], "schedule-edit");
+        assert_eq!(json[9]["options"][2]["max_length"], 2000);
+        assert_eq!(json[13]["name"], "rsvp-attendance");
+        assert!(json[13].get("default_member_permissions").is_none());
+        assert_eq!(json[13]["options"][0]["name"], "event-id");
     }
 
     #[test]

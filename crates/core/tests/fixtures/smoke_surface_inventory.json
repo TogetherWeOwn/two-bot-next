@@ -1,6 +1,6 @@
 {
   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
-  "count": 33,
+  "count": 35,
   "dm_permission_all_false": true,
   "commands": [
     {
@@ -457,6 +457,82 @@
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Needs seeded scheduled rows (DB); the no-DB offline rule excludes it."
+    },
+    {
+      "name": "schedule-inspect",
+      "description": "Inspect a saved scheduled message",
+      "family": "automations",
+      "gate": "automations",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "id",
+          "description": "Scheduled message id",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 128,
+          "choices": []
+        },
+        {
+          "name": "view",
+          "description": "metadata (default) or body",
+          "type": "string",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 8,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Needs a live scheduled-message id to inspect (DB); read-only views are pinned by the disposable-database acceptance instead."
+    },
+    {
+      "name": "schedule-edit",
+      "description": "Correct only a scheduled message body",
+      "family": "automations",
+      "gate": "automations",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "id",
+          "description": "Scheduled message id",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 128,
+          "choices": []
+        },
+        {
+          "name": "revision",
+          "description": "Revision from schedule-inspect",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 128,
+          "choices": []
+        },
+        {
+          "name": "body",
+          "description": "Replacement message text",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 2000,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Mutating admin correction that needs a live scheduled-message id plus its inspect revision; the read-only smoke excludes state writes."
     },
     {
       "name": "sticky",

@@ -9,7 +9,7 @@
 //! the denial order (guild fence → feature gate → permission bits →
 //! policy/validation).
 //!
-//! Scope: the 32 non-voice built-in slash commands in `docs/commands.md` (core +
+//! Scope: the 35 non-voice built-in slash commands in `docs/commands.md` (core +
 //! scorecard + automation + announcement + moderation). Out of scope on
 //! purpose: voice commands (`voice_commands`, separate slice with its own
 //! `TWO_VOICE` gate and a `kick` name collision resolved first-wins in favour
@@ -290,6 +290,37 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             "AutomationAdmin",
             "Ephemeral text list of scheduled messages for this server.",
             &["Gate:AutomationsDisabled", "Perm:ManageServerRequired"],
+        ),
+        row(
+            "schedule-inspect",
+            37,
+            E2eGate::Automations,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "AutomationAdmin",
+            "Ephemeral defer then one private content-only view: saved metadata plus the edit revision by default, or the whole saved body verbatim. No mutation or audit row.",
+            &[
+                "Gate:AutomationsDisabled",
+                "Perm:ManageServerRequired",
+                "Valid:id:required",
+                "Valid:view:metadata|body",
+            ],
+        ),
+        row(
+            "schedule-edit",
+            38,
+            E2eGate::Automations,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "AutomationAdmin",
+            "Ephemeral defer then ephemeral save confirmation plus one content-free audit row; only body, updater and timestamp change, and only when the inspect revision still matches an idle definition.",
+            &[
+                "Gate:AutomationsDisabled",
+                "Perm:ManageServerRequired",
+                "Valid:id:required",
+                "Valid:revision:required",
+                "Valid:body:required",
+            ],
         ),
         row(
             "sticky",

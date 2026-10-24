@@ -66,10 +66,10 @@ Original registry surface: `CORE_COMMAND_DATA` (always published) = leveling onl
 | 30 | `/feed-list` | `page` opt ≥1 (1-based, default 1) | `ManageGuild` | **S4** |
 
 Runtime permission contract: `crates/core/src/command_permissions.rs` represents
-all 36 rows (33 retained builtins — the 27 legacy ones plus the Next-only
-`/help`, `/privacy`, `/command-inspect`, `/reopen`, `/purge-preview` and
-`/channel-inspect` — the dropped rota command, custom slash commands,
-and prefix triggers). The router checks the invoking interaction's resolved
+all 38 rows (35 retained builtins — the 27 legacy ones plus the Next-only
+`/help`, `/privacy`, `/command-inspect`, `/reopen`, `/purge-preview`,
+`/channel-inspect`, `/schedule-inspect` and `/schedule-edit` — the dropped
+rota command, custom slash commands, and prefix triggers). The router checks the invoking interaction's resolved
 `member.permissions`, not bot permissions or command-picker defaults, before
 returning a builtin handler. Missing restricted bits produce an ephemeral refusal
 and a metadata-only `command_permission_denied` tracing audit event (command,
@@ -123,6 +123,8 @@ golden exception or a claim of whole-baseline registry parity.
 
 | `purge-preview` | docs/parity.md §1 purge-preview | Add the Next-only staff-private purge sample, appended after `unlock`: moderation-gated, guild-only, ManageMessages, one required integer `count` (1–100), no reason. Shares execution's pin/own-bot filtering and bulk/single age planner; never deletes or writes audit/claim/lease state. |
 | `channel-inspect` | docs/parity.md §1 channel-inspect | Add the Next-only staff-private channel restriction snapshot after `purge-preview`: moderation-gated, guild-only, ManageChannels, no options. Saved lockdown plus live slowmode; explicit unknown setter/time where unavailable, no state mutation. |
+| `schedule-inspect` | docs/parity.md §1 #19 inspect | Add the Next-only `/schedule-inspect` management command (no legacy counterpart): automation-gated, guild-only, `ManageGuild`-gated, published after `schedule-list`. Required `id` (≤128 UTF-16 units, canonical or unique literal prefix) and optional `view` (metadata/body, metadata by default). One private ephemeral content-only view per call — saved metadata plus the opaque edit revision, or the whole saved body verbatim — read-only including audits; never a channel send, registration, claim touch or definition mutation. |
+| `schedule-edit` | docs/parity.md §1 #19 body correction | Add the Next-only `/schedule-edit` management command (no legacy counterpart): automation-gated, guild-only, `ManageGuild`-gated, published after `schedule-inspect`. Required `id` (≤128), required `revision` from inspect (≤128) and required `body` (≤2000, creation policy). Atomically rewrites only body/updater/timestamp plus one content-free `scheduled.edit` audit under the row lock, and only when the revision still matches an idle definition; armed claims, pending nonces and uncertain delivery refuse with an inspect/retry instruction. No timing, destination or recurrence option exists. |
 
 These are the complete registry exceptions, mirrored by the test allowlist.
 Only equivalent guild-API representation defaults are canonicalized: omitted
