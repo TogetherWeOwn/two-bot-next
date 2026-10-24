@@ -341,9 +341,17 @@ async fn schedule_body_edit_saves_only_body_updater_and_atomic_content_free_audi
         );
         assert_eq!(matching[0]["guild_id"], GUILD_S);
         assert_eq!(matching[0]["actor_id"], "88");
+        let audit_at = matching[0]["created_at"]
+            .as_str()
+            .expect("audit created_at instant");
+        let saved = row(db.pool(), id).await;
+        let row_at = saved["updated_at"].as_str().expect("saved edit timestamp");
         assert_eq!(
-            matching[0]["created_at"],
-            row(db.pool(), id).await["updated_at"]
+            time::OffsetDateTime::parse(audit_at, &time::format_description::well_known::Rfc3339)
+                .expect("audit instant parses"),
+            time::OffsetDateTime::parse(row_at, &time::format_description::well_known::Rfc3339)
+                .expect("row instant parses"),
+            "audit and row record the same edit instant"
         );
         assert_content_free_audits(&audits(db.pool()).await);
     }
