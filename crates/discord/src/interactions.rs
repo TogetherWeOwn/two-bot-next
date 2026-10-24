@@ -480,13 +480,7 @@ impl InteractionRuntime {
         interaction: &Interaction,
     ) -> Result<bool, crate::DiscordError> {
         use twilight_model::application::interaction::application_command::CommandOptionValue;
-        // Accept both Discord's partial channel and the older channel_id
-        // representation already used by gateway interactions in this runtime.
-        let channel_id = interaction
-            .channel
-            .as_ref()
-            .map(|channel| channel.id)
-            .or(interaction.channel_id);
+        let channel_id = crate::channel_moderation::invoking_channel_id(interaction);
         let (Some(guild), Some(channel_id), Some(InteractionData::ApplicationCommand(data))) =
             (interaction.guild_id, channel_id, interaction.data.as_ref())
         else {
@@ -502,12 +496,7 @@ impl InteractionRuntime {
         let reply = match cursor {
             Ok(cursor) => tokio::time::timeout(
                 std::time::Duration::from_secs(1),
-                crate::lfg_list::list(
-                    &self.pool,
-                    &guild.to_string(),
-                    &channel_id.to_string(),
-                    cursor,
-                ),
+                crate::lfg_list::list(&self.pool, &guild.to_string(), &channel_id, cursor),
             )
             .await
             .unwrap_or_else(|_| two_bot_core::lfg_list::UNAVAILABLE.into()),

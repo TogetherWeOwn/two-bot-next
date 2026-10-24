@@ -362,7 +362,7 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
         ),
         row(
             "lfg-list",
-            33,
+            34,
             E2eGate::Announcements,
             PERM_MANAGE_EVENTS,
             "ManageEvents",
