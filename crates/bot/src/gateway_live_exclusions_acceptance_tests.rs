@@ -291,7 +291,9 @@ async fn message_free_refresh(stream: Stream) {
     (poll.action)().await.expect("initial real settings poll");
     let live = crate::settings_jobs::live().expect("registered live reader");
     let pipeline = build_pipeline(vec![], None);
-    pipeline.enable_community_facts(fixture.pool().clone());
+    pipeline
+        .enable_community_facts(fixture.pool().clone())
+        .expect("healthy fixture arming");
     let store = two_bot_cutover::settings::SettingsStore::new(fixture.pool());
     let mut expected = Vec::new();
     let mut inserted = 0;
@@ -332,11 +334,13 @@ async fn message_free_refresh(stream: Stream) {
                 }
                 let event = stream.event(guild, &actor);
                 refresh_channel_classifier_from_poller(&pipeline, &event);
-                let requests = pipeline.collect_at(
-                    &event,
-                    "2026-10-20T12:01:00.000Z",
-                    two_bot_discord::MessageEligibility::default(),
-                );
+                let requests = pipeline
+                    .collect_at(
+                        &event,
+                        "2026-10-20T12:01:00.000Z",
+                        two_bot_discord::MessageEligibility::default(),
+                    )
+                    .expect("healthy collect");
                 pipeline
                     .drain(requests)
                     .await
@@ -425,7 +429,9 @@ async fn member_remove_closes_voice_with_fresh_exclusions() {
     let live = crate::settings_jobs::live().expect("registered live reader");
     let store = two_bot_cutover::settings::SettingsStore::new(fixture.pool());
     let pipeline = build_pipeline(vec![], None);
-    pipeline.enable_community_facts(fixture.pool().clone());
+    pipeline
+        .enable_community_facts(fixture.pool().clone())
+        .expect("healthy fixture arming");
     let mut expected = Vec::new();
     let mut inserted = 0;
 
@@ -572,11 +578,13 @@ async fn member_remove_closes_voice_with_fresh_exclusions() {
         let ended = format!("2026-10-20T12:{index:02}:30.000Z");
         let join = Stream::Voice.event(guild, actor);
         refresh_channel_classifier_from_poller(&pipeline, &join);
-        let requests = pipeline.collect_at(
-            &join,
-            &started,
-            two_bot_discord::MessageEligibility::default(),
-        );
+        let requests = pipeline
+            .collect_at(
+                &join,
+                &started,
+                two_bot_discord::MessageEligibility::default(),
+            )
+            .expect("healthy collect");
         pipeline
             .drain(requests)
             .await
@@ -604,11 +612,13 @@ async fn member_remove_closes_voice_with_fresh_exclusions() {
                 .expect("real MemberRemove payload"),
         );
         refresh_channel_classifier_from_poller(&pipeline, &leave);
-        let requests = pipeline.collect_at(
-            &leave,
-            &ended,
-            two_bot_discord::MessageEligibility::default(),
-        );
+        let requests = pipeline
+            .collect_at(
+                &leave,
+                &ended,
+                two_bot_discord::MessageEligibility::default(),
+            )
+            .expect("healthy collect");
         pipeline
             .drain(requests)
             .await
