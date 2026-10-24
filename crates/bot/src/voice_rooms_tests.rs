@@ -9233,7 +9233,7 @@ fn access_show_splits_rows_without_clipping_tokens() {
         assert!(text.contains("Required role:"));
         let mut rest = text.as_str();
         while let Some(start) = rest.find("<@&") {
-            rest = &rest[start + 4..];
+            rest = &rest[start + "<@&>".len()..];
             let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
             covered.push(digits.parse::<u64>().unwrap());
             assert!(rest[digits.len()..].starts_with('>'), "clipped token");

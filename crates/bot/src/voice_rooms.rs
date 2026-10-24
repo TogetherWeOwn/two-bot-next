@@ -13103,7 +13103,7 @@ fn access_row(command: &str, roles: &[Snowflake]) -> String {
 /// mention token. Empty roles never split: the whole row is short.
 fn access_row_units(command: &str, roles: &[Snowflake], capacity: usize) -> Vec<String> {
     let whole = access_row(command, roles);
-    if roles.is_empty() || text_len(&whole) + 1 <= capacity {
+    if roles.is_empty() || text_len(&whole) < capacity {
         return vec![whole];
     }
     // Worst-case segment label over every segment (a segment holds at least
