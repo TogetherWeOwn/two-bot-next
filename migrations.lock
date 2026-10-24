@@ -508,6 +508,14 @@
     "crates/cutover/migrations/0462_audit_reconcile_cursor.sql": {
       "sha256": "5c0ddbb7a347f3cf0c23e3e5216fe30aa276d6dbe5747dbbaae358fec6d9ee02",
       "justification": "Nullable durable audit reconciliation floor: checkpoint only fully inspected pages, resume across bounded claims without another POST, and preserve the original boundary and acceptance evidence. Additive IF NOT EXISTS; previous-binary rollback retains this column. Renumbered before first merge to 0462 because main owns 0458/0459 starboard and 0460/0461 giveaways; SQL bytes unchanged and no live migration performed."
+    },
+    "crates/store/migrations/0465_giveaway_pause_resume.sql": {
+      "sha256": "f970c7d2d8258badb41d25f8344a262497cf9acb23b83185bcfd4cae11fee5ea",
+      "justification": "Giveaways pause/resume: nullable paused_at marker so resume extends ends_at by the paused span; additive ADD COLUMN IF NOT EXISTS mirrored as cutover 0466."
+    },
+    "crates/cutover/migrations/0466_giveaway_pause_resume.sql": {
+      "sha256": "031cf3a0c87c58dfc4dd348e32e8043292578500fcf1055333a7a0e1ae8e1cb4",
+      "justification": "Cutover mirror of the store 0465 giveaway paused_at marker; additive ADD COLUMN IF NOT EXISTS so both chains cross-run in either order."
     }
   }
 }

@@ -872,8 +872,9 @@ pub async fn pause_giveaway(
 /// Resume a paused giveaway: the deadline moves forward by the paused span
 /// (see [`crate::giveaway::resume_deadline_ms`]), the pause marker clears,
 /// and entries reopen. Returns the new deadline, or `None` when the giveaway
-/// is unknown or not paused. The row lock serializes racing resumes; the
-/// second finds `open` and reports `None`.
+/// is unknown, not paused, or the recomputed deadline is unrepresentable.
+/// The row lock serializes racing resumes; the second finds `open` and
+/// reports `None`.
 pub async fn resume_giveaway(
     pool: &Pool<Postgres>,
     guild_id: &str,
@@ -896,8 +897,9 @@ pub async fn resume_giveaway(
     let paused_ms = row.paused_at.map_or(epoch_ms(now), epoch_ms);
     let ends_ms =
         crate::giveaway::resume_deadline_ms(epoch_ms(row.ends_at), paused_ms, epoch_ms(now));
-    let ends_at = OffsetDateTime::from_unix_timestamp_nanos(ends_ms as i128 * 1_000_000)
-        .unwrap_or(OffsetDateTime::MAX);
+    let Ok(ends_at) = OffsetDateTime::from_unix_timestamp_nanos(ends_ms as i128 * 1_000_000) else {
+        return Ok(None);
+    };
     sqlx::query(
         "UPDATE giveaways SET status = 'open', ends_at = $3, paused_at = NULL, updated_at = $4
           WHERE guild_id = $1 AND id = $2 AND status = 'paused'",
@@ -914,7 +916,8 @@ pub async fn resume_giveaway(
 
 /// Extend an open or paused giveaway's deadline by `extra_seconds` (validated
 /// by the caller with [`crate::giveaway::extend_deadline_ms`]). Returns the
-/// new deadline, or `None` when the giveaway is unknown, drawn or cancelled.
+/// new deadline, or `None` when the giveaway is unknown, drawn or cancelled,
+/// or the new deadline is unrepresentable.
 /// The row lock serializes racing extends against each other and the resume
 /// math above. Extending a paused row keeps it paused.
 pub async fn extend_giveaway(
@@ -941,8 +944,9 @@ pub async fn extend_giveaway(
     else {
         return Ok(None);
     };
-    let ends_at = OffsetDateTime::from_unix_timestamp_nanos(ends_ms as i128 * 1_000_000)
-        .unwrap_or(OffsetDateTime::MAX);
+    let Ok(ends_at) = OffsetDateTime::from_unix_timestamp_nanos(ends_ms as i128 * 1_000_000) else {
+        return Ok(None);
+    };
     sqlx::query(
         "UPDATE giveaways SET ends_at = $3, updated_at = $4 WHERE guild_id = $1 AND id = $2",
     )
