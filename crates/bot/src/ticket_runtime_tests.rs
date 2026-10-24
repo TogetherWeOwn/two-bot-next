@@ -109,7 +109,7 @@ async fn stored_destination_rows_move_the_live_ticket_config_without_restart() {
 
     let (mut writer, live) = live_channel();
     // A stored category row wins over the boot deployment value on the next
-    // refresh; panel, staff and the cold cooldown are untouched.
+    // refresh; panel, staff and cooldown have no rows so are untouched.
     writer.publish(&SettingsSnapshot {
         revision: 1,
         rows: vec![SettingRow {
@@ -148,6 +148,129 @@ async fn stored_destination_rows_move_the_live_ticket_config_without_restart() {
     assert_eq!(
         runtime.config_for_test(),
         TicketConfig::from_vars(&deployment_vars(), 100, COOLDOWN_SECONDS).unwrap()
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn stored_cooldown_rows_move_the_live_ticket_cooldown_without_restart() {
+    let mock = MockRest::start(Vec::new(), ScriptedResponse::status(500)).await;
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@agent-testdb:5432/agent_test")
+        .unwrap();
+    let executor =
+        ActionExecutor::with_proxy("ticket-test-token".into(), Some(mock.origin())).unwrap();
+    // Production filters deployment to the destination keys; new() carries
+    // the effective boot cooldown itself, so build the map the same way.
+    let deployment = deployment_vars();
+    let runtime = TicketRuntime::new(
+        pool,
+        executor,
+        TicketConfig::from_vars(&deployment, 100, COOLDOWN_SECONDS).unwrap(),
+        deployment,
+    )
+    .unwrap();
+
+    let (mut writer, live) = live_channel();
+    let cooldown_row = |value: serde_json::Value| SettingRow {
+        guild_id: "100".to_owned(),
+        key: COOLDOWN_KEY.to_owned(),
+        value,
+        version: 1,
+    };
+    // Stored rows win in both directions over the boot deployment value.
+    writer.publish(&SettingsSnapshot {
+        revision: 1,
+        rows: vec![cooldown_row(json!(600))],
+    });
+    runtime.refresh_config_with(Some(&live));
+    assert_eq!(runtime.config_for_test().cooldown_seconds, 600);
+    writer.publish(&SettingsSnapshot {
+        revision: 2,
+        rows: vec![cooldown_row(json!(60))],
+    });
+    runtime.refresh_config_with(Some(&live));
+    assert_eq!(runtime.config_for_test().cooldown_seconds, 60);
+
+    // A malformed stored row keeps the last good cooldown while destinations
+    // still move.
+    writer.publish(&SettingsSnapshot {
+        revision: 3,
+        rows: vec![
+            SettingRow {
+                guild_id: "100".to_owned(),
+                key: COOLDOWN_KEY.to_owned(),
+                value: json!("never"),
+                version: 1,
+            },
+            SettingRow {
+                guild_id: "100".to_owned(),
+                key: "DISCORD_TICKET_CATEGORY_ID".to_owned(),
+                value: json!("201"),
+                version: 1,
+            },
+        ],
+    });
+    runtime.refresh_config_with(Some(&live));
+    let config = runtime.config_for_test();
+    assert_eq!(config.cooldown_seconds, 60);
+    assert_eq!(config.category_id, "201");
+
+    // Deleting the row hands the cooldown back to the boot deployment value.
+    writer.publish(&SettingsSnapshot {
+        revision: 4,
+        rows: vec![],
+    });
+    runtime.refresh_config_with(Some(&live));
+    assert_eq!(runtime.config_for_test().cooldown_seconds, COOLDOWN_SECONDS);
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn ops_cooldown_apply_clear_and_expiry_refresh_without_a_database_revision() {
+    use two_bot_core::settings::{OpsApplyOutcome, OpsRecord, MAX_OPS_STALENESS};
+
+    let mock = MockRest::start(Vec::new(), ScriptedResponse::status(500)).await;
+    let runtime = runtime(&mock);
+    let (mut writer, live) = live_channel();
+    writer.publish(&SettingsSnapshot {
+        revision: 1,
+        rows: vec![],
+    });
+    runtime.refresh_config_with(Some(&live));
+    assert_eq!(runtime.config_for_test().cooldown_seconds, COOLDOWN_SECONDS);
+    let now = std::time::Instant::now();
+    for (epoch, overrides, expected) in [
+        (
+            1,
+            HashMap::from([(COOLDOWN_KEY.to_owned(), "60".to_owned())]),
+            60,
+        ),
+        (2, HashMap::new(), COOLDOWN_SECONDS),
+        (
+            3,
+            HashMap::from([(COOLDOWN_KEY.to_owned(), "30".to_owned())]),
+            30,
+        ),
+    ] {
+        assert!(matches!(
+            writer.apply_ops(Some(&OpsRecord { epoch, overrides }), now),
+            OpsApplyOutcome::Applied { .. }
+        ));
+        assert_eq!(live.revision(), 1, "ops does not move the DB revision");
+        runtime.refresh_config_with(Some(&live));
+        assert_eq!(runtime.config_for_test().cooldown_seconds, expected);
+    }
+    assert_eq!(
+        writer.apply_ops(None, now + MAX_OPS_STALENESS + Duration::from_secs(1)),
+        OpsApplyOutcome::Expired
+    );
+    assert_eq!(live.revision(), 1);
+    runtime.refresh_config_with(Some(&live));
+    assert_eq!(runtime.config_for_test().cooldown_seconds, COOLDOWN_SECONDS);
+    assert!(
+        mock.requests().is_empty(),
+        "refresh needs no REST or DB I/O"
     );
     mock.shutdown().await;
 }

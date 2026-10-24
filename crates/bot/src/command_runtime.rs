@@ -1004,10 +1004,20 @@ impl CommandRuntime {
                 else {
                     return true;
                 };
-                // The gateway also delivers these to the live voice sink. Yield
-                // before user-slot/lane admission so overload cannot answer a
-                // voice-owned command with the shared runtime's busy callback.
-                if self.voice_owns_interaction(&interaction) {
+                // The gateway also delivers these to their feature owners. Yield
+                // before user-slot/lane admission so overload cannot race the
+                // voice or onboarding defer with the shared busy callback.
+                if self.voice_owns_interaction(&interaction)
+                    || matches!(
+                        route_interaction(&self.interactions.router, &interaction, None),
+                        RoutedInteraction::Slash {
+                            outcome: SlashOutcome::Handled {
+                                handler: HandlerId::Reopen
+                            },
+                            ..
+                        }
+                    )
+                {
                     return true;
                 }
                 let runtime = Arc::clone(self);
@@ -1428,6 +1438,15 @@ impl CommandRuntime {
         let SlashOutcome::Handled { handler } = outcome else {
             return;
         };
+        if handler == HandlerId::Reopen {
+            // The onboarding worker owns `/reopen` end to end (ingress defer
+            // at reception plus the durable menu job through the same
+            // pipeline as the picker components). Answering here — even the
+            // unavailable terminal below — would race that owner for the
+            // single initial callback, so this runtime stays silent exactly
+            // like it does for the `GamePicker`/`SessionPicker` components.
+            return;
+        }
         if matches!(handler, HandlerId::Rank | HandlerId::Leaderboard) {
             // Leveling owns its defer-then-edit lifecycle: an ephemeral defer
             // for rank, a public defer for leaderboard, each completed by one
@@ -2588,6 +2607,12 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     // `/privacy` member self-serve is never activation-fenced either: every
     // member may opt out of analytics in any guild.
     router.register(Box::new(SliceHandler(HandlerId::Privacy)));
+    // `/reopen` picker recovery is never activation-fenced either: every
+    // member may reopen their own pickers in any gate state. Execution
+    // lives in the onboarding worker (`on_interaction` below stays silent
+    // for it, exactly like the picker components); this registration only
+    // advertises the ownership the router outcome names.
+    router.register(Box::new(SliceHandler(HandlerId::Reopen)));
     router
 }
 
