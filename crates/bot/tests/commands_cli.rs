@@ -77,9 +77,13 @@ fn matching_registry() -> Value {
         object.entry("options").or_insert(json!([]));
         for option in command["options"].as_array_mut().unwrap() {
             let object = option.as_object_mut().unwrap();
-            object.insert("required".into(), json!(false));
+            // The server echoes back required flags and fixed choices: only
+            // fill in Discord's defaults where the compiled option omits
+            // them, so a required choice option (like `/reopen kind`)
+            // still matches its own echo.
+            object.entry("required").or_insert(json!(false));
             object.insert("autocomplete".into(), json!(false));
-            object.insert("choices".into(), json!([]));
+            object.entry("choices").or_insert(json!([]));
             object.insert("name_localizations".into(), json!({}));
             object.insert("description_localizations".into(), json!({}));
         }
@@ -128,6 +132,7 @@ async fn diff_and_publish_default_to_get_only_without_opening_a_database() {
             "+ 1/rank",
             "+ 1/leaderboard",
             "+ 1/help",
+            "+ 1/reopen",
             "Dry run: no commands written.",
         ] {
             assert!(
