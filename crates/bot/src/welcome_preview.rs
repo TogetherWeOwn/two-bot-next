@@ -126,6 +126,20 @@ impl OnboardingRuntime {
         let components = picker_components(picker, &[], &config.session_picks);
         // Components remain byte-identical to the live renderer. Their original
         // preview message banner fences submissions before config or mutations.
+        if components.is_empty() {
+            // The live channel post omits the components key when the picker
+            // is empty (anchor mode); the preview must serialize identically
+            // rather than sending an explicit empty array.
+            return self
+                .executor
+                .edit_interaction_response_with_blocked_retry(
+                    interaction.application_id.get(),
+                    &interaction.token,
+                    &content,
+                )
+                .await
+                .map_err(|_| RuntimeError::Discord);
+        }
         self.executor
             .edit_interaction_response_with_components_and_blocked_retry(
                 interaction.application_id.get(),
