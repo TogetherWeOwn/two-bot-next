@@ -78,9 +78,11 @@ use PolicyHook::{
 /// no help command), the Next-only `/privacy` member self-serve
 /// (parity row 32), management-only `/command-inspect` (parity row 33),
 /// `/reopen` picker recovery (parity row 34), plus the private moderation
-/// reads `/purge-preview` (row 35) and `/channel-inspect` (row 36).
+/// reads `/purge-preview` (row 35) and `/channel-inspect` (row 36), and the
+/// private schedule management reads `/schedule-inspect` (row 37) and
+/// `/schedule-edit` (row 38).
 /// No Administrator-only exception: preserve the legacy resolved-bit check.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 36] = [
+pub const COMMAND_PERMISSIONS: [CommandPermission; 38] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),

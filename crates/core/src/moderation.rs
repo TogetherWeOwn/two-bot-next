@@ -652,11 +652,11 @@ mod tests {
             ]
         );
         assert_eq!(
-            &names[22..27],
+            &names[24..29],
             ["ban", "tempban", "kick", "timeout", "warn"]
         );
         assert_eq!(
-            &names[27..],
+            &names[29..],
             [
                 "purge",
                 "slowmode",

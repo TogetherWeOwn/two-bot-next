@@ -30,6 +30,10 @@ use crate::automation_quota::{lock_quota, AutomationQuota, QuotaWriteError};
 use crate::scheduled::advance_next_run_iso;
 
 /// One scheduled message row (legacy `ScheduledMessageRow`).
+///
+/// `Debug` is manual: `claim_token` is the ticker lease capability, so it
+/// stays out of diagnostics while every other field remains available
+/// (same shape as [`crate::giveaway_store::GiveawayRow`]).
 #[derive(Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct ScheduledMessageRow {
     pub id: String,
@@ -50,6 +54,33 @@ pub struct ScheduledMessageRow {
     pub occurrence_nonce: Option<String>,
     /// Armed before POST; expiry/restart never proves the occurrence unsent.
     pub delivery_uncertain: bool,
+}
+
+impl std::fmt::Debug for ScheduledMessageRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScheduledMessageRow")
+            .field("id", &self.id)
+            .field("guild_id", &self.guild_id)
+            .field("channel_id", &self.channel_id)
+            .field("body", &self.body)
+            .field("next_run_at", &self.next_run_at)
+            .field("interval_seconds", &self.interval_seconds)
+            .field("enabled", &self.enabled)
+            .field("last_run_at", &self.last_run_at)
+            .field("last_message_id", &self.last_message_id)
+            .field("created_by", &self.created_by)
+            .field("created_at", &self.created_at)
+            .field("updated_by", &self.updated_by)
+            .field("updated_at", &self.updated_at)
+            .field(
+                "claim_token",
+                &self.claim_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("claimed_at", &self.claimed_at)
+            .field("occurrence_nonce", &self.occurrence_nonce)
+            .field("delivery_uncertain", &self.delivery_uncertain)
+            .finish()
+    }
 }
 
 /// A scheduled-message definition write (legacy `putScheduled` input row).
@@ -434,7 +465,7 @@ pub fn schedule_revision_token(row: &ScheduledMessageRow) -> String {
     } else {
         b"\x00"
     });
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// Delivery fence that refuses a body-only correction: an unconsumed
