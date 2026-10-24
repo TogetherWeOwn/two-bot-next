@@ -395,7 +395,7 @@ async fn enabled_clone_copies_saved_fields_without_trigger_history_or_source_mut
         .map(|d| d["name"].as_str().expect("published command name"))
         .collect();
     for required in [
-        "ping",
+        "help",
         "command",
         "command-inspect",
         "command-clone",
@@ -1184,7 +1184,7 @@ async fn shared_runtime_full_set_publication_never_loses_an_admitted_clone() {
         .map(|d| d["name"].as_str())
         .collect();
     for name in [
-        "ping",
+        "help",
         "command-clone",
         "source",
         "occupied",
