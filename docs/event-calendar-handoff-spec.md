@@ -20,14 +20,14 @@ mechanism and data handling were not inspected.
 | Option | Value and cost | Disposition |
 | --- | --- | --- |
 | No build; current time tag | `/rsvp-attendance` already shows the member's saved time as a Discord-localized tag; members copy it by hand | Safe default; retain unless the boundary below is accepted |
-| One-event RFC 5545 `.ics` attachment | One ephemeral file, expected to import in common calendar apps (unverified hypothesis; section 7), nothing leaves the reply except the file; needs a **file-in-reply seam this repo lacks** (section 2) | Smallest private handoff that meets the constraints; recommend for **spec review**, not build |
+| One-event RFC 5545 `.ics` attachment | One ephemeral file, expected to import in common calendar apps (unverified hypothesis; section 7), nothing leaves the reply except the file; needs generalizing the voice-scoped file-in-reply seam (section 2) | Smallest private handoff that meets the constraints; recommend for **spec review**, not build |
 | Add-to-calendar link | No file, but needs a vendor URL carrying title and time in a query string, one vendor per link, and (for the vendor URL shape this author knows) an end time that TWO does not have; a TWO-hosted link would be a new public endpoint | Do not add; vendor URL behavior was **not verified** here |
 
 Out of scope and not proposed: OAuth or calendar APIs, subscriptions, a feed
 (`webcal://` or otherwise), recurring series, attendee or roster export, DMs,
 notifications, reminders, update synchronization, new endpoints, spend.
 
-## 2. Verified baseline and missing seams
+## 2. Verified baseline and existing seams
 
 Inspected repository head: `89b26ae050ffba9fb409622ffd54d31cdc79e7fc`.
 
@@ -45,17 +45,33 @@ Inspected repository head: `89b26ae050ffba9fb409622ffd54d31cdc79e7fc`.
   offset start to UTC millis, e.g. `+01:00` to `...Z`. `updated_at` is the
   poller's UTC-millis observation time (`website_store.rs:280`). The mirror
   polls every 10 minutes (`scheduled_events.rs:31`); `0452` adds tombstones.
-- **Missing seam 1:** no code path attaches a file to an interaction reply.
-  `Attachment` appears only as an inbound command-option type
-  (`crates/core/src/commands.rs:74`); the only multipart text in the tree is the
-  S3 backup note (`crates/core/src/backup/s3.rs:6`), and replies are plain
-  content truncated to 2,000 characters (`crates/discord/src/interactions.rs:120`).
-  The recommended option therefore needs a new reply-with-file capability. That
-  makes "one PR, at most one engineering day" **optimistic**; if the seam cannot
-  stay small, stop this proposal rather than downgrade silently.
-- **Missing seam 2:** no reusable "can this member see this channel" check was
-  found for non-voice channels (`voice_permissions.rs` is voice-specific). The
-  build must name or add one; it must not infer visibility from an RSVP row.
+- **File-in-reply seam (exists, voice-scoped):** voice `/export` already
+  attaches a file to an ephemeral interaction reply. `export_file_response`
+  (`crates/bot/src/voice_rooms.rs:11708`) builds an ephemeral
+  `InteractionResponse` carrying `Attachment::from_bytes`; the `/export`
+  handler calls it at `:13753`, `complete` plumbs attachments through at
+  `:14172` into `complete_interaction`, and the upload bytes survive the
+  sanitized round trip (`crates/discord/src/message_safety.rs:181-186`). That
+  handler is gated to server managers (`may_manage_server`, `:13735`:
+  `ADMINISTRATOR | MANAGE_GUILD`). The recommended option therefore needs to
+  **generalize** this seam from manager-only to any RSVP'd member, not build a
+  new transport. An earlier revision claimed no such path existed; the claim
+  was wrong (the text search missed Twilight's `Attachment` API, which never
+  names multipart) and is corrected here. If the seam cannot stay small, stop
+  this proposal rather than downgrade silently.
+- **Member-channel visibility check (exists):** `resolve_channel_access`
+  (`crates/discord/src/channel_access.rs:28`) resolves
+  `ChannelAccess { view, ... }` from roles and overwrites, and
+  `crates/bot/src/preflight.rs:607` already uses `access.view` to gate
+  non-voice `GuildText`/`Announcement` channels (fetch the channel, roles and
+  overwrites over REST, then resolve; see
+  `docs/channel-access-acceptance.md`). The second parameter is named `bot_id`
+  but takes any member id (preflight passes `user.id`). The build must reuse
+  this check with live REST reads for roles and overwrites; it must not infer
+  visibility from an RSVP row. An earlier revision claimed no reusable check
+  existed; the claim was wrong and is corrected here. The channel-less case
+  (section 4, step 4) stays an open CISO question, not an assumed guild-wide
+  event.
 
 No live guild, permission, deployment or shared-database writer was inspected.
 Import behavior in real calendar apps was **not** verified (section 7).
@@ -169,11 +185,14 @@ Rules the generator must satisfy (reference oracle in section 6):
 **CISO proposal assessment:** acceptable to circulate for intent review with the
 controls above; **not** a grant, not independent approval of our own boundary
 request, and not runtime security acceptance. Blocking findings before any
-build: (1) accept or narrow the new file-export boundary and the Discord
-attachment retention; (2) name the channel-visibility check (seam 2) and decide
-the channel-less case; (3) accept the field allowlist, notably excluding
-description and location. If the file seam needs broad authority or persistent
-state, stop this proposal. No credential or permission is requested here.
+build: (1) accept or narrow the privilege expansion (ephemeral file export
+already exists for server managers via voice `/export`; this proposal extends
+it to any RSVP'd member) and the Discord attachment retention; (2) decide the
+channel-less case (the visibility check itself, `resolve_channel_access`, is
+named in section 2); (3) accept the field allowlist, notably excluding
+description and location. If generalizing the file seam needs broad authority
+or persistent state, stop this proposal. No credential or permission is
+requested here.
 
 ## 6. Agent-facing result and offline fixture contract
 
@@ -339,14 +358,15 @@ directly to the owner or to an invented host executor.
 The decision must accept or revise: the ephemeral preview-then-export flow; the
 `.ics` attachment as the only export; the four-property field allowlist with
 description and location excluded; the collapsed `UNAVAILABLE` ordering; the
-no-end-time and UTC-only representation; and the new file-in-reply seam. A
-material revision binds a fresh review request and alignment.
+no-end-time and UTC-only representation; and generalizing the voice-scoped
+file-in-reply seam to RSVP'd members. A material revision binds a fresh review
+request and alignment.
 
 By 2026-10-31 the metric is **all 16 oracle rows have agreed or explicitly
 rejected outcomes, the three blocking findings have written disposition, and the
-existing permission path is shown to support a member-channel visibility check**.
+named visibility check is shown wired to the RSVP'd-member path**.
 This measures design completeness, not engagement. Retain only if the fixture
-matrix shows no unintended disclosure and that permission path exists; otherwise
+matrix shows no unintended disclosure and that wiring holds; otherwise
 revise or stop this proposal, not the project. Default while unresolved is no
 build and the current time tag. No timeout auto-approves; a future demand
 experiment needs its own hypothesis, metric and date.
