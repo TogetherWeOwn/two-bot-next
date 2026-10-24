@@ -28,6 +28,7 @@ mod command_runtime;
 #[cfg(test)]
 mod command_runtime_tests;
 mod commands_cli;
+mod community_classifier;
 mod community_jobs;
 mod containment_runtime;
 #[cfg(test)]
@@ -71,6 +72,7 @@ mod gateway_failure;
 mod gateway_metrics;
 #[cfg(test)]
 mod gateway_tests;
+mod giveaway_runtime;
 #[cfg(test)]
 mod hotpath_settings_test_support;
 mod interaction_admission;
@@ -1040,7 +1042,8 @@ fn build_interaction_runtime(
             executor,
             0,
             two_bot_core::ClassifierConfig::from_env(),
-        ),
+        )
+        .with_classifier_provider(Arc::new(community_classifier::LiveClassifier)),
     ))
 }
 

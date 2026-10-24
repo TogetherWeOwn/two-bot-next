@@ -78,16 +78,17 @@ use PolicyHook::{
 /// no help command), the Next-only `/privacy` member self-serve
 /// (parity row 32), management-only `/command-inspect` (parity row 33),
 /// `/reopen` picker recovery (parity row 34), the private moderation reads
-/// `/purge-preview` (row 35) and `/channel-inspect` (row 36), and the
-/// Next-only pause/resume `/command-disable` and `/command-enable` (parity
-/// rows 37 and 38).
+/// `/purge-preview` (row 35) and `/channel-inspect` (row 36), `/giveaway`
+/// timed entry (parity row 37), and the Next-only pause/resume
+/// `/command-disable` and `/command-enable` (parity rows 38 and 39).
 /// No Administrator-only exception: preserve the legacy resolved-bit check.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 38] = [
+pub const COMMAND_PERMISSIONS: [CommandPermission; 39] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),
     row(32, "privacy", BuiltinSlash, 0, None),
     row(34, "reopen", BuiltinSlash, 0, None),
+    row(37, "giveaway", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(
         3,
         "ban",
@@ -153,8 +154,8 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 38] = [
     row(15, "command-remove", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(16, "command-list", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(33, "command-inspect", BuiltinSlash, PERM_MANAGE_GUILD, None),
-    row(37, "command-disable", BuiltinSlash, PERM_MANAGE_GUILD, None),
-    row(38, "command-enable", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(38, "command-disable", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(39, "command-enable", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(17, "schedule", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(18, "schedule-remove", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(19, "schedule-list", BuiltinSlash, PERM_MANAGE_GUILD, None),
