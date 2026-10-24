@@ -157,6 +157,8 @@ fn parity_builtins_route_to_their_handlers() {
             HandlerId::Moderation(ModerationAction::Lockdown),
         ),
         ("unlock", HandlerId::Moderation(ModerationAction::Unlock)),
+        ("purge-preview", HandlerId::PurgePreview),
+        ("channel-inspect", HandlerId::ChannelInspect),
         ("attendance", HandlerId::ScorecardAttendance),
         ("command", HandlerId::AutomationAdmin),
         ("command-remove", HandlerId::AutomationAdmin),
@@ -177,8 +179,8 @@ fn parity_builtins_route_to_their_handlers() {
     ];
     assert_eq!(
         cases.len(),
-        31,
-        "all 31 parity and Next-only builtins covered"
+        33,
+        "all 33 parity and Next-only builtins covered"
     );
     for (name, handler) in cases {
         assert_eq!(
@@ -205,5 +207,5 @@ fn e2e_matrix_still_matches_the_publish_set() {
         matrix_names, published_names,
         "matrix drift: the fix must not change the parity publish set"
     );
-    assert_eq!(matrix.len(), 31, "contract covers the 31 built-in commands");
+    assert_eq!(matrix.len(), 33, "contract covers the 33 built-in commands");
 }
