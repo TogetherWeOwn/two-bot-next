@@ -414,7 +414,7 @@ fn redact_source_query(raw: &str, reasons: &mut Vec<&'static str>) -> String {
     // Some origins (Rack/Rails, Perl CGI) treat `;` as a pair separator too;
     // splitting only on `&` would leave a credential pair hidden inside a
     // safe-looking value. Preserve the original separator in the projection.
-    for chunk in raw.split_inclusive(|c| c == '&' || c == ';') {
+    for chunk in raw.split_inclusive(['&', ';']) {
         let (pair, separator) = if let Some(stripped) = chunk.strip_suffix('&') {
             (stripped, "&")
         } else if let Some(stripped) = chunk.strip_suffix(';') {
