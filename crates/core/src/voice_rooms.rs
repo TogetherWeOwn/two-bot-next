@@ -3088,9 +3088,15 @@ mod tests {
         assert_eq!(defs[0].options.len(), 1);
         assert_eq!(defs[0].options[0].name, "name");
         assert!(defs[0].options[0].required == Some(true));
-        // `/setup` is viewable by anyone; handler actions need admin.
+        // `/setup` is viewable by anyone; handler actions need admin. It
+        // takes one optional 1-based creator page.
         assert_eq!(defs[1].default_member_permissions, None);
-        assert!(defs[1].options.is_empty());
+        assert_eq!(defs[1].options.len(), 1);
+        assert_eq!(defs[1].options[0].name, "page");
+        assert_eq!(defs[1].options[0].kind, CommandOptionType::Integer.as_u8());
+        assert_eq!(defs[1].options[0].required, None);
+        assert_eq!(defs[1].options[0].min_value, Some(1));
+        assert_eq!(defs[1].options[0].max_value, None);
         // `/ping` and `/invite` are open to everyone and take no options.
         for def in &defs[2..4] {
             assert_eq!(def.default_member_permissions, None);
@@ -3142,6 +3148,17 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["show", "creation", "role", "restrict", "unrestrict"]
         );
+        // `/access show` takes one optional 1-based settings page.
+        assert_eq!(access.options[0].name, "show");
+        assert_eq!(access.options[0].options.len(), 1);
+        assert_eq!(access.options[0].options[0].name, "page");
+        assert_eq!(
+            access.options[0].options[0].kind,
+            CommandOptionType::Integer.as_u8()
+        );
+        assert_eq!(access.options[0].options[0].required, None);
+        assert_eq!(access.options[0].options[0].min_value, Some(1));
+        assert_eq!(access.options[0].options[0].max_value, None);
         assert_eq!(
             logging.default_member_permissions,
             Some(PERM_MANAGE_CHANNELS.to_string())
