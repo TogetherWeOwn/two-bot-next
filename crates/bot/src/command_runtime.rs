@@ -2473,6 +2473,14 @@ pub(crate) fn feed_add_options_strict(
     if sources.len() > 1 {
         return Err(FEED_ADD_DUPLICATE_SOURCE);
     }
+    // Wrong-type phase: a present-but-unusable option refuses before any
+    // missing option is named, in declared order.
+    if !matches!(kinds.first(), None | Some(CommandOptionValue::String(_))) {
+        return Err(FEED_ADD_INVALID_KIND);
+    }
+    if !matches!(sources.first(), None | Some(CommandOptionValue::String(_))) {
+        return Err(FEED_ADD_INVALID_SOURCE);
+    }
     let kind = match kinds.first() {
         None => return Err(FEED_ADD_MISSING_KIND),
         Some(CommandOptionValue::String(value)) => (*value).clone(),
@@ -2666,6 +2674,17 @@ pub(crate) fn sticky_options_strict(
     }
     if debounces.len() > 1 {
         return Err(STICKY_DUPLICATE_DEBOUNCE);
+    }
+    // Wrong-type phase: a present-but-unusable option refuses before a
+    // missing `body` is named, in declared order.
+    if !matches!(bodies.first(), None | Some(CommandOptionValue::String(_))) {
+        return Err(STICKY_INVALID_BODY);
+    }
+    if !matches!(
+        debounces.first(),
+        None | Some(CommandOptionValue::Integer(_))
+    ) {
+        return Err(STICKY_INVALID_DEBOUNCE);
     }
     let body = match bodies.first() {
         None => return Err(STICKY_MISSING_BODY),

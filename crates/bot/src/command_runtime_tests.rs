@@ -1206,6 +1206,20 @@ fn sticky_options_strict_refuses_wrong_types_duplicates_and_missing_body() {
         sticky_options_strict(&duplicate_wins),
         Err("Duplicate body. Use /sticky body:<text> debounce:<seconds>.")
     );
+    // Wrong types beat a missing `body`: the unusable `debounce` is named
+    // even though `body` is absent.
+    let wrong_type_beats_missing = slash(
+        "sticky",
+        Some(CHANNEL),
+        vec![option(
+            "debounce",
+            CommandOptionValue::String("soon".to_owned()),
+        )],
+    );
+    assert_eq!(
+        sticky_options_strict(&wrong_type_beats_missing),
+        Err("Invalid debounce. Use /sticky body:<text> debounce:<seconds>.")
+    );
     let mut no_data = slash("sticky", Some(CHANNEL), Vec::new());
     no_data.data = None;
     assert_eq!(
@@ -3044,6 +3058,26 @@ fn feed_add_options_strict_refuses_wrong_types_duplicates_and_missing_options() 
     assert_eq!(
         feed_add_options_strict(&duplicate_wins),
         Err("Duplicate source. Use /feed-add kind:rss source:<https-url>.")
+    );
+    // Wrong types beat missing options across options: a present-but-unusable
+    // value is named even when the other option is absent.
+    let wrong_type_beats_missing = slash(
+        "feed-add",
+        Some(CHANNEL),
+        vec![option("source", CommandOptionValue::Integer(7))],
+    );
+    assert_eq!(
+        feed_add_options_strict(&wrong_type_beats_missing),
+        Err("Invalid source. Use /feed-add kind:rss source:<https-url>.")
+    );
+    let wrong_kind_alone = slash(
+        "feed-add",
+        Some(CHANNEL),
+        vec![option("kind", CommandOptionValue::Integer(1))],
+    );
+    assert_eq!(
+        feed_add_options_strict(&wrong_kind_alone),
+        Err("Invalid kind. Use /feed-add kind:rss source:<https-url>.")
     );
     let missing_kind = slash(
         "feed-add",
