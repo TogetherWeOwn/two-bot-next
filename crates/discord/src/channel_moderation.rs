@@ -692,7 +692,7 @@ fn channel_enforcement_outcome(
 }
 
 #[allow(deprecated)]
-fn invoking_channel_id(interaction: &Interaction) -> Option<String> {
+pub(crate) fn invoking_channel_id(interaction: &Interaction) -> Option<String> {
     interaction
         .channel
         .as_ref()

@@ -1367,7 +1367,7 @@ impl CommandRuntime {
             &routed,
             RoutedInteraction::Slash {
                 outcome: SlashOutcome::Handled {
-                    handler: HandlerId::Lfg | HandlerId::LfgClose,
+                    handler: HandlerId::Lfg | HandlerId::LfgClose | HandlerId::LfgList,
                 },
                 ..
             } | RoutedInteraction::Component {
