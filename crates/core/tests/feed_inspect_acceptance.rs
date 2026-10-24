@@ -541,6 +541,69 @@ fn inspect_plain_token_redaction_preserves_safe_query_identity() {
     assert_normalized_query_credentials_redacted("token");
 }
 
+fn assert_semicolon_query_credentials_redacted(
+    raw_query: &str,
+    secrets: &[&str],
+    expected_identities: &[&str],
+) {
+    let source = format!("https://example.org/{}/feed?{raw_query}", "a".repeat(160));
+    for secret in secrets {
+        assert!(
+            source.find(secret).expect("fixture has credential") > 128,
+            "credential must be beyond the legacy source preview"
+        );
+    }
+    let normalized = normalize_source(FeedKind::Rss, &source)
+        .expect("semicolon-separated credential query is a valid saved source");
+    for secret in secrets {
+        assert!(
+            normalized.contains(secret),
+            "normalization is not redaction"
+        );
+    }
+    let text = relay("relay-query-redaction", &normalized, None, true).inspect_text();
+    assert_bounded(&text);
+    for secret in secrets {
+        assert!(
+            !text.contains(secret),
+            "semicolon-separated credential value must not survive inspect: {text}"
+        );
+    }
+    assert!(
+        text.to_ascii_lowercase().contains("redact"),
+        "semicolon credential removal must have an explicit notice: {text}"
+    );
+    let source_line = text
+        .lines()
+        .find(|line| line.starts_with("Source: "))
+        .expect("detail projects a source line");
+    for identity in expected_identities {
+        assert!(
+            source_line.contains(identity),
+            "safe identity {identity} survives semicolon credential redaction: {text}"
+        );
+    }
+    assert!(
+        source_line.contains("format=rss;"),
+        "original semicolon separator survives in the projection: {text}"
+    );
+    assert_no_success_labels(&text);
+}
+
+#[test]
+fn inspect_redacts_semicolon_separated_credentials_preserving_separator() {
+    assert_semicolon_query_credentials_redacted(
+        "format=rss;token=fixture-semicolon-secret-value",
+        &["fixture-semicolon-secret-value"],
+        &["example.org", "format=rss"],
+    );
+    assert_semicolon_query_credentials_redacted(
+        "format=rss;token=fixture-mixed-secret-one&channel_id=UC0123456789",
+        &["fixture-mixed-secret-one"],
+        &["example.org", "format=rss", r"channel\_id=UC0123456789"],
+    );
+}
+
 #[test]
 fn inspect_public_ipv6_source_has_exactly_one_bracket_pair() {
     let source = "https://[2606:4700:4700::1111]/feed";
