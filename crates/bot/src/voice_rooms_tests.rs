@@ -9325,7 +9325,10 @@ fn access_row_units_keep_exact_capacity_rows_whole() {
     let whole = format!("- /kick: {}", vec!["<@&7>"; 314].join(" "));
     let length = text_len(&whole);
     for capacity in [length, length + 1] {
-        assert_eq!(access_row_units("kick", &roles, capacity), [whole.clone()]);
+        assert_eq!(
+            access_row_units("kick", &roles, capacity),
+            std::slice::from_ref(&whole)
+        );
     }
     let segments = access_row_units("kick", &roles, length - 1);
     assert!(segments.len() > 1, "capacity+1 must split");
