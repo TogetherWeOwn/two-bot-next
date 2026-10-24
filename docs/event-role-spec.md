@@ -124,10 +124,13 @@ Roles and a role below the bot; when those are missing the row is loud per the
 cleanup rule, never dropped. A member who left the guild needs no REST call.
 
 **Bounds.** At most one role per event and one active event per role; a role
-stays bound-or-draining until its granted and `pending_revoke` rows reach zero,
-and rebind while draining is refused (`ROLE_DRAINING`). Pool cap 5 roles per
-guild, so at most 5 active bindings and 5,000 ledger rows (1,000 grants/event,
-the RSVP cap). A role is eligible only if it exists, is not @everyone or
+stays bound-or-draining until no non-terminal row remains (`granted`,
+`pending_grant` or `pending_revoke`: a pending add may already have reached
+Discord), and rebind while draining is refused (`ROLE_DRAINING`). Pool cap 5
+roles per guild, so at most 5 active bindings and 5,000 non-terminal ledger
+rows (1,000 grants/event, the RSVP cap). Terminal rows are kept 90 days (§5),
+so total stored rows have no fixed bound without a limit on sequential events;
+the build sizes and indexes that prune. A role is eligible only if it exists, is not @everyone or
 managed, has `permissions == 0`, appears in no channel overwrite (any
 appearance, stricter than the self-role new-access helper), has `hoist ==
 false`, is referenced by no other TWO config (self-role panels, join roles,
@@ -143,13 +146,17 @@ post in a channel can ping a mentionable role there; staff enable copy
 discloses this (not staff-only).
 
 **Stale-grant cleanup.** A level-triggered sweep ticks at most every 60 s and
-handles at most 50 ledger rows per tick, revoke rows oldest-first ahead of
-finishing any intent. It computes desired state `binding active ∧ RSVP Going ∧
-opted in ∧ member present ∧ before expiry ∧ role still safe` against fresh
-member and role reads. Worst-case drain, oldest-first: one full event (≤ 1,000
-rows) drains in ≤ 20 ticks (≤ 20 min); the 5,000-row ceiling drains in ≤ 100
-ticks (≤ 100 min). Cancel, complete and expiry therefore land within one
-10-minute mirror poll plus ≤ 20 min for a single event. The sweep **only
+handles at most 50 ledger rows per tick guild-global (one shared budget, not
+per event), revoke rows oldest-first ahead of finishing any intent. It
+computes desired state `binding active ∧ RSVP Going ∧ opted in ∧ member
+present ∧ before expiry ∧ role still safe` against fresh member and role
+reads; a granted row whose member presence cannot be positively read is kept
+for retry, never asserted desired. Worst-case drain, oldest-first: one full
+event draining alone (≤ 1,000 rows, otherwise empty ledger) finishes in ≤ 20
+ticks (≤ 20 min); under a full 5,000-row ledger any single event's rows can
+finish as late as tick ~100 (~100 min). Cancel, complete and expiry therefore
+land within one 10-minute mirror poll plus ≤ 20 min isolated, up to ~100 min
+under a full ledger. The sweep **only
 revokes**. It never grants and never re-grants a role a member or staff removed
 (`externally_removed` is terminal until a new explicit click). It retries
 `pending_revoke` rows: a crash between the row write and the REST remove must
@@ -185,7 +192,7 @@ disappears quietly.
   bind and on every grant), `ROLE_HOISTED`, `ROLE_REFERENCED` (another TWO
   config uses it), `BOT_MISSING_MANAGE_ROLES`, `ROLE_HIERARCHY` (raise the
   bot's role above it), `ROLE_IN_USE`, `ROLE_DRAINING` (previous event's rows
-  not yet revoked), `ROLE_NOT_MENTIONABLE`, plus `ANNOUNCEMENTS_DISABLED`,
+  not yet settled), `ROLE_NOT_MENTIONABLE`, plus `ANNOUNCEMENTS_DISABLED`,
   `MEMBER_UNAVAILABLE` (invoker not a live member) and, on the grant path
   only, `EXPIRED` (past the hard stop). Bind runs it once; every grant
   re-runs the safety checks on a fresh snapshot, because a role can gain
@@ -200,8 +207,12 @@ disappears quietly.
   decides concurrent RSVP/leave). Consent withdrawal (Remove click, RSVP flip)
   takes the same lock and attempts one `remove_guild_member_role` inline,
   settling `revoked` and writing the audit row; on failure the row becomes
-  `pending_revoke` for the sweep to retry. Unique `(guild_id, role_id)` where
-  bound-or-draining enforces one event per role until the drain completes. An
+  `pending_revoke` for the sweep to retry. Two write-time predicates back the
+  §3 bounds: unique `(guild_id, role_id)` where bound-or-draining enforces one
+  event per role until the drain completes, and unique `(guild_id, event_id)`
+  where bound-or-draining enforces one role per event. Binds take a
+  per-`(guild,event)` advisory lock before the preflight re-check and insert,
+  so concurrent staff binds serialize instead of double-binding. An
   unknown future state is inert: never granted, never revoked, never deleted.
 - Guild isolation: every key, lock and query carries `guild_id`; a role or event
   from another guild is `UNAVAILABLE`.
@@ -211,7 +222,7 @@ disappears quietly.
 | Condition | Behavior |
 | --- | --- |
 | Event rescheduled | Binding follows the event ID; expiry recomputed from the mirror; no grant, revoke or message |
-| Event canceled/completed | Revoke all `granted` rows within the sweep; worst-case latency is one 10-minute mirror poll plus ≤ 20 min single-event drain (§3), disclosed to staff |
+| Event canceled/completed | Revoke all `granted` rows within the sweep; worst-case latency is one 10-minute mirror poll plus ≤ 20 min isolated, up to ~100 min under a full ledger (§3), disclosed to staff |
 | Role deleted externally | Binding becomes `SUSPENDED_ROLE_MISSING`; no recreation, no grant; staff see it in status |
 | Role changes (permissions, overwrite presence, managed flag, hoist, hierarchy) | Change detection runs on every sweep tick and every grant; any change suspends the binding (`SUSPENDED_ROLE_CHANGED`); no new grants; revoke continues. Residual TOCTOU between the fresh read and the REST add is accepted |
 | Member left guild | Row becomes `member_left`; no REST call |
@@ -248,8 +259,8 @@ bot never mentions the role itself.
 | Attendance disclosure | Separate explicit opt-in; the control label itself names the visibility; role visibility is a new public marker the bot cannot hide |
 | Bot touching unrelated roles/members | Only allowlisted roles and only rows the bot granted; manual holders untouched |
 | Grant after consent withdrawn | Locked re-read before and after REST; compensating revoke; inline withdrawal with sweep backstop |
-| Stale cancel (up to 10 minutes plus drain) | Disclosed (≤ 10 min poll + ≤ 20 min single-event drain); mention of a canceled event's role may still reach holders |
-| Role rebound before the drain | Bound-or-draining uniqueness plus `ROLE_DRAINING`; rebind refused until granted and `pending_revoke` rows reach zero |
+| Stale cancel (up to 10 minutes plus drain) | Disclosed (≤ 10 min poll + ≤ 20 min isolated, up to ~100 min under a full ledger); mention of a canceled event's role may still reach holders |
+| Role rebound before the drain | Bound-or-draining uniqueness plus `ROLE_DRAINING`; rebind refused until no non-terminal row (`granted`, `pending_grant`, `pending_revoke`) remains |
 | Silent stuck revoke | Bounded retry, staff-visible `revoke_blocked` count, alert past 1 h overdue |
 | Cross-guild leakage | Guild-keyed rows and locks; foreign IDs collapse to `UNAVAILABLE` |
 
@@ -357,8 +368,9 @@ python3 scripts/check_docs_index.py --json
 ...         return "refuse", "EXPIRED", 0
 ...     if i.get("member") != "present":
 ...         return "refuse", "MEMBER_UNAVAILABLE", 0
-...     if i.get("role_state", "safe") != "safe":
-...         return "refuse", "ROLE_" + i["role_state"].upper(), 0
+...     rs = i.get("role_state", "unknown")
+...     if rs != "safe":
+...         return "refuse", "ROLE_" + str(rs).upper(), 0
 ...     if i.get("held"):
 ...         return "noop", "ALREADY_HELD", 0
 ...     return "grant", "GRANTED", 1
@@ -378,7 +390,7 @@ python3 scripts/check_docs_index.py --json
 ...         return "revoke", "RETRY_REVOKE", 1
 ...     if (i.get("binding") != "active" or i.get("rsvp") != "going"
 ...             or not i.get("opt_in", False) or i.get("expired")
-...             or i.get("role_state", "safe") != "safe"):
+...             or i.get("role_state", "unknown") != "safe"):
 ...         if i["state"] == "granted":
 ...             if i.get("bot_can_revoke", True) is False:
 ...                 return "keep", "REVOKE_BLOCKED", 0
@@ -391,18 +403,25 @@ python3 scripts/check_docs_index.py --json
 ...     if i["state"] == "pending_grant":
 ...         # still desired here; finish only while fresh, present and safe
 ...         if (i.get("age_min", 0) <= 15 and i.get("member") == "present"
-...                 and i.get("role_state", "safe") == "safe"):
+...                 and i.get("role_state") == "safe"):
 ...             return "grant", "FINISH_INTENT", 1
 ...         if i.get("held"):
 ...             if i.get("bot_can_revoke", True) is False:
 ...                 return "keep", "REVOKE_BLOCKED", 0
 ...             return "revoke", "REVOKE_UNCONFIRMED_GRANT", 1
 ...         return "mark", "EXPIRED_UNCONFIRMED", 0
+...     if i.get("member") != "present":
+...         # granted row, presence unreadable: keep for retry, never assert desired
+...         return "keep", "PRESENCE_UNKNOWN", 0
 ...     return "keep", "DESIRED", 0
 >>> def status(rows):
 ...     # staff-visible revoke health: blocked count plus 1 h overdue alert
 ...     blocked = [r for r in rows if r.get("revoke_blocked")]
 ...     return len(blocked), any(r.get("overdue_min", 0) > 60 for r in blocked)
+>>> NONTERMINAL = ("granted", "pending_grant", "pending_revoke")
+>>> def drained(rows):
+...     # bound-or-draining release: no row may still hold the role
+...     return not [r for r in rows if r.get("state") in NONTERMINAL]
 >>> pre = [
 ...     ("ok", OK_INPUT, "OK"),
 ...     ("missing_evidence", {}, "UNAVAILABLE"),
@@ -429,7 +448,9 @@ python3 scripts/check_docs_index.py --json
 >>> for name, case, want in pre:
 ...     assert preflight(case)[0] == want, name
 >>> assert all(preflight(c)[1] for _, c, _ in pre)
->>> GOOD = dict(rsvp="going", opt_in=True, binding="active", member="present")
+>>> GOOD = dict(rsvp="going", opt_in=True, binding="active", member="present",
+...             role_state="safe")
+>>> GOOD_NOROLE = dict((k, v) for k, v in GOOD.items() if k != "role_state")
 >>> gr = [
 ...     ("grant", GOOD, ("grant", "GRANTED", 1)),
 ...     ("duplicate", dict(GOOD, held=True), ("noop", "ALREADY_HELD", 0)),
@@ -442,11 +463,14 @@ python3 scripts/check_docs_index.py --json
 ...     ("expired", dict(GOOD, expired=True), ("refuse", "EXPIRED", 0)),
 ...     ("role_deleted", dict(GOOD, role_state="missing"), ("refuse", "ROLE_MISSING", 0)),
 ...     ("role_changed", dict(GOOD, role_state="changed"), ("refuse", "ROLE_CHANGED", 0)),
+...     ("grant_role_evidence_missing", GOOD_NOROLE, ("refuse", "ROLE_UNKNOWN", 0)),
 ... ]
 >>> for name, case, want in gr:
 ...     assert grant(case) == want, name
 >>> assert all(w == 0 for _, _, (d, _, w) in gr if d != "grant")
->>> ST = dict(state="granted", binding="active", rsvp="going", member="present", held=True, opt_in=True)
+>>> ST = dict(state="granted", binding="active", rsvp="going", member="present",
+...           held=True, opt_in=True, role_state="safe")
+>>> ST_NOROLE = dict((k, v) for k, v in ST.items() if k != "role_state")
 >>> sw = [
 ...     ("desired", ST, ("keep", "DESIRED", 0)),
 ...     ("declined", dict(ST, rsvp="declined"), ("revoke", "NO_LONGER_DESIRED", 1)),
@@ -471,6 +495,8 @@ python3 scripts/check_docs_index.py --json
 ...     ("pending_revoke_confirmed", dict(ST, state="pending_revoke", held=False), ("mark", "REVOKE_CONFIRMED", 0)),
 ...     ("pending_revoke_blocked", dict(ST, state="pending_revoke", bot_can_revoke=False), ("keep", "REVOKE_BLOCKED", 0)),
 ...     ("future_state", dict(ST, state="v9_quarantine"), ("keep", "INERT_STATE", 0)),
+...     ("unknown_member_retry", dict(ST, member="unknown"), ("keep", "PRESENCE_UNKNOWN", 0)),
+...     ("sweep_role_evidence_missing", ST_NOROLE, ("revoke", "NO_LONGER_DESIRED", 1)),
 ... ]
 >>> for name, case, want in sw:
 ...     assert sweep(case) == want, name
@@ -482,21 +508,34 @@ python3 scripts/check_docs_index.py --json
 ... ]
 >>> for name, rows, want in bl:
 ...     assert status(rows) == want, name
->>> names = [n for n, _, _ in pre] + [n for n, _, _ in gr] + [n for n, _, _ in sw] + [n for n, _, _ in bl]
->>> assert len(pre) + len(gr) + len(sw) + len(bl) == 58
+>>> dr = [
+...     ("empty", [], True),
+...     ("terminal_only", [{"state": "revoked"}, {"state": "expired_unconfirmed"}], True),
+...     ("granted_blocks", [{"state": "granted"}], False),
+...     ("pending_grant_blocks", [{"state": "pending_grant"}], False),
+...     ("pending_revoke_blocks", [{"state": "pending_revoke"}], False),
+... ]
+>>> for name, rows, want in dr:
+...     assert drained(rows) == want, name
+>>> names = ([n for n, _, _ in pre] + [n for n, _, _ in gr] + [n for n, _, _ in sw]
+...          + [n for n, _, _ in bl] + [n for n, _, _ in dr])
+>>> assert len(pre) + len(gr) + len(sw) + len(bl) + len(dr) == 66
 >>> assert 5 * 1000 == 5000 and 24 * 60 > 15
+>>> # 1200 s: one full event draining alone; 6000 s: any single event under a full ledger
 >>> assert 1000 // 50 * 60 == 1200 and 5000 // 50 * 60 == 6000
 >>> print(json.dumps({"schema": "events.attendee_role.oracle.v1", "fixtures": len(names), "status": "pass"}, sort_keys=True))
-{"fixtures": 58, "schema": "events.attendee_role.oracle.v1", "status": "pass"}
+{"fixtures": 66, "schema": "events.attendee_role.oracle.v1", "status": "pass"}
 
 ```
 
 Fixtures the reference model cannot express need future protected acceptance
 tests with barriers, an injected clock and REST fault injection against the
-real callers in disposable fixtures: concurrent RSVP/leave interleavings
-(before-REST and after-REST re-read), duplicate delivery of one click,
-inline-withdraw versus sweep races, the per-guild isolation of locks, and
-rollback to an older binary. Zero tests is not proof; none are created here.
+real callers in disposable fixtures: concurrent bind/bind interleavings (the
+per-(guild,event) lock plus the event-side unique predicate), concurrent
+RSVP/leave interleavings (before-REST and after-REST re-read), duplicate
+delivery of one click, inline-withdraw versus sweep races, the per-guild
+isolation of locks, and rollback to an older binary. Zero tests is not proof;
+none are created here.
 
 ## 8. Acceptance boundary, review metric and undo
 
@@ -510,7 +549,7 @@ bounded by the mirror poll plus the stated drain, inline consent withdrawal,
 and no DM, ping, role creation or retroactive grant.
 Any material revision rebinds review to the new revision.
 
-By 2026-10-31 the metric is **all 58 fixtures have agreed or explicitly
+By 2026-10-31 the metric is **all 66 fixtures have agreed or explicitly
 rejected outcomes and the narrowing conditions and review findings have written
 disposition** (see §6 and the PR thread). This measures design completeness,
 not demand. Keep this proposal only if grants are provably scoped, revocable
