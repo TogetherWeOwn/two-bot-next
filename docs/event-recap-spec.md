@@ -50,7 +50,7 @@ Inspected repository head: `89b26ae050ffba9fb409622ffd54d31cdc79e7fc`.
   and check-ins at **1,000** each; `:424` audits `event.checkin`. Check-ins are
   `community_facts` rows with `source = checkin_source(occurrence)`, indexed by
   `0426_community_facts_guild_source.sql` as `(guild_id, source)`.
-- `crates/discord/src/rsvp.rs:464-470` proves an occurrence with a live
+- `crates/discord/src/rsvp.rs:473-484` proves an occurrence with a live
   guild-scoped `get_scheduled_event` before any write; the recap reuses that read.
 - `crates/cutover/src/privacy.rs:44` opt-out purges only `events`, `members`,
   `invite_snapshots`, `community_facts` and installs suppression. It does **not**
@@ -126,7 +126,8 @@ shared `message_safety::content` neutralizer, which covers **mass mentions only*
 custom emoji, timestamps, slash-command and guild-navigation tokens), then
 delete any stray `<` or `>`, so no member, role or channel ID survives in the
 title; (4) collapse whitespace runs to one space and trim; (5) an empty result
-becomes the literal `Event`; (6) truncate to 100 UTF-16 units with an ellipsis.
+becomes the literal `Event`; (6) if longer than 100 UTF-16 units, keep the
+longest whole-scalar prefix of at most 99 units and append `…` (one unit).
 Plain markdown formatting characters are left as inert text. The send sets
 `allowed_mentions: {parse: []}` as a second layer, not the definition.
 Counts come from existing rows read by the bare event ID: RSVP statuses
@@ -184,11 +185,20 @@ expired audit fence cannot reopen an old event.
 ## 6. Once-only publish, audit and restarts
 
 No new table. At-most-once uses `announcements_audit_log` with deterministic IDs
-and `ON CONFLICT DO NOTHING`, plus a per-recap **session-level** advisory lock
-`recap:{guild}:{occurrence}` (like the LFG locks) held from step 1 through
-step 3, so a concurrent clicker waits and then sees the outcome. The claim
-insert in step 1 commits on its own, before the send, so a crash leaves it
-visible.
+and `ON CONFLICT DO NOTHING`, plus a per-recap **session-level** advisory lock.
+Acquire `pg_advisory_lock(hashtextextended($1, 0))` once, binding
+`recap:{guild}:{occurrence}`, on one held, session-affine database connection
+(a transaction-pooled endpoint is not eligible). Unlike the LFG
+`pg_advisory_xact_lock` (`lfg_store.rs:301,390`), this lock survives the step-1
+commit: keep that same connection from step 1 through step 3, including across
+the Discord send, so a concurrent clicker waits and then sees the outcome.
+All transactions below use that connection; do not return it to the pool between
+steps. The claim insert in step 1 commits on its own, before the send, so a crash
+leaves it visible. In a finalizer on every exit, release with
+`pg_advisory_unlock(hashtextextended($1, 0))` using the same key and connection.
+On cancellation or unconfirmed unlock, close/discard the connection instead of
+returning a possibly locked session to the pool. A lost session must abort the
+attempt; never acquire another connection and resume its send.
 
 1. Under the lock, first check the rows: a `posted` row returns
    ALREADY_PUBLISHED; a claim row without a `posted` row returns COMMIT_UNKNOWN
@@ -205,7 +215,8 @@ visible.
    DELETEs the claim row, commit it, release the lock and return SEND_REJECTED.
    The two writes apply together or not at all. A later retry claims fresh and
    posts at most once; each rejection leaves its own failed row because the
-   nonce differs per click. Never release after an ambiguous send: that stays
+   nonce differs per click. After an ambiguous send, retain the **claim row**,
+   not the session lock: release/discard the connection as above and return
    COMMIT_UNKNOWN.
 
 If the process dies inside that transaction it rolls back whole: the claim stays
@@ -325,7 +336,7 @@ one posted message. Counts are `going/interested/checked_in`.
 | age_boundary | Completed, started exactly 30 days ago -> PREVIEW 3/2/2 |
 | too_old | Completed, started 30 days + 1 s ago -> EVENT_TOO_OLD, 0 posts |
 | age_crossing | Preview at 30 days passes; click 1 s later -> EVENT_TOO_OLD, 0 posts |
-| mention_title | Title `Finals <@123456789012345678> <@&5> <#9>` -> rendered `Finals`, no ID, no markup |
+| mention_title | Title `Finals <@123456789012345678> <@&5> <#9>` -> rendered `Finals`, no ID, no markup; non-BMP boundary titles obey the 100-UTF-16-unit bound without splitting a scalar |
 | denied | Organizer lost Manage Events before click -> DENIED, 0 posts |
 | foreign | Event in guild `g2` -> UNAVAILABLE, no oracle |
 | duplicate | Publish twice -> POSTED then ALREADY_PUBLISHED, 1 post |
@@ -336,7 +347,7 @@ one posted message. Counts are `going/interested/checked_in`.
 | stale | Counts change between preview and click -> PREVIEW_STALE, 0 posts |
 | version | `recap.v1` preview clicked under `recap.v2` -> PREVIEW_STALE |
 | epoch_advance | Click 5 s after preview, data unchanged -> POSTED with the preview's `Snapshot`, 1 post |
-| preview_expired | Click 901 s after preview -> PREVIEW_STALE, 0 posts; future epoch -> PREVIEW_STALE |
+| preview_expired | Click exactly 900 s after preview -> POSTED with preview snapshot; at 901 s or with future epoch -> PREVIEW_STALE, 0 posts |
 | custom_id_max | 20-digit guild/event/organizer + 10-digit epoch + 12-hex digest -> custom_id 95 chars, occurrence and epoch literal |
 
 Runnable offline document check (Python stdlib; from repo root):
@@ -355,10 +366,19 @@ is not proof. No acceptance or implementation task is created here.
 ```pycon
 >>> import json, re
 >>> def render_title(raw):
-...     """Title contract steps 1, 3, 4, 5 (the Rust neutralizer, step 2, is not modeled)."""
+...     """Title contract except the Rust mass-mention neutralizer (step 2)."""
 ...     t = re.sub(r"<[^<>]*>", "", raw.strip())
 ...     t = re.sub(r"[<>]", "", t)
-...     return re.sub(r"\s+", " ", t).strip() or "Event"
+...     t = re.sub(r"\s+", " ", t).strip() or "Event"
+...     if len(t.encode("utf-16-le")) <= 200:
+...         return t
+...     prefix, units = "", 0
+...     for ch in t:
+...         width = len(ch.encode("utf-16-le")) // 2
+...         if units + width > 99:
+...             break
+...         prefix, units = prefix + ch, units + width
+...     return prefix + "…"
 >>> def recap(going=3, interested=2, checked=2, opted_out_going=0,
 ...           opted_out_interested=0, status="completed", started=True,
 ...           manager=True, same_guild=True, labeled=False, posted=0,
@@ -416,6 +436,7 @@ is not proof. No acceptance or implementation task is created here.
 >>> for name, (kwargs, expected) in cases.items():
 ...     assert recap(**kwargs) == expected, name
 >>> assert recap(epoch_in_future=True)[0] == "PREVIEW_STALE"
+>>> assert recap(preview_age_s=900)[0] == "PREVIEW"
 >>> # age_crossing: age is evaluated at preview and again at click
 >>> assert recap(age_s=30 * 86400)[0] == "PREVIEW"
 >>> assert recap(age_s=30 * 86400 + 1)[0] == "EVENT_TOO_OLD"
@@ -426,11 +447,24 @@ is not proof. No acceptance or implementation task is created here.
 >>> assert render_title("Finals <@123456789012345678> <@&5> <#9>") == "Finals"
 >>> assert render_title("  a <@!7>b <  ") == "a b"
 >>> assert render_title("<@1>") == "Event"
+>>> assert render_title("😀" * 50) == "😀" * 50
+>>> assert render_title("😀" * 50 + "a") == "😀" * 49 + "…"
+>>> assert render_title("a" * 98 + "😀a") == "a" * 98 + "…"
 >>> # audit rows: a claim commits before the send; failed-insert + claim-delete is one txn
 >>> class Store:
 ...     def __init__(self):
 ...         self.rows = {}
-...     def click(self, who, interaction, send="ok", crash_in_cleanup=False):
+...     def preview(self, snapshot_epoch, age_s=0):
+...         assert recap(age_s=age_s)[0] == "PREVIEW"
+...         return {"snapshot_epoch": snapshot_epoch, "event_start": snapshot_epoch - age_s}
+...     def click(self, who, interaction, send="ok", crash_in_cleanup=False,
+...               preview=None, now=None):
+...         if preview is not None:
+...             result = recap(age_s=now - preview["event_start"],
+...                            preview_age_s=now - preview["snapshot_epoch"],
+...                            epoch_in_future=now < preview["snapshot_epoch"])
+...             if result[0] != "PREVIEW":
+...                 return result[0]
 ...         if "posted" in self.rows:
 ...             return "ALREADY_PUBLISHED"
 ...         if "claim" in self.rows:
@@ -443,7 +477,28 @@ is not proof. No acceptance or implementation task is created here.
 ...             del self.rows["claim"]
 ...             return "SEND_REJECTED"
 ...         self.rows["posted"] = who
+...         if preview is not None:
+...             self.rows["snapshot_epoch"] = preview["snapshot_epoch"]
 ...         return "POSTED"
+>>> # epoch_advance: click-time validation carries the preview snapshot into the post
+>>> s = Store()
+>>> preview = s.preview(1000)
+>>> assert s.click("o", "i1", preview=preview, now=1005) == "POSTED"
+>>> assert s.rows["snapshot_epoch"] == preview["snapshot_epoch"] == 1000
+>>> # preview_expired: exactly 900 seconds remains valid; 901 or a future epoch refuses
+>>> s = Store()
+>>> preview = s.preview(1000)
+>>> assert s.click("o", "i1", preview=preview, now=1900) == "POSTED"
+>>> assert s.rows["snapshot_epoch"] == 1000
+>>> for now in (1901, 999):
+...     s = Store()
+...     assert s.click("o", "i1", preview=preview, now=now) == "PREVIEW_STALE"
+...     assert s.rows == {}
+>>> # age_crossing: a valid preview must not publish once the event crosses 30 days
+>>> s = Store()
+>>> preview = s.preview(1000, age_s=30 * 86400)
+>>> assert s.click("o", "i1", preview=preview, now=1001) == "EVENT_TOO_OLD"
+>>> assert s.rows == {}
 >>> # concurrent: the lock serializes; one click wins, the other sees the posted row
 >>> s = Store()
 >>> assert sorted([s.click("o1", "i1"), s.click("o2", "i2")]) == ["ALREADY_PUBLISHED", "POSTED"]
