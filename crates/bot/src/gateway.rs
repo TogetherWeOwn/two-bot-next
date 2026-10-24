@@ -1747,26 +1747,31 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         // The only onboarding effect at reception is a bounded
                         // initial ACK via the shared executor; the memory-only
                         // ticket is consumed after the ordered COMMIT.
-                        let acknowledgement = match (onboarding.as_ref(), dispatch.as_deref()) {
-                            (Some(runtime), Some(ReceivedDispatch { event: Event::InteractionCreate(interaction), .. }))
-                                if runtime.accepts_interaction(&interaction.0) =>
-                            {
-                                // The permit is a drop guard held by the spawned
-                                // task: a panicking `acknowledge` releases it
-                                // during unwind instead of leaking capacity.
-                                let permit = match AckPermit::try_acquire(&in_flight_acks) {
-                                    Some(permit) => permit,
-                                    None => return Err(ingress_capacity_failure()),
-                                };
-                                let (send, receive) = tokio::sync::oneshot::channel();
-                                let runtime = Arc::clone(runtime);
-                                let interaction = interaction.0.clone();
-                                tokio::spawn(async move {
-                                    let _permit = permit;
-                                    let confirmed = runtime.acknowledge(&interaction, received_at).await;
-                                    let _ = send.send(confirmed);
-                                });
-                                Some(receive)
+                        let acknowledgement = match (onboarding.as_ref(), dispatch.as_deref_mut()) {
+                            (Some(runtime), Some(ReceivedDispatch { event: Event::InteractionCreate(interaction), .. })) => {
+                                match runtime.resolve_interaction(&interaction.0).map(|resolved| resolved.into_owned()) {
+                                    Some(resolved) => {
+                                        // Preserve registered slash identity in the
+                                        // post-commit job as well as this ACK task.
+                                        interaction.0 = resolved.clone();
+                                        // The permit is a drop guard held by the spawned
+                                        // task: a panicking `acknowledge` releases it
+                                        // during unwind instead of leaking capacity.
+                                        let permit = match AckPermit::try_acquire(&in_flight_acks) {
+                                            Some(permit) => permit,
+                                            None => return Err(ingress_capacity_failure()),
+                                        };
+                                        let (send, receive) = tokio::sync::oneshot::channel();
+                                        let runtime = Arc::clone(runtime);
+                                        tokio::spawn(async move {
+                                            let _permit = permit;
+                                            let confirmed = runtime.acknowledge(&resolved, received_at).await;
+                                            let _ = send.send(confirmed);
+                                        });
+                                        Some(receive)
+                                    }
+                                    None => None,
+                                }
                             }
                             _ => None,
                         };

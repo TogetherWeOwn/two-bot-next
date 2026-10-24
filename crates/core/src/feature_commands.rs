@@ -168,7 +168,7 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
             )
             .max_length(MAX_INSPECT_ARGUMENT_UNITS as u32),
         ]),
-        // Next-only saved-response lifecycle (parity rows 34-35): pause and
+        // Next-only saved-response lifecycle (parity rows 35-36): pause and
         // resume one definition without deleting it. Published immediately
         // after `command-inspect`; automation-gated and `ManageGuild`-gated
         // like the other admin commands. Reserved builtin names, never
@@ -517,11 +517,18 @@ mod tests {
     #[test]
     fn no_collision_with_leveling_core_or_within_slice() {
         let merged = merge_commands(&[feature_commands()], &[]).expect("slice 2 merges cleanly");
-        // 4 core + 1 scorecard + 11 automation + 7 announcement.
-        assert_eq!(merged.len(), 23);
+        // 5 core + 1 scorecard + 11 automation + 7 announcement.
+        assert_eq!(merged.len(), 24);
         assert_eq!(
-            &names(&merged)[..5],
-            ["rank", "leaderboard", "help", "privacy", "attendance"]
+            &names(&merged)[..6],
+            [
+                "rank",
+                "leaderboard",
+                "help",
+                "privacy",
+                "reopen",
+                "attendance"
+            ]
         );
         assert!(!merged.iter().any(|d| d.dm_permission));
     }

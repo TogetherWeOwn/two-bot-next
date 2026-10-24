@@ -9,14 +9,14 @@ verdicts in `docs/smoke-run-record.md`.
 
 - Registry: `InteractionRouter::publish_set` with all feature gates on
   (scorecard, automations, announcements, moderation), no custom rows.
-- Rendered reference: `docs/commands.md` — the 32 built-ins plus the voice set
-  (53 with the voice gates on), registry bounds,
+- Rendered reference: `docs/commands.md` — the 33 built-ins plus the voice set
+  (54 with the voice gates on), registry bounds,
   DMs false on every row (guild-only, legacy `setDMPermission(false)`).
 - Merge order (first definition wins, Discord 100-command ceiling):
   core → scorecard → automations → announcements → moderation.
 
-Counts: 4 core + 1 scorecard + 11 automations + 7 announcements +
-9 moderation = **32 built-ins**. Machine-readable mirror:
+Counts: 5 core + 1 scorecard + 11 automations + 7 announcements +
+9 moderation = **33 built-ins**. Machine-readable mirror:
 `crates/core/tests/fixtures/smoke_surface_inventory.json`, checked by
 `crates/core/tests/smoke_surface_inventory.rs` (registry shape in publish
 order, exactly-five-covered gate, handler routing for the five).
@@ -42,7 +42,7 @@ are pinned offline by `crates/discord/tests/denied_path_probes.rs` (one test
 per row; each probe asserts a read-only `Refuse` with the immediate ephemeral
 type-4 reply on an isolated gate-safe router).
 
-## Deferred: 25 commands with reasons
+## Deferred: 28 commands with reasons
 
 Deferred means out of the read-only smoke, not untested: every row below
 is published by the same registry the unit test pins, and most share a
@@ -52,11 +52,14 @@ handler family with a covered command.
 | --- | --- | --- |
 | `/help` | core | Next-only discovery command with no legacy counterpart; answers from the live publish set with no store or network effect, so offline router and renderer tests pin it instead of the live smoke five. |
 | `/privacy` | core | Next-only member self-serve with no legacy counterpart; the purge-plus-suppression-plus-receipt path is pinned by the gateway dispatch tests on a disposable database rather than the live smoke five. |
+| `/reopen` | core | Next-only self-service picker recovery with no legacy counterpart; the defer-first menu open and zero-mutation contract are pinned by the onboarding disposable-database acceptance tests rather than the live smoke five. |
 | `/attendance` | scorecard | Needs a seeded event-occurrence plus a verified-human fixture; outside the one-per-family smoke budget. |
 | `/command` | automations | Mutating admin CRUD that creates live commands; the read-only smoke excludes state writes. |
 | `/command-remove` | automations | Destructive admin op; excluded from the read-only smoke. |
 | `/command-list` | automations | Needs DB-backed custom rows, which the no-DB rule excludes; the list is empty in the smoke guild. |
 | `/command-inspect` | automations | Needs a named DB-backed custom row to inspect, which the no-DB rule excludes; read-only views are pinned by the disposable-database acceptance instead. |
+| `/command-disable` | automations | Mutates a saved DB-backed definition and republishes the full guild registry; covered by disposable-database acceptance, not the read-only smoke. |
+| `/command-enable` | automations | Mutates a saved DB-backed definition and republishes the full guild registry; covered by disposable-database acceptance, not the read-only smoke. |
 | `/schedule` | automations | Effect fires on a wall-clock delay the offline smoke cannot observe; needs a timed live-guild pass. |
 | `/schedule-remove` | automations | Destructive and needs a live scheduled-message id; sequenced after a schedule create, not standalone. |
 | `/schedule-list` | automations | Needs seeded scheduled rows (DB); the no-DB rule excludes it. |
