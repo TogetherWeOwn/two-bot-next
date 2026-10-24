@@ -31,6 +31,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("schedule-remove", "docs/parity.md §1 #18 caps"),
     ("sticky", "docs/parity.md §1 #20 caps"),
     ("lfg", "docs/parity.md §1 #26 caps"),
+    ("lfg", "docs/parity.md §1 #26 preview"),
     ("lfg-close", "docs/parity.md §1 #27 caps"),
     ("feed-add", "docs/parity.md §1 #28 caps"),
     ("feed-remove", "docs/parity.md §1 #29 caps"),
@@ -552,6 +553,45 @@ pub fn expected_registry() -> Value {
             "legacy {name}/{option_name}"
         );
         option["max_length"] = json!(max_length);
+    }
+    // LFG private preview: the Next-only additive fourth `preview` boolean
+    // keeps the signup form submittable without posting. The three legacy
+    // string options (title, starts-at, roles) and their bounds stay
+    // untouched; the option itself is optional (`required` omitted, which the
+    // canonical form normalizes to false) with no bounds or choices.
+    {
+        let _ = INTENTIONAL_DIFFERENCES
+            .iter()
+            .find(|(command, reference)| {
+                *command == "lfg" && *reference == "docs/parity.md §1 #26 preview"
+            })
+            .expect("preview has a documented command exception");
+        let command = commands
+            .iter_mut()
+            .find(|command| command["name"] == "lfg")
+            .expect("docs/parity.md §1 #26 preview");
+        assert_eq!(command["default_member_permissions"], json!("8589934592"));
+        assert_eq!(command["dm_permission"], json!(false));
+        let options = command["options"]
+            .as_array_mut()
+            .expect("command options array");
+        assert_eq!(
+            options.len(),
+            3,
+            "legacy lfg publishes exactly title, starts-at, roles"
+        );
+        assert_eq!(options[0]["name"], json!("title"));
+        assert_eq!(options[1]["name"], json!("starts-at"));
+        assert_eq!(options[2]["name"], json!("roles"));
+        for option in options.iter() {
+            assert_eq!(option["type"], json!(3), "legacy lfg options stay strings");
+            assert_eq!(option["required"], json!(true));
+        }
+        options.push(json!({
+            "name": "preview",
+            "description": "Privately preview without posting",
+            "type": 5
+        }));
     }
     // Schedule-list pagination: the Next-only additive `page` option keeps
     // every configured id discoverable within Discord's 2,000-unit cap.

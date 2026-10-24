@@ -73,6 +73,7 @@ fn option_type_name(kind: u8) -> &'static str {
         1 => "subcommand",
         3 => "string",
         4 => "integer",
+        5 => "boolean",
         6 => "user",
         8 => "role",
         other => panic!("document new command option type {other}"),

@@ -348,6 +348,11 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
                 )
                 .required()
                 .max_length(MAX_ROLE_SPEC_CHARS as u32),
+                CommandOption::new(
+                    "preview",
+                    "Privately preview without posting",
+                    CommandOptionType::Boolean,
+                ),
             ]),
         CommandDefinition::new("lfg-close", "Close a raid/LFG signup")
             .permissions(PERM_MANAGE_EVENTS)

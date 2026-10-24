@@ -114,6 +114,7 @@ golden exception or a claim of whole-baseline registry parity.
 | `schedule-remove` | docs/parity.md §1 #18 caps | Advertise only `max_length` 128 on `id`; empty and overlong prefixes are refused before resolution. |
 | `sticky` | docs/parity.md §1 #20 caps | Advertise only `max_length` 2000 on `body`, matching the runtime cap; every other field stays legacy-identical. |
 | `lfg` | docs/parity.md §1 #26 caps | Advertise only `max_length` matching the runtime caps (`title` 100, `roles` 2339 UTF-16 units); every other field stays legacy-identical. |
+| `lfg` | docs/parity.md §1 #26 preview | Add the Next-only optional boolean `preview` ("Privately preview without posting") as the fourth option; omitted or false posts exactly as legacy, true renders one private ephemeral preview with no store, quota, audit or channel effect. The three legacy string options stay untouched. |
 | `lfg-close` | docs/parity.md §1 #27 caps | Advertise only `max_length` 128 on `id`; every other field stays legacy-identical. |
 | `feed-add` | docs/parity.md §1 #28 caps | Advertise only `max_length` 2048 on `source`, matching the server-side byte bound enforced before URL parsing. |
 | `feed-remove` | docs/parity.md §1 #29 caps | Advertise only `max_length` 128 on `id`; every other field stays legacy-identical. |

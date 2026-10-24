@@ -230,6 +230,40 @@ pub fn refusal_response(refusal: RouterRefusal) -> InteractionResponse {
     text_response(InteractionReply::new(refusal.message(), true))
 }
 
+/// Wrong-type `preview` refusal, in the feed/sticky strict-decode style: name
+/// the option and show a copyable corrected invocation.
+#[cfg(feature = "db")]
+const LFG_INVALID_PREVIEW: &str = "Invalid preview. Use /lfg title:<title> starts-at:<iso-8601> roles:<role:Label:count> preview:true.";
+/// Duplicated `preview` refusal, same style as [`LFG_INVALID_PREVIEW`].
+#[cfg(feature = "db")]
+const LFG_DUPLICATE_PREVIEW: &str = "Duplicate preview. Use /lfg title:<title> starts-at:<iso-8601> roles:<role:Label:count> preview:true.";
+
+/// Strict `/lfg` `preview` decode: omitted means post, boolean `true`
+/// previews, anything else refuses before any store or channel effect.
+/// Duplicates win over wrong types, matching the feed/sticky/schedule
+/// strict decoders; unknown options stay ignored.
+#[cfg(feature = "db")]
+fn decode_lfg_preview(
+    options: &[twilight_model::application::interaction::application_command::CommandDataOption],
+) -> Result<bool, crate::lfg_interactions::LfgError> {
+    use twilight_model::application::interaction::application_command::CommandOptionValue;
+    let mut found = options.iter().filter(|option| option.name == "preview");
+    let Some(first) = found.next() else {
+        return Ok(false);
+    };
+    if found.next().is_some() {
+        return Err(crate::lfg_interactions::LfgError::Invalid(
+            LFG_DUPLICATE_PREVIEW.into(),
+        ));
+    }
+    match &first.value {
+        CommandOptionValue::Boolean(preview) => Ok(*preview),
+        _ => Err(crate::lfg_interactions::LfgError::Invalid(
+            LFG_INVALID_PREVIEW.into(),
+        )),
+    }
+}
+
 #[must_use]
 pub fn response_for_slash(outcome: &SlashOutcome) -> Option<InteractionResponse> {
     match outcome {
@@ -637,16 +671,32 @@ impl InteractionRuntime {
                         .ok_or_else(|| LfgError::Invalid(format!("Missing {name} option.")))
                 };
                 if data.name == "lfg" {
-                    option("title").and_then(|title| {
-                        Ok(LfgRequest::Create {
-                            title,
-                            starts_at: option("starts-at")?,
-                            roles: option("roles")?,
-                            channel_id: interaction
-                                .channel
-                                .as_ref()
-                                .map(|c| c.id.to_string())
-                                .ok_or_else(|| LfgError::Invalid("Missing channel.".into()))?,
+                    // Combinators, not `?`: this arm evaluates to a request
+                    // result, while the function returns a dispatch result.
+                    decode_lfg_preview(&data.options).and_then(|preview| {
+                        option("title").and_then(|title| {
+                            let starts_at = option("starts-at")?;
+                            let roles = option("roles")?;
+                            if preview {
+                                Ok(LfgRequest::Preview {
+                                    title,
+                                    starts_at,
+                                    roles,
+                                })
+                            } else {
+                                Ok(LfgRequest::Create {
+                                    title,
+                                    starts_at,
+                                    roles,
+                                    channel_id: interaction
+                                        .channel
+                                        .as_ref()
+                                        .map(|c| c.id.to_string())
+                                        .ok_or_else(|| {
+                                            LfgError::Invalid("Missing channel.".into())
+                                        })?,
+                                })
+                            }
                         })
                     })
                 } else if data.name == "lfg-edit" {

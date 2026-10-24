@@ -14,6 +14,14 @@ pub enum LfgRequest {
         roles: String,
         channel_id: String,
     },
+    /// Private `/lfg preview:true` render: validated and rendered with the
+    /// same framework-free core as [`LfgRequest::Create`], but answered
+    /// before admission with no pool, identity, audit or channel effect.
+    Preview {
+        title: String,
+        starts_at: String,
+        roles: String,
+    },
     Close {
         post_id: String,
     },
@@ -169,8 +177,30 @@ impl LfgInteractions {
         interaction_id: u64,
         bot_user_id: u64,
     ) -> Result<String, LfgError> {
+        // Preview answers before identity derivation, queue admission, locks,
+        // SQL, audit or channel effects: pure validation plus the creation
+        // body renderer, with no store dependency at all.
+        if let LfgRequest::Preview {
+            title,
+            starts_at,
+            roles,
+        } = &request
+        {
+            let now = time::OffsetDateTime::now_utc();
+            return lfg::preview_lfg_content(
+                title,
+                starts_at,
+                roles,
+                (now.unix_timestamp_nanos() / 1_000_000) as i64,
+            )
+            .map_err(LfgError::Invalid);
+        }
         let id = match &request {
             LfgRequest::Create { .. } => format!("lfg-{interaction_id}"),
+            // Preview returns above, before any persisted identity exists.
+            LfgRequest::Preview { .. } => {
+                return Err(LfgError::Invalid("Invalid LFG preview.".into()));
+            }
             LfgRequest::Close { post_id }
             | LfgRequest::Edit { post_id, .. }
             | LfgRequest::Select(
@@ -439,6 +469,11 @@ impl LfgInteractions {
                     format!("LFG edit saved. Starts at {starts_at}."),
                     true,
                 )
+            }
+            // Preview returns before admission; reaching the store would be a
+            // routing defect, so fail closed without touching it.
+            LfgRequest::Preview { .. } => {
+                return Err(LfgError::Invalid("Invalid LFG preview.".into()));
             }
             LfgRequest::Close { .. } => {
                 let closed = store::close_lfg(&self.pool, guild_id, &id, &at).await?;
