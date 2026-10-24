@@ -617,7 +617,8 @@ fn activation_runtime(guild: u64, token: &str, origin: String) -> Arc<CommandRun
 async fn activation_boot_publishes_only_permitted_capabilities() {
     use two_bot_core::{
         activation::LiveCapability, announcement_commands, automation_commands,
-        moderation_commands, ComponentHandler, ComponentOutcome, HandlerId,
+        moderation_commands, ComponentHandler, ComponentOutcome, HandlerId, SlashContext,
+        SlashOutcome,
     };
     const STAGING: u64 = 1545644954272137297;
     const LIVE: u64 = 326474832151838730;
@@ -673,16 +674,34 @@ async fn activation_boot_publishes_only_permitted_capabilities() {
                 definition.name
             );
         }
+        let prefixed = token.starts_with("Bot ");
+        assert_eq!(
+            names.contains(&"lfg-list"),
+            staging,
+            "lfg-list publication, guild={guild}, app={app}, prefixed={prefixed}"
+        );
         for handler in [
             HandlerId::AutomationAdmin,
             HandlerId::Giveaway,
-            HandlerId::LfgList,
             HandlerId::FeedAdd,
             HandlerId::FeedRemove,
             HandlerId::FeedList,
             HandlerId::FeedInspect,
         ] {
-            assert_eq!(runtime.router().handler_for(&handler).is_some(), staging);
+            assert_eq!(
+                runtime.router().handler_for(&handler).is_some(),
+                staging,
+                "conditional {handler:?} registration, guild={guild}, app={app}, prefixed={prefixed}"
+            );
+        }
+        // LFG adapter ownership is composed unconditionally, unlike the
+        // activation-fenced publication and invocation checked separately.
+        for handler in [HandlerId::Lfg, HandlerId::LfgClose, HandlerId::LfgList] {
+            assert_eq!(
+                runtime.router().handler_for(&handler).map(|h| h.id()),
+                Some(handler),
+                "LFG ownership {handler:?}, guild={guild}, app={app}, prefixed={prefixed}"
+            );
         }
         assert_eq!(
             runtime
@@ -704,6 +723,81 @@ async fn activation_boot_publishes_only_permitted_capabilities() {
             let msg = message(4444, CHANNEL, false, Some(guild));
             assert_eq!(runtime.on_message(&msg).await, ActivityOutcome::None);
             assert_eq!(mock.requests().len(), 1, "no sticky side effect");
+        }
+        for interaction_guild in [Some(guild), Some(9999), None] {
+            for permissions in [
+                Some(Permissions::MANAGE_EVENTS),
+                Some(Permissions::MANAGE_GUILD),
+                Some(Permissions::empty()),
+                None,
+            ] {
+                let expected = if interaction_guild != Some(guild) {
+                    SlashOutcome::Ignore
+                } else if !staging {
+                    SlashOutcome::Refuse {
+                        refusal: RouterRefusal::AnnouncementsDisabled,
+                    }
+                } else if permissions == Some(Permissions::MANAGE_EVENTS) {
+                    SlashOutcome::Handled {
+                        handler: HandlerId::LfgList,
+                    }
+                } else {
+                    SlashOutcome::Refuse {
+                        refusal: RouterRefusal::ManageEventsRequired,
+                    }
+                };
+                let context = format!(
+                    "lfg-list guild={guild}, app={app}, prefixed={prefixed}, \
+                     interaction_guild={interaction_guild:?}, permissions={permissions:?}"
+                );
+                assert_eq!(
+                    runtime.router().route_slash(&SlashContext {
+                        name: "lfg-list",
+                        guild_id: interaction_guild,
+                        actor_permissions: permissions.map(|p| p.bits()),
+                        custom_row: None,
+                    }),
+                    expected,
+                    "{context}"
+                );
+                if matches!(expected, SlashOutcome::Handled { .. }) {
+                    // Positive routing control only: do not execute the DB read.
+                    continue;
+                }
+                let mut interaction = slash("lfg-list", Some(CHANNEL), Vec::new());
+                interaction.application_id = Id::new(app);
+                interaction.guild_id = interaction_guild.map(Id::new);
+                interaction.member.as_mut().unwrap().permissions = permissions;
+                let before = mock.requests().len();
+                tokio::time::timeout(Duration::from_secs(2), runtime.on_interaction(&interaction))
+                    .await
+                    .unwrap_or_else(|_| panic!("refusal must precede DB execution: {context}"));
+                let requests = mock.requests();
+                match expected {
+                    SlashOutcome::Ignore => {
+                        assert_eq!(requests.len(), before, "silent guild fence: {context}");
+                    }
+                    SlashOutcome::Refuse { refusal } => {
+                        assert_eq!(
+                            requests.len(),
+                            before + 1,
+                            "one refusal only; no lookup, defer, edit or effects: {context}"
+                        );
+                        let callback = &requests[before];
+                        assert_eq!(callback.method, "POST", "{context}");
+                        assert_eq!(
+                            callback.path, "/api/v10/interactions/7/sticky-test-token/callback",
+                            "{context}"
+                        );
+                        let reply: serde_json::Value =
+                            serde_json::from_slice(&callback.body).unwrap();
+                        assert_eq!(reply["type"], 4, "immediate refusal: {context}");
+                        assert_eq!(reply["data"]["flags"], 64, "ephemeral: {context}");
+                        assert_eq!(reply["data"]["content"], refusal.message(), "{context}");
+                    }
+                    other => panic!("unexpected negative control {other:?}: {context}"),
+                }
+            }
         }
         mock.shutdown().await;
     }
