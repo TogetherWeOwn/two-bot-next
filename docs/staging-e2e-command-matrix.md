@@ -53,6 +53,7 @@ guild.`), all other builtins stay silent (`Ignore`); stale or unknown names
 | 26 | `/lfg` | `TWO_ANNOUNCEMENTS` | ManageEvents | Ephemeral signup post + audit row | `AnnouncementsDisabled`, `ManageEventsRequired`, `title`/`starts-at`/`roles` required |
 | 27 | `/lfg-close` | `TWO_ANNOUNCEMENTS` | ManageEvents | Ephemeral confirmation + audit row | `AnnouncementsDisabled`, `ManageEventsRequired`, `id` required |
 | 26 | `/lfg-edit` | `TWO_ANNOUNCEMENTS` | ManageEvents | Ephemeral saved-edit receipt with canonical start time; refreshes the existing post, preserving signups | `AnnouncementsDisabled`, `ManageEventsRequired`, `id` required ≤128; `title` ≤100 or future ISO-8601 `starts-at` required; same-guild open post only |
+| 38 | `/lfg-list` | `TWO_ANNOUNCEMENTS` | ManageEvents | Ephemeral current-channel open confirmed posts, at most five whole rows, bounded cursor continuation; no mutations | `AnnouncementsDisabled`, `ManageEventsRequired`, optional `cursor` ≤512 bound to guild/channel/query, invalid or stale page → restart |
 | 28 | `/feed-add` | `TWO_ANNOUNCEMENTS` | ManageGuild | Ephemeral defer then confirmation + audit row | `AnnouncementsDisabled`, `ManageServerRequired`, `kind` rss/youtube/twitch, `source` required |
 | 29 | `/feed-remove` | `TWO_ANNOUNCEMENTS` | ManageGuild | Ephemeral confirmation + audit row | `AnnouncementsDisabled`, `ManageServerRequired`, `id` required |
 | 30 | `/feed-list` | `TWO_ANNOUNCEMENTS` | ManageGuild | Ephemeral relay list | `AnnouncementsDisabled`, `ManageServerRequired` |
@@ -77,7 +78,7 @@ unknown metadata never becomes a claim that no restriction exists.
 
 ## Voice slice: vote-kick, setup/import (CI-proven handlers; staging round-trip UNPROVEN)
 
-The `TWO_VOICE` slice stays out of the live 33-row suite above. Its handlers
+The `TWO_VOICE` slice stays out of the live 35-row suite above. Its handlers
 are proven deterministically in CI with constructed interaction inputs and no
 guild, network, or database. The user-originated staging round-trip is
 UNPROVEN: a bot token cannot invoke slash commands or click components, so no

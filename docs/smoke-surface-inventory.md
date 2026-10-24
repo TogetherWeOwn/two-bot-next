@@ -66,6 +66,7 @@ handler family with a covered command.
 | `/giveaway` | automations | Create/cancel write stored state and create/update a live message; list needs seeded DB rows. Excluded from the read-only smoke. |
 | `/rsvp-attendance` | announcements | Needs seeded RSVPs on a live scheduled event; the announcements-open family is covered by `/rsvp`. |
 | `/lfg-close` | announcements | Needs a live LFG post id; sequenced after the `/lfg` create step in the live pass, not standalone. |
+| `/lfg-list` | announcements | Read-only current-channel list but needs seeded open LFG posts; the announcements create path is covered by `/lfg`. |
 | `/feed-add` | announcements | Triggers external fetch plus channel relay writes; the offline rule excludes network effects. |
 | `/feed-remove` | announcements | Destructive and needs a live feed id; sequenced after a feed-add, not standalone. |
 | `/feed-list` | announcements | Needs seeded feed relays (DB); the no-DB rule excludes it. |

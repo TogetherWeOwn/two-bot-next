@@ -34,7 +34,7 @@ Help is ephemeral and does not execute the selected command. The command picker
 hides gated commands you cannot use; help explains published requirements but
 does not evaluate every effective Discord permission or guarantee authorization.
 
-Built-in commands: 56.
+Built-in commands: 57.
 
 ## `/access`
 
@@ -351,6 +351,17 @@ Update a raid/LFG title or start time
 | `id` | string | true | — | — | 128 | — | LFG id from the posted signup |
 | `title` | string | false | — | — | 100 | — | Event or group title |
 | `starts-at` | string | false | — | — | — | — | ISO-8601 start time, e.g. 2026-10-04T18:00:00Z |
+
+## `/lfg-list`
+
+List open game posts in this channel
+
+- Default permissions: ManageEvents (`8589934592`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `cursor` | string | false | — | — | 512 | — | Continue a current-channel list |
 
 ## `/limit`
 

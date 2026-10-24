@@ -316,10 +316,28 @@ pub fn expected_registry() -> Value {
         .expect("legacy lfg-close remains published")
         + 1;
     commands.insert(after_close, edit);
+    // Next-only current-channel discovery has its own independent literal.
+    // No production constants or registry builders supply either expectation.
+    let lfg_list = json!({
+        "name": "lfg-list",
+        "description": "List open game posts in this channel",
+        "dm_permission": false,
+        "default_member_permissions": "8589934592",
+        "options": [
+            {"name": "cursor", "description": "Continue a current-channel list", "type": 3,
+             "max_length": 512}
+        ]
+    });
+    let after_edit = commands
+        .iter()
+        .position(|c| c["name"] == "lfg-edit")
+        .expect("lfg-edit is published")
+        + 1;
+    commands.insert(after_edit, lfg_list);
     // Next-only `/giveaway` timed entry: no legacy counterpart. Insert at the
     // publish position (index 15, after sticky-remove and the
-    // inspect/help/privacy/reopen inserts above; the lfg-edit insert lands
-    // after lfg-close and leaves index 15 undisturbed) as the exact
+    // inspect/help/privacy/reopen inserts above; the lfg-edit and lfg-list inserts land
+    // after lfg-close and leave index 15 undisturbed) as the exact
     // published definition, so parity pins its shape too.
     let giveaway = serde_json::to_value(
         CommandDefinition::new("giveaway", "Create, list or cancel a giveaway")
