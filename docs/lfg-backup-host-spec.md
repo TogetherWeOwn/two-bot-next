@@ -164,15 +164,25 @@ End is irreversible for that delegation; a later cover needs a fresh invite.
   binding first, never blind-reapply. Close-versus-use has two legal serial
   orders only: use-then-close, or close-then-refuse.
 - Erasure of either the inviter or the backup host ends every live delegation
-  in that guild naming them and clears their subject fields, inside the
-  existing guarded erasure transaction; include the table in dry-run counts and
-  manifest coverage for both operator `erase_member` and queued
-  `complete_request`. Retain an identity-free spent marker (post/delegation/
-  state/reason/times) with the parent post lifetime; parent erasure/guild
-  purge removes it. Old snapshots may contain delegation rows: before serving
-  restored data, terminalize restored delegations and delete subject fields.
+  in that guild naming them, inside the existing guarded erasure transaction,
+  for both operator `erase_member` and queued `complete_request`. Three stores
+  share one disposition, all included in dry-run counts and manifest coverage
+  for both executors: (1) delegation rows clear inviter/backup subject fields
+  and retain an identity-free spent marker (post/delegation/state/reason/
+  times) with the parent post lifetime; parent erasure/guild purge removes it;
+  (2) cursor rows `(delegation_id, member_id)` delete every row where
+  `member_id` is the erased member, with no tombstone; (3) audit rows delete
+  every row where actor or target is the erased member, with no
+  retain-for-accountability exemption (unlike immutable `guild_settings_audit`,
+  this audit is deletable). The existing `announcements_audit_log` manifest
+  entry covers a different table/columns and does not carry this audit. Old
+  snapshots may contain delegation/cursor/audit rows: before serving restored
+  data, terminalize restored delegations, delete restored cursor rows naming
+  erased members, and delete restored audit rows naming them.
 - Audit invite/accept/refuse/revoke/resign/expire/end with actor/delegation/
-  post IDs, bounded to the parent post lifetime — no indefinite copy. The
+  post IDs, bounded to the parent post lifetime — no indefinite copy. Erasure
+  deletes audit rows naming the erased member (above); terminal clear does not
+  otherwise delete audit for non-erased members. The
   current non-atomic LFG audit (§2) cannot carry this; atomic participation is
   a blocking gap (§5).
 
@@ -193,7 +203,7 @@ Incremental spend target $0 on the existing process/database; unmeasured.
 | Invisible authority/confused deputy | Full binding + fresh proof on every use; staff UI must distinguish "backup host (one post)" from Manage Events; residual risk is a host mistaking delegation scope — host intent review must accept the matrix, not assume staff intuition |
 | Replay/repudiation | One serial state/cursor transaction; close/edit/erasure writers must participate. Existing audit-only dedup is insufficient; no runtime approval until that gap is proved closed |
 | Unsolicited contact/harassment | Pull-only delivery, no DM/ping/mention path, silent refusals, minimal invite disclosure. Repeated unwanted invites are rate-limited but not otherwise blocked; hosts can already contact members through existing channels |
-| Erasure/restore | Same-guild end-and-clear inside both executors; spent marker with post lifetime; restore terminalization. No claim of backup destruction or Discord-side ephemeral erasure |
+| Erasure/restore | Same-guild end-and-clear inside both executors for delegation subject fields, cursor rows and audit rows naming the erased member (delete, no exemption); spent marker with post lifetime; restore terminalization plus cursor/audit deletion. No claim of backup destruction or Discord-side ephemeral erasure |
 | Abuse/outage | Caps, existing lane admission, deny-by-default matrix. Database failure means unavailable/unknown, never an assumed grant or an assumed end |
 
 **CISO proposal assessment:** acceptable to circulate for intent review with the
@@ -245,19 +255,27 @@ unchanged signups/roles and zero new messages/mentions/DMs/role grants.
 | already_authorized | Invite a Manage Events holder -> ALREADY_AUTHORIZED, no row |
 | invite | `h` previews + confirms -> INVITED, one invited slot |
 | double_invite | Second invite while invited/active -> CONFLICT, slot unchanged |
-| accept | `b` accepts exact revision -> ACTIVE; replay same id -> UNCHANGED |
-| accept_after_revoke | Revoke then delayed accept -> ENDED, accept loses |
-| revoke/resign | Host revoke or `b` resign -> ENDED, idempotent repeat |
+| accept | `b` accepts exact revision -> ACTIVE |
+| accept_replay | Replay same id/fingerprint -> UNCHANGED, no write |
+| accept_after_revoke | Revoke then delayed accept -> ENDED, accept loses; late accept after resign likewise loses |
+| revoke | Host revoke -> ENDED, idempotent repeat |
+| resign | `b` resign -> ENDED, idempotent repeat |
 | use_after_end | Delegated close after end -> ENDED, no mutation |
-| foreign_* | Foreign guild/post/message/application/author/non-member actor -> UNAVAILABLE, no row; shared ID cannot select a target actor |
+| foreign_guild | Foreign guild -> UNAVAILABLE, no row; shared ID cannot select a target actor |
+| foreign_post | Foreign post -> UNAVAILABLE, no row |
+| foreign_message | Foreign message binding -> UNAVAILABLE, no row |
+| foreign_application | Foreign application -> UNAVAILABLE, no row |
+| foreign_author | Foreign bot author -> UNAVAILABLE, no row |
+| foreign_nonmember | Non-member actor -> UNAVAILABLE, no row |
 | stale_revision | Accept/use at wrong revision -> STALE, state unchanged |
 | prohibited_op | Backup moves a signup, invites another backup, or touches another post -> FORBIDDEN, state unchanged |
 | close_ends | Post close ends delegation atomically; use-then-close or close-then-refuse only |
 | expiry | Invite past `min(24h, starts)` or active past `min(starts+2h, accept+7d)` -> EXPIRED/ENDED; DB equality at deadline is expired |
-| inviter_loses_authority | `h` loses Manage Events -> delegation persists; another host can still revoke; each use re-proves `b` |
-| backup_departs | Observed definitive departure -> delegation ended; unknown evidence refuses without ending |
-| erasure | Erase `h` or `b` -> live g1 delegations naming them end + subject fields cleared; g2 byte-identical; dry-run unchanged |
-| restart/replay | Restart expires overdue before admission; same id + altered action -> refuse; late accept cannot resurrect a resign |
+| inviter_loses_authority | `h` loses Manage Events -> delegation persists ACTIVE; another host can still revoke; each use re-proves `b` |
+| backup_departs | Observed definitive departure -> ENDED; unknown evidence refuses without ending |
+| restart_expires | Restart expires overdue before admission; no callback creates a missing delegation |
+| tampered_replay | Same id + altered action -> FORBIDDEN, state unchanged |
+| erasure | Erase `h` or `b` -> live g1 delegations naming them end + subject/cursor/audit rows cleared per §4; g2 byte-identical; dry-run unchanged |
 | store_outage | Failure before transaction -> STORE_UNAVAILABLE, no saved reply; never an assumed grant or end |
 
 Runnable offline document check (Python stdlib; from repo root):
@@ -275,7 +293,7 @@ zero tests is not proof. No acceptance/implementation task is created by this
 proposal.
 
 ```pycon
->>> import json
+>>> import json, pathlib
 >>> # (case, reason, invited, active, terminal); abstract expected snapshots
 >>> oracle = [
 ...     ("no_authority_invite", "FORBIDDEN", 0, 0, False),
@@ -290,24 +308,42 @@ proposal.
 ...     ("use_after_end", "ENDED", 0, 0, True),
 ...     ("foreign_guild", "UNAVAILABLE", 0, 0, False),
 ...     ("foreign_post", "UNAVAILABLE", 0, 0, False),
-...     ("foreign_member", "UNAVAILABLE", 0, 0, False),
+...     ("foreign_message", "UNAVAILABLE", 0, 0, False),
+...     ("foreign_application", "UNAVAILABLE", 0, 0, False),
+...     ("foreign_author", "UNAVAILABLE", 0, 0, False),
+...     ("foreign_nonmember", "UNAVAILABLE", 0, 0, False),
 ...     ("stale_revision", "STALE", 0, 1, False),
 ...     ("prohibited_op", "FORBIDDEN", 0, 1, False),
 ...     ("close_ends", "ENDED", 0, 0, True),
 ...     ("expiry", "EXPIRED", 0, 0, True),
+...     ("inviter_loses_authority", "ACTIVE", 0, 1, False),
+...     ("backup_departs", "ENDED", 0, 0, True),
+...     ("restart_expires", "EXPIRED", 0, 0, True),
+...     ("tampered_replay", "FORBIDDEN", 0, 1, False),
 ...     ("erasure", "ENDED", 0, 0, True),
 ...     ("store_outage", "STORE_UNAVAILABLE", 0, 0, False),
 ... ]
->>> assert len({row[0] for row in oracle}) == len(oracle) == 19
+>>> _lines = pathlib.Path("docs/lfg-backup-host-spec.md").read_text().splitlines()
+>>> _start = next(i for i, l in enumerate(_lines) if l.startswith("| Case |"))
+>>> _matrix = []
+>>> for _l in _lines[_start + 2:]:
+...     if not _l.startswith("| "):
+...         break
+...     _matrix.append(_l.split("|")[1].strip())
+>>> assert set(_matrix) == {row[0] for row in oracle}, set(_matrix) ^ {row[0] for row in oracle}
+>>> assert len({row[0] for row in oracle}) == len(oracle) == len(_matrix) == 26
 >>> assert all(i + a <= 1 for _, _, i, a, _ in oracle)
 >>> assert all((i, a) == (0, 0) for _, _, i, a, end in oracle if end)
 >>> assert all(row[1:5] == ("UNAVAILABLE", 0, 0, 0) for row in oracle if row[0].startswith("foreign_"))
+>>> assert sum(1 for row in oracle if row[0].startswith("foreign_")) == 6
 >>> assert dict((name, i) for name, _, i, _, _ in oracle)["double_invite"] == 1
+>>> assert dict((name, r) for name, r, _, _, _ in oracle)["inviter_loses_authority"] == "ACTIVE"
+>>> assert dict((name, a) for name, _, _, a, _ in oracle)["tampered_replay"] == 1
 >>> invited_at, starts_at, now = 0, 10000, 17200
 >>> assert min(invited_at + 86400, starts_at) == 10000  # invite cannot outlive start
 >>> assert min(starts_at + 7200, 0 + 604800) == 17200 and not now < 17200  # active ends at starts+2h
 >>> print(json.dumps({"schema": "lfg.backup.oracle.v1", "fixtures": len(oracle), "status": "pass"}, sort_keys=True))
-{"fixtures": 19, "schema": "lfg.backup.oracle.v1", "status": "pass"}
+{"fixtures": 26, "schema": "lfg.backup.oracle.v1", "status": "pass"}
 
 ```
 
@@ -324,11 +360,12 @@ invented host executor.
 The decision must accept or revise: staff-handoff default, single-slot
 invite/accept/revoke, pull-only delivery, close-only-today matrix, expiry
 formula, inviter-independence with any-host revoke, serial seam with erasure
-participation, and the parent-lifetime spent marker. No build timeline follows
+participation, cursor/audit delete-on-erasure in both executors with restore
+coverage, and the parent-lifetime spent marker. No build timeline follows
 acceptance. On any material revision, bind a fresh review request and alignment
 to that revision.
 
-By 2026-10-31, metric is **all 19 fixture-matrix rows have agreed or explicitly
+By 2026-10-31, metric is **all 26 fixture-matrix rows have agreed or explicitly
 rejected outcomes, the three blocking findings have written disposition, and
 the B-vs-C choice is recorded with demand evidence or its absence**. This
 measures design completeness, not engagement. Default while unresolved is B/A
