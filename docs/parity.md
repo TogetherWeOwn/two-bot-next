@@ -66,10 +66,10 @@ Original registry surface: `CORE_COMMAND_DATA` (always published) = leveling onl
 | 30 | `/feed-list` | `page` opt ≥1 (1-based, default 1) | `ManageGuild` | **S4** |
 
 Runtime permission contract: `crates/core/src/command_permissions.rs` represents
-all 38 rows (35 retained builtins — the 27 legacy ones plus the Next-only
+all 39 rows (36 retained builtins — the 27 legacy ones plus the Next-only
 `/help`, `/privacy`, `/command-inspect`, `/reopen`, `/lfg-edit`,
-`/purge-preview`, `/channel-inspect` and `/giveaway` — the dropped rota command,
-custom slash commands, and prefix triggers). The router checks the invoking interaction's resolved
+`/purge-preview`, `/channel-inspect`, `/giveaway` and `/lfg-list` — the dropped
+rota command, custom slash commands, and prefix triggers). The router checks the invoking interaction's resolved
 `member.permissions`, not bot permissions or command-picker defaults, before
 returning a builtin handler. Missing restricted bits produce an ephemeral refusal
 and a metadata-only `command_permission_denied` tracing audit event (command,

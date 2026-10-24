@@ -1,6 +1,6 @@
 {
   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
-  "count": 34,
+  "count": 35,
   "dm_permission_all_false": true,
   "commands": [
     {
@@ -745,6 +745,29 @@
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Needs a live LFG post id; sequenced after the lfg create step in the live pass, not standalone."
+    },
+    {
+      "name": "lfg-list",
+      "description": "List open game posts in this channel",
+      "family": "announcements",
+      "gate": "announcements",
+      "default_member_permissions": "8589934592",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "cursor",
+          "description": "Continue a current-channel list",
+          "type": "string",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 512,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Read-only current-channel list but needs seeded open LFG posts; the announcements create path is covered by lfg."
     },
     {
       "name": "feed-add",

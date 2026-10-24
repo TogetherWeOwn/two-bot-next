@@ -131,8 +131,9 @@ fn help_lists_only_handled_commands() {
     );
 }
 
-/// Registry compatibility: all 35 parity and Next-only builtins route to
-/// their handlers. The templateassistant unpublish remains covered.
+/// Registry compatibility: all 35 parity and Next-only builtins plus the
+/// separate lfg-list discovery case route to their handlers;
+/// templateassistant stays unpublished.
 #[test]
 fn parity_builtins_route_to_their_handlers() {
     let router = InteractionRouter::new(parity_gates());
@@ -182,7 +183,7 @@ fn parity_builtins_route_to_their_handlers() {
     assert_eq!(
         cases.len(),
         35,
-        "all 35 parity and Next-only builtins covered"
+        "all builtins except the separate lfg-list case covered"
     );
     for (name, handler) in cases {
         assert_eq!(
@@ -191,6 +192,25 @@ fn parity_builtins_route_to_their_handlers() {
             "{name} routes to its handler",
         );
     }
+    // Next-only `/lfg-list`: name-based so the baseline still compiles before
+    // the production `HandlerId::LfgList` arm lands. Resolves via the publish
+    // registry when available instead of naming the enum.
+    let defs = router.publish_set(&[]).expect("parity set assembles");
+    let lfg_list = defs
+        .iter()
+        .find(|d| d.name == "lfg-list")
+        .expect("lfg-list is published after lfg-close and lfg-edit");
+    assert_eq!(
+        lfg_list.description.as_str(),
+        "List open game posts in this channel"
+    );
+    assert!(
+        matches!(
+            router.route_slash(&ctx("lfg-list")),
+            SlashOutcome::Handled { .. }
+        ),
+        "lfg-list routes to its handler"
+    );
 }
 
 /// The Next-only `/giveaway` timed entry routes to its registered handler.
@@ -227,5 +247,5 @@ fn e2e_matrix_still_matches_the_publish_set() {
         matrix_names, published_names,
         "matrix drift: the fix must not change the parity publish set"
     );
-    assert_eq!(matrix.len(), 35, "contract covers the 35 built-in commands");
+    assert_eq!(matrix.len(), 36, "contract covers the 36 built-in commands");
 }

@@ -974,9 +974,10 @@ mod tests {
         // `rsvp-attendance`. First-wins merge must publish each exactly once.
         let merged = merge_commands(&[feature_commands(), moderation_commands()], &[])
             .expect("slices merge cleanly");
-        // 5 core + 19 feature (inspection, reopen, lfg-edit and giveaway)
+        // 5 core + 20 feature (inspection, reopen, giveaway, lfg-edit and
+        // lfg-list)
         // + 9 mutations + 2 reads: nothing deduped away.
-        assert_eq!(merged.len(), 35);
+        assert_eq!(merged.len(), 36);
         let names: Vec<_> = merged.iter().map(|d| d.name.as_str()).collect();
         for name in ["attendance", "rsvp", "rsvp-attendance"] {
             assert_eq!(

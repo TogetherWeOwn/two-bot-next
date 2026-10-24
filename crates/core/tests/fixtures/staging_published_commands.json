@@ -1,5 +1,5 @@
 {
-  "_comment": "Expected staging publish manifest (offline carve), including the protected saved-response inspection contract. Regenerate by reading InteractionRouter::publish_set with all publish gates on: TWO_AUTOMATIONS=1, TWO_ANNOUNCEMENTS=1, TWO_MODERATION=1 (plus its protected-user/role validation), TWO_COMMUNITY_SCORECARD=1. The drift test (staging_publish_manifest.rs) fails if the router-advertised set differs from this file. This fixture never touches a guild and carries no secrets: guild IDs, tokens and live publish stay in the live-publish workflow (docs/command-publish.md). Dynamic DB-backed custom commands are additive and automation-gated; the pinned 'faq' row below is a representative example so the test can prove the gating, not a claim about staging database contents.",
+  "_comment": "Expected staging publish manifest (offline carve), preserving saved-command inspection and current-channel discovery. Verify against InteractionRouter::publish_set with all publish gates on: TWO_AUTOMATIONS=1, TWO_ANNOUNCEMENTS=1, TWO_MODERATION=1 (plus its protected-user/role validation), TWO_COMMUNITY_SCORECARD=1. The drift test (staging_publish_manifest.rs) fails if the router-advertised set differs from this file. This fixture never touches a guild and carries no secrets: guild IDs, tokens and live publish stay in the live-publish workflow (docs/command-publish.md). Dynamic DB-backed custom commands are additive and automation-gated; the pinned 'faq' row below is a representative example so the test can prove the gating, not a claim about staging database contents.",
   "gates": {
     "automations": true,
     "announcements": true,
@@ -27,6 +27,7 @@
     "rsvp-attendance",
     "lfg",
     "lfg-close",
+    "lfg-list",
     "feed-add",
     "feed-remove",
     "feed-list",
@@ -66,6 +67,7 @@
     "rsvp-attendance",
     "lfg",
     "lfg-close",
+    "lfg-list",
     "feed-add",
     "feed-remove",
     "feed-list",

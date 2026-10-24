@@ -1,4 +1,37 @@
-# LFG Select validation, audit loss and redelivery
+# LFG discovery, Select validation, audit loss and redelivery
+
+## Find open game posts in this channel
+
+`/lfg-list` requires Manage Events and returns an ephemeral list from the invoking
+channel only. It retains the announcements and configured-guild gates, but an
+automation pause does not block this read. No new role grants are required.
+
+Only open posts with a confirmed, canonical Discord message identity are listed.
+Unconfirmed/delivery-uncertain and closed posts are excluded. Today's LFG policy
+has no automatic start-time expiry, so past starts remain visible and labeled
+`past`; unreadable start times are labeled `unknown`, never fabricated.
+
+Rows contain the stable management ID, inert complete title, Discord-localized
+start time and validated guild/channel/message jump link. No signup, creator or
+role data is selected. The SQL query filters guild and channel before its fixed
+six-row limit (five rows plus lookahead), ordered by creation time then ID. It
+uses no OFFSET, counts or Discord history scan.
+
+Each page contains at most five whole rows, possibly fewer to fit Discord's
+2,000 UTF-16-unit content limit including its footer. Copy `/lfg-list cursor:<token>`
+to continue in the same channel. Restart without a cursor when a page is invalid
+or stale, including after a process restart. Cursors are versioned authenticated
+keysets bound to this guild, channel and query; they carry no foreign-channel
+counts. Concurrent closures are skipped and earlier inserts appear on restart,
+not through offset-based skipping. End and empty states are explicit. Store
+failure is an unavailable reply, not an empty list. A malformed or individually
+oversized persisted row fails explicitly instead of silently shortening it.
+
+Discovery is separate from mutation/delivery code: no signup/close operation,
+audit append, channel write, identity/history lookup or delivery-fence reset.
+`crates/discord/tests/lfg_list_acceptance.rs` exercises the actual interaction
+path and bounded SQL against disposable fixtures and loopback Discord only;
+it is not staging or production evidence.
 
 The Select parser and direct interaction service validate post IDs with the
 same `lfg::valid_post_id` predicate as Close: nonempty and at most 128 UTF-16

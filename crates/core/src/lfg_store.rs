@@ -284,6 +284,51 @@ pub async fn get_lfg(
     .transpose()
 }
 
+/// Read one current-channel keyset page, plus one lookahead, without loading
+/// signup/role/member data or taking any mutation/delivery locks. Today's LFG
+/// policy has no start-time expiry: past open confirmed posts remain eligible.
+/// Every visibility/identity predicate is applied in SQL before LIMIT.
+pub async fn list_lfg_channel(
+    pool: &sqlx::PgPool,
+    guild_id: &str,
+    channel_id: &str,
+    after: Option<&crate::lfg_list::ListCursor>,
+) -> Result<Vec<crate::lfg_list::ListPost>, sqlx::Error> {
+    type ListRow = (String, String, String, Option<i64>, time::OffsetDateTime);
+    let rows: Vec<ListRow> = sqlx::query_as(
+        "SELECT id, title, message_id,
+                CASE WHEN isfinite(starts_at)
+                     THEN trunc(extract(epoch FROM starts_at))::bigint END,
+                created_at
+         FROM lfg_posts
+         WHERE guild_id = $1 AND channel_id = $2 AND status = 'open'
+           AND message_id ~ '^[1-9][0-9]{0,19}$'
+           AND (length(message_id) < 20 OR message_id COLLATE \"C\" <= $5)
+           AND isfinite(created_at)
+           AND ($3::timestamptz IS NULL OR (created_at, id) > ($3, $4))
+         ORDER BY created_at ASC, id ASC LIMIT 6",
+    )
+    .bind(guild_id)
+    .bind(channel_id)
+    .bind(after.map(|cursor| cursor.created_at))
+    .bind(after.map(|cursor| cursor.id.as_str()))
+    .bind(u64::MAX.to_string())
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(id, title, message_id, starts_at, created_at)| crate::lfg_list::ListPost {
+                id,
+                title,
+                message_id,
+                starts_at,
+                created_at,
+            },
+        )
+        .collect())
+}
+
 /// Delete a post (cascades to roles + signups). Legacy `deleteLfg`: the
 /// failed-post path removes fenced durable state after an unreconciled
 /// Discord error.
