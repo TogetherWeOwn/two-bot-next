@@ -67,6 +67,11 @@ IMAGE_MAX_BYTES = 112 * MIB
 # lto, strip): 17,833,864 bytes (17.01 MiB), 8,072 over 17 MiB. 18 MiB
 # restores ~1 MiB of headroom while keeping a working tripwire; revisit if
 # the binary approaches it.
+# 2026-10-24 merged-tree re-measurement: PR #1662 head f3e325d3 merged with
+# main 87d53098 (including the REST-acquisition 1d8129b1 and dispatcher
+# e07140dd repairs) measures 17,854,776 bytes (17.03 MiB) in hosted CI
+# (run 40094727805), 28,984 over 17 MiB. 18 MiB stands on merged-tree
+# evidence with no new dependencies and no release-profile change.
 BINARY_MAX_BYTES = 18 * MIB
 # CLI refusal bounds (not budget policy): --image-max-bytes/--binary-max-bytes
 # outside 1..cap are unusable — a non-positive budget can never pass and a
