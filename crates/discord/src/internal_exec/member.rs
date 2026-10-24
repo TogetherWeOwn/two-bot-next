@@ -8,7 +8,7 @@ use super::{ActionExecutor, RawResponse};
 use crate::ratelimit_guard::GuardError;
 use serde::Deserialize;
 use std::time::Duration;
-use twilight_http::request::TryIntoRequest;
+use twilight_http::request::{Request, TryIntoRequest};
 use twilight_model::id::{marker::GenericMarker, Id};
 use two_bot_core::internal_actions::{
     ActionError, ErrorCode, GuildAddMemberRequest, RoleAssignRequest,
@@ -155,12 +155,15 @@ struct RoleSnapshot {
 }
 
 impl ActionExecutor {
-    async fn member_request<T: TryIntoRequest>(
+    // Only building the request depends on its Twilight builder type. Keep the
+    // bounded exchange and refusal handling in one concrete async state machine.
+    #[inline(never)]
+    async fn member_request(
         &self,
-        build: T,
+        request: Result<Request, twilight_http::Error>,
         timeout_ms: u64,
     ) -> Result<RawResponse, MemberError> {
-        let request = build.try_into_request().map_err(|_| {
+        let request = request.map_err(|_| {
             ActionError::new(
                 ErrorCode::Malformed,
                 "Invalid Discord request",
@@ -200,7 +203,8 @@ impl ActionExecutor {
             .member_request(
                 self.inner
                     .factory
-                    .guild_member(numeric_id(guild_id)?.cast(), numeric_id(user_id)?.cast()),
+                    .guild_member(numeric_id(guild_id)?.cast(), numeric_id(user_id)?.cast())
+                    .try_into_request(),
                 ROLE_TIMEOUT_MS,
             )
             .await?;
@@ -242,11 +246,14 @@ impl ActionExecutor {
         }
         let mut response = self
             .member_request(
-                self.inner.factory.add_guild_member(
-                    numeric_id(guild_id)?.cast(),
-                    numeric_id(request.discord_id())?.cast(),
-                    access_token,
-                ),
+                self.inner
+                    .factory
+                    .add_guild_member(
+                        numeric_id(guild_id)?.cast(),
+                        numeric_id(request.discord_id())?.cast(),
+                        access_token,
+                    )
+                    .try_into_request(),
                 ADD_MEMBER_TIMEOUT_MS,
             )
             .await?;
@@ -305,7 +312,10 @@ impl ActionExecutor {
             .await?
             .ok_or_else(unreadable)?;
         let response = self
-            .member_request(self.inner.factory.roles(guild), ROLE_TIMEOUT_MS)
+            .member_request(
+                self.inner.factory.roles(guild).try_into_request(),
+                ROLE_TIMEOUT_MS,
+            )
             .await?;
         let roles: Vec<RoleSnapshot> =
             serde_json::from_slice(&response.body).map_err(|_| unreadable())?;
@@ -342,7 +352,10 @@ impl ActionExecutor {
         }
         let mut response = self
             .member_request(
-                self.inner.factory.add_guild_member_role(guild, user, role),
+                self.inner
+                    .factory
+                    .add_guild_member_role(guild, user, role)
+                    .try_into_request(),
                 ROLE_TIMEOUT_MS,
             )
             .await?;
@@ -351,5 +364,39 @@ impl ActionExecutor {
         }
         response.complete().await;
         Ok(MemberOutcome::Assigned)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn invalid_member_request_keeps_its_redacted_error() {
+        let executor = ActionExecutor::with_proxy(
+            "fixture-bot-token".into(),
+            Some("http://127.0.0.1:1".into()),
+        )
+        .expect("loopback executor");
+        let content = "fixture-private-content".repeat(100);
+        let error = executor
+            .member_request(
+                executor
+                    .inner
+                    .factory
+                    .create_message(Id::new(1))
+                    .content(&content)
+                    .try_into_request(),
+                ROLE_TIMEOUT_MS,
+            )
+            .await
+            .expect_err("oversized request must fail before dispatch");
+        let MemberError::Action(error) = error else {
+            panic!("invalid request must not reach admission");
+        };
+        assert_eq!(error.code, ErrorCode::Malformed);
+        assert_eq!(error.message, "Invalid Discord request");
+        assert_eq!(error.log_reason, "discord_request_invalid");
+        assert!(!format!("{error:?}").contains("fixture"));
     }
 }
