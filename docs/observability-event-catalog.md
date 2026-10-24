@@ -30,13 +30,16 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 | --- | --- | --- |
 | `gateway intents resolved` | `crates/bot/src/main.rs` (`run`) | Boot resolved the gateway intents; `voice_presences` states whether `GUILD_PRESENCES` was requested (the enabling flag may be a secret binding, so only the boolean is logged). `false` means voice-room game names can never be detected this boot |
 | `durable gateway initialized; shard connecting` | `crates/bot/src/main.rs` (`run`) | Supervisor built the shard; `resume=true` means a saved checkpoint was offered, `false` means fresh IDENTIFY |
+| `community facts arming refused; capture disabled` | `crates/bot/src/main.rs` (`run`) | Facts-sink arming refused at boot; capture stays disabled exactly like the scorecard flag being off |
 | `gateway shard loop started` | `crates/bot/src/gateway.rs` (`run_shard`) | Reception task entered the Twilight stream loop |
 | `gateway reconnect failed; Twilight will retry` | `crates/bot/src/gateway.rs` (`run_shard`) | Transport reconnect attempt failed; Twilight owns the retry |
 | `cold resume committed; requesting voice snapshot via identify` | `crates/bot/src/gateway.rs` (`run_shard`) | Cold voice RESUME committed; reception IDENTIFies for a fresh voice snapshot |
 | `gateway ready; checkpoint committed` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Dispatch committed and shard marked Connected |
 | `gateway leveling dispatch failed` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Leveling funnel drain failed inside the checkpoint deadline |
+| `gateway leveling collect failed` | `crates/bot/src/gateway.rs` (`requests_or_hold_cursor`) | Leveling funnel collection refused (poisoned deferred buffer); checkpoint cursor held so the worker stops and the supervisor restarts |
 | `gateway community facts dispatch failed` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Community facts drain failed; worker continues and the scorecard fails closed on missing coverage |
 | `gateway community facts dispatch timed out` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Community facts drain missed the checkpoint deadline; worker continues and the scorecard fails closed on missing coverage |
+| `gateway community facts buffer poisoned` | `crates/bot/src/gateway.rs` (`hold_cursor_on_facts_poison`) | Community facts buffer poisoned; checkpoint cursor held so the worker stops and the supervisor restarts, unlike an ordinary write failure |
 | `gateway dispatch refused: duplicate JSON key` | `crates/bot/src/gateway.rs` (`run_shard`) | MESSAGE_UPDATE bytes carried a repeated JSON key; parse and dispatch skipped with no verdict input, worker still commits the checkpoint so a resume replays nothing |
 | `gateway onboarding job invalid` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Dispatch-worker durable onboarding payload failed to serialize; recorded as a typed error, checkpoint unchanged |
 | `onboarding interaction interrupted; member must reselect` | `crates/bot/src/gateway.rs` (`onboarding_queue`) | Durable onboarding job recovered without callback credentials; kept as interruption receipt |
@@ -330,8 +333,9 @@ Each label owns independent `two_bot_job_runs_total{job,outcome}`,
 `two_bot_job_consecutive_failures{job}` and
 `two_bot_job_last_error_class{job,class}` series (see the job allowlist
 `JOBS` in `metrics.rs`). Success in one label never clears another label's
-streak. None of these four has a `JOB_INTERVAL_SECONDS` cadence entry, so
-staleness tickets via `job_unknown_stale` below instead of `job_stale`.
+streak. The first four labels below have no `JOB_INTERVAL_SECONDS` cadence
+entry, so staleness tickets via `job_unknown_stale` instead of `job_stale`.
+`lfg_sweep` has a 60-second cadence entry and uses `job_stale`.
 
 | Job label | Producer (stable anchor) | Meaning |
 | --- | --- | --- |
@@ -339,6 +343,7 @@ staleness tickets via `job_unknown_stale` below instead of `job_stale`.
 | `self_role_recovery` | `self_role_handlers.rs` (`recovery_job`) | Self-role repair sweep every 30 s; a successful sweep need not settle every pending repair; failure-only alerting, no `job_stale` paging |
 | `member_unban_sweep` | `member_runtime.rs` (`sweep_job`) | Member unban sweep every 30 s with an attempt timeout that may outlive its cadence; a successful sweep need not complete any unban; failure-only alerting |
 | `automod_expiry` | `automod_gateway.rs` (`expiry_job`) | Automod repeat-history expiry tick every 60 s; a gateway without built activation is a no-op success, and real expiry work runs only with the automod gate on; failure-only alerting |
+| `lfg_sweep` | `lfg_jobs.rs` (`register`) | Bounded LFG lifecycle sweep every 60 s under announcement/identity gates; at most 20 candidates, row-local failures continue, and success does not prove every row or message refresh settled; 60 s `job_stale` cadence |
 
 ## Alert rules
 

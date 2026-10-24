@@ -160,10 +160,26 @@ pub(crate) enum StoreErrorKind {
 pub(crate) enum RuntimeError {
     Store(StoreErrorKind),
     Rest(SelfRoleRestError),
+    CatalogueChanged,
     Stale,
     InvalidSnapshot,
     PendingExchange,
 }
+
+impl std::fmt::Display for RuntimeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Store(_) => "self-role store operation failed",
+            Self::Rest(_) => "self-role REST operation failed",
+            Self::CatalogueChanged => "self-role catalogue changed",
+            Self::Stale => "self-role claim is stale",
+            Self::InvalidSnapshot => "self-role snapshot is invalid",
+            Self::PendingExchange => "self-role exchange is pending",
+        })
+    }
+}
+
+impl std::error::Error for RuntimeError {}
 
 async fn store_io<T>(
     operation: impl Future<Output = Result<T, StoreError>>,
@@ -172,6 +188,7 @@ async fn store_io<T>(
         .await
         .map_err(|_| RuntimeError::Store(StoreErrorKind::Timeout))?
         .map_err(|error| match error {
+            StoreError::CatalogueChanged => RuntimeError::CatalogueChanged,
             StoreError::StaleClaim => RuntimeError::Stale,
             StoreError::PendingExchange => RuntimeError::PendingExchange,
             _ => RuntimeError::Store(StoreErrorKind::Database),
@@ -1199,10 +1216,30 @@ impl SelfRoleRuntime {
 
     /// Claim first, exclusive lane second, authoritative policy/member last.
     /// No gateway/cache role set or permission mask participates in planning.
+    #[cfg(test)]
     pub async fn prepare(
         &self,
         request: &SelfRoleRequest,
         panel: &SelfRolePanel,
+    ) -> Result<Admission, RuntimeError> {
+        self.prepare_with_revision(request, panel, None).await
+    }
+
+    pub async fn prepare_at_revision(
+        &self,
+        request: &SelfRoleRequest,
+        panel: &SelfRolePanel,
+        revision: i64,
+    ) -> Result<Admission, RuntimeError> {
+        self.prepare_with_revision(request, panel, Some(revision))
+            .await
+    }
+
+    async fn prepare_with_revision(
+        &self,
+        request: &SelfRoleRequest,
+        panel: &SelfRolePanel,
+        revision: Option<i64>,
     ) -> Result<Admission, RuntimeError> {
         if request.guild_id != self.guild_id
             || request.channel_id != panel.channel_id
@@ -1234,7 +1271,7 @@ impl SelfRoleRuntime {
             desired_role_ids: vec![],
             pre_mutation_role_ids: vec![],
         };
-        self.prepare_audit(audit, panel, Some(request.selection.clone()))
+        self.prepare_audit(audit, panel, Some(request.selection.clone()), revision)
             .await
     }
 
@@ -1271,7 +1308,7 @@ impl SelfRoleRuntime {
             desired_role_ids: vec![],
             pre_mutation_role_ids: vec![],
         };
-        self.prepare_audit(audit, panel, None).await
+        self.prepare_audit(audit, panel, None, None).await
     }
 
     pub async fn recovery_candidates(
@@ -1294,8 +1331,18 @@ impl SelfRoleRuntime {
         mut audit: SelfRoleAudit,
         panel: &SelfRolePanel,
         selection: Option<Selection>,
+        revision: Option<i64>,
     ) -> Result<Admission, RuntimeError> {
-        let Some(mut event) = store_io(self.store.claim_pending_audit(&audit)).await? else {
+        let claim = match revision {
+            Some(revision) => {
+                match store_io(self.store.claim_pending_audit_at_revision(&audit, revision)).await {
+                    Err(RuntimeError::CatalogueChanged) => return Ok(Admission::Ignored),
+                    result => result?,
+                }
+            }
+            None => store_io(self.store.claim_pending_audit(&audit)).await?,
+        };
+        let Some(mut event) = claim else {
             return Ok(Admission::Duplicate);
         };
         let selection = match selection {
