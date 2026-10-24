@@ -307,6 +307,10 @@ pub struct RawResponse {
     pub(crate) completion: Option<two_bot_core::send_admission::AdmissionPermit>,
 }
 
+type AdmittedSendFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(RawResponse, bool), DiscordError>> + Send + 'a>,
+>;
+
 impl std::fmt::Debug for RawResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RawResponse")
@@ -1284,30 +1288,36 @@ impl ActionExecutor {
             .await
     }
 
-    async fn send_admitted_for(
-        &self,
-        request: &Request,
+    // Erase the wire future at one non-inlined constructor, so the many REST
+    // wrappers share its poll/drop code instead of embedding the transport.
+    // Counting and the deadline stay lazy; cancellation still drops in place.
+    #[inline(never)]
+    fn send_admitted_for<'a>(
+        &'a self,
+        request: &'a Request,
         budget: Duration,
-    ) -> Result<(RawResponse, bool), DiscordError> {
-        self.count();
-        // The absolute attempt instant is fixed before durable admission, so
-        // the admit, the header wait and the body share the one deadline.
-        let deadline = tokio::time::Instant::now() + budget;
-        self.inner
-            .transport
-            .send_request(request, Some(deadline))
-            .await
-            .map_err(|detail| {
-                // A body that never completed inside the wire budget is
-                // "Discord did not answer in time" (legacy `upstream_timeout`).
-                // The stalled-header marker maps the same way: headers never
-                // arrived in time ([TOG-12562](/TOG/issues/TOG-12562)).
-                if detail == BODY_TIMEOUT_MESSAGE || detail == HEADER_TIMEOUT_MESSAGE {
-                    DiscordError::Timeout
-                } else {
-                    DiscordError::Unavailable(detail)
-                }
-            })
+    ) -> AdmittedSendFuture<'a> {
+        Box::pin(async move {
+            self.count();
+            // The absolute attempt instant is fixed before durable admission, so
+            // the admit, the header wait and the body share the one deadline.
+            let deadline = tokio::time::Instant::now() + budget;
+            self.inner
+                .transport
+                .send_request(request, Some(deadline))
+                .await
+                .map_err(|detail| {
+                    // A body that never completed inside the wire budget is
+                    // "Discord did not answer in time" (legacy `upstream_timeout`).
+                    // The stalled-header marker maps the same way: headers never
+                    // arrived in time.
+                    if detail == BODY_TIMEOUT_MESSAGE || detail == HEADER_TIMEOUT_MESSAGE {
+                        DiscordError::Timeout
+                    } else {
+                        DiscordError::Unavailable(detail)
+                    }
+                })
+        })
     }
 
     async fn send_paced(
@@ -1450,6 +1460,7 @@ impl ActionExecutor {
 
     /// One attempt bounded by `timeout`, borrowing the request so a caller can
     /// re-attempt it after a pre-wire refusal.
+    #[inline(never)]
     async fn call_once_raw_lane_for(
         &self,
         request: &Request,
@@ -4430,6 +4441,75 @@ mod tests {
         ] {
             assert!(!error.is_admission_blocked(), "{error:?}");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn admitted_send_stays_lazy_and_cancellation_drops_its_admission() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::Poll;
+
+        struct AdmissionDrop(Arc<AtomicUsize>);
+        impl Drop for AdmissionDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        #[derive(Debug)]
+        struct PendingAdmission {
+            key: TokenKey,
+            entered: Arc<AtomicUsize>,
+            dropped: Arc<AtomicUsize>,
+        }
+        impl SendAdmission for PendingAdmission {
+            fn token_key(&self) -> &TokenKey {
+                &self.key
+            }
+
+            fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+                Box::pin(async move {
+                    let _drop = AdmissionDrop(self.dropped.clone());
+                    self.entered.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending().await
+                })
+            }
+        }
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let entered = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let token = "fixture-lazy-send-token";
+        let executor = ActionExecutor::with_admission(
+            token.to_owned(),
+            Some("http://127.0.0.1:1".to_owned()),
+            Arc::new(PendingAdmission {
+                key: TokenKey::for_bot_token(token).expect("fixture token key"),
+                entered: entered.clone(),
+                dropped: dropped.clone(),
+            }),
+        )
+        .expect("fixture executor");
+        let request = Request::from_route(&Route::GetCurrentUser);
+        let budget = Duration::from_millis(50);
+        let unpolled = executor.send_admitted_for(&request, budget);
+        drop(unpolled);
+        assert_eq!(executor.requests(), 0);
+        assert_eq!(entered.load(Ordering::SeqCst), 0);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+
+        let mut pending = Box::pin(executor.send_admitted_for(&request, budget));
+        // Construction must not start the deadline or durable admission.
+        tokio::time::advance(budget * 2).await;
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(executor.requests(), 1);
+        assert_eq!(entered.load(Ordering::SeqCst), 1);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        drop(pending);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
     }
 
     fn boot_executor() -> ActionExecutor {
