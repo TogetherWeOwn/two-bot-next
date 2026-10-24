@@ -57,16 +57,13 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use sqlx::PgPool;
-use twilight_model::application::command::CommandType;
 use twilight_model::application::interaction::application_command::{
-    CommandData, CommandDataOption, CommandOptionValue,
+    CommandDataOption, CommandOptionValue,
 };
-use twilight_model::application::interaction::{Interaction, InteractionData, InteractionType};
-use twilight_model::guild::{MemberFlags, PartialMember, Permissions};
+use twilight_model::application::interaction::Interaction;
+use twilight_model::guild::Permissions;
 use twilight_model::id::marker::RoleMarker;
 use twilight_model::id::{AnonymizableId, Id};
-use twilight_model::oauth::ApplicationIntegrationMap;
-use twilight_model::user::User;
 use two_bot_core::funnel::format_iso_millis;
 use two_bot_core::router::replies::UNKNOWN_COMMAND_REPLY;
 use two_bot_core::tickets::{decide_open, COOLDOWN_SECONDS};
@@ -135,32 +132,6 @@ async fn harness(db: &TestDatabase, mock: &MockRest) -> (Arc<TicketRuntime>, Arc
     (tickets, commands)
 }
 
-fn user(id: u64) -> User {
-    User {
-        accent_color: None,
-        avatar: None,
-        avatar_decoration: None,
-        avatar_decoration_data: None,
-        banner: None,
-        bot: false,
-        discriminator: 0,
-        email: None,
-        flags: None,
-        global_name: None,
-        id: Id::new(id),
-        locale: None,
-        mfa_enabled: None,
-        name: "member".to_owned(),
-        premium_type: None,
-        primary_guild: None,
-        public_flags: None,
-        system: None,
-        verified: None,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-#[allow(deprecated)]
 fn slash(
     name: &str,
     guild_id: u64,
@@ -170,51 +141,21 @@ fn slash(
     options: Vec<CommandDataOption>,
     interaction_id: u64,
 ) -> Interaction {
-    Interaction {
-        app_permissions: None,
-        application_id: Id::new(APP_ID),
-        authorizing_integration_owners: ApplicationIntegrationMap {
-            guild: Some(AnonymizableId::Id(Id::new(guild_id))),
-            user: None,
-        },
-        channel: None,
-        channel_id: Some(Id::new(CHANNEL_BASE)),
-        context: None,
-        data: Some(InteractionData::ApplicationCommand(Box::new(CommandData {
-            guild_id: None,
-            id: Id::new(1),
-            name: name.to_owned(),
-            kind: CommandType::ChatInput,
-            options,
-            resolved: None,
-            target_id: None,
-        }))),
-        entitlements: Vec::new(),
-        guild: None,
-        guild_id: Some(Id::new(guild_id)),
-        guild_locale: None,
-        id: Id::new(interaction_id),
-        kind: InteractionType::ApplicationCommand,
-        locale: None,
-        member: Some(PartialMember {
-            avatar: None,
-            avatar_decoration_data: None,
-            banner: None,
-            communication_disabled_until: None,
-            deaf: false,
-            flags: MemberFlags::empty(),
-            joined_at: None,
-            mute: false,
-            nick: None,
-            permissions: Some(permissions),
-            premium_since: None,
-            roles,
-            user: Some(user(member_id)),
-        }),
-        message: None,
-        token: format!("ticket-list-test-{interaction_id}"),
-        user: Some(user(member_id)),
-    }
+    // Reuse the shared fixture and mutate only non-deprecated fields: the
+    // deprecated `channel_id` literal stays inside the grandfathered helper,
+    // so this file adds no silenced-checker waivers.
+    let mut interaction = super::slash(name, Some(CHANNEL_BASE), options);
+    interaction.application_id = Id::new(APP_ID);
+    interaction.authorizing_integration_owners.guild = Some(AnonymizableId::Id(Id::new(guild_id)));
+    interaction.guild_id = Some(Id::new(guild_id));
+    interaction.id = Id::new(interaction_id);
+    interaction.token = format!("ticket-list-test-{interaction_id}");
+    let member = interaction.member.as_mut().expect("guild member");
+    member.permissions = Some(permissions);
+    member.roles = roles;
+    member.user = Some(super::user(member_id, false));
+    interaction.user = Some(super::user(member_id, false));
+    interaction
 }
 
 fn member_slash(
