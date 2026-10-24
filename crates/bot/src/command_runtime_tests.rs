@@ -375,11 +375,22 @@ pub(crate) fn slash(
             guild: Some(AnonymizableId::Id(Id::new(GUILD))),
             user: None,
         },
-        channel: None,
+        // Real Discord populates both for guild slash commands: the
+        // registration guild (identity resolution scopes guild receipts by
+        // it) and the channel object (template context needs it).
+        channel: channel.map(|id| {
+            serde_json::from_value::<twilight_model::channel::Channel>(serde_json::json!({
+                "id": id.to_string(),
+                "guild_id": GUILD.to_string(),
+                "type": 0,
+                "name": "commands",
+            }))
+            .expect("slash fixture channel")
+        }),
         channel_id: channel.map(Id::new),
         context: None,
         data: Some(InteractionData::ApplicationCommand(Box::new(CommandData {
-            guild_id: None,
+            guild_id: Some(Id::new(GUILD)),
             id: Id::new(1),
             name: name.to_owned(),
             kind: CommandType::ChatInput,
