@@ -783,7 +783,18 @@ async fn schedule_body_edit_control_existing_list_and_ticker_are_real_and_read_o
     let before = rows(db.pool()).await;
     let listed =
         private_text(&invoke(db.pool(), slash("schedule-list", Some(CHANNEL), Vec::new())).await);
-    assert!(listed.contains(ID) && listed.contains("Page 1 of 1"));
+    assert_eq!(
+        schedule_list_row_lines(&listed)
+            .into_iter()
+            .map(schedule_list_row_id)
+            .collect::<Vec<_>>(),
+        vec![ID],
+        "list the complete canonical id exactly once"
+    );
+    assert!(
+        matches!(schedule_list_page_indicator(&listed), None | Some((1, 1))),
+        "the existing single-page contract allows an omitted indicator: {listed}"
+    );
     assert!(
         !listed.contains(OLD),
         "list remains bounded metadata, not a body dump"
