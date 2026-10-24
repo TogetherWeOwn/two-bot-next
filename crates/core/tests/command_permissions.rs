@@ -94,16 +94,25 @@ fn all_30_rows_equal_parity_section1() {
     // The 30 legacy parity rows plus the Next-only `/help` discovery command
     // (parity row 31 — legacy has no help command), `/privacy` member
     // self-serve (row 32), management-only `/command-inspect` (row 33),
-    // and `/giveaway` timed entry (row 34). Next-only rows do not appear
-    // in the legacy §1 table above; registry equality covers every builtin.
-    assert_eq!(COMMAND_PERMISSIONS.len(), 34);
+    // `/reopen` picker recovery (row 34) and `/giveaway` timed entry
+    // (row 35). Next-only rows do not appear in the legacy §1 table above;
+    // registry equality covers every builtin.
+    assert_eq!(COMMAND_PERMISSIONS.len(), 35);
     assert_eq!(
         COMMAND_PERMISSIONS
             .iter()
             .map(|row| row.command)
             .collect::<HashSet<_>>()
             .len(),
-        34
+        35
+    );
+    assert_eq!(
+        COMMAND_PERMISSIONS
+            .iter()
+            .map(|row| row.parity_row)
+            .collect::<HashSet<_>>(),
+        (1..=35).collect::<HashSet<_>>(),
+        "parity rows are contiguous 1..=35"
     );
     let help = command_permission("help").expect("help has a permission row");
     assert_eq!(help.required_permissions, 0);
@@ -113,8 +122,13 @@ fn all_30_rows_equal_parity_section1() {
     assert_eq!(inspect.required_permissions, 32, "ManageGuild bit");
     assert_eq!(inspect.surface, CommandSurface::BuiltinSlash);
     assert_eq!(inspect.policy_hook, None);
+    let reopen = command_permission("reopen").expect("reopen has a permission row");
+    assert_eq!(reopen.parity_row, 34);
+    assert_eq!(reopen.required_permissions, 0);
+    assert_eq!(reopen.surface, CommandSurface::BuiltinSlash);
+    assert_eq!(reopen.policy_hook, None);
     let giveaway = command_permission("giveaway").expect("giveaway has a permission row");
-    assert_eq!(giveaway.parity_row, 34);
+    assert_eq!(giveaway.parity_row, 35);
     assert_eq!(giveaway.required_permissions, 32, "ManageGuild bit");
     assert_eq!(giveaway.surface, CommandSurface::BuiltinSlash);
     assert_eq!(giveaway.policy_hook, None);
@@ -133,7 +147,7 @@ fn permission_table_equals_the_complete_published_registry() {
         .iter()
         .filter(|row| row.surface == CommandSurface::BuiltinSlash)
         .collect();
-    assert_eq!(builtins.len(), 31);
+    assert_eq!(builtins.len(), 32);
     assert_eq!(published.len(), builtins.len() + 1);
     for row in builtins {
         let definition = published
@@ -257,7 +271,7 @@ fn every_routed_builtin_name_has_a_permission_row() {
             other => panic!("{name} is published or retained but does not route: {other:?}"),
         }
     }
-    assert_eq!(routed, 31, "every retained builtin routes");
+    assert_eq!(routed, 32, "every retained builtin routes");
 }
 
 #[test]
