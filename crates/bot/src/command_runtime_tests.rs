@@ -30,8 +30,10 @@ mod sticky_uncertain_acceptance_tests;
 
 #[path = "custom_command_list_pages_acceptance.rs"]
 mod custom_command_list_pages_acceptance;
-#[path = "schedule_absolute_acceptance_tests.rs"]
-mod schedule_absolute_acceptance;
+// PROBE-ONLY: runtime RED module excluded so CI reaches the registration integration step.
+// Handoff branch keeps this module; this ref exists solely to observe registration RED.
+// #[path = "schedule_absolute_acceptance_tests.rs"]
+// mod schedule_absolute_acceptance;
 
 use std::collections::VecDeque;
 use std::str::FromStr;
