@@ -1091,6 +1091,10 @@ fn actor_id(interaction: &Interaction) -> String {
         .unwrap_or_default()
 }
 
+/// Invoking channel as a snowflake string. `channel_id` is deprecated on the
+/// wire but still the field Discord populates for guild slash commands; the
+/// replacement `channel` object carries the id plus a payload we never read.
+#[allow(deprecated)]
 fn interaction_channel(interaction: &Interaction) -> Option<String> {
     interaction
         .channel
