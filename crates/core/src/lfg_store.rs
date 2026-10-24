@@ -367,12 +367,15 @@ pub async fn signup_lfg(
         .bind(format!("lfg:{guild_id}:{id}"))
         .execute(&mut *tx)
         .await?;
-    let post: Option<(String,)> =
-        sqlx::query_as("SELECT status FROM lfg_posts WHERE guild_id = $1 AND id = $2")
-            .bind(guild_id)
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await?;
+    let post: Option<(String,)> = sqlx::query_as(
+        "SELECT CASE WHEN starts_at <= $3::timestamptz THEN 'closed' ELSE status END
+             FROM lfg_posts WHERE guild_id = $1 AND id = $2",
+    )
+    .bind(guild_id)
+    .bind(id)
+    .bind(joined_at)
+    .fetch_optional(&mut *tx)
+    .await?;
     let Some((status,)) = post else {
         tx.commit().await?;
         return Ok(SignupOutcome::Missing);
