@@ -59,12 +59,24 @@ IMAGE_MAX_BYTES = 112 * MIB
 # headroom, so 17 MiB restores a working tripwire with ~1 MiB of headroom;
 # revisit if the binary approaches it.
 # The voice actor-init retry measured 16,782,904 bytes (+6,808, no new dependencies).
-# 2026-10-24: main at 25377c8 measured 17,806,608 bytes (19,184 under 17 MiB),
-# so the next slice of any size tripped the guard. The feed pause/resume slice
-# (~24,800 bytes of command, store and poller code, no new dependencies, same
-# minimal release profile) measured 17,831,440 bytes (5,648 over) on CI run
-# 40099776675 job 120889388251, so the ceiling moves to 18 MiB (~1 MiB of
-# headroom); revisit if the binary approaches it.
+# 2026-10-23 recalibration: main measured 17,761,096 bytes (16.94 MiB) in
+# hosted CI (check.yml run 39957230025), leaving ~64 KiB of headroom. The
+# giveaway create/entry slice (runtime, admission, REST paths, countdown
+# supervisor job; PR #1662 merge build, run 39986772829) adds ~71 KiB with
+# no new dependencies and no release-profile change (still opt-level=z,
+# lto, strip): 17,833,864 bytes (17.01 MiB), 8,072 over 17 MiB. 18 MiB
+# restores ~1 MiB of headroom while keeping a working tripwire; revisit if
+# the binary approaches it.
+# 2026-10-24 merged-tree re-measurement: PR #1662 head f3e325d3 merged with
+# main 87d53098 (including the REST-acquisition 1d8129b1 and dispatcher
+# e07140dd repairs) measures 17,854,776 bytes (17.03 MiB) in hosted CI
+# (run 40094727805), 28,984 over 17 MiB. 18 MiB stands on merged-tree
+# evidence with no new dependencies and no release-profile change.
+# 2026-10-24: the feed pause/resume slice (~24,800 bytes of command, store
+# and poller code, no new dependencies, same minimal release profile)
+# measured 17,831,440 bytes (5,648 over 17 MiB) on its pre-giveaway base
+# (CI run 40099776675 job 120889388251). The giveaway+feed union below the
+# 18 MiB ceiling is confirmed by this merge's own container-smoke run.
 BINARY_MAX_BYTES = 18 * MIB
 # CLI refusal bounds (not budget policy): --image-max-bytes/--binary-max-bytes
 # outside 1..cap are unusable — a non-positive budget can never pass and a
@@ -338,11 +350,12 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
                 ["token_invalid", "ready"],
             ], f"/readyz body must report a ready process, parked gateway, database down and valid token state; got status={code} body={json.dumps(body)[:2000]}")
             # The runtime always reports informational job status alongside
-            # readiness; with no credentials all fourteen jobs must be parked,
+            # readiness; with no credentials all fifteen jobs must be parked,
             # non-running and never started. Jobs never flip the 503 above. The
             # audit-retry, scheduled-messages, self-role recovery, feeds,
-            # settings-poll, member-unban-sweep, LFG sweep and retention entries
-            # are always listed (parked when their services are unregistered).
+            # settings-poll, member-unban-sweep, LFG sweep, retention and
+            # giveaway-countdown entries are always listed (parked when their
+            # services are unregistered).
             parked = {"parked": True, "running": False, "last_start": None,
                       "last_success": None, "last_error_class": None,
                       "consecutive_failures": 0}
@@ -351,9 +364,9 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
                     "counter", "rank", "scheduled_events", "settings", "presence_probe",
                     "community_scorecard", "inactivity", "audit_retry",
                     "self_role_recovery", "scheduled_messages", "feeds",
-                    "member_unban_sweep", "retention", "lfg_sweep",
+                    "member_unban_sweep", "retention", "lfg_sweep", "giveaway_countdown",
                 )
-            }, "/readyz body must report all fourteen jobs parked, non-running, never started")
+            }, "/readyz body must report all fifteen jobs parked, non-running, never started")
             # Check PID 1, not merely Docker's configured user or an exec helper.
             uid = pid1_uids(name)
             require(len(uid) == 4 and all(value != 0 for value in uid), "runtime PID 1 is root")

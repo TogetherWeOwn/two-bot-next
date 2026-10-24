@@ -40,6 +40,12 @@ mod custom_command_list_pages_acceptance;
 #[path = "help_detail_acceptance.rs"]
 mod help_detail_acceptance;
 
+#[path = "giveaway_admission_edge_acceptance_tests.rs"]
+mod giveaway_admission_edge_acceptance_tests;
+#[path = "giveaway_countdown_edge_acceptance_tests.rs"]
+mod giveaway_countdown_edge_acceptance_tests;
+#[path = "giveaway_create_entry_acceptance_tests.rs"]
+mod giveaway_create_entry_acceptance_tests;
 #[path = "schedule_strict_decode_acceptance_tests.rs"]
 mod schedule_strict_decode_acceptance_tests;
 
@@ -1414,10 +1420,12 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "leaderboard"
                         | "help"
                         | "privacy"
+                        | "giveaway"
                         | "reopen"
                 )
             })
             .collect();
+        assert!(!unwired.contains(&"giveaway"));
         assert!(!unwired.contains(&"rank"));
         assert!(!unwired.contains(&"leaderboard"));
         assert!(!unwired.contains(&"help"));
@@ -3856,6 +3864,7 @@ async fn ready_publishes_the_complete_merged_registry_once() {
         "schedule-list",
         "sticky",
         "sticky-remove",
+        "giveaway",
         "rsvp",
         "rsvp-attendance",
         "lfg",
@@ -4005,6 +4014,7 @@ fn production_router_matches_composed_production_wiring() {
             HandlerId::ScorecardAttendance,
             HandlerId::AutomationAdmin,
             HandlerId::AutomationCustom,
+            HandlerId::Giveaway,
             HandlerId::Rsvp,
             HandlerId::RsvpAttendance,
             HandlerId::Lfg,
@@ -4071,6 +4081,18 @@ fn production_router_matches_composed_production_wiring() {
                         };
                         let real = composed(gates, member_present);
                         let seam = InteractionRouter::production_router(gates, member_present);
+                        // Equal absence is not conformance: both constructors
+                        // must register the dedicated handler while enabled.
+                        for (name, router) in [("composed", &real), ("seam", &seam)] {
+                            assert_eq!(
+                                router.handler_for(&HandlerId::Giveaway).map(|h| h.id()),
+                                automations.then_some(HandlerId::Giveaway),
+                                "{name} giveaway registration follows automations \
+                                 (scorecard={scorecard} automations={automations} \
+                                 announcements={announcements} moderation={moderation} \
+                                 member={member_present})"
+                            );
+                        }
                         for id in every_handler_id() {
                             assert_eq!(
                                 real.handler_for(&id).is_some(),
