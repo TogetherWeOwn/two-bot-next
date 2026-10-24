@@ -9,14 +9,14 @@ verdicts in `docs/smoke-run-record.md`.
 
 - Registry: `InteractionRouter::publish_set` with all feature gates on
   (scorecard, automations, announcements, moderation), no custom rows.
-- Rendered reference: `docs/commands.md` — the 34 built-ins plus the voice set
-  (55 with the voice gates on), registry bounds,
+- Rendered reference: `docs/commands.md` — the 35 built-ins plus the voice set
+  (56 with the voice gates on), registry bounds,
   DMs false on every row (guild-only, legacy `setDMPermission(false)`).
 - Merge order (first definition wins, Discord 100-command ceiling):
   core → scorecard → automations → announcements → moderation.
 
-Counts: 5 core + 1 scorecard + 10 automations + 7 announcements +
-9 moderation + 2 private reads = **34 built-ins**. Machine-readable mirror:
+Counts: 5 core + 1 scorecard + 10 automations + 8 announcements +
+9 moderation + 2 private reads = **35 built-ins**. Machine-readable mirror:
 `crates/core/tests/fixtures/smoke_surface_inventory.json`, checked by
 `crates/core/tests/smoke_surface_inventory.rs` (registry shape in publish
 order, exactly-five-covered gate, handler routing for the five).
@@ -66,6 +66,7 @@ handler family with a covered command.
 | `/giveaway` | automations | Create/cancel write stored state and create/update a live message; list needs seeded DB rows. Excluded from the read-only smoke. |
 | `/rsvp-attendance` | announcements | Needs seeded RSVPs on a live scheduled event; the announcements-open family is covered by `/rsvp`. |
 | `/lfg-close` | announcements | Needs a live LFG post id; sequenced after the `/lfg` create step in the live pass, not standalone. |
+| `/lfg-list` | announcements | Read-only current-channel list but needs seeded open LFG posts; the announcements create path is covered by `/lfg`. |
 | `/feed-add` | announcements | Triggers external fetch plus channel relay writes; the offline rule excludes network effects. |
 | `/feed-remove` | announcements | Destructive and needs a live feed id; sequenced after a feed-add, not standalone. |
 | `/feed-list` | announcements | Needs seeded feed relays (DB); the no-DB rule excludes it. |
