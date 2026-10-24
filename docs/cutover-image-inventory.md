@@ -168,7 +168,7 @@ Before the deployment digest is pinned:
    names, `SHA256SUMS`, and both gate results under the Releases receipt of
    the B4 evidence manifest (`docs/cutover.md` B4). That receipt does not list
    SBOMs yet, so add them there.
-3. Re-measure on the candidate's image ID, and confirm the 112 MiB / 17 MiB
+3. Re-measure on the candidate's image ID, and confirm the 112 MiB / 18 MiB
    budgets pass. CI keeps the candidate image only as the
    `sbom-partial-<run_id>-<attempt>` artifact (`image.tar`, 1-day retention),
    so download it within that window. R1 and R4 are saved-tar layer-blob

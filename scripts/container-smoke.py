@@ -59,12 +59,18 @@ IMAGE_MAX_BYTES = 112 * MIB
 # headroom, so 17 MiB restores a working tripwire with ~1 MiB of headroom;
 # revisit if the binary approaches it.
 # The voice actor-init retry measured 16,782,904 bytes (+6,808, no new dependencies).
-BINARY_MAX_BYTES = 17 * MIB
+# 2026-10-24: main at 25377c8 measured 17,806,608 bytes (19,184 under 17 MiB),
+# so the next slice of any size tripped the guard. The feed pause/resume slice
+# (~24,800 bytes of command, store and poller code, no new dependencies, same
+# minimal release profile) measured 17,831,440 bytes (5,648 over) on CI run
+# 40099776675 job 120889388251, so the ceiling moves to 18 MiB (~1 MiB of
+# headroom); revisit if the binary approaches it.
+BINARY_MAX_BYTES = 18 * MIB
 # CLI refusal bounds (not budget policy): --image-max-bytes/--binary-max-bytes
 # outside 1..cap are unusable — a non-positive budget can never pass and a
 # gigantic one silently disables the budget — so main() refuses them with a
 # fixed message before any Docker call. The caps sit far above any sane
-# override (defaults are 112 MiB/17 MiB) and far below budget-disabling
+# override (defaults are 112 MiB/18 MiB) and far below budget-disabling
 # magnitudes; sane values pass through byte-identically.
 IMAGE_BUDGET_CAP_BYTES = 1024 * MIB
 BINARY_BUDGET_CAP_BYTES = 256 * MIB
