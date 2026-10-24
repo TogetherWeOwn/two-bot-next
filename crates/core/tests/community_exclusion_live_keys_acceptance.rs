@@ -15,7 +15,7 @@
 //! - The five (`TWO_COMMUNITY_AUTOMATION_ACTOR_IDS`,
 //!   `TWO_COMMUNITY_RAID_ACTOR_IDS`, `TWO_COMMUNITY_STAGING_GUILD_IDS`,
 //!   `TWO_COMMUNITY_STAGING_ACTOR_IDS`, `TWO_COMMUNITY_TEST_ACTOR_IDS`)
-//!   classify `Hot`, join `HOT_WIRED` (36 entries), report hot (never cold)
+//!   classify `Hot`, join `HOT_WIRED` (39 entries), report hot (never cold)
 //!   with env-string from/to on a live poll, and serve live per guild with
 //!   no cross-guild leak.
 //! - Stored rows override boot env store-first (the TOG-19027 pattern): one
@@ -198,8 +198,8 @@ fn five_keys_are_classified_hot_and_hot_wired() {
         assert!(HOT_WIRED.contains(&key), "{key}");
         assert!(is_storable_key(key), "{key}");
     }
-    // 31 wired before this slice, plus these five.
-    assert_eq!(HOT_WIRED.len(), 36, "HOT_WIRED must gain exactly the five");
+    // 34 wired before this slice, plus these five.
+    assert_eq!(HOT_WIRED.len(), 39, "HOT_WIRED must gain exactly the five");
 }
 
 // ---------------------------------------------------------------------------
