@@ -2,7 +2,9 @@
 //! Link acceptance is exercised at the guild-aware runtime boundary, without
 //! prescribing a new public parser API or discarding the link's guild early.
 
-use two_bot_core::{parse_attendance_occurrence, validate_event_id, validate_occurrence_id};
+use two_bot_core::{
+    parse_attendance_occurrence, validate_event_id, validate_occurrence_id, CheckinError,
+};
 
 #[test]
 fn existing_representable_numeric_event_ids_remain_unchanged() {
@@ -31,6 +33,30 @@ fn numeric_event_ids_must_fit_a_nonzero_discord_snowflake() {
             "accepted non-snowflake {id}"
         );
     }
+}
+
+#[test]
+fn bare_attendance_anchor_refuses_u64_overflow() {
+    assert_eq!(
+        parse_attendance_occurrence("18446744073709551616"),
+        Err(CheckinError::UnanchoredOccurrence)
+    );
+}
+
+#[test]
+fn bare_attendance_anchor_refuses_twenty_digit_overflow() {
+    assert_eq!(
+        parse_attendance_occurrence("99999999999999999999"),
+        Err(CheckinError::UnanchoredOccurrence)
+    );
+}
+
+#[test]
+fn bare_attendance_anchor_refuses_all_zero() {
+    assert_eq!(
+        parse_attendance_occurrence("00000000000000000"),
+        Err(CheckinError::UnanchoredOccurrence)
+    );
 }
 
 #[test]
