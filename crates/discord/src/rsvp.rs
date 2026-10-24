@@ -449,7 +449,7 @@ async fn execute(
             // Pasted links confirm with the stable numeric identity they
             // normalized to; raw ids keep the legacy sentence byte-identical.
             Ok(if pasted_link {
-                rsvp_saved_text_with_event(status, &event_id)
+                rsvp_saved_text_with_event(status, &record.event_id)
             } else {
                 rsvp_saved_text(status)
             })
