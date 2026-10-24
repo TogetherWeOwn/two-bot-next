@@ -473,6 +473,7 @@ mod tests {
 
     #[test]
     fn slice2_names_match_legacy_in_order() {
+        assert_eq!(automation_commands().len(), 10);
         assert_eq!(
             names(&feature_commands()),
             [
@@ -486,6 +487,7 @@ mod tests {
                 "schedule-list",
                 "sticky",
                 "sticky-remove",
+                "giveaway",
                 "rsvp",
                 "rsvp-attendance",
                 "lfg",
@@ -501,8 +503,8 @@ mod tests {
     #[test]
     fn no_collision_with_leveling_core_or_within_slice() {
         let merged = merge_commands(&[feature_commands()], &[]).expect("slice 2 merges cleanly");
-        // 5 core + 1 scorecard + 9 automation + 8 announcement.
-        assert_eq!(merged.len(), 23);
+        // 5 core + 1 scorecard + 10 automation + 8 announcement.
+        assert_eq!(merged.len(), 24);
         assert_eq!(
             &names(&merged)[..6],
             [
@@ -540,6 +542,7 @@ mod tests {
             "schedule-list",
             "sticky",
             "sticky-remove",
+            "giveaway",
         ] {
             assert_eq!(is(&auto, name), manage_guild, "{name} gates ManageGuild");
         }
@@ -776,13 +779,15 @@ mod tests {
         assert_eq!(json[0]["default_member_permissions"], "8589934592");
         assert_eq!(json[0]["options"][0]["name"], "event-occurrence");
         assert_eq!(json[0]["options"][0]["max_length"], 128);
-        // Saved-response inspection publishes after `command-list`, shifting
-        // the announcement slice one index later.
+        // Inspection follows command-list; giveaway follows sticky-remove.
+        // Both shift the announcement slice without replacing any command.
         assert_eq!(json[4]["name"], "command-inspect");
         assert_eq!(json[4]["options"][2]["max_length"], 500);
-        assert_eq!(json[11]["name"], "rsvp-attendance");
-        assert!(json[11].get("default_member_permissions").is_none());
-        assert_eq!(json[11]["options"][0]["name"], "event-id");
+        assert_eq!(json[10]["name"], "giveaway");
+        assert_eq!(json[10]["default_member_permissions"], "32");
+        assert_eq!(json[12]["name"], "rsvp-attendance");
+        assert!(json[12].get("default_member_permissions").is_none());
+        assert_eq!(json[12]["options"][0]["name"], "event-id");
     }
 
     #[test]

@@ -498,26 +498,52 @@ mod tests {
     #[test]
     fn desired_registry_uses_existing_feature_gates() {
         let mut env = vars();
-        assert_eq!(
-            desired_definitions(2222, &env)
-                .expect("desired registry assembles")
-                .len(),
-            5
+        let default = desired_definitions(2222, &env).expect("desired registry assembles");
+        assert_eq!(default.len(), 5);
+        assert!(
+            default.iter().any(|def| def.name == "reopen"),
+            "reopen is core-always in the default registry"
         );
         env.insert("TWO_AUTOMATIONS".into(), "1".into());
         env.insert("TWO_ANNOUNCEMENTS".into(), "1".into());
         env.insert("TWO_COMMUNITY_SCORECARD".into(), "1".into());
         env.insert("TWO_MODERATION".into(), "1".into());
         env.insert("TWO_OWEN_USER_ID".into(), "123456789012345678".into());
+        let all_on = desired_definitions(2222, &env).expect("desired registry assembles");
         assert_eq!(
-            desired_definitions(2222, &env)
-                .expect("desired registry assembles")
-                .len(),
-            // 31 all-gate builtins (30 plus always-on `/reopen`) plus the
-            // moderation-gated reads `/purge-preview` and `/channel-inspect`
-            // and the Next-only `/feed-inspect` relay detail; no new feature
-            // gate.
-            34
+            all_on.len(),
+            // 32 all-gate builtins (31 plus automations-gated `/giveaway`)
+            // plus the moderation-gated reads `/purge-preview` and
+            // `/channel-inspect` and the Next-only `/feed-inspect` relay
+            // detail; no new feature gate.
+            35
+        );
+        assert!(
+            all_on.iter().any(|def| def.name == "reopen"),
+            "reopen survives the all-on registry"
+        );
+        assert!(
+            all_on.iter().any(|def| def.name == "giveaway"),
+            "giveaway survives the all-on registry"
+        );
+        assert!(
+            all_on.iter().any(|def| def.name == "feed-inspect"),
+            "feed-inspect survives the all-on registry"
+        );
+        env.insert("TWO_VOICE".into(), "1".into());
+        let with_voice = desired_definitions(2222, &env).expect("desired registry assembles");
+        assert_eq!(with_voice.len(), 56);
+        assert!(
+            with_voice.iter().any(|def| def.name == "reopen"),
+            "reopen survives the voice registry"
+        );
+        assert!(
+            with_voice.iter().any(|def| def.name == "giveaway"),
+            "giveaway survives the voice registry"
+        );
+        assert!(
+            with_voice.iter().any(|def| def.name == "feed-inspect"),
+            "feed-inspect survives the voice registry"
         );
     }
 }
