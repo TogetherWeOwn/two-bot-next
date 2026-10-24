@@ -65,13 +65,20 @@ fn matching_registry() -> Value {
     let mut wire = compiled_registry();
     let commands = wire.as_array_mut().unwrap();
     for (index, command) in commands.iter_mut().enumerate() {
+        // The server echoes the writable permission gate; only everyone-commands
+        // come back null. Forcing null on a gated command would fake drift.
+        let gated = command
+            .get("default_member_permissions")
+            .is_some_and(|value| !value.is_null());
         let object = command.as_object_mut().unwrap();
         object.insert("id".into(), json!((8000 + index).to_string()));
         object.insert("application_id".into(), json!(APP_ID.to_string()));
         object.insert("guild_id".into(), json!(GUILD_ID.to_string()));
         object.insert("version".into(), json!("9876"));
         object.insert("nsfw".into(), json!(false));
-        object.insert("default_member_permissions".into(), Value::Null);
+        if !gated {
+            object.insert("default_member_permissions".into(), Value::Null);
+        }
         object.insert("name_localizations".into(), json!({}));
         object.insert("description_localizations".into(), json!({}));
         object.entry("options").or_insert(json!([]));
