@@ -146,7 +146,7 @@ impl RefusalFixture {
         Ok(())
     }
 
-    fn command(&self, panel: &SelfRolePanel) -> CommandRuntime {
+    fn command(&self, panel: &SelfRolePanel) -> Arc<CommandRuntime> {
         let feature = self.runtime();
         let executor = feature.executor.clone();
         let service = Arc::new(recovery_service(feature, panel).unwrap());
