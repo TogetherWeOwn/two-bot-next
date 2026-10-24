@@ -45,7 +45,18 @@
       "gate": "always",
       "default_member_permissions": null,
       "dm_permission": false,
-      "options": [],
+      "options": [
+        {
+          "name": "command",
+          "description": "Command name (case-insensitive; optional leading /)",
+          "type": "string",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 32,
+          "choices": []
+        }
+      ],
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Next-only discovery command with no legacy counterpart; answers from the live publish set with no store or network effect, so it is pinned offline by the router and help-renderer tests rather than the live smoke five."
