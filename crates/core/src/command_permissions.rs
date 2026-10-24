@@ -77,10 +77,12 @@ use PolicyHook::{
 /// plus the Next-only `/help` discovery command (parity row 31 — legacy has
 /// no help command), the Next-only `/privacy` member self-serve
 /// (parity row 32), management-only `/command-inspect` (parity row 33),
-/// `/reopen` picker recovery (parity row 34) and the Next-only pause/resume
-/// `/command-disable` and `/command-enable` (parity rows 35 and 36).
+/// `/reopen` picker recovery (parity row 34), the private moderation reads
+/// `/purge-preview` (row 35) and `/channel-inspect` (row 36), and the
+/// Next-only pause/resume `/command-disable` and `/command-enable` (parity
+/// rows 37 and 38).
 /// No Administrator-only exception: preserve the legacy resolved-bit check.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 36] = [
+pub const COMMAND_PERMISSIONS: [CommandPermission; 38] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),
@@ -125,6 +127,20 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 36] = [
     row(9, "slowmode", BuiltinSlash, PERM_MANAGE_CHANNELS, None),
     row(10, "lockdown", BuiltinSlash, PERM_MANAGE_CHANNELS, None),
     row(11, "unlock", BuiltinSlash, PERM_MANAGE_CHANNELS, None),
+    row(
+        35,
+        "purge-preview",
+        BuiltinSlash,
+        PERM_MANAGE_MESSAGES,
+        None,
+    ),
+    row(
+        36,
+        "channel-inspect",
+        BuiltinSlash,
+        PERM_MANAGE_CHANNELS,
+        None,
+    ),
     row(12, "attendance", BuiltinSlash, PERM_MANAGE_EVENTS, None),
     row(
         13,
@@ -137,8 +153,8 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 36] = [
     row(15, "command-remove", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(16, "command-list", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(33, "command-inspect", BuiltinSlash, PERM_MANAGE_GUILD, None),
-    row(35, "command-disable", BuiltinSlash, PERM_MANAGE_GUILD, None),
-    row(36, "command-enable", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(37, "command-disable", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(38, "command-enable", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(17, "schedule", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(18, "schedule-remove", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(19, "schedule-list", BuiltinSlash, PERM_MANAGE_GUILD, None),
