@@ -81,16 +81,17 @@ use PolicyHook::{
 /// plus the Next-only `/help` discovery command (parity row 31 — legacy has
 /// no help command), the Next-only `/privacy` member self-serve
 /// (parity row 32), management-only `/command-inspect` (parity row 33),
-/// `/reopen` picker recovery (parity row 34), and staff aggregate
-/// `/game-mix` (parity row 35).
+/// `/reopen` picker recovery (parity row 34), the private moderation
+/// reads `/purge-preview` (row 35) and `/channel-inspect` (row 36), and
+/// staff aggregate `/game-mix` (parity row 37).
 /// Only `/game-mix` admits Administrator alone; legacy masks are unchanged.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 35] = [
+pub const COMMAND_PERMISSIONS: [CommandPermission; 37] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),
     row(32, "privacy", BuiltinSlash, 0, None),
     row(34, "reopen", BuiltinSlash, 0, None),
-    row(35, "game-mix", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(37, "game-mix", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(
         3,
         "ban",
@@ -130,6 +131,20 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 35] = [
     row(9, "slowmode", BuiltinSlash, PERM_MANAGE_CHANNELS, None),
     row(10, "lockdown", BuiltinSlash, PERM_MANAGE_CHANNELS, None),
     row(11, "unlock", BuiltinSlash, PERM_MANAGE_CHANNELS, None),
+    row(
+        35,
+        "purge-preview",
+        BuiltinSlash,
+        PERM_MANAGE_MESSAGES,
+        None,
+    ),
+    row(
+        36,
+        "channel-inspect",
+        BuiltinSlash,
+        PERM_MANAGE_CHANNELS,
+        None,
+    ),
     row(12, "attendance", BuiltinSlash, PERM_MANAGE_EVENTS, None),
     row(
         13,
