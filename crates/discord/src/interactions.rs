@@ -287,7 +287,9 @@ impl InteractionRuntime {
             &routed,
             RoutedInteraction::Slash {
                 outcome: SlashOutcome::Handled {
-                    handler: two_bot_core::HandlerId::Lfg | two_bot_core::HandlerId::LfgClose,
+                    handler: two_bot_core::HandlerId::Lfg
+                        | two_bot_core::HandlerId::LfgClose
+                        | two_bot_core::HandlerId::LfgList,
                 },
                 ..
             } | RoutedInteraction::Component {
@@ -446,6 +448,7 @@ impl InteractionRuntime {
         }
         router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::Lfg)));
         router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::LfgClose)));
+        router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::LfgList)));
         Self {
             router: std::sync::Arc::new(router),
             pool: pool.clone(),
@@ -534,6 +537,45 @@ impl InteractionRuntime {
         self.bot_user_id().await
     }
 
+    /// A read-only lookup has a one-second budget, leaving time for the
+    /// immediate ephemeral callback within Discord's three-second window.
+    async fn handle_lfg_list(
+        &self,
+        interaction: &Interaction,
+    ) -> Result<bool, crate::DiscordError> {
+        use twilight_model::application::interaction::application_command::CommandOptionValue;
+        let channel_id = crate::channel_moderation::invoking_channel_id(interaction);
+        let (Some(guild), Some(channel_id), Some(InteractionData::ApplicationCommand(data))) =
+            (interaction.guild_id, channel_id, interaction.data.as_ref())
+        else {
+            return Ok(false);
+        };
+        let cursor = match data.options.iter().find(|option| option.name == "cursor") {
+            Some(option) => match &option.value {
+                CommandOptionValue::String(value) => Ok(Some(value.as_str())),
+                _ => Err(two_bot_core::lfg_list::INVALID_PAGE),
+            },
+            None => Ok(None),
+        };
+        let reply = match cursor {
+            Ok(cursor) => tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                crate::lfg_list::list(&self.pool, &guild.to_string(), &channel_id, cursor),
+            )
+            .await
+            .unwrap_or_else(|_| two_bot_core::lfg_list::UNAVAILABLE.into()),
+            Err(reply) => reply.into(),
+        };
+        self.executor
+            .answer_interaction_with_blocked_retry(
+                interaction.id.get(),
+                &interaction.token,
+                &text_response(InteractionReply::new(reply, true)),
+            )
+            .await?;
+        Ok(true)
+    }
+
     /// Execute an outcome from this runtime's shared router without routing twice.
     pub async fn handle_routed(
         &self,
@@ -551,6 +593,13 @@ impl InteractionRuntime {
         use twilight_model::channel::message::{component::ComponentType, AllowedMentions};
         use two_bot_core::{ComponentHandler, HandlerId};
         let request = match routed {
+            RoutedInteraction::Slash {
+                outcome:
+                    SlashOutcome::Handled {
+                        handler: HandlerId::LfgList,
+                    },
+                ..
+            } => return self.handle_lfg_list(interaction).await,
             RoutedInteraction::Slash {
                 outcome: SlashOutcome::Refuse { refusal },
                 ..
