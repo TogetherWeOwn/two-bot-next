@@ -31,6 +31,8 @@
     {"name": "slowmode", "allow": ["manage_channels", "all_bits"], "deny": "ModerationPermission(Slowmode)"},
     {"name": "lockdown", "allow": ["manage_channels", "all_bits"], "deny": "ModerationPermission(Lockdown)"},
     {"name": "unlock", "allow": ["manage_channels", "all_bits"], "deny": "ModerationPermission(Unlock)"},
+    {"name": "purge-preview", "allow": ["manage_messages", "all_bits"], "deny": "PurgePreviewPermission"},
+    {"name": "channel-inspect", "allow": ["manage_channels", "all_bits"], "deny": "ChannelInspectPermission"},
     {"name": "attendance", "allow": ["manage_events", "all_bits"], "deny": "ManageEventsRequired"},
     {"name": "lfg", "allow": ["manage_events", "all_bits"], "deny": "ManageEventsRequired"},
     {"name": "lfg-close", "allow": ["manage_events", "all_bits"], "deny": "ManageEventsRequired"},

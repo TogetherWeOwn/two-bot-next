@@ -38,7 +38,9 @@
     "purge",
     "slowmode",
     "lockdown",
-    "unlock"
+    "unlock",
+    "purge-preview",
+    "channel-inspect"
   ],
   "example_dynamic": [
     { "name": "faq", "description": "Example automation-gated custom command", "enabled": true }
@@ -76,10 +78,12 @@
     "slowmode",
     "lockdown",
     "unlock",
+    "purge-preview",
+    "channel-inspect",
     "faq"
   ],
   "voice": {
-    "_comment": "Voice set published beside the 31 builtins when TWO_VOICE=1 (RouterGates::voice), in publish order after moderation, default_member_permissions as Discord decimal bitfields (null = no default gate). The voice vote-kick `kick` is the 17th voice definition but loses first-wins to moderation /kick, so it is listed under shadowed_by_first_wins instead. /templateassistant stays unpublished in every gate state until its slice lands with a handler; the `assistant` section below keeps its name and intended default gate so the slice re-activates against the same shape. The drift tests (staging_publish_manifest.rs) fail if InteractionRouter::publish_set differs; regenerate from publish_set output, never hand-edit names. Live publish read-back stays on the staging cards.",
+    "_comment": "Voice set published beside the 34 builtins when TWO_VOICE=1 (RouterGates::voice), in publish order after moderation, default_member_permissions as Discord decimal bitfields (null = no default gate). The voice vote-kick `kick` is the 17th voice definition but loses first-wins to moderation /kick, so it is listed under shadowed_by_first_wins instead. /templateassistant stays unpublished in every gate state until its slice lands with a handler; the `assistant` section below keeps its name and intended default gate so the slice re-activates against the same shape. The drift tests (staging_publish_manifest.rs) fail if InteractionRouter::publish_set differs; regenerate from publish_set output, never hand-edit names. Live publish read-back stays on the staging cards.",
     "gates": {
       "voice": true,
       "voice_assistant": true

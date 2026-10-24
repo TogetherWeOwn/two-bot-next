@@ -1,6 +1,6 @@
 {
   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
-  "count": 32,
+  "count": 34,
   "dm_permission_all_false": true,
   "commands": [
     {
@@ -1020,6 +1020,41 @@
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Channel-state mutation; excluded from the read-only smoke. Same family as ban (covered)."
+    },
+    {
+      "name": "purge-preview",
+      "description": "Privately preview a purge without deleting messages",
+      "family": "moderation",
+      "gate": "moderation",
+      "default_member_permissions": "8192",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "count",
+          "description": "Newest messages to sample (1-100)",
+          "type": "integer",
+          "required": true,
+          "min_value": 1,
+          "max_value": 100,
+          "max_length": null,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Next-only private read; covered by offline preview/inspect acceptance, outside the unchanged top-five live smoke."
+    },
+    {
+      "name": "channel-inspect",
+      "description": "Privately inspect saved lockdown and live slowmode",
+      "family": "moderation",
+      "gate": "moderation",
+      "default_member_permissions": "16",
+      "dm_permission": false,
+      "options": [],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Next-only private read; covered by offline preview/inspect acceptance, outside the unchanged top-five live smoke."
     }
   ]
 }
