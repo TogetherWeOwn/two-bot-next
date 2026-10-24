@@ -3,8 +3,7 @@ use std::collections::BTreeSet;
 use two_bot_core::commands::{
     CommandChoice, CommandDefinition, CommandOption, CommandOptionType, EVENT_REFERENCE_MAX_CHARS,
     HELP_DESCRIPTION, MAX_RESOURCE_ID_CHARS, OCCURRENCE_ID_MAX_CHARS, PERM_MANAGE_GUILD,
-    PRIVACY_DESCRIPTION,
-    REOPEN_DESCRIPTION,
+    PRIVACY_DESCRIPTION, REOPEN_DESCRIPTION,
 };
 use two_bot_core::custom_commands::{
     MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_TEMPLATE_CHARS, MAX_TEXT_TRIGGER_CHARS,
