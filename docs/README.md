@@ -104,6 +104,7 @@ and reasons live in `scripts/check_docs_index.py` (`LARGE_DOCS`), not a second c
 - [Raid boundaries](raid-port.md)
 - [Raid response](raid-response.md)
 - [Custom commands](custom-commands.md)
+- [Bounded args substitution proposal (design only)](custom-command-args-spec.md)
 - [Self-role storage](self-roles.md)
 - [Settings parser tests](internal-settings-acceptance.md)
 - [Settings refresh tests](settings-catalog-acceptance.md)
