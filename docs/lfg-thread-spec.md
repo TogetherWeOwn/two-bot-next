@@ -149,7 +149,7 @@ States in `lfg_threads`: `pending -> created -> ended`, plus `orphaned`. One row
 
 | Event | Result |
 | --- | --- |
-| Post closed (`/lfg-close`) | `created` -> `ended`; tidy-up below |
+| Post closed (`/lfg-close`) | No thread -> no row; `created` -> `ended`; tidy-up below |
 | Post expired (sweep closes 15 min after start) | same transition inside the sweep pass |
 | Post message deleted | Detected only when the sweep or a create attempt reads the message and gets "unknown message": `created` -> `orphaned` |
 | Post row removed (erasure, guild purge) | Row cascades away; the Discord thread is left alone |
@@ -333,7 +333,8 @@ bot messages in the thread and unchanged signups/roles.
 | unreadable_perms | Overwrite read fails -> UNAVAILABLE, never a guess |
 | unbound_post | `message_id` null -> NOT_POSTED, 0 writes |
 | bad_channel | Parent is announcement/forum -> UNSUPPORTED_CHANNEL, 0 writes |
-| post_closed | Post closed by `/lfg-close` -> POST_CLOSED, no create; existing thread -> ended |
+| post_closed_no_thread | Post closed by `/lfg-close` with no thread -> POST_CLOSED, no create, 0 rows |
+| post_closed_with_thread | Post closed by `/lfg-close` with a `created` thread -> POST_CLOSED, no create; thread `created` -> `ended`, 1 row |
 | post_expired | Sweep closes at start + 15 min -> thread ended in the same pass |
 | post_deleted | Message gone (unknown message) -> POST_DELETED, state orphaned, no Discord write |
 | foreign_guild | Guild `g2` -> UNAVAILABLE, 0 writes, no identifiers |
@@ -379,7 +380,8 @@ not proof. No acceptance/implementation task is created by this proposal.
 ...     ("unreadable_perms", "UNAVAILABLE", 0, 0, 0),
 ...     ("unbound_post", "NOT_POSTED", 0, 0, 0),
 ...     ("bad_channel", "UNSUPPORTED_CHANNEL", 0, 0, 0),
-...     ("post_closed", "POST_CLOSED", 0, 0, 0),
+...     ("post_closed_no_thread", "POST_CLOSED", 0, 0, 0),
+...     ("post_closed_with_thread", "POST_CLOSED", 0, 0, 1),
 ...     ("post_expired", "POST_CLOSED", 0, 0, 1),
 ...     ("post_deleted", "POST_DELETED", 0, 0, 1),
 ...     ("foreign_guild", "UNAVAILABLE", 0, 0, 0),
@@ -407,7 +409,7 @@ not proof. No acceptance/implementation task is created by this proposal.
 ...         break
 ...     _matrix.append(_l.split("|")[1].strip())
 >>> assert set(_matrix) == {row[0] for row in oracle}, set(_matrix) ^ {row[0] for row in oracle}
->>> assert len({row[0] for row in oracle}) == len(oracle) == len(_matrix) == 27
+>>> assert len({row[0] for row in oracle}) == len(oracle) == len(_matrix) == 28
 >>> assert all(adds == 0 for _, _, _, adds, _ in oracle)
 >>> assert all(rows in (0, 1) and writes <= 2 for _, _, writes, _, rows in oracle)
 >>> # Only a confirm that reaches Discord, or the optional archive pair, writes
@@ -417,6 +419,10 @@ not proof. No acceptance/implementation task is created by this proposal.
 >>> assert dict((n, r) for n, r, _, _, _ in oracle)["thread_exists_foreign"] == "THREAD_EXISTS"
 >>> assert all(row[1:] == ("UNAVAILABLE", 0, 0, 0) for row in oracle if row[0].startswith("foreign_"))
 >>> assert all(row[2:] == (0, 0, 0) for row in oracle if row[1] in ("FORBIDDEN", "CAP_REACHED", "STALE", "NOT_POSTED"))
+>>> # §4 close transition: no thread persists nothing, created persists one ended row
+>>> assert dict((n, rows) for n, _, _, _, rows in oracle)["post_closed_no_thread"] == 0
+>>> assert dict((n, rows) for n, _, _, _, rows in oracle)["post_closed_with_thread"] == 1
+>>> assert dict((n, rows) for n, _, _, _, rows in oracle)["post_expired"] == 1
 >>> # Discord constants: one thread per message, id == message id, archive choices
 >>> archive_choices, default_archive = (60, 1440, 4320, 10080), 1440
 >>> assert default_archive in archive_choices
@@ -425,7 +431,7 @@ not proof. No acceptance/implementation task is created by this proposal.
 >>> assert 1 <= len("x" * 100) <= 100  # LFG title cap fits the thread-name range
 >>> assert 10 <= 20 and 5 < 10  # guild thread cap within the open-post cap; hourly < live cap
 >>> print(json.dumps({"schema": "lfg.thread.oracle.v1", "fixtures": len(oracle), "status": "pass"}, sort_keys=True))
-{"fixtures": 27, "schema": "lfg.thread.oracle.v1", "status": "pass"}
+{"fixtures": 28, "schema": "lfg.thread.oracle.v1", "status": "pass"}
 
 ```
 
@@ -447,7 +453,7 @@ proposed caps (10 live, 5 per hour); no-member-data side table; audit-actor
 deletion on erasure; and orphan handling by bookkeeping, not deletion. On any
 material revision, bind a fresh review request and alignment to that revision.
 
-By 2026-10-31, metric is **all 27 fixture-matrix rows have agreed or explicitly
+By 2026-10-31, metric is **all 28 fixture-matrix rows have agreed or explicitly
 rejected outcomes, the four blocking findings have written disposition, and the
 A-vs-C choice is recorded with demand evidence or its absence**. This measures
 design completeness, not engagement. Keep the proposal only if the fixtures show
