@@ -307,6 +307,10 @@ pub struct RawResponse {
     pub(crate) completion: Option<two_bot_core::send_admission::AdmissionPermit>,
 }
 
+type AdmittedSendFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(RawResponse, bool), DiscordError>> + Send + 'a>,
+>;
+
 impl std::fmt::Debug for RawResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RawResponse")
@@ -1292,11 +1296,7 @@ impl ActionExecutor {
         &'a self,
         request: &'a Request,
         budget: Duration,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<(RawResponse, bool), DiscordError>> + Send + 'a,
-        >,
-    > {
+    ) -> AdmittedSendFuture<'a> {
         Box::pin(async move {
             self.count();
             // The absolute attempt instant is fixed before durable admission, so
