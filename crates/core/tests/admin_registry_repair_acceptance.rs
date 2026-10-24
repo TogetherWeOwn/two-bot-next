@@ -475,23 +475,39 @@ mod database {
     async fn pre_repair_migrators(chain: &str, shipped: i64) -> (Migrator, Migrator) {
         // Apply unrelated predecessors too: a refusal must roll back the repair,
         // not accidentally compare history across a successful earlier migration.
-        let first_repair = super::forward_registry_files(chain, shipped)
+        let repair_versions: Vec<i64> = super::forward_registry_files(chain, shipped)
+            .iter()
+            .map(|path| {
+                path.file_name()
+                    .expect("repair filename")
+                    .to_str()
+                    .expect("UTF-8 repair filename")
+                    .split('_')
+                    .next()
+                    .expect("repair version")
+                    .parse::<i64>()
+                    .expect("numeric repair version")
+            })
+            .collect();
+        let first_repair = *repair_versions
             .first()
-            .expect("forward registry repair exists")
-            .file_name()
-            .expect("repair filename")
-            .to_str()
-            .expect("UTF-8 repair filename")
-            .split('_')
-            .next()
-            .expect("repair version")
-            .parse::<i64>()
-            .expect("numeric repair version");
-        let latest = migrator(chain).await;
+            .expect("forward registry repair exists");
+        let full = migrator(chain).await;
         let prefix = Migrator::with_migrations(
-            latest
-                .iter()
+            full.iter()
                 .filter(|m| m.version < first_repair)
+                .cloned()
+                .collect(),
+        );
+        // Scope the upgrade to the actual forward registry repairs. Later
+        // non-repair migrations (for example cutover 0465 voice settings) must
+        // not trip repair-contract assertions: they legitimately add
+        // tables/functions, and they may reference chain-only tables absent on
+        // the mirrored chain. Migration numbers are globally unique across
+        // chains, so a later feature can never be renumbered below a repair.
+        let latest = Migrator::with_migrations(
+            full.iter()
+                .filter(|m| m.version < first_repair || repair_versions.contains(&m.version))
                 .cloned()
                 .collect(),
         );
