@@ -305,6 +305,23 @@ pub fn expected_registry() -> Value {
         .expect("legacy command-list remains published")
         + 1;
     commands.insert(after_list, inspect);
+    // Next-only current-channel discovery has its own independent literal.
+    // No production constants or registry builders supply either expectation.
+    let lfg_list = json!({
+        "name": "lfg-list",
+        "description": "List open game posts in this channel",
+        "dm_permission": false,
+        "default_member_permissions": "8589934592",
+        "options": [
+            {"name": "cursor", "description": "Continue a current-channel list", "type": 3,
+             "max_length": 512}
+        ]
+    });
+    let lfg_close_pos = commands
+        .iter()
+        .position(|c| c["name"] == "lfg-close")
+        .expect("lfg-close is published");
+    commands.insert(lfg_close_pos + 1, lfg_list);
     // Next-only `/giveaway` timed entry: no legacy counterpart. Insert at the
     // publish position (index 16: 15 on main plus the `/game-mix` core insert
     // at 5 above, after sticky-remove and the inspect/help/privacy/reopen

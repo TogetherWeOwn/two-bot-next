@@ -348,6 +348,17 @@ Close a raid/LFG signup
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `id` | string | true | — | — | 128 | — | LFG id from the posted signup |
 
+## `/lfg-list`
+
+List open game posts in this channel
+
+- Default permissions: ManageEvents (`8589934592`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `cursor` | string | false | — | — | 512 | — | Continue a current-channel list |
+
 ## `/limit`
 
 Set your room's user limit (no number locks it at the current headcount)
