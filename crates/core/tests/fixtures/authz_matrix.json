@@ -18,6 +18,7 @@
     {"name": "leaderboard", "allow": "*"},
     {"name": "help", "allow": "*"},
     {"name": "privacy", "allow": "*"},
+    {"name": "reopen", "allow": "*"},
     {"name": "game-mix", "allow": ["manage_guild", "administrator_only", "all_bits"], "deny": "ManageServerRequired"},
     {"name": "rsvp", "allow": "*"},
     {"name": "rsvp-attendance", "allow": "*"},

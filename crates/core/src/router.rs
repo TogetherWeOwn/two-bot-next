@@ -121,6 +121,7 @@ pub enum HandlerId {
     Leaderboard,
     Help,
     Privacy,
+    Reopen,
     GameMix,
     ScorecardAttendance,
     AutomationAdmin,
@@ -416,6 +417,7 @@ impl InteractionRouter {
             HandlerId::Leaderboard,
             HandlerId::Help,
             HandlerId::Privacy,
+            HandlerId::Reopen,
             HandlerId::GameMix,
         ] {
             register(id);
@@ -634,6 +636,17 @@ impl InteractionRouter {
             // guild fence above plus the handler's own guild check.
             "privacy" => Row {
                 handler: HandlerId::Privacy,
+                gate: RowGate::Always,
+                permission_refusal: None,
+            },
+            // Self-service picker recovery: always on, open to everyone.
+            // The subject is always the invoker (a `kind` choice, no target
+            // option), so no permission gate applies; an unavailable kind
+            // gets private no-effect guidance from the handler after the
+            // defer, where the kind is visible — the router never sees
+            // options, so kind-level enablement cannot live here.
+            "reopen" => Row {
+                handler: HandlerId::Reopen,
                 gate: RowGate::Always,
                 permission_refusal: None,
             },
@@ -910,6 +923,7 @@ mod tests {
             ("leaderboard", HandlerId::Leaderboard),
             ("help", HandlerId::Help),
             ("privacy", HandlerId::Privacy),
+            ("reopen", HandlerId::Reopen),
             ("game-mix", HandlerId::GameMix),
             ("ban", HandlerId::Moderation(ModerationAction::Ban)),
             ("tempban", HandlerId::Moderation(ModerationAction::TempBan)),
@@ -944,7 +958,7 @@ mod tests {
             ("feed-remove", HandlerId::FeedRemove),
             ("feed-list", HandlerId::FeedList),
         ];
-        assert_eq!(cases.len(), 31, "all 31 handler-owned builtins covered");
+        assert_eq!(cases.len(), 32, "all 32 handler-owned builtins covered");
         for (name, handler) in cases {
             assert_eq!(
                 r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
@@ -1419,16 +1433,17 @@ mod tests {
         }];
         let set = r.publish_set(&custom).expect("full set assembles");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        // 5 core + 1 scorecard + 9 automation + 7 announcement + 9 moderation
-        // + 1 custom = 32, in publish order, guild-only throughout.
-        assert_eq!(set.len(), 32);
+        // 6 core + 1 scorecard + 9 automation + 7 announcement + 9 moderation
+        // + 1 custom = 33, in publish order, guild-only throughout.
+        assert_eq!(set.len(), 33);
         assert_eq!(
-            &names[..6],
+            &names[..7],
             [
                 "rank",
                 "leaderboard",
                 "help",
                 "privacy",
+                "reopen",
                 "game-mix",
                 "attendance"
             ]
@@ -1436,13 +1451,13 @@ mod tests {
         assert!(names.contains(&"rsvp-attendance"));
         assert_eq!(names.iter().filter(|n| **n == "attendance").count(), 1);
         assert_eq!(
-            &names[22..31],
+            &names[23..32],
             [
                 "ban", "tempban", "kick", "timeout", "warn", "purge", "slowmode", "lockdown",
                 "unlock",
             ]
         );
-        assert_eq!(names[31], "faq");
+        assert_eq!(names[32], "faq");
         assert!(set.iter().all(|c| !c.dm_permission));
     }
 
@@ -1465,7 +1480,14 @@ mod tests {
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
             names,
-            ["rank", "leaderboard", "help", "privacy", "game-mix"]
+            [
+                "rank",
+                "leaderboard",
+                "help",
+                "privacy",
+                "reopen",
+                "game-mix"
+            ]
         );
     }
 
@@ -1489,7 +1511,14 @@ mod tests {
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
             names,
-            ["rank", "leaderboard", "help", "privacy", "game-mix"]
+            [
+                "rank",
+                "leaderboard",
+                "help",
+                "privacy",
+                "reopen",
+                "game-mix"
+            ]
         );
         // Over-limit stored catalogs no longer fail the publish either.
         let crowded: Vec<_> = (0..99)
@@ -1500,7 +1529,7 @@ mod tests {
             })
             .collect();
         let set = off.publish_set(&crowded).expect("core-only set");
-        assert_eq!(set.len(), 5);
+        assert_eq!(set.len(), 6);
     }
 
     #[test]
@@ -1617,7 +1646,7 @@ mod tests {
     fn voice_set_publishes_after_moderation_only_while_gated() {
         let off = published(all_on());
         let off_names: Vec<_> = off.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(off.len(), 31);
+        assert_eq!(off.len(), 32);
         for name in VOICE_NAMES.iter().filter(|name| **name != "kick") {
             assert!(
                 !off_names.contains(name),
@@ -1627,16 +1656,16 @@ mod tests {
 
         let on = published(voice_on());
         let on_names: Vec<_> = on.iter().map(|c| c.name.as_str()).collect();
-        // 31 builtins keep their order; the 21 voice names that survive
+        // 32 builtins keep their order; the 21 voice names that survive
         // first-wins follow in voice order. `kick` is already moderation's.
-        assert_eq!(on.len(), 52);
-        assert_eq!(on_names[..31], off_names[..]);
+        assert_eq!(on.len(), 53);
+        assert_eq!(on_names[..32], off_names[..]);
         let expected: Vec<_> = VOICE_NAMES
             .iter()
             .copied()
             .filter(|name| *name != "kick")
             .collect();
-        assert_eq!(on_names[31..], expected[..]);
+        assert_eq!(on_names[32..], expected[..]);
         assert!(!on_names.contains(&"templateassistant"));
         assert!(on.iter().all(|c| !c.dm_permission));
     }

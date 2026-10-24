@@ -47,7 +47,7 @@ fn matrix_matches_the_published_set_exactly() {
         matrix_names, published_names,
         "matrix drift: ship a matrix row with every new command and drop the row with every removed one"
     );
-    assert_eq!(matrix.len(), 31, "contract covers the 31 built-in commands");
+    assert_eq!(matrix.len(), 32, "contract covers the 32 built-in commands");
 }
 
 #[test]
@@ -82,7 +82,14 @@ fn matrix_gates_and_permissions_match_the_registry() {
             "/{} must stay guild-only (dm_permission false)",
             row.command
         );
-        let always = ["rank", "leaderboard", "help", "privacy", "game-mix"];
+        let always = [
+            "rank",
+            "leaderboard",
+            "help",
+            "privacy",
+            "reopen",
+            "game-mix",
+        ];
         let expected_gate = if always.contains(&row.command) {
             E2eGate::Always
         } else if row.command == "attendance" {

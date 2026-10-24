@@ -80,15 +80,17 @@ use PolicyHook::{
 /// All 30 parity rows, including the three non-static-slash dispositions,
 /// plus the Next-only `/help` discovery command (parity row 31 — legacy has
 /// no help command), the Next-only `/privacy` member self-serve
-/// (parity row 32) and the Next-only management-only `/command-inspect`
-/// (parity row 33), and staff aggregate `/game-mix` (parity row 34).
+/// (parity row 32), management-only `/command-inspect` (parity row 33),
+/// `/reopen` picker recovery (parity row 34), and staff aggregate
+/// `/game-mix` (parity row 35).
 /// Only `/game-mix` admits Administrator alone; legacy masks are unchanged.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 34] = [
+pub const COMMAND_PERMISSIONS: [CommandPermission; 35] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),
     row(32, "privacy", BuiltinSlash, 0, None),
-    row(34, "game-mix", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(34, "reopen", BuiltinSlash, 0, None),
+    row(35, "game-mix", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(
         3,
         "ban",

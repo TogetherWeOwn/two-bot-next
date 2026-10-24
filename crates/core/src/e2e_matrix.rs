@@ -34,7 +34,7 @@ use crate::commands::{
 /// must set on staging for the command to be published at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum E2eGate {
-    /// Always published (`rank`, `leaderboard`, `help`, `privacy`).
+    /// Always published (`rank`, `leaderboard`, `help`, `privacy`, `reopen`).
     Always,
     /// `TWO_COMMUNITY_SCORECARD=1`.
     Scorecard,
@@ -172,8 +172,18 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             ],
         ),
         row(
-            "game-mix",
+            "reopen",
             34,
+            E2eGate::Always,
+            0,
+            "Everyone",
+            "Reopen",
+            "Deferred ephemeral reply; a fresh games or session menu edit for the invoker only, built from current roles and current configured picks with zero role, channel or funnel writes. Disabled kinds, malformed invocations and failed lookups get a private no-effect guidance edit instead of a menu.",
+            &["Valid:kind:required,games|session"],
+        ),
+        row(
+            "game-mix",
+            35,
             E2eGate::Always,
             PERM_MANAGE_GUILD,
             "ManageGuild",

@@ -594,7 +594,7 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
             .collect();
         // The harness boots with a synthetic token no clearance recognizes,
         // so activation narrows every clearable surface while scorecard
-        // stays: the single boot PUT carries exactly the five core commands
+        // stays: the single boot PUT carries exactly the six core commands
         // plus scorecard, each once. Uncleared
         // surfaces stay unpublished (and refused at dispatch) rather than
         // advertised.
@@ -605,6 +605,7 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
                 "leaderboard",
                 "help",
                 "privacy",
+                "reopen",
                 "game-mix",
                 "attendance"
             ],
