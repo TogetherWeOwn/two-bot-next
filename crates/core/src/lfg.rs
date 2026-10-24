@@ -506,19 +506,29 @@ pub fn preview_lfg_content(
 }
 
 /// Break mention-pill syntax (`<@user>`, `<@&role>`, `<#channel>`,
-/// `<:emoji>`) so hostile titles/labels render as literal text in an
-/// ephemeral preview. Inserts a zero-width space after `<` — the same
-/// invisible technique `message_safety::neutralize_mentions` uses for mass
-/// mentions, and neutral for every legitimate preview character.
+/// `<:emoji>`, `<a:animated:>`, `</command:>`) so hostile titles/labels
+/// render as literal text in an ephemeral preview. Inserts a zero-width
+/// space after `<` — the same invisible technique
+/// `message_safety::neutralize_mentions` uses for mass mentions, and neutral
+/// for every legitimate preview character. Discord timestamps (`<t:...>`)
+/// are untouched.
 fn break_mention_pills(text: &str) -> String {
     let mut broken = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        broken.push(ch);
-        if ch == '<' && matches!(chars.peek(), Some('@' | '#' | ':')) {
+    let mut rest = text;
+    while let Some(index) = rest.find('<') {
+        let (before, from) = rest.split_at(index);
+        broken.push_str(before);
+        broken.push('<');
+        // `<` is one byte, so this split is always on a boundary.
+        let after = &from[1..];
+        // `a` needs its colon: a bare `<a` is ordinary text, while `<a:`
+        // starts an animated emoji. Every other prefix is pill-only.
+        if after.starts_with(['@', '#', ':', '/']) || after.starts_with("a:") {
             broken.push('\u{200b}');
         }
+        rest = after;
     }
+    broken.push_str(rest);
     broken
 }
 
@@ -1302,6 +1312,12 @@ mod tests {
         assert!(!preview.contains("@everyone"));
         assert!(!preview.contains("<@3333>"));
         assert!(!preview.contains("<@&5555>"));
+        // Animated emoji and command mentions break too, while timestamps
+        // and bare `<a` text pass through visibly unchanged.
+        assert_eq!(
+            break_mention_pills("<a:dance:123> </lfg:456> <t:789:F> 1<a <#12> <:e:34>"),
+            "<\u{200b}a:dance:123> <\u{200b}/lfg:456> <t:789:F> 1<a <\u{200b}#12> <\u{200b}:e:34>"
+        );
         assert!(preview.encode_utf16().count() <= MAX_MESSAGE_CHARS);
         // Maximum valid inputs stay bounded with the title retained.
         let title = "😀".repeat(50);
