@@ -1,6 +1,6 @@
 {
   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
-  "count": 34,
+  "count": 35,
   "dm_permission_all_false": true,
   "commands": [
     {
@@ -514,6 +514,123 @@
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Channel-state mutation; excluded from the read-only smoke."
+    },
+    {
+      "name": "giveaway",
+      "description": "Create, list or cancel a giveaway",
+      "family": "automations",
+      "gate": "automations",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "create",
+          "description": "Create a giveaway in this channel",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [],
+          "options": [
+            {
+              "name": "prize",
+              "description": "Prize text (up to 200 characters)",
+              "type": "string",
+              "required": true,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 200,
+              "choices": []
+            },
+            {
+              "name": "duration",
+              "description": "Entry window in minutes (1–43200)",
+              "type": "integer",
+              "required": true,
+              "min_value": 1,
+              "max_value": 43200,
+              "max_length": null,
+              "choices": []
+            },
+            {
+              "name": "winners",
+              "description": "Number of winners",
+              "type": "integer",
+              "required": true,
+              "min_value": 1,
+              "max_value": 100,
+              "max_length": null,
+              "choices": []
+            },
+            {
+              "name": "required-role",
+              "description": "Role every entrant must hold",
+              "type": "role",
+              "required": false,
+              "min_value": null,
+              "max_value": null,
+              "max_length": null,
+              "choices": []
+            },
+            {
+              "name": "min-account-age-days",
+              "description": "Minimum account age in days",
+              "type": "integer",
+              "required": false,
+              "min_value": 0,
+              "max_value": 3650,
+              "max_length": null,
+              "choices": []
+            },
+            {
+              "name": "min-server-age-days",
+              "description": "Minimum time in this server in days",
+              "type": "integer",
+              "required": false,
+              "min_value": 0,
+              "max_value": 3650,
+              "max_length": null,
+              "choices": []
+            }
+          ]
+        },
+        {
+          "name": "list",
+          "description": "List open giveaways",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "cancel",
+          "description": "Cancel an open or paused giveaway",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [],
+          "options": [
+            {
+              "name": "id",
+              "description": "Giveaway id",
+              "type": "string",
+              "required": true,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 64,
+              "choices": []
+            }
+          ]
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "State-mutating timed entry (create/cancel writes plus the draw ticker); pinned by the gateway dispatch and store tests rather than the live smoke five."
     },
     {
       "name": "rsvp",

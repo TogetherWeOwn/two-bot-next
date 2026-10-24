@@ -637,8 +637,8 @@ mod tests {
     fn full_registry_merges_without_collision() {
         let merged = merge_commands(&[feature_commands(), moderation_commands()], &[])
             .expect("slices 1-3 merge cleanly");
-        // 6 core + 17 slice-2 + 9 moderation mutations + 2 private reads.
-        assert_eq!(merged.len(), 34);
+        // 6 core + 18 slice-2 + 9 moderation mutations + 2 private reads.
+        assert_eq!(merged.len(), 35);
         let names: Vec<_> = merged.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(
             &names[..7],
@@ -652,12 +652,19 @@ mod tests {
                 "attendance"
             ]
         );
+        for name in ["command-inspect", "reopen", "giveaway", "game-mix"] {
+            assert_eq!(
+                names.iter().filter(|n| **n == name).count(),
+                1,
+                "{name} must remain unique in the combined registry"
+            );
+        }
         assert_eq!(
-            &names[23..28],
+            &names[24..29],
             ["ban", "tempban", "kick", "timeout", "warn"]
         );
         assert_eq!(
-            &names[28..],
+            &names[29..],
             [
                 "purge",
                 "slowmode",

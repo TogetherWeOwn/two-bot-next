@@ -81,17 +81,18 @@ use PolicyHook::{
 /// plus the Next-only `/help` discovery command (parity row 31 — legacy has
 /// no help command), the Next-only `/privacy` member self-serve
 /// (parity row 32), management-only `/command-inspect` (parity row 33),
-/// `/reopen` picker recovery (parity row 34), the private moderation
-/// reads `/purge-preview` (row 35) and `/channel-inspect` (row 36), and
-/// staff aggregate `/game-mix` (parity row 37).
+/// `/reopen` picker recovery (parity row 34), the private moderation reads
+/// `/purge-preview` (row 35) and `/channel-inspect` (row 36), `/giveaway`
+/// timed entry (parity row 37), and staff aggregate `/game-mix` (row 38).
 /// Only `/game-mix` admits Administrator alone; legacy masks are unchanged.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 37] = [
+pub const COMMAND_PERMISSIONS: [CommandPermission; 38] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),
     row(32, "privacy", BuiltinSlash, 0, None),
     row(34, "reopen", BuiltinSlash, 0, None),
-    row(37, "game-mix", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(37, "giveaway", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(38, "game-mix", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(
         3,
         "ban",

@@ -59,6 +59,19 @@ IMAGE_MAX_BYTES = 112 * MIB
 # headroom, so 17 MiB restores a working tripwire with ~1 MiB of headroom;
 # revisit if the binary approaches it.
 # The voice actor-init retry measured 16,782,904 bytes (+6,808, no new dependencies).
+# 2026-10-23 recalibration: main measured 17,761,096 bytes (16.94 MiB) in
+# hosted CI (check.yml run 39957230025), leaving ~64 KiB of headroom. The
+# giveaway create/entry slice (runtime, admission, REST paths, countdown
+# supervisor job; PR #1662 merge build, run 39986772829) adds ~71 KiB with
+# no new dependencies and no release-profile change (still opt-level=z,
+# lto, strip): 17,833,864 bytes (17.01 MiB), 8,072 over 17 MiB. 18 MiB
+# restores ~1 MiB of headroom while keeping a working tripwire; revisit if
+# the binary approaches it.
+# 2026-10-24 merged-tree re-measurement: PR #1662 head f3e325d3 merged with
+# main 87d53098 (including the REST-acquisition 1d8129b1 and dispatcher
+# e07140dd repairs) measures 17,854,776 bytes (17.03 MiB) in hosted CI
+# (run 40094727805), 28,984 over 17 MiB. 18 MiB stands on merged-tree
+# evidence with no new dependencies and no release-profile change.
 # On 2026-10-24 the 17 MiB ceiling was reached on main itself: main at
 # cc07f31436 measured 17,845,208 bytes (17.02 MiB), 19,416 bytes over, in
 # [its container smoke job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/40061835103/job/120785881426).
@@ -341,11 +354,12 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
                 ["token_invalid", "ready"],
             ], f"/readyz body must report a ready process, parked gateway, database down and valid token state; got status={code} body={json.dumps(body)[:2000]}")
             # The runtime always reports informational job status alongside
-            # readiness; with no credentials all fourteen jobs must be parked,
+            # readiness; with no credentials all fifteen jobs must be parked,
             # non-running and never started. Jobs never flip the 503 above. The
             # audit-retry, scheduled-messages, self-role recovery, feeds,
-            # settings-poll, member-unban-sweep, LFG sweep and retention entries
-            # are always listed (parked when their services are unregistered).
+            # settings-poll, member-unban-sweep, LFG sweep, retention and
+            # giveaway-countdown entries are always listed (parked when their
+            # services are unregistered).
             parked = {"parked": True, "running": False, "last_start": None,
                       "last_success": None, "last_error_class": None,
                       "consecutive_failures": 0}
@@ -354,9 +368,9 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
                     "counter", "rank", "scheduled_events", "settings", "presence_probe",
                     "community_scorecard", "inactivity", "audit_retry",
                     "self_role_recovery", "scheduled_messages", "feeds",
-                    "member_unban_sweep", "retention", "lfg_sweep",
+                    "member_unban_sweep", "retention", "lfg_sweep", "giveaway_countdown",
                 )
-            }, "/readyz body must report all fourteen jobs parked, non-running, never started")
+            }, "/readyz body must report all fifteen jobs parked, non-running, never started")
             # Check PID 1, not merely Docker's configured user or an exec helper.
             uid = pid1_uids(name)
             require(len(uid) == 4 and all(value != 0 for value in uid), "runtime PID 1 is root")
